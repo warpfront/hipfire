@@ -14,6 +14,7 @@ pub mod partition;
 pub mod recipes;
 pub mod recipes_fp8;
 pub mod toolchain;
+pub mod union;
 
 pub use arch::{ArchProfile, CodeObjectIdentity, IsaVersion};
 pub use campaign::{
@@ -133,7 +134,7 @@ impl SchedulerProfile {
         }
     }
 
-    const fn llvm_args(self) -> &'static [&'static str] {
+    pub const fn llvm_args(self) -> &'static [&'static str] {
         match self {
             Self::Default => &[],
             Self::MaxIlp => &["-mllvm", "-misched=gcn-max-ilp"],
@@ -192,12 +193,10 @@ pub struct CompileRequest {
     pub extra_args: Vec<OsString>,
     pub manifest: Option<PathBuf>,
     pub inspect: bool,
-    /// hipfire-local delta: environment applied to the hipcc invocation.
+    /// Environment applied only to the hipcc invocation.
     ///
-    /// hipcc resolves its own LLVM and device libraries through `ROCM_PATH`.
-    /// On a ROCm rooted outside `/opt/rocm` it reports a valid `--version` and
-    /// then fails every compile with `clang++: not found`, so the caller must
-    /// be able to pin the resolved root explicitly.
+    /// This lets callers pin a non-default ROCm root without mutating the
+    /// process environment used by inspection and replay.
     pub envs: Vec<(OsString, OsString)>,
 }
 
@@ -215,7 +214,7 @@ impl CompileRequest {
             hipcc: resolve_hipcc(),
             working_directory: None,
             optimization_level: 3,
-            fast_math: false,
+            fast_math: true,
             scheduler_profile: SchedulerProfile::Default,
             defines: Vec::new(),
             extra_args: Vec::new(),
@@ -230,7 +229,6 @@ impl CompileRequest {
         self
     }
 
-    /// hipfire-local delta: pin one environment variable for the hipcc call.
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.envs.push((key.into(), value.into()));
         self
@@ -272,6 +270,8 @@ pub struct ExistingCodeObjectRequest {
     pub hipcc: PathBuf,
     pub command: Vec<String>,
     pub manifest: Option<PathBuf>,
+    pub scheduler_profile: SchedulerProfile,
+    pub peacemaker: Option<PeacemakerRecord>,
 }
 
 impl ExistingCodeObjectRequest {
@@ -288,6 +288,8 @@ impl ExistingCodeObjectRequest {
             hipcc: resolve_hipcc(),
             command: Vec::new(),
             manifest: None,
+            scheduler_profile: SchedulerProfile::Default,
+            peacemaker: None,
         }
     }
 
@@ -308,6 +310,16 @@ impl ExistingCodeObjectRequest {
 
     pub fn manifest(mut self, path: impl Into<PathBuf>) -> Self {
         self.manifest = Some(path.into());
+        self
+    }
+
+    pub fn scheduler_profile(mut self, profile: SchedulerProfile) -> Self {
+        self.scheduler_profile = profile;
+        self
+    }
+
+    pub fn peacemaker(mut self, record: PeacemakerRecord) -> Self {
+        self.peacemaker = Some(record);
         self
     }
 }
@@ -346,6 +358,31 @@ pub enum MutableReadCache {
     VmemOnly,
 }
 
+/// Compiler-derived access mode for one global-buffer kernarg.
+///
+/// AMDGPU code-object metadata emits `.actual_access` after whole-body memory
+/// analysis. Radiowave preserves that result so submission layers do not need
+/// a kernel-name table to recover pointer effects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelArgumentAccess {
+    ReadOnly,
+    WriteOnly,
+    ReadWrite,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct KernelArgumentReport {
+    pub offset: u32,
+    pub size: u32,
+    #[serde(default)]
+    pub value_kind: String,
+    #[serde(default)]
+    pub address_space: Option<String>,
+    #[serde(default)]
+    pub actual_access: Option<KernelArgumentAccess>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct KernelReport {
     pub name: String,
@@ -357,6 +394,8 @@ pub struct KernelReport {
     pub private_segment_fixed_size: u32,
     #[serde(default)]
     pub mutable_read_cache: MutableReadCache,
+    #[serde(default)]
+    pub arguments: Vec<KernelArgumentReport>,
     pub instructions: InstructionStats,
 }
 
@@ -386,6 +425,68 @@ impl CodeObjectInspection {
     }
 }
 
+/// Provenance and shape evidence for an externally produced code object.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeacemakerRecord {
+    pub arm: PeacemakerArm,
+    pub producer: PeacemakerProducer,
+    pub tools: Vec<PeacemakerTool>,
+    pub s_text_sha256: String,
+    pub text_section_sha256: String,
+    pub shape_contract: serde_json::Value,
+    pub shape_result: serde_json::Value,
+    pub oracle_receipt: Option<OracleReceipt>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PeacemakerArm {
+    CustomIsa,
+    CustomAco,
+    PostRa,
+    Hipcc,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeacemakerProducer {
+    pub builder_crate_version: String,
+    pub builder_git_sha: String,
+    pub proof_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aco_commit: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PeacemakerTool {
+    pub role: PeacemakerToolRole,
+    pub path: PathBuf,
+    pub version: String,
+    pub argv: Vec<String>,
+    pub sha256: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PeacemakerToolRole {
+    Assembler,
+    Linker,
+    Bundler,
+    Aco,
+    /// peacemaker-isa's native code-object writer: assembler, linker and
+    /// bundler in one, no ROCm tool.
+    Native,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct OracleReceipt {
+    pub suite: String,
+    pub fixtures_sha256: String,
+    pub cases: u32,
+    pub differing_bits: u64,
+    pub device_uuid: String,
+    pub date: String,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompileManifest {
     pub schema_version: u32,
@@ -404,6 +505,8 @@ pub struct CompileManifest {
     pub support_header_sha256: String,
     pub output_sha256: String,
     pub inspection: Option<CodeObjectInspection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peacemaker: Option<PeacemakerRecord>,
 }
 
 /// A manifest whose compiler identity, schema, inspection payload, and
@@ -441,6 +544,16 @@ impl CodeObjectCertification {
                 manifest.output_sha256, actual_sha256
             )));
         }
+        if manifest
+            .peacemaker
+            .as_ref()
+            .and_then(|record| record.oracle_receipt.as_ref())
+            .is_some_and(|receipt| receipt.differing_bits != 0)
+        {
+            return Err(Error::InvalidCertification(
+                "peacemaker oracle receipt has differing bits".to_owned(),
+            ));
+        }
         Ok(Self { manifest })
     }
 
@@ -467,6 +580,34 @@ impl CodeObjectCertification {
             .map_or(MutableReadCache::ScalarOrUnknown, |kernel| {
                 kernel.mutable_read_cache
             })
+    }
+
+    /// Exact global-buffer effects certified from AMDGPU `.actual_access`.
+    ///
+    /// Older manifests fail closed. AMDGPU omits `.actual_access` for some
+    /// mutable or in-place pointers; those are conservatively `ReadWrite`,
+    /// never inferred as read-only.
+    pub fn argument_effects(&self, symbol: &str) -> Option<Vec<(usize, KernelArgumentAccess)>> {
+        if self.manifest.schema_version < 4 {
+            return None;
+        }
+        let kernel = self.kernel(symbol)?;
+        let mut effects = Vec::new();
+        for argument in &kernel.arguments {
+            if argument.value_kind != "global_buffer" {
+                continue;
+            }
+            if argument.size != 8 {
+                return None;
+            }
+            effects.push((
+                usize::try_from(argument.offset).ok()?,
+                argument
+                    .actual_access
+                    .unwrap_or(KernelArgumentAccess::ReadWrite),
+            ));
+        }
+        (!effects.is_empty()).then_some(effects)
     }
 }
 
@@ -516,7 +657,7 @@ impl Compiler {
         rendered_command.push(request.hipcc.to_string_lossy().into_owned());
         rendered_command.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
         let manifest = CompileManifest {
-            schema_version: 3,
+            schema_version: 5,
             compiler: "radiowave".to_owned(),
             generated_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -534,6 +675,7 @@ impl Compiler {
             support_header_sha256: sha256_bytes(HIP_SUPPORT_HEADER.as_bytes()),
             output_sha256: output_sha256.clone(),
             inspection: inspection.clone(),
+            peacemaker: None,
         };
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
@@ -576,7 +718,7 @@ impl Compiler {
             fs::create_dir_all(parent)?;
         }
         let manifest = CompileManifest {
-            schema_version: 3,
+            schema_version: 5,
             compiler: "radiowave".to_owned(),
             generated_unix_seconds: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -586,7 +728,12 @@ impl Compiler {
             output: output.clone(),
             arch: request.arch.clone(),
             wavefront: request.wavefront,
-            scheduler_profile: SchedulerProfile::Default,
+            // Use the caller-supplied profile so the manifest honestly reflects
+            // what produced the object. Previously this was hardcoded to
+            // `Default`, so a `memory-clause` object was silently described as
+            // `default` during measurement and the field could not be used as
+            // evidence of the actual build.
+            scheduler_profile: request.scheduler_profile,
             hipcc: request.hipcc.clone(),
             hipcc_version: tool_version(&request.hipcc),
             command: request.command.clone(),
@@ -596,6 +743,7 @@ impl Compiler {
             support_header_sha256: sha256_bytes(&[]),
             output_sha256: output_sha256.clone(),
             inspection: Some(inspection.clone()),
+            peacemaker: request.peacemaker.clone(),
         };
         fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest)?)?;
 
@@ -818,16 +966,20 @@ fn configured_tool(variable: &str, root: &Path, name: &str) -> PathBuf {
     if let Some(path) = env::var_os(variable) {
         return path.into();
     }
-    for candidate in [
-        root.join("lib/llvm/bin").join(name),
-        root.join("llvm/bin").join(name),
-        root.join("bin").join(name),
-    ] {
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    name.into()
+    tool_under_root(root, name, env::consts::EXE_SUFFIX).unwrap_or_else(|| name.into())
+}
+
+/// The Windows HIP SDK ships `bin\llvm-objdump.exe`; missing it falls back to a PATH LLVM without amdgpu.
+fn tool_under_root(root: &Path, name: &str, exe_suffix: &str) -> Option<PathBuf> {
+    ["lib/llvm/bin", "llvm/bin", "bin"]
+        .into_iter()
+        .flat_map(|dir| {
+            let dir = root.join(dir);
+            let suffixed =
+                (!exe_suffix.is_empty()).then(|| dir.join(format!("{name}{exe_suffix}")));
+            std::iter::once(dir.join(name)).chain(suffixed)
+        })
+        .find(|candidate| candidate.is_file())
 }
 
 fn checked_output(command: &mut Command, label: &str) -> Result<Output> {
@@ -873,15 +1025,55 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 fn parse_metadata(notes: &str) -> Vec<KernelReport> {
     let mut reports = Vec::new();
     let mut current: Option<KernelReport> = None;
+    let mut current_argument: Option<KernelArgumentReport> = None;
+    let mut in_arguments = false;
+
+    let flush_argument = |current: &mut Option<KernelReport>,
+                          argument: &mut Option<KernelArgumentReport>| {
+        if let (Some(report), Some(argument)) = (current.as_mut(), argument.take()) {
+            report.arguments.push(argument);
+        }
+    };
+
     for line in notes.lines() {
-        if let Some(name) = line.strip_prefix("    .name:") {
-            if let Some(report) = current.take() {
+        if line.starts_with("  - .args:") {
+            flush_argument(&mut current, &mut current_argument);
+            if let Some(report) = current.take().filter(|report| !report.name.is_empty()) {
                 reports.push(report);
             }
-            current = Some(KernelReport {
-                name: name.trim().trim_matches('"').to_owned(),
-                ..KernelReport::default()
-            });
+            current = Some(KernelReport::default());
+            in_arguments = true;
+            continue;
+        }
+        if in_arguments && line.starts_with("      - .") {
+            flush_argument(&mut current, &mut current_argument);
+            let mut argument = KernelArgumentReport::default();
+            parse_argument_metadata_field(
+                &mut argument,
+                line.trim_start().strip_prefix("- ").unwrap_or_default(),
+            );
+            current_argument = Some(argument);
+            continue;
+        }
+        if in_arguments && line.starts_with("        .") {
+            if let Some(argument) = current_argument.as_mut() {
+                parse_argument_metadata_field(argument, line.trim());
+            }
+            continue;
+        }
+        if in_arguments && line.starts_with("    .") {
+            flush_argument(&mut current, &mut current_argument);
+            in_arguments = false;
+        }
+        if let Some(name) = line.strip_prefix("    .name:") {
+            if current
+                .as_ref()
+                .is_some_and(|report| !report.name.is_empty())
+            {
+                reports.push(current.take().unwrap());
+            }
+            let report = current.get_or_insert_with(KernelReport::default);
+            report.name = name.trim().trim_matches('"').to_owned();
             continue;
         }
         let Some(report) = current.as_mut() else {
@@ -904,11 +1096,34 @@ fn parse_metadata(notes: &str) -> Vec<KernelReport> {
             }
         }
     }
+    flush_argument(&mut current, &mut current_argument);
     if let Some(report) = current {
         reports.push(report);
     }
     reports.retain(|report| !report.name.is_empty());
     reports
+}
+
+fn parse_argument_metadata_field(argument: &mut KernelArgumentReport, field: &str) {
+    let Some((name, value)) = field.split_once(':') else {
+        return;
+    };
+    let value = value.trim().trim_matches('"');
+    match name.trim() {
+        ".actual_access" => {
+            argument.actual_access = match value {
+                "read_only" => Some(KernelArgumentAccess::ReadOnly),
+                "write_only" => Some(KernelArgumentAccess::WriteOnly),
+                "read_write" => Some(KernelArgumentAccess::ReadWrite),
+                _ => None,
+            };
+        }
+        ".address_space" => argument.address_space = Some(value.to_owned()),
+        ".offset" => argument.offset = value.parse().unwrap_or_default(),
+        ".size" => argument.size = value.parse().unwrap_or_default(),
+        ".value_kind" => argument.value_kind = value.to_owned(),
+        _ => {}
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1190,6 +1405,7 @@ mod tests {
             command: Vec::new(),
             source_sha256: "source".to_owned(),
             support_header_sha256: "header".to_owned(),
+            peacemaker: None,
             output_sha256: sha256_bytes(code_object),
             inspection: Some(CodeObjectInspection {
                 bundle_target: "hipv4-amdgcn-amd-amdhsa--gfx1201".to_owned(),
@@ -1226,6 +1442,121 @@ mod tests {
         assert_eq!(reports[0].vgpr_count, 8);
         assert!(!reports[0].has_spills());
         assert!(reports[1].has_spills());
+    }
+
+    #[test]
+    fn parses_compiler_derived_global_buffer_effects() {
+        let notes = r#"
+amdhsa.kernels:
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           4
+        .value_kind:     by_value
+    .kernarg_segment_size: 24
+    .name:           effects
+    .wavefront_size: 32
+"#;
+        let reports = parse_metadata(notes);
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0].arguments,
+            vec![
+                KernelArgumentReport {
+                    offset: 0,
+                    size: 8,
+                    value_kind: "global_buffer".to_owned(),
+                    address_space: Some("global".to_owned()),
+                    actual_access: Some(KernelArgumentAccess::ReadOnly),
+                },
+                KernelArgumentReport {
+                    offset: 8,
+                    size: 8,
+                    value_kind: "global_buffer".to_owned(),
+                    address_space: Some("global".to_owned()),
+                    actual_access: Some(KernelArgumentAccess::WriteOnly),
+                },
+                KernelArgumentReport {
+                    offset: 16,
+                    size: 4,
+                    value_kind: "by_value".to_owned(),
+                    address_space: None,
+                    actual_access: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn schema_four_certification_exposes_argument_effects() {
+        let code = b"schema-four code object";
+        let manifest = CompileManifest {
+            schema_version: 4,
+            compiler: "radiowave".to_owned(),
+            generated_unix_seconds: 0,
+            source: "kernel.hip".into(),
+            output: "kernel.hsaco".into(),
+            arch: "gfx1151".to_owned(),
+            wavefront: Wavefront::Wave32,
+            scheduler_profile: SchedulerProfile::Default,
+            hipcc: "hipcc".into(),
+            hipcc_version: "test".to_owned(),
+            command: Vec::new(),
+            source_sha256: "source".to_owned(),
+            support_header_sha256: "header".to_owned(),
+            output_sha256: sha256_bytes(code),
+            inspection: Some(CodeObjectInspection {
+                bundle_target: "hipv4-amdgcn-amd-amdhsa--gfx1151".to_owned(),
+                identity: None,
+                kernels: vec![KernelReport {
+                    name: "effects".to_owned(),
+                    arguments: vec![
+                        KernelArgumentReport {
+                            offset: 0,
+                            size: 8,
+                            value_kind: "global_buffer".to_owned(),
+                            address_space: Some("global".to_owned()),
+                            actual_access: Some(KernelArgumentAccess::ReadOnly),
+                        },
+                        KernelArgumentReport {
+                            offset: 8,
+                            size: 8,
+                            value_kind: "global_buffer".to_owned(),
+                            address_space: Some("global".to_owned()),
+                            actual_access: Some(KernelArgumentAccess::ReadWrite),
+                        },
+                        KernelArgumentReport {
+                            offset: 16,
+                            size: 8,
+                            value_kind: "global_buffer".to_owned(),
+                            address_space: Some("global".to_owned()),
+                            actual_access: None,
+                        },
+                    ],
+                    ..KernelReport::default()
+                }],
+            }),
+            peacemaker: None,
+        };
+        let encoded = serde_json::to_string(&manifest).unwrap();
+        let certification = CodeObjectCertification::from_json(code, &encoded).unwrap();
+        assert_eq!(
+            certification.argument_effects("effects.kd"),
+            Some(vec![
+                (0, KernelArgumentAccess::ReadOnly),
+                (8, KernelArgumentAccess::ReadWrite),
+                (16, KernelArgumentAccess::ReadWrite),
+            ])
+        );
     }
 
     #[test]
@@ -1396,6 +1727,56 @@ mod tests {
     }
 
     #[test]
+    fn inspection_tools_resolve_with_the_host_executable_suffix() {
+        let root = env::temp_dir().join(format!(
+            "radiowave-tool-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/llvm-objdump.exe"), "").unwrap();
+
+        assert_eq!(
+            tool_under_root(&root, "llvm-objdump", ".exe"),
+            Some(root.join("bin").join("llvm-objdump.exe"))
+        );
+        assert_eq!(tool_under_root(&root, "llvm-objdump", ""), None);
+
+        fs::create_dir_all(root.join("lib/llvm/bin")).unwrap();
+        fs::write(root.join("lib/llvm/bin/llvm-objdump"), "").unwrap();
+        assert_eq!(
+            tool_under_root(&root, "llvm-objdump", ".exe"),
+            Some(root.join("lib/llvm/bin").join("llvm-objdump"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compile_request_preserves_fast_math_unless_explicitly_disabled() {
+        let mut request = CompileRequest::new("kernel.hip", "kernel.hsaco", "gfx1151");
+        let default_args = compile_args(
+            &request,
+            Path::new("/tmp/kernel.hip"),
+            Path::new("/tmp/kernel.hsaco"),
+            Path::new("/tmp/radiowave.h"),
+        );
+        assert!(default_args.iter().any(|arg| arg == "-ffast-math"));
+
+        request.fast_math = false;
+        let strict_args = compile_args(
+            &request,
+            Path::new("/tmp/kernel.hip"),
+            Path::new("/tmp/kernel.hsaco"),
+            Path::new("/tmp/radiowave.h"),
+        );
+        assert!(!strict_args.iter().any(|arg| arg == "-ffast-math"));
+    }
+
+    #[test]
     fn compile_target_is_forwarded_without_a_gpu_family_allowlist() {
         let request = CompileRequest::new("kernel.hip", "kernel.hsaco", "future-amdgpu");
         let args = compile_args(
@@ -1405,27 +1786,6 @@ mod tests {
             Path::new("/tmp/radiowave.h"),
         );
         assert!(args.iter().any(|arg| arg == "--offload-arch=future-amdgpu"));
-    }
-
-    #[test]
-    fn compile_request_uses_strict_math_unless_fast_math_is_explicit() {
-        let mut request = CompileRequest::new("kernel.hip", "kernel.hsaco", "gfx1201");
-        let strict_args = compile_args(
-            &request,
-            Path::new("/tmp/kernel.hip"),
-            Path::new("/tmp/kernel.hsaco"),
-            Path::new("/tmp/radiowave.h"),
-        );
-        assert!(!strict_args.iter().any(|arg| arg == "-ffast-math"));
-
-        request.fast_math = true;
-        let fast_args = compile_args(
-            &request,
-            Path::new("/tmp/kernel.hip"),
-            Path::new("/tmp/kernel.hsaco"),
-            Path::new("/tmp/radiowave.h"),
-        );
-        assert!(fast_args.iter().any(|arg| arg == "-ffast-math"));
     }
 
     #[test]
@@ -1534,5 +1894,59 @@ mod tests {
                 .unwrap();
         manifest["schema_version"] = 2.into();
         assert!(CodeObjectCertification::from_json(code, &manifest.to_string()).is_err());
+    }
+    #[test]
+    fn schema_five_preserves_custom_provenance_and_rejects_failed_oracle() {
+        let code = b"verified custom code object";
+        let mut manifest: CompileManifest =
+            serde_json::from_str(&certification_manifest(code, MutableReadCache::VmemOnly))
+                .unwrap();
+        manifest.schema_version = 5;
+        manifest.peacemaker = Some(PeacemakerRecord {
+            arm: PeacemakerArm::CustomIsa,
+            producer: PeacemakerProducer {
+                builder_crate_version: "0.1".into(),
+                builder_git_sha: "abc".into(),
+                proof_sha256: "def".into(),
+                aco_commit: None,
+            },
+            tools: vec![PeacemakerTool {
+                role: PeacemakerToolRole::Assembler,
+                path: "llvm-mc".into(),
+                version: "23".into(),
+                argv: vec!["llvm-mc".into(), "-mcpu=gfx1201".into()],
+                sha256: "123".into(),
+            }],
+            s_text_sha256: "s".into(),
+            text_section_sha256: "t".into(),
+            shape_contract: serde_json::json!({"symbol": "consumer"}),
+            shape_result: serde_json::json!({"vopd_packets": 96}),
+            oracle_receipt: Some(OracleReceipt {
+                suite: "G1".into(),
+                fixtures_sha256: "fixture".into(),
+                cases: 34,
+                differing_bits: 0,
+                device_uuid: "device".into(),
+                date: "2026-09-25".into(),
+            }),
+        });
+        let encoded = serde_json::to_string(&manifest).unwrap();
+        let certified = CodeObjectCertification::from_json(code, &encoded).unwrap();
+        let provenance = certified.manifest().peacemaker.as_ref().unwrap();
+        assert_eq!(provenance.arm, PeacemakerArm::CustomIsa);
+        assert_eq!(provenance.tools[0].argv[1], "-mcpu=gfx1201");
+        assert_eq!(provenance.oracle_receipt.as_ref().unwrap().cases, 34);
+        manifest
+            .peacemaker
+            .as_mut()
+            .unwrap()
+            .oracle_receipt
+            .as_mut()
+            .unwrap()
+            .differing_bits = 1;
+        assert!(
+            CodeObjectCertification::from_json(code, &serde_json::to_string(&manifest).unwrap())
+                .is_err()
+        );
     }
 }

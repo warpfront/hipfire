@@ -1,0 +1,13 @@
+[gpu-lock] directory=/tmp/hipfire-locks
+[hipfire] host-memory reclaim mitigation armed: GPU_PINNED_MIN_XFER_SIZE=100000
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-pci-0000:14:00.0.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+[devices] logical 1: HIP gfx1036 0000:14:00.0 = index 1 pci-0000:14:00.0
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+  KV cache: requested mode=q8, effective K=q8, effective V=q8
+  partial offload: 0 of 40 layers host-placed, routed experts host on 36 layers, device weights 4049 MiB of 13095 MiB available
+  kv reserved: 32768 tokens x 10880 B = 340 MiB; pbs floor 2616 MiB; draft 0 MiB; slack 128 MiB; weight budget 13095 MiB of 16180 MiB free
+  moe offload: 0 of 40 layers host-placed, routed experts host on 36 layers (408 MiB of routed experts per layer, 14688 MiB total); pinned host 14688 MiB; device weights 4049 MiB
+hipfire: daemon error: [gpu retryable=false rolled_back=false attempt=0] load failed: host-placed weights need 14.3 GiB of pinned host RAM plus 4 GiB headroom, but MemAvailable is 15.5 GiB (plus 0.0 GiB estimated in TTM's page pool); free host memory or keep more weights in VRAM (memory.moe_expert_budget / memory.gpu_layer_budget). GPU: gfx1201 (16180 MB free / 16304 MB total)

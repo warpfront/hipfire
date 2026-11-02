@@ -1,0 +1,189 @@
+== list
+Model configuration: qwen3:8b
+Catalog: <ROOT>/models.toml (Empty)
+GPU: unknown (no gpu_arch in install.json)
+
+Quality
+  reasoning.effort                            auto             default            next message
+
+Memory & context
+  memory.max_seq                              32768            default            next model load
+
+Advanced
+  generation.max_tokens                       1234             you                next message
+  generation.temperature                      0.3              default            next message
+-- models.toml
+== set reasoning.effort high
+qwen3:8b reasoning.effort = high
+-- models.toml
+schema_version = 1
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.reasoning]
+effort = "high"
+== list after set
+Model configuration: qwen3:8b
+Catalog: <ROOT>/models.toml (Toml)
+GPU: unknown (no gpu_arch in install.json)
+
+Quality
+  reasoning.effort                            high             this model         next message
+
+Memory & context
+  memory.max_seq                              32768            default            next model load
+
+Advanced
+  generation.max_tokens                       1234             you                next message
+  generation.temperature                      0.3              default            next message
+-- models.toml
+schema_version = 1
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.reasoning]
+effort = "high"
+== set alias key
+qwen3:8b memory.max_seq = 4096
+-- models.toml
+schema_version = 1
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.memory]
+max_seq = 4096
+
+[models."qwen3:8b".overrides.reasoning]
+effort = "high"
+== set local model
+local-thing.mq4 generation.temperature = 0.5
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.memory]
+max_seq = 4096
+
+[models."qwen3:8b".overrides.reasoning]
+effort = "high"
+== set developer key
+error: developer configuration is global process policy; omit the model argument
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.memory]
+max_seq = 4096
+
+[models."qwen3:8b".overrides.reasoning]
+effort = "high"
+== set process key
+error: invalid value for kernel.iu4_prefill: field is not valid in a per-model override
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.memory]
+max_seq = 4096
+
+[models."qwen3:8b".overrides.reasoning]
+effort = "high"
+== reset reasoning.effort
+qwen3:8b reasoning.effort override removed
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.memory]
+max_seq = 4096
+== reset reasoning.effort again
+qwen3:8b reasoning.effort was already inherited
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.memory]
+max_seq = 4096
+== reset unknown key
+error: unknown configuration key 'no.such.key'
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+
+[models."qwen3:8b".overrides.memory]
+max_seq = 4096
+== reset all
+all qwen3:8b overrides removed
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+== reset model without overrides
+never-seen has no per-model overrides
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"
+== list local after sets
+Model configuration: local-thing.mq4
+Catalog: <ROOT>/models.toml (Toml)
+GPU: unknown (no gpu_arch in install.json)
+
+Quality
+  reasoning.effort                            auto             default            next message
+
+Memory & context
+  memory.max_seq                              32768            default            next model load
+
+Advanced
+  generation.max_tokens                       1234             you                next message
+  generation.temperature                      0.5              this model         next message
+-- models.toml
+schema_version = 1
+
+[models."local-thing.mq4".overrides.generation]
+temperature = 0.5
+
+[models."qwen3:8b"]
+registry_tag = "qwen3:8b"

@@ -2,13 +2,16 @@
 , rustPlatform
 , rocmPackages
 , makeWrapper
+, symlinkJoin
 , rocmSupport ? true
 , src ? lib.cleanSource ./..
 , cargoLockFile ? ../Cargo.lock
+, kernels
 }:
 
 let
   cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+  rocmRoot = import ./rocm-root.nix { inherit symlinkJoin rocmPackages; };
 in
 rustPlatform.buildRustPackage {
   pname = "hipfire";
@@ -18,12 +21,10 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = cargoLockFile;
   doCheck = false;  # tests require GPU
 
-  # The main binaries are cargo [[example]] targets, not [[bin]].
+  # The deliverables are standalone binary crates (mirrors Containerfile).
   buildPhase = ''
     runHook preBuild
-    cargo build --release --features deltanet \
-      --example daemon --example infer --example infer_hfq \
-      -p hipfire-runtime
+    cargo build --release -p hipfire-daemon
     cargo build --release -p hipfire-cli
     runHook postBuild
   '';
@@ -36,21 +37,23 @@ rustPlatform.buildRustPackage {
     runHook preInstall
 
     mkdir -p $out/bin
+    # current_exe resolves to hipfire-daemon-unwrapped in this directory.
+    cp -r ${kernels}/kernels $out/bin/kernels
 
-    # Install and wrap daemon binary with LD_LIBRARY_PATH for libamdhip64.so dlopen
-    cp target/release/examples/daemon $out/bin/hipfire-daemon-unwrapped
+    # Install and wrap daemon binary with LD_LIBRARY_PATH for libamdhip64.so dlopen.
+    # `hipfire-daemon`'s [[bin]] name is `daemon`, so the artifact is
+    # target/release/daemon (mirrors Containerfile's COPY to /opt/hipfire/bin/daemon).
+    cp target/release/daemon $out/bin/hipfire-daemon-unwrapped
     makeWrapper $out/bin/hipfire-daemon-unwrapped $out/bin/hipfire-daemon \
-      ${lib.optionalString rocmSupport
-        "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
+      ${lib.optionalString rocmSupport ''
+        --set-default HIPFIRE_ROCM_PATH ${rocmRoot} \
+        --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
           rocmPackages.clr
           rocmPackages.rocm-runtime
           rocmPackages.rocm-comgr
           rocmPackages.rocprofiler-register
-        ]}"}
-
-    # Install other binaries
-    cp target/release/examples/infer $out/bin/hipfire-infer 2>/dev/null || true
-    cp target/release/examples/infer_hfq $out/bin/hipfire-infer-hfq 2>/dev/null || true
+        ]}
+      ''}
 
     # Install the native Rust control plane. HIPFIRE_DAEMON_BIN points it at
     # the ROCm-wrapped daemon rather than relying on a source-tree layout.
@@ -58,7 +61,7 @@ rustPlatform.buildRustPackage {
     makeWrapper $out/bin/hipfire-unwrapped $out/bin/hipfire \
       --set HIPFIRE_DAEMON_BIN $out/bin/hipfire-daemon \
       ${lib.optionalString rocmSupport
-        "--prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
+        "--set-default HIPFIRE_ROCM_PATH ${rocmRoot} --prefix LD_LIBRARY_PATH : ${lib.makeLibraryPath [
           rocmPackages.clr
           rocmPackages.rocm-runtime
           rocmPackages.rocm-comgr
@@ -71,7 +74,7 @@ rustPlatform.buildRustPackage {
   meta = with lib; {
     description = "LLM inference for AMD RDNA GPUs";
     homepage = "https://github.com/warpfront/hipfire";
-    license = licenses.mit;
+    license = [ licenses.asl20 licenses.mit ];
     platforms = [ "x86_64-linux" ];
     mainProgram = "hipfire";
   };

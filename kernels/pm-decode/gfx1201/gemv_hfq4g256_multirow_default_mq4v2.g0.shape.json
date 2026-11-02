@@ -1,0 +1,19 @@
+{
+  "counts": {
+    "v_fma_mix_f32": 16,
+    "v_fmac_f32_e32": 14,
+    "v_mul_f32_e32": 2
+  },
+  "forbidden": [
+    "scratch_load_b32",
+    "scratch_store_b32"
+  ],
+  "group_segment_fixed_bytes": 0,
+  "launch_dynamic_lds_bytes": 0,
+  "require_wave32": true,
+  "require_zero_private": true,
+  "require_zero_spills": true,
+  "sgpr_max": 10,
+  "symbol": "gemv_mq4g256v2_multirow_r2_dog_g0",
+  "vgpr_max": 20
+}

@@ -1,0 +1,11 @@
+[package]
+name = "peacemaker-author"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PM kernel language M0: typed targets, LDS regions, wait tokens and scopes over a lowering backend"
+
+[dependencies]
+
+[dev-dependencies]
+trybuild = "1"

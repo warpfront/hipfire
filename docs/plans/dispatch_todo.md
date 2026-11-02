@@ -3,7 +3,7 @@
 Tracked findings from the tri-code review (GLM-5 / Gemini 2.5 Pro / Claude Opus 4.8),
 plus architectural items surfaced during Ship 3.3 implementation. Ordered by severity.
 
-Source reviews: `findings/dispatch_3.x_code_rev_{glm5,gemini,claude}.md`
+Source reviews: `docs/investigations/dispatch/dispatch_3.x_code_rev_glm5.md`, `findings/dispatch_3.x_code_rev_{gemini,claude}.md`
 
 ---
 

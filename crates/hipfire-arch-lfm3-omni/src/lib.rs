@@ -20,7 +20,7 @@
 //!   * **Omni generate loop** (planned, 4c) — the interleaved text/audio state
 //!     machine in the daemon.
 //!
-//! arch_id stays 13 (the depth decoder + codebook_embedding are detected by
+//! arch_id stays 24 (the depth decoder + codebook_embedding are detected by
 //! tensor presence, the qwen35-vl / lfm3-vl / lfm3-audio precedent). Forward
 //! dispatch is static (not trait-routed), matching the project convention.
 //!

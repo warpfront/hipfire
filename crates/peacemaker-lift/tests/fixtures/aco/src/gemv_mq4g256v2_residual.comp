@@ -1,0 +1,181 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// P0 gate shader #2 (PM-ACO-PARITY.md section 6, P0): MQ4-G256 v2 residual GEMV, the real
+// incumbent kernel `gemv_mq4g256v2_residual` (kernels/src/gemv_mq4g256v2_residual.hip, builder twin
+// crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs), expressed as
+// compiler INPUT (SPIR-V), not as post-RA assembly.
+//
+//   y[row] += A[row] . x          (A: HFQ4-G256, 136 bytes per 256-weight group)
+//
+// ABI / geometry identical to the incumbent: one wave32 workgroup (local size 32) per ROW PAIR,
+// `row0 = workgroup_id.x << 1` (the incumbent launch uses grid = M; workgroups with row0 >= M exit).
+// Push block (inline, 32 bytes): A u64 @0, x u64 @8, y u64 @16, M i32 @24, K i32 @28.
+//
+// Numerics reproduce the incumbent hipcc-compiled/builder-twin order EXACTLY:
+//  * group header: lane<16 reads u32@0, lane>=16 reads u32@4; scale = f16 lo, zero = f16 hi (exact
+//    f16->f32); weight_n = fma(scale, float((packed >> 4n) & 15), zero)         [v_fma_mix_f32]
+//  * per-group dot: d = x*w (first product, rounded) then d = fma(x_n, w_n, d) in sequence; ROW A
+//    (acc*) starts x0 then x1, ROW B (bcc*) starts x1 then x0 (the frozen clang DAG order recorded by
+//    the builder twin: quad VOPD mul src0=X+row, tail `order=[1,0,2..7]` for row 1), then n=2..7
+//  * acc[g%4] += d per group (four independent group streams per row; K tail groups accumulate into
+//    streams 0..tail-1 after all quads), acc = (a0+a1)+(a2+a3), then a shfl_down(16,8,4,2,1) tree
+//  * epilogue (lane 0): two-row: y.x = acc + y.x, y.y = bcc + y.y (one 8-byte load/store);
+//    odd last row: y = y + acc.
+// No atomics, no LDS, no scratch.
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_shuffle_relative : require
+#extension GL_EXT_spirv_intrinsics : require
+
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4464], 4459, 32); // DenormPreserve, width 32
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4466], 4461, 32); // SignedZeroInfNanPreserve, width 32
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WordsRO { uint w[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) readonly buffer XVec4RO { vec4 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer YPairRW { vec2 v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer YOneRW { float f[]; };
+
+layout(push_constant, std430) uniform PushBlock {
+    uint64_t A;
+    uint64_t x;
+    uint64_t y;
+    int M;
+    int K;
+} pc;
+
+// sc*nibble + zp as a single fused multiply-add (the incumbent v_fma_mix_f32).
+float weight(float sc, float zp, uint pk, uint n) {
+    return fma(sc, float((pk >> (4u * n)) & 15u), zp);
+}
+
+// Eight-term group dot in the incumbent chain order. `row_b` selects the x1-then-x0 start.
+float dog8(float sc, float zp, uint pk, vec4 xa, vec4 xb, bool row_b) {
+    float w0 = weight(sc, zp, pk, 0u);
+    float w1 = weight(sc, zp, pk, 1u);
+    float w2 = weight(sc, zp, pk, 2u);
+    float w3 = weight(sc, zp, pk, 3u);
+    float w4 = weight(sc, zp, pk, 4u);
+    float w5 = weight(sc, zp, pk, 5u);
+    float w6 = weight(sc, zp, pk, 6u);
+    float w7 = weight(sc, zp, pk, 7u);
+    precise float d;
+    if (!row_b) {
+        d = xa.x * w0;
+        d = fma(xa.y, w1, d);
+    } else {
+        d = xa.y * w1;
+        d = fma(xa.x, w0, d);
+    }
+    d = fma(xa.z, w2, d);
+    d = fma(xa.w, w3, d);
+    d = fma(xb.x, w4, d);
+    d = fma(xb.y, w5, d);
+    d = fma(xb.z, w6, d);
+    d = fma(xb.w, w7, d);
+    return d;
+}
+
+// One group's dot for both rows. `off0`/`off1` are the 64-bit byte offsets of the two row bases.
+void group_dots(uint64_t off0, uint64_t off1, int g, uint tid, out float da, out float db) {
+    XVec4RO xp = XVec4RO(pc.x);
+    uint xi = uint(g) * 64u + tid * 2u; // (g*256 + tid*8) floats / 4
+    vec4 xa = xp.v[xi];
+    vec4 xb = xp.v[xi + 1u];
+
+    uint64_t goff = uint64_t(g) * 136ul;
+
+    WordsRO pa = WordsRO(pc.A + off0 + goff);
+    uint hA = pa.w[0];
+    uint hB = pa.w[1];
+    vec2 ha = unpackHalf2x16(tid < 16u ? hA : hB);
+    uint pka = pa.w[2u + tid];
+
+    WordsRO pb = WordsRO(pc.A + off1 + goff);
+    uint hA1 = pb.w[0];
+    uint hB1 = pb.w[1];
+    vec2 hb = unpackHalf2x16(tid < 16u ? hA1 : hB1);
+    uint pkb = pb.w[2u + tid];
+
+    da = dog8(ha.x, ha.y, pka, xa, xb, false);
+    db = dog8(hb.x, hb.y, pkb, xa, xb, true);
+}
+
+// shfl_down tree; lane 0 holds the complete sum (other lanes' values are irrelevant, as in the incumbent).
+float shfl_down_sum(float v) {
+    precise float r = v;
+    r = r + subgroupShuffleDown(r, 16u);
+    r = r + subgroupShuffleDown(r, 8u);
+    r = r + subgroupShuffleDown(r, 4u);
+    r = r + subgroupShuffleDown(r, 2u);
+    r = r + subgroupShuffleDown(r, 1u);
+    return r;
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    int row0 = int(gl_WorkGroupID.x) << 1;
+    if (row0 >= pc.M)
+        return;
+    int row1 = row0 + 1;
+    bool have_row1 = row1 < pc.M;
+
+    int groups_per_row = pc.K / 256;
+    uint64_t row_stride = uint64_t(groups_per_row) * 136ul;
+    uint64_t off0 = uint64_t(row0) * row_stride;
+    uint64_t off1 = uint64_t(have_row1 ? row1 : row0) * row_stride;
+
+    int quads = groups_per_row >> 2;
+    int tail = groups_per_row & 3;
+
+    precise float acc0 = 0.0, acc1 = 0.0, acc2 = 0.0, acc3 = 0.0;
+    precise float bcc0 = 0.0, bcc1 = 0.0, bcc2 = 0.0, bcc3 = 0.0;
+    float da, db;
+
+    for (int q = 0; q < quads; q++) {
+        int g = q << 2;
+        group_dots(off0, off1, g, tid, da, db);
+        acc0 += da; bcc0 += db;
+        group_dots(off0, off1, g + 1, tid, da, db);
+        acc1 += da; bcc1 += db;
+        group_dots(off0, off1, g + 2, tid, da, db);
+        acc2 += da; bcc2 += db;
+        group_dots(off0, off1, g + 3, tid, da, db);
+        acc3 += da; bcc3 += db;
+    }
+
+    if (tail >= 1) {
+        group_dots(off0, off1, quads << 2, tid, da, db);
+        acc0 += da; bcc0 += db;
+    }
+    if (tail >= 2) {
+        group_dots(off0, off1, (quads << 2) + 1, tid, da, db);
+        acc1 += da; bcc1 += db;
+    }
+    if (tail >= 3) {
+        group_dots(off0, off1, (quads << 2) + 2, tid, da, db);
+        acc2 += da; bcc2 += db;
+    }
+
+    precise float acc = (acc0 + acc1) + (acc2 + acc3);
+    precise float bcc = (bcc0 + bcc1) + (bcc2 + bcc3);
+    acc = shfl_down_sum(acc);
+    bcc = shfl_down_sum(bcc);
+
+    if (tid == 0u) {
+        if (have_row1) {
+            YPairRW yp = YPairRW(pc.y);
+            vec2 yy = yp.v[uint(row0) >> 1];
+            yy.x = acc + yy.x;
+            yy.y = bcc + yy.y;
+            yp.v[uint(row0) >> 1] = yy;
+        } else {
+            YOneRW yo = YOneRW(pc.y);
+            yo.f[uint(row0)] = yo.f[uint(row0)] + acc;
+        }
+    }
+}

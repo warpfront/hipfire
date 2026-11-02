@@ -1,0 +1,96 @@
+{
+  "_comment": "Inputs for scripts/readme_charts.py (GPU support matrix). Sources per column below. Regenerate with: python3 scripts/readme_charts.py",
+  "matrix": {
+    "_comment": "Levels: tuned = arch-specific kernels or default-on route; generic = runs on the portable/typed-dispatch path; none = not available. Capability, not admission or certification (docs/ARCHITECTURE.md).",
+    "features": [
+      "Decode",
+      "Prefill WMMA",
+      "DFlash",
+      "MTP",
+      "NPU prefill",
+      "Redline"
+    ],
+    "archs": [
+      {
+        "label": "Vega / CDNA",
+        "detail": "gfx906, gfx908, gfx940-942",
+        "cells": [
+          "generic",
+          "none",
+          "generic",
+          "generic",
+          "none",
+          "none"
+        ]
+      },
+      {
+        "label": "RDNA1",
+        "detail": "gfx1010-1013",
+        "cells": [
+          "generic",
+          "none",
+          "generic",
+          "generic",
+          "none",
+          "generic"
+        ]
+      },
+      {
+        "label": "RDNA2",
+        "detail": "gfx1030-1032",
+        "cells": [
+          "generic",
+          "none",
+          "generic",
+          "generic",
+          "none",
+          "generic"
+        ]
+      },
+      {
+        "label": "RDNA3",
+        "detail": "gfx1100-1103",
+        "cells": [
+          "tuned",
+          "tuned",
+          "tuned",
+          "tuned",
+          "none",
+          "tuned"
+        ]
+      },
+      {
+        "label": "RDNA3.5",
+        "detail": "gfx1150-1152 (Strix Halo gfx1151)",
+        "cells": [
+          "tuned",
+          "tuned",
+          "tuned",
+          "tuned",
+          "tuned",
+          "tuned"
+        ]
+      },
+      {
+        "label": "RDNA4",
+        "detail": "gfx1200, gfx1201",
+        "cells": [
+          "tuned",
+          "tuned",
+          "tuned",
+          "tuned",
+          "none",
+          "tuned"
+        ]
+      }
+    ],
+    "sources": {
+      "Decode": "docs/ARCHITECTURE.md kernel-select layer (hipfire-dispatch / rdna-compute family tables pick WMMA -> specialized -> baseline); README GPU table; CHANGELOG 0.4.4 #478: MQ6/HFQ6 GEMV rows admitted on RDNA1/RDNA2 (generic wave32 kernels, resolve-tested on CPU)",
+      "Prefill WMMA": "docs/ARCHITECTURE.md (WMMA family tables); docs/BENCHMARKS.md supporting notes (gfx12 WMMA paths; gfx906 uses dp4a MMQ, CDNA is MFMA not WMMA)",
+      "DFlash": "docs/speculation-support-inventory.md (DFlash is per model arch, GPU-generic); tuned: CHANGELOG 0.4.2 gfx1100 shared rotations, gfx1151 XLDS verify GEMMs, gfx1201 continuous-batching / device accept; CHANGELOG 0.4.4 gfx1201 native-fp8 split-KV verifier (#921, #922)",
+      "MTP": "docs/speculation-support-inventory.md (MTP per model arch); tuned: CHANGELOG 0.4.2 gfx1151 MTP cap 4 + DET prompt fill, gfx1201 batched MTP fill; CHANGELOG 0.4.4 exact gfx1100 int8-activation verify GEMV (#987), WMMA split-K verify attention (#989), 65,536-token draft vocabulary (#998), all default on",
+      "NPU prefill": "CHANGELOG 0.4.2 Flash-Next NPU trunk route: exact gfx1151 with XDNA2 only",
+      "Redline": "README / docs/ARCHITECTURE.md Redline roles: RDNA1-RDNA4 dispatch; mq4r_redline_default on exact gfx1100/gfx1151/gfx1201"
+    }
+  }
+}

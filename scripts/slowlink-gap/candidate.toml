@@ -1,0 +1,5 @@
+schema_version = 1
+[memory]
+ple_format = "q4"
+[developer]
+qwen4_slowlink_prefill = true

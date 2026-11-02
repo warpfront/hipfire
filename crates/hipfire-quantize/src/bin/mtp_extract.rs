@@ -860,12 +860,19 @@ fn main() {
 
     let dense_mtp = find_tensor(&st_files, "mtp.layers.0.mlp.gate_proj.weight").is_some();
     let moe_mtp = find_tensor(&st_files, "mtp.layers.0.mlp.experts.gate_up_proj").is_some();
-    let ffn_kind = match (dense_mtp, moe_mtp) {
-        (true, _) => "dense",
-        (false, true) => "moe",
-        (false, false) => panic!(
-            "MTP FFN tensors not found: expected dense gate_proj/up_proj/down_proj \
-             or MoE experts.gate_up_proj"
+    // Ornith 1.5 ships the MTP module's routed experts UN-stacked, as per-expert
+    // 2-D tensors, even though the model body's experts are canonical stacked-3D.
+    // Same layout ORNITH 1.0 had body-side (fixed in 54e99d9d); here it survives
+    // in the MTP head.
+    let moe_unstacked_mtp =
+        find_tensor(&st_files, "mtp.layers.0.mlp.experts.0.gate_proj.weight").is_some();
+    let ffn_kind = match (dense_mtp, moe_mtp, moe_unstacked_mtp) {
+        (true, _, _) => "dense",
+        (false, true, _) => "moe",
+        (false, false, true) => "moe",
+        (false, false, false) => panic!(
+            "MTP FFN tensors not found: expected dense gate_proj/up_proj/down_proj, \
+             stacked MoE experts.gate_up_proj, or un-stacked experts.{{N}}.gate_proj"
         ),
     };
 
@@ -941,32 +948,64 @@ fn main() {
             hfq_tensors.push(tensor);
         }
 
-        let (gate_up_meta, gate_up_raw) =
-            find_tensor(&st_files, "mtp.layers.0.mlp.experts.gate_up_proj")
-                .expect("MoE MTP missing experts.gate_up_proj");
-        let (down_meta, down_raw) = find_tensor(&st_files, "mtp.layers.0.mlp.experts.down_proj")
-            .expect("MoE MTP missing experts.down_proj");
-        assert_eq!(
-            gate_up_meta.shape,
-            vec![num_experts, 2 * moe_intermediate_size, n_embd],
-            "experts.gate_up_proj shape mismatch"
-        );
-        assert_eq!(
-            down_meta.shape,
-            vec![num_experts, n_embd, moe_intermediate_size],
-            "experts.down_proj shape mismatch"
-        );
+        let stacked = find_tensor(&st_files, "mtp.layers.0.mlp.experts.gate_up_proj");
+        if let Some((gate_up_meta, _)) = stacked.as_ref() {
+            assert_eq!(
+                gate_up_meta.shape,
+                vec![num_experts, 2 * moe_intermediate_size, n_embd],
+                "experts.gate_up_proj shape mismatch"
+            );
+            let (down_meta, _) = find_tensor(&st_files, "mtp.layers.0.mlp.experts.down_proj")
+                .expect("MoE MTP missing experts.down_proj");
+            assert_eq!(
+                down_meta.shape,
+                vec![num_experts, n_embd, moe_intermediate_size],
+                "experts.down_proj shape mismatch"
+            );
+        }
 
         let gate_up_elems = 2 * moe_intermediate_size * n_embd;
         let down_elems = n_embd * moe_intermediate_size;
-        total_in_bytes += gate_up_raw.len() + down_raw.len();
+        // Input byte accounting: stacked reads two big tensors; un-stacked reads
+        // 3 per expert and is tallied inside the loops via the fused buffers.
+        if let Some((_, graw)) = stacked.as_ref() {
+            total_in_bytes += graw.len();
+        }
+        if let Some((_, draw)) = find_tensor(&st_files, "mtp.layers.0.mlp.experts.down_proj") {
+            total_in_bytes += draw.len();
+        }
         for expert_idx in 0..num_experts {
-            let f32_data = to_f32_range(
-                gate_up_raw,
-                &gate_up_meta.dtype,
-                expert_idx * gate_up_elems,
-                gate_up_elems,
-            );
+            let f32_data = if let Some((gm, graw)) = stacked.as_ref() {
+                to_f32_range(graw, &gm.dtype, expert_idx * gate_up_elems, gate_up_elems)
+            } else {
+                // Fuse per-expert gate and up into [2*inter, hidden].
+                //
+                // ORDER IS LOAD-BEARING: the consumer computes
+                // silu(gu[..inter]) * gu[inter..], so gate rows MUST come first.
+                // up-then-gate loads cleanly and produces fluent, wrong output —
+                // only the coherence gate would catch it.
+                let gname = format!("mtp.layers.0.mlp.experts.{expert_idx}.gate_proj.weight");
+                let uname = format!("mtp.layers.0.mlp.experts.{expert_idx}.up_proj.weight");
+                let (gmeta, graw) = find_tensor(&st_files, &gname)
+                    .unwrap_or_else(|| panic!("un-stacked MTP missing {gname}"));
+                let (umeta, uraw) = find_tensor(&st_files, &uname)
+                    .unwrap_or_else(|| panic!("un-stacked MTP missing {uname}"));
+                assert_eq!(
+                    gmeta.shape,
+                    vec![moe_intermediate_size, n_embd],
+                    "{gname} shape mismatch"
+                );
+                assert_eq!(
+                    umeta.shape,
+                    vec![moe_intermediate_size, n_embd],
+                    "{uname} shape mismatch"
+                );
+                let half = moe_intermediate_size * n_embd;
+                let mut fused = to_f32_range(graw, &gmeta.dtype, 0, half);
+                fused.extend_from_slice(&to_f32_range(uraw, &umeta.dtype, 0, half));
+                debug_assert_eq!(fused.len(), gate_up_elems);
+                fused
+            };
             let hf_name = format!("moe_experts.{expert_idx}.gate_up");
             let (quant_type, group_size, bytes, label) = quantize_mtp_tensor(
                 &hf_name,
@@ -996,13 +1035,21 @@ fn main() {
                 data: bytes,
             });
         }
+        let stacked_down = find_tensor(&st_files, "mtp.layers.0.mlp.experts.down_proj");
         for expert_idx in 0..num_experts {
-            let f32_data = to_f32_range(
-                down_raw,
-                &down_meta.dtype,
-                expert_idx * down_elems,
-                down_elems,
-            );
+            let f32_data = if let Some((dm, draw)) = stacked_down.as_ref() {
+                to_f32_range(draw, &dm.dtype, expert_idx * down_elems, down_elems)
+            } else {
+                let dname = format!("mtp.layers.0.mlp.experts.{expert_idx}.down_proj.weight");
+                let (dmeta, draw) = find_tensor(&st_files, &dname)
+                    .unwrap_or_else(|| panic!("un-stacked MTP missing {dname}"));
+                assert_eq!(
+                    dmeta.shape,
+                    vec![n_embd, moe_intermediate_size],
+                    "{dname} shape mismatch"
+                );
+                to_f32_range(draw, &dmeta.dtype, 0, down_elems)
+            };
             let hf_name = format!("moe_experts.{expert_idx}.down");
             let (quant_type, group_size, bytes, label) = quantize_mtp_tensor(
                 &hf_name,

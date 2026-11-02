@@ -1,0 +1,4 @@
+# WF1: fold twins + merged wide tails, GPU only (no NPU command): down n=1024, gate_up J=3, J=1 (coarse)
+--mode fold --layer 2 --xq $DATA/L2.down.a4.bin --npu-cols 1024 --reg coarse --iters 4
+--mode fold --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 3072 --reg coarse --iters 4
+--mode fold --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 1024 --reg coarse --iters 4

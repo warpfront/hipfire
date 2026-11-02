@@ -1,0 +1,287 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The `fp8_gemm` generator (MQ4V2 weights x E4M3 activations, v_wmma_f32_16x16x16_fp8_fp8,
+// 256 x 128 x 8 waves, gfx1201), composed in `.rip` from the `fp8::*` natives of
+// `fp8_gemm::blocks`.
+//
+// `fp8_gemm::emit(spec)` (kernels/fp8_gemm/mod.rs) is written over exactly the blocks this script
+// calls, so for every valid Spec the script re-emits the production kernel's bytes (`s_text` and
+// proof). A test in peacemaker-rip (`fp8_gemm_twin_matches_the_rust_emit`) requires it for every
+// valid Spec on gfx1201. Edit the composition here and re-run: no rebuild.
+//
+// The shipped generator is an untyped-`Builder` kernel, so this script is too: it builds with
+// `Builder::new` (no `Workgroup`) and every LDS store and load (`b.ds_store(slot, insn)`,
+// `b.ds_load(slot, insn)`), every barrier (`b.barrier_with_scope`, `b.barrier_signal`,
+// `b.barrier_wait`), every branch (`b.control`) and the K-loop (`b.loop_`) is a statement here that
+// you can move; the builder's slot machine, wait ledger, hazard guards and loop fixpoint refuse a
+// wrong one (a read of a slot that is not published, a barrier over an undrained store, a loop
+// whose back edge differs from its entry). The natives that touch LDS only return `Instruction`s
+// (`fp8::publish_a_insns`, `fp8::fragment_insns`, `fp8::ratio_store_insn`, ...). Every other native
+// (fetch, address set-up, WMMA, fold arithmetic, the epilogue) emits into the builder passed as its
+// first argument. The epilogue (a jump network, and for the GDN-fused QKVZA the whole GDN
+// preparation with its own LDS ring) is one native, `fp8::epilogue`.
+//
+// Variant grammar: the shipped variant name, `Spec::variant()`:
+//
+//     ratio-256x128x8-SCALE.EPI
+//
+//     SCALE  row | k128                      (per-row ratio | per-K128 token ratio)
+//     EPI    set | add | silu | silu-bf16 | qkv | qkvza | qkvzagdn
+//
+// e.g. `ratio-256x128x8-row.set`, `ratio-256x128x8-k128.qkvza`, `ratio-256x128x8-row.silu-bf16`.
+// A combination without a generator is refused by `Fp8Gen::new` with the Rust `Spec::validate`
+// message (`silu-bf16` and `qkvzagdn` are row-scaled only). `VARIANTS` lists every valid one.
+// gfx1201 only. Geometry (256 rows x 128 tokens x 8 waves, the LDS layout of six slots, the
+// register map) is fixed by the Rust generator and needs a rebuild to change.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &[
+    "ratio-256x128x8-row.set",
+    "ratio-256x128x8-row.add",
+    "ratio-256x128x8-row.silu",
+    "ratio-256x128x8-row.silu-bf16",
+    "ratio-256x128x8-row.qkv",
+    "ratio-256x128x8-row.qkvza",
+    "ratio-256x128x8-row.qkvzagdn",
+    "ratio-256x128x8-k128.set",
+    "ratio-256x128x8-k128.add",
+    "ratio-256x128x8-k128.silu",
+    "ratio-256x128x8-k128.qkv",
+    "ratio-256x128x8-k128.qkvza",
+];
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let g = Fp8Gen::new(fp8_spec(&spec.variant, spec.arch)?)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    b.enable_delay_alu();
+    declare_lds(&mut b, &g)?;
+    prologue(&mut b, &g)?;
+    kloop(&mut b, &g)?;
+    fp8::epilogue(&mut b, &g)?;
+    fp8::label(&mut b, fp8::END)?;
+    b.control(Instruction::new("s_endpgm", vec![], vec![]))?;
+    b.finish()
+}
+
+// The variant name as the `Fp8Spec` it names.
+fn fp8_spec(variant: &str, arch: Arch) -> Result<Fp8Spec, String> {
+    let prefix = "ratio-256x128x8-";
+    if !variant.starts_with(prefix) {
+        return Err(format!("variant `{variant}`: expected ratio-256x128x8-SCALE.EPI"));
+    }
+    let rest = variant.replace(prefix, "");
+    let parts: Vec<&str> = rest.split('.').collect();
+    if parts.len() != 2 {
+        return Err(format!("variant `{variant}`: expected ratio-256x128x8-SCALE.EPI"));
+    }
+    let scale = match parts[0] {
+        "row" => Fp8Scale::Row,
+        "k128" => Fp8Scale::K128,
+        s => return Err(format!("variant `{variant}`: unknown scale `{s}` (row, k128)")),
+    };
+    let epi = match parts[1] {
+        "set" => Fp8Epi::Set,
+        "add" => Fp8Epi::Add,
+        "silu" => Fp8Epi::GateUpSilu,
+        "silu-bf16" => Fp8Epi::GateUpSiluBf16,
+        "qkv" => Fp8Epi::Qkv,
+        "qkvza" => Fp8Epi::Qkvza,
+        "qkvzagdn" => Fp8Epi::QkvzaGdn,
+        e => return Err(format!("variant `{variant}`: unknown epilogue `{e}` (set, add, silu, silu-bf16, qkv, qkvza, qkvzagdn)")),
+    };
+    Ok(Fp8Spec { arch: arch, scale: scale, epi: epi })
+}
+
+// ---------------------------------------------------------------------------------------------
+// LDS: six slots (ids 0..6 in this order): the two A payload buffers, the two row-ratio planes R
+// and the two per-token D-ratio planes (K128 only).
+
+fn declare_lds(b: &mut Builder, g: &Fp8Gen) -> Result<(), String> {
+    let names = ["A0", "A1", "R0", "R1", "D0", "D1"];
+    for i in 0..6 {
+        let (base, bytes) = g.slot(names[i]).unwrap();
+        let id = b.lds_slot(names[i], base, bytes)?;
+        if id != i {
+            return Err(format!("LDS slot {} got id {id}", names[i]));
+        }
+    }
+    Ok(())
+}
+
+fn branch(b: &mut Builder, label: &str) -> Result<(), String> {
+    b.control(Instruction::new(format!("s_cbranch_scc1 {label}"), vec![], vec![]))
+}
+
+// ---------------------------------------------------------------------------------------------
+// Prologue: kernel arguments, the banded CTA raster, descriptors, lane addresses, and A slab 0
+// published once (including masked token lanes, whose out-of-range reads return zero).
+
+fn prologue(b: &mut Builder, g: &Fp8Gen) -> Result<(), String> {
+    fp8::prologue_front(b, g)?;
+    // The launch grid guarantees valid tiles; this exit keeps an oversubscribed one harmless.
+    branch(b, fp8::END)?;
+    fp8::prologue_lanes(b, g)?;
+    fp8::fetch_a(b, g, 0, 0)?;
+    publish_a(b, g, 0)?;
+    b.barrier_with_scope([ready(0)], "lds_only")?;
+    Ok(())
+}
+
+fn publish_a(b: &mut Builder, g: &Fp8Gen, slot: usize) -> Result<(), String> {
+    for insn in fp8::publish_a_insns(g, slot)? {
+        b.ds_store(slot, insn)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The rolled K-loop. Block b = K128 block b; the first block runs ahead of the loop (it seeds the
+// weight ring and starts the accumulators from the WMMA's inline zero), the loop runs two blocks
+// per trip, the last block is peeled (no next-block prefetch and no fold).
+
+fn kloop(b: &mut Builder, g: &Fp8Gen) -> Result<(), String> {
+    fp8::label(b, fp8::BEGIN)?;
+    block(b, g, true, true)?;
+    fp8::trips_setup(b, g)?;
+    branch(b, fp8::LOOP_END)?;
+    b.loop_(fp8::LOOP, |b| {
+        block(b, g, true, false)?;
+        block(b, g, true, false)?;
+        fp8::trip_end(b, g)?;
+        branch(b, fp8::LOOP)
+    })?;
+    fp8::label(b, fp8::LOOP_END)?;
+    block(b, g, false, false)?;
+    // Final global values are read only after all WMMA users of the fragment ring have retired.
+    fp8::wait_all(b)?;
+    b.control(Instruction::new(format!("s_branch {}", fp8::EPILOGUE), vec![], vec![]))
+}
+
+// One K16 step: the four A fragment loads from `slot`, then the 16 WMMAs.
+fn step(b: &mut Builder, g: &Fp8Gen, unit: usize, st: usize, first: bool, slot: usize) -> Result<(), String> {
+    for insn in fp8::fragment_insns(g, slot, 2 * (unit % 2) + st)? {
+        b.ds_load(slot, insn)?;
+    }
+    for i in 0..16 {
+        fp8::mma(b, g, unit, st, first, i)?;
+    }
+    Ok(())
+}
+
+// One K128 block. On entry A0 is Published. A1's VMEM payload is fetched before slab 0, published
+// after all slab-0 fragment readers, then a uniform barrier retires A0 and publishes the ratio
+// planes for the next block; the next A0 payload is stored once every A1 read has issued, the
+// fold runs, and a split barrier retires A1 and the ratio planes and publishes A0. `p` is the
+// ratio plane of the block (0 for the first, 1 for every later one).
+fn block(b: &mut Builder, g: &Fp8Gen, next: bool, first: bool) -> Result<(), String> {
+    let k128 = g.spec().scale == Fp8Scale::K128;
+    let p = if first { 0 } else { 1 };
+    fp8::weight_base(b, g)?;
+    if first {
+        fp8::fetch_w(b, g, 0)?;
+        fp8::fetch_w(b, g, 1)?;
+    }
+    fp8::fetch_a(b, g, 0, 1)?;
+    if next {
+        fp8::fetch_next_ratio(b, g, 1)?;
+    }
+    for u in 0..2 {
+        for st in 0..2 {
+            step(b, g, u, st, first && u == 0 && st == 0, 0)?;
+        }
+        // Two-unit 16-VGPR ring: the unit just consumed is dead.
+        fp8::fetch_w(b, g, u + 2)?;
+    }
+    publish_a(b, g, 1)?;
+    if next {
+        b.ds_store(2 + p, fp8::ratio_store_insn(g, p)?)?;
+        if k128 {
+            fp8::d_prepare(b, g, 1)?;
+            b.ds_store(4 + p, fp8::d_store_insn(g, p)?)?;
+            fp8::d_restore(b, g)?;
+        }
+    }
+    let mut b1 = vec![retire(0), ready(1)];
+    if next {
+        b1.push(ready(2 + p));
+        if k128 {
+            b1.push(ready(4 + p));
+        }
+    }
+    b.barrier_with_scope(b1, "lds_only")?;
+    if next {
+        fp8::fetch_a(b, g, 1, 0)?;
+    }
+    for u in 2..4 {
+        for st in 0..2 {
+            step(b, g, u, st, false, 1)?;
+        }
+        // The retired K32 unit is free while the other unit still feeds WMMA; the next K128's
+        // weights are 0x8000 bytes beyond this block's base.
+        if next {
+            fp8::fetch_w(b, g, u + 14)?;
+        }
+    }
+    if next {
+        // The next A0 payload was prefetched before slab 1; its stores wait for all A1 reads.
+        publish_a(b, g, 0)?;
+        fold(b, g, p)?;
+        let mut b2 = vec![retire(1), retire(2 + p), ready(0)];
+        if k128 {
+            b2.push(retire(4 + p));
+        }
+        b.barrier_signal(b2)?;
+        b.barrier_wait()?;
+    } else {
+        b.barrier_with_scope([retire(1)], "lds_only")?;
+    }
+    fp8::advance_block(b, g)?;
+    fp8::wait_all(b)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// The fold: published ratios of the next half scale the accumulators.
+
+// The two b128 loads of row group `i`'s eight ratios (Row).
+fn row_group_loads(b: &mut Builder, g: &Fp8Gen, plane: usize, i: usize) -> Result<(), String> {
+    for insn in fp8::fold_row_group_load_insns(g, plane, i)? {
+        b.ds_load(2 + plane, insn)?;
+    }
+    Ok(())
+}
+
+fn fold(b: &mut Builder, g: &Fp8Gen, plane: usize) -> Result<(), String> {
+    if g.spec().scale == Fp8Scale::K128 {
+        // K128: the four per-token D ratios, then 16 row pairs, each times the D ratio.
+        for insn in fp8::fold_k128_token_load_insns(g, plane)? {
+            b.ds_load(4 + plane, insn)?;
+        }
+        for i in 0..4 {
+            for h in 0..4 {
+                let e = 2 * h;
+                for insn in fp8::fold_k128_pair_load_insns(g, plane, i, e)? {
+                    b.ds_load(2 + plane, insn)?;
+                }
+                fp8::fold_k128_pair_scale(b, g, i, e)?;
+            }
+        }
+        return Ok(());
+    }
+    // Row: the eight ratios of group i arrive in two b128 loads, one group ahead of their 16
+    // packets. The A-publish stores still read v168..v175, so every store has drained before the
+    // first load; each group then waits only for its own two loads.
+    b.wait(Counter::Ds, 0)?;
+    row_group_loads(b, g, plane, 0)?;
+    for i in 0..4 {
+        if i + 1 < 4 {
+            row_group_loads(b, g, plane, i + 1)?;
+        }
+        b.wait(Counter::Ds, if i + 1 < 4 { 2 } else { 0 })?;
+        fp8::fold_row_group_scale(b, g, i)?;
+    }
+    Ok(())
+}

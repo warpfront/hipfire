@@ -1,0 +1,101 @@
+{
+  "script_md5": "da83bb231ea7fbbb96a4e3247392de2c",
+  "rows": [
+    {
+      "module": "fused_qkvza_hfq4g256_mq4v2",
+      "symbol": "fused_qkvza_mq4g256v2",
+      "dims": [
+        10240,
+        6144,
+        48,
+        48,
+        5120
+      ],
+      "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/fused_qkvza_mq4g256v2/occ0",
+      "arm": "hipcc",
+      "object": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/fused_qkvza_hfq4g256_mq4v2/rep-1/kernel.hsaco",
+      "object_md5": "5c910221c116565990a4c00e56c9230d",
+      "object_sha256": "8b4ad8d1ae1f45ebbde2979fa2fe9c2cf88703a4045d1c42fea177660094ec47",
+      "input_md5": {
+        "0": "79eeab613dcfebce38f3f1f20c9fc6a2",
+        "8": "4ad9d58ef1e628209ca505e7ba322443",
+        "16": "a05e01199d940ccf4329b0f64b2fb434",
+        "24": "2880a95d9b74b50fc5891aab656c22f2",
+        "32": "abfd03d4be0c4056d9a1248a4ad23fc0",
+        "40": "6934e0fba02a286a814ef4cd8b4efbd0",
+        "48": "11e7613d5047d1fde6d7dcfa40a2ea37",
+        "56": "fc507fa375048299f4d56aa776cc89d1",
+        "64": "5958cd07ce1bb0e6056860482788fb37"
+      },
+      "weight_bytes": 44825600,
+      "samples_ms": [
+        0.06276100128889084,
+        0.06256099790334702,
+        0.0612809993326664,
+        0.06132100149989128,
+        0.06096100062131882,
+        0.06084100157022476,
+        0.06092099845409393,
+        0.06088100001215935,
+        0.0610009990632534,
+        0.06120099872350693,
+        0.3650459945201874,
+        0.06040100008249283,
+        0.06060099974274635,
+        0.06064099818468094,
+        0.060520999133586884
+      ],
+      "median_ms": 0.06096100062131882,
+      "weight_GBs": 735.3160142244111,
+      "post_mismatches": 0
+    },
+    {
+      "module": "fused_qkvza_hfq4g256_mq4v2",
+      "symbol": "fused_qkvza_mq4g256v2",
+      "dims": [
+        10240,
+        6144,
+        48,
+        48,
+        5120
+      ],
+      "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/fused_qkvza_mq4g256v2/occ0",
+      "arm": "probe",
+      "object": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.co",
+      "object_md5": "1474ccfe59be24c19f98019b74a99876",
+      "object_sha256": "31ac049859d799558b6f9e44176f94a68c6bfbcd3145ac23bf127b7ab4f36f38",
+      "input_md5": {
+        "0": "79eeab613dcfebce38f3f1f20c9fc6a2",
+        "8": "4ad9d58ef1e628209ca505e7ba322443",
+        "16": "a05e01199d940ccf4329b0f64b2fb434",
+        "24": "2880a95d9b74b50fc5891aab656c22f2",
+        "32": "abfd03d4be0c4056d9a1248a4ad23fc0",
+        "40": "6934e0fba02a286a814ef4cd8b4efbd0",
+        "48": "11e7613d5047d1fde6d7dcfa40a2ea37",
+        "56": "fc507fa375048299f4d56aa776cc89d1",
+        "64": "5958cd07ce1bb0e6056860482788fb37"
+      },
+      "weight_bytes": 44825600,
+      "samples_ms": [
+        0.11120200157165527,
+        0.06636100262403488,
+        0.06252100318670273,
+        0.061921000480651855,
+        0.06204099953174591,
+        0.062001001089811325,
+        0.061840999871492386,
+        0.06172100082039833,
+        0.06204099953174591,
+        0.06244099885225296,
+        0.06212100014090538,
+        0.10868199914693832,
+        0.061921000480651855,
+        0.0618010014295578,
+        0.06228100135922432
+      ],
+      "median_ms": 0.06204099953174591,
+      "weight_GBs": 722.5157611631173,
+      "post_mismatches": 0
+    }
+  ]
+}

@@ -19,11 +19,40 @@
 #define HEADS_PER_WG 1
 #endif
 
+// gfx1201, gfx1100 and gfx1151: spell out the arithmetic the unfused reference
+// kernels (conv1d_silu_split_f32 + fused_qk_l2_norm_scale_f32) compile to on
+// these arches. Both leave FMA contraction to the compiler, and it contracts
+// the same source expressions differently in this kernel: here w3*x rounds and
+// w2*s0 fuses (the reference rounds w2*s0 and fuses w3*x), and the unrolled
+// square sum fuses the lane's first element onto its second (the reference
+// rounds the first and fuses the second). Either difference moves Q/K/V by an
+// ULP, so the lowered decode (which uses this fusion) was not byte-identical to
+// the hand decode (which uses the reference pair). Explicit fmaf with
+// contraction off makes the fused kernel produce the reference bytes. Other
+// arches keep the original expressions (their code objects are unchanged).
+#if defined(__gfx1201__) || defined(__gfx1100__) || defined(__gfx1151__)
+#define HIPFIRE_CQN_REFERENCE_ORDER 1
+
+// conv1d_silu_split_f32 on these arches: fma(w0, s2, fma(w1, s1, fma(w3, x, w2*s0))).
+__device__ __forceinline__ float cqn_conv_taps(
+    const float* __restrict__ weight, int c, float x, float s0, float s1, float s2
+) {
+#pragma clang fp contract(off)
+    float y = weight[c * 4 + 2] * s0;
+    y = __builtin_fmaf(weight[c * 4 + 3], x, y);
+    y = __builtin_fmaf(weight[c * 4 + 1], s1, y);
+    y = __builtin_fmaf(weight[c * 4], s2, y);
+    return y;
+}
+#endif
+
 // gfx1100/gfx1201 decode-only fusion of conv1d_silu_split_f32 and
 // fused_qk_l2_norm_scale_f32. Q/K conv results stage in LDS, then the first
-// wave for each head performs the exact existing four-value lane sum, XOR
+// wave for each head performs the existing four-value lane sum, XOR
 // reduction, and two-step Q scale. V channels retain the original independent
-// conv path. Q/K reach global memory only once, already normalized.
+// conv path. Q/K reach global memory only once, already normalized. On
+// gfx1201, gfx1100 and gfx1151 the arithmetic is byte-identical to the
+// reference pair (see above).
 extern "C" __launch_bounds__(HIPFIRE_CQN_BLOCK)
 __global__ void HIPFIRE_CQN_KERNEL(
     float* __restrict__ q_out,
@@ -87,8 +116,12 @@ __global__ void HIPFIRE_CQN_KERNEL(
             float s0 = state[c * 3];
             float s1 = state[c * 3 + 1];
             float s2 = state[c * 3 + 2];
+#if defined(HIPFIRE_CQN_REFERENCE_ORDER)
+            float y = cqn_conv_taps(weight, c, x, s0, s1, s2);
+#else
             float y = weight[c * 4 + 3] * x + weight[c * 4 + 2] * s0
                     + weight[c * 4 + 1] * s1 + weight[c * 4] * s2;
+#endif
             float result = y / (1.0f + expf(-y));
             state[c * 3 + 2] = s1;
             state[c * 3 + 1] = s0;
@@ -106,8 +139,12 @@ __global__ void HIPFIRE_CQN_KERNEL(
             float qs0 = state[qc * 3];
             float qs1 = state[qc * 3 + 1];
             float qs2 = state[qc * 3 + 2];
+#if defined(HIPFIRE_CQN_REFERENCE_ORDER)
+            float qy = cqn_conv_taps(weight, qc, qx, qs0, qs1, qs2);
+#else
             float qy = weight[qc * 4 + 3] * qx + weight[qc * 4 + 2] * qs0
                      + weight[qc * 4 + 1] * qs1 + weight[qc * 4] * qs2;
+#endif
             float qr = qy / (1.0f + expf(-qy));
             state[qc * 3 + 2] = qs1;
             state[qc * 3 + 1] = qs0;
@@ -118,8 +155,12 @@ __global__ void HIPFIRE_CQN_KERNEL(
             float ks0 = state[kc * 3];
             float ks1 = state[kc * 3 + 1];
             float ks2 = state[kc * 3 + 2];
+#if defined(HIPFIRE_CQN_REFERENCE_ORDER)
+            float ky = cqn_conv_taps(weight, kc, kx, ks0, ks1, ks2);
+#else
             float ky = weight[kc * 4 + 3] * kx + weight[kc * 4 + 2] * ks0
                      + weight[kc * 4 + 1] * ks1 + weight[kc * 4] * ks2;
+#endif
             float kr = ky / (1.0f + expf(-ky));
             state[kc * 3 + 2] = ks1;
             state[kc * 3 + 1] = ks0;
@@ -140,8 +181,14 @@ __global__ void HIPFIRE_CQN_KERNEL(
             for (int d = lane; d < HD; d += 32) {
                 const float qv = q_s[reduce_head * HD + d];
                 const float kv = k_s[reduce_head * HD + d];
+#if defined(HIPFIRE_CQN_REFERENCE_ORDER)
+                // fused_qk_l2_norm_scale_f32: acc = fma(v, v, acc) from 0.
+                q_sq = __builtin_fmaf(qv, qv, q_sq);
+                k_sq = __builtin_fmaf(kv, kv, k_sq);
+#else
                 q_sq += qv * qv;
                 k_sq += kv * kv;
+#endif
             }
             for (int o = 16; o > 0; o >>= 1) {
                 q_sq += __shfl_xor(q_sq, o);
@@ -167,8 +214,13 @@ __global__ void HIPFIRE_CQN_KERNEL(
             for (int d = tid; d < HD; d += 32) {
                 const float qv = q_s[d];
                 const float kv = k_s[d];
+#if defined(HIPFIRE_CQN_REFERENCE_ORDER)
+                q_sq = __builtin_fmaf(qv, qv, q_sq);
+                k_sq = __builtin_fmaf(kv, kv, k_sq);
+#else
                 q_sq += qv * qv;
                 k_sq += kv * kv;
+#endif
             }
             for (int o = 16; o > 0; o >>= 1) {
                 q_sq += __shfl_xor(q_sq, o);
@@ -199,8 +251,12 @@ __global__ void HIPFIRE_CQN_KERNEL(
     float s0 = state[c * 3];
     float s1 = state[c * 3 + 1];
     float s2 = state[c * 3 + 2];
+#if defined(HIPFIRE_CQN_REFERENCE_ORDER)
+    float y = cqn_conv_taps(weight, c, x, s0, s1, s2);
+#else
     float y = weight[c * 4 + 3] * x + weight[c * 4 + 2] * s0
             + weight[c * 4 + 1] * s1 + weight[c * 4] * s2;
+#endif
     float result = y / (1.0f + expf(-y));
     state[c * 3 + 2] = s1;
     state[c * 3 + 1] = s0;

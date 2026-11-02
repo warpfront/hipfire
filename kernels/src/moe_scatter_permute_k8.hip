@@ -64,6 +64,8 @@ extern "C" __global__ void moe_scatter_permute_k8(
             // down-combine: per (token, m), iterate K_TOP slots and read
             // inverse_perm[token*K_TOP + k] to locate each contribution.
             inverse_perm[i] = sorted_pos;
+        } else {
+            inverse_perm[i] = -1;  // unrouted slot (id outside [0, E)): no grouped row
         }
     }
     __syncthreads();

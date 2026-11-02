@@ -1,0 +1,386 @@
+{
+  "module": "qwen4_slab_union_plan_t8_pm_gfx1151",
+  "arch": "gfx1151",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "unknown",
+  "s_text_sha256": "e7f9b545433c4ada9e067b8d788297e77b4afe4e7e86541145c9073cdcc22854",
+  "kernels": [
+    {
+      "kernel_id": "qwen4_slab_union_plan",
+      "variant": "t8",
+      "arch": "gfx1151",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "unknown",
+      "reg_plan": [
+        {
+          "name": "kernarg",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "workgroup_x",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "args_0",
+          "kind": "s",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "n_experts",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "tile",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "absolute_base",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "limit",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "temporary",
+          "kind": "s",
+          "base": 20,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scan_index",
+          "kind": "s",
+          "base": 21,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "saved_exec",
+          "kind": "s",
+          "base": 26,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "mask",
+          "kind": "s",
+          "base": 22,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "mask2",
+          "kind": "s",
+          "base": 24,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "slot_state",
+          "kind": "v",
+          "base": 0,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "slot_state",
+          "kind": "v",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "slot_state",
+          "kind": "v",
+          "base": 16,
+          "len": 8,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 24,
+      "next_free_sgpr": 27,
+      "waits": [
+        {
+          "pc_index": 3,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 34,
+          "insn": "s_waitcnt vmcnt(0)",
+          "counter": "Vm",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 40,
+          "insn": "s_waitcnt vmcnt(0)",
+          "counter": "Vm",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 54,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 63,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 85,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 99,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 133,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 136,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 146,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 149,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 157,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 163,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 170,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 175,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 178,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 188,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 191,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 199,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 205,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 209,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [
+        {
+          "name": "ids",
+          "base": 0,
+          "len": 320,
+          "state": "Reading"
+        },
+        {
+          "name": "buckets",
+          "base": 320,
+          "len": 320,
+          "state": "Reading"
+        },
+        {
+          "name": "heads",
+          "base": 640,
+          "len": 320,
+          "state": "Reading"
+        },
+        {
+          "name": "totals",
+          "base": 960,
+          "len": 320,
+          "state": "Reading"
+        }
+      ],
+      "barriers": [
+        {
+          "pc_index": 55,
+          "transitions": [
+            "Ready(0)",
+            "Ready(1)"
+          ]
+        },
+        {
+          "pc_index": 86,
+          "transitions": [
+            "Ready(2)",
+            "Ready(3)"
+          ]
+        }
+      ],
+      "loop_fixpoints": [
+        {
+          "head": ".Lunion_matches",
+          "iterations": 2
+        },
+        {
+          "head": ".Lunion_heads",
+          "iterations": 2
+        }
+      ],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "e7f9b545433c4ada9e067b8d788297e77b4afe4e7e86541145c9073cdcc22854"
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+python3 target/g4_direct_campaign.py

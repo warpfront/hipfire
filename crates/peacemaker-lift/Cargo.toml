@@ -1,0 +1,42 @@
+[package]
+name = "peacemaker-lift"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+peacemaker-ir = { path = "../peacemaker-ir" }
+object = { version = "0.38", default-features = false, features = ["read", "write"] }
+smallvec = "1"
+rmpv = "1"
+thiserror.workspace = true
+sha2 = "0.10"
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+insta = "1"
+
+# Research probes / checkers: opt-in `--features lab`, so they are not type-checked by `cargo build --all-targets`.
+[features]
+lab = []
+
+[[example]]
+name = "hazard_check"
+required-features = ["lab"]
+
+[[example]]
+name = "isa_gap_audit"
+required-features = ["lab"]
+
+[[example]]
+name = "x1_gap_scan"
+required-features = ["lab"]
+
+[[example]]
+name = "x1_lift_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "x1_repass"
+required-features = ["lab"]

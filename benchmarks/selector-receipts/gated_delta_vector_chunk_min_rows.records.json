@@ -1,0 +1,53 @@
+{
+ "schema": "g3.crossover_records.v1",
+ "node": "gated_delta_vector_chunk_node bench (Gpu::gated_delta_net_vector_{serial,chunked}_f32, Raon geometry H40 D128, per-key decay, BF16-rounded output)",
+ "arch": "gfx1201",
+ "card": "R9700 fabric card A",
+ "fabric_job": "j5818",
+ "binary": "bin/g3f-205bec96d7/node md5 2170f51ba42f2da3d676284c742cd949",
+ "note": "self-measured wall of 200 back-to-back launches per route in one process (exclusive timing job), not a pm-census judge record",
+ "rows": [
+  {
+   "rows": 64,
+   "serial_ms_per_layer": 0.06173581,
+   "chunked_ms_per_layer": 0.04600657,
+   "chunked_over_serial": 0.7452169170534896,
+   "reps": 200
+  },
+  {
+   "rows": 128,
+   "serial_ms_per_layer": 0.112807855,
+   "chunked_ms_per_layer": 0.08282226,
+   "chunked_over_serial": 0.7341887672627052,
+   "reps": 200
+  },
+  {
+   "rows": 192,
+   "serial_ms_per_layer": 0.16436032999999997,
+   "chunked_ms_per_layer": 0.102272235,
+   "chunked_over_serial": 0.6222440354068407,
+   "reps": 200
+  },
+  {
+   "rows": 256,
+   "serial_ms_per_layer": 0.22368017,
+   "chunked_ms_per_layer": 0.132202345,
+   "chunked_over_serial": 0.5910329243759068,
+   "reps": 200
+  },
+  {
+   "rows": 512,
+   "serial_ms_per_layer": 0.458030965,
+   "chunked_ms_per_layer": 0.29016021999999997,
+   "chunked_over_serial": 0.6334947681976042,
+   "reps": 200
+  },
+  {
+   "rows": 1024,
+   "serial_ms_per_layer": 0.88439229,
+   "chunked_ms_per_layer": 0.5598747,
+   "chunked_over_serial": 0.633061489036726,
+   "reps": 200
+  }
+ ]
+}

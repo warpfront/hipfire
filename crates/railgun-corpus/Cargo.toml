@@ -1,0 +1,15 @@
+[package]
+name = "railgun-corpus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Runtime-side reader for railgun fact records: the peacemaker-receipt schema and the offline JIT receipt corpus lookup (railgun design §2.5, D12)"
+publish = false
+
+# The runtime may depend on this crate; it must never reach peacemaker
+# (checked by peacemaker-ir's `runtime_dependency_graph_does_not_include_peacemaker`).
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

@@ -76,8 +76,41 @@ impl Architecture for Qwen35 {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
+        Self::load_weights_with_placement(hfq, cfg, gpu, None)
+    }
+
+    fn load_weights_with_placement(
+        hfq: &mut HfqFile,
+        cfg: &Self::Config,
+        gpu: &mut Gpu,
+        placement: Option<&hipfire_runtime::offload::Placement>,
+    ) -> Result<Self::Weights, String> {
+        // One line when `memory.offload_exec=cpu`, naming which spilled formats
+        // the CPU can actually execute (silent otherwise; see the fn's docs).
+        // Reads the resolved placement, not the config-level `i_gpu_start` mirror,
+        // so an experts-only spill is reported instead of "nothing is spilled".
+        // Before the source takes its mutable borrow of `hfq`.
+        crate::qwen35::load::report_cpu_exec_coverage(hfq, cfg, placement);
+        // A retained-replay backend and CPU-executed steps are mutually
+        // exclusive: the tape cannot express a step the CPU owns. Refuse the
+        // load rather than replay a route with stale activations.
+        // The `None` route is the pre-placement one — no placement was resolved,
+        // so nothing is spilled and the gate starts off.
+        let host_weights = placement.map_or(0, |p| p.host_layers() + p.host_expert_layers());
+        // Any host-mapped weight the CPU may multiply is a host sync point: a
+        // whole-layer spill's own weights through the step seam, and a routed
+        // expert's down projection through the MoE CPU splice (default-on
+        // diagnostic). Use the same host-weight sum the retained-replay refusal
+        // does, so the flag cannot under-report.
+        gpu.set_host_cpu_weights(hipfire_dispatch::cpu_offload_active(host_weights));
+        hipfire_dispatch::reject_cpu_exec_under_redline(host_weights, gpu.replay.is_enabled())
+            .map_err(|e| format!("qwen35: {e}"))?;
         let mut source = HfqSource::new(hfq, cfg);
-        let layout = Layout::single(cfg.n_layers);
+        let layout = match placement {
+            // `None` = fully resident, byte-identical to the pre-offload loader.
+            None => Layout::single(cfg.n_layers),
+            Some(placement) => Layout::single(cfg.n_layers).with_placement(placement.clone()),
+        };
         qwen35_load_weights(&mut source, std::slice::from_mut(gpu), &layout)
             .map_err(|e| format!("qwen35: load_weights failed: {e:?}"))
     }

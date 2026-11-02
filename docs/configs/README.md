@@ -9,6 +9,7 @@ passed as `HIPFIRE_*` environment variables.
 | [`user.toml`](user.toml) | Users | Generation, memory, prompt, speculation, and serve policy. |
 | [`developer.toml`](developer.toml) | Developers | Hardware selection, kernel policy, graphs, diagnostics, and the experimental escape namespace. |
 | [`redline-pm4.toml`](redline-pm4.toml) | Redline developers | Explicit retained-PM4 transport and diagnostic policy. |
+| [`batched-redline-pm4-product.toml`](batched-redline-pm4-product.toml) | Redline developers | Certified fixed-slot sampled AR batch route for gfx1201 Qwen3.6 A3B MQ4R. Pins the retained-PM4 batch shape; not a built-in profile. |
 
 Each file is a complete valid profile, but it is intentionally not a dump of
 every default. Missing keys continue to inherit registry or compiled policy.
@@ -23,8 +24,9 @@ hipfire config profile set dev       # docs/configs/developer.toml
 hipfire config profile set redline   # docs/configs/redline-pm4.toml
 ```
 
-`hipfire config profile set <name>` replaces the entire sparse global
-`config.toml` with the selected built-in or custom profile. Profile names are
+`hipfire config profile set <name>` merges the selected built-in or custom
+profile into the sparse global `config.toml`: its keys overwrite the same keys,
+every other key is kept. Profile names are
 control-plane identifiers only; they are never stored inside the TOML file.
 Snapshot the current global layer as a custom profile with:
 
@@ -69,8 +71,11 @@ concatenation operation; merge the desired keys or use `hipfire config set`
 | `HIPFIRE_DFLASH_MODE=auto` | `speculation.dflash = "auto"` |
 | `HIPFIRE_MTP_MODE=on` | `speculation.mtp = "on"` |
 | `HIPFIRE_MTP_K=3` | `speculation.mtp_k = 3` |
+| `HIPFIRE_MTP_NGRAM=1` | `speculation.mtp_ngram = "on"` |
+| `HIPFIRE_MTP_NGRAM_COPY=1` | `speculation.mtp_ngram_copy = "on"` |
+| `HIPFIRE_DFLASH_LOOKUP=1` | `speculation.dflash_lookup = "on"` |
 | `HIPFIRE_PROMPT_CACHE_CAP=64` | `memory.prompt_cache_capacity = 64` |
-| `HIPFIRE_DEVICES=3` | `hardware.devices = "3"`; startup applies `ROCR_VISIBLE_DEVICES=3` and matching `HIP_VISIBLE_DEVICES=0` |
+| `HIPFIRE_DEVICES=3` | `hardware.devices = "3"`; startup resolves PCI-order card 3 and applies `ROCR_VISIBLE_DEVICES=<its UUID, or ROCr ordinal>` with `HIP_VISIBLE_DEVICES=0` |
 | `HIPFIRE_REPLAY_BACKEND=redline` | `replay.backend = "redline"` |
 | `HIPFIRE_REPLAY_TRANSPORT=pm4` | `replay.transport = "pm4"` |
 | `HIPFIRE_REPLAY_PM4_QUEUES=2` | `diagnostic.replay.pm4_queues = "2"` |

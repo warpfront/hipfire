@@ -35,6 +35,285 @@ pub fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
     }
 }
 
+/// The close a Qwen chat template frames reasoning with (`<think>\n…\n</think>\n\n`).
+/// Spliced when an explicit `max_think_tokens` budget runs out on the Qwen4
+/// routes, so the model continues from the exact text it was trained to answer
+/// after (vLLM's `thinking_token_budget` forces the parser's end marker the same
+/// way). For Flash-Next this encodes to `\n` 198, `</think>` 248069, `\n\n` 271.
+pub const QWEN_TEMPLATE_THINK_CLOSE: &str = "\n</think>\n\n";
+
+/// What [`ThinkBudget::observe`] asks the decode loop to do after a token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThinkBudgetStep {
+    /// Keep decoding.
+    Continue,
+    /// The budget ran out inside the think span: splice the close text next.
+    ForceClose,
+    /// The budget ran out again in a span re-opened after the forced close:
+    /// stop the turn (no second splice, so a model that keeps re-opening
+    /// `<think>` cannot run the turn out).
+    Exhausted,
+}
+
+/// Explicit `max_think_tokens` accounting shared by the AR and speculative
+/// producers, so both force the close after the same token.
+///
+/// Every committed token that leaves the stream inside a think span counts;
+/// entering a span starts the count over. When the count reaches the budget the
+/// first time, the caller splices the close and reports how many tokens it
+/// queued through [`Self::closing`]; those tokens are not counted (the leading
+/// `\n` of [`QWEN_TEMPLATE_THINK_CLOSE`] is still inside the span).
+#[derive(Debug, Clone, Default)]
+pub struct ThinkBudget {
+    max: usize,
+    count: usize,
+    prev_in_think: bool,
+    force_closed: bool,
+    closing: usize,
+}
+
+impl ThinkBudget {
+    /// `max == 0` is uncapped: [`Self::observe`] always continues.
+    pub fn new(max: usize) -> Self {
+        Self {
+            max,
+            ..Self::default()
+        }
+    }
+
+    /// Whether a budget is set (callers skip the think scan otherwise).
+    pub fn enabled(&self) -> bool {
+        self.max > 0
+    }
+
+    /// Account one committed token; `in_think` is the stream state after it.
+    pub fn observe(&mut self, in_think: bool) -> ThinkBudgetStep {
+        if self.max == 0 {
+            return ThinkBudgetStep::Continue;
+        }
+        if self.closing > 0 {
+            self.closing -= 1;
+            self.prev_in_think = in_think;
+            return ThinkBudgetStep::Continue;
+        }
+        if in_think && !self.prev_in_think {
+            self.count = 0;
+        }
+        if in_think {
+            self.count += 1;
+        }
+        self.prev_in_think = in_think;
+        if !in_think || self.count < self.max {
+            return ThinkBudgetStep::Continue;
+        }
+        if self.force_closed {
+            return ThinkBudgetStep::Exhausted;
+        }
+        self.force_closed = true;
+        ThinkBudgetStep::ForceClose
+    }
+
+    /// The caller queued `tokens` close tokens after a
+    /// [`ThinkBudgetStep::ForceClose`]; skip them in the count.
+    pub fn closing(&mut self, tokens: usize) {
+        self.closing = tokens;
+    }
+
+    /// The most tokens the caller may commit next such that no
+    /// [`Self::observe`] call within the first `n - 1` of them returns
+    /// [`ThinkBudgetStep::ForceClose`] or [`ThinkBudgetStep::Exhausted`]: a
+    /// non-`Continue` step can only fall on the `n`-th (last) token, so a
+    /// speculative window of that size never needs repair after the fact.
+    /// `None` when no cap applies: the budget is disabled, or the stream is
+    /// outside a span with no close queued. `Some` is always `>= 1`.
+    ///
+    /// `in_think` is the stream state after the last observed token.
+    ///
+    /// - In a span (`in_think`, no queued close): `max - count` more tokens
+    ///   fit before the count reaches `max`, and the `max`-th lands on the last.
+    /// - Outside a span: uncapped. Nothing can trip until a committed token
+    ///   opens a span. Capping at `max` here would hold every answer window to
+    ///   `max` tokens for the rest of the turn, and thinking-off requests
+    ///   carry `max == 1`, so speculation would stop entirely. A span that
+    ///   opens and trips inside the same window is a strict-prefix window,
+    ///   which the decode loop repairs or realigns like any other.
+    /// - While close tokens are queued (`closing > 0`): `closing` plus the
+    ///   in-span cap. The queued tokens never count, but they never reset the
+    ///   count either: a stream still inside the span afterwards continues the
+    ///   count left at the `ForceClose` (`max`), so the first token after them
+    ///   may already trip. A span that leaves and re-opens resets the count and
+    ///   only trips later.
+    ///
+    /// A span that closes and re-opens inside the window resets the count, so
+    /// it only delays the trip and never moves it earlier.
+    pub fn window_cap(&self, in_think: bool) -> Option<usize> {
+        if self.max == 0 {
+            return None;
+        }
+        let cap = if self.closing > 0 {
+            self.closing + self.max.saturating_sub(self.count).max(1)
+        } else if in_think {
+            self.max.saturating_sub(self.count)
+        } else {
+            return None;
+        };
+        Some(cap.max(1))
+    }
+}
+
+const THINK_OPEN: &str = "<think>";
+const THINK_CLOSE: &str = "</think>";
+
+/// Ordered channel fragments produced by ThinkOutputRouter.
+///
+/// Content is not yet classifier-authorized visible text: callers must still
+/// pass it through ToolOutputRouter before exposing it to a client.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ThinkRouteEvent {
+    /// Text outside a think span, ready for tool-protocol classification.
+    Content(String),
+    /// Text inside a think span, ready for the typed reasoning channel.
+    Reasoning(String),
+}
+
+/// Incremental <think>...</think> channel router.
+///
+/// The router is chunk-boundary invariant: it holds only a trailing prefix of
+/// an opener/closer and emits every other byte immediately in input order. It
+/// deliberately does not recognize end-of-turn markers; EosFilter remains the
+/// sole EOT/UTF-8 authority and must run before this router.
+pub struct ThinkOutputRouter {
+    in_think: bool,
+    pending: String,
+    strip_answer_newlines: bool,
+    /// Initial prompt state retained so `reset` can reuse this router for a
+    /// fresh turn without losing assistant-prefix think semantics.
+    started_in_think: bool,
+    /// Once terminal output is finalized, no later bytes may cross the
+    /// client-visible boundary until `reset` or a fresh router starts a turn.
+    finished: bool,
+}
+
+impl ThinkOutputRouter {
+    /// Start a fresh turn. started_in_think is true when the rendered prompt
+    /// already supplied the opening marker, so generated bytes begin directly
+    /// in the reasoning channel.
+    pub fn new(started_in_think: bool) -> Self {
+        Self {
+            in_think: started_in_think,
+            pending: String::new(),
+            strip_answer_newlines: false,
+            started_in_think,
+            finished: false,
+        }
+    }
+
+    /// Reuse this router for a fresh turn, restoring the prompt-derived
+    /// initial channel and clearing all buffered/terminal state.
+    pub fn reset(&mut self) {
+        self.in_think = self.started_in_think;
+        self.pending.clear();
+        self.strip_answer_newlines = false;
+        self.finished = false;
+    }
+
+    /// Whether the generated stream currently has an unclosed think span.
+    pub fn in_think(&self) -> bool {
+        self.in_think
+    }
+
+    /// Route one UTF-8-safe text chunk into out without allocating an
+    /// intermediate event vector. Existing entries in out are preserved.
+    pub fn push_into(&mut self, text: &str, out: &mut Vec<ThinkRouteEvent>) {
+        if self.finished || text.is_empty() {
+            return;
+        }
+        self.pending.push_str(text);
+        self.drain(false, out);
+    }
+
+    /// End-of-stream: classify a trailing partial marker as ordinary text.
+    /// The first call consumes the pending bytes; repeated calls and late
+    /// input are inert, preserving exactly-once terminal ownership.
+    pub fn finish_into(&mut self, out: &mut Vec<ThinkRouteEvent>) {
+        if self.finished {
+            return;
+        }
+        self.drain(true, out);
+        self.finished = true;
+    }
+
+    fn drain(&mut self, finish: bool, out: &mut Vec<ThinkRouteEvent>) {
+        loop {
+            if let Some((at, marker)) = next_think_marker(&self.pending) {
+                let before = self.pending[..at].to_owned();
+                self.emit(before, out);
+                self.pending.drain(..at + marker.len());
+                if marker == THINK_OPEN {
+                    self.in_think = true;
+                } else {
+                    self.in_think = false;
+                    self.strip_answer_newlines = true;
+                }
+                continue;
+            }
+
+            let hold = if finish {
+                0
+            } else {
+                longest_think_prefix_suffix(&self.pending)
+            };
+            let emit_len = self.pending.len().saturating_sub(hold);
+            if emit_len > 0 {
+                let text = self.pending[..emit_len].to_owned();
+                self.pending.drain(..emit_len);
+                self.emit(text, out);
+            }
+            break;
+        }
+    }
+
+    fn emit(&mut self, mut text: String, out: &mut Vec<ThinkRouteEvent>) {
+        if !self.in_think && self.strip_answer_newlines {
+            let trimmed = text.trim_start_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                return;
+            }
+            text = trimmed.to_owned();
+            self.strip_answer_newlines = false;
+        }
+        if text.is_empty() {
+            return;
+        }
+        if self.in_think {
+            out.push(ThinkRouteEvent::Reasoning(text));
+        } else {
+            out.push(ThinkRouteEvent::Content(text));
+        }
+    }
+}
+
+fn next_think_marker(text: &str) -> Option<(usize, &'static str)> {
+    [THINK_OPEN, THINK_CLOSE]
+        .into_iter()
+        .filter_map(|marker| text.find(marker).map(|at| (at, marker)))
+        .min_by_key(|(at, _)| *at)
+}
+
+fn longest_think_prefix_suffix(text: &str) -> usize {
+    [THINK_OPEN, THINK_CLOSE]
+        .into_iter()
+        .map(|marker| {
+            let max = text.len().min(marker.len().saturating_sub(1));
+            (1..=max)
+                .rev()
+                .find(|&len| text.ends_with(&marker[..len]))
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 const TOOL_CALL_OPEN: &str = "<tool_call>";
 const TOOL_CALL_CLOSE: &str = "</tool_call>";
 
@@ -102,6 +381,9 @@ enum RouteState {
 /// ordered prose and complete calls, and latches fail-closed on malformed or
 /// truncated protocol.
 pub struct ToolOutputRouter {
+    /// Whether this request declared at least one executable tool. Tool-like
+    /// text is ordinary assistant content when no tool contract exists.
+    enabled: bool,
     state: RouteState,
     /// Unsettled text: Normal holdback tail, or InToolCall body accumulator
     /// (may include a trailing partial delimiter still being matched).
@@ -127,12 +409,22 @@ impl ToolOutputRouter {
     /// Fresh router with empty buffers.
     pub fn new() -> Self {
         Self {
+            enabled: true,
             state: RouteState::Normal,
             buf: String::new(),
             cursor: DelimCursor::new(),
             seen: 0,
             completed: Vec::new(),
             malformed: None,
+        }
+    }
+
+    /// Router for a tool-free request. Reserved-looking text remains visible
+    /// and can never become executable or fail the tool protocol.
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Self::new()
         }
     }
 
@@ -151,6 +443,13 @@ impl ToolOutputRouter {
     /// Returns [`Err`] once malformed/truncated protocol is detected; the error
     /// stays latched for subsequent calls.
     pub fn push(&mut self, chunk: &str) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+        if !self.enabled {
+            return if chunk.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![visible_event(chunk.to_string())])
+            };
+        }
         if let Some(err) = self.malformed.clone() {
             return Err(err);
         }
@@ -163,6 +462,11 @@ impl ToolOutputRouter {
 
     /// End-of-stream: flush held prose, or fail closed on an open tool span.
     pub fn finish(mut self) -> Result<Vec<ToolRouteEvent>, ToolRouteError> {
+        if !self.enabled {
+            debug_assert!(self.buf.is_empty());
+            debug_assert!(self.completed.is_empty());
+            return Ok(Vec::new());
+        }
         if let Some(err) = self.malformed.clone() {
             return Err(err);
         }
@@ -476,11 +780,21 @@ fn parse_strict_tool_call_body(body_raw: &str) -> Option<crate::prompt_frame::To
             .get("arguments")
             .cloned()
             .unwrap_or(serde_json::Value::Object(Default::default()));
-        return Some(crate::prompt_frame::ToolCall { name, arguments });
+        return Some(crate::prompt_frame::ToolCall {
+            id: None,
+            name,
+            arguments,
+            rendered_body: None,
+        });
     }
     // Form 3: fully valid Qwen XML (requires </function>, fully consumed params).
     if let Some((name, arguments)) = extract_qwen_xml_tool_call_strict(body) {
-        return Some(crate::prompt_frame::ToolCall { name, arguments });
+        return Some(crate::prompt_frame::ToolCall {
+            id: None,
+            name,
+            arguments,
+            rendered_body: None,
+        });
     }
     None
 }
@@ -533,7 +847,12 @@ fn parse_one_tool_call_body(body_raw: &str) -> Option<crate::prompt_frame::ToolC
             // else: truncated mid-args — unrecoverable.
         }
     }
-    parsed.map(|(name, arguments)| crate::prompt_frame::ToolCall { name, arguments })
+    parsed.map(|(name, arguments)| crate::prompt_frame::ToolCall {
+        id: None,
+        name,
+        arguments,
+        rendered_body: None,
+    })
 }
 
 fn strip_chatml_leakage(body_raw: &str) -> String {
@@ -574,6 +893,353 @@ pub fn extract_tool_calls_from_text(s: &str) -> Vec<crate::prompt_frame::ToolCal
         }
     }
     out
+}
+
+/// Extract LFM2.5 Pythonic tool calls. Liquid's format wraps a Python list
+/// literal of function calls inside dedicated special tokens (see
+/// [`LFM_TOOL_OPEN`] / [`LFM_TOOL_CLOSE`]). The daemon normally suppresses
+/// these markers at the token level before text reaches the stream, but this
+/// extractor scans decoded text so a caller with the full run recovers the
+/// calls byte-for-byte.
+///
+/// Mirrors vLLM's `pythonic` tool parser: the span body is one
+/// `[f(k=v, ...), g(...)]` list; each call maps to a [`ToolCall`] whose
+/// `arguments` is a JSON object built from the keyword arguments; positional
+/// arguments are parsed but dropped (vLLM `handle_single_tool` does the
+/// same); dotted function names (`a.b.c(...)`) are preserved; a body that
+/// fails to parse contributes no calls — the caller decides whether the raw
+/// text stays visible, matching vLLM's "treat as regular text" fallback.
+pub fn extract_lfm_tool_calls(s: &str) -> Vec<crate::prompt_frame::ToolCall> {
+    let mut out: Vec<crate::prompt_frame::ToolCall> = Vec::new();
+    let mut search_pos = 0;
+    while let Some(open_rel) = s[search_pos..].find(LFM_TOOL_OPEN) {
+        let body_start = search_pos + open_rel + LFM_TOOL_OPEN.len();
+        let (body_end, advance) = match s[body_start..].find(LFM_TOOL_CLOSE) {
+            Some(i) => (body_start + i, body_start + i + LFM_TOOL_CLOSE.len()),
+            None => (s.len(), s.len()),
+        };
+        if let Some(calls) = parse_lfm_call_list(&s[body_start..body_end]) {
+            out.extend(calls);
+        }
+        search_pos = advance;
+        if advance == s.len() {
+            break;
+        }
+    }
+    out
+}
+
+/// LFM2.5 tool-call span markers (literal text form of the special tokens,
+/// written as escapes so this file never carries the raw marker bytes).
+pub(crate) const LFM_TOOL_OPEN: &str = "\x3C\x7Ctool_call_start\x7C\x3E";
+pub(crate) const LFM_TOOL_CLOSE: &str = "\x3C\x7Ctool_call_end\x7C\x3E";
+
+/// Parse one LFM tool-call BODY — the bytes BETWEEN the markers — into calls.
+/// `[]` on malformed input (vLLM's treat-as-text fallback is the caller's
+/// choice). For text that still carries the markers use
+/// [`extract_lfm_tool_calls`].
+pub fn parse_lfm_tool_call_body(body: &str) -> Vec<crate::prompt_frame::ToolCall> {
+    parse_lfm_call_list(body).unwrap_or_default()
+}
+
+/// Parse one LFM tool-call body: a Python list literal of `name(k=v, ...)`
+/// calls. All-or-nothing per span, like vLLM — `None` on any malformed input
+/// so the caller leaves the text alone.
+fn parse_lfm_call_list(body: &str) -> Option<Vec<crate::prompt_frame::ToolCall>> {
+    let mut p = LfmPyParser::new(body);
+    p.expect(b'[')?;
+    let mut calls = Vec::new();
+    loop {
+        p.skip_ws();
+        if p.eat(b']') {
+            break;
+        }
+        calls.push(p.parse_call()?);
+        p.skip_ws();
+        if !p.eat(b',') {
+            p.expect(b']')?;
+            break;
+        }
+    }
+    p.skip_ws();
+    if !p.at_end() {
+        return None;
+    }
+    Some(calls)
+}
+
+struct LfmPyParser<'a> {
+    s: &'a [u8],
+    i: usize,
+}
+
+impl<'a> LfmPyParser<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            s: s.as_bytes(),
+            i: 0,
+        }
+    }
+    fn at_end(&self) -> bool {
+        self.i >= self.s.len()
+    }
+    fn skip_ws(&mut self) {
+        while self.i < self.s.len() && self.s[self.i].is_ascii_whitespace() {
+            self.i += 1;
+        }
+    }
+    fn eat(&mut self, c: u8) -> bool {
+        self.skip_ws();
+        if self.i < self.s.len() && self.s[self.i] == c {
+            self.i += 1;
+            true
+        } else {
+            false
+        }
+    }
+    fn expect(&mut self, c: u8) -> Option<()> {
+        self.eat(c).then_some(())
+    }
+    /// `ident` or dotted `a.b.c` — the call target, preserved verbatim.
+    fn parse_name(&mut self) -> Option<String> {
+        self.skip_ws();
+        let start = self.i;
+        if self.i < self.s.len() && (self.s[self.i].is_ascii_alphabetic() || self.s[self.i] == b'_')
+        {
+            self.i += 1;
+        } else {
+            return None;
+        }
+        loop {
+            while self.i < self.s.len()
+                && (self.s[self.i].is_ascii_alphanumeric() || self.s[self.i] == b'_')
+            {
+                self.i += 1;
+            }
+            if self.i < self.s.len()
+                && self.s[self.i] == b'.'
+                && self
+                    .s
+                    .get(self.i + 1)
+                    .is_some_and(|&n| n.is_ascii_alphabetic() || n == b'_')
+            {
+                self.i += 1;
+            } else {
+                break;
+            }
+        }
+        Some(std::str::from_utf8(&self.s[start..self.i]).ok()?.to_owned())
+    }
+    /// `name(k=v, pos, k2=v2)` → one [`ToolCall`]; positional args parsed,
+    /// dropped (vLLM convention).
+    fn parse_call(&mut self) -> Option<crate::prompt_frame::ToolCall> {
+        let name = self.parse_name()?;
+        self.expect(b'(')?;
+        let mut args = serde_json::Map::new();
+        loop {
+            self.skip_ws();
+            if self.eat(b')') {
+                break;
+            }
+            // Keyword arg iff `ident` directly followed by `=` (not `==`).
+            let save = self.i;
+            let is_kw = self.parse_name().is_some_and(|_| {
+                self.skip_ws();
+                self.s.get(self.i) == Some(&b'=') && self.s.get(self.i + 1) != Some(&b'=')
+            });
+            self.i = save;
+            if is_kw {
+                let key = self.parse_name()?;
+                self.expect(b'=')?;
+                let v = self.parse_value()?;
+                args.insert(key, v);
+            } else {
+                let _ = self.parse_value()?;
+            }
+            self.skip_ws();
+            if !self.eat(b',') {
+                self.expect(b')')?;
+                break;
+            }
+        }
+        Some(crate::prompt_frame::ToolCall {
+            id: None,
+            name,
+            arguments: serde_json::Value::Object(args),
+            rendered_body: None,
+        })
+    }
+    /// Python-literal value: string, number, bool/None, list, or dict.
+    fn parse_value(&mut self) -> Option<serde_json::Value> {
+        self.skip_ws();
+        let c = *self.s.get(self.i)?;
+        match c {
+            b'"' | b'\'' => self.parse_string(),
+            b'[' => {
+                self.i += 1;
+                let mut v = Vec::new();
+                loop {
+                    self.skip_ws();
+                    if self.eat(b']') {
+                        break;
+                    }
+                    v.push(self.parse_value()?);
+                    self.skip_ws();
+                    if !self.eat(b',') {
+                        self.expect(b']')?;
+                        break;
+                    }
+                }
+                Some(serde_json::Value::Array(v))
+            }
+            b'{' => {
+                self.i += 1;
+                let mut m = serde_json::Map::new();
+                loop {
+                    self.skip_ws();
+                    if self.eat(b'}') {
+                        break;
+                    }
+                    let k = self.parse_value()?;
+                    let k = match k {
+                        serde_json::Value::String(s) => s,
+                        _ => return None,
+                    };
+                    self.expect(b':')?;
+                    let v = self.parse_value()?;
+                    m.insert(k, v);
+                    self.skip_ws();
+                    if !self.eat(b',') {
+                        self.expect(b'}')?;
+                        break;
+                    }
+                }
+                Some(serde_json::Value::Object(m))
+            }
+            _ => self.parse_atom(),
+        }
+    }
+    /// Bareword / number: `True`, `False`, `None` (and JSON spellings), or a
+    /// numeric literal. Anything else (bare identifier, unary `+`, etc.)
+    /// rejects — a silently-accepted garbage arg is worse than no call.
+    fn parse_atom(&mut self) -> Option<serde_json::Value> {
+        let start = self.i;
+        while self.i < self.s.len()
+            && !matches!(self.s[self.i], b')' | b']' | b'}' | b',' | b':' | b'=')
+            && !self.s[self.i].is_ascii_whitespace()
+        {
+            self.i += 1;
+        }
+        let word = std::str::from_utf8(&self.s[start..self.i]).ok()?;
+        match word {
+            "True" | "true" => Some(serde_json::Value::Bool(true)),
+            "False" | "false" => Some(serde_json::Value::Bool(false)),
+            "None" | "null" => Some(serde_json::Value::Null),
+            _ => {
+                if let Ok(i) = word.parse::<i64>() {
+                    Some(serde_json::Value::from(i))
+                } else if let Ok(f) = word.parse::<f64>() {
+                    if f.is_finite() {
+                        serde_json::Number::from_f64(f).map(serde_json::Value::Number)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    /// Single- or double-quoted string with Python escape handling.
+    /// `\\n \\t \\r \\\\ \\' \\" \\0 \\xNN \\uXXXX \\UXXXXXXXX` all decode;
+    /// unknown escapes keep the backslash (Python's pass-through rule).
+    /// Triple-quoted strings supported.
+    fn parse_string(&mut self) -> Option<serde_json::Value> {
+        let quote = self.s[self.i];
+        self.i += 1;
+        let triple = self.s.get(self.i) == Some(&quote) && self.s.get(self.i + 1) == Some(&quote);
+        if triple {
+            self.i += 2;
+        }
+        let mut out = String::new();
+        loop {
+            let c = *self.s.get(self.i)?;
+            if c == quote {
+                if triple {
+                    if self.s.get(self.i + 1) == Some(&quote)
+                        && self.s.get(self.i + 2) == Some(&quote)
+                    {
+                        self.i += 3;
+                        break;
+                    }
+                    out.push(quote as char);
+                    self.i += 1;
+                    continue;
+                }
+                self.i += 1;
+                break;
+            }
+            if !triple && c == b'\n' {
+                return None; // unterminated single-line string
+            }
+            if c != b'\\' {
+                let width = utf8_len(c);
+                let end = self.i + width;
+                if end > self.s.len() {
+                    return None;
+                }
+                out.push_str(std::str::from_utf8(&self.s[self.i..end]).ok()?);
+                self.i = end;
+                continue;
+            }
+            self.i += 1;
+            let esc = *self.s.get(self.i)?;
+            self.i += 1;
+            match esc {
+                b'n' => out.push('\n'),
+                b't' => out.push('\t'),
+                b'r' => out.push('\r'),
+                b'0' => out.push('\0'),
+                b'\\' => out.push('\\'),
+                b'\'' => out.push('\''),
+                b'"' => out.push('"'),
+                b'a' => out.push('\u{07}'),
+                b'b' => out.push('\u{08}'),
+                b'f' => out.push('\u{0C}'),
+                b'v' => out.push('\u{0B}'),
+                b'x' => out.push(self.hex_char(2)?),
+                b'u' => out.push(self.hex_char(4)?),
+                b'U' => out.push(self.hex_char(8)?),
+                b'\n' => {} // line continuation
+                _ => {
+                    out.push('\\');
+                    out.push(esc as char);
+                }
+            }
+        }
+        Some(serde_json::Value::String(out))
+    }
+    fn hex_char(&mut self, n: usize) -> Option<char> {
+        if self.i + n > self.s.len() {
+            return None;
+        }
+        let hex = std::str::from_utf8(&self.s[self.i..self.i + n]).ok()?;
+        let v = u32::from_str_radix(hex, 16).ok()?;
+        self.i += n;
+        char::from_u32(v)
+    }
+}
+
+fn utf8_len(b: u8) -> usize {
+    if b < 0x80 {
+        1
+    } else if b < 0xE0 {
+        2
+    } else if b < 0xF0 {
+        3
+    } else {
+        4
+    }
 }
 
 /// Parse Qwen3.5/3.6's native tool-call body (legacy-tolerant):
@@ -640,20 +1306,36 @@ fn extract_qwen_xml_tool_call_inner(
         }
         rest = &rest[key_end + 1..];
         let value_end = rest.find("</parameter>")?;
-        let value = rest[..value_end].trim();
-        arguments.insert(key.to_string(), coerce_qwen_xml_parameter(value));
+        let value = strip_template_newlines(&rest[..value_end]);
+        arguments.insert(
+            key.to_string(),
+            serde_json::Value::String(value.to_string()),
+        );
         rest = &rest[value_end + "</parameter>".len()..];
     }
     // Strict: after all parameters, only whitespace may remain before </function>.
     if strict && !rest.chars().all(|c| c.is_whitespace()) {
         return None;
     }
-    // Strict: nothing after </function> either.
+    // Strict: after </function>, allow only whitespace or duplicate copies of
+    // that same closer. The duplicate is content-free and has been observed on
+    // otherwise valid greedy tool-call output; anything else still fails
+    // closed as malformed protocol.
     if strict {
         if let Some(end) = after_name.find("</function>") {
-            let after_close = &after_name[end + "</function>".len()..];
-            if !after_close.chars().all(|c| c.is_whitespace()) {
+            let mut tail = after_name[end + "</function>".len()..].trim_start();
+            let mut dropped = 0usize;
+            while let Some(rest) = tail.strip_prefix("</function>") {
+                tail = rest.trim_start();
+                dropped += 1;
+            }
+            if !tail.chars().all(|c| c.is_whitespace()) {
                 return None;
+            }
+            if dropped > 0 {
+                eprintln!(
+                    "[hipfire] tool_call: dropped {dropped} duplicated </function> closer(s)"
+                );
             }
         }
     }
@@ -661,19 +1343,19 @@ fn extract_qwen_xml_tool_call_inner(
     Some((name.to_string(), serde_json::Value::Object(arguments)))
 }
 
-/// Match the CLI's native-XML value coercion: JSON primitives, objects, and
-/// arrays retain their types; ordinary text stays a string.
-fn coerce_qwen_xml_parameter(value: &str) -> serde_json::Value {
-    let typed = matches!(value, "true" | "false" | "null")
-        || value.parse::<f64>().is_ok()
-        || (value.starts_with('{') && value.ends_with('}'))
-        || (value.starts_with('[') && value.ends_with(']'));
-    if typed {
-        if let Ok(parsed) = serde_json::from_str(value) {
-            return parsed;
-        }
-    }
-    serde_json::Value::String(value.to_string())
+/// Strip the formatting newline the Qwen chat template puts around every
+/// parameter value (`<parameter=K>\nVALUE\n</parameter>`): at most one leading
+/// and one trailing `\n`, nothing else. All other whitespace belongs to the
+/// value (a file's final newline, a patch's leading indent). Matches vLLM's
+/// Qwen3-Coder/XML parser (`trim_one_wrapping_newline`,
+/// `rust/src/parser/src/tool/qwen_coder.rs:298-301` @ v0.31.0).
+///
+/// Values stay strings here. The parser has no tool schemas; the serve
+/// gateway types them against the request's declared schema, so a `string`
+/// parameter keeps the model's exact text even when it looks like JSON.
+pub(crate) fn strip_template_newlines(value: &str) -> &str {
+    let value = value.strip_prefix('\n').unwrap_or(value);
+    value.strip_suffix('\n').unwrap_or(value)
 }
 
 /// Relaxed name extraction: matches `"name": "X"` (or `'name': 'X'`,
@@ -849,8 +1531,8 @@ pub fn tool_call_args_object_complete(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_tool_calls_from_text, ToolOutputRouter, ToolRouteError, ToolRouteEvent,
-        TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+        extract_lfm_tool_calls, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
+        ToolOutputRouter, ToolRouteError, ToolRouteEvent, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
     };
     use crate::prompt_frame::ToolCall;
 
@@ -918,13 +1600,15 @@ mod tests {
     }
 
     #[test]
-    fn coerces_qwen_native_xml_parameter_types() {
-        let emitted = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n</function>\n</tool_call>";
+    fn qwen_xml_values_stay_untyped_strings() {
+        // No schema at parse time: typing is the serve gateway's job.
+        let emitted = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n<parameter=missing>null</parameter>\n</function>\n</tool_call>";
         let calls = extract_tool_calls_from_text(emitted);
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].arguments["count"], 42);
-        assert_eq!(calls[0].arguments["enabled"], true);
-        assert_eq!(calls[0].arguments["options"]["mode"], "fast");
+        assert_eq!(calls[0].arguments["count"], "42");
+        assert_eq!(calls[0].arguments["enabled"], "true");
+        assert_eq!(calls[0].arguments["options"], "{\"mode\":\"fast\"}");
+        assert_eq!(calls[0].arguments["missing"], "null");
     }
 
     #[test]
@@ -933,13 +1617,223 @@ mod tests {
         let calls = extract_tool_calls_from_text(emitted);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "write_file");
-        assert_eq!(calls[0].arguments["content"]["name"], "wrong");
+        assert_eq!(
+            calls[0].arguments["content"],
+            "{\"name\":\"wrong\",\"arguments\":{\"x\":1}}"
+        );
+    }
+
+    /// HA-12 (hermesagent20 p1 `http/00201`): `skill_manage` writes a Python
+    /// file whose verifier wants 88 bytes ending in `\n`. The call is rebuilt
+    /// in the template's `<parameter=K>\nVALUE\n</parameter>` shape from the
+    /// captured arguments; the value's own final newline sits before the
+    /// template's.
+    const HA12_CALL: &str = "<tool_call>\n<function=skill_manage>\n<parameter=action>\nwrite_file\n</parameter>\n<parameter=name>\nrelease-check\n</parameter>\n<parameter=file_path>\nscripts/validate_release.py\n</parameter>\n<parameter=file_content>\ndef validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n\n</parameter>\n</function>\n</tool_call>";
+    const HA12_FILE: &str =
+        "def validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n";
+
+    #[test]
+    fn qwen_xml_ha12_file_keeps_trailing_newline() {
+        assert_eq!(HA12_FILE.len(), 88);
+        let calls = extract_tool_calls_from_text(HA12_CALL);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["file_content"], HA12_FILE);
+        assert_eq!(calls[0].arguments["action"], "write_file");
+        assert_eq!(
+            calls[0].arguments["file_path"],
+            "scripts/validate_release.py"
+        );
+        // Streaming router: byte-split anywhere, same exact bytes.
+        for split in [1, 97, 300, HA12_CALL.len() - 30] {
+            let (vis, routed, term) = feed(&[&HA12_CALL[..split], &HA12_CALL[split..]]);
+            assert_eq!(term, Terminal::Ok);
+            assert_eq!(vis, "");
+            assert_eq!(routed.len(), 1);
+            call_eq(&routed[0], &calls[0]);
+        }
+    }
+
+    /// HA-17 (hermesagent20 p1 `http/00313-00324`): the sub-agent wrote
+    /// `{"sum": 10}` (with a space) and got `{"sum":10}` back 14 times.
+    #[test]
+    fn qwen_xml_ha17_json_looking_string_is_verbatim() {
+        let write = "<tool_call>\n<function=write_file>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=content>\n{\"sum\": 10}\n</parameter>\n</function>\n</tool_call>";
+        let patch = "<tool_call>\n<function=patch>\n<parameter=mode>\nreplace\n</parameter>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=old_string>\n{\"sum\":10}\n</parameter>\n<parameter=new_string>\n{\"sum\": 10}\n</parameter>\n</function>\n</tool_call>";
+        for (text, key, want) in [
+            (write, "content", "{\"sum\": 10}"),
+            (patch, "old_string", "{\"sum\":10}"),
+            (patch, "new_string", "{\"sum\": 10}"),
+        ] {
+            let calls = extract_tool_calls_from_text(text);
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].arguments[key], want);
+            let (_, routed, term) = feed(&[text]);
+            assert_eq!(term, Terminal::Ok);
+            assert_eq!(routed[0].arguments[key], want);
+        }
+    }
+
+    #[test]
+    fn qwen_xml_strips_exactly_one_template_newline_each_side() {
+        let cases: &[(&str, &str)] = &[
+            // Template-shaped value: both formatting newlines go.
+            ("\nplain\n", "plain"),
+            // Inner and extra edge whitespace is value content.
+            ("\n    indented();\n\n", "    indented();\n"),
+            ("\n\nblank first line\n", "\nblank first line"),
+            ("  spaces  ", "  spaces  "),
+            ("\n\ttab\t\n", "\ttab\t"),
+            // CRLF: only `\n` is a template newline (vLLM parity), so the
+            // `\r`s stay.
+            ("\r\nline\r\n", "\r\nline\r"),
+            ("\nline\r\n\n", "line\r\n"),
+            // Empty values.
+            ("", ""),
+            ("\n", ""),
+            ("\n\n", ""),
+            ("\n\n\n", "\n"),
+            ("   ", "   "),
+            // Nested JSON in a string param keeps its spacing.
+            ("\n{\"a\": {\"b\": [1, 2]}}\n", "{\"a\": {\"b\": [1, 2]}}"),
+        ];
+        for (raw, want) in cases {
+            let text = format!(
+                "<tool_call>\n<function=f>\n<parameter=v>{raw}</parameter>\n</function>\n</tool_call>"
+            );
+            let calls = extract_tool_calls_from_text(&text);
+            assert_eq!(calls.len(), 1, "raw={raw:?}");
+            assert_eq!(calls[0].arguments["v"], *want, "legacy raw={raw:?}");
+            let (_, routed, term) = feed(&[&text]);
+            assert_eq!(term, Terminal::Ok, "raw={raw:?}");
+            assert_eq!(routed[0].arguments["v"], *want, "router raw={raw:?}");
+        }
     }
 
     #[test]
     fn rejects_truncated_qwen_native_xml_parameter() {
         let emitted = "<tool_call><function=write_file><parameter=path>/tmp/incomplete";
         assert!(extract_tool_calls_from_text(emitted).is_empty());
+    }
+
+    fn feed_think(started: bool, chunks: &[&str]) -> (String, String, bool) {
+        let mut router = ThinkOutputRouter::new(started);
+        let mut events = Vec::new();
+        for chunk in chunks {
+            router.push_into(chunk, &mut events);
+        }
+        router.finish_into(&mut events);
+        let mut content = String::new();
+        let mut reasoning = String::new();
+        for event in events {
+            match event {
+                ThinkRouteEvent::Content(text) => content.push_str(&text),
+                ThinkRouteEvent::Reasoning(text) => reasoning.push_str(&text),
+            }
+        }
+        (content, reasoning, router.in_think())
+    }
+
+    #[test]
+    fn think_router_started_span_routes_reasoning_then_answer() {
+        let (content, reasoning, open) = feed_think(true, &["private plan</thi", "nk>\n\nanswer"]);
+        assert_eq!(reasoning, "private plan");
+        assert_eq!(content, "answer");
+        assert!(!open);
+    }
+
+    #[test]
+    fn think_router_explicit_markers_are_chunk_boundary_invariant() {
+        let full = "pre<think>reason</think>\n\npost";
+        let expected = feed_think(false, &[full]);
+        assert_eq!(expected, ("prepost".into(), "reason".into(), false));
+        for split in 1..full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            assert_eq!(
+                feed_think(false, &[&full[..split], &full[split..]]),
+                expected,
+                "split={split}"
+            );
+        }
+    }
+
+    #[test]
+    fn think_router_preserves_event_order_across_reopened_spans() {
+        let mut router = ThinkOutputRouter::new(false);
+        let mut events = Vec::new();
+        router.push_into("a<think>r1</think>b<think>r2</think>c", &mut events);
+        router.finish_into(&mut events);
+        assert_eq!(
+            events,
+            vec![
+                ThinkRouteEvent::Content("a".into()),
+                ThinkRouteEvent::Reasoning("r1".into()),
+                ThinkRouteEvent::Content("b".into()),
+                ThinkRouteEvent::Reasoning("r2".into()),
+                ThinkRouteEvent::Content("c".into()),
+            ]
+        );
+        assert!(!router.in_think());
+    }
+
+    #[test]
+    fn think_router_finish_is_idempotent_and_blocks_late_output() {
+        let mut router = ThinkOutputRouter::new(true);
+        let mut events = Vec::new();
+        router.push_into("reason</thi", &mut events);
+        router.finish_into(&mut events);
+        let first_len = events.len();
+        router.finish_into(&mut events);
+        router.push_into("nk>late", &mut events);
+        assert_eq!(events.len(), first_len);
+        assert!(router.in_think());
+    }
+
+    #[test]
+    fn think_router_reset_reuses_finished_router_with_initial_think_state() {
+        let mut router = ThinkOutputRouter::new(true);
+        let mut events = Vec::new();
+
+        router.push_into("first", &mut events);
+        router.finish_into(&mut events);
+        router.push_into("late", &mut events);
+        assert_eq!(
+            events,
+            vec![ThinkRouteEvent::Reasoning("first".into())],
+            "finished routers must reject late bytes before reset"
+        );
+
+        router.reset();
+        assert!(
+            router.in_think(),
+            "reset must restore started-in-think state"
+        );
+        router.push_into("second", &mut events);
+        router.finish_into(&mut events);
+        assert_eq!(
+            events,
+            vec![
+                ThinkRouteEvent::Reasoning("first".into()),
+                ThinkRouteEvent::Reasoning("second".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn think_router_orphan_close_drops_marker_and_keeps_answer() {
+        let (content, reasoning, open) = feed_think(false, &["</thi", "nk>\r\nanswer"]);
+        assert_eq!(content, "answer");
+        assert!(reasoning.is_empty());
+        assert!(!open);
+    }
+
+    #[test]
+    fn think_router_finish_flushes_partial_marker_in_current_channel() {
+        let (content, reasoning, open) = feed_think(true, &["reason</thi"]);
+        assert!(content.is_empty());
+        assert_eq!(reasoning, "reason</thi");
+        assert!(open);
     }
 
     // ── ToolOutputRouter ─────────────────────────────────────────────
@@ -1045,20 +1939,23 @@ mod tests {
     }
 
     #[test]
-    fn router_qwen_xml_type_coercion_and_name_priority() {
+    fn router_qwen_xml_untyped_values_and_name_priority() {
         let a = "<tool_call>\n<function=probe>\n<parameter=count>42</parameter>\n<parameter=enabled>true</parameter>\n<parameter=options>{\"mode\":\"fast\"}</parameter>\n</function>\n</tool_call>";
         let (vis, calls, term) = feed(&[a]);
         assert_eq!(term, Terminal::Ok);
-        assert_eq!(calls[0].arguments["count"], 42);
-        assert_eq!(calls[0].arguments["enabled"], true);
-        assert_eq!(calls[0].arguments["options"]["mode"], "fast");
+        assert_eq!(calls[0].arguments["count"], "42");
+        assert_eq!(calls[0].arguments["enabled"], "true");
+        assert_eq!(calls[0].arguments["options"], "{\"mode\":\"fast\"}");
         assert_no_protocol_leak(&vis);
 
         let b = "<tool_call><function=write_file><parameter=content>{\"name\":\"wrong\",\"arguments\":{\"x\":1}}</parameter></function></tool_call>";
         let (_, calls, term) = feed(&[b]);
         assert_eq!(term, Terminal::Ok);
         assert_eq!(calls[0].name, "write_file");
-        assert_eq!(calls[0].arguments["content"]["name"], "wrong");
+        assert_eq!(
+            calls[0].arguments["content"],
+            "{\"name\":\"wrong\",\"arguments\":{\"x\":1}}"
+        );
     }
 
     #[test]
@@ -1405,6 +2302,36 @@ mod tests {
     }
 
     #[test]
+    fn router_qwen_xml_duplicate_function_closer_is_repaired() {
+        let s = "<tool_call><function=read_file><parameter=path>src/main.rs</parameter></function>\n</function>\n</tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/main.rs");
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_multiple_duplicate_function_closers_are_repaired() {
+        let s = "<tool_call><function=read_file><parameter=path>x</parameter></function></function> </function></tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["path"], "x");
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_duplicate_closer_with_trailing_content_fails_closed() {
+        let s = "<tool_call><function=read_file><parameter=path>x</parameter></function></function>extra</tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
     fn router_visible_text_never_includes_call_body() {
         let full = r#"Hi.<tool_call>
 {"name": "bash", "arguments": {"cmd": "echo hi"}}
@@ -1427,11 +2354,335 @@ mod tests {
     }
 
     #[test]
+    fn disabled_router_keeps_tool_like_text_visible_and_non_executable() {
+        let text = "<tool_call>\n<function=cat\n</function>\n</tool_call>";
+        let mut router = ToolOutputRouter::disabled();
+        let events = router
+            .push(text)
+            .expect("tool-free text must remain visible");
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ToolRouteEvent::VisibleText(visible) => assert_eq!(visible.as_str(), text),
+            ToolRouteEvent::ToolCall(_) => panic!("tool-free text became executable"),
+        }
+        assert!(router.tool_calls().is_empty());
+        assert!(!router.is_malformed());
+        assert!(router.finish().expect("disabled finish").is_empty());
+    }
+
+    #[test]
     fn router_malformed_latches_on_subsequent_push() {
         let mut r = ToolOutputRouter::new();
         let err = r.push("<tool_call></tool_call>").expect_err("empty body");
         assert!(matches!(err, ToolRouteError::MalformedToolProtocol { .. }));
         let err2 = r.push("more").expect_err("latched");
         assert_eq!(err2.detail(), err.detail());
+    }
+
+    // ── ThinkBudget::window_cap ──────────────────────────────────────────
+
+    use super::{ThinkBudget, ThinkBudgetStep};
+
+    const CLOSE_TOKENS: usize = 3;
+
+    /// Feed one committed token; mirror the decode loop by queueing the
+    /// close tokens after a ForceClose.
+    fn budget_step(b: &mut ThinkBudget, in_think: bool) -> ThinkBudgetStep {
+        let step = b.observe(in_think);
+        if step == ThinkBudgetStep::ForceClose {
+            b.closing(CLOSE_TOKENS);
+        }
+        step
+    }
+
+    /// Commit `cap` tokens following `pattern` bit by bit (bit i = stream
+    /// `in_think` after token i) and assert that only the last token may
+    /// intervene. Returns the last token's step.
+    fn commit_window(b: &ThinkBudget, cap: usize, pattern: u32, context: &str) -> ThinkBudgetStep {
+        let mut b = b.clone();
+        let mut last = ThinkBudgetStep::Continue;
+        for i in 0..cap {
+            let step = budget_step(&mut b, (pattern >> i) & 1 == 1);
+            if i + 1 < cap {
+                assert_eq!(
+                    step,
+                    ThinkBudgetStep::Continue,
+                    "{context}: intervention strictly inside the window (token {i} of {cap}, pattern {pattern:b})"
+                );
+            }
+            last = step;
+        }
+        last
+    }
+
+    /// Window length the uncapped (out-of-span) checks commit.
+    const UNCAPPED_LEN: usize = 7;
+
+    /// Commit `UNCAPPED_LEN` tokens following `pattern` from an uncapped
+    /// (out-of-span) state and assert that any intervention falls on a token
+    /// inside a span: one this window opened, since it started outside any.
+    /// The decode loop repairs such a strict-prefix window.
+    fn uncapped_window(b: &ThinkBudget, pattern: u32, context: &str) {
+        let mut b = b.clone();
+        for i in 0..UNCAPPED_LEN {
+            let in_think = (pattern >> i) & 1 == 1;
+            let step = budget_step(&mut b, in_think);
+            assert!(
+                step == ThinkBudgetStep::Continue || in_think,
+                "{context}: uncapped window intervened outside a span it opened (token {i}, pattern {pattern:b})"
+            );
+        }
+    }
+
+    #[test]
+    fn window_cap_disabled_is_none() {
+        let b = ThinkBudget::new(0);
+        assert_eq!(b.window_cap(false), None);
+        assert_eq!(b.window_cap(true), None);
+        assert_eq!(ThinkBudget::default().window_cap(true), None);
+    }
+
+    #[test]
+    fn window_cap_in_span_counts_zero_through_max() {
+        const MAX: usize = 6;
+        // Start inside a span (open-think prefix), then spend 0..MAX tokens.
+        for spent in 0..MAX {
+            let mut b = ThinkBudget::new(MAX);
+            for _ in 0..spent {
+                assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+            }
+            let cap = b.window_cap(true).expect("enabled");
+            assert_eq!(cap, MAX - spent, "spent={spent}");
+            assert!(cap >= 1);
+            // Staying in the span lands the force-close exactly on the last token.
+            let all_in = (1u32 << cap) - 1;
+            assert_eq!(
+                commit_window(&b, cap, all_in, "in span"),
+                ThinkBudgetStep::ForceClose,
+                "spent={spent}"
+            );
+            // Every other continuation never intervenes before the last token.
+            for pattern in 0..(1u32 << cap) {
+                commit_window(&b, cap, pattern, "in span");
+            }
+        }
+    }
+
+    #[test]
+    fn window_cap_out_of_span_is_uncapped() {
+        const MAX: usize = 5;
+        // Fresh budget, stream not in a span.
+        let b = ThinkBudget::new(MAX);
+        assert_eq!(b.window_cap(false), None);
+        for pattern in 0..(1u32 << UNCAPPED_LEN) {
+            uncapped_window(&b, pattern, "fresh out of span");
+        }
+        // After a span closed on its own (the count is stale and must not leak).
+        let mut b = ThinkBudget::new(MAX);
+        for _ in 0..(MAX - 1) {
+            assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        }
+        assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(false), None);
+        for pattern in 0..(1u32 << UNCAPPED_LEN) {
+            uncapped_window(&b, pattern, "closed span");
+        }
+        // A re-opened span counts from 1: the in-span cap applies again and
+        // the force-close lands on its last token.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(true), Some(MAX - 1));
+        assert_eq!(
+            commit_window(&b, MAX - 1, (1u32 << (MAX - 1)) - 1, "re-opened span"),
+            ThinkBudgetStep::ForceClose
+        );
+    }
+
+    /// Thinking off reaches the budget as `max_think_tokens == 1` behind a
+    /// closed-think prefix, so the answer streams outside any span: no MTP
+    /// window may be capped (a cap of 1 turns speculation off). The in-span
+    /// and close-token caps still engage if the answer opens a span.
+    #[test]
+    fn window_cap_thinking_off_never_caps_answer_windows() {
+        let mut b = ThinkBudget::new(1);
+        for _ in 0..256 {
+            assert_eq!(b.window_cap(false), None);
+            assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        }
+        assert_eq!(b.window_cap(false), None);
+        // An opened span trips on its opening token (count 1 == max) and the
+        // queued close tokens are capped.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::ForceClose);
+        assert_eq!(b.window_cap(true), Some(CLOSE_TOKENS + 1));
+        for left in (0..CLOSE_TOKENS).rev() {
+            assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+            if left > 0 {
+                assert_eq!(b.window_cap(false), Some(left + 1));
+            }
+        }
+        // Back in the answer: uncapped again.
+        assert_eq!(b.window_cap(false), None);
+        // A second opened span ends the turn on its opening token.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Exhausted);
+    }
+
+    #[test]
+    fn window_cap_after_force_close_covers_closing_then_reopened_span() {
+        const MAX: usize = 4;
+        let mut b = ThinkBudget::new(MAX);
+        for _ in 0..(MAX - 1) {
+            assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        }
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::ForceClose);
+
+        // Closing tokens are queued. The count stays at `max` through them,
+        // so a stream still in the span trips on the first token after them.
+        let cap = CLOSE_TOKENS + 1;
+        assert_eq!(b.window_cap(true), Some(cap));
+        assert_eq!(
+            commit_window(&b, cap, (1u32 << cap) - 1, "span never closed"),
+            ThinkBudgetStep::Exhausted
+        );
+        for pattern in 0..(1u32 << cap) {
+            commit_window(&b, cap, pattern, "after force close");
+        }
+
+        // Part-way through the close tokens the cap shrinks with `closing`.
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(true), Some(CLOSE_TOKENS - 1 + 1));
+        assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(false), Some(CLOSE_TOKENS - 2 + 1));
+
+        // The close text ended the span: uncapped again. A re-opened span
+        // counts from 1 and its Exhausted lands exactly on the last token of
+        // the in-span cap.
+        assert_eq!(budget_step(&mut b, false), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(false), None);
+        assert_eq!(budget_step(&mut b, true), ThinkBudgetStep::Continue);
+        assert_eq!(b.window_cap(true), Some(MAX - 1));
+        assert_eq!(
+            commit_window(&b, MAX - 1, (1u32 << (MAX - 1)) - 1, "reopened span"),
+            ThinkBudgetStep::Exhausted
+        );
+    }
+
+    #[test]
+    fn window_cap_holds_for_any_reachable_state() {
+        for max in 1..=3usize {
+            for start_in_think in [false, true] {
+                // Every prefix of up to 9 committed tokens reaches a state;
+                // skip prefixes whose turn already ended (Exhausted).
+                for len in 0..=9usize {
+                    for prefix in 0..(1u32 << len) {
+                        let mut b = ThinkBudget::new(max);
+                        let mut last_in_think = start_in_think;
+                        let mut ended = false;
+                        for i in 0..len {
+                            let in_think = (prefix >> i) & 1 == 1;
+                            if budget_step(&mut b, in_think) == ThinkBudgetStep::Exhausted {
+                                ended = true;
+                                break;
+                            }
+                            last_in_think = in_think;
+                        }
+                        if ended {
+                            continue;
+                        }
+                        let ctx = format!("max={max} prefix={prefix:b}/{len}");
+                        match b.window_cap(last_in_think) {
+                            Some(cap) => {
+                                assert!(cap >= 1, "{ctx}");
+                                assert!(cap <= CLOSE_TOKENS + max, "{ctx}");
+                                for pattern in 0..(1u32 << cap) {
+                                    commit_window(&b, cap, pattern, &ctx);
+                                }
+                            }
+                            None => {
+                                assert!(!last_in_think, "{ctx}: uncapped inside a span");
+                                for pattern in 0..(1u32 << UNCAPPED_LEN) {
+                                    uncapped_window(&b, pattern, &ctx);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lfm_tool_call_span_parses_like_vllm_pythonic() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        let text = format!("pre {open}[get_candidate_status(candidate_id=\"12345\")]{close}post");
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_candidate_status");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"candidate_id": "12345"})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_multiple_calls_and_value_types() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        let text = format!(
+            "{open}[f(a=1, b=2.5, c=True, d=None, e=['x', 3]), ns.g(flag=false, l=[1,2], m={{'k': 'v'}})]{close}"
+        );
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"a":1,"b":2.5,"c":true,"d":null,"e":["x",3]})
+        );
+        assert_eq!(calls[1].name, "ns.g");
+        assert_eq!(
+            calls[1].arguments,
+            serde_json::json!({"flag":false,"l":[1,2],"m":{"k":"v"}})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_positional_dropped_and_escapes() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        // Positional args parse but are dropped (vLLM handle_single_tool).
+        let text =
+            format!("{open}[g('pos', s='line1\\nline2', q='it\\'s', x='\\x41\\u0042')]{close}");
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"s":"line1\nline2","q":"it's","x":"AB"})
+        );
+    }
+
+    #[test]
+    fn lfm_tool_call_malformed_body_yields_no_calls() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        let close = "\x3C\x7Ctool_call_end\x7C\x3E";
+        for bad in [
+            format!("{open}not a list{close}"),
+            format!("{open}[f(a=)]{close}"),
+            format!("{open}[f(a=1) trailing{close}"),
+            format!("{open}[f(a='unterminated)]{close}"),
+        ] {
+            assert!(
+                extract_lfm_tool_calls(&bad).is_empty(),
+                "should not fabricate calls from {bad:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lfm_tool_call_unclosed_span_still_extracted() {
+        let open = "\x3C\x7Ctool_call_start\x7C\x3E";
+        // Whole-buffer tolerant path: unclosed span at end recovers the call.
+        let text = format!("{open}[f(a=1)]");
+        let calls = extract_lfm_tool_calls(&text);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "f");
     }
 }

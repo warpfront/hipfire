@@ -1,0 +1,19 @@
+[gpu-lock] directory=/tmp/hipfire-locks
+[hipfire] host-memory reclaim mitigation armed: GPU_PINNED_MIN_XFER_SIZE=100000
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-pci-0000:14:00.0.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+[devices] logical 1: HIP gfx1036 0000:14:00.0 = index 1 pci-0000:14:00.0
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+  KV cache: requested mode=q8, effective K=q8, effective V=q8
+  partial offload: 0 of 40 layers host-placed, routed experts host on 14 layers, device weights 13083 MiB of 13095 MiB available
+  kv reserved: 32768 tokens x 10880 B = 340 MiB; pbs floor 2616 MiB; draft 0 MiB; slack 128 MiB; weight budget 13095 MiB of 16180 MiB free
+  moe offload: 0 of 40 layers host-placed, routed experts host on 14 layers (410 MiB of routed experts per layer, 5743 MiB total); pinned host 5743 MiB; device weights 13083 MiB
+  DeltaNet state: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+  loading output_norm...
+  loading output (separate lm_head)...
+  loading layer 0/40 (LinearAttention + MoE)...
+hipfire: daemon error: [gpu retryable=false rolled_back=false attempt=0] load failed: qwen35: load_weights failed: HipError { code: 0, message: "qwen35: layer 0 routed experts are host-placed (memory.moe_expert_budget) but expert packing does not apply: every routed expert must share one dtype and stride, and only MQ4/MQ4V2/MQ4C are packable. Refusing a per-expert host fallback, which would cost ~512 MiB of tail pad per layer; re-quantize the experts to a packable MQ4 format (hipError=0)", context: None }. GPU: gfx1201 (14960 MB free / 16304 MB total)

@@ -1,0 +1,50 @@
+{
+  "railgun_flag_set_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 0,
+    "instructions": 19,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 19,
+    "table": "gfx1151",
+    "vgpr_high_water": 4,
+    "wait_facts": 3
+  },
+  "railgun_guard_add_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 2,
+    "instructions": 29,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 19,
+    "table": "gfx1151",
+    "vgpr_high_water": 4,
+    "wait_facts": 5
+  },
+  "railgun_guard_step_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 0,
+    "instructions": 25,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 19,
+    "table": "gfx1151",
+    "vgpr_high_water": 4,
+    "wait_facts": 5
+  }
+}

@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-xdna"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+libc = "0.2"
+parking_lot = "0.12"

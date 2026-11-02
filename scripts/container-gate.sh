@@ -4,12 +4,11 @@
 # PR / dev-build validation path — the same in-repo gates, reproducibly.
 #
 # Usage:
-#   scripts/container-gate.sh [gate-script [args...]]
+#   scripts/container-gate.sh [command [args...]]
 #
-# Defaults to scripts/coherence-gate.sh. Examples:
-#   scripts/container-gate.sh                              # coherence battery
-#   scripts/container-gate.sh scripts/serve-multiturn-gate.sh
-#   scripts/container-gate.sh scripts/coherence-gate-dflash.sh
+# No default gate; select a route from docs/VALIDATION.md. Examples:
+#   scripts/container-gate.sh python3 scripts/serve_harness.py battery --model <model>
+#   scripts/container-gate.sh python3 scripts/redline_daemon_harness.py
 #
 # Environment:
 #   HIPFIRE_CONTAINER=podman|docker   container runtime (default: podman)
@@ -30,8 +29,8 @@ if [ ${#GATE_CMD[@]} -eq 0 ]; then
     # exit 127 inside the container. Fail closed here with a usable message.
     echo "[container-gate] no gate command given." >&2
     echo "  There is no universal gate; select a route from docs/VALIDATION.md and pass it, e.g.:" >&2
-    echo "    scripts/container-gate.sh scripts/serve_harness.py battery --model <model>" >&2
-    echo "    scripts/container-gate.sh scripts/redline_daemon_harness.py" >&2
+    echo "    scripts/container-gate.sh python3 scripts/serve_harness.py battery --model <model>" >&2
+    echo "    scripts/container-gate.sh python3 scripts/redline_daemon_harness.py" >&2
     exit 2
 fi
 

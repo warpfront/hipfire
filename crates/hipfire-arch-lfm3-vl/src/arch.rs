@@ -10,7 +10,7 @@
 //! Scope
 //! -----
 //! LFM3-VL is "LFM3 text decoder + LFM3-VL vision tower + projector". The text
-//! path is owned by `hipfire-arch-lfm3::Lfm3` (arch_id 13) and loaded through
+//! path is owned by `hipfire-arch-lfm3::Lfm3` (arch_id 24) and loaded through
 //! THAT trait impl. This impl covers ONLY the vision-tower + projector bring-up
 //! (config + weights). A VL model load in `daemon.rs` runs both:
 //!
@@ -39,11 +39,11 @@ impl Architecture for Lfm3Vl {
     type Config = VisionConfig;
 
     fn arch_id() -> u32 {
-        // LFM3-VL ships under arch_id 13 (same as the LFM3 text backbone —
+        // LFM3-VL ships under arch_id 24 (same as the LFM3 text backbone —
         // the VL model is LFM3 text + vision tower). Vision is detected by
         // tensor presence (`model.vision_tower.patchifier.weight`), matching
         // the qwen35-vl precedent where arch_id stays 5 for the VL variant.
-        13
+        24
     }
 
     fn name() -> &'static str {

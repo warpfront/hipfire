@@ -1,0 +1,77 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The `gdn_chunk_prep_pm` generator (Qwen GDN chunk preparation for the A3B geometry, gfx1201),
+// composed in `.rip` from the `gdn::*` natives of `gdn_chunk_prep::blocks`.
+//
+// `gdn_chunk_prep::emit(arch, spec)` is written over exactly the blocks this script calls, so the
+// script re-emits the production kernel's bytes (`s_text` and proof). A test in peacemaker-rip
+// (`gdn_twin_matches_the_rust_emit`) requires it and the digests in peacemaker-isa
+// (`producers_pinned`) pin the Rust side. Edit the composition and re-run: no rebuild.
+//
+// An untyped-`Builder` kernel with no LDS: every block emits straight into the builder. What is
+// script-level: the order of the phases (prologue, the gate unit, the conv unit, the conv_state
+// ring advance), the gate loop and the three conv region loops (`b.loop_` over `gdn::gate_body` and
+// `gdn::row_body`), the unit dispatch branches, where `wait_all` drains sit, and the exit.
+//
+// Variant grammar: the one geometry, `chunk_prep` (HK 16, HV 32, head dim 128). gfx1201 only.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &["chunk_prep"];
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    if spec.variant != "chunk_prep" {
+        return Err(format!("variant `{}`: expected chunk_prep", spec.variant));
+    }
+    let g = GdnGen::new(spec.arch)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    b.enable_delay_alu();
+    gdn::prologue(&mut b)?;
+    gate(&mut b)?;
+    conv(&mut b)?;
+    gdn::epilogue(&mut b)?;
+    prod::wait_all(&mut b)?;
+    prod::label(&mut b, gdn::label("end")?)?;
+    b.control(Instruction::new("s_endpgm", vec![], vec![]))?;
+    b.finish()
+}
+
+// Only the by == 0 blocks run the gates (every wave: four heads, two rows per lane, the 64-row
+// prefix).
+fn gate(b: &mut Builder) -> Result<(), String> {
+    gdn::gate_guard(b)?;
+    gdn::gate_setup(b)?;
+    prod::wait_all(b)?;
+    b.loop_(gdn::label("gate_loop")?, |b| {
+        gdn::gate_body(b)
+    })?;
+    prod::wait_all(b)?;
+    prod::label(b, gdn::label("gate_done")?)?;
+    Ok(())
+}
+
+// Wave w of block (bx, by) owns conv unit u = 8 by + w: q heads, then k heads, then v heads.
+fn conv(b: &mut Builder) -> Result<(), String> {
+    gdn::conv_setup(b)?;
+    gdn::conv_to_v(b)?;
+    gdn::conv_to_k(b)?;
+    gdn::region_setup(b, "q")?;
+    b.loop_(gdn::label("q_loop")?, |b| {
+        gdn::row_body(b, "q", gdn::label("q_loop")?)
+    })?;
+    gdn::to_epi(b)?;
+    prod::label(b, gdn::label("k_start")?)?;
+    gdn::region_setup(b, "k")?;
+    b.loop_(gdn::label("k_loop")?, |b| {
+        gdn::row_body(b, "k", gdn::label("k_loop")?)
+    })?;
+    gdn::to_epi(b)?;
+    prod::label(b, gdn::label("v_start")?)?;
+    gdn::region_setup(b, "v")?;
+    b.loop_(gdn::label("v_loop")?, |b| {
+        gdn::row_body(b, "v", gdn::label("v_loop")?)
+    })?;
+    Ok(())
+}

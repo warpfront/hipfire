@@ -1,0 +1,106 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/home/avery/.hipfire/models/ornith-1.5-35b-a3b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5_moe",
+    "dim": 2048,
+    "layers": 40,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 200000,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": null,
+    "card_cap": null,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 5444,
+    "vram_total_mb": 16304,
+    "model_loaded": true,
+    "model_arch": "qwen3_5_moe",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 16238,
+  "max_tokens": 512,
+  "runs": 1,
+  "batch": 1,
+  "prompt_tokens": 735,
+  "prompt_md5": "0b86c16d0c842ffb63515356ad97f0b7",
+  "prompt_chars": 2927,
+  "warnings": [],
+  "decode_tok_s": {
+    "median": 60.4,
+    "mean": 60.4,
+    "min": 60.4,
+    "max": 60.4,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 644.9,
+    "mean": 644.9,
+    "min": 644.9,
+    "max": 644.9,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 53.2,
+    "mean": 53.2,
+    "min": 53.2,
+    "max": 53.2,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 1139.7,
+    "mean": 1139.7,
+    "min": 1139.7,
+    "max": 1139.7,
+    "stdev": 0.0
+  },
+  "samples": {
+    "decode": [
+      60.4
+    ],
+    "prefill": [
+      644.9
+    ],
+    "wall": [
+      53.2
+    ],
+    "ttft_ms": [
+      1139.7
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}

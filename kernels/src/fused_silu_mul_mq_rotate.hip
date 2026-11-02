@@ -18,9 +18,17 @@
 //
 // Structure matches mq_rotate_x exactly — only phase 1 differs (read
 // gate[i]+up[i] and compute silu*up, vs read x[i]).
+//
+// HIPFIRE_IU4_SIDECAR: C2 producer path — after final *s*signs2, optionally
+// store f32 and always emit block_i4_128 via the shared wave quant recipe.
 
-extern "C" __launch_bounds__(32, 16)
-__global__ void fused_silu_mul_mq_rotate(
+#ifndef HIPFIRE_SILU_MQ_ROTATE_KERNEL
+#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate
+#endif
+
+#if defined(__gfx1030__) && !defined(HIPFIRE_IU4_SIDECAR)
+extern "C" __launch_bounds__(32)
+__global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     const float* __restrict__ gate,
     const float* __restrict__ up,
     const float* __restrict__ signs1,
@@ -28,18 +36,109 @@ __global__ void fused_silu_mul_mq_rotate(
     float* __restrict__ x_rot,
     int K
 ) {
-    const int group = blockIdx.x;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
-    if (group >= groups_total) return;
+    if (groups_total <= 0) return;
 
-    // Batch row: grid.y is the batch dim. For decode grid=[groups_total, 1, 1]
-    // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
-    // grid=[groups_total, N, 1]; gate, up, and x_rot are [N × K] row-major.
-    const long long batch_off = (long long)blockIdx.y * K;
+    // Batch row: grid.x folds (token, group) as x = token * groups_total +
+    // group (group fastest, the order the former [groups_total, N] grid
+    // dispatched in), keeping the row count out of grid.y, which HIP bounds
+    // at 65535. Decode grid=[groups_total, 1, 1] is token 0 (byte-identical
+    // to pre-batching). gate, up, and x_rot are [N × K] row-major.
+    const unsigned bx = blockIdx.x;
+    const int token = (int)(bx / (unsigned)groups_total);
+    const int group = (int)(bx - (unsigned)token * (unsigned)groups_total);
+    const long long batch_off = (long long)token * K;
     const float* gate_b  = gate  + batch_off;
     const float* up_b    = up    + batch_off;
           float* x_rot_b = x_rot + batch_off;
+
+    int d0 = tid * 8;
+    int base = group * 256 + d0;
+
+    // Phase 1: register-only silu(gate)*up*signs1 — one element at a time.
+    // silu(z) = z / (1 + exp(-z)). No arrays or loops (private-mem fail-closed).
+    float v0, v1, v2, v3, v4, v5, v6, v7;
+    {
+        float g = gate_b[base];
+        float u = up_b[base];
+        v0 = g / (1.0f + expf(-(g))) * u * signs1[d0];
+    }
+    {
+        float g = gate_b[base + 1];
+        float u = up_b[base + 1];
+        v1 = g / (1.0f + expf(-(g))) * u * signs1[d0 + 1];
+    }
+    {
+        float g = gate_b[base + 2];
+        float u = up_b[base + 2];
+        v2 = g / (1.0f + expf(-(g))) * u * signs1[d0 + 2];
+    }
+    {
+        float g = gate_b[base + 3];
+        float u = up_b[base + 3];
+        v3 = g / (1.0f + expf(-(g))) * u * signs1[d0 + 3];
+    }
+    {
+        float g = gate_b[base + 4];
+        float u = up_b[base + 4];
+        v4 = g / (1.0f + expf(-(g))) * u * signs1[d0 + 4];
+    }
+    {
+        float g = gate_b[base + 5];
+        float u = up_b[base + 5];
+        v5 = g / (1.0f + expf(-(g))) * u * signs1[d0 + 5];
+    }
+    {
+        float g = gate_b[base + 6];
+        float u = up_b[base + 6];
+        v6 = g / (1.0f + expf(-(g))) * u * signs1[d0 + 6];
+    }
+    {
+        float g = gate_b[base + 7];
+        float u = up_b[base + 7];
+        v7 = g / (1.0f + expf(-(g))) * u * signs1[d0 + 7];
+    }
+#else
+extern "C" __launch_bounds__(32, 16)
+__global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
+    const float* __restrict__ gate,
+    const float* __restrict__ up,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+#ifdef HIPFIRE_IU4_SIDECAR
+    float* __restrict__ x_rot,          // nullable when emit_f32=false
+    block_i4_128* __restrict__ x_i4,    // [K/128, N]
+    int K,
+    int N
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    , int cand_mode                     // 0: compiled emit (legacy); 8: exact reference8
+#endif
+#else
+    float* __restrict__ x_rot,
+    int K
+#endif
+) {
+    const int tid = threadIdx.x;
+    const int groups_total = K / 256;
+    if (groups_total <= 0) return;
+
+    // Batch row: grid.x folds (token, group) as x = token * groups_total +
+    // group (group fastest, the order the former [groups_total, N] grid
+    // dispatched in), keeping the row count out of grid.y, which HIP bounds
+    // at 65535. Decode grid=[groups_total, 1, 1] is token 0 (byte-identical
+    // to pre-batching). gate, up, and x_rot are [N × K] row-major.
+    const unsigned bx = blockIdx.x;
+    const int token = (int)(bx / (unsigned)groups_total);
+    const int group = (int)(bx - (unsigned)token * (unsigned)groups_total);
+    const long long batch_off = (long long)token * K;
+    const float* gate_b  = gate  + batch_off;
+    const float* up_b    = up    + batch_off;
+#ifdef HIPFIRE_IU4_SIDECAR
+          float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
+#else
+          float* x_rot_b = x_rot + batch_off;
+#endif
 
     int d0 = tid * 8;
     int base = group * 256 + d0;
@@ -65,6 +164,7 @@ __global__ void fused_silu_mul_mq_rotate(
     float v6 = SILU_MUL(g6, u6) * signs1[d0 + 6];
     float v7 = SILU_MUL(g7, u7) * signs1[d0 + 7];
     #undef SILU_MUL
+#endif
 
     // Local butterfly: strides 1, 2, 4 — identical to mq_rotate_x.
     float t;
@@ -102,12 +202,46 @@ __global__ void fused_silu_mul_mq_rotate(
     #undef HBFLY
 
     const float s = 0.0625f;
-    x_rot_b[base]     = v0 * s * signs2[d0];
-    x_rot_b[base + 1] = v1 * s * signs2[d0 + 1];
-    x_rot_b[base + 2] = v2 * s * signs2[d0 + 2];
-    x_rot_b[base + 3] = v3 * s * signs2[d0 + 3];
-    x_rot_b[base + 4] = v4 * s * signs2[d0 + 4];
-    x_rot_b[base + 5] = v5 * s * signs2[d0 + 5];
-    x_rot_b[base + 6] = v6 * s * signs2[d0 + 6];
-    x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
+    float f0 = v0 * s * signs2[d0];
+    float f1 = v1 * s * signs2[d0 + 1];
+    float f2 = v2 * s * signs2[d0 + 2];
+    float f3 = v3 * s * signs2[d0 + 3];
+    float f4 = v4 * s * signs2[d0 + 4];
+    float f5 = v5 * s * signs2[d0 + 5];
+    float f6 = v6 * s * signs2[d0 + 6];
+    float f7 = v7 * s * signs2[d0 + 7];
+#ifdef HIPFIRE_IU4_SIDECAR
+    if (x_rot_b != nullptr) {
+        x_rot_b[base]     = f0;
+        x_rot_b[base + 1] = f1;
+        x_rot_b[base + 2] = f2;
+        x_rot_b[base + 3] = f3;
+        x_rot_b[base + 4] = f4;
+        x_rot_b[base + 5] = f5;
+        x_rot_b[base + 6] = f6;
+        x_rot_b[base + 7] = f7;
+    }
+#ifdef HIPFIRE_IU4_RUNTIME_CAND
+    // Wave-uniform kernel arg: 8 = standalone-quantizer reference through
+    // the shared `emit_iu4_sidecar_from_producer8<true>`; else the
+    // compiled emit below, unchanged. The f32 body above is shared.
+    if (cand_mode == 8) {
+        emit_iu4_sidecar_from_producer8<true>(
+            f0, f1, f2, f3, f4, f5, f6, f7,
+            x_i4, group, token, N, tid);
+    } else
+#endif
+    emit_iu4_sidecar_from_producer8(
+        f0, f1, f2, f3, f4, f5, f6, f7,
+        x_i4, group, token, N, tid);
+#else
+    x_rot_b[base]     = f0;
+    x_rot_b[base + 1] = f1;
+    x_rot_b[base + 2] = f2;
+    x_rot_b[base + 3] = f3;
+    x_rot_b[base + 4] = f4;
+    x_rot_b[base + 5] = f5;
+    x_rot_b[base + 6] = f6;
+    x_rot_b[base + 7] = f7;
+#endif
 }

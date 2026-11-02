@@ -9,21 +9,37 @@ build = "build.rs"
 name = "hipfire"
 path = "src/main.rs"
 
+
 [dependencies]
-anyhow = "1"
-base64 = "0.22"
-clap = { version = "4.6", features = ["derive"] }
+anyhow.workspace = true
+bytes = "1"
+clap = { workspace = true, features = ["derive"] }
 ctrlc = { version = "3", features = ["termination"] }
+flate2 = "1"
+getrandom = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 libc = "0.2"
+md5 = "0.8"
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
 hipfire-config = { path = "../hipfire-config" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-client = { path = "../hipfire-client" }
+hipfire-loader = { path = "../hipfire-loader" }
 hipfire-registry = { path = "../hipfire-registry" }
 hipfire-runtime = { path = "../hipfire-runtime", default-features = false, features = ["deltanet"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-sha2 = "0.10"
-tiny_http = "0.12"
+saddle-core = { path = "../saddle-core" }
+rdna-compute = { path = "../rdna-compute" }
+
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+base64.workspace = true
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util"] }
+tokio-util = { version = "0.7", features = ["rt"] }
 ureq = "3"
+# LFM3 serve surface: /tts + /v1/realtime (Phase 5 re-homes onto serve/*).
+tiny_http = "0.12"
 tungstenite = { version = "0.30.0", default-features = false }
 sha1 = "0.10"
-

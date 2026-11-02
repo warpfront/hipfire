@@ -10,7 +10,7 @@
 use hipfire_arch_lfm3_omni::{
     omni_generate, omni_stream_prefill, omni_stream_step, DepthRng, MIXED_START_TOKEN,
 };
-use hipfire_loader::{load_model, ModelState};
+use hipfire_loader::load_model;
 use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
 use rdna_compute::Gpu;
 
@@ -39,13 +39,15 @@ fn main() {
     let mut model = load_model(&path, 2048, None, None, None, None, &CaskConfig::default(), 1, SpecLoadCfg::default(), &mut gpu)
         .expect("load_model");
     let prompt_tokens = build_prompt(&model, &prompt);
-    let depth_cfg = model.lfm3_depth_config.as_ref().unwrap().clone();
+    let depth_cfg = model.lfm3_depth_config().unwrap().clone();
     let (text_ids_b, audio_codes_b, text_n_b) = {
         let bundle = match model.state.as_mut() {
-            Some(ModelState::Lfm3(b)) => b,
-            _ => panic!("not lfm3"),
+            Some(s) => (s.as_mut() as &mut dyn std::any::Any)
+                .downcast_mut::<hipfire_loader::Lfm3Bundle>()
+                .expect("not lfm3"),
+            None => panic!("not lfm3"),
         };
-        let dw = model.lfm3_depth_weights.as_ref().unwrap();
+        let dw = bundle.depth_weights.as_ref().unwrap();
         let mut rng = DepthRng::new(seed);
         let out = omni_generate(
             &bundle.config, &bundle.weights, &mut bundle.state,
@@ -63,10 +65,12 @@ fn main() {
         .expect("load_model (batch2)");
     let (text_ids_b2, audio_codes_b2) = {
         let bundle = match model2.state.as_mut() {
-            Some(ModelState::Lfm3(b)) => b,
-            _ => panic!("not lfm3"),
+            Some(s) => (s.as_mut() as &mut dyn std::any::Any)
+                .downcast_mut::<hipfire_loader::Lfm3Bundle>()
+                .expect("not lfm3"),
+            None => panic!("not lfm3"),
         };
-        let dw = model2.lfm3_depth_weights.as_ref().unwrap();
+        let dw = bundle.depth_weights.as_ref().unwrap();
         let mut rng = DepthRng::new(seed);
         let out = omni_generate(
             &bundle.config, &bundle.weights, &mut bundle.state,
@@ -101,17 +105,19 @@ fn main() {
     let mut model = load_model(&path, 2048, None, None, None, None, &CaskConfig::default(), 1, SpecLoadCfg::default(), &mut gpu)
         .expect("load_model (streaming)");
     let prompt_tokens_s = build_prompt(&model, &prompt);
-    let depth_cfg = model.lfm3_depth_config.as_ref().unwrap().clone();
+    let depth_cfg = model.lfm3_depth_config().unwrap().clone();
     assert_eq!(prompt_tokens, prompt_tokens_s, "prompt construction differs");
 
     let mut text_ids_s: Vec<u32> = Vec::new();
     let mut audio_codes_s: Vec<u32> = Vec::new();
     {
         let bundle = match model.state.as_mut() {
-            Some(ModelState::Lfm3(b)) => b,
-            _ => panic!("not lfm3"),
+            Some(s) => (s.as_mut() as &mut dyn std::any::Any)
+                .downcast_mut::<hipfire_loader::Lfm3Bundle>()
+                .expect("not lfm3"),
+            None => panic!("not lfm3"),
         };
-        let dw = model.lfm3_depth_weights.as_ref().unwrap();
+        let dw = bundle.depth_weights.as_ref().unwrap();
         let mut rng = DepthRng::new(seed);
         let mut stream = omni_stream_prefill(
             &bundle.config, &bundle.weights, &mut bundle.state, &mut gpu, &prompt_tokens_s,

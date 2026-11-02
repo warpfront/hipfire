@@ -20,7 +20,7 @@ use crate::hipfire::dashboard::{run_bounded, RocmSmiRun};
 use crate::hipfire::native_cli_command;
 
 /// Hard wall-clock bound on `hipfire diag` — it spawns the daemon (GPU init), so
-/// it is much heavier than rocm-smi, but a hung daemon must not leak the worker
+/// it is much heavier than the amd-smi / rocm-smi probes, but a hung daemon must not leak the worker
 /// thread or an orphan holding VRAM forever.
 const DOCTOR_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -83,7 +83,7 @@ fn run_inner() -> DoctorReport {
 
 /// Extract the top-level JSON object — first `{` to last `}` — from diag's
 /// stdout, tolerating leading log lines AND pretty multi-line formatting (the
-/// CLI emits `JSON.stringify(..., null, 2)`, so a single-line scan would miss it).
+/// CLI prints `serde_json::to_string_pretty`, so a single-line scan would miss it).
 fn extract_json_object(stdout: &str) -> Option<&str> {
     let start = stdout.find('{')?;
     let end = stdout.rfind('}')?;
@@ -175,6 +175,15 @@ pub fn parse_diag_json(body: &str) -> DoctorReport {
         }
     };
     checks.push(check("live GPU probe", gpu_ok, gpu_detail));
+    // Kexec HandOver scratch (CMA pageblocks the GPU cannot use). Older CLIs do
+    // not report it, so an absent key adds no check; `warn` shows as not ok.
+    if let Some(status) = v["kho_scratch"]["status"].as_str() {
+        checks.push(check(
+            "KHO scratch",
+            status == "pass",
+            v["kho_scratch"]["detail"].as_str().unwrap_or(status),
+        ));
+    }
 
     DoctorReport {
         checks,
@@ -211,6 +220,23 @@ mod tests {
     }
 
     #[test]
+    fn parse_diag_kho_scratch_warn_and_absent() {
+        let warn = r#"{"kho_scratch": {"name": "kho_scratch", "status": "warn",
+            "scratch_bytes": 14193524736, "detail": "KHO scratch reserves 13.2 GiB unusable by the GPU; boot with kho=off to reclaim it"}}"#;
+        let r = parse_diag_json(warn);
+        let kho = r.checks.iter().find(|c| c.name == "KHO scratch").unwrap();
+        assert!(!kho.ok);
+        assert!(kho.detail.contains("kho=off"), "{}", kho.detail);
+        let pass = r#"{"kho_scratch": {"status": "pass", "detail": "none"}}"#;
+        assert!(parse_diag_json(pass)
+            .checks
+            .iter()
+            .any(|c| c.name == "KHO scratch" && c.ok));
+        let absent = parse_diag_json(r#"{"platform": "linux"}"#);
+        assert!(absent.checks.iter().all(|c| c.name != "KHO scratch"));
+    }
+
+    #[test]
     fn parse_diag_marks_missing_as_failures() {
         // Honest: absent fields fail, the live probe surfaces its error.
         let body = r#"{
@@ -243,7 +269,7 @@ mod tests {
 
     #[test]
     fn extract_json_object_handles_pretty_multiline_with_log_prefix() {
-        // The CLI emits JSON.stringify(.., null, 2) — pretty + possibly after logs.
+        // The CLI pretty-prints the report, possibly after log lines.
         let stdout = "warming up\n{\n  \"platform\": \"linux\",\n  \"kfd\": true\n}\n";
         let json = extract_json_object(stdout).expect("object extracted");
         let r = parse_diag_json(json);

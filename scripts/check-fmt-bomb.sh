@@ -4,8 +4,8 @@ set -uo pipefail
 # Detect a workspace-wide Rust reformat in the STAGED diff, whatever produced
 # it — `cargo fmt`, an IDE format-on-save, a non-Claude agent, muscle memory.
 #
-# Why this exists: the repo carries historical rustfmt debt, so CI only checks
-# CHANGED files (scripts/ci-rustfmt-changed.sh). A bare `cargo fmt` rewrites
+# Why this exists: master and branches cut before the 0.4.3 sweep carry
+# historical rustfmt debt (beta is clean since the sweep). There a bare `cargo fmt` rewrites
 # every file in the workspace, burying the real change under a 200+ file diff
 # and making review impossible. scripts/fmt-changed.sh is the correct tool.
 #
@@ -54,8 +54,8 @@ cat >&2 <<EOF
 ✗ fmt bomb: $whitespace_only staged Rust files changed ONLY in whitespace
   (out of ${#staged[@]} staged .rs files, threshold $threshold).
 
-  This is the signature of a workspace-wide 'cargo fmt'. The repo carries
-  historical format debt and CI only gates CHANGED files, so a full-workspace
+  This is the signature of a workspace-wide 'cargo fmt'. master and branches
+  cut before the 0.4.3 sweep carry historical format debt, so a full-workspace
   reformat buries the real change and makes review impossible.
 
   Inspect: git diff --cached --stat -- '*.rs'

@@ -1,0 +1,5684 @@
+{
+  "args": [
+    "/scratch/g942/target-pmcdna/release/examples/cdna_card_tierc",
+    "--quick",
+    "--hsaco-dir",
+    "/scratch/g942/pmcdna/60bfa12b8af3d21ab311d8b7b2052b7fcd6409fe/hsaco",
+    "--receipt",
+    "/scratch/g942/pmcdna/60bfa12b8af3d21ab311d8b7b2052b7fcd6409fe/cdna_card_tierc.quick.json"
+  ],
+  "assumptions": [
+    "[UNVERIFIED: confirm on MI300X] the installed HIP runtime accepts the PeaceMaker-emitted v6 code object through hipModuleLoadData",
+    "[UNVERIFIED: confirm on MI300X] hipModuleLaunchKernel with the explicit-kernarg blob (HIP_LAUNCH_PARAM_BUFFER_*) binds the identical bytes for the PM and the HIP twin kernels (PM kernarg sizes 48 / 68 / 16, no hidden arguments)",
+    "[UNVERIFIED: confirm on MI300X] the MFMA FP8 accumulation order of the hardware equals one of the emulator AccumModels (default Cdna3Fused); the MoE receipt lists which models match bit for bit",
+    "[UNVERIFIED: confirm on MI300X] hipcc-built <name>.hsaco are raw (unbundled) ELF code objects: both hipModuleLoadData and the emulator loader read them as-is",
+    "[UNVERIFIED: confirm on MI300X] hardware FP8 conversion overflow / NaN behaviour matches the emulator (inputs are generated inside the OCP finite range after scaling, so overflow is not exercised)",
+    "[UNVERIFIED: confirm on MI300X] hipGetDeviceProperties reports gcnArchName `gfx942` for MI300X (the harness refuses any other string)",
+    "no module unload / device reset between cases: a faulting kernel can poison the HIP context, after which later cases report errors"
+  ],
+  "cases": [
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        64,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 6144,
+          "name": "x_f32",
+          "output": false,
+          "sha256": "7f031b695e3381e6510fee5327833fe320a045fd679c6f81b8d6ddc6255043c3"
+        },
+        {
+          "bytes": 1536,
+          "name": "x_fp8",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 48,
+          "name": "half_sums",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 24,
+          "name": "row_scales",
+          "output": true,
+          "sha256": null
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "K256 mode1 shift0 random (6 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        6,
+        1,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "pm_cdna_fp8_act_producer",
+      "kernarg_bytes": 48,
+      "kernel": "act_producer",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "fp8_act_producer",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 1536,
+            "elements": 1536,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "ocp-e4m3 codes",
+            "length_lhs": 1536,
+            "length_rhs": 1536,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 1536,
+              "default_model": true,
+              "elements": 1536,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "ocp-e4m3 codes",
+              "length_lhs": 1536,
+              "length_rhs": 1536,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 1536,
+              "default_model": true,
+              "elements": 1536,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "ocp-e4m3 codes",
+              "length_lhs": 1536,
+              "length_rhs": 1536,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "ocp-e4m3 codes",
+          "output": "x_fp8",
+          "sha256": {
+            "cardHIP": "c1ce26ca4f21910911a4f1fb5cda82aa7ab486b034d5f7a2ab86a79c74f19a26",
+            "cardPM": "c1ce26ca4f21910911a4f1fb5cda82aa7ab486b034d5f7a2ab86a79c74f19a26",
+            "cpu_ref_default": "c1ce26ca4f21910911a4f1fb5cda82aa7ab486b034d5f7a2ab86a79c74f19a26",
+            "simHIP": null,
+            "simPM_default": "c1ce26ca4f21910911a4f1fb5cda82aa7ab486b034d5f7a2ab86a79c74f19a26"
+          }
+        },
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 48,
+            "elements": 12,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 48,
+            "length_rhs": 48,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 48,
+              "default_model": true,
+              "elements": 12,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 48,
+              "length_rhs": 48,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 48,
+              "default_model": true,
+              "elements": 12,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 48,
+              "length_rhs": 48,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "half_sums",
+          "sha256": {
+            "cardHIP": "207968e90c34b6f373f4ec8dbb3de42d83bf6e6151030998972993e85e7e1746",
+            "cardPM": "207968e90c34b6f373f4ec8dbb3de42d83bf6e6151030998972993e85e7e1746",
+            "cpu_ref_default": "207968e90c34b6f373f4ec8dbb3de42d83bf6e6151030998972993e85e7e1746",
+            "simHIP": null,
+            "simPM_default": "207968e90c34b6f373f4ec8dbb3de42d83bf6e6151030998972993e85e7e1746"
+          }
+        },
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 24,
+            "elements": 6,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 24,
+            "length_rhs": 24,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 24,
+              "default_model": true,
+              "elements": 6,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 24,
+              "length_rhs": 24,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 24,
+              "default_model": true,
+              "elements": 6,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 24,
+              "length_rhs": 24,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "row_scales",
+          "sha256": {
+            "cardHIP": "8c9940775f382b84e9632f0e529fd327ae4195a9475e5c6de161ab3b1b596b35",
+            "cardPM": "8c9940775f382b84e9632f0e529fd327ae4195a9475e5c6de161ab3b1b596b35",
+            "cpu_ref_default": "8c9940775f382b84e9632f0e529fd327ae4195a9475e5c6de161ab3b1b596b35",
+            "simHIP": null,
+            "simPM_default": "8c9940775f382b84e9632f0e529fd327ae4195a9475e5c6de161ab3b1b596b35"
+          }
+        }
+      ],
+      "pm_symbol": "pm_cdna_fp8_act_producer",
+      "poison_byte": "0xee",
+      "seed": "0x123456788abcce71",
+      "shape": {
+        "adversarial": false,
+        "k": 256,
+        "row_scale_shift": 0,
+        "rows": 6,
+        "scale_mode": 1
+      },
+      "status": "PASS",
+      "wall_seconds": 0.022073238
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        64,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 59392,
+          "name": "x_f32",
+          "output": false,
+          "sha256": "b5309e3c12dba630db963452f52164d96130233d0b312a060dcc54e4f952bf9c"
+        },
+        {
+          "bytes": 14848,
+          "name": "x_fp8",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 464,
+          "name": "half_sums",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 232,
+          "name": "row_scales",
+          "output": true,
+          "sha256": null
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "K256 mode1 shift0 adversarial (58 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        58,
+        1,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "pm_cdna_fp8_act_producer",
+      "kernarg_bytes": 48,
+      "kernel": "act_producer",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "fp8_act_producer",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 14848,
+            "elements": 14848,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "ocp-e4m3 codes",
+            "length_lhs": 14848,
+            "length_rhs": 14848,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 14848,
+              "default_model": true,
+              "elements": 14848,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "ocp-e4m3 codes",
+              "length_lhs": 14848,
+              "length_rhs": 14848,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 14848,
+              "default_model": true,
+              "elements": 14848,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "ocp-e4m3 codes",
+              "length_lhs": 14848,
+              "length_rhs": 14848,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "ocp-e4m3 codes",
+          "output": "x_fp8",
+          "sha256": {
+            "cardHIP": "0960c19fc5b675669bae810824296f20fe603a08bca786dd7ad874548de19f7a",
+            "cardPM": "0960c19fc5b675669bae810824296f20fe603a08bca786dd7ad874548de19f7a",
+            "cpu_ref_default": "0960c19fc5b675669bae810824296f20fe603a08bca786dd7ad874548de19f7a",
+            "simHIP": null,
+            "simPM_default": "0960c19fc5b675669bae810824296f20fe603a08bca786dd7ad874548de19f7a"
+          }
+        },
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 464,
+            "elements": 116,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 464,
+            "length_rhs": 464,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 464,
+              "default_model": true,
+              "elements": 116,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 464,
+              "length_rhs": 464,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 464,
+              "default_model": true,
+              "elements": 116,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 464,
+              "length_rhs": 464,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "half_sums",
+          "sha256": {
+            "cardHIP": "56ee24d6cb9e55a826ca1b766eb45a8c38340312c3fde8e9b459338150c0e8d2",
+            "cardPM": "56ee24d6cb9e55a826ca1b766eb45a8c38340312c3fde8e9b459338150c0e8d2",
+            "cpu_ref_default": "56ee24d6cb9e55a826ca1b766eb45a8c38340312c3fde8e9b459338150c0e8d2",
+            "simHIP": null,
+            "simPM_default": "56ee24d6cb9e55a826ca1b766eb45a8c38340312c3fde8e9b459338150c0e8d2"
+          }
+        },
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 232,
+            "elements": 58,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 232,
+            "length_rhs": 232,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 232,
+              "default_model": true,
+              "elements": 58,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 232,
+              "length_rhs": 232,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 232,
+              "default_model": true,
+              "elements": 58,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 232,
+              "length_rhs": 232,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "row_scales",
+          "sha256": {
+            "cardHIP": "44ce603b67eace1d64c897420732dbfcb9fe31c09389b9de9a34383265ba2163",
+            "cardPM": "44ce603b67eace1d64c897420732dbfcb9fe31c09389b9de9a34383265ba2163",
+            "cpu_ref_default": "44ce603b67eace1d64c897420732dbfcb9fe31c09389b9de9a34383265ba2163",
+            "simHIP": null,
+            "simPM_default": "44ce603b67eace1d64c897420732dbfcb9fe31c09389b9de9a34383265ba2163"
+          }
+        }
+      ],
+      "pm_symbol": "pm_cdna_fp8_act_producer",
+      "poison_byte": "0xee",
+      "seed": "0x123456788abcce70",
+      "shape": {
+        "adversarial": true,
+        "k": 256,
+        "row_scale_shift": 0,
+        "rows": 58,
+        "scale_mode": 1
+      },
+      "status": "PASS",
+      "wall_seconds": 0.039059292
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        64,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 6144,
+          "name": "x_f32",
+          "output": false,
+          "sha256": "b406a97aa20716ce92b531047c0670704ab6093ed8e39e39f5f927a4fa1111a9"
+        },
+        {
+          "bytes": 1536,
+          "name": "x_fp8",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 48,
+          "name": "half_sums",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 24,
+          "name": "row_scales",
+          "output": true,
+          "sha256": null
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "K256 mode0 shift0 random (6 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        6,
+        1,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "pm_cdna_fp8_act_producer",
+      "kernarg_bytes": 48,
+      "kernel": "act_producer",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "fp8_act_producer",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 1536,
+            "elements": 1536,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "ocp-e4m3 codes",
+            "length_lhs": 1536,
+            "length_rhs": 1536,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 1536,
+              "default_model": true,
+              "elements": 1536,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "ocp-e4m3 codes",
+              "length_lhs": 1536,
+              "length_rhs": 1536,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 1536,
+              "default_model": true,
+              "elements": 1536,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "ocp-e4m3 codes",
+              "length_lhs": 1536,
+              "length_rhs": 1536,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "ocp-e4m3 codes",
+          "output": "x_fp8",
+          "sha256": {
+            "cardHIP": "cde058d78bffe04ea15dfd504369d4e3d007e7ad33edace92d582f92fcbb7a19",
+            "cardPM": "cde058d78bffe04ea15dfd504369d4e3d007e7ad33edace92d582f92fcbb7a19",
+            "cpu_ref_default": "cde058d78bffe04ea15dfd504369d4e3d007e7ad33edace92d582f92fcbb7a19",
+            "simHIP": null,
+            "simPM_default": "cde058d78bffe04ea15dfd504369d4e3d007e7ad33edace92d582f92fcbb7a19"
+          }
+        },
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 48,
+            "elements": 12,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 48,
+            "length_rhs": 48,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 48,
+              "default_model": true,
+              "elements": 12,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 48,
+              "length_rhs": 48,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 48,
+              "default_model": true,
+              "elements": 12,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 48,
+              "length_rhs": 48,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "half_sums",
+          "sha256": {
+            "cardHIP": "2a2c8d772c06b801bbb7b3fb353de72d43044d9f13967b1eb4511844d7a60a78",
+            "cardPM": "2a2c8d772c06b801bbb7b3fb353de72d43044d9f13967b1eb4511844d7a60a78",
+            "cpu_ref_default": "2a2c8d772c06b801bbb7b3fb353de72d43044d9f13967b1eb4511844d7a60a78",
+            "simHIP": null,
+            "simPM_default": "2a2c8d772c06b801bbb7b3fb353de72d43044d9f13967b1eb4511844d7a60a78"
+          }
+        },
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 24,
+            "elements": 6,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 24,
+            "length_rhs": 24,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 24,
+              "default_model": true,
+              "elements": 6,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 24,
+              "length_rhs": 24,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 24,
+              "default_model": true,
+              "elements": 6,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 24,
+              "length_rhs": 24,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "row_scales",
+          "sha256": {
+            "cardHIP": "f46913286d895f62d646314f400fc3d7a543cf34eb4ae56df87f43dc4582a36b",
+            "cardPM": "f46913286d895f62d646314f400fc3d7a543cf34eb4ae56df87f43dc4582a36b",
+            "cpu_ref_default": "f46913286d895f62d646314f400fc3d7a543cf34eb4ae56df87f43dc4582a36b",
+            "simHIP": null,
+            "simPM_default": "f46913286d895f62d646314f400fc3d7a543cf34eb4ae56df87f43dc4582a36b"
+          }
+        }
+      ],
+      "pm_symbol": "pm_cdna_fp8_act_producer",
+      "poison_byte": "0xee",
+      "seed": "0x123456788abcde71",
+      "shape": {
+        "adversarial": false,
+        "k": 256,
+        "row_scale_shift": 0,
+        "rows": 6,
+        "scale_mode": 0
+      },
+      "status": "PASS",
+      "wall_seconds": 0.003213869
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        64,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 46080,
+          "name": "x_f32",
+          "output": false,
+          "sha256": "35a873868f64f4f5a076c8c4b4f5e86d003bd0f005a1894817dd50a2073696e9"
+        },
+        {
+          "bytes": 11520,
+          "name": "x_fp8",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 360,
+          "name": "half_sums",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 180,
+          "name": "row_scales",
+          "output": true,
+          "sha256": null
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "K256 mode0 shift0 adversarial (45 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        45,
+        1,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "pm_cdna_fp8_act_producer",
+      "kernarg_bytes": 48,
+      "kernel": "act_producer",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "fp8_act_producer",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 11520,
+            "elements": 11520,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "ocp-e4m3 codes",
+            "length_lhs": 11520,
+            "length_rhs": 11520,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 11520,
+              "default_model": true,
+              "elements": 11520,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "ocp-e4m3 codes",
+              "length_lhs": 11520,
+              "length_rhs": 11520,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 11520,
+              "default_model": true,
+              "elements": 11520,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "ocp-e4m3 codes",
+              "length_lhs": 11520,
+              "length_rhs": 11520,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "ocp-e4m3 codes",
+          "output": "x_fp8",
+          "sha256": {
+            "cardHIP": "7bc86d5f2446ca4f8f759f949cb5c6310da406f287ea50a2c018416ac0f3de82",
+            "cardPM": "7bc86d5f2446ca4f8f759f949cb5c6310da406f287ea50a2c018416ac0f3de82",
+            "cpu_ref_default": "7bc86d5f2446ca4f8f759f949cb5c6310da406f287ea50a2c018416ac0f3de82",
+            "simHIP": null,
+            "simPM_default": "7bc86d5f2446ca4f8f759f949cb5c6310da406f287ea50a2c018416ac0f3de82"
+          }
+        },
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 360,
+            "elements": 90,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 360,
+            "length_rhs": 360,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 360,
+              "default_model": true,
+              "elements": 90,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 360,
+              "length_rhs": 360,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 360,
+              "default_model": true,
+              "elements": 90,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 360,
+              "length_rhs": 360,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "half_sums",
+          "sha256": {
+            "cardHIP": "aa8e28fb89f396504dcf3806b77b710fdb5f061a21b431f53c1f4a206946f594",
+            "cardPM": "aa8e28fb89f396504dcf3806b77b710fdb5f061a21b431f53c1f4a206946f594",
+            "cpu_ref_default": "aa8e28fb89f396504dcf3806b77b710fdb5f061a21b431f53c1f4a206946f594",
+            "simHIP": null,
+            "simPM_default": "aa8e28fb89f396504dcf3806b77b710fdb5f061a21b431f53c1f4a206946f594"
+          }
+        },
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 180,
+            "elements": 45,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 180,
+            "length_rhs": 180,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 180,
+              "default_model": true,
+              "elements": 45,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 180,
+              "length_rhs": 180,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 180,
+              "default_model": true,
+              "elements": 45,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 180,
+              "length_rhs": 180,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "row_scales",
+          "sha256": {
+            "cardHIP": "24cac2760ec887a76fc17cf15f9012f39ea88a28f39e22c9fd50d3e4dd15f94e",
+            "cardPM": "24cac2760ec887a76fc17cf15f9012f39ea88a28f39e22c9fd50d3e4dd15f94e",
+            "cpu_ref_default": "24cac2760ec887a76fc17cf15f9012f39ea88a28f39e22c9fd50d3e4dd15f94e",
+            "simHIP": null,
+            "simPM_default": "24cac2760ec887a76fc17cf15f9012f39ea88a28f39e22c9fd50d3e4dd15f94e"
+          }
+        }
+      ],
+      "pm_symbol": "pm_cdna_fp8_act_producer",
+      "poison_byte": "0xee",
+      "seed": "0x123456788abcde70",
+      "shape": {
+        "adversarial": true,
+        "k": 256,
+        "row_scale_shift": 0,
+        "rows": 45,
+        "scale_mode": 0
+      },
+      "status": "PASS",
+      "wall_seconds": 0.011936458
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 25344,
+          "name": "W",
+          "output": false,
+          "sha256": "bdbc06a3b461ed4613b1e340181fba4467aa3990cc273eddc20208e31620ac39"
+        },
+        {
+          "bytes": 64,
+          "name": "tile_desc",
+          "output": false,
+          "sha256": "117397481938b52cea5ab0b4ddcaa3ebf2047d33b686ad59d9fcc9dca5847692"
+        },
+        {
+          "bytes": 208,
+          "name": "sorted_rows",
+          "output": false,
+          "sha256": "ef3b2d093ee048313e09fdbd0b912d021004ba3cecbdec6665d787db42f50768"
+        },
+        {
+          "bytes": 1792,
+          "name": "X",
+          "output": false,
+          "sha256": "f95cad207a8a5cf674456d5f07d23fefd8b8e65742b23b360d60c2bc9d55db34"
+        },
+        {
+          "bytes": 56,
+          "name": "x_scale",
+          "output": false,
+          "sha256": "95fdd3ddf21cc115335ffd52136f637c7bc77a3fff17c1ca301257034c9e6d2f"
+        },
+        {
+          "bytes": 13312,
+          "name": "Y",
+          "output": true,
+          "sha256": null
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "moe random partial+padded+skipped tiles R64 K128",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        1,
+        4,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `gemm_fp8b128_moe_grouped_fp8mfma`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "gemm_fp8b128_moe_grouped_fp8mfma",
+      "kernarg_bytes": 68,
+      "kernel": "moe_gate_up",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Exact",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Serial",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Grouped(4)",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Grouped(8)",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Grouped(16)",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Grouped(32)",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused",
+        "Exact",
+        "Serial",
+        "Grouped(4)",
+        "Grouped(8)",
+        "Grouped(16)",
+        "Grouped(32)"
+      ],
+      "module": "fp8_moe_gate_up",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 13312,
+            "elements": 3328,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 13312,
+            "length_rhs": 13312,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 13312,
+              "default_model": true,
+              "elements": 3328,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.3",
+                  "rhs_hex": "0xca7bedb5",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.3",
+                  "rhs_hex": "0xca3fea99",
+                  "row": 0
+                },
+                {
+                  "col": 4,
+                  "index": "0x4",
+                  "lhs": "-2055666.6",
+                  "lhs_hex": "0xc9faef95",
+                  "rhs": "-2055666.9",
+                  "rhs_hex": "0xc9faef97",
+                  "row": 0
+                },
+                {
+                  "col": 6,
+                  "index": "0x6",
+                  "lhs": "-2473817.8",
+                  "lhs_hex": "0xca16fd67",
+                  "rhs": "-2473817.5",
+                  "rhs_hex": "0xca16fd66",
+                  "row": 0
+                },
+                {
+                  "col": 9,
+                  "index": "0x9",
+                  "lhs": "3954933.0",
+                  "lhs_hex": "0x4a7163d4",
+                  "rhs": "3954933.5",
+                  "rhs_hex": "0x4a7163d6",
+                  "row": 0
+                },
+                {
+                  "col": 10,
+                  "index": "0xa",
+                  "lhs": "623151.44",
+                  "lhs_hex": "0x491822f7",
+                  "rhs": "623151.5",
+                  "rhs_hex": "0x491822f8",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.78",
+                  "rhs_hex": "0x48a7f459",
+                  "row": 0
+                },
+                {
+                  "col": 12,
+                  "index": "0xc",
+                  "lhs": "500777.56",
+                  "lhs_hex": "0x48f48532",
+                  "rhs": "500777.38",
+                  "rhs_hex": "0x48f4852c",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 90,
+              "mismatch_bytes": 837,
+              "mismatch_elements": 827,
+              "model": "Exact",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.0",
+                  "rhs_hex": "0xca7bedb4",
+                  "row": 0
+                },
+                {
+                  "col": 1,
+                  "index": "0x1",
+                  "lhs": "-7718500.5",
+                  "lhs_hex": "0xcaeb8cc9",
+                  "rhs": "-7718501.5",
+                  "rhs_hex": "0xcaeb8ccb",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.0",
+                  "rhs_hex": "0xca3fea98",
+                  "row": 0
+                },
+                {
+                  "col": 3,
+                  "index": "0x3",
+                  "lhs": "2976144.5",
+                  "lhs_hex": "0x4a35a642",
+                  "rhs": "2976144.0",
+                  "rhs_hex": "0x4a35a640",
+                  "row": 0
+                },
+                {
+                  "col": 4,
+                  "index": "0x4",
+                  "lhs": "-2055666.6",
+                  "lhs_hex": "0xc9faef95",
+                  "rhs": "-2055667.0",
+                  "rhs_hex": "0xc9faef98",
+                  "row": 0
+                },
+                {
+                  "col": 8,
+                  "index": "0x8",
+                  "lhs": "7274844.0",
+                  "lhs_hex": "0x4ade02b8",
+                  "rhs": "7274846.0",
+                  "rhs_hex": "0x4ade02bc",
+                  "row": 0
+                },
+                {
+                  "col": 9,
+                  "index": "0x9",
+                  "lhs": "3954933.0",
+                  "lhs_hex": "0x4a7163d4",
+                  "rhs": "3954933.5",
+                  "rhs_hex": "0x4a7163d6",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.44",
+                  "rhs_hex": "0x48a7f44e",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 105,
+              "mismatch_bytes": 1122,
+              "mismatch_elements": 1095,
+              "model": "Serial",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.0",
+                  "rhs_hex": "0xca7bedb4",
+                  "row": 0
+                },
+                {
+                  "col": 1,
+                  "index": "0x1",
+                  "lhs": "-7718500.5",
+                  "lhs_hex": "0xcaeb8cc9",
+                  "rhs": "-7718500.0",
+                  "rhs_hex": "0xcaeb8cc8",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.0",
+                  "rhs_hex": "0xca3fea98",
+                  "row": 0
+                },
+                {
+                  "col": 5,
+                  "index": "0x5",
+                  "lhs": "2115914.3",
+                  "lhs_hex": "0x4a012529",
+                  "rhs": "2115914.0",
+                  "rhs_hex": "0x4a012528",
+                  "row": 0
+                },
+                {
+                  "col": 6,
+                  "index": "0x6",
+                  "lhs": "-2473817.8",
+                  "lhs_hex": "0xca16fd67",
+                  "rhs": "-2473817.5",
+                  "rhs_hex": "0xca16fd66",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.44",
+                  "rhs_hex": "0x48a7f44e",
+                  "row": 0
+                },
+                {
+                  "col": 12,
+                  "index": "0xc",
+                  "lhs": "500777.56",
+                  "lhs_hex": "0x48f48532",
+                  "rhs": "500777.38",
+                  "rhs_hex": "0x48f4852c",
+                  "row": 0
+                },
+                {
+                  "col": 13,
+                  "index": "0xd",
+                  "lhs": "2552438.8",
+                  "lhs_hex": "0x4a1bc9db",
+                  "rhs": "2552438.3",
+                  "rhs_hex": "0x4a1bc9d9",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 96,
+              "mismatch_bytes": 1032,
+              "mismatch_elements": 1025,
+              "model": "Grouped(4)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.0",
+                  "rhs_hex": "0xca7bedb4",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.5",
+                  "rhs_hex": "0xca3fea9a",
+                  "row": 0
+                },
+                {
+                  "col": 3,
+                  "index": "0x3",
+                  "lhs": "2976144.5",
+                  "lhs_hex": "0x4a35a642",
+                  "rhs": "2976144.3",
+                  "rhs_hex": "0x4a35a641",
+                  "row": 0
+                },
+                {
+                  "col": 6,
+                  "index": "0x6",
+                  "lhs": "-2473817.8",
+                  "lhs_hex": "0xca16fd67",
+                  "rhs": "-2473818.0",
+                  "rhs_hex": "0xca16fd68",
+                  "row": 0
+                },
+                {
+                  "col": 8,
+                  "index": "0x8",
+                  "lhs": "7274844.0",
+                  "lhs_hex": "0x4ade02b8",
+                  "rhs": "7274843.5",
+                  "rhs_hex": "0x4ade02b7",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.44",
+                  "rhs_hex": "0x48a7f44e",
+                  "row": 0
+                },
+                {
+                  "col": 13,
+                  "index": "0xd",
+                  "lhs": "2552438.8",
+                  "lhs_hex": "0x4a1bc9db",
+                  "rhs": "2552438.5",
+                  "rhs_hex": "0x4a1bc9da",
+                  "row": 0
+                },
+                {
+                  "col": 14,
+                  "index": "0xe",
+                  "lhs": "1582145.3",
+                  "lhs_hex": "0x49c1220a",
+                  "rhs": "1582145.8",
+                  "rhs_hex": "0x49c1220e",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 93,
+              "mismatch_bytes": 928,
+              "mismatch_elements": 920,
+              "model": "Grouped(8)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.5",
+                  "rhs_hex": "0xca3fea9a",
+                  "row": 0
+                },
+                {
+                  "col": 4,
+                  "index": "0x4",
+                  "lhs": "-2055666.6",
+                  "lhs_hex": "0xc9faef95",
+                  "rhs": "-2055666.9",
+                  "rhs_hex": "0xc9faef97",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.78",
+                  "rhs_hex": "0x48a7f459",
+                  "row": 0
+                },
+                {
+                  "col": 14,
+                  "index": "0xe",
+                  "lhs": "1582145.3",
+                  "lhs_hex": "0x49c1220a",
+                  "rhs": "1582145.8",
+                  "rhs_hex": "0x49c1220e",
+                  "row": 0
+                },
+                {
+                  "col": 16,
+                  "index": "0x10",
+                  "lhs": "785354.75",
+                  "lhs_hex": "0x493fbcac",
+                  "rhs": "785354.5",
+                  "rhs_hex": "0x493fbca8",
+                  "row": 0
+                },
+                {
+                  "col": 17,
+                  "index": "0x11",
+                  "lhs": "246924.08",
+                  "lhs_hex": "0x48712305",
+                  "rhs": "246924.3",
+                  "rhs_hex": "0x48712313",
+                  "row": 0
+                },
+                {
+                  "col": 20,
+                  "index": "0x14",
+                  "lhs": "1169381.8",
+                  "lhs_hex": "0x498ebf2e",
+                  "rhs": "1169381.9",
+                  "rhs_hex": "0x498ebf2f",
+                  "row": 0
+                },
+                {
+                  "col": 24,
+                  "index": "0x18",
+                  "lhs": "-513960.1",
+                  "lhs_hex": "0xc8faf503",
+                  "rhs": "-513959.97",
+                  "rhs_hex": "0xc8faf4ff",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 62,
+              "mismatch_bytes": 567,
+              "mismatch_elements": 553,
+              "model": "Grouped(16)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.3",
+                  "rhs_hex": "0xca7bedb5",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.3",
+                  "rhs_hex": "0xca3fea99",
+                  "row": 0
+                },
+                {
+                  "col": 4,
+                  "index": "0x4",
+                  "lhs": "-2055666.6",
+                  "lhs_hex": "0xc9faef95",
+                  "rhs": "-2055666.9",
+                  "rhs_hex": "0xc9faef97",
+                  "row": 0
+                },
+                {
+                  "col": 6,
+                  "index": "0x6",
+                  "lhs": "-2473817.8",
+                  "lhs_hex": "0xca16fd67",
+                  "rhs": "-2473817.5",
+                  "rhs_hex": "0xca16fd66",
+                  "row": 0
+                },
+                {
+                  "col": 9,
+                  "index": "0x9",
+                  "lhs": "3954933.0",
+                  "lhs_hex": "0x4a7163d4",
+                  "rhs": "3954933.5",
+                  "rhs_hex": "0x4a7163d6",
+                  "row": 0
+                },
+                {
+                  "col": 10,
+                  "index": "0xa",
+                  "lhs": "623151.44",
+                  "lhs_hex": "0x491822f7",
+                  "rhs": "623151.5",
+                  "rhs_hex": "0x491822f8",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.78",
+                  "rhs_hex": "0x48a7f459",
+                  "row": 0
+                },
+                {
+                  "col": 12,
+                  "index": "0xc",
+                  "lhs": "500777.56",
+                  "lhs_hex": "0x48f48532",
+                  "rhs": "500777.38",
+                  "rhs_hex": "0x48f4852c",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 90,
+              "mismatch_bytes": 837,
+              "mismatch_elements": 827,
+              "model": "Grouped(32)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 13312,
+              "default_model": true,
+              "elements": 3328,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.3",
+                  "rhs_hex": "0xca7bedb5",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.3",
+                  "rhs_hex": "0xca3fea99",
+                  "row": 0
+                },
+                {
+                  "col": 4,
+                  "index": "0x4",
+                  "lhs": "-2055666.6",
+                  "lhs_hex": "0xc9faef95",
+                  "rhs": "-2055666.9",
+                  "rhs_hex": "0xc9faef97",
+                  "row": 0
+                },
+                {
+                  "col": 6,
+                  "index": "0x6",
+                  "lhs": "-2473817.8",
+                  "lhs_hex": "0xca16fd67",
+                  "rhs": "-2473817.5",
+                  "rhs_hex": "0xca16fd66",
+                  "row": 0
+                },
+                {
+                  "col": 9,
+                  "index": "0x9",
+                  "lhs": "3954933.0",
+                  "lhs_hex": "0x4a7163d4",
+                  "rhs": "3954933.5",
+                  "rhs_hex": "0x4a7163d6",
+                  "row": 0
+                },
+                {
+                  "col": 10,
+                  "index": "0xa",
+                  "lhs": "623151.44",
+                  "lhs_hex": "0x491822f7",
+                  "rhs": "623151.5",
+                  "rhs_hex": "0x491822f8",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.78",
+                  "rhs_hex": "0x48a7f459",
+                  "row": 0
+                },
+                {
+                  "col": 12,
+                  "index": "0xc",
+                  "lhs": "500777.56",
+                  "lhs_hex": "0x48f48532",
+                  "rhs": "500777.38",
+                  "rhs_hex": "0x48f4852c",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 90,
+              "mismatch_bytes": 837,
+              "mismatch_elements": 827,
+              "model": "Exact",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.0",
+                  "rhs_hex": "0xca7bedb4",
+                  "row": 0
+                },
+                {
+                  "col": 1,
+                  "index": "0x1",
+                  "lhs": "-7718500.5",
+                  "lhs_hex": "0xcaeb8cc9",
+                  "rhs": "-7718501.5",
+                  "rhs_hex": "0xcaeb8ccb",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.0",
+                  "rhs_hex": "0xca3fea98",
+                  "row": 0
+                },
+                {
+                  "col": 3,
+                  "index": "0x3",
+                  "lhs": "2976144.5",
+                  "lhs_hex": "0x4a35a642",
+                  "rhs": "2976144.0",
+                  "rhs_hex": "0x4a35a640",
+                  "row": 0
+                },
+                {
+                  "col": 4,
+                  "index": "0x4",
+                  "lhs": "-2055666.6",
+                  "lhs_hex": "0xc9faef95",
+                  "rhs": "-2055667.0",
+                  "rhs_hex": "0xc9faef98",
+                  "row": 0
+                },
+                {
+                  "col": 8,
+                  "index": "0x8",
+                  "lhs": "7274844.0",
+                  "lhs_hex": "0x4ade02b8",
+                  "rhs": "7274846.0",
+                  "rhs_hex": "0x4ade02bc",
+                  "row": 0
+                },
+                {
+                  "col": 9,
+                  "index": "0x9",
+                  "lhs": "3954933.0",
+                  "lhs_hex": "0x4a7163d4",
+                  "rhs": "3954933.5",
+                  "rhs_hex": "0x4a7163d6",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.44",
+                  "rhs_hex": "0x48a7f44e",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 105,
+              "mismatch_bytes": 1122,
+              "mismatch_elements": 1095,
+              "model": "Serial",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.0",
+                  "rhs_hex": "0xca7bedb4",
+                  "row": 0
+                },
+                {
+                  "col": 1,
+                  "index": "0x1",
+                  "lhs": "-7718500.5",
+                  "lhs_hex": "0xcaeb8cc9",
+                  "rhs": "-7718500.0",
+                  "rhs_hex": "0xcaeb8cc8",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.0",
+                  "rhs_hex": "0xca3fea98",
+                  "row": 0
+                },
+                {
+                  "col": 5,
+                  "index": "0x5",
+                  "lhs": "2115914.3",
+                  "lhs_hex": "0x4a012529",
+                  "rhs": "2115914.0",
+                  "rhs_hex": "0x4a012528",
+                  "row": 0
+                },
+                {
+                  "col": 6,
+                  "index": "0x6",
+                  "lhs": "-2473817.8",
+                  "lhs_hex": "0xca16fd67",
+                  "rhs": "-2473817.5",
+                  "rhs_hex": "0xca16fd66",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.44",
+                  "rhs_hex": "0x48a7f44e",
+                  "row": 0
+                },
+                {
+                  "col": 12,
+                  "index": "0xc",
+                  "lhs": "500777.56",
+                  "lhs_hex": "0x48f48532",
+                  "rhs": "500777.38",
+                  "rhs_hex": "0x48f4852c",
+                  "row": 0
+                },
+                {
+                  "col": 13,
+                  "index": "0xd",
+                  "lhs": "2552438.8",
+                  "lhs_hex": "0x4a1bc9db",
+                  "rhs": "2552438.3",
+                  "rhs_hex": "0x4a1bc9d9",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 96,
+              "mismatch_bytes": 1032,
+              "mismatch_elements": 1025,
+              "model": "Grouped(4)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.0",
+                  "rhs_hex": "0xca7bedb4",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.5",
+                  "rhs_hex": "0xca3fea9a",
+                  "row": 0
+                },
+                {
+                  "col": 3,
+                  "index": "0x3",
+                  "lhs": "2976144.5",
+                  "lhs_hex": "0x4a35a642",
+                  "rhs": "2976144.3",
+                  "rhs_hex": "0x4a35a641",
+                  "row": 0
+                },
+                {
+                  "col": 6,
+                  "index": "0x6",
+                  "lhs": "-2473817.8",
+                  "lhs_hex": "0xca16fd67",
+                  "rhs": "-2473818.0",
+                  "rhs_hex": "0xca16fd68",
+                  "row": 0
+                },
+                {
+                  "col": 8,
+                  "index": "0x8",
+                  "lhs": "7274844.0",
+                  "lhs_hex": "0x4ade02b8",
+                  "rhs": "7274843.5",
+                  "rhs_hex": "0x4ade02b7",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.44",
+                  "rhs_hex": "0x48a7f44e",
+                  "row": 0
+                },
+                {
+                  "col": 13,
+                  "index": "0xd",
+                  "lhs": "2552438.8",
+                  "lhs_hex": "0x4a1bc9db",
+                  "rhs": "2552438.5",
+                  "rhs_hex": "0x4a1bc9da",
+                  "row": 0
+                },
+                {
+                  "col": 14,
+                  "index": "0xe",
+                  "lhs": "1582145.3",
+                  "lhs_hex": "0x49c1220a",
+                  "rhs": "1582145.8",
+                  "rhs_hex": "0x49c1220e",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 93,
+              "mismatch_bytes": 928,
+              "mismatch_elements": 920,
+              "model": "Grouped(8)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.5",
+                  "rhs_hex": "0xca3fea9a",
+                  "row": 0
+                },
+                {
+                  "col": 4,
+                  "index": "0x4",
+                  "lhs": "-2055666.6",
+                  "lhs_hex": "0xc9faef95",
+                  "rhs": "-2055666.9",
+                  "rhs_hex": "0xc9faef97",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.78",
+                  "rhs_hex": "0x48a7f459",
+                  "row": 0
+                },
+                {
+                  "col": 14,
+                  "index": "0xe",
+                  "lhs": "1582145.3",
+                  "lhs_hex": "0x49c1220a",
+                  "rhs": "1582145.8",
+                  "rhs_hex": "0x49c1220e",
+                  "row": 0
+                },
+                {
+                  "col": 16,
+                  "index": "0x10",
+                  "lhs": "785354.75",
+                  "lhs_hex": "0x493fbcac",
+                  "rhs": "785354.5",
+                  "rhs_hex": "0x493fbca8",
+                  "row": 0
+                },
+                {
+                  "col": 17,
+                  "index": "0x11",
+                  "lhs": "246924.08",
+                  "lhs_hex": "0x48712305",
+                  "rhs": "246924.3",
+                  "rhs_hex": "0x48712313",
+                  "row": 0
+                },
+                {
+                  "col": 20,
+                  "index": "0x14",
+                  "lhs": "1169381.8",
+                  "lhs_hex": "0x498ebf2e",
+                  "rhs": "1169381.9",
+                  "rhs_hex": "0x498ebf2f",
+                  "row": 0
+                },
+                {
+                  "col": 24,
+                  "index": "0x18",
+                  "lhs": "-513960.1",
+                  "lhs_hex": "0xc8faf503",
+                  "rhs": "-513959.97",
+                  "rhs_hex": "0xc8faf4ff",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 62,
+              "mismatch_bytes": 567,
+              "mismatch_elements": 553,
+              "model": "Grouped(16)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 13312,
+              "default_model": false,
+              "elements": 3328,
+              "first_mismatches": [
+                {
+                  "col": 0,
+                  "index": "0x0",
+                  "lhs": "-4127597.8",
+                  "lhs_hex": "0xca7bedb7",
+                  "rhs": "-4127597.3",
+                  "rhs_hex": "0xca7bedb5",
+                  "row": 0
+                },
+                {
+                  "col": 2,
+                  "index": "0x2",
+                  "lhs": "-3144358.8",
+                  "lhs_hex": "0xca3fea9b",
+                  "rhs": "-3144358.3",
+                  "rhs_hex": "0xca3fea99",
+                  "row": 0
+                },
+                {
+                  "col": 4,
+                  "index": "0x4",
+                  "lhs": "-2055666.6",
+                  "lhs_hex": "0xc9faef95",
+                  "rhs": "-2055666.9",
+                  "rhs_hex": "0xc9faef97",
+                  "row": 0
+                },
+                {
+                  "col": 6,
+                  "index": "0x6",
+                  "lhs": "-2473817.8",
+                  "lhs_hex": "0xca16fd67",
+                  "rhs": "-2473817.5",
+                  "rhs_hex": "0xca16fd66",
+                  "row": 0
+                },
+                {
+                  "col": 9,
+                  "index": "0x9",
+                  "lhs": "3954933.0",
+                  "lhs_hex": "0x4a7163d4",
+                  "rhs": "3954933.5",
+                  "rhs_hex": "0x4a7163d6",
+                  "row": 0
+                },
+                {
+                  "col": 10,
+                  "index": "0xa",
+                  "lhs": "623151.44",
+                  "lhs_hex": "0x491822f7",
+                  "rhs": "623151.5",
+                  "rhs_hex": "0x491822f8",
+                  "row": 0
+                },
+                {
+                  "col": 11,
+                  "index": "0xb",
+                  "lhs": "343970.28",
+                  "lhs_hex": "0x48a7f449",
+                  "rhs": "343970.78",
+                  "rhs_hex": "0x48a7f459",
+                  "row": 0
+                },
+                {
+                  "col": 12,
+                  "index": "0xc",
+                  "lhs": "500777.56",
+                  "lhs_hex": "0x48f48532",
+                  "rhs": "500777.38",
+                  "rhs_hex": "0x48f4852c",
+                  "row": 0
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 13312,
+              "length_rhs": 13312,
+              "max_ulp_finite": 90,
+              "mismatch_bytes": 837,
+              "mismatch_elements": 827,
+              "model": "Grouped(32)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `gemm_fp8b128_moe_grouped_fp8mfma`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "Y",
+          "sha256": {
+            "cardHIP": "f3b7c21edcc6f284e29091e59cbacda26536bb846db913c819b2dbdd3b2e9828",
+            "cardPM": "f3b7c21edcc6f284e29091e59cbacda26536bb846db913c819b2dbdd3b2e9828",
+            "cpu_ref_default": "f3b7c21edcc6f284e29091e59cbacda26536bb846db913c819b2dbdd3b2e9828",
+            "simHIP": null,
+            "simPM_default": "f3b7c21edcc6f284e29091e59cbacda26536bb846db913c819b2dbdd3b2e9828"
+          }
+        }
+      ],
+      "pm_symbol": "gemm_fp8b128_moe_grouped_fp8mfma_pm",
+      "poison_byte": "0xee",
+      "seed": "0x6d6f6501",
+      "shape": {
+        "adversarial": false,
+        "expert_stride": 8448,
+        "experts": 3,
+        "k": 128,
+        "live_rows": 36,
+        "r": 64,
+        "sorted_rows": 52,
+        "tile_desc": [
+          [
+            2,
+            0,
+            16,
+            0
+          ],
+          [
+            2,
+            16,
+            4,
+            0
+          ],
+          [
+            0,
+            20,
+            16,
+            0
+          ],
+          [
+            -1,
+            36,
+            16,
+            0
+          ]
+        ],
+        "tiles": 4,
+        "x_row_div": 2
+      },
+      "status": "PASS",
+      "wall_seconds": 0.033203437
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 25344,
+          "name": "W",
+          "output": false,
+          "sha256": "7c45caaf8d209e7dc69a66aa094f05155708e07ddb6539e773b02091fe758bac"
+        },
+        {
+          "bytes": 32,
+          "name": "tile_desc",
+          "output": false,
+          "sha256": "452a0a8785496d60abf3b2bd2d9425c712c09f4645c41cdd571ef6aa5deeadf3"
+        },
+        {
+          "bytes": 128,
+          "name": "sorted_rows",
+          "output": false,
+          "sha256": "9cc4af30860e840993123edb0ba85c11f43cd467c66b0c3eaeae973288feefa0"
+        },
+        {
+          "bytes": 2560,
+          "name": "X",
+          "output": false,
+          "sha256": "3cd86dce9291a6f2b313d293700200feabfdf323ed1363c27a19b36b9b7eaadc"
+        },
+        {
+          "bytes": 80,
+          "name": "x_scale",
+          "output": false,
+          "sha256": "4ef4b9d0ca8d18685657b320e447a08e641924965c62d740ed57adab0320d5da"
+        },
+        {
+          "bytes": 8192,
+          "name": "Y",
+          "output": true,
+          "sha256": null
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "moe adversarial R64 K128",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        1,
+        2,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `gemm_fp8b128_moe_grouped_fp8mfma`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "gemm_fp8b128_moe_grouped_fp8mfma",
+      "kernarg_bytes": 68,
+      "kernel": "moe_gate_up",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Exact",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Serial",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Grouped(4)",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Grouped(8)",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Grouped(16)",
+          "reference_error": null,
+          "simPM_error": null
+        },
+        {
+          "b_cardPM_matches_cpu_ref": false,
+          "c_cardPM_matches_simPM": false,
+          "default": false,
+          "model": "Grouped(32)",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused",
+        "Exact",
+        "Serial",
+        "Grouped(4)",
+        "Grouped(8)",
+        "Grouped(16)",
+        "Grouped(32)"
+      ],
+      "module": "fp8_moe_gate_up",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 8192,
+            "elements": 2048,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 8192,
+            "length_rhs": 8192,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 8192,
+              "default_model": true,
+              "elements": 2048,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 5,
+                  "index": "0x345",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.9",
+                  "rhs_hex": "0x4884ccdd",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.023",
+                  "rhs_hex": "0x4647c818",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.4155",
+                  "rhs_hex": "0xc5f6cb53",
+                  "row": 13
+                },
+                {
+                  "col": 61,
+                  "index": "0x37d",
+                  "lhs": "20610.05",
+                  "lhs_hex": "0x46a1041a",
+                  "rhs": "20610.049",
+                  "rhs_hex": "0x46a10419",
+                  "row": 13
+                },
+                {
+                  "col": 62,
+                  "index": "0x37e",
+                  "lhs": "-6140.8594",
+                  "lhs_hex": "0xc5bfe6e0",
+                  "rhs": "-6140.8535",
+                  "rhs_hex": "0xc5bfe6d4",
+                  "row": 13
+                },
+                {
+                  "col": 5,
+                  "index": "0x3c5",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.9",
+                  "rhs_hex": "0x4884ccdd",
+                  "row": 15
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 12,
+              "mismatch_bytes": 23,
+              "mismatch_elements": 22,
+              "model": "Exact",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 5,
+                  "index": "0x345",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.84",
+                  "rhs_hex": "0x4884ccdb",
+                  "row": 13
+                },
+                {
+                  "col": 6,
+                  "index": "0x346",
+                  "lhs": "91062.836",
+                  "lhs_hex": "0x47b1db6b",
+                  "rhs": "91062.86",
+                  "rhs_hex": "0x47b1db6e",
+                  "row": 13
+                },
+                {
+                  "col": 13,
+                  "index": "0x34d",
+                  "lhs": "-26153.127",
+                  "lhs_hex": "0xc6cc5241",
+                  "rhs": "-26153.125",
+                  "rhs_hex": "0xc6cc5240",
+                  "row": 13
+                },
+                {
+                  "col": 21,
+                  "index": "0x355",
+                  "lhs": "-82126.305",
+                  "lhs_hex": "0xc7a06727",
+                  "rhs": "-82126.3",
+                  "rhs_hex": "0xc7a06726",
+                  "row": 13
+                },
+                {
+                  "col": 22,
+                  "index": "0x356",
+                  "lhs": "58164.023",
+                  "lhs_hex": "0x47633406",
+                  "rhs": "58164.03",
+                  "rhs_hex": "0x47633408",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 30,
+                  "index": "0x35e",
+                  "lhs": "229436.14",
+                  "lhs_hex": "0x48600f09",
+                  "rhs": "229436.11",
+                  "rhs_hex": "0x48600f07",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.242",
+                  "rhs_hex": "0x471e973e",
+                  "row": 13
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 40,
+              "mismatch_bytes": 35,
+              "mismatch_elements": 34,
+              "model": "Serial",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 13,
+                  "index": "0x34d",
+                  "lhs": "-26153.127",
+                  "lhs_hex": "0xc6cc5241",
+                  "rhs": "-26153.125",
+                  "rhs_hex": "0xc6cc5240",
+                  "row": 13
+                },
+                {
+                  "col": 21,
+                  "index": "0x355",
+                  "lhs": "-82126.305",
+                  "lhs_hex": "0xc7a06727",
+                  "rhs": "-82126.3",
+                  "rhs_hex": "0xc7a06726",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.242",
+                  "rhs_hex": "0x471e973e",
+                  "row": 13
+                },
+                {
+                  "col": 38,
+                  "index": "0x366",
+                  "lhs": "335049.63",
+                  "lhs_hex": "0x48a39934",
+                  "rhs": "335049.6",
+                  "rhs_hex": "0x48a39933",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.035",
+                  "rhs_hex": "0x4647c824",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.414",
+                  "rhs_hex": "0xc5f6cb50",
+                  "row": 13
+                },
+                {
+                  "col": 54,
+                  "index": "0x376",
+                  "lhs": "513658.25",
+                  "lhs_hex": "0x48facf48",
+                  "rhs": "513658.2",
+                  "rhs_hex": "0x48facf46",
+                  "row": 13
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 48,
+              "mismatch_bytes": 29,
+              "mismatch_elements": 28,
+              "model": "Grouped(4)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.0205",
+                  "rhs_hex": "0x4647c815",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.414",
+                  "rhs_hex": "0xc5f6cb50",
+                  "row": 13
+                },
+                {
+                  "col": 62,
+                  "index": "0x37e",
+                  "lhs": "-6140.8594",
+                  "lhs_hex": "0xc5bfe6e0",
+                  "rhs": "-6140.837",
+                  "rhs_hex": "0xc5bfe6b2",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x3dd",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 15
+                },
+                {
+                  "col": 37,
+                  "index": "0x3e5",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 15
+                },
+                {
+                  "col": 46,
+                  "index": "0x3ee",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.0205",
+                  "rhs_hex": "0x4647c815",
+                  "row": 15
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 46,
+              "mismatch_bytes": 22,
+              "mismatch_elements": 21,
+              "model": "Grouped(8)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.016",
+                  "rhs_hex": "0x4647c810",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.4155",
+                  "rhs_hex": "0xc5f6cb53",
+                  "row": 13
+                },
+                {
+                  "col": 62,
+                  "index": "0x37e",
+                  "lhs": "-6140.8594",
+                  "lhs_hex": "0xc5bfe6e0",
+                  "rhs": "-6140.8545",
+                  "rhs_hex": "0xc5bfe6d6",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x3dd",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 15
+                },
+                {
+                  "col": 37,
+                  "index": "0x3e5",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 15
+                },
+                {
+                  "col": 46,
+                  "index": "0x3ee",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.016",
+                  "rhs_hex": "0x4647c810",
+                  "row": 15
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 10,
+              "mismatch_bytes": 16,
+              "mismatch_elements": 15,
+              "model": "Grouped(16)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 5,
+                  "index": "0x345",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.9",
+                  "rhs_hex": "0x4884ccdd",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.023",
+                  "rhs_hex": "0x4647c818",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.4155",
+                  "rhs_hex": "0xc5f6cb53",
+                  "row": 13
+                },
+                {
+                  "col": 61,
+                  "index": "0x37d",
+                  "lhs": "20610.05",
+                  "lhs_hex": "0x46a1041a",
+                  "rhs": "20610.049",
+                  "rhs_hex": "0x46a10419",
+                  "row": 13
+                },
+                {
+                  "col": 62,
+                  "index": "0x37e",
+                  "lhs": "-6140.8594",
+                  "lhs_hex": "0xc5bfe6e0",
+                  "rhs": "-6140.8535",
+                  "rhs_hex": "0xc5bfe6d4",
+                  "row": 13
+                },
+                {
+                  "col": 5,
+                  "index": "0x3c5",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.9",
+                  "rhs_hex": "0x4884ccdd",
+                  "row": 15
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 12,
+              "mismatch_bytes": 23,
+              "mismatch_elements": 22,
+              "model": "Grouped(32)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 8192,
+              "default_model": true,
+              "elements": 2048,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 5,
+                  "index": "0x345",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.9",
+                  "rhs_hex": "0x4884ccdd",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.023",
+                  "rhs_hex": "0x4647c818",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.4155",
+                  "rhs_hex": "0xc5f6cb53",
+                  "row": 13
+                },
+                {
+                  "col": 61,
+                  "index": "0x37d",
+                  "lhs": "20610.05",
+                  "lhs_hex": "0x46a1041a",
+                  "rhs": "20610.049",
+                  "rhs_hex": "0x46a10419",
+                  "row": 13
+                },
+                {
+                  "col": 62,
+                  "index": "0x37e",
+                  "lhs": "-6140.8594",
+                  "lhs_hex": "0xc5bfe6e0",
+                  "rhs": "-6140.8535",
+                  "rhs_hex": "0xc5bfe6d4",
+                  "row": 13
+                },
+                {
+                  "col": 5,
+                  "index": "0x3c5",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.9",
+                  "rhs_hex": "0x4884ccdd",
+                  "row": 15
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 12,
+              "mismatch_bytes": 23,
+              "mismatch_elements": 22,
+              "model": "Exact",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 5,
+                  "index": "0x345",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.84",
+                  "rhs_hex": "0x4884ccdb",
+                  "row": 13
+                },
+                {
+                  "col": 6,
+                  "index": "0x346",
+                  "lhs": "91062.836",
+                  "lhs_hex": "0x47b1db6b",
+                  "rhs": "91062.86",
+                  "rhs_hex": "0x47b1db6e",
+                  "row": 13
+                },
+                {
+                  "col": 13,
+                  "index": "0x34d",
+                  "lhs": "-26153.127",
+                  "lhs_hex": "0xc6cc5241",
+                  "rhs": "-26153.125",
+                  "rhs_hex": "0xc6cc5240",
+                  "row": 13
+                },
+                {
+                  "col": 21,
+                  "index": "0x355",
+                  "lhs": "-82126.305",
+                  "lhs_hex": "0xc7a06727",
+                  "rhs": "-82126.3",
+                  "rhs_hex": "0xc7a06726",
+                  "row": 13
+                },
+                {
+                  "col": 22,
+                  "index": "0x356",
+                  "lhs": "58164.023",
+                  "lhs_hex": "0x47633406",
+                  "rhs": "58164.03",
+                  "rhs_hex": "0x47633408",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 30,
+                  "index": "0x35e",
+                  "lhs": "229436.14",
+                  "lhs_hex": "0x48600f09",
+                  "rhs": "229436.11",
+                  "rhs_hex": "0x48600f07",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.242",
+                  "rhs_hex": "0x471e973e",
+                  "row": 13
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 40,
+              "mismatch_bytes": 35,
+              "mismatch_elements": 34,
+              "model": "Serial",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 13,
+                  "index": "0x34d",
+                  "lhs": "-26153.127",
+                  "lhs_hex": "0xc6cc5241",
+                  "rhs": "-26153.125",
+                  "rhs_hex": "0xc6cc5240",
+                  "row": 13
+                },
+                {
+                  "col": 21,
+                  "index": "0x355",
+                  "lhs": "-82126.305",
+                  "lhs_hex": "0xc7a06727",
+                  "rhs": "-82126.3",
+                  "rhs_hex": "0xc7a06726",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.242",
+                  "rhs_hex": "0x471e973e",
+                  "row": 13
+                },
+                {
+                  "col": 38,
+                  "index": "0x366",
+                  "lhs": "335049.63",
+                  "lhs_hex": "0x48a39934",
+                  "rhs": "335049.6",
+                  "rhs_hex": "0x48a39933",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.035",
+                  "rhs_hex": "0x4647c824",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.414",
+                  "rhs_hex": "0xc5f6cb50",
+                  "row": 13
+                },
+                {
+                  "col": 54,
+                  "index": "0x376",
+                  "lhs": "513658.25",
+                  "lhs_hex": "0x48facf48",
+                  "rhs": "513658.2",
+                  "rhs_hex": "0x48facf46",
+                  "row": 13
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 48,
+              "mismatch_bytes": 29,
+              "mismatch_elements": 28,
+              "model": "Grouped(4)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.0205",
+                  "rhs_hex": "0x4647c815",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.414",
+                  "rhs_hex": "0xc5f6cb50",
+                  "row": 13
+                },
+                {
+                  "col": 62,
+                  "index": "0x37e",
+                  "lhs": "-6140.8594",
+                  "lhs_hex": "0xc5bfe6e0",
+                  "rhs": "-6140.837",
+                  "rhs_hex": "0xc5bfe6b2",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x3dd",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 15
+                },
+                {
+                  "col": 37,
+                  "index": "0x3e5",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 15
+                },
+                {
+                  "col": 46,
+                  "index": "0x3ee",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.0205",
+                  "rhs_hex": "0x4647c815",
+                  "row": 15
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 46,
+              "mismatch_bytes": 22,
+              "mismatch_elements": 21,
+              "model": "Grouped(8)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.016",
+                  "rhs_hex": "0x4647c810",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.4155",
+                  "rhs_hex": "0xc5f6cb53",
+                  "row": 13
+                },
+                {
+                  "col": 62,
+                  "index": "0x37e",
+                  "lhs": "-6140.8594",
+                  "lhs_hex": "0xc5bfe6e0",
+                  "rhs": "-6140.8545",
+                  "rhs_hex": "0xc5bfe6d6",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x3dd",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 15
+                },
+                {
+                  "col": 37,
+                  "index": "0x3e5",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 15
+                },
+                {
+                  "col": 46,
+                  "index": "0x3ee",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.016",
+                  "rhs_hex": "0x4647c810",
+                  "row": 15
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 10,
+              "mismatch_bytes": 16,
+              "mismatch_elements": 15,
+              "model": "Grouped(16)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            },
+            {
+              "bytes": 8192,
+              "default_model": false,
+              "elements": 2048,
+              "first_mismatches": [
+                {
+                  "col": 5,
+                  "index": "0x345",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.9",
+                  "rhs_hex": "0x4884ccdd",
+                  "row": 13
+                },
+                {
+                  "col": 29,
+                  "index": "0x35d",
+                  "lhs": "119354.086",
+                  "lhs_hex": "0x47e91d0b",
+                  "rhs": "119354.09",
+                  "rhs_hex": "0x47e91d0c",
+                  "row": 13
+                },
+                {
+                  "col": 37,
+                  "index": "0x365",
+                  "lhs": "40599.254",
+                  "lhs_hex": "0x471e9741",
+                  "rhs": "40599.25",
+                  "rhs_hex": "0x471e9740",
+                  "row": 13
+                },
+                {
+                  "col": 46,
+                  "index": "0x36e",
+                  "lhs": "12786.012",
+                  "lhs_hex": "0x4647c80c",
+                  "rhs": "12786.023",
+                  "rhs_hex": "0x4647c818",
+                  "row": 13
+                },
+                {
+                  "col": 53,
+                  "index": "0x375",
+                  "lhs": "-7897.418",
+                  "lhs_hex": "0xc5f6cb58",
+                  "rhs": "-7897.4155",
+                  "rhs_hex": "0xc5f6cb53",
+                  "row": 13
+                },
+                {
+                  "col": 61,
+                  "index": "0x37d",
+                  "lhs": "20610.05",
+                  "lhs_hex": "0x46a1041a",
+                  "rhs": "20610.049",
+                  "rhs_hex": "0x46a10419",
+                  "row": 13
+                },
+                {
+                  "col": 62,
+                  "index": "0x37e",
+                  "lhs": "-6140.8594",
+                  "lhs_hex": "0xc5bfe6e0",
+                  "rhs": "-6140.8535",
+                  "rhs_hex": "0xc5bfe6d4",
+                  "row": 13
+                },
+                {
+                  "col": 5,
+                  "index": "0x3c5",
+                  "lhs": "271974.94",
+                  "lhs_hex": "0x4884ccde",
+                  "rhs": "271974.9",
+                  "rhs_hex": "0x4884ccdd",
+                  "row": 15
+                }
+              ],
+              "identical": false,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 8192,
+              "length_rhs": 8192,
+              "max_ulp_finite": 12,
+              "mismatch_bytes": 23,
+              "mismatch_elements": 22,
+              "model": "Grouped(32)",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "MISMATCH"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `gemm_fp8b128_moe_grouped_fp8mfma`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "Y",
+          "sha256": {
+            "cardHIP": "7953e0ed741e8dac357c0b86b584aac4086667258eeaccf74e05b18de74a7342",
+            "cardPM": "7953e0ed741e8dac357c0b86b584aac4086667258eeaccf74e05b18de74a7342",
+            "cpu_ref_default": "7953e0ed741e8dac357c0b86b584aac4086667258eeaccf74e05b18de74a7342",
+            "simHIP": null,
+            "simPM_default": "7953e0ed741e8dac357c0b86b584aac4086667258eeaccf74e05b18de74a7342"
+          }
+        }
+      ],
+      "pm_symbol": "gemm_fp8b128_moe_grouped_fp8mfma_pm",
+      "poison_byte": "0xee",
+      "seed": "0x6d6f6502",
+      "shape": {
+        "adversarial": true,
+        "expert_stride": 8448,
+        "experts": 3,
+        "k": 128,
+        "live_rows": 32,
+        "r": 64,
+        "sorted_rows": 32,
+        "tile_desc": [
+          [
+            1,
+            0,
+            16,
+            0
+          ],
+          [
+            0,
+            16,
+            16,
+            0
+          ]
+        ],
+        "tiles": 2,
+        "x_row_div": 1
+      },
+      "status": "PASS",
+      "wall_seconds": 0.013682869
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 3096,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 12288,
+          "name": "src",
+          "output": false,
+          "sha256": "e683afd763634fcf771401bc90e8915fc70f1d8fff2eaa7fd3b4ed63523facc2"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H2 encode random (6 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        2,
+        6,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h2_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_encode_h2",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 3096,
+            "elements": 3096,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "qsa row (codes + f16 scales)",
+            "length_lhs": 3096,
+            "length_rhs": 3096,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 3096,
+              "default_model": true,
+              "elements": 3096,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 3096,
+              "length_rhs": 3096,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 3096,
+              "default_model": true,
+              "elements": 3096,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 3096,
+              "length_rhs": 3096,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "qsa row (codes + f16 scales)",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "9e6e824e749e671a09d5dbd004a7195c540d2f6e2db10d1061ea6ecfdf45ceb1",
+            "cardPM": "9e6e824e749e671a09d5dbd004a7195c540d2f6e2db10d1061ea6ecfdf45ceb1",
+            "cpu_ref_default": "9e6e824e749e671a09d5dbd004a7195c540d2f6e2db10d1061ea6ecfdf45ceb1",
+            "simHIP": null,
+            "simPM_default": "9e6e824e749e671a09d5dbd004a7195c540d2f6e2db10d1061ea6ecfdf45ceb1"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_encode_fp8_h2_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0x3482b7ab120d0497",
+      "shape": {
+        "generator": "random",
+        "head_dim": 256,
+        "kv_heads": 2,
+        "row_bytes": 516,
+        "rows": 6
+      },
+      "status": "PASS",
+      "wall_seconds": 0.008415474
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 2064,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 8192,
+          "name": "src",
+          "output": false,
+          "sha256": "51763d5967bb1c6bc2ca256c5e468babd93419ff5bcd3055462cc918f285273a"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H2 encode zero (4 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        2,
+        4,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h2_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_encode_h2",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 2064,
+            "elements": 2064,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "qsa row (codes + f16 scales)",
+            "length_lhs": 2064,
+            "length_rhs": 2064,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 2064,
+              "default_model": true,
+              "elements": 2064,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 2064,
+              "length_rhs": 2064,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 2064,
+              "default_model": true,
+              "elements": 2064,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 2064,
+              "length_rhs": 2064,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "qsa row (codes + f16 scales)",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "a277b0c66ddb9c648c2992d0ce694fcfd5fb0d57a7c31e4151b1f468b8213af2",
+            "cardPM": "a277b0c66ddb9c648c2992d0ce694fcfd5fb0d57a7c31e4151b1f468b8213af2",
+            "cpu_ref_default": "a277b0c66ddb9c648c2992d0ce694fcfd5fb0d57a7c31e4151b1f468b8213af2",
+            "simHIP": null,
+            "simPM_default": "a277b0c66ddb9c648c2992d0ce694fcfd5fb0d57a7c31e4151b1f468b8213af2"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_encode_fp8_h2_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0xbc1e91d8482add96",
+      "shape": {
+        "generator": "zero",
+        "head_dim": 256,
+        "kv_heads": 2,
+        "row_bytes": 516,
+        "rows": 4
+      },
+      "status": "PASS",
+      "wall_seconds": 0.005801922
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 10836,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 43008,
+          "name": "src",
+          "output": false,
+          "sha256": "1c90f31e1bccceda005ef3903a201e338bbe7b25163be7fe9d5cf1b9cef5dc1b"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H2 encode bump (21 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        2,
+        21,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h2_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_encode_h2",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 10836,
+            "elements": 10836,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "qsa row (codes + f16 scales)",
+            "length_lhs": 10836,
+            "length_rhs": 10836,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 10836,
+              "default_model": true,
+              "elements": 10836,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 10836,
+              "length_rhs": 10836,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 10836,
+              "default_model": true,
+              "elements": 10836,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 10836,
+              "length_rhs": 10836,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "qsa row (codes + f16 scales)",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "1b86ad9fe51196e25e385fe134c52de0aa9500e032f09ba555128d4993fc82dc",
+            "cardPM": "1b86ad9fe51196e25e385fe134c52de0aa9500e032f09ba555128d4993fc82dc",
+            "cpu_ref_default": "1b86ad9fe51196e25e385fe134c52de0aa9500e032f09ba555128d4993fc82dc",
+            "simHIP": null,
+            "simPM_default": "1b86ad9fe51196e25e385fe134c52de0aa9500e032f09ba555128d4993fc82dc"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_encode_fp8_h2_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0x61faaf229db35a60",
+      "shape": {
+        "generator": "bump",
+        "head_dim": 256,
+        "kv_heads": 2,
+        "row_bytes": 516,
+        "rows": 21
+      },
+      "status": "PASS",
+      "wall_seconds": 0.04761939
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 1032,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 4096,
+          "name": "src",
+          "output": false,
+          "sha256": "799caab1e775ab88996f375ab451d5a4486c6413182928fcd10958a3367f07cc"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H2 encode neg0 (2 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        2,
+        2,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h2_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_encode_h2",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 1032,
+            "elements": 1032,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "qsa row (codes + f16 scales)",
+            "length_lhs": 1032,
+            "length_rhs": 1032,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 1032,
+              "default_model": true,
+              "elements": 1032,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 1032,
+              "length_rhs": 1032,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 1032,
+              "default_model": true,
+              "elements": 1032,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 1032,
+              "length_rhs": 1032,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "qsa row (codes + f16 scales)",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "5cd289e90beacebd44edfcf39d8214313844c8cb5fd68853807e65f600c0fba0",
+            "cardPM": "5cd289e90beacebd44edfcf39d8214313844c8cb5fd68853807e65f600c0fba0",
+            "cpu_ref_default": "5cd289e90beacebd44edfcf39d8214313844c8cb5fd68853807e65f600c0fba0",
+            "simHIP": null,
+            "simPM_default": "5cd289e90beacebd44edfcf39d8214313844c8cb5fd68853807e65f600c0fba0"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_encode_fp8_h2_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0x7b48e303df2221b6",
+      "shape": {
+        "generator": "neg0",
+        "head_dim": 256,
+        "kv_heads": 2,
+        "row_bytes": 516,
+        "rows": 2
+      },
+      "status": "PASS",
+      "wall_seconds": 0.002863561
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 49152,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 12384,
+          "name": "src",
+          "output": false,
+          "sha256": "9b8f5499f42c07a918cdeb20b063510756f61e81e4bcba85cba4efc4e4d14706"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H2 decode all-codes (24 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        2,
+        24,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_decode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_decode_fp8_h2_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_decode_h2",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 49152,
+            "elements": 12288,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 49152,
+            "length_rhs": 49152,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 49152,
+              "default_model": true,
+              "elements": 12288,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 49152,
+              "length_rhs": 49152,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 49152,
+              "default_model": true,
+              "elements": 12288,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 49152,
+              "length_rhs": 49152,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_decode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "03a4322d84ff82e9d69f35942b7194c08c127641dabef172646c7dd9a1bbd41d",
+            "cardPM": "03a4322d84ff82e9d69f35942b7194c08c127641dabef172646c7dd9a1bbd41d",
+            "cpu_ref_default": "03a4322d84ff82e9d69f35942b7194c08c127641dabef172646c7dd9a1bbd41d",
+            "simHIP": null,
+            "simPM_default": "03a4322d84ff82e9d69f35942b7194c08c127641dabef172646c7dd9a1bbd41d"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_decode_fp8_h2_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0xcae4714ed59115d8",
+      "shape": {
+        "head_dim": 256,
+        "input": "all-codes",
+        "kv_heads": 2,
+        "row_bytes": 516,
+        "rows": 24
+      },
+      "status": "PASS",
+      "wall_seconds": 0.015473937
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 12288,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 3096,
+          "name": "src",
+          "output": false,
+          "sha256": "a26ce4cd3c56385ab9ed91e80c451fc8f6d389cb13d601ad5a5775a2622fd578"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H2 decode encoded-random (6 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        2,
+        6,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_decode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_decode_fp8_h2_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_decode_h2",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 12288,
+            "elements": 3072,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 12288,
+            "length_rhs": 12288,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 12288,
+              "default_model": true,
+              "elements": 3072,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 12288,
+              "length_rhs": 12288,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 12288,
+              "default_model": true,
+              "elements": 3072,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 12288,
+              "length_rhs": 12288,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_decode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "c4fb7fdfcfd665fb34a55602bfca60f5c89330a7933781c7f7c34173610ea369",
+            "cardPM": "c4fb7fdfcfd665fb34a55602bfca60f5c89330a7933781c7f7c34173610ea369",
+            "cpu_ref_default": "c4fb7fdfcfd665fb34a55602bfca60f5c89330a7933781c7f7c34173610ea369",
+            "simHIP": null,
+            "simPM_default": "c4fb7fdfcfd665fb34a55602bfca60f5c89330a7933781c7f7c34173610ea369"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_decode_fp8_h2_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0xb28231a07fb916f8",
+      "shape": {
+        "head_dim": 256,
+        "input": "encoded-random",
+        "kv_heads": 2,
+        "row_bytes": 516,
+        "rows": 6
+      },
+      "status": "PASS",
+      "wall_seconds": 0.001357645
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 6192,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 24576,
+          "name": "src",
+          "output": false,
+          "sha256": "2a7998da74202b338c2a7392ba05ad9c429ce0c32f44405d6b869de4c6cc2722"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H4 encode random (6 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        4,
+        6,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h4_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_encode_h4",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 6192,
+            "elements": 6192,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "qsa row (codes + f16 scales)",
+            "length_lhs": 6192,
+            "length_rhs": 6192,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 6192,
+              "default_model": true,
+              "elements": 6192,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 6192,
+              "length_rhs": 6192,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 6192,
+              "default_model": true,
+              "elements": 6192,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 6192,
+              "length_rhs": 6192,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "qsa row (codes + f16 scales)",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "ff5d1546d9419f0414e0ab3325d277fb91b71c7e7b0848636daded2b30c3d9a3",
+            "cardPM": "ff5d1546d9419f0414e0ab3325d277fb91b71c7e7b0848636daded2b30c3d9a3",
+            "cpu_ref_default": "ff5d1546d9419f0414e0ab3325d277fb91b71c7e7b0848636daded2b30c3d9a3",
+            "simHIP": null,
+            "simPM_default": "ff5d1546d9419f0414e0ab3325d277fb91b71c7e7b0848636daded2b30c3d9a3"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_encode_fp8_h4_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0x3482b7ab120d0297",
+      "shape": {
+        "generator": "random",
+        "head_dim": 256,
+        "kv_heads": 4,
+        "row_bytes": 1032,
+        "rows": 6
+      },
+      "status": "PASS",
+      "wall_seconds": 0.017017212
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 4128,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 16384,
+          "name": "src",
+          "output": false,
+          "sha256": "ced16eca75a15773e23a4c7eb9626c339dd3722fa326e3eb972f03daa9c2d1c8"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H4 encode zero (4 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        4,
+        4,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h4_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_encode_h4",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 4128,
+            "elements": 4128,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "qsa row (codes + f16 scales)",
+            "length_lhs": 4128,
+            "length_rhs": 4128,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 4128,
+              "default_model": true,
+              "elements": 4128,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 4128,
+              "length_rhs": 4128,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 4128,
+              "default_model": true,
+              "elements": 4128,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 4128,
+              "length_rhs": 4128,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "qsa row (codes + f16 scales)",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "8814bfd0d21648529254696befdb874f9c2654ed5d62d740ecad19cd16fd83dc",
+            "cardPM": "8814bfd0d21648529254696befdb874f9c2654ed5d62d740ecad19cd16fd83dc",
+            "cpu_ref_default": "8814bfd0d21648529254696befdb874f9c2654ed5d62d740ecad19cd16fd83dc",
+            "simHIP": null,
+            "simPM_default": "8814bfd0d21648529254696befdb874f9c2654ed5d62d740ecad19cd16fd83dc"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_encode_fp8_h4_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0xbc1e91d8482adb96",
+      "shape": {
+        "generator": "zero",
+        "head_dim": 256,
+        "kv_heads": 4,
+        "row_bytes": 1032,
+        "rows": 4
+      },
+      "status": "PASS",
+      "wall_seconds": 0.011674131
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 11352,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 45056,
+          "name": "src",
+          "output": false,
+          "sha256": "b6b76b3c835a1ec1ffee5ac5dde868ce2d05a0fad4666c19925a79079fe611c8"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H4 encode bump (11 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        4,
+        11,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h4_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_encode_h4",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 11352,
+            "elements": 11352,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "qsa row (codes + f16 scales)",
+            "length_lhs": 11352,
+            "length_rhs": 11352,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 11352,
+              "default_model": true,
+              "elements": 11352,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 11352,
+              "length_rhs": 11352,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 11352,
+              "default_model": true,
+              "elements": 11352,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 11352,
+              "length_rhs": 11352,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "qsa row (codes + f16 scales)",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "806cfcb31664889b9b532aacc5e3736ebc6c7165e2451e075aa7ec83749b009b",
+            "cardPM": "806cfcb31664889b9b532aacc5e3736ebc6c7165e2451e075aa7ec83749b009b",
+            "cpu_ref_default": "806cfcb31664889b9b532aacc5e3736ebc6c7165e2451e075aa7ec83749b009b",
+            "simHIP": null,
+            "simPM_default": "806cfcb31664889b9b532aacc5e3736ebc6c7165e2451e075aa7ec83749b009b"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_encode_fp8_h4_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0x61faaf229db35c60",
+      "shape": {
+        "generator": "bump",
+        "head_dim": 256,
+        "kv_heads": 4,
+        "row_bytes": 1032,
+        "rows": 11
+      },
+      "status": "PASS",
+      "wall_seconds": 0.034592349
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 2064,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 8192,
+          "name": "src",
+          "output": false,
+          "sha256": "a7717cc64e1ca1e0f3fb2a291ba6a27ed92c8af36a72c99e47e829441c96e5c7"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H4 encode neg0 (2 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        4,
+        2,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h4_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_encode_h4",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 2064,
+            "elements": 2064,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": null,
+            "kind": "qsa row (codes + f16 scales)",
+            "length_lhs": 2064,
+            "length_rhs": 2064,
+            "max_ulp_finite": null,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": null,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 2064,
+              "default_model": true,
+              "elements": 2064,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 2064,
+              "length_rhs": 2064,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 2064,
+              "default_model": true,
+              "elements": 2064,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": null,
+              "kind": "qsa row (codes + f16 scales)",
+              "length_lhs": 2064,
+              "length_rhs": 2064,
+              "max_ulp_finite": null,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": null,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "qsa row (codes + f16 scales)",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "d1de323886b3909bcd4b96703978faf67e89452e6e601dde09f87a1c591b3a70",
+            "cardPM": "d1de323886b3909bcd4b96703978faf67e89452e6e601dde09f87a1c591b3a70",
+            "cpu_ref_default": "d1de323886b3909bcd4b96703978faf67e89452e6e601dde09f87a1c591b3a70",
+            "simHIP": null,
+            "simPM_default": "d1de323886b3909bcd4b96703978faf67e89452e6e601dde09f87a1c591b3a70"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_encode_fp8_h4_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0x7b48e303df2227b6",
+      "shape": {
+        "generator": "neg0",
+        "head_dim": 256,
+        "kv_heads": 4,
+        "row_bytes": 1032,
+        "rows": 2
+      },
+      "status": "PASS",
+      "wall_seconds": 0.00576569
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 98304,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 24768,
+          "name": "src",
+          "output": false,
+          "sha256": "e7a6b73b2b3d8f4c724eaee2a57f072a7276ebc855cacf0e41db81d1cd6836e1"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H4 decode all-codes (24 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        4,
+        24,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_decode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_decode_fp8_h4_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_decode_h4",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 98304,
+            "elements": 24576,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 98304,
+            "length_rhs": 98304,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 98304,
+              "default_model": true,
+              "elements": 24576,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 98304,
+              "length_rhs": 98304,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 98304,
+              "default_model": true,
+              "elements": 24576,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 98304,
+              "length_rhs": 98304,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_decode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "ab14099cd5e7ff29b545ec5cfaa69415dfad4c4a84fec806c895c5cfb48dd5fe",
+            "cardPM": "ab14099cd5e7ff29b545ec5cfaa69415dfad4c4a84fec806c895c5cfb48dd5fe",
+            "cpu_ref_default": "ab14099cd5e7ff29b545ec5cfaa69415dfad4c4a84fec806c895c5cfb48dd5fe",
+            "simHIP": null,
+            "simPM_default": "ab14099cd5e7ff29b545ec5cfaa69415dfad4c4a84fec806c895c5cfb48dd5fe"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_decode_fp8_h4_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0xcae4714ed59113d8",
+      "shape": {
+        "head_dim": 256,
+        "input": "all-codes",
+        "kv_heads": 4,
+        "row_bytes": 1032,
+        "rows": 24
+      },
+      "status": "PASS",
+      "wall_seconds": 0.015115059
+    },
+    {
+      "a_cardPM_vs_cardHIP": true,
+      "b_default_cardPM_vs_cpu_ref": true,
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "buffers": [
+        {
+          "bytes": 24576,
+          "name": "dst",
+          "output": true,
+          "sha256": null
+        },
+        {
+          "bytes": 6192,
+          "name": "src",
+          "output": false,
+          "sha256": "532fcaffd4b21f6af1bda863b8c87b62c3c75ab3ff3d10dad10192ffaad8990b"
+        }
+      ],
+      "c_default_cardPM_vs_simPM": true,
+      "cardHIP_source": "hardware HIP twin",
+      "card_columns": "hardware",
+      "case": "H4 decode encoded-random (6 rows)",
+      "d_cardHIP_vs_simHIP": null,
+      "errors": [],
+      "grid": [
+        4,
+        6,
+        1
+      ],
+      "hip_emulation": {
+        "available": false,
+        "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_decode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_decode_fp8_h4_gfx942",
+      "kernarg_bytes": 16,
+      "kernel": "qsa_decode_h4",
+      "model_matches": [
+        {
+          "b_cardPM_matches_cpu_ref": true,
+          "c_cardPM_matches_simPM": true,
+          "default": true,
+          "model": "Cdna3Fused",
+          "reference_error": null,
+          "simPM_error": null
+        }
+      ],
+      "models": [
+        "Cdna3Fused"
+      ],
+      "module": "qsa_fp8_kv",
+      "outputs": [
+        {
+          "a_cardPM_vs_cardHIP": {
+            "bytes": 24576,
+            "elements": 6144,
+            "first_mismatches": [],
+            "identical": true,
+            "inf_mismatch_elements": 0,
+            "kind": "f32",
+            "length_lhs": 24576,
+            "length_rhs": 24576,
+            "max_ulp_finite": 0,
+            "mismatch_bytes": 0,
+            "mismatch_elements": 0,
+            "nan_mismatch_elements": 0,
+            "status": "compared"
+          },
+          "b_cardPM_vs_cpu_ref": [
+            {
+              "bytes": 24576,
+              "default_model": true,
+              "elements": 6144,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 24576,
+              "length_rhs": 24576,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "c_cardPM_vs_simPM": [
+            {
+              "bytes": 24576,
+              "default_model": true,
+              "elements": 6144,
+              "first_mismatches": [],
+              "identical": true,
+              "inf_mismatch_elements": 0,
+              "kind": "f32",
+              "length_lhs": 24576,
+              "length_rhs": 24576,
+              "max_ulp_finite": 0,
+              "mismatch_bytes": 0,
+              "mismatch_elements": 0,
+              "model": "Cdna3Fused",
+              "nan_mismatch_elements": 0,
+              "status": "compared",
+              "verdict": "match"
+            }
+          ],
+          "d_cardHIP_vs_simHIP": {
+            "reason": "HIP twin unavailable in the emulator: emulator cannot load the HIP twin `qsa_kv_decode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)",
+            "status": "unavailable"
+          },
+          "kind": "f32",
+          "output": "dst",
+          "sha256": {
+            "cardHIP": "ce0f3bb10946fc0655c4eb5a8f13aa351835e9ddad76efc5ccd9ca280b061cc1",
+            "cardPM": "ce0f3bb10946fc0655c4eb5a8f13aa351835e9ddad76efc5ccd9ca280b061cc1",
+            "cpu_ref_default": "ce0f3bb10946fc0655c4eb5a8f13aa351835e9ddad76efc5ccd9ca280b061cc1",
+            "simHIP": null,
+            "simPM_default": "ce0f3bb10946fc0655c4eb5a8f13aa351835e9ddad76efc5ccd9ca280b061cc1"
+          }
+        }
+      ],
+      "pm_symbol": "qsa_kv_decode_fp8_h4_pm_gfx942",
+      "poison_byte": "0xee",
+      "seed": "0xb28231a07fb910f8",
+      "shape": {
+        "head_dim": 256,
+        "input": "encoded-random",
+        "kv_heads": 4,
+        "row_bytes": 1032,
+        "rows": 6
+      },
+      "status": "PASS",
+      "wall_seconds": 0.002621043
+    }
+  ],
+  "code_object_version": "v6",
+  "complete": true,
+  "default_accum_model": "Cdna3Fused",
+  "errors": [],
+  "exit_ok": true,
+  "host": {
+    "arch": "x86_64",
+    "cpu_model": "INTEL(R) XEON(R) PLATINUM 8568Y+",
+    "cwd": "/scratch/g942/pmcdna/xfer",
+    "env": {
+      "HIP_VISIBLE_DEVICES": null,
+      "HSA_OVERRIDE_GFX_VERSION": null,
+      "ROCR_VISIBLE_DEVICES": null
+    },
+    "executable": "/scratch/g942/target-pmcdna/release/examples/cdna_card_tierc",
+    "hostname": "rocm-10-1-gpu-mi300x1-192gb-devcloud-atl1",
+    "kernel": "6.8.0-146-generic",
+    "logical_cpus": 20,
+    "os": "linux",
+    "unix_time": 1791969265,
+    "user": "root"
+  },
+  "hsaco": [
+    {
+      "bytes": 10680,
+      "error": null,
+      "name": "fp8_act_producer",
+      "path": "/scratch/g942/pmcdna/60bfa12b8af3d21ab311d8b7b2052b7fcd6409fe/hsaco/fp8_act_producer.hsaco",
+      "sha256": "c0c85a325872d21814af016760d9976ab90b5a232f873745bc877d3b2e58b105"
+    },
+    {
+      "bytes": 10696,
+      "error": null,
+      "name": "fp8_moe_gate_up",
+      "path": "/scratch/g942/pmcdna/60bfa12b8af3d21ab311d8b7b2052b7fcd6409fe/hsaco/fp8_moe_gate_up.hsaco",
+      "sha256": "f5f2d4aa9e517eff5b7a1f5976c18e394cbd30364e46ef872cbe4168141a322a"
+    },
+    {
+      "bytes": 13824,
+      "error": null,
+      "name": "qsa_fp8_kv",
+      "path": "/scratch/g942/pmcdna/60bfa12b8af3d21ab311d8b7b2052b7fcd6409fe/hsaco/qsa_fp8_kv.hsaco",
+      "sha256": "ed4ced2b9c5a4d52d1c41455edee1cfb7a7d530d6201ff63d5202b53ad089524"
+    }
+  ],
+  "hsaco_dir": "/scratch/g942/pmcdna/60bfa12b8af3d21ab311d8b7b2052b7fcd6409fe/hsaco",
+  "kernels": [
+    {
+      "hip_emulator_load": {
+        "available": false,
+        "reason": "emulator cannot load the HIP twin `pm_cdna_fp8_act_producer`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "pm_cdna_fp8_act_producer",
+      "kernel": "act_producer",
+      "module": "fp8_act_producer",
+      "pm_code_object_bytes": 4432,
+      "pm_code_object_sha256": "fcc4b3073cd275932206423e6bc90e040697c00070b4306de3f51204068e6102",
+      "pm_error": null,
+      "pm_symbol": "pm_cdna_fp8_act_producer",
+      "pm_words": 330
+    },
+    {
+      "hip_emulator_load": {
+        "available": false,
+        "reason": "emulator cannot load the HIP twin `gemm_fp8b128_moe_grouped_fp8mfma`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "gemm_fp8b128_moe_grouped_fp8mfma",
+      "kernel": "moe_gate_up",
+      "module": "fp8_moe_gate_up",
+      "pm_code_object_bytes": 4688,
+      "pm_code_object_sha256": "a3c4b280cc79b26a9a48d14d81189e807f3a2184062865879623bda6307e1081",
+      "pm_error": null,
+      "pm_symbol": "gemm_fp8b128_moe_grouped_fp8mfma_pm",
+      "pm_words": 259
+    },
+    {
+      "hip_emulator_load": {
+        "available": false,
+        "reason": "emulator cannot load the HIP twin `qsa_kv_encode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h2_gfx942",
+      "kernel": "qsa_encode_h2",
+      "module": "qsa_fp8_kv",
+      "pm_code_object_bytes": 3520,
+      "pm_code_object_sha256": "358bb503007d266c74b64315739ed7212ed94b4a723bfe05d8ff622eee4a63c3",
+      "pm_error": null,
+      "pm_symbol": "qsa_kv_encode_fp8_h2_pm_gfx942",
+      "pm_words": 161
+    },
+    {
+      "hip_emulator_load": {
+        "available": false,
+        "reason": "emulator cannot load the HIP twin `qsa_kv_encode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_encode_fp8_h4_gfx942",
+      "kernel": "qsa_encode_h4",
+      "module": "qsa_fp8_kv",
+      "pm_code_object_bytes": 3520,
+      "pm_code_object_sha256": "ad92909007255afad85f06d2888525231ec431cbab2032d96d1a30079a8dfb69",
+      "pm_error": null,
+      "pm_symbol": "qsa_kv_encode_fp8_h4_pm_gfx942",
+      "pm_words": 161
+    },
+    {
+      "hip_emulator_load": {
+        "available": false,
+        "reason": "emulator cannot load the HIP twin `qsa_kv_decode_fp8_h2_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_decode_fp8_h2_gfx942",
+      "kernel": "qsa_decode_h2",
+      "module": "qsa_fp8_kv",
+      "pm_code_object_bytes": 3024,
+      "pm_code_object_sha256": "5aaeaab0eb30356a0d9b51e19df8c4ee7c0e8b874eb8e38e2a7a6841dd58a5c3",
+      "pm_error": null,
+      "pm_symbol": "qsa_kv_decode_fp8_h2_pm_gfx942",
+      "pm_words": 37
+    },
+    {
+      "hip_emulator_load": {
+        "available": false,
+        "reason": "emulator cannot load the HIP twin `qsa_kv_decode_fp8_h4_gfx942`: fault: not an ELF file (bad magic)"
+      },
+      "hip_symbol": "qsa_kv_decode_fp8_h4_gfx942",
+      "kernel": "qsa_decode_h4",
+      "module": "qsa_fp8_kv",
+      "pm_code_object_bytes": 3024,
+      "pm_code_object_sha256": "4c78ea73dc99a029a571fe8271cd3f978de6856dcd34f3959dd0e3002bb26a98",
+      "pm_error": null,
+      "pm_symbol": "qsa_kv_decode_fp8_h4_pm_gfx942",
+      "pm_words": 37
+    }
+  ],
+  "mode": "card",
+  "poison_byte": "0xee",
+  "quick": true,
+  "runtime": {
+    "device": 0,
+    "device_arch": "gfx942",
+    "device_count": 1,
+    "hip_runtime_version": "7.16"
+  },
+  "schema": "cdna_card_tierc/1",
+  "summary": {
+    "cases": 18,
+    "fail": 0,
+    "pass": 18,
+    "setup_or_run_errors": 0
+  },
+  "tools": {
+    "clang": {
+      "command": "/opt/rocm/lib/llvm/bin/clang --version",
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang.cfg\n"
+    },
+    "hipcc": {
+      "command": "/opt/rocm/bin/hipcc --version",
+      "exit_code": 0,
+      "ok": true,
+      "stderr": "",
+      "stdout": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg\n"
+    }
+  },
+  "wall_seconds": 4.239929567
+}

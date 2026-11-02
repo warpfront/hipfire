@@ -2,8 +2,8 @@
 
 **Project**: HipFire — `feature/dispatch-unification`
 **Date**: 2026-06-01
-**Assessed by**: Nils Balkow-Tychsen (Senior QA Engineer Agent)
-**Codebase**: /home/bjoern/hipfire
+**Assessed by**: Senior QA review
+**Codebase**: local hipfire checkout
 **Scope**: Branch diff — `feature/dispatch-unification` vs `master` (33 commits)
 
 ---

@@ -1,0 +1,23 @@
+{
+  "prompt": "a photograph of a red apple on a wooden table, studio lighting",
+  "steps": 20,
+  "width": 1024,
+  "height": 1024,
+  "guidance": 3.5,
+  "sampler": "euler",
+  "scheduler": "simple",
+  "shift": 3.1581929,
+  "shift_mu": 1.15,
+  "source": "ComfyUI 0.31.0, FLUX.1-dev BFL single-file (flux1-dev.safetensors), noise_seed 7",
+  "note_noise": "init.latent is ComfyUI's OWN noise for seed 7, in VAE space, verified at mean 0.0021 / std 0.9997 in model space. Extracting it is much harder than it looks and THREE obvious routes fail, each producing a plausible 1 MB file with the correct name, shape and dtype. Check any regenerated init.latent by its statistics, never by its size; the gate asserts them.",
+  "note_noise_failures": [
+    "add_noise=disable does not hand ComfyUI our noise: on a flow-matching model noise_scaling(sigma0=1, noise=0, latent) = 1*0 + (1-1)*latent = 0, so the sampler starts from zeros. Visible as grey stripes.",
+    "KSamplerAdvanced(add_noise=enable, start_at_step=0, end_at_step=0) returns the ZEROS it was given: last_step=0 truncates sigmas to length 1, then the guard 'start_step < len(sigmas)-1' is '0 < 0', false, so KSampler.sample returns latent_image unchanged. Silent; the file looks fine and reads as a constant.",
+    "SamplerCustomAdvanced with a 1-element SIGMAS of value 1.0 returns +/-inf everywhere. CFGGuider.inner_sample ends with inverse_noise_scaling(sigmas[-1], samples), which for flow matching is latent/(1.0 - sigma); a 1-element array forces sigmas[-1] == sigmas[0] == 1.0, so it divides by zero. Sign survives, magnitude does not. ComfyUI's own AddNoise node calls nan_to_num(posinf=0) for this reason.",
+    "AddNoise(model, noise, sigmas, latent_image) is the node built for this job, but it is flagged experimental and raises 'Expected all tensors to be on the same device' because BasicScheduler returns CUDA sigmas while the noise and latent are on CPU."
+  ],
+  "note_noise_solution": "Use SamplerCustomAdvanced with ManualSigmas set to the single value 0.5. A 1-element array runs zero Euler iterations, so the two scalings are the only arithmetic applied and they cancel EXACTLY: noise_scaling(0.5, n, 0) = 0.5*n, then inverse_noise_scaling(0.5, .) = 0.5*n/(1-0.5) = n. 0.5 and 1-0.5 are exact in binary, so this is not an approximation, and sigma0=0.5 avoids the divide-by-zero that sigma0=1 hits. comfy.sample.prepare_noise depends only on shape and seed, so the noise recovered here is byte-identical to the noise the golden run drew from seed 7.",
+  "note_shift": "MEASURED, not derived. ComfyUI applies DYNAMIC SHIFTING: the shift is exp(mu), not mu. At 1024x1024 the resolution interpolation gives mu = 1.15, so the shift is exp(1.15) = 3.1581929. An earlier version of this fixture recorded 1.15 as the shift and forced hipfire onto that schedule, which is further from ComfyUI than the checkpoint's own static 3.0 would have been. shift_mu records the raw interpolation output so the two are never confused again.",
+  "note_shift_evidence": "Established by pinning ComfyUI to explicit sigma lists with ManualSigmas and diffing the resulting latents, all from identical seed-7 noise. Sampler node: KSamplerAdvanced(cfg=1.0, ConditioningZeroOut negative) vs SamplerCustomAdvanced+BasicGuider gives rel_l2 0.0000 - bit-identical, so the node is not a confound and cfg=1.0 genuinely skips the negative. Schedule: ComfyUI native vs a list built with shift=1.15 gives rel_l2 0.2474; ComfyUI native vs a list built with shift=exp(1.15)=3.158 gives rel_l2 0.0049, the residual being 6-decimal rounding in the hand-computed list. A whole-schedule difference is therefore worth ~0.25 of rel_l2 on its own, which also calibrates the gate: no tolerance below that can survive a scheduler mismatch, and a failing gate should suspect the schedule before the transformer.",
+  "regenerate": "1) init.latent: UNETLoader(flux1-dev) + DualCLIPLoader(clip_l, t5xxl_fp16, type=flux) + CLIPTextEncode(prompt) + FluxGuidance(3.5) + EmptySD3LatentImage(1024x1024) + BasicGuider(model, cond) + KSamplerSelect(euler) + ManualSigmas(\"0.5\") + RandomNoise(noise_seed=7) + SamplerCustomAdvanced + SaveLatent. The guider is wired but never called, because zero Euler iterations run. 2) golden.latent: same prefix + ConditioningZeroOut(CLIPTextEncode) as negative + KSamplerAdvanced(add_noise=enable, noise_seed=7, steps=20, cfg=1.0, euler/simple, start_at_step=0, end_at_step=10000, return_with_leftover_noise=disable) + SaveLatent."
+}

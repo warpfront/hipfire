@@ -4,10 +4,11 @@
 
 //! Ship 6 EP (expert-parallel) decode-parity validation for qwen3.x-A3B.
 //!
-//! Brings up `tp_size` replicated ranks via `Gpus::init_tp`, loads the model
-//! **replicated** on every rank, shards each MoE layer's routed experts per
-//! rank (`shard_all_moe_layers`), then greedy-decodes a fixed prompt through
-//! the EP forward driver (`qwen35::forward_ep` → all-reduce-EP executor).
+//! Brings up `tp_size` EP ranks via `Gpus::init_ep`, sealed-streaming-loads
+//! each rank's compact experts via `qwen35::load_weights_ep_rank` (owned
+//! experts only, zero dummies elsewhere), then greedy-decodes a fixed prompt
+//! through the EP forward driver (`qwen35::forward_ep` → all-reduce-EP
+//! executor).
 //!
 //! Two gates:
 //!   1. **In-process anchor (tp=1 only):** rank 0 owns all experts at tp=1, so
@@ -140,18 +141,26 @@ fn main() {
         prompt_tokens.len(),
     );
 
-    // ── bring up N ranks ────────────────────────────────────────────────────
-    let mut gpus = Gpus::init_tp(tp, config.n_layers).expect("init_tp");
+    // ── bring up N EP ranks ─────────────────────────────────────────────────
+    let mut gpus = Gpus::init_ep(tp, config.n_layers).expect("init_ep");
     let n = gpus.devices.len();
     assert_eq!(
         n, tp,
-        "init_tp gave {n} devices, expected {tp} (check HIP_VISIBLE_DEVICES)"
+        "init_ep gave {n} devices, expected {tp} (check HIP_VISIBLE_DEVICES)"
     );
     for (r, d) in gpus.devices.iter().enumerate() {
         eprintln!("  rank {r}: device_id={} arch={}", d.device_id, d.arch);
     }
 
-    // ── replicated load + per-rank expert shard ─────────────────────────────
+    // ── sealed per-rank streaming load ──────────────────────────────────────
+    // Each rank loads ONLY its plan-derived owned experts (local-slot order)
+    // with layout-specific zero dummies for non-owned globals — bounding the
+    // load peak to ~(sharded total + one layer) instead of the full model
+    // (which OOMs a >VRAM model like .mq6 even with EP). The cloned mesh +
+    // physical list keep the sealed plan mesh and the runtime topology in
+    // agreement.
+    let mesh = gpus.mesh.clone();
+    let physical_devices: Vec<i32> = gpus.devices.iter().map(|dev| dev.device_id).collect();
     let shard = ShardConfig::new(
         tp,
         /*tp_kv_replicate=*/ true,
@@ -163,28 +172,20 @@ fn main() {
     for r in 0..n {
         gpus.devices[r].bind_thread().expect("bind rank");
         let mut hfq = HfqFile::open(model_path).expect("reopen model");
-        eprintln!("  [rank {r}] streaming-load owned experts (EP shard) ...");
-        // Stream ONLY rank r's owned experts during load — load_moe_ffn reads
-        // this TLS shard context and skips non-owned experts, bounding the load
-        // peak to ~(sharded total + one layer) instead of the full model (which
-        // OOMs a >VRAM model like .mq6 even with EP). Cleared after the load.
-        qwen35::set_ep_expert_shard(Some((shard.clone(), r)));
-        let mut w = {
-            let mut src = qwen35::HfqSource::new(&mut hfq, &config);
-            let layout = qwen35::Layout::single(config.n_layers);
-            qwen35::load_weights(
-                &mut src,
-                std::slice::from_mut(&mut gpus.devices[r]),
-                &layout,
-            )
-        }
-        .expect("load_weights");
-        qwen35::set_ep_expert_shard(None);
+        eprintln!("  [rank {r}] sealed-streaming-load owned experts ...");
+        let w = qwen35::load_weights_ep_rank(
+            &mut hfq,
+            &mut gpus.devices[r],
+            &config,
+            &mesh,
+            &physical_devices,
+            shard.clone(),
+            r,
+        )
+        .expect("load_weights_ep_rank");
         weights_per_rank.push(w);
     }
-    eprintln!(
-        "  all ranks streaming-loaded + sharded (assign=stride: rank r owns experts e%{tp}==r)"
-    );
+    eprintln!("  all ranks sealed-loaded (assign=stride: rank r owns experts e%{tp}==r)");
 
     // ── per-rank state + routed partials (+ prefill scratch when batched) ────
     use hipfire_arch_qwen35::qwen35::PrefillBatchScratch;
@@ -286,6 +287,7 @@ fn main() {
                 &scratch_per_rank,
                 &pbs_per_rank,
                 &prefill_partials,
+                None,
             )
             .expect("forward_prefill_batch_ep chunk");
             offset += chunk_n;
@@ -305,6 +307,7 @@ fn main() {
                 &dn_per_rank,
                 &scratch_per_rank,
                 &partials,
+                None,
             )
             .expect("forward_ep prefill");
         }
@@ -335,6 +338,7 @@ fn main() {
             &dn_per_rank,
             &scratch_per_rank,
             &partials,
+            None,
         )
         .expect("forward_ep decode");
         gpus.devices[0].bind_thread().expect("bind 0");
@@ -378,13 +382,39 @@ fn main() {
     //    production prefill is itself token-by-token.) ──────
     if n == 1 && !batched_prefill {
         eprintln!("\n=== tp=1 anchor: production forward_scratch (unsharded rank 0) ===");
-        let mut kv_ref = KvCache::new_gpu_q8(
-            &mut gpus.devices[0],
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
+        // The reference MUST sit on the same KV tier as the EP side, or the
+        // anchor compares two tiers and reports a false ANCHOR FAIL on any
+        // non-q8 run (it did, on fwht3, before this was tier-aware).
+        let mut kv_ref = match kv_mode.as_str() {
+            "asym3" => KvCache::new_gpu_asym3(
+                &mut gpus.devices[0],
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            ),
+            "fwht3" => {
+                let is_kv: Vec<bool> = config
+                    .layer_types
+                    .iter()
+                    .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
+                    .collect();
+                KvCache::new_gpu_fwht3_filtered(
+                    &mut gpus.devices[0],
+                    &is_kv,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_seq,
+                )
+            }
+            _ => KvCache::new_gpu_q8(
+                &mut gpus.devices[0],
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            ),
+        }
         .expect("kv ref");
         let mut dn_ref = DeltaNetState::new(&mut gpus.devices[0], &config).expect("dn ref");
         let scratch_ref =

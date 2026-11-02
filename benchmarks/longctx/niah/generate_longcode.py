@@ -10,7 +10,7 @@ unchanged with --pretok / --write-pretok.
 
 The truncation to TRUNCATE_CHARS (~45K chars) is intentional: the
 0.8B drafter goes NaN at very long context (escalated as
-ScoringDegenerate in MANUAL_REVIEW.md). 13K source tokens stays
+ScoringDegenerate in docs/investigations/pflash/2026-05-manual-review.md). 13K source tokens stays
 well below the empirical 16K-17K boundary where NaN starts, so the
 fixture exercises PFlash on real code without hitting the unrelated
 drafter bug.
@@ -35,7 +35,7 @@ SOURCE = REPO / "crates" / "engine" / "src" / "pflash.rs"
 OUT = REPO / "benchmarks" / "prompts" / "longcode_pflash.jsonl"
 
 # Truncate to keep token count below the drafter NaN boundary (see
-# MANUAL_REVIEW.md "PFlash score kernel produces NaN at ~21K source tokens").
+# docs/investigations/pflash/2026-05-manual-review.md "PFlash score kernel produces NaN at ~21K source tokens").
 # 45K chars * 1/3.5 = ~13K tokens after chatml wrap, well below ~16K threshold.
 TRUNCATE_CHARS = 45000
 

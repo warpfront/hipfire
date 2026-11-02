@@ -1,0 +1,111 @@
+{
+  "scope": "Exact device observations for the seven gate classes in the 56-pair j607/j608 fixture diagnostic plus g=-inf; strict exact-key lookup only, no host exp2/divide fallback",
+  "base_sha256": "b87323681b415cc353cf4c170d03f535ba8838710da44b8960a55bb1b6c08afa",
+  "generic_sha256": "df5840430bc309ceed553e29c79428afc8f453dd2cfdcbf3a702528b54c323aa",
+  "mulup_pin_sha256": "2a504a9ccd0b0e892235f8fe93d2c4f0eebe04db33b8f0366efa637c03df79ab",
+  "exp2": [
+    {
+      "arg": 1055041773,
+      "result": 1068365908
+    },
+    {
+      "arg": 2143289344,
+      "result": 2143289344
+    },
+    {
+      "arg": 2143363909,
+      "result": 2143363909
+    },
+    {
+      "arg": 3202525421,
+      "result": 1060919986
+    },
+    {
+      "arg": 4290772992,
+      "result": 4290772992
+    },
+    {
+      "arg": 4291117857,
+      "result": 4291117857
+    }
+  ],
+  "ldexp": [
+    {
+      "arg": 1060919986,
+      "exponent": -1,
+      "result": 1052531378
+    },
+    {
+      "arg": 1068365908,
+      "exponent": 1,
+      "result": 1076754516
+    },
+    {
+      "arg": 2143289344,
+      "exponent": 0,
+      "result": 2143289344
+    },
+    {
+      "arg": 2143363909,
+      "exponent": 0,
+      "result": 2143363909
+    },
+    {
+      "arg": 4290772992,
+      "exponent": -2147483648,
+      "result": 4290772992
+    },
+    {
+      "arg": 4290772992,
+      "exponent": 2147483647,
+      "result": 4290772992
+    },
+    {
+      "arg": 4291117857,
+      "exponent": 0,
+      "result": 4291117857
+    }
+  ],
+  "divide": [
+    {
+      "numerator": 1065353216,
+      "denominator": 1068439212,
+      "result": 1060841128
+    },
+    {
+      "numerator": 2139095040,
+      "denominator": 1065353216,
+      "result": 2139095040
+    },
+    {
+      "numerator": 2139169605,
+      "denominator": 2143363909,
+      "result": 2143363909
+    },
+    {
+      "numerator": 2143289344,
+      "denominator": 2143289344,
+      "result": 2143289344
+    },
+    {
+      "numerator": 2143363909,
+      "denominator": 2143363909,
+      "result": 2143363909
+    },
+    {
+      "numerator": 3212836864,
+      "denominator": 1080948820,
+      "result": 3196695217
+    },
+    {
+      "numerator": 4286578688,
+      "denominator": 2139095040,
+      "result": 4290772992
+    },
+    {
+      "numerator": 4291117857,
+      "denominator": 4291117857,
+      "result": 4291117857
+    }
+  ]
+}

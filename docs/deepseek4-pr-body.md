@@ -1,6 +1,32 @@
 # Add DeepSeek V4 Flash support (arch_id=9)
 
-Bring DeepSeek V4 Flash onto the canonical upstream serving path.
+> **Lifecycle: historical — archived PR description (misplaced as a docs
+> page).** This file is the body text of the 2026-05 DeepSeek V4 Flash
+> bring-up PR, kept only for provenance. It is **not** current
+> documentation, a baseline, or an acceptance record. Specifically:
+> - Every number below is a 2026-05 `measured` observation on one
+>   machine, model build, and binary set (md5s listed), not a default,
+>   floor, or admission; current claims live in
+>   [`BENCHMARKS.md`](BENCHMARKS.md) and [`VALIDATION.md`](VALIDATION.md).
+> - The "Gates passed" section cites the retired `coherence-gate.sh`
+>   battery. Per [`VALIDATION.md`](VALIDATION.md) § "Retired coherence-gate
+>   scripts" that family is historical reproduction only, never promotion
+>   or acceptance.
+> - The "Deferred to follow-up PRs" and "Notes for reviewers" lists are
+>   PR-time state; the gfx12 and other items may since have changed.
+>   `hfq_split` now lives as `crates/saddle-lab/examples/hfq_split.rs`
+>   (archived research harness).
+> - Current owners for DeepSeek V4: [`architecture-ids.md`](architecture-ids.md)
+>   (arch 9), [`MODELS.md`](MODELS.md), [`env-vars.md`](env-vars.md), and
+>   the code in `crates/hipfire-arch-deepseek4/`.
+>
+> **Recommendation:** this belongs in the PR / git history, not in `docs/`.
+> Move it under a historical archive directory (for example
+> `docs/plans/historical/`) or delete it once the PR record is judged
+> sufficient; that needs an [`INDEX.md`](INDEX.md) row update, so it is not
+> done here.
+
+Bring DeepSeek V4 Flash onto the main serving path.
 Targets the production `deepseek-v4-flash.mq2lloyd` build: MQ2-Lloyd
 routed experts (96 % of bytes), Q8_0 attention + router + shared-expert
 weights, F16 compressor / indexer / Hyper-Connections / norms. KV cache
@@ -43,7 +69,7 @@ DeepSeek V4 diverges from the qwen35 / LLaMA paths in five load-bearing places:
 
 ## Perf numbers (gfx1151 / Strix Halo / Radeon 8060S)
 
-All measured against `/data/hipfire-models/deepseek-v4-flash.mq2lloyd`
+All measured against a local copy of `deepseek-v4-flash.mq2lloyd`
 (arch_id=9, MTP layer in `deepseek-v4-flash-mtp.mq2lloyd` sidecar).
 
 | Config | PP tok/s | TG tok/s | Notes |
@@ -90,10 +116,10 @@ pointing at the split sidecar.
 - **`./scripts/coherence-gate.sh --full`**: DeepSeek V4 cases all OK
   (deepseek4-cap → "The capital of France is Paris.", deepseek4-reason → correct
   9-sheep reasoning, deepseek4-long-prefill → on-topic LRU-cache code review).
-  No hard errors. Report `/tmp/coherence-20260523-112955.md`.
+  No hard errors. Report kept locally (not committed).
 - **`./scripts/coherence-gate-deepseek4-mtp.sh --fast`**: deepseek4-mtp-code-k2 → OK,
   80.5% K=2 accept, 17.63 tok/s, unique_ratio=0.55, max_freq=0.062. No
-  hard errors. Report `/tmp/coherence-deepseek4-mtp-20260523-114823.md`.
+  hard errors. Report kept locally (not committed).
 
 ## MTP sidecar split
 
@@ -143,7 +169,7 @@ These are intentionally out of scope and clearly documented:
   drafter's seed but never emitted. Output stream starts at token 2.
   Same behaviour in `deepseek4_chat` and in `generate_deepseek4` — not introduced
   by this PR; flagging for awareness.
-- **HIP-graph kernarg-bake bug** (`feedback_deepseek4_hipgraphs_swa_kernarg_bug`)
+- **HIP-graph kernarg-bake bug**
   is a known issue on the DeepSeek V4 dev branch — captured at first decode then
   replayed with stable host-side update buffers. Default-on for gfx11/12;
   opt out via `HIPFIRE_DEEPSEEK4_GRAPH=0`.

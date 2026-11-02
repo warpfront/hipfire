@@ -103,9 +103,8 @@ mkdir -p "$MODEL_STORE" "$OUT/logits" "$OUT/prompts"
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
     cargo build --release -p hipfire-quantize --bin hipfire-quantize
-    cargo build --release --features deltanet -p hipfire-runtime \
-        --example greedy_dump_top5 \
-        --example decode_tokens
+    cargo build --release -p saddle-lab --features arch-qwen35 --example greedy_dump_top5
+    cargo build --release --features deltanet -p hipfire-runtime --example decode_tokens
 fi
 
 {
@@ -178,7 +177,7 @@ for format in "${FORMAT_ARR[@]}"; do
     fi
 done
 
-./scripts/quant_compare_top5.py "$OUT/logits/f32" "${specs[@]}" --wide-margin "$WIDE_MARGIN" \
+python3 -m tools.bench.quant_compare_top5 "$OUT/logits/f32" "${specs[@]}" --wide-margin "$WIDE_MARGIN" \
     > "$OUT/compare.json"
 
 {

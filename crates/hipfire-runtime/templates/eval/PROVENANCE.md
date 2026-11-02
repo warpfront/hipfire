@@ -29,3 +29,14 @@ already feeds reasoning-in-history (verbatim splice) and is validated-coherent,
 so froggeric+preserve is the same reasoning-in-history rendered via the trained
 template — low coherence risk. NEXT: wire qwen generate() to render via this
 (flag-gated) + reasoning_content from asst_turn_cache + run both coherence gates.
+
+- **qwen38-27b-mq6-official.jinja** — the Qwen3.8 27B chat_template, extracted
+  byte-exact (8952 bytes, sha256
+  `c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041`) from
+  `tokenizer_config.chat_template` in the HFQ metadata of registry artifact
+  `qwen3.8:27b-mq6` (`https://huggingface.co/hipfire-models/qwen3.8-27b/resolve/main/qwen3.8-27b.mq6`,
+  21750254592 B), via HTTP Range of the metadata JSON (file offset 14310342).
+  Identical to the template in local `qwen3.8-27b.mq4r`, `.mq4-pro`, and
+  `.mq4-xt.asym.hfq`. Natively supports `reasoning_effort` ∈ {low, medium, xhigh}
+  (default xhigh when undefined; high/max raise). Used by the
+  `prompt_frame.rs` effort-probe regression.

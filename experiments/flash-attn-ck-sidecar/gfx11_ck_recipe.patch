@@ -1,0 +1,218 @@
+diff --git a/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py b/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py
+index c00bdcea3..13fd303fa 100644
+--- a/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py
++++ b/example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py
+@@ -105,9 +105,22 @@ using fmha_pipeline = {F_pipeline}<
+     fmha_pipeline_problem>;
+ 
+ using fmha_epilogue =
+-    ck_tile::Default2DEpilogue<ck_tile::Default2DEpilogueProblem<typename FmhaFwdTypeConfig<fmha_dtype>::OaccDataType,
++    ck_tile::DefaultGemm2DEpilogue<ck_tile::DefaultGemm2DEpilogueProblem<
++                               typename FmhaFwdTypeConfig<fmha_dtype>::PDataType,
++                               typename FmhaFwdTypeConfig<fmha_dtype>::VDataType,
++                               ck_tile::tuple<>,
++                               typename FmhaFwdTypeConfig<fmha_dtype>::OaccDataType,
+                                typename FmhaFwdTypeConfig<fmha_dtype>::ODataType,
+-                               {F_spad}, {F_dvpad}>>;
++                               ck_tile::tuple<>,
++                               ck_tile::tensor_layout::gemm::RowMajor,
++                               ck_tile::element_wise::PassThrough,
++                               fmha_shape::kM0,
++                               fmha_shape::kN1,
++                               {F_spad}, {F_dvpad},
++                               fmha_shape::Gemm1WarpTile::at(ck_tile::number<0>{{}}),
++                               fmha_shape::Gemm1WarpTile::at(ck_tile::number<1>{{}}),
++                               fmha_shape::Gemm1WarpTile::at(ck_tile::number<2>{{}}),
++                               true>>;
+ 
+ using fmha_kernel = {F_kernel}<fmha_pipeline, fmha_epilogue>;
+ 
+@@ -1135,6 +1148,20 @@ class CustomFactory(KernelComponentFactoryGfx9, CompatibilityRuleFactoryGfx9):
+         return result
+ 
+ 
++class KernelComponentFactoryGfx11(KernelComponentFactoryGfx12):
++    arch = ArchTrait("gfx11")
++
++    @classmethod
++    def get_hdim_tile_size_dict(cls, dtype: str) -> Optional[dict]:
++        tiles = super().get_hdim_tile_size_dict(dtype)
++        if dtype in cls._DT_FP16_BF16:
++            tiles[(64, 64)] = [
++                FmhaFwdTileSize(64, 32, 32, 64, 32, 64, 4, 1, 1, 4, 1, 1, 16, 16, 16, 16, 16, 16, -1),
++                FmhaFwdTileSize(64, 64, 32, 64, 32, 64, 4, 1, 1, 4, 1, 1, 16, 16, 16, 16, 16, 16, -1),
++            ]
++        return tiles
++
++
+ def get_factory(target: str):
+     if os.environ.get("CK_TILE_FMHA_FWD_CUSTOM_FACTORY", "0") == "1":
+         return CustomFactory
+@@ -1146,6 +1173,8 @@ def get_factory(target: str):
+     if target.startswith("gfx9"):
+         return KernelComponentFactoryGfx9
+ 
++    if target.startswith("gfx11"):
++        return KernelComponentFactoryGfx11
+     if target.startswith("gfx12"):
+         return KernelComponentFactoryGfx12
+ 
+diff --git a/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs.hpp b/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs.hpp
+index 9e1eb3bde..a05746a39 100644
+--- a/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs.hpp
++++ b/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qr_ks_vs.hpp
+@@ -123,7 +123,10 @@ struct BlockFmhaPipelineQRKSVS
+ 
+     CK_TILE_HOST_DEVICE static constexpr ck_tile::index_t GetSmemSize()
+     {
+-        return Policy::template GetSmemSize<Problem>();
++        constexpr index_t kBaseSmemSize = Policy::template GetSmemSize<Problem>();
++        constexpr index_t kORemapSmemSize =
++            BlockFmhaShape::kM0 * BlockFmhaShape::kN1 * sizeof(ODataType);
++        return kBaseSmemSize > kORemapSmemSize ? kBaseSmemSize : kORemapSmemSize;
+     }
+ 
+     template <typename QDramBlockWindowTmp,
+@@ -225,6 +228,39 @@ struct BlockFmhaPipelineQRKSVS
+ 
+         // init Oacc, M, L
+         auto o_acc = OaccBlockTileType{};
++        constexpr index_t kNumWarps = kBlockSize / get_warp_size();
++        constexpr auto o_acc_result_dist = []() {
++            constexpr index_t M1 = kNumWarps;
++            constexpr index_t M2 = min(kM0 / M1, get_warp_size());
++            constexpr index_t N0 = get_warp_size() / M2;
++            constexpr index_t N1 = kN1 / N0;
++            constexpr index_t M0 = kM0 / (M2 * M1);
++
++            static_assert(kNumWarps * get_warp_size() <= kM0 * kN1);
++
++            return make_static_tile_distribution(
++                tile_distribution_encoding<sequence<1>,
++                                           tuple<sequence<M0, M1, M2>, sequence<N0, N1>>,
++                                           tuple<sequence<1>, sequence<1, 2>>,
++                                           tuple<sequence<1>, sequence<2, 0>>,
++                                           sequence<1, 2>,
++                                           sequence<0, 1>>{});
++        }();
++
++        auto remap_o_acc_for_epilogue = [&](const auto& o_tile_like) {
++            constexpr auto o_acc_lds_desc =
++                make_naive_tensor_descriptor_packed(make_tuple(number<kM0>{}, number<kN1>{}));
++            auto o_acc_lds_view = make_tensor_view<address_space_enum::lds>(
++                reinterpret_cast<ODataType*>(smem_ptr), o_acc_lds_desc);
++            auto o_acc_store_window =
++                make_tile_window(o_acc_lds_view, o_acc_lds_desc.get_lengths(), {0, 0});
++            store_tile(o_acc_store_window, o_tile_like);
++            block_sync_lds();
++
++            auto o_acc_result_window = make_tile_window(
++                o_acc_lds_view, o_acc_lds_desc.get_lengths(), {0, 0}, o_acc_result_dist);
++            return load_tile(o_acc_result_window);
++        };
+         auto m     = MLBlockTileType{};
+         auto l     = MLBlockTileType{};
+ 
+@@ -255,7 +291,8 @@ struct BlockFmhaPipelineQRKSVS
+ 
+                 // Note: here occ are all cleard, return it
+                 // Note: q loaded but no fence, ignore it.
+-                return o_acc;
++                return remap_o_acc_for_epilogue(
++                    cast_tile<ODataType>(tile_elementwise_in(o_acc_element_func, o_acc)));
+             }
+         }
+ 
+@@ -588,6 +625,28 @@ struct BlockFmhaPipelineQRKSVS
+             }
+ 
+             block_sync_lds();
++            const auto p_compute_casted =
++                cast_tile<PDataType>(tile_elementwise_in(p_compute_element_func, p_compute));
++            block_sync_lds();
++
++            constexpr auto p_shape  = make_tuple(number<kM0>{}, number<kN0>{});
++            constexpr auto p_origin = multi_index<2>{0, 0};
++            auto p_lds_ptr          = reinterpret_cast<PDataType*>(smem_ptr);
++            auto p_lds_desc         = make_naive_tensor_descriptor_packed(p_shape);
++            auto p_lds_view = make_tensor_view<address_space_enum::lds>(p_lds_ptr, p_lds_desc);
++
++            auto p_store_window = make_tile_window(
++                p_lds_view, p_shape, p_origin, p_compute_casted.get_tile_distribution());
++            store_tile(p_store_window, p_compute_casted);
++            block_sync_lds();
++
++            constexpr auto p_gemm_distribution =
++                Policy::template MakePRegTileDistribution<Problem>();
++            auto p_load_window =
++                make_tile_window(p_lds_view, p_shape, p_origin, p_gemm_distribution);
++            const auto p = load_tile(p_load_window);
++            block_sync_lds();
++
+             if constexpr(std::is_same_v<VLayout, ck_tile::tensor_layout::gemm::RowMajor>)
+             {
+                 auto v_shuffle_tmp = make_static_distributed_tensor<VDataType>(
+@@ -604,9 +663,6 @@ struct BlockFmhaPipelineQRKSVS
+             }
+             move_tile_window(v_dram_window, {0, kK1});
+ 
+-            const auto p =
+-                cast_tile<PDataType>(tile_elementwise_in(p_compute_element_func, p_compute));
+-
+             // STAGE 3, KV gemm
+             if constexpr(k1_loops > 1)
+             {
+@@ -699,9 +755,10 @@ struct BlockFmhaPipelineQRKSVS
+             });
+         });
+ 
+-        o_acc = tile_elementwise_in(o_acc_element_func, o_acc);
++        const auto o_acc_epilogue = tile_elementwise_in(o_acc_element_func, o_acc);
++        const auto o_acc_store    = cast_tile<ODataType>(o_acc_epilogue);
+ 
+-        return o_acc;
++        return remap_o_acc_for_epilogue(o_acc_store);
+     }
+ 
+     template <typename QDramBlockWindowTmp,
+diff --git a/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qx_ks_vs_custom_policy.hpp b/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qx_ks_vs_custom_policy.hpp
+index 4acd5d725..0b2f9cc78 100644
+--- a/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qx_ks_vs_custom_policy.hpp
++++ b/include/ck_tile/ops/fmha/pipeline/block_fmha_pipeline_qx_ks_vs_custom_policy.hpp
+@@ -966,6 +966,16 @@ struct BlockFmhaPipelineQXKSVSCustomPolicy : BlockFmhaPipelineQXCustomPolicy<QLo
+         }
+     }
+ 
++    template <typename Problem>
++    CK_TILE_HOST_DEVICE static constexpr auto MakePRegTileDistribution()
++    {
++        using BlockGemm = remove_cvref_t<decltype(GetKVBlockGemm<Problem>())>;
++
++        return BlockGemm::template MakeABlockTileDistribution<
++            Problem::BlockFmhaShape::kM0,
++            Problem::BlockFmhaShape::kN0>();
++    }
++
+     template <typename Problem>
+     CK_TILE_HOST_DEVICE static constexpr auto GetKVBlockGemm()
+     {
+diff --git a/include/ck_tile/ops/gemm/block/block_gemm_areg_bsmem_creg_v2.hpp b/include/ck_tile/ops/gemm/block/block_gemm_areg_bsmem_creg_v2.hpp
+index 0aa7509b1..34e5e476c 100644
+--- a/include/ck_tile/ops/gemm/block/block_gemm_areg_bsmem_creg_v2.hpp
++++ b/include/ck_tile/ops/gemm/block/block_gemm_areg_bsmem_creg_v2.hpp
+@@ -76,7 +76,14 @@ struct BlockGemmARegBSmemCRegV2
+         auto a_block_tensor = make_static_distributed_tensor<typename ABlockTensorTmp::DataType>(
+             MakeABlockTileDistribution());
+ 
+-        a_block_tensor.get_thread_buffer() = a_block_tensor_tmp.get_thread_buffer();
++        constexpr auto dst_spans = decltype(a_block_tensor)::get_distributed_spans();
++
++        sweep_tile_span(dst_spans[number<0>{}], [&](auto idx0) {
++            sweep_tile_span(dst_spans[number<1>{}], [&](auto idx1) {
++                constexpr auto idx = make_tuple(idx0, idx1);
++                a_block_tensor(idx) = a_block_tensor_tmp[idx];
++            });
++        });
+ 
+         // construct B-warp-window
+         auto b_warp_window_tmp = make_tile_window(

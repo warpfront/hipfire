@@ -1,0 +1,135 @@
+[
+  {
+    "family": "qwen35",
+    "file": "qwen35.json",
+    "md5": "7b6074791b84e7ce3a5fc12746b82d48",
+    "source": "Qwen/Qwen3.5-0.8B",
+    "revision": "2fc06364715b967f1860aea9cf38778875588b17"
+  },
+  {
+    "family": "deepseek4",
+    "file": "deepseek4.json",
+    "md5": "3f75dbea81fe67dd8c07843bdf9ce36e",
+    "source": "deepseek-ai/DeepSeek-V4-Flash",
+    "revision": "60d8d70770c6776ff598c94bb586a859a38244f1"
+  },
+  {
+    "family": "minimax",
+    "file": "minimax.json",
+    "md5": "7355e91b49c3dc787c6fa57d1a1d1b37",
+    "source": "MiniMaxAI/MiniMax-M2.5",
+    "revision": "f710177d938eff80b684d42c5aa84b382612f21f"
+  },
+  {
+    "family": "lfm2",
+    "file": "lfm2.json",
+    "md5": "83703d34b17eca9dd512ca67668028fc",
+    "source": "LiquidAI/LFM2-1.2B",
+    "revision": "40f3da0d0164913923aee9462c23077868b816a3"
+  },
+  {
+    "family": "llama_bpe",
+    "file": "llama_bpe.json",
+    "md5": "f97dc2d5d300c4703d55dede68005737",
+    "source": "unsloth/Llama-3.2-1B",
+    "revision": "9535bd9b1d1dea6acafbdc4813b728796aeb28da"
+  },
+  {
+    "family": "qwen36",
+    "file": "qwen35.json",
+    "md5": "7b6074791b84e7ce3a5fc12746b82d48",
+    "source": "Qwen/Qwen3.6-27B",
+    "revision": "6a9e13bd6fc8f0983b9b99948120bc37f49c13e9"
+  },
+  {
+    "family": "qwen38_flash_next",
+    "file": "../hf_tokenizer_corpus/tokenizer.json",
+    "md5": "085e10165f24499bb9d8fcee7e17f9ee",
+    "source": "Qwen/Qwen3.8-Flash-Next",
+    "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540"
+  },
+  {
+    "family": "minimax27",
+    "file": "minimax.json",
+    "md5": "7355e91b49c3dc787c6fa57d1a1d1b37",
+    "source": "MiniMaxAI/MiniMax-M2.7",
+    "revision": "d494266a4affc0d2995ba1fa35c8481cbd84294b"
+  },
+  {
+    "family": "lfm25",
+    "file": "lfm25.json",
+    "md5": "f3d06a5968563f841bbb9a9afe047770",
+    "source": "LiquidAI/LFM2.5-1.2B-Instruct",
+    "revision": "0f604ada3f766f9f257460c4c9f0b5d6f69d431b"
+  },
+  {
+    "family": "qwen38",
+    "file": "../hf_tokenizer_corpus/tokenizer.json",
+    "md5": "085e10165f24499bb9d8fcee7e17f9ee",
+    "source": "Qwen/Qwen3.8-27B",
+    "revision": "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0"
+  },
+  {
+    "family": "qwen3",
+    "file": "qwen3.json",
+    "md5": "6423133b9cc1a2077b57822c30c211aa",
+    "source": "Qwen/Qwen3-8B",
+    "revision": "b968826d9c46dd6066d109eabc6255188de91218"
+  },
+  {
+    "family": "dots_ocr",
+    "file": "dots_ocr.json",
+    "md5": "034bc4e603ccec3bbbc72be339823da2",
+    "source": "rednote-hilab/dots.ocr",
+    "revision": "c0111ce6bc07803dbc267932ffef0ae3a51dc951"
+  },
+  {
+    "family": "muse_glimmer",
+    "file": "muse_glimmer.json",
+    "md5": "ae4bf15545a10374a97957596126e3b0",
+    "source": "meta-models/Muse-Glimmer-30B",
+    "revision": "a4e59da52a7bc87ae7251dd5545c0dd437c44b68"
+  },
+  {
+    "family": "qwen25",
+    "file": "qwen25.json",
+    "md5": "3f99a313c3754208a7f3acfccadc53cd",
+    "source": "Qwen/Qwen2.5-0.5B",
+    "revision": "060db6499f32faf8b98477b0a26969ef7d8b9987"
+  },
+  {
+    "family": "north_mini_code",
+    "file": "north_mini_code.json",
+    "md5": "197e80d0984fdfcc76dcc5947d0a582f",
+    "source": "CohereLabs/North-Mini-Code-1.0",
+    "revision": "d11e61a842617a22dc328552fa5bb86231ee4f37"
+  },
+  {
+    "family": "maple",
+    "file": "qwen3.json",
+    "md5": "6423133b9cc1a2077b57822c30c211aa",
+    "source": "deepgrove/maple-preview",
+    "revision": "ac1ddd79d2b5cb4406f5d2bebdf95406ce505a07"
+  },
+  {
+    "family": "ornith",
+    "file": "qwen35.json",
+    "md5": "7b6074791b84e7ce3a5fc12746b82d48",
+    "source": "ornith-ai/Ornith-1.5-35B-A3B",
+    "revision": "10fbf86fed7ecee4a061f8b499a618f46001cac1"
+  },
+  {
+    "family": "vibethinker",
+    "file": "vibethinker.json",
+    "md5": "b422c36b9638fd8e4f16b1daeaf5dd38",
+    "source": "WeiboAI/VibeThinker-3B",
+    "revision": "77bd2cced09193c8b9a59a32bd8577bbd1f3e01c"
+  },
+  {
+    "family": "lfm25_moe",
+    "file": "lfm25_moe.json",
+    "md5": "7b8067a580173d3eb1697afae3b456f5",
+    "source": "LiquidAI/LFM2.5-8B-A1B",
+    "revision": "5dd22602c2e9f6a097b1de4c4efe0658b605015c"
+  }
+]

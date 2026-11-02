@@ -15,7 +15,7 @@
 //!
 //! Usage: `asr_stream_smoke [audio_hfq] [chunk_samples]`
 
-use hipfire_loader::{load_model, ModelState};
+use hipfire_loader::load_model;
 use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
 use rdna_compute::Gpu;
 
@@ -46,7 +46,7 @@ fn main() {
         &mut gpu,
     )
     .expect("load_model");
-    let (audio_cfg, audio_weights) = match (&model.lfm3_audio_config, &model.lfm3_audio_weights) {
+    let (audio_cfg, audio_weights) = match (model.lfm3_audio_config(), model.lfm3_audio_weights()) {
         (Some(c), Some(w)) => (c.clone(), w),
         _ => panic!("loaded model has no LFM3-Audio encoder"),
     };

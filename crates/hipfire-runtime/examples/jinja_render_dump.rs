@@ -91,6 +91,14 @@ fn main() {
     if let Some(p) = preserve {
         ctx_map.insert("preserve_thinking".into(), serde_json::Value::Bool(p));
     }
+    // The control-plane resolver supplies a concrete semantic effort. Keep it
+    // optional here so raw-template default audits remain available too.
+    if let Some(effort) = fixture.get("reasoning_effort").and_then(|v| v.as_str()) {
+        ctx_map.insert(
+            "reasoning_effort".into(),
+            serde_json::Value::String(effort.to_owned()),
+        );
+    }
     let ctx_json = serde_json::Value::Object(ctx_map);
 
     let mut env = Environment::new();

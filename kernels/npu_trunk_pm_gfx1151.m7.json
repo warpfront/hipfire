@@ -1,0 +1,50 @@
+{
+  "npu_trunk_consume_bf16_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 47,
+    "instructions": 128,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 35,
+    "table": "gfx1151",
+    "vgpr_high_water": 31,
+    "wait_facts": 3
+  },
+  "npu_trunk_consume_f32_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 47,
+    "instructions": 129,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 35,
+    "table": "gfx1151",
+    "vgpr_high_water": 31,
+    "wait_facts": 3
+  },
+  "npu_trunk_i8_gemm_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 40,
+    "instructions": 179,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 37,
+    "table": "gfx1151",
+    "vgpr_high_water": 32,
+    "wait_facts": 10
+  }
+}

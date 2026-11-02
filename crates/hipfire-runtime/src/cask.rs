@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+// lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
+
 //! CASK: core-aware selective KV compression (arXiv:2604.10900).
 //!
 //! Sits atop TriAttention. TriAttention scores tokens and keeps the top-B;
@@ -23,7 +25,7 @@
 //! "score mass, similarity, or position-aware" as options; softmax over
 //! score is the score-mass variant with a numerically stable normalizer.
 
-use crate::llama::{f16_to_f32, f32_to_f16, KvCache};
+use crate::llama::{f16_to_f32, f32_to_f16, KvCache, KvCacheExt};
 use crate::triattn::{EvictionCtx, EvictionResult};
 use hip_bridge::HipResult;
 use hipfire_dispatch::families::kv_tier::KTier;
@@ -91,6 +93,9 @@ impl CaskCtx {
         kv: &mut KvCache,
         current_physical: usize,
     ) -> HipResult<Option<EvictionResult>> {
+        if !self.base.is_active() {
+            return Ok(None);
+        }
         if current_physical < self.base.budget + self.base.beta {
             return Ok(None);
         }
@@ -345,7 +350,7 @@ impl CaskCtx {
                         self.fold_m,
                         budget,
                     )?,
-                    KTier::Asym4 { .. } => gpu.kv_fold_asym4(
+                    KTier::Asym4 { fwht } => gpu.kv_fold_asym4(
                         &kv.k_gpu[layer_idx],
                         &self.base.k_compact,
                         &indices_dev,
@@ -354,6 +359,7 @@ impl CaskCtx {
                         d,
                         self.fold_m,
                         budget,
+                        fwht,
                     )?,
                     KTier::Asym2 { .. } => gpu.kv_fold_asym2(
                         &kv.k_gpu[layer_idx],

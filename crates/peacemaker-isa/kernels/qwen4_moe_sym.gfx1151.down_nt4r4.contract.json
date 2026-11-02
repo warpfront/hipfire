@@ -1,0 +1,25 @@
+{
+  "symbol": "qwen4_moe_down_iu4_sym_pm_gfx1151_nt4r4",
+  "counts": {
+    "buffer_load_b128": 320,
+    "buffer_load_b32": 86,
+    "buffer_store_b128": 16,
+    "ds_swizzle_b32": 160,
+    "s_endpgm": 1,
+    "v_dual_fmac_f32": 320,
+    "v_dual_mul_f32": 640,
+    "v_permlanex16_b32": 32,
+    "v_wmma_i32_16x16x16_iu4": 640,
+    "vopd_packets": 960
+  },
+  "forbidden": [
+    "scratch_*", "flat_*", "global_*", "ds_read*", "ds_write*",
+    "v_readlane*", "v_writelane*", "ds_load*", "ds_store*", "s_barrier*", "s_wait_*"
+  ],
+  "vgpr_max": 208,
+  "sgpr_max": 104,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 0
+}

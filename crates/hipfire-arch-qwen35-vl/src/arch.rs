@@ -20,6 +20,12 @@
 //!   let text_w   = <Qwen35   as Architecture>::load_weights(&hfq, &text_cfg, gpu)?;
 //!   let vis_w    = <Qwen35Vl as Architecture>::load_weights(&hfq, &vis_cfg, gpu)?;
 //!
+//! `Qwen35Vl::load_weights` takes no mode argument, so it places the tower
+//! per the schema default of `vision.mode` (`hipfire_config::vision_mode_default()`):
+//! streamed from host for every mode but `resident`. A caller that has the
+//! resolved mode calls `qwen35_vl::load_vision_weights(hfq, cfg, gpu,
+//! TowerResidency::from_vision_mode(mode))` directly.
+//!
 //! Splitting the two arches at the trait level keeps each crate's bring-up
 //! independently exercisable (e.g. unit-testing config parsing for the
 //! vision tower without instantiating the full text decoder).
@@ -37,7 +43,9 @@
 //! unit value. (The text decoder's KV / DeltaNet state is owned by the
 //! `Qwen35` arch impl, not duplicated here.)
 
-use crate::qwen35_vl::{load_vision_weights, vision_config_from_hfq, VisionConfig, VisionWeights};
+use crate::qwen35_vl::{
+    load_vision_weights, vision_config_from_hfq, TowerResidency, VisionConfig, VisionWeights,
+};
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use rdna_compute::Gpu;
@@ -75,7 +83,8 @@ impl Architecture for Qwen35Vl {
         cfg: &Self::Config,
         gpu: &mut Gpu,
     ) -> Result<Self::Weights, String> {
-        load_vision_weights(hfq, cfg, gpu)
+        let residency = TowerResidency::from_vision_mode(hipfire_config::vision_mode_default());
+        load_vision_weights(hfq, cfg, gpu, residency)
             .map_err(|e| format!("qwen35-vl: load_vision_weights failed: {e:?}"))
     }
 

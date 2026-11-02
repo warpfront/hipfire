@@ -25,7 +25,10 @@ __global__ void kv_fold_asym4(
     const float* __restrict__ src_weights,     // [budget × m]
     int n_kv,
     int head_dim,
-    int m
+    int m,
+    // Quantizer threshold scale, chosen by the host from the K tier: sqrt(2) for
+    // FWHT records at hd 256 (matches the fwht4 writer), 1.0 for Givens and hd 128.
+    float q_scale
 ) {
     const int out_slot = blockIdx.x;
     const int kv_head = blockIdx.y;
@@ -78,7 +81,8 @@ __global__ void kv_fold_asym4(
     #pragma unroll
     for (int off = 16; off > 0; off >>= 1) lsq += __shfl_xor(lsq, off);
     const float new_cnorm = sqrtf(lsq);
-    const float inv_cnorm = new_cnorm > 1e-10f ? 1.f / new_cnorm : 0.f;
+    // The fold is not norm-corrected, so the stored cnorm undoes q_scale.
+    const float inv_cnorm = new_cnorm > 1e-10f ? 1.f / new_cnorm * q_scale : 0.f;
 
     // 3. Quantize & pack 4-bit indices.
     int idx_out[8];
@@ -94,7 +98,7 @@ __global__ void kv_fold_asym4(
     unsigned char* dst_head = dst + (size_t)out_slot * bytes_per_pos
                                   + (size_t)kv_head * bytes_per_head;
     if (tid == 0) {
-        *(float*)dst_head = new_cnorm;
+        *(float*)dst_head = new_cnorm / q_scale;
     }
     for (int half = 0; half < n_halves; ++half) {
         const int base = half * 4;

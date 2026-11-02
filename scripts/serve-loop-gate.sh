@@ -42,27 +42,58 @@ MODEL="$(pick_model)"
 # GPU coordination (reuse the repo's flock-based mutex).
 # shellcheck disable=SC1091
 if [ -f "$ROOT/scripts/gpu-lock.sh" ]; then source "$ROOT/scripts/gpu-lock.sh" && gpu_acquire "serve-loop-gate" || true; fi
+SERVE_PID=""
+# Kill ONLY the serve we spawned (tracked PID, its session/process group and its
+# children). Never pkill -f: on a shared host "daemon" also matches the multica
+# runtime and other agents' hipfire daemons. The serve runs under setsid, so
+# its PID is also its process-group id and `kill -- -PID` reaches the daemon it
+# spawned. TERM first, then KILL after ~10 s so a hung daemon cannot keep the
+# GPU lock fd (or the port) alive past the gate. A SIGKILLed gate runs no trap,
+# so the serve also gets --pdeathsig (see start_serve); the daemon exits on
+# stdin EOF once its serve is gone.
+kill_serve() {
+  [ -n "$SERVE_PID" ] || return 0
+  local pid="$SERVE_PID" i; SERVE_PID=""
+  pkill -TERM -P "$pid" >/dev/null 2>&1 || true
+  kill -TERM -- "-$pid" >/dev/null 2>&1 || true
+  kill -TERM "$pid" >/dev/null 2>&1 || true
+  for i in $(seq 1 20); do
+    kill -0 -- "-$pid" >/dev/null 2>&1 || kill -0 "$pid" >/dev/null 2>&1 || return 0
+    sleep 0.5
+  done
+  pkill -KILL -P "$pid" >/dev/null 2>&1 || true
+  kill -KILL -- "-$pid" >/dev/null 2>&1 || true
+  kill -KILL "$pid" >/dev/null 2>&1 || true
+}
 cleanup() {
-  fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true
-  pkill -f "examples/daemon" >/dev/null 2>&1 || true
+  kill_serve
   command -v gpu_release >/dev/null 2>&1 && gpu_release || true
 }
 trap cleanup EXIT
 
 HIPFIRE="${HIPFIRE_CLI_BIN:-$ROOT/target/release/hipfire}"
+# `hipfire serve` resolves its daemon via find_daemon(), which probes
+# ~/.hipfire/bin/daemon before the tree build. Pin the tree's daemon so the gate
+# tests the code under review, not whatever is installed (a caller may override).
+export HIPFIRE_DAEMON_BIN="${HIPFIRE_DAEMON_BIN:-$ROOT/target/release/daemon}"
 [ -x "$HIPFIRE" ] || HIPFIRE="$(command -v hipfire || true)"
 [ -x "$HIPFIRE" ] || { echo "serve-loop-gate: native hipfire CLI not found; build cargo build --release -p hipfire-cli" >&2; exit 2; }
 
 SERVELOG="$(mktemp)"
 start_serve() { # $1 = extra env (e.g. "HIPFIRE_DFLASH_OFF")
-  fuser -k "${PORT}/tcp" >/dev/null 2>&1 || true; pkill -f "examples/daemon" >/dev/null 2>&1 || true; sleep 1
+  kill_serve; sleep 1
+  # Anything still listening is not ours; refuse rather than test it.
+  if (exec 3<>"/dev/tcp/127.0.0.1/${PORT}") 2>/dev/null; then
+    echo "serve-loop-gate: port $PORT is already in use by another process; set HIPFIRE_SERVE_GATE_PORT" >&2; exit 2
+  fi
   : > "$SERVELOG"
   local cfg=""; [ "${1:-}" = "ar" ] && cfg="HIPFIRE_DFLASH_DRAFT="  # disable draft auto-detect → AR path
-  env $cfg HIPFIRE_MODEL="$MODEL" setsid "$HIPFIRE" serve 0.0.0.0 "$PORT" >"$SERVELOG" 2>&1 & disown
+  env $cfg HIPFIRE_MODEL="$MODEL" setsid setpriv --pdeathsig TERM "$HIPFIRE" serve 0.0.0.0 "$PORT" >"$SERVELOG" 2>&1 &
+  SERVE_PID=$!; disown "$SERVE_PID" 2>/dev/null || true
   local warm=0
   for _ in $(seq 1 150); do
-    if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/health" 2>/dev/null | jq -e '.model != null and .loading_model == null' >/dev/null 2>&1; then warm=1; break; fi
-    grep -qiE 'panicked|FATAL|port in use|pre-warm failed' "$SERVELOG" && break
+    if curl -fsS --max-time 2 "http://127.0.0.1:${PORT}/health" 2>/dev/null | jq -e --argjson pid "$SERVE_PID" '.pid == $pid and .model != null and .loading_model == null' >/dev/null 2>&1; then warm=1; break; fi
+    grep -qiE 'panicked|FATAL|address already in use|pre-warm failed' "$SERVELOG" && break
     sleep 2
   done
   if grep -qiE 'panicked|FATAL' "$SERVELOG"; then echo "serve-loop-gate: FAIL — daemon panicked at startup" >&2; tail -5 "$SERVELOG" >&2; return 1; fi

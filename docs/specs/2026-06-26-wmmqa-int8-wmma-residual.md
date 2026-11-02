@@ -11,7 +11,7 @@ The HFQ4 dense residual prefill GEMM dominates prefill on gfx1100 — rocprofv3 
 It runs the **scalar sdot4 MMQ** path (llama.cpp lineage, `#158`) — light int8 traffic but
 **no matrix cores**.
 
-A force-WMMA A/B this session (k9lin, WMMA confirmed via rocprof) showed fp16-WMMA is
+A force-WMMA A/B this session (gfx1100 dev workstation, WMMA confirmed via rocprof) showed fp16-WMMA is
 **~9–15% slower** than MMQ at every ctx (1k/4k/16k) — but only ~15% *despite moving 2× the
 bytes* (fp16 vs int8 activations). If it were purely memory-bound, 2× traffic → ~2× slower.
 It's only 15% → the GEMM is **partially compute-bound, and the matrix cores DO help**; fp16's
@@ -63,7 +63,7 @@ body-include.
 - **Gate:** `./scripts/coherence-gate.sh` (mandatory — kernel change).
 - **Perf:** A/B vs MMQ at 1k/4k/16k prefill on gfx1100. **Win bar: >5% over MMQ** (above the
   ±1–3% noise band).
-- **Fleet:** gfx1100 (k9lin) only.
+- **Fleet:** gfx1100 (dev workstation) only.
 
 ## Off-ramp
 

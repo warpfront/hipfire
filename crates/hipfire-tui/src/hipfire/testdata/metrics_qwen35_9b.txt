@@ -1,0 +1,141 @@
+# HELP hipfire_requests_total Completed generation requests.
+# TYPE hipfire_requests_total counter
+hipfire_requests_total 2
+# HELP hipfire_requests_failed_total Chat and image requests answered with an error, or whose stream ended in an error event. Oversized or unparseable bodies and admission rejections are not counted here.
+# TYPE hipfire_requests_failed_total counter
+hipfire_requests_failed_total 0
+# HELP hipfire_admission_rejected_total Requests refused by admission control (queue full, or queue wait timed out).
+# TYPE hipfire_admission_rejected_total counter
+hipfire_admission_rejected_total 0
+# HELP hipfire_prompt_tokens_total Prompt tokens of completed chat requests, as reported by the daemon.
+# TYPE hipfire_prompt_tokens_total counter
+hipfire_prompt_tokens_total 32
+# HELP hipfire_completion_tokens_total Generated tokens of completed chat requests, as reported by the daemon.
+# TYPE hipfire_completion_tokens_total counter
+hipfire_completion_tokens_total 400
+# HELP hipfire_cached_prompt_tokens_total Prompt tokens served from the prefix cache, as reported by the daemon.
+# TYPE hipfire_cached_prompt_tokens_total counter
+hipfire_cached_prompt_tokens_total 0
+# HELP hipfire_retries_total Chat attempts retried after a transient daemon failure.
+# TYPE hipfire_retries_total counter
+hipfire_retries_total 0
+# HELP hipfire_retries_succeeded_total Chat requests that completed on a retry.
+# TYPE hipfire_retries_succeeded_total counter
+hipfire_retries_succeeded_total 0
+# HELP hipfire_queue_depth Requests currently in flight or queued.
+# TYPE hipfire_queue_depth gauge
+hipfire_queue_depth 0
+# HELP hipfire_queue_capacity Admission control capacity.
+# TYPE hipfire_queue_capacity gauge
+hipfire_queue_capacity 1
+# HELP hipfire_uptime_seconds Seconds since the gateway started.
+# TYPE hipfire_uptime_seconds gauge
+hipfire_uptime_seconds 36
+# HELP hipfire_engine_up 1 while the daemon is up, 0 while it is restarting or unhealthy.
+# TYPE hipfire_engine_up gauge
+hipfire_engine_up 1
+# HELP hipfire_model_loading 1 while a model load is in progress, 0 otherwise.
+# TYPE hipfire_model_loading gauge
+hipfire_model_loading 0
+# HELP hipfire_context_capacity_tokens Context (KV capacity) the resident model was loaded with; 0 when none is resident.
+# TYPE hipfire_context_capacity_tokens gauge
+hipfire_context_capacity_tokens 8192
+# HELP hipfire_model_info The resident model.
+# TYPE hipfire_model_info gauge
+hipfire_model_info{model="qwen3.5:9b"} 1
+# HELP hipfire_ttft_milliseconds Time to first token, per request.
+# TYPE hipfire_ttft_milliseconds histogram
+hipfire_ttft_milliseconds_bucket{le="10"} 0
+hipfire_ttft_milliseconds_bucket{le="25"} 0
+hipfire_ttft_milliseconds_bucket{le="50"} 1
+hipfire_ttft_milliseconds_bucket{le="100"} 2
+hipfire_ttft_milliseconds_bucket{le="250"} 2
+hipfire_ttft_milliseconds_bucket{le="500"} 2
+hipfire_ttft_milliseconds_bucket{le="1000"} 2
+hipfire_ttft_milliseconds_bucket{le="2500"} 2
+hipfire_ttft_milliseconds_bucket{le="5000"} 2
+hipfire_ttft_milliseconds_bucket{le="10000"} 2
+hipfire_ttft_milliseconds_bucket{le="30000"} 2
+hipfire_ttft_milliseconds_bucket{le="60000"} 2
+hipfire_ttft_milliseconds_bucket{le="+Inf"} 2
+hipfire_ttft_milliseconds_sum 119
+hipfire_ttft_milliseconds_count 2
+# HELP hipfire_request_latency_milliseconds Wall time per request.
+# TYPE hipfire_request_latency_milliseconds histogram
+hipfire_request_latency_milliseconds_bucket{le="10"} 0
+hipfire_request_latency_milliseconds_bucket{le="25"} 0
+hipfire_request_latency_milliseconds_bucket{le="50"} 0
+hipfire_request_latency_milliseconds_bucket{le="100"} 0
+hipfire_request_latency_milliseconds_bucket{le="250"} 0
+hipfire_request_latency_milliseconds_bucket{le="500"} 0
+hipfire_request_latency_milliseconds_bucket{le="1000"} 0
+hipfire_request_latency_milliseconds_bucket{le="2500"} 0
+hipfire_request_latency_milliseconds_bucket{le="5000"} 2
+hipfire_request_latency_milliseconds_bucket{le="10000"} 2
+hipfire_request_latency_milliseconds_bucket{le="30000"} 2
+hipfire_request_latency_milliseconds_bucket{le="60000"} 2
+hipfire_request_latency_milliseconds_bucket{le="+Inf"} 2
+hipfire_request_latency_milliseconds_sum 8510.442
+hipfire_request_latency_milliseconds_count 2
+# HELP hipfire_time_per_output_token_milliseconds Time per output token after the first, per chat request.
+# TYPE hipfire_time_per_output_token_milliseconds histogram
+hipfire_time_per_output_token_milliseconds_bucket{le="2"} 0
+hipfire_time_per_output_token_milliseconds_bucket{le="5"} 0
+hipfire_time_per_output_token_milliseconds_bucket{le="10"} 0
+hipfire_time_per_output_token_milliseconds_bucket{le="15"} 0
+hipfire_time_per_output_token_milliseconds_bucket{le="20"} 0
+hipfire_time_per_output_token_milliseconds_bucket{le="30"} 2
+hipfire_time_per_output_token_milliseconds_bucket{le="50"} 2
+hipfire_time_per_output_token_milliseconds_bucket{le="75"} 2
+hipfire_time_per_output_token_milliseconds_bucket{le="100"} 2
+hipfire_time_per_output_token_milliseconds_bucket{le="200"} 2
+hipfire_time_per_output_token_milliseconds_bucket{le="500"} 2
+hipfire_time_per_output_token_milliseconds_bucket{le="+Inf"} 2
+hipfire_time_per_output_token_milliseconds_sum 42.167
+hipfire_time_per_output_token_milliseconds_count 2
+# HELP hipfire_decode_tokens_per_second Decode throughput per request.
+# TYPE hipfire_decode_tokens_per_second histogram
+hipfire_decode_tokens_per_second_bucket{le="1"} 0
+hipfire_decode_tokens_per_second_bucket{le="2"} 0
+hipfire_decode_tokens_per_second_bucket{le="5"} 0
+hipfire_decode_tokens_per_second_bucket{le="10"} 0
+hipfire_decode_tokens_per_second_bucket{le="20"} 0
+hipfire_decode_tokens_per_second_bucket{le="30"} 0
+hipfire_decode_tokens_per_second_bucket{le="50"} 2
+hipfire_decode_tokens_per_second_bucket{le="75"} 2
+hipfire_decode_tokens_per_second_bucket{le="100"} 2
+hipfire_decode_tokens_per_second_bucket{le="150"} 2
+hipfire_decode_tokens_per_second_bucket{le="200"} 2
+hipfire_decode_tokens_per_second_bucket{le="300"} 2
+hipfire_decode_tokens_per_second_bucket{le="500"} 2
+hipfire_decode_tokens_per_second_bucket{le="1000"} 2
+hipfire_decode_tokens_per_second_bucket{le="2500"} 2
+hipfire_decode_tokens_per_second_bucket{le="5000"} 2
+hipfire_decode_tokens_per_second_bucket{le="+Inf"} 2
+hipfire_decode_tokens_per_second_sum 95.3
+hipfire_decode_tokens_per_second_count 2
+# HELP hipfire_prefill_tokens_per_second Prefill throughput per request.
+# TYPE hipfire_prefill_tokens_per_second histogram
+hipfire_prefill_tokens_per_second_bucket{le="1"} 0
+hipfire_prefill_tokens_per_second_bucket{le="2"} 0
+hipfire_prefill_tokens_per_second_bucket{le="5"} 0
+hipfire_prefill_tokens_per_second_bucket{le="10"} 0
+hipfire_prefill_tokens_per_second_bucket{le="20"} 0
+hipfire_prefill_tokens_per_second_bucket{le="30"} 0
+hipfire_prefill_tokens_per_second_bucket{le="50"} 0
+hipfire_prefill_tokens_per_second_bucket{le="75"} 0
+hipfire_prefill_tokens_per_second_bucket{le="100"} 0
+hipfire_prefill_tokens_per_second_bucket{le="150"} 0
+hipfire_prefill_tokens_per_second_bucket{le="200"} 0
+hipfire_prefill_tokens_per_second_bucket{le="300"} 1
+hipfire_prefill_tokens_per_second_bucket{le="500"} 2
+hipfire_prefill_tokens_per_second_bucket{le="1000"} 2
+hipfire_prefill_tokens_per_second_bucket{le="2500"} 2
+hipfire_prefill_tokens_per_second_bucket{le="5000"} 2
+hipfire_prefill_tokens_per_second_bucket{le="+Inf"} 2
+hipfire_prefill_tokens_per_second_sum 625.2
+hipfire_prefill_tokens_per_second_count 2
+# HELP hipfire_spec_tau Speculative decoding mean accepted length (tau), per request that reports one.
+# TYPE hipfire_spec_tau summary
+hipfire_spec_tau_sum 0
+hipfire_spec_tau_count 0

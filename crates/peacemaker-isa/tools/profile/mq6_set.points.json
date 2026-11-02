@@ -1,0 +1,16 @@
+{
+  "symbol": "gemm_mq6g256v2_mmq_i8_pm_set_gfx1201",
+  "vgpr_limit": 216,
+  "rules": [
+    {"name": "m0", "label": ".Lmq6i8_m0"},
+    {"name": "m0.fold", "label": ".Lmq6i8_m0_fold"},
+    {"name": "m1", "label": ".Lmq6i8_m1"},
+    {"name": "m1.fold", "label": ".Lmq6i8_m1_fold"},
+    {"name": "bar.pre_signal", "before": "s_barrier_signal"},
+    {"name": "bar.post_signal", "after": "s_barrier_signal"},
+    {"name": "bar.pre_wait", "before": "s_barrier_wait"},
+    {"name": "bar.post_wait", "after": "s_barrier_wait"},
+    {"name": "w.pre", "before": "s_wait_loadcnt_dscnt"},
+    {"name": "w.post", "after": "s_wait_loadcnt_dscnt"}
+  ]
+}

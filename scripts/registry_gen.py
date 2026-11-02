@@ -12,7 +12,7 @@ old CLIs that read {models, aliases} keep working unchanged; new fields are
 purely additive:
   top-level : schema_version, generated_at
   per-entry : sha256 (HF LFS oid), size_bytes, arch_id, quant
-  sidecars  : triattn/mtp gain sha256/size_bytes next to their `file`
+  sidecars  : triattn/mtp/dflash gain sha256/size_bytes next to their `file`
 
 Fail-closed: ANY problem — repo unreachable, file missing from the repo
 tree, file not LFS (no sha256), size_bytes disagreeing with curated
@@ -20,8 +20,8 @@ size_gb, unmappable arch_id/quant, alias pointing at a missing tag, or a
 superset violation — aborts with exit 1 and does NOT write output. A broken
 run must never replace a good committed registry.
 
-Namespace probe: every repo in the hipfire-models and schuttdev namespaces
-is enumerated; repos that exist on HF but have no curated entry are listed
+Namespace probe: every repo in the hipfire-models namespace is enumerated;
+repos that exist on HF but have no curated entry are listed
 as warnings (discovery aid), never auto-added — the curated overlay is
 authoritative for what the CLI offers.
 
@@ -47,25 +47,75 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 HF_API = "https://huggingface.co"
-PROBE_NAMESPACES = ("hipfire-models", "schuttdev")
+PROBE_NAMESPACES = ("hipfire-models",)
 SCHEMA_VERSION = 1
 # Curated size_gb is a rounded decimal-GB figure; the HF byte count is ground
 # truth. Disagreement beyond this fraction means the curated entry is stale
 # (wrong file / re-quantized upload) — fail so a human reconciles it.
 SIZE_TOLERANCE = 0.25
+# Flash-Next MQ4 XTS is published as ONE split base (`<name>-base.mq4-xts`) on
+# the family's shared PLE pair, under four stock tags. The monolithic spellings
+# below are removed from HF: no entry may download them. A verified local
+# monolithic keeps serving the split tags through a pin compiled into the
+# client (hipfire-registry GRANDFATHERED_MONOLITHICS), so these names survive
+# here only to be banned.
+FLASH_NEXT_XTS_REPO = "hipfire-models/qwen3.8-flash-next"
+FLASH_NEXT_XTS_LEGACY_FILE = "qwen3.8-flash-next-gptq3.mq4"
+FLASH_NEXT_XTS_CANONICAL_FILE = "qwen3.8-flash-next.mq4-xts"
+FLASH_NEXT_XTS_MONOLITHIC_FILES = (
+    FLASH_NEXT_XTS_CANONICAL_FILE,
+    FLASH_NEXT_XTS_LEGACY_FILE,
+)
+FLASH_NEXT_XTS_SPLIT_BASE_FILE = "qwen3.8-flash-next-base.mq4-xts"
+FLASH_NEXT_XTS_SPLIT_BASE_SHA256 = (
+    "eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45"
+)
+FLASH_NEXT_XTS_SPLIT_BASE_SIZE = 70888270360
+FLASH_NEXT_XTS_TAGS = (
+    "qwen3.8:flash-next",
+    "qwen3.8:flash-next-mq4",
+    "qwen3.8:flash-next-gptq3",
+    "qwen3.8:flash-next-mq4-xts",
+)
+# The family-shared PLE rows every Flash-Next split base names.
+FLASH_NEXT_XTS_SHARED_PLE = {
+    "q4": "qwen3.8-flash-next.ple-q4",
+    "q8": "qwen3.8-flash-next.ple-q8",
+}
 # Known weight-file quant suffixes (see docs/MODELS.md). Anything else is an
 # error: a new format must be added here deliberately, not silently passed.
 KNOWN_QUANTS = {
     "mq2lloyd",
+    # Maple-Preview's UNROTATED MQ2-Lloyd sibling (qt=51, MQ2G256LloydU). Shares
+    # mq2lloyd's 72 B/group layout byte-for-byte but is NOT FWHT-rotated, so it
+    # is a distinct format and must not be filed as "mq2lloyd": feeding a
+    # rotated activation to unrotated weights is silent garbage, not an error.
+    "mq2lloydu",
     "mq2",
+    "mq2r",
     "mq3",
     "mq3p",
     "mq4",
     "mq4p",
     "mq4r",
+    "mq4rs",
     "mq5",
     "mq6",
+    # Qwen3.8-Flash-Next's packed trunk rung: MQ6G256V2 (qt47) on the wide
+    # attention/GDN projections, Q8F16 (qt3) embedding and language head,
+    # MQ4G256V2/MQ4G128V2 routed experts. The suffix is that artifact's
+    # published SKU name; quant_for() reads it verbatim from the file name.
+    "mq6q8",
+    # The same rung with the PLE n-gram rows packed to Q8F16 as well, which is
+    # the canonical Flash-Next artifact today. quant_for() reads the suffix
+    # verbatim from the published file name.
+    "mq6q8-pleq8",
     "mfp4",
+    # PrismML Bonsai low-bit: TQ2G128 ternary / BQ1G128 binary. Added with the
+    # filename rename in the same commit -- quant_for() reads the extension and
+    # an unknown one aborts the whole run.
+    "tq2",
+    "bq1",
     "hf4",
     "hf6",
     "q8",
@@ -77,6 +127,12 @@ KNOWN_QUANTS = {
 # entry carrying an unknown value fails the run (fail-closed, like arch_id/quant).
 KNOWN_KV_MODES = {
     "auto",
+    "f32",
+    "f16",
+    # maple (arch 15) only: a flat 2-byte BF16 KV tier. Per-site acceptance
+    # lives in hipfire_runtime::kv_mode's policies; this list is only the
+    # schema allow-list, and must stay in sync with hipfire-config's KV_MODES.
+    "bf16",
     "q8",
     "asym4",
     "asym3",
@@ -88,8 +144,20 @@ KNOWN_KV_MODES = {
     "turbo4",
     "turbo3",
     "turbo2",
+    # Qwen4 (Flash-Next) QSA fp8 K/V; exact-gfx1201 sites only.
+    "fp8",
+    # Gemma4 lowered full-tier opt-out back to Givens asym3 (on Qwen it names
+    # the same legacy K as `--kv-k legacy-asym3`); mirrors hipfire-config.
+    "legacy-asym3",
 }
 KNOWN_TOOL_FORMATS = {"hermes", "qwen_xml"}
+# Flash-Next split-base PLE row sidecars (the `ple` map, keyed by format token
+# `q4`, `q8`, ...): live-annotated from the HF tree like every other sidecar, and
+# digest-pinned (LFS oid required). Mirrors hipfire-registry's `ple` validation.
+PLE_FORMAT_KEY = re.compile(r"^[a-z0-9]+$")
+# Stem (before `-base`) of the one split-base family whose PLE row files are
+# shared between bases (`qwen3.8-flash-next.ple-<key>`).
+SHARED_PLE_FAMILY = "qwen3.8-flash-next"
 
 # Bounds for the optional curated `recommended_settings` (author-recommended
 # inference settings inherited from the parent model card). MUST stay in sync
@@ -104,6 +172,35 @@ RECOMMENDED_BOUNDS = {
     "presence_penalty": (0.0, 2.0, False),
     "repeat_penalty": (0.5, 2.0, False),
 }
+# Mirrors hipfire-config's REASONING_EFFORTS. Includes Qwen3.8's ladder
+# (`low|medium|xhigh`) plus generic OpenAI-style values for other parents.
+REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+# Legacy named cap presets for non-effort-native templates (e.g. Qwen3.6).
+# Absence means uncapped. Effort-native families must omit this field.
+THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
+
+
+def _effort_native_tag(tag: str) -> bool:
+    """True for families whose reasoning is effort-semantic with no registry cap.
+
+    Qwen3.8, DeepSeek V4 Flash (+preview/SKU suffixes), Muse Glimmer, and Ornith
+    product SKUs. Draft/dflash sidecars are excluded. `thinking_budget` is rejected on
+    these tags; absence means uncapped.
+    """
+    # Strip optional "sampling_profiles.<mode>" suffix used by callers.
+    base = tag.split(" sampling_profiles.", 1)[0]
+    family = base.split(":", 1)[0]
+    if "draft" in base or "dflash" in base:
+        return False
+    if family == "qwen3.8":
+        return True
+    if family in {"deepseek-v4-flash", "deepseek-v4-flash-preview"}:
+        return True
+    if family == "muse-glimmer" or base in {"muse-glimmer", "muse-glimmer:fast"}:
+        return True
+    if family in {"ornith-1.5", "ornith1.5", "ornith"}:
+        return True
+    return False
 
 
 def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
@@ -111,13 +208,23 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
 
     Mirrors hipfire-registry's recommended-settings bounds. Adds a
     descriptive error per offending key; does not mutate rs (deepcopy already
-    carries it through)."""
+    carries it through).
+
+    Effort-native tags (Qwen3.8 / DeepSeek4 / Muse Glimmer) must not ship
+    `thinking_budget`; absence means uncapped. Legacy non-native models may
+    still set named budget presets.
+    """
     if rs is None:
         return
     if not isinstance(rs, dict):
         errors.append(f"{tag}: recommended_settings must be an object, got {type(rs).__name__}")
         return
-    allowed = set(RECOMMENDED_BOUNDS) | {"system_prompt"}
+    allowed = set(RECOMMENDED_BOUNDS) | {
+        "system_prompt",
+        "reasoning_effort",
+        "thinking_budget",
+    }
+    effort_native = _effort_native_tag(tag)
     for key, val in rs.items():
         if key not in allowed:
             errors.append(f"{tag}: recommended_settings has unknown key {key!r} (allowed: {sorted(allowed)})")
@@ -125,6 +232,26 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
         if key == "system_prompt":
             if not isinstance(val, str):
                 errors.append(f"{tag}: recommended_settings.system_prompt must be a string")
+            continue
+        if key == "reasoning_effort":
+            if val not in REASONING_EFFORTS:
+                errors.append(
+                    f"{tag}: recommended_settings.reasoning_effort must be one of "
+                    f"{sorted(REASONING_EFFORTS)}, got {val!r}"
+                )
+            continue
+        if key == "thinking_budget":
+            if effort_native:
+                errors.append(
+                    f"{tag}: thinking_budget is unsupported on effort-native models "
+                    f"(omit the field; absence means uncapped), got {val!r}"
+                )
+                continue
+            if val not in THINKING_BUDGETS:
+                errors.append(
+                    f"{tag}: recommended_settings.thinking_budget must be one of "
+                    f"{sorted(THINKING_BUDGETS)}, got {val!r}"
+                )
             continue
         lo, hi, int_only = RECOMMENDED_BOUNDS[key]
         if isinstance(val, bool) or not isinstance(val, (int, float)):
@@ -151,25 +278,66 @@ def log(msg: str) -> None:
 # Derived from the tag family + file name. Unknown families return None and
 # fail the run: every new model family must be mapped here explicitly.
 #   1  = plain Qwen3 (llama-crate config_from_hfq branch)
-#   5  = Qwen3.5/3.6 dense hybrid (incl. carnice / qwopus finetunes)
-#   6  = Qwen3.5/3.6 MoE / A3B
+#   5  = Qwen3.5/3.6/3.8 dense hybrid (incl. carnice / qwopus / decider finetunes)
+#   6  = Qwen3.5/3.6/3.8 MoE / A3B
 #   9  = DeepSeek V4 Flash
 #   11 = LFM2.5 family
 #   12 = Cohere2-MoE / North-Mini-Code
-#   13 = LFM3 family (text / VL / audio / omni variants)
+#   14 = Muse Glimmer dense text tower
+#   16 = Qwen4 experimental / Qwen3.8-Flash-Next
+#   24 = LFM3 family (text / VL / audio / omni variants)
 #   20 = DFlash drafter sidecar (crates/hipfire-quantize/src/bin/dflash_convert.rs)
+#   23 = Muse Glimmer DFlash drafter (muse_glimmer_assistant)
 def arch_id_for(tag: str, entry: dict) -> int | None:
     file = entry.get("file", "")
+    family = tag.split(":", 1)[0]
+    # Glimmer is checked before the generic dflash rule: its drafter is
+    # muse_glimmer_assistant (23), not the arch-20 sidecar, even though the
+    # filename says dflash.
+    if family == "muse-glimmer":
+        return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
-    family = tag.split(":", 1)[0]
-    if family in ("qwen3.5", "qwen3.6", "qwopus3.6", "carnice", "qwopus"):
+    # Prism ML Bonsai = behaviour-preserving transform of Qwen3.6-27B,
+    # architecture unchanged (dense qwen35).
+    if family == "bonsai":
+        return 5
+    if family == "qwen3.8" and ("flash-next" in tag or "flash-next" in file):
+        # Qwen3.8-Flash-Next is the Qwen4 experimental arch-16 carrier,
+        # not the ordinary Qwen3.8 dense arch-5 family.
+        return 16
+    if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
+    # Decider-4B = dense Qwen3.5-4B finetune used as a /v1/systemone judge
+    # (Mapika/decider-4b, Apache-2.0). The architecture is unchanged dense
+    # qwen3_5 (5); it has no A3B variant, so there is no "a3b" split here.
+    if family == "decider":
+        return 5
+
+    # EmbeddingGemma 2 (`google/embeddinggemma-2`) — the arch-18 single-vector
+    # embedding encoder: a Gemma-4-family bidirectional trunk with no LM head,
+    # served only by the `embed` verb. Its towers ride a `<trunk-stem>.vl`
+    # sidecar, declared per entry below like the Qwen3.8-27B vision slot.
+    if family in ("embeddinggemma", "embeddinggemma-2"):
+        return 18
+
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
+    # Ornith 1.5 = Qwen3.5-family VL finetune. 35B-A3B is qwen3_5_moe (6), the
+    # 9B is dense qwen3_5 (5). Keyed on "a3b" like the qwen3.5 family above.
+    #
+    # BOTH spellings are mapped on purpose. The canonical tag is the hyphenated
+    # "ornith-1.5"; the artifacts were briefly published as "ornith1.5", which
+    # survives as an alias. Aliases do NOT reach this function (build_registry
+    # calls it over `models` only), so the unhyphenated arm is not load-bearing
+    # today — it is here so that re-adding or reverting to the old tag spelling
+    # cannot fail-close. An unmapped family returns None, which aborts the ENTIRE
+    # daily run, every other model's entry included.
+    if family in ("ornith-1.5", "ornith1.5", "ornith"):
+        return 6 if "a3b" in tag else 5
     if family == "qwen3":
         return 1
-    if family == "deepseek-v4-flash":
+    if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
         return 9
     if family == "minimax" or family.startswith("minimax-"):
         return 10
@@ -179,15 +347,30 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 13
     if family == "north-mini-code":
         return 12
+    # Maple-Preview: natively-ternary 256-expert MoE, its own arch crate.
+    if family == "maple-preview":
+        return 15
+    # KRAFTON Raon-1-mini-preview: RDA + MLA + mHC MoE (arch 19, RaonCarrier).
+    if family == "raon-1-mini-preview":
+        return 19
     if family == "vibethinker":
         return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
+    # FLUX.1 MMDiT trunk packs (per-component HFQ, arch 40; sidecar ids
+    # 41/42/43 live in the packs' own headers, not the registry entry).
+    if family in ("flux", "flux.schnell", "flux.dev"):
+        return 40
     return None
 
 
 def quant_for(file: str) -> str | None:
     # DFlash drafts encode their quant in the stem: qwen35-9b-dflash-mq4.hfq
     m = re.search(r"[-.](mq\d)\.hfq$", file)
-    if m:
+    if m and m.group(1) in KNOWN_QUANTS:
+        return m.group(1)
+    # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-xts / model.mq4-pro → quant mq4;
+    # an -xts suffix may carry a hot-expert count (model.mq2-xts-4500 → quant mq2)
+    m = re.search(r"\.(mq\d)(?:-(?:xts?(?:-\d+)?|pro))?$", file)
+    if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     ext = file.rsplit(".", 1)[-1]
     if ext in KNOWN_QUANTS:
@@ -258,10 +441,116 @@ def is_strict_superset(old: object, new: object, path: str, errors: list[str]) -
         errors.append(f"superset violation at {path}: {old!r} != {new!r}")
 
 
+def validate_flash_next_xts(models: dict, errors: list[str]) -> None:
+    """The four stock MQ4 tags are one split base on the shared PLE pair."""
+    if not any(tag in models for tag in FLASH_NEXT_XTS_TAGS) and not any(
+        entry.get("repo") == FLASH_NEXT_XTS_REPO for entry in models.values()
+    ):
+        # build_registry also serves small, unrelated fixture/custom catalogs.
+        return
+    for tag, entry in models.items():
+        if entry.get("file") in FLASH_NEXT_XTS_MONOLITHIC_FILES:
+            errors.append(
+                f"{tag}: names the removed monolithic {entry['file']!r}; the MQ4 XTS "
+                f"payload is only published as {FLASH_NEXT_XTS_SPLIT_BASE_FILE!r}"
+            )
+    expected = {
+        "repo": FLASH_NEXT_XTS_REPO,
+        "file": FLASH_NEXT_XTS_SPLIT_BASE_FILE,
+        "sha256": FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+        "size_bytes": FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+        "arch_id": 16,
+        "quant": "mq4",
+    }
+    present: list[tuple[str, dict]] = []
+    for tag in FLASH_NEXT_XTS_TAGS:
+        entry = models.get(tag)
+        if entry is None:
+            errors.append(f"{tag}: required Flash-Next MQ4 XTS tag is missing")
+            continue
+        present.append((tag, entry))
+        for key, value in expected.items():
+            if entry.get(key) != value:
+                errors.append(f"{tag}: XTS invariant {key} must be {value!r}")
+        desc = entry.get("desc", "")
+        if "MQ4 XTS" not in desc or "GPTQ3" in desc:
+            errors.append(f"{tag}: user-facing recipe must be named MQ4 XTS")
+        ple = entry.get("ple")
+        ple = ple if isinstance(ple, dict) else {}
+        for key, file in FLASH_NEXT_XTS_SHARED_PLE.items():
+            sidecar = ple.get(key)
+            if not isinstance(sidecar, dict) or sidecar.get("file") != file:
+                errors.append(f"{tag}: ple.{key} must be the shared {file!r}")
+
+    # One artifact under four names: identity, settings and sidecars never differ.
+    if present:
+        first_tag, first = present[0]
+        for tag, entry in present[1:]:
+            if entry != first:
+                errors.append(f"{tag}: XTS metadata differs from {first_tag}")
+
+
+def split_base_stem(file: str) -> str | None:
+    """`<stem>` of a bare split-base file name `<stem>-base.<ext>`, else None."""
+    if "/" in file or "\\" in file:
+        return None
+    stem = file.rsplit(".", 1)[0] if "." in file else file
+    if not stem.endswith("-base") or stem == "-base":
+        return None
+    return stem[: -len("-base")]
+
+
+def validate_ple_sidecar(
+    tag: str, file: str, key: str, sidecar: dict, errors: list[str]
+) -> None:
+    """Fail-closed mirror of the registry's `ple` map rules for one sidecar."""
+    kind = f"ple.{key}"
+    if not PLE_FORMAT_KEY.fullmatch(key):
+        errors.append(
+            f"{tag}: invalid PLE format key {key!r} (expected lowercase letters and digits)"
+        )
+        return
+    family = split_base_stem(file)
+    if family is None:
+        errors.append(
+            f"{tag}: {kind} requires a split base file (<name>-base.<ext>), got {file!r}"
+        )
+        return
+    own = f"{file}.ple-{key}"
+    shared = f"{SHARED_PLE_FAMILY}.ple-{key}" if family == SHARED_PLE_FAMILY else None
+    if sidecar.get("file") not in (own, shared):
+        errors.append(
+            f"{tag}: {kind} file {sidecar.get('file')!r} must be {own!r}"
+            + (f" or the shared {shared!r}" if shared else "")
+        )
+
+
+def validate_shared_ple_pins(models: dict, errors: list[str]) -> None:
+    """Every entry naming a shared PLE file must pin the same bytes."""
+    pins: dict[str, tuple[str, tuple]] = {}
+    for tag, entry in models.items():
+        ple = entry.get("ple")
+        if not isinstance(ple, dict):
+            continue
+        for key, sidecar in ple.items():
+            if not isinstance(sidecar, dict):
+                continue
+            file = sidecar.get("file", "")
+            if "/" in file or file != f"{SHARED_PLE_FAMILY}.ple-{key}":
+                continue
+            pin = (sidecar.get("sha256"), sidecar.get("size_bytes"))
+            first_tag, first = pins.setdefault(file, (tag, pin))
+            if pin != first:
+                errors.append(
+                    f"{tag}: ple.{key} shared file {file!r} is pinned differently "
+                    f"than by {first_tag}"
+                )
+
+
 def annotate_sidecar(
     sidecar: dict, tree: dict[str, dict], tag: str, kind: str, errors: list[str]
 ) -> dict:
-    """triattn/mtp sub-object: require existence, add sha256/size_bytes if LFS."""
+    """triattn/mtp/dflash/vision sub-object: require existence, add sha256/size_bytes if LFS."""
     out = dict(sidecar)
     fname = sidecar.get("file", "")
     item = tree.get(fname)
@@ -294,12 +583,25 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
     # One tree fetch per unique repo.
     repos = sorted({e["repo"] for e in models.values() if e.get("repo")})
+    if FLASH_NEXT_XTS_REPO in repos and aliases.get("qwen3.8:flash") != "qwen3.8:flash-next":
+        errors.append("qwen3.8:flash must alias qwen3.8:flash-next (MQ4 XTS)")
+    # Image-component (diffusion) repos publish AFTER their packs exist, so a
+    # missing repo is expected until the first upload: sizes/digests stay TBD
+    # on those entries. Fail-closed stays for text-model repos, where a probe
+    # failure means a typo or a broken upload.
+    image_repos = {e["repo"] for e in models.values() if e.get("arch_id") == 40}
     trees: dict[str, dict[str, dict]] = {}
     for repo in repos:
         try:
             trees[repo] = repo_tree(repo, token)
             log(f"probed {repo}: {len(trees[repo])} files")
         except Exception as e:  # noqa: BLE001 — collected, run fails closed
+            if repo in image_repos:
+                log(
+                    f"repo {repo}: image-component repo not published yet ({e}); "
+                    f"sizes/digests stay TBD"
+                )
+                continue
             errors.append(f"repo {repo}: tree probe failed: {e}")
 
     out_models: dict = {}
@@ -328,7 +630,6 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                 f"{tag}: invalid default_tool_format {tool_format!r} "
                 f"(allowed: {sorted(KNOWN_TOOL_FORMATS)})"
             )
-
         # Optional curated recommended_settings (carried verbatim by deepcopy).
         # Validate bounds — fail-closed, matching hipfire-registry.
         validate_recommended_settings(tag, entry.get("recommended_settings"), errors)
@@ -352,8 +653,16 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
         repo = entry.get("repo", "")
         if not repo:
-            # Local-only entry (pull short-circuits). Nothing to probe.
-            new_entry.update({"sha256": None, "size_bytes": None})
+            # Local-only entry (pull short-circuits). A campaign artifact may
+            # still carry a curated content identity even though there is no
+            # Hugging Face tree to probe. Preserve it verbatim and validate it
+            # below through the generated registry parser.
+            new_entry.update(
+                {
+                    "sha256": entry.get("sha256"),
+                    "size_bytes": entry.get("size_bytes"),
+                }
+            )
         elif repo in trees:
             tree = trees[repo]
             item = tree.get(entry["file"])
@@ -376,9 +685,34 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                                 f"HF {size_bytes / 1e9:.2f} GB ({drift:.0%} drift); "
                                 f"update registry/models.json"
                             )
-            for kind in ("triattn", "mtp"):
+            for kind in ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
+            ple = entry.get("ple")
+            if ple is not None:
+                if not isinstance(ple, dict):
+                    errors.append(f"{tag}: ple must be an object keyed by format token")
+                else:
+                    new_entry["ple"] = {}
+                    for key, sidecar in ple.items():
+                        kind = f"ple.{key}"
+                        if not isinstance(sidecar, dict):
+                            errors.append(f"{tag}: {kind} must be a sidecar object")
+                            continue
+                        validate_ple_sidecar(tag, entry["file"], key, sidecar, errors)
+                        annotated = annotate_sidecar(sidecar, tree, tag, kind, errors)
+                        if not annotated.get("sha256"):
+                            errors.append(f"{tag}: {kind} sidecar has no LFS sha256 pin")
+                        new_entry["ple"][key] = annotated
+            # `heads` is a MAP of sidecars (alternative lm_head overlays), not a
+            # single one — same annotation, once per entry, so a head that is
+            # missing from the repo fails the run like any other sidecar.
+            if isinstance(entry.get("heads"), dict):
+                new_entry["heads"] = {
+                    name: annotate_sidecar(sc, tree, tag, f"heads.{name}", errors)
+                    for name, sc in entry["heads"].items()
+                    if isinstance(sc, dict)
+                }
         # repo probe already failed → error recorded above; entry still gets
         # arch_id/quant so the error list is the only blocker.
 
@@ -403,6 +737,8 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
     # Strict-superset guarantee — the whole point of v1 back-compat.
     is_strict_superset(curated.get("models", {}), registry["models"], "models", errors)
     is_strict_superset(curated.get("aliases", {}), registry["aliases"], "aliases", errors)
+    validate_flash_next_xts(out_models, errors)
+    validate_shared_ple_pins(out_models, errors)
 
     if errors:
         return None, errors

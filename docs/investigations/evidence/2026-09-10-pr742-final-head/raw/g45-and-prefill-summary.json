@@ -1,0 +1,650 @@
+{
+  "binary": "/tmp/hipfire-g4-e786-target/release/daemon",
+  "binary_sha256": "82c45928b85318d1760855d4c0f40f20508618c586c9cf910edbee9f03f1b9b7",
+  "target_sha256": "ea615949ddf6a180eee03ff6fde39f7e51148f153b1b05f82258b9953088576e",
+  "draft_sha256": "3d428b97c1911a9ad815cc52fbee080306852c1dafad6b1b17bb70bd68010301",
+  "cases": {
+    "ordinary_stop": {
+      "request": {
+        "type": "generate",
+        "id": "g45-stop",
+        "attempt_id": 401,
+        "prompt": "Reply with exactly one short line containing OK.",
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "thinking_enabled": false,
+        "stop": [
+          "\n"
+        ]
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "OK",
+      "events": [
+        {
+          "type": "gen_start",
+          "id": "g45-stop",
+          "started_in_think": false,
+          "attempt_id": 401,
+          "contract_version": 2
+        },
+        {
+          "type": "token",
+          "id": "g45-stop",
+          "text": "OK",
+          "attempt_id": 401
+        },
+        {
+          "type": "commit_ready",
+          "id": "g45-stop",
+          "tokens": 2,
+          "tok_s": 0.1,
+          "prefill_tokens": 21,
+          "prefill_ms": 12016.6,
+          "prefill_tok_s": 1.7,
+          "decode_tok_s": 0.4,
+          "ttft_ms": 12016.6,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 401
+        },
+        {
+          "type": "done",
+          "id": "g45-stop",
+          "tokens": 2,
+          "tok_s": 0.1,
+          "prefill_tokens": 21,
+          "prefill_ms": 12016.6,
+          "prefill_tok_s": 1.7,
+          "decode_tok_s": 0.4,
+          "ttft_ms": 12016.6,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 401
+        }
+      ],
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g45-stop",
+          "tokens": 2,
+          "tok_s": 0.1,
+          "prefill_tokens": 21,
+          "prefill_ms": 12016.6,
+          "prefill_tok_s": 1.7,
+          "decode_tok_s": 0.4,
+          "ttft_ms": 12016.6,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 401
+        }
+      ],
+      "terminal_count": 1,
+      "commit_ready_equals_done": true,
+      "attempt_correlation": true
+    },
+    "max_tokens_length": {
+      "request": {
+        "type": "generate",
+        "id": "g45-length",
+        "attempt_id": 402,
+        "prompt": "Write a detailed explanation of Rust ownership and borrowing.",
+        "temperature": 0.0,
+        "max_tokens": 1,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "R",
+      "events": [
+        {
+          "type": "gen_start",
+          "id": "g45-length",
+          "started_in_think": false,
+          "attempt_id": 402,
+          "contract_version": 2
+        },
+        {
+          "type": "token",
+          "id": "g45-length",
+          "text": "R",
+          "attempt_id": 402
+        },
+        {
+          "type": "commit_ready",
+          "id": "g45-length",
+          "tokens": 1,
+          "tok_s": 4.3,
+          "prefill_tokens": 22,
+          "prefill_ms": 165.7,
+          "prefill_tok_s": 132.7,
+          "decode_tok_s": 14.9,
+          "ttft_ms": 165.7,
+          "cached_tokens": 0,
+          "finish_reason": "length",
+          "attempt_id": 402
+        },
+        {
+          "type": "done",
+          "id": "g45-length",
+          "tokens": 1,
+          "tok_s": 4.3,
+          "prefill_tokens": 22,
+          "prefill_ms": 165.7,
+          "prefill_tok_s": 132.7,
+          "decode_tok_s": 14.9,
+          "ttft_ms": 165.7,
+          "cached_tokens": 0,
+          "finish_reason": "length",
+          "attempt_id": 402
+        }
+      ],
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g45-length",
+          "tokens": 1,
+          "tok_s": 4.3,
+          "prefill_tokens": 22,
+          "prefill_ms": 165.7,
+          "prefill_tok_s": 132.7,
+          "decode_tok_s": 14.9,
+          "ttft_ms": 165.7,
+          "cached_tokens": 0,
+          "finish_reason": "length",
+          "attempt_id": 402
+        }
+      ],
+      "terminal_count": 1,
+      "commit_ready_equals_done": true,
+      "attempt_correlation": true
+    },
+    "assistant_prefix_open_think": {
+      "request": {
+        "type": "generate",
+        "id": "g45-open-think",
+        "attempt_id": 403,
+        "prompt": "Produce a concise answer after reasoning.",
+        "temperature": 0.0,
+        "max_tokens": 16,
+        "max_think_tokens": 0,
+        "thinking_enabled": true,
+        "assistant_prefix": "open_think"
+      },
+      "event_types": [
+        "gen_start",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "reasoning",
+        "error"
+      ],
+      "decoded_text": "",
+      "events": [
+        {
+          "type": "gen_start",
+          "id": "g45-open-think",
+          "started_in_think": true,
+          "attempt_id": 403,
+          "contract_version": 2
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": "Thinking",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": " Process",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": ":",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": "\n\n",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": "1",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": ".",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": " ",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": " **",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": "An",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": "alyze",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": " the",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": " Request",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": ":**",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": "\n",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": "   ",
+          "attempt_id": 403
+        },
+        {
+          "type": "reasoning",
+          "id": "g45-open-think",
+          "text": " *",
+          "attempt_id": 403
+        },
+        {
+          "type": "error",
+          "message": "open think span at end of generation (validation)",
+          "class": "validation",
+          "retryable": false,
+          "rolled_back": true,
+          "attempt_id": 403,
+          "id": "g45-open-think"
+        }
+      ],
+      "terminal_events": [
+        {
+          "type": "error",
+          "message": "open think span at end of generation (validation)",
+          "class": "validation",
+          "retryable": false,
+          "rolled_back": true,
+          "attempt_id": 403,
+          "id": "g45-open-think"
+        }
+      ],
+      "terminal_count": 1,
+      "commit_ready_equals_done": null,
+      "attempt_correlation": true
+    },
+    "next_turn_reuse": {
+      "request": {
+        "type": "generate",
+        "id": "g45-reuse",
+        "attempt_id": 405,
+        "prompt": "After reset answer exactly REUSED.",
+        "temperature": 0.0,
+        "max_tokens": 16,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "REUSED",
+      "events": [
+        {
+          "type": "gen_start",
+          "id": "g45-reuse",
+          "started_in_think": false,
+          "attempt_id": 405,
+          "contract_version": 2
+        },
+        {
+          "type": "token",
+          "id": "g45-reuse",
+          "text": "RE",
+          "attempt_id": 405
+        },
+        {
+          "type": "token",
+          "id": "g45-reuse",
+          "text": "USED",
+          "attempt_id": 405
+        },
+        {
+          "type": "commit_ready",
+          "id": "g45-reuse",
+          "tokens": 3,
+          "tok_s": 8.1,
+          "prefill_tokens": 19,
+          "prefill_ms": 164.6,
+          "prefill_tok_s": 115.4,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 164.6,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 405
+        },
+        {
+          "type": "done",
+          "id": "g45-reuse",
+          "tokens": 3,
+          "tok_s": 8.1,
+          "prefill_tokens": 19,
+          "prefill_ms": 164.6,
+          "prefill_tok_s": 115.4,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 164.6,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 405
+        }
+      ],
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g45-reuse",
+          "tokens": 3,
+          "tok_s": 8.1,
+          "prefill_tokens": 19,
+          "prefill_ms": 164.6,
+          "prefill_tok_s": 115.4,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 164.6,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 405
+        }
+      ],
+      "terminal_count": 1,
+      "commit_ready_equals_done": true,
+      "attempt_correlation": true
+    }
+  },
+  "load": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "fresh_snapshot": {
+    "type": "test_state_snapshot",
+    "schema_version": 1,
+    "arch": "qwen35",
+    "eligible_routes": [
+      "qwen_ar",
+      "qwen_dflash"
+    ],
+    "state_epoch": 0,
+    "seq_pos": 0,
+    "conversation_len": 0,
+    "kv_hash": "ef63c0f140b9a325",
+    "kv_bytes": 67133440,
+    "recurrent_hash": "6a67742d55922325",
+    "recurrent_bytes": 120324096,
+    "graph_clean": true,
+    "replay_clean": true,
+    "drafter_reset": true,
+    "checkpoint_empty": true,
+    "adaptive_clean": true,
+    "asst_cache_empty": true,
+    "prefix_cache_clean": true
+  },
+  "open_snapshot": {
+    "type": "test_state_snapshot",
+    "schema_version": 1,
+    "arch": "qwen35",
+    "eligible_routes": [
+      "qwen_ar",
+      "qwen_dflash"
+    ],
+    "state_epoch": 0,
+    "seq_pos": 0,
+    "conversation_len": 0,
+    "kv_hash": "072b960ed51b642e",
+    "kv_bytes": 67133440,
+    "recurrent_hash": "6a67742d55922325",
+    "recurrent_bytes": 120324096,
+    "graph_clean": true,
+    "replay_clean": true,
+    "drafter_reset": true,
+    "checkpoint_empty": true,
+    "adaptive_clean": true,
+    "asst_cache_empty": true,
+    "prefix_cache_clean": true
+  },
+  "reset_after_open": {
+    "type": "reset",
+    "rolled_back": true,
+    "state_epoch": 1,
+    "seq_pos": 0,
+    "conversation_len": 0,
+    "attempt_id": 404,
+    "retry_reset_eligible": true
+  },
+  "post_terminal_ping": {
+    "event": {
+      "type": "pong"
+    },
+    "assertions": {
+      "pong": true
+    }
+  },
+  "reuse_snapshot": {
+    "type": "test_state_snapshot",
+    "schema_version": 1,
+    "arch": "qwen35",
+    "eligible_routes": [
+      "qwen_ar",
+      "qwen_dflash"
+    ],
+    "state_epoch": 1,
+    "seq_pos": 23,
+    "conversation_len": 23,
+    "kv_hash": "9e1ecfc2295a6edf",
+    "kv_bytes": 67133440,
+    "recurrent_hash": "28c31fae9b14ca0a",
+    "recurrent_bytes": 120324096,
+    "graph_clean": false,
+    "replay_clean": true,
+    "drafter_reset": true,
+    "checkpoint_empty": false,
+    "adaptive_clean": true,
+    "asst_cache_empty": false,
+    "prefix_cache_clean": false
+  },
+  "unload": {
+    "type": "unloaded"
+  },
+  "prefill_load": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "controlled_abort_prefill": {
+    "request": {
+      "type": "generate",
+      "id": "g46-abort-prefill-controlled",
+      "attempt_id": 501,
+      "prompt": "Write a long detailed answer about Rust ownership.",
+      "temperature": 0.0,
+      "max_tokens": 64,
+      "thinking_enabled": false
+    },
+    "event_types": [
+      "gen_start",
+      "aborted",
+      "done"
+    ],
+    "decoded_text": "",
+    "events": [
+      {
+        "type": "gen_start",
+        "id": "g46-abort-prefill-controlled",
+        "started_in_think": false,
+        "attempt_id": 501,
+        "contract_version": 2
+      },
+      {
+        "type": "aborted",
+        "id": "g46-abort-prefill-controlled",
+        "reason": "client_cancelled",
+        "attempt_id": 501
+      },
+      {
+        "type": "done",
+        "id": "g46-abort-prefill-controlled",
+        "finish_reason": "aborted",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "prefill_ms": 0,
+        "decode_ms": 0,
+        "attempt_id": 501
+      }
+    ],
+    "terminal_events": [
+      {
+        "type": "aborted",
+        "id": "g46-abort-prefill-controlled",
+        "reason": "client_cancelled",
+        "attempt_id": 501
+      },
+      {
+        "type": "done",
+        "id": "g46-abort-prefill-controlled",
+        "finish_reason": "aborted",
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "prefill_ms": 0,
+        "decode_ms": 0,
+        "attempt_id": 501
+      }
+    ],
+    "terminal_count": 2,
+    "assertions": {
+      "abort_sent_at_gen_start": true,
+      "no_token_before_abort": true,
+      "aborted_done_pair": true
+    }
+  },
+  "controlled_snapshot": {
+    "type": "test_state_snapshot",
+    "schema_version": 1,
+    "arch": "qwen35",
+    "eligible_routes": [
+      "qwen_ar",
+      "qwen_dflash"
+    ],
+    "state_epoch": 0,
+    "seq_pos": 0,
+    "conversation_len": 0,
+    "kv_hash": "f70f832c141f910b",
+    "kv_bytes": 67133440,
+    "recurrent_hash": "6a67742d55922325",
+    "recurrent_bytes": 120324096,
+    "graph_clean": true,
+    "replay_clean": true,
+    "drafter_reset": true,
+    "checkpoint_empty": true,
+    "adaptive_clean": true,
+    "asst_cache_empty": true,
+    "prefix_cache_clean": true
+  },
+  "controlled_reset": {
+    "type": "reset",
+    "rolled_back": true,
+    "state_epoch": 1,
+    "seq_pos": 0,
+    "conversation_len": 0,
+    "attempt_id": 502,
+    "retry_reset_eligible": true
+  },
+  "controlled_unload": {
+    "type": "unloaded"
+  }
+}

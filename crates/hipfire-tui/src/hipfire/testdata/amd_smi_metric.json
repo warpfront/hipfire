@@ -1,0 +1,328 @@
+{
+    "gpu_data": [
+        {
+            "gpu": 0,
+            "usage": {
+                "gfx_activity": {
+                    "value": 0,
+                    "unit": "%"
+                },
+                "umc_activity": {
+                    "value": 0,
+                    "unit": "%"
+                },
+                "mm_activity": {
+                    "value": 0,
+                    "unit": "%"
+                },
+                "vcn_activity": [
+                    {
+                        "value": 0,
+                        "unit": "%"
+                    },
+                    "N/A",
+                    "N/A",
+                    "N/A"
+                ],
+                "jpeg_activity": [
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A"
+                ],
+                "gfx_busy_inst": "N/A",
+                "jpeg_busy": "N/A",
+                "vcn_busy": {
+                    "value": 0,
+                    "unit": "%"
+                }
+            },
+            "power": {
+                "socket_power": {
+                    "value": 23,
+                    "unit": "W"
+                },
+                "gfx_voltage": {
+                    "value": 75,
+                    "unit": "mV"
+                },
+                "soc_voltage": {
+                    "value": 873,
+                    "unit": "mV"
+                },
+                "mem_voltage": {
+                    "value": 1250,
+                    "unit": "mV"
+                },
+                "throttle_status": "THROTTLED",
+                "power_management": "ENABLED",
+                "ubb_power": "N/A"
+            },
+            "temperature": {
+                "edge": {
+                    "value": 47,
+                    "unit": "C"
+                },
+                "hotspot": {
+                    "value": 48,
+                    "unit": "C"
+                },
+                "mem": {
+                    "value": 50,
+                    "unit": "C"
+                },
+                "hbm_stacks": [
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A"
+                ],
+                "mid": [
+                    "N/A",
+                    "N/A"
+                ],
+                "aid": [
+                    "N/A",
+                    "N/A"
+                ],
+                "xcd": "N/A"
+            },
+            "mem_usage": {
+                "total_vram": {
+                    "value": 32624,
+                    "unit": "MB"
+                },
+                "used_vram": {
+                    "value": 57,
+                    "unit": "MB"
+                },
+                "free_vram": {
+                    "value": 32567,
+                    "unit": "MB"
+                },
+                "total_visible_vram": {
+                    "value": 32624,
+                    "unit": "MB"
+                },
+                "used_visible_vram": {
+                    "value": 57,
+                    "unit": "MB"
+                },
+                "free_visible_vram": {
+                    "value": 32567,
+                    "unit": "MB"
+                },
+                "total_gtt": {
+                    "value": 62922,
+                    "unit": "MB"
+                },
+                "used_gtt": {
+                    "value": 14,
+                    "unit": "MB"
+                },
+                "free_gtt": {
+                    "value": 62908,
+                    "unit": "MB"
+                }
+            }
+        },
+        {
+            "gpu": 1,
+            "usage": {
+                "gfx_activity": {
+                    "value": 0,
+                    "unit": "%"
+                },
+                "umc_activity": {
+                    "value": 0,
+                    "unit": "%"
+                },
+                "mm_activity": {
+                    "value": 0,
+                    "unit": "%"
+                },
+                "vcn_activity": [
+                    {
+                        "value": 0,
+                        "unit": "%"
+                    },
+                    "N/A",
+                    "N/A",
+                    "N/A"
+                ],
+                "jpeg_activity": [
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A"
+                ],
+                "gfx_busy_inst": "N/A",
+                "jpeg_busy": "N/A",
+                "vcn_busy": {
+                    "value": 0,
+                    "unit": "%"
+                }
+            },
+            "power": {
+                "socket_power": {
+                    "value": 22,
+                    "unit": "W"
+                },
+                "gfx_voltage": {
+                    "value": 86,
+                    "unit": "mV"
+                },
+                "soc_voltage": {
+                    "value": 877,
+                    "unit": "mV"
+                },
+                "mem_voltage": {
+                    "value": 1250,
+                    "unit": "mV"
+                },
+                "throttle_status": "THROTTLED",
+                "power_management": "ENABLED",
+                "ubb_power": "N/A"
+            },
+            "temperature": {
+                "edge": {
+                    "value": 43,
+                    "unit": "C"
+                },
+                "hotspot": {
+                    "value": 44,
+                    "unit": "C"
+                },
+                "mem": {
+                    "value": 46,
+                    "unit": "C"
+                },
+                "hbm_stacks": [
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A",
+                    "N/A"
+                ],
+                "mid": [
+                    "N/A",
+                    "N/A"
+                ],
+                "aid": [
+                    "N/A",
+                    "N/A"
+                ],
+                "xcd": "N/A"
+            },
+            "mem_usage": {
+                "total_vram": {
+                    "value": 32624,
+                    "unit": "MB"
+                },
+                "used_vram": {
+                    "value": 57,
+                    "unit": "MB"
+                },
+                "free_vram": {
+                    "value": 32567,
+                    "unit": "MB"
+                },
+                "total_visible_vram": {
+                    "value": 32624,
+                    "unit": "MB"
+                },
+                "used_visible_vram": {
+                    "value": 57,
+                    "unit": "MB"
+                },
+                "free_visible_vram": {
+                    "value": 32567,
+                    "unit": "MB"
+                },
+                "total_gtt": {
+                    "value": 62922,
+                    "unit": "MB"
+                },
+                "used_gtt": {
+                    "value": 14,
+                    "unit": "MB"
+                },
+                "free_gtt": {
+                    "value": 62908,
+                    "unit": "MB"
+                }
+            }
+        }
+    ]
+}

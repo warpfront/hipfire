@@ -1,0 +1,34 @@
+{
+  "gemv_mq4g256v2_rows_x4_pm_gfx1201": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 1513,
+    "instructions": 5784,
+    "lds_accesses": 360,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 360,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 80,
+    "table": "gfx1201",
+    "vgpr_high_water": 121,
+    "wait_facts": 529
+  },
+  "gemv_mq4g256v2_rows_x4_t8_pm_gfx1201": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 1513,
+    "instructions": 5818,
+    "lds_accesses": 360,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 360,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 80,
+    "table": "gfx1201",
+    "vgpr_high_water": 121,
+    "wait_facts": 529
+  }
+}

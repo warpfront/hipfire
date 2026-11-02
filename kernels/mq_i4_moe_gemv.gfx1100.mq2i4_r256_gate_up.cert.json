@@ -1,0 +1,757 @@
+{
+  "schema_version": 5,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1792014146,
+  "source": "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b2.k1.s",
+  "output": "/home/kaden/qcal/release-0.4.3/consumer24-k1/kernels/mq_i4_moe_gemv_pm_gfx1100.hxaco",
+  "arch": "gfx1100",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/bin/hipcc",
+  "hipcc_version": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg",
+  "command": [
+    "/home/kaden/qcal/release-0.4.3/target-consumer24-b2/release/peacemaker",
+    "native",
+    "--arch=gfx1100",
+    "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b2.k1.s",
+    "--co=/home/kaden/qcal/release-0.4.3/consumer24-k1/kernels/mq_i4_moe_gemv_pm_gfx1100.co",
+    "--bundle=/home/kaden/qcal/release-0.4.3/consumer24-k1/kernels/mq_i4_moe_gemv_pm_gfx1100.hxaco",
+    "--host-target=host-x86_64-unknown-linux-gnu"
+  ],
+  "source_sha256": "ab43f22e1a05ce0890fb1ef7769c3428c6f6acadf5f8a67a89abaff85e643c28",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "27c1cadb8fafcb5f4a1d3e40782589325989b2b79b799b086b66e44710ac1069",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1100",
+    "identity": {
+      "architecture": "gfx1100",
+      "elf_machine_id": 65,
+      "isa": {
+        "major": 11,
+        "minor": 0,
+        "stepping": 0
+      }
+    },
+    "kernels": [
+      {
+        "name": "mq_i4_moe_gemv_mq2i4_r256_gate_up_pm_gfx1100",
+        "wavefront_size": 32,
+        "vgpr_count": 104,
+        "sgpr_count": 80,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 40,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 48,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 64,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 68,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 72,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 76,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 80,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 84,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1683,
+          "buffer_loads": 56,
+          "buffer_stores": 0,
+          "global_loads": 15,
+          "global_stores": 8,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 7,
+          "kernarg_scalar_loads": 4,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 3,
+          "wait_instructions": 531,
+          "delay_alu_instructions": 478,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 2
+        }
+      },
+      {
+        "name": "mq_i4_moe_gemv_mq2i4_r128_down_pm_gfx1100",
+        "wavefront_size": 32,
+        "vgpr_count": 80,
+        "sgpr_count": 80,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 40,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 48,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 64,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 68,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 72,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 76,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 80,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 84,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 614,
+          "buffer_loads": 8,
+          "buffer_stores": 0,
+          "global_loads": 3,
+          "global_stores": 8,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 7,
+          "kernarg_scalar_loads": 4,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 3,
+          "wait_instructions": 204,
+          "delay_alu_instructions": 157,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 2
+        }
+      },
+      {
+        "name": "mq_i4_moe_gemv_mq4sym_r256_gate_up_pm_gfx1100",
+        "wavefront_size": 32,
+        "vgpr_count": 144,
+        "sgpr_count": 80,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 40,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 48,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 64,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 68,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 72,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 76,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 80,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 84,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 2226,
+          "buffer_loads": 112,
+          "buffer_stores": 0,
+          "global_loads": 15,
+          "global_stores": 8,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 7,
+          "kernarg_scalar_loads": 4,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 3,
+          "wait_instructions": 763,
+          "delay_alu_instructions": 710,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 2
+        }
+      },
+      {
+        "name": "mq_i4_moe_gemv_mq4sym_r128_down_pm_gfx1100",
+        "wavefront_size": 32,
+        "vgpr_count": 80,
+        "sgpr_count": 80,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 40,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 48,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 64,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 68,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 72,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 76,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 80,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 84,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 594,
+          "buffer_loads": 8,
+          "buffer_stores": 0,
+          "global_loads": 3,
+          "global_stores": 8,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 7,
+          "kernarg_scalar_loads": 4,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 3,
+          "wait_instructions": 197,
+          "delay_alu_instructions": 150,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 2
+        }
+      }
+    ]
+  },
+  "peacemaker": {
+    "arm": "custom-isa",
+    "producer": {
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "unknown",
+      "proof_sha256": "a37c592ed2c35d082c89e9360aa6810db1e1c315351a8c3b22d070b75d77a547"
+    },
+    "tools": [
+      {
+        "role": "native",
+        "path": "/home/kaden/qcal/release-0.4.3/target-consumer24-b2/release/peacemaker",
+        "version": "peacemaker-isa 0.4.1 native code object v6 writer (ld.lld 24.0.0 layout)",
+        "argv": [
+          "/home/kaden/qcal/release-0.4.3/target-consumer24-b2/release/peacemaker",
+          "native",
+          "--arch=gfx1100",
+          "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b2.k1.s",
+          "--co=/home/kaden/qcal/release-0.4.3/consumer24-k1/kernels/mq_i4_moe_gemv_pm_gfx1100.co",
+          "--bundle=/home/kaden/qcal/release-0.4.3/consumer24-k1/kernels/mq_i4_moe_gemv_pm_gfx1100.hxaco",
+          "--host-target=host-x86_64-unknown-linux-gnu"
+        ],
+        "sha256": "62879fd16e3873eba89b787a04cb5baff8508681c3206370856fe7431af429f2"
+      }
+    ],
+    "s_text_sha256": "ab43f22e1a05ce0890fb1ef7769c3428c6f6acadf5f8a67a89abaff85e643c28",
+    "text_section_sha256": "372e14630ae358c6194d149fc0e472cf278252922e1283031ff28fa97d497339",
+    "shape_contract": {
+      "symbol": "mq_i4_moe_gemv_mq2i4_r256_gate_up_pm_gfx1100",
+      "start_label": null,
+      "end_label": null,
+      "counts": {
+        "buffer_load_b128": 56,
+        "ds_bpermute_b32": 40,
+        "global_load_b32": 1,
+        "global_load_u16": 7,
+        "global_load_u8": 7,
+        "global_store_b32": 8,
+        "s_cbranch_scc0": 115,
+        "s_cbranch_scc1": 7,
+        "s_cselect_b64": 1,
+        "s_delay_alu": 478,
+        "s_endpgm": 1,
+        "s_load_b128": 1,
+        "s_load_b256": 2,
+        "s_load_b32": 1,
+        "s_load_b64": 3,
+        "s_waitcnt": 51,
+        "s_waitcnt_depctr": 1,
+        "v_add_f32_e32": 120,
+        "v_add_lshl_u32": 5,
+        "v_bfe_u32": 28,
+        "v_cmpx_eq_u32_e32": 1,
+        "v_cndmask_b32_e64": 49,
+        "v_cvt_f32_f16_e64": 7,
+        "v_cvt_f32_i32_e32": 28,
+        "v_cvt_f32_u32_e32": 2,
+        "v_fmac_f32_e32": 168,
+        "v_min_u32_e32": 1,
+        "v_mul_f32_e32": 85,
+        "v_mul_lo_u32": 3,
+        "v_readlane_b32": 16
+      },
+      "forbidden": [
+        "scratch_*",
+        "flat_*",
+        "ds_load*",
+        "ds_store*",
+        "ds_swizzle*",
+        "ds_read*",
+        "ds_write*",
+        "s_barrier*",
+        "v_writelane*",
+        "v_wmma*",
+        "v_swmmac*",
+        "v_fma_mix*",
+        "s_setpc*",
+        "s_swappc*",
+        "s_wait_loadcnt*",
+        "s_wait_dscnt*",
+        "s_wait_storecnt*",
+        "s_wait_kmcnt*",
+        "s_wait_alu",
+        "s_add_co_*",
+        "s_sub_co_*"
+      ],
+      "vgpr_max": 104,
+      "sgpr_max": 80,
+      "require_wave32": true,
+      "require_zero_spills": true,
+      "require_zero_private": true,
+      "launch_dynamic_lds_bytes": 0,
+      "group_segment_fixed_bytes": 0
+    },
+    "shape_result": {
+      "counts": {
+        "buffer_load_b128": 56,
+        "ds_bpermute_b32": 40,
+        "global_load_b32": 1,
+        "global_load_u16": 7,
+        "global_load_u8": 7,
+        "global_store_b32": 8,
+        "s_add_i32": 9,
+        "s_add_u32": 5,
+        "s_addc_u32": 5,
+        "s_and_b32": 1,
+        "s_cbranch_scc0": 115,
+        "s_cbranch_scc1": 7,
+        "s_cmp_eq_u32": 2,
+        "s_cmp_ge_u32": 2,
+        "s_cmp_gt_u32": 114,
+        "s_cmp_lt_u32": 5,
+        "s_cselect_b32": 1,
+        "s_cselect_b64": 1,
+        "s_delay_alu": 478,
+        "s_endpgm": 1,
+        "s_load_b128": 1,
+        "s_load_b256": 2,
+        "s_load_b32": 1,
+        "s_load_b64": 3,
+        "s_lshl_b32": 20,
+        "s_lshr_b32": 3,
+        "s_mov_b32": 7,
+        "s_mul_i32": 12,
+        "s_sub_i32": 2,
+        "s_waitcnt": 51,
+        "s_waitcnt_depctr": 1,
+        "s_waitcnt_vscnt": 1,
+        "v_add_f32_e32": 120,
+        "v_add_lshl_u32": 5,
+        "v_add_nc_u32_e32": 103,
+        "v_bfe_u32": 28,
+        "v_cmp_gt_i32_e64": 1,
+        "v_cmp_gt_u32_e64": 5,
+        "v_cmp_le_i32_e64": 1,
+        "v_cmp_le_u32_e64": 1,
+        "v_cmpx_eq_u32_e32": 1,
+        "v_cndmask_b32_e64": 49,
+        "v_cvt_f32_f16_e64": 7,
+        "v_cvt_f32_i32_e32": 28,
+        "v_cvt_f32_u32_e32": 2,
+        "v_cvt_u32_f32_e32": 1,
+        "v_fmac_f32_e32": 168,
+        "v_lshlrev_b32_e32": 30,
+        "v_min_u32_e32": 1,
+        "v_mov_b32_e32": 56,
+        "v_mul_f32_e32": 85,
+        "v_mul_lo_u32": 3,
+        "v_mul_u32_u24_e32": 1,
+        "v_rcp_iflag_f32_e32": 1,
+        "v_readlane_b32": 16,
+        "v_sub_nc_u32_e32": 1,
+        "valu_slots": 714
+      },
+      "vgpr_count": 104,
+      "sgpr_count": 80,
+      "wavefront_size": 32,
+      "private_segment_fixed_size": 0,
+      "vgpr_spill_count": 0,
+      "sgpr_spill_count": 0,
+      "launch_dynamic_lds_bytes": 0,
+      "max_lds_access_end": 0,
+      "max_used_vgpr": 104,
+      "max_used_sgpr": 80,
+      "descriptor_vgpr_reservation": 104,
+      "m7_analysis": {
+        "lift": "byte-exact",
+        "table": "gfx1100",
+        "instructions": 1683,
+        "obligations": {},
+        "wait_facts": 53,
+        "barrier_pairs": 0,
+        "clauses": 0,
+        "delays": 478,
+        "ambiguous_delays": 0,
+        "vgpr_high_water": 104,
+        "sgpr_high_water": 80,
+        "lds_accesses": 40,
+        "lds_unknown_addresses": 40,
+        "lds_max_known_end": null
+      }
+    },
+    "oracle_receipt": null
+  }
+}

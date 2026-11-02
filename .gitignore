@@ -44,6 +44,7 @@ kernels/compiled/
 # Local secrets (lmx api key, etc.) — never commit
 .env
 .env.*
+!.env.example
 docs/superpowers/
 .worktrees/
 .dflash-reference/
@@ -61,8 +62,10 @@ __pycache__/
 *.log
 /tmp/
 
-# Local Claude agent state
+# Local agent harness state (Claude / Oh My Pi). Per-session bookkeeping,
+# worktrees, and artifact caches — never part of the tracked tree.
 .claude/
+.omp/
 # Personal CLI instructions
 cli/CLAUDE.md
 CLAUDE.local.md
@@ -80,7 +83,6 @@ artifacts/
 .codeinsight+research/
 .local-bench-scratch/
 .gm/rs-learn.db
-findings/
 .plugkit-browser-profile/
 .plugkit-browser-profile-*/
 .plugkit-agent-worktree/
@@ -107,8 +109,6 @@ research/
 
 # Scratch research bundles (raw PR diffs, model-conversion test artifacts)
 .codeinsight+research/
-
-bench/coherence-results/
 
 # kld_reduce.py outputs when run from repo root
 result-data.json
@@ -143,5 +143,66 @@ docs/investigations/*/sources/
 *.rocpd
 *.pftrace
 
+# Harvested corpus index — regenerable from autoresearch/corpus/*.jsonl
+# via scripts/harvest_ledgers.py --ingest
+autoresearch/db/ar.db
+
+# Redline capture-corpus index — regenerable from redline/corpus/*.jsonl
+# via python3 -m tools.capture.harvest_redline --ingest
+redline/db/redline.db
+
 # Local research scratch (agent surveys, microbenches)
 .research/
+
+# superpowers subagent-driven-development scratch (ledger, briefs, review packages)
+.superpowers/
+
+# Code-intelligence index (per-checkout, machine-local)
+.codegraph/
+
+# graphify knowledge-graph output (regenerable; never track)
+/graphify-out/
+# Gate-run artifacts (parent-calibration manifests, gate logs). Regenerate
+# with examples/ds4_parent_{inventory,codec}_gate; the durable numbers live
+# in commit messages and docs/investigations/.
+out/
+
+# DeepSeek V4 reference source is third-party and gitignored at
+# .codeinsight+research/; never vendor it into the tracked tree.
+crates/hipfire-arch-deepseek4/reference_oracle/model.py
+crates/hipfire-arch-deepseek4/reference_oracle/kernel.py
+crates/hipfire-arch-deepseek4/reference_oracle/config.json
+crates/hipfire-arch-deepseek4/reference_oracle/__pycache__/
+
+# MI300X calibration deployment bundles (regenerable)
+dist/
+dist_test/
+
+# hipcc ICE reproducer dumps and -save-temps intermediates (.s, .tmp.bc,
+# .s.tmp) emitted into CWD
+*.hipi
+*.hipfb
+/*-hip-amdgcn-amd-amdhsa-*
+/*-host-x86_64-unknown-linux-gnu.s
+
+# Root-level agent scratch trees; durable evidence goes in docs/ or commit
+# messages
+/scratch-*/
+scs_suite_report.json
+npu-bisect-out/
+npu-bisect2-out/
+npu-probe-out/
+# calibrate.py freeze's plain-text working copies of the frozen reported
+# rows (label + served probabilities, no dataset text). Only the gzipped
+# form of a licence-clear source (bench/jev/DATA-LICENSES.md) is committed,
+# by explicit path; a source with restrictive or unclear redistribution
+# terms stays here, local-only.
+bench/jev/*/probs/*.jsonl
+
+# heldout.py run's per-model answer rows (probs + gold, no dataset text).
+# Same rule as probs/ above: a licence-clear source's file is committed
+# gzip-compressed (gzip -n), by explicit path; ag-news, duplicates,
+# yelp-stars, offensive, sentiment-it and hellaswag
+# (bench/jev/DATA-LICENSES.md) stay here as plain .jsonl, local-only, never
+# staged even incidentally by a wildcard add.
+bench/jev/*/heldout/*.jsonl

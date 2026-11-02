@@ -1,0 +1,1 @@
+HOME=/tmp/hipfire-g4-vl-home HIPFIRE_LOCAL=1 HIPFIRE_NO_REGISTRY_FETCH=1 HIPFIRE_DAEMON_BIN=/tmp/hipfire-g4-e786-target/release/daemon /tmp/hipfire-g4-e786-target/release/hipfire run /home/bjoern/.hipfire/models/qwen3.6-27b-vl.mq4 --image benchmarks/vision/images/scene_1.jpg --max-tokens 32 --no-stream -j "Describe this image in 2-3 sentences. /no_think"

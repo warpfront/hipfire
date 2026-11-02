@@ -77,13 +77,48 @@ impl ShardConfig {
     /// Build a shard config for `tp_size` ranks.
     ///
     /// `n_experts == 0` yields an empty `expert_to_rank` (dense model).
-    /// Errors if `tp_size == 0`, or `n_experts` is non-zero and not divisible
-    /// by `tp_size` (v1 requires balanced expert blocks — see TP plan §3.6).
+    /// Errors if `tp_size == 0`, or if experts do not divide evenly. Models
+    /// with an explicitly certified uneven route use
+    /// [`Self::new_uneven_experts`] instead.
     pub fn new(
         tp_size: usize,
         tp_kv_replicate: bool,
         n_experts: usize,
         assign: ExpertAssign,
+    ) -> Result<Self, String> {
+        Self::build(
+            tp_size,
+            tp_kv_replicate,
+            n_experts,
+            assign,
+            /* allow_uneven_experts=*/ false,
+        )
+    }
+
+    /// Build a shard config that permits a one-expert imbalance. This is an
+    /// explicit admission seam for models such as DeepSeek V4 TP3; existing
+    /// Qwen/MiniMax callers of [`Self::new`] retain the prior fail-closed rule.
+    pub fn new_uneven_experts(
+        tp_size: usize,
+        tp_kv_replicate: bool,
+        n_experts: usize,
+        assign: ExpertAssign,
+    ) -> Result<Self, String> {
+        Self::build(
+            tp_size,
+            tp_kv_replicate,
+            n_experts,
+            assign,
+            /* allow_uneven_experts=*/ true,
+        )
+    }
+
+    fn build(
+        tp_size: usize,
+        tp_kv_replicate: bool,
+        n_experts: usize,
+        assign: ExpertAssign,
+        allow_uneven_experts: bool,
     ) -> Result<Self, String> {
         if tp_size == 0 {
             return Err("ShardConfig: tp_size must be >= 1".to_string());
@@ -91,17 +126,20 @@ impl ShardConfig {
         let expert_to_rank = if n_experts == 0 {
             Vec::new()
         } else {
-            if n_experts % tp_size != 0 {
+            if !allow_uneven_experts && n_experts % tp_size != 0 {
                 return Err(format!(
                     "ShardConfig: n_experts ({n_experts}) not divisible by tp_size \
-                     ({tp_size}); v1 requires balanced expert blocks"
+                     ({tp_size}); use an explicitly admitted uneven-expert route"
                 ));
             }
-            let per = n_experts / tp_size;
             (0..n_experts)
                 .map(|e| {
                     let rank = match assign {
-                        ExpertAssign::Contiguous => e / per,
+                        ExpertAssign::Contiguous => (0..tp_size)
+                            .find(|&rank| {
+                                Self::balanced_range(rank, tp_size, n_experts).contains(&e)
+                            })
+                            .expect("balanced expert ranges cover every expert"),
                         ExpertAssign::Stride => e % tp_size,
                     };
                     rank as u8
@@ -119,6 +157,20 @@ impl ShardConfig {
     #[inline]
     pub fn is_single(&self) -> bool {
         self.tp_size == 1
+    }
+
+    /// Deterministically partition `total` whole units across `parts`, giving
+    /// the first `total % parts` ranks one extra unit. The ranges tile
+    /// `0..total` exactly with no gaps or padding.
+    #[inline]
+    pub fn balanced_range(rank: usize, parts: usize, total: usize) -> Range<usize> {
+        assert!(parts > 0, "balanced_range parts must be non-zero");
+        assert!(rank < parts, "balanced_range rank out of bounds");
+        let base = total / parts;
+        let remainder = total % parts;
+        let start = rank * base + rank.min(remainder);
+        let len = base + usize::from(rank < remainder);
+        start..start + len
     }
 
     /// Validate the head geometry against this shard config. Call at model
@@ -263,24 +315,35 @@ impl ShardConfig {
     // `owns_expert` / `experts_on_rank` below, Stage 5) into a `[N×dim]`
     // partial, then the partials are all-reduced. See `docs/plans/tp-3e-ep-moe.md`.
 
-    /// Routed experts owned per rank (`n_experts / tp_size`). Dense model
-    /// (`expert_to_rank` empty) → `n_experts` (single owner).
+    /// Maximum routed experts owned by any rank. Dense model
+    /// (`expert_to_rank` empty) → `n_experts` (single owner). Existing even
+    /// splits are unchanged; uneven splits return the safe allocation bound.
     #[inline]
     pub fn experts_per_rank(&self, n_experts: usize) -> usize {
         if self.expert_to_rank.is_empty() {
             n_experts
         } else {
-            n_experts / self.tp_size
+            n_experts.div_ceil(self.tp_size)
         }
     }
 
-    /// Validate the MoE expert split: `n_experts` must be divisible by
-    /// `tp_size` (v1 requires balanced expert blocks — `new` already enforces
-    /// this when constructed with `n_experts`; this re-checks at the call site).
+    /// Validate that this assignment covers exactly `n_experts` and names only
+    /// live ranks. Uneven splits are legal.
     pub fn validate_moe(&self, n_experts: usize) -> Result<(), String> {
-        if n_experts % self.tp_size != 0 {
+        if self.expert_to_rank.len() != n_experts {
             return Err(format!(
-                "validate_moe: n_experts ({n_experts}) not divisible by tp_size ({})",
+                "validate_moe: assignment length {} != n_experts {n_experts}",
+                self.expert_to_rank.len()
+            ));
+        }
+        if let Some((expert, owner)) = self
+            .expert_to_rank
+            .iter()
+            .enumerate()
+            .find(|(_, owner)| **owner as usize >= self.tp_size)
+        {
+            return Err(format!(
+                "validate_moe: expert {expert} names invalid rank {owner}/{}",
                 self.tp_size
             ));
         }
@@ -332,6 +395,67 @@ impl ShardConfig {
     }
 }
 
+/// Select whole output rows from a row-major, uniform-row packed matrix.
+/// This is the byte-exact column-parallel primitive used by quantized TP
+/// loaders: no quant group is decoded or rewritten.
+pub fn slice_uniform_rows(
+    data: &[u8],
+    rows: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>, String> {
+    if start > end || end > rows || rows == 0 || data.len() % rows != 0 {
+        return Err(format!(
+            "invalid uniform-row slice {start}..{end} for rows={rows}, bytes={}",
+            data.len()
+        ));
+    }
+    let row_bytes = data.len() / rows;
+    Ok(data[start * row_bytes..end * row_bytes].to_vec())
+}
+
+/// Select whole quant groups from every row of a row-major packed matrix.
+/// `start` and `end` are input-column indices and must be group aligned.
+pub fn slice_uniform_group_cols(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    start: usize,
+    end: usize,
+    group_size: usize,
+) -> Result<Vec<u8>, String> {
+    if rows == 0
+        || group_size == 0
+        || start > end
+        || end > cols
+        || cols % group_size != 0
+        || start % group_size != 0
+        || end % group_size != 0
+        || data.len() % rows != 0
+    {
+        return Err(format!(
+            "invalid uniform-group column slice {start}..{end} for {rows}x{cols}, group={group_size}, bytes={}",
+            data.len()
+        ));
+    }
+    let groups = cols / group_size;
+    let row_bytes = data.len() / rows;
+    if row_bytes % groups != 0 {
+        return Err(format!(
+            "row bytes {row_bytes} are not divisible by {groups} quant groups"
+        ));
+    }
+    let group_bytes = row_bytes / groups;
+    let first_group = start / group_size;
+    let selected_bytes = (end - start) / group_size * group_bytes;
+    let mut out = Vec::with_capacity(rows * selected_bytes);
+    for row in 0..rows {
+        let offset = row * row_bytes + first_group * group_bytes;
+        out.extend_from_slice(&data[offset..offset + selected_bytes]);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,9 +485,52 @@ mod tests {
     }
 
     #[test]
-    fn expert_assign_non_divisible_errors() {
-        // 256 experts across tp=3 is not balanced.
+    fn packed_matrix_slices_tile_without_requantization() {
+        let rows = 4;
+        let cols = 512;
+        let group_size = 256;
+        let group_bytes = 5;
+        let data: Vec<u8> = (0..rows * 2 * group_bytes).map(|i| i as u8).collect();
+
+        let top = slice_uniform_rows(&data, rows, 0, 2).unwrap();
+        let bottom = slice_uniform_rows(&data, rows, 2, 4).unwrap();
+        assert_eq!([top, bottom].concat(), data);
+
+        let left = slice_uniform_group_cols(&data, rows, cols, 0, 256, group_size).unwrap();
+        let right = slice_uniform_group_cols(&data, rows, cols, 256, 512, group_size).unwrap();
+        for row in 0..rows {
+            assert_eq!(
+                [
+                    &left[row * group_bytes..(row + 1) * group_bytes],
+                    &right[row * group_bytes..(row + 1) * group_bytes]
+                ]
+                .concat(),
+                data[row * 2 * group_bytes..(row + 1) * 2 * group_bytes]
+            );
+        }
+    }
+
+    #[test]
+    fn packed_column_slice_rejects_partial_groups() {
+        let data = vec![0u8; 4 * 10];
+        assert!(slice_uniform_group_cols(&data, 4, 512, 128, 384, 256).is_err());
+    }
+
+    #[test]
+    fn expert_assign_non_divisible_tp3() {
         assert!(ShardConfig::new(3, true, 256, ExpertAssign::Stride).is_err());
+        let stride = ShardConfig::new_uneven_experts(3, true, 256, ExpertAssign::Stride).unwrap();
+        assert_eq!(stride.experts_on_rank(0).len(), 86);
+        assert_eq!(stride.experts_on_rank(1).len(), 85);
+        assert_eq!(stride.experts_on_rank(2).len(), 85);
+        let contiguous =
+            ShardConfig::new_uneven_experts(3, true, 256, ExpertAssign::Contiguous).unwrap();
+        assert_eq!(contiguous.experts_on_rank(0), (0..86).collect::<Vec<_>>());
+        assert_eq!(contiguous.experts_on_rank(1), (86..171).collect::<Vec<_>>());
+        assert_eq!(
+            contiguous.experts_on_rank(2),
+            (171..256).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -544,13 +711,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_moe_divisibility() {
+    fn validate_moe_assignment() {
         let s2 = ShardConfig::new(2, true, 256, ExpertAssign::Stride).unwrap();
         assert!(s2.validate_moe(256).is_ok());
         // 100 experts on 3 ranks is unbalanced.
-        let s3 = ShardConfig::new(3, true, 0, ExpertAssign::Stride).unwrap();
-        assert!(s3.validate_moe(100).is_err());
-        assert!(s3.validate_moe(255).is_ok());
+        let s3 = ShardConfig::new_uneven_experts(3, true, 256, ExpertAssign::Stride).unwrap();
+        assert!(s3.validate_moe(256).is_ok());
+        assert!(s3.validate_moe(255).is_err());
     }
 
     #[test]

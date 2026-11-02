@@ -8,15 +8,15 @@ DeltaNet-hybrid crate) — that arch and its existing "DFlash" spec machinery ar
 unrelated and must not be touched. The verify path + per-layer dense compute ride
 llama; only the *drafting algorithm shape* is borrowed from deepseek4 (below).
 
-**Provenance (corrected — both weights AND source now verified):**
+**Provenance (corrected — both weights AND source now verified; `<dspark-work>` is a local scratch directory, not part of this repository):**
 - Tensor table below: **verified from the real drafter weights** —
-  `/home/bjoern/dspark-work/qwen3/ckpt/model.safetensors` (4.7GB BF16, single file,
+  `<dspark-work>/qwen3/ckpt/model.safetensors` (4.7GB BF16, single file,
   64 tensors), downloaded 2026-07-01 (the original note asserted this table without
   the weights on disk).
 - Forward-logic claims (bidirectional block, `main_x` dual-stream KV-fusion):
   **byte-confirmed from the real `Qwen3DSparkModel` source** — DeepSpec (DeepSeek's
   spec-decode codebase, MIT, released 2026-06-27), cloned to
-  `/home/bjoern/dspark-work/DeepSpec/deepspec/modeling/dspark/qwen3/modeling.py`
+  `<dspark-work>/DeepSpec/deepspec/modeling/dspark/qwen3/modeling.py`
   (repo `github.com/deepseek-ai/DeepSpec`). This source does **not** ship with the
   HF checkpoint — it lives only in the DeepSpec repo. Key confirmations:
   `fc = Linear(5*hidden, hidden, bias=False)` then `hidden_norm(fc(...))` before the

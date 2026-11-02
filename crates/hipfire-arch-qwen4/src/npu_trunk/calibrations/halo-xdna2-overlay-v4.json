@@ -1,0 +1,74 @@
+{
+  "gpu": {
+    "trunk_in_ms_per_8192": {
+      "qkv": 383.0,
+      "zab": 159.4,
+      "q": 155.3,
+      "kvidx": 27.9
+    },
+    "uniform_per_layer_ms": 52.381,
+    "gdn_core_per_layer_ms": 5.63,
+    "qsa_per_layer_ms": 39.443,
+    "qsa_growth_per_layer_ms_per_8192_prefix": 4.55,
+    "fixed_per_chunk_ms": 0.0,
+    "boundary_tax_ms": 320.0,
+    "min_bank_rows": 2048
+  },
+  "families": {
+    "qkv": {
+      "layer": "gdn",
+      "cols": 10240,
+      "out_dtype": "bf16"
+    },
+    "zab": {
+      "layer": "gdn",
+      "cols": 6400,
+      "out_dtype": "f32"
+    },
+    "q": {
+      "layer": "qsa",
+      "cols": 12288,
+      "out_dtype": "f32"
+    },
+    "kvidx": {
+      "layer": "qsa",
+      "cols": 1792,
+      "out_dtype": "f32"
+    }
+  },
+  "glue": {
+    "pack_ms_8192": 0.407,
+    "sync_ms": 4.58,
+    "consume_mode": "direct",
+    "consume_ms_per_col_8192": {
+      "bf16": 0.0001729368932038835,
+      "f32": 0.00027912621359223297
+    }
+  },
+  "key": {
+    "device": {
+      "arch": "gfx1151",
+      "pci_bdf": "0000:c0:00.0",
+      "npu_fw_version": "1.1.2.65"
+    },
+    "build": "hipfire-0.4.2:npu-trunk-bf16-rowmajor-v1",
+    "kernel": {
+      "uname_release": "7.3.0-rc7-perfopt+"
+    },
+    "epilogue": "bf16",
+    "trunk_route": "overlay:gfx1151-zab-v1",
+    "model_trunk_index_sha256": "098bd75fd3a6a5174d06033f2b3ec7febeb7777e7eba4696b64cecca5e3418b6"
+  },
+  "npu": {
+    "tops_corun": 12.5,
+    "bytes_per_kop": 0.895,
+    "epilogue": "bf16",
+    "panel_cols": 1280
+  },
+  "contention": {
+    "alpha_overlap": 1.049,
+    "model": "measured full-prefill slowdown with continuous G80 BF16 stream (j104, x1.049 median); fit predicts x1.050"
+  },
+  "schema_version": 4,
+  "margin": 0.0
+}

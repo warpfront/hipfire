@@ -1,0 +1,89 @@
+{
+  "script_md5": "da83bb231ea7fbbb96a4e3247392de2c",
+  "rows": [
+    {
+      "module": "fused_gate_up_hfq4g256_mq4v2",
+      "symbol": "fused_gate_up_mq4g256v2",
+      "dims": [
+        17408,
+        17408,
+        5120
+      ],
+      "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/fused_gate_up_mq4g256v2/occ0",
+      "arm": "hipcc",
+      "object": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/fused_gate_up_hfq4g256_mq4v2/rep-1/kernel.hsaco",
+      "object_md5": "dcac96d66d37a022c31d9c58698fdc5c",
+      "object_sha256": "15ba238cb18017fe2124d35b2abea78c480926cdd4d2a7f992668789e9d52f70",
+      "input_md5": {
+        "0": "e062340ffd40a2dd55d807233f5c3997",
+        "8": "8313564b7b3cbf65acab380974a9f6b2",
+        "16": "7fafae63b0b902aeb528c7f16aa5b60c",
+        "24": "e9cb3db62840c9babb1429ca292610aa",
+        "32": "ea6720501741738940872cbd6f67f5dc"
+      },
+      "weight_bytes": 94699520,
+      "samples_ms": [
+        0.2602429986000061,
+        0.47552600502967834,
+        0.23020200431346893,
+        0.23112300038337708,
+        0.2756029963493347,
+        0.23040199279785156,
+        0.27468299865722656,
+        0.3947249948978424,
+        0.18368299305438995,
+        0.22908300161361694,
+        0.3953239917755127,
+        0.1658419966697693,
+        0.16572199761867523,
+        0.165802001953125,
+        0.16576199233531952
+      ],
+      "median_ms": 0.23040199279785156,
+      "weight_GBs": 411.0186672000132,
+      "post_mismatches": 0
+    },
+    {
+      "module": "fused_gate_up_hfq4g256_mq4v2",
+      "symbol": "fused_gate_up_mq4g256v2",
+      "dims": [
+        17408,
+        17408,
+        5120
+      ],
+      "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/fused_gate_up_mq4g256v2/occ0",
+      "arm": "probe",
+      "object": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_gate_up_hfq4g256_mq4v2.co",
+      "object_md5": "377638f91efe45727307ad2c237d8594",
+      "object_sha256": "1e8ca901ec0f68269c92890b5eb69b3031db346530ea480aa7ffc35c70ede5c8",
+      "input_md5": {
+        "0": "e062340ffd40a2dd55d807233f5c3997",
+        "8": "8313564b7b3cbf65acab380974a9f6b2",
+        "16": "7fafae63b0b902aeb528c7f16aa5b60c",
+        "24": "e9cb3db62840c9babb1429ca292610aa",
+        "32": "ea6720501741738940872cbd6f67f5dc"
+      },
+      "weight_bytes": 94699520,
+      "samples_ms": [
+        0.2759239971637726,
+        0.25904399156570435,
+        0.4918459951877594,
+        0.23064300417900085,
+        0.41164499521255493,
+        0.18416200578212738,
+        0.18424199521541595,
+        0.18392300605773926,
+        0.21176299452781677,
+        0.16744199395179749,
+        0.16696199774742126,
+        0.16720199584960938,
+        0.16692200303077698,
+        0.2122430056333542,
+        0.16720199584960938
+      ],
+      "median_ms": 0.18424199521541595,
+      "weight_GBs": 513.9953021528952,
+      "post_mismatches": 0
+    }
+  ]
+}

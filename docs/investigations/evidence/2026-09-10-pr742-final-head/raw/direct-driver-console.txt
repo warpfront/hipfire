@@ -1,0 +1,1 @@
+{"binary_sha256": "82c45928b85318d1760855d4c0f40f20508618c586c9cf910edbee9f03f1b9b7", "phases": 42, "summary": "/home/bjoern/hipfire/.claude/worktrees/g4-next-integration/docs/investigations/evidence/2026-09-10-pr742-final-head/raw/direct-stdio-summary.json"}

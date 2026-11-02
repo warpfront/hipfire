@@ -118,7 +118,7 @@ python3 scripts/kernel_atlas.py collect-ar \
   --prefill 32 \
   --prefill 128 \
   --gen 50 \
-  --kv-mode asym3 \
+  --kv-mode q8 \
   --graph \
   --output .codeinsight+research/kernel-atlas/runs/$(date -u +%Y%m%dT%H%M%SZ)-ar.jsonl
 ```
@@ -157,7 +157,9 @@ DFlash rows record prompt md5 plus metrics the demo prints
 (`decode_tok_s`, tau, TTFT, emitted/accepted tokens, cycles, …).
 `collect-dflash` **rejects** every `--kv-mode` except `q8`, `fwht2`,
 `fwht3`, or `fwht4` before launch (default `q8`). `asym*` is not accepted
-by this collector — do not paste AR defaults into DFlash collection.
+by this collector. `collect-ar`'s own `--kv-mode` default is still the legacy
+`asym3` (the `bench_qwen35_mq4` example builds the Givens constructor for it);
+pass `--kv-mode q8` (or `fwht3` for the headroom mode) explicitly.
 
 Tok/s alone is **not** DFlash correctness. For correctness claims, use a
 path named in VALIDATION (path oracle and/or maintained harnesses) —

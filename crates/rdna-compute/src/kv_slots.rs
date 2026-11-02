@@ -1,0 +1,693 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// Host-side mirror of the multi-slot KV descriptor and the flat row-tile list
+// that drives batched attention launches.
+//
+// A "row tile" is up to BR consecutive query rows belonging to ONE slot. No
+// tile may span a slot boundary — a workgroup owns one tile and reads one
+// slot's KV, so a straddling tile would read the wrong sequence's cache.
+
+/// Byte-identical mirror of `struct KvSlotDesc` in `kernels/src/kv_slot_desc.h`.
+/// 32 bytes, 8-byte aligned. Changing either side without the other silently
+/// corrupts every KV address.
+///
+/// # Paged KV cache
+///
+/// `block_table` is a GPU pointer to an array of physical page indices. When
+/// non-null, the descriptor is in **paged mode** and KV address translation
+/// is:
+///   `phys_page * page_tokens * per_pos_bytes + page_off * per_pos_bytes`
+/// where `phys_page = block_table[pos / page_tokens]` and
+/// `page_off = pos % page_tokens`, with `per_pos_bytes` passed per call —
+/// K and V may (and for asym3 DO) differ, but the physical page a logical
+/// page maps to is shared, so both arenas resolve through the one table.
+///
+/// When `block_table` is null, the descriptor is in **legacy contiguous mode**
+/// and translation degenerates to `legacy_{k,v}_base + pos * per_pos_bytes`,
+/// byte-identical to the pre-paged kernel. This keeps every kernel on one
+/// code path.
+///
+/// **Legacy K/V bases are separate.** They differ whenever the K and V
+/// per-position strides differ — asym3 (3-bit rotated K against Q8_0 V) is
+/// the standing case and its arena builders pack K and V slabs at different
+/// offsets. Q8_0 / BF16 keep them equal: their strides match, and the Q8
+/// flash-prefill kernel stages K and V through ONE shared slab offset (it
+/// reads only `legacy_k_base`, so carrying the second base costs it nothing).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KvSlotDesc {
+    /// GPU pointer to array of physical page indices, or null for legacy
+    /// contiguous mode. Stored as a raw 64-bit device address so the struct
+    /// can be built on the host and uploaded as a flat byte buffer.
+    pub block_table: u64,
+    /// Byte offset of this slot's K slab in the K arena (legacy mode only).
+    pub legacy_k_base: u64,
+    /// Byte offset of this slot's V slab in the V arena (legacy mode only).
+    /// Equal to `legacy_k_base` whenever K and V share a per-position stride.
+    pub legacy_v_base: u64,
+    /// Logical KV length. The kernel reads positions `[0, seq_len)`.
+    pub seq_len: i32,
+    /// Page size in tokens (e.g. 128). 0 = legacy contiguous mode.
+    pub page_tokens: i32,
+}
+
+/// Compute the legacy contiguous-mode slab capacity for a slot with
+/// `seq_len` live tokens. Mirrors the rounding `build_arena` and
+/// `SlotPool::new` apply: `seq_len` rounded up to a multiple of
+/// `PAGE_TOKENS` (128). In paged mode this value is not meaningful —
+/// each page is exactly `PAGE_TOKENS` and the block table tracks how
+/// many are live.
+pub fn legacy_cap(seq_len: usize) -> usize {
+    seq_len.div_ceil(crate::page_pool::PAGE_TOKENS) * crate::page_pool::PAGE_TOKENS
+}
+
+/// Total query rows across all slots.
+pub fn total_rows(slot_query_counts: &[usize]) -> usize {
+    slot_query_counts.iter().sum()
+}
+
+/// Minimal f32 -> IEEE binary16 bit pattern (round-toward-zero mantissa).
+/// Only needs to cover the small positive scales used by the correctness
+/// harness and `test_q8_flash_prefill`. Moved here (from a private copy in
+/// `examples/test_q8_flash_prefill.rs`) so Task 7's harness and Task 8's
+/// benchmark share one implementation rather than drifting apart.
+pub fn half_from_f32(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32 - 127 + 15;
+    let mant = (bits & 0x007F_FFFF) >> 13;
+    if exp <= 0 {
+        return sign;
+    }
+    if exp >= 31 {
+        return sign | 0x7C00;
+    }
+    sign | ((exp as u16) << 10) | (mant as u16)
+}
+
+/// Build one KV arena holding `seq_lens.len()` contiguous slabs and the
+/// matching descriptor table. Each slab is `cap` tokens; `cap` is rounded up
+/// so a future page size divides it (spec §6.4).
+///
+/// `poison_except`: when `Some(target)`, every slab other than `target` is
+/// filled with NaN-producing bytes. Used by the isolation test.
+///
+/// Slab contents vary by slot index — identical slabs would let a cross-slot
+/// addressing bug pass by symmetry.
+///
+/// Deviation from the task-7 brief's worked example: the brief's loop counts
+/// 34-byte blocks as `cap * per_pos_bytes / 34` (floor division). For Q8_0
+/// strides (always an exact multiple of 34) that is harmless, but asym3's K
+/// stride (`n_kv_heads * (4 + head_dim*3/8)`, e.g. 200 or 400 B/pos at
+/// hd=256) is NOT a multiple of 34, so floor division silently
+/// under-allocates a slot's slab by up to 33 bytes. For a slot whose
+/// `seq_len` lands exactly on `cap` (common in these shapes: 512, 8192,
+/// 1024, 2048, 4096 are all multiples of PAGE_TOKENS), that shortfall is
+/// inside the very last position this function will actually address,
+/// which — for the LAST slot in the arena — is an out-of-bounds device
+/// read past the end of the uploaded buffer. Using `div_ceil` instead
+/// (over-allocating by at most 33 never-addressed padding bytes) removes
+/// that risk without changing anything an addressing-correctness test can
+/// observe.
+pub fn build_arena(
+    seq_lens: &[usize],
+    per_pos_bytes: usize,
+    poison_except: Option<usize>,
+) -> (Vec<u8>, Vec<KvSlotDesc>) {
+    let mut arena = Vec::new();
+    let mut descs = Vec::with_capacity(seq_lens.len());
+    for (slot, &sl) in seq_lens.iter().enumerate() {
+        let cap = sl.div_ceil(crate::page_pool::PAGE_TOKENS) * crate::page_pool::PAGE_TOKENS;
+        let base = arena.len() as u64;
+        let poisoned = poison_except.is_some_and(|t| t != slot);
+        let n_blocks = (cap * per_pos_bytes).div_ceil(34);
+        for blk_idx in 0..n_blocks {
+            // f16 scale: 0x7E00 is NaN; otherwise a per-slot varying value.
+            let (lo, hi) = if poisoned {
+                (0x00u8, 0x7Eu8)
+            } else {
+                let h = half_from_f32(0.02 + (((blk_idx + slot * 7) % 13) as f32) * 0.005);
+                ((h & 0xFF) as u8, (h >> 8) as u8)
+            };
+            arena.push(lo);
+            arena.push(hi);
+            for j in 0..32 {
+                arena.push((((blk_idx * 31 + j * 17 + slot * 101) % 251) as i32 - 125) as i8 as u8);
+            }
+        }
+        descs.push(KvSlotDesc {
+            block_table: 0, // legacy contiguous mode
+            // Q8_0 strides: K and V slabs sit at the same offset in their
+            // separate arenas.
+            legacy_k_base: base,
+            legacy_v_base: base,
+            seq_len: sl as i32,
+            page_tokens: 0, // 0 = legacy mode
+        });
+    }
+    (arena, descs)
+}
+
+/// Build an asym3 K arena. NOT the same generator as [`build_arena`] — found
+/// necessary empirically while running the Task 7 harness, not part of the
+/// brief's original design.
+///
+/// asym3's K layout (`kernels/src/attention_flash_asym3_tile_batched.hip`)
+/// is `[4-byte cnorm f32][packed 3-bit body]` per (position, kv_head), with
+/// `cnorm` read via `*(const float*)kb` at a byte offset that is NOT a
+/// multiple of 34 (`k_bytes_per_head = 4 + head_dim*3/8`, e.g. 100 at
+/// hd=256 — coprime-ish with 34). [`build_arena`]'s generic filler only
+/// controls the FIRST 2 bytes of each 34-byte block (an f16 "scale" — safe
+/// for Q8_0, whose scale read is always aligned to that same 2-byte field);
+/// every other byte, including whichever 4 bytes a given `cnorm` read
+/// lands on, comes from an unconstrained pseudo-random byte formula. Read
+/// as an IEEE-754 f32, 4 essentially-random bytes have a real chance
+/// (roughly 1/256 per read, from the exponent byte alone) of landing on a
+/// subnormal, infinity, or NaN bit pattern. At the scale of hundreds of
+/// `cnorm` reads per shape (`cap * n_kv_heads` positions), this fired in
+/// practice: an isolation-test run reported "NaN leaked from a neighbouring
+/// slot" that traced back to a `cnorm` value that was ALREADY non-finite in
+/// the clean (unpoisoned) run — not a leak at all. The golden-equivalence
+/// test did not catch it beforehand because `assert_close`'s comparison
+/// (`(g - w).abs() / tol`) is silently vacuous when both `g` and `w` are
+/// NaN (`NaN > worst` is always false in IEEE comparisons), so a candidate
+/// and reference that independently compute the same garbage from the same
+/// bytes both report a perfect match.
+///
+/// This generator instead constructs `cnorm` explicitly as a small, finite,
+/// per-slot/position/head-varying f32 (so it can never land on a special
+/// bit pattern by chance) and leaves the packed 3-bit body bytes
+/// pseudo-random and unconstrained (safe regardless of value: they only
+/// ever select one of 8 bounded entries from `TURBO_C3_256`).
+pub fn build_asym3_k_arena(
+    seq_lens: &[usize],
+    n_kv_heads: usize,
+    head_dim: usize,
+    poison_except: Option<usize>,
+) -> (Vec<u8>, Vec<KvSlotDesc>) {
+    let head_bytes = 4 + (head_dim * 3) / 8;
+    let mut arena = Vec::new();
+    let mut descs = Vec::with_capacity(seq_lens.len());
+    for (slot, &sl) in seq_lens.iter().enumerate() {
+        let cap = sl.div_ceil(crate::page_pool::PAGE_TOKENS) * crate::page_pool::PAGE_TOKENS;
+        let base = arena.len() as u64;
+        let poisoned = poison_except.is_some_and(|t| t != slot);
+        for pos in 0..cap {
+            for kvh in 0..n_kv_heads {
+                let cnorm: f32 = if poisoned {
+                    f32::NAN
+                } else {
+                    0.02 + (((pos + kvh * 13 + slot * 7) % 13) as f32) * 0.005
+                };
+                arena.extend_from_slice(&cnorm.to_ne_bytes());
+                for j in 0..(head_bytes - 4) {
+                    arena.push(
+                        (((pos * 31 + j * 17 + slot * 101 + kvh * 53) % 251) as i32 - 125) as i8
+                            as u8,
+                    );
+                }
+            }
+        }
+        descs.push(KvSlotDesc {
+            block_table: 0, // legacy contiguous mode
+            // K-ONLY arena: this builder packs the asym3 K slabs, whose
+            // offsets are meaningless in the (Q8_0-strided) V arena. Callers
+            // that need a full descriptor table must take `legacy_v_base`
+            // from the V arena's own builder — see the harnesses' `merge_descs`.
+            legacy_k_base: base,
+            legacy_v_base: base,
+            seq_len: sl as i32,
+            page_tokens: 0, // 0 = legacy mode
+        });
+    }
+    (arena, descs)
+}
+
+/// Build the flat tile list. Returns `(tile_slot, tile_row0, tile_qbase)`:
+///
+/// - `tile_slot[t]`  — slot index owning tile `t`
+/// - `tile_row0[t]`  — first query row of tile `t` *within its slot*
+/// - `tile_qbase[t]` — first query row of tile `t` in the *global* flat row
+///   space, which is how `q` and `out` are indexed
+///
+/// Both row indices are needed: KV addressing is slot-relative (via the
+/// descriptor's `seq_len`) while Q/out addressing is global. Conflating them
+/// makes slot 0 correct and every later slot read the wrong query.
+///
+/// Slots with zero query rows produce no tiles — an empty tile would read
+/// uninitialised Q and write garbage into `out`.
+pub fn build_tiles(slot_query_counts: &[usize], br: usize) -> (Vec<i32>, Vec<i32>, Vec<i32>) {
+    assert!(br > 0, "br must be positive");
+    let mut tile_slot = Vec::new();
+    let mut tile_row0 = Vec::new();
+    let mut tile_qbase = Vec::new();
+    let mut global = 0usize;
+    for (slot, &m) in slot_query_counts.iter().enumerate() {
+        let mut row0 = 0usize;
+        while row0 < m {
+            tile_slot.push(slot as i32);
+            tile_row0.push(row0 as i32);
+            tile_qbase.push((global + row0) as i32);
+            row0 += br;
+        }
+        global += m;
+    }
+    (tile_slot, tile_row0, tile_qbase)
+}
+
+// ── Attention tile size ─────────────────────────────────────────────────────
+//
+// Single source of truth for resolving `HIPFIRE_ATTN_TILE_SIZE`. Before this
+// function existed, three call sites (the `launch_asym_flash_batched` kernel
+// launcher in `attention.rs`, and two spots in the multi-slot microbench)
+// each hand-copied the identical parse-and-validate logic, with comments
+// saying "MUST mirror ... exactly". That duplication is what let a
+// hardcoded `128` divisor silently drift out of sync with the launcher's own
+// resolution and undersize the `partials` buffer, corrupting device memory
+// (see `.superpowers/sdd/task-8-report.md`'s "Defect found and fixed"
+// section for the illegal-memory-access this caused). Every caller that
+// needs this value MUST go through this function instead of re-deriving it.
+
+// NOTE: the batched-attention tile size resolver lives on `Gpu::attn_tile_size()`
+// (crates/rdna-compute/src/dispatch.rs), not here. `kv_slots` is production
+// `src/`, where scripts/check-env-docs.py forbids direct HIPFIRE_* reads —
+// they must route through a central config reader (feature_flags.rs).
+
+// ── Memory preflight ────────────────────────────────────────────────────────
+//
+// On 2026-08-07 the SP1 harnesses drove nine GLOBAL OOM kills on the dev box,
+// killing the user's applications (steamwebhelper, teams-for-linux, slack,
+// Firefox) rather than the benchmark. On Strix Halo the GPU's GTT is system
+// RAM and the box has NO SWAP, so an overshoot does not degrade — it goes
+// straight to the global OOM killer, which picks victims by oom_score, not by
+// culpability.
+//
+// `scripts/run-bounded.sh` is the hard backstop (a cgroup, so a kill lands on
+// us). This function is the first line of defence: refuse cheaply and clearly
+// BEFORE allocating, so a bad configuration reports itself instead of dying
+// half-way through and leaving the GPU in an unknown state.
+//
+// The defence is Strix-shaped, so the host-headroom half is configurable —
+// `memory.oom_guard` (compat `HIPFIRE_OOM_GUARD`), default `auto`:
+//   - unified-memory APU arch (gfx1151 etc.) → guard ON: GPU allocations come
+//     out of system RAM, so the refusal protects the desktop;
+//   - discrete-GPU arch (gfx1100 etc.) → guard OFF: an overshoot is a plain
+//     failed hipMalloc, failing one request, not the box;
+//   - no GPU arch known (e.g. the CLI supervising a daemon) → decided by host
+//     swap state: with swap an overcommit degrades rather than kills;
+//   - explicit `true`/`false` overrides the decision either way.
+// The R9700 deployment-target budget above is NOT configurable: it always
+// applies, on every arch, with the guard on or off.
+
+/// Default deployment-target budget: the R9700 has 32 GB. A configuration that
+/// does not fit here cannot ship, regardless of what this 125 GiB dev box can
+/// absorb.
+pub const R9700_VRAM_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+
+/// Headroom left for the rest of the system. Chosen so the desktop survives.
+const HEADROOM_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+
+/// Host RAM available to unmovable allocations (`MemAvailable - CMA`),
+/// in bytes. `None` if unreadable. Delegates to
+/// [`crate::uma_memory::mem_available_bytes`], the shared rule.
+pub fn mem_available_bytes() -> Option<u64> {
+    crate::uma_memory::mem_available_bytes()
+}
+
+/// Refuse a planned allocation that would exceed the deployment target's
+/// VRAM. When the guard is active, also refuse one that would leave this
+/// box without enough headroom to stay responsive.
+///
+/// The deployment-target ceiling is UNCONDITIONAL: a configuration that does
+/// not fit the R9700 cannot ship, regardless of host RAM. Only the
+/// `MemAvailable` headroom check is gated by `memory.oom_guard` (compat
+/// `HIPFIRE_OOM_GUARD`), default `auto`: headroom assumes GPU memory comes
+/// from system RAM, so `auto` keeps it on only for unified-memory APU
+/// architectures (and, when no GPU arch is known in this process, for hosts
+/// without swap). See `hipfire_config::oom_guard_effective`.
+///
+/// `planned_bytes` must be the TOTAL the caller is about to hold live at once,
+/// not a single buffer. Returns `Err` with an actionable message; callers should
+/// skip the configuration rather than proceed.
+///
+/// `budget_bytes` is the deployment-target VRAM ceiling; pass
+/// [`R9700_VRAM_BYTES`] unless a harness deliberately overrides it. It is a
+/// parameter rather than an env read because the budget is *harness policy*,
+/// and `kv_slots` is production `src/`, where direct HIPFIRE_* reads are
+/// forbidden by scripts/check-env-docs.py. Harnesses live in `examples/`,
+/// which is exempt, so they read any override there and pass it in.
+pub fn preflight_alloc(planned_bytes: u64, budget_bytes: u64, what: &str) -> Result<(), String> {
+    // Gpu::init records the detected arch; until it runs (or in GPU-less
+    // processes) the resolver falls back to host swap state. The budget
+    // check below always runs; only the headroom check stands down.
+    let guard = hipfire_config::oom_guard_effective(crate::arch_caps::process_gpu_arch());
+    if !guard {
+        static INACTIVE_NOTE: std::sync::Once = std::sync::Once::new();
+        INACTIVE_NOTE.call_once(|| {
+            eprintln!(
+                "[kv_slots] memory preflight headroom check inactive (memory.oom_guard); \
+                 deployment-target budget still enforced"
+            );
+        });
+    }
+    preflight_checks(planned_bytes, budget_bytes, what, guard)
+}
+
+/// The guard's actual checks: the deployment-target budget always, the host
+/// headroom check only when `guard_active`. Deterministic on every machine
+/// for a fixed `guard_active`, so the unit tests below assert refusal
+/// behavior rather than this box's config. [`preflight_alloc`] is the
+/// production entry that resolves `guard_active` from config + GPU arch.
+pub(crate) fn preflight_checks(
+    planned_bytes: u64,
+    budget_bytes: u64,
+    what: &str,
+    guard_active: bool,
+) -> Result<(), String> {
+    let budget = budget_bytes;
+
+    let gib = |b: u64| b as f64 / 1073741824.0;
+
+    if planned_bytes > budget {
+        return Err(format!(
+            "{what}: needs {:.2} GiB but the deployment target (R9700) budget is \
+             {:.2} GiB. This configuration cannot ship even if this dev box can \
+             absorb it. Shrink slots x context.",
+            gib(planned_bytes),
+            gib(budget)
+        ));
+    }
+
+    // The deployment budget above always applies; only host headroom is
+    // gated. With the guard off an overshoot is a plain failed hipMalloc,
+    // not a global OOM, so there is no headroom to protect.
+    if !guard_active {
+        return Ok(());
+    }
+
+    // A unified-memory APU allocates GTT, which also takes freed GTT pages
+    // TTM parked in its page pool (outside MemAvailable).
+    let uma =
+        crate::arch_caps::process_gpu_arch().is_some_and(hipfire_config::is_unified_memory_arch);
+    let available = if uma {
+        crate::uma_memory::host_available_bytes()
+    } else {
+        mem_available_bytes()
+    };
+    preflight_headroom(planned_bytes, what, available, uma)
+}
+
+/// The host-headroom half of the guard for an already-resolved available
+/// figure: `MemAvailable - CMA` (plus TTM's pool when `uma`). Pure, so
+/// tests drive it with fixed `/proc/meminfo` text.
+fn preflight_headroom(
+    planned_bytes: u64,
+    what: &str,
+    available: Option<u64>,
+    uma: bool,
+) -> Result<(), String> {
+    let gib = |b: u64| b as f64 / 1073741824.0;
+    match available {
+        Some(avail) => {
+            if planned_bytes.saturating_add(HEADROOM_BYTES) > avail {
+                return Err(format!(
+                    "{what}: needs {:.2} GiB but MemAvailable (excluding CMA){} is only \
+                     {:.2} GiB (keeping {:.2} GiB headroom). This box has NO SWAP and GPU \
+                     memory comes from system RAM, so proceeding risks a GLOBAL \
+                     OOM that kills the user's applications, not this process. \
+                     Skipping.",
+                    gib(planned_bytes),
+                    if uma { " + TTM pool" } else { "" },
+                    gib(avail),
+                    gib(HEADROOM_BYTES)
+                ));
+            }
+            Ok(())
+        }
+        // Fail closed: if we cannot read MemAvailable we cannot reason about
+        // safety, and the failure mode we are guarding against costs the user
+        // their desktop session.
+        None => Err(format!(
+            "{what}: cannot read MemAvailable from /proc/meminfo; refusing to \
+             allocate {:.2} GiB blind.",
+            gib(planned_bytes)
+        )),
+    }
+}
+
+/// Byte-identical mirror of `struct KvSlotDesc` in
+/// `kernels/src/kv_slot_desc_vmm.h` (the `_vmm` module variant). 32 bytes,
+/// 8-byte aligned. One array per KV layer, one entry per request slot.
+///
+/// Unlike [`KvSlotDesc`] the bases are ABSOLUTE device virtual addresses of a
+/// request's own VMM reservation for that layer (`KvCache` per-request
+/// owner), never offsets into a shared arena. `_vmm` kernels are launched
+/// with null K/V arena pointers and address `base + pos * stride`. Every
+/// access traps on the device unless
+/// `0 <= pos < mapped_positions <= logical_bound`; the host rejects the same
+/// conditions first in [`validate_vmm_rows`].
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VmmKvSlotDesc {
+    /// Absolute device VA of this request's K reservation for the layer.
+    pub k_base: u64,
+    /// Absolute device VA of this request's V reservation for the layer.
+    pub v_base: u64,
+    /// Positions `[0, mapped_positions)` are physically mapped on both sides.
+    pub mapped_positions: u32,
+    /// Metadata/admission-resolved context bound for this request.
+    pub logical_bound: u32,
+    /// `Gpu::vmm_owner_generation` of the K owner; binds rows to one owner
+    /// instance so a reused slot or a stale request cannot alias a new one.
+    pub owner_generation: u64,
+}
+
+const _: () = assert!(std::mem::size_of::<VmmKvSlotDesc>() == 32);
+const _: () = assert!(std::mem::align_of::<VmmKvSlotDesc>() == 8);
+
+impl VmmKvSlotDesc {
+    /// Masked/idle slot: every device access through it traps.
+    pub const MASKED: Self = Self {
+        k_base: 0,
+        v_base: 0,
+        mapped_positions: 0,
+        logical_bound: 0,
+        owner_generation: 0,
+    };
+
+    /// Host-side check of one row write/read at absolute `position`.
+    pub fn check_position(&self, position: i64) -> Result<(), String> {
+        if self.k_base == 0 || self.v_base == 0 || self.owner_generation == 0 {
+            return Err("VMM KV row targets a masked/unbound slot descriptor".into());
+        }
+        if self.mapped_positions > self.logical_bound {
+            return Err(format!(
+                "VMM KV descriptor mapped_positions {} exceeds logical_bound {}",
+                self.mapped_positions, self.logical_bound
+            ));
+        }
+        if position < 0 || position >= self.mapped_positions as i64 {
+            return Err(format!(
+                "VMM KV row position {position} outside mapped prefix [0, {})",
+                self.mapped_positions
+            ));
+        }
+        Ok(())
+    }
+
+    /// Raw bytes for staging upload (`descs.len() * 32`).
+    pub fn as_bytes(descs: &[Self]) -> &[u8] {
+        // SAFETY: repr(C), no padding (4 u64-aligned fields, 2 u32 packed
+        // between them), size asserted at 32 above.
+        unsafe {
+            std::slice::from_raw_parts(descs.as_ptr() as *const u8, std::mem::size_of_val(descs))
+        }
+    }
+}
+
+/// Host gate run before every `_vmm` write/attention launch: each row's slot
+/// is in range, bound to the owner generation (request epoch) the planner
+/// assigned that row, and its absolute position lies in the mapped prefix.
+/// Wrong-row (row points at another request's slot) and wrong-epoch (stale
+/// generation after abort/slot reuse) both fail here.
+pub fn validate_vmm_rows(
+    descs: &[VmmKvSlotDesc],
+    row_slot: &[i32],
+    positions: &[i32],
+    row_owner_generation: &[u64],
+) -> Result<(), String> {
+    if row_slot.len() != positions.len() || row_slot.len() != row_owner_generation.len() {
+        return Err(format!(
+            "VMM KV row arrays disagree: row_slot={} positions={} generations={}",
+            row_slot.len(),
+            positions.len(),
+            row_owner_generation.len()
+        ));
+    }
+    for (row, ((&slot, &pos), &generation)) in row_slot
+        .iter()
+        .zip(positions)
+        .zip(row_owner_generation)
+        .enumerate()
+    {
+        let desc = usize::try_from(slot)
+            .ok()
+            .and_then(|s| descs.get(s))
+            .ok_or_else(|| {
+                format!(
+                    "VMM KV row {row} slot {slot} outside {} descriptors",
+                    descs.len()
+                )
+            })?;
+        if desc.owner_generation != generation {
+            return Err(format!(
+                "VMM KV row {row} slot {slot} owner generation {} != row epoch generation {generation}",
+                desc.owner_generation
+            ));
+        }
+        desc.check_position(pos as i64)
+            .map_err(|e| format!("VMM KV row {row} slot {slot}: {e}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preflight_refuses_over_target_budget() {
+        // 64 GiB against the 32 GiB R9700 target: must refuse even though this
+        // dev box has 125 GiB. Guard on: both branches are live.
+        let e =
+            preflight_checks(64 * 1024 * 1024 * 1024, R9700_VRAM_BYTES, "test", true).unwrap_err();
+        assert!(e.contains("deployment target"), "unexpected message: {e}");
+    }
+
+    #[test]
+    fn preflight_guard_off_still_refuses_over_budget() {
+        // The deployment-target ceiling is unconditional: guard off skips
+        // only the host headroom check, never the budget refusal.
+        let e =
+            preflight_checks(64 * 1024 * 1024 * 1024, R9700_VRAM_BYTES, "test", false).unwrap_err();
+        assert!(e.contains("deployment target"), "unexpected message: {e}");
+    }
+
+    #[test]
+    fn preflight_guard_off_skips_memavailable_refusal() {
+        // u64::MAX against a u64::MAX budget passes the ceiling (strict `>`),
+        // but saturates MemAvailable + headroom on any host — so guard-on
+        // must refuse while guard-off skips to Ok.
+        assert!(preflight_checks(u64::MAX, u64::MAX, "test", true).is_err());
+        assert!(preflight_checks(u64::MAX, u64::MAX, "test", false).is_ok());
+    }
+
+    #[test]
+    fn preflight_allows_a_small_allocation() {
+        // 64 MiB is under budget and under any plausible MemAvailable. Pure
+        // checks: this test must pass regardless of this box's oom_guard
+        // setting.
+        assert!(preflight_checks(64 * 1024 * 1024, R9700_VRAM_BYTES, "test", true).is_ok());
+    }
+
+    #[test]
+    fn mem_available_is_readable_and_sane() {
+        let a = mem_available_bytes().expect("MemAvailable must be readable on Linux");
+        assert!(a > 0, "MemAvailable should be positive");
+    }
+
+    /// hipx-shaped `/proc/meminfo`: `CmaTotal` is 0 and `CmaFree` is 0.45 GiB
+    /// (page cache filled the KHO scratch) of the 66.8 GiB `MemAvailable`.
+    const HIPX_MEMINFO: &str = "MemAvailable: 70000080 kB\nCmaTotal: 0 kB\nCmaFree: 470684 kB\n";
+
+    /// hipx `/proc/zoneinfo` `cma` lines: 3,465,216 pages = 13,536 MiB.
+    const HIPX_ZONEINFO: &str = "Node 0, zone      DMA\n        cma      0\n      nr_free_cma  0\n\
+        Node 0, zone    DMA32\n        cma      194560\n      nr_free_cma  61919\n\
+        Node 0, zone   Normal\n        cma      3270656\n      nr_free_cma  55000\n";
+
+    #[test]
+    fn preflight_headroom_excludes_the_cma_region() {
+        let gib = 1024 * 1024 * 1024u64;
+        let available =
+            crate::uma_memory::meminfo_available_bytes(HIPX_MEMINFO, Some(HIPX_ZONEINFO));
+        // Raw MemAvailable (66.8 GiB) would admit 55 GiB + 8 GiB headroom;
+        // MemAvailable - CMA region (53.6 GiB) must not.
+        let raw = crate::uma_memory::meminfo_field(HIPX_MEMINFO, "MemAvailable");
+        assert!(preflight_headroom(55 * gib, "test", raw, false).is_ok());
+        let e = preflight_headroom(55 * gib, "test", available, false).unwrap_err();
+        assert!(e.contains("excluding CMA"), "unexpected message: {e}");
+        // Within MemAvailable - CMA - headroom: still admitted.
+        assert!(preflight_headroom(45 * gib, "test", available, false).is_ok());
+    }
+
+    #[test]
+    fn preflight_headroom_refuses_when_only_cma_is_available() {
+        let cma_only = "MemAvailable: 13858816 kB\nCmaTotal: 0 kB\nCmaFree: 13858816 kB\n";
+        let available = crate::uma_memory::meminfo_available_bytes(cma_only, None);
+        assert_eq!(available, Some(0));
+        assert!(preflight_headroom(1, "test", available, false).is_err());
+        assert!(preflight_headroom(0, "test", None, false).is_err());
+    }
+
+    #[test]
+    fn desc_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<KvSlotDesc>(), 32);
+        assert_eq!(std::mem::align_of::<KvSlotDesc>(), 8);
+    }
+
+    #[test]
+    fn tiles_never_span_a_slot() {
+        // 3 slots with 1, 3 and 8 query rows; BR = 4.
+        // Slot 0 -> 1 tile, slot 1 -> 1 tile, slot 2 -> 2 tiles. Total 4.
+        let (tile_slot, tile_row0, _) = build_tiles(&[1, 3, 8], 4);
+        assert_eq!(tile_slot, vec![0, 1, 2, 2]);
+        assert_eq!(tile_row0, vec![0, 0, 0, 4]);
+    }
+
+    #[test]
+    fn tile_qbase_is_the_global_flat_row() {
+        // Same shape: global flat rows are 0 | 1,2,3 | 4..11, so the four
+        // tiles start at global rows 0, 1, 4 and 8.
+        let (_, _, tile_qbase) = build_tiles(&[1, 3, 8], 4);
+        assert_eq!(tile_qbase, vec![0, 1, 4, 8]);
+    }
+
+    #[test]
+    fn br_one_gives_one_tile_per_row() {
+        let (tile_slot, tile_row0, tile_qbase) = build_tiles(&[1, 1, 1, 1], 1);
+        assert_eq!(tile_slot, vec![0, 1, 2, 3]);
+        assert_eq!(tile_row0, vec![0, 0, 0, 0]);
+        assert_eq!(tile_qbase, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn zero_query_slots_produce_no_tiles() {
+        // A slot with nothing to do this step must not get a tile — an empty
+        // tile would read uninitialised Q and write garbage to out.
+        // Slot 2's rows still start at global row 2, after slot 0's two rows.
+        let (tile_slot, tile_row0, tile_qbase) = build_tiles(&[2, 0, 3], 4);
+        assert_eq!(tile_slot, vec![0, 2]);
+        assert_eq!(tile_row0, vec![0, 0]);
+        assert_eq!(tile_qbase, vec![0, 2]);
+    }
+
+    #[test]
+    fn total_rows_sums_query_counts() {
+        assert_eq!(total_rows(&[1, 3, 8]), 12);
+        assert_eq!(total_rows(&[]), 0);
+    }
+
+    #[test]
+    fn mixed_prefill_and_decode_batch() {
+        // The shape SP1 exists for: slot 0 verifies 8 draft tokens, slot 1
+        // chunk-prefills 256, slots 2-3 decode 1 each. BR = 8.
+        let (tile_slot, _, _) = build_tiles(&[8, 256, 1, 1], 8);
+        assert_eq!(tile_slot.iter().filter(|&&s| s == 0).count(), 1);
+        assert_eq!(tile_slot.iter().filter(|&&s| s == 1).count(), 32);
+        assert_eq!(tile_slot.iter().filter(|&&s| s == 2).count(), 1);
+        assert_eq!(tile_slot.iter().filter(|&&s| s == 3).count(), 1);
+        assert_eq!(tile_slot.len(), 35);
+    }
+}

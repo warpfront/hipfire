@@ -1,0 +1,4057 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// gfx1201-only GQA-fused FA2 prefill attention (research opt-in).
+//
+// One workgroup owns one KV head and eight token positions: 48 live rows
+// (8 positions x 6 query heads, H=24/Hkv=4/D=256) packed into three 16-row
+// WMMA tiles, plus one loader/helper wave. K and V are each dequantized
+// exactly once per 64-key tile into two fragment-major f16 LDS planes
+// (32 KiB each: 2048 aligned half8 fragments per plane, one b128 load per
+// fragment at the consumers), then reused by all six query heads. Scores,
+// online-softmax state (m, l), and f32 O remain in VGPRs; dynamic LDS is
+// exactly 65,536 B.
+//
+// Grid:  [ceil(batch/8), 4, 1] direct (x=batch tiles, y=KV head),
+//        [ceil(batch/8), 4, n_splits] partial.
+// Block: 128 threads (four wave32s; waves 0..2 compute, wave 3 helper).
+//
+// Row mapping (compute wave w=0..2, packed index t=0..15):
+//   head_local = 2*w + (t >> 3);  q_local = t & 7;
+//   h = 6*kv_h + head_local;      q_row = 8*blockIdx.x + q_local.
+//
+// Swapped operand order (no P transpose exists):
+// gfx12 WMMA: lane (ml=lane&15, kg=lane>>4) supplies A[row=ml][k=kg*8..+8]
+// and B[row=ml][k=kg*8..+8]; acc[j] = C[8*kg+j][ml] with
+// C[i][n] = sum_k A[i][k]*B[n][k].
+//   QK computes S^T = K*Q^T: A = K fragment (row ml = key 0..15),
+//     B = Q fragment (row ml = packed query), acc[j] = S[query=ml][key].
+//     Each lane owns one query row; the other key half sits in lane ml^16,
+//     combined with one shfl_xor(16). m, l, alpha are per-lane scalars.
+//   PV computes O^T = V^T*P^T: A = V^T fragment (row ml = dim 0..15 of the
+//     dc tile), B = the packed P half8, Ofr[dc][j] = O[query=ml][dim].
+//     O rows are the lane's OWN softmax query, so rescale/normalization
+// LDS fragment layout (frozen; F = 8 f16 = 16 B, lane = 16*kg+ml):
+//   Kfrag(sub,dc,lane) = ((dc*4+sub)*32+lane)*F, K at byte 0;
+//   Vfrag(sub,dc,lane) = ((sub*16+dc)*32+lane)*F, V at byte 32768.
+//   K fragment j = K[key=sub*16+ml][dim=dc*16+kg*8+j];
+//   V fragment j = V[key=sub*16+kg*8+j][dim=dc*16+ml].
+// Consumers issue one aligned half8 (b128) load per fragment; no wrap.
+//
+// Q f16 rounding matches the incumbent (Q/K/V/P operands f16,
+// accumulators/state/O f32). No slots, no windows, no FP8, no other arch.
+
+#include <hip/hip_runtime.h>
+
+// K-cache mode, selected at JIT time (kernels.rs concat define):
+//   0 = standard Q8 K (34 B blocks, f16 scale + 32 int8 codes).
+//   3 = fwht3 K (100 B/head: f32 cnorm + 96 B of 3-bit codes, K stored
+//       FWHT-rotated; V stays Q8_0). KMODE=3 dequantizes fwht3 K into the
+//       K plane; the Q-side signed-FWHT-256 rotation lives in the
+//       pre-convert kernel below (fwht_shfl_forward_256 from
+//       turbo_common.h — prepended by the launcher, NOT #included here: the
+//       runtime compile has no -I to kernels/src), applied to the f32 row
+//       BEFORE the cast. Everything downstream of the K plane (fragment
+//       layout, QK/PV, softmax, epilogue) is untouched.
+//   4 = fwht4 K (132 B/head: f32 cnorm + 128 B of 4-bit codes, per-128-half
+//       signed-FWHT rotation, TURBO_C4 codebook; V stays Q8_0). Same K-plane
+//       fill contract as KMODE=3; pre-convert rotates with fwht_shfl_forward.
+//   8 = native fp8 KV, Q0 fill-time decode (slice-B): K and V rows are
+//       token-local [codes: 4*256 bytes, head-major][scales: 4 f16]
+//       (stride 1032). The fill decodes f16(f32(scale)*decode_e4m3(code))
+//       into the same f16 planes; everything downstream is untouched.
+#ifndef HIPFIRE_FA2_KMODE
+#define HIPFIRE_FA2_KMODE 0
+#endif
+
+// A3B native-fp8 specialization (KMODE=8 f16 body only, never FA2_FP8):
+// `-DHIPFIRE_FA2_Q0_A3B` compiles H=16/Hkv=2/D=256 (GQA8) instead of the
+// H=24/Hkv=4/D=256 (GQA6) Q0 geometry. It exists as the HIP oracle twin of
+// the PeaceMaker `attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201` export (same
+// frozen kernel ABI): 4 compute waves (one 16-row tile each, 8 positions x 8
+// heads) plus one barrier-only helper wave (block 160); the cooperative fills
+// run on tid < 128 only. Native fp8 row = [2*256 head-major codes][2 f16
+// scales] (stride 516). Without the macro every constant below is the Q0
+// H24/KV4 value, so all other objects are byte-identical.
+#ifdef HIPFIRE_FA2_Q0_A3B
+#if HIPFIRE_FA2_KMODE != 8 || defined(HIPFIRE_FA2_FP8)
+#error "HIPFIRE_FA2_Q0_A3B requires HIPFIRE_FA2_KMODE=8 without HIPFIRE_FA2_FP8"
+#endif
+#define FA2_HEADS 16
+#define FA2_KV_HEADS 2
+#define FA2_BLOCK 160
+#else
+#define FA2_HEADS 24
+#define FA2_KV_HEADS 4
+#define FA2_BLOCK 128
+#endif
+#define FA2_GQA (FA2_HEADS / FA2_KV_HEADS)
+#define FA2_CWAVES (FA2_GQA / 2)
+// Native fp8 token-local row: head-major codes, then one f16 scale per KV head.
+#define FA2_FP8_SCALE_OFF (FA2_KV_HEADS * 256)
+#define FA2_FP8_ROW (FA2_FP8_SCALE_OFF + FA2_KV_HEADS * 2)
+
+// Product split-KV verifier (HIPFIRE_GFX12_FA2_SPLIT_VERIFY): only the base
+// f16/Q8 `attention_q8_0_fa2_gqa_{partial,merge}_gfx1201` entries use the CK
+// style LSE + normalized-Oacc record layout. Every other module build
+// (fp8-KV KMODE=8, FP8 renamed symbols, fwht3k KMODE=3, stage-b / packet)
+// keeps the 258-float [m, l, O_unnormalized] records, so those objects stay
+// byte-identical.
+#if HIPFIRE_FA2_KMODE == 0 && !defined(HIPFIRE_FA2_FP8)
+#define HIPFIRE_FA2_SPLIT_LSE_ENTRY 1
+#endif
+// Native-fp8-KV split-KV verifier (HIPFIRE_FA2_SPLIT_LSE_FP8, KMODE=8, f16
+// body): the same LSE + normalized-Oacc records as the Q8 verifier, behind
+// distinct `_lse_` entry symbols so the KMODE=8 Q0 module keeps its
+// 258-float records and symbols byte-identical.
+#if defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+#if HIPFIRE_FA2_KMODE != 8 || defined(HIPFIRE_FA2_FP8)
+#error "HIPFIRE_FA2_SPLIT_LSE_FP8 needs KMODE=8 and the f16 body"
+#endif
+#define HIPFIRE_FA2_SPLIT_LSE_ENTRY 1
+#endif
+
+// U0 scaffold: HIPFIRE_FA2_FP8 renames entry symbols only. Body stays the
+// f16 kernel until Ua (planes) / Ub (QK) / Uc (PV). gfx120x-only.
+#ifdef HIPFIRE_FA2_FP8
+#if !defined(__gfx1200__) && !defined(__gfx1201__)
+#error "HIPFIRE_FA2_FP8 is gfx120x-only"
+#endif
+#endif
+
+typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
+typedef float __attribute__((ext_vector_type(8))) float8_t;
+
+typedef union {
+    uint32_t u;
+    _Float16 h[2];
+} fa2_dw_t;
+// fp8 WMMA operand (8 bytes = one fragment) and HW e4m3 decode pair. Types
+// only: no code, no object impact on any translation unit.
+typedef int __attribute__((ext_vector_type(2))) v2i_t;
+typedef float __attribute__((ext_vector_type(2))) float2_t;
+
+// Frozen fragment-offset helpers (half-element units; one fragment = 8).
+// lane = 16*kg+ml. K plane starts at half 0, V plane at half 16384.
+__device__ __forceinline__ int fa2_koff(int sub, int dc, int lane, int j)
+{
+    return ((dc * 4 + sub) * 32 + lane) * 8 + j;
+}
+__device__ __forceinline__ int fa2_voff(int sub, int dc, int lane, int j)
+{
+    return ((sub * 16 + dc) * 32 + lane) * 8 + j;
+}
+__device__ __forceinline__ int fa2_kfrag8(int sub, int dc, int lane)
+{
+    return (dc * 4 + sub) * 32 + lane;
+}
+__device__ __forceinline__ int fa2_vfrag8(int sub, int dc, int lane)
+{
+    return (sub * 16 + dc) * 32 + lane;
+}
+#if HIPFIRE_FA2_KMODE == 8
+// OCP E4M3FN -> f32, bit-exact copy of hipfire_fp8_e4m3_to_f32_tile in
+// attention_flash_q8_0_tile.hip (the tiled reference). The Q0 fill below
+// must match the reference decode exactly at the f16 rounding point:
+// f16(f32(stored_scale) * decode_e4m3(code)). Guarded so the KMODE=0/3
+// translation units never see it.
+static __device__ __forceinline__ float fa2_fp8_e4m3_to_f32(unsigned char b) {
+    const unsigned int u = b;
+    const unsigned int s = (u & 0x80u) << 24;
+    const unsigned int e = (u >> 3) & 0x0fu;
+    const unsigned int m = u & 0x07u;
+    if (e == 0u) {
+        const float f = (float)m * 1.953125e-3f;  // m * 2^-9, exact
+        return s ? -f : f;
+    }
+    if (e == 15u) {
+        const float f = (m == 7u) ? __builtin_bit_cast(float, 0x7fc00000u)
+                                  : 256.0f * (1.0f + (float)m * 0.125f);
+        return s ? -f : f;
+    }
+    return __builtin_bit_cast(float, s | ((e - 7u + 127u) << 23) | (m << 20));
+}
+// Split-KV verifier fill: four E4M3 codes of one dword through the gfx12
+// v_cvt_pk_f32_fp8 pair. Equal to fa2_fp8_e4m3_to_f32 for every non-NaN
+// code (the VerifyAttn twin relies on the same identity), so the f16 plane
+// values are unchanged; NaN codes still decode to NaN.
+#if defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+static __device__ __forceinline__ void fa2_fp8x4_to_f32(uint32_t u, float (&d)[4]) {
+    typedef float fa2_f32x2 __attribute__((ext_vector_type(2)));
+    const fa2_f32x2 lo = __builtin_amdgcn_cvt_pk_f32_fp8(u, false);
+    const fa2_f32x2 hi = __builtin_amdgcn_cvt_pk_f32_fp8(u, true);
+    d[0] = lo.x; d[1] = lo.y; d[2] = hi.x; d[3] = hi.y;
+}
+#endif
+#endif
+
+// Shared workgroup body. PARTIAL=false writes normalized O to `out`;
+// PARTIAL=true && !SPLIT_LSE writes [m, l, O_unnormalized[256]] records
+// (stride 258) to `out`. `tile0/tile1` bound the KT64 tile range (direct:
+// whole sequence; partial split: this split's disjoint range). `split`
+// selects the record plane for PARTIAL (ignored otherwise).
+// SPLIT_LSE (PARTIAL only; the product split-KV verifier, see
+// attention_q8_0_fa2_gqa_partial_gfx1201) follows CK split-KV's accumulator
+// contract in one caller-owned allocation: F32 LSE records first, then
+// normalized F32 O accumulators, record index
+// ((query * H + head) * n_splits + split); tile0/tile1 are ignored and each
+// split takes its range of the live tiles derived from positions[]. Q arrives
+// f16 pre-converted row-major [batch, 24, 256] (see
+// attention_fa2_q_preconvert_gfx1201); the body never touches f32 Q.
+template <bool PARTIAL, bool SPLIT_LSE = false>
+__device__ __forceinline__ void fa2_gqa_body(
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int batch_size,
+    float scale_attn,
+    int kv_h,
+    int q_base,
+    int tile0,
+    int tile1,
+    int split,
+    int n_splits)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int kg = lane >> 4;
+    const bool compute = wave < FA2_CWAVES;
+    // Cooperative fills are written for exactly 128 filler threads; the A3B
+    // block (160) has a fifth barrier-only helper wave. Compile-time true at
+    // block 128, so the default objects are unchanged.
+    const bool filler = (FA2_BLOCK == 128) || (tid < 128);
+    (void)filler;
+
+    const int q_stride = FA2_HEADS * 256;
+    const int row_stride = FA2_KV_HEADS * (256 / 32) * 34;
+    const int kv_blk = kv_h * (256 / 32);
+
+    extern __shared__ uint32_t LDS[];
+    // Fragment-major f16 planes: K at byte 0, V at byte 32768.
+    _Float16* K16 = (_Float16*)LDS;
+    _Float16* V16 = (_Float16*)(LDS + 8192);
+
+    // ---- Transition 1: online state init (compute waves) ----
+    // Q arrives f16 pre-converted (see attention_fa2_q_preconvert_gfx1201);
+    // within a KT64 tile, each dim-chunk Q fragment is loaded once (one
+    // aligned 16-byte half8 load per 8 dims, no cvt) and reused for all
+    // four subtiles' QK WMMAs (F4a); softmax/PV still run sub0..sub3 in
+    // order so online order and PV accumulation stay unchanged.
+    float8_t Ofr[16];
+    float m_old = -INFINITY;
+    float l_val = 0.0f;
+    int h_ml = 0;
+    int qr_ml = 0;
+    bool qok_ml = false;
+    unsigned qq_base = 0;
+    if (compute) {
+        h_ml = FA2_GQA * kv_h + (wave << 1) + (ml >> 3);
+        qr_ml = q_base + (ml & 7);
+        qok_ml = qr_ml < batch_size;
+        qq_base = (unsigned)qr_ml * (unsigned)(FA2_HEADS * 256) + (unsigned)h_ml * 256u;
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc)
+            Ofr[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    }
+
+    // ---- Per-WG causal bounds (positions[] is authoritative) ----
+    // Wave-local: each wave's lanes 0..7 read the same eight positions and
+    // reduce them with the identical integer min/max graph, so all four
+    // waves derive the same gmin/gmax/seq_len with no mailbox and no
+    // barrier. Other lanes keep the existing sentinel values.
+    int wmx = -1;
+    int wmn = 0x7fffffff;
+    if (lane < 8) {
+        const int qr = q_base + lane;
+        if (qr < batch_size) {
+            const int p = positions[qr];
+            wmx = p;
+            wmn = p;
+        }
+    }
+    wmx = max(wmx, __shfl_xor(wmx, 16, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 8, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 4, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 2, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 1, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 16, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 8, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 4, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 2, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 1, 32));
+    // Uniformize through lane 0 of this wave; every wave reduced the same
+    // eight positions, so every wave's lane 0 holds the same values.
+    const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+    const int gmin = __builtin_amdgcn_readfirstlane(wmn);
+    const int seq_len = gmax + 1;
+
+    // ---- Transitions 2-4: KT64 tiles ----
+    // SPLIT_LSE: this split owns a disjoint range of the live KT64 tiles
+    // derived from positions[] (not the max-context-sized static range the
+    // caller passes for the legacy 258-float records).
+    int t_begin = tile0;
+    int t_end = tile1;
+    if constexpr (SPLIT_LSE) {
+        const int tiles_total = (seq_len + 63) / 64;
+        const int tiles_per_split = (tiles_total + n_splits - 1) / n_splits;
+        t_begin = split * tiles_per_split;
+        t_end = min(t_begin + tiles_per_split, tiles_total);
+    }
+    for (int tile = t_begin; tile < t_end; ++tile) {
+        const int ktile = tile * 64;
+        if (ktile >= seq_len)
+            break;
+
+        // ---- Transition 2: cooperative KT64 fill (all four waves) ----
+#if HIPFIRE_FA2_KMODE == 8
+        // Native fp8 K (Q0 fill-time decode): per (position, kv head) the
+        // token-local row is [codes: 4*256 bytes, head-major][scales: 4 f16]
+        // (stride 1032 = 4*(256+2); Hkv=4/D=256 gated at every entry).
+        // b*32..b*32+31 of key ktile+k and dequantizes 32 dims = 8 dwords
+        // straight into the fragment-order f16 K plane: dword w covers the
+        // 4-wide dim run at 4-aligned d0 = b*32+w*4, which never crosses an
+        // 8-dim fragment boundary, so all four share one (dc, lane) with
+        // j = d0&7 .. +3 (same addressing as the q8 arm below). V fill
+        // below is the native-fp8 twin of the Q8_0 V fill.
+        // Decode matches the tiled reference exactly at the f16 rounding
+        // point: f16(f32(stored_scale) * decode_e4m3(code)). Out-of-range
+        // rows read zero codes with a zero scale, like the Q8 path.
+        (void)row_stride;
+        (void)kv_blk;
+        for (int t = 0; t < (filler ? 4 : 0); ++t) {
+            const int idx = tid + t * 128;
+            const int k = idx >> 3;
+            const int b = idx & 7;
+            const int gk = ktile + k;
+            const unsigned char* row = (gk < seq_len)
+                ? k_cache + (unsigned long long)gk * (unsigned long long)FA2_FP8_ROW
+                : nullptr;
+            uint16_t su = 0;
+            if (row != nullptr)
+                su = (uint16_t)row[FA2_FP8_SCALE_OFF + kv_h * 2] |
+                    ((uint16_t)row[FA2_FP8_SCALE_OFF + kv_h * 2 + 1] << 8);
+            _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
+            const float sf = (float)s;
+            const int sub = k >> 4;
+            const int mlk = k & 15;
+            const unsigned char* codes = (row != nullptr)
+                ? row + (unsigned long long)kv_h * 256ULL + (unsigned long long)b * 32ULL
+                : nullptr;
+#if defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+            // Split verifier: the 32 codes as four 8-byte loads issued up
+            // front (rows are 1032 B = 8-byte aligned; the head/run offsets
+            // are multiples of 32), then the hardware fp8 pair decode.
+            uint32_t uw[8];
+            if (codes != nullptr) {
+                const uint2* c8 = (const uint2*)codes;
+#pragma unroll
+                for (int h = 0; h < 4; ++h) {
+                    const uint2 v = c8[h];
+                    uw[2 * h] = v.x;
+                    uw[2 * h + 1] = v.y;
+                }
+            } else {
+#pragma unroll
+                for (int w = 0; w < 8; ++w) uw[w] = 0;
+            }
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                float dv[4];
+                fa2_fp8x4_to_f32(uw[w], dv);
+                const float d0 = dv[0], d1 = dv[1], d2 = dv[2], d3 = dv[3];
+#else
+#pragma unroll 1
+            // 8 dwords cover the 32 codes (memcpy emits a correct load at any
+            // alignment; 1032 / 516 % 4 == 0 so rows stay dword-aligned anyway).
+            for (int w = 0; w < 8; ++w) {
+                uint32_t u = 0;
+                if (codes != nullptr)
+                    __builtin_memcpy(&u, codes + w * 4, 4);
+                const float d0 = fa2_fp8_e4m3_to_f32((unsigned char)u);
+                const float d1 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 8));
+                const float d2 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 16));
+                const float d3 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 24));
+#endif
+                // 4-wide dim run at 4-aligned dd (template K:355-365).
+                const int dd = b * 32 + w * 4;
+                const int dc = dd >> 4;
+                const int ln = 16 * ((dd >> 3) & 1) + mlk;
+                const int o = fa2_koff(sub, dc, ln, dd & 7);
+                K16[o] = (_Float16)(sf * d0);
+                K16[o + 1] = (_Float16)(sf * d1);
+                K16[o + 2] = (_Float16)(sf * d2);
+                K16[o + 3] = (_Float16)(sf * d3);
+            }
+        }
+#else
+#if HIPFIRE_FA2_KMODE == 4
+        // fwht4 K: per (position, kv head) record = [f32 cnorm][128 B of
+        // 4-bit codes] (k_bytes_per_head = 132, k_bytes_per_pos = 4*132 =
+        // 528, head offset kv_h*132 — the contract of
+        // attention_flash_fwht4_tile_batched and kv_cache_write_asym_k_fwht4*).
+        // Dim d lives in byte 4 + d/2, low nibble for even d; value = cnorm *
+        // TURBO_C4[nibble] (128-wide codebook). Slot (k, b) owns dims
+        // b*32..b*32+31 = 16 bytes at rec+4+b*16 (4 dwords, 8 dims each, one
+        // fragment per dword).
+        for (int t = 0; t < 4; ++t) {
+            const int s = tid + t * 128;
+            const int k = s >> 3;
+            const int b = s & 7;
+            const int gk = ktile + k;
+            const unsigned char* rec = (gk < seq_len)
+                ? k_cache + (unsigned long long)gk * 528ULL
+                    + (unsigned long long)(kv_h * 132)
+                : nullptr;
+            float cnorm = 0.0f;
+            if (rec != nullptr)
+                __builtin_memcpy(&cnorm, rec, 4);
+            const int sub = k >> 4;
+            const int mlk = k & 15;
+#pragma unroll 1
+            for (int w = 0; w < 4; ++w) {
+                uint32_t packed = 0;
+                if (rec != nullptr)
+                    __builtin_memcpy(&packed, rec + 4 + b * 16 + w * 4, 4);
+                const int d0 = b * 32 + w * 8;
+                const int dc = d0 >> 4;
+                const int ln = 16 * ((d0 >> 3) & 1) + mlk;
+                const int o = fa2_koff(sub, dc, ln, 0);
+#pragma unroll
+                for (int i = 0; i < 8; ++i)
+                    K16[o + i] = (_Float16)(cnorm * TURBO_C4[(packed >> (4 * i)) & 0xF]);
+            }
+        }
+#elif HIPFIRE_FA2_KMODE == 3
+        // fwht3 K: per (position, kv head) record = [f32 cnorm][96 B codes]
+        // (k_bytes_per_head = 100, k_bytes_per_pos = 4*100 = 400, head offset
+        // kv_h*100 — the same contract as attention_flash_fwht3_tile_batched
+        // and kv_cache_write_asym_k_fwht3*). 512 slots (k*8+b, like the Q8
+        // path); slot (k, b) owns lanes b*4..b*4+3 (lane l owns dims l*8..+8
+        // via 3 bytes at +4+l*3, code (packed >> 3*i) & 7, value cnorm *
+        // TURBO_C3_256[code]). Arithmetic is unchanged; the two halves of
+        // each dword pair land in their Kfrag(sub=k>>4, dc, lane) fragment
+        // via fa2_koff instead of the old swizzled dword plane, so block b
+        // covers the same dims b*32..b*32+31. V fill below is unchanged.
+        for (int t = 0; t < 4; ++t) {
+            const int s = tid + t * 128;
+            const int k = s >> 3;
+            const int b = s & 7;
+            const int gk = ktile + k;
+            const unsigned char* rec = (gk < seq_len)
+                ? k_cache + (unsigned long long)gk * 400ULL
+                    + (unsigned long long)(kv_h * 100)
+                : nullptr;
+            float cnorm = 0.0f;
+            if (rec != nullptr)
+                __builtin_memcpy(&cnorm, rec, 4);
+            const int sub = k >> 4;
+            const int mlk = k & 15;
+#pragma unroll 1
+            for (int m = 0; m < 4; ++m) {
+                uint32_t packed = 0;
+                if (rec != nullptr)
+                    __builtin_memcpy(&packed, rec + 4 + (b * 4 + m) * 3, 3);
+                const int p0 = (b * 4 + m) * 4;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int code0 = (packed >> (6 * i)) & 7;
+                    const int code1 = (packed >> (6 * i + 3)) & 7;
+                    // Pair p0+i holds dims 2*(p0+i), 2*(p0+i)+1; d0 is
+                    // even, so both halves share one fragment.
+                    const int d0 = (p0 + i) * 2;
+                    const int dc = d0 >> 4;
+                    const int ln = 16 * ((d0 >> 3) & 1) + mlk;
+                    const int o = fa2_koff(sub, dc, ln, d0 & 7);
+                    K16[o] = (_Float16)(cnorm * TURBO_C3_256[code0]);
+                    K16[o + 1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
+                }
+            }
+        }
+#else
+        // K: 512 blocks (k*8+b), one block per slot. Codes are loaded on
+        // demand per pair (no staging array); dequant arithmetic is
+        // unchanged and the four halves land in their Kfrag(sub=k>>4, dc,
+        // lane) fragment via fa2_koff. The 4-wide dim run at 4-aligned d0
+        // never crosses an 8-dim fragment boundary, so all four share one
+        // (dc, lane) with j = d0&7 .. +3.
+        for (int t = 0; t < 4; ++t) {
+            const int idx = tid + t * 128;
+            const int k = idx >> 3;
+            const int b = idx & 7;
+            const int gk = ktile + k;
+            const unsigned char* blk = (gk < seq_len)
+                ? k_cache + (unsigned long long)gk * (unsigned long long)row_stride
+                    + (unsigned long long)(kv_blk + b) * 34ULL
+                : nullptr;
+            uint16_t su = 0;
+            if (blk != nullptr)
+                su = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
+            _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
+            const float sf = (float)s;
+            const int sub = k >> 4;
+            const int mlk = k & 15;
+#pragma unroll 1
+            // 8 quads cover the 32 codes (blk+2 may be 2-mod-4;
+            // memcpy emits a correct unaligned load either way).
+            for (int w = 0; w < 8; ++w) {
+                uint32_t u = 0;
+                if (blk != nullptr)
+                    __builtin_memcpy(&u, blk + 2 + w * 4, 4);
+                const float c0 = (float)(int8_t)u;
+                const float c1 = (float)(int8_t)(u >> 8);
+                const float c2 = (float)(int8_t)(u >> 16);
+                const float c3 = (float)(int8_t)(u >> 24);
+                const int d0 = b * 32 + w * 4;
+                const int dc = d0 >> 4;
+                const int ln = 16 * ((d0 >> 3) & 1) + mlk;
+                const int o = fa2_koff(sub, dc, ln, d0 & 7);
+                K16[o] = (_Float16)(sf * c0);
+                K16[o + 1] = (_Float16)(sf * c1);
+                K16[o + 2] = (_Float16)(sf * c2);
+                K16[o + 3] = (_Float16)(sf * c3);
+            }
+        }
+#endif
+#endif
+#if HIPFIRE_FA2_KMODE == 8
+        // Native fp8 V (Q0 fill-time decode): 256 key-pairs (m*8+b) like the
+        // Q8 path; each slot reads dims b*32..b*32+31 of keys ktile+2m /
+        // ktile+2m+1 from their token-local fp8 rows and packs
+        // (V[2m][d], V[2m+1][d]) per output dim into the fragment-order f16
+        // V plane via fa2_voff (same addressing as the q8 arm below):
+        // 2m/2m+1 never straddle a sub/kg boundary, so both halves share
+        // one fragment at consecutive j. Same decode/rounding contract as
+        // the K fill above.
+        for (int t = 0; t < (filler ? 2 : 0); ++t) {
+            const int pair = tid + t * 128;
+            const int m = pair >> 3;
+            const int b = pair & 7;
+            const int k0 = ktile + 2 * m;
+            const unsigned char* row0 = (k0 < seq_len)
+                ? v_cache + (unsigned long long)k0 * (unsigned long long)FA2_FP8_ROW
+                : nullptr;
+            const unsigned char* row1 = (k0 + 1 < seq_len)
+                ? v_cache + (unsigned long long)(k0 + 1) * (unsigned long long)FA2_FP8_ROW
+                : nullptr;
+            uint16_t s0u = 0;
+            uint16_t s1u = 0;
+            if (row0 != nullptr)
+                s0u = (uint16_t)row0[FA2_FP8_SCALE_OFF + kv_h * 2] |
+                    ((uint16_t)row0[FA2_FP8_SCALE_OFF + kv_h * 2 + 1] << 8);
+            if (row1 != nullptr)
+                s1u = (uint16_t)row1[FA2_FP8_SCALE_OFF + kv_h * 2] |
+                    ((uint16_t)row1[FA2_FP8_SCALE_OFF + kv_h * 2 + 1] << 8);
+            _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
+            _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
+            const float sf0 = (float)s0;
+            const float sf1 = (float)s1;
+            const unsigned char* vc0 = (row0 != nullptr)
+                ? row0 + (unsigned long long)kv_h * 256ULL + (unsigned long long)b * 32ULL
+                : nullptr;
+            const unsigned char* vc1 = (row1 != nullptr)
+                ? row1 + (unsigned long long)kv_h * 256ULL + (unsigned long long)b * 32ULL
+                : nullptr;
+            const int sub = (2 * m) >> 4;
+            const int kgm = ((2 * m) >> 3) & 1;
+            const int j0 = (2 * m) & 7;
+#if defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+            // Split verifier: both rows' 32 codes as 8-byte loads up front,
+            // hardware fp8 pair decode per dword (see the K fill above).
+            uint32_t uw0[8], uw1[8];
+#pragma unroll
+            for (int h = 0; h < 4; ++h) {
+                const uint2 a = (vc0 != nullptr) ? ((const uint2*)vc0)[h] : make_uint2(0u, 0u);
+                const uint2 c2 = (vc1 != nullptr) ? ((const uint2*)vc1)[h] : make_uint2(0u, 0u);
+                uw0[2 * h] = a.x; uw0[2 * h + 1] = a.y;
+                uw1[2 * h] = c2.x; uw1[2 * h + 1] = c2.y;
+            }
+#pragma unroll
+            for (int w = 0; w < 8; ++w) {
+                float dv0[4], dv1[4];
+                fa2_fp8x4_to_f32(uw0[w], dv0);
+                fa2_fp8x4_to_f32(uw1[w], dv1);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int d = b * 32 + w * 4 + c;
+                    const float v0 = dv0[c];
+                    const float v1 = dv1[c];
+#else
+#pragma unroll 1
+            for (int w = 0; w < 8; ++w) {
+                uint32_t u0 = 0, u1 = 0;
+                if (vc0 != nullptr)
+                    __builtin_memcpy(&u0, vc0 + w * 4, 4);
+                if (vc1 != nullptr)
+                    __builtin_memcpy(&u1, vc1 + w * 4, 4);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int d = b * 32 + w * 4 + c;
+                    const float v0 = fa2_fp8_e4m3_to_f32((unsigned char)(u0 >> (c * 8)));
+                    const float v1 = fa2_fp8_e4m3_to_f32((unsigned char)(u1 >> (c * 8)));
+#endif
+                    const int dc = d >> 4;
+                    const int ln = 16 * kgm + (d & 15);
+                    const int o = fa2_voff(sub, dc, ln, j0);
+                    V16[o] = (_Float16)(sf0 * v0);
+                    V16[o + 1] = (_Float16)(sf1 * v1);
+                }
+            }
+        }
+#else
+        // V: 256 key-pairs (m*8+b); each slot reads the even and odd block.
+        // Dequant arithmetic is unchanged; the pair (V[2m][d], V[2m+1][d])
+        // lands in its Vfrag(sub=(2m)>>4, dc, lane) fragment via fa2_voff.
+        // 2m/2m+1 never straddle a sub/kg boundary, so both halves share
+        // one fragment at consecutive j. Codes are loaded on demand per dim
+        // (no staging array).
+        for (int t = 0; t < 2; ++t) {
+            const int pair = tid + t * 128;
+            const int m = pair >> 3;
+            const int b = pair & 7;
+            const int k0 = ktile + 2 * m;
+            const unsigned char* blk0 = (k0 < seq_len)
+                ? v_cache + (unsigned long long)k0 * (unsigned long long)row_stride
+                    + (unsigned long long)(kv_blk + b) * 34ULL
+                : nullptr;
+            const unsigned char* blk1 = (k0 + 1 < seq_len)
+                ? v_cache + (unsigned long long)(k0 + 1) * (unsigned long long)row_stride
+                    + (unsigned long long)(kv_blk + b) * 34ULL
+                : nullptr;
+            uint16_t s0u = 0;
+            uint16_t s1u = 0;
+            if (blk0 != nullptr)
+                s0u = (uint16_t)blk0[0] | ((uint16_t)blk0[1] << 8);
+            if (blk1 != nullptr)
+                s1u = (uint16_t)blk1[0] | ((uint16_t)blk1[1] << 8);
+            _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
+            _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
+            const float sf0 = (float)s0;
+            const float sf1 = (float)s1;
+            const int sub = (2 * m) >> 4;
+            const int kgm = ((2 * m) >> 3) & 1;
+            const int j0 = (2 * m) & 7;
+#pragma unroll 1
+            for (int w = 0; w < 8; ++w) {
+                uint32_t u0 = 0, u1 = 0;
+                if (blk0 != nullptr)
+                    __builtin_memcpy(&u0, blk0 + 2 + w * 4, 4);
+                if (blk1 != nullptr)
+                    __builtin_memcpy(&u1, blk1 + 2 + w * 4, 4);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int d = b * 32 + w * 4 + c;
+                    const float c0 = (float)(int8_t)(u0 >> (c * 8));
+                    const float c1 = (float)(int8_t)(u1 >> (c * 8));
+                    const int dc = d >> 4;
+                    const int ln = 16 * kgm + (d & 15);
+                    const int o = fa2_voff(sub, dc, ln, j0);
+                    V16[o] = (_Float16)(sf0 * c0);
+                    V16[o + 1] = (_Float16)(sf1 * c1);
+                }
+        }
+        }
+#endif
+        __syncthreads();
+
+        // ---- Transition 3: four KT16 QK/softmax/PV subtiles ----
+        // F4a: each Q dim-chunk fragment is loaded once per tile and shared
+        // by all four subtiles' QK WMMAs; softmax/PV still run sub0..sub3 in
+        // order so online-softmax order and PV accumulation are unchanged
+        // (bit-exact: every subtile accumulates dc 0..15 in the same order
+        // as the old per-subtile reload).
+        if (compute) {
+            const bool do0 = ktile <= gmax;
+            const bool do1 = ktile + 16 <= gmax;
+            const bool do2 = ktile + 32 <= gmax;
+            const bool do3 = ktile + 48 <= gmax;
+            float8_t sacc0 =
+                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            float8_t sacc1 =
+                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            float8_t sacc2 =
+                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            float8_t sacc3 =
+                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            if (do0 || do1 || do2 || do3) {
+                // QK as S^T = K*Q^T: A = K fragment (row ml = key),
+                // B = Q fragment loaded once per chunk (row ml = query).
+                // acc[j] = S[query=ml][key=8*kg+j].
+                const unsigned qb = qq_base;
+                // Unrolled by 4: each group's Q loads issue once, then each
+                // live subtile's K loads + WMMAs consume the shared fragments
+                // (software pipelining for LDS/L1 latency). One scheduling
+                // barrier per group bounds the in-flight fragments.
+#pragma unroll
+                for (int dg = 0; dg < 4; ++dg) {
+                    half8_t qfa[4];
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const int dc = dg * 4 + u;
+                        // One aligned 16-byte half8 load per 8 dims, no cvt:
+                        // the pre-convert wrote f16 with the identical cast
+                        // the old f32 path applied per fragment, so the WMMA
+                        // B operand is bit-identical. qd[kg] selects this
+                        // lane's 8 dims (dc*16+kg*8..+8).
+                        const half8_t* qd =
+                            (const half8_t*)(q16 + qb + (unsigned)(dc * 16));
+                        half8_t qf = {0, 0, 0, 0, 0, 0, 0, 0};
+                        if (qok_ml)
+                            qf = qd[kg];
+                        qfa[u] = qf;
+                    }
+                    if (do0) {
+                        half8_t kfa[4];
+                        const half8_t* Kf = (const half8_t*)K16;
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            // One aligned half8 load = Kfrag(sub=0, dc,
+                            // lane): K[key=ml][dim=dc*16+kg*8..+8].
+                            kfa[u] = Kf[fa2_kfrag8(0, dc, lane)];
+                        }
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            sacc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kfa[u], qfa[u], sacc0);
+                    }
+                    if (do1) {
+                        half8_t kfa[4];
+                        const half8_t* Kf = (const half8_t*)K16;
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            // One aligned half8 load = Kfrag(sub=1, dc,
+                            // lane): K[key=16+ml][dim=dc*16+kg*8..+8].
+                            kfa[u] = Kf[fa2_kfrag8(1, dc, lane)];
+                        }
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            sacc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kfa[u], qfa[u], sacc1);
+                    }
+                    if (do2) {
+                        half8_t kfa[4];
+                        const half8_t* Kf = (const half8_t*)K16;
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            // One aligned half8 load = Kfrag(sub=2, dc,
+                            // lane): K[key=32+ml][dim=dc*16+kg*8..+8].
+                            kfa[u] = Kf[fa2_kfrag8(2, dc, lane)];
+                        }
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            sacc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kfa[u], qfa[u], sacc2);
+                    }
+                    if (do3) {
+                        half8_t kfa[4];
+                        const half8_t* Kf = (const half8_t*)K16;
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            // One aligned half8 load = Kfrag(sub=3, dc,
+                            // lane): K[key=48+ml][dim=dc*16+kg*8..+8].
+                            kfa[u] = Kf[fa2_kfrag8(3, dc, lane)];
+                        }
+#pragma unroll
+                        for (int u = 0; u < 4; ++u)
+                            sacc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kfa[u], qfa[u], sacc3);
+                    }
+                    asm volatile("" ::: "memory");
+                }
+            }
+#pragma unroll 1
+            for (int sub = 0; sub < 4; ++sub) {
+                const bool dos = (sub == 0) ? do0
+                    : (sub == 1) ? do1 : (sub == 2) ? do2 : do3;
+                if (!dos)
+                    continue;
+                float8_t sacc = (sub == 0) ? sacc0
+                    : (sub == 1) ? sacc1 : (sub == 2) ? sacc2 : sacc3;
+                const int kt_sub = ktile + sub * 16;
+                const bool full = (kt_sub + 15) <= gmin;
+                // This lane's softmax query is ml; its position is loaded
+                // once per subtile (masked path only).
+                const int pos_ml =
+                    (!full && qok_ml) ? positions[qr_ml] : 0;
+
+                // Mask + row max. The mx chain serializes the unrolled
+                // rows; the other key half is combined with one shuffle.
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int key_g = kt_sub + 8 * kg + j;
+                    const bool ok = qok_ml && (full || key_g <= pos_ml);
+                    const float x = ok ? sacc[j] * scale_attn : -INFINITY;
+                    // NOTE: max-accumulation happens in the second pass
+                    // below; this pass only masks into sc.
+                    sacc[j] = x;
+                }
+                float mx = -INFINITY;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    mx = fmaxf(mx, sacc[j]);
+                mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+                const float m_new = fmaxf(m_old, mx);
+                const float alpha =
+                    (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                m_old = m_new;
+
+                // Exponent origin only: m_old already holds the real running
+                // maximum. Use +0 when m_new == -inf so masked (-inf) scores
+                // stay +0 while a live NaN score survives and propagates.
+                const float exp_origin = (m_new == -INFINITY) ? 0.0f : m_new;
+
+                // Probabilities pack straight into the PV B operand.
+                // The sum chain likewise serializes rows.
+                half8_t prow;
+                float sum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float e = __expf(sacc[j] - exp_origin);
+                    prow[j] = (_Float16)e;
+                    sum += e;
+                }
+                sum += __shfl_xor(sum, 16, 32);
+                l_val = l_val * alpha + sum;
+
+                // O rescale with the lane's OWN alpha: Ofr rows are the
+                // lane's own softmax query (O[query=ml][dim]).
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= alpha;
+
+                // PV as O^T = V^T*P^T: A = V^T fragment (row ml = dim of
+                // the dc tile), B = prow. Ofr[dc][j] = O[query][dim].
+                // One aligned half8 load = Vfrag(sub, dc, lane):
+                // V[key=sub*16+kg*8..+8][dim=dc*16+ml].
+                const half8_t* Vf = (const half8_t*)V16;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const half8_t vf = Vf[fa2_vfrag8(sub, dc, lane)];
+                    Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                        vf, prow, Ofr[dc]);
+                    // Bound V-load hoisting to this chunk.
+                    asm volatile("" ::: "memory");
+                }
+            }
+        }
+        // Tile turnover: no wave may overwrite LDS before every PV read
+        // has finished.
+        __syncthreads();
+    }
+
+    // ---- Transition 4: completion ----
+    // Ofr[dc][j] at lane (ml,kg) = O[query=ml][dim=dc*16+8*kg+j]: own
+    // query rows, 8 consecutive dims per dc. Own l_val normalizes.
+    if (compute) {
+        if (!PARTIAL) {
+            if (qok_ml) {
+                const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+                // 32-bit row base (whole O tensor < 10 MiB).
+                const unsigned bo =
+                    (unsigned)qr_ml * (unsigned)(FA2_HEADS * 256) + (unsigned)h_ml * 256u;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const unsigned bd = bo + (unsigned)(dc * 16 + kg * 8);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        out[bd + (unsigned)j] = Ofr[dc][j] * inv;
+                }
+            }
+        } else if constexpr (SPLIT_LSE) {
+            // CK-style split-KV contract. Keep LSE and Oacc in separate
+            // logical planes so the combine kernel has unambiguous strides:
+            //   lse[record]
+            //   oacc[record][256] (normalized partial output)
+            // record = ((query * H + head) * n_splits + split).
+            const unsigned records =
+                (unsigned)batch_size * (unsigned)FA2_HEADS * (unsigned)n_splits;
+            float* lse = out;
+            float* oacc = out + records;
+            const unsigned record =
+                ((unsigned)qr_ml * (unsigned)FA2_HEADS + (unsigned)h_ml)
+                    * (unsigned)n_splits + (unsigned)split;
+            const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+            if (kg == 0) {
+                if (qok_ml) {
+                    lse[record] = l_val > 0.0f
+                        ? m_old + __logf(l_val)
+                        : -INFINITY;
+                }
+            }
+            if (qok_ml) {
+                float* rec = oacc + record * 256u;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned rj = (unsigned)(kg * 8 + j);
+#pragma unroll
+                    for (int dc = 0; dc < 16; ++dc)
+                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j] * inv;
+                }
+            }
+        } else {
+            // Caller-owned partial records: [m, l, O_unnormalized[256]],
+            // stride 258, layout [((qr*H + h)*S + split)]. Every lane owns
+            // its query ml; lanes (ml, 0) write m/l once.
+            if (kg == 0) {
+                if (qok_ml) {
+                    // 32-bit record base (partials < 64 MiB even at S=8).
+                    const unsigned rb =
+                        (((unsigned)qr_ml * (unsigned)FA2_HEADS + (unsigned)h_ml)
+                             * (unsigned)n_splits + (unsigned)split)
+                        * 258u;
+                    float* rec = out + rb;
+                    rec[0] = m_old;
+                    rec[1] = l_val;
+                }
+            }
+            if (qok_ml) {
+                const unsigned rb =
+                    (((unsigned)qr_ml * (unsigned)FA2_HEADS + (unsigned)h_ml)
+                         * (unsigned)n_splits + (unsigned)split)
+                        * 258u;
+                float* rec = out + rb;
+                // j-outer/dc-inner, matching the direct epilogue's proven
+                // structure: j selects this lane's 8 dims per chunk.
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned rj = rb + 2u + (unsigned)(kg * 8 + j);
+#pragma unroll
+                    for (int dc = 0; dc < 16; ++dc)
+                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j];
+                }
+            }
+        }
+    }
+}
+
+// ---- Stage-b route-N byte-copy fill + dump (B1b diagnostic) ----
+// KMODE=8 + HIPFIRE_FA2_FP8 only. The fill copies native e4m3 codes verbatim
+// into the fragment-order fp8 planes (F = 8 bytes, K at byte 0, V at byte
+// 16384; dynamic LDS 32768) with NO decode, NO VALU, NO f16 rounding:
+//   K: one lane per (key, dc16) pair (1024/tile, 256/wave, 8/lane):
+//      one global_load_b128 + two ds_store_b64 (dims dc*16+0..7 and +8..15
+//      land in Kfrag(sub,dc,ml) and Kfrag(sub,dc,16+ml), 128 bytes apart).
+//   V: one lane per (sub, dc, lane) fragment (2048/tile, 512/wave, 16/lane):
+//      8 global_load_u8 (8 keys at one dim, 1032-strided) + one ds_store_b64.
+// Out-of-range keys (gk >= seq_len) write code 0. Scales are NEVER staged:
+// route N reads them header-direct through fa2_scale_n below (S3 sizes no
+// scale plane; Main ruling). The dump writes LDS planes + accessor-read
+// scales to `out` for the host oracle, then returns: with 32768 LDS the f16
+// body cannot run here (its V plane at byte 32768 is out of bounds), so B2
+// replaces dump+return with the fp8 body while keeping this fill.
+//
+// Route-N scale accessor (header-direct). B4 gives route Q the same
+// signature backed by its scratch scale plane, so the B2/B3 epilogue calls
+// only this and the body stays source-agnostic. OOR keys read scale 0,
+// matching the code-0 rule (§2: zero fragments contribute exactly zero).
+static __device__ __forceinline__ float fa2_scale_n(
+    const unsigned char* __restrict__ cache, int gkey, int kv_h, int seq_len)
+{
+    uint16_t u = 0;
+    if (gkey < seq_len) {
+        const unsigned char* row =
+            cache + (unsigned long long)gkey * 1032ULL;
+        u = (uint16_t)row[1024 + kv_h * 2] |
+            ((uint16_t)row[1024 + kv_h * 2 + 1] << 8);
+    }
+    return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
+}
+
+// B1b fill+dump. Dump layout per (blockIdx.x, kv_h, split, tile), in u32
+// words at out + ((((bx*4+kv_h)*S+s)*512+t)*8320): K plane (4096) | V plane
+// (4096) | K scales as f32 via fa2_scale_n (64) | V scales (64). T_MAX=512
+// mirrors the partial tile convention; S=1/s=0 on direct.
+template <bool PARTIAL>
+__device__ void fa2_stageb_nfill_dump(
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int batch_size,
+    int kv_h,
+    int q_base,
+    int tile0,
+    int tile1,
+    int split,
+    int n_splits)
+{
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+
+    // Wave-local causal bounds (same mailbox-free graph as the body: every
+    // wave reduces the same eight positions).
+    int wmx = -1;
+    int wmn = 0x7fffffff;
+    if (lane < 8) {
+        const int qr = q_base + lane;
+        if (qr < batch_size) {
+            const int p = positions[qr];
+            wmx = p;
+            wmn = p;
+        }
+    }
+    wmx = max(wmx, __shfl_xor(wmx, 16, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 8, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 4, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 2, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 1, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 16, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 8, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 4, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 2, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 1, 32));
+    const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+    const int gmin = __builtin_amdgcn_readfirstlane(wmn);
+    (void)gmin;
+    const int seq_len = gmax + 1;
+
+    extern __shared__ uint32_t LDS[];
+    unsigned char* K8 = (unsigned char*)LDS;
+    unsigned char* V8 = (unsigned char*)LDS + 16384;
+
+    for (int tile = tile0; tile < tile1; ++tile) {
+        const int ktile = tile * 64;
+        if (ktile >= seq_len)
+            break;
+
+        // ---- Route-N K fill: 1024 (key, dc) pairs, 8 per lane ----
+        // Fast path (key in range) is straight-line: one b128 + two b64
+        // per pair. Edge keys take the zeroing path. Full tiles never
+        // diverge, so the steady-state census sees only the fast path.
+        for (int t = 0; t < 8; ++t) {
+            const int idx = tid + t * 128;
+            const int k = idx >> 4;
+            const int dc = idx & 15;
+            const int gk = ktile + k;
+            const int sub = k >> 4;
+            const int ml = k & 15;
+            unsigned char* dst =
+                K8 + (unsigned)(((dc * 4 + sub) * 32 + ml) * 8);
+            if (gk < seq_len) {
+                const unsigned char* src = k_cache
+                    + (unsigned long long)gk * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dc * 16ULL;
+                uint4 v = *(const uint4*)src;
+                *(unsigned long long*)dst =
+                    ((unsigned long long)v.y << 32) | v.x;
+                *(unsigned long long*)(dst + 128) =
+                    ((unsigned long long)v.w << 32) | v.z;
+            } else {
+                *(unsigned long long*)dst = 0ULL;
+                *(unsigned long long*)(dst + 128) = 0ULL;
+            }
+        }
+
+        // ---- Route-N V fill: 2048 fragments, 16 per lane ----
+        // Fast path (all 8 keys in range): 8 byte loads off ONE row base
+        // with constant stride offsets (1032) + one b64 store. Edge
+        // fragments fall back to per-byte predication; all-OOR writes zero.
+        for (int t = 0; t < 16; ++t) {
+            const int idx = tid + t * 128;
+            const int sub = idx >> 9;
+            const int r = idx & 511;
+            const int dc = r >> 5;
+            const int vlane = r & 31;
+            const int ml = vlane & 15;
+            const int kg = vlane >> 4;
+            const int dim = dc * 16 + ml;
+            const int kbase = ktile + sub * 16 + kg * 8;
+            unsigned char* dst = V8
+                + (unsigned)(((sub * 16 + dc) * 32 + vlane) * 8);
+            unsigned long long w = 0;
+            if (kbase + 7 < seq_len) {
+                const unsigned char* r0 = v_cache
+                    + (unsigned long long)kbase * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dim;
+                w = (unsigned long long)r0[0]
+                    | ((unsigned long long)r0[1032] << 8)
+                    | ((unsigned long long)r0[2064] << 16)
+                    | ((unsigned long long)r0[3096] << 24)
+                    | ((unsigned long long)r0[4128] << 32)
+                    | ((unsigned long long)r0[5160] << 40)
+                    | ((unsigned long long)r0[6192] << 48)
+                    | ((unsigned long long)r0[7224] << 56);
+            } else if (kbase < seq_len) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int gkey = kbase + j;
+                    unsigned char c = 0;
+                    if (gkey < seq_len)
+                        c = *(v_cache + (unsigned long long)gkey * 1032ULL
+                            + (unsigned long long)kv_h * 256ULL
+                            + (unsigned long long)dim);
+                    // j-th byte of the fragment word (token-major rows are
+                    // 1032 apart: no vector load exists for a V fragment).
+                    w |= (unsigned long long)c
+                        << (unsigned long long)(j * 8);
+                }
+            }
+            *(unsigned long long*)dst = w;
+        }
+        __syncthreads();
+
+        // ---- Dump: planes + accessor-read scales ----
+        const unsigned long long dump =
+            (((((unsigned long long)(int)blockIdx.x * 4u
+                 + (unsigned long long)kv_h)
+                * (unsigned long long)n_splits + (unsigned long long)split)
+               * 512ULL + (unsigned long long)tile)
+              * 8320ULL);
+        uint32_t* D = (uint32_t*)out + dump;
+        for (int i = 0; i < 16; ++i)
+            ((uint4*)D)[tid * 16 + i] =
+                ((const uint4*)LDS)[tid * 16 + i];
+        if (tid < 64) {
+            const int gk = ktile + tid;
+            ((float*)D)[8192 + tid] =
+                fa2_scale_n(k_cache, gk, kv_h, seq_len);
+            ((float*)D)[8256 + tid] =
+                fa2_scale_n(v_cache, gk, kv_h, seq_len);
+        }
+        __syncthreads();
+    }
+}
+// ---- Stage-b route-N body with fp8 QK leg (B2) ----
+// Separate template so the f16 objects stay identical. Skeleton (bounds,
+// tile loop, softmax order, O/partial records, barriers) mirrors
+// fa2_gqa_body; differences: route-N byte-copy fill (same loops as the B1b
+// oracle fn above), QK as S^T = K8*Q8^T in fp8 WMMA (64 per compute wave
+// per full tile; one b64 per fragment operand; Q streamed from the fp8
+// scratch row), score[j] = (acc[j]*qs)*sk[key_j] at the old scale position
+// (qs formed per tile (qs_tile); sk for the 8 OWNED keys sub*16+8*kg+j via
+// fa2_scale_n, one subtile lifetime, sharing one 8-register file with sv).
+// - PV in fp8 with the bounded changing-unit O (B3): w = e*sv, b_new =
+//   max(wmax/448, 2^-64), p8 = E4M3_RNE(w/b_new), rho = (alpha*b_prev)/b_new
+//   folded into the Ofr rescale; V fragments load codes directly (no
+//   decode); completion stores the physical numerator (direct: Ofr*b_prev/l,
+//   partial: b_prev*Ofr in stride-258 records, merge untouched).
+template <bool PARTIAL>
+__device__ void fa2_stageb_nbody(
+    const unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int batch_size,
+    float scale_attn,
+    int kv_h,
+    int q_base,
+    int tile0,
+    int tile1,
+    int split,
+    int n_splits)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int kg = lane >> 4;
+    const bool compute = wave < 3;
+
+    extern __shared__ uint32_t LDS[];
+    // fp8 fragment planes: K at byte 0, V at byte 16384 (32768 LDS).
+    unsigned char* K8 = (unsigned char*)LDS;
+    unsigned char* V8 = (unsigned char*)LDS + 16384;
+
+    float8_t Ofr[16];
+    float m_old = -INFINITY;
+    float l_val = 0.0f;
+    // Changing-unit O state (§5): O_physical = b_prev*Ofr across subtiles
+    // and tiles. b_prev = 1 with zero Ofr is the correct initial unit.
+    float b_prev = 1.0f;
+    int h_ml = 0;
+    int qr_ml = 0;
+    bool qok_ml = false;
+    unsigned qb = 0;
+    if (compute) {
+        h_ml = 6 * kv_h + (wave << 1) + (ml >> 3);
+        qr_ml = q_base + (ml & 7);
+        qok_ml = qr_ml < batch_size;
+        qb = ((unsigned)qr_ml * 24u + (unsigned)h_ml) * 256u;
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc)
+            Ofr[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    }
+
+    // ---- Per-WG causal bounds (positions[] is authoritative) ----
+    // Wave-local: each wave's lanes 0..7 read the same eight positions and
+    // reduce them with the identical integer min/max graph, so all four
+    // waves derive the same gmin/gmax/seq_len with no mailbox and no
+    // barrier. Other lanes keep the existing sentinel values.
+    int wmx = -1;
+    int wmn = 0x7fffffff;
+    if (lane < 8) {
+        const int qr = q_base + lane;
+        if (qr < batch_size) {
+            const int p = positions[qr];
+            wmx = p;
+            wmn = p;
+        }
+    }
+    wmx = max(wmx, __shfl_xor(wmx, 16, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 8, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 4, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 2, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 1, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 16, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 8, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 4, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 2, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 1, 32));
+    const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+    const int gmin = __builtin_amdgcn_readfirstlane(wmn);
+    const int seq_len = gmax + 1;
+
+    // ---- KT64 tiles ----
+    for (int tile = tile0; tile < tile1; ++tile) {
+        const int ktile = tile * 64;
+        if (ktile >= seq_len)
+            break;
+
+        // ---- Route-N byte-copy fill (same loops as the B1b oracle) ----
+        // Rolled (unlike the oracle copy): rolling serializes the 24 slot
+        // copies so their temps reuse instead of overlapping in scheduling
+        // (saves ~80 VGPR); dynamic work is identical, plus loop latches.
+#pragma unroll 1
+        for (int t = 0; t < 8; ++t) {
+            const int idx = tid + t * 128;
+            const int k = idx >> 4;
+            const int dc = idx & 15;
+            const int gk = ktile + k;
+            const int sub = k >> 4;
+            const int mlk = k & 15;
+            unsigned char* dst =
+                K8 + (unsigned)(((dc * 4 + sub) * 32 + mlk) * 8);
+            if (gk < seq_len) {
+                const unsigned char* src = k_cache
+                    + (unsigned long long)gk * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dc * 16ULL;
+                uint4 v = *(const uint4*)src;
+                *(unsigned long long*)dst =
+                    ((unsigned long long)v.y << 32) | v.x;
+                *(unsigned long long*)(dst + 128) =
+                    ((unsigned long long)v.w << 32) | v.z;
+            } else {
+                *(unsigned long long*)dst = 0ULL;
+                *(unsigned long long*)(dst + 128) = 0ULL;
+            }
+        }
+#pragma unroll 1
+        for (int t = 0; t < 16; ++t) {
+            const int idx = tid + t * 128;
+            const int sub = idx >> 9;
+            const int r = idx & 511;
+            const int dc = r >> 5;
+            const int vlane = r & 31;
+            const int mlv = vlane & 15;
+            const int kgv = vlane >> 4;
+            const int dim = dc * 16 + mlv;
+            const int kbase = ktile + sub * 16 + kgv * 8;
+            unsigned char* dst = V8
+                + (unsigned)(((sub * 16 + dc) * 32 + vlane) * 8);
+            unsigned long long w = 0;
+            if (kbase + 7 < seq_len) {
+                const unsigned char* r0 = v_cache
+                    + (unsigned long long)kbase * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dim;
+                w = (unsigned long long)r0[0]
+                    | ((unsigned long long)r0[1032] << 8)
+                    | ((unsigned long long)r0[2064] << 16)
+                    | ((unsigned long long)r0[3096] << 24)
+                    | ((unsigned long long)r0[4128] << 32)
+                    | ((unsigned long long)r0[5160] << 40)
+                    | ((unsigned long long)r0[6192] << 48)
+                    | ((unsigned long long)r0[7224] << 56);
+            } else if (kbase < seq_len) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int gkey = kbase + j;
+                    unsigned char c = 0;
+                    if (gkey < seq_len)
+                        c = *(v_cache + (unsigned long long)gkey * 1032ULL
+                            + (unsigned long long)kv_h * 256ULL
+                            + (unsigned long long)dim);
+                    w |= (unsigned long long)c
+                        << (unsigned long long)(j * 8);
+                }
+            }
+            *(unsigned long long*)dst = w;
+        }
+        __syncthreads();
+
+        // ---- Four KT16 QK/softmax/PV subtiles (online order kept) ----
+        // Fused per subtile (B2 VGPR tradeoff): each live subtile runs its
+        // own QK dg groups into one sacc, then mask/softmax/PV in order, so
+        // online-softmax order and PV accumulation are unchanged.
+        if (compute) {
+            const bool do0 = ktile <= gmax;
+            const bool do1 = ktile + 16 <= gmax;
+            const bool do2 = ktile + 32 <= gmax;
+            const bool do3 = ktile + 48 <= gmax;
+            // qs formed per tile (not per call): sq is constant for the
+            // query, so holding qb/sqp/sqv across the fill only wastes
+            // VGPRs. One f32 load + mul per tile; negligible packets.
+            float qs_tile = 0.0f;
+            {
+                const unsigned qrow =
+                    (unsigned)qr_ml * 24u + (unsigned)h_ml;
+                const float* sqp = (const float*)(
+                    q8_codes + (unsigned)batch_size * 24u * 256u);
+                float sqv = 1.0f;
+                if (qok_ml)
+                    sqv = sqp[qrow];
+                qs_tile = sqv * scale_attn;
+            }
+#pragma unroll 1
+            for (int sub = 0; sub < 4; ++sub) {
+                const bool dos = (sub == 0) ? do0
+                    : (sub == 1) ? do1 : (sub == 2) ? do2 : do3;
+                if (!dos)
+                    continue;
+                // QK for this subtile only (fused: one sacc instead of four
+                // saves 24 VGPR; Q reloaded per live subtile — L1-served —
+                // while K/WMMA counts are unchanged). S^T = K8*Q8^T in fp8.
+                float8_t sacc =
+                    (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                // K base in v2i units (sub factored once per subtile; dc
+                // below is unrolled-const, so every fragment load is a base
+                // VGPR + immediate offset — the slice-A addressing idiom.
+                // Dynamic fa2_kfrag8 indexing here cost ~100 packets/tile in
+                // index math + spill reloads; never do that again.)
+                const unsigned kbn = (unsigned)(sub * 32) + (unsigned)lane;
+                const v2i_t* Kf = (const v2i_t*)K8;
+                // V base in u64 units for the expand below (same idiom).
+                const unsigned vbn = (unsigned)(sub * 512) + (unsigned)lane;
+                // OOR-query clamp (per subtile): row 0 always exists, and
+                // below are unconditionally valid.
+                const unsigned qbb = qok_ml ? qb : 0u;
+#pragma unroll 1
+                for (int dg = 0; dg < 4; ++dg) {
+                    // Q base per group (dg*64 unrolled-const → immediate).
+                    // OOR lanes clamp to row 0 (valid: batch >= 1): their
+                    // scores are fully discarded by the mask below, so all
+                    // lanes issue straight-line loads (no diamonds).
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const int dc = dg * 4 + u;
+                        // One aligned 8-byte load: Q codes for this lane's
+                        // query at dims dc*16+kg*8..+8.
+                        const v2i_t* qd = (const v2i_t*)(
+                            q8_codes + qbb + (unsigned)(dc * 16));
+                        v2i_t qf = qd[kg];
+                        // One aligned 8-byte load = Kfrag(sub, dc, lane):
+                        // static immediate kbn + dc*128 (dc unrolled-const).
+                        v2i_t kf = Kf[kbn + dc * 128];
+                        sacc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                            kf, qf, sacc);
+                    }
+                    // Bound the in-flight fragments to this group.
+                    asm volatile("" ::: "memory");
+                }
+                const int kt_sub = ktile + sub * 16;
+                const bool full = (kt_sub + 15) <= gmin;
+                const int pos_ml =
+                    (!full && qok_ml) ? positions[qr_ml] : 0;
+                // sk for the 8 OWNED keys (transposed ownership: this lane
+                // supplies K row ml but owns acc keys sub*16+8*kg+j, never
+                // ml). One subtile lifetime, sharing one 8-register file
+                // with sv below (sk is dead once scores are formed).
+                float sc[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sc[j] = fa2_scale_n(
+                        k_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
+                // Mask + row max, scale folded at the old position.
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int key_g = kt_sub + 8 * kg + j;
+                    const bool ok = qok_ml && (full || key_g <= pos_ml);
+                    const float x = ok ? (sacc[j] * qs_tile) * sc[j] : -INFINITY;
+                    sacc[j] = x;
+                }
+                float mx = -INFINITY;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    mx = fmaxf(mx, sacc[j]);
+                mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+                const float m_new = fmaxf(m_old, mx);
+                const float alpha =
+                    (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                m_old = m_new;
+
+                // Weighted-P quantization (plan §5): l accumulates
+                // UNWEIGHTED e; w = e*sv enters only the numerator. sacc is
+                // dead after e, so w reuses its registers (no w array).
+                // sv reuses the scale file (sk dead: scores are formed).
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sc[j] = fa2_scale_n(
+                        v_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
+                float sum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float e = (m_new == -INFINITY)
+                        ? 0.0f
+                        : __expf(sacc[j] - m_new);
+                    sum += e;
+                    sacc[j] = e * sc[j];
+                }
+                sum += __shfl_xor(sum, 16, 32);
+                l_val = l_val * alpha + sum;
+
+                // Block scale over all 16 valid keys (both halves agree):
+                // wmax reduces this lane's 8 w combined with the partner
+                // ml^16 lane. b_new floors at 2^-64; zero-weight rows keep
+                // b_prev with zero P (w = 0 encodes to code 0 exactly).
+                float wmax = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    wmax = fmaxf(wmax, sacc[j]);
+                wmax = fmaxf(wmax, __shfl_xor(wmax, 16, 32));
+                float b_new = b_prev;
+                if (wmax > 0.0f)
+                    b_new = fmaxf(wmax / 448.0f, 0x1p-64f);
+                // O invariant O_physical = b_prev*Ofr: fold rho into the
+                // existing 128-value rescale pass (replaces *= alpha).
+                const float rho = (alpha * b_prev) / b_new;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= rho;
+
+                // PV as O^T = V8^T*P8^T in fp8: A = V^T fragment codes
+                // (row ml = dim of the dc tile, one b64, no decode), B =
+                // the packed P8 v2i. Ofr[dc][j] = O[query][dim].
+                // p8 = E4M3_RNE(w/b_new): 8 weights/lane in 2 dwords,
+                // packed ONCE per subtile (division matches the host model
+                // exactly); the dc loop only streams V fragments. Packing
+                // inside the loop would redo 8 divs + 4 cvts 16 times.
+                unsigned int p0 = 0u;
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[0] / b_new, sacc[1] / b_new, p0, false);
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[2] / b_new, sacc[3] / b_new, p0, true);
+                unsigned int p1 = 0u;
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[4] / b_new, sacc[5] / b_new, p1, false);
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[6] / b_new, sacc[7] / b_new, p1, true);
+                const v2i_t pb = {(int)p0, (int)p1};
+                const v2i_t* Vf = (const v2i_t*)V8;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const v2i_t va = Vf[vbn + dc * 32];
+                    Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        va, pb, Ofr[dc]);
+                    // Bound V-load hoisting to this chunk.
+                    asm volatile("" ::: "memory");
+                }
+                b_prev = b_new;
+            }
+        }
+        // Tile turnover: no wave may overwrite LDS before every PV read
+        // has finished.
+        __syncthreads();
+    }
+
+    // ---- Completion (same records as the f16 body) ----
+    if (compute) {
+        if (!PARTIAL) {
+            if (qok_ml) {
+                const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+                const unsigned bo =
+                    (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const unsigned bd = bo + (unsigned)(dc * 16 + kg * 8);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        out[bd + (unsigned)j] = Ofr[dc][j] * (b_prev * inv);
+                }
+            }
+        } else {
+            if (kg == 0) {
+                if (qok_ml) {
+                    const unsigned rb =
+                        (((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                             * (unsigned)n_splits + (unsigned)split)
+                        * 258u;
+                    float* rec = out + rb;
+                    rec[0] = m_old;
+                    rec[1] = l_val;
+                }
+            }
+            if (qok_ml) {
+                const unsigned rb =
+                    (((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                         * (unsigned)n_splits + (unsigned)split)
+                        * 258u;
+                float* rec = out + rb;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned rj = 2u + (unsigned)(kg * 8 + j);
+#pragma unroll
+                    for (int dc = 0; dc < 16; ++dc)
+                        rec[rj + (unsigned)(dc * 16)] = b_prev * Ofr[dc][j];
+                }
+            }
+        }
+    }
+}
+
+
+// Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
+// size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
+// Q0 (slice-B) entry: KMODE=8 selects `attention_fp8_e4m3_fa2_gqa_f16_gfx1201`
+// (native-fp8 fill, f16 body). Stage-b arithmetic, when it lands, gets its
+// own symbol; the f16 name stays Q0-only. KMODE=0/3 arms below are untouched.
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
+// B1b diagnostic (§14.2/§14.3): route-N byte-copy fill + plane dump; the fp8
+// body lands in B2. Kernargs frozen: fp8-code Q in the old Q slot (unused by
+// the fill), sq at +batch*24*256, out is the plane dump buffer, 32768 LDS.
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_gfx1201(
+    const unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    // B2: the fp8-QK body consumes the planes in place (dump retired).
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_stageb_nbody<false>(q8_codes, k_cache, v_cache, out, positions,
+                            batch_size, scale_attn, kv_h, q_base, 0,
+                            0x3fffffff, 0, 1);
+}
+#else
+#if HIPFIRE_FA2_KMODE == 8
+#ifdef HIPFIRE_FA2_Q0_A3B
+// A3B H16/KV2 twin of the PeaceMaker export `..._f16_pm_gfx1201`: its own
+// symbol (the host function cache is keyed by symbol alone).
+extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_fp8_e4m3_fa2_gqa_f16_a3b_gfx1201(
+#else
+extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
+#endif
+#elif defined(HIPFIRE_FA2_FP8)
+extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_q8_0_fa2_gqa_fp8_gfx1201(
+#else
+extern "C" __global__ __launch_bounds__(FA2_BLOCK, 1) void attention_q8_0_fa2_gqa_gfx1201(
+#endif
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != FA2_HEADS || n_kv_heads != FA2_KV_HEADS || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= FA2_KV_HEADS)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
+}
+#endif
+
+// ---- F4b: on-device Q pre-convert (f32 -> f16, optional FWHT-256) ----
+// Launch once per FA2 call before the body below, on the same stream (no
+// sync needed: same-stream ordering covers the q16 handoff). Reads f32 Q
+// row-major [batch, 24, 256] — the exact layout/stride the body used to
+// read — and writes f16 scratch row-major [batch, 24, 256] with the
+// IDENTICAL `(_Float16)` cast the body used per fragment (device
+// v_cvt_f16_f32, RNE), so the WMMA B operand is bit-identical.
+//
+// With do_rotate != 0 (fwht3 module only) applies fwht_shfl_forward_256 to
+// the f32 row BEFORE the cast: same helper, same lane mapping (lane owns
+// dims lane*8..+8), same op order as the old in-body prologue, so rotated
+// values are bit-identical. Reads the ORIGINAL f32 Q and leaves it
+// untouched — Q is now immutable across launches (replay-idempotent).
+// signs1/signs2 may be null when do_rotate == 0.
+//
+// The entry name is KMODE-selected: the Q8 module (KMODE=0) exports
+// attention_fa2_q_preconvert_gfx1201, the fwht3 module (KMODE=3) exports
+// attention_fa2_q_preconvert_fwht3_gfx1201. The host function cache
+// (rdna-compute compile_and_load_kernel) is keyed by SYMBOL, not by
+// (module, symbol): one shared name across the two module builds silently
+// binds whichever build registered first. Distinct symbols make each
+// launcher resolve its own module's build.
+#if HIPFIRE_FA2_KMODE == 4
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht4_gfx1201
+#elif HIPFIRE_FA2_KMODE == 3
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx1201
+#elif HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fp8_e4m3_fa2_q_preconvert_lse_gfx1201
+#elif HIPFIRE_FA2_KMODE == 8
+// Q0 body is f16 with no rotation, same as KMODE=0, but the symbol must be
+// distinct: the host function cache is keyed by symbol alone.
+#ifdef HIPFIRE_FA2_Q0_A3B
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fp8_e4m3_fa2_q_preconvert_f16_a3b_gfx1201
+#else
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201
+#endif
+#else
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_gfx1201
+#endif
+//
+// One wave32 per Q row (4 rows per 128-thread block): the row index depends
+// only on (blockIdx.x, wave), so every lane of a wave takes the same early
+// path and the ds_swizzle group inside fwht_shfl_forward_256 stays intact.
+// Rows are disjoint across waves/blocks (no LDS, no barrier); each f16 row
+// is written exactly once (one aligned 16-byte store per lane).
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SYM(
+    const float* __restrict__ q,
+    _Float16* __restrict__ q16,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int batch_size,
+    int do_rotate)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int r = (int)blockIdx.x * 4 + wave;
+    if (r >= batch_size * FA2_HEADS)
+        return;
+    const int qr = r / FA2_HEADS;
+    const int h = r % FA2_HEADS;
+    const float* rp = q + (unsigned)qr * (unsigned)(FA2_HEADS * 256) + (unsigned)h * 256u;
+    _Float16* wp = q16 + (unsigned)qr * (unsigned)(FA2_HEADS * 256) + (unsigned)h * 256u;
+#if HIPFIRE_FA2_KMODE == 4
+    // fwht4 K is rotated per 128-half (signed FWHT-128, 4 dims/lane); signs
+    // tables are the 128-entry fwht4 tables indexed by lane*4 inside the helper.
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+        const int d0 = half * 128 + lane * 4;
+        float a = rp[d0 + 0], b = rp[d0 + 1], c = rp[d0 + 2], d = rp[d0 + 3];
+        if (do_rotate)
+            fwht_shfl_forward(a, b, c, d, signs1, signs2, lane);
+        typedef _Float16 __attribute__((ext_vector_type(4))) half4_t;
+        half4_t o4;
+        o4[0] = (_Float16)a; o4[1] = (_Float16)b;
+        o4[2] = (_Float16)c; o4[3] = (_Float16)d;
+        *(half4_t*)(wp + d0) = o4;
+    }
+    return;
+#else
+    float v0 = rp[lane * 8 + 0], v1 = rp[lane * 8 + 1];
+    float v2 = rp[lane * 8 + 2], v3 = rp[lane * 8 + 3];
+    float v4 = rp[lane * 8 + 4], v5 = rp[lane * 8 + 5];
+    float v6 = rp[lane * 8 + 6], v7 = rp[lane * 8 + 7];
+#if HIPFIRE_FA2_KMODE == 3
+    if (do_rotate)
+        fwht_shfl_forward_256(v0, v1, v2, v3, v4, v5, v6, v7,
+                              signs1, signs2, lane);
+#else
+    (void)signs1;
+    (void)signs2;
+    (void)do_rotate;
+#endif
+    half8_t o;
+    o[0] = (_Float16)v0; o[1] = (_Float16)v1;
+    o[2] = (_Float16)v2; o[3] = (_Float16)v3;
+    o[4] = (_Float16)v4; o[5] = (_Float16)v5;
+    o[6] = (_Float16)v6; o[7] = (_Float16)v7;
+    *(half8_t*)(wp + lane * 8) = o;
+#endif
+}
+
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
+// ---- Stage-b Q pre-convert (f32 -> e4m3 codes + f32 sq, plan §3) ----
+// One wave32 per Q row (same grid convention as the f16 pre-convert:
+// r = blockIdx.x*4+wave, grid [(batch*24).div_ceil(4)], block 128, no LDS;
+// the launcher in attention.rs owns the grid). amax = wave_max(|q|) over a
+// 5-step shfl_xor tree; sq = (amax == 0) ? 1 : amax/448 in f32 (never
+// rounded: sq is an epilogue multiplier, not a WMMA operand); cq =
+// E4M3_RNE(q/sq) via __builtin_amdgcn_cvt_pk_fp8_f32 — the same instruction
+// the native fp8 writer uses. 8 codes/lane in one aligned u64 store; sq by
+// lane 0. Zero rows yield zero codes with sq=1. Q never mutated. B2 gates
+// the numerics; B1b gates compile + resources.
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201(
+    const float* __restrict__ q,
+    unsigned char* __restrict__ codes,
+    float* __restrict__ sq,
+    int batch_size)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int r = (int)blockIdx.x * 4 + wave;
+    if (r >= batch_size * 24)
+        return;
+    const int qr = r / 24;
+    const int h = r % 24;
+    const float* rp = q + (unsigned)qr * 6144u + (unsigned)h * 256u;
+    const float v0 = rp[lane * 8 + 0], v1 = rp[lane * 8 + 1];
+    const float v2 = rp[lane * 8 + 2], v3 = rp[lane * 8 + 3];
+    const float v4 = rp[lane * 8 + 4], v5 = rp[lane * 8 + 5];
+    const float v6 = rp[lane * 8 + 6], v7 = rp[lane * 8 + 7];
+    float a = fabsf(v0);
+    a = fmaxf(a, fabsf(v1));
+    a = fmaxf(a, fabsf(v2));
+    a = fmaxf(a, fabsf(v3));
+    a = fmaxf(a, fabsf(v4));
+    a = fmaxf(a, fabsf(v5));
+    a = fmaxf(a, fabsf(v6));
+    a = fmaxf(a, fabsf(v7));
+    a = fmaxf(a, __shfl_xor(a, 16, 32));
+    a = fmaxf(a, __shfl_xor(a, 8, 32));
+    a = fmaxf(a, __shfl_xor(a, 4, 32));
+    a = fmaxf(a, __shfl_xor(a, 2, 32));
+    a = fmaxf(a, __shfl_xor(a, 1, 32));
+    const float s = (a == 0.0f) ? 1.0f : a / 448.0f;
+    unsigned int w0 = 0u;
+    w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v0 / s, v1 / s, w0, false);
+    w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v2 / s, v3 / s, w0, true);
+    unsigned int w1 = 0u;
+    w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v4 / s, v5 / s, w1, false);
+    w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v6 / s, v7 / s, w1, true);
+    unsigned char* wp = codes + ((unsigned)qr * 24u + (unsigned)h) * 256u
+        + (unsigned)lane * 8u;
+    *(unsigned int*)wp = w0;
+    *(unsigned int*)(wp + 4) = w1;
+    if (lane == 0)
+        sq[(unsigned)qr * 24u + (unsigned)h] = s;
+}
+#endif
+
+// ---- KMODE=3 entry: fwht3 K, pre-rotated + pre-converted f16 Q ----
+// K is stored FWHT-rotated, so Q must be rotated before QK (orthogonal
+// transform: dot products preserved; fwht_shfl_forward_256 is normalized
+// 1/sqrt(256) = 1/16 and scale_attn applies downstream exactly as in the
+// Q8 path — no scale change). The rotation now lives in
+// attention_fa2_q_preconvert_fwht3_gfx1201 (same helper, same op order), so
+// this entry takes the SAME kernarg list as the Q8 entry above (q16 at
+// offset 0, no signs) and never mutates Q: replay-idempotent,
+// capture-safe.
+#if HIPFIRE_FA2_KMODE == 3
+#ifdef HIPFIRE_FA2_FP8
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201(
+#else
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+#endif
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
+}
+#endif
+
+// ---- KMODE=4 entry: fwht4 K (4-bit, per-128-half rotation), identical to the fwht3k entry ----
+#if HIPFIRE_FA2_KMODE == 4
+#ifdef HIPFIRE_FA2_FP8
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht4k_fp8_gfx1201(
+#else
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht4k_gfx1201(
+#endif
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
+                        scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
+}
+#endif
+
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
+// B1b diagnostic partial twin: same tile partition as the f16 partial; the
+// dump index carries the split so split dumps never alias.
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_gfx1201(
+    const unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn,
+    int n_splits)
+{
+    // B2: the fp8-QK body consumes the planes in place (dump retired).
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 8)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    const int split = blockIdx.z;
+    if (split >= n_splits)
+        return;
+    const int per = (512 + n_splits - 1) / n_splits;
+    const int t0 = split * per;
+    const int t1 = t0 + per;
+    fa2_stageb_nbody<true>(q8_codes, k_cache, v_cache, out, positions,
+                           batch_size, scale_attn, kv_h, q_base, t0, t1,
+                           split, n_splits);
+}
+#elif !defined(HIPFIRE_FA2_Q0_A3B)
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_lse_gfx1201(
+#elif HIPFIRE_FA2_KMODE == 8
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_f16_gfx1201(
+#elif defined(HIPFIRE_FA2_FP8)
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_fp8_gfx1201(
+#else
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_gfx1201(
+#endif
+    const _Float16* __restrict__ q16,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn,
+    int n_splits)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 64)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    const int split = blockIdx.z;
+    if (split >= n_splits)
+        return;
+#if defined(HIPFIRE_FA2_SPLIT_LSE_ENTRY)
+    // Product split-KV: each split derives its tile range from the live
+    // seq_len inside the body (SPLIT_LSE) and writes LSE + normalized O.
+    fa2_gqa_body<true, true>(q16, k_cache, v_cache, partials, positions,
+                             batch_size, scale_attn, kv_h, q_base, 0, 0,
+                             split, n_splits);
+#else
+    // Key-range partition needs seq_len, which lives in positions[] on
+    // the host side of the launcher... instead partition by tile index
+    // with an unbounded range: split s owns tiles [s*T/S,(s+1)*T/S) of
+    // the clamped range. The body cannot know T yet, so approximate with
+    // a fixed upper bound derived from the 32768 max_ctx_len gate:
+    // T_MAX = 32768/64 = 512 tiles; per = ceil(512/S).
+    const int per = (512 + n_splits - 1) / n_splits;
+    const int t0 = split * per;
+    const int t1 = t0 + per;
+    fa2_gqa_body<true>(q16, k_cache, v_cache, partials, positions, batch_size,
+                       scale_attn, kv_h, q_base, t0, t1, split, n_splits);
+#endif
+}
+#endif
+
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
+// Stage-b merge (§14.3): record format is scale-free (physical numerator in
+// the 258-float record), so this is the f16 merge body under the stage-b
+// symbol. Duplicated rather than shared so the Q0 object stays identical.
+extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_gfx1201(
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    int batch_size,
+    int n_heads,
+    int head_dim,
+    int n_splits)
+{
+    if (n_heads != 24 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 8)
+        return;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int rec = blockIdx.x * 8 + wave;
+    if (rec >= batch_size * n_heads)
+        return;
+    float m = -INFINITY;
+    for (int s = 0; s < n_splits; ++s) {
+        const float* pr =
+            partials + ((long long)rec * n_splits + s) * 258;
+        m = fmaxf(m, pr[0]);
+    }
+    for (int d = lane; d < head_dim; d += 32) {
+        float num = 0.0f;
+        float den = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const float* pr =
+                partials + ((long long)rec * n_splits + s) * 258;
+            const float w =
+                (pr[1] > 0.0f) ? __expf(pr[0] - m) : 0.0f;
+            den += w * pr[1];
+            num += w * pr[2 + d];
+        }
+        out[(long long)rec * head_dim + d] =
+            (den > 0.0f) ? num / den : 0.0f;
+    }
+}
+#elif !defined(HIPFIRE_FA2_Q0_A3B)
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_SPLIT_LSE_FP8)
+extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_lse_gfx1201(
+#elif HIPFIRE_FA2_KMODE == 8
+extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_f16_gfx1201(
+#elif defined(HIPFIRE_FA2_FP8)
+extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_fp8_gfx1201(
+#else
+extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_gfx1201(
+#endif
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    int batch_size,
+    int n_heads,
+    int head_dim,
+    int n_splits)
+{
+    if (n_heads != 24 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 64)
+        return;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int rec = blockIdx.x * 8 + wave;
+    if (rec >= batch_size * n_heads)
+        return;
+#if defined(HIPFIRE_FA2_SPLIT_LSE_ENTRY)
+    // Product split-KV records (see fa2_gqa_body<true, true>): F32 LSE plane
+    // first, then normalized F32 O accumulators. Stable max-LSE combine; a
+    // split with no live tiles carries LSE=-inf and contributes nothing.
+    const long long records =
+        (long long)batch_size * n_heads * n_splits;
+    const float* lse = partials;
+    const float* oacc = partials + records;
+    float m = -INFINITY;
+    for (int s = 0; s < n_splits; ++s)
+        m = fmaxf(m, lse[(long long)rec * n_splits + s]);
+    for (int d = lane; d < head_dim; d += 32) {
+        float num = 0.0f;
+        float den = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const long long record = (long long)rec * n_splits + s;
+            const float split_lse = lse[record];
+            const float w = isfinite(split_lse) ? __expf(split_lse - m) : 0.0f;
+            den += w;
+            num += w * oacc[record * head_dim + d];
+        }
+        out[(long long)rec * head_dim + d] =
+            (den > 0.0f) ? num / den : 0.0f;
+    }
+#else
+    float m = -INFINITY;
+    for (int s = 0; s < n_splits; ++s) {
+        const float* pr =
+            partials + ((long long)rec * n_splits + s) * 258;
+        m = fmaxf(m, pr[0]);
+    }
+    for (int d = lane; d < head_dim; d += 32) {
+        float num = 0.0f;
+        float den = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const float* pr =
+                partials + ((long long)rec * n_splits + s) * 258;
+            const float w =
+                (pr[1] > 0.0f) ? __expf(pr[0] - m) : 0.0f;
+            den += w * pr[1];
+            num += w * pr[2 + d];
+        }
+        out[(long long)rec * head_dim + d] =
+            (den > 0.0f) ? num / den : 0.0f;
+    }
+#endif
+}
+#endif
+// ---- Packet-minimal Q128 body (FaPacket K1, exact) ----
+// Gated by HIPFIRE_FA2_PACKET (default route via kernel.gfx12_fa_packet): all
+// other translation units preprocess this region away, so K0/K3/K8 objects stay
+// byte-identical. Geometry: 256 threads / eight wave32s, ALL computing, 128
+// densely enumerated query-head rows per KV head, KT64, 49408 B dynamic LDS.
+// Fill is the T-verified paired mechanism (b128 K/V pairs, wave-private 2
+// KiB transpose scratch, shared native-scale headers). Arithmetic graph is
+// the stage-b recurrence unchanged (true divisions, serial sum, rho fold);
+// reductions use the fixed permlanex16 partner idiom. Q fragments reload in
+// four-fragment groups during QK so the exact transpose remains spill-free.
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) && defined(HIPFIRE_FA2_PACKET)
+static __device__ __forceinline__ float fa2_pkt_xor16(float v)
+{
+    int bits = __builtin_bit_cast(int, v);
+    bits = __builtin_amdgcn_permlanex16(bits, bits, 0x76543210, 0xfedcba98,
+                                        false, false);
+    return __builtin_bit_cast(float, bits);
+}
+static __device__ __forceinline__ float fa2_pkt_f16(uint16_t u)
+{
+    return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
+}
+template <bool PARTIAL, bool FUSED_Q>
+__device__ void fa2_stageb_packet_body(
+    const float* __restrict__ q,
+    unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int batch_size,
+    int query_offset,
+    float scale_attn,
+    int kv_h,
+    int row_base,
+    int tile0,
+    int tile1,
+    int split,
+    int n_splits)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int kg = lane >> 4;
+    extern __shared__ uint32_t LDS[];
+    unsigned char* K8 = (unsigned char*)LDS;
+    unsigned char* V8 = (unsigned char*)LDS + 16384;
+    uint32_t* SCR = LDS + 8192 + (unsigned)wave * 512u;
+    const uint16_t* SK = (const uint16_t*)((const unsigned char*)LDS + 49152);
+    const uint16_t* SV = (const uint16_t*)((const unsigned char*)LDS + 49280);
+    // Dense ownership: each (query, head_local) has exactly one owner.
+    const int row = row_base + 16 * wave + ml;
+    const int query_local = row / 6;
+    const int query = query_offset + query_local;
+    const int head = 6 * kv_h + row % 6;
+    const bool qok = row < 6 * batch_size;
+    float8_t Ofr[16];
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc)
+        Ofr[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float m_old = -INFINITY;
+    float l_val = 0.0f;
+    float b_prev = 1.0f;
+    const unsigned qrow =
+        (qok ? (unsigned)query * 24u + (unsigned)head : 0u);
+    // The direct packet entry folds the old one-wave-per-row Q converter.
+    // Lanes ml and ml+16 own the same Q row and scan disjoint 128-element
+    // halves; xor16 reproduces the converter's row amax. A second pass writes
+    // the same eight-code groups to the existing Q scratch once per row; the
+    // KT16 body then keeps its original bounded global fp8 loads instead of
+    // repeating conversion for every key tile.
+    float q_row_scale = 1.0f;
+    if constexpr (FUSED_Q) {
+        if (qok) {
+            const float* qp = q + (unsigned long long)qrow * 256ULL;
+            float a = 0.0f;
+#pragma unroll
+            for (int frag = 0; frag < 16; ++frag) {
+                const float8_t v = *(const float8_t*)(
+                    qp + (unsigned)(frag * 16 + kg * 8));
+                a = fmaxf(a, fabsf(v[0]));
+                a = fmaxf(a, fabsf(v[1]));
+                a = fmaxf(a, fabsf(v[2]));
+                a = fmaxf(a, fabsf(v[3]));
+                a = fmaxf(a, fabsf(v[4]));
+                a = fmaxf(a, fabsf(v[5]));
+                a = fmaxf(a, fabsf(v[6]));
+                a = fmaxf(a, fabsf(v[7]));
+            }
+            a = fmaxf(a, fa2_pkt_xor16(a));
+            q_row_scale = (a == 0.0f) ? 1.0f : a / 448.0f;
+#pragma unroll 1
+            for (int frag = 0; frag < 16; ++frag) {
+                const float8_t v = *(const float8_t*)(
+                    qp + (unsigned)(frag * 16 + kg * 8));
+                unsigned int w0 = 0u;
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[0] / q_row_scale, v[1] / q_row_scale, w0, false);
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[2] / q_row_scale, v[3] / q_row_scale, w0, true);
+                unsigned int w1 = 0u;
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[4] / q_row_scale, v[5] / q_row_scale, w1, false);
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[6] / q_row_scale, v[7] / q_row_scale, w1, true);
+                unsigned char* wp = q8_codes + qrow * 256u
+                    + (unsigned)(frag * 16 + kg * 8);
+                *(unsigned int*)wp = w0;
+                *(unsigned int*)(wp + 4) = w1;
+            }
+        }
+    } else if (qok) {
+        const float* q_scales = (const float*)(
+            q8_codes + (unsigned)batch_size * 24u * 256u);
+        q_row_scale = q_scales[qrow];
+    }
+    // WG bounds: lanes 0..21 load the same guarded prefix (<=22 positions)
+    // and reduce with the identical integer graph on every wave.
+    int wmx = -1;
+    int wmn = 0x7fffffff;
+    if (lane < 22) {
+        const int qr = query_offset + row_base / 6 + lane;
+        if (qr < query_offset + batch_size) {
+            const int p = positions[qr];
+            wmx = p;
+            wmn = p;
+        }
+    }
+    wmx = max(wmx, __shfl_xor(wmx, 16, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 8, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 4, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 2, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 1, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 16, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 8, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 4, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 2, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 1, 32));
+    const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+    const int gmin = __builtin_amdgcn_readfirstlane(wmn);
+    const int seq_len = gmax + 1;
+    const bool qok_all = (row_base + 127 < 6 * batch_size);
+    for (int tile = tile0; tile < tile1; ++tile) {
+        const int ktile = tile * 64;
+        if (ktile >= seq_len)
+            break;
+        // Hoisted full-tile predicate: every K/V/header key valid and every
+        // score unmasked. Edge path keeps guarded semantics below.
+        const bool full = qok_all && (ktile + 63 <= gmin);
+        // ---- Paired K fill (T-verified; 8-byte-aligned u64, no b128 cast)
+        for (int t = 0; t < 4; ++t) {
+            const int idx = tid + t * 256;
+            const int ln = idx & 31;
+            const int sub = (idx >> 5) & 3;
+            const int p = idx >> 7;
+            const int gk = ktile + sub * 16 + (ln & 15);
+            uint4 pair = {0u, 0u, 0u, 0u};
+            if (gk < seq_len) {
+                const unsigned char* rrow = k_cache +
+                    (unsigned long long)gk * 1032ULL +
+                    (unsigned long long)kv_h * 256ULL;
+                const unsigned long long* r64 =
+                    (const unsigned long long*)rrow;
+                unsigned long long a =
+                    r64[(unsigned)(2 * p) * 2u + (unsigned)(ln >> 4)];
+                unsigned long long b =
+                    r64[(unsigned)(2 * p + 1) * 2u + (unsigned)(ln >> 4)];
+                pair.x = (uint32_t)(a & 0xffffffffULL);
+                pair.y = (uint32_t)(a >> 32);
+                pair.z = (uint32_t)(b & 0xffffffffULL);
+                pair.w = (uint32_t)(b >> 32);
+            }
+            *(uint4*)(K8 + (unsigned)(((p * 4 + sub) * 32 + ln) * 16)) = pair;
+        }
+        // ---- V raw staging: wave w owns keys ktile+8w..+7 ----
+        for (int r = 0; r < 8; ++r) {
+            const int gkey = ktile + wave * 8 + r;
+            const bool ok = gkey < seq_len;
+            unsigned long long v = 0ULL;
+            if (ok) {
+                const unsigned char* rrow = v_cache +
+                    (unsigned long long)gkey * 1032ULL +
+                    (unsigned long long)kv_h * 256ULL;
+                v = *(const unsigned long long*)(rrow + (unsigned)lane * 8u);
+            }
+            SCR[(((r * 64 + lane * 2) ^ ((r & 3) * 8)))] =
+                (uint32_t)(v & 0xffffffffULL);
+            SCR[(((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8)))] =
+                (uint32_t)(v >> 32);
+        }
+        __syncthreads();
+        // ---- Transpose + paired V stores (sub=w>>1, key-half=w&1) ----
+        {
+            const int sub = wave >> 1;
+            const int r = ml & 3;
+            const int dq = ml >> 2;
+            const uint32_t rbase0 = (uint32_t)r * 64u;
+            const uint32_t rbase1 = (uint32_t)(r + 4) * 64u;
+            const uint32_t rmask = (uint32_t)(r & 3) * 8u;
+            const uint32_t sel1 = ((r & 1) == 0) ? 0x06020400u : 0x03070105u;
+            const uint32_t sel2 = (r < 2) ? 0x05040100u : 0x03020706u;
+            (void)kg;
+            if (((lane >> 4) & 1) == (wave & 1)) {
+                for (int t = 0; t < 8; ++t) {
+                    const int p = t;
+                    uint4 store = {0u, 0u, 0u, 0u};
+                    uint32_t* s32 = (uint32_t*)&store;
+                    for (int h = 0; h < 2; ++h) {
+                        const int dc = 2 * p + h;
+                        const uint32_t w = (uint32_t)(dc * 4 + dq);
+                        const uint32_t d0 = SCR[((rbase0 + w) ^ rmask)];
+                        const uint32_t d1 = SCR[((rbase1 + w) ^ rmask)];
+                        uint32_t e0 = (uint32_t)__shfl_xor((int)d0, 1, 32);
+                        e0 = __builtin_amdgcn_perm(e0, d0, sel1);
+                        uint32_t e1 = (uint32_t)__shfl_xor((int)d1, 1, 32);
+                        e1 = __builtin_amdgcn_perm(e1, d1, sel1);
+                        uint32_t f0 = (uint32_t)__shfl_xor((int)e0, 2, 32);
+                        s32[h * 2] = __builtin_amdgcn_perm(f0, e0, sel2);
+                        uint32_t f1 = (uint32_t)__shfl_xor((int)e1, 2, 32);
+                        s32[h * 2 + 1] =
+                            __builtin_amdgcn_perm(f1, e1, sel2);
+                    }
+                    *(uint4*)(V8 +
+                              (unsigned)(((sub * 8 + p) * 32 + lane) * 16)) =
+                        store;
+                }
+            }
+        }
+        // ---- Shared scale headers: threads 0..63 copy both halves ----
+        if (tid < 64) {
+            const int gk = ktile + tid;
+            uint16_t skv = 0, svv = 0;
+            if (gk < seq_len) {
+                const unsigned char* kr =
+                    k_cache + (unsigned long long)gk * 1032ULL;
+                const unsigned char* vr =
+                    v_cache + (unsigned long long)gk * 1032ULL;
+                skv = (uint16_t)kr[1024 + kv_h * 2] |
+                    ((uint16_t)kr[1024 + kv_h * 2 + 1] << 8);
+                svv = (uint16_t)vr[1024 + kv_h * 2] |
+                    ((uint16_t)vr[1024 + kv_h * 2 + 1] << 8);
+            }
+            ((uint16_t*)((unsigned char*)LDS + 49152))[tid] = skv;
+            ((uint16_t*)((unsigned char*)LDS + 49280))[tid] = svv;
+        }
+        __syncthreads();
+        // ---- Compute: four KT16 recurrences, exact stage-b graph ----
+        {
+            const bool do0 = ktile <= gmax;
+            const bool do1 = ktile + 16 <= gmax;
+            const bool do2 = ktile + 32 <= gmax;
+            const bool do3 = ktile + 48 <= gmax;
+            const float qs_tile = q_row_scale * scale_attn;
+            const int pos = (!full && qok) ? positions[query] : 0;
+            const v2i_t* Kf = (const v2i_t*)K8;
+            const v2i_t* Vf = (const v2i_t*)V8;
+            const unsigned kbn = (unsigned)lane;
+            const unsigned vbn = (unsigned)lane;
+#pragma unroll 1
+            for (int sub = 0; sub < 4; ++sub) {
+                const bool dos = (sub == 0) ? do0
+                    : (sub == 1) ? do1 : (sub == 2) ? do2 : do3;
+                if (!dos)
+                    continue;
+                float8_t sacc =
+                    (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                // QK: one paired b128 K load supplies two dc operands.
+                // Q loads stay bounded to four fragments per dg group;
+                // retaining all sixteen across the fill forces spills once
+                // the exact V transpose is present.
+#pragma unroll 1
+                for (int dg = 0; dg < 4; ++dg) {
+#pragma unroll
+                    for (int u = 0; u < 2; ++u) {
+                        const int p = 2 * dg + u;
+                        const uint4* kp =
+                            (const uint4*)(K8 +
+                                (unsigned)(((p * 4 + sub) * 32 + lane) * 16));
+                        const uint4 kv = *kp;
+                        const v2i_t kf0 = {(int)kv.x, (int)kv.y};
+                        const v2i_t kf1 = {(int)kv.z, (int)kv.w};
+                        const unsigned qb = qrow * 256u;
+                        const v2i_t* qd0 = (const v2i_t*)(
+                            q8_codes + qb + (unsigned)(2 * p * 16));
+                        const v2i_t* qd1 = (const v2i_t*)(
+                            q8_codes + qb + (unsigned)((2 * p + 1) * 16));
+                        const v2i_t qf0 = qd0[kg];
+                        const v2i_t qf1 = qd1[kg];
+                        sacc =
+                            __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                                kf0, qf0, sacc);
+                        sacc =
+                            __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                                kf1, qf1, sacc);
+                    }
+                    asm volatile("" ::: "memory");
+                }
+                (void)kbn;
+                const int kt_sub = ktile + sub * 16;
+                const bool sub_full = full || ((kt_sub + 15) <= gmin);
+                float sc[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sc[j] = fa2_pkt_f16(SK[sub * 16 + 8 * kg + j]);
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int key_g = kt_sub + 8 * kg + j;
+                    const bool ok =
+                        qok && (sub_full || key_g <= pos);
+                    const float x =
+                        ok ? (sacc[j] * qs_tile) * sc[j] : -INFINITY;
+                    sacc[j] = x;
+                }
+                float mx = -INFINITY;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    mx = fmaxf(mx, sacc[j]);
+                mx = fmaxf(mx, fa2_pkt_xor16(mx));
+                const float m_new = fmaxf(m_old, mx);
+                const float alpha =
+                    (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                m_old = m_new;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sc[j] = fa2_pkt_f16(SV[sub * 16 + 8 * kg + j]);
+                float sum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float e = (m_new == -INFINITY)
+                        ? 0.0f
+                        : __expf(sacc[j] - m_new);
+                    sum += e;
+                    sacc[j] = e * sc[j];
+                }
+                sum += fa2_pkt_xor16(sum);
+                l_val = l_val * alpha + sum;
+                float wmax = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    wmax = fmaxf(wmax, sacc[j]);
+                wmax = fmaxf(wmax, fa2_pkt_xor16(wmax));
+                float b_new = b_prev;
+                if (wmax > 0.0f)
+                    b_new = fmaxf(wmax / 448.0f, 0x1p-64f);
+                const float rho = (alpha * b_prev) / b_new;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= rho;
+                unsigned int p0 = 0u;
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[0] / b_new, sacc[1] / b_new, p0, false);
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[2] / b_new, sacc[3] / b_new, p0, true);
+                unsigned int p1 = 0u;
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[4] / b_new, sacc[5] / b_new, p1, false);
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[6] / b_new, sacc[7] / b_new, p1, true);
+                const v2i_t pb = {(int)p0, (int)p1};
+#pragma unroll
+                for (int p = 0; p < 8; ++p) {
+                    const uint4* vp =
+                        (const uint4*)(V8 + (unsigned)(((sub * 8 + p) * 32 +
+                                                      lane) * 16));
+                    const uint4 vv = *vp;
+                    const v2i_t va0 = {(int)vv.x, (int)vv.y};
+                    const v2i_t va1 = {(int)vv.z, (int)vv.w};
+                    Ofr[2 * p] =
+                        __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                            va0, pb, Ofr[2 * p]);
+                    Ofr[2 * p + 1] =
+                        __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                            va1, pb, Ofr[2 * p + 1]);
+                    asm volatile("" ::: "memory");
+                }
+                (void)vbn;
+                b_prev = b_new;
+            }
+            (void)Vf;
+            (void)Kf;
+        }
+        __syncthreads();
+    }
+    // ---- Completion (same records as the f16/stage-b bodies) ----
+    if (!PARTIAL) {
+        if (qok) {
+            const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+            const unsigned bo =
+                (unsigned)query * 6144u + (unsigned)head * 256u;
+#pragma unroll
+            for (int dc = 0; dc < 16; ++dc) {
+                const unsigned bd = bo + (unsigned)(dc * 16 + kg * 8);
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    out[bd + (unsigned)j] = Ofr[dc][j] * (b_prev * inv);
+            }
+        }
+    } else {
+        if (kg == 0) {
+            if (qok) {
+                const unsigned rb =
+                    (((unsigned)query * 24u + (unsigned)head)
+                         * (unsigned)n_splits + (unsigned)split)
+                    * 258u;
+                float* rec = out + rb;
+                rec[0] = m_old;
+                rec[1] = l_val;
+            }
+        }
+        if (qok) {
+            const unsigned rb =
+                (((unsigned)query * 24u + (unsigned)head)
+                     * (unsigned)n_splits + (unsigned)split)
+                * 258u;
+            float* rec = out + rb;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const unsigned rj = 2u + (unsigned)(kg * 8 + j);
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    rec[rj + (unsigned)(dc * 16)] = b_prev * Ofr[dc][j];
+            }
+        }
+    }
+}
+// Packet direct entry: native-fp8 fill, fused f32->E4M3 Q, dense Q128
+// ownership. For widened prefill, z enumerates equal-length 512-row runs;
+// x restarts within each run so the row grouping and causal bounds are
+// identical to the former per-step launches.
+// Grid [ceil(min(batch,512)*6/128), 4, ceil(batch/512)], block 256,
+// 49408 B dynamic LDS.
+extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
+    const float* __restrict__ q,
+    unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int query_offset = batch_size > 512 ? 512 * (int)blockIdx.z : 0;
+    if (query_offset >= batch_size)
+        return;
+    const int run_rows = min(512, batch_size - query_offset);
+    const int row_base = 128 * (int)blockIdx.x;
+    if (row_base >= 6 * run_rows)
+        return;
+    fa2_stageb_packet_body<false, true>(
+        q, q8_codes, k_cache, v_cache, out, positions, run_rows, query_offset,
+        scale_attn, kv_h, row_base, 0, 0x3fffffff, 0, 1);
+}
+// Packet partial twin: same KT64 tile partition as the stage-b partial.
+extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_packet_partial_gfx1201(
+    const unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn,
+    int n_splits)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 8)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int row_base = 128 * (int)blockIdx.x;
+    if (row_base >= 6 * batch_size)
+        return;
+    const int split = blockIdx.z;
+    if (split >= n_splits)
+        return;
+    const int per = (512 + n_splits - 1) / n_splits;
+    const int t0 = split * per;
+    const int t1 = t0 + per;
+    fa2_stageb_packet_body<true, false>(
+        nullptr, (unsigned char*)q8_codes, k_cache, v_cache, out, positions,
+        batch_size, 0, scale_attn, kv_h, row_base, t0, t1, split, n_splits);
+}
+// Packet merge: scale-free 258-float records, same body as stage-b merge
+// under its own symbol (duplicated so the route-N object stays identical).
+extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_packet_merge_gfx1201(
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    int batch_size,
+    int n_heads,
+    int head_dim,
+    int n_splits)
+{
+    if (n_heads != 24 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 8)
+        return;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int rec = blockIdx.x * 8 + wave;
+    if (rec >= batch_size * n_heads)
+        return;
+    float m = -INFINITY;
+    for (int s = 0; s < n_splits; ++s) {
+        const float* pr =
+            partials + ((long long)rec * n_splits + s) * 258;
+        m = fmaxf(m, pr[0]);
+    }
+    for (int d = lane; d < head_dim; d += 32) {
+        float num = 0.0f;
+        float den = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const float* pr =
+                partials + ((long long)rec * n_splits + s) * 258;
+            const float w =
+                (pr[1] > 0.0f) ? __expf(pr[0] - m) : 0.0f;
+            den += w * pr[1];
+            num += w * pr[2 + d];
+        }
+        out[(long long)rec * head_dim + d] =
+            (den > 0.0f) ? num / den : 0.0f;
+    }
+}
+#endif
+
+// ---- Register-resident-Q wide packet candidate ----
+// One 768-thread workgroup owns 384 query-head rows for one KV head.
+// Converted Q fragments remain live across the complete KV loop.
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) && defined(HIPFIRE_FA2_QRESIDENT)
+static __device__ __forceinline__ float fa2_qr_xor16(float v)
+{
+    int bits = __builtin_bit_cast(int, v);
+    bits = __builtin_amdgcn_permlanex16(bits, bits, 0x76543210, 0xfedcba98,
+                                        false, false);
+    return __builtin_bit_cast(float, bits);
+}
+
+static __device__ __forceinline__ float fa2_qr_f16(uint16_t u)
+{
+    return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
+}
+
+extern "C" __global__ __launch_bounds__(768, 1)
+void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = (int)blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int query_offset = batch_size > 512 ? 512 * (int)blockIdx.z : 0;
+    if (query_offset >= batch_size)
+        return;
+    const int run_rows = min(512, batch_size - query_offset);
+    const int row_base = 384 * (int)blockIdx.x;
+    if (row_base >= 6 * run_rows)
+        return;
+
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int kg = lane >> 4;
+    const int row = row_base + 16 * wave + ml;
+    const int query_local = row / 6;
+    const int query = query_offset + query_local;
+    const int head = 6 * kv_h + row % 6;
+    const bool qok = row < 6 * run_rows;
+    const unsigned qrow =
+        qok ? (unsigned)query * 24u + (unsigned)head : 0u;
+
+    // Sixteen resident 16-dimension Q fragments, one lane-half per row.
+    v2i_t Qfr[16];
+    float q_row_scale = 1.0f;
+    if (qok) {
+        const float* qp = q + (unsigned long long)qrow * 256ULL;
+        float a = 0.0f;
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag) {
+            const float8_t v = *(const float8_t*)(
+                qp + (unsigned)(frag * 16 + kg * 8));
+            a = fmaxf(a, fabsf(v[0]));
+            a = fmaxf(a, fabsf(v[1]));
+            a = fmaxf(a, fabsf(v[2]));
+            a = fmaxf(a, fabsf(v[3]));
+            a = fmaxf(a, fabsf(v[4]));
+            a = fmaxf(a, fabsf(v[5]));
+            a = fmaxf(a, fabsf(v[6]));
+            a = fmaxf(a, fabsf(v[7]));
+        }
+        a = fmaxf(a, fa2_qr_xor16(a));
+        q_row_scale = (a == 0.0f) ? 1.0f : a / 448.0f;
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag) {
+            const float8_t v = *(const float8_t*)(
+                qp + (unsigned)(frag * 16 + kg * 8));
+            unsigned int w0 = 0u;
+            w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                v[0] / q_row_scale, v[1] / q_row_scale, w0, false);
+            w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                v[2] / q_row_scale, v[3] / q_row_scale, w0, true);
+            unsigned int w1 = 0u;
+            w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                v[4] / q_row_scale, v[5] / q_row_scale, w1, false);
+            w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                v[6] / q_row_scale, v[7] / q_row_scale, w1, true);
+            Qfr[frag] = (v2i_t){(int)w0, (int)w1};
+        }
+    } else {
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag)
+            Qfr[frag] = (v2i_t){0, 0};
+    }
+
+    extern __shared__ uint32_t LDS[];
+    unsigned char* K8 = (unsigned char*)LDS;
+    unsigned char* V8 = (unsigned char*)LDS + 16384;
+    uint32_t* SCR = LDS + 8192 + (unsigned)wave * 512u;
+    const uint16_t* SK =
+        (const uint16_t*)((const unsigned char*)LDS + 49152);
+    const uint16_t* SV =
+        (const uint16_t*)((const unsigned char*)LDS + 49280);
+
+    // One-time query-position bound reduction. The two barrier costs are
+    // outside the KV loop and the scale-header bytes are overwritten later.
+    int* bounds = (int*)((unsigned char*)LDS + 49152);
+    if (tid == 0) {
+        bounds[0] = -1;
+        bounds[1] = 0x7fffffff;
+    }
+    __syncthreads();
+    const int bound_queries = ((min(row_base + 384, 6 * run_rows) - 1) / 6)
+        - row_base / 6 + 1;
+    if (tid < bound_queries) {
+        const int ql = row_base / 6 + tid;
+        if (ql < run_rows) {
+            const int p = positions[query_offset + ql];
+            atomicMax(bounds + 0, p);
+            atomicMin(bounds + 1, p);
+        }
+    }
+    __syncthreads();
+    const int gmax = bounds[0];
+    const int gmin = bounds[1];
+    const int seq_len = gmax + 1;
+    const bool qok_all = row_base + 383 < 6 * run_rows;
+
+    float8_t Ofr[16];
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc)
+        Ofr[dc] =
+            (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float m_ref = -INFINITY;
+    float l_val = 0.0f;
+    float b_ref = 0x1p-64f;
+
+    for (int ktile = 0; ktile < seq_len; ktile += 64) {
+        const bool full = qok_all && (ktile + 63 <= gmin);
+
+        // The first 256 threads fill the shared K plane.
+        if (tid < 256) {
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int idx = tid + t * 256;
+                const int ln = idx & 31;
+                const int sub = (idx >> 5) & 3;
+                const int p = idx >> 7;
+                const int gk = ktile + sub * 16 + (ln & 15);
+                uint4 pair = {0u, 0u, 0u, 0u};
+                if (gk < seq_len) {
+                    const unsigned char* rrow =
+                        k_cache + (unsigned long long)gk * 1032ULL
+                        + (unsigned long long)kv_h * 256ULL;
+                    const unsigned long long* r64 =
+                        (const unsigned long long*)rrow;
+                    const unsigned long long a =
+                        r64[(unsigned)(2 * p) * 2u
+                            + (unsigned)(ln >> 4)];
+                    const unsigned long long b =
+                        r64[(unsigned)(2 * p + 1) * 2u
+                            + (unsigned)(ln >> 4)];
+                    pair.x = (uint32_t)(a & 0xffffffffULL);
+                    pair.y = (uint32_t)(a >> 32);
+                    pair.z = (uint32_t)(b & 0xffffffffULL);
+                    pair.w = (uint32_t)(b >> 32);
+                }
+                *(uint4*)(K8
+                    + (unsigned)(((p * 4 + sub) * 32 + ln) * 16)) = pair;
+            }
+        }
+
+        // Only eight waves are needed to stage the common V64 tile.
+        if (wave < 8) {
+#pragma unroll 4
+            for (int r = 0; r < 8; ++r) {
+                const int gkey = ktile + wave * 8 + r;
+                unsigned long long v = 0ULL;
+                if (gkey < seq_len) {
+                    const unsigned char* rrow =
+                        v_cache + (unsigned long long)gkey * 1032ULL
+                        + (unsigned long long)kv_h * 256ULL;
+                    v = *(const unsigned long long*)(
+                        rrow + (unsigned)lane * 8u);
+                }
+                SCR[((r * 64 + lane * 2) ^ ((r & 3) * 8))] =
+                    (uint32_t)(v & 0xffffffffULL);
+                SCR[((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8))] =
+                    (uint32_t)(v >> 32);
+            }
+        }
+        // Each transpose wave consumes only its own private SCR region.
+        // A wave barrier is sufficient; the later workgroup barrier publishes
+        // completed K/V planes to all 24 compute waves.
+        __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+        __builtin_amdgcn_wave_barrier();
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+
+        if (wave < 8) {
+            const int sub = wave >> 1;
+            const int r = ml & 3;
+            const int dq = ml >> 2;
+            const uint32_t rbase0 = (uint32_t)r * 64u;
+            const uint32_t rbase1 = (uint32_t)(r + 4) * 64u;
+            const uint32_t rmask = (uint32_t)(r & 3) * 8u;
+            const uint32_t sel1 =
+                ((r & 1) == 0) ? 0x06020400u : 0x03070105u;
+            const uint32_t sel2 =
+                (r < 2) ? 0x05040100u : 0x03020706u;
+            if (((lane >> 4) & 1) == (wave & 1)) {
+#pragma unroll 4
+                for (int p = 0; p < 8; ++p) {
+                    uint4 store = {0u, 0u, 0u, 0u};
+                    uint32_t* s32 = (uint32_t*)&store;
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int dc = 2 * p + h;
+                        const uint32_t w = (uint32_t)(dc * 4 + dq);
+                        const uint32_t d0 = SCR[((rbase0 + w) ^ rmask)];
+                        const uint32_t d1 = SCR[((rbase1 + w) ^ rmask)];
+                        uint32_t e0 =
+                            (uint32_t)__shfl_xor((int)d0, 1, 32);
+                        e0 = __builtin_amdgcn_perm(e0, d0, sel1);
+                        uint32_t e1 =
+                            (uint32_t)__shfl_xor((int)d1, 1, 32);
+                        e1 = __builtin_amdgcn_perm(e1, d1, sel1);
+                        const uint32_t f0 =
+                            (uint32_t)__shfl_xor((int)e0, 2, 32);
+                        s32[h * 2] =
+                            __builtin_amdgcn_perm(f0, e0, sel2);
+                        const uint32_t f1 =
+                            (uint32_t)__shfl_xor((int)e1, 2, 32);
+                        s32[h * 2 + 1] =
+                            __builtin_amdgcn_perm(f1, e1, sel2);
+                    }
+                    *(uint4*)(V8
+                        + (unsigned)(((sub * 8 + p) * 32 + lane) * 16))
+                        = store;
+                }
+            }
+        }
+
+        if (tid < 64) {
+            const int gk = ktile + tid;
+            uint16_t skv = 0, svv = 0;
+            if (gk < seq_len) {
+                const unsigned char* kr =
+                    k_cache + (unsigned long long)gk * 1032ULL;
+                const unsigned char* vr =
+                    v_cache + (unsigned long long)gk * 1032ULL;
+                skv = (uint16_t)kr[1024 + kv_h * 2]
+                    | ((uint16_t)kr[1024 + kv_h * 2 + 1] << 8);
+                svv = (uint16_t)vr[1024 + kv_h * 2]
+                    | ((uint16_t)vr[1024 + kv_h * 2 + 1] << 8);
+            }
+            ((uint16_t*)((unsigned char*)LDS + 49152))[tid] = skv;
+            ((uint16_t*)((unsigned char*)LDS + 49280))[tid] = svv;
+        }
+        __syncthreads();
+
+        const bool do0 = ktile <= gmax;
+        const bool do1 = ktile + 16 <= gmax;
+        const bool do2 = ktile + 32 <= gmax;
+        const bool do3 = ktile + 48 <= gmax;
+        const float qs_tile = q_row_scale * scale_attn;
+        const int pos = (!full && qok) ? positions[query] : 0;
+#pragma unroll 1
+        for (int sub = 0; sub < 4; ++sub) {
+            const bool dos = (sub == 0) ? do0
+                : (sub == 1) ? do1 : (sub == 2) ? do2 : do3;
+            if (!dos)
+                continue;
+            float8_t sacc =
+                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const uint4 kv = *(const uint4*)(K8
+                    + (unsigned)(((p * 4 + sub) * 32 + lane) * 16));
+                const v2i_t kf0 = {(int)kv.x, (int)kv.y};
+                const v2i_t kf1 = {(int)kv.z, (int)kv.w};
+                sacc =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        kf0, Qfr[2 * p], sacc);
+                sacc =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        kf1, Qfr[2 * p + 1], sacc);
+                asm volatile("" ::: "memory");
+            }
+
+            const int kt_sub = ktile + sub * 16;
+            const bool sub_full = full || ((kt_sub + 15) <= gmin);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int key_g = kt_sub + 8 * kg + j;
+                const bool ok =
+                    qok && (sub_full || key_g <= pos);
+                sacc[j] = ok
+                    ? (sacc[j] * qs_tile)
+                        * fa2_qr_f16(SK[sub * 16 + 8 * kg + j])
+                    : -INFINITY;
+            }
+            float mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                mx = fmaxf(mx, sacc[j]);
+            mx = fmaxf(mx, fa2_qr_xor16(mx));
+
+            // Keep a stable maximum for up to four natural-log units. A rare
+            // rebase moves the common alpha into the physical O scale rather
+            // than multiplying all 128 logical accumulator elements.
+            if (mx != -INFINITY) {
+                if (m_ref == -INFINITY) {
+                    m_ref = mx;
+                } else if (mx > m_ref + 4.0f) {
+                    const float alpha = __expf(m_ref - mx);
+                    l_val *= alpha;
+                    b_ref *= alpha;
+                    m_ref = mx;
+                }
+            }
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float e = (m_ref == -INFINITY)
+                    ? 0.0f : __expf(sacc[j] - m_ref);
+                sum += e;
+                sacc[j] =
+                    e * fa2_qr_f16(SV[sub * 16 + 8 * kg + j]);
+            }
+            sum += fa2_qr_xor16(sum);
+            l_val += sum;
+
+            float wmax = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                wmax = fmaxf(wmax, sacc[j]);
+            wmax = fmaxf(wmax, fa2_qr_xor16(wmax));
+            const float needed =
+                wmax > 0.0f ? fmaxf(wmax / 448.0f, 0x1p-64f) : b_ref;
+            if (needed > b_ref) {
+                const float rho = b_ref / needed;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= rho;
+                b_ref = needed;
+            }
+
+            unsigned int p0 = 0u;
+            p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                sacc[0] / b_ref, sacc[1] / b_ref, p0, false);
+            p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                sacc[2] / b_ref, sacc[3] / b_ref, p0, true);
+            unsigned int p1 = 0u;
+            p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                sacc[4] / b_ref, sacc[5] / b_ref, p1, false);
+            p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                sacc[6] / b_ref, sacc[7] / b_ref, p1, true);
+            const v2i_t pb = {(int)p0, (int)p1};
+#pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const uint4 vv = *(const uint4*)(V8
+                    + (unsigned)(((sub * 8 + p) * 32 + lane) * 16));
+                const v2i_t va0 = {(int)vv.x, (int)vv.y};
+                const v2i_t va1 = {(int)vv.z, (int)vv.w};
+                Ofr[2 * p] =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        va0, pb, Ofr[2 * p]);
+                Ofr[2 * p + 1] =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        va1, pb, Ofr[2 * p + 1]);
+                asm volatile("" ::: "memory");
+            }
+        }
+        __syncthreads();
+    }
+
+    if (qok) {
+        const float inv = l_val > 0.0f ? b_ref / l_val : 0.0f;
+        const unsigned bo =
+            (unsigned)query * 6144u + (unsigned)head * 256u;
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc) {
+            const unsigned bd =
+                bo + (unsigned)(dc * 16 + kg * 8);
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                out[bd + (unsigned)j] = Ofr[dc][j] * inv;
+        }
+    }
+}
+#endif
+
+// ---- Register-resident-Q v2: exact reschedule of the v1 body ----
+// Same geometry and per-row arithmetic as
+// attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 (768 threads, 384 query-head
+// rows = 64 queries x 6 heads per KV head, 16 QK + 16 PV fp8 WMMA per 16-key
+// sub in the same accumulation order and sub order); every output bit
+// matches v1. Only the schedule and the evaluation of exactly-rounded
+// quantities change:
+//  * Keys stream through two LDS buffers of KT48 (3 subs). Tile t+1 is
+//    committed to the idle buffer at the top of tile t and tile t+2's loads
+//    are issued, so one barrier per tile orders both the fill (RAW) and the
+//    buffer reuse (WAR); the v1-style single KT64 buffer needed two. All 24
+//    waves share the fills (12 K waves, 12 V waves, wave 0 also scales).
+//    V arrives pre-transposed via GLOBAL_LOAD_TR_B64, so the SCR transpose
+//    plane and its bpermutes go.
+//  * Scales are staged as exact f32 values; full subs skip masking and
+//    diagonal subs mask with selects instead of per-key branches.
+//  * x/448 uses q=x*c, r=fma(-q,448,x), fma(r,c,q) (exhaustively equal to
+//    IEEE x/448 for every finite x >= 2^-50; smaller/non-finite keep IEEE).
+//  * The E4M3 codes of v/q_row_scale and p/b_ref come from products with
+//    RN(RN(1/d)(1 -+ 2^-21)): those bracket RN(v/d), and E4M3 rounding is
+//    monotone, so equal codes at both ends are the IEEE-division codes.
+//    Unequal ends (0.007% of subs) recompute with IEEE division.
+//  * Workgroups run heaviest-first (grid x/z reversed).
+// Grid [ceil(min(batch,512)/64), 4, ceil(batch/512)], block 768,
+// 49936 B dynamic LDS: two KT48 buffers of 24960 B (K8 12 KiB, V8 12 KiB,
+// SK/SV f32 192 B each), then the bounds pair at 49920.
+// HIPFIRE_FA2_QRESIDENT_V2_Q8 builds the Q8-input twin
+// attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201: identical body, but the
+// prologue loads the E4M3 Q codes and row scales emitted by
+// qwen35_fa_prep_fp8q_batched_gfx1201 (same values the F32 prologue derives;
+// per (row, head) 256 code bytes with dim 16f+8kg+j at byte kg*128+f*8+j).
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) \
+    && (defined(HIPFIRE_FA2_QRESIDENT_V2) || defined(HIPFIRE_FA2_QRESIDENT_V2_Q8))
+static __device__ __forceinline__ float fa2_qr2_xor16(float v)
+{
+    int bits = __builtin_bit_cast(int, v);
+    bits = __builtin_amdgcn_permlanex16(bits, bits, 0x76543210, 0xfedcba98,
+                                        false, false);
+    return __builtin_bit_cast(float, bits);
+}
+
+// RN(x / 448) for finite x >= 2^-50 (exhaustively verified on gfx1201).
+static __device__ __forceinline__ float fa2_qr2_div448(float x)
+{
+    const float c = 1.0f / 448.0f;
+    const float q = x * c;
+    const float r = __builtin_fmaf(-q, 448.0f, x);
+    return __builtin_fmaf(r, c, q);
+}
+
+// Bracketing reciprocals for the fp8 code check: RN(RN(1/d)(1 -+ 2^-21)).
+#define FA2_QR2_YLO(y) ((y) * 0x1.fffffp-1f)
+#define FA2_QR2_YHI(y) ((y) * 0x1.000008p+0f)
+
+#if defined(HIPFIRE_FA2_A4_EPILOGUE)
+// ---- A4 attention-output epilogue (HIPFIRE_FA2_A4_EPILOGUE) ----
+// attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201 runs the Q8 body
+// unchanged and, instead of storing the f32 output O = Ofr * inv, forms the
+// out-projection's A4 slab in the epilogue: exactly what
+// sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab (mq_rotate_x_i4.hip +
+// block_i4_128_quant.hip, IU4_A4_CANDIDATES=2, HIPFIRE_IU4_SLAB) computes
+// from that O. Head dim 256 is one FWHT-256 group and two K128 blocks, so a
+// row's lane pair (ml, ml + 16) holds a whole group: dim d = 16 dc + 8 kg + j
+// sits in Ofr[dc][j] of lane 16 kg + ml.
+// Arithmetic, element by element, as the producer:
+//  * x = O * sigmoid(gate), gate read in place from the Q/gate rows (float
+//    512 h + 256 + d); sigmoid is fa2_a4_sigmoid below, bit-identical to the
+//    producer's `1.0f / (1.0f + expf(-g))` for all 2^32 g;
+//  * v = (x / awq[256 h + d]) * signs1[d];
+//  * FWHT-256 stages in the producer's order, dim bits 0..7, each butterfly
+//    (lo, hi) -> (lo + hi, lo - hi): bits 0-2 are j (in register), bit 3 is
+//    kg (lane ^ 16: fma(+-1, v, partner) is exactly v + p / p - v), bits
+//    4-7 are dc (in register);
+//  * f = (v * 0.0625f) * signs2[d].
+// Quant of each K128 block, as emit_iu4_sidecar_c2_gfx12: amax (max is
+// order-free), the same d0/d1 and refined reciprocals, codes, frac test,
+// and the reference divides when any lane of the wave fails it (both
+// branches give the reference codes, so the wave granularity is free). The
+// block mse is the reference tree: per group of 4 elements (g = e >> 2) an
+// fma chain in element order, then pairs of g differing in bit 4, 3, 2, 1,
+// 0. Here g bits 2-4 are dc bits 0-2 (in register), bit 1 is kg (lane ^ 16)
+// and bit 0 is j bit 2. Code sum is exact integer arithmetic; qs word w =
+// 2 (dc & 7) + kg holds the lane's eight codes of that dc. Slab store: per
+// block (2 h + blk) planes [d 4N][s 4N][qs 0..31: 32N][qs 32..63: 32N].
+#define FA2_A4_AWQ_STRIDE 268  // 268 / 4 = 67 = 3 (mod 16): the 12 (head, kg) b128 reads of one load hit distinct bank quads
+#define FA2_A4_GATE_AHEAD 3    // gate loads in flight ahead of the dc being computed
+// Scheduling fence: keeps the 128-value working set from being interleaved
+// across phases (which spills); six resident waves per SIMD supply the ILP.
+#define FA2_A4_FENCE() __builtin_amdgcn_sched_barrier(0)
+
+static __device__ __forceinline__ int fa2_a4_xor16i(int v)
+{
+    return __builtin_amdgcn_permlanex16(v, v, 0x76543210, 0xfedcba98, false, false);
+}
+
+// sigmoid(g) with the bits of the producer's `1.0f / (1.0f + expf(-g))` for
+// every one of the 2^32 f32 g (NaN payloads, signed zeros, denormals and
+// infinities included; exhaustive check on gfx1201: fa2_a4_sigmoid_exhaust in
+// the attn-epi harness). Contraction off: the sequence is the ocml expf
+// expansion hipcc emits for the producer (hi/lo split of -g log2 e, rint,
+// exp2, ldexp), except
+//  * one NaN-propagating clamp of g to [-128, 128] (v_maximumminimum_f32)
+//    replaces its two compare+select range fixups: g > 103.28 gives e = 0,
+//    g < -88.72 gives e = inf, and both saturate 1 + e to the same value;
+//  * the IEEE 1 / d (d = 1 + e >= 1, VCC-bound div_scale/div_fmas) becomes
+//    rcp(d 2^-32) 2^-32 (rcp would flush for d >= 2^126), one residual
+//    correction and the same v_div_fixup_f32 for the special operands.
+static __device__ __forceinline__ float fa2_a4_sigmoid(float g)
+{
+#pragma clang fp contract(off)
+    const float x = __builtin_elementwise_minimum(
+        __builtin_elementwise_maximum(g, -128.0f), 128.0f);
+    const float hi = __uint_as_float(0xbfb8aa3bu);  // -log2(e), high part
+    const float lo = __uint_as_float(0xb2a5705fu);  // low part
+    const float ph = x * hi;
+    float pl = __builtin_fmaf(x, hi, -ph);
+    const float rn = __builtin_rintf(ph);
+    pl = __builtin_fmaf(x, lo, pl);
+    const float t = (ph - rn) + pl;
+    const float e = __builtin_amdgcn_ldexpf(__builtin_amdgcn_exp2f(t), (int)rn);
+    const float d = 1.0f + e;
+    const float r = __builtin_amdgcn_rcpf(d * 0x1p-32f) * 0x1p-32f;
+    const float q = __builtin_fmaf(__builtin_fmaf(-d, r, 1.0f), r, r);
+    return __builtin_amdgcn_div_fixupf(q, d, 1.0f);
+}
+
+// Producer-order FWHT stages on dim bits 0-2 (the eight j of one dc).
+static __device__ __forceinline__ void fa2_a4_fwht8(float (&o)[8])
+{
+    float v0 = o[0], v1 = o[1], v2 = o[2], v3 = o[3];
+    float v4 = o[4], v5 = o[5], v6 = o[6], v7 = o[7];
+    float t;
+    t = v0; v0 = v0 + v1; v1 = t - v1;
+    t = v2; v2 = v2 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v5; v5 = t - v5;
+    t = v6; v6 = v6 + v7; v7 = t - v7;
+
+    t = v0; v0 = v0 + v2; v2 = t - v2;
+    t = v1; v1 = v1 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v6; v6 = t - v6;
+    t = v5; v5 = v5 + v7; v7 = t - v7;
+
+    t = v0; v0 = v0 + v4; v4 = t - v4;
+    t = v1; v1 = v1 + v5; v5 = t - v5;
+    t = v2; v2 = v2 + v6; v6 = t - v6;
+    t = v3; v3 = v3 + v7; v7 = t - v7;
+    o[0] = v0; o[1] = v1; o[2] = v2; o[3] = v3;
+    o[4] = v4; o[5] = v5; o[6] = v6; o[7] = v7;
+}
+
+// Reference mse tree of one candidate from the per-(dc & 7, j >> 2) chains.
+static __device__ __forceinline__ float fa2_a4_mse(const float c[8][2])
+{
+    float w[2];
+#pragma unroll
+    for (int jb = 0; jb < 2; ++jb) {
+        w[jb] = ((c[0][jb] + c[4][jb]) + (c[2][jb] + c[6][jb]))
+              + ((c[1][jb] + c[5][jb]) + (c[3][jb] + c[7][jb]));
+        w[jb] += fa2_qr2_xor16(w[jb]);
+    }
+    return w[0] + w[1];
+}
+
+// Both candidates' block mse over o[0..7] (one K128 block of this lane) as
+// iu4_c2_mse: q0 clamped, q1 as given (already clamped by the caller on the
+// divide path, in range on the fast path).
+template <bool Divide>
+static __device__ __forceinline__ void fa2_a4_block_mse(
+    const float (*o)[8], float d0, float d1, float r0, float r1,
+    float& mse0, float& mse1, float& frac)
+{
+    float c0[8][2], c1[8][2];
+#pragma unroll
+    for (int dcl = 0; dcl < 8; ++dcl) {
+#pragma unroll
+        for (int jb = 0; jb < 2; ++jb) {
+            float a0 = 0.0f, a1 = 0.0f;
+#pragma unroll
+            for (int jj = 0; jj < 4; ++jj) {
+                const float x = o[dcl][4 * jb + jj];
+                float q0, q1;
+                if (Divide) {
+                    q0 = rintf(x / d0);
+                    q1 = fminf(fmaxf(rintf(x / d1), -8.0f), 7.0f);
+                } else {
+                    const float y0 = x * r0;
+                    const float y1 = x * r1;
+                    q0 = rintf(y0);
+                    q1 = rintf(y1);
+                    frac = fmaxf(frac, fmaxf(fabsf(y0 - q0), fabsf(y1 - q1)));
+                }
+                q0 = fminf(fmaxf(q0, -8.0f), 7.0f);
+                const float e0 = __fmaf_rn(-q0, d0, x);
+                const float e1 = __fmaf_rn(-q1, d1, x);
+                a0 = __fmaf_rn(e0, e0, a0);
+                a1 = __fmaf_rn(e1, e1, a1);
+            }
+            c0[dcl][jb] = a0;
+            c1[dcl][jb] = a1;
+        }
+        FA2_A4_FENCE();
+    }
+    mse0 = fa2_a4_mse(c0);
+    mse1 = fa2_a4_mse(c1);
+}
+
+// Final codes of one K128 block: the chosen candidate (the reference's q0 is
+// clamped, its fast-path q1 is in range, so both clamp), or on unit lanes
+// the reference's unit/zero fallback (Unit: some lane of the wave has one);
+// the lane's code sum and one qs word per dcl.
+template <bool Divide, bool Unit>
+static __device__ __forceinline__ void fa2_a4_codes(
+    const float (*o)[8], float dsel, float rsel, bool unit, bool zero, int& s,
+    unsigned int w[8])
+{
+#pragma unroll
+    for (int dcl = 0; dcl < 8; ++dcl) {
+        unsigned int word = 0u;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const float x = o[dcl][j];
+            float q = Divide ? rintf(x / dsel) : rintf(x * rsel);
+            q = fminf(fmaxf(q, -8.0f), 7.0f);
+            if (Unit && unit)
+                q = zero ? 0.0f : fminf(fmaxf(rintf(x / 1.0f), -8.0f), 7.0f);
+            const int qi = (int)q;
+            s += qi;
+            word |= (unsigned int)(qi & 15) << (4 * j);
+        }
+        w[dcl] = word;
+        FA2_A4_FENCE();
+    }
+}
+
+// Scale (the producer's `v * s * signs2[d]`), quantize and store one K128
+// block (o[0..7] = dc 8 blk .. 8 blk + 7, s2 = signs2 + 128 blk + 8 kg).
+// The scale runs here so each block's multiplies stay next to its uses.
+static __device__ __forceinline__ void fa2_a4_block(
+    float (*o)[8], const float* s2, int kg, bool qok, unsigned tok, int head,
+    int blk, unsigned char* __restrict__ x_i4, int N)
+{
+    float amax = 0.0f;
+#pragma unroll
+    for (int dcl = 0; dcl < 8; ++dcl) {
+        const float4 t0 = *(const float4*)(s2 + dcl * 16);
+        const float4 t1 = *(const float4*)(s2 + dcl * 16 + 4);
+        const float sv[8] = {t0.x, t0.y, t0.z, t0.w, t1.x, t1.y, t1.z, t1.w};
+        const float s = 0.0625f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            o[dcl][j] = o[dcl][j] * s * sv[j];
+            // max_num is order-free; seeded with the first element so an
+            // all-NaN block keeps amax = NaN as in the reference.
+            amax = (dcl | j) ? fmaxf(amax, fabsf(o[dcl][j])) : fabsf(o[dcl][j]);
+        }
+        FA2_A4_FENCE();
+    }
+    amax = fmaxf(amax, fa2_qr2_xor16(amax));
+    const bool zero = amax == 0.0f;
+
+    const float candidate_base = (amax / 7.0f) * 0.5f;
+    const float d0 = candidate_base * 0x1.b6db6ep+0f;
+    const float d1 = candidate_base * 2.0f;
+    float r0 = __builtin_amdgcn_rcpf(d0);
+    float r1 = __builtin_amdgcn_rcpf(d1);
+    r0 = __fmaf_rn(r0, __fmaf_rn(-d0, r0, 1.0f), r0);
+    r1 = __fmaf_rn(r1, __fmaf_rn(-d1, r1, 1.0f), r1);
+
+    float mse0, mse1, frac = 0.0f;
+    fa2_a4_block_mse<false>(o, d0, d1, r0, r1, mse0, mse1, frac);
+    const bool exact = zero
+        || (amax >= 0x1p-100f && amax <= 0x1.fffffep+127f && frac <= 0.5f - 0x1p-18f);
+    const bool divide = __builtin_amdgcn_ballot_w32(!exact) != 0u;
+    if (divide)
+        fa2_a4_block_mse<true>(o, d0, d1, r0, r1, mse0, mse1, frac);
+    const bool take0 = mse0 < 1.0e30f;
+    const bool use1 = mse1 < (take0 ? mse0 : 1.0e30f);
+    const bool unit = zero || !(take0 || use1);
+    const float dsel = use1 ? d1 : d0;
+    const float rsel = use1 ? r1 : r0;
+
+    // The divide codes are the reference codes whatever the frac test said,
+    // so a wave with a unit lane takes them too; the common wave runs the
+    // fast codes without the per-element unit select.
+    int s = 0;
+    unsigned int w[8];
+    if (divide || __builtin_amdgcn_ballot_w32(unit) != 0u)
+        fa2_a4_codes<true, true>(o, dsel, rsel, unit, zero, s, w);
+    else
+        fa2_a4_codes<false, false>(o, dsel, rsel, unit, zero, s, w);
+    s += fa2_a4_xor16i(s);
+
+    // Word 2 dcl + kg; the lane pair trades words so each lane stores 16
+    // contiguous bytes per qs plane (kg 0: words 0-3 / 8-11, kg 1: 4-7 /
+    // 12-15): kg 1 sends its dcl 0,1 / 4,5 words, kg 0 its dcl 2,3 / 6,7.
+    unsigned int e[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int lo = (i & 1) + 4 * (i >> 1);
+        e[i] = (unsigned int)fa2_a4_xor16i((int)(kg ? w[lo] : w[lo + 2]));
+    }
+    if (qok) {
+        unsigned char* b = x_i4 + (unsigned long long)(2 * head + blk)
+            * (unsigned long long)N * 72ULL;
+        const unsigned long long n = (unsigned long long)N;
+        if (kg == 0) {
+            *(float*)(b + tok * 4ULL) = unit ? 1.0f : dsel;
+            *(int*)(b + 4ULL * n + tok * 4ULL) = s;
+        }
+#pragma unroll
+        for (int plane = 0; plane < 2; ++plane) {
+            const int d = 4 * plane;
+            unsigned char* p = b + (plane ? 40ULL : 8ULL) * n + tok * 32ULL
+                + (unsigned)(kg * 16);
+            const uint2 lo = kg ? make_uint2(e[2 * plane], w[d + 2])
+                                : make_uint2(w[d], e[2 * plane]);
+            const uint2 hi = kg ? make_uint2(e[2 * plane + 1], w[d + 3])
+                                : make_uint2(w[d + 1], e[2 * plane + 1]);
+            *(uint2*)p = lo;
+            *(uint2*)(p + 8) = hi;
+        }
+    }
+}
+
+static __device__ __forceinline__ void fa2_a4_epilogue(
+    const float8_t (&O)[16], float inv, bool qok, int query, int head, int hl,
+    int kg, const float* __restrict__ qgate, const float* awq_l,
+    const float* s1_l, const float* s2_l, unsigned char* __restrict__ x_i4,
+    int N)
+{
+    const unsigned tok = qok ? (unsigned)query : 0u;
+    const float* gp = qgate + (unsigned long long)tok * 12288ULL
+        + (unsigned)(head * 512 + 256 + kg * 8);
+    const float* ap = awq_l + hl * FA2_A4_AWQ_STRIDE + kg * 8;
+    const float* s1 = s1_l + kg * 8;
+    // Scalar working set: element-wise updates of the float8_t accumulator
+    // tuples would keep whole 8-register tuples live.
+    float o[16][8];
+    // Gate ring: the loads for dc + FA2_A4_GATE_AHEAD issue while dc computes.
+    float4 gr[FA2_A4_GATE_AHEAD][2];
+#pragma unroll
+    for (int i = 0; i < FA2_A4_GATE_AHEAD; ++i) {
+        gr[i][0] = *(const float4*)(gp + i * 16);
+        gr[i][1] = *(const float4*)(gp + i * 16 + 4);
+    }
+    // v = (O * sigmoid(gate) / awq) * signs1, FWHT dim bits 0-2.
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc) {
+        const float4 g0 = gr[dc % FA2_A4_GATE_AHEAD][0];
+        const float4 g1 = gr[dc % FA2_A4_GATE_AHEAD][1];
+        if (dc + FA2_A4_GATE_AHEAD < 16) {
+            gr[dc % FA2_A4_GATE_AHEAD][0] =
+                *(const float4*)(gp + (dc + FA2_A4_GATE_AHEAD) * 16);
+            gr[dc % FA2_A4_GATE_AHEAD][1] =
+                *(const float4*)(gp + (dc + FA2_A4_GATE_AHEAD) * 16 + 4);
+        }
+        const float4 a0 = *(const float4*)(ap + dc * 16);
+        const float4 a1 = *(const float4*)(ap + dc * 16 + 4);
+        const float4 t0 = *(const float4*)(s1 + dc * 16);
+        const float4 t1 = *(const float4*)(s1 + dc * 16 + 4);
+        const float gv[8] = {g0.x, g0.y, g0.z, g0.w, g1.x, g1.y, g1.z, g1.w};
+        const float av[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+        const float sv[8] = {t0.x, t0.y, t0.z, t0.w, t1.x, t1.y, t1.z, t1.w};
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            float x = O[dc][j] * inv;
+            x = x * fa2_a4_sigmoid(gv[j]);
+            o[dc][j] = (x / av[j]) * sv[j];
+        }
+        fa2_a4_fwht8(o[dc]);
+        FA2_A4_FENCE();
+    }
+    // FWHT dim bit 3 (lane ^ 16), then bits 4-7 one j at a time.
+    const float sg = kg ? -1.0f : 1.0f;
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc) {
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            o[dc][j] = __builtin_fmaf(sg, o[dc][j], fa2_qr2_xor16(o[dc][j]));
+        FA2_A4_FENCE();
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+        for (int b = 1; b < 16; b <<= 1)
+#pragma unroll
+            for (int dc = 0; dc < 16; ++dc)
+                if (!(dc & b)) {
+                    const float lo = o[dc][j];
+                    const float hi = o[dc + b][j];
+                    o[dc][j] = lo + hi;
+                    o[dc + b][j] = lo - hi;
+                }
+        FA2_A4_FENCE();
+    }
+    fa2_a4_block(&o[0], s2_l + kg * 8, kg, qok, tok, head, 0, x_i4, N);
+    FA2_A4_FENCE();
+    fa2_a4_block(&o[8], s2_l + 128 + kg * 8, kg, qok, tok, head, 1, x_i4, N);
+}
+#endif
+
+// Wave arbitration hint (A3B only; no arithmetic): the WMMA bursts of one
+// wave run ahead of the others' VALU/fill work. The dense body is unchanged.
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+#define FA2_QR2_PRIO(x) __builtin_amdgcn_s_setprio(x)
+#else
+#define FA2_QR2_PRIO(x) ((void)0)
+#endif
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+// Geometry-only specialization: the KT48 Q-resident arithmetic below is shared.
+#if !defined(HIPFIRE_FA2_QRESIDENT_V2_Q8) || defined(HIPFIRE_FA2_A4_EPILOGUE)
+#error "A3B requires the Q8-input body without the A4 epilogue"
+#endif
+static __device__ __forceinline__
+void fa2_qresident_v2_q8_a3b_body(
+    const unsigned char* __restrict__ q_codes,
+    const float* __restrict__ q_scales,
+#else
+extern "C" __global__ __launch_bounds__(768, 1)
+__attribute__((amdgpu_waves_per_eu(6), amdgpu_num_vgpr(240)))
+#if defined(HIPFIRE_FA2_A4_EPILOGUE)
+void attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201(
+    const unsigned char* __restrict__ q_codes,
+    const float* __restrict__ q_scales,
+#elif defined(HIPFIRE_FA2_QRESIDENT_V2_Q8)
+void attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
+    const unsigned char* __restrict__ q_codes,
+    const float* __restrict__ q_scales,
+#else
+void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
+    const float* __restrict__ q,
+#endif
+#endif
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+#if defined(HIPFIRE_FA2_A4_EPILOGUE)
+    const float* __restrict__ qgate,      // [N, 24 x (256 q, 256 gate)] f32
+    const float* __restrict__ awq_scale,  // [6144] f32
+    const float* __restrict__ signs1,     // [256] FWHT signs
+    const float* __restrict__ signs2,     // [256]
+    unsigned char* __restrict__ x_i4,     // A4 slab, 48 blocks x 72 N bytes
+#else
+    float* __restrict__ out,
+#endif
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    constexpr int QR_HEADS = 16, QR_KV_HEADS = 2, QR_GQA = 8;
+#else
+    constexpr int QR_HEADS = 24, QR_KV_HEADS = 4, QR_GQA = 6;
+#endif
+    constexpr unsigned QR_KV_CODES = QR_KV_HEADS * 256u;
+    constexpr unsigned long long QR_KV_STRIDE = QR_KV_CODES + QR_KV_HEADS * 2u;
+    constexpr unsigned QR_OUT_STRIDE = QR_HEADS * 256u;
+    if (n_heads != QR_HEADS || n_kv_heads != QR_KV_HEADS || head_dim != 256)
+        return;
+    const int kv_h = (int)blockIdx.y;
+    if (kv_h >= QR_KV_HEADS)
+        return;
+    // Heaviest-first: the last run and the last query block start first.
+    const int bz = (int)gridDim.z - 1 - (int)blockIdx.z;
+    const int bx = (int)gridDim.x - 1 - (int)blockIdx.x;
+    const int query_offset = batch_size > 512 ? 512 * bz : 0;
+    if (query_offset >= batch_size)
+        return;
+    const int run_rows = min(512, batch_size - query_offset);
+    const int row_base = 384 * bx;
+    if (row_base >= QR_GQA * run_rows)
+        return;
+
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int kg = lane >> 4;
+    const int row = row_base + 16 * wave + ml;
+    const int query_local = row / QR_GQA;
+    const int query = query_offset + query_local;
+    const int head = QR_GQA * kv_h + row % QR_GQA;
+    const bool qok = row < QR_GQA * run_rows;
+    const unsigned qrow =
+        qok ? (unsigned)query * (unsigned)QR_HEADS + (unsigned)head : 0u;
+
+    extern __shared__ uint32_t LDS[];
+    int* bounds = (int*)((unsigned char*)LDS + 49920);
+
+    if (tid == 0) {
+        bounds[0] = -1;
+        bounds[1] = 0x7fffffff;
+    }
+    __syncthreads();
+    const int bound_queries = ((min(row_base + 384, QR_GQA * run_rows) - 1) / QR_GQA)
+        - row_base / QR_GQA + 1;
+    if (tid < bound_queries) {
+        const int ql = row_base / QR_GQA + tid;
+        if (ql < run_rows) {
+            const int p = positions[query_offset + ql];
+            atomicMax(bounds + 0, p);
+            atomicMin(bounds + 1, p);
+        }
+    }
+    const int pos = qok ? positions[query] : 0;
+
+    // Resident Q fragments: the v1 codes, computed with the bracket check
+    // (or loaded as produced upstream by the Q8-input twin).
+    v2i_t Qfr[16];
+    float q_row_scale = 1.0f;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8)
+    if (qok) {
+        const uint4* qp8 = (const uint4*)(q_codes
+            + (unsigned long long)qrow * 256ULL + (unsigned)kg * 128u);
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const uint4 w = qp8[m];
+            Qfr[2 * m] = (v2i_t){(int)w.x, (int)w.y};
+            Qfr[2 * m + 1] = (v2i_t){(int)w.z, (int)w.w};
+        }
+        q_row_scale = q_scales[qrow];
+    } else
+#else
+    if (qok) {
+        const float* qp = q + (unsigned long long)qrow * 256ULL;
+        float a = 0.0f;
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag) {
+            const float8_t v = *(const float8_t*)(
+                qp + (unsigned)(frag * 16 + kg * 8));
+            a = fmaxf(a, fabsf(v[0]));
+            a = fmaxf(a, fabsf(v[1]));
+            a = fmaxf(a, fabsf(v[2]));
+            a = fmaxf(a, fabsf(v[3]));
+            a = fmaxf(a, fabsf(v[4]));
+            a = fmaxf(a, fabsf(v[5]));
+            a = fmaxf(a, fabsf(v[6]));
+            a = fmaxf(a, fabsf(v[7]));
+        }
+        a = fmaxf(a, fa2_qr2_xor16(a));
+        q_row_scale = (a == 0.0f) ? 1.0f
+            : ((a >= 0x1p-50f && a <= 0x1p+120f) ? fa2_qr2_div448(a)
+                                                  : a / 448.0f);
+        const float yq = 1.0f / q_row_scale;
+        const float yqlo = FA2_QR2_YLO(yq);
+        const float yqhi = FA2_QR2_YHI(yq);
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag) {
+            const float8_t v = *(const float8_t*)(
+                qp + (unsigned)(frag * 16 + kg * 8));
+            unsigned int w0 = 0u, w1 = 0u, h0 = 0u, h1 = 0u;
+            w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[0] * yqlo, v[1] * yqlo, w0, false);
+            w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[2] * yqlo, v[3] * yqlo, w0, true);
+            w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[4] * yqlo, v[5] * yqlo, w1, false);
+            w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[6] * yqlo, v[7] * yqlo, w1, true);
+            h0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[0] * yqhi, v[1] * yqhi, h0, false);
+            h0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[2] * yqhi, v[3] * yqhi, h0, true);
+            h1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[4] * yqhi, v[5] * yqhi, h1, false);
+            h1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[6] * yqhi, v[7] * yqhi, h1, true);
+            if ((w0 != h0) | (w1 != h1)) {
+                w0 = 0u;
+                w1 = 0u;
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[0] / q_row_scale, v[1] / q_row_scale, w0, false);
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[2] / q_row_scale, v[3] / q_row_scale, w0, true);
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[4] / q_row_scale, v[5] / q_row_scale, w1, false);
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[6] / q_row_scale, v[7] / q_row_scale, w1, true);
+            }
+            Qfr[frag] = (v2i_t){(int)w0, (int)w1};
+        }
+    } else
+#endif
+    {
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag)
+            Qfr[frag] = (v2i_t){0, 0};
+    }
+    __syncthreads();
+    const int gmax = bounds[0];
+    const int gmin = bounds[1];
+    const int seq_len = gmax + 1;
+    const bool qok_all = row_base + 383 < QR_GQA * run_rows;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    const bool wave_live = row_base + 16 * wave < QR_GQA * run_rows;
+#endif
+
+    // Fill roles (dense H24; the A3B fill below has its own roles): waves
+    // 0..11 load K (4 b64 wave-loads each), waves 12..23 load pre-transposed
+    // V (4 GLOBAL_LOAD_TR_B64 each), wave 0 also loads the tile's 48 K/V
+    // scale pairs. Keys at/after seq_len are zero in every plane, as in v1.
+    constexpr int TK = 48;
+    constexpr unsigned KPL = 12288u;
+    constexpr unsigned BUFB = 2u * KPL + 384u;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+    // A3B fill (native 516-byte rows: four-byte alignment only). Every wave
+    // loads one 16-byte K chunk (one key, 16 dims); waves 12..23 also load
+    // one 4-byte word per key of an 8-key x 4-dim V block and transpose it
+    // into four fragment words in commit(); wave 0 loads the tile's 48 K/V
+    // scale pairs. Keys at/after seq_len are zero in every plane, as in v1.
+    const bool sfill = wave == 0;
+    const bool vfill = wave >= 12;
+    const int ksub = wave >> 3;
+    const int kdcf = ((wave & 7) << 1) | (lane & 1);
+    const int kml = lane >> 1;
+    const int vw_i = wave - 12;
+    const int vsub = vw_i >> 2;
+    const int vkg = (vw_i >> 1) & 1;
+    const int vdc = ((vw_i & 1) << 3) | (lane >> 2);
+    uint32_t kwords[4];
+    uint32_t vwords[8];
+    uint32_t spre[2];
+
+    auto issue = [&](int kt) {
+        {
+            const int gk = kt + ksub * 16 + kml;
+            uint32_t k0 = 0u, k1 = 0u, k2 = 0u, k3 = 0u;
+            if (gk < seq_len) {
+                const uint32_t* p = (const uint32_t*)(k_cache
+                    + (unsigned long long)gk * QR_KV_STRIDE
+                    + (unsigned)(kv_h * 256 + kdcf * 16));
+                k0 = p[0];
+                k1 = p[1];
+                k2 = p[2];
+                k3 = p[3];
+            }
+            kwords[0] = k0;
+            kwords[1] = k1;
+            kwords[2] = k2;
+            kwords[3] = k3;
+        }
+        if (vfill) {
+            const int kb = kt + vsub * 16 + vkg * 8;
+            const unsigned char* vp = v_cache
+                + (unsigned)(kv_h * 256 + vdc * 16 + (lane & 3) * 4);
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                const int key = min(kb + r, seq_len - 1);
+                vwords[r] = *(const uint32_t*)(
+                    vp + (unsigned long long)key * QR_KV_STRIDE);
+            }
+        }
+        if (sfill) {
+            uint32_t s0 = 0u, s1 = 0u;
+            const int gk0 = kt + lane;
+            const int gk1 = kt + 32 + lane;
+            if (gk0 < seq_len) {
+                const unsigned char* kr = k_cache
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                const unsigned char* vr = v_cache
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                s0 = (uint32_t)*(const uint16_t*)kr
+                    | ((uint32_t)*(const uint16_t*)vr << 16);
+            }
+            if (lane < 16 && gk1 < seq_len) {
+                const unsigned char* kr = k_cache
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                const unsigned char* vr = v_cache
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                s1 = (uint32_t)*(const uint16_t*)kr
+                    | ((uint32_t)*(const uint16_t*)vr << 16);
+            }
+            spre[0] = s0;
+            spre[1] = s1;
+        }
+    };
+    auto commit = [&](int kt, unsigned b) {
+        unsigned char* K8w = (unsigned char*)LDS + b * BUFB;
+        unsigned char* V8w = K8w + KPL;
+        float* SKw = (float*)(K8w + 2u * KPL);
+        float* SVw = SKw + 48;
+        {
+            // Key kml, dims 16*kdcf..+15: the kg=0 / kg=1 fragment halves.
+            unsigned char* kd = K8w
+                + (unsigned)((((kdcf >> 1) * 3 + ksub) * 32 + kml) * 16
+                             + (kdcf & 1) * 8);
+            *(unsigned long long*)kd = (unsigned long long)kwords[0]
+                | ((unsigned long long)kwords[1] << 32);
+            *(unsigned long long*)(kd + 256) = (unsigned long long)kwords[2]
+                | ((unsigned long long)kwords[3] << 32);
+        }
+        if (vfill) {
+            // 8 keys x 4 dims -> four fragment words (byte j = key k0 + j).
+            const int k0 = kt + vsub * 16 + vkg * 8;
+            unsigned long long keep = ~0ULL;
+            if (k0 + 8 > seq_len) {
+                const int nvalid = max(0, seq_len - k0);
+                keep = (1ULL << (8 * nvalid)) - 1ULL;
+            }
+            uint32_t lo[4], hi[4];
+#pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint32_t w0 = vwords[4 * h], w1 = vwords[4 * h + 1];
+                const uint32_t w2 = vwords[4 * h + 2], w3 = vwords[4 * h + 3];
+                const uint32_t t0 = __builtin_amdgcn_perm(w1, w0, 0x05010400u);
+                const uint32_t t1 = __builtin_amdgcn_perm(w1, w0, 0x07030602u);
+                const uint32_t u0 = __builtin_amdgcn_perm(w3, w2, 0x05010400u);
+                const uint32_t u1 = __builtin_amdgcn_perm(w3, w2, 0x07030602u);
+                uint32_t* o = h ? hi : lo;
+                o[0] = __builtin_amdgcn_perm(u0, t0, 0x05040100u);
+                o[1] = __builtin_amdgcn_perm(u0, t0, 0x07060302u);
+                o[2] = __builtin_amdgcn_perm(u1, t1, 0x05040100u);
+                o[3] = __builtin_amdgcn_perm(u1, t1, 0x07060302u);
+            }
+            unsigned char* vdst = V8w
+                + (unsigned)(((vsub * 8 + (vdc >> 1)) * 32 + vkg * 16
+                              + 4 * (lane & 3)) * 16 + (vdc & 1) * 8);
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const unsigned long long v =
+                    ((unsigned long long)lo[c] | ((unsigned long long)hi[c] << 32))
+                    & keep;
+                *(unsigned long long*)(vdst + c * 16) = v;
+            }
+        }
+        if (sfill) {
+            const fa2_dw_t d0 = {.u = spre[0]};
+            const fa2_dw_t d1 = {.u = spre[1]};
+            SKw[lane] = (float)d0.h[0];
+            SVw[lane] = (float)d0.h[1];
+            if (lane < 16) {
+                SKw[32 + lane] = (float)d1.h[0];
+                SVw[32 + lane] = (float)d1.h[1];
+            }
+        }
+    };
+#else
+    const bool kfill = wave < 12;
+    const bool sfill = wave == 0;
+    unsigned long long pre[4];
+    uint32_t spre[2];
+
+    auto issue = [&](int kt) {
+        if (kfill) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int idx = wave * 4 + i;
+                const int sub = idx >> 4;
+                const int dcf = idx & 15;
+                const int gk = kt + sub * 16 + ml;
+                unsigned long long v = 0ULL;
+                if (gk < seq_len) {
+                    const unsigned char* p = k_cache
+                        + (unsigned long long)gk * QR_KV_STRIDE
+                        + (unsigned)(kv_h * 256 + dcf * 16 + kg * 8);
+                    v = *(const unsigned long long*)p;
+                }
+                pre[i] = v;
+            }
+        } else {
+            const int skey = 8 * (lane >> 4) + 4 * ((lane >> 3) & 1)
+                + (lane & 3);
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int idx = (wave - 12) * 4 + i;
+                const int sub = idx >> 4;
+                const int dc = idx & 15;
+                const int gk = min(kt + sub * 16 + skey, seq_len - 1);
+                const unsigned char* p = v_cache
+                    + (unsigned long long)gk * QR_KV_STRIDE
+                    + (unsigned)(kv_h * 256 + dc * 16
+                                 + 8 * ((lane >> 2) & 1));
+                const v2i_t r = __builtin_amdgcn_global_load_tr_b64_v2i32(
+                    (__attribute__((address_space(1))) v2i_t*)(p));
+                pre[i] = (unsigned long long)(uint32_t)r.x
+                    | ((unsigned long long)(uint32_t)r.y << 32);
+            }
+        }
+        if (sfill) {
+            uint32_t s0 = 0u, s1 = 0u;
+            const int gk0 = kt + lane;
+            const int gk1 = kt + 32 + lane;
+            if (gk0 < seq_len) {
+                const unsigned char* kr = k_cache
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                const unsigned char* vr = v_cache
+                    + (unsigned long long)gk0 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                s0 = (uint32_t)*(const uint16_t*)kr
+                    | ((uint32_t)*(const uint16_t*)vr << 16);
+            }
+            if (lane < 16 && gk1 < seq_len) {
+                const unsigned char* kr = k_cache
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                const unsigned char* vr = v_cache
+                    + (unsigned long long)gk1 * QR_KV_STRIDE + QR_KV_CODES + kv_h * 2;
+                s1 = (uint32_t)*(const uint16_t*)kr
+                    | ((uint32_t)*(const uint16_t*)vr << 16);
+            }
+            spre[0] = s0;
+            spre[1] = s1;
+        }
+    };
+    auto commit = [&](int kt, unsigned b) {
+        unsigned char* K8w = (unsigned char*)LDS + b * BUFB;
+        unsigned char* V8w = K8w + KPL;
+        float* SKw = (float*)(K8w + 2u * KPL);
+        float* SVw = SKw + 48;
+        if (kfill) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int idx = wave * 4 + i;
+                const int sub = idx >> 4;
+                const int dcf = idx & 15;
+                *(unsigned long long*)(K8w
+                    + (unsigned)((((dcf >> 1) * 3 + sub) * 32 + lane) * 16
+                                 + (dcf & 1) * 8)) = pre[i];
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int idx = (wave - 12) * 4 + i;
+                const int sub = idx >> 4;
+                const int dc = idx & 15;
+                unsigned long long v = pre[i];
+                const int k0 = kt + sub * 16 + kg * 8;
+                if (k0 + 8 > seq_len) {
+                    const int nvalid = max(0, seq_len - k0);
+                    v &= (1ULL << (8 * nvalid)) - 1ULL;
+                }
+                *(unsigned long long*)(V8w
+                    + (unsigned)(((sub * 8 + (dc >> 1)) * 32 + lane) * 16
+                                 + (dc & 1) * 8)) = v;
+            }
+        }
+        if (sfill) {
+            const fa2_dw_t d0 = {.u = spre[0]};
+            const fa2_dw_t d1 = {.u = spre[1]};
+            SKw[lane] = (float)d0.h[0];
+            SVw[lane] = (float)d0.h[1];
+            if (lane < 16) {
+                SKw[32 + lane] = (float)d1.h[0];
+                SVw[32 + lane] = (float)d1.h[1];
+            }
+        }
+    };
+
+#endif
+
+    float8_t Ofr[16];
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc)
+        Ofr[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float m_ref = -INFINITY;
+    float l_val = 0.0f;
+    float b_ref = 0x1p-64f;
+    float yb = 1.0f / b_ref;
+    float yblo = FA2_QR2_YLO(yb);
+    float ybhi = FA2_QR2_YHI(yb);
+    const float qs_tile = q_row_scale * scale_attn;
+
+    issue(0);
+    commit(0, 0u);
+    if (TK < seq_len)
+        issue(TK);
+    __syncthreads();
+    unsigned buf = 0u;
+    for (int ktile = 0; ktile < seq_len; ktile += TK) {
+        FA2_QR2_PRIO(0);
+        if (ktile + TK < seq_len) {
+            commit(ktile + TK, buf ^ 1u);
+            if (ktile + 2 * TK < seq_len)
+                issue(ktile + 2 * TK);
+        }
+        const unsigned char* K8 = (const unsigned char*)LDS + buf * BUFB;
+        const unsigned char* V8 = K8 + KPL;
+        const float* SKf = (const float*)(K8 + 2u * KPL);
+        const float* SVf = SKf + 48;
+        const bool full = qok_all && (ktile + TK - 1 <= gmin);
+#pragma unroll 1
+        for (int sub = 0; sub < 3; ++sub) {
+            const int kt_sub = ktile + sub * 16;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+            // A wave whose 16 rows all lie past the run's last query computes
+            // nothing that is stored; it still fills and joins the barriers.
+            if (kt_sub > gmax || !wave_live)
+                break;
+#else
+            if (kt_sub > gmax)
+                break;
+#endif
+            float8_t sacc =
+                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+            FA2_QR2_PRIO(3);
+#pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const uint4 kv = *(const uint4*)(K8
+                    + (unsigned)(((p * 3 + sub) * 32 + lane) * 16));
+                const v2i_t kf0 = {(int)kv.x, (int)kv.y};
+                const v2i_t kf1 = {(int)kv.z, (int)kv.w};
+                sacc =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        kf0, Qfr[2 * p], sacc);
+                sacc =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        kf1, Qfr[2 * p + 1], sacc);
+                asm volatile("" ::: "memory");
+            }
+            FA2_QR2_PRIO(0);
+            const float4 sk0 = *(const float4*)(SKf + sub * 16 + 8 * kg);
+            const float4 sk1 = *(const float4*)(SKf + sub * 16 + 8 * kg + 4);
+            const float4 sv0 = *(const float4*)(SVf + sub * 16 + 8 * kg);
+            const float4 sv1 = *(const float4*)(SVf + sub * 16 + 8 * kg + 4);
+            const float skv[8] = {sk0.x, sk0.y, sk0.z, sk0.w,
+                                  sk1.x, sk1.y, sk1.z, sk1.w};
+            const float svv[8] = {sv0.x, sv0.y, sv0.z, sv0.w,
+                                  sv1.x, sv1.y, sv1.z, sv1.w};
+            const bool sub_full = full || ((kt_sub + 15) <= gmin);
+            if (sub_full && qok_all) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sacc[j] = (sacc[j] * qs_tile) * skv[j];
+            } else {
+                // v1: ok = qok && (sub_full || key_g <= pos).
+                const int lim = sub_full ? 8 : pos - kt_sub - 8 * kg;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const bool ok = qok && (j <= lim);
+                    const float t = (sacc[j] * qs_tile) * skv[j];
+                    sacc[j] = ok ? t : -INFINITY;
+                }
+            }
+            float mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                mx = fmaxf(mx, sacc[j]);
+            mx = fmaxf(mx, fa2_qr2_xor16(mx));
+
+            if (mx != -INFINITY) {
+                if (m_ref == -INFINITY) {
+                    m_ref = mx;
+                } else if (mx > m_ref + 4.0f) {
+                    const float alpha = __expf(m_ref - mx);
+                    l_val *= alpha;
+                    b_ref *= alpha;
+                    m_ref = mx;
+                    yb = 1.0f / b_ref;
+                    yblo = FA2_QR2_YLO(yb);
+                    ybhi = FA2_QR2_YHI(yb);
+                }
+            }
+            float sum = 0.0f;
+            if (__builtin_amdgcn_ballot_w32(m_ref == -INFINITY) == 0u) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float e = __expf(sacc[j] - m_ref);
+                    sum += e;
+                    sacc[j] = e * svv[j];
+                }
+            } else {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float e = (m_ref == -INFINITY)
+                        ? 0.0f : __expf(sacc[j] - m_ref);
+                    sum += e;
+                    sacc[j] = e * svv[j];
+                }
+            }
+            sum += fa2_qr2_xor16(sum);
+            l_val += sum;
+
+            float wmax = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                wmax = fmaxf(wmax, sacc[j]);
+            wmax = fmaxf(wmax, fa2_qr2_xor16(wmax));
+            // fmaxf(fa2_qr2_div448(x), 2^-64) == fmaxf(x / 448, 2^-64) for
+            // every finite x > 0 (exhaustive), and wmax <= e^4 * 65504.
+            const float needed = wmax > 0.0f
+                ? fmaxf(fa2_qr2_div448(wmax), 0x1p-64f)
+                : b_ref;
+            if (needed > b_ref) {
+                const float rho = b_ref / needed;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= rho;
+                b_ref = needed;
+                yb = 1.0f / b_ref;
+                yblo = FA2_QR2_YLO(yb);
+                ybhi = FA2_QR2_YHI(yb);
+            }
+
+            // P codes: cvt(sacc/b_ref) via the bracket check. The inline asm
+            // only names uninitialised seeds: every half is overwritten.
+            unsigned int p0, p1, h0, h1;
+            asm("; fa2 qr2 seeds %0 %1 %2 %3"
+                : "=v"(p0), "=v"(p1), "=v"(h0), "=v"(h1));
+            p0 = __builtin_amdgcn_cvt_pk_fp8_f32(sacc[0] * yblo, sacc[1] * yblo, p0, false);
+            p0 = __builtin_amdgcn_cvt_pk_fp8_f32(sacc[2] * yblo, sacc[3] * yblo, p0, true);
+            p1 = __builtin_amdgcn_cvt_pk_fp8_f32(sacc[4] * yblo, sacc[5] * yblo, p1, false);
+            p1 = __builtin_amdgcn_cvt_pk_fp8_f32(sacc[6] * yblo, sacc[7] * yblo, p1, true);
+            h0 = __builtin_amdgcn_cvt_pk_fp8_f32(sacc[0] * ybhi, sacc[1] * ybhi, h0, false);
+            h0 = __builtin_amdgcn_cvt_pk_fp8_f32(sacc[2] * ybhi, sacc[3] * ybhi, h0, true);
+            h1 = __builtin_amdgcn_cvt_pk_fp8_f32(sacc[4] * ybhi, sacc[5] * ybhi, h1, false);
+            h1 = __builtin_amdgcn_cvt_pk_fp8_f32(sacc[6] * ybhi, sacc[7] * ybhi, h1, true);
+            if ((p0 != h0) | (p1 != h1)) {
+                p0 = 0u;
+                p1 = 0u;
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[0] / b_ref, sacc[1] / b_ref, p0, false);
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[2] / b_ref, sacc[3] / b_ref, p0, true);
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[4] / b_ref, sacc[5] / b_ref, p1, false);
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[6] / b_ref, sacc[7] / b_ref, p1, true);
+            }
+            const v2i_t pb = {(int)p0, (int)p1};
+            FA2_QR2_PRIO(3);
+#pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const uint4 vv = *(const uint4*)(V8
+                    + (unsigned)(((sub * 8 + p) * 32 + lane) * 16));
+                const v2i_t va0 = {(int)vv.x, (int)vv.y};
+                const v2i_t va1 = {(int)vv.z, (int)vv.w};
+                Ofr[2 * p] =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        va0, pb, Ofr[2 * p]);
+                Ofr[2 * p + 1] =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        va1, pb, Ofr[2 * p + 1]);
+                asm volatile("" ::: "memory");
+            }
+        }
+        __syncthreads();
+        buf ^= 1u;
+    }
+
+#if defined(HIPFIRE_FA2_A4_EPILOGUE)
+    // The last tile's barrier retired every K/V read: reuse the LDS for this
+    // workgroup's six AWQ rows and the two sign vectors.
+    {
+        // [awq rows 6 x FA2_A4_AWQ_STRIDE][signs1 256][signs2 256]
+        float* awq_l = (float*)LDS;
+        float* s1_l = awq_l + 6 * FA2_A4_AWQ_STRIDE;
+        float* s2_l = s1_l + 256;
+        const float* awq_h = awq_scale + kv_h * 1536;
+        awq_l[(tid >> 8) * FA2_A4_AWQ_STRIDE + (tid & 255)] = awq_h[tid];
+        awq_l[((tid >> 8) + 3) * FA2_A4_AWQ_STRIDE + (tid & 255)] = awq_h[tid + 768];
+        if (tid < 256)
+            s1_l[tid] = signs1[tid];
+        else if (tid < 512)
+            s2_l[tid - 256] = signs2[tid - 256];
+        __syncthreads();
+        const float inv = l_val > 0.0f ? b_ref / l_val : 0.0f;
+        fa2_a4_epilogue(Ofr, inv, qok, query, head, row % 6, kg, qgate,
+                        awq_l, s1_l, s2_l, x_i4, batch_size);
+    }
+#else
+    if (qok) {
+        const float inv = l_val > 0.0f ? b_ref / l_val : 0.0f;
+        const unsigned bo =
+            (unsigned)query * QR_OUT_STRIDE + (unsigned)head * 256u;
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc) {
+            const unsigned bd =
+                bo + (unsigned)(dc * 16 + kg * 8);
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                out[bd + (unsigned)j] = Ofr[dc][j] * inv;
+        }
+    }
+#endif
+}
+
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8_A3B)
+// Both entry points use the dense packed ABI. The range caller advances both
+// Q planes independently from the FULL allocation's plane bases, and advances
+// output/positions; batch_size is the number of rows in that selected range.
+#define FA2_QR2_A3B_ENTRY(NAME) \
+extern "C" __global__ __launch_bounds__(768, 1) \
+__attribute__((amdgpu_waves_per_eu(6), amdgpu_num_vgpr(240))) \
+void NAME( \
+    const unsigned char* __restrict__ q_codes, \
+    const float* __restrict__ q_scales, \
+    const unsigned char* __restrict__ k_cache, \
+    const unsigned char* __restrict__ v_cache, \
+    float* __restrict__ out, \
+    const int* __restrict__ positions, \
+    int n_heads, int n_kv_heads, int head_dim, int batch_size, float scale_attn) \
+{ \
+    fa2_qresident_v2_q8_a3b_body(q_codes, q_scales, k_cache, v_cache, out, \
+        positions, n_heads, n_kv_heads, head_dim, batch_size, scale_attn); \
+}
+FA2_QR2_A3B_ENTRY(attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a3b_gfx1201)
+FA2_QR2_A3B_ENTRY(attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_range_a3b_gfx1201)
+#undef FA2_QR2_A3B_ENTRY
+#endif
+#undef FA2_QR2_PRIO
+#undef FA2_QR2_YLO
+#undef FA2_QR2_YHI
+#endif

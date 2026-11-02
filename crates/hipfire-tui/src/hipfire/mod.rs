@@ -9,11 +9,17 @@ pub mod dashboard;
 pub mod doctor;
 pub mod knobs;
 pub mod log_tail;
+pub mod metrics;
 pub mod model_actions;
 pub mod profile_wizard;
+pub mod pull_choice;
 pub mod registry;
+pub mod scope_view;
+pub mod search;
 pub mod serve_ctrl;
+pub mod settings_model;
 pub mod status;
+pub mod tuning_view;
 pub mod ui_state;
 pub mod writer;
 
@@ -26,6 +32,12 @@ pub fn native_cli_path() -> Option<PathBuf> {
         if path.is_file() {
             return Some(path);
         }
+    }
+    // Tests never fall back to a real build: a test reaching
+    // `start_background_serve` would exec a detached `hipfire serve` that
+    // outlives the test and holds the GPU and its per-card locks.
+    if cfg!(test) {
+        return None;
     }
     let home = env::var_os("HIPFIRE_HOME")
         .map(PathBuf::from)
@@ -70,11 +82,18 @@ impl HipfirePaths {
             .map(PathBuf::from)
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".hipfire")))
             .unwrap_or_else(|| PathBuf::from(".hipfire"));
-        let models = env::var_os("HIPFIRE_MODELS_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| root.join("models"));
+        let models = env::var_os("HIPFIRE_MODELS_DIR").map(PathBuf::from);
+        let mut paths = Self::under(root);
+        if let Some(models) = models {
+            paths.models = models;
+        }
+        paths
+    }
+
+    /// Every path under `root`, reading no environment (fixture homes).
+    pub fn under(root: PathBuf) -> Self {
         Self {
-            models,
+            models: root.join("models"),
             config: root.join("config.toml"),
             legacy_config: root.join("config.json"),
             models_catalog: root.join("models.toml"),
@@ -89,12 +108,27 @@ impl HipfirePaths {
     }
 }
 
+/// Serialises the tests that mutate process env (`HIPFIRE_CLI_BIN`, ...).
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
+    fn native_cli_path_never_falls_back_to_a_real_build_under_test() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        env::remove_var("HIPFIRE_CLI_BIN");
+        assert_eq!(native_cli_path(), None);
+        // The deliberate spawn: with a built `target/*/hipfire` on disk this
+        // used to exec a detached `hipfire serve -d`.
+        assert!(status::start_background_serve().is_err());
+    }
+
+    #[test]
     fn native_cli_path_resolves_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = env::temp_dir().join(format!("hipfire-native-cli-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let binary = dir.join("hipfire");

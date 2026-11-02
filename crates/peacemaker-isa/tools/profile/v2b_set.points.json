@@ -1,0 +1,85 @@
+{
+ "symbol": "gemm_mq4g256v2_residual_iu4_pm_v2b_set_gfx1151",
+ "rules": [
+  {
+   "name": "epoch",
+   "before": "ds_load_2addr_b64 v[184:187], v249 offset0:16 offset1:144",
+   "occurrences": [
+    0,
+    4
+   ]
+  },
+  {
+   "name": "pass",
+   "before": "ds_load_2addr_b64 v[184:187], v249 offset0:16 offset1:144",
+   "occurrences": [
+    1,
+    2,
+    3,
+    5,
+    6,
+    7
+   ]
+  },
+  {
+   "name": "epoch",
+   "before": "ds_load_2addr_b64 v[184:187], v251 offset0:16 offset1:144",
+   "occurrences": [
+    0,
+    4
+   ]
+  },
+  {
+   "name": "pass",
+   "before": "ds_load_2addr_b64 v[184:187], v251 offset0:16 offset1:144",
+   "occurrences": [
+    1,
+    2,
+    3,
+    5,
+    6,
+    7
+   ]
+  },
+  {
+   "name": "fold",
+   "before": "v_cvt_f32_f16_e64 v220"
+  },
+  {
+   "name": "fold",
+   "before": "v_cvt_f32_f16_e64 v255"
+  },
+  {
+   "name": "fold",
+   "before": "v_mov_b32_dpp v192, v220 row_share:8"
+  },
+  {
+   "name": "fold",
+   "before": "v_mov_b32_dpp v192, v255 row_share:8"
+  },
+  {
+   "name": "stage",
+   "before": "v_xor_b32_e32 v224"
+  },
+  {
+   "name": "stage.done",
+   "after": "ds_store_b64 v244, v[238:239]"
+  },
+  {
+   "name": "bar.pre_signal",
+   "before": "s_barrier"
+  },
+  {
+   "name": "bar.post_wait",
+   "after": "s_barrier"
+  },
+  {
+   "name": "head",
+   "before": "global_load_u16 v221"
+  },
+  {
+   "name": "epilogue",
+   "label": ".Lv2b_set_epilogue"
+  }
+ ]
+}

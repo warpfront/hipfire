@@ -87,7 +87,7 @@ Commits by author (top of list):
   821  Kaden Schutt <k9crypto@protonmail.com>
    80  Kaden Schutt <151092359+Kaden-Schutt@users.noreply.github.com>
    79  Kevin Read <me@kevin-read.com>
-   55  kaden <kaden@k9lin.local>
+   55  kaden <kaden@<local-workstation>>
    19  Kevin Read <kevin.read@schleifenbauer.eu>
    17  Björn Bösel <bjoernboesel@gmail.com>
    17  alpineq <alpineq@protonmail.com>
@@ -110,7 +110,7 @@ LOC contributed by author (top of list):
 ```
 
 Kaden's three identity strings (k9crypto + 151092359+Kaden-Schutt +
-k9lin.local) collapse to one person, totaling ~1.68M LOC and ~956
+local-workstation address) collapse to one person, totaling ~1.68M LOC and ~956
 commits — dominant by ~17× over the next contributor.
 
 LOC counts via `--shortstat` are coarse (they count any line change
@@ -609,8 +609,8 @@ docstring:
 ```markdown
 ## Licensing & attribution
 
-hipfire is licensed under the Apache License 2.0. See [LICENSE](LICENSE)
-and [NOTICE](NOTICE).
+hipfire is licensed under the Apache License 2.0. See `LICENSE`
+and `NOTICE`.
 
 ### For contributors
 - By submitting a contribution, you certify that you have the right

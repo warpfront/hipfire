@@ -241,6 +241,50 @@ class InstallRevisionTests(unittest.TestCase):
             INSTALLER_TEXT,
         )
 
+    def test_default_selects_latest_release_tag(self):
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            api = tmp / "latest.json"
+            api.write_text('{\n  "url": "x",\n  "tag_name": "v0.4.2.1",\n  "name": "v0.4.2.1"\n}\n', encoding="utf-8")
+            result = _curl_installer(
+                tmp, "--print-selection", "--yes",
+                home=tmp / "home", remote=tmp / "remote",
+                extra_env={"HIPFIRE_RELEASES_LATEST_API": api.as_uri()},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "tag v0.4.2.1")
+            self.assertFalse((tmp / "home").exists())
+
+    def test_default_falls_back_to_master_with_warning(self):
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            for body in (None, '{"message": "Not Found"}', '{"tag_name": "--upload-pack=x"}'):
+                api = tmp / "latest.json"
+                if body is None:
+                    api.unlink(missing_ok=True)
+                else:
+                    api.write_text(body, encoding="utf-8")
+                result = _curl_installer(
+                    tmp, "--print-selection", "--yes",
+                    home=tmp / "home", remote=tmp / "remote",
+                    extra_env={"HIPFIRE_RELEASES_LATEST_API": api.as_uri()},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.strip(), "branch master")
+                self.assertIn("WARNING: could not resolve the latest hipfire release", result.stderr)
+
+    def test_explicit_branch_skips_release_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp_s:
+            tmp = Path(tmp_s)
+            result = _curl_installer(
+                tmp, "--branch", "beta", "--print-selection",
+                home=tmp / "home", remote=tmp / "remote",
+                extra_env={"HIPFIRE_RELEASES_LATEST_API": (tmp / "missing.json").as_uri()},
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), "branch beta")
+            self.assertNotIn("WARNING", result.stderr)
+
     def test_managed_dirty_tree_refused_before_mutation(self):
         with tempfile.TemporaryDirectory() as tmp_s:
             tmp = Path(tmp_s)

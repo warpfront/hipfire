@@ -1,0 +1,206 @@
+{
+  "schema_version": 5,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1792116478,
+  "source": "/home/kaden/qcal/release-0.4.3/pm-code-end/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s",
+  "output": "/home/kaden/qcal/release-0.4.3/pm-code-end/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
+  "arch": "gfx1201",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg",
+  "command": [
+    "/home/kaden/qcal/release-0.4.3/pm-code-end/target/debug/peacemaker",
+    "native",
+    "--arch=gfx1201",
+    "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s",
+    "--co=kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co",
+    "--bundle=kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
+    "--host-target=host-x86_64-unknown-linux-gnu"
+  ],
+  "source_sha256": "463cad60ff98ae9eec7ec9d52632745cd8d16acef672b057029cf8c7b42b28dd",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
+    "identity": {
+      "architecture": "gfx1201",
+      "elf_machine_id": 78,
+      "isa": {
+        "major": 12,
+        "minor": 0,
+        "stepping": 1
+      }
+    },
+    "kernels": [
+      {
+        "name": "gemv_mq4g256v2_residual",
+        "wavefront_size": 32,
+        "vgpr_count": 108,
+        "sgpr_count": 30,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 686,
+          "buffer_loads": 28,
+          "buffer_stores": 0,
+          "global_loads": 16,
+          "global_stores": 2,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 3,
+          "kernarg_scalar_loads": 3,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 48,
+          "delay_alu_instructions": 0,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 19
+        }
+      }
+    ]
+  },
+  "peacemaker": {
+    "arm": "custom-isa",
+    "producer": {
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "proof_sha256": "7841824b22f266904466041d1b8a2317358717baea2630dd60a55d894ea78cb4"
+    },
+    "tools": [
+      {
+        "role": "native",
+        "path": "/home/kaden/qcal/release-0.4.3/pm-code-end/target/debug/peacemaker",
+        "version": "peacemaker-isa 0.4.1 native code object v6 writer (ld.lld 24.0.0 layout)",
+        "argv": [
+          "/home/kaden/qcal/release-0.4.3/pm-code-end/target/debug/peacemaker",
+          "native",
+          "--arch=gfx1201",
+          "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s",
+          "--co=kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co",
+          "--bundle=kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
+          "--host-target=host-x86_64-unknown-linux-gnu"
+        ],
+        "sha256": "e5c932568d3681aec5ce3bd84c462da2c5be27e137bb4582a50635794262b796"
+      }
+    ],
+    "s_text_sha256": "463cad60ff98ae9eec7ec9d52632745cd8d16acef672b057029cf8c7b42b28dd",
+    "text_section_sha256": "95dde5707528c9968218763814ec15b1901f07f8380fc0070a271da63b674c04",
+    "shape_contract": {
+      "counts": {},
+      "end_label": null,
+      "forbidden": [],
+      "group_segment_fixed_bytes": 0,
+      "launch_dynamic_lds_bytes": 0,
+      "require_wave32": true,
+      "require_zero_private": true,
+      "require_zero_spills": true,
+      "sgpr_max": null,
+      "start_label": null,
+      "symbol": "gemv_mq4g256v2_residual",
+      "vgpr_max": null
+    },
+    "shape_result": {
+      "counts": {
+        "buffer_load_b32": 14,
+        "buffer_load_b64": 14,
+        "ds_bpermute_b32": 8,
+        "ds_swizzle_b32": 2,
+        "global_load_b128": 14,
+        "global_load_b32": 1,
+        "global_load_b64": 1,
+        "global_store_b32": 1,
+        "global_store_b64": 1,
+        "s_add_co_i32": 14,
+        "s_and_b32": 1,
+        "s_branch": 1,
+        "s_cbranch_execz": 1,
+        "s_cbranch_scc0": 3,
+        "s_cbranch_scc1": 4,
+        "s_cmp_eq_u32": 2,
+        "s_cmp_ge_i32": 1,
+        "s_cmp_lg_u32": 1,
+        "s_cmp_lt_i32": 1,
+        "s_cmp_lt_u32": 3,
+        "s_cselect_b32": 2,
+        "s_endpgm": 1,
+        "s_load_b128": 1,
+        "s_load_b64": 2,
+        "s_lshl_b32": 6,
+        "s_lshr_b32": 2,
+        "s_mov_b32": 4,
+        "s_mul_i32": 7,
+        "s_wait_alu": 9,
+        "s_wait_dscnt": 10,
+        "s_wait_kmcnt": 2,
+        "s_wait_loadcnt": 25,
+        "s_wait_storecnt": 2,
+        "v_add_f32_e32": 25,
+        "v_add_lshl_u32": 8,
+        "v_add_nc_u32_e32": 12,
+        "v_bfe_u32": 112,
+        "v_cmp_gt_u32_e32": 15,
+        "v_cmpx_eq_u32_e32": 1,
+        "v_cndmask_b32_e32": 14,
+        "v_cndmask_b32_e64": 8,
+        "v_cvt_f32_ubyte0_e32": 112,
+        "v_dual_add_f32": 4,
+        "v_dual_fmac_f32": 28,
+        "v_dual_mul_f32": 4,
+        "v_fma_mix_f32": 112,
+        "v_fmac_f32_e32": 42,
+        "v_lshlrev_b32_e32": 5,
+        "v_mov_b32_e32": 17,
+        "v_mul_f32_e32": 6,
+        "valu_slots": 525,
+        "vopd_packets": 36
+      },
+      "private_segment_fixed_size": 0,
+      "sgpr_count": 30,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 108,
+      "vgpr_spill_count": 0,
+      "wavefront_size": 32
+    },
+    "oracle_receipt": null
+  }
+}

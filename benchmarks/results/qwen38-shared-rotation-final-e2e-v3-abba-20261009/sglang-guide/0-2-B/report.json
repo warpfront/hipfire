@@ -1,0 +1,202 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/media/990Pro/hipfire/models/qwen3.8-27b.mq4-xts",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 16384,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": 262144,
+    "card_cap": 870671,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 28370,
+    "vram_total_mb": 46064,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 46016,
+  "max_seq": {
+    "effective": 16384,
+    "requested": 16384,
+    "source": "flag",
+    "run_need": null,
+    "model_limit": null
+  },
+  "max_tokens": 8192,
+  "runs": 1,
+  "warmups": 2,
+  "batch": 1,
+  "prompt_tokens": 115,
+  "prompt_md5": "fd5d95da904b610d01f2e82b608cc0da",
+  "prompt_chars": 194,
+  "warnings": [
+    "prompt is 115 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "power_device": {
+    "card": "card0",
+    "pci": "0000:9e:00.0",
+    "arch": "gfx1100",
+    "selected_by": "ROCR_VISIBLE_DEVICES=1",
+    "sample_period_ms": 500
+  },
+  "power": [
+    {
+      "samples": 95,
+      "duration_s": 46.56,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 60.0,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 82.0
+          },
+          "junction": {
+            "max": 99.0
+          },
+          "mem": {
+            "max": 90.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 2009.2,
+            "min": 873.0,
+            "max": 2692.0
+          },
+          "mclk": {
+            "avg": 1124.0,
+            "min": 1124.0,
+            "max": 1124.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 46064.0,
+        "vram_used_mib": 18110.2,
+        "vram_free_mib": 27953.8,
+        "gtt_total_mib": 112655.5,
+        "gtt_used_mib": 17.1,
+        "gtt_free_mib": 112638.4,
+        "mem_total_mib": 225310.9,
+        "mem_available_mib": 207480.8
+      }
+    }
+  ],
+  "decode_tok_s": {
+    "median": 59.6,
+    "mean": 59.6,
+    "min": 59.6,
+    "max": 59.6,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 606.5,
+    "mean": 606.5,
+    "min": 606.5,
+    "max": 606.5,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 59.3,
+    "mean": 59.3,
+    "min": 59.3,
+    "max": 59.3,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 189.6,
+    "mean": 189.6,
+    "min": 189.6,
+    "max": 189.6,
+    "stdev": 0.0
+  },
+  "spec_requested": "dflash",
+  "spec_route": [
+    "dflash"
+  ],
+  "spec_tau": [
+    2.31
+  ],
+  "run_events": [
+    {
+      "type": "done",
+      "id": "chatcmpl-977131-3",
+      "tokens": 2762,
+      "tok_s": 59.3,
+      "prefill_tokens": 115,
+      "prefill_ms": 189.6,
+      "prefill_tok_s": 606.5,
+      "decode_tok_s": 59.6,
+      "ttft_ms": 189.6,
+      "dflash": true,
+      "tau": 2.31,
+      "cycles": 834,
+      "cached_tokens": 0,
+      "finish_reason": "stop",
+      "attempt_id": 1,
+      "bench_output": "# SGLang：面向高吞吐大模型服务的运行时架构解析\n\n## 1. 核心定义与问题域\n\n**SGLang**（Structured Generation Language）是一个专为大语言模型（LLM）推理服务设计的高性能运行时（Runtime）和编译器框架。它由 UC Berkeley 团队开发，旨在解决通用 LLM 服务框架（如早期版本的 vLLM 或 TGI）在**高并发、长上下文、结构化输出**场景下存在的性能瓶颈。\n\nSGLang 试图解决的核心问题包括：\n\n1.  **前缀重复计算浪费**：在多轮对话、Agent 工作流或批量推理中，大量请求共享相同的系统提示（System Prompt）或上下文前缀。传统框架往往无法高效复用这些已计算的 KV Cache，导致 GPU 算力浪费。\n2.  **结构化生成效率低**：当需要模型输出 JSON、XML 或符合特定语法约束的内容时，传统方法（如 Logits Bias 或后处理校验）效率低下且易出错。SGLang 将语法约束直接融入解码过程。\n3.  **调度与批处理僵化**：通用框架的连续批处理（Continuous Batching）策略在面对长短不一的请求时，可能导致“队头阻塞”或内存碎片化，影响整体吞吐量。\n\nSGLang 的核心创新在于其**RadixAttention** 机制和**编译器驱动的执行优化**，将 LLM 推理从“逐 token 生成”转变为“基于前缀树的批量优化生成”。\n\n---\n\n## 2. 核心组件协同机制\n\nSGLang 的性能优势并非来自单一技术，而是多个子系统在运行时紧密协同的结果。\n\n### 2.1 RadixAttention：前缀缓存的核心\n\nRadixAttention 是 SGLang 的标志性特性。它使用**基数树（Radix Tree）** 来管理 KV Cache。\n\n-   **工作原理**：每个节点代表一个 token 序列的前缀。当新请求到来时，系统首先检查其前缀是否已存在于树中。\n-   **协同效应**：\n    -   如果前缀匹配，直接复用已有的 KV Cache，跳过 Prefill 阶段的大部分计算。\n    -   如果部分匹配，仅计算新增部分的 KV Cache，并更新树结构。\n    -   这种机制使得**多轮对话**和**共享系统提示**的场景吞吐量显著提升，因为 Prefill 阶段（计算密集型）被大幅压缩。\n\n### 2.2 结构化生成（Structured Generation）\n\nSGLang 支持通过 JSON Schema 或正则表达式定义输出约束。\n\n-   **实现方式**：在解码阶段，SGLang 将语法约束编译为**有限状态机（FSM）**，并在每一步 token 采样时，将不符合语法的 token 的 logit 值设为 $-\\infty$。\n-   **协同效应**：\n    -   与 RadixAttention 结合：即使输出被约束，前缀缓存依然有效。\n    -   与调度器结合：结构化生成通常意味着更短的生成长度（因为约束限制了无效路径），调度器可以更精确地预测请求完成时间，优化批处理大小。\n\n### 2.3 运行时与编译器优化\n\nSGLang 采用**编译器驱动**的设计，将模型推理图编译为高效的 CUDA 内核。\n\n-   **算子融合**：将 LayerNorm、GEMM、Softmax 等操作融合，减少内存访问开销。\n-   **动态形状优化**：针对变长序列，动态调整内核参数，避免 padding 浪费。\n-   **与 RadixAttention 协同**：编译器生成的内核能够高效处理非连续内存块（由 Radix Tree 管理），确保缓存复用时的计算效率。\n\n### 2.4 调度与并行能力\n\nSGLang 的调度器采用**优先级感知**和**内存感知**策略。\n\n-   **连续批处理增强**：不仅基于请求数量，还基于**内存占用**和**预计生成长度**进行调度。\n-   **并行策略**：\n    -   **张量并行（TP）**：将模型权重分片到多个 GPU，适用于大模型。\n    -   **流水线并行（PP）**：将模型层分片，适用于超长上下文。\n    -   **与 RadixAttention 协同**：调度器确保共享前缀的请求被分配到同一批处理中，最大化缓存命中率。\n\n---\n\n## 3. 端到端流程：从请求到 Token 返回\n\n以下是一个典型请求在 SGLang 中的处理流程：\n\n1.  **请求接收与解析**：\n    -   客户端发送请求，包含 `prompt`、`sampling_params` 和可选的 `structured_output_schema`。\n    -   SGLang 前端解析请求，提取前缀 token 序列。\n\n2.  **前缀匹配与缓存查找（RadixAttention）**：\n    -   调度器查询 Radix Tree，检查请求前缀是否已存在。\n    -   **情况 A（完全匹配）**：直接加载已有 KV Cache，跳过 Prefill。\n    -   **情况 B（部分匹配）**：加载匹配部分的 KV Cache，仅对新增 token 执行 Prefill。\n    -   **情况 C（无匹配）**：执行完整 Prefill，并将新生成的 KV Cache 插入 Radix Tree。\n\n3.  **批处理调度**：\n    -   调度器将当前请求与队列中其他请求合并，形成一批（Batch）。\n    -   调度器考虑内存限制、请求优先级和预计生成长度，优化批处理大小。\n\n4.  **Prefill 阶段（如需要）**：\n    -   对新增 token 执行前向传播，计算 KV Cache。\n    -   编译器生成的融合内核在此阶段高效执行。\n\n5.  **Decode 阶段（逐 token 生成）**：\n    -   进入自回归解码循环。\n    -   **结构化生成检查**：如果存在约束，FSM 更新状态，屏蔽非法 token 的 logit。\n    -   **采样**：根据采样参数（temperature, top_p 等）选择下一个 token。\n    -   **KV Cache 更新**：将新 token 的 KV 追加到 Radix Tree 对应节点。\n\n6.  **流式返回**：\n    -   生成的 token 通过 WebSocket 或 HTTP 流式返回给客户端。\n    -   请求完成后，其 KV Cache 保留在 Radix Tree 中，供后续请求复用（直到被 LRU 策略淘汰）。\n\n---\n\n## 4. 适用与不适用场景\n\n### 适用场景\n\n1.  **多轮对话与 Agent 工作流**：\n    -   系统提示（System Prompt）固定，用户输入变化。RadixAttention 可大幅减少重复计算。\n2.  **结构化数据生成**：\n    -   需要输出 JSON、SQL 查询或特定格式文本。SGLang 的原生支持比后处理更可靠、高效。\n3.  **高吞吐批量推理**：\n    -   大量请求共享相似前缀（如文档摘要、代码补全）。\n4.  **长上下文服务**：\n    -   结合流水线并行，SGLang 能更高效地管理长序列的 KV Cache。\n\n### 不适用场景\n\n1.  **单次、无共享前缀的短请求**：\n    -   如果每个请求都是独立的、短小的，且无共享前缀，RadixAttention 的优势不明显，甚至可能因树管理开销而略逊于简单框架。\n2.  **极端低延迟要求（单请求）**：\n    -   SGLang 优化的是**吞吐量**（Throughput），而非单请求延迟（Latency）。对于需要最低可能延迟的单用户交互，专用低延迟框架可能更优。\n3.  **非 LLM 任务**：\n    -   SGLang 专为 LLM 推理设计，不适用于图像生成、嵌入模型等非自回归任务。\n\n---\n\n## 5. 与通用 vLLM 风格服务系统的比较维度\n\n在评估 SGLang 与 vLLM 等通用框架时，应关注以下维度：\n\n| 维度 | SGLang | 通用 vLLM 风格框架 |\n|------|--------|-------------------|\n| **前缀缓存机制** | Radix Tree，显式管理，高命中率 | PagedAttention，隐式管理，依赖块复用 |\n| **结构化生成** | 原生支持，编译进解码过程 | 通常依赖 Logits Bias 或后处理，效率较低 |\n| **调度策略** | 内存感知 + 优先级感知，优化批处理 | 连续批处理，基于请求数量 |\n| **编译器优化** | 深度算子融合，动态形状优化 | 标准 CUDA 内核，优化程度取决于版本 |\n| **吞吐量（共享前缀）** | 显著更高（因 Prefill 复用） | 较低（重复计算 Prefill） |\n| **单请求延迟** | 中等（优化吞吐量） | 可能更低（优化延迟） |\n| **部署复杂度** | 较高（需理解 Radix Tree 和编译器） | 较低（配置简单） |\n| **生态兼容性** | 支持主流模型，但部分新特性需特定版本 | 生态更广泛，社区支持更成熟 |\n\n**关键结论**：如果你的工作负载具有**高前缀共享率**或**强结构化输出需求**，SGLang 在吞吐量上具有显著优势。如果工作负载是**随机、独立、短请求**，通用框架可能更简单且性能差异不大。\n\n---\n\n## 6. 最小但现实的部署示例\n\n以下是一个使用 SGLang 部署 Llama-3-8B-Instruct 模型，并启用结构化生成的最小示例。\n\n### 6.1 安装\n\n```bash\npip install sglang\n```\n\n### 6.2 启动服务器\n\n```bash\npython -m sglang.launch_server \\\n    --model-path meta-llama/Llama-3-8B-Instruct \\\n    --tp 1 \\\n    --port 30000 \\\n    --enable-structured-output\n```\n\n-   `--tp 1`：张量并行度为 1（单 GPU）。\n-   `--enable-structured-output`：启用结构化生成支持。\n\n### 6.3 客户端请求（Python）\n\n```python\nimport requests\nimport json\n\nurl = \"http://localhost:30000/generate\"\n\n# 定义 JSON Schema 约束\nschema = {\n    \"type\": \"object\",\n    \"properties\": {\n        \"name\": {\"type\": \"string\"},\n        \"age\": {\"type\": \"integer\"}\n    },\n    \"required\": [\"name\", \"age\"]\n}\n\npayload = {\n    \"text\": \"Generate a JSON object for a person named Alice, age 30.\",\n    \"sampling_params\": {\n        \"temperature\": 0.7,\n        \"max_new_tokens\": 100\n    },\n    \"structured_output\": json.dumps(schema)\n}\n\nresponse = requests.post(url, json=payload)\nresult = response.json()\n\nprint(\"Generated Output:\", result[\"text\"])\n# 预期输出类似: {\"name\": \"Alice\", \"age\": 30}\n```\n\n### 6.4 验证前缀缓存效果\n\n发送两个请求，共享相同系统提示：\n\n```python\nsystem_prompt = \"You are a helpful assistant.\"\n\n# 请求 1\npayload1 = {\n    \"text\": f\"{system_prompt} What is the capital of France?\",\n    \"sampling_params\": {\"max_new_tokens\": 10}\n}\nrequests.post(url, json=payload1)\n\n# 请求 2（共享前缀）\npayload2 = {\n    \"text\": f\"{system_prompt} What is the capital of Germany?\",\n    \"sampling_params\": {\"max_new_tokens\": 10}\n}\nrequests.post(url, json=payload2)\n```\n\n在 SGLang 日志中，你会看到第二个请求的 Prefill 时间显著短于第一个，因为系统提示的 KV Cache 被复用。\n\n---\n\n## 7. 总结\n\nSGLang 是一个面向**高吞吐、结构化、共享前缀**场景的 LLM 推理运行时。其核心优势在于 RadixAttention 对前缀缓存的高效管理，以及编译器驱动的执行优化。它并非通用框架的简单替代品，而是在特定工作负载下提供显著性能提升的专业工具。在选择时，应重点评估工作负载的前缀共享率和结构化输出需求，而非仅关注单请求延迟。"
+    }
+  ],
+  "samples": {
+    "decode": [
+      59.6
+    ],
+    "prefill": [
+      606.5
+    ],
+    "wall": [
+      59.3
+    ],
+    "ttft_ms": [
+      189.6
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}

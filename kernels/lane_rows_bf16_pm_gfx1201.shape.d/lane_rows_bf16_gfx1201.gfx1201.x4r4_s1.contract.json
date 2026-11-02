@@ -1,0 +1,986 @@
+{
+  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: A0\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A1\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A2\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: A3\n        .offset: 24\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: x\n        .offset: 32\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y0\n        .offset: 40\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y1\n        .offset: 48\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y2\n        .offset: 56\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y3\n        .offset: 64\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: M0\n        .offset: 72\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M1\n        .offset: 76\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M2\n        .offset: 80\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: M3\n        .offset: 84\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: K\n        .offset: 88\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: C\n        .offset: 92\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 0\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 96\n    .max_flat_workgroup_size: 32\n    .name: gemv_bf16_xf32_x4_xbatch_r4_pm_gfx1201\n    .private_segment_fixed_size: 0\n    .sgpr_count: 99\n    .sgpr_spill_count: 0\n    .symbol: gemv_bf16_xf32_x4_xbatch_r4_pm_gfx1201.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 72\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1201\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
+  "arch": "gfx1201",
+  "builder_proof": {
+    "arch": "gfx1201",
+    "barriers": [],
+    "builder_crate_version": "0.4.1",
+    "builder_git_sha": "unknown",
+    "clauses": [],
+    "forbidden_mnemonics_checked": [
+      "s_waitcnt (gfx12)",
+      "scratch_*"
+    ],
+    "hazards": [
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 5,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 88,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 90,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 97,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 100,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 128,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_3)",
+        "pc_index": 130,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 134,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 136,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 138,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 140,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 148,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 150,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 152,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 154,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 162,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 164,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 166,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 168,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 176,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 178,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 180,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 182,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 187,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 196,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 198,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 205,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 208,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 225,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_2)",
+        "pc_index": 229,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_3)",
+        "pc_index": 233,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 237,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 242,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 248,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 252,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 256,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 260,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 273,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 278,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 295,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 312,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 329,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 351,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 353,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 359,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 361,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 367,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 369,
+        "rule": "gfx12 SGPR read-after-write"
+      }
+    ],
+    "kernel_id": "lane_rows_bf16",
+    "lds_slots": [],
+    "loop_fixpoints": [
+      {
+        "head": ".Lb16x4r4_group",
+        "iterations": 2
+      },
+      {
+        "head": ".Lb16x4r4_tile32",
+        "iterations": 2
+      }
+    ],
+    "next_free_sgpr": 97,
+    "next_free_vgpr": 72,
+    "reg_plan": [
+      {
+        "base": 0,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "kernarg"
+      },
+      {
+        "base": 2,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "weight_ptr"
+      },
+      {
+        "base": 4,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "x_ptr"
+      },
+      {
+        "base": 6,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "y_ptr"
+      },
+      {
+        "base": 8,
+        "kind": "s",
+        "len": 8,
+        "live": "Whole",
+        "name": "kernarg_a"
+      },
+      {
+        "base": 32,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "k"
+      },
+      {
+        "base": 33,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "c"
+      },
+      {
+        "base": 34,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "m_selected"
+      },
+      {
+        "base": 40,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "workgroup"
+      },
+      {
+        "base": 41,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "wave"
+      },
+      {
+        "base": 42,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "row"
+      },
+      {
+        "base": 44,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "groups"
+      },
+      {
+        "base": 45,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "temp"
+      },
+      {
+        "base": 46,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "temp2"
+      },
+      {
+        "base": 47,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "exec_mask"
+      },
+      {
+        "base": 48,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "k_remaining"
+      },
+      {
+        "base": 49,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "group_offset"
+      },
+      {
+        "base": 50,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "x_group_offset"
+      },
+      {
+        "base": 51,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "group_index"
+      },
+      {
+        "base": 52,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "k_bytes"
+      },
+      {
+        "base": 53,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "m_bytes"
+      },
+      {
+        "base": 54,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "row_bytes"
+      },
+      {
+        "base": 55,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "store_temp"
+      },
+      {
+        "base": 57,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "weight_row_bytes"
+      },
+      {
+        "base": 58,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "k_local"
+      },
+      {
+        "base": 95,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "weight_row_lo"
+      },
+      {
+        "base": 96,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "weight_row_hi"
+      },
+      {
+        "base": 16,
+        "kind": "s",
+        "len": 8,
+        "live": "Whole",
+        "name": "kernarg_b"
+      },
+      {
+        "base": 24,
+        "kind": "s",
+        "len": 4,
+        "live": "Whole",
+        "name": "kernarg_c"
+      },
+      {
+        "base": 28,
+        "kind": "s",
+        "len": 4,
+        "live": "Whole",
+        "name": "kernarg_d"
+      },
+      {
+        "base": 35,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "matrix_base"
+      },
+      {
+        "base": 36,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "blocks_0"
+      },
+      {
+        "base": 37,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "blocks_01"
+      },
+      {
+        "base": 38,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "blocks_012"
+      },
+      {
+        "base": 39,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "blocks_0123"
+      },
+      {
+        "base": 56,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar_domain"
+      },
+      {
+        "base": 59,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "tiles32"
+      },
+      {
+        "base": 64,
+        "kind": "s",
+        "len": 8,
+        "live": "Whole",
+        "name": "x_row_ptrs0"
+      },
+      {
+        "base": 0,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "tid"
+      },
+      {
+        "base": 1,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "weight_offset"
+      },
+      {
+        "base": 2,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "x_offset"
+      },
+      {
+        "base": 3,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "shuffle_addr"
+      },
+      {
+        "base": 4,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "lane"
+      },
+      {
+        "base": 5,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "temp"
+      },
+      {
+        "base": 6,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "lds_store"
+      },
+      {
+        "base": 7,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "lds_lane"
+      },
+      {
+        "base": 8,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "lds_read"
+      },
+      {
+        "base": 9,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "partial_addr"
+      },
+      {
+        "base": 10,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "y_addr"
+      },
+      {
+        "base": 11,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "y_data"
+      },
+      {
+        "base": 12,
+        "kind": "v",
+        "len": 4,
+        "live": "Whole",
+        "name": "item_q"
+      },
+      {
+        "base": 16,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "weights"
+      },
+      {
+        "base": 24,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "x_row0"
+      },
+      {
+        "base": 32,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "x_row1"
+      },
+      {
+        "base": 40,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "x_row2"
+      },
+      {
+        "base": 48,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "x_row3"
+      },
+      {
+        "base": 56,
+        "kind": "v",
+        "len": 4,
+        "live": "Whole",
+        "name": "acc_row0"
+      },
+      {
+        "base": 60,
+        "kind": "v",
+        "len": 4,
+        "live": "Whole",
+        "name": "acc_row1"
+      },
+      {
+        "base": 64,
+        "kind": "v",
+        "len": 4,
+        "live": "Whole",
+        "name": "acc_row2"
+      },
+      {
+        "base": 68,
+        "kind": "v",
+        "len": 4,
+        "live": "Whole",
+        "name": "acc_row3"
+      }
+    ],
+    "s_text_sha256": "b3a90f78c0ddf1b8a22a4505200048e650d8a95f1d063c5e08608f9630997ce7",
+    "variant": "x4r4_s1",
+    "vopd_pairs": 0,
+    "waits": [
+      {
+        "count": 0,
+        "counter": "Km",
+        "insn": "s_wait_kmcnt 0x0",
+        "pc_index": 9,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Load",
+        "insn": "s_wait_loadcnt 0x0",
+        "pc_index": 119,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Load",
+        "insn": "s_wait_loadcnt 0x0",
+        "pc_index": 223,
+        "reason": "Barrier"
+      },
+      {
+        "count": 3,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x3",
+        "pc_index": 266,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x2",
+        "pc_index": 268,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x1",
+        "pc_index": 270,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 272,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x3",
+        "pc_index": 284,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x2",
+        "pc_index": 286,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x1",
+        "pc_index": 288,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 290,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x3",
+        "pc_index": 301,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x2",
+        "pc_index": 303,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x1",
+        "pc_index": 305,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 307,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x3",
+        "pc_index": 318,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x2",
+        "pc_index": 320,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x1",
+        "pc_index": 322,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 324,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x3",
+        "pc_index": 335,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x2",
+        "pc_index": 337,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x1",
+        "pc_index": 339,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 341,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 373,
+        "reason": "Barrier"
+      }
+    ]
+  },
+  "group_segment_fixed_bytes": 0,
+  "isa_shape": {
+    "barriers": 0,
+    "ds": 20,
+    "instructions": 376,
+    "next_free_sgpr": 97,
+    "next_free_vgpr": 72,
+    "valu_slots": 121,
+    "vmem": 18,
+    "vopd_pairs": 0,
+    "waits": 72,
+    "wmma": 0
+  },
+  "kernarg_segment_bytes": 96,
+  "launch": {
+    "block": [
+      32,
+      1,
+      1
+    ],
+    "grid": [
+      "sum Mi",
+      "1",
+      "1"
+    ],
+    "row_domain": {
+      "logical_rows": {
+        "max": 4,
+        "min": 1
+      }
+    }
+  },
+  "launch_dynamic_lds_bytes": 0,
+  "module": "lane_rows_bf16_pm_gfx1201",
+  "require_wave32": true,
+  "require_zero_private": true,
+  "require_zero_spills": true,
+  "sgpr_max": 97,
+  "symbol": "gemv_bf16_xf32_x4_xbatch_r4_pm_gfx1201",
+  "vgpr_max": 72
+}

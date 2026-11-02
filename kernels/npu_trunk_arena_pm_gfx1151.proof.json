@@ -1,0 +1,939 @@
+{
+  "module": "npu_trunk_arena_pm_gfx1151",
+  "arch": "gfx1151",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "d26a565301e4950661962c0f99c9b8aaa88b70aee49e2f59a009627b819c7342",
+  "kernels": [
+    {
+      "kernel_id": "npu_trunk_arena",
+      "variant": "npu_arena_copy_bf16_f32_pm",
+      "arch": "gfx1151",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "reg_plan": [
+        {
+          "name": "kernargs",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 20,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 21,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 22,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 23,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 4,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 5,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 6,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 7,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 8,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 9,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 10,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 11,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 16,
+      "next_free_sgpr": 24,
+      "waits": [
+        {
+          "pc_index": 14,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s16"
+            }
+          }
+        },
+        {
+          "pc_index": 32,
+          "insn": "s_waitcnt vmcnt(0)",
+          "counter": "Vm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v3"
+            }
+          }
+        },
+        {
+          "pc_index": 35,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 15,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 20,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 22,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 28,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 30,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "c9900d303544fdf390002be3dfc471d57a0e5488e0a6788ed07fb1f3e50e6a18"
+    },
+    {
+      "kernel_id": "npu_trunk_arena",
+      "variant": "npu_arena_copy_bf16_bf16_pm",
+      "arch": "gfx1151",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "reg_plan": [
+        {
+          "name": "kernargs",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 20,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 21,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 22,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 23,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 4,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 5,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 6,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 7,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 8,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 9,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 10,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 11,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 16,
+      "next_free_sgpr": 24,
+      "waits": [
+        {
+          "pc_index": 14,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s16"
+            }
+          }
+        },
+        {
+          "pc_index": 32,
+          "insn": "s_waitcnt vmcnt(0)",
+          "counter": "Vm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v3"
+            }
+          }
+        },
+        {
+          "pc_index": 34,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 15,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 20,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 22,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 28,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 30,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "26c995476f144db65596b37f8fb87283a2f9ce1ba815791e7d58894af9f4928d"
+    },
+    {
+      "kernel_id": "npu_trunk_arena",
+      "variant": "npu_arena_copy_f32_f32_pm",
+      "arch": "gfx1151",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "reg_plan": [
+        {
+          "name": "kernargs",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 20,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 21,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 22,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 23,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 4,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 5,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 6,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 7,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 8,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 9,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 10,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 11,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 16,
+      "next_free_sgpr": 24,
+      "waits": [
+        {
+          "pc_index": 14,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s16"
+            }
+          }
+        },
+        {
+          "pc_index": 32,
+          "insn": "s_waitcnt vmcnt(0)",
+          "counter": "Vm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v3"
+            }
+          }
+        },
+        {
+          "pc_index": 34,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 15,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 20,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 22,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 28,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 30,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "0adb9b4c102c4ec1a1ebce05ba5c6f8fb5f1d05b8764a700205cff342e664430"
+    }
+  ]
+}

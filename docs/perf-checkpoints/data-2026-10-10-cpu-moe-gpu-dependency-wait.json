@@ -1,0 +1,838 @@
+{
+ "schema": "cpu-moe-gpu-dependency-wait/2",
+ "date": "2026-10-10",
+ "owner": "CpuWaitModeBench",
+ "identity": {
+  "source_commit": "82a06e95d2b6a61aa150af766b22866acc74275b",
+  "source_branch": "feature/qwen35-moe-offload",
+  "tree": "clean",
+  "cli_md5": "653bcaee005273dd4df8f353d95c8c52",
+  "daemon_md5": "23a7dccec849572bc68078ff25eab235",
+  "frozen_copies": ".codeinsight+research/cpu-depbench-20261010-104403/",
+  "model_tag": "qwen3.6:35b-a3b",
+  "model_path": "/home/avery/.hipfire/models/qwen3.6-35b-a3b.mq4p",
+  "model_md5": "f9b5b13eb24ecbe4b39f3a3f4a297645",
+  "model_note": "local graded-mq4p fixture; differs from AGENTS.md canonical DFlash-A3B acceptance pin edde51ec; NOT the canonical fixture",
+  "model_quant": "mq4p (graded-HQ MoE; router Q8 + shared gate/up HFQ4/MQ + SharedDown)",
+  "prompt_file": "benchmarks/prompts/merge_sort_thinking_off.txt",
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "hardware": {
+   "gpu_product": "AMD Radeon RX 9070 XT",
+   "gfx": "gfx1201 (Navi 48, 17.1 GB VRAM)",
+   "rocm_hip": "7.2.53211",
+   "cpu": "AMD Ryzen 7 7800X3D 8-Core",
+   "cpu_workers": "default Rayon (HIPFIRE knobs unset; RAYON_NUM_THREADS unset)"
+  },
+  "config": "budget24/specoff/graph0/HIP-replay/GPU0/q8-vmm/seq4096/256tok/DPM10s; GPU_MAX_HW_QUEUES unset (auto RDNA4 cap 1 observed); serial under /tmp/hipfire-gpu.lock; memory.max_seq scoped 4096 per run, restored 200000 after",
+  "knob_source": "crates/rdna-compute/src/dispatch.rs:1684-1702 reads HIPFIRE_HIP_WAIT (spin=0x01/auto=0/yield=2/block=4) before set_device; no source change"
+ },
+ "invocations": [
+  {
+   "id": "cpu-exec-debug-20261010-104436",
+   "mode": "unset",
+   "role": "prior baseline"
+  },
+  {
+   "id": "cpu-exec-debug-20261010-104605",
+   "mode": "unset",
+   "role": "prior baseline"
+  },
+  {
+   "id": "cpu-exec-debug-20261010-104733",
+   "mode": "unset",
+   "role": "prior baseline"
+  },
+  {
+   "id": "cpu-exec-debug-20261010-110401",
+   "mode": "spin",
+   "role": "spin pair 1"
+  },
+  {
+   "id": "cpu-exec-debug-20261010-110538",
+   "mode": "unset",
+   "role": "interleaved unset (thermal bias)"
+  },
+  {
+   "id": "cpu-exec-debug-20261010-110709",
+   "mode": "spin",
+   "role": "spin pair 2"
+  },
+  {
+   "id": "cpu-exec-debug-20261010-110835",
+   "mode": "spin",
+   "role": "spin pair 3"
+  }
+ ],
+ "pairs": {
+  "cpu-exec-debug-20261010-104436": {
+   "wait_mode": "unset",
+   "trace": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```",
+    "tokens": 166,
+    "tok_s": 51.8,
+    "finish_reason": "stop"
+   },
+   "control": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    result = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            result.append(left[i])\n            i += 1\n        else:\n            result.append(right[j])\n            j += 1\n            \n    result.extend(left[i:])\n    result.extend(right[j:])\n    \n    return result\n```",
+    "tokens": 160,
+    "tok_s": 52.4,
+    "finish_reason": "stop"
+   }
+  },
+  "cpu-exec-debug-20261010-104605": {
+   "wait_mode": "unset",
+   "trace": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n            \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```",
+    "tokens": 166,
+    "tok_s": 51.4,
+    "finish_reason": "stop"
+   },
+   "control": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```",
+    "tokens": 166,
+    "tok_s": 53.7,
+    "finish_reason": "stop"
+   }
+  },
+  "cpu-exec-debug-20261010-104733": {
+   "wait_mode": "unset",
+   "trace": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```",
+    "tokens": 160,
+    "tok_s": 52.0,
+    "finish_reason": "stop"
+   },
+   "control": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])\n    \n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n            \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```",
+    "tokens": 141,
+    "tok_s": 51.2,
+    "finish_reason": "stop"
+   }
+  },
+  "cpu-exec-debug-20261010-110401": {
+   "wait_mode": "spin",
+   "trace": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n            \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```",
+    "tokens": 166,
+    "tok_s": 51.4,
+    "finish_reason": "stop"
+   },
+   "control": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    merged = []\n    i = j = 0\n    \n    while i < len(left_half) and j < len(right_half):\n        if left_half[i] < right_half[j]:\n            merged.append(left_half[i])\n            i += 1\n        else:\n            merged.append(right_half[j])\n            j += 1\n            \n    while i < len(left_half):\n        merged.append(left_half[i])\n        i += 1\n        \n    while j < len(right_half):\n        merged.append(right_half[j])\n        j += 1\n        \n    return merged\n```",
+    "tokens": 180,
+    "tok_s": 53.1,
+    "finish_reason": "stop"
+   }
+  },
+  "cpu-exec-debug-20261010-110538": {
+   "wait_mode": "unset",
+   "trace": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n            \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```",
+    "tokens": 166,
+    "tok_s": 50.8,
+    "finish_reason": "stop"
+   },
+   "control": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])\n    \n    return merge(left, right)\n\ndef merge(left, right):\n    result = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            result.append(left[i])\n            i += 1\n        else:\n            result.append(right[j])\n            j += 1\n    \n    result.extend(left[i:])\n    result.extend(right[j:])\n    \n    return result\n```",
+    "tokens": 156,
+    "tok_s": 52.0,
+    "finish_reason": "stop"
+   }
+  },
+  "cpu-exec-debug-20261010-110709": {
+   "wait_mode": "spin",
+   "trace": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```",
+    "tokens": 166,
+    "tok_s": 51.7,
+    "finish_reason": "stop"
+   },
+   "control": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```",
+    "tokens": 160,
+    "tok_s": 52.8,
+    "finish_reason": "stop"
+   }
+  },
+  "cpu-exec-debug-20261010-110835": {
+   "wait_mode": "spin",
+   "trace": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n            \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```",
+    "tokens": 160,
+    "tok_s": 51.5,
+    "finish_reason": "stop"
+   },
+   "control": {
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n            \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```",
+    "tokens": 160,
+    "tok_s": 52.1,
+    "finish_reason": "stop"
+   }
+  }
+ },
+ "shapes_note": "final cumulative line per (quant,graded) from trace log; mean-per-call over stated calls/steps, NOT per-call samples; rows=1 decode splice",
+ "shapes": {
+  "20261010-104436": {
+   "Mq4G256|true": {
+    "calls": 512,
+    "cpu_steps": 1503,
+    "gu_ms": 0.23,
+    "dn_ms": 0.12,
+    "total_ms": 0.59,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|true": {
+    "calls": 1024,
+    "cpu_steps": 1908,
+    "gu_ms": 0.22,
+    "dn_ms": 0.12,
+    "total_ms": 0.58,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq6G256|true": {
+    "calls": 256,
+    "cpu_steps": 2635,
+    "gu_ms": 0.25,
+    "dn_ms": 0.13,
+    "total_ms": 0.62,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|false": {
+    "calls": 128,
+    "cpu_steps": 2560,
+    "gu_ms": 0.2,
+    "dn_ms": 0.11,
+    "total_ms": 0.55,
+    "d2h_wait_ms": 0.12
+   }
+  },
+  "20261010-104605": {
+   "Mq4G256|true": {
+    "calls": 512,
+    "cpu_steps": 1503,
+    "gu_ms": 0.25,
+    "dn_ms": 0.13,
+    "total_ms": 0.62,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|true": {
+    "calls": 1024,
+    "cpu_steps": 1908,
+    "gu_ms": 0.24,
+    "dn_ms": 0.13,
+    "total_ms": 0.6,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq6G256|true": {
+    "calls": 256,
+    "cpu_steps": 2622,
+    "gu_ms": 0.26,
+    "dn_ms": 0.14,
+    "total_ms": 0.63,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|false": {
+    "calls": 128,
+    "cpu_steps": 2596,
+    "gu_ms": 0.21,
+    "dn_ms": 0.12,
+    "total_ms": 0.57,
+    "d2h_wait_ms": 0.12
+   }
+  },
+  "20261010-104733": {
+   "Mq4G256|true": {
+    "calls": 512,
+    "cpu_steps": 1478,
+    "gu_ms": 0.23,
+    "dn_ms": 0.12,
+    "total_ms": 0.59,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|true": {
+    "calls": 1024,
+    "cpu_steps": 1915,
+    "gu_ms": 0.22,
+    "dn_ms": 0.12,
+    "total_ms": 0.58,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq6G256|true": {
+    "calls": 256,
+    "cpu_steps": 2559,
+    "gu_ms": 0.24,
+    "dn_ms": 0.13,
+    "total_ms": 0.6,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq3G256Lloyd|false": {
+    "calls": 64,
+    "cpu_steps": 1459,
+    "gu_ms": 0.21,
+    "dn_ms": 0.11,
+    "total_ms": 0.56,
+    "d2h_wait_ms": 0.13
+   }
+  },
+  "20261010-110401": {
+   "Mq4G256|true": {
+    "calls": 512,
+    "cpu_steps": 1503,
+    "gu_ms": 0.24,
+    "dn_ms": 0.13,
+    "total_ms": 0.61,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|true": {
+    "calls": 1024,
+    "cpu_steps": 1912,
+    "gu_ms": 0.23,
+    "dn_ms": 0.13,
+    "total_ms": 0.6,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq6G256|true": {
+    "calls": 256,
+    "cpu_steps": 2618,
+    "gu_ms": 0.25,
+    "dn_ms": 0.13,
+    "total_ms": 0.62,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|false": {
+    "calls": 128,
+    "cpu_steps": 2556,
+    "gu_ms": 0.21,
+    "dn_ms": 0.11,
+    "total_ms": 0.56,
+    "d2h_wait_ms": 0.13
+   }
+  },
+  "20261010-110538": {
+   "Mq4G256|true": {
+    "calls": 512,
+    "cpu_steps": 1503,
+    "gu_ms": 0.25,
+    "dn_ms": 0.13,
+    "total_ms": 0.62,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|true": {
+    "calls": 1024,
+    "cpu_steps": 1908,
+    "gu_ms": 0.23,
+    "dn_ms": 0.12,
+    "total_ms": 0.59,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq6G256|true": {
+    "calls": 256,
+    "cpu_steps": 2622,
+    "gu_ms": 0.25,
+    "dn_ms": 0.13,
+    "total_ms": 0.63,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq3G256Lloyd|false": {
+    "calls": 128,
+    "cpu_steps": 2596,
+    "gu_ms": 0.2,
+    "dn_ms": 0.11,
+    "total_ms": 0.55,
+    "d2h_wait_ms": 0.13
+   }
+  },
+  "20261010-110709": {
+   "Mq4G256|true": {
+    "calls": 512,
+    "cpu_steps": 1503,
+    "gu_ms": 0.23,
+    "dn_ms": 0.12,
+    "total_ms": 0.59,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|true": {
+    "calls": 1024,
+    "cpu_steps": 1908,
+    "gu_ms": 0.22,
+    "dn_ms": 0.12,
+    "total_ms": 0.58,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq6G256|true": {
+    "calls": 256,
+    "cpu_steps": 2635,
+    "gu_ms": 0.24,
+    "dn_ms": 0.13,
+    "total_ms": 0.61,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq3G256Lloyd|false": {
+    "calls": 128,
+    "cpu_steps": 2560,
+    "gu_ms": 0.2,
+    "dn_ms": 0.11,
+    "total_ms": 0.55,
+    "d2h_wait_ms": 0.13
+   }
+  },
+  "20261010-110835": {
+   "Mq4G256|true": {
+    "calls": 512,
+    "cpu_steps": 1478,
+    "gu_ms": 0.23,
+    "dn_ms": 0.13,
+    "total_ms": 0.6,
+    "d2h_wait_ms": 0.12
+   },
+   "Mq3G256Lloyd|true": {
+    "calls": 1024,
+    "cpu_steps": 1911,
+    "gu_ms": 0.22,
+    "dn_ms": 0.12,
+    "total_ms": 0.58,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq6G256|true": {
+    "calls": 256,
+    "cpu_steps": 2544,
+    "gu_ms": 0.24,
+    "dn_ms": 0.13,
+    "total_ms": 0.6,
+    "d2h_wait_ms": 0.13
+   },
+   "Mq3G256Lloyd|false": {
+    "calls": 64,
+    "cpu_steps": 1459,
+    "gu_ms": 0.2,
+    "dn_ms": 0.11,
+    "total_ms": 0.54,
+    "d2h_wait_ms": 0.13
+   }
+  }
+ },
+ "decomposition": {
+  "source": ".codeinsight+research/prof-20261010-105310/{daemon_kernel_trace.csv (37k rows), daemon_hip_api_trace.csv (85k), daemon_memory_copy_trace.csv (18k H2D-labeled only; D2H via d2h4_end anchor)}",
+  "signed_field_semantics": "entry_minus_sd_end_us = sync_entry - sd_end (NEGATIVE when producer pending); return_minus_d2h4_end_us = sync_return - d2h4_end (small positive = true post-completion tail)",
+  "classification": "unfinished ordered producer span (~89us med) + D2H + ~7us post-copy tail; NOT pure GPU compute (busy/idle split below) and NOT pure driver overhead",
+  "busy_idle_entry_to_sd_end_us": {
+   "method": "per-splice overlap of GateSide chain kernel device intervals with [sync_entry, sd_end] from daemon_kernel_trace.csv",
+   "span": {
+    "min": 33.68,
+    "p50": 88.65,
+    "max": 102.86,
+    "mean": 85.7
+   },
+   "gpu_busy": {
+    "min": 23.28,
+    "p50": 53.17,
+    "max": 66.22,
+    "mean": 52.3
+   },
+   "inter_dispatch_idle": {
+    "min": 10.4,
+    "p50": 35.4,
+    "max": 39.0,
+    "mean": 33.41
+   },
+   "busy_fraction_med": 0.61,
+   "note": "idle is normal ~3.2us/kernel launch pacing across ~11-kernel chain, not stall"
+  },
+  "percentiles_us": {
+   "sd_end_minus_entry": {
+    "n": 16,
+    "min": 33.684,
+    "p50": 88.649,
+    "p90": 102.042,
+    "max": 102.861,
+    "mean": 85.705
+   },
+   "d2h4_end_minus_entry": {
+    "n": 16,
+    "min": 54.684,
+    "p50": 109.549,
+    "p90": 122.922,
+    "max": 123.741,
+    "mean": 106.633
+   },
+   "return_minus_d2h4_end_all": {
+    "n": 16,
+    "min": 6.606,
+    "p50": 6.794,
+    "p90": 6.972,
+    "max": 170.105,
+    "mean": 17.012
+   },
+   "return_minus_d2h4_end_no_outlier": {
+    "n": 15,
+    "min": 6.606,
+    "p50": 6.788,
+    "p90": 6.956,
+    "max": 6.972,
+    "mean": 6.806,
+    "outlier": "slot5 170.105 with 280us total sync"
+   },
+   "pending_fraction_of_sync": {
+    "n": 16,
+    "min": 0.317,
+    "p50": 0.761,
+    "p90": 0.786,
+    "max": 0.788,
+    "mean": 0.72
+   },
+   "sync_total": {
+    "n": 16,
+    "min": 61.29,
+    "p50": 117.63,
+    "p90": 130.48,
+    "max": 280.008,
+    "mean": 123.644
+   }
+  },
+  "running_at_entry": "14/16 nonzero: 11 gemv_q8_0 + 1 mq_rotate_x + 1 gemv_hfq4g256_multirow_r2 + 1 sigmoid_mul_f32; slots 2,10 empty",
+  "gateside_chain_slot0_us": "pre-MoE projection gemv_q8_0@grid65536 29.88 (prior-layer mixer/output projection per scout; grid alone cannot name it) > add 2.04 > rmsnorm 2.28 > mq_rotate 2.12 > router gemv_q8_0@8192 3.92 > selector gemv_q8_0@32 8.72 > 2x shared gate/up multirow_r2@8192 3.32+3.24 > topk 5.84 > silu 2.60 > SharedDown@65536 14.40",
+  "grid_medians_us_16_splices": {
+   "q8@65536": "28.76 (16.84-33.84)",
+   "q8@8192": "3.92",
+   "q8@32": "3.68 (3.52-8.72)",
+   "multirow@8192": "3.00",
+   "topk@64": "5.64",
+   "silu@64": "2.32",
+   "SharedDown@65536": "14.44 (14.04-15.00)"
+  },
+  "per_layer": [
+   {
+    "layer_slot": 0,
+    "sd_disp": 36216,
+    "sync_entry": 97085806357038,
+    "sync_return": 97085806487518,
+    "sync_dur_us": 130.48,
+    "orig_entry_minus_sd_end_us": -102.861,
+    "orig_entry_minus_d2h4_end_us": -123.741,
+    "orig_return_minus_d2h4_end_us": 6.739,
+    "corr_sd_end_minus_entry_us": 102.861,
+    "corr_d2h4_end_minus_entry_us": 123.741,
+    "corr_return_minus_d2h4_end_us": 6.739,
+    "corr_pending_fraction": 0.7883,
+    "running_at_entry": [
+     "gemv_q8_0:36206"
+    ],
+    "last_kernel": "gemv_q8_0:36206"
+   },
+   {
+    "layer_slot": 1,
+    "sd_disp": 36238,
+    "sync_entry": 97085807066414,
+    "sync_return": 97085807189164,
+    "sync_dur_us": 122.75,
+    "orig_entry_minus_sd_end_us": -94.949,
+    "orig_entry_minus_d2h4_end_us": -115.95,
+    "orig_return_minus_d2h4_end_us": 6.8,
+    "corr_sd_end_minus_entry_us": 94.949,
+    "corr_d2h4_end_minus_entry_us": 115.95,
+    "corr_return_minus_d2h4_end_us": 6.8,
+    "corr_pending_fraction": 0.7735,
+    "running_at_entry": [
+     "gemv_q8_0:36228"
+    ],
+    "last_kernel": "gemv_q8_0:36228"
+   },
+   {
+    "layer_slot": 2,
+    "sd_disp": 36260,
+    "sync_entry": 97085807761351,
+    "sync_return": 97085807867870,
+    "sync_dur_us": 106.519,
+    "orig_entry_minus_sd_end_us": -78.557,
+    "orig_entry_minus_d2h4_end_us": -99.597,
+    "orig_return_minus_d2h4_end_us": 6.922,
+    "corr_sd_end_minus_entry_us": 78.557,
+    "corr_d2h4_end_minus_entry_us": 99.597,
+    "corr_return_minus_d2h4_end_us": 6.922,
+    "corr_pending_fraction": 0.7375,
+    "running_at_entry": [],
+    "last_kernel": "gemv_q8_0:36250"
+   },
+   {
+    "layer_slot": 3,
+    "sd_disp": 36284,
+    "sync_entry": 97085808452467,
+    "sync_return": 97085808545447,
+    "sync_dur_us": 92.98,
+    "orig_entry_minus_sd_end_us": -65.336,
+    "orig_entry_minus_d2h4_end_us": -86.216,
+    "orig_return_minus_d2h4_end_us": 6.764,
+    "corr_sd_end_minus_entry_us": 65.336,
+    "corr_d2h4_end_minus_entry_us": 86.216,
+    "corr_return_minus_d2h4_end_us": 6.764,
+    "corr_pending_fraction": 0.7027,
+    "running_at_entry": [
+     "mq_rotate_x:36277"
+    ],
+    "last_kernel": "mq_rotate_x:36277"
+   },
+   {
+    "layer_slot": 4,
+    "sd_disp": 36306,
+    "sync_entry": 97085809125004,
+    "sync_return": 97085809244333,
+    "sync_dur_us": 119.329,
+    "orig_entry_minus_sd_end_us": -91.934,
+    "orig_entry_minus_d2h4_end_us": -112.654,
+    "orig_return_minus_d2h4_end_us": 6.675,
+    "corr_sd_end_minus_entry_us": 91.934,
+    "corr_d2h4_end_minus_entry_us": 112.654,
+    "corr_return_minus_d2h4_end_us": 6.675,
+    "corr_pending_fraction": 0.7704,
+    "running_at_entry": [
+     "gemv_q8_0:36296"
+    ],
+    "last_kernel": "gemv_q8_0:36296"
+   },
+   {
+    "layer_slot": 5,
+    "sd_disp": 36328,
+    "sync_entry": 97085809797060,
+    "sync_return": 97085810077068,
+    "sync_dur_us": 280.008,
+    "orig_entry_minus_sd_end_us": -88.863,
+    "orig_entry_minus_d2h4_end_us": -109.903,
+    "orig_return_minus_d2h4_end_us": 170.105,
+    "corr_sd_end_minus_entry_us": 88.863,
+    "corr_d2h4_end_minus_entry_us": 109.903,
+    "corr_return_minus_d2h4_end_us": 170.105,
+    "corr_pending_fraction": 0.3174,
+    "running_at_entry": [
+     "gemv_q8_0:36318"
+    ],
+    "last_kernel": "gemv_q8_0:36318"
+   },
+   {
+    "layer_slot": 6,
+    "sd_disp": 36350,
+    "sync_entry": 97085810615146,
+    "sync_return": 97085810729495,
+    "sync_dur_us": 114.349,
+    "orig_entry_minus_sd_end_us": -86.712,
+    "orig_entry_minus_d2h4_end_us": -107.393,
+    "orig_return_minus_d2h4_end_us": 6.956,
+    "corr_sd_end_minus_entry_us": 86.712,
+    "corr_d2h4_end_minus_entry_us": 107.393,
+    "corr_return_minus_d2h4_end_us": 6.956,
+    "corr_pending_fraction": 0.7583,
+    "running_at_entry": [
+     "gemv_q8_0:36340"
+    ],
+    "last_kernel": "gemv_q8_0:36340"
+   },
+   {
+    "layer_slot": 7,
+    "sd_disp": 36374,
+    "sync_entry": 97085811552661,
+    "sync_return": 97085811613951,
+    "sync_dur_us": 61.29,
+    "orig_entry_minus_sd_end_us": -33.684,
+    "orig_entry_minus_d2h4_end_us": -54.684,
+    "orig_return_minus_d2h4_end_us": 6.606,
+    "corr_sd_end_minus_entry_us": 33.684,
+    "corr_d2h4_end_minus_entry_us": 54.684,
+    "corr_return_minus_d2h4_end_us": 6.606,
+    "corr_pending_fraction": 0.5496,
+    "running_at_entry": [
+     "gemv_hfq4g256_multirow_r2:36371"
+    ],
+    "last_kernel": "gemv_hfq4g256_multirow_r2:36371"
+   },
+   {
+    "layer_slot": 8,
+    "sd_disp": 36396,
+    "sync_entry": 97085812203148,
+    "sync_return": 97085812332897,
+    "sync_dur_us": 129.749,
+    "orig_entry_minus_sd_end_us": -102.042,
+    "orig_entry_minus_d2h4_end_us": -122.922,
+    "orig_return_minus_d2h4_end_us": 6.827,
+    "corr_sd_end_minus_entry_us": 102.042,
+    "corr_d2h4_end_minus_entry_us": 122.922,
+    "corr_return_minus_d2h4_end_us": 6.827,
+    "corr_pending_fraction": 0.7865,
+    "running_at_entry": [
+     "gemv_q8_0:36386"
+    ],
+    "last_kernel": "gemv_q8_0:36386"
+   },
+   {
+    "layer_slot": 9,
+    "sd_disp": 36418,
+    "sync_entry": 97085812918834,
+    "sync_return": 97085813028983,
+    "sync_dur_us": 110.149,
+    "orig_entry_minus_sd_end_us": -82.321,
+    "orig_entry_minus_d2h4_end_us": -103.361,
+    "orig_return_minus_d2h4_end_us": 6.788,
+    "corr_sd_end_minus_entry_us": 82.321,
+    "corr_d2h4_end_minus_entry_us": 103.361,
+    "corr_return_minus_d2h4_end_us": 6.788,
+    "corr_pending_fraction": 0.7474,
+    "running_at_entry": [
+     "gemv_q8_0:36408"
+    ],
+    "last_kernel": "gemv_q8_0:36408"
+   },
+   {
+    "layer_slot": 10,
+    "sd_disp": 36440,
+    "sync_entry": 97085813583370,
+    "sync_return": 97085813687070,
+    "sync_dur_us": 103.7,
+    "orig_entry_minus_sd_end_us": -76.089,
+    "orig_entry_minus_d2h4_end_us": -96.969,
+    "orig_return_minus_d2h4_end_us": 6.731,
+    "corr_sd_end_minus_entry_us": 76.089,
+    "corr_d2h4_end_minus_entry_us": 96.969,
+    "corr_return_minus_d2h4_end_us": 6.731,
+    "corr_pending_fraction": 0.7337,
+    "running_at_entry": [],
+    "last_kernel": "gemv_q8_0:36430"
+   },
+   {
+    "layer_slot": 11,
+    "sd_disp": 36464,
+    "sync_entry": 97085814268987,
+    "sync_return": 97085814395116,
+    "sync_dur_us": 126.129,
+    "orig_entry_minus_sd_end_us": -97.997,
+    "orig_entry_minus_d2h4_end_us": -119.157,
+    "orig_return_minus_d2h4_end_us": 6.972,
+    "corr_sd_end_minus_entry_us": 97.997,
+    "corr_d2h4_end_minus_entry_us": 119.157,
+    "corr_return_minus_d2h4_end_us": 6.972,
+    "corr_pending_fraction": 0.777,
+    "running_at_entry": [
+     "sigmoid_mul_f32:36453"
+    ],
+    "last_kernel": "sigmoid_mul_f32:36453"
+   },
+   {
+    "layer_slot": 12,
+    "sd_disp": 36486,
+    "sync_entry": 97085814977253,
+    "sync_return": 97085815102682,
+    "sync_dur_us": 125.429,
+    "orig_entry_minus_sd_end_us": -97.866,
+    "orig_entry_minus_d2h4_end_us": -118.546,
+    "orig_return_minus_d2h4_end_us": 6.883,
+    "corr_sd_end_minus_entry_us": 97.866,
+    "corr_d2h4_end_minus_entry_us": 118.546,
+    "corr_return_minus_d2h4_end_us": 6.883,
+    "corr_pending_fraction": 0.7803,
+    "running_at_entry": [
+     "gemv_q8_0:36476"
+    ],
+    "last_kernel": "gemv_q8_0:36476"
+   },
+   {
+    "layer_slot": 13,
+    "sd_disp": 36508,
+    "sync_entry": 97085815668519,
+    "sync_return": 97085815784449,
+    "sync_dur_us": 115.93,
+    "orig_entry_minus_sd_end_us": -88.435,
+    "orig_entry_minus_d2h4_end_us": -109.195,
+    "orig_return_minus_d2h4_end_us": 6.735,
+    "corr_sd_end_minus_entry_us": 88.435,
+    "corr_d2h4_end_minus_entry_us": 109.195,
+    "corr_return_minus_d2h4_end_us": 6.735,
+    "corr_pending_fraction": 0.7628,
+    "running_at_entry": [
+     "gemv_q8_0:36498"
+    ],
+    "last_kernel": "gemv_q8_0:36498"
+   },
+   {
+    "layer_slot": 14,
+    "sd_disp": 36530,
+    "sync_entry": 97085816296266,
+    "sync_return": 97085816424265,
+    "sync_dur_us": 127.999,
+    "orig_entry_minus_sd_end_us": -100.312,
+    "orig_entry_minus_d2h4_end_us": -121.233,
+    "orig_return_minus_d2h4_end_us": 6.766,
+    "corr_sd_end_minus_entry_us": 100.312,
+    "corr_d2h4_end_minus_entry_us": 121.233,
+    "corr_return_minus_d2h4_end_us": 6.766,
+    "corr_pending_fraction": 0.7837,
+    "running_at_entry": [
+     "gemv_q8_0:36520"
+    ],
+    "last_kernel": "gemv_q8_0:36520"
+   },
+   {
+    "layer_slot": 15,
+    "sd_disp": 36554,
+    "sync_entry": 97085816977952,
+    "sync_return": 97085817089472,
+    "sync_dur_us": 111.52,
+    "orig_entry_minus_sd_end_us": -83.321,
+    "orig_entry_minus_d2h4_end_us": -104.601,
+    "orig_return_minus_d2h4_end_us": 6.919,
+    "corr_sd_end_minus_entry_us": 83.321,
+    "corr_d2h4_end_minus_entry_us": 104.601,
+    "corr_return_minus_d2h4_end_us": 6.919,
+    "corr_pending_fraction": 0.7471,
+    "running_at_entry": [
+     "gemv_q8_0:36544"
+    ],
+    "last_kernel": "gemv_q8_0:36544"
+   }
+  ]
+ },
+ "ab_result": {
+  "spin_trace_tok_s": [
+   51.4,
+   51.7,
+   51.5
+  ],
+  "spin_control_tok_s": [
+   53.1,
+   52.8,
+   52.1
+  ],
+  "unset_control_all": [
+   52.4,
+   53.7,
+   51.2,
+   52.0
+  ],
+  "unset_trace_all": [
+   51.8,
+   51.4,
+   52.0,
+   50.8
+  ],
+  "verdict": "REJECT spin policy: unset control med 52.2 vs spin med 52.8 (+0.6 inside spread); per-shape d2h_wait 0.12-0.13 identical both modes; no CPU GEMV regression. Addressable tail ~7us/splice x16 ~= 0.11ms/token vs ~19.2ms step (max ~0.6%, unmeasurable).",
+  "next_bottleneck": "CPU GU exec 0.20-0.26ms/splice (largest host piece), then pre-MoE projection ~29us + SharedDown ~14.4us; route-ready overlap bounded <<0.10ms and needs extra sync"
+ },
+ "caveats": [
+  "serve-run2.json length16 runaway=true is an intentionally truncated attribution probe, NOT a passed serve correctness battery; 256-tok stop/coherent merge_sort outputs are runtime smoke evidence only",
+  "cross-run reconciliation: host waits from 256-tok debug runs, device times from 16-tok serve trace; same fixture/settings otherwise",
+  "instrumented serve decode tok/s is attribution only, never a throughput claim; throughput claims use timing-disabled controls only",
+  "no product admission: numbers bound to the pinned local fixture/commit/hardware above",
+  "profile scope: single final decode token across the 16 CPU-deferred layers; per-layer medians are cross-layer medians and do not add exactly to a token total",
+  "sampled outputs vary in completion length (141-180 tokens) and are NOT byte-identical routings; tok/s compares across variable-length decodes of the same prompt, never identical token streams",
+  "disposition: keep existing runtime/defaults/script; spin null; no code optimization supported by this evidence. 89us ordered span = busy ~53us + inter-dispatch gaps ~35us; potential kernel fusion could reduce gaps but is beyond simple sync cleanup",
+  "next: GU/DN CPU math plus actual GPU pre-MoE output projection / SharedDown; route-ready overlap stays bounded <<0.10ms"
+ ],
+ "artifacts": [
+  ".codeinsight+research/cpu-exec-debug-20261010-{104436,104605,104733,110401,110538,110709,110835}.{trace.log,json,control.json}",
+  ".codeinsight+research/prof-20261010-105310/daemon_kernel_trace.csv",
+  ".codeinsight+research/prof-20261010-105310/daemon_hip_api_trace.csv",
+  ".codeinsight+research/prof-20261010-105310/daemon_memory_copy_trace.csv",
+  ".codeinsight+research/prof-20261010-105310/splice_sync_decomposition.json",
+  ".codeinsight+research/prof-20261010-105310/serve-run2.json",
+  ".codeinsight+research/prof-20261010-105310/serve2.log",
+  ".codeinsight+research/cpu-depbench-20261010-104403/{source_identity.txt,binary_md5.txt}"
+ ],
+ "discovery": "local paths verified present this session; frozen depbench dir + all 7 pair files + prof CSVs read directly",
+ "edits": "none (no source/config/script/build/test changes; HIPFIRE_HIP_WAIT never persisted; debug script unchanged)"
+}

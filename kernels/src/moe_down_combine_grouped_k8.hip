@@ -22,7 +22,7 @@
 //   topk_weights   : [N × K_TOP] f32
 //   x_residual     : [N × dim] f32 (in-place +=)
 //
-// Grid: (ceil(dim/256), N). Block: [256]. LDS: 0.
+// Grid: (N, ceil(dim/256)). Block: [256]. LDS: 0. Token on x (limit 2^31).
 
 extern "C" __global__ void moe_down_combine_grouped_k8(
     const float* __restrict__ Y_down_grouped,
@@ -31,8 +31,8 @@ extern "C" __global__ void moe_down_combine_grouped_k8(
     float*       __restrict__ x_residual,
     int dim, int K_TOP
 ) {
-    const int token = blockIdx.y;
-    const int m_col = blockIdx.x * blockDim.x + threadIdx.x;
+    const int token = blockIdx.x;
+    const int m_col = blockIdx.y * blockDim.x + threadIdx.x;
     if (m_col >= dim) return;
 
     const int weights_base = token * K_TOP;
@@ -46,6 +46,7 @@ extern "C" __global__ void moe_down_combine_grouped_k8(
     for (int k = 0; k < 8; k++) {
         if (k < K_TOP) {
             const int slot = inverse_perm[flat_base + k];
+            if (slot < 0) continue;  // unrouted slot (invalid id): contributes nothing
             const float w  = topk_weights[weights_base + k];
             const float v  = Y_down_grouped[(long long)slot * dim + m_col];
             acc += w * v;

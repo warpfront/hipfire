@@ -3,9 +3,10 @@
 schema_version = 1
 
 [hardware]
-# One physical list drives ROCr and the matching post-filter HIP logical IDs.
-# Replaces HIPFIRE_DEVICES=0. Use a comma-separated string for multiple GPUs;
-# the selected devices are exposed to the engine as logical 0..N-1.
+# One device list drives ROCr and the matching post-filter HIP logical IDs.
+# Replaces HIPFIRE_DEVICES=0. Entries: PCI-order index (rocm-smi order),
+# gfxNNNN (first free card of that arch), GPU-<uuid>, or a PCI address; the
+# selected devices are exposed to the engine as logical 0..N-1 in list order.
 devices = "0"
 allow_mixed_arch = false
 tp_use_rccl = true

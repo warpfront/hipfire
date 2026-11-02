@@ -14,7 +14,7 @@ the document-internal context primes the model toward the local
 narrative, away from the buried fact.
 
 Token target: ~13K (well below the 0.8B drafter NaN threshold ~16K
-documented in MANUAL_REVIEW.md).
+documented in docs/investigations/pflash/2026-05-manual-review.md).
 
 The three documents are:
   1. A monastery rule book (mid-document fact: "the bell rings

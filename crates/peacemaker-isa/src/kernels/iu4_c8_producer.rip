@@ -1,0 +1,83 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The `iu4_c8_producer_pm` generator (exact C8 IU4 producers of the A3B prefill route, gfx1201: the
+// rotate, norm, sigmoid-gated rotate and norm-out exports), composed in `.rip` from the `c8::*`
+// natives of `iu4_c8_producer::blocks`.
+//
+// `iu4_c8_producer::emit(arch, export)` is written over exactly the blocks this script calls, so for
+// every export the script re-emits the production kernel's bytes (`s_text` and proof). A test in
+// peacemaker-rip (`c8_twin_matches_the_rust_emit`) requires it for all four, and the committed
+// digests in peacemaker-isa (`producers_pinned`) pin the Rust side. Edit the composition below and
+// re-run: no rebuild.
+//
+// The shipped generator is an untyped-`Builder` kernel, so this script is too: it builds with
+// `Builder::new` (no `Workgroup`). What is script-level: which front the export runs, the ORDER of
+// the norm's phases (row loads, the phase-2 prefetch, the sum of squares, the reduction, the rms,
+// the apply), and the norm's LDS exchange itself: the partial's `b.ds_store`, the
+// `b.barrier_with_scope` and the `b.ds_load`s are statements here (the natives return the
+// instructions: `c8::norm_store_insn`, `c8::norm_load_insns`), so the builder's slot machine and
+// wait ledger check a move. The rotate, the FWHT-scale-store, the C8 quantizer and the record store are
+// single blocks.
+//
+// Variant grammar: the export's tag (`Export::tag()`):
+//
+//     rotate | norm | sigmoid_rotate | norm_out
+//
+// gfx1201 only. K, the row bound and the register map are fixed by the Rust generator and need a
+// rebuild to change.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &["rotate", "norm", "sigmoid_rotate", "norm_out"];
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let g = C8Gen::new(spec.arch, spec.variant)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    b.enable_delay_alu();
+    if g.lds_bytes() != 0 {
+        b.lds_slot("rms_partials", 0, g.lds_bytes())?;
+    }
+    c8::prologue(&mut b, &g)?;
+    front(&mut b, &g)?;
+    c8::fwht_scale_store(&mut b)?;
+    c8::quantize(&mut b)?;
+    c8::store_record(&mut b, &g)?;
+    b.finish()
+}
+
+// The export's front: the rotate's x * signs1 (AWQ divide first), the sigmoid gate in front of it,
+// or the RMSNorm.
+fn front(b: &mut Builder, g: &C8Gen) -> Result<(), String> {
+    let tag = g.tag();
+    if tag == "rotate" {
+        c8::rotate_front(b)?;
+    } else if tag == "sigmoid_rotate" {
+        c8::sigmoid_rotate_front(b)?;
+    } else {
+        norm_front(b, g)?;
+    }
+    Ok(())
+}
+
+// Norm: the row's dwords, the next phase's loads, the per-thread sum of squares, the reduction
+// (in-wave tree and/or the LDS exchange of the eight wave partials), rms = rsqrt(eps + mean), then
+// y = (x * w) * rms, the AWQ divide and signs1. `norm` and `norm_out` differ in the reduction order
+// (see `norm_reduce_pre` / `norm_reduce_post`) and in what `norm_apply` stores.
+fn norm_front(b: &mut Builder, g: &C8Gen) -> Result<(), String> {
+    c8::norm_row_loads(b)?;
+    c8::norm_prefetch(b)?;
+    c8::norm_sumsq(b)?;
+    c8::norm_reduce_pre(b, g)?;
+    b.ds_store(0, c8::norm_store_insn())?;
+    b.barrier_with_scope([ready(0)], "lds_only")?;
+    c8::norm_reduce_addr(b, g)?;
+    for insn in c8::norm_load_insns() {
+        b.ds_load(0, insn)?;
+    }
+    c8::norm_reduce_post(b, g)?;
+    c8::norm_rms(b)?;
+    c8::norm_apply(b, g)?;
+    Ok(())
+}

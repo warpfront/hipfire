@@ -1,0 +1,11 @@
+{
+  "scope": "four-group G0 arithmetic including exact shfl-down16,8,4,2,1; not a production twin admission",
+  "symbol": "pm_decode_qkvza_g0",
+  "arch": "gfx1201",
+  "s_text_sha256": "29caa047325fd1be1a368425f84d6e021617981bc132dbc5bcae0d23894b2a9d",
+  "code_object_sha256": "f91aee1ebedac32b1fa8ee02d716f97cb0cb6f3ba1c4401fd32b95daa6c548ec",
+  "m7": {"ambiguous_delays": 0, "barrier_pairs": 0, "clauses": 0, "delays": 0, "instructions": 205, "lds_accesses": 5, "lds_max_known_end": null, "lds_unknown_addresses": 5, "lift": "byte-exact", "obligations": {}, "sgpr_high_water": 12, "table": "gfx1201", "vgpr_high_water": 23, "wait_facts": 10},
+  "crosslane_note": "The five DS operations use the crossbar, not LDS memory. M7 currently classifies crosslane accesses as unknown LDS addresses; there are no obligations.",
+  "tensor_oracle": "not exercised",
+  "removed_modules": 0
+}

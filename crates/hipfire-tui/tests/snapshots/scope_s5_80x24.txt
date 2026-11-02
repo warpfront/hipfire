@@ -1,0 +1,24 @@
+         hipfire · control panel    serve: offline    model: qwen3.8:27b
+
+ Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
+
+────────────────────────────────────────────────────────────────────────────────
+ Tuning: Balanced  p    GPU: gfx1151    Editing: qwen3.8:27b  m
+ [Quality]  Speed  Memory  Speculation  Hardware  Advanced             / search
+ ┌ Quality · values for qwen3.8:27b only ─────────────────────────────────────┐
+ │  Setting                  Using now               From                     │
+ │  Prompt processing        Fast (4-bit math)       all models only (locked) │
+ │  Flash-Next experts       — not used by 27B       all models only (locked) │
+ │  Flash-Next word table    — not used by 27B       all models only (locked) │
+ │  Thinking                 on                      default                  │
+ │> Thinking effort          ● high                  this model               │
+ │  Thinking cap             med                     default                  │
+ └─────────────────────────────────────────────────────────── rows 1–6 of 8 ↓ ┘
+ ┌ Thinking effort ───────────────────────────────────────────────────────────┐
+ │How hard the model is told to think, in its own vocabulary.                 │
+ │qwen3.8:27b: high (this model). All other models: low (you, config.toml).   │
+ │Del removes this model's value so it follows "all models" again.            │
+ │reasoning.effort · applies to the next message · m edit all models          │
+ └────────────────────────────────────────────────────────────────────────────┘
+↑↓ move · ←→ change · Del follow all-models · m scope · o overrides · ? help
+

@@ -34,7 +34,7 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, Step};
-use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::{KvCache, KvCacheExt};
 use hipfire_runtime::model_source::ModelSource;
 // (DTYPE-1: the bf16 conversion helpers moved to the shared
 // `safetensors_source::source_bytes_to_*` converters, used via full paths
@@ -416,8 +416,8 @@ impl CodecState {
             physical_cap: None,
         };
         let kv = KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY, head_dim).mode,
-            hipfire_runtime::llama::KvTarget::Single(gpu),
+            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY).mode,
+            gpu,
             &dims,
         )
         .map_err(|e| format!("codec: kv cache: {e:?}"))?;
@@ -583,6 +583,7 @@ fn codec_attn_mixer(
         block_start: 0,
         block_cols: 0,
         output_gate: None,
+        output_awq_scale: None,
         output: &st.fa_attn_out,
     };
     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }]).map_err(|e| format!("codec L{l}: attention: {e:?}"))?;

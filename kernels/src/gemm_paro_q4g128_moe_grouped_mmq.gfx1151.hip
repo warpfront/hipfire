@@ -63,7 +63,8 @@ extern "C" __global__ void gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
     const int*                 __restrict__ sorted_slot_index,  // [m_total]
     const block_q8_1_mmq*      __restrict__ X_q8_src,           // [K/128 × x_src_rows]
     float*                     __restrict__ Y_grouped,          // [m_total × M]
-    int M, int K, int x_row_div, int m_total, int x_src_rows
+    int M, int K, int x_row_div, int m_total, int x_src_rows,
+    int n_experts
 ) {
     const int tid = threadIdx.x;
     const int row_start = blockIdx.x * 16;
@@ -73,7 +74,7 @@ extern "C" __global__ void gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
     if (row_start >= M || slot_start >= m_total) return;
 
     const int expert_id = expert_tile_ids[tile_y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
 
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 
@@ -84,6 +85,7 @@ extern "C" __global__ void gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
         const int flat = sorted_slot_index[slot_idx];
         if (flat >= 0) {
             x_row = (x_row_div > 1) ? (flat / x_row_div) : flat;
+            if (x_row >= x_src_rows) x_row = -1;  // malformed slot: treat as padding
         }
     }
 
@@ -199,7 +201,7 @@ extern "C" __global__ void gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
 // Stub for non-gfx1151 archs.
 extern "C" __global__ void gemm_paro_q4g128_moe_grouped_mmq_gfx1151(
     const unsigned long long*, const int*, const int*,
-    const void*, float*, int, int, int, int, int
+    const void*, float*, int, int, int, int, int, int
 ) {}
 
 #endif

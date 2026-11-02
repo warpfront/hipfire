@@ -70,7 +70,6 @@ struct Args {
     detect_timing: bool,
     no_strip_think: bool,
     self_check: bool,
-    emit_committed_jsonl: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -98,7 +97,6 @@ fn parse_args() -> Result<Args, String> {
             }
             "--detect-timing" => args.detect_timing = true,
             "--no-strip-think" => args.no_strip_think = true,
-            "--emit-committed-jsonl" => args.emit_committed_jsonl = it.next(),
             "--self-check" => args.self_check = true,
             "-h" | "--help" => {
                 print_help();
@@ -129,7 +127,6 @@ fn print_help() {
           --stall-tokens N      enable think_stall detector with budget N\n  \
           --detect-timing       enable per-token step-time spike detector\n  \
           --no-strip-think      ask daemon to leave <think> bytes intact\n  \
-          --emit-committed-jsonl OUT  write committed token ids to JSONL\n  \
           --self-check          run synthetic+replay self-check (no GPU needed)\n"
     );
 }
@@ -175,19 +172,24 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn find_daemon_binary() -> Result<PathBuf, String> {
-    // Prefer release; fall back to debug. Mirror the gate scripts'
-    // discovery behaviour.
-    let candidates = [
-        "target/release/examples/daemon",
-        "target/debug/examples/daemon",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Ok(p);
+    // Prefer release; fall back to debug. Platform-shaped names match
+    // hipfire-cli `daemon_bin_names` / `find_daemon_in`: Windows probes
+    // `.exe` then bare; Unix probes bare only (never `.exe`, so a stale
+    // PE left on a Linux tree cannot win over a real daemon).
+    let names: &[&str] = if cfg!(windows) {
+        &["daemon.exe", "daemon"]
+    } else {
+        &["daemon"]
+    };
+    for name in names {
+        for profile in ["release", "debug"] {
+            let p = PathBuf::from(format!("target/{profile}/{name}"));
+            if p.exists() {
+                return Ok(p);
+            }
         }
     }
-    Err("daemon binary not found; run `cargo build --release --example daemon --features deltanet` first".into())
+    Err("daemon binary not found; run `cargo build --release -p hipfire-daemon` first".into())
 }
 
 fn print_live(name: &str, verdict: &Verdict, t_ms: u64, pos: Option<usize>) {
@@ -451,18 +453,6 @@ fn drive_generate(
                 break;
             }
             _ => {} // ignore other event types
-        }
-    }
-
-    // Write committed token IDs to JSONL if requested.
-    if let Some(ref path) = args.emit_committed_jsonl {
-        if let Ok(mut f) = std::fs::File::create(path) {
-            use std::io::Write;
-            for (i, tok_id) in &committed_ids {
-                let _ = writeln!(f, r#"{{"i":{},"id":{}}}"#, i, tok_id);
-            }
-        } else {
-            eprintln!("[probe] warning: could not create {}", path);
         }
     }
 

@@ -1,0 +1,19 @@
+[package]
+name = "va-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Direct VA-API (VCN JPEG) dispatch via dlopen — VL image decode (`image.decode = vcn|auto`); dlopen-only, no link-time GPU dep"
+license = "Apache-2.0"
+
+[dependencies]
+libloading = { workspace = true }
+hipfire-config = { path = "../hipfire-config" }
+
+[features]
+default = []
+# Throwaway probes stay out of the default build (leanup ungated_examples).
+lab = []
+
+[[example]]
+name = "parse_fixtures"
+required-features = ["lab"]

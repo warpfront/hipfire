@@ -17,17 +17,16 @@
 #
 # HOW KERNEL PINNING WORKS  (crates/rdna-compute/src/compiler.rs)
 #
-#   precompiled kernels/compiled/<arch>/<name>.hsaco exists?
-#     .hash sidecar matches src_hash        -> use it
-#     no valid hash AND no device compiler  -> use it, engine warns
-#     no valid hash AND compiler present    -> RECOMPILE (pinning defeated)
+#   Installed kernels/compiled/<arch>/<module> objects require a matching
+#   .hsaco + .hash + .index.json triple. The index binds module, symbols,
+#   source, flags, scheduler profile, ABI, packaging key, object SHA-256 and
+#   toolchain identity. Missing or mismatched metadata fails closed.
 #
-# src_hash folds in `toolchain_id`, so a different toolchain invalidates our
-# sidecars by design. `run --pin-kernels` therefore installs the blobs AND
-# hides the device compiler from the daemon's PATH, taking the middle branch so
-# our exact code objects execute. The engine prints its own "Output may be
-# incorrect" warning in that state; under --pin-kernels that warning is
-# EXPECTED and is precisely the confirmation that our blobs are in use.
+# Capture the indexed install directory, not the content-keyed hot JIT cache.
+# HIPFIRE_KERNEL_CACHE may explicitly select an alternative indexed directory.
+# `run --pin-kernels` installs all three files and disables the device compiler
+# with HIPFIRE_NO_DEVICE_COMPILER=1. The loader reports "indexed package
+# verified" for accepted objects; it does not permit unverified binaries.
 #
 # TOOLCHAIN NOTE
 #
@@ -146,11 +145,17 @@ cmd_capture() {
   trap 'rm -rf "$stage"' RETURN
   mkdir -p "$stage/hsaco/$arch"
 
-  local cache="${HIPFIRE_KERNEL_CACHE:-.hipfire_kernels}/$arch"
-  [ -d "$cache" ] || die "no kernel cache at $cache — run the golden fixture first so code objects exist"
-  cp "$cache"/*.hsaco "$stage/hsaco/$arch/" 2>/dev/null || die "no .hsaco found in $cache"
-  # .hash sidecars let a same-toolchain box use these without --pin-kernels.
-  cp "$cache"/*.hash "$stage/hsaco/$arch/" 2>/dev/null || true
+  local cache="${HIPFIRE_KERNEL_CACHE:-kernels/compiled}/$arch"
+  [ -d "$cache" ] || die "no indexed kernel package at $cache — run the golden fixture first so installed code objects exist"
+  local object stem
+  local -a objects=("$cache"/*.hsaco)
+  [ -f "${objects[0]}" ] || die "no .hsaco found in $cache"
+  for object in "${objects[@]}"; do
+    stem="${object%.hsaco}"
+    [ -f "$stem.hash" ] || die "missing hash sidecar: $stem.hash"
+    [ -f "$stem.index.json" ] || die "missing indexed-object metadata: $stem.index.json"
+    cp "$object" "$stem.hash" "$stem.index.json" "$stage/hsaco/$arch/"
+  done
 
   if [ -z "$attestation" ]; then
     attestation="$(ls -1t .redline-work/golden/*"$arch"*.golden.json 2>/dev/null | head -1 || true)"
@@ -185,7 +190,7 @@ cmd_capture() {
 
   rocm-smi --showallinfo > "$stage/gpu.txt" 2>&1 || amd-smi static > "$stage/gpu.txt" 2>&1 || echo unavailable > "$stage/gpu.txt"
 
-  "$PY" - "$stage" "$arch" "$stamp" "target/release/examples/daemon" "$SCHEMA_VERSION" <<'PYCAP'
+  "$PY" - "$stage" "$arch" "$stamp" "target/release/daemon" "$SCHEMA_VERSION" <<'PYCAP'
 import hashlib, json, pathlib, subprocess, sys
 
 stage, arch, stamp, daemon, schema = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
@@ -271,7 +276,7 @@ do_verify() {
   local local_commit; local_commit="$(git rev-parse HEAD 2>/dev/null || echo unknown)"
 
   "$PY" - "$dir" "$local_arch" "$local_rocm" "$local_hipcc" "$local_codegen" \
-        "$local_commit" "target/release/examples/daemon" \
+        "$local_commit" "target/release/daemon" \
         "${HIPFIRE_KERNEL_CACHE:-.hipfire_kernels}" <<'PYVER'
 import hashlib, json, os, pathlib, sys
 
@@ -421,7 +426,8 @@ cmd_run() {
   if [ "$pin" -eq 1 ]; then
     mkdir -p "kernels/compiled/$arch"
     cp "$dir/hsaco/$arch"/*.hsaco "kernels/compiled/$arch/"
-    cp "$dir/hsaco/$arch"/*.hash "kernels/compiled/$arch/" 2>/dev/null || true
+    cp "$dir/hsaco/$arch"/*.hash "kernels/compiled/$arch/"
+    cp "$dir/hsaco/$arch"/*.index.json "kernels/compiled/$arch/"
     echo "  pinned $(ls -1 "kernels/compiled/$arch"/*.hsaco 2>/dev/null | wc -l) packaged code objects -> kernels/compiled/$arch"
 
     # Evict locally-JIT'd blobs so the pinned ones are what actually load.
@@ -435,8 +441,7 @@ cmd_run() {
     # silently recompiled instead of pinning. Use the explicit switch.
     env_prefix=(env "HIPFIRE_NO_DEVICE_COMPILER=1")
     echo "  HIPFIRE_NO_DEVICE_COMPILER=1 — engine will treat the compiler as absent"
-    echo "  the engine will warn 'Output may be incorrect' — that is EXPECTED here"
-    echo "  and is the confirmation that OUR code objects are executing."
+    echo "  accepted objects must report 'indexed package verified'; missing or mismatched metadata fails closed"
   fi
 
   echo

@@ -1,0 +1,8 @@
+{
+  "group_segment_fixed_bytes": 0,
+  "launch_dynamic_lds_bytes": 0,
+  "require_wave32": true,
+  "require_zero_private": true,
+  "require_zero_spills": true,
+  "symbol": "gemv_mq4g256v2_xbatch_pm"
+}

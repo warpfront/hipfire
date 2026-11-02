@@ -1,0 +1,24 @@
+[package]
+name = "hipfire-arch-lfm2-vl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LFM2-VL SigLIP2-NaFlex vision tower + projector for hipfire (arch 11 carrier)"
+
+[features]
+# Same gating as hipfire-arch-qwen35-vl: the GPU primitives are wired through
+# the `deltanet` feature chain; vision stays compilable (CPU-only tests) when
+# it is off.
+default = ["deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde_json.workspace = true
+# PNG decode/resize only — JPEG goes through
+# `hipfire_runtime::imagedec` (libjpeg-turbo-rs), so the `jpeg`
+# feature stays off and zune-jpeg stays out of the lock.
+image.workspace = true
+libm = "0.2"

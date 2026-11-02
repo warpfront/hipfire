@@ -1,0 +1,20 @@
+[package]
+name = "a4-ec"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+faer = { version = "0.24.4", default-features = false, features = ["std", "rayon", "linalg"] }
+rayon = "1.12"
+half = "2.7"
+memmap2 = "0.9"
+serde_json = "1"
+md5 = "0.8"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+debug = false
+codegen-units = 4

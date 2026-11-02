@@ -16,7 +16,7 @@
 
 use hipfire_arch_lfm3::forward::decode_step;
 use hipfire_arch_lfm3_omni::{sample_audio_frame, DepthRng};
-use hipfire_loader::{load_model, ModelState};
+use hipfire_loader::load_model;
 use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
 use rdna_compute::Gpu;
 
@@ -46,7 +46,7 @@ fn main() {
         &mut gpu,
     )
     .expect("load_model");
-    eprintln!("  arch_id={}  depth_decoder={}", model.arch_id, model.lfm3_depth_weights.is_some());
+    eprintln!("  arch_id={}  depth_decoder={}", model.arch_id, model.lfm3_depth_weights().is_some());
 
     // Tokenize the prompt. The omni model was trained on ChatML + BOS
     // (<|startoftext|> = 124894); a bare prompt produces repetition collapse.
@@ -66,8 +66,10 @@ fn main() {
     eprintln!("depth_smoke: prefilling text backbone ({} tokens)...", tokens.len());
     let hidden: Vec<f32> = {
         let bundle = match model.state.as_mut() {
-            Some(ModelState::Lfm3(b)) => b,
-            _ => panic!("loaded model is not LFM3"),
+            Some(s) => (s.as_mut() as &mut dyn std::any::Any)
+                .downcast_mut::<hipfire_loader::Lfm3Bundle>()
+                .expect("loaded model is not LFM3"),
+            None => panic!("loaded model is not LFM3"),
         };
         let mut last_logits: Option<Vec<f32>> = None;
         for (i, &tok_id) in tokens.iter().enumerate() {
@@ -109,14 +111,8 @@ fn main() {
     );
 
     // Phase 2: MaskGIT-sample one audio frame from the hidden state.
-    let depth_cfg = model
-        .lfm3_depth_config
-        .as_ref()
-        .expect("depth config missing");
-    let depth_weights = model
-        .lfm3_depth_weights
-        .as_ref()
-        .expect("depth weights missing");
+    let depth_cfg = model.lfm3_depth_config().expect("depth config missing");
+    let depth_weights = model.lfm3_depth_weights().expect("depth weights missing");
 
     eprintln!(
         "depth_smoke: sampling audio frame (maskgit {:?}, temp={}, rep={})...",

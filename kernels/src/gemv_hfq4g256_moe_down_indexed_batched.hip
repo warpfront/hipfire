@@ -27,7 +27,7 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_bat
     const float* __restrict__ topk_weights,              // [N × K_TOP]
     const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
     float*       __restrict__ x_residual,                // [N × M]
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -37,6 +37,7 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_bat
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =

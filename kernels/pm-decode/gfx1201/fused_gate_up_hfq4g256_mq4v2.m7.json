@@ -1,0 +1,18 @@
+{
+  "fused_gate_up_mq4g256v2": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 0,
+    "instructions": 407,
+    "lds_accesses": 5,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 5,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 32,
+    "table": "gfx1201",
+    "vgpr_high_water": 64,
+    "wait_facts": 26
+  }
+}

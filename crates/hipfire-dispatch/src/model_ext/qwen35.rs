@@ -100,11 +100,7 @@ pub trait Qwen35ModelExt {
     ///
     /// Dispatches to `gated_delta_net_f32`, `gated_delta_net_q8`,
     /// or `gated_delta_net_q4` based on `params.quant`.
-    fn run_delta_net_step(
-        &self,
-        gpu: &mut Gpu,
-        params: &DeltaNetStepParams,
-    ) -> Result<(), String>;
+    fn run_delta_net_step(&self, gpu: &mut Gpu, params: &DeltaNetStepParams) -> Result<(), String>;
 
     /// Run batched sequential DeltaNet updates (prefill).
     ///
@@ -119,11 +115,7 @@ pub trait Qwen35ModelExt {
     /// Run tree-batched DeltaNet (speculative-decode path).
     ///
     /// Only supported with Q8 state (the tree tape mechanism is Q8-specific).
-    fn run_delta_net_tree(
-        &self,
-        gpu: &mut Gpu,
-        params: &DeltaNetTreeParams,
-    ) -> Result<(), String>;
+    fn run_delta_net_tree(&self, gpu: &mut Gpu, params: &DeltaNetTreeParams) -> Result<(), String>;
 
     /// Zero the conv-state ring buffer.
     fn reset_conv_state(
@@ -137,29 +129,45 @@ pub trait Qwen35ModelExt {
 // ── Default implementations ────────────────────────────
 
 impl Qwen35ModelExt for () {
-    fn run_delta_net_step(
-        &self,
-        gpu: &mut Gpu,
-        params: &DeltaNetStepParams,
-    ) -> Result<(), String> {
+    fn run_delta_net_step(&self, gpu: &mut Gpu, params: &DeltaNetStepParams) -> Result<(), String> {
         match params.quant {
             StateQuant::FP32 => gpu.gated_delta_net_f32(
-                params.q, params.k, params.v,
-                params.gate, params.beta,
-                params.state, params.output,
-                1, params.n_heads, params.head_dim,
+                params.q,
+                params.k,
+                params.v,
+                params.gate,
+                params.beta,
+                params.state,
+                params.output,
+                1,
+                params.n_heads,
+                params.head_dim,
             ),
             StateQuant::Q8 => gpu.gated_delta_net_q8(
-                params.q, params.k, params.v,
-                params.gate, params.beta,
-                params.state, params.s_scales, params.output,
-                1, params.n_heads, params.head_dim,
+                params.q,
+                params.k,
+                params.v,
+                params.gate,
+                params.beta,
+                params.state,
+                params.s_scales,
+                params.output,
+                1,
+                params.n_heads,
+                params.head_dim,
             ),
             StateQuant::Q4 => gpu.gated_delta_net_q4(
-                params.q, params.k, params.v,
-                params.gate, params.beta,
-                params.state, params.s_scales, params.output,
-                1, params.n_heads, params.head_dim,
+                params.q,
+                params.k,
+                params.v,
+                params.gate,
+                params.beta,
+                params.state,
+                params.s_scales,
+                params.output,
+                1,
+                params.n_heads,
+                params.head_dim,
             ),
         }
         .map_err(|e| format!("delta_net_step: {e:?}"))
@@ -172,10 +180,17 @@ impl Qwen35ModelExt for () {
     ) -> Result<(), String> {
         match params.quant {
             StateQuant::Q8 => gpu.gated_delta_net_q8_batch_seq(
-                params.q_batch, params.k_batch, params.v_batch,
-                params.gate_batch, params.beta_batch,
-                params.state, params.s_scales, params.output_batch,
-                params.n_tokens, params.n_heads, params.head_dim,
+                params.q_batch,
+                params.k_batch,
+                params.v_batch,
+                params.gate_batch,
+                params.beta_batch,
+                params.state,
+                params.s_scales,
+                params.output_batch,
+                params.n_tokens,
+                params.n_heads,
+                params.head_dim,
             ),
             _ => {
                 // FP32/Q4: loop single-token kernel.
@@ -185,19 +200,38 @@ impl Qwen35ModelExt for () {
                     let q = params.q_batch.sub_offset(i * stride, stride);
                     let k = params.k_batch.sub_offset(i * stride, stride);
                     let v = params.v_batch.sub_offset(i * stride, stride);
-                    let g = params.gate_batch.sub_offset(i * params.n_heads, params.n_heads);
-                    let b = params.beta_batch.sub_offset(i * params.n_heads, params.n_heads);
+                    let g = params
+                        .gate_batch
+                        .sub_offset(i * params.n_heads, params.n_heads);
+                    let b = params
+                        .beta_batch
+                        .sub_offset(i * params.n_heads, params.n_heads);
                     let o = params.output_batch.sub_offset(i * stride, stride);
                     match params.quant {
                         StateQuant::FP32 => gpu.gated_delta_net_f32(
-                            &q, &k, &v, &g, &b,
-                            params.state, &o,
-                            1, params.n_heads, params.head_dim,
+                            &q,
+                            &k,
+                            &v,
+                            &g,
+                            &b,
+                            params.state,
+                            &o,
+                            1,
+                            params.n_heads,
+                            params.head_dim,
                         ),
                         StateQuant::Q4 => gpu.gated_delta_net_q4(
-                            &q, &k, &v, &g, &b,
-                            params.state, params.s_scales, &o,
-                            1, params.n_heads, params.head_dim,
+                            &q,
+                            &k,
+                            &v,
+                            &g,
+                            &b,
+                            params.state,
+                            params.s_scales,
+                            &o,
+                            1,
+                            params.n_heads,
+                            params.head_dim,
                         ),
                         _ => unreachable!(),
                     }
@@ -209,18 +243,22 @@ impl Qwen35ModelExt for () {
         .map_err(|e| format!("delta_net_batch: {e:?}"))
     }
 
-    fn run_delta_net_tree(
-        &self,
-        gpu: &mut Gpu,
-        params: &DeltaNetTreeParams,
-    ) -> Result<(), String> {
+    fn run_delta_net_tree(&self, gpu: &mut Gpu, params: &DeltaNetTreeParams) -> Result<(), String> {
         gpu.gated_delta_net_q8_tree_batch_seq(
-            params.q_batch, params.k_batch, params.v_batch,
-            params.gate_batch, params.beta_batch,
-            params.s_q8_init, params.s_scales_init,
-            params.s_tape_q8, params.s_tape_scales,
-            params.parent_indices, params.output_batch,
-            params.n_tokens, params.n_heads, params.head_dim,
+            params.q_batch,
+            params.k_batch,
+            params.v_batch,
+            params.gate_batch,
+            params.beta_batch,
+            params.s_q8_init,
+            params.s_scales_init,
+            params.s_tape_q8,
+            params.s_tape_scales,
+            params.parent_indices,
+            params.output_batch,
+            params.n_tokens,
+            params.n_heads,
+            params.head_dim,
         )
         .map_err(|e| format!("delta_net_tree: {e:?}"))
     }
@@ -231,7 +269,8 @@ impl Qwen35ModelExt for () {
         state: &GpuTensor,
         _conv_state_size: usize,
     ) -> Result<(), String> {
-        gpu.hip.memset(&state.buf, 0, state.buf.size())
+        gpu.hip
+            .memset(&state.buf, 0, state.buf.size())
             .map_err(|e| format!("reset_conv_state: {e:?}"))
     }
 }

@@ -21,21 +21,27 @@
           rocmSupport = true;
           src = lib.cleanSource ./.;
           cargoLockFile = ./Cargo.lock;
+          kernels = hipfire-kernels;
         };
 
-        # Default to no precompiled kernels — daemon JIT-compiles on first
-        # use. Override via `services.hipfire.gpuTargets` in NixOS module
-        # (e.g. `lib.mkForce [ "gfx1010" ]`) or pass an override to
-        # `hipfire-kernels` in your own flake. Empty default avoids the
-        # silent footgun where 5700-XT users build gfx1100 kernels.
+        # The package and standalone kernel output share the same source and
+        # exact-source registry. Unsupported GPUs still use hipcc JIT.
         hipfire-kernels = pkgs.callPackage ./nix/kernels.nix {
-          gpuTargets = [];
+          src = lib.cleanSource ./.;
+          cargoLockFile = ./Cargo.lock;
         };
       in
       {
         packages = {
           default = hipfire;
           inherit hipfire hipfire-kernels;
+        };
+
+        checks = lib.optionalAttrs pkgs.stdenv.isLinux {
+          dflash-config = import ./nix/tests/dflash-config.nix {
+            inherit pkgs lib system;
+            nixosSystem = nixpkgs.lib.nixosSystem;
+          };
         };
 
         devShells.default = pkgs.callPackage ./nix/dev-shell.nix {
@@ -53,16 +59,18 @@
       # NixOS module's `pkgs.rocmPackages` LD_LIBRARY_PATH.
       overlays.default = final: prev: {
         rocmPackages = (import nixpkgs {
-          inherit (final) system;
+          system = final.stdenv.hostPlatform.system;
           config = { rocmSupport = true; allowUnfree = true; };
         }).rocmPackages;
         hipfire = final.callPackage ./nix/package.nix {
           rocmSupport = true;
           src = lib.cleanSource ./.;
           cargoLockFile = ./Cargo.lock;
+          kernels = final.hipfire-kernels;
         };
         hipfire-kernels = final.callPackage ./nix/kernels.nix {
-          gpuTargets = [];  # JIT by default; override per-host
+          src = lib.cleanSource ./.;
+          cargoLockFile = ./Cargo.lock;
         };
       };
     };

@@ -1,0 +1,194 @@
+{
+  "kernel_id": "fused_qkv_hfq4g256_mq4v2",
+  "variant": "g0-single-group-lane-dot",
+  "arch": "gfx1201",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "98b910e97c",
+  "reg_plan": [
+    {
+      "name": "workitem",
+      "kind": "v",
+      "base": 0,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v1",
+      "kind": "v",
+      "base": 1,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v2",
+      "kind": "v",
+      "base": 2,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v3",
+      "kind": "v",
+      "base": 3,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v4",
+      "kind": "v",
+      "base": 4,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v5",
+      "kind": "v",
+      "base": 5,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v6",
+      "kind": "v",
+      "base": 6,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v7",
+      "kind": "v",
+      "base": 7,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v24",
+      "kind": "v",
+      "base": 24,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v25",
+      "kind": "v",
+      "base": 25,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "v8",
+      "kind": "v",
+      "base": 8,
+      "len": 8,
+      "live": "Whole"
+    },
+    {
+      "name": "v16",
+      "kind": "v",
+      "base": 16,
+      "len": 8,
+      "live": "Whole"
+    },
+    {
+      "name": "kernarg",
+      "kind": "s",
+      "base": 0,
+      "len": 2,
+      "live": "Whole"
+    },
+    {
+      "name": "wg_x",
+      "kind": "s",
+      "base": 2,
+      "len": 1,
+      "live": "Whole"
+    },
+    {
+      "name": "s4",
+      "kind": "s",
+      "base": 4,
+      "len": 2,
+      "live": "Whole"
+    },
+    {
+      "name": "s6",
+      "kind": "s",
+      "base": 6,
+      "len": 2,
+      "live": "Whole"
+    },
+    {
+      "name": "s8",
+      "kind": "s",
+      "base": 8,
+      "len": 2,
+      "live": "Whole"
+    }
+  ],
+  "next_free_vgpr": 26,
+  "next_free_sgpr": 10,
+  "waits": [
+    {
+      "pc_index": 8,
+      "insn": "s_wait_kmcnt 0x0",
+      "counter": "Km",
+      "count": 0,
+      "reason": {
+        "Use": {
+          "reg": "s[4:5]"
+        }
+      }
+    },
+    {
+      "pc_index": 13,
+      "insn": "s_wait_loadcnt 0x2",
+      "counter": "Load",
+      "count": 2,
+      "reason": {
+        "Use": {
+          "reg": "v6"
+        }
+      }
+    },
+    {
+      "pc_index": 38,
+      "insn": "s_wait_loadcnt 0x1",
+      "counter": "Load",
+      "count": 1,
+      "reason": {
+        "Use": {
+          "reg": "v[8:11]"
+        }
+      }
+    },
+    {
+      "pc_index": 43,
+      "insn": "s_wait_loadcnt 0x0",
+      "counter": "Load",
+      "count": 0,
+      "reason": {
+        "Use": {
+          "reg": "v[12:15]"
+        }
+      }
+    },
+    {
+      "pc_index": 51,
+      "insn": "s_wait_storecnt 0x0",
+      "counter": "Store",
+      "count": 0,
+      "reason": "Barrier"
+    }
+  ],
+  "hazards": [],
+  "clauses": [],
+  "vopd_pairs": 0,
+  "lds_slots": [],
+  "barriers": [],
+  "loop_fixpoints": [],
+  "forbidden_mnemonics_checked": [
+    "s_waitcnt (gfx12)",
+    "scratch_*"
+  ],
+  "s_text_sha256": "b2ebeb171b1fe742c4f370bbfdd8f5c8eaf7b6968eab71cb53f38785c48546d2"
+}

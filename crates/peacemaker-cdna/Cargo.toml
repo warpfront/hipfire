@@ -1,0 +1,9 @@
+[package]
+name = "peacemaker-cdna"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CDNA (CDNA3 and later; gfx942 / MI300X first, wave64) instruction model for PeaceMaker: an arch-variant enum with a per-variant capability table, typed instructions with encoder/decoder and llvm-mc-compatible printer per format, FP8/BF8 (FNUZ and OCP) conversions, the gfx90a+ kernel descriptor layout, and a pure-CPU wave64 workgroup emulator (`sim`). Used by peacemaker-isa's `cdna` arm."
+publish = false
+
+[dependencies]

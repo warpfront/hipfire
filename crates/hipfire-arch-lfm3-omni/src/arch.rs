@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! `Architecture` trait placeholder for the LFM3-Omni depth decoder. The depth
-//! decoder is not a standalone Architecture (it rides on arch_id 13 alongside
+//! decoder is not a standalone Architecture (it rides on arch_id 24 alongside
 //! the LFM3 text backbone, detected by `model.depth_decoder.*` tensor
 //! presence). This module exists for crate symmetry with the sibling
 //! hipfire-arch-lfm3-{vl,audio} crates; the real entry points are the free
@@ -24,7 +24,7 @@ impl Architecture for Lfm3Omni {
     type Config = DepthConfig;
 
     fn arch_id() -> u32 {
-        13
+        24
     }
     fn name() -> &'static str {
         "lfm3-omni"

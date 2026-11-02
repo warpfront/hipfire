@@ -1,0 +1,109 @@
+{
+  "preset": "quality-first",
+  "arch": "gfx1201",
+  "config_path": "<ROOT>/config.toml",
+  "scope": "all models",
+  "lines": [
+    {
+      "id": "prompt-processing",
+      "title": "Prompt processing",
+      "summary": "Fast (4-bit math) → Accurate (fp8)",
+      "scope": "27B-class dense models",
+      "keys": [
+        "kernel.iu4_prefill"
+      ],
+      "from": {
+        "kernel.iu4_prefill": true
+      },
+      "to": {
+        "kernel.iu4_prefill": false
+      },
+      "ticked": true,
+      "requirement": {
+        "met": true,
+        "reason": null,
+        "fix": null
+      },
+      "evidence": {
+        "kld_from": 0.069571,
+        "kld_to": 0.041859,
+        "metric": "WT2 KLD",
+        "speed_from": 4641.0,
+        "speed_to": 3852.0,
+        "speed_metric": "pp8192 tok/s (≈)",
+        "closer": "40% closer",
+        "slower": "1.2× slower",
+        "typing": "unchanged",
+        "caveat": "cross-card: A4 on card C vs fp8 on card A, 300 W",
+        "source": "AGENTS.md:639-642; CHANGELOG.md:1770"
+      }
+    },
+    {
+      "id": "flash-next-experts",
+      "title": "Flash-Next experts",
+      "summary": "Fast (4-bit) → Accurate (16-bit)",
+      "scope": "Flash-Next only",
+      "keys": [
+        "developer.qwen4_moe_sym_iu4"
+      ],
+      "from": {
+        "developer.qwen4_moe_sym_iu4": null
+      },
+      "to": {
+        "developer.qwen4_moe_sym_iu4": false
+      },
+      "ticked": true,
+      "requirement": {
+        "met": true,
+        "reason": null,
+        "fix": null
+      },
+      "evidence": {
+        "kld_from": null,
+        "kld_to": null,
+        "metric": null,
+        "speed_from": null,
+        "speed_to": null,
+        "speed_metric": null,
+        "closer": null,
+        "slower": null,
+        "typing": "unchanged",
+        "caveat": "only Strix Halo measured",
+        "source": null
+      }
+    }
+  ],
+  "notes": [],
+  "not_changed": [
+    {
+      "what": "KV cache",
+      "why": "fp8 vs exact within noise"
+    },
+    {
+      "what": "speculation",
+      "why": "designed lossless"
+    },
+    {
+      "what": "context, devices, offload, model",
+      "why": "yours; presets never change them"
+    }
+  ],
+  "net_diff": {
+    "added": [
+      {
+        "key": "developer.qwen4_moe_sym_iu4",
+        "value": false
+      },
+      {
+        "key": "kernel.iu4_prefill",
+        "value": false
+      }
+    ],
+    "changed": [],
+    "removed": []
+  },
+  "reverted": [],
+  "kept": [],
+  "conflicts": [],
+  "takes_effect": "serve restart"
+}

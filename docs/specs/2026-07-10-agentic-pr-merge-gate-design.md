@@ -80,8 +80,8 @@ never a failure. "If any *eligible* arch regresses → reject."
 
 ### 4.1 Arch → box dispatch (unselected boxes never start)
 
-The GPU fleet is **two** boxes: **hipx owns {gfx1100, gfx1151}**, **hiptrx owns
-{gfx1201}**. Claude reads the PR and selects the necessary boxes, archs, models,
+The GPU fleet is **two** boxes: **the gfx11 box owns {gfx1100, gfx1151}**, **the
+gfx12 box owns {gfx1201}**. Claude reads the PR and selects the necessary boxes, archs, models,
 and bespoke behavior tests. The deterministic validator separately computes the
 PR's minimum **affected archs** from the diff:
 
@@ -93,8 +93,8 @@ PR's minimum **affected archs** from the diff:
 - A validated `decision=skip` is permitted only for a deterministically trivial
   diff and produces one explicit no-runner PASS on Ubuntu.
 
-Thus a gfx1201-only change dispatches hiptrx without creating a no-op hipx job;
-a shared daemon change cannot dispatch until both hipx and hiptrx are covered.
+Thus a gfx1201-only change dispatches the gfx12 box without creating a no-op gfx11 job;
+a shared daemon change cannot dispatch until both the gfx11 and gfx12 boxes are covered.
 Cross-arch isolation remains part of the deterministic collected evidence.
 
 ## 5. Model × arch fit map (config-driven)
@@ -111,7 +111,7 @@ gate runs only fitting cells.
 The dispatch schema assigns one `models` list per box, and the runner applies
 that same list to every arch selected on the box. The list must therefore be the
 intersection of model support across the selected archs, never the union. For
-example, `deepseek4` is invalid in a hipx assignment containing both gfx1100 and
+example, `deepseek4` is invalid in a gfx11-box assignment containing both gfx1100 and
 gfx1151; it is valid only when that assignment selects gfx1151 alone.
 
 The **canonical battery** (`qwen3.6-27b` + `qwen3.6-a3b`) always runs on every
@@ -187,7 +187,7 @@ Claude must write `review.md` and exact JSON with this shape:
   "risk": "moderate",
   "reason": "shared daemon path requires the full fleet",
   "boxes": {
-    "hipx": {
+    "gfx11": {
       "run": true,
       "archs": ["gfx1100", "gfx1151"],
       "models": ["qwen3.6-27b.mq4"],
@@ -196,7 +196,7 @@ Claude must write `review.md` and exact JSON with this shape:
          "prompt": "exact box-local test", "expect": "machine-checkable result"}
       ]
     },
-    "hiptrx": {
+    "gfx12": {
       "run": true,
       "archs": ["gfx1201"],
       "models": ["qwen3.6-27b.mq4"],
@@ -238,7 +238,7 @@ false-pass/false-reject rates:
 | moderate | codex **terra high** |
 | high-risk | codex **sol xhigh** |
 
-codex authenticates **box-local** on hipx/hiptrx (not a GitHub secret). pi.dev
+codex authenticates **box-local** on the gfx11 and gfx12 boxes (not a GitHub secret). pi.dev
 slots in as a fourth harness when added (§Phase 6).
 
 **Bounded behavior executor.** The merge gate does not call autoresearch's
@@ -443,11 +443,11 @@ fallback if self-hosted runners ever prove painful.
   `/gate`. Draft PRs are gated out of automatic runs. `/merge` is handled by the
   separate merge-command workflow.
 - **Matrix:** emitted by `ar gate --validate-plan` from Claude's plan. It contains
-  zero, one, or both physical boxes; a selected hipx job runs its selected subset
-  of gfx1100/gfx1151 sequentially, while hiptrx owns gfx1201.
+  zero, one, or both physical boxes; a selected gfx11 job runs its selected subset
+  of gfx1100/gfx1151 sequentially, while the gfx12 box owns gfx1201.
 - **Concurrency:** GH group per PR with `cancel-in-progress: false` **+ on-box
   `gpu-lock.sh`**. A later `/gate` request queues instead of cancelling an active
-  dispatch or measurement. hipx runs its selected archs under one lock, keeping
+  dispatch or measurement. The gfx11 box runs its selected archs under one lock, keeping
   co-resident perf measurements from perturbing each other. The gate is
   a lock *citizen* (never `rm`s the lockfile) but a **priority** one — it can
   preempt the background loop (§17) so a human waiting on a PR is never starved
@@ -456,9 +456,9 @@ fallback if self-hosted runners ever prove painful.
   completeness and immutable identity, computes the authoritative outcome, then
   re-invokes Claude to write one explanation/action. A validator constrains that
   action before the workflow posts or merges.
-- **Freshness:** on every landing, sync `master` + rebuild `staging` on hipx and
-  hiptrx (validators) and on the k9lin dev checkout (repo sync only; k9lin stays
-  zero-validation).
+- **Freshness:** on every landing, sync `master` + rebuild `staging` on the gfx11 and
+  gfx12 boxes (validators) and on the gfx1100 dev checkout (repo sync only; the dev
+  checkout stays zero-validation).
 
 ## 15. Ledger
 
@@ -477,8 +477,8 @@ provide (bring-up is Phase 0):
 
 | Runner | Labels | Archs | Executors | Tools required |
 |---|---|---|---|---|
-| **hipx** | `self-hosted, gfx1100, gfx1151` | gfx1100, gfx1151 | codex | rocprofv3, passwordless `sudo -n` (clock pin), `MODELS_DIR`, cargo, bun, `gpu-lock.sh` |
-| **hiptrx** | `self-hosted, gfx1201` | gfx1201 | codex + grok | same + `GROK_BIN` |
+| **gfx11 box** | `self-hosted, gfx1100, gfx1151` | gfx1100, gfx1151 | codex | rocprofv3, passwordless `sudo -n` (clock pin), `MODELS_DIR`, cargo, bun, `gpu-lock.sh` |
+| **gfx12 box** | `self-hosted, gfx1201` | gfx1201 | codex + grok | same + `GROK_BIN` |
 
 Per-box `gpu-lock.sh` serializes the gate against the loop. Secrets:
 `CLAUDE_CODE_OAUTH_TOKEN` (Claude App, for Tier 2 dispatch/interpret/merge);
@@ -494,7 +494,7 @@ codex/grok auth on-box.
     **auto-releases** the lock on holder death — no stale lock is possible — so
     the gate acquires on its next 5s poll. Nothing to do (never `rm` the
     lockfile).
-  - *Holder is a peer gate job on the same box* (hipx: gfx1100 + gfx1151) → they
+  - *Holder is a peer gate job on the same box* (gfx11 box: gfx1100 + gfx1151) → they
     serialize on the per-box lock **by design**, so neither perturbs the other's
     perf measurement; the reentrancy guard (`HIPFIRE_GPU_LOCK_OWNER`) keeps a
     gate's own nested sub-measurements from self-deadlocking.
@@ -542,7 +542,7 @@ codex/grok auth on-box.
 
 ## 19. Rollout
 
-1. **Phase 0** — runners on hipx/hiptrx (§16) + the loop `gate-priority` hook
+1. **Phase 0** — runners on the gfx11 and gfx12 boxes (§16) + the loop `gate-priority` hook
    (`driver.py`/`watcher.py` honor the marker between rounds, §17) so the gate can
    preempt a running loop.
 2. **Phase 1** — `ar gate` engine (gates 0–3b) + no-GPU unit tests.

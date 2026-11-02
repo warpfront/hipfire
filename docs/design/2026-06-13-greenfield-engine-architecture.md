@@ -269,10 +269,10 @@ splice. (The companion doc's "awkward 10%" bullet is corrected to match.)
   driver from qwen35/ds4/minimax into one generic driver in `hipfire-runtime` over a small per-arch
   trait, reusing `run_layer_program_ep`. Shrinks the future-C surface (3 drivers → 1). Lifetime-heavy
   (per-layer `Vec<Bindings>` borrowing `kv_per_rank.iter_mut()`); touches live ds4/minimax EP → must
-  hold byte-parity (`ep_decode_parity.rs` + multi-GPU coherence on hiptrx).
+  hold byte-parity (`ep_decode_parity.rs` + multi-GPU coherence on a 4×gfx1201 host).
 - **B — wire qwen35 EP to the daemon (orthogonal product value).** Add `EpArch::Qwen35` +
-  `load_model_ep`/`generate_ep` arms so qwen35-A3B EP is usable across hiptrx (4×gfx1201).
-  Mechanical, but **adds** EP surface — moves *away* from C; validate on hiptrx (ssh), not locally.
+  `load_model_ep`/`generate_ep` arms so qwen35-A3B EP is usable across a 4×gfx1201 host.
+  Mechanical, but **adds** EP surface — moves *away* from C; validate on a 4×gfx1201 host (ssh), not locally.
 - **C — full rehome (the actual unblock; gated on the core Runtime-enum refactor).** Fold
   `EpState`/`EpArch` into `Runtime::Qwen35Rt.ep` (§2) so EP becomes one *transport mode* of the
   arch's own runtime; delete the sibling state + `generate_ep` fork. Only then is "the qwen35

@@ -242,6 +242,13 @@ pub fn spec_step_dflash_mtp(
             llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
+            llama::EmbeddingFormat::Ggml(_) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+                )
+                .into())
+            }
             _ => panic!("dflash_mtp: unsupported target embedding format"),
         }
     }
@@ -290,7 +297,7 @@ pub fn spec_step_dflash_mtp(
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         match w_out.gpu_dtype {
             DType::Q8_0 => {
-                gpu.gemm_q8_0_batched(
+                gpu.gemm_q8_0_batched_f32_chunked(
                     &w_out.buf,
                     &hidden_rows,
                     &logits_batch,
@@ -829,6 +836,13 @@ pub fn spec_step_dflash_mtp_tree(
             llama::EmbeddingFormat::F32 => {
                 gpu.embedding_lookup(&target.weights.token_embd, &dst, tok, h)?
             }
+            llama::EmbeddingFormat::Ggml(_) => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+                )
+                .into())
+            }
             _ => panic!("dflash_mtp_tree: unsupported target embedding format"),
         }
     }
@@ -875,7 +889,7 @@ pub fn spec_step_dflash_mtp_tree(
         let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
         let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
         match w_out.gpu_dtype {
-            DType::Q8_0 => gpu.gemm_q8_0_batched(
+            DType::Q8_0 => gpu.gemm_q8_0_batched_f32_chunked(
                 &w_out.buf,
                 &hidden_rows,
                 &logits_batch,
@@ -1015,6 +1029,7 @@ pub fn spec_step_dflash_mtp_tree(
         n_mtp_forwards,
         trunk_weights,
         Some(&state.gemm_rotate_scratch),
+        false,
     )?;
 
     // ── 3. Batched MTP lm_head + top-K extraction ─────────────────────────

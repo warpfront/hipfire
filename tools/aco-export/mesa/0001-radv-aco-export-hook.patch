@@ -1,0 +1,650 @@
+diff --git a/src/amd/compiler/aco_interface.cpp b/src/amd/compiler/aco_interface.cpp
+index df53849..9f04d13 100644
+--- a/src/amd/compiler/aco_interface.cpp
++++ b/src/amd/compiler/aco_interface.cpp
+@@ -16,6 +16,19 @@
+ #include <iostream>
+ #include <vector>
+ 
++/* hipfire offline export: register usage recorded by the last register allocation on this thread. */
++extern "C" {
++__thread unsigned aco_export_ra_max_used_vgprs;
++__thread unsigned aco_export_ra_max_used_sgprs;
++__thread unsigned aco_export_typed_ordinary_sgprs;
++__thread unsigned aco_export_typed_vgprs;
++__thread unsigned aco_export_typed_vcc;
++__thread unsigned aco_export_typed_other_special;
++__thread uint32_t aco_export_typed_sgpr_read_mask[4];
++__thread uint32_t aco_export_typed_sgpr_def_mask[4];
++__thread uint32_t aco_export_typed_entry_live_mask[4];
++}
++
+ using namespace aco;
+ 
+ namespace {
+@@ -226,6 +239,107 @@ aco_compile_shader_part(const struct aco_compiler_options* options,
+                    disasm.data(), disasm.size());
+ }
+ 
++/* hipfire offline export: measure register use from the final typed post-RA instructions (every fixed
++ * Operand / Definition PhysReg range), after all ACO passes and before assembly. Ordinary SGPRs are
++ * s0..s105; s106/s107 are VCC; everything else (>=108) is a special register (TTMP, M0, EXEC, ...). */
++static void
++export_measure_typed_regs(Program* program)
++{
++   unsigned ord = 0, vgpr = 0, vcc = 0, other_special = 0;
++   uint32_t reads[4] = {0, 0, 0, 0}, defs[4] = {0, 0, 0, 0};
++   auto account = [&](PhysReg r, unsigned dwords, uint32_t* mask) {
++      for (unsigned i = r.reg(); i < r.reg() + dwords; i++) {
++         if (i >= 256) {
++            vgpr = std::max(vgpr, i - 256 + 1);
++         } else if (i < 106) {
++            ord = std::max(ord, i + 1);
++            mask[i / 32] |= 1u << (i % 32);
++         } else if (i < 108) {
++            vcc = 1;
++         } else {
++            other_special = 1;
++         }
++      }
++   };
++   for (Block& block : program->blocks) {
++      for (aco_ptr<Instruction>& instr : block.instructions) {
++         for (Operand& op : instr->operands) {
++            if (op.isConstant() || op.isUndefined() || !op.isFixed())
++               continue;
++            account(op.physReg(), op.size(), reads);
++         }
++         for (Definition& def : instr->definitions) {
++            if (!def.isFixed())
++               continue;
++            account(def.physReg(), def.size(), defs);
++         }
++      }
++   }
++
++   /* Typed entry liveness over the linear CFG: an ordinary SGPR is live-in at the entry iff some path reads it
++    * before every write. p_startpgm is skipped (it only names the entry values); conditional-move style
++    * SALU defs (name contains "cmov") do not kill. */
++   const unsigned nblocks = program->blocks.size();
++   std::vector<std::array<uint32_t, 4>> use_b(nblocks, {0, 0, 0, 0}), def_b(nblocks, {0, 0, 0, 0}),
++      live_in(nblocks, {0, 0, 0, 0});
++   auto touch = [](PhysReg r, unsigned dwords, uint32_t* mask) {
++      for (unsigned i = r.reg(); i < r.reg() + dwords && i < 106; i++)
++         mask[i / 32] |= 1u << (i % 32);
++   };
++   for (Block& block : program->blocks) {
++      const unsigned b = block.index;
++      for (aco_ptr<Instruction>& instr : block.instructions) {
++         if (instr->opcode == aco_opcode::p_startpgm)
++            continue;
++         const bool conditional = strstr(instr_info.name[(int)instr->opcode], "cmov") != NULL;
++         for (Operand& op : instr->operands) {
++            if (op.isConstant() || op.isUndefined() || !op.isFixed())
++               continue;
++            uint32_t m[4] = {0, 0, 0, 0};
++            touch(op.physReg(), op.size(), m);
++            for (unsigned w = 0; w < 4; w++)
++               use_b[b][w] |= m[w] & ~def_b[b][w];
++         }
++         if (conditional)
++            continue;
++         for (Definition& def : instr->definitions) {
++            if (!def.isFixed())
++               continue;
++            touch(def.physReg(), def.size(), def_b[b].data());
++         }
++      }
++   }
++   for (bool changed = true; changed;) {
++      changed = false;
++      for (unsigned bi = nblocks; bi-- > 0;) {
++         std::array<uint32_t, 4> out = {0, 0, 0, 0};
++         for (unsigned s : program->blocks[bi].linear_succs)
++            for (unsigned w = 0; w < 4; w++)
++               out[w] |= live_in[s][w];
++         for (unsigned w = 0; w < 4; w++) {
++            const uint32_t in = use_b[bi][w] | (out[w] & ~def_b[bi][w]);
++            if (in != live_in[bi][w]) {
++               live_in[bi][w] = in;
++               changed = true;
++            }
++         }
++      }
++   }
++   uint32_t entry_live[4] = {0, 0, 0, 0};
++   if (nblocks)
++      for (unsigned w = 0; w < 4; w++)
++         entry_live[w] = live_in[0][w];
++   aco_export_typed_ordinary_sgprs = ord;
++   aco_export_typed_vgprs = vgpr;
++   aco_export_typed_vcc = vcc;
++   aco_export_typed_other_special = other_special;
++   for (unsigned i = 0; i < 4; i++) {
++      aco_export_typed_sgpr_read_mask[i] = reads[i];
++      aco_export_typed_sgpr_def_mask[i] = defs[i];
++      aco_export_typed_entry_live_mask[i] = entry_live[i];
++   }
++}
++
+ } /* end namespace */
+ 
+ void
+@@ -248,6 +362,7 @@ aco_compile_shader(const struct aco_compiler_options* options, const struct aco_
+    select_program(program.get(), shader_count, shaders, &config, options, info, args);
+ 
+    std::string llvm_ir = aco_postprocess_shader(options, program);
++   export_measure_typed_regs(program.get());
+ 
+    /* assembly */
+    std::vector<uint32_t> code;
+diff --git a/src/amd/compiler/aco_interface.h b/src/amd/compiler/aco_interface.h
+index 5b61dcd..d9c926c 100644
+--- a/src/amd/compiler/aco_interface.h
++++ b/src/amd/compiler/aco_interface.h
+@@ -69,6 +69,19 @@ void aco_compile_trap_handler(const struct aco_compiler_options* options,
+                               const struct aco_shader_info* info, const struct ac_shader_args* args,
+                               aco_callback* build_binary, void** binary);
+ 
++/* hipfire offline export: addressable VGPR/SGPR counts (max used index + 1) of the last register allocation. */
++extern __thread unsigned aco_export_ra_max_used_vgprs;
++extern __thread unsigned aco_export_ra_max_used_sgprs;
++/* hipfire offline export: typed post-RA measurement (all passes done, before assembly): ordinary SGPR count
++ * (highest touched s0..s105 + 1), VGPR count, VCC/special touched, per-SGPR operand-read / definition masks. */
++extern __thread unsigned aco_export_typed_ordinary_sgprs;
++extern __thread unsigned aco_export_typed_vgprs;
++extern __thread unsigned aco_export_typed_vcc;
++extern __thread unsigned aco_export_typed_other_special;
++extern __thread uint32_t aco_export_typed_sgpr_read_mask[4];
++extern __thread uint32_t aco_export_typed_sgpr_def_mask[4];
++extern __thread uint32_t aco_export_typed_entry_live_mask[4]; /* ordinary SGPRs live-in at the entry (typed liveness over the linear CFG) */
++
+ uint64_t aco_get_codegen_flags();
+ 
+ bool aco_is_gpu_supported(const struct radeon_info* info);
+diff --git a/src/amd/compiler/aco_register_allocation.cpp b/src/amd/compiler/aco_register_allocation.cpp
+index 75b49d0..9eaf151 100644
+--- a/src/amd/compiler/aco_register_allocation.cpp
++++ b/src/amd/compiler/aco_register_allocation.cpp
+@@ -16,6 +16,12 @@
+ #include <optional>
+ #include <vector>
+ 
++/* hipfire offline export: register usage recorded by this allocation (defined in aco_interface.cpp). */
++extern "C" {
++extern __thread unsigned aco_export_ra_max_used_vgprs;
++extern __thread unsigned aco_export_ra_max_used_sgprs;
++}
++
+ namespace aco {
+ namespace {
+ 
+@@ -4243,6 +4249,8 @@ register_allocation(Program* program, ra_test_policy policy)
+    } /* end for BB */
+ 
+    /* num_gpr = rnd_up(max_used_gpr + 1) */
++   aco_export_ra_max_used_vgprs = ctx.max_used_vgpr + 1;
++   aco_export_ra_max_used_sgprs = ctx.max_used_sgpr + 1;
+    program->config->num_vgprs =
+       std::min<uint16_t>(get_vgpr_alloc(program, ctx.max_used_vgpr + 1), 256);
+    program->config->num_sgprs = get_sgpr_alloc(program, ctx.max_used_sgpr + 1);
+diff --git a/src/amd/vulkan/radv_aco_export.inc b/src/amd/vulkan/radv_aco_export.inc
+new file mode 100644
+index 0000000..8308e6f
+--- /dev/null
++++ b/src/amd/vulkan/radv_aco_export.inc
+@@ -0,0 +1,396 @@
++/*
++ * hipfire offline developer export hook for the pinned RADV (NOT part of upstream Mesa).
++ *
++ * Included textually by radv_shader.c immediately before radv_aco_build_shader_binary() so that it
++ * can call RADV's own static helpers (radv_precompute_registers) and see the exact structures the
++ * driver itself feeds to the GPU.  It captures, for a COMPUTE shader compiled through the real
++ * SPIR-V -> NIR -> radv_postprocess_nir -> aco_compile_shader pipeline:
++ *   - the raw ACO output code words (exec_size / code_size) written byte-for-byte to shader.bin,
++ *   - the aco_callback arguments (pre-postprocess config, aco symbols, ACO's own disasm string),
++ *   - the post-radv_postprocess_binary_config config (RSRC1/2/3, float mode, LDS, scratch, regs),
++ *   - the complete ac_shader_args / radv_shader_args arg table (file/offset/size/type) with the
++ *     field name of every slot, user_sgprs_locs, inline push constant dword mask,
++ *   - radv_shader_info compute fields, aco options/info, physical device identity,
++ *   - RADV's own precomputed compute registers (via radv_precompute_registers on a shader copy),
++ *   - the final NIR text.
++ * Active only when RADV_ACO_EXPORT_DIR is set.  64-bit values are written as 16-hex-digit strings
++ * so that no JSON consumer can truncate them.
++ */
++
++#include <errno.h>
++#include <inttypes.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++
++struct radv_aco_export_stash {
++   bool valid;
++   struct ac_shader_config config;
++   uint32_t exec_size;
++   uint32_t code_dw;
++   uint32_t *code;
++   struct aco_symbol *symbols;
++   unsigned num_symbols;
++   char *disasm;
++   unsigned disasm_size;
++};
++
++static __thread struct radv_aco_export_stash radv_aco_export_stash_tls;
++static unsigned radv_aco_export_counter;
++
++static const char *
++radv_aco_export_dir(void)
++{
++   const char *dir = getenv("RADV_ACO_EXPORT_DIR");
++   return (dir && dir[0]) ? dir : NULL;
++}
++
++static void
++radv_aco_export_stash_clear(void)
++{
++   struct radv_aco_export_stash *s = &radv_aco_export_stash_tls;
++   free(s->code);
++   free(s->symbols);
++   free(s->disasm);
++   memset(s, 0, sizeof(*s));
++}
++
++/* Called from the aco_callback with the exact callback arguments. */
++static void
++radv_aco_export_stash_callback(const struct ac_shader_config *config, const char *disasm_str, unsigned disasm_size,
++                               uint32_t exec_size, const uint32_t *code, uint32_t code_dw,
++                               const struct aco_symbol *symbols, unsigned num_symbols)
++{
++   if (!radv_aco_export_dir())
++      return;
++   radv_aco_export_stash_clear();
++   struct radv_aco_export_stash *s = &radv_aco_export_stash_tls;
++   s->config = *config;
++   s->exec_size = exec_size;
++   s->code_dw = code_dw;
++   s->code = malloc((size_t)code_dw * 4);
++   memcpy(s->code, code, (size_t)code_dw * 4);
++   s->num_symbols = num_symbols;
++   if (num_symbols) {
++      s->symbols = malloc(sizeof(*symbols) * num_symbols);
++      memcpy(s->symbols, symbols, sizeof(*symbols) * num_symbols);
++   }
++   s->disasm_size = disasm_size;
++   if (disasm_size) {
++      s->disasm = malloc(disasm_size);
++      memcpy(s->disasm, disasm_str, disasm_size);
++   }
++   s->valid = true;
++}
++
++static void
++radv_aco_export_json_str(FILE *f, const char *s)
++{
++   fputc('"', f);
++   for (; s && *s; s++) {
++      unsigned char c = (unsigned char)*s;
++      if (c == '"' || c == '\\')
++         fprintf(f, "\\%c", c);
++      else if (c < 0x20)
++         fprintf(f, "\\u%04x", c);
++      else
++         fputc(c, f);
++   }
++   fputc('"', f);
++}
++
++static void
++radv_aco_export_config_json(FILE *f, const struct ac_shader_config *c)
++{
++   fprintf(f,
++           "{\"num_sgprs\":%u,\"num_vgprs\":%u,\"num_shared_vgprs\":%u,\"spilled_sgprs\":%u,"
++           "\"spilled_vgprs\":%u,\"lds_size\":%u,\"spi_ps_input_ena\":%u,\"spi_ps_input_addr\":%u,"
++           "\"float_mode\":%u,\"scratch_bytes_per_wave\":%u,\"wgp_mode\":%s,\"rsrc1\":%u,\"rsrc2\":%u,"
++           "\"rsrc3\":%u}",
++           c->num_sgprs, c->num_vgprs, c->num_shared_vgprs, c->spilled_sgprs, c->spilled_vgprs, c->lds_size,
++           c->spi_ps_input_ena, c->spi_ps_input_addr, c->float_mode, c->scratch_bytes_per_wave,
++           c->wgp_mode ? "true" : "false", c->rsrc1, c->rsrc2, c->rsrc3);
++}
++
++struct radv_aco_export_name {
++   const char *name;
++   int index; /* position inside an array field, or -1 */
++   struct ac_arg arg;
++};
++
++#define RADV_ACO_EXPORT_MAX_NAMES (AC_MAX_ARGS * 2)
++
++static unsigned
++radv_aco_export_collect_names(const struct radv_shader_args *a, enum amd_gfx_level gfx_level,
++                              struct radv_aco_export_name *out)
++{
++   unsigned n = 0;
++#define ONE(field)                                                                                                     \
++   do {                                                                                                                \
++      if (a->field.used)                                                                                               \
++         out[n++] = (struct radv_aco_export_name){#field, -1, a->field};                                               \
++   } while (0)
++#define ARR(field, count)                                                                                              \
++   do {                                                                                                                \
++      for (unsigned i_ = 0; i_ < (count); i_++)                                                                        \
++         if (a->field[i_].used)                                                                                        \
++            out[n++] = (struct radv_aco_export_name){#field, (int)i_, a->field[i_]};                                   \
++   } while (0)
++   ONE(ac.ring_offsets);
++   ARR(descriptors, MAX_SETS);
++   ONE(ac.push_constants);
++   ONE(ac.dynamic_descriptors);
++   for (unsigned i = 0; i < AC_MAX_INLINE_PUSH_CONSTS; i++)
++      if (a->ac.inline_push_consts[i].used)
++         out[n++] = (struct radv_aco_export_name){"ac.inline_push_consts", (int)i, a->ac.inline_push_consts[i]};
++   ONE(ac.num_work_groups);
++   /* GFX12 declares workgroup_ids[i].used = true without allocating an SGPR slot
++    * (radv_shader_args.c: "if (gfx_level >= GFX12) args->ac.workgroup_ids[i].used = true"). Their
++    * arg_index is meaningless and must not be mapped to a slot. */
++   if (gfx_level < GFX12)
++      ARR(ac.workgroup_ids, 3);
++   ONE(ac.tg_size);
++   ONE(ac.scratch_offset);
++   ONE(ac.local_invocation_ids_packed);
++   ONE(ac.local_invocation_id_x);
++   ONE(ac.local_invocation_id_y);
++   ONE(ac.local_invocation_id_z);
++   ONE(ac.draw_id);
++   ONE(ac.task_ring_entry);
++   ONE(ac.view_index);
++#undef ONE
++#undef ARR
++   return n;
++}
++
++static void
++radv_aco_export_args_json(FILE *f, const struct radv_shader_args *a, enum amd_gfx_level gfx_level)
++{
++   struct radv_aco_export_name *names = calloc(RADV_ACO_EXPORT_MAX_NAMES, sizeof(*names));
++   unsigned num_names = radv_aco_export_collect_names(a, gfx_level, names);
++   const struct ac_shader_args *ac = &a->ac;
++
++   fprintf(f, "{\"arg_count\":%u,\"num_sgprs_used\":%u,\"num_vgprs_used\":%u,\"num_user_sgprs\":%u,",
++           ac->arg_count, ac->num_sgprs_used, ac->num_vgprs_used, a->num_user_sgprs);
++   fprintf(f, "\"load_grid_size_from_user_sgpr\":%s,\"explicit_scratch_args\":%s,",
++           a->load_grid_size_from_user_sgpr ? "true" : "false", a->explicit_scratch_args ? "true" : "false");
++   fprintf(f, "\"inline_push_const_mask\":\"%016" PRIx64 "\",", ac->inline_push_const_mask);
++
++   fprintf(f, "\"args\":[");
++   for (unsigned i = 0; i < ac->arg_count; i++) {
++      const char *name = NULL;
++      int index = -1;
++      unsigned matches = 0;
++      for (unsigned j = 0; j < num_names; j++) {
++         if (names[j].arg.arg_index == i) {
++            if (!matches) {
++               name = names[j].name;
++               index = names[j].index;
++            }
++            matches++;
++         }
++      }
++      fprintf(f, "%s{\"slot\":%u,\"file\":\"%s\",\"offset\":%u,\"size\":%u,\"type\":\"%s\",\"skip\":%s,"
++                 "\"pending_vmem\":%s,\"preserved\":%s,\"field\":",
++              i ? "," : "", i, ac->args[i].file == AC_ARG_SGPR ? "sgpr" : "vgpr", ac->args[i].offset,
++              ac->args[i].size, ac->args[i].type == AC_ARG_CONST_ADDR ? "const_addr" : "value",
++              ac->args[i].skip ? "true" : "false", ac->args[i].pending_vmem ? "true" : "false",
++              ac->args[i].preserved ? "true" : "false");
++      if (name)
++         radv_aco_export_json_str(f, name);
++      else
++         fputs("null", f);
++      fprintf(f, ",\"field_index\":%d,\"field_alias_count\":%u}", index, matches);
++   }
++   fprintf(f, "],");
++
++   fprintf(f, "\"gfx12_implicit_workgroup_ids\":[%s,%s,%s],", ac->workgroup_ids[0].used && gfx_level >= GFX12 ? "true" : "false",
++           ac->workgroup_ids[1].used && gfx_level >= GFX12 ? "true" : "false",
++           ac->workgroup_ids[2].used && gfx_level >= GFX12 ? "true" : "false");
++
++   fprintf(f, "\"user_sgprs_locs\":{\"descriptor_sets_enabled\":%u,\"descriptor_sets\":[", a->user_sgprs_locs.descriptor_sets_enabled);
++   for (unsigned i = 0; i < MAX_SETS; i++)
++      fprintf(f, "%s{\"sgpr_idx\":%d,\"num_sgprs\":%u}", i ? "," : "", a->user_sgprs_locs.descriptor_sets[i].sgpr_idx,
++              a->user_sgprs_locs.descriptor_sets[i].num_sgprs);
++   fprintf(f, "],\"shader_data\":[");
++   for (unsigned i = 0; i < AC_UD_MAX_UD; i++)
++      fprintf(f, "%s{\"ud\":%u,\"sgpr_idx\":%d,\"num_sgprs\":%u}", i ? "," : "", i,
++              a->user_sgprs_locs.shader_data[i].sgpr_idx, a->user_sgprs_locs.shader_data[i].num_sgprs);
++   fprintf(f, "]}}");
++   free(names);
++}
++
++static const char *
++radv_aco_export_symbol_name(enum aco_symbol_id id)
++{
++   switch (id) {
++   case aco_symbol_invalid: return "invalid";
++   case aco_symbol_scratch_addr_lo: return "scratch_addr_lo";
++   case aco_symbol_scratch_addr_hi: return "scratch_addr_hi";
++   case aco_symbol_const_data_addr: return "const_data_addr";
++   }
++   return "unknown";
++}
++
++static void
++radv_aco_export_write_file(const char *dir, const char *name, const void *data, size_t size)
++{
++   char path[4096];
++   snprintf(path, sizeof(path), "%s/%s", dir, name);
++   FILE *f = fopen(path, "wb");
++   if (!f) {
++      fprintf(stderr, "radv_aco_export: cannot write %s: %s\n", path, strerror(errno));
++      abort();
++   }
++   if (size && fwrite(data, 1, size, f) != size) {
++      fprintf(stderr, "radv_aco_export: short write %s\n", path);
++      abort();
++   }
++   fclose(f);
++}
++
++static void
++radv_aco_export_emit(struct radv_device *device, const struct radv_shader_binary *binary,
++                     struct nir_shader *const *shaders, int shader_count, const struct radv_shader_args *args,
++                     const struct aco_compiler_options *ac_opts, const struct aco_shader_info *ac_info,
++                     const struct radv_shader_stage_key *stage_key, const struct radv_nir_compiler_options *options)
++{
++   const char *root = radv_aco_export_dir();
++   struct radv_aco_export_stash *s = &radv_aco_export_stash_tls;
++   /* RADV-internal (meta/helper) compute shaders are not application shaders: never exported. */
++   if (!root || !s->valid || shader_count != 1 || shaders[0]->info.stage != MESA_SHADER_COMPUTE ||
++       shaders[0]->info.internal) {
++      radv_aco_export_stash_clear();
++      return;
++   }
++
++   const struct radv_physical_device *pdev = radv_device_physical(device);
++   const struct radeon_info *ri = &pdev->info;
++   const struct radv_shader_info *info = &binary->info;
++
++   char dir[4096];
++   unsigned n = p_atomic_inc_return(&radv_aco_export_counter) - 1;
++   snprintf(dir, sizeof(dir), "%s/compute-%u", root, n);
++   if (mkdir(root, 0777) && errno != EEXIST) {
++      fprintf(stderr, "radv_aco_export: mkdir %s: %s\n", root, strerror(errno));
++      abort();
++   }
++   if (mkdir(dir, 0777) && errno != EEXIST) {
++      fprintf(stderr, "radv_aco_export: mkdir %s: %s\n", dir, strerror(errno));
++      abort();
++   }
++
++   /* RADV's own precomputed registers, computed by the driver function on a copy. */
++   struct radv_shader *tmp = calloc(1, sizeof(*tmp));
++   tmp->info = *info;
++   tmp->config = binary->config;
++   radv_precompute_registers(device, tmp);
++
++   radv_aco_export_write_file(dir, "shader.bin", s->code, (size_t)s->code_dw * 4);
++   radv_aco_export_write_file(dir, "aco.disasm.txt", s->disasm ? s->disasm : "", s->disasm_size ? s->disasm_size - 1 : 0);
++
++   {
++      char *nir_text = NULL;
++      size_t nir_size = 0;
++      struct u_memstream mem;
++      if (u_memstream_open(&mem, &nir_text, &nir_size)) {
++         FILE *memf = u_memstream_get(&mem);
++         nir_print_shader(shaders[0], memf);
++         u_memstream_close(&mem);
++         radv_aco_export_write_file(dir, "final.nir.txt", nir_text, nir_size);
++         free(nir_text);
++      }
++   }
++
++   char path[4096];
++   snprintf(path, sizeof(path), "%s/capture.json", dir);
++   FILE *f = fopen(path, "wb");
++   if (!f) {
++      fprintf(stderr, "radv_aco_export: cannot write %s\n", path);
++      abort();
++   }
++
++   fprintf(f, "{\"schema\":\"radv-aco-capture-v1\",\"stage\":\"compute\",\"capture_point\":"
++              "\"radv_shader.c:shader_compile after radv_postprocess_binary_config\",");
++   fprintf(f, "\"exec_size\":%u,\"code_size\":%u,", s->exec_size, s->code_dw * 4);
++   fprintf(f, "\"ra_max_used\":{\"vgprs\":%u,\"sgprs\":%u,\"source\":\"aco_register_allocation.cpp ctx.max_used_{v,s}gpr+1\"},",
++           aco_export_ra_max_used_vgprs, aco_export_ra_max_used_sgprs);
++   fprintf(f, "\"typed_post_ra\":{\"ordinary_sgprs\":%u,\"vgprs\":%u,\"vcc_touched\":%s,\"other_special_touched\":%s,"
++              "\"sgpr_read_mask\":[\"%08x\",\"%08x\",\"%08x\",\"%08x\"],\"sgpr_def_mask\":[\"%08x\",\"%08x\",\"%08x\",\"%08x\"],"
++              "\"entry_live_mask\":[\"%08x\",\"%08x\",\"%08x\",\"%08x\"],"
++              "\"source\":\"aco_interface.cpp export_measure_typed_regs: every fixed Operand/Definition PhysReg range of the final typed instructions after aco_postprocess_shader, before emit_program; ordinary = s0..s105 (mask bit i = s[i]), s106-107 = VCC; entry_live_mask = ordinary SGPRs read before any write on some path of the linear CFG (p_startpgm skipped, cmov defs do not kill)\"},",
++           aco_export_typed_ordinary_sgprs, aco_export_typed_vgprs, aco_export_typed_vcc ? "true" : "false",
++           aco_export_typed_other_special ? "true" : "false", aco_export_typed_sgpr_read_mask[0],
++           aco_export_typed_sgpr_read_mask[1], aco_export_typed_sgpr_read_mask[2], aco_export_typed_sgpr_read_mask[3],
++           aco_export_typed_sgpr_def_mask[0], aco_export_typed_sgpr_def_mask[1], aco_export_typed_sgpr_def_mask[2],
++           aco_export_typed_sgpr_def_mask[3], aco_export_typed_entry_live_mask[0], aco_export_typed_entry_live_mask[1],
++           aco_export_typed_entry_live_mask[2], aco_export_typed_entry_live_mask[3]);
++   fprintf(f, "\"aco_callback_config\":");
++   radv_aco_export_config_json(f, &s->config);
++   fprintf(f, ",\"config\":");
++   radv_aco_export_config_json(f, &binary->config);
++   fprintf(f, ",\"symbols\":[");
++   for (unsigned i = 0; i < s->num_symbols; i++)
++      fprintf(f, "%s{\"id\":\"%s\",\"id_value\":%u,\"offset\":%u}", i ? "," : "",
++              radv_aco_export_symbol_name(s->symbols[i].id), (unsigned)s->symbols[i].id, s->symbols[i].offset);
++   fprintf(f, "],");
++
++   fprintf(f, "\"aco_options\":{\"gfx_level\":%d,\"family\":%d,\"address32_hi\":%u,\"wgp_mode\":%s,"
++              "\"optimisations_disabled\":%s,\"record_asm\":%s,\"record_ir\":%s,\"record_stats\":%s,"
++              "\"load_grid_size_from_user_sgpr\":%s,\"has_ls_vgpr_init_bug\":%s,\"is_opengl\":%s},",
++           (int)ac_opts->gfx_level, (int)ac_opts->family, ac_opts->address32_hi, ac_opts->wgp_mode ? "true" : "false",
++           ac_opts->optimisations_disabled ? "true" : "false", ac_opts->record_asm ? "true" : "false",
++           ac_opts->record_ir ? "true" : "false", ac_opts->record_stats ? "true" : "false",
++           ac_opts->load_grid_size_from_user_sgpr ? "true" : "false",
++           ac_opts->has_ls_vgpr_init_bug ? "true" : "false", ac_opts->is_opengl ? "true" : "false");
++   fprintf(f, "\"aco_info\":{\"hw_stage\":%d,\"wave_size\":%u,\"workgroup_size\":%u,\"lds_size\":%u,"
++              "\"uses_full_subgroups\":%s},",
++           (int)ac_info->hw_stage, ac_info->wave_size, ac_info->workgroup_size, ac_info->lds_size,
++           ac_info->cs.uses_full_subgroups ? "true" : "false");
++   fprintf(f, "\"radv_options\":{\"robust_buffer_access_llvm\":%s,\"wgp_mode\":%s,\"check_ir\":%s},",
++           options->robust_buffer_access_llvm ? "true" : "false", options->wgp_mode ? "true" : "false",
++           options->check_ir ? "true" : "false");
++   fprintf(f, "\"stage_key\":{\"optimisations_disabled\":%u,\"storage_robustness2\":%u,\"uniform_robustness2\":%u,"
++              "\"subgroup_require_full\":%u,\"subgroup_required_size\":%u,\"subgroup_allow_varying\":%u},",
++           stage_key->optimisations_disabled, stage_key->storage_robustness2, stage_key->uniform_robustness2,
++           stage_key->subgroup_require_full, stage_key->subgroup_required_size, stage_key->subgroup_allow_varying);
++
++   fprintf(f, "\"physical_device\":{\"name\":");
++   radv_aco_export_json_str(f, pdev->marketing_name);
++   fprintf(f, ",\"family_name\":");
++   radv_aco_export_json_str(f, ac_get_family_name(ri->family));
++   fprintf(f, ",\"family\":%d,\"gfx_level\":%d,\"chip_rev\":%u,\"pci_id\":%u,\"family_overridden\":%s,"
++              "\"address32_hi\":%u,\"lds_size_per_workgroup\":%u,\"has_graphics\":%s},",
++           (int)ri->family, (int)ri->gfx_level, ri->chip_rev, ri->pci_id, ri->family_overridden ? "true" : "false",
++           ri->address32_hi, ri->lds_size_per_workgroup, ri->has_graphics ? "true" : "false");
++
++   fprintf(f, "\"radv_shader_info\":{\"wave_size\":%u,\"workgroup_size\":%u,\"user_data_0\":%u,"
++              "\"push_constant_size\":%u,\"desc_set_used_mask\":%u,\"inline_push_constant_mask\":\"%016" PRIx64 "\","
++              "\"can_inline_all_push_constants\":%s,\"loads_push_constants\":%s,\"loads_dynamic_offsets\":%s,"
++              "\"cs\":{\"block_size\":[%u,%u,%u],\"uses_block_id\":[%s,%s,%s],\"uses_thread_id\":[%s,%s,%s],"
++              "\"uses_grid_size\":%s,\"uses_local_invocation_idx\":%s,\"uses_full_subgroups\":%s,"
++              "\"derivative_group\":%u}},",
++           info->wave_size, info->workgroup_size, info->user_data_0, info->push_constant_size, info->desc_set_used_mask,
++           info->inline_push_constant_mask, info->can_inline_all_push_constants ? "true" : "false",
++           info->loads_push_constants ? "true" : "false", info->loads_dynamic_offsets ? "true" : "false",
++           info->cs.block_size[0], info->cs.block_size[1], info->cs.block_size[2],
++           info->cs.uses_block_id[0] ? "true" : "false", info->cs.uses_block_id[1] ? "true" : "false",
++           info->cs.uses_block_id[2] ? "true" : "false", info->cs.uses_thread_id[0] ? "true" : "false",
++           info->cs.uses_thread_id[1] ? "true" : "false", info->cs.uses_thread_id[2] ? "true" : "false",
++           info->cs.uses_grid_size ? "true" : "false", info->cs.uses_local_invocation_idx ? "true" : "false",
++           info->cs.uses_full_subgroups ? "true" : "false", (unsigned)info->cs.derivative_group);
++
++   fprintf(f, "\"regs\":{\"compute_resource_limits\":%u,\"compute_num_thread_x\":%u,\"compute_num_thread_y\":%u,"
++              "\"compute_num_thread_z\":%u,\"pgm_rsrc1_reg\":%u,\"pgm_rsrc2_reg\":%u,\"pgm_rsrc3_reg\":%u,"
++              "\"device_dispatch_initiator\":%u},",
++           tmp->regs.cs.compute_resource_limits, tmp->regs.cs.compute_num_thread_x, tmp->regs.cs.compute_num_thread_y,
++           tmp->regs.cs.compute_num_thread_z, tmp->regs.pgm_rsrc1, tmp->regs.pgm_rsrc2, tmp->regs.pgm_rsrc3,
++           device->dispatch_initiator);
++
++   fprintf(f, "\"shader_args\":");
++   radv_aco_export_args_json(f, args, ri->gfx_level);
++   fprintf(f, "}\n");
++   fclose(f);
++
++   free(tmp);
++   radv_aco_export_stash_clear();
++}
+diff --git a/src/amd/vulkan/radv_shader.c b/src/amd/vulkan/radv_shader.c
+index 1c3f7a1..ba9bf88 100644
+--- a/src/amd/vulkan/radv_shader.c
++++ b/src/amd/vulkan/radv_shader.c
+@@ -3190,6 +3190,8 @@ radv_dump_nir_shaders(const struct radv_instance *instance, struct nir_shader *c
+    return ret;
+ }
+ 
++#include "radv_aco_export.inc"
++
+ static void
+ radv_aco_build_shader_binary(void **bin, const struct ac_shader_config *config, const char *llvm_ir_str,
+                              unsigned llvm_ir_size, const char *disasm_str, unsigned disasm_size,
+@@ -3199,6 +3201,8 @@ radv_aco_build_shader_binary(void **bin, const struct ac_shader_config *config,
+ {
+    struct radv_shader_binary **binary = (struct radv_shader_binary **)bin;
+ 
++   radv_aco_export_stash_callback(config, disasm_str, disasm_size, exec_size, code, code_dw, symbols, num_symbols);
++
+    uint32_t debug_info_size = debug_info_count * sizeof(struct ac_shader_debug_info);
+    uint32_t stats_size = statistics ? sizeof(struct amd_stats) : 0;
+ 
+@@ -3294,6 +3298,9 @@ shader_compile(struct radv_device *device, struct nir_shader *const *shaders, in
+    options->debug.private_data = &debug_data;
+ 
+    struct radv_shader_binary *binary = NULL;
++   struct aco_shader_info ac_info = {0};
++   struct aco_compiler_options ac_opts = {0};
++   bool used_aco = false;
+ 
+ #if AMD_LLVM_AVAILABLE
+    const struct radv_physical_device *pdev = radv_device_physical(device);
+@@ -3307,12 +3314,13 @@ shader_compile(struct radv_device *device, struct nir_shader *const *shaders, in
+    if (false) {
+ #endif
+    } else {
+-      struct aco_shader_info ac_info;
+-      struct aco_compiler_options ac_opts;
+       radv_aco_convert_opts(&ac_opts, options, args, stage_key);
++      if (radv_aco_export_dir())
++         ac_opts.record_asm = true;
+       radv_aco_convert_shader_info(&ac_info, info, args, &device->cache_key, options->info->gfx_level);
+       aco_compile_shader(&ac_opts, &ac_info, shader_count, shaders, &args->ac, &radv_aco_build_shader_binary,
+                          (void **)&binary);
++      used_aco = true;
+    }
+ 
+    binary->info = *info;
+@@ -3322,6 +3330,9 @@ shader_compile(struct radv_device *device, struct nir_shader *const *shaders, in
+       return NULL;
+    }
+ 
++   if (used_aco)
++      radv_aco_export_emit(device, binary, shaders, shader_count, args, &ac_opts, &ac_info, stage_key, options);
++
+    return binary;
+ }
+ 

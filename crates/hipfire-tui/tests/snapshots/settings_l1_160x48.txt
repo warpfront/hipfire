@@ -1,0 +1,48 @@
+                                                 hipfire · control panel    serve: offline    model: qwen3.8:27b
+
+ Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ┌ Settings ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │Tuning: Balanced (p)    GPU: gfx1151 (install.json)    Model: qwen3.8:27b (default)    Editing: all models (m)                                              │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ ┌──────────────────────┐┌ Quality ─────────────────────────────────────────────────────────────────────────────────┐┌ Prompt processing ─────────────────────┐
+ │Groups                ││  Setting                       Using now               From                Applies       ││How the model reads your prompt before  │
+ │> Quality            8││> Prompt processing             Fast (4-bit math)       default · gfx1151   restart       ││it starts to answer.                    │
+ │  Speed              5││  Flash-Next experts            — not used by 27B       Flash-Next only     restart       ││                                        │
+ │  Memory & context  32││  Flash-Next word table         — not used by 27B       Flash-Next only     restart       ││Options on this GPU                     │
+ │  Speculation       35││  Thinking                      on                      default             new chat      ││  ● Fast (4-bit math)  built-in default │
+ │  Hardware/devices   7││  Thinking effort               ● low                   you                 next message  ││  ○ Accurate (8-bit math)               │
+ │  Advanced         225││  Thinking cap                  med                     default             next message  ││      43% closer · 1.6× slower          │
+ │                      ││  reasoning.max_tokens          not set                 default             next message  ││                                        │
+ │Filters               ││  reasoning.max_total_tokens    0                       default             next message  ││Why "Fast (4-bit math)"                 │
+ │  Changed only (c) off││  — also affects quality —                                                                ││  1. built-in default · gfx1151         │
+ │  Hide unused (h)  off││  KV cache precision            q8 (auto)               default             see Memory    ││     Fast (4-bit math)  ← used          │
+ │                      ││                                                                                          ││     no registry, profile, preset,      │
+ │                      ││                                                                                          ││     user, model or environment value   │
+ │                      ││                                                                                          ││     is set                             │
+ │                      ││                                                                                          ││                                        │
+ │                      ││                                                                                          ││Measured · gfx1151                      │
+ │                      ││                                                                                          ││  KLD vs full model (lower = closer)    │
+ │                      ││                                                                                          ││    WT2  Fast 0.0695   Accurate 0.0394  │
+ │                      ││                                                                                          ││    code24  Fast 0.0485   Accurate      │
+ │                      ││                                                                                          ││0.0273                                  │
+ │                      ││                                                                                          ││  prompt speed pp8192 tok/s             │
+ │                      ││                                                                                          ││    Fast 974.2   Accurate 603.8         │
+ │                      ││                                                                                          ││  pp32000 tok/s                         │
+ │                      ││                                                                                          ││    Fast 777.0   Accurate 521.4         │
+ │                      ││                                                                                          ││  typing speed: unchanged (prefill,     │
+ │                      ││                                                                                          ││batch ≥ 64)                             │
+ │                      ││                                                                                          ││  source: PR #902 body                  │
+ │                      ││                                                                                          ││  (qwen3.8-27b.mq4-xts, HIP 7.2, 85 W   │
+ │                      ││                                                                                          ││  socket)                               │
+ │                      ││                                                                                          ││                                        │
+ │                      ││                                                                                          ││Takes effect  after serve restart       │
+ │                      ││                                                                                          ││Writes        kernel.gfx11_a8_prefill   │
+ │                      ││                                                                                          ││Environment   HIPFIRE_GFX11_A8_PREFILL  │
+ │                      ││ Quality settings change the answers themselves. "Better" here means closer to the        ││Per model     no — one value per serve  │
+ │                      ││ full-precision model, and it usually costs speed. Speed and speculation settings are     ││              process                   │
+ │                      ││ designed not to change answers.                                                          ││                                        │
+ └──────────────────────┘└──────────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────┘
+↑↓ move · ←→ change · Del default · / search · ? help · p tuning · m scope · o overrides · R reset-all · 1-6 group · Enter save · c changed · h hide unused
+

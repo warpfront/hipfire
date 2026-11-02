@@ -8,6 +8,13 @@
 #define HIPFIRE_MOE_DOWN_KERNEL gemv_hfq4g256_moe_down_k8_indexed_batched_expanded
 #endif
 
+// HIPFIRE_MOE_DOWN_ANY_K=1 builds the general K%256==0 twin (group loop).
+// The default body below is the K=512 (two-group) specialization and reads
+// only groups 0..1; the launcher routes every other K to the twin.
+#ifndef HIPFIRE_MOE_DOWN_ANY_K
+#define HIPFIRE_MOE_DOWN_ANY_K 0
+#endif
+
 // Atomic-free variant of `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched`.
 //
 // Same per-(token, krank) GEMV compute. Instead of `atomicAdd(scale * acc)`
@@ -52,7 +59,7 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     const float* __restrict__ topk_weights,               // [N × K_TOP]
     float*       __restrict__ x_residual,                 // [N × M], in-place
 #endif
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row0 = blockIdx.x * 4;
     if (row0 >= M) return;
@@ -68,6 +75,16 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    const bool expert_valid = (unsigned)expert_id < (unsigned)n_experts;
+    if (!expert_valid) {
+        if (tid == 0) {
+            const long long out_inv = ((long long)bid * K_TOP + krank) * (long long)M;
+            expert_outputs[out_inv + row0] = 0.0f;
+            if (have_row1) expert_outputs[out_inv + row1] = 0.0f;
+            if (have_row2) expert_outputs[out_inv + row2] = 0.0f;
+            if (have_row3) expert_outputs[out_inv + row3] = 0.0f;
+        }
+    } else {
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =
@@ -99,11 +116,13 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     __builtin_amdgcn_s_prefetch_data((const void*)row_ptr3, 0);
 #endif
 
+#if !HIPFIRE_MOE_DOWN_ANY_K
     // 2 live pairwise slots/row (acc2/acc3 would stay 0 on groups==2).
     float acc0 = 0.0f, acc1 = 0.0f;
     float bcc0 = 0.0f, bcc1 = 0.0f;
     float ccc0 = 0.0f, ccc1 = 0.0f;
     float dcc0 = 0.0f, dcc1 = 0.0f;
+#endif
 
     #if HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER
     // gfx1151 hybrid cache lowering: scale/zero-point are wave-uniform, so
@@ -131,6 +150,27 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
              + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7); \
     } while (0)
 
+#if HIPFIRE_MOE_DOWN_ANY_K
+    // General K%256==0 (LFM2 K=1792, MiniMax K=1536): one accumulator per row.
+    float acc = 0.0f, bcc = 0.0f, ccc = 0.0f, dcc = 0.0f;
+    for (int g = 0; g < groups_per_row; ++g) {
+        const long long w_off = (long long)g * 136;
+        const int x_off = g * 256 + tid * 8;
+        const float4 xv_a = *reinterpret_cast<const float4*>(x + x_off);
+        const float4 xv_b = *reinterpret_cast<const float4*>(x + x_off + 4);
+        DOG_X8(row_ptr0 + w_off, row_rsrc0, w_off, acc,
+               xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+        DOG_X8(row_ptr1 + w_off, row_rsrc1, w_off, bcc,
+               xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+        DOG_X8(row_ptr2 + w_off, row_rsrc2, w_off, ccc,
+               xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+        DOG_X8(row_ptr3 + w_off, row_rsrc3, w_off, dcc,
+               xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+    }
+    #undef DOG_X8
+    #undef HIPFIRE_MOE_DOWN_LOAD_SC
+    #undef HIPFIRE_MOE_DOWN_LOAD_ZP
+#else
     // Hoist both groups' 16 x elements (float4×4) before any weight DOG.
     const int base0 = tid * 8;
     const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
@@ -166,6 +206,7 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
     float bcc = bcc0 + bcc1;
     float ccc = ccc0 + ccc1;
     float dcc = dcc0 + dcc1;
+#endif
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
     for (int offset = 16; offset > 0; offset >>= 1)
@@ -185,6 +226,8 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
         if (have_row2) expert_outputs[out_base + row2] = ccc;
         if (have_row3) expert_outputs[out_base + row3] = dcc;
     }
+
+    }  // expert_valid
 
 #if HIPFIRE_MOE_DOWN_LAST_COMBINE
     // Preserve one independently schedulable expert wave per workgroup. Each

@@ -20,7 +20,7 @@
 //! `get(tensor_name_without_dot_weight_suffix, 0)` per MQ4G256 tensor.
 
 use byteorder::{ByteOrder, LittleEndian};
-use memmap2::{Advice, Mmap};
+use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
@@ -36,8 +36,15 @@ pub enum HessianError {
     Io(std::io::Error),
     InvalidMagic([u8; 4]),
     UnsupportedVersion(u32),
-    TruncatedFile { needed: usize, have: usize },
-    NegativeDiagonal { tensor: String, index: usize, value: f32 },
+    TruncatedFile {
+        needed: usize,
+        have: usize,
+    },
+    NegativeDiagonal {
+        tensor: String,
+        index: usize,
+        value: f32,
+    },
     UnknownDtype(u32),
 }
 
@@ -46,7 +53,11 @@ impl std::fmt::Display for HessianError {
         match self {
             HessianError::Io(e) => write!(f, "I/O error: {e}"),
             HessianError::InvalidMagic(m) => {
-                write!(f, "invalid HFHS magic: got {m:?}, expected {:?}", HFHS_MAGIC)
+                write!(
+                    f,
+                    "invalid HFHS magic: got {m:?}, expected {:?}",
+                    HFHS_MAGIC
+                )
             }
             HessianError::UnsupportedVersion(v) => {
                 write!(f, "unsupported HFHS version {v}, this build understands v{HFHS_VERSION_SUPPORTED}")
@@ -54,7 +65,11 @@ impl std::fmt::Display for HessianError {
             HessianError::TruncatedFile { needed, have } => {
                 write!(f, "HFHS truncated: needed {needed} bytes, file is {have}")
             }
-            HessianError::NegativeDiagonal { tensor, index, value } => write!(
+            HessianError::NegativeDiagonal {
+                tensor,
+                index,
+                value,
+            } => write!(
                 f,
                 "Hessian for tensor {tensor:?} has negative diagonal H[{index},{index}] = {value} \
                  (should be ≥0 by PSD construction; likely FP corruption — fall back to plain MQ4)"
@@ -112,7 +127,11 @@ impl<'a> HessianRef<'a> {
 
     /// Read the `[i, j]` entry as f64. O(1).
     pub fn at(&self, i: usize, j: usize) -> f64 {
-        debug_assert!(i < self.k && j < self.k, "out of bounds: H[{i},{j}] K={}", self.k);
+        debug_assert!(
+            i < self.k && j < self.k,
+            "out of bounds: H[{i},{j}] K={}",
+            self.k
+        );
         let off = (i * self.k + j) * self.dtype.size_bytes();
         match self.dtype {
             HessianDtype::F32 => LittleEndian::read_f32(&self.bytes[off..off + 4]) as f64,
@@ -123,7 +142,7 @@ impl<'a> HessianRef<'a> {
 
 /// Per-tensor record layout (computed at open, points into the mmap).
 struct TensorEntry {
-    name_offset: usize,    // byte offset of the name string in mmap
+    name_offset: usize, // byte offset of the name string in mmap
     name_len: usize,
     expert_idx: u32,
     k: usize,
@@ -154,11 +173,12 @@ impl HessianSidecar {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         // Hint sequential access: the quantizer walks tensor-by-tensor.
+        // `memmap2::Advice` only exists on unix; on other platforms the hint
+        // is a no-op and the call is compiled out entirely.
         #[cfg(unix)]
         {
-            mmap.advise(Advice::Sequential).ok();
+            mmap.advise(memmap2::Advice::Sequential).ok();
         }
-        let _ = Advice::Sequential; // silence unused on non-unix
 
         if mmap.len() < HEADER_SIZE {
             return Err(HessianError::TruncatedFile {
@@ -183,7 +203,10 @@ impl HessianSidecar {
         let mut pos = HEADER_SIZE;
         for _ in 0..n_tensors {
             if pos + 4 > mmap.len() {
-                return Err(HessianError::TruncatedFile { needed: pos + 4, have: mmap.len() });
+                return Err(HessianError::TruncatedFile {
+                    needed: pos + 4,
+                    have: mmap.len(),
+                });
             }
             let name_len = LittleEndian::read_u32(&mmap[pos..pos + 4]) as usize;
             pos += 4;
@@ -195,7 +218,7 @@ impl HessianSidecar {
             }
             let name_offset = pos;
             let name = std::str::from_utf8(&mmap[pos..pos + name_len])
-                .map_err(|_| HessianError::InvalidMagic([0; 4]))?  // reuse for UTF-8 failure
+                .map_err(|_| HessianError::InvalidMagic([0; 4]))? // reuse for UTF-8 failure
                 .to_string();
             pos += name_len;
             let expert_idx = LittleEndian::read_u32(&mmap[pos..pos + 4]);
@@ -249,8 +272,10 @@ impl HessianSidecar {
         // than alternative gymnastics for this rare-call path.
         let entry = self.index.get(&(name.to_string(), expert_idx))?;
         Some(HessianRef {
-            name: std::str::from_utf8(&self.mmap[entry.name_offset..entry.name_offset + entry.name_len])
-                .ok()?,
+            name: std::str::from_utf8(
+                &self.mmap[entry.name_offset..entry.name_offset + entry.name_len],
+            )
+            .ok()?,
             expert_idx: entry.expert_idx,
             k: entry.k,
             dtype: entry.dtype,
@@ -262,8 +287,10 @@ impl HessianSidecar {
     /// symmetry / PSD check at start of quantize) and debug dumps.
     pub fn tensors(&self) -> impl Iterator<Item = HessianRef<'_>> + '_ {
         self.index.values().map(|entry| HessianRef {
-            name: std::str::from_utf8(&self.mmap[entry.name_offset..entry.name_offset + entry.name_len])
-                .unwrap_or(""),
+            name: std::str::from_utf8(
+                &self.mmap[entry.name_offset..entry.name_offset + entry.name_len],
+            )
+            .unwrap_or(""),
             expert_idx: entry.expert_idx,
             k: entry.k,
             dtype: entry.dtype,
@@ -334,6 +361,7 @@ impl HessianSidecar {
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::path::PathBuf;
     use tempfile::NamedTempFile;
 
     /// Build a minimal v1 HFHS file with two tiny tensors for round-trip
@@ -344,17 +372,17 @@ mod tests {
 
         // Header
         f.write_all(b"HFHS").unwrap();
-        f.write_all(&1u32.to_le_bytes()).unwrap();      // version
-        f.write_all(&2u64.to_le_bytes()).unwrap();      // n_tensors
-        f.write_all(&0u64.to_le_bytes()).unwrap();      // reserved
+        f.write_all(&1u32.to_le_bytes()).unwrap(); // version
+        f.write_all(&2u64.to_le_bytes()).unwrap(); // n_tensors
+        f.write_all(&0u64.to_le_bytes()).unwrap(); // reserved
 
         // Tensor 1: "tA", expert_idx=0, K=2, FP32, H = [[1.0, 0.5], [0.5, 2.0]]
         let name1 = b"tA";
         f.write_all(&(name1.len() as u32).to_le_bytes()).unwrap();
         f.write_all(name1).unwrap();
-        f.write_all(&0u32.to_le_bytes()).unwrap();      // expert_idx
-        f.write_all(&2u32.to_le_bytes()).unwrap();      // K
-        f.write_all(&1u32.to_le_bytes()).unwrap();      // dtype = F32
+        f.write_all(&0u32.to_le_bytes()).unwrap(); // expert_idx
+        f.write_all(&2u32.to_le_bytes()).unwrap(); // K
+        f.write_all(&1u32.to_le_bytes()).unwrap(); // dtype = F32
         for v in [1.0_f32, 0.5_f32, 0.5_f32, 2.0_f32] {
             f.write_all(&v.to_le_bytes()).unwrap();
         }
@@ -363,9 +391,9 @@ mod tests {
         let name2 = b"tB";
         f.write_all(&(name2.len() as u32).to_le_bytes()).unwrap();
         f.write_all(name2).unwrap();
-        f.write_all(&3u32.to_le_bytes()).unwrap();      // expert_idx
-        f.write_all(&2u32.to_le_bytes()).unwrap();      // K
-        f.write_all(&2u32.to_le_bytes()).unwrap();      // dtype = F64
+        f.write_all(&3u32.to_le_bytes()).unwrap(); // expert_idx
+        f.write_all(&2u32.to_le_bytes()).unwrap(); // K
+        f.write_all(&2u32.to_le_bytes()).unwrap(); // dtype = F64
         for v in [3.0_f64, 1.0_f64, 1.0_f64, 4.0_f64] {
             f.write_all(&v.to_le_bytes()).unwrap();
         }
@@ -450,5 +478,46 @@ mod tests {
         let sc = HessianSidecar::open(tf.path()).unwrap();
         let ta = sc.get("tA", 0).unwrap();
         HessianSidecar::check_positive_diagonal(&ta).expect("tA has positive diagonal");
+    }
+
+    /// Python `reference_gptq/formats.py` writer → Rust `HessianSidecar` reader.
+    /// Fixture produced by `reference_gptq/make_fixtures.py` from the format contract.
+    #[test]
+    fn python_fixture_hfhs_roundtrip() {
+        let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("reference_gptq/fixtures/smoke.hfhs");
+        assert!(
+            path.is_file(),
+            "missing fixture {path:?}; run reference_gptq/make_fixtures.py"
+        );
+        let sc = HessianSidecar::open(&path).expect("open python HFHS fixture");
+        assert_eq!(sc.n_tensors(), 2);
+
+        let t0 = sc.get("model.layers.0.q_proj", 0).expect("q_proj");
+        assert_eq!(t0.k, 2);
+        assert_eq!(t0.dtype, HessianDtype::F32);
+        assert_eq!(t0.at(0, 0), 1.0);
+        assert_eq!(t0.at(0, 1), 0.25);
+        assert_eq!(t0.at(1, 0), 0.25);
+        assert_eq!(t0.at(1, 1), 2.0);
+
+        let t1 = sc
+            .get("model.layers.1.mlp.down_proj", 3)
+            .expect("down_proj expert 3");
+        assert_eq!(t1.k, 3);
+        assert_eq!(t1.dtype, HessianDtype::F32);
+        assert!((t1.at(0, 0) - 3.0).abs() < 1e-6);
+        assert!((t1.at(2, 2) - 5.0).abs() < 1e-6);
+        // Wrong expert → miss
+        assert!(sc.get("model.layers.1.mlp.down_proj", 0).is_none());
+
+        let mut path64 = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path64.push("reference_gptq/fixtures/smoke_f64.hfhs");
+        let sc64 = HessianSidecar::open(&path64).expect("open f64 fixture");
+        let tb = sc64.get("tB", 0).expect("tB");
+        assert_eq!(tb.dtype, HessianDtype::F64);
+        assert_eq!(tb.at(0, 0), 3.0);
+        assert_eq!(tb.at(1, 1), 4.0);
+        assert_eq!(tb.at(2, 2), 5.0);
     }
 }

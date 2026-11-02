@@ -26,7 +26,7 @@
 //!
 //! ## Coverage (the whole served fleet, one substrate)
 //! - `Proj` / `ResidualGemv` / `Moe`     → qwen35, MiniMax(reuse), cohere2moe(reuse)
-//! - `Attend` (flavor-carrying)          → all; Gemma SWA/qk-norm/softcap/k_eq_v live here as flavors
+//! - `Attend`                            → all
 //! - `Recurrent`                         → qwen35 DeltaNet linear-attention state
 //! - `Conv`                              → LFM2 depthwise causal short-conv mixer (+ conv state)
 //! - `Escape(EscapeKind)`                → irregular/stateful: deepseek4 compressor/indexer/SWA, etc.
@@ -34,7 +34,9 @@
 //! NOTE: nothing here is on a live path yet. The live forward remains
 //! `execute_steps`; this substrate is wired behind `HIPFIRE_FORWARD_LOWERED`
 //! (default off) in later steps, validated byte-identical via the
-//! `HIPFIRE_FORWARD_ORACLE` dual-run.
+//! `HIPFIRE_FORWARD_ORACLE` dual-run. `run_layer_program` additionally refuses
+//! the `HIPFIRE_FORWARD_LOWERED` + `memory.offload_exec=cpu` combination when a
+//! program op reads a host-mapped weight (see the executor docs).
 
 use super::steps::{match_fused_prefix, step_op_kind, Step};
 use crate::context::DispatchCtx;
@@ -62,54 +64,10 @@ pub enum ScratchSlot {
     Cache(u32),
 }
 
-/// FFN/gate-up activation flavor. SiLU for qwen-family; GeLU-tanh (GeGLU) for
-/// Gemma (`gelu_tanh(gate)·up`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActFlavor {
-    SiluMul,
-    GeluTanhMul,
-}
-
-/// RoPE flavor carried by an `Attend` super-op (resolved from config at load).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RopeFlavor {
-    None,
-    /// Standard rotate-half (most archs). `theta` = rope base.
-    HalfRotate {
-        theta: f32,
-    },
-    /// Interleaved full-dim RoPE (e.g. cohere2moe).
-    Interleaved {
-        theta: f32,
-    },
-}
-
-/// Attention-block flavor — everything that distinguishes one arch's attention
-/// from another, resolved at load so the per-token `Attend` is branch-free.
-/// Gemma exercises the full surface (SWA window, per-head qk-norm, q·√hd scaling,
-/// the k_eq_v weightless-V-RMSNorm prelude, logit softcap).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct AttnFlavor {
-    /// Sliding-window size; 0 = full (global) attention. Gemma alternates
-    /// Sliding(1024)/Full per layer.
-    pub window: u32,
-    /// Per-head q_norm/k_norm over head_dim (Gemma, qwen35).
-    pub qk_norm: bool,
-    /// q *= sqrt(head_dim) (Gemma query scaling).
-    pub q_scale_sqrt_hd: bool,
-    /// V = copy of K before k_norm + weightless RMSNorm on V (Gemma full layers).
-    pub k_eq_v: bool,
-    /// Attention-logit softcap value; 0.0 = none (Gemma-2 style).
-    pub logit_softcap: f32,
-    pub rope: RopeFlavor,
-}
-
 /// Per-super-op flavor payload (None for ops with no flavor axis, e.g. Proj).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OpFlavor {
     None,
-    Attn(AttnFlavor),
-    Act(ActFlavor),
 }
 
 /// Irregular/stateful ops that don't map onto a single fused kernel. Each is a
@@ -123,8 +81,6 @@ pub enum EscapeKind {
     Deepseek4IndexerTopK,
     /// deepseek4 sparse SWA over the gathered top-K KV.
     Deepseek4SwaTopK,
-    /// Gemma final logit softcap (output stage).
-    GemmaLogitSoftcap,
 }
 
 /// One coarse super-op. For `Proj`/`ResidualGemv`/`Moe` the `key` is the
@@ -146,7 +102,7 @@ pub enum SuperOpKind {
     /// projection cluster did NOT fuse — mirrors execute_steps' unfused
     /// per-step launch_op path (rmsnorm, then individual Proj gemvs).
     Norm,
-    /// Attention block (flavor in `OpFlavor::Attn`).
+    /// Attention block.
     Attend,
     /// MoE FFN block (routes to MoeFamily / run_moe_decode).
     Moe,
@@ -249,9 +205,9 @@ fn lower_walk(
 /// the frozen `KernelKey`s match `execute_steps` byte-for-byte — no fusion drift.
 ///
 /// TODO(arch-migration, Step 3+): populate `WeightSlot`/`ScratchSlot` bindings
-/// and `AttnFlavor`/`ActFlavor` from the arch's weight/scratch tables + config.
-/// This step freezes the FUSION STRUCTURE + kernel keys; the per-arch migration
-/// supplies the operand slots + flavor data (and the executor binds them).
+/// from the arch's weight/scratch tables. This step freezes the FUSION
+/// STRUCTURE + kernel keys; the per-arch migration supplies the operand slots
+/// (and the executor binds them).
 pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
     lower_walk(
         steps.len(),
@@ -260,6 +216,7 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
             PipelineOp::GemvResidual => SuperOpKind::ResidualGemv,
             PipelineOp::RmsnormAutomatic => SuperOpKind::Norm,
             PipelineOp::Attend => SuperOpKind::Attend,
+            PipelineOp::MoeCombine => SuperOpKind::Moe,
             // Rope/QkNorm/BiasAdd are per-op-only Step vocabulary: never fused,
             // never lowered via superop. Emitting them into a lowered program
             // is a bug (no SuperOpKind exists for them).
@@ -274,6 +231,62 @@ pub fn lower_layer(steps: &[Step], ctx: &DispatchCtx) -> LayerProgram {
 }
 
 // ── Step 1c: the LayerProgram executor ─────────────────────────────────────
+
+/// Which EP MoE combine the runtime driver must run for one `Moe` super-op.
+/// Queried per rank; all ranks must agree (mixed modes are a fail-stop
+/// error, never a fallback).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum EpMoeCombineMode {
+    /// Rank-partial flow: per-rank zeroed partials, all-reduce-sum,
+    /// residual add. The mode DeepSeek4/MiniMax always select.
+    RankPartial,
+    /// Root-routed slot-order flow (Qwen plan-bound compact EP): the root
+    /// routes on-GPU and seals a route-producer proof; every rank writes its
+    /// owned expert outputs into the global slot layout while zero-dummy
+    /// experts write zero. The runtime gathers those rows to root, then Qwen
+    /// invokes the ordinary single-device slot-order combine once, broadcasts
+    /// the finished partial, and adds it to every residual stream.
+    RootRoutedPartial,
+}
+
+/// Borrowed root-routed view for one EP rank. Every buffer is borrowed from
+/// the arch binding; the view owns nothing and performs no copy. The static
+/// contract identity is cached at load binding and read here as a u64 —
+/// never re-rendered (rendering allocates) and never hashed per token.
+#[derive(Clone, Copy)]
+pub struct EpMoeRouteView<'a> {
+    /// Plan-bound experts for this rank (table + rank-local cache).
+    pub experts: super::sealed_moe::BoundMoeExperts<'a>,
+    /// Safetensors layer index (== `MoeFfnWeights.layer_idx`).
+    pub layer: usize,
+    /// Residual width (== hidden size).
+    pub hidden: usize,
+    /// Route width (top-k; root-routed requires 8).
+    pub k: usize,
+    /// Global expert count.
+    pub n_exp: usize,
+    /// Selected expert IDs (`moe_topk_indices`, `[k]` i32).
+    pub topk_ids: &'a GpuTensor,
+    /// Selected expert weights (`moe_topk_weights`, `[k]` f32).
+    pub topk_weights: &'a GpuTensor,
+    /// Rank-local expert outputs in global slot layout. Exactly one rank owns
+    /// each selected slot; all other ranks write zero through dummy experts.
+    pub slot_outputs: &'a GpuTensor,
+}
+
+impl EpMoeRouteView<'_> {
+    /// The adapted execution contract, if the runtime sealer attached one.
+    /// `None` means this rank is not plan-bound and can never authorize a
+    /// root-routed combine.
+    pub fn execution_contract(&self) -> Option<&super::sealed_moe::ExpertExecutionContract> {
+        self.experts.execution_contract()
+    }
+    /// Load-bound static identity of the adapted execution contract, if
+    /// plan-bound. Compared as u64 on the hot path; no per-token hashing.
+    pub fn contract_id(&self) -> Option<u64> {
+        self.experts.contract_id()
+    }
+}
 
 /// Per-kind handlers the executor calls, implemented ARCH-SIDE (where the live
 /// weight/scratch/state tensors live). This keeps `run_layer_program` itself
@@ -335,6 +348,23 @@ pub trait ForwardBindings {
         kind: EscapeKind,
     ) -> Result<(), DispatchError>;
 
+    /// Whether this op reads a host-mapped weight buffer.
+    ///
+    /// The lowered program carries indices only ([`WeightSlot`]), so the executor
+    /// cannot test residency itself: the arch answers from its live weight tables
+    /// via `gpu.host_located(&weight.buf)` — the same test
+    /// `crate::cpu_exec::reads_host_mapped_weight` applies to a `Step`'s weight.
+    /// Only GEMV/GEMM weights count (projections, the fused down-projection, the
+    /// MoE router/shared/routed weights): norm, state, KV, and conv reads stay on
+    /// the GPU by design (see the `cpu_exec` scope docs) and must not trip this.
+    /// `run_layer_program` refuses the `HIPFIRE_FORWARD_LOWERED` +
+    /// `memory.offload_exec=cpu` combination when any op answers true. Defaults
+    /// to `false`, so resident-only archs (no spill support) — and any lowered
+    /// program with no host-mapped weight — run exactly as before.
+    fn op_reads_host_mapped_weight(&self, _gpu: &Gpu, _op: &SuperOp) -> bool {
+        false
+    }
+
     // ── Expert-parallel (Ship 6 substrate-EP) hooks ─────────────────────────
     // Default to unsupported; only EP-target MoE arches (qwen3.6-A3B, MiniMax,
     // DeepSeek-V4) override these. Non-MoE arches and the single-GPU path never
@@ -363,9 +393,120 @@ pub trait ForwardBindings {
         })
     }
 
-    /// EP: add the all-reduced routed partial into this rank's residual stream
-    /// (the arch-specific buffer that holds the post-attention residual). Called
-    /// by the EP executor once, after the MoE all-reduce.
+    /// Root half of root-routed EP MoE: seal and produce the authoritative
+    /// SoftmaxTopK route, then write owned expert rows into `slot_outputs`.
+    /// The shared expert may accumulate into the zeroed root `partial`, but
+    /// routed rows are not folded until [`ep_finish_moe_slot_order`].
+    /// Unsupported by default; Qwen overrides it. The driver calls this only
+    /// after every rank reported [`EpMoeCombineMode::RootRoutedPartial`].
+    fn ep_run_moe_root(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _partial: &GpuTensor,
+    ) -> Result<super::sealed_moe::MoeRouteProducerProof, DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_run_moe_root-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    /// Non-root half of the root-routed EP MoE: seal the routed contrib
+    /// against `proof` (matching static contract/layer/k/n_exp plus the
+    /// non-root compact role, all checked before any launch) and run the
+    /// owned experts over the broadcast root route IDs already resident in
+    /// the rank's top-k buffers into `partial`. No router runs here —
+    /// per-rank re-routing is the divergence this removes. Unsupported by
+    /// default; Qwen overrides it.
+    fn ep_run_moe_contrib(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _proof: &super::sealed_moe::MoeRouteProducerProof,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_run_moe_contrib-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+    /// Pure preflight for the root half of the root-routed EP MoE: build and
+    /// validate the actual bound experts, params, seal, and route-producer
+    /// proof from the same tensor/params builders as
+    /// [`ep_run_moe_root`](Self::ep_run_moe_root), but enqueue NOTHING.
+    /// Returns the opaque
+    /// [`MoeRouteProducerProof`](super::sealed_moe::MoeRouteProducerProof)
+    /// as validation capability (static load-bound metadata), not a claim
+    /// that device bytes are already produced. The runtime EP driver calls
+    /// this on rank 0 after metadata/capacity checks but BEFORE zeroing any
+    /// partial; the normal root-compute → broadcast → non-root-compute flow
+    /// still follows. Unsupported by default; Qwen overrides it.
+    fn ep_preflight_moe_root(
+        &self,
+        _gpu: &Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _partial: &GpuTensor,
+    ) -> Result<super::sealed_moe::MoeRouteProducerProof, DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_preflight_moe_root-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Pure preflight for the non-root half of the root-routed EP MoE:
+    /// validate the actual bound experts, params, and proof adoption from
+    /// the same builders as
+    /// [`ep_run_moe_contrib`](Self::ep_run_moe_contrib), but enqueue
+    /// NOTHING. The runtime EP driver calls this on every non-root rank
+    /// against the root preflight proof after metadata/capacity checks but
+    /// BEFORE zeroing any partial; the normal broadcast →
+    /// non-root-compute flow still follows. Unsupported by default; Qwen
+    /// overrides it.
+    fn ep_preflight_moe_contrib(
+        &self,
+        _gpu: &Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _proof: &super::sealed_moe::MoeRouteProducerProof,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_preflight_moe_contrib-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Finish root-routed MoE after all per-rank slot outputs have been
+    /// gathered into rank 0's global slot layout. The implementation must run
+    /// the architecture's ordinary single-device slot-order combine exactly
+    /// once into `partial`.
+    fn ep_finish_moe_slot_order(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_moe_slot_order-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// EP: add the root-combined, byte-copied routed partial into this rank's
+    /// residual stream. Called once after slot-order combine and broadcast.
     fn ep_add_into_residual(
         &mut self,
         _gpu: &mut Gpu,
@@ -374,6 +515,141 @@ pub trait ForwardBindings {
         Err(DispatchError::UnsupportedVariant {
             family: "ep",
             variant: "ep_add_into_residual-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Which EP MoE combine this binding will execute when the runtime EP
+    /// driver reaches a `Moe` super-op. Defaults to [`EpMoeCombineMode::RankPartial`],
+    /// so DeepSeek4/MiniMax (and every existing EP route) stay byte-for-byte
+    /// on the rank-partial all-reduce flow without touching their impls.
+    /// Qwen overrides this: root-routed partials for plan-bound compact EP
+    /// bindings.
+    fn ep_moe_combine_mode(&self) -> EpMoeCombineMode {
+        EpMoeCombineMode::RankPartial
+    }
+
+    /// Borrow this rank's root-routed view (plan-bound experts plus the
+    /// resident route buffers). `None` by default and for any non-root-routed
+    /// binding; the runtime EP driver calls this only after every rank
+    /// reported [`EpMoeCombineMode::RootRoutedPartial`], and a missing view
+    /// there is a fail-stop error, never a fallback.
+    fn ep_moe_route_view(&self) -> Option<EpMoeRouteView<'_>> {
+        None
+    }
+
+    /// Borrow the replicated residual after the root has evaluated the shared
+    /// expert. Root-routed decode synchronizes this base to non-root ranks
+    /// before gathering routed slots so the final residual add preserves the
+    /// single-device order `(residual + shared) + routed`.
+    fn ep_moe_shared_residual(&self) -> Option<&GpuTensor> {
+        None
+    }
+
+    /// Whether this rank replaces replicated `Attend` with a rank-local
+    /// attention projection whose hidden-width result must be all-reduced.
+    /// False by default, so existing Qwen, MiniMax, and single-rank routes do
+    /// not change behavior.
+    fn attention_tp_enabled(&self) -> bool {
+        false
+    }
+
+    /// Run the rank-local attention body up to (but excluding) the residual
+    /// mix. Called only when every rank reports [`attention_tp_enabled`].
+    fn run_attend_ep(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "run_attend_ep-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Return the hidden-width rank-local attention partial produced by
+    /// [`run_attend_ep`]. The EP executor all-reduces this buffer in place.
+    fn ep_attention_partial(&self) -> Option<&GpuTensor> {
+        None
+    }
+
+    /// Finish the attention residual mix after the rank-local partial has been
+    /// all-reduced in place.
+    fn ep_finish_attend(&mut self, _gpu: &mut Gpu) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// Whether this binding can fuse a fixed four-rank peer reduction into
+    /// both post-attention and post-MoE Hyper-Connection consumers.
+    ///
+    /// False by default: the runtime also requires four peer-connected
+    /// gfx1201 devices before invoking either hook.
+    fn supports_tp_peer_hc4(&self) -> bool {
+        false
+    }
+
+    /// Whether this binding can fuse a fixed three-rank peer reduction into
+    /// both post-attention and post-MoE Hyper-Connection consumers.
+    fn supports_tp_peer_hc3(&self) -> bool {
+        false
+    }
+
+    fn ep_finish_attend_peer_hc3(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 3],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend_peer_hc3-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    fn ep_finish_moe_peer_hc3(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 3],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_moe_peer_hc3-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    fn ep_finish_attend_peer_hc4(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 4],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_attend_peer_hc4-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    fn ep_finish_moe_peer_hc4(
+        &mut self,
+        _gpu: &mut Gpu,
+        _partials: [&GpuTensor; 4],
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_moe_peer_hc4-not-implemented-for-arch",
             arch: "",
             quant: "",
         })
@@ -412,12 +688,36 @@ pub fn dispatch_super_op<B: ForwardBindings>(
 /// arch's forward (qwen35 first) builds a `LoweredForward` at load and calls this
 /// behind `HIPFIRE_FORWARD_LOWERED` (default off), oracle-validated byte-identical
 /// vs the hand `execute_steps` path before the default is flipped per arch.
+///
+/// Fail closed on `HIPFIRE_FORWARD_LOWERED` + `memory.offload_exec=cpu`: when CPU
+/// execution is enabled and any op in `program` reads a host-mapped weight (via
+/// [`ForwardBindings::op_reads_host_mapped_weight`] — the same
+/// `gpu.host_located(&weight.buf)` test `crate::cpu_exec::reads_host_mapped_weight`
+/// applies to a `Step`'s weight), this returns a `DispatchError` instead of
+/// launching. The lowered path bypasses the step seam that routes host-mapped
+/// weights to the CPU, so it would read them on the GPU over PCIe and skip both
+/// the CPU splice and the splice coverage. A lowered program with no
+/// host-mapped weight runs exactly as before.
 pub fn run_layer_program<B: ForwardBindings>(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
     program: &LayerProgram,
     bindings: &mut B,
 ) -> Result<(), DispatchError> {
+    if crate::cpu_exec::cpu_exec_enabled()
+        && program
+            .iter()
+            .any(|op| bindings.op_reads_host_mapped_weight(gpu, op))
+    {
+        return Err(DispatchError::Hip(
+            "HIPFIRE_FORWARD_LOWERED with memory.offload_exec=cpu refuses a lowered program \
+             reading a host-mapped weight: the lowered path bypasses the step seam that routes \
+             host-mapped weights to the CPU, so it would read them on the GPU over PCIe and skip \
+             the CPU splice and the splice coverage. Set memory.offload_exec=pcie \
+             (HIPFIRE_OFFLOAD_EXEC=pcie) or HIPFIRE_FORWARD_LOWERED=0"
+                .into(),
+        ));
+    }
     for op in program {
         dispatch_super_op(gpu, ctx, op, bindings)?;
     }

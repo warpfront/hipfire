@@ -6,11 +6,18 @@ mod app;
 mod hipfire;
 mod ui;
 mod ui_chat;
+mod ui_scope;
+mod ui_settings;
+mod ui_tuning;
+
+#[cfg(test)]
+mod test_support;
 
 use std::{io, panic};
 
 use anyhow::Result;
 use app::App;
+use base64::Engine as _;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyModifiers,
@@ -27,6 +34,8 @@ fn main() -> Result<()> {
     // Non-interactive argument handling (headless-safe, no TTY required).
     // Only the first argument is inspected — every branch returns/exits, so
     // there is never a second iteration.
+    let mut start_settings = false;
+    let mut start_tuning = false;
     let profile_wizard = if let Some(arg) = std::env::args().nth(1) {
         match arg.as_str() {
             "--version" | "-V" => {
@@ -41,6 +50,19 @@ fn main() -> Result<()> {
                 return run_check();
             }
             "--config-profile-wizard" => true,
+            // `hipfire config` launches with this: open on Settings for this
+            // launch only (see `tab_to_persist`).
+            "--settings" => {
+                start_settings = true;
+                false
+            }
+            // `hipfire config tuning` launches with this: Settings with the
+            // Tuning preset chooser open.
+            "--tuning" => {
+                start_settings = true;
+                start_tuning = true;
+                false
+            }
             other => {
                 eprintln!("hipfire-tui: unknown argument '{other}'");
                 print_help();
@@ -55,13 +77,17 @@ fn main() -> Result<()> {
     let result = if profile_wizard {
         hipfire::profile_wizard::run(&mut terminal)
     } else {
-        run(&mut terminal)
+        run(&mut terminal, start_settings, start_tuning)
     };
     restore_terminal(&mut terminal)?;
     result
 }
 fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+fn help_text() -> String {
+    format!(
         "hipfire-tui {VERSION} - terminal UI for hipfire\n\
          \n\
          USAGE:\n    \
@@ -73,11 +99,16 @@ fn print_help() {
                  --check              Load config/registry/models without entering the\n                         \
                                       render loop, then exit 0 on success (headless smoke)\n    \
                  --config-profile-wizard\n                         \
-                                      Select/create profiles and browse config variables\n\
+                                      Select/create profiles and browse config variables\n    \
+                 --settings           Open on the Settings tab for this launch (what\n                         \
+                                      `hipfire config` runs); the saved tab is kept\n    \
+                 --tuning             Open on Settings with the Tuning preset chooser\n                         \
+                                      (what `hipfire config tuning` runs)\n\
          \n\
          With no flags, hipfire-tui launches the interactive ratatui UI (requires a TTY).\n\
-         Tabs: Home, Dashboard, Chat, Models, Settings, System. Tab/Shift+Tab to switch, q to quit."
-    );
+         Tabs: Home, Dashboard, Chat, Models, Settings, System, Logs. Tab/Shift+Tab to switch, ? for help, q to quit.\n\
+         Esc never quits: it only closes/cancels (help, prompts, edits, chat)."
+    )
 }
 
 /// Construct the App state (config + registry + local models) WITHOUT entering
@@ -142,9 +173,35 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+/// The tab to write to ui_state.json on exit. A `--settings` launch overrides
+/// the restored tab for that launch only: if the user is still on the forced
+/// Settings tab, the tab ui_state restored (`launch_saved`) stays persisted;
+/// once they navigate elsewhere, wherever they ended up is saved as usual.
+fn tab_to_persist(current: app::Tab, launch_saved: Option<app::Tab>) -> app::Tab {
+    match launch_saved {
+        Some(saved) if current == app::Tab::Settings => saved,
+        _ => current,
+    }
+}
+
+/// Apply `--settings`: switch to the Settings tab and return the tab ui_state
+/// restored, so [`tab_to_persist`] can keep it. `None` when not overridden.
+fn apply_launch_tab(app: &mut App, start_settings: bool) -> Option<app::Tab> {
+    start_settings.then(|| std::mem::replace(&mut app.tab, app::Tab::Settings))
+}
+
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    start_settings: bool,
+    start_tuning: bool,
+) -> Result<()> {
     let mut app = App::load()?;
+    let launch_saved = apply_launch_tab(&mut app, start_settings);
+    if start_tuning {
+        app.open_tuning();
+    }
     let result = event_loop(terminal, &mut app);
+    app.tab = tab_to_persist(app.tab, launch_saved);
     // Persist session UI state (active tab + expanded Models groups) on ANY exit
     // — clean quit OR a propagated error — so the next launch reopens where the
     // user left off. Best-effort (the save swallows its own errors); a panic
@@ -166,31 +223,8 @@ fn emit_clipboard(text: &str) {
 
 /// The OSC 52 set-clipboard escape frame for `text` (extracted for testing).
 fn osc52_sequence(text: &str) -> String {
-    format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()))
-}
-
-/// Minimal standard-alphabet base64 (OSC 52 payload); avoids a new dependency.
-fn base64_encode(data: &[u8]) -> String {
-    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let n = (chunk[0] as u32) << 16
-            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
-            | *chunk.get(2).unwrap_or(&0) as u32;
-        out.push(T[(n >> 18 & 63) as usize] as char);
-        out.push(T[(n >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            T[(n >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            T[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+    use base64::engine::general_purpose::STANDARD;
+    format!("\x1b]52;c;{}\x07", STANDARD.encode(text.as_bytes()))
 }
 
 fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
@@ -231,12 +265,19 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut A
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) -> bool {
+    // The quit-while-pulling confirmation is modal on every tab (and over the
+    // help overlay): y quits after cancelling the pull, n / Esc disarms, and
+    // every other key (including a second Ctrl+C or a global `q`) is swallowed.
+    if app.confirm_quit {
+        return app.handle_quit_confirm_key(key);
+    }
+
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
         if app.chat.sending {
             app.chat.status = "generation in progress — press Esc to stop it".into();
             return false;
         }
-        return true;
+        return app.request_quit();
     }
 
     // The `?` help overlay is modal: while it is open, any key (other than the
@@ -246,10 +287,38 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
+    // The scope picker and the per-model overrides list are modal: every key
+    // goes to them (Esc closes), so q / r / ? / Tab cannot act underneath.
+    if app.scope_screen_open() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
     // A Models delete-confirmation is modal: route every key to the tab handler
     // (which acts only on y / n / Esc) so a global `q` or `r` cannot quit or
     // reload while the confirm is armed.
     if app.tab == app::Tab::Models && app.confirm_delete.is_some() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
+    // The Models pull chooser (PLE / draft) is modal as well: every key goes to
+    // the tab handler so q / r / ? / Tab cannot act while it is open.
+    if app.tab == app::Tab::Models && app.pull_choice.is_some() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
+    // A Settings Tuning screen (chooser, preview, undo confirm) owns every key:
+    // the preview must not be left by a global `q`, `r` or Tab by accident.
+    if app.tab == app::Tab::Settings && app.tuning_open() {
+        app.handle_tab_key(key);
+        return false;
+    }
+
+    // A Dashboard stop/restart confirmation is modal too: every key goes to the
+    // tab handler (y / n / Esc only) so q / r / ? / Tab cannot act while armed.
+    if app.tab == app::Tab::Dashboard && app.confirm_serve.is_some() {
         app.handle_tab_key(key);
         return false;
     }
@@ -262,9 +331,11 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         return false;
     }
 
-    // While a settings value is being edited, keystrokes (including q/e/a/r)
-    // feed the edit buffer rather than triggering global shortcuts.
-    let editing_setting = app.tab == app::Tab::Settings && app.settings_edit.is_some();
+    // While a settings value is being edited or the `/` search buffer has
+    // focus, keystrokes (including q/r/?) feed it rather than triggering
+    // global shortcuts.
+    let editing_setting = app.tab == app::Tab::Settings
+        && (app.settings_edit.is_some() || app.settings_search_typing());
     if editing_setting && !matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
         app.handle_tab_key(key);
         return false;
@@ -277,29 +348,30 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     let chat_capturing = app.tab == app::Tab::Chat && app.chat.is_input_focused();
 
     match key.code {
-        KeyCode::Char('q') if !chat_capturing => return true,
+        KeyCode::Char('q') if !chat_capturing => return app.request_quit(),
         KeyCode::Esc => {
-            // While editing a settings value OR previewing an enum (5b), Esc
-            // cancels that instead of quitting / blurring chat.
+            // Esc only closes or cancels (a settings edit / enum preview, a chat
+            // generation, the chat input focus); it never quits. With nothing to
+            // cancel it does nothing. Help and the y/n modals are handled above.
             if app.tab == app::Tab::Settings
-                && (app.settings_edit.is_some() || app.settings_pending.is_some())
+                && (app.settings_edit.is_some()
+                    || app.settings_pending.is_some()
+                    || app.settings_search.is_some())
             {
                 app.handle_tab_key(key);
+            } else if app.tab == app::Tab::Chat && app.has_queued_send() {
+                // A queued send (serve not online yet) is cancelled before
+                // Esc can blur the input or stop a generation.
+                app.cancel_queued_send();
             } else if app.chat.sending {
                 app.chat.request_abort();
             } else if chat_capturing {
-                // Only blur the chat input when the Chat tab is the one focused;
-                // on other tabs Esc quits as before.
                 app.chat.blur_input();
-            } else {
-                return true;
             }
         }
         KeyCode::Tab => app.next_tab(),
         KeyCode::BackTab => app.prev_tab(),
         KeyCode::Char('r') if !chat_capturing => app.reload(),
-        KeyCode::Char('e') if app.tab == app::Tab::Settings => app.set_settings_easy(true),
-        KeyCode::Char('a') if app.tab == app::Tab::Settings => app.set_settings_easy(false),
         // `?` opens the keybinding help overlay (unless the chat input is
         // capturing text, where `?` is a literal character).
         KeyCode::Char('?') if !chat_capturing => app.show_help = true,
@@ -330,6 +402,15 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
                     app.confirm_reset_all = false;
                     app.settings_pending = None;
                 }
+                if tab != app::Tab::Dashboard {
+                    // Likewise a pending serve stop/restart confirm.
+                    app.confirm_serve = None;
+                }
+                if tab != app::Tab::Models {
+                    // And an open pull chooser (modal; must not reopen on return).
+                    app.pull_choice = None;
+                }
+                app.close_scope_screen();
                 app.tab = tab;
             }
         }
@@ -356,8 +437,8 @@ mod tests {
     use super::*;
     use app::Tab;
 
-    fn test_app() -> App {
-        App::load().expect("App::load")
+    fn test_app() -> (App, crate::test_support::TempHome) {
+        crate::test_support::hermetic_app()
     }
     fn k(c: KeyCode) -> KeyEvent {
         KeyEvent::new(c, KeyModifiers::NONE)
@@ -372,17 +453,49 @@ mod tests {
     }
 
     #[test]
+    fn settings_flag_opens_on_settings_for_this_launch_only() {
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Models; // what ui_state.json restored
+        assert_eq!(apply_launch_tab(&mut app, false), None);
+        assert_eq!(app.tab, Tab::Models, "no flag leaves the restored tab");
+
+        let saved = apply_launch_tab(&mut app, true);
+        assert_eq!(saved, Some(Tab::Models));
+        assert_eq!(app.tab, Tab::Settings, "--settings starts on Settings");
+        // Quitting while still on the forced tab keeps the previously saved one.
+        assert_eq!(tab_to_persist(app.tab, saved), Tab::Models);
+        // Navigating elsewhere persists as usual.
+        assert_eq!(tab_to_persist(Tab::Logs, saved), Tab::Logs);
+        // Without the flag nothing is rewritten.
+        assert_eq!(tab_to_persist(Tab::Settings, None), Tab::Settings);
+    }
+
+    #[test]
+    fn help_documents_the_settings_flag() {
+        let help = help_text();
+        assert!(help.contains("--settings"), "{help}");
+        assert!(help.contains("Settings tab"), "{help}");
+    }
+
+    #[test]
     fn base64_matches_rfc4648_vectors() {
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-        // High bytes (0x80-0xFF) — the `& 63` masking keeps table indexing valid.
-        assert_eq!(base64_encode(&[0xFF, 0x00, 0x80]), "/wCA");
+        use base64::engine::general_purpose::STANDARD;
+        assert_eq!(STANDARD.encode(b""), "");
+        assert_eq!(STANDARD.encode(b"f"), "Zg==");
+        assert_eq!(STANDARD.encode(b"fo"), "Zm8=");
+        assert_eq!(STANDARD.encode(b"foo"), "Zm9v");
+        assert_eq!(STANDARD.encode(b"foob"), "Zm9vYg==");
+        assert_eq!(STANDARD.encode(b"foobar"), "Zm9vYmFy");
+        // High bytes exercise the full 6-bit table range.
+        assert_eq!(STANDARD.encode([0xFF, 0x00, 0x80]), "/wCA");
         // Multibyte UTF-8 round-trips through the byte encoder.
-        assert_eq!(base64_encode("é".as_bytes()), "w6k=");
+        assert_eq!(STANDARD.encode("é".as_bytes()), "w6k=");
+        // 32-byte blob (OSC 52 payloads are rarely tiny): bytes 0..32.
+        let blob: Vec<u8> = (0..32).collect();
+        assert_eq!(
+            STANDARD.encode(&blob),
+            "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
+        );
     }
 
     #[test]
@@ -392,7 +505,7 @@ mod tests {
 
     #[test]
     fn question_mark_opens_help_then_any_key_closes_it() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Home;
         assert!(!app.show_help);
         let quit = handle_key(&mut app, k(KeyCode::Char('?')));
@@ -406,7 +519,7 @@ mod tests {
 
     #[test]
     fn left_click_on_tab_region_switches_tab() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Home;
         app.tab_row_y = 3;
         app.tab_hitboxes = vec![(0, 6, Tab::Home), (9, 20, Tab::Dashboard)];
@@ -419,7 +532,7 @@ mod tests {
 
     #[test]
     fn click_off_the_tab_bar_does_not_switch() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.tab = Tab::Home;
         app.tab_row_y = 3;
         app.tab_hitboxes = vec![(0, 6, Tab::Home), (9, 20, Tab::Dashboard)];
@@ -436,7 +549,7 @@ mod tests {
 
     #[test]
     fn scroll_dismisses_help_overlay() {
-        let mut app = test_app();
+        let (mut app, _home) = test_app();
         app.show_help = true;
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert!(!app.show_help);
@@ -445,11 +558,14 @@ mod tests {
     #[test]
     fn scroll_moves_list_selection() {
         // The wheel must actually move the active list (its real purpose), not
-        // just dismiss the overlay. Settings easy-mode has a fixed row set, so
-        // the selection movement is deterministic.
-        let mut app = test_app();
+        // just dismiss the overlay. The Quality group always has several rows,
+        // so the selection movement is deterministic.
+        let (mut app, _home) = test_app();
         app.tab = Tab::Settings;
-        app.settings_easy = true;
+        app.settings_group = hipfire_config::intent::Intent::Quality;
+        app.settings_search = None;
+        app.settings_changed_only = false;
+        app.settings_hide_unused = false;
         app.settings_selected = 0;
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollDown, 0, 0));
         assert_eq!(
@@ -458,5 +574,256 @@ mod tests {
         );
         handle_mouse(&mut app, mouse(MouseEventKind::ScrollUp, 0, 0));
         assert_eq!(app.settings_selected, 0, "scroll up retreats it");
+    }
+
+    #[test]
+    fn settings_search_keeps_q_r_and_help_keys_as_text() {
+        let mut fixture = crate::test_support::FixtureBuilder::new("gfx1201").build();
+        let app = &mut fixture.app;
+        assert!(!handle_key(app, k(KeyCode::Char('/'))));
+        for c in ['q', 'r', '?', 'e'] {
+            assert!(!handle_key(app, k(KeyCode::Char(c))), "{c} quit");
+        }
+        assert_eq!(app.settings_search.as_ref().unwrap().query, "qr?e");
+        assert!(!app.show_help);
+        // Esc clears the search; with the buffer unfocused, q quits again.
+        assert!(!handle_key(app, k(KeyCode::Esc)));
+        assert!(app.settings_search.is_none());
+        assert!(!handle_key(app, k(KeyCode::Char('/'))));
+        assert!(!handle_key(app, k(KeyCode::Enter)));
+        assert!(handle_key(app, k(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn esc_never_quits_on_any_non_chat_tab() {
+        for tab in [
+            Tab::Home,
+            Tab::Dashboard,
+            Tab::Models,
+            Tab::Settings,
+            Tab::System,
+            Tab::Logs,
+        ] {
+            let (mut app, _home) = test_app();
+            app.tab = tab;
+            app.settings_edit = None;
+            app.settings_pending = None;
+            assert!(
+                !handle_key(&mut app, k(KeyCode::Esc)),
+                "Esc quit on {tab:?}"
+            );
+            assert_eq!(app.tab, tab);
+        }
+    }
+
+    #[test]
+    fn dashboard_restart_then_n_starts_no_serve_command() {
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Dashboard;
+        assert!(!handle_key(&mut app, k(KeyCode::Char('R'))));
+        assert!(app.confirm_serve.is_some(), "R arms the confirm");
+        assert!(!app.serve_cmd_running(), "arming starts nothing");
+        assert!(!handle_key(&mut app, k(KeyCode::Char('n'))));
+        assert!(app.confirm_serve.is_none());
+        assert!(!app.serve_cmd_running(), "n starts no serve command");
+        assert!(app.serve_cmd_label.is_empty());
+        assert_eq!(
+            app.toast.as_ref().map(|t| t.text.as_str()),
+            Some("cancelled")
+        );
+    }
+
+    #[test]
+    fn dashboard_stop_then_y_starts_the_stop_command() {
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Dashboard;
+        handle_key(&mut app, k(KeyCode::Char('x')));
+        assert!(app.confirm_serve.is_some());
+        assert!(!app.serve_cmd_running(), "x alone runs nothing");
+        assert!(!handle_key(&mut app, k(KeyCode::Char('y'))));
+        assert!(app.confirm_serve.is_none());
+        assert!(app.serve_cmd_running(), "y runs the stop command");
+        assert_eq!(app.serve_cmd_label, "stop");
+    }
+
+    #[test]
+    fn armed_serve_confirm_is_modal_and_disarms_on_tab_leave() {
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Dashboard;
+        handle_key(&mut app, k(KeyCode::Char('R')));
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('q'))),
+            "q must not quit"
+        );
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('r'))),
+            "r must not reload"
+        );
+        assert!(!handle_key(&mut app, k(KeyCode::Char('?'))));
+        assert!(!app.show_help, "? must not open help while armed");
+        handle_key(&mut app, k(KeyCode::Tab));
+        assert_eq!(app.tab, Tab::Dashboard, "Tab is swallowed while armed");
+        assert!(app.confirm_serve.is_some(), "still armed after stray keys");
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Esc)),
+            "Esc cancels, never quits"
+        );
+        assert!(app.confirm_serve.is_none());
+
+        // Leaving by Tab or mouse disarms.
+        handle_key(&mut app, k(KeyCode::Char('x')));
+        app.confirm_serve = Some(crate::hipfire::serve_ctrl::ServeAction::Stop);
+        app.next_tab();
+        assert!(app.confirm_serve.is_none(), "Tab disarms");
+        app.tab = Tab::Dashboard;
+        app.confirm_serve = Some(crate::hipfire::serve_ctrl::ServeAction::Restart);
+        app.tab_row_y = 3;
+        app.tab_hitboxes = vec![(0, 6, Tab::Home), (9, 20, Tab::Dashboard)];
+        handle_mouse(
+            &mut app,
+            mouse(MouseEventKind::Down(MouseButton::Left), 2, 3),
+        );
+        assert_eq!(app.tab, Tab::Home);
+        assert!(app.confirm_serve.is_none(), "mouse tab switch disarms");
+        app.tab = Tab::Dashboard;
+        app.confirm_serve = Some(crate::hipfire::serve_ctrl::ServeAction::Restart);
+        app.prev_tab();
+        assert!(app.confirm_serve.is_none(), "BackTab disarms");
+    }
+
+    fn ctrl_c() -> KeyEvent {
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
+    }
+
+    fn cancel_set(flag: &std::sync::atomic::AtomicBool) -> bool {
+        flag.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn q_with_running_pull_asks_before_quitting() {
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Home;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = app.inject_pull("qwen3.5:4b".into(), rx);
+
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('q'))),
+            "q arms, not quits"
+        );
+        assert!(app.confirm_quit);
+        assert!(!cancel_set(&cancel));
+
+        // Modal: tab switching, a second q and Ctrl+C are all swallowed.
+        assert!(!handle_key(&mut app, k(KeyCode::Tab)));
+        assert_eq!(app.tab, Tab::Home, "Tab is swallowed while armed");
+        assert!(!handle_key(&mut app, k(KeyCode::Char('q'))));
+        assert!(!handle_key(&mut app, ctrl_c()));
+        assert!(app.confirm_quit);
+
+        assert!(!handle_key(&mut app, k(KeyCode::Char('n'))), "n disarms");
+        assert!(!app.confirm_quit);
+        assert!(!cancel_set(&cancel), "n must not cancel the pull");
+        assert!(app.pull.is_some());
+
+        assert!(!handle_key(&mut app, k(KeyCode::Char('q'))));
+        assert!(handle_key(&mut app, k(KeyCode::Char('y'))), "y quits");
+        assert!(cancel_set(&cancel), "y cancels the pull before quitting");
+    }
+
+    #[test]
+    fn ctrl_c_with_running_pull_asks_before_quitting() {
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Models;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        let cancel = app.inject_pull("qwen3.5:4b".into(), rx);
+
+        assert!(!handle_key(&mut app, ctrl_c()));
+        assert!(app.confirm_quit);
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Esc)),
+            "Esc disarms, not quits"
+        );
+        assert!(!app.confirm_quit);
+        assert!(!cancel_set(&cancel));
+
+        assert!(!handle_key(&mut app, ctrl_c()));
+        assert!(handle_key(&mut app, k(KeyCode::Char('Y'))));
+        assert!(cancel_set(&cancel));
+    }
+
+    #[test]
+    fn quit_is_immediate_without_a_pull() {
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Home;
+        assert!(handle_key(&mut app, k(KeyCode::Char('q'))));
+        assert!(!app.confirm_quit);
+        assert!(handle_key(&mut app, ctrl_c()));
+    }
+
+    #[test]
+    fn esc_on_chat_cancels_a_queued_send_instead_of_blurring_or_quitting() {
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Chat;
+        // Health is unknown at this point, so Enter queues (and starts nothing).
+        app.chat.input = "hello".into();
+        assert!(!handle_key(&mut app, k(KeyCode::Enter)));
+        assert!(app.has_queued_send());
+        assert!(app.chat.input.is_empty());
+
+        assert!(!handle_key(&mut app, k(KeyCode::Esc)), "Esc must not quit");
+        assert!(!app.has_queued_send());
+        assert_eq!(app.chat.input, "hello", "text is back in the input box");
+        assert_eq!(app.chat.status, "queued message cancelled");
+        assert!(
+            app.chat.is_input_focused(),
+            "cancelling does not also blur the input"
+        );
+    }
+
+    #[test]
+    fn pull_chooser_is_modal_q_does_not_quit_and_esc_closes_it() {
+        use crate::hipfire::registry::{ModelEntry, ModelRow};
+        let (mut app, _home) = test_app();
+        app.tab = Tab::Models;
+        let mut entry = ModelEntry::default();
+        entry.ple.insert(
+            "q4".into(),
+            hipfire_registry::Sidecar {
+                file: "x.ple-q4".into(),
+                sha256: None,
+                size_bytes: Some(1_000_000_000),
+            },
+        );
+        app.registry.models = vec![ModelRow {
+            tag: "zz:ple".into(),
+            entry,
+            downloaded: false,
+            has_mtp: false,
+        }];
+        app.registry.expanded_groups = ["zz".to_string()].into_iter().collect();
+        app.registry.selected = 1;
+
+        assert!(!handle_key(&mut app, k(KeyCode::Char('p'))));
+        assert!(app.pull_choice.is_some());
+
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('q'))),
+            "q must not quit"
+        );
+        assert!(!app.confirm_quit);
+        assert!(
+            !handle_key(&mut app, k(KeyCode::Char('r'))),
+            "r must not reload"
+        );
+        assert!(!handle_key(&mut app, k(KeyCode::Char('?'))));
+        assert!(!app.show_help, "? must not open help");
+        assert!(!handle_key(&mut app, k(KeyCode::Tab)));
+        assert_eq!(app.tab, Tab::Models, "Tab must not switch");
+        assert!(app.pull_choice.is_some());
+
+        assert!(!handle_key(&mut app, k(KeyCode::Esc)));
+        assert!(app.pull_choice.is_none(), "Esc closes the chooser");
+        assert!(app.pull.is_none(), "Esc starts no pull");
+        assert!(handle_key(&mut app, k(KeyCode::Char('q'))), "q quits again");
     }
 }

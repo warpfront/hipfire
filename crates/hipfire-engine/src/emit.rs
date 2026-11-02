@@ -1,0 +1,433 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Emit helpers — architecture-neutral JSONL wire protocol.
+//!
+//! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
+
+use crate::terminal::{active_attempt_id, claim_wire_terminal};
+
+/// Result of a terminal emission attempt.
+///
+/// `claimed` records ownership of the lifecycle terminal slot independently
+/// from `delivered`: a writer can consume the slot and still fail to make the
+/// bytes visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalEmitOutcome {
+    claimed: bool,
+    delivered: bool,
+}
+
+impl TerminalEmitOutcome {
+    pub const fn claimed(self) -> bool {
+        self.claimed
+    }
+
+    pub const fn delivered(self) -> bool {
+        self.delivered
+    }
+
+    pub(crate) const fn new(claimed: bool, delivered: bool) -> Self {
+        Self { claimed, delivered }
+    }
+
+    /// Preserve claim ownership while replacing the delivery result.
+    pub const fn with_delivery(self, delivered: bool) -> Self {
+        Self {
+            claimed: self.claimed,
+            delivered,
+        }
+    }
+}
+
+/// Whether the authoritative Jinja generation suffix opens a reasoning span.
+/// This is deliberately tail-only: a literal `<think>` in user content must
+/// not reclassify the assistant's visible answer as reasoning.
+pub fn render_tail_opens_think(rendered: &str) -> bool {
+    rendered.trim_end().ends_with("<think>")
+}
+
+/// The assistant framing a rendered prompt's generation turn sits in.
+///
+/// Companion to [`render_tail_opens_think`]. The Jinja render owns the
+/// generation suffix, so the framing used for continuation and for the
+/// engine's reasoning state must be read back from the rendered bytes — not
+/// assumed from the request's `assistant_prefix`, and not from the
+/// tokenizer's token inventory. A tokenizer that registers `<think>` does
+/// not imply the prompt frames a think block: the standard Qwen3-family
+/// template emits no opener when thinking is enabled and lets the model
+/// generate `<think>` itself, while `enable_thinking=false` emits a closed
+/// `<think>\n\n</think>\n\n` block.
+///
+/// Only the live generation turn — the segment after the last
+/// `<|im_start|>` — is classified, and by think-marker pairs rather than by
+/// suffix match: history assistant turns legitimately contain closed think
+/// blocks, user content may carry literal think markup, and a template may
+/// seed reasoning text after the opener (`<think>Let me…`), which a bare
+/// `ends_with` would misread as `Plain` and route the span's reasoning to
+/// the visible channel. A render with no `<|im_start|>` (non-ChatML
+/// template) classifies the whole trimmed render.
+pub fn render_assistant_prefix(rendered: &str) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+    use hipfire_runtime::prompt_frame::AssistantPrefix;
+    let turn = rendered
+        .rfind("<|im_start|>")
+        .map(|at| &rendered[at..])
+        .unwrap_or(rendered);
+    match (turn.rfind("<think>"), turn.rfind("</think>")) {
+        // The newest marker in the live turn is an unclosed opener — the
+        // bare `<think>` tail, a seeded one, or a re-opened span.
+        (Some(_), None) => AssistantPrefix::OpenThink,
+        (Some(o), Some(c)) if o > c => AssistantPrefix::OpenThink,
+        // The live turn carries a closed think span (the thinking-off guard
+        // block) or only a stray closer.
+        (_, Some(_)) => AssistantPrefix::ClosedThink,
+        (None, None) => AssistantPrefix::Plain,
+    }
+}
+
+/// Reduce the authoritative rendered-prompt state to the signal consumed by
+/// speculative emitters. Jinja owns the generation suffix, so the request's
+/// `assistant_prefix` is not authoritative once rendering succeeds.
+pub fn spec_assistant_prefix(
+    started_in_think: bool,
+) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+    if started_in_think {
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    } else {
+        hipfire_runtime::prompt_frame::AssistantPrefix::Plain
+    }
+}
+
+/// Emit `gen_start`. When `contract_version` is `Some(2)`, the CLI latches the
+/// Increment-A semantic fold (visible-only tokens + buffered tool_calls).
+/// Only routes that fully satisfy the producer contract may pass `Some(2)`.
+/// Accepts any `Write` so deterministic tests can exercise the real writer
+/// (including hostile request ids) without a live stdout handle.
+pub fn emit_gen_start(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    started_in_think: bool,
+    contract_version: Option<u32>,
+) {
+    let envelope = hipfire_runtime::semantic::wire_gen_start(
+        id,
+        started_in_think,
+        active_attempt_id(),
+        contract_version,
+    );
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+/// Qwen single-GPU AR and DFlash/spec share semantic contract v2 once the
+/// router-backed producer path is active for the turn.
+pub const QWEN_AR_SEMANTIC_CONTRACT_VERSION: u32 = 2;
+pub const QWEN_DFLASH_SEMANTIC_CONTRACT_VERSION: u32 = QWEN_AR_SEMANTIC_CONTRACT_VERSION;
+
+/// Emit one classifier-authorized visible token event (no protocol markers).
+pub fn emit_visible_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
+    let envelope = serde_json::json!({
+        "type": "token",
+        "id": id,
+        "text": text,
+        "attempt_id": active_attempt_id(),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+/// Emit one producer-classified reasoning fragment.
+pub fn emit_reasoning_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
+    let envelope = serde_json::json!({
+        "type": "reasoning",
+        "id": id,
+        "text": text,
+        "attempt_id": active_attempt_id(),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+/// Canonical `{id?, name, arguments}` array for staged terminal / tool_calls events.
+pub fn tool_calls_canonical_json(
+    calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) -> Vec<serde_json::Value> {
+    calls
+        .iter()
+        .map(|tc| {
+            let mut value = serde_json::json!({
+                "name": tc.name,
+                "arguments": tc.arguments,
+            });
+            if let Some(id) = tc.id.as_deref() {
+                value["id"] = serde_json::Value::String(id.to_owned());
+            }
+            value
+        })
+        .collect()
+}
+
+/// Embed canonical `calls` on a staged done payload when finish_reason is
+/// tool_calls. Other finish reasons omit/empty calls so commit_ready and final
+/// done stay payload-identical without a separate post-commit tool event.
+pub fn stage_terminal_tool_calls(
+    pending_done: &mut serde_json::Value,
+    finish_reason: &str,
+    calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) {
+    if finish_reason == "tool_calls" {
+        pending_done["calls"] = serde_json::Value::Array(tool_calls_canonical_json(calls));
+    }
+}
+
+/// Emit structured `tool_calls` for a tool-safe terminal only.
+pub fn emit_tool_calls_event(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    calls: &[hipfire_runtime::prompt_frame::ToolCall],
+) {
+    if calls.is_empty() {
+        return;
+    }
+    let calls_json = tool_calls_canonical_json(calls);
+    let envelope = serde_json::json!({
+        "type": "tool_calls",
+        "id": id,
+        "calls": calls_json,
+        "attempt_id": active_attempt_id(),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+}
+
+// ── canonical JSON helpers (moved from daemon.rs for emit path) ──────────
+
+pub fn write_canonical_json(v: &serde_json::Value, out: &mut String) {
+    match v {
+        serde_json::Value::Null => out.push_str("null"),
+        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
+        serde_json::Value::Number(n) => out.push_str(&n.to_string()),
+        serde_json::Value::String(s) => out.push_str(&serde_json::to_string(s).unwrap()),
+        serde_json::Value::Array(arr) => {
+            out.push('[');
+            for (i, el) in arr.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_canonical_json(el, out);
+            }
+            out.push(']');
+        }
+        serde_json::Value::Object(map) => {
+            out.push('{');
+            let mut keys: Vec<_> = map.keys().collect();
+            keys.sort();
+            for (i, k) in keys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push_str(&serde_json::to_string(*k).unwrap_or_else(|_| "\"\"".to_string()));
+                out.push(':');
+                write_canonical_json(&map[*k], out);
+            }
+            out.push('}');
+        }
+    }
+}
+
+pub fn canonical_json(v: &serde_json::Value) -> String {
+    let mut out = String::new();
+    write_canonical_json(v, &mut out);
+    out
+}
+
+pub fn emit_error_with_id(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: impl std::fmt::Display,
+) {
+    emit_active_attempt_error(
+        stdout,
+        Some(id),
+        &message.to_string(),
+        "internal",
+        false,
+        false,
+    );
+}
+
+pub fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Display) {
+    emit_active_attempt_error(stdout, None, &message.to_string(), "internal", false, false);
+}
+
+pub fn emit_active_attempt_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) -> bool {
+    emit_active_attempt_error_outcome(stdout, id, message, class, retryable, rolled_back)
+        .delivered()
+}
+
+/// Emit an active-attempt error while retaining whether its terminal claim was
+/// consumed when the writer fails.
+pub fn emit_active_attempt_error_outcome(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) -> TerminalEmitOutcome {
+    let attempt_id = active_attempt_id();
+    // Attempt zero is the uncorrelated pre-admission channel. It must never
+    // be emitted by an active terminal writer.
+    if attempt_id == 0 {
+        return TerminalEmitOutcome::new(false, false);
+    }
+    let claimed = if let Some(id) = id {
+        if !claim_wire_terminal(id, attempt_id) {
+            return TerminalEmitOutcome::new(false, false);
+        }
+        true
+    } else {
+        false
+    };
+    TerminalEmitOutcome::new(
+        claimed,
+        write_error_envelope(
+            stdout,
+            id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+            attempt_id,
+        ),
+    )
+}
+
+pub fn emit_uncorrelated_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    let _ = write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
+}
+fn write_error_envelope(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+    attempt_id: u64,
+) -> bool {
+    let mut envelope = serde_json::json!({
+        "type": "error",
+        "message": message,
+        "class": class,
+        "retryable": retryable,
+        "rolled_back": rolled_back,
+        "attempt_id": attempt_id,
+    });
+    if let Some(id) = id {
+        envelope["id"] = serde_json::Value::String(id.to_owned());
+    }
+    if writeln!(stdout, "{}", envelope).is_err() {
+        return false;
+    }
+    stdout.flush().is_ok()
+}
+
+/// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
+/// line on the IPC stream (active-attempt internal error, echoes TLS).
+pub fn write_error(stdout: &mut impl std::io::Write, id: &str, message: &str) {
+    emit_active_attempt_error(stdout, Some(id), message, "internal", false, false);
+}
+
+/// Typed active-attempt error writer used by generation failure paths.
+pub fn write_typed_error(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
+}
+
+pub fn emit_qwen_ar_info(stdout: &mut impl std::io::Write, id: &str, message: &str) {
+    let envelope = serde_json::json!({
+        "type": "info",
+        "id": id,
+        "message": message,
+        "attempt_id": active_attempt_id(),
+    });
+    let _ = writeln!(stdout, "{}", envelope);
+    let _ = stdout.flush();
+}
+
+pub fn emit_qwen_ar_cancelled(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) -> bool {
+    emit_qwen_ar_cancelled_outcome(stdout, id, completion_tokens).delivered()
+}
+
+/// Emit a cancellation while retaining whether its terminal claim was
+/// consumed when the writer fails.
+pub fn emit_qwen_ar_cancelled_outcome(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) -> TerminalEmitOutcome {
+    let attempt_id = active_attempt_id();
+    if !claim_wire_terminal(id, attempt_id) {
+        return TerminalEmitOutcome::new(false, false);
+    }
+    let aborted = hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id);
+    if writeln!(stdout, "{}", aborted).is_err() {
+        return TerminalEmitOutcome::new(true, false);
+    }
+    let done = hipfire_runtime::semantic::wire_aborted_done(id, completion_tokens, attempt_id);
+    if writeln!(stdout, "{}", done).is_err() {
+        return TerminalEmitOutcome::new(true, false);
+    }
+    TerminalEmitOutcome::new(true, stdout.flush().is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_runtime::prompt_frame::ToolCall;
+
+    #[test]
+    fn canonical_tool_calls_preserve_optional_server_id() {
+        let calls = vec![
+            ToolCall {
+                id: Some("call_hf_1_2_0".into()),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text":"hi"}),
+                rendered_body: None,
+            },
+            ToolCall {
+                id: None,
+                name: "legacy".into(),
+                arguments: serde_json::json!({}),
+                rendered_body: None,
+            },
+        ];
+        let values = tool_calls_canonical_json(&calls);
+        assert_eq!(values[0]["id"], "call_hf_1_2_0");
+        assert!(values[1].get("id").is_none());
+    }
+}

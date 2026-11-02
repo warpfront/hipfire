@@ -146,9 +146,6 @@ fn main() {
 fn set_ldsstage(gpu: &mut Gpu, enabled: bool) {
     let mut flags = (*gpu.flags).clone();
     flags.hfq4g256_ldsstage_wmma = enabled;
-    // The MW16 branch precedes the staged residual guard. Keep it disabled so
-    // enabled=true unambiguously reaches the kernel under test.
-    flags.mw16 = false;
     gpu.flags = Arc::new(flags);
 }
 

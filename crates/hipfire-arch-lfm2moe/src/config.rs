@@ -195,6 +195,11 @@ impl Lfm2MoeConfig {
 
     /// Parse from a raw `config.json` Value (the inner `config` blob).
     pub fn from_config_value(inner: &serde_json::Value) -> Result<Self, String> {
+        // lfm2_vl checkpoints (LFM2.5-VL, model_type lfm2_vl) wrap the text
+        // model in a nested `text_config` next to vision/projector sections;
+        // the arch-11 text carrier parses that sub-object. Text-only load of a
+        // VL artifact stays the contract until the VL crate lands.
+        let inner = inner.get("text_config").unwrap_or(inner);
         let raw: RawLfm2MoeConfig = serde_json::from_value(inner.clone())
             .map_err(|e| format!("lfm2moe: parsing config failed: {e}"))?;
         let head_dim = raw
@@ -302,6 +307,10 @@ impl Lfm2MoeConfig {
             .iter()
             .filter(|&&t| t == MixerKind::Conv)
             .count()
+    }
+    /// Dense-only models have `num_experts == 0` (Lfm2ForCausalLM).
+    pub fn is_dense(&self) -> bool {
+        self.num_experts == 0
     }
 }
 

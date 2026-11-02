@@ -1,0 +1,101 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/path/to/models/qwen3.8-27b.mq3-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 4374,
+    "vram_total_mb": 16304,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 16182,
+  "max_tokens": 64,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 59,
+  "prompt_md5": "5835c71e471849b4a72e1dc8e39695e7",
+  "prompt_chars": 215,
+  "warnings": [
+    "prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 15.2,
+    "mean": 15.220000000000002,
+    "min": 15.1,
+    "max": 15.4,
+    "stdev": 0.09797958971132743
+  },
+  "prefill_tok_s": {
+    "median": 94.4,
+    "mean": 94.26,
+    "min": 93.5,
+    "max": 94.8,
+    "stdev": 0.44090815370097214
+  },
+  "wall_tok_s": {
+    "median": 13.2,
+    "mean": 13.219999999999999,
+    "min": 13.2,
+    "max": 13.3,
+    "stdev": 0.04000000000000057
+  },
+  "ttft_ms": {
+    "median": 625.3,
+    "mean": 626.0199999999999,
+    "min": 622.3,
+    "max": 631.3,
+    "stdev": 3.0155596495509727
+  },
+  "samples": {
+    "decode": [
+      15.4,
+      15.2,
+      15.2,
+      15.1,
+      15.2
+    ],
+    "prefill": [
+      93.5,
+      94.8,
+      94.1,
+      94.5,
+      94.4
+    ],
+    "wall": [
+      13.3,
+      13.2,
+      13.2,
+      13.2,
+      13.2
+    ],
+    "ttft_ms": [
+      631.3,
+      622.3,
+      626.8,
+      624.4,
+      625.3
+    ]
+  }
+}

@@ -100,8 +100,8 @@ fn quantize_mq2_lloyd(k: usize, rows: usize, seed: u64) -> Vec<u8> {
 /// d = amax/127, qs = rint(clamp(x/d, -127, 127)), store sum of original floats.
 /// Layout: [K/128][N] of block_q8_1_mmq (144 B each).
 struct BlockQ81 {
-    d: [f32; 4],     // scale per 32-el sub-block
-    sum: [f32; 4],   // sum of original floats (unused by MQ2L, used by HFQ4)
+    d: [f32; 4],   // scale per 32-el sub-block
+    sum: [f32; 4], // sum of original floats (unused by MQ2L, used by HFQ4)
     qs: [i8; 128],
 }
 
@@ -249,7 +249,10 @@ fn rms_rel(got: &[f32], exp: &[f32], n: usize) -> (f64, usize) {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!("Arch: {}", gpu.arch);
-    assert_eq!(gpu.arch, "gfx1030", "this channel test is exact-gfx1030 only");
+    assert_eq!(
+        gpu.arch, "gfx1030",
+        "this channel test is exact-gfx1030 only"
+    );
 
     const TOP_K: usize = 8;
     let shapes: &[(usize, usize, usize, &str)] = &[
@@ -265,7 +268,9 @@ fn main() {
     for &(m, k, batch, label) in shapes {
         let m_total = batch * TOP_K;
         let m_total_pad = ((m_total + 15) / 16) * 16;
-        println!("\n=== {label} | M={m} K={k} batch={batch} m_total={m_total} pad={m_total_pad} ===");
+        println!(
+            "\n=== {label} | M={m} K={k} batch={batch} m_total={m_total} pad={m_total_pad} ==="
+        );
         if m % 16 != 0 || k % 256 != 0 {
             println!("  SKIP shape");
             continue;
@@ -295,7 +300,9 @@ fn main() {
             .flat_map(|_| 0i32.to_le_bytes().to_vec())
             .collect();
         let tp_gpu = gpu.hip.malloc(tile_ids_bytes.len()).expect("malloc TP");
-        gpu.hip.memcpy_htod(&tp_gpu, &tile_ids_bytes).expect("htod TP");
+        gpu.hip
+            .memcpy_htod(&tp_gpu, &tile_ids_bytes)
+            .expect("htod TP");
 
         let perm_bytes: Vec<u8> = (0..m_total_pad)
             .flat_map(|i| {
@@ -307,13 +314,42 @@ fn main() {
         gpu.hip.memcpy_htod(&sp_gpu, &perm_bytes).expect("htod SP");
 
         let ep_t = wrap_buf(ep_gpu.as_ptr(), 8, vec![1], DType::F32);
-        let tp_t = wrap_buf(tp_gpu.as_ptr(), tile_ids_bytes.len(), vec![slot_tiles], DType::F32);
-        let sp_t = wrap_buf(sp_gpu.as_ptr(), perm_bytes.len(), vec![m_total_pad], DType::F32);
-        let x_t = wrap_buf(x_gpu.as_ptr(), x_f32_bytes.len(), vec![m_total, k], DType::F32);
-        let y_t = wrap_buf(y_gpu.as_ptr(), m_total_pad * m * 4, vec![m_total_pad, m], DType::F32);
+        let tp_t = wrap_buf(
+            tp_gpu.as_ptr(),
+            tile_ids_bytes.len(),
+            vec![slot_tiles],
+            DType::F32,
+        );
+        let sp_t = wrap_buf(
+            sp_gpu.as_ptr(),
+            perm_bytes.len(),
+            vec![m_total_pad],
+            DType::F32,
+        );
+        let x_t = wrap_buf(
+            x_gpu.as_ptr(),
+            x_f32_bytes.len(),
+            vec![m_total, k],
+            DType::F32,
+        );
+        let y_t = wrap_buf(
+            y_gpu.as_ptr(),
+            m_total_pad * m * 4,
+            vec![m_total_pad, m],
+            DType::F32,
+        );
 
         gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
-            &ep_t, &tp_t, &sp_t, &x_t, &y_t, m, k, 1, m_total_pad, m_total,
+            &ep_t,
+            &tp_t,
+            &sp_t,
+            &x_t,
+            &y_t,
+            m,
+            k,
+            1,
+            m_total_pad,
+            m_total,
         )
         .expect("kernel launch");
         gpu.hip.device_synchronize().expect("sync");
@@ -372,7 +408,16 @@ fn main() {
 
         for _ in 0..WARMUP {
             gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
-                &ep_t, &tp_t, &sp_t, &x_t, &y_t, m, k, 1, m_total_pad, m_total,
+                &ep_t,
+                &tp_t,
+                &sp_t,
+                &x_t,
+                &y_t,
+                m,
+                k,
+                1,
+                m_total_pad,
+                m_total,
             )
             .unwrap();
         }
@@ -380,7 +425,16 @@ fn main() {
         let t0 = Instant::now();
         for _ in 0..TRIALS {
             gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
-                &ep_t, &tp_t, &sp_t, &x_t, &y_t, m, k, 1, m_total_pad, m_total,
+                &ep_t,
+                &tp_t,
+                &sp_t,
+                &x_t,
+                &y_t,
+                m,
+                k,
+                1,
+                m_total_pad,
+                m_total,
             )
             .unwrap();
         }

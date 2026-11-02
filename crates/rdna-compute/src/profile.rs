@@ -17,7 +17,7 @@
 //! accurately but loses any async pipelining the runtime would have done.
 //! For bandwidth attribution this is exactly what we want.
 
-use hip_bridge::{Event, HipResult, HipRuntime};
+use hip_bridge::{Event, HipResult, HipRuntime, Stream};
 use std::cell::RefCell;
 
 #[derive(Debug, Clone)]
@@ -133,6 +133,294 @@ pub fn end_timer(hip: &HipRuntime, timer: Option<Timer>) -> HipResult<()> {
     Ok(())
 }
 
+// ─── Launch-level timing (every kernel through the launch funnels) ─────────
+//
+// `begin_timer` only covers launchers that call it by hand; kernels without a
+// call site (e.g. latent attention, hc row fold, grouped ops) are invisible to
+// it. The launch funnels (`launch_maybe_blob*`, `launch_blob_recorded`) also
+// bracket each launch with an event pair while launch-level timing is active,
+// so a profile of an arch whose kernels were never individually instrumented is
+// complete by construction. Same discipline as `Timer`: one event pair per
+// launch, synchronized immediately, so per-kernel times are isolated GPU spans
+// and the profiled wall time is inflated. Independent of `start`/`stop`
+// (`begin_timer` entries and launch entries never share a collector, so a
+// kernel is never counted twice). Inactive cost: one thread-local read.
+
+/// One launch observed by launch-level timing.
+#[derive(Debug, Clone)]
+pub struct LaunchEntry {
+    pub kernel: String,
+    pub time_us: f64,
+}
+
+thread_local! {
+    static LAUNCH_PROFILE: RefCell<Option<Vec<LaunchEntry>>> = const { RefCell::new(None) };
+}
+
+/// Start launch-level collection. Clears any prior state.
+pub fn start_launches() {
+    LAUNCH_PROFILE.with(|p| *p.borrow_mut() = Some(Vec::with_capacity(8192)));
+}
+
+/// Stop launch-level collection and return the entries (None if not started).
+pub fn stop_launches() -> Option<Vec<LaunchEntry>> {
+    LAUNCH_PROFILE.with(|p| p.borrow_mut().take())
+}
+
+/// True while launch-level timing is collecting.
+#[inline]
+pub fn launches_active() -> bool {
+    LAUNCH_PROFILE.with(|p| p.borrow().is_some())
+}
+
+/// Start/stop events of one funnel launch. Consumed by `finish`.
+pub struct LaunchTimer {
+    kernel: String,
+    start: Event,
+    stop: Event,
+}
+
+impl LaunchTimer {
+    /// Record the stop event on `stream`, wait for it and store the span.
+    /// Event errors are swallowed (profiling never fails a forward).
+    pub fn finish(self, hip: &HipRuntime, stream: Option<&Stream>) {
+        let _ = hip.event_record(&self.stop, stream);
+        let _ = hip.event_synchronize(&self.stop);
+        let ms = hip.event_elapsed_ms(&self.start, &self.stop).unwrap_or(0.0);
+        LAUNCH_PROFILE.with(|p| {
+            if let Some(entries) = &mut *p.borrow_mut() {
+                entries.push(LaunchEntry {
+                    kernel: self.kernel,
+                    time_us: ms as f64 * 1000.0,
+                });
+            }
+        });
+        let _ = hip.event_destroy(self.start);
+        let _ = hip.event_destroy(self.stop);
+    }
+}
+
+/// Begin a launch-level span on `stream`; `None` when launch-level timing is
+/// off (the hot-path case).
+#[inline]
+pub fn begin_launch_timer(
+    hip: &HipRuntime,
+    kernel: &str,
+    stream: Option<&Stream>,
+) -> Option<LaunchTimer> {
+    if !launches_active() {
+        return None;
+    }
+    let start = hip.event_create().ok()?;
+    let stop = hip.event_create().ok()?;
+    if hip.event_record(&start, stream).is_err() {
+        let _ = hip.event_destroy(start);
+        let _ = hip.event_destroy(stop);
+        return None;
+    }
+    Some(LaunchTimer {
+        kernel: kernel.to_string(),
+        start,
+        stop,
+    })
+}
+
+// ─── Deferred (non-synchronizing) timer pairs ──────────────────────────────
+//
+// `Timer::finish` above synchronizes the stop event immediately — exactly
+// right for isolated per-kernel bandwidth attribution (see the module doc).
+// It is wrong for a caller wrapping hundreds of launches in one step (e.g.
+// one FLUX denoise step, ~1,000 kernel launches): syncing the host thread
+// after every single one serializes launches that would otherwise pipeline
+// back-to-back on the GPU, inflating the summed per-family time far past the
+// step's real wall clock.
+//
+// `PendingTimer` only ever enqueues `hipEventRecord` calls (never
+// `hipEventSynchronize`). A caller collects many of them across a step and
+// resolves the whole batch at once with `resolve_deferred`, which
+// synchronizes exactly ONCE.
+//
+// Deliberately independent of `start`/`is_active`/`record`: routing this
+// through the shared `is_active()` gate would also switch on every other
+// `Timer`-based call site reachable from the same code path (several already
+// exist, e.g. `attention_flux`, `layernorm_modulate`, `qk_rmsnorm_rope_flux`)
+// and reintroduce exactly the per-launch synchronization this type exists to
+// avoid. Callers manage their own on/off switch and only call
+// `begin_deferred` when profiling is active.
+
+/// One start/stop `hipEvent` pair, recorded non-synchronously. See the
+/// section doc above for why this is separate from [`Timer`].
+pub struct PendingTimer {
+    start: Event,
+    stop: Event,
+}
+
+/// Record the start event on `stream` (`None` = null/legacy stream).
+/// Non-blocking. Pair with [`PendingTimer::mark_stop`], then batch-resolve
+/// with [`resolve_deferred`].
+pub fn begin_deferred(hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<PendingTimer> {
+    let start = hip.event_create()?;
+    let stop = hip.event_create()?;
+    hip.event_record(&start, stream)?;
+    Ok(PendingTimer { start, stop })
+}
+
+impl PendingTimer {
+    /// Record the stop event on `stream`. Non-blocking.
+    pub fn mark_stop(&self, hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<()> {
+        hip.event_record(&self.stop, stream)
+    }
+}
+
+/// Resolve a batch of [`PendingTimer`]s collected across one step, each
+/// tagged with a caller-chosen label. Synchronizes exactly ONCE — on
+/// `stream` if given, else on the last timer's stop event — then reads every
+/// pair's elapsed time and destroys the events.
+///
+/// Safe without a per-pair wait: HIP stream completion is FIFO, so once the
+/// sync call returns, every event recorded earlier on the same stream (every
+/// entry but the last, and the last itself) has also completed.
+pub fn resolve_deferred<L>(
+    hip: &HipRuntime,
+    stream: Option<&Stream>,
+    timers: Vec<(L, PendingTimer)>,
+) -> Vec<(L, f64)> {
+    if timers.is_empty() {
+        return Vec::new();
+    }
+    match stream {
+        Some(s) => {
+            let _ = hip.stream_synchronize(s);
+        }
+        None => {
+            let _ = hip.event_synchronize(&timers.last().expect("checked non-empty above").1.stop);
+        }
+    }
+    let mut out = Vec::with_capacity(timers.len());
+    for (label, t) in timers {
+        let ms = hip.event_elapsed_ms(&t.start, &t.stop).unwrap_or(0.0);
+        out.push((label, ms as f64 * 1000.0));
+        let _ = hip.event_destroy(t.start);
+        let _ = hip.event_destroy(t.stop);
+    }
+    out
+}
+
+/// A labelled GPU span in flight: start event recorded, stop not yet.
+pub struct Span {
+    label: &'static str,
+    timer: PendingTimer,
+    started_unix_us: u64,
+}
+
+/// Total GPU time of every span that shared a label, with the wall-clock
+/// window (unix microseconds) from the first span's start to the last's end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SpanTotal {
+    pub label: &'static str,
+    pub us: f64,
+    pub first_start_unix_us: u64,
+    pub last_end_unix_us: u64,
+}
+
+/// Collects labelled GPU spans with [`begin_deferred`] events and resolves
+/// them with ONE synchronize ([`resolve_deferred`]), so instrumenting a long
+/// run of launches never serializes them. The caller owns the on/off switch:
+/// a disabled profiler (also the `Default`) makes every call a no-op, and
+/// profiling never fails the work it measures (event errors drop the span).
+#[derive(Default)]
+pub struct SpanProfiler {
+    enabled: bool,
+    done: Vec<(Span, u64)>,
+}
+
+/// Wall clock in unix microseconds (0 if the clock is before the epoch).
+pub fn unix_micros() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_micros() as u64)
+        .unwrap_or(0)
+}
+
+impl SpanProfiler {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            done: Vec::new(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Start a span; `None` when disabled. Spans may nest or overlap.
+    pub fn begin(
+        &self,
+        hip: &HipRuntime,
+        stream: Option<&Stream>,
+        label: &'static str,
+    ) -> Option<Span> {
+        if !self.enabled {
+            return None;
+        }
+        let started_unix_us = unix_micros();
+        begin_deferred(hip, stream).ok().map(|timer| Span {
+            label,
+            timer,
+            started_unix_us,
+        })
+    }
+
+    /// Record the span's stop event (non-blocking) and keep it for `resolve`.
+    pub fn end(&mut self, hip: &HipRuntime, stream: Option<&Stream>, span: Option<Span>) {
+        if let Some(span) = span {
+            if span.timer.mark_stop(hip, stream).is_ok() {
+                self.done.push((span, unix_micros()));
+            }
+        }
+    }
+
+    /// Resolve every ended span and sum them per label, in first-seen order.
+    pub fn resolve(self, hip: &HipRuntime, stream: Option<&Stream>) -> Vec<SpanTotal> {
+        let mut windows = Vec::with_capacity(self.done.len());
+        let mut timers = Vec::with_capacity(self.done.len());
+        for (span, ended) in self.done {
+            windows.push((span.started_unix_us, ended));
+            timers.push((span.label, span.timer));
+        }
+        sum_by_label(
+            resolve_deferred(hip, stream, timers)
+                .into_iter()
+                .zip(windows),
+        )
+    }
+}
+
+/// Sum resolved `(label, us)` spans with their `(start, end)` wall windows
+/// per label, in first-seen order.
+fn sum_by_label(
+    spans: impl IntoIterator<Item = ((&'static str, f64), (u64, u64))>,
+) -> Vec<SpanTotal> {
+    let mut totals: Vec<SpanTotal> = Vec::new();
+    for ((label, us), (started, ended)) in spans {
+        match totals.iter_mut().find(|total| total.label == label) {
+            Some(total) => {
+                total.us += us;
+                total.first_start_unix_us = total.first_start_unix_us.min(started);
+                total.last_end_unix_us = total.last_end_unix_us.max(ended);
+            }
+            None => totals.push(SpanTotal {
+                label,
+                us,
+                first_start_unix_us: started,
+                last_end_unix_us: ended,
+            }),
+        }
+    }
+    totals
+}
+
 // ─── Byte count formulas for common kernel shapes ──────────────────────────
 //
 // Each helper takes kernel dimensions and returns the number of bytes the
@@ -151,16 +439,26 @@ pub fn gemv_hfq4g256_bytes(m: usize, k: usize) -> usize {
     hfq4g256_weight_bytes(m, k) + k * 4 + m * 4
 }
 
-/// HFQ4-G128 weight footprint: 72 B per 128-element group (4 B scale +
-/// 4 B zero + 64 B packed 4-bit weights).
+/// Flat HFQ4 weight footprint for `group`-element groups: 4 B scale + 4 B
+/// zero + `group / 2` B packed 4-bit weights per group (72 B at G128, 40 B
+/// at G64).
+pub fn hfq4_weight_bytes(m: usize, k: usize, group: usize) -> usize {
+    m * k.div_ceil(group) * (8 + group / 2)
+}
+
+/// HFQ4-G128 weight footprint (72 B per 128-element group).
 pub fn hfq4g128_weight_bytes(m: usize, k: usize) -> usize {
-    let groups = k / 128;
-    m * groups * 72
+    hfq4_weight_bytes(m, k, 128)
 }
 
 /// Bytes for a single-row HFQ4-G128 GEMV: weight + input vector + output vector.
 pub fn gemv_hfq4g128_bytes(m: usize, k: usize) -> usize {
     hfq4g128_weight_bytes(m, k) + k * 4 + m * 4
+}
+
+/// Bytes for a single-row HFQ4-G64 GEMV: weight + input vector + output vector.
+pub fn gemv_hfq4g64_bytes(m: usize, k: usize) -> usize {
+    hfq4_weight_bytes(m, k, 64) + k * 4 + m * 4
 }
 
 /// HFQ3-G256 weight footprint: 104 B per 256-element group (4 B scale +
@@ -240,6 +538,37 @@ pub fn gemv_hfp4g32_bytes(m: usize, k: usize) -> usize {
     hfp4g32_weight_bytes(m, k) + k * 4 + m * 4
 }
 
+/// MQ5G256V2 weight footprint: 168 B/group
+pub fn mq5g256v2_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 168
+}
+pub fn gemv_mq5g256v2_bytes(m: usize, k: usize) -> usize {
+    mq5g256v2_weight_bytes(m, k) + k * 4 + m * 4
+}
+/// MQ6G256V2
+pub fn mq6g256v2_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 200
+}
+pub fn gemv_mq6g256v2_bytes(m: usize, k: usize) -> usize {
+    mq6g256v2_weight_bytes(m, k) + k * 4 + m * 4
+}
+pub fn mq3g256v2_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 104
+}
+pub fn gemv_mq3g256v2_bytes(m: usize, k: usize) -> usize {
+    mq3g256v2_weight_bytes(m, k) + k * 4 + m * 4
+}
+pub fn mq2g256v2_weight_bytes(m: usize, k: usize) -> usize {
+    let groups = k / 256;
+    m * groups * 72
+}
+pub fn gemv_mq2g256v2_bytes(m: usize, k: usize) -> usize {
+    mq2g256v2_weight_bytes(m, k) + k * 4 + m * 4
+}
+
 /// FWHT rotation kernel: read x, read two sign tables, write x_rot.
 pub fn mq_rotate_bytes(k: usize) -> usize {
     k * 4 + 256 * 4 * 2 + k * 4
@@ -262,11 +591,7 @@ pub fn elementwise1_bytes(n: usize) -> usize {
 
 /// DeltaNet Q8 recurrence: roughly state in + state out + Q/K/V + gate/beta +
 /// output. Dominated by state read+write.
-pub fn gated_delta_net_q8_bytes(
-    n_tokens: usize,
-    n_heads: usize,
-    head_dim: usize,
-) -> usize {
+pub fn gated_delta_net_q8_bytes(n_tokens: usize, n_heads: usize, head_dim: usize) -> usize {
     let state_bytes = n_heads * head_dim * head_dim; // Q8: 1 byte each
     let state_scales = n_heads * head_dim * 4;
     let qkv = 3 * n_tokens * n_heads * head_dim * 4;
@@ -292,6 +617,33 @@ pub fn attention_q8_0_kv_bytes(
     let out_bytes = n_heads * head_dim * 4;
     q_bytes + kv_bytes + out_bytes
 }
+/// Q8_0 flash-prefill attention: read Q, re-read K+V caches, write output.
+/// `batch` = query rows in this launch; `ctx` = max(positions)+1 (NOT the
+/// batch size — under chunked prefill each row re-reads its full causal
+/// prefix, so K/V traffic scales with absolute context).
+///
+/// Bytes estimate (bandwidth attribution only; the profile share % is
+/// time-based and exact regardless):
+/// - Q:   `batch * n_heads * head_dim * 4` (f32 Q in both the scalar and
+///   WMMA kernels).
+/// - K/V: `batch * ctx * n_kv_heads * (head_dim + 4)`. Per query row the
+///   kernel streams its causal K prefix and V prefix; the x2 for the two
+///   streams and the /2 for the causal-triangle average fold to x1. The `+4`
+///   folds in the Q8_0 scales (one scale per 32-elem block — same convention
+///   as `attention_q8_0_kv_bytes`).
+/// - out: `batch * n_heads * head_dim * 4` (f32).
+pub fn attention_q8_0_flash_prefill_bytes(
+    batch: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    ctx: usize,
+) -> usize {
+    let q_bytes = batch * n_heads * head_dim * 4;
+    let kv_bytes = batch * ctx * n_kv_heads * (head_dim + 4);
+    let out_bytes = batch * n_heads * head_dim * 4;
+    q_bytes + kv_bytes + out_bytes
+}
 
 /// RoPE (partial interleaved): read Q, read K, write both back.
 pub fn rope_bytes(n_heads: usize, n_kv_heads: usize, head_dim: usize) -> usize {
@@ -312,7 +664,7 @@ pub fn conv1d_silu_bytes(n_channels: usize) -> usize {
         + n_channels * state_slots * 4     // state read
         + n_channels * kernel_size * 4     // weight
         + n_channels * 4                   // output
-        + n_channels * state_slots * 4     // state write
+        + n_channels * state_slots * 4 // state write
 }
 
 /// KV cache write (Q8_0 flavor, per token position).
@@ -322,10 +674,63 @@ pub fn kv_cache_write_q8_0_bytes(n_kv_heads: usize, head_dim: usize) -> usize {
     let dst = n_kv_heads * (head_dim + 4); // int8 + scale
     src + dst
 }
+/// KV cache write (native fp8-E4M3 flavor, per token position): f32 source
+/// vector + one token-local row (Hkv*D codes + Hkv f16 scales).
+pub fn kv_cache_write_fp8_e4m3_bytes(n_kv_heads: usize, head_dim: usize) -> usize {
+    let src = n_kv_heads * head_dim * 4;
+    let dst = n_kv_heads * (head_dim + 2);
+    src + dst
+}
+/// Native fp8-E4M3 KV attention: read Q, read K+V caches, write output.
+/// `kv_len` = current sequence length.
+pub fn attention_fp8_e4m3_kv_bytes(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> usize {
+    let q_bytes = n_heads * head_dim * 4;
+    let kv_bytes_per_pos = n_kv_heads * (head_dim + 2);
+    let kv_bytes = 2 * kv_len * kv_bytes_per_pos;
+    let out_bytes = n_heads * head_dim * 4;
+    q_bytes + kv_bytes + out_bytes
+}
+/// Native flat-bf16 KV attention: same shape, 2 bytes/element, no scales.
+pub fn attention_bf16_kv_bytes(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> usize {
+    let q_bytes = n_heads * head_dim * 4;
+    let kv_bytes_per_pos = n_kv_heads * head_dim * 2;
+    let kv_bytes = 2 * kv_len * kv_bytes_per_pos;
+    let out_bytes = n_heads * head_dim * 4;
+    q_bytes + kv_bytes + out_bytes
+}
 
 /// Gated norm (L2 + affine): similar bandwidth profile to rmsnorm but with an
 /// extra z gate input.
 pub fn gated_norm_bytes(n: usize) -> usize {
     // Read x, z, weight. Write out.
     n * 4 * 4
+}
+
+#[cfg(test)]
+mod span_tests {
+    #[test]
+    fn span_totals_sum_per_label_in_first_seen_order() {
+        let totals = super::sum_by_label([
+            (("verify", 10.0), (100, 110)),
+            (("draft", 2.0), (90, 95)),
+            (("verify", 5.0), (120, 130)),
+        ]);
+        assert_eq!(totals.len(), 2);
+        assert_eq!((totals[0].label, totals[0].us), ("verify", 15.0));
+        assert_eq!(
+            (totals[0].first_start_unix_us, totals[0].last_end_unix_us),
+            (100, 130)
+        );
+        assert_eq!((totals[1].label, totals[1].us), ("draft", 2.0));
+    }
 }

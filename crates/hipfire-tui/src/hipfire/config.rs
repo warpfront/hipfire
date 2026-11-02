@@ -2,10 +2,13 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire - see LICENSE and NOTICE in the project root.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::path::Path;
 
+use hipfire_client::ServiceEndpoint;
 use hipfire_config::{
-    field, load_catalog, load_global, resolve, ConfigFormat, ConfigPaths, ConfigValue, NamedLayer,
+    field, load_catalog, load_global, resolve, secret::BearerToken, ConfigFormat, ConfigPaths,
+    ConfigValue, NamedLayer,
 };
 
 use super::HipfirePaths;
@@ -16,12 +19,6 @@ pub struct ConfigState {
     pub port: u16,
     pub default_model: String,
     pub values: BTreeMap<String, String>,
-    /// Keys explicitly present in `~/.hipfire/config.toml` — i.e. user overrides,
-    /// as opposed to inherited/hardcoded defaults. `values` always carries every
-    /// default key merged with the disk overlay, so this set is the only way to
-    /// tell an override apart from a default (drives reset gating + the 5c
-    /// override marker).
-    pub overrides: BTreeSet<String>,
     pub per_model_count: usize,
     pub loaded_from_disk: bool,
     pub warning: Option<String>,
@@ -29,8 +26,17 @@ pub struct ConfigState {
 
 impl ConfigState {
     pub fn load(paths: &HipfirePaths) -> Self {
+        Self::load_inner(paths, true)
+    }
+
+    /// [`ConfigState::load`] without the `HIPFIRE_SERVE_API_KEY_FILE`
+    /// process-environment override: reads only `paths`.
+    pub fn load_hermetic(paths: &HipfirePaths) -> Self {
+        Self::load_inner(paths, false)
+    }
+
+    fn load_inner(paths: &HipfirePaths, read_env: bool) -> Self {
         let mut values = defaults();
-        let mut overrides = BTreeSet::new();
         let mut loaded_from_disk = false;
         let mut warning = None;
 
@@ -39,7 +45,6 @@ impl ConfigState {
                 loaded_from_disk = loaded.format != ConfigFormat::Empty;
                 for (canonical, value) in loaded.layer.values {
                     if let Some(schema) = field(&canonical) {
-                        overrides.insert(schema.legacy_key.to_owned());
                         values.insert(schema.legacy_key.to_owned(), value_to_string(&value));
                     }
                 }
@@ -48,6 +53,30 @@ impl ConfigState {
                 }
             }
             Err(error) => warning = Some(format!("config parse error: {error}")),
+        }
+
+        // `HIPFIRE_SERVE_API_KEY_FILE` outranks the config file, matching the
+        // CLI's resolution order for this key.
+        if let Some(schema) = field("serve.api_key_file").filter(|_| read_env) {
+            if let Some(name) = schema.env_compat {
+                if let Ok(raw) = std::env::var(name) {
+                    match schema.parse_cli(&raw) {
+                        Ok(value) => {
+                            values.insert(schema.legacy_key.to_owned(), value_to_string(&value));
+                        }
+                        Err(error) => {
+                            // Retain the invalid override so HTTP callers fail
+                            // closed instead of using the old or absent key.
+                            values.insert(schema.legacy_key.to_owned(), raw);
+                            let message = format!("{name}: {error}");
+                            warning = Some(match warning.take() {
+                                Some(previous) => format!("{previous}; {message}"),
+                                None => message,
+                            });
+                        }
+                    }
+                }
+            }
         }
 
         let per_model_count = load_catalog(&ConfigPaths::under(&paths.root))
@@ -72,18 +101,10 @@ impl ConfigState {
             port,
             default_model,
             values,
-            overrides,
             per_model_count,
             loaded_from_disk,
             warning,
         }
-    }
-
-    /// True when `key` is an explicit user override in config.toml (vs an
-    /// inherited/hardcoded default). Drives reset gating ("already default") and
-    /// the override marker in the Settings view.
-    pub fn is_override(&self, key: &str) -> bool {
-        self.overrides.contains(key)
     }
 
     /// The hardcoded default map, for cross-checking the knob explainer defaults
@@ -101,164 +122,78 @@ impl ConfigState {
         }
     }
 
-    /// Config keys behind each easy-mode row, in display order. `None` marks a
-    /// row that is composite/non-editable inline (e.g. the `host:port` serve
-    /// row, or the Model row which is set from the Models tab). The TUI editor
-    /// uses this to resolve a selected easy row to a writable config key.
-    pub fn easy_keys(&self) -> Vec<Option<&'static str>> {
-        vec![
-            None,            // Model (set via Models tab)
-            Some("max_seq"), // Context
-            Some("dflash_mode"),
-            Some("prefill_compression"), // Prefill (pflash)
-            Some("kv_cache"),
-            Some("thinking"),
-            Some("thinking_budget"),
-            None, // Serve host:port (composite)
-        ]
+    /// Authenticated endpoint for the local serve process. Loads the bearer
+    /// from the resolved `serve.api_key_file` (empty = keyless). Errors name
+    /// the key file path and the violated rule, never the token.
+    pub fn service_endpoint(&self) -> Result<ServiceEndpoint, String> {
+        let key_file = self.values.get("api_key_file").map_or("", String::as_str);
+        if !key_file.is_empty()
+            && (key_file.trim() != key_file || !Path::new(key_file).is_absolute())
+        {
+            return Err("serve.api_key_file must be an absolute path".to_owned());
+        }
+        let bearer = if key_file.is_empty() {
+            None
+        } else {
+            Some(
+                BearerToken::load(Path::new(key_file))
+                    .map_err(|error| format!("serve.api_key_file: {error}"))?,
+            )
+        };
+        ServiceEndpoint::local(&self.host, self.port, bearer).map_err(|error| error.to_string())
     }
+}
 
-    /// True when prefill compression is requested (auto/always) but no
-    /// `prefill_drafter` is set — pflash then silently no-ops. Mirrors the bun
-    /// CLI warning (`prefill_compression=… but prefill_drafter is unset`). Surfaced
-    /// honestly in the easy row + as a toast when the user enables compression.
-    ///
-    /// Scope: this reflects the GLOBAL config (`~/.hipfire/config.toml`), which is
-    /// what the Settings tab edits — like every other row here. A per-model
-    /// override (`hipfire config <tag> set prefill_drafter …`, counted in
-    /// `per_model_count`) is resolved by the daemon at serve time and is NOT
-    /// layered in here; the daemon's own gate is the final word. Empty-string =
-    /// disabled matches the shared schema exactly (`"" disables`).
-    pub fn pflash_needs_drafter(&self) -> bool {
-        let compression = self
-            .values
-            .get("prefill_compression")
-            .map(String::as_str)
-            .unwrap_or("off");
-        let drafter_empty = self
-            .values
-            .get("prefill_drafter")
-            .map(|s| s.is_empty())
-            .unwrap_or(true);
-        compression != "off" && drafter_empty
+/// Plain label for a layer-count budget (`memory.gpu_layer_budget`,
+/// `memory.moe_expert_budget`). The editor seeds its buffer from `values`, not
+/// from this label.
+pub(crate) fn layers_label(raw: &str) -> String {
+    match raw {
+        // Unset keeps every layer resident on every model. Name the state rather
+        // than leaving a blank value column.
+        "" => "all on GPU".into(),
+        // `-1` is the schema's reserved auto spelling, and the rule also accepts
+        // a literal `auto`; both mean fit-to-card and neither is a layer count.
+        "-1" | "auto" => "auto (fits to card)".into(),
+        v => format!("{v} on GPU"),
     }
+}
 
-    /// Per-easy-row override status, parallel to [`easy_rows`]/[`easy_keys`].
-    /// Unlike `easy_keys` (which is `None` for the non-inline-editable Model /
-    /// Serve composite rows), this resolves override status for EVERY row from
-    /// its underlying config key(s), so the 5c override marker is consistent with
-    /// the advanced view — a user-set `default_model` / `host` / `port` shows as
-    /// changed in easy mode too, not just advanced.
-    pub fn easy_override_state(&self) -> Vec<bool> {
-        vec![
-            self.is_override("default_model"),                    // Model
-            self.is_override("max_seq"),                          // Context
-            self.is_override("dflash_mode"),                      // Spec decode
-            self.is_override("prefill_compression"),              // Prefill
-            self.is_override("kv_cache"),                         // KV cache
-            self.is_override("thinking"),                         // Thinking
-            self.is_override("thinking_budget"),                  // Reasoning budget
-            self.is_override("host") || self.is_override("port"), // Serve
-        ]
+/// Plain label for `memory.offload_exec`.
+pub(crate) fn offload_exec_label(raw: &str) -> String {
+    match raw {
+        "" | "pcie" => "over PCIe".into(),
+        "cpu" => "on CPU".into(),
+        "passback" => "passback (CPU + GPU)".into(),
+        // Only reachable if the schema's list grows: show it rather than
+        // mislabel it.
+        other => other.to_string(),
     }
+}
 
-    /// Help-lookup key for each easy row, parallel to [`easy_rows`]/[`easy_keys`].
-    /// Unlike `easy_keys`, this maps the composite Model/Serve rows to a
-    /// representative key (default_model / host) so the 5e explainer pane has
-    /// something to show for every row.
-    pub fn easy_help_keys(&self) -> Vec<&'static str> {
-        vec![
-            "default_model",       // Model
-            "max_seq",             // Context
-            "dflash_mode",         // Spec decode
-            "prefill_compression", // Prefill
-            "kv_cache",            // KV cache
-            "thinking",            // Thinking
-            "thinking_budget",     // Reasoning budget
-            "host",                // Serve
-        ]
-    }
-
-    pub fn easy_rows(&self) -> Vec<(&'static str, String, &'static str)> {
-        vec![
-            (
-                "Model",
-                self.default_model.clone(),
-                "Default model pre-warmed by serve and used by chat.",
-            ),
-            (
-                "Context",
-                self.values
-                    .get("max_seq")
-                    .cloned()
-                    .unwrap_or_else(|| "32768".into()),
-                "KV cache capacity allocated at load.",
-            ),
-            (
-                "Spec decode",
-                self.values
-                    .get("dflash_mode")
-                    .cloned()
-                    .unwrap_or_else(|| "off".into()),
-                "DFlash mode. Keep off unless intentionally testing drafts.",
-            ),
-            (
-                "Prefill",
-                {
-                    let c = self
-                        .values
-                        .get("prefill_compression")
-                        .cloned()
-                        .unwrap_or_else(|| "off".into());
-                    // Honest: compression on without a drafter is a no-op.
-                    if self.pflash_needs_drafter() {
-                        format!("{c} (needs drafter)")
-                    } else {
-                        c
-                    }
-                },
-                "Prefill KV compression (pflash). Needs a prefill_drafter (.hfq) to engage.",
-            ),
-            (
-                "KV cache",
-                self.values
-                    .get("kv_cache")
-                    .cloned()
-                    .unwrap_or_else(|| "auto".into()),
-                "Precision/memory tradeoff for attention cache.",
-            ),
-            (
-                "Thinking",
-                self.values
-                    .get("thinking")
-                    .cloned()
-                    .unwrap_or_else(|| "on".into()),
-                "Whether reasoning models emit a hidden think block.",
-            ),
-            (
-                "Reasoning budget",
-                self.values
-                    .get("thinking_budget")
-                    .cloned()
-                    .unwrap_or_else(|| "med".into()),
-                "Named <think> token cap (low/med/high/xhigh/max/uncapped).",
-            ),
-            (
-                "Serve",
-                format!("{}:{}", self.host, self.port),
-                "OpenAI-compatible endpoint used by chat and API clients.",
-            ),
-        ]
+/// Plain label for `memory.offload_passback_share`.
+pub(crate) fn passback_share_label(raw: &str) -> String {
+    match raw {
+        "" | "auto" => "auto (scheduled)".into(),
+        other => other.to_string(),
     }
 }
 
 fn defaults() -> BTreeMap<String, String> {
-    resolve(Vec::<NamedLayer>::new())
-        .expect("shared built-in config schema validates")
-        .legacy_values()
-        .into_iter()
-        .map(|(key, value)| (key, value_to_string(&value)))
-        .collect()
+    default_map().clone()
+}
+
+/// The schema defaults, resolved once: the explainer reads them every frame.
+fn default_map() -> &'static BTreeMap<String, String> {
+    static DEFAULTS: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
+    DEFAULTS.get_or_init(|| {
+        resolve(Vec::<NamedLayer>::new())
+            .expect("shared built-in config schema validates")
+            .legacy_values()
+            .into_iter()
+            .map(|(key, value)| (key, value_to_string(&value)))
+            .collect()
+    })
 }
 
 fn value_to_string(value: &ConfigValue) -> String {
@@ -278,9 +213,7 @@ mod tests {
     /// A ConfigState seeded from an explicit value map (defaults overlaid).
     fn state_with(pairs: &[(&str, &str)]) -> ConfigState {
         let mut values = defaults();
-        let mut overrides = BTreeSet::new();
         for (k, v) in pairs {
-            overrides.insert((*k).to_string());
             values.insert((*k).to_string(), (*v).to_string());
         }
         ConfigState {
@@ -288,7 +221,6 @@ mod tests {
             port: 11435,
             default_model: "qwen3.5:9b".into(),
             values,
-            overrides,
             per_model_count: 0,
             loaded_from_disk: true,
             warning: None,
@@ -296,82 +228,61 @@ mod tests {
     }
 
     #[test]
-    fn pflash_needs_drafter_logic() {
-        // 5d honest state: compression on + no drafter -> warns; with a drafter,
-        // or compression off, -> fine.
-        assert!(
-            !state_with(&[]).pflash_needs_drafter(),
-            "off by default = fine"
+    fn service_endpoint_keeps_keyless_local_behavior_and_rejects_bad_key_paths() {
+        let endpoint = state_with(&[]).service_endpoint().unwrap();
+        assert!(endpoint.bearer().is_none());
+        assert_eq!(
+            hipfire_client::service_url(&endpoint, "/health"),
+            "http://127.0.0.1:11435/health"
         );
-        assert!(
-            state_with(&[("prefill_compression", "auto")]).pflash_needs_drafter(),
-            "auto without drafter needs one"
+        assert!(state_with(&[("api_key_file", "relative-key")])
+            .service_endpoint()
+            .unwrap_err()
+            .contains("absolute path"));
+        let missing =
+            std::env::temp_dir().join(format!("hipfire-tui-key-missing-{}", std::process::id()));
+        assert!(state_with(&[("api_key_file", missing.to_str().unwrap())])
+            .service_endpoint()
+            .is_err());
+    }
+
+    /// The layer-count label is the one cell grammar of the GPU-layers rows:
+    /// `-1` is the schema's *auto* spelling, not a count of layers, and a
+    /// cleared key reads as unset rather than as the string the JSON layer
+    /// produces for null.
+    #[test]
+    fn layer_label_renders_unset_count_and_auto() {
+        // Unset never spills, including on a MoE model.
+        assert_eq!(layers_label(""), "all on GPU");
+        assert_eq!(layers_label("32"), "32 on GPU");
+        assert_eq!(
+            layers_label("-1"),
+            "auto (fits to card)",
+            "-1 means auto, not -1 layers on the GPU"
         );
-        assert!(
-            state_with(&[("prefill_compression", "always")]).pflash_needs_drafter(),
-            "always without drafter needs one"
-        );
-        assert!(
-            !state_with(&[
-                ("prefill_compression", "auto"),
-                ("prefill_drafter", "/d.hfq")
-            ])
-            .pflash_needs_drafter(),
-            "auto WITH a drafter is fine"
+        assert_eq!(
+            layers_label("auto"),
+            "auto (fits to card)",
+            "the literal auto spelling (accepted by the value rule) is not a count"
         );
     }
 
+    /// The exec label's two arms.
     #[test]
-    fn easy_rows_surface_pflash_with_honest_hint() {
-        // The Prefill easy row exists and flags the missing drafter inline.
-        let st = state_with(&[("prefill_compression", "auto")]);
-        let prefill = st
-            .easy_rows()
-            .into_iter()
-            .find(|(label, _, _)| *label == "Prefill")
-            .expect("Prefill easy row present");
-        assert!(
-            prefill.1.contains("needs drafter"),
-            "no-op state shown: {}",
-            prefill.1
-        );
-
-        // With a drafter set, the hint goes away.
-        let st2 = state_with(&[
-            ("prefill_compression", "auto"),
-            ("prefill_drafter", "/d.hfq"),
-        ]);
-        let prefill2 = st2
-            .easy_rows()
-            .into_iter()
-            .find(|(label, _, _)| *label == "Prefill")
-            .unwrap();
-        assert!(
-            !prefill2.1.contains("needs drafter"),
-            "hint cleared: {}",
-            prefill2.1
-        );
+    fn offload_exec_label_renders_both_arms() {
+        assert_eq!(offload_exec_label(""), "over PCIe");
+        assert_eq!(offload_exec_label("pcie"), "over PCIe");
+        assert_eq!(offload_exec_label("cpu"), "on CPU");
+        assert_eq!(offload_exec_label("passback"), "passback (CPU + GPU)");
     }
 
+    /// Unset and `auto` both mean "the engine schedules it", and a pinned
+    /// number renders as itself.
     #[test]
-    fn easy_view_vectors_stay_parallel() {
-        // All four easy vectors must stay equal length (5d adds a row, 5e adds
-        // help keys) or the marker/help attaches to the wrong row.
-        let st = state_with(&[]);
-        let n = st.easy_rows().len();
-        assert_eq!(st.easy_keys().len(), n);
-        assert_eq!(st.easy_override_state().len(), n);
-        assert_eq!(st.easy_help_keys().len(), n);
-    }
-
-    #[test]
-    fn easy_help_keys_have_explainers() {
-        // 5e: every easy row's help key must resolve to a curated explainer.
-        for key in state_with(&[]).easy_help_keys() {
-            assert!(
-                crate::hipfire::knobs::knob_info(key).is_some(),
-                "easy help key {key} has no explainer"
-            );
-        }
+    fn passback_share_label_renders_scheduled_and_pinned() {
+        assert_eq!(passback_share_label(""), "auto (scheduled)");
+        assert_eq!(passback_share_label("auto"), "auto (scheduled)");
+        assert_eq!(passback_share_label("0"), "0");
+        assert_eq!(passback_share_label("0.375"), "0.375");
     }
 }

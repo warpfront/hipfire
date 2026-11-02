@@ -1,0 +1,65 @@
+Here is part of a software project's documentation:
+
+# Architecture
+
+How a `hipfire run` becomes tokens on the current modular tree. Runtime source
+wins on conflict. Mutable command surfaces, model catalogs, and env inventories
+live in their own owners ([`CLI.md`](CLI.md), [`MODELS.md`](MODELS.md),
+[`env-vars.md`](env-vars.md)); this page maps crates, loaders, and data flow.
+
+Truth-state labels follow [`INDEX.md`](INDEX.md). Implementation capability is
+not product admission: a compiled path or runtime gate is not certification.
+
+## Workspace map
+
+Workspace members (`Cargo.toml`):
+
+```text
+crates/
+├── hip-bridge/              # dlopen HIP FFI (libamdhip64)
+├── hsa-bridge/              # thin public HSA queue/AQL helpers
+├── rdna-compute/            # Gpu, kernel compile/cache, HIP launch families
+├── radiowave/               # signal/scheduling support for the compute layer
+├── saddle-core/             # the substrate: grammar, KV, caps, sampling policy
+├── hipfire-runtime/         # arch-agnostic infra + Architecture trait; LLaMA forward still lives here
+├── hipfire-loader/          # Carrier registry, load_model, LoadedModel, batch staging
+├── hipfire-engine/          # arch-free serve engine: scheduler, terminal, emit, prompt
+├── hipfire-generate/        # generation bodies: ar, qwen, dense, vision, batch, redline fixtures
+├── hipfire-daemon/          # the product binary — [[bin]] name = "daemon", no required-features
+├── hipfire-dispatch/        # dtype/arch family tables + MoE/attn pipelines
+├── hipfire-dispatch-tests/  # dispatch coverage tests
+├── hipfire-arch-*/          # per-family config/weights/state/forward (12)
+├── hipfire-ds4-parent/      # DeepSeek-V4 parent/teacher tooling (name provisional)
+├── hipfire-pflash/          # PFlash prefill compression — retained legacy research, default off
+├── hipfire-quantize/        # CPU encoder (safetensors/GGUF → .mq* / .hfq*)
+├── hipfire-detect/          # observational JSONL behavior detectors
+├── hipfire-atlas/           # Kernel Atlas schema + emit helpers
+├── hipfire-config/          # typed TOML config + migration
+├── hipfire-registry/        # strict bundled/dynamic model registry
+├── hipfire-client/          # daemon JSONL + OpenAI HTTP/SSE client
+├── hipfire-cli/             # native operator and HTTP service
+├── hipfire-tui/             # terminal UI
+├── hipfire-reap/            # utility crate
+├── saddle-lab/              # research examples and one-off harnesses
+├── redline/                 # experimental direct-KMD / bare-libdrm research
+├── redline-dispatch/        # retained-tape record/replay + plan selection
+└── redline-rocr/            # public ROCr/HSA ABI + PM4 packet builders
+```
+
+HIP sources live under `kernels/src/`; there is no JavaScript/TypeScript
+operator runtime.
+
+### Layering
+
+| Layer | Crates | Role |
+|---|---|---|
+| Operator | `hipfire-cli`, `hipfire-config`, `hipfire-registry`, `hipfire-client`, `hipfire-tui` | Tag resolve, typed config, pull, HTTP service/client, one-shot daemon spawn |
+| Product binary | `hipfire-daemon` | `[[bin]] name = "daemon"`. Message dispatch and process lifetime only |
+| Generation | `hipfire-generate` | The generate bodies: `ar`, `qwen`, `dense`, `vision`, `batch`, `img`, plus the Redline fixtures |
+| Serve engine | `hipfire-engine` | Scheduler, terminal control, emit, prompt. **Zero arch dependencies** |
+| Composition root | `hipfire-loader` | Carrier registry, single `load_model` dispatch, `LoadedModel`, continuous-batch staging |
+| Arch forward | `hipfire-arch-*` | Config / weights / state / static-dispatch forward (LLaMA exception: canonical forward remains in runtime) |
+| Shared infra | `hipfire-runtime` | HFQ/safetensors, tokenizer, sampler, framing, spec primitives, `Architecture` trait |
+| Substrate | `saddle-core` | Grammar, KV cache, `ArchCaps`, sampling polic
+
+Continue this documentation with several new, detailed sections in the same style. Write at length.

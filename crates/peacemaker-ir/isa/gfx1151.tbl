@@ -1,0 +1,28 @@
+# gfx1151 RDNA3.5 deltas on top of gfx1100. XML SHA-256 c36b6d79b1e940d74107221c985f5a7fde248025da251d2c6ef756c4cd31391a; isarefs §5-6; isaprobe/gfx1151/report.md.
+s_cvt_f32_u32	sop1	0x65	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_f32_u32 s99, s96	BEE36560	-
+s_cvt_u32_f32	sop1	0x67	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_u32_f32 s99, s99	BEE36763	-
+s_mul_f32	sop2	0x44	SDST:32,SSRC0:32,SSRC1:32,literal@last	SDST	SSRC0,SSRC1	-	-	s_mul_f32 s99, s99, 0x4f7ffffe	A263FF63 4F7FFFFE	-
+s_cmp_ge_f32	sopc	0x46	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_ge_f32 s6, s4	BF460406	-
+s_fmac_f32	sop2	0x47	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1,SDST	-	-	s_fmac_f32 s6, s0, s4	A3860400	-
+s_trunc_f32	sop1	0x62	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_trunc_f32 s20, s20	BE946214	-
+s_add_f32	sop2	0x40	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_add_f32 s13, s13, s14	A00D0E0D	-
+s_cmp_eq_f32	sopc	0x42	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_eq_f32 s16, 1.0	BF42F210	-
+s_cmp_gt_f32	sopc	0x44	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_gt_f32 s20, 0	BF448014	-
+s_cmp_le_f32	sopc	0x43	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_le_f32 s3, 0	BF438003	-
+s_cmp_lt_f32	sopc	0x41	SSRC0:32,SSRC1:32,literal@last	-	SSRC0,SSRC1	scc:w	-	s_cmp_lt_f32 s0, 0x800000	BF41FF00 00800000	-
+s_cmp_neq_f32	sopc	0x4d	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_neq_f32 s21, 1.0	BF4DF215	-
+s_cmp_ngt_f32	sopc	0x4b	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_ngt_f32 s20, 0	BF4B8014	-
+s_cmp_nle_f32	sopc	0x4c	SSRC0:32,SSRC1:32,literal@last	-	SSRC0,SSRC1	scc:w	-	s_cmp_nle_f32 s8, 0xefa18f08	BF4CFF08 EFA18F08	-
+s_cmp_nlt_f32	sopc	0x4e	SSRC0:32,SSRC1:32,literal@last	-	SSRC0,SSRC1	scc:w	-	s_cmp_nlt_f32 s12, 0xc2ce8ed0	BF4EFF0C C2CE8ED0	-
+s_cvt_f16_f32	sop1	0x68	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_f16_f32 s3, s16	BE836810	-
+s_cvt_f32_i32	sop1	0x64	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_f32_i32 s0, s9	BE806409	-
+s_cvt_i32_f32	sop1	0x66	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_i32_f32 s14, s15	BE8E660F	-
+s_rndne_f32	sop1	0x63	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_rndne_f32 s15, s13	BE8F630D	-
+s_sub_f32	sop2	0x41	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_sub_f32 s12, s12, s18	A08C120C	-
+s_max_f32	sop2	0x43	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_max_f32 s3, s3, s21	A1831503	-
+v_subrev_f32_e32	vop2	0x5	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_subrev_f32_e32 v22, s22, v24	0A2C3016	-
+s_fmamk_f32	sop2	0x46	SDST:32,SSRC0:32,SSRC1:32,literal@last	SDST	SSRC0,SSRC1,SDST	-	-	s_fmamk_f32 s18, s13, 0x3fb8aa3b, s18	A312120D 3FB8AA3B	-
+# pm-opcode-fill (2026-10-12): gfx1151-only (llvm-mc -mcpu=gfx1100 rejects them: "instruction not supported on this GPU"; MR-ISA amdgpu_isa_rdna3_5.xml has them, rdna3.xml does not). Opcodes = Mesa aco_opcodes.py gfx11 column.
+s_cvt_f32_f16	sop1	0x69	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_f32_f16 s16, s3	BE906903	-
+s_cvt_hi_f32_f16	sop1	0x6a	SDST:32,SSRC0:32	SDST	SSRC0	-	-	s_cvt_hi_f32_f16 s0, s0	BE806A00	-
+s_fmaak_f32	sop2	0x45	SDST:32,SSRC0:32,SSRC1:32,literal@last	SDST	SSRC0,SSRC1	-	-	s_fmaak_f32 s3, s3, s5, 0x358637bd	A2830503 358637BD	-

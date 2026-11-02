@@ -1,0 +1,47 @@
+{
+ "generator": "numpy 2.4.4 np.savez (force_zip64=True) + subq4_calib.py pack_tensor transcription",
+ "files": {
+  "tiny_w3.npz": {
+   "bits": 3,
+   "gate_up": [
+    4,
+    256
+   ],
+   "down": [
+    8,
+    128
+   ],
+   "npz_sha256": "9917fec8f16447a0989649992e5eb94579e7d96fbbd3f5eedcc8270dd77ce1be",
+   "expected_bin": "tiny_w3.expected.bin",
+   "expected_sha256": "83c69ed3929991c6ca08492dd7ffaa28cc0c74149d8d661a64702b3c7a2b8221",
+   "expected_len": 800,
+   "gate_up_codes_bytes": 384,
+   "gate_up_scale_bytes": 16,
+   "down_codes_bytes": 384,
+   "down_scale_bytes": 16,
+   "zero_group": "gate_up row1 group1 (scale +0, codes midpoint)",
+   "extremes": "down row7 scale 65504, row6 scale f16 subnormal"
+  },
+  "tiny_w2.npz": {
+   "bits": 2,
+   "gate_up": [
+    4,
+    256
+   ],
+   "down": [
+    8,
+    128
+   ],
+   "npz_sha256": "4fc8200ff3fafb4d73287b927a60b98f7a6ebde7beaf069f153bb622a778ee60",
+   "expected_bin": "tiny_w2.expected.bin",
+   "expected_sha256": "cc347c8feb98e99b94ce864896a4ff39e1b32ce15beb9009ef7f6b823c535502",
+   "expected_len": 544,
+   "gate_up_codes_bytes": 256,
+   "gate_up_scale_bytes": 16,
+   "down_codes_bytes": 256,
+   "down_scale_bytes": 16,
+   "zero_group": "gate_up row1 group1 (scale +0, codes midpoint)",
+   "extremes": "down row7 scale 65504, row6 scale f16 subnormal"
+  }
+ }
+}

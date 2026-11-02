@@ -12,19 +12,20 @@ pub use generic::{AqlKernelCatalog, GenericAqlError, PreparedAqlPlan};
 pub use queue_policy::{QueuePolicy, QueuePolicyParseError};
 pub use redline_rocr::abi;
 pub use redline_rocr::{
-    AqlQueue, BARRIER_DEPENDENCY_CAPACITY, CompletionSignal, Executable, FenceScope,
-    Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError, Gfx10Pm4CommandBuffer,
-    Gfx11ComputeResourceLimitsPolicy, Gfx11DispatchInterleave, Gfx11Pm4CommandBuffer,
-    Gfx12Pm4CommandBuffer, GpuDevice, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel,
-    KernelMetadata, KernelPm4Metadata, LaunchGeometry, LoadError, MissingSymbol, PacketError,
-    PciBusId, PciBusIdParseError, Pm4BuildError, QueueDepthReport, QueueDepthSample,
+    AqlQueue, BARRIER_DEPENDENCY_CAPACITY, CodeObjectBytes, CompletionSignal, Executable,
+    FenceScope, Gfx10DispatchInitiatorPolicy, Gfx10KernelImage, Gfx10Pm4BuildError,
+    Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
+    Gfx11DispatchInterleave, Gfx11Pm4CommandBuffer, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer,
+    Gfx12RmwAcquirePolicy, GpuDevice, GpuSelector, HeaderPolicy, KernargBuffer, KernargPool,
+    Kernel, KernelMetadata, KernelPm4Metadata, LaunchGeometry, LoadError, MissingSymbol,
+    PacketError, PciBusId, PciBusIdParseError, Pm4BuildError, QueueDepthReport, QueueDepthSample,
     QueueDepthStats, QueueSet, Runtime, RuntimeError, Symbols, load_symbols,
 };
 pub use replay::{
-    BatchFencePolicy, GpuBatchTiming, GpuMultiQueueTiming, PhasedMultiQueuePm4Ib, RecordedDispatch,
-    RecordedGraph, ReplayError, ReplaySubmission, SingleQueueBatchGraph,
-    SingleQueueBatchSubmission, SingleQueuePm4Ib, TwoQueueBatchSubmission, TwoQueuePhase,
-    TwoQueuePhasedGraph, TwoQueueSerializedBatchGraph, TwoQueueSubmission,
+    BatchFencePolicy, DecodedDispatch, GpuBatchTiming, GpuMultiQueueTiming, PhasedMultiQueuePm4Ib,
+    Quiescence, RecordedDispatch, RecordedGraph, ReplayError, ReplaySubmission,
+    SingleQueueBatchGraph, SingleQueueBatchSubmission, SingleQueuePm4Ib, TwoQueueBatchSubmission,
+    TwoQueuePhase, TwoQueuePhasedGraph, TwoQueueSerializedBatchGraph, TwoQueueSubmission,
 };
 
 #[cfg(test)]

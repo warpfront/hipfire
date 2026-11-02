@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! LFM3 architecture (arch_id 13): Liquid AI's third-generation foundation
+//! LFM3 architecture (arch_id 24): Liquid AI's third-generation foundation
 //! model text backbone. An evolution of LFM2 (`hipfire-arch-lfm2moe`,
 //! arch_id 11) with three layer types instead of two:
 //!
@@ -42,7 +42,6 @@ pub use arch::Lfm3;
 pub use config::{config_from_source, Lfm3Config, MixerKind};
 pub use forward::{decode_step, decode_step_capture, decode_step_with_embed};
 pub use lfm3::{load_weights_from_source, Lfm3State, Lfm3Weights};
-pub use spec_impl::Lfm3Bundle;
 
 /// Architecture id for LFM3.
 pub const ARCH_ID: u32 = 13;

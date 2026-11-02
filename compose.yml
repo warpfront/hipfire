@@ -1,0 +1,139 @@
+# hipfire: docker compose / podman compose stack.
+#   docker compose up -d           (or: podman compose up -d)  pulls the model, then serves on 127.0.0.1:11435
+#   curl http://127.0.0.1:11435/health
+#   curl http://127.0.0.1:11435/v1/chat/completions -H 'Content-Type: application/json' \
+#     -d '{"model":"qwen3.8:27b-mq4-xts","messages":[{"role":"user","content":"hello"}]}'
+#   Profiles: --profile monitoring (Prometheus + Grafana), --profile halo-tune (Strix Halo host tuning).
+#   Settings: copy .env.example to .env. Details: docs/CONTAINER.md
+
+name: hipfire
+
+# One engine definition shared by hipfire-init and hipfire. YAML merge keys are
+# shallow, so the list-valued keys live in the anchor and each service takes the
+# whole block; only command/restart/healthcheck/etc. differ per service.
+x-hipfire-engine: &hipfire-engine
+  image: ${HIPFIRE_IMAGE:-ghcr.io/warpfront/hipfire:latest}
+  # Both services carry the same build, so whichever starts first builds the image.
+  build:
+    context: .
+    dockerfile: Containerfile
+    target: ${HIPFIRE_IMAGE_TARGET:-full}
+  devices:
+    - /dev/kfd
+    - /dev/dri
+  group_add:
+    - video
+    - render
+  security_opt:
+    - seccomp=unconfined
+  # Rootless podman: keep the user's supplementary groups so the GPU nodes stay accessible.
+  annotations:
+    run.oci.keep_original_groups: "1"
+  environment:
+    - HIPFIRE_MODEL=${HIPFIRE_MODEL:-qwen3.8:27b-mq4-xts}
+    - HIPFIRE_SERVE_UI=${HIPFIRE_UI:-0}
+    - HIPFIRE_SERVE_ARGS=${HIPFIRE_SERVE_ARGS:-}
+    - HF_TOKEN
+    - HIPFIRE_DEVICES
+    - ROCR_VISIBLE_DEVICES
+  volumes:
+    - ${HIPFIRE_MODELS_PATH:-hipfire-models}:/home/hipfire/.hipfire/models
+    - hipfire-config:/home/hipfire/.hipfire
+    - hipfire-kernels:/var/cache/hipfire
+
+services:
+  # Downloads the model once (no-op when already present and valid), then exits.
+  hipfire-init:
+    <<: *hipfire-engine
+    command: pull --yes ${HIPFIRE_MODEL:-qwen3.8:27b-mq4-xts}
+    restart: "no"
+
+  hipfire:
+    <<: *hipfire-engine
+    command: ["serve"]
+    init: true
+    restart: unless-stopped
+    depends_on:
+      hipfire-init:
+        condition: service_completed_successfully
+    ports:
+      - ${HIPFIRE_BIND:-127.0.0.1}:${HIPFIRE_PORT:-11435}:11435
+    # /health answers during model load; only report healthy once loading_model is null.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - |
+          body=$$(curl -fsS http://127.0.0.1:11435/health) && ! printf '%s' "$$body" | grep -Eq '"loading_model"[[:space:]]*:[[:space:]]*"'
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 15m
+
+  prometheus:
+    image: docker.io/prom/prometheus:v3.5.0
+    profiles: [monitoring]
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./docker/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - ${HIPFIRE_BIND:-127.0.0.1}:${PROMETHEUS_PORT:-9090}:9090
+
+  # GPU memory/busy per card and host memory; no published port, only Prometheus scrapes it.
+  node-exporter:
+    image: docker.io/prom/node-exporter:v1.9.1
+    profiles: [monitoring]
+    restart: unless-stopped
+    command:
+      - --path.sysfs=/host/sys
+      - --path.procfs=/host/proc
+      - --collector.disable-defaults
+      - --collector.drm
+      - --collector.meminfo
+    volumes:
+      - /sys:/host/sys:ro
+      - /proc:/host/proc:ro
+
+  grafana:
+    image: docker.io/grafana/grafana:12.1.1
+    profiles: [monitoring]
+    restart: unless-stopped
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/var/lib/grafana/dashboards/hipfire.json
+    volumes:
+      - ./docker/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - ${HIPFIRE_BIND:-127.0.0.1}:${GRAFANA_PORT:-3000}:3000
+
+  # Opt-in Strix Halo host tuning (hipfire-halo-tune apply); one-shot and privileged.
+  halo-tune:
+    image: ${HIPFIRE_IMAGE:-ghcr.io/warpfront/hipfire:latest}
+    build:
+      context: .
+      dockerfile: Containerfile
+      target: ${HIPFIRE_IMAGE_TARGET:-full}
+    profiles: [halo-tune]
+    entrypoint: ["hipfire-halo-tune"]
+    command: ["apply"]
+    privileged: true
+    user: "0:0"
+    restart: "no"
+    volumes:
+      - halo-tune-state:/var/lib/hipfire-halo-tune
+
+volumes:
+  hipfire-models:
+  hipfire-config:
+  hipfire-kernels:
+  prometheus-data:
+  grafana-data:
+  halo-tune-state:

@@ -1,0 +1,1 @@
+{"phases": 6, "summary": "/home/bjoern/hipfire/.claude/worktrees/g4-next-integration/docs/investigations/evidence/2026-09-10-pr742-final-head/raw/batch-corrected-summary.json"}

@@ -17,17 +17,19 @@ const PACKET3_COPY_DATA: u32 = 0x40;
 const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
+const PACKET3_NOP: u32 = 0x10;
+/// Largest body a single type-3 packet can carry (14-bit count field + 1).
+const PACKET3_MAX_BODY_DWORDS: u32 = 0x4000;
 
-// GFX12 SET_SH_REG offsets. The gfx12 register headers number COMPUTE
-// registers from regCOMPUTE_DISPATCH_INITIATOR=0x1ba0; SET_SH_REG retains the
-// architectural 0x200 COMPUTE window used by ROCr's PM4 builders.
+// GC 12.0.x SET_SH_REG offsets used by gfx1200/gfx1201. The register headers
+// number COMPUTE registers from regCOMPUTE_DISPATCH_INITIATOR=0x1ba0;
+// SET_SH_REG retains the architectural 0x200 COMPUTE window used by ROCr's
+// PM4 builders. GC 12.1 relocates these registers and needs a distinct map.
 const COMPUTE_NUM_THREAD_X: u32 = 0x207;
 const COMPUTE_PGM_LO: u32 = 0x20c;
 const COMPUTE_PGM_RSRC1: u32 = 0x212;
 const COMPUTE_RESOURCE_LIMITS: u32 = 0x215;
-const COMPUTE_TMPRING_SIZE: u32 = 0x216;
-const COMPUTE_PGM_RSRC3_GFX12: u32 = 0x223;
-const COMPUTE_STATIC_THREAD_MGMT_SE0: u32 = 0x230;
+const COMPUTE_PGM_RSRC3_GFX12: u32 = 0x228;
 const COMPUTE_USER_DATA_0: u32 = 0x240;
 
 const LDS_SIZE_MASK: u32 = 0x00ff_8000;
@@ -39,6 +41,65 @@ const ENABLE_WAVEFRONT_SIZE32: u16 = 1 << 10;
 const SUPPORTED_KERNEL_PROPERTIES: u16 = ENABLE_SGPR_KERNARG_SEGMENT_PTR | ENABLE_WAVEFRONT_SIZE32;
 const DISPATCH_INITIATOR_BASE: u32 = (1 << 0) | (1 << 2) | (1 << 5);
 const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
+const GCR_GLK_INV: u32 = 1 << 7;
+const GCR_GLV_INV: u32 = 1 << 8;
+const GCR_GL1_INV: u32 = 1 << 9;
+const GCR_GL2_INV: u32 = 1 << 14;
+const GCR_GL2_WB: u32 = 1 << 15;
+const GCR_SEQ_FORWARD: u32 = 1 << 16;
+
+/// Cache actions to pair with a compute-idle wait between dependent gfx12
+/// dispatches in one retained PM4 stream.
+///
+/// Ported from upstream redline-rocr pm4.rs. CurrentSequential is the rung
+/// hipfire already ships: its gcr_cntl (0x10180) is exactly what
+/// acquire_inter_node_gfx12 emits, so default-rung tapes are byte-identical
+/// before and after this port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Gfx12RmwAcquirePolicy {
+    /// Existing hipfire policy: invalidate scalar/vector read caches and
+    /// force forward cache sequencing.
+    CurrentSequential,
+    /// Conservative global-cache experiment, heavier than the Mesa RADV
+    /// 25.2 coherent-buffer compute barrier: it also writes back and
+    /// invalidates L2.
+    RadvGlobal,
+    /// Same-agent candidate: retain scalar, vector, and merged L1
+    /// invalidation, but omit the global L2 action and forward sequencing.
+    SameAgentParallelL1,
+    /// Earlier scalar/vector-L0 experiment, retained for measurement
+    /// compatibility rather than as the generic default.
+    SameAgentParallelL0,
+    /// Radiowave-certified HIP/LLVM consumer: mutable resources are read only
+    /// through VMEM, so invalidate vector L0 and merged L1 while retaining the
+    /// unrelated scalar cache and coherent L2/MALL.
+    HipLlvmVmemL1,
+}
+
+impl Gfx12RmwAcquirePolicy {
+    const fn gcr_cntl(self) -> u32 {
+        match self {
+            Self::CurrentSequential => GCR_GLK_INV | GCR_GLV_INV | GCR_SEQ_FORWARD,
+            Self::RadvGlobal => GCR_GLK_INV | GCR_GLV_INV | GCR_GL1_INV | GCR_GL2_INV | GCR_GL2_WB,
+            Self::SameAgentParallelL1 => GCR_GLK_INV | GCR_GLV_INV | GCR_GL1_INV,
+            Self::SameAgentParallelL0 => GCR_GLK_INV | GCR_GLV_INV,
+            Self::HipLlvmVmemL1 => GCR_GLV_INV | GCR_GL1_INV,
+        }
+    }
+}
+
+/// Command-processor pacing around each `DISPATCH_DIRECT` of a retained gfx12
+/// tape. Every variant emits only `NOP` packets, which write no register and
+/// no memory, so a paced tape runs the same dispatches with the same state as
+/// the unpaced one; only packet positions in the IB move.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Gfx12DispatchPacing {
+    #[default]
+    None,
+    /// One `NOP` with this many zero body dwords after every dispatch
+    /// (clamped to one packet's maximum body).
+    PostDispatchNop(u32),
+}
 
 /// Retained GFX12 PM4 command words suitable for one PM4 indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -46,6 +107,8 @@ pub struct Gfx12Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
     cache_dynamic_registers: bool,
+    pacing: Gfx12DispatchPacing,
+    pacing_dwords: u64,
 }
 
 impl Gfx12Pm4CommandBuffer {
@@ -58,9 +121,9 @@ impl Gfx12Pm4CommandBuffer {
     /// The first write to every register is always emitted.
     pub fn new_stateful() -> Self {
         Self {
-            dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             cache_dynamic_registers: true,
+            ..Self::default()
         }
     }
 
@@ -69,9 +132,36 @@ impl Gfx12Pm4CommandBuffer {
     /// in the legacy encoder.
     pub fn new_static_stateful() -> Self {
         Self {
-            dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
             cache_dynamic_registers: false,
+            ..Self::default()
+        }
+    }
+
+    /// Pace every later [`Self::dispatch`] with `NOP` packets.
+    pub fn set_dispatch_pacing(&mut self, pacing: Gfx12DispatchPacing) {
+        self.pacing = pacing;
+    }
+
+    /// Dwords of `NOP` packets emitted by dispatch pacing so far.
+    pub fn pacing_dwords(&self) -> u64 {
+        self.pacing_dwords
+    }
+
+    /// Emit one `NOP` packet of exactly `total` dwords (header included).
+    fn nop(&mut self, total: u32) {
+        debug_assert!((2..=PACKET3_MAX_BODY_DWORDS + 1).contains(&total));
+        self.dwords.push(packet3(PACKET3_NOP, total - 1, false));
+        self.dwords
+            .extend(std::iter::repeat_n(0, (total - 1) as usize));
+        self.pacing_dwords += u64::from(total);
+    }
+
+    fn pace_after_dispatch(&mut self) {
+        if let Gfx12DispatchPacing::PostDispatchNop(body) = self.pacing {
+            if body != 0 {
+                self.nop(body.min(PACKET3_MAX_BODY_DWORDS) + 1);
+            }
         }
     }
 
@@ -105,7 +195,7 @@ impl Gfx12Pm4CommandBuffer {
     /// scalar, and vector cache visibility without carrying removed gfx11
     /// GL1/metadata bits into the merged RDNA4 hierarchy.
     pub fn acquire_system_gfx12(&mut self) {
-        self.emit_acquire_gcr(0x1c1d1);
+        self.emit_acquire_gcr(0xc3b1);
     }
 
     /// Return a copy bracketed by GPU-clock writes. The end timestamp follows
@@ -252,8 +342,58 @@ impl Gfx12Pm4CommandBuffer {
     /// Same-agent inter-node acquire for one retained gfx12 tape. Kernel code
     /// is immutable and L2/MALL remains coherent, so only scalar/vector read
     /// caches plus forward sequencing are invalidated.
+    ///
+    /// This is the `CurrentSequential` rung of the RMW ladder below; routing
+    /// through `acquire_rmw_gfx12` keeps the default encoding byte-identical
+    /// by construction.
     pub fn acquire_inter_node_gfx12(&mut self) {
-        self.emit_acquire_gcr(0x10180);
+        self.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::CurrentSequential);
+    }
+
+    /// Generic same-agent GFX12 shader-write to shader-read/write boundary.
+    ///
+    /// `CS_PARTIAL_FLUSH` prevents a later dispatch from overlapping its
+    /// producer. The acquire then invalidates scalar, vector, and merged L1
+    /// shader read caches while retaining coherent L2/MALL contents. This is
+    /// the fail-closed path for consumers whose scalar-memory behavior is not
+    /// certified.
+    ///
+    /// This boundary is valid only when producer and consumer execute on the
+    /// same gfx12 agent and the resource remains a coherent shader buffer.
+    /// Host/device ownership changes or non-coherent resources require the
+    /// broader system/global acquire path.
+    pub fn dependency_rmw_same_agent_gfx12(&mut self) {
+        self.wait_compute_idle();
+        self.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::SameAgentParallelL1);
+    }
+
+    /// Same-agent boundary for a HIP/LLVM consumer certified to read mutable
+    /// resources through VMEM only.
+    ///
+    /// The completion edge remains identical to the generic boundary. Only
+    /// the unrelated scalar-cache invalidation is omitted; vector L0 and the
+    /// merged L1 are still invalidated. Unknown or scalar-reading consumers
+    /// must use `dependency_rmw_same_agent_gfx12`.
+    pub fn dependency_rmw_hip_llvm_vmem_gfx12(&mut self) {
+        self.wait_compute_idle();
+        self.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::HipLlvmVmemL1);
+    }
+
+    /// Emit the cache half of a gfx12 read-modify-write dependency boundary.
+    /// Callers must emit `wait_compute_idle` first when the later dispatch
+    /// reads or overwrites memory written by the earlier dispatch.
+    ///
+    /// Ported from upstream redline-rocr pm4.rs. The `CurrentSequential` rung
+    /// routes through the pre-existing hipfire emitter so current tapes are
+    /// byte-identical by default; the remaining rungs use the RADV-shaped
+    /// emitter, whose mask/coop words already match hipfire's encoding.
+    pub fn acquire_rmw_gfx12(&mut self, policy: Gfx12RmwAcquirePolicy) {
+        match policy {
+            Gfx12RmwAcquirePolicy::CurrentSequential => {
+                self.emit_acquire_gcr(policy.gcr_cntl());
+            }
+            _ => self.emit_acquire_gcr_radv(policy.gcr_cntl()),
+        }
     }
 
     fn emit_acquire_gcr(&mut self, gcr_cntl: u32) {
@@ -261,10 +401,23 @@ impl Gfx12Pm4CommandBuffer {
             packet3(PACKET3_ACQUIRE_MEM, 7, false),
             0,
             u32::MAX,
-            0xff,
+            0x00ff_ffff,
             0,
             0,
-            4,
+            0x0000_000a,
+            gcr_cntl,
+        ]);
+    }
+
+    fn emit_acquire_gcr_radv(&mut self, gcr_cntl: u32) {
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_ACQUIRE_MEM, 7, false),
+            0,
+            u32::MAX,
+            0x00ff_ffff,
+            0,
+            0,
+            0x0000_000a,
             gcr_cntl,
         ]);
     }
@@ -314,7 +467,6 @@ impl Gfx12Pm4CommandBuffer {
         );
         self.set_sh_regs(COMPUTE_PGM_RSRC1, &[pm4.compute_pgm_rsrc1, rsrc2]);
         self.set_sh_regs(COMPUTE_PGM_RSRC3_GFX12, &[pm4.compute_pgm_rsrc3]);
-        self.set_sh_regs(COMPUTE_TMPRING_SIZE, &[0]);
         self.set_sh_regs(
             COMPUTE_NUM_THREAD_X,
             &[
@@ -323,10 +475,10 @@ impl Gfx12Pm4CommandBuffer {
                 u32::from(geometry.workgroup[2]),
             ],
         );
-        // Match ROCr's direct-dispatch template: all waves per SH are allowed
-        // and every shader engine remains eligible.
+        // Match ROCr's direct-dispatch template: all waves per SH are allowed.
+        // TMPRING and STATIC_THREAD_MGMT belong to the queue/MQD; retain KFD's
+        // scratch and CU-affinity state instead of replacing it per dispatch.
         self.set_sh_regs(COMPUTE_RESOURCE_LIMITS, &[0x3ff]);
-        self.set_sh_regs(COMPUTE_STATIC_THREAD_MGMT_SE0, &[u32::MAX; 4]);
         if needs_kernarg {
             let address = kernarg_address as usize as u64;
             self.set_sh_regs(
@@ -341,6 +493,7 @@ impl Gfx12Pm4CommandBuffer {
         // with CS_W32_EN derived from the kernel descriptor. A mixed-wave
         // retained tape must never inherit this bit from the preceding node.
         self.dwords.push(dispatch_initiator(wave32));
+        self.pace_after_dispatch();
         Ok(())
     }
 
@@ -372,10 +525,7 @@ impl Gfx12Pm4CommandBuffer {
 
     fn set_sh_regs(&mut self, first: u32, values: &[u32]) {
         debug_assert!(!values.is_empty());
-        let static_registers = matches!(
-            first,
-            COMPUTE_TMPRING_SIZE | COMPUTE_RESOURCE_LIMITS | COMPUTE_STATIC_THREAD_MGMT_SE0
-        );
+        let static_registers = first == COMPUTE_RESOURCE_LIMITS;
         if !self.cache_dynamic_registers && !static_registers {
             self.emit_set_sh_regs(first, values);
             return;
@@ -672,6 +822,11 @@ mod tests {
     }
 
     #[test]
+    fn gfx120x_program_resource_offset_matches_gc_12_0_headers() {
+        assert_eq!(COMPUTE_PGM_RSRC3_GFX12, 0x228);
+    }
+
+    #[test]
     fn dispatch_initiator_tracks_kernel_descriptor_wave_size() {
         assert_eq!(dispatch_initiator(false), 0x25);
         assert_eq!(dispatch_initiator(true), 0x8025);
@@ -687,10 +842,59 @@ mod tests {
         assert_eq!(commands.dwords()[0], 0xc006_5800);
         assert_eq!(commands.dwords()[7], 0x1c3f1);
         assert_eq!(commands.dwords()[8], 0xc006_5800);
-        assert_eq!(commands.dwords()[15], 0x1c1d1);
+        assert_eq!(commands.dwords()[15], 0xc3b1);
         assert_eq!(commands.dwords()[16], 0xc006_5800);
         assert_eq!(commands.dwords()[23], 0x10180);
+        for base in [8, 16] {
+            assert_eq!(commands.dwords()[base + 3], 0x00ff_ffff);
+            assert_eq!(commands.dwords()[base + 6], 0x0000_000a);
+        }
         assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x407]);
+    }
+
+    #[test]
+    fn rmw_acquire_ladder_encodings_are_stable() {
+        assert_eq!(Gfx12RmwAcquirePolicy::CurrentSequential.gcr_cntl(), 0x10180);
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::RadvGlobal.gcr_cntl(),
+            (1 << 7) | (1 << 8) | (1 << 9) | (1 << 14) | (1 << 15)
+        );
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::SameAgentParallelL1.gcr_cntl(),
+            (1 << 7) | (1 << 8) | (1 << 9)
+        );
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::SameAgentParallelL0.gcr_cntl(),
+            (1 << 7) | (1 << 8)
+        );
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::HipLlvmVmemL1.gcr_cntl(),
+            (1 << 8) | (1 << 9)
+        );
+
+        // The default rung is byte-identical to the pre-ladder inter-node
+        // acquire: same GCR word through the same packet shape.
+        let mut legacy = Gfx12Pm4CommandBuffer::new();
+        legacy.acquire_inter_node_gfx12();
+        let mut rung = Gfx12Pm4CommandBuffer::new();
+        rung.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::CurrentSequential);
+        assert_eq!(rung.dwords(), legacy.dwords());
+        assert_eq!(rung.dwords()[7], 0x10180);
+
+        // The Radiowave VMEM rung keeps the packet shape and differs only in
+        // the GCR word: scalar invalidate dropped, L1 invalidate kept.
+        let mut vmem = Gfx12Pm4CommandBuffer::new();
+        vmem.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::HipLlvmVmemL1);
+        assert_eq!(vmem.dwords().len(), legacy.dwords().len());
+        assert_eq!(&vmem.dwords()[..7], &legacy.dwords()[..7]);
+        assert_eq!(vmem.dwords()[7], (1 << 8) | (1 << 9));
+
+        // The full dependency boundary is wait-then-acquire with the VMEM
+        // GCR word.
+        let mut boundary = Gfx12Pm4CommandBuffer::new();
+        boundary.dependency_rmw_hip_llvm_vmem_gfx12();
+        assert_eq!(&boundary.dwords()[..2], &[0xc000_4600, 0x407]);
+        assert_eq!(&boundary.dwords()[2..], vmem.dwords());
     }
 
     #[test]
@@ -740,5 +944,79 @@ mod tests {
             commands.len_dwords() - dynamic_len,
             dynamic_len - static_len
         );
+    }
+
+    /// Emit `n` dispatches with register runs of varying length the way
+    /// `dispatch` does, under `pacing`.
+    fn paced_stream(n: usize, pacing: Gfx12DispatchPacing) -> Gfx12Pm4CommandBuffer {
+        let mut buffer = Gfx12Pm4CommandBuffer::new();
+        buffer.set_dispatch_pacing(pacing);
+        buffer.acquire_system_gfx12();
+        for i in 0..n {
+            if i % 3 == 1 {
+                buffer.wait_compute_idle();
+            }
+            buffer.emit_set_sh_regs(COMPUTE_PGM_LO, &vec![i as u32; 1 + i % 5]);
+            buffer
+                .dwords
+                .push(packet3(PACKET3_DISPATCH_DIRECT, 4, true));
+            buffer
+                .dwords
+                .extend_from_slice(&[i as u32 + 1, 1, 1, 0x8025]);
+            buffer.pace_after_dispatch();
+        }
+        buffer.wait_compute_idle();
+        buffer
+    }
+
+    /// Packets of `dwords` with every NOP removed, plus the DISPATCH_DIRECT
+    /// header positions.
+    fn strip_nops(dwords: &[u32]) -> (Vec<u32>, Vec<usize>) {
+        let (mut kept, mut dispatches, mut cursor) = (Vec::new(), Vec::new(), 0);
+        while cursor < dwords.len() {
+            let header = dwords[cursor];
+            assert_eq!(header >> 30, 3, "non-PACKET3 header at {cursor}");
+            let next = cursor + 2 + ((header >> 16) & 0x3fff) as usize;
+            let opcode = (header >> 8) & 0xff;
+            if opcode == PACKET3_NOP {
+                assert!(dwords[cursor + 1..next].iter().all(|word| *word == 0));
+            } else {
+                if opcode == PACKET3_DISPATCH_DIRECT {
+                    dispatches.push(cursor);
+                }
+                kept.extend_from_slice(&dwords[cursor..next]);
+            }
+            cursor = next;
+        }
+        (kept, dispatches)
+    }
+
+    /// Pacing only inserts zero-body NOP packets: removing them restores the
+    /// unpaced tape exactly, and the NOP immediately follows every dispatch.
+    #[test]
+    fn dispatch_pacing_inserts_only_nops_at_the_requested_positions() {
+        let plain = paced_stream(23, Gfx12DispatchPacing::None);
+        assert_eq!(plain.pacing_dwords(), 0);
+        for body in [1, 64, 128] {
+            let pacing = Gfx12DispatchPacing::PostDispatchNop(body);
+            let paced = paced_stream(23, pacing);
+            assert_eq!(
+                u64::from(paced.len_dwords() - plain.len_dwords()),
+                paced.pacing_dwords(),
+                "{pacing:?}"
+            );
+            let timed = paced.with_gpu_timestamps(0x1000, 0x1008);
+            let (kept, dispatches) = strip_nops(timed.dwords());
+            assert_eq!(
+                kept,
+                plain.with_gpu_timestamps(0x1000, 0x1008).dwords(),
+                "{pacing:?}"
+            );
+            assert_eq!(dispatches.len(), 23);
+            assert_eq!(paced.pacing_dwords(), 23 * u64::from(body + 1));
+            for at in dispatches {
+                assert_eq!(timed.dwords()[at + 5], packet3(PACKET3_NOP, body, false));
+            }
+        }
     }
 }

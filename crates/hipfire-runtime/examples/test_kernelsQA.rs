@@ -12,6 +12,9 @@ use std::process::{Command, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[path = "qwen4_tierc/mod.rs"]
+mod qwen4_tierc;
+
 const SKIP_EXIT: u8 = 10;
 
 struct CaseDef {
@@ -95,6 +98,7 @@ enum CaseOutcome {
 fn main() -> ExitCode {
     let mut case_name: Option<String> = None;
     let mut expected_arch: Option<String> = None;
+    let mut filter: Option<String> = None;
 
     let args: Vec<String> = env::args().collect();
     let mut i = 1usize;
@@ -108,6 +112,10 @@ fn main() -> ExitCode {
                 i += 1;
                 expected_arch = args.get(i).cloned();
             }
+            "--filter" => {
+                i += 1;
+                filter = args.get(i).cloned();
+            }
             _ => {}
         }
         i += 1;
@@ -117,10 +125,11 @@ fn main() -> ExitCode {
         return run_case(&case, expected_arch.as_deref());
     }
 
-    supervisor(expected_arch.as_deref())
+    supervisor(expected_arch.as_deref(), filter.as_deref())
 }
 
-fn supervisor(expected_arch: Option<&str>) -> ExitCode {
+/// `filter`: run only cases whose name contains this substring.
+fn supervisor(expected_arch: Option<&str>, filter: Option<&str>) -> ExitCode {
     let exe = match env::current_exe() {
         Ok(path) => path,
         Err(err) => {
@@ -138,10 +147,15 @@ fn supervisor(expected_arch: Option<&str>) -> ExitCode {
         eprintln!("Expected arch: {arch}");
     }
 
-    for case in CASES {
-        eprintln!("\n--- {} ---", case.name);
+    let all_cases = CASES
+        .iter()
+        .map(|c| (c.name, c.timeout))
+        .chain(qwen4_tierc::cases().map(|c| (c.name, Duration::from_secs(c.timeout_s))))
+        .filter(|(name, _)| filter.map_or(true, |f| name.contains(f)));
+    for (case_name, case_timeout) in all_cases {
+        eprintln!("\n--- {} ---", case_name);
         let mut cmd = Command::new(&exe);
-        cmd.arg("--qa-case").arg(case.name);
+        cmd.arg("--qa-case").arg(case_name);
         if let Some(arch) = expected_arch {
             cmd.arg("--expected-arch").arg(arch);
         }
@@ -160,7 +174,7 @@ fn supervisor(expected_arch: Option<&str>) -> ExitCode {
             match child.try_wait() {
                 Ok(Some(status)) => break status.code().unwrap_or(1),
                 Ok(None) => {
-                    if start.elapsed() > case.timeout {
+                    if start.elapsed() > case_timeout {
                         let _ = child.kill();
                         let _ = child.wait();
                         break 124;
@@ -179,7 +193,7 @@ fn supervisor(expected_arch: Option<&str>) -> ExitCode {
                 passed += 1;
                 eprintln!(
                     "SUPERVISOR PASS {} ({:.0}ms)",
-                    case.name,
+                    case_name,
                     start.elapsed().as_secs_f64() * 1000.0
                 );
             }
@@ -187,7 +201,7 @@ fn supervisor(expected_arch: Option<&str>) -> ExitCode {
                 skipped += 1;
                 eprintln!(
                     "SUPERVISOR SKIP {} ({:.0}ms)",
-                    case.name,
+                    case_name,
                     start.elapsed().as_secs_f64() * 1000.0
                 );
             }
@@ -195,13 +209,13 @@ fn supervisor(expected_arch: Option<&str>) -> ExitCode {
                 failed += 1;
                 eprintln!(
                     "SUPERVISOR FAIL {} timed out after {:.1}s",
-                    case.name,
-                    case.timeout.as_secs_f64()
+                    case_name,
+                    case_timeout.as_secs_f64()
                 );
             }
             other => {
                 failed += 1;
-                eprintln!("SUPERVISOR FAIL {} rc={other}", case.name);
+                eprintln!("SUPERVISOR FAIL {} rc={other}", case_name);
             }
         }
     }
@@ -236,7 +250,16 @@ fn run_case(case_name: &str, expected_arch: Option<&str>) -> ExitCode {
         "vision_gemm_f16" => vision_gemm_f16(expected_arch),
         "vision_layernorm_batched" => vision_layernorm_batched(expected_arch),
         "vision_transpose_f32" => vision_transpose_f32(expected_arch),
-        other => CaseOutcome::Fail(format!("unknown case: {other}")),
+        other => match qwen4_tierc::find(other) {
+            Some(case) => match init_gpu(expected_arch) {
+                Ok(mut gpu) => match (case.run)(&mut gpu) {
+                    Ok(msg) => CaseOutcome::Pass(format!("[{}] {msg}", gpu.arch)),
+                    Err(msg) => CaseOutcome::Fail(format!("[{}] {msg}", gpu.arch)),
+                },
+                Err(outcome) => outcome,
+            },
+            None => CaseOutcome::Fail(format!("unknown case: {other}")),
+        },
     });
 
     match outcome {

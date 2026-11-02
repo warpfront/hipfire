@@ -1,0 +1,5 @@
+# WF2: fold scheduler v2 (no tickets, pre-checked claims, 8-unit passes), GPU only: down n=1024, gate_up J=3 (claim 16, 64), J=1
+--mode fold --layer 2 --xq $DATA/L2.down.a4.bin --npu-cols 1024 --reg coarse --iters 4
+--mode fold --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 3072 --reg coarse --iters 4
+--mode fold --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 3072 --reg coarse --iters 4 --claim 64
+--mode fold --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 1024 --reg coarse --iters 4

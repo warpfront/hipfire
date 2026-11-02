@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# lifecycle: deprecated since 0.4.0, removal 0.5.0 — retired coherence-gate battery; historical reproduction only (docs/VALIDATION.md)
+echo "warning: coherence-gate-minimax.sh is deprecated and will be removed in 0.5.0; retired coherence-gate battery, not acceptance evidence (docs/VALIDATION.md)" >&2
 # coherence-gate-minimax.sh — MiniMax-M2 prefill coherence gate via the DAEMON
 # chat template (the real serving path), not raw greedy prompts.
 #
@@ -19,7 +21,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODEL="${HIPFIRE_MINIMAX_MODEL:-$HOME/.hipfire/models/MiniMax-M2.7.mq2}"
 MAX_TOKENS="${MAX_TOKENS:-200}"
 OUT="${HIPFIRE_MINIMAX_GATE_OUT:-/tmp/coherence-minimax-$(date +%Y%m%d-%H%M%S).md}"
@@ -51,9 +53,9 @@ balanced equation is six carbon dioxide plus six water, in the presence of light
 energy, yielding one glucose molecule plus six oxygen molecules."
 )
 
-if [ ! -x "$EXE" ] || [ crates/hipfire-runtime/examples/daemon.rs -nt "$EXE" ]; then
+if [ ! -x "$EXE" ] || [ crates/hipfire-daemon/src/main.rs -nt "$EXE" ]; then
   echo "coherence-gate-minimax: building daemon..." >&2
-  cargo build --release --example daemon --features deltanet >&2 || { echo "build failed" >&2; exit 2; }
+ cargo build --release -p hipfire-daemon >&2 || { echo "build failed" >&2; exit 2; }
 fi
 
 if [ -f scripts/gpu-lock.sh ]; then

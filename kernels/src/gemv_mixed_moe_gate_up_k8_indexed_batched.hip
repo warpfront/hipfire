@@ -23,6 +23,15 @@
 //   dtype_tags[expert_id] == 4 → mfp4-E8    (16 B row hdr + (K/32)*17 B;
 //                                             136 B/256-group, E8 lattice VQ)
 //
+// Frozen mixed gate/down pair tags 7..18 (process-local loader metadata).
+// Gate-side decode only in this kernel (gate_up weight blob is uniform per
+// expert). V1 f32 scale/zero headers are NOT interchangeable with V2 dual-half
+// f16 s0/z0/s1/z1 headers — wrong branch yields fluent corruption.
+//   7  MQ4V2/MQ4V2   8  MQ6V2/MQ6V2   9  MQ4V2/MQ6V1  10 MQ4V2/MQ2L
+//  11 MQ4V2/MQ4V1  12 MQ4V1/MQ4V2  13 MQ4V2/MQ3L  14 MQ4V2/MFP4E8
+//  15 MQ4V2/MFP3E8 16 MQ4V2/MFP2E8 17 MQ4V2/MQ6V2 18 MQ4V1/MQ6V2
+// Gate decoder map: 7,9,10,11,13,14,15,16,17 → MQ4V2; 8 → MQ6V2; 12,18 → MQ4V1.
+
 // All branches accumulate into a SINGLE `acc` and share one wave32 reduce
 // + one gate/up split write (M = 2*MI: first half → y_gate, second half →
 // y_up) — byte-identical output layout to both reference kernels.
@@ -32,7 +41,7 @@
 //
 // Shapes:
 //   expert_ptrs : [n_exp]
-//   dtype_tags  : [n_exp]                     u8, 0=MQ6 / 1=MQ2-Lloyd / 2=MQ4 / 3=MQ3-Lloyd
+//   dtype_tags  : [n_exp]                     u8, 0..6 legacy / 7..18 mixed pairs
 //   topk_indices: [N × K_TOP]
 //   x           : [N × K]
 //   y_gate      : [N × K_TOP × MI]            (MI = M / 2)
@@ -379,7 +388,7 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
     const float* __restrict__ x,                         // [N × K]
     float* __restrict__ y_gate,                          // [N × K_TOP × MI]
     float* __restrict__ y_up,                            // [N × K_TOP × MI]
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -388,6 +397,15 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[bid * K_TOP + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            const int mi_inv = M >> 1;
+            const long long base_inv = (long long)bid * K_TOP * mi_inv + (long long)krank * mi_inv;
+            if (row < mi_inv) y_gate[base_inv + row] = 0.0f;
+            else              y_up[base_inv + (row - mi_inv)] = 0.0f;
+        }
+        return;
+    }
     const unsigned char tag = dtype_tags[expert_id]; // block-uniform
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
@@ -427,6 +445,36 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
        +(_s*(float)((_pk>>8)&0xFu)+_z)*x_row[_b+2] +(_s*(float)((_pk>>12)&0xFu)+_z)*x_row[_b+3] \
        +(_s*(float)((_pk>>16)&0xFu)+_z)*x_row[_b+4]+(_s*(float)((_pk>>20)&0xFu)+_z)*x_row[_b+5] \
        +(_s*(float)((_pk>>24)&0xFu)+_z)*x_row[_b+6]+(_s*(float)((_pk>>28)&0xFu)+_z)*x_row[_b+7]; })
+// MQ4G256V2 (qt44): same 136 B stride / nibble payload as MQ4V1, dual-half f16
+// header [s0,z0,s1,z1]. Lane-constant half: tid 0..15 → gp+0, tid 16..31 → gp+4.
+// Sister: gemv_mq4g256v2_moe_gate_up_k8_indexed.hip / gemv_mq4g256v2.hip.
+#define _MQ4V2G(gg) ({ \
+        const char* _gp = (const char*)A + ((long long)row * groups_per_row + (gg)) * 136; \
+        unsigned int _h = *(const unsigned int*)(_gp + ((tid < 16) ? 0 : 4)); \
+        float _s = __half2float(__ushort_as_half((unsigned short)(_h & 0xFFFFu))); \
+        float _z = __half2float(__ushort_as_half((unsigned short)(_h >> 16))); \
+        unsigned int _pk = *(const unsigned int*)(_gp + 8 + tid * 4); \
+        int _b = (gg) * 256 + tid * 8; \
+        (_s*(float)(_pk&0xFu)+_z)*x_row[_b]        +(_s*(float)((_pk>>4)&0xFu)+_z)*x_row[_b+1] \
+       +(_s*(float)((_pk>>8)&0xFu)+_z)*x_row[_b+2] +(_s*(float)((_pk>>12)&0xFu)+_z)*x_row[_b+3] \
+       +(_s*(float)((_pk>>16)&0xFu)+_z)*x_row[_b+4]+(_s*(float)((_pk>>20)&0xFu)+_z)*x_row[_b+5] \
+       +(_s*(float)((_pk>>24)&0xFu)+_z)*x_row[_b+6]+(_s*(float)((_pk>>28)&0xFu)+_z)*x_row[_b+7]; })
+// MQ6G256V2 (qt47): same 200 B stride / 6-bit payload as MQ6V1, dual-half f16
+// header. Sister: gemv_mq6g256v2.hip (dense decode axis only).
+#define _MQ6V2G(gg) ({ \
+        const char* _gp = (const char*)A + ((long long)row * groups_per_row + (gg)) * 200; \
+        unsigned int _h = *(const unsigned int*)(_gp + ((tid < 16) ? 0 : 4)); \
+        float _s = __half2float(__ushort_as_half((unsigned short)(_h & 0xFFFFu))); \
+        float _z = __half2float(__ushort_as_half((unsigned short)(_h >> 16))); \
+        const unsigned char* _d = (const unsigned char*)(_gp + 8) + tid * 6; \
+        int _bi = (gg) * 256 + tid * 8; \
+        unsigned char _b0=_d[0],_b1=_d[1],_b2=_d[2],_b3=_d[3],_b4=_d[4],_b5=_d[5]; \
+        int _q0=_b0&63,_q1=(_b0>>6)|((_b1&0xF)<<2),_q2=(_b1>>4)|((_b2&3)<<4),_q3=_b2>>2, \
+            _q4=_b3&63,_q5=(_b3>>6)|((_b4&0xF)<<2),_q6=(_b4>>4)|((_b5&3)<<4),_q7=_b5>>2; \
+        (_s*(float)_q0+_z)*x_row[_bi]   +(_s*(float)_q1+_z)*x_row[_bi+1] \
+       +(_s*(float)_q2+_z)*x_row[_bi+2] +(_s*(float)_q3+_z)*x_row[_bi+3] \
+       +(_s*(float)_q4+_z)*x_row[_bi+4] +(_s*(float)_q5+_z)*x_row[_bi+5] \
+       +(_s*(float)_q6+_z)*x_row[_bi+6] +(_s*(float)_q7+_z)*x_row[_bi+7]; })
 
     if (tag == 0) {
         // ---- MQ6 branch (200 B/group affine dequant), 4-accumulator unroll ----
@@ -466,8 +514,8 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
                 +  cb[(b1 >> 4) & 3] * x_row[base + 6]
                 +  cb[b1 >> 6]       * x_row[base + 7];
         }
-    } else if (tag == 2) {
-        // ---- MQ4 branch (136 B/group), 4-accumulator unroll ----
+    } else if (tag == 2 || tag == 12 || tag == 18) {
+        // ---- MQ4 / MQ4V1 gate (136 B/group f32 s/z), tags 12+18 pair gate side ----
         float _a0=0.f,_a1=0.f,_a2=0.f,_a3=0.f;
         int g = 0;
         for (; g + 3 < groups_per_row; g += 4) {
@@ -510,9 +558,32 @@ extern "C" __global__ void gemv_mixed_moe_gate_up_k8_indexed_batched(
     } else if (tag == 6) {
         // ---- mfp2-E8 branch (16 B row hdr + (K/32)* 9 B;  72 B / 256-group) ----
         acc = mfp2e8_row_partial(A, x_row, row, K, tid);
+    } else if (tag == 7 || tag == 9 || tag == 10 || tag == 11 ||
+               tag == 13 || tag == 14 || tag == 15 || tag == 16 || tag == 17) {
+        // ---- MQ4V2 gate (136 B/group dual-half f16 header), tags 7/9..11/13..17 ----
+        float _a0=0.f,_a1=0.f,_a2=0.f,_a3=0.f;
+        int g = 0;
+        for (; g + 3 < groups_per_row; g += 4) {
+            _a0 += _MQ4V2G(g);   _a1 += _MQ4V2G(g+1);
+            _a2 += _MQ4V2G(g+2); _a3 += _MQ4V2G(g+3);
+        }
+        for (; g < groups_per_row; g++) _a0 += _MQ4V2G(g);
+        acc = (_a0 + _a1) + (_a2 + _a3);
+    } else if (tag == 8) {
+        // ---- MQ6V2 gate (200 B/group dual-half f16 header) ----
+        float _a0=0.f,_a1=0.f,_a2=0.f,_a3=0.f;
+        int g = 0;
+        for (; g + 3 < groups_per_row; g += 4) {
+            _a0 += _MQ6V2G(g);   _a1 += _MQ6V2G(g+1);
+            _a2 += _MQ6V2G(g+2); _a3 += _MQ6V2G(g+3);
+        }
+        for (; g < groups_per_row; g++) _a0 += _MQ6V2G(g);
+        acc = (_a0 + _a1) + (_a2 + _a3);
     }
 #undef _MQ6G
 #undef _MQ4G
+#undef _MQ4V2G
+#undef _MQ6V2G
 
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);

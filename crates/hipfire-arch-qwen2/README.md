@@ -34,4 +34,4 @@ deferred follow-ons.
 ## Validation target
 
 `Qwen2-1.5B-Instruct` from HuggingFace at
-`/home/kread/.cache/huggingface/hub/models--Qwen--Qwen2-1.5B-Instruct/`.
+`$HF_HOME/hub/models--Qwen--Qwen2-1.5B-Instruct/` (default `$HF_HOME` is `~/.cache/huggingface`).

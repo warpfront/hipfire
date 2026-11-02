@@ -451,3 +451,134 @@ extern "C" __global__ void gemv_hfq4g256_multirow_r8(
 ) {
     gemv_hfq4g256_multirow_body<8>(A, x, y, M, K);
 }
+
+// N-row-batched twin of gemv_hfq4g256_multirow_r2 for the spec-verify lm_head:
+// X [N, K], Y [N, M] row-major. Each block owns 2 weight rows and NB x rows;
+// weight dwords are loaded once per group-quad and reused for every x row, so
+// the matrix streams ceil(N/NB) times (adjacent blocks share rows -> L2/MALL
+// hits) instead of N times. Per (row, x) the arithmetic is the r2 kernel's
+// expression for expression (same DOG trees, acc[g%4] slots, combine and
+// shuffle order), so outputs are bitwise equal to N r2 launches.
+// Flat loads only: the dispatch admits gfx1151, where r2 also compiles flat.
+// Grid: [ceil(M/2) * ceil(N/NB)], chunk index fastest. Block: [32].
+template<int NB>
+__device__ __forceinline__ void gemv_hfq4g256_multirow_r2_xn_body(
+    const char* __restrict__ A,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int M, int K, int N
+) {
+    const int chunks = (N + NB - 1) / NB;
+    const int pair = blockIdx.x / chunks;
+    const int n0 = (blockIdx.x - pair * chunks) * NB;
+    const int row0 = pair << 1;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const bool have_row1 = row1 < M;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const long long row_stride = (long long)groups_per_row * 136;
+    const char* row_ptr0 = A + (long long)row0 * row_stride;
+    const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
+    const int boff = tid * 4;
+
+    float acc[NB][8];
+    #pragma unroll
+    for (int b = 0; b < NB; b++) {
+        #pragma unroll
+        for (int j = 0; j < 8; j++) acc[b][j] = 0.0f;
+    }
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+    #define XN_DOG(sc, zp, pk, a, xs) \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * xs[0] \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * xs[1] \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * xs[2] \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * xs[3] \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * xs[4] \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * xs[5] \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * xs[6] \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * xs[7]
+
+    // Loads the (sc, zp, pk) of group g for both rows; slot s in 0..3.
+    #define XN_LOAD_W(g, s) \
+        sc0[s] = __builtin_bit_cast(float, *(const unsigned int*)(row_ptr0 + (g) * 136)); \
+        zp0[s] = __builtin_bit_cast(float, *(const unsigned int*)(row_ptr0 + (g) * 136 + 4)); \
+        pk0[s] = *(const unsigned int*)(row_ptr0 + (g) * 136 + 8 + boff); \
+        sc1[s] = __builtin_bit_cast(float, *(const unsigned int*)(row_ptr1 + (g) * 136)); \
+        zp1[s] = __builtin_bit_cast(float, *(const unsigned int*)(row_ptr1 + (g) * 136 + 4)); \
+        pk1[s] = *(const unsigned int*)(row_ptr1 + (g) * 136 + 8 + boff)
+
+    float sc0[4], zp0[4], sc1[4], zp1[4];
+    unsigned int pk0[4], pk1[4];
+
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        XN_LOAD_W(g, 0); XN_LOAD_W(g + 1, 1); XN_LOAD_W(g + 2, 2); XN_LOAD_W(g + 3, 3);
+        // Group-major: group s's weights stay live while every x row consumes
+        // them; only acc spans the whole x chunk.
+        #pragma unroll
+        for (int s = 0; s < 4; s++) {
+            #pragma unroll
+            for (int b = 0; b < NB; b++) {
+                const int n = (n0 + b < N) ? (n0 + b) : n0;
+                const float* xr = X + (long long)n * K + (g + s) * 256 + tid * 8;
+                const float4 v0 = *reinterpret_cast<const float4*>(xr);
+                const float4 v1 = *reinterpret_cast<const float4*>(xr + 4);
+                const float xs[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+                XN_DOG(sc0[s], zp0[s], pk0[s], acc[b][s], xs);
+                XN_DOG(sc1[s], zp1[s], pk1[s], acc[b][4 + s], xs);
+            }
+        }
+    }
+    #pragma unroll
+    for (int s = 0; s < 3; s++) {
+        if (tail > s) {
+            const int g = (quads << 2) + s;
+            XN_LOAD_W(g, s);
+            #pragma unroll
+            for (int b = 0; b < NB; b++) {
+                const int n = (n0 + b < N) ? (n0 + b) : n0;
+                const float* xr = X + (long long)n * K + g * 256 + tid * 8;
+                const float4 v0 = *reinterpret_cast<const float4*>(xr);
+                const float4 v1 = *reinterpret_cast<const float4*>(xr + 4);
+                const float xs[8] = {v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w};
+                XN_DOG(sc0[s], zp0[s], pk0[s], acc[b][s], xs);
+                XN_DOG(sc1[s], zp1[s], pk1[s], acc[b][4 + s], xs);
+            }
+        }
+    }
+    #undef XN_LOAD_W
+    #undef XN_DOG
+
+    #pragma unroll
+    for (int b = 0; b < NB; b++) {
+        float s0 = (acc[b][0] + acc[b][1]) + (acc[b][2] + acc[b][3]);
+        float s1 = (acc[b][4] + acc[b][5]) + (acc[b][6] + acc[b][7]);
+        for (int offset = 16; offset > 0; offset >>= 1) {
+            s0 += __shfl_down(s0, offset);
+            s1 += __shfl_down(s1, offset);
+        }
+        if (tid == 0 && n0 + b < N) {
+            float* y = Y + (long long)(n0 + b) * M;
+            y[row0] = s0;
+            if (have_row1) y[row1] = s1;
+        }
+    }
+}
+
+__launch_bounds__(32, 8)
+extern "C" __global__ void gemv_hfq4g256_multirow_r2_x4(
+    const char* __restrict__ A, const float* __restrict__ X, float* __restrict__ Y,
+    int M, int K, int N) {
+    gemv_hfq4g256_multirow_r2_xn_body<4>(A, X, Y, M, K, N);
+}
+
+__launch_bounds__(32, 4)
+extern "C" __global__ void gemv_hfq4g256_multirow_r2_x8(
+    const char* __restrict__ A, const float* __restrict__ X, float* __restrict__ Y,
+    int M, int K, int N) {
+    gemv_hfq4g256_multirow_r2_xn_body<8>(A, X, Y, M, K, N);
+}

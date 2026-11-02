@@ -1,0 +1,14 @@
+sha=60bfa12b8af3d21ab311d8b7b2052b7fcd6409fe
+cargo 1.98.1 (797e8a9bc 2026-08-05)
+rustc 1.98.1 (48a229cea 2026-09-01)
+HIP version: 7.16.26385-0000000
+AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm/core-10.1/lib/llvm/bin
+Configuration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg
+AMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)
+Target: x86_64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /opt/rocm/core-10.1/lib/llvm/bin
+Configuration file: /opt/rocm/core-10.1/lib/llvm/bin/clang.cfg

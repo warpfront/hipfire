@@ -1,0 +1,146 @@
+[
+  {
+    "module": "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201",
+    "sha256": "8ea6a146eeb5f60e6bbe5cfa273fda0ed2e467dc7246d72279e48d7b2a80bc11",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_a4epi_gfx1201.hip",
+    "source_md5": "1c29fe96d280b1592918abd90fe9f795"
+  },
+  {
+    "module": "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201",
+    "sha256": "0c0df82f6b5b188ae3a3bb95fa43108e1e028675dd24acd6ca1efe3eab336adf",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201.hip",
+    "source_md5": "97be85e70f69476bace065f7f8951a6c"
+  },
+  {
+    "module": "gdn_chunk_scan_bf16_mseg",
+    "sha256": "ef4c9e320632aae7b7eac781f8de954397bec0de22c16d0d160603e2d4385232",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gdn_chunk_scan_bf16_mseg.hip",
+    "source_md5": "09dccbd9165e632818009bf497184e8d"
+  },
+  {
+    "module": "gemv_hfq4g256_multirow_default_mq4v2",
+    "sha256": "64b1b7eededa4bce636b8799247d7a66e7ef045f32d1674d07180bd56b98c3af",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.hip",
+    "source_md5": "d5d617da7a1ef1bd5e0fdd6687243509"
+  },
+  {
+    "module": "gdn_chunk_kkt_solve",
+    "sha256": "547f09fbac69142852447137e3b4cc518276ccc3c6288f04d4e82dd6fae6fa5f",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gdn_chunk_kkt_solve.hip",
+    "source_md5": "0a3f921d9c0a5f107731e2585d6b59c2"
+  },
+  {
+    "module": "gdn_chunk_scan_bf16",
+    "sha256": "cb7cf0ba7f3d8f336b64a0bcb0bf12e1bfa6da0433303cf67c4889fa193a0502",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gdn_chunk_scan_bf16.hip",
+    "source_md5": "25dea2890eaefa3640631ecb7e9051df"
+  },
+  {
+    "module": "gdn_chunk_kkt_solve_batched",
+    "sha256": "3386be90756bfd472d84eed19ed1545e95865adfb9a83cecc80577e22acb8d8b",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gdn_chunk_kkt_solve_batched.hip",
+    "source_md5": "7d5ac30301ef19c5746641a5aa329721"
+  },
+  {
+    "module": "qwen35_fa_prep_batched_gfx1201",
+    "sha256": "b13cf6c6af0802cba6cd305e71c2b6cae1f653cfcb9961e0e78868add59ccce5",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/qwen35_fa_prep_batched_gfx1201.hip",
+    "source_md5": "5821fc61a754e1efcc6e0d4e0af88279"
+  },
+  {
+    "module": "qwen35_fa_prep_fp8q_nogate_batched_gfx1201",
+    "sha256": "b13cf6c6af0802cba6cd305e71c2b6cae1f653cfcb9961e0e78868add59ccce5",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/qwen35_fa_prep_fp8q_nogate_batched_gfx1201.hip",
+    "source_md5": "5821fc61a754e1efcc6e0d4e0af88279"
+  },
+  {
+    "module": "gated_delta_net_q8_fast",
+    "sha256": "0cbfc2d3cc51bd4b74441caf3e0a6286983ff172a40f1c3b9614c267888bbe94",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gated_delta_net_q8_fast.hip",
+    "source_md5": "d2398ea8ad2be0f1d83ecc34ec89e910"
+  },
+  {
+    "module": "gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab",
+    "sha256": "9f6eede4451ddb5a8cd9b02d8daf7bad8434730f66b975421bfd11aa227b5299",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16_slab.hip",
+    "source_md5": "6e7bd53689067ccb5c5efa6c0d828e75"
+  },
+  {
+    "module": "rmsnorm_f32_rowsplit",
+    "sha256": "2923d5361f5e68971f0124d1a16dd8f78ea4fe00aba02fe6ffee3649982d19a9",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/rmsnorm_f32_rowsplit.hip",
+    "source_md5": "725b8484edcf6140523ac87a95caa477"
+  },
+  {
+    "module": "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv",
+    "sha256": "ebc8abd6354a8a9cea21ef3a5a319e9533b1c5d9ea74d37d810a4b9cf3751b68",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2_slab_fdiv.hip",
+    "source_md5": "afa4f2293e8c3673d97115d759a97950"
+  },
+  {
+    "module": "rmsnorm",
+    "sha256": "4cac09faa9d0883e6ca9d100bb13455ae88cfb8984e2ea68250ee2e3f64777f1",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/rmsnorm.hip",
+    "source_md5": "e1e6d22cec4e4bf50330685056b5163a"
+  },
+  {
+    "module": "gdn_chunk_prep",
+    "sha256": "647a8572510a11f972e2b14829f91d71da1b1de0943789b3ec824ecc59c225c8",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gdn_chunk_prep.hip",
+    "source_md5": "1ecb5a312c9a7b962421a7424cee641b"
+  },
+  {
+    "module": "gated_norm_mq_rotate_awq_i4_gfx12_v2_slab",
+    "sha256": "8f657edea89b471dac2f95a5e3c20aa328a1475afc32977f72d84856186845d7",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gated_norm_mq_rotate_awq_i4_gfx12_v2_slab.hip",
+    "source_md5": "45d8a29ff8033466b46f5f81ce093a34"
+  },
+  {
+    "module": "gdn_pre_batched_gfx1201",
+    "sha256": "1933d97267b7926922a108ea3a8d2ee56e2d91d17ee1c35f93e1290c75f92dcc",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gdn_pre_batched_gfx1201.hip",
+    "source_md5": "b47bf8486f41f801ba2848dbfa5c759a"
+  },
+  {
+    "module": "gdn_chunk_prep_fixup",
+    "sha256": "93f66bdf4d5904c7e85e662160cba1dbd28f70a079660759e64a40fbd08371aa",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gdn_chunk_prep_fixup.hip",
+    "source_md5": "7a504522365d32cd91fdc0c0af479b93"
+  },
+  {
+    "module": "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab",
+    "sha256": "257b752b7b6c4374e45235f2f50ac065f94484fd886ef75d8963de39581297cf",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/sigmoid_mul_rotate_x_mq_awq_i4_gfx12_slab.hip",
+    "source_md5": "4f9f477275016e47026155c459f405e7"
+  },
+  {
+    "module": "gemv_mq4g256v2_mq4v2",
+    "sha256": "34abe17f6f057aeedc4eba707617535adf84eb9aaa07326435f9c4fcd79d2749",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/gemv_mq4g256v2_mq4v2.hip",
+    "source_md5": "1a2c9d9c70aa3c4a34fae67557dce97c"
+  },
+  {
+    "module": "fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast",
+    "sha256": "1b67a7e4213ddbfda883b25c1073602d8c538ee8c4457fc9185ea7ddd6940281",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/fused_silu_mul_mq_rotate_awq_i4_hin_gfx12_slab_tokfast.hip",
+    "source_md5": "602ed717d6064c732e391433fa45a0e0"
+  },
+  {
+    "module": "mq_rotate_x",
+    "sha256": "0f4efbebb43c5d7b630c6383e9048549b18a338699b39411c8151dbb6061b51b",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/mq_rotate_x.hip",
+    "source_md5": "5a1883e5b41abf59da663b378ad01d13"
+  },
+  {
+    "module": "embedding_q8_batched",
+    "sha256": "c0c2ecaeeae83d88fad9e5af82c6d521ee5b06492a563a95561677aadf4bf6ce",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/embedding_q8_batched.hip",
+    "source_md5": "3352c89cf61944439acdccc5266cc442"
+  },
+  {
+    "module": "kv_cache_write_fp8_e4m3_batched",
+    "sha256": "a8d5a80f9d6cc9cceb7b67f568bdb8ef15ff512e6a3758b7dc8a7da1d5c824ef",
+    "original_source": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1201/kv_cache_write_fp8_e4m3_batched.hip",
+    "source_md5": "5c57194f41ebbfba257da42ac0e6988a"
+  }
+]

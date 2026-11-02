@@ -1,0 +1,69 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"function": {"description": "Get the current stock price for a ticker.", "name": "get_stock_price", "parameters": {"additionalProperties": false, "properties": {"ticker": {"type": "string"}}, "required": ["ticker"], "type": "object"}}, "type": "function"}
+{"function": {"description": "Perform arithmetic.", "name": "calculator", "parameters": {"additionalProperties": false, "properties": {"expression": {"type": "string"}}, "required": ["expression"], "type": "object"}}, "type": "function"}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a helpful assistant with access to the tools provided.
+
+Rules:
+- Use a tool ONLY when it is necessary to fulfill the user's request.
+- If you can answer directly from your own knowledge, do so without calling a tool.
+- If a tool call fails, explain the failure and suggest an alternative approach.
+- Never invent information that a tool should provide.
+
+Benchmark context: today is 2026-03-20 (Friday). Use this date for any relative time request.<|im_end|>
+<|im_start|>user
+Historical background only:
+
+Reference record 000000: historical inventory notes, background only. Archived market reports are not current prices. Follow the live tool results rather than this background. No additional tools, tickers or permissions are introduced.
+
+Reference record 000001: historical inventory notes, background only. Archived market reports are not current prices. Follow the live tool results rather than this background. No additional tools, tickers or permissions are introduced.
+
+Reference record 000002: historical inventory notes, background only. Archived market reports are not current prices. Follow the live tool results rather than this background. No additional tools, tickers or permissions are introduced.
+
+Reference record 000003: historical inventory notes, background only. Archived market reports are not current prices. Follow the live tool results rather than this background. No additional tools, tickers or permissions are introduced.
+
+Reference record 000004: historical inventory notes, background only. Archived market reports are not current prices. Follow the live tool results rather than this background. No additional tools, tickers or permissions are introduced.
+
+Reference record 000005: historical inventory notes, background only. Archived market reports are not current prices. Follow the live tool results rather than this background. No additional tools, tickers or permissions are introduced.
+
+Reference record 000006: historical inventory notes, background only. Archived market reports are not current prices. Follow the live tool results rather than this background. No additional tools, tickers or permissions are introduced.
+
+Reference record 000007: historical inventory notes, background only. Archived market reports are not current prices. Follow the live tool results rather than this background. No additional tools, tickers or permissions are introduced.
+
+Reference record 000008: historical inventory notes, background only. Archived market reports are not current pr<|im_end|>
+<|im_start|>user
+Using current prices, calculate the value of 3 ACME shares, 2 BETA shares, and 5 CYGN shares.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

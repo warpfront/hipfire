@@ -1,0 +1,631 @@
+{
+  "schema_version": 5,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1793187476,
+  "source": "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/sgpr16/moesym/new-work/none/qwen4_moe_iu4_sym_w3_pm_gfx1100.s",
+  "output": "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/sgpr16/moesym/new-work/none/qwen4_moe_iu4_sym_w3_pm_gfx1100.hxaco",
+  "arch": "gfx1100",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg",
+  "command": [
+    "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/sgpr16-moesym-wt/target/debug/examples/emit_qwen4_moe_sym_gfx1100",
+    "native",
+    "--arch=gfx1100",
+    "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/sgpr16/moesym/new-work/none/qwen4_moe_iu4_sym_w3_pm_gfx1100.s",
+    "--co=/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/sgpr16/moesym/new-work/none/qwen4_moe_iu4_sym_w3_pm_gfx1100.co",
+    "--bundle=/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/sgpr16/moesym/new-work/none/qwen4_moe_iu4_sym_w3_pm_gfx1100.hxaco",
+    "--host-target=host-x86_64-unknown-linux-gnu"
+  ],
+  "source_sha256": "07ee13f3d84ec0f3e2f1e428fc424062c010813ae9e157ad9cd7d8e222f8222a",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "da46eb46d4637234da818cb0a0563963b769b1e09fdc4181d02e253807beaa74",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1100",
+    "identity": {
+      "architecture": "gfx1100",
+      "elf_machine_id": 65,
+      "isa": {
+        "major": 11,
+        "minor": 0,
+        "stepping": 0
+      }
+    },
+    "kernels": [
+      {
+        "name": "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1100",
+        "wavefront_size": 32,
+        "vgpr_count": 152,
+        "sgpr_count": 98,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 40,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 44,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 48,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 52,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1451,
+          "buffer_loads": 40,
+          "buffer_stores": 1,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 8,
+          "kernarg_scalar_loads": 6,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 2,
+          "wait_instructions": 559,
+          "delay_alu_instructions": 498,
+          "memory_clause_instructions": 3,
+          "max_consecutive_vmem_instructions": 39
+        }
+      },
+      {
+        "name": "qwen4_moe_down_iu4_sym_w3_pm_gfx1100",
+        "wavefront_size": 32,
+        "vgpr_count": 136,
+        "sgpr_count": 96,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 40,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 44,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 48,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 52,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 606,
+          "buffer_loads": 23,
+          "buffer_stores": 1,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 8,
+          "kernarg_scalar_loads": 6,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 2,
+          "wait_instructions": 221,
+          "delay_alu_instructions": 187,
+          "memory_clause_instructions": 2,
+          "max_consecutive_vmem_instructions": 22
+        }
+      },
+      {
+        "name": "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1100_acc",
+        "wavefront_size": 32,
+        "vgpr_count": 152,
+        "sgpr_count": 96,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 40,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 44,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 48,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 52,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 921,
+          "buffer_loads": 40,
+          "buffer_stores": 16,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 8,
+          "kernarg_scalar_loads": 6,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 2,
+          "wait_instructions": 350,
+          "delay_alu_instructions": 291,
+          "memory_clause_instructions": 3,
+          "max_consecutive_vmem_instructions": 39
+        }
+      },
+      {
+        "name": "qwen4_moe_down_iu4_sym_w3_pm_gfx1100_acc",
+        "wavefront_size": 32,
+        "vgpr_count": 136,
+        "sgpr_count": 96,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 40,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 44,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 48,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 52,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 56,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 60,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 537,
+          "buffer_loads": 23,
+          "buffer_stores": 8,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 8,
+          "kernarg_scalar_loads": 6,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 2,
+          "wait_instructions": 195,
+          "delay_alu_instructions": 161,
+          "memory_clause_instructions": 2,
+          "max_consecutive_vmem_instructions": 22
+        }
+      }
+    ]
+  },
+  "peacemaker": {
+    "arm": "custom-isa",
+    "producer": {
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "unknown",
+      "proof_sha256": "07ee13f3d84ec0f3e2f1e428fc424062c010813ae9e157ad9cd7d8e222f8222a"
+    },
+    "tools": [
+      {
+        "role": "native",
+        "path": "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/sgpr16-moesym-wt/target/debug/examples/emit_qwen4_moe_sym_gfx1100",
+        "version": "peacemaker-isa 0.4.1 native code object v6 writer (ld.lld 24.0.0 layout)",
+        "argv": [
+          "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/sgpr16-moesym-wt/target/debug/examples/emit_qwen4_moe_sym_gfx1100",
+          "native",
+          "--arch=gfx1100",
+          "/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/sgpr16/moesym/new-work/none/qwen4_moe_iu4_sym_w3_pm_gfx1100.s",
+          "--co=/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/sgpr16/moesym/new-work/none/qwen4_moe_iu4_sym_w3_pm_gfx1100.co",
+          "--bundle=/home/kaden/qcal/release-0.4.3/pm-krsi-1100/scratch/sgpr16/moesym/new-work/none/qwen4_moe_iu4_sym_w3_pm_gfx1100.hxaco",
+          "--host-target=host-x86_64-unknown-linux-gnu"
+        ],
+        "sha256": "cc54b3761fe5f8a4cd5dcca304feeaff5f329749142686bf4bc7046697a77a78"
+      }
+    ],
+    "s_text_sha256": "07ee13f3d84ec0f3e2f1e428fc424062c010813ae9e157ad9cd7d8e222f8222a",
+    "text_section_sha256": "b09c7cc4045c3ee820349afd5b1596d46b9191a9c0535080c77db99d15e05561",
+    "shape_contract": {
+      "counts": {
+        "buffer_load_b128": 4,
+        "buffer_load_b32": 18,
+        "buffer_load_u16": 1,
+        "buffer_store_b128": 1,
+        "ds_swizzle_b32": 8,
+        "s_endpgm": 1,
+        "s_load_b256": 1,
+        "s_load_b32": 3,
+        "s_load_b64": 4,
+        "s_waitcnt": 33,
+        "v_dual_fmac_f32": 4,
+        "v_dual_mul_f32": 8,
+        "v_permlanex16_b32": 2,
+        "v_wmma_i32_16x16x16_iu4": 8,
+        "vopd_packets": 12
+      },
+      "end_label": null,
+      "forbidden": [
+        "scratch_*",
+        "flat_*",
+        "global_*",
+        "ds_load*",
+        "ds_store*",
+        "ds_read*",
+        "ds_write*",
+        "s_barrier*",
+        "v_readlane*",
+        "v_writelane*",
+        "s_wait_*",
+        "s_setpc*",
+        "s_swappc*",
+        "s_denorm_mode*",
+        "s_round_mode*",
+        "s_setreg*",
+        "v_wmma_i32_16x16x32*",
+        "v_wmma_i32_16x16x16_iu8*",
+        "v_wmma_f*",
+        "v_wmma_bf16*",
+        "v_swmmac*"
+      ],
+      "group_segment_fixed_bytes": 0,
+      "launch_dynamic_lds_bytes": 0,
+      "require_wave32": true,
+      "require_zero_private": true,
+      "require_zero_spills": true,
+      "sgpr_max": 104,
+      "start_label": null,
+      "symbol": "qwen4_moe_down_iu4_sym_w3_pm_gfx1100",
+      "vgpr_max": 136
+    },
+    "shape_result": {
+      "counts": {
+        "buffer_load_b128": 4,
+        "buffer_load_b32": 18,
+        "buffer_load_u16": 1,
+        "buffer_store_b128": 1,
+        "ds_swizzle_b32": 8,
+        "s_add_i32": 2,
+        "s_add_u32": 7,
+        "s_addc_u32": 5,
+        "s_cbranch_scc1": 4,
+        "s_clause": 2,
+        "s_cmp_eq_u32": 1,
+        "s_cmp_ge_i32": 1,
+        "s_cmp_ge_u32": 1,
+        "s_cmp_lg_u32": 1,
+        "s_delay_alu": 187,
+        "s_endpgm": 1,
+        "s_load_b256": 1,
+        "s_load_b32": 3,
+        "s_load_b64": 4,
+        "s_lshl_b32": 7,
+        "s_lshr_b32": 3,
+        "s_mov_b32": 19,
+        "s_mul_i32": 9,
+        "s_sub_u32": 2,
+        "s_waitcnt": 33,
+        "s_waitcnt_depctr": 1,
+        "v_add3_u32": 8,
+        "v_add_nc_u32_e32": 8,
+        "v_and_b32_e32": 3,
+        "v_bfe_u32": 8,
+        "v_bfi_b32": 48,
+        "v_cmp_class_f32_e64": 8,
+        "v_cmp_gt_i32_e64": 1,
+        "v_cmp_le_i32_e64": 1,
+        "v_cmp_le_u32_e64": 1,
+        "v_cndmask_b32_e64": 29,
+        "v_cvt_f32_f16_e64": 1,
+        "v_cvt_f32_u32_e32": 2,
+        "v_cvt_u32_f32_e32": 1,
+        "v_dual_fmac_f32": 4,
+        "v_dual_mul_f32": 8,
+        "v_lshl_add_u32": 1,
+        "v_lshlrev_b32_e32": 66,
+        "v_lshrrev_b32_e32": 2,
+        "v_mov_b32_e32": 20,
+        "v_mul_f32_e32": 1,
+        "v_mul_lo_u32": 2,
+        "v_mul_u32_u24_e32": 3,
+        "v_or_b32_e32": 17,
+        "v_perm_b32": 8,
+        "v_permlanex16_b32": 2,
+        "v_rcp_iflag_f32_e32": 1,
+        "v_readfirstlane_b32": 1,
+        "v_sub_nc_u32_e32": 1,
+        "v_wmma_i32_16x16x16_iu4": 8,
+        "v_xor_b32_e32": 16,
+        "valu_slots": 272,
+        "vopd_packets": 12
+      },
+      "descriptor_vgpr_reservation": 136,
+      "launch_dynamic_lds_bytes": 0,
+      "m7_analysis": {
+        "ambiguous_delays": 0,
+        "barrier_pairs": 0,
+        "clauses": 2,
+        "delays": 187,
+        "instructions": 606,
+        "lds_accesses": 8,
+        "lds_max_known_end": null,
+        "lds_unknown_addresses": 8,
+        "lift": "byte-exact",
+        "obligations": {},
+        "sgpr_high_water": 96,
+        "table": "gfx1100",
+        "vgpr_high_water": 132,
+        "wait_facts": 34
+      },
+      "max_lds_access_end": 0,
+      "max_used_sgpr": 96,
+      "max_used_vgpr": 132,
+      "private_segment_fixed_size": 0,
+      "sgpr_count": 96,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 136,
+      "vgpr_spill_count": 0,
+      "wavefront_size": 32
+    },
+    "oracle_receipt": null
+  }
+}

@@ -23,7 +23,7 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed_wave64(
     const float* __restrict__ x,                         // [K]
     float* __restrict__ y_gate,                          // [K_TOP × MI]
     float* __restrict__ y_up,                            // [K_TOP × MI]
-    int M, int K
+    int M, int K, int n_experts
 ) {
     const int tid = threadIdx.x;
     const int warp_id = tid >> 5;       // 0 or 1
@@ -34,6 +34,14 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed_wave64(
     const int krank = blockIdx.y;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (lane == 0) {
+            const int mi_inv = M >> 1;
+            if (row < mi_inv) y_gate[krank * mi_inv + row] = 0.0f;
+            else              y_up[krank * mi_inv + (row - mi_inv)] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 

@@ -1,0 +1,18 @@
+{
+  "qwen4_slab_union_plan_t8_pm_gfx1151": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 2,
+    "clauses": 0,
+    "delays": 0,
+    "instructions": 207,
+    "lds_accesses": 8,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 8,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 27,
+    "table": "gfx1151",
+    "vgpr_high_water": 23,
+    "wait_facts": 21
+  }
+}

@@ -1,0 +1,23 @@
+[package]
+name = "npu-tools"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XDNA2 NPU binaries: npu-tools diagnostics, npu-gemm, npu-hello, npu-experts, npu-ring, npu-railgun, npu-bw, npu-coop, and the lab-only coop27 GPU+NPU co-op prototype. Experimental, dark."
+publish = false
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+peacemaker-npu = { path = "../peacemaker-npu" }
+railgun = { path = "../railgun", features = ["npu"] }
+regex.workspace = true
+serde_json.workspace = true
+
+[features]
+# `coop27`: dense Qwen3.8-27B FFN GPU+NPU co-op prototype (gfx1151 + XDNA2), lab only.
+lab = []
+
+[[bin]]
+name = "coop27"
+path = "src/bin/coop27/main.rs"
+required-features = ["lab"]

@@ -2,7 +2,7 @@
 
 Target model: **Qwen3.6-35B-A3B** (qwen3_5_moe, 256 experts/top-8, 40 layers, hidden
 2048, moe_inter 512). All KLD vs an f32-native oracle (`q36a3b-f32-oracle.hfq`); refs
-`q36a3b-{wt2,agentic}-f32.kldref.bin`. Branch `feat/moe-awq-experts` on mi300.
+`q36a3b-{wt2,agentic}-f32.kldref.bin`. Branch `feat/moe-awq-experts` on the MI300X rental box.
 Decode = per-token scoring; "q8/fwht4" = KV mode.
 
 ---
@@ -117,11 +117,11 @@ MQ2-Lloyd MoE indexed kernels already exist (ds4: `gemv_mq2g256_lloyd_moe_down_i
 
 ## 6. 5700XT / gfx1010 (RDNA1) — origin loop CLOSED
 qwen3.5-0.8B mq4 runs **coherent, native gfx1010** (no GFX override) at **256.8 tok/s
-decode** on hipx (HIP_VISIBLE_DEVICES=0, 8.6 GB). RDNA1 forward-correctness gate passes.
+decode** on a 4×gfx1010 host (HIP_VISIBLE_DEVICES=0, 8.6 GB). RDNA1 forward-correctness gate passes.
 A3B-on-5700XT plan: **GTT cold-expert offload** — host-map cold experts
 (`hipHostMalloc...Mapped`); the indexed MoE GEMV ptr-table is location-agnostic, so no
 pager — heavy-tail masks GTT slowness. Moved to a dedicated worktree
-(hipx `~/hipfire-gfx1010`, branch `gfx1010-opt`).
+(on the gfx1010 host, `~/hipfire-gfx1010`, branch `gfx1010-opt`).
 
 ---
 

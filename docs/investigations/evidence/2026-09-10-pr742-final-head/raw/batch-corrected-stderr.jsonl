@@ -1,0 +1,85 @@
+{"ts": 1789062435.3445845, "phase": "batch-corrected-load", "line": "2026-09-10T17:47:15.344519Z  INFO daemon starting pid=2397153"}
+{"ts": 1789062435.376083, "phase": "batch-corrected-load", "line": "GPU dev 0: gfx1151 (131.1 GB VRAM, HIP 7.2)"}
+{"ts": 1789062435.376233, "phase": "batch-corrected-load", "line": "  pre-compiled kernels: /tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151"}
+{"ts": 1789062435.703878, "phase": "batch-corrected-load", "line": "  DeltaNet state: Q8"}
+{"ts": 1789062435.704088, "phase": "batch-corrected-load", "line": "  loading token_embd..."}
+{"ts": 1789062435.704113, "phase": "batch-corrected-load", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789062436.1653366, "phase": "batch-corrected-load", "line": "  loading output_norm..."}
+{"ts": 1789062436.1665561, "phase": "batch-corrected-load", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789062436.3961415, "phase": "batch-corrected-load", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789062436.396321, "phase": "batch-corrected-load", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789062436.4318733, "phase": "batch-corrected-load", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789062436.4559915, "phase": "batch-corrected-load", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789062436.4807591, "phase": "batch-corrected-load", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789062436.5055988, "phase": "batch-corrected-load", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789062436.5312054, "phase": "batch-corrected-load", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789062436.5575683, "phase": "batch-corrected-load", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789062436.5839217, "phase": "batch-corrected-load", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789062436.6091359, "phase": "batch-corrected-load", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789062436.6347513, "phase": "batch-corrected-load", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789062436.6583536, "phase": "batch-corrected-load", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789062436.689979, "phase": "batch-corrected-load", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789062436.713123, "phase": "batch-corrected-load", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789062436.7370079, "phase": "batch-corrected-load", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789062436.7596047, "phase": "batch-corrected-load", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789062436.7817953, "phase": "batch-corrected-load", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789062436.8041308, "phase": "batch-corrected-load", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789062436.8280854, "phase": "batch-corrected-load", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789062436.8522284, "phase": "batch-corrected-load", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789062436.8777778, "phase": "batch-corrected-load", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789062436.9038503, "phase": "batch-corrected-load", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789062436.9284456, "phase": "batch-corrected-load", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789062436.9539988, "phase": "batch-corrected-load", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789062436.9790108, "phase": "batch-corrected-load", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789062437.003362, "phase": "batch-corrected-load", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789062437.0280793, "phase": "batch-corrected-load", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789062437.0515966, "phase": "batch-corrected-load", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789062437.0739188, "phase": "batch-corrected-load", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789062437.0978386, "phase": "batch-corrected-load", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789062437.1216183, "phase": "batch-corrected-load", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789062437.145642, "phase": "batch-corrected-load", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789062437.1698806, "phase": "batch-corrected-load", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789062437.1919923, "phase": "batch-corrected-load", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789062437.216328, "phase": "batch-corrected-load", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789062437.2395008, "phase": "batch-corrected-load", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789062437.2645535, "phase": "batch-corrected-load", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789062437.2892804, "phase": "batch-corrected-load", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789062437.3144135, "phase": "batch-corrected-load", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789062437.3412032, "phase": "batch-corrected-load", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789062437.3651254, "phase": "batch-corrected-load", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789062437.3876047, "phase": "batch-corrected-load", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789062437.4112306, "phase": "batch-corrected-load", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789062437.433322, "phase": "batch-corrected-load", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789062437.4553971, "phase": "batch-corrected-load", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789062437.4788952, "phase": "batch-corrected-load", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789062437.5044692, "phase": "batch-corrected-load", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789062437.5270128, "phase": "batch-corrected-load", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789062437.5520105, "phase": "batch-corrected-load", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789062437.5744967, "phase": "batch-corrected-load", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789062437.5974388, "phase": "batch-corrected-load", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789062437.6221366, "phase": "batch-corrected-load", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789062437.6475143, "phase": "batch-corrected-load", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789062437.6720476, "phase": "batch-corrected-load", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789062437.6986184, "phase": "batch-corrected-load", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789062437.7243953, "phase": "batch-corrected-load", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789062437.7474174, "phase": "batch-corrected-load", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789062437.7720351, "phase": "batch-corrected-load", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789062437.7984686, "phase": "batch-corrected-load", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789062437.8226712, "phase": "batch-corrected-load", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789062437.8470523, "phase": "batch-corrected-load", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789062437.870064, "phase": "batch-corrected-load", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789062437.8946664, "phase": "batch-corrected-load", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789062437.9201493, "phase": "batch-corrected-load", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789062437.945269, "phase": "batch-corrected-load", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789062437.9685843, "phase": "batch-corrected-load", "line": "  weight sweep: 2264 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789062437.9722984, "phase": "batch-corrected-load", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789062438.0022159, "phase": "batch-corrected-load", "line": "KV cache: q8 (16/64 layers carry KV, others placeholder)"}
+{"ts": 1789062438.0164545, "phase": "batch-corrected-load", "line": "[daemon] continuous batch staged: slots=2 lane_cap=4096 repeat_cap=2048"}
+{"ts": 1789062443.529622, "phase": "batch-corrected-lane-commit-b-commit", "line": "2026-09-10T17:47:23.529503Z  INFO daemon control command received request_id=\"lane-commit-b\" attempt_id=602 command=\"commit\""}
+{"ts": 1789062443.5298798, "phase": "batch-corrected-lane-commit-b-commit", "line": "[daemon-control] received commit for id=lane-commit-b attempt_id=602"}
+{"ts": 1789062443.8251495, "phase": "batch-corrected-lane-commit-a-commit", "line": "2026-09-10T17:47:23.825110Z  INFO daemon control command received request_id=\"lane-commit-a\" attempt_id=601 command=\"commit\""}
+{"ts": 1789062443.8252144, "phase": "batch-corrected-lane-commit-a-commit", "line": "[daemon-control] received commit for id=lane-commit-a attempt_id=601"}
+{"ts": 1789062443.8276155, "phase": "same-key-reuse", "line": "2026-09-10T17:47:23.827577Z  INFO daemon control command received request_id=\"lane-commit-a\" attempt_id=601 command=\"abort\""}
+{"ts": 1789062443.8276634, "phase": "same-key-reuse", "line": "[daemon-control] received abort for id=lane-commit-a attempt_id=601"}
+{"ts": 1789062444.2825916, "phase": "same-key-reuse-commit", "line": "2026-09-10T17:47:24.282517Z  INFO daemon control command received request_id=\"lane-commit-a\" attempt_id=601 command=\"commit\""}
+{"ts": 1789062444.2827792, "phase": "same-key-reuse-commit", "line": "[daemon-control] received commit for id=lane-commit-a attempt_id=601"}

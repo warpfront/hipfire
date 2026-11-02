@@ -38,7 +38,7 @@ use hipfire_runtime::llama::{gemv_family, weight_gemm, EmbeddingFormat, WeightTe
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::weight_backend::{
     dequant_norm, dequant_weight_raw, flat_name_candidates, load_embedding, resolve_lm_head,
-    HfqBackend, WeightBackend,
+    HfqBackend, MemoryTarget, WeightBackend, WeightResidency,
 };
 use hipfire_runtime::{screen_weight_tensor, MmqScreenable};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -199,7 +199,7 @@ pub fn from_config_value(
         }
     }
     let eos_token_ids = if eos_token_ids.is_empty() {
-        vec![151645]
+        vec![hipfire_runtime::chatml::IM_END]
     } else {
         eos_token_ids
     };
@@ -276,26 +276,29 @@ impl Qwen2Weights {
 
     /// Release every GPU buffer back to the pool. Consumes self.
     /// Mirrors `LlamaWeights::free_gpu` and `Qwen35Weights::free_gpu`
-    /// — the daemon calls this on unload to actually return VRAM.
+    /// — the daemon calls this on unload to actually return VRAM. Linear
+    /// weights go through `WeightTensor::free_all` so any PARO / AWQ sidecar
+    /// (none are allocated for Qwen2 today, but the forward already reads
+    /// `awq_scale`) is released with the buffer instead of leaking per reload.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
         if !self.tied_lm_head {
-            let _ = gpu.free_tensor(self.output.buf);
+            self.output.free_all(gpu);
         }
         for l in self.layers {
             let _ = gpu.free_tensor(l.attn_norm);
-            let _ = gpu.free_tensor(l.wq.buf);
+            l.wq.free_all(gpu);
             let _ = gpu.free_tensor(l.wq_bias);
-            let _ = gpu.free_tensor(l.wk.buf);
+            l.wk.free_all(gpu);
             let _ = gpu.free_tensor(l.wk_bias);
-            let _ = gpu.free_tensor(l.wv.buf);
+            l.wv.free_all(gpu);
             let _ = gpu.free_tensor(l.wv_bias);
-            let _ = gpu.free_tensor(l.wo.buf);
+            l.wo.free_all(gpu);
             let _ = gpu.free_tensor(l.ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate.buf);
-            let _ = gpu.free_tensor(l.w_up.buf);
-            let _ = gpu.free_tensor(l.w_down.buf);
+            l.w_gate.free_all(gpu);
+            l.w_up.free_all(gpu);
+            l.w_down.free_all(gpu);
         }
     }
 }
@@ -410,6 +413,7 @@ fn load_lm_head(
                 cfg.vocab_size,
                 cfg.hidden_size,
                 flat_name_candidates,
+                MemoryTarget::Device,
             )
         },
         // qwen2 is single-GPU; the reupload arm is never taken.
@@ -433,6 +437,8 @@ fn load_layer(
         candidates: flat_name_candidates,
         read_proj: load_weight_tensor,
         layer: i,
+        // qwen2 is always fully resident — no offload support.
+        residency: WeightResidency::Resident,
     };
 
     Ok(Qwen2LayerWeights {
@@ -485,15 +491,16 @@ fn load_norm_weight_raw(
 /// implementation.
 fn load_weight_tensor(
     hfq: &HfqFile,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     name: &str,
     m: usize,
     k: usize,
     candidates: fn(&str) -> Vec<String>,
+    target: MemoryTarget,
 ) -> HipResult<WeightTensor> {
     for cand in candidates(name) {
         if let Some((info, data)) = hfq.tensor_data_vec(&cand) {
-            return dequant_weight_raw(gpu, info.quant_type, &data, m, k);
+            return dequant_weight_raw(gpu, info.quant_type, &data, m, k, target);
         }
     }
     panic!("qwen2: tensor not found: {name}");
@@ -635,6 +642,9 @@ fn load_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -682,6 +692,9 @@ fn load_lm_head_from_source(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         Ok((wt, true))
     } else {
@@ -1052,6 +1065,10 @@ pub fn forward_step(
             gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Ggml(_) => return Err(hip_bridge::HipError::new(
+            0,
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+        )),
     }
 
     forward_step_after_x(gpu, weights, cfg, state, pos)
@@ -1115,6 +1132,10 @@ pub fn embed_token_row(
             gpu.embedding_lookup_q4k(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, &state.x, token, dim)?,
+        EmbeddingFormat::Ggml(_) => return Err(hip_bridge::HipError::new(
+            0,
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+        )),
     }
     gpu.download_f32(&state.x)
 }
@@ -1187,6 +1208,7 @@ fn forward_step_after_x(
                     k: layer.wq.k,
                     eps: cfg.rms_norm_eps,
                     rotation: qkv_rot,
+                    rows: 1,
                 },
                 Step::Gemv {
                     w: &wrq,
@@ -1340,6 +1362,7 @@ fn forward_step_after_x(
                     k: layer.w_gate.k,
                     eps: cfg.rms_norm_eps,
                     rotation: ffn_rot,
+                    rows: 1,
                 },
                 Step::Gemv {
                     w: &wrg,
@@ -2125,6 +2148,8 @@ impl DenseArch for Qwen2Dense<'_> {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            quant_bf16: false,
+            quant_fp8: false,
             f32_policy: F32AttnPolicy::Gqa {
                 n_heads: k.n_heads,
                 n_kv_heads: k.n_kv_heads,
@@ -2168,6 +2193,7 @@ impl DenseArch for Qwen2Dense<'_> {
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &st.attn_out,
         };
         Ok(Some((plan, io)))

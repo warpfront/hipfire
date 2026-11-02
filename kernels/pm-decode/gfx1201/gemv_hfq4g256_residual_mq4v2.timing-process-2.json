@@ -1,0 +1,161 @@
+{
+  "script_md5": "da83bb231ea7fbbb96a4e3247392de2c",
+  "rows": [
+    {
+      "module": "gemv_hfq4g256_residual_mq4v2",
+      "symbol": "gemv_mq4g256v2_residual",
+      "dims": [
+        5120,
+        6144
+      ],
+      "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ0",
+      "arm": "hipcc",
+      "object": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/kernel.hsaco",
+      "object_md5": "f6a2fe00a4fee6d21f92c09bebf68b5f",
+      "object_sha256": "bd87c3e5a11ae57644a3e462af3398adea5da973cfc95789230d0e6d79b742ca",
+      "input_md5": {
+        "0": "1afb9ef873f4d5e75030659c9e75023e",
+        "8": "ad2c50077a02aa64de07179636655567",
+        "16": "0211162eeb580e6d09618e7543c1b824"
+      },
+      "weight_bytes": 16711680,
+      "samples_ms": [
+        0.02515999972820282,
+        0.025200000032782555,
+        0.025359999388456345,
+        0.02544100023806095,
+        0.02539999969303608,
+        0.02524000033736229,
+        0.025241000577807426,
+        0.024080000817775726,
+        0.024320000782608986,
+        0.024320999160408974,
+        0.024159999564290047,
+        0.024159999564290047,
+        0.02412099950015545,
+        0.024000000208616257,
+        0.024399999529123306
+      ],
+      "median_ms": 0.024399999529123306,
+      "weight_GBs": 684.9049312502365,
+      "post_mismatches": 0
+    },
+    {
+      "module": "gemv_hfq4g256_residual_mq4v2",
+      "symbol": "gemv_mq4g256v2_residual",
+      "dims": [
+        5120,
+        6144
+      ],
+      "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ0",
+      "arm": "probe",
+      "object": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co",
+      "object_md5": "03c5be5561da84888b5f40bc8cb6ab16",
+      "object_sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d",
+      "input_md5": {
+        "0": "1afb9ef873f4d5e75030659c9e75023e",
+        "8": "ad2c50077a02aa64de07179636655567",
+        "16": "0211162eeb580e6d09618e7543c1b824"
+      },
+      "weight_bytes": 16711680,
+      "samples_ms": [
+        0.029559999704360962,
+        0.02980099990963936,
+        0.02828099951148033,
+        0.02879999950528145,
+        0.028279999271035194,
+        0.028519999235868454,
+        0.028200000524520874,
+        0.02768000029027462,
+        0.027000000700354576,
+        0.027201000601053238,
+        0.027720000594854355,
+        0.02751999907195568,
+        0.02768000029027462,
+        0.027319999411702156,
+        0.027201000601053238
+      ],
+      "median_ms": 0.027720000594854355,
+      "weight_GBs": 602.8744459371396,
+      "post_mismatches": 0
+    },
+    {
+      "module": "gemv_hfq4g256_residual_mq4v2",
+      "symbol": "gemv_mq4g256v2_residual",
+      "dims": [
+        5120,
+        17408
+      ],
+      "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ127",
+      "arm": "hipcc",
+      "object": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/kernel.hsaco",
+      "object_md5": "f6a2fe00a4fee6d21f92c09bebf68b5f",
+      "object_sha256": "bd87c3e5a11ae57644a3e462af3398adea5da973cfc95789230d0e6d79b742ca",
+      "input_md5": {
+        "0": "4c5ec9fbc2ba749e14bab04f918f8ab5",
+        "8": "124f5dbfc9ec52ac559bdd4446e032bd",
+        "16": "51af8b3d2718467400369de8c95c7a82"
+      },
+      "weight_bytes": 47349760,
+      "samples_ms": [
+        0.05412000045180321,
+        0.054281000047922134,
+        0.05236100032925606,
+        0.05220099911093712,
+        0.052000999450683594,
+        0.05180099979043007,
+        0.05159999802708626,
+        0.052880000323057175,
+        0.05164000019431114,
+        0.05167999863624573,
+        0.05251999944448471,
+        0.05139999836683273,
+        0.05152000114321709,
+        0.05155999958515167,
+        0.05155999958515167
+      ],
+      "median_ms": 0.05180099979043007,
+      "weight_GBs": 914.0703884396377,
+      "post_mismatches": 0
+    },
+    {
+      "module": "gemv_hfq4g256_residual_mq4v2",
+      "symbol": "gemv_mq4g256v2_residual",
+      "dims": [
+        5120,
+        17408
+      ],
+      "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ127",
+      "arm": "probe",
+      "object": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co",
+      "object_md5": "03c5be5561da84888b5f40bc8cb6ab16",
+      "object_sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d",
+      "input_md5": {
+        "0": "4c5ec9fbc2ba749e14bab04f918f8ab5",
+        "8": "124f5dbfc9ec52ac559bdd4446e032bd",
+        "16": "51af8b3d2718467400369de8c95c7a82"
+      },
+      "weight_bytes": 47349760,
+      "samples_ms": [
+        0.06027999892830849,
+        0.059960998594760895,
+        0.058400001376867294,
+        0.05827999860048294,
+        0.05840099975466728,
+        0.05848100036382675,
+        0.05828100070357323,
+        0.0583610013127327,
+        0.05812099948525429,
+        0.05848100036382675,
+        0.058400001376867294,
+        0.05835999920964241,
+        0.05843999981880188,
+        0.05816100165247917,
+        0.05840099975466728
+      ],
+      "median_ms": 0.058400001376867294,
+      "weight_GBs": 810.7835425284017,
+      "post_mismatches": 0
+    }
+  ]
+}

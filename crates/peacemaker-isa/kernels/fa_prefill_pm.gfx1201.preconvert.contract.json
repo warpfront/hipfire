@@ -1,0 +1,34 @@
+{
+  "counts": {
+    "global_load_b128": 2,
+    "global_store_b32": 4,
+    "s_endpgm": 1,
+    "s_load_b128": 1,
+    "s_load_b32": 1,
+    "v_cvt_f16_f32_e32": 8,
+    "v_readfirstlane_b32": 1
+  },
+  "forbidden": [
+    "scratch_*",
+    "flat_*",
+    "buffer_*",
+    "global_atomic*",
+    "ds_*",
+    "s_barrier*",
+    "v_wmma*",
+    "v_swmmac*",
+    "v_writelane*",
+    "s_setpc*",
+    "s_swappc*",
+    "s_call*",
+    "s_waitcnt*"
+  ],
+  "group_segment_fixed_bytes": 0,
+  "launch_dynamic_lds_bytes": 0,
+  "require_wave32": true,
+  "require_zero_private": true,
+  "require_zero_spills": true,
+  "sgpr_max": 104,
+  "symbol": "attention_fa2_q_preconvert_pm_gfx1201",
+  "vgpr_max": 24
+}

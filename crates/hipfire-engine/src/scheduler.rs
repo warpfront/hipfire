@@ -1,0 +1,1464 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Host-side continuous-batch scheduler — architecture-neutral.
+//!
+//! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
+//! No behaviour change.
+
+use std::time::Instant;
+
+use crate::terminal::{
+    batch_active_owner_matches, batch_bind_active, batch_check_abort,
+    batch_clear_terminal_at_generation, batch_is_current, batch_mark_ready_with_pending,
+    batch_poll_decision, batch_ready_owner_matches, batch_transition_to_queued, AttemptKey,
+    BatchGeneration, ClientTerminalDecision, LaneTicket, SingletonTransfer,
+    CLIENT_TERMINAL_COMMIT_TIMEOUT,
+};
+
+// ── Batch sampling controls and cohort key ───────────────────────────────
+
+/// Validated sampling controls for a single request. One active cohort has
+/// exactly one key because `sample_product` accepts scalar controls but
+/// per-row RNG/history.
+#[derive(Debug, Clone)]
+pub struct BatchSampling {
+    pub temp: f32,
+    pub top_p: f32,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f32>,
+    pub repeat_penalty: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+    pub repeat_window: usize,
+}
+
+impl BatchSampling {
+    pub fn key(&self) -> BatchSamplingKey {
+        BatchSamplingKey {
+            temp_bits: self.temp.to_bits(),
+            top_p_bits: self.top_p.to_bits(),
+            top_k: self.top_k,
+            min_p_bits: self.min_p.map(|v| v.to_bits()),
+            repeat_bits: self.repeat_penalty.to_bits(),
+            presence_bits: self.presence_penalty.to_bits(),
+            frequency_bits: self.frequency_penalty.to_bits(),
+            repeat_window: self.repeat_window,
+        }
+    }
+}
+
+/// Canonical sampling key made from validated values via `f32::to_bits`.
+/// Derived Eq/Hash is bit-exact; no epsilon.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BatchSamplingKey {
+    pub temp_bits: u32,
+    pub top_p_bits: u32,
+    pub top_k: Option<u32>,
+    pub min_p_bits: Option<u32>,
+    pub repeat_bits: u32,
+    pub presence_bits: u32,
+    pub frequency_bits: u32,
+    pub repeat_window: usize,
+}
+
+// ── Typed lane state ─────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct QwenBatchLane {
+    pub key: AttemptKey,
+    pub ticket: LaneTicket,
+    pub sampling: BatchSampling,
+    pub prompt_len: usize,
+    pub seq_pos: usize,
+    pub next_token: Option<u32>,
+    pub rng_state: u64,
+    pub conversation_tokens: Vec<u32>,
+    pub streamed_tokens: Vec<u32>,
+    pub bytes_fed_to_filter: usize,
+    pub created_at: Instant,
+    /// Host Instant after successful lane prefill + first sample.
+    pub prefill_done_at: Option<Instant>,
+    /// Host Instant stamped immediately before the first classified token emit.
+    pub first_token_at: Option<Instant>,
+    /// Peak concurrent Running lanes observed while this lane was active.
+    pub max_active_lanes: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchPendingTerminal {
+    pub key: AttemptKey,
+    pub ticket: LaneTicket,
+    pub sampling: BatchSampling,
+    pub prompt_len: usize,
+    pub seq_pos: usize,
+    pub pending_done: serde_json::Value,
+    pub deadline: Instant,
+}
+
+#[derive(Debug)]
+pub enum BatchLane {
+    Empty { generation: u64 },
+    Seeding(QwenBatchLane),
+    Running(QwenBatchLane),
+    AwaitingClient(BatchPendingTerminal),
+}
+
+impl BatchLane {
+    pub fn generation(&self) -> u64 {
+        match self {
+            BatchLane::Empty { generation } => *generation,
+            BatchLane::Seeding(l) => l.ticket.generation,
+            BatchLane::Running(l) => l.ticket.generation,
+            BatchLane::AwaitingClient(t) => t.ticket.generation,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        matches!(self, BatchLane::Empty { .. })
+    }
+    pub fn is_awaiting(&self) -> bool {
+        matches!(self, BatchLane::AwaitingClient(_))
+    }
+    pub fn key(&self) -> Option<&AttemptKey> {
+        match self {
+            BatchLane::Empty { .. } => None,
+            BatchLane::Seeding(l) => Some(&l.key),
+            BatchLane::Running(l) => Some(&l.key),
+            BatchLane::AwaitingClient(t) => Some(&t.key),
+        }
+    }
+}
+
+/// Host-side continuous-batch scheduler (no GPU). Owns fixed slots, pending
+/// inbox keyed by `(id, attempt_id)`, cohort sampling key, and per-lane
+/// lifecycle. GPU batch state (`Qwen35DecodeBatchState`) is layered above
+/// when available; tests drive this scheduler directly.
+pub struct ContinuousBatchScheduler {
+    pub max_batch: usize,
+    pub lane_capacity: usize,
+    pub lanes: Vec<BatchLane>,
+    pub inbox: std::collections::VecDeque<AttemptKey>,
+    pub pending: std::collections::HashMap<AttemptKey, BatchPendingRequest>,
+    pub pending_sampling: std::collections::HashMap<AttemptKey, BatchSampling>,
+    pub cohort_key: Option<BatchSamplingKey>,
+    pub next_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchPendingRequest {
+    pub key: AttemptKey,
+    /// Opaque terminal-registry admission owner. This is independent of the
+    /// scheduler's lane reuse generation.
+    pub admission: BatchGeneration,
+    /// Exact wire request retained for a singleton handoff. Batch barriers
+    /// must not reconstruct a reduced generate payload.
+    pub original_msg: serde_json::Value,
+    pub prompt: String,
+    pub prompt_tokens: Vec<u32>,
+    pub started_in_think: bool,
+    pub system: Option<String>,
+    pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    pub max_think_tokens: usize,
+    pub max_tokens: usize,
+    /// Explicit wire `seed` (OpenAI-compatible), parsed and rejected-loudly by
+    /// the daemon before enqueue. `None` = unseeded: the lane draws fresh
+    /// counter/nonce entropy at assignment time.
+    pub client_seed: Option<u64>,
+    pub sampling: BatchSampling,
+}
+
+impl ContinuousBatchScheduler {
+    pub fn new(max_batch: usize, lane_capacity: usize) -> Self {
+        let lanes = (0..max_batch)
+            .map(|_| BatchLane::Empty { generation: 0 })
+            .collect();
+        Self {
+            max_batch,
+            lane_capacity,
+            lanes,
+            inbox: std::collections::VecDeque::new(),
+            pending: std::collections::HashMap::new(),
+            pending_sampling: std::collections::HashMap::new(),
+            cohort_key: None,
+            next_generation: 1,
+        }
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.max_batch
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l,
+                    BatchLane::Seeding(_) | BatchLane::Running(_) | BatchLane::AwaitingClient(_)
+                )
+            })
+            .count()
+    }
+    pub fn running_count(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|l| matches!(l, BatchLane::Running(_)))
+            .count()
+    }
+    pub fn awaiting_count(&self) -> usize {
+        self.lanes
+            .iter()
+            .filter(|l| matches!(l, BatchLane::AwaitingClient(_)))
+            .count()
+    }
+
+    pub fn empty_lanes(&self) -> Vec<usize> {
+        self.lanes
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.is_empty())
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub fn enqueue(&mut self, req: BatchPendingRequest) -> bool {
+        let key = req.key.clone();
+        if !batch_is_current(&key.id, key.attempt_id, req.admission)
+            || self.pending.contains_key(&key)
+            || self.inbox.contains(&key)
+        {
+            return false;
+        }
+        let sampling = req.sampling.clone();
+        self.inbox.push_back(key.clone());
+        self.pending.insert(key.clone(), req);
+        self.pending_sampling.insert(key, sampling);
+        true
+    }
+
+    pub fn cohort_key_for(&self, key: &AttemptKey) -> Option<BatchSamplingKey> {
+        self.pending_sampling.get(key).map(|s| s.key())
+    }
+
+    pub fn try_assign_one(&mut self) -> Option<(AttemptKey, LaneTicket)> {
+        let lane_idx = self.lanes.iter().position(|l| l.is_empty())?;
+        let front_key = self.inbox.front()?.clone();
+        let req_sampling_key = self.cohort_key_for(&front_key)?;
+        if let Some(cohort) = &self.cohort_key {
+            if cohort != &req_sampling_key {
+                return None;
+            }
+        }
+        let key = self.inbox.pop_front()?;
+        let req = self.pending.get(&key)?.clone();
+        if !batch_is_current(&key.id, key.attempt_id, req.admission) {
+            self.pending.remove(&key);
+            self.pending_sampling.remove(&key);
+            self.maybe_clear_cohort();
+            return None;
+        }
+        let lane_generation = self.next_generation;
+        self.next_generation += 1;
+        let ticket = LaneTicket {
+            lane: lane_idx,
+            generation: lane_generation,
+            admission: req.admission,
+        };
+        // The reader may already have promoted the key to Queued. The
+        // idempotent transition keeps direct inbox and daemon enqueue paths
+        // on one generation-checked producer API.
+        if !batch_transition_to_queued(&key.id, key.attempt_id, req.admission)
+            || !batch_bind_active(&key.id, key.attempt_id, req.admission, ticket)
+        {
+            self.pending.remove(&key);
+            self.pending_sampling.remove(&key);
+            self.maybe_clear_cohort();
+            return None;
+        }
+        let lane = QwenBatchLane {
+            key: key.clone(),
+            ticket,
+            sampling: req.sampling.clone(),
+            prompt_len: req.prompt_tokens.len(),
+            seq_pos: 0,
+            next_token: None,
+            rng_state: request_rng_u64(&key, req.client_seed),
+            conversation_tokens: Vec::new(),
+            streamed_tokens: Vec::new(),
+            bytes_fed_to_filter: 0,
+            created_at: Instant::now(),
+            prefill_done_at: None,
+            first_token_at: None,
+            max_active_lanes: 0,
+        };
+        self.lanes[lane_idx] = BatchLane::Running(lane);
+        if self.cohort_key.is_none() {
+            self.cohort_key = Some(req_sampling_key);
+        }
+        Some((key, ticket))
+    }
+
+    /// Install an already-started request (a singleton generation promoted
+    /// into the batch via `singleton_handoff_to_batch`) directly as a Running
+    /// lane. Unlike [`Self::enqueue`] + [`Self::try_assign_one`] it never
+    /// passes through the inbox, so the driver neither re-announces nor
+    /// re-prefills it. `progress` carries the lane's wire/host progress
+    /// (positions, emitted tokens, filter offset, RNG, timings); its key and
+    /// ticket are overwritten. Returns the bound ticket, or `None` (nothing
+    /// installed) when no lane is free, the cohort differs, or the admission
+    /// is not current.
+    pub fn adopt_running(
+        &mut self,
+        req: BatchPendingRequest,
+        progress: QwenBatchLane,
+    ) -> Option<LaneTicket> {
+        let key = req.key.clone();
+        let lane_idx = self.lanes.iter().position(|l| l.is_empty())?;
+        let sampling_key = req.sampling.key();
+        if self.cohort_key.as_ref().is_some_and(|c| c != &sampling_key)
+            || self.pending.contains_key(&key)
+            || self.inbox.contains(&key)
+            || !batch_is_current(&key.id, key.attempt_id, req.admission)
+        {
+            return None;
+        }
+        let ticket = LaneTicket {
+            lane: lane_idx,
+            generation: self.next_generation,
+            admission: req.admission,
+        };
+        if !batch_transition_to_queued(&key.id, key.attempt_id, req.admission)
+            || !batch_bind_active(&key.id, key.attempt_id, req.admission, ticket)
+        {
+            return None;
+        }
+        self.next_generation += 1;
+        self.pending_sampling
+            .insert(key.clone(), req.sampling.clone());
+        self.pending.insert(key.clone(), req);
+        self.lanes[lane_idx] = BatchLane::Running(QwenBatchLane {
+            key,
+            ticket,
+            ..progress
+        });
+        if self.cohort_key.is_none() {
+            self.cohort_key = Some(sampling_key);
+        }
+        Some(ticket)
+    }
+
+    pub fn mark_awaiting_commit(&mut self, lane: usize, pending_done: serde_json::Value) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let lane_state =
+            std::mem::replace(&mut self.lanes[lane], BatchLane::Empty { generation: 0 });
+        match lane_state {
+            BatchLane::Running(q) => {
+                let key = q.key.clone();
+                let ticket = q.ticket;
+                if !batch_mark_ready_with_pending(
+                    &key.id,
+                    key.attempt_id,
+                    ticket.admission,
+                    ticket,
+                    pending_done.clone(),
+                ) {
+                    self.lanes[lane] = BatchLane::Running(q);
+                    return false;
+                }
+                let sampling = q.sampling.clone();
+                let prompt_len = q.prompt_len;
+                let seq_pos = q.seq_pos;
+                let deadline = Instant::now() + CLIENT_TERMINAL_COMMIT_TIMEOUT;
+                let term = BatchPendingTerminal {
+                    key: key.clone(),
+                    ticket,
+                    sampling,
+                    prompt_len,
+                    seq_pos,
+                    pending_done,
+                    deadline,
+                };
+                self.lanes[lane] = BatchLane::AwaitingClient(term);
+                true
+            }
+            other => {
+                self.lanes[lane] = other;
+                false
+            }
+        }
+    }
+
+    pub fn commit_lane(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        self.commit_lane_inner(lane, expected, admission, true)
+    }
+
+    /// Commit a ready lane while retaining its keyed terminal registry entry.
+    ///
+    /// Continuous-batch callers use this when a staged `done` still needs to
+    /// claim the request-owned terminal slot. They must clear the entry after
+    /// the terminal writer has claimed and emitted the envelope.
+    pub fn commit_lane_retain_terminal(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        self.commit_lane_inner(lane, expected, admission, false)
+    }
+
+    fn commit_lane_inner(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+        clear_terminal: bool,
+    ) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::AwaitingClient(t) if &t.key == expected => (t.ticket, t.ticket.generation),
+            _ => return false,
+        };
+        if ticket.admission != admission {
+            return false;
+        }
+        if !matches!(
+            batch_poll_decision(&expected.id, expected.attempt_id, admission),
+            Some(ClientTerminalDecision::Commit)
+        ) || !batch_ready_owner_matches(&expected.id, expected.attempt_id, admission, ticket)
+        {
+            return false;
+        }
+        self.lanes[lane] = BatchLane::Empty {
+            generation: lane_generation + 1,
+        };
+        self.pending.remove(expected);
+        self.pending_sampling.remove(expected);
+        if clear_terminal {
+            batch_clear_terminal_at_generation(&expected.id, expected.attempt_id, admission);
+        }
+        self.maybe_clear_cohort();
+        true
+    }
+
+    pub fn abort_lane(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
+                (q.ticket, q.ticket.generation)
+            }
+            BatchLane::AwaitingClient(t) if &t.key == expected => (t.ticket, t.ticket.generation),
+            _ => return false,
+        };
+        if ticket.admission != admission
+            || (!batch_active_owner_matches(&expected.id, expected.attempt_id, admission, ticket)
+                && !batch_ready_owner_matches(&expected.id, expected.attempt_id, admission, ticket))
+        {
+            return false;
+        }
+        self.lanes[lane] = BatchLane::Empty {
+            generation: lane_generation + 1,
+        };
+        self.pending.remove(expected);
+        self.pending_sampling.remove(expected);
+        self.inbox.retain(|k| k != expected);
+        batch_clear_terminal_at_generation(&expected.id, expected.attempt_id, admission);
+        self.maybe_clear_cohort();
+        true
+    }
+
+    /// Retire a lane after a successful GPU reset while keeping the exact
+    /// batch terminal owner live for an immediate singleton handoff.
+    ///
+    /// Unlike [`Self::abort_lane`], this deliberately does not clear the
+    /// keyed terminal registry. The caller must consume that owner with
+    /// `batch_handoff_to_singleton_and_clear`; clearing it first would make a
+    /// reset failure or stale requeue unclaimable.
+    pub fn retire_lane_for_singleton(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
+                (q.ticket, q.ticket.generation)
+            }
+            BatchLane::AwaitingClient(t) if &t.key == expected => (t.ticket, t.ticket.generation),
+            _ => return false,
+        };
+        if ticket.admission != admission
+            || !batch_active_owner_matches(&expected.id, expected.attempt_id, admission, ticket)
+        {
+            return false;
+        }
+        self.lanes[lane] = BatchLane::Empty {
+            generation: lane_generation + 1,
+        };
+        self.pending.remove(expected);
+        self.pending_sampling.remove(expected);
+        self.inbox.retain(|k| k != expected);
+        self.maybe_clear_cohort();
+        true
+    }
+
+    pub fn abort_queued(&mut self, key: &AttemptKey, admission: BatchGeneration) -> bool {
+        if !self.inbox.contains(key) {
+            return false;
+        }
+        if self
+            .pending
+            .get(key)
+            .is_none_or(|request| request.admission != admission)
+        {
+            return false;
+        }
+        if !batch_is_current(&key.id, key.attempt_id, admission)
+            || !batch_check_abort(&key.id, key.attempt_id, admission)
+        {
+            return false;
+        }
+        self.inbox.retain(|k| k != key);
+        self.pending.remove(key);
+        self.pending_sampling.remove(key);
+        batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+        self.maybe_clear_cohort();
+        true
+    }
+
+    pub fn reset_lane_for_reuse(&mut self, lane: usize) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        if !self.lanes[lane].is_empty() {
+            return false;
+        }
+        true
+    }
+
+    pub fn fail_all_active(&mut self) -> Vec<AttemptKey> {
+        let mut failed = Vec::new();
+        let mut owned = Vec::new();
+        for lane in &mut self.lanes {
+            match lane {
+                BatchLane::Running(q) | BatchLane::Seeding(q) => {
+                    failed.push(q.key.clone());
+                    owned.push((q.key.clone(), q.ticket.admission));
+                }
+                BatchLane::AwaitingClient(t) => {
+                    failed.push(t.key.clone());
+                    owned.push((t.key.clone(), t.ticket.admission));
+                }
+                BatchLane::Empty { .. } => {}
+            }
+            if !matches!(lane, BatchLane::Empty { .. }) {
+                let generation = lane.generation();
+                *lane = BatchLane::Empty {
+                    generation: generation + 1,
+                };
+            }
+        }
+        for (key, admission) in owned {
+            self.pending.remove(&key);
+            self.pending_sampling.remove(&key);
+            batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+        }
+        for key in self.inbox.drain(..) {
+            let admission = self.pending.get(&key).map(|request| request.admission);
+            self.pending.remove(&key);
+            self.pending_sampling.remove(&key);
+            if let Some(admission) = admission {
+                batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+            }
+        }
+        self.cohort_key = None;
+        failed
+    }
+
+    pub fn maybe_clear_cohort(&mut self) {
+        let has_active = self.lanes.iter().any(|l| {
+            matches!(
+                l,
+                BatchLane::Seeding(_) | BatchLane::Running(_) | BatchLane::AwaitingClient(_)
+            )
+        });
+        if !has_active {
+            self.cohort_key = None;
+        }
+        if !has_active && self.inbox.is_empty() {
+            self.cohort_key = None;
+        }
+    }
+
+    pub fn find_lane_by_key(&self, key: &AttemptKey) -> Option<usize> {
+        self.lanes
+            .iter()
+            .position(|l| l.key().is_some_and(|k| k == key))
+    }
+    pub fn pending_done_for(&self, lane: usize) -> Option<serde_json::Value> {
+        match &self.lanes[lane] {
+            BatchLane::AwaitingClient(t) => Some(t.pending_done.clone()),
+            _ => None,
+        }
+    }
+    pub fn deadline_for(&self, lane: usize) -> Option<Instant> {
+        match &self.lanes[lane] {
+            BatchLane::AwaitingClient(t) => Some(t.deadline),
+            _ => None,
+        }
+    }
+}
+/// Deterministic per-request RNG derived from canonical base 0x13579BDF mixed
+/// with the key's id bytes and attempt_id. Ensures each lane/request gets a
+/// distinct stream rather than the same fixed seed.
+pub fn batch_rng_for_key(key: &AttemptKey) -> u64 {
+    let mut h = 0x13579BDFu64;
+    h = h.wrapping_add(key.attempt_id.wrapping_mul(0x9E3779B97F4A7C15));
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58476D1CE4E5B9);
+    h ^= h >> 27;
+    for &b in key.id.as_bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        h ^= h >> 33;
+    }
+    h = h.wrapping_mul(0xFF51AFD7ED558CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CEB9FE1A85EC53);
+    h ^= h >> 33;
+    if h == 0 {
+        0x13579BDF
+    } else {
+        h
+    }
+}
+
+/// Process-global monotonic request counter, mixed into every unseeded
+/// request's derived RNG so two requests that reuse the same wire key (clients
+/// that always send `id:"r1", attempt_id:1`) still get distinct sampler
+/// streams — on the sequential route AND across continuous-batch cohorts.
+static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-start nonce (nanos since UNIX_EPOCH). Mixed into the derived seed so
+/// raw daemon clients that reuse identical `(id, attempt_id)` keys across
+/// daemon restarts do not replay the same unseeded draw sequences; within a
+/// process the counter already guarantees distinctness.
+static BOOT_NONCE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+});
+
+/// Fresh unseeded per-request RNG state: [`batch_rng_for_key`] mixed with the
+/// process-global request counter and [`BOOT_NONCE`]. Every call draws new
+/// counter entropy regardless of client keying.
+pub fn fresh_request_rng(key: &AttemptKey) -> u64 {
+    batch_rng_for_key(key)
+        ^ *BOOT_NONCE
+        ^ REQUEST_COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_mul(0x9E3779B97F4A7C15)
+}
+
+/// Explicit-seed RNG state: splitmix over the wire seed ALONE (attempt
+/// identity deliberately excluded so an explicit seed reproduces its draw
+/// sequence for every request that carries it). `0` maps to the 0x13579BDF
+/// sentinel because xorshift state 0 is stuck.
+pub fn seeded_request_rng(client_seed: u64) -> u64 {
+    let mut z = client_seed.wrapping_add(0x13579BDF);
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58476D1CE4E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0xFF51AFD7ED558CCD);
+    z ^= z >> 31;
+    let seed = z as u32;
+    if seed == 0 {
+        0x13579BDF as u64
+    } else {
+        seed as u64
+    }
+}
+
+/// Per-request sampler RNG across BOTH sampling routes: explicit wire `seed`
+/// wins via [`seeded_request_rng`], else fresh counter/nonce entropy via
+/// [`fresh_request_rng`]. Consumed as u32 by the sample kernels; returned
+/// widened so callers need no second cast.
+pub fn request_rng_u64(key: &AttemptKey, client_seed: Option<u64>) -> u64 {
+    match client_seed {
+        Some(s) => seeded_request_rng(s),
+        None => fresh_request_rng(key),
+    }
+}
+
+/// Per-request sampler seed (u32) for the sequential AR route, replacing the
+/// historical fixed 0x13579BDF that made same-prompt requests byte-identical
+/// at temp>0. The result is never 0: xorshift32 treats a 0 state as
+/// stuck/degenerate.
+pub fn request_seed_for(key: &AttemptKey, client_seed: Option<u64>) -> u32 {
+    let seed = request_rng_u64(key, client_seed) as u32;
+    if seed == 0 {
+        0x13579BDF
+    } else {
+        seed
+    }
+}
+
+/// Eligibility for continuous batching. Conservative: only single-GPU
+/// exact HIP Qwen 5/6, Flash-Next (qwen4, 16) exact AR lanes and dense LFM 11
+/// stateless text without excluded features.
+///
+/// This is the architecture-capability and request-shape gate only: it reads
+/// the static `supports_continuous_batch` cap and says nothing about whether a
+/// batch route was actually staged. The qwen4 cap is true solely for the
+/// fn-lanes route, which exists only when the load staged it under
+/// `serve.vmm_batch`; the daemon decides on the staged route
+/// (`continuous_batch_capable`, the staged bundle state) before a request
+/// enters the scheduler. This function never constructs or admits lanes.
+pub fn is_batch_eligible(
+    caps: &saddle_core::caps::ArchCaps,
+    req: &saddle_core::caps::BatchEligibilityRequest,
+) -> bool {
+    if !req.serve_continuous_batch {
+        return false;
+    }
+    if req.continuous_batch_size <= 1 {
+        return false;
+    }
+    if !caps.supports_continuous_batch {
+        return false;
+    }
+    if req.pp != 1 || req.ep_is_some {
+        return false;
+    }
+    if req.has_image || req.has_tools || req.has_stop {
+        return false;
+    }
+    if req.has_speculator || req.has_adaptive || req.has_pflash {
+        return false;
+    }
+    if req.has_messages_history {
+        return false;
+    }
+    if !req.think_mode_is_nonthink {
+        return false;
+    }
+    true
+}
+
+/// Return the sole user message's text when the request has an eligible
+/// single-user `messages` array. Prompt-only requests return `None`.
+pub fn batch_single_user_content(msg: &serde_json::Value) -> Option<String> {
+    let arr = msg.get("messages")?.as_array()?;
+    if arr.len() != 1 {
+        return None;
+    }
+    arr[0]
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+}
+
+/// HTTP/OpenAI `messages` are batch-eligible only when absent (prompt path)
+/// or exactly one user turn. Multi-turn, system/assistant/tool roles, and
+/// tool_call payloads stay on the sequential route.
+pub fn batch_messages_are_single_user(msg: &serde_json::Value) -> bool {
+    let Some(messages) = msg.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    if arr.is_empty() {
+        return true;
+    }
+    if arr.len() != 1 {
+        return false;
+    }
+    let m0 = &arr[0];
+    if m0.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return false;
+    }
+    // Shared contract with CLI: sole user content must be a plain string.
+    // Multipart (array) and image content are sequential-only.
+    if m0.get("content").and_then(|v| v.as_str()).is_none() {
+        return false;
+    }
+    // Tool-call payloads on the sole message force sequential (batch v1 has
+    // no tools path). Empty / missing tool_calls is fine.
+    if let Some(tc) = m0.get("tool_calls") {
+        if tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object() {
+            return false;
+        }
+    }
+    true
+}
+
+/// VMM batch route message shape: a text chat of any length. Every turn is
+/// `system`/`user`/`assistant` with plain string content, rendered through
+/// the model's Jinja template exactly as the singleton route renders it.
+/// Still sequential, with their reasons:
+/// - `tool` turns and non-empty `tool_calls`: tool replay needs the
+///   singleton's grammar-constrained CPU sampling and tool-call parser,
+///   which the batch executor does not run per row;
+/// - multipart / image content: the vision path.
+pub fn batch_messages_are_text_chat(msg: &serde_json::Value) -> bool {
+    let Some(messages) = msg.get("messages") else {
+        return true;
+    };
+    let Some(arr) = messages.as_array() else {
+        return false;
+    };
+    arr.iter().all(|m| {
+        matches!(
+            m.get("role").and_then(|v| v.as_str()),
+            Some("system" | "user" | "assistant")
+        ) && m.get("content").is_some_and(|v| v.is_string())
+            && !m
+                .get("tool_calls")
+                .is_some_and(|tc| tc.as_array().is_some_and(|a| !a.is_empty()) || tc.is_object())
+    })
+}
+
+pub fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize {
+    params
+        .and_then(|v| v.get("continuous_batch_size"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize
+}
+
+/// Load-time VMM continuous-batching route request (`params.serve_vmm_batch`,
+/// projected by serve only when `serve.vmm_batch` is on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VmmBatchParams {
+    pub spec: bool,
+    pub nonexact: bool,
+    pub sampled: bool,
+    pub max_batch_tokens: usize,
+    pub prefill_min_tokens: usize,
+}
+
+pub fn parse_vmm_batch_params(params: Option<&serde_json::Value>) -> Option<VmmBatchParams> {
+    let v = params?.get("serve_vmm_batch")?;
+    let flag = |k: &str, d: bool| v.get(k).and_then(|x| x.as_bool()).unwrap_or(d);
+    let num = |k: &str, d: u64| v.get(k).and_then(|x| x.as_u64()).unwrap_or(d) as usize;
+    Some(VmmBatchParams {
+        spec: flag("spec", true),
+        nonexact: flag("nonexact", false),
+        sampled: flag("sampled", false),
+        max_batch_tokens: num("max_batch_tokens", 4096).max(1),
+        prefill_min_tokens: num("prefill_min_tokens", 1).max(1),
+    })
+}
+
+pub fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
+    msg.get("params")
+        .and_then(|p| p.get("serve_continuous_batch"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        || msg
+            .get("serve_continuous_batch")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+}
+
+/// `max_tokens` a generate request resolves to when the wire omits it. Every
+/// generate route (sequential, continuous batch, multi-slot) uses this.
+pub const DEFAULT_GENERATE_MAX_TOKENS: usize = 4096;
+
+/// Effective `(temperature, top_p)` for a generate request on every route.
+/// Precedence per knob: explicit request field > the `.hfq`-baked author
+/// recommendation (`rec_*`) > the carrier's arch ladder.
+pub fn resolve_temp_top_p(
+    msg: &serde_json::Value,
+    arch_id: u32,
+    rec_temperature: Option<f32>,
+    rec_top_p: Option<f32>,
+) -> (f32, f32) {
+    let defaults = hipfire_loader::carrier_for(arch_id)
+        .map(|c| c.sampling_defaults())
+        .unwrap_or_default();
+    let default_temp = rec_temperature.map(|x| x as f64).unwrap_or(defaults.temp);
+    let default_top_p = rec_top_p.map(|x| x as f64).unwrap_or(defaults.top_p);
+    let temp = msg
+        .get("temperature")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(default_temp) as f32;
+    let top_p = msg
+        .get("top_p")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(default_top_p) as f32;
+    (temp, top_p)
+}
+
+pub fn resolve_batch_sampling(
+    msg: &serde_json::Value,
+    m: &hipfire_loader::LoadedModel,
+) -> BatchSampling {
+    let defaults = hipfire_loader::carrier_for(m.arch_id)
+        .map(|c| c.sampling_defaults())
+        .unwrap_or_default();
+    let (temp, top_p) = resolve_temp_top_p(msg, m.arch_id, m.rec_temperature, m.rec_top_p);
+    let default_repeat = defaults.repeat_penalty;
+    let repeat_penalty = msg
+        .get("repeat_penalty")
+        .or_else(|| msg.get("repetition_penalty"))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(default_repeat) as f32;
+    let repeat_window = msg
+        .get("repeat_window")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(128) as usize;
+    let presence_penalty =
+        (msg.get("presence_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(m.rec_presence_penalty.unwrap_or(0.0) as f64) as f32)
+            .max(0.0);
+    let frequency_penalty = (msg
+        .get("frequency_penalty")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0) as f32)
+        .max(0.0);
+    let top_k: Option<u32> = msg
+        .get("top_k")
+        .and_then(|v| v.as_u64())
+        .map(|k| k as u32)
+        .or_else(|| m.rec_top_k.map(|k| k as u32))
+        .filter(|&k| k > 0);
+    let min_p: Option<f32> = msg
+        .get("min_p")
+        .and_then(|v| v.as_f64())
+        .map(|p| p as f32)
+        .or(m.rec_min_p)
+        .filter(|&p| p > 0.0);
+    BatchSampling {
+        temp,
+        top_p,
+        top_k,
+        min_p,
+        repeat_penalty,
+        presence_penalty,
+        frequency_penalty,
+        repeat_window,
+    }
+}
+
+pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
+    if sched.active_count() != 0 || sched.awaiting_count() != 0 {
+        return 0;
+    }
+    if sched.inbox.len() < 2 {
+        return 0;
+    }
+    // Peek front without mutating.
+    let front_key = match sched.inbox.front() {
+        Some(k) => k.clone(),
+        None => return 0,
+    };
+    let front_req = match sched.pending.get(&front_key) {
+        Some(r) => r,
+        None => return 0,
+    };
+    // Front must be ordinary: non-thinking, max_tokens>0, within capacity, not aborted.
+    if front_req.started_in_think {
+        return 0;
+    }
+    if front_req.max_tokens == 0 {
+        return 0;
+    }
+    if front_req.prompt_tokens.is_empty()
+        || front_req.prompt_tokens.len() >= sched.lane_capacity
+        || !crate::terminal::batch_lfm_admission_ok(
+            front_req.prompt_tokens.len(),
+            front_req.max_tokens,
+            sched.lane_capacity,
+        )
+    {
+        return 0;
+    }
+    if !crate::terminal::batch_is_current(&front_key.id, front_key.attempt_id, front_req.admission)
+        || crate::terminal::batch_check_abort(
+            &front_key.id,
+            front_key.attempt_id,
+            front_req.admission,
+        )
+    {
+        return 0;
+    }
+    let first_len = front_req.prompt_tokens.len();
+    let first_cohort = match sched.pending_sampling.get(&front_key) {
+        Some(s) => s.key(),
+        None => return 0,
+    };
+    let mut count = 1usize;
+    for key in sched.inbox.iter().skip(1) {
+        if count >= sched.max_batch {
+            break;
+        }
+        let req = match sched.pending.get(key) {
+            Some(r) => r,
+            None => break,
+        };
+        if req.started_in_think {
+            break;
+        }
+        if req.max_tokens == 0 {
+            break;
+        }
+        if req.prompt_tokens.len() != first_len {
+            break;
+        }
+        if req.prompt_tokens.is_empty()
+            || req.prompt_tokens.len() >= sched.lane_capacity
+            || !crate::terminal::batch_lfm_admission_ok(
+                req.prompt_tokens.len(),
+                req.max_tokens,
+                sched.lane_capacity,
+            )
+        {
+            break;
+        }
+        if !crate::terminal::batch_is_current(&key.id, key.attempt_id, req.admission)
+            || crate::terminal::batch_check_abort(&key.id, key.attempt_id, req.admission)
+        {
+            break;
+        }
+        let cohort = match sched.pending_sampling.get(key) {
+            Some(s) => s.key(),
+            None => break,
+        };
+        if cohort != first_cohort {
+            break;
+        }
+        count += 1;
+    }
+    if count >= 2 {
+        count
+    } else {
+        0
+    }
+}
+
+/// Small helper that reuses the existing `sample_lane_product` contract and
+/// populates the same lane fields as the sequential `while let try_assign_one` path.
+pub fn lfm_populate_lane_after_sample(
+    sched: &mut ContinuousBatchScheduler,
+    lane_idx: usize,
+    next_token: u32,
+    next_rng: u32,
+    prompt_len: usize,
+) {
+    if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
+        lane.prompt_len = prompt_len;
+        lane.seq_pos = prompt_len;
+        lane.next_token = Some(next_token);
+        lane.rng_state = next_rng as u64;
+        lane.conversation_tokens = Vec::new();
+        lane.streamed_tokens = Vec::new();
+        lane.bytes_fed_to_filter = 0;
+        lane.prefill_done_at = Some(Instant::now());
+    }
+}
+
+// ── Daemon inbox with barrier pushback ─────────────────────────────────
+
+/// Async inbox for DaemonMsg. The reader announces keys before queuing;
+/// the main loop drains via `try_recv` between GPU ticks. A non-generate
+/// or cohort-incompatible message is `push_front`ed as a barrier so it is
+/// not lost and returns to the outer `inbox.recv()` for sequential handling.
+pub struct DaemonInbox {
+    pub rx: std::sync::mpsc::Receiver<DaemonMsg>,
+    pub backlog: std::collections::VecDeque<DaemonMsg>,
+}
+
+/// Serve-batched generate messages queued for the main loop (reader-sent or
+/// pushed back, not yet received). A running singleton generation polls it
+/// at token boundaries to decide whether to promote itself into the VMM
+/// batch driver; nothing else reads it.
+static QUEUED_BATCH_GENERATES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn is_batch_generate(msg: &DaemonMsg) -> bool {
+    match msg {
+        DaemonMsg::RegularWithAdmission(v, _) | DaemonMsg::Regular(v) => {
+            v.get("type").and_then(|t| t.as_str()) == Some("generate")
+                && parse_serve_continuous_batch(v)
+        }
+        _ => false,
+    }
+}
+
+/// Reader thread: account one message about to be sent on the inbox channel.
+pub fn note_daemon_msg_queued(msg: &DaemonMsg) {
+    if is_batch_generate(msg) {
+        QUEUED_BATCH_GENERATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Number of serve-batched generates waiting for the main loop.
+pub fn queued_batch_generates() -> usize {
+    QUEUED_BATCH_GENERATES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn note_received<T>(r: Result<DaemonMsg, T>) -> Result<DaemonMsg, T> {
+    if let Ok(msg) = &r {
+        if is_batch_generate(msg) {
+            let _ = QUEUED_BATCH_GENERATES.fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| Some(n.saturating_sub(1)),
+            );
+        }
+    }
+    r
+}
+
+impl DaemonInbox {
+    pub fn new(rx: std::sync::mpsc::Receiver<DaemonMsg>) -> Self {
+        Self {
+            rx,
+            backlog: std::collections::VecDeque::new(),
+        }
+    }
+    pub fn recv(&mut self) -> Result<DaemonMsg, std::sync::mpsc::RecvError> {
+        if let Some(msg) = self.backlog.pop_front() {
+            return note_received(Ok(msg));
+        }
+        note_received(self.rx.recv())
+    }
+    pub fn try_recv(&mut self) -> Result<DaemonMsg, std::sync::mpsc::TryRecvError> {
+        if let Some(msg) = self.backlog.pop_front() {
+            return note_received(Ok(msg));
+        }
+        note_received(self.rx.try_recv())
+    }
+    pub fn recv_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<DaemonMsg, std::sync::mpsc::RecvTimeoutError> {
+        if let Some(msg) = self.backlog.pop_front() {
+            return note_received(Ok(msg));
+        }
+        note_received(self.rx.recv_timeout(timeout))
+    }
+    pub fn push_front(&mut self, msg: DaemonMsg) {
+        if is_batch_generate(&msg) {
+            QUEUED_BATCH_GENERATES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.backlog.push_front(msg);
+    }
+    /// Non-blocking: move every already-delivered message into the backlog
+    /// (order preserved) and report whether one is a serve-batched generate
+    /// (`serve_continuous_batch`). The VMM route uses this to send a request
+    /// that is lonely at dispatch to the unchanged singleton route.
+    pub fn has_pending_batch_generate(&mut self) -> bool {
+        while let Ok(msg) = self.rx.try_recv() {
+            self.backlog.push_back(msg);
+        }
+        self.backlog.iter().any(|m| match m {
+            DaemonMsg::RegularWithAdmission(v, _) | DaemonMsg::Regular(v) => {
+                v.get("type").and_then(|t| t.as_str()) == Some("generate")
+                    && parse_serve_continuous_batch(v)
+            }
+            _ => false,
+        })
+    }
+}
+
+/// Message types pushed from the stdin-reader thread to the main
+/// processing loop. Abort/commit control messages are NOT forwarded —
+/// they're handled inline in the reader thread via
+/// [`apply_terminal_control`]. This is what lets the abort signal
+/// interrupt a mid-flight prefill; the main loop is blocked on prefill
+/// compute and would only see new stdin lines after that prefill completed.
+#[derive(Debug, Clone)]
+pub enum DaemonMsg {
+    Regular(serde_json::Value),
+    /// A generate request with the admission token minted by the stdin reader.
+    ///
+    /// The token is carried out-of-band: it is an internal ownership
+    /// capability and must never be recovered by looking up the request key
+    /// after the message has been admitted.
+    RegularWithAdmission(serde_json::Value, BatchGeneration),
+    /// A batch think-barrier handoff that already owns the singleton
+    /// terminal transaction. Main must adopt the snapshot; it must not
+    /// re-announce or rediscover the retired batch admission.
+    SingletonWithAdmission(serde_json::Value, SingletonTransfer),
+    ParseError(String),
+}
+
+/// Preserve an explicit singleton owner while a batch driver parks a full
+/// request as a sequential barrier.
+pub fn daemon_singleton_with_admission(
+    value: serde_json::Value,
+    transfer: SingletonTransfer,
+) -> DaemonMsg {
+    DaemonMsg::SingletonWithAdmission(value, transfer)
+}
+
+/// Preserve an admission token while a batch driver parks a message as a
+/// sequential barrier.
+pub fn daemon_regular_with_admission(
+    value: serde_json::Value,
+    admission: Option<BatchGeneration>,
+) -> DaemonMsg {
+    match admission {
+        Some(admission) => DaemonMsg::RegularWithAdmission(value, admission),
+        None => DaemonMsg::Regular(value),
+    }
+}
+
+pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
+
+/// Error from the real GPU batch driver. Host stub never errors.
+#[derive(Debug)]
+pub enum BatchDriveError {
+    Gpu(String),
+    Poisoned(String),
+}
+impl std::fmt::Display for BatchDriveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BatchDriveError::Gpu(s) => write!(f, "batch gpu error: {}", s),
+            BatchDriveError::Poisoned(s) => write!(f, "batch poisoned: {}", s),
+        }
+    }
+}
+impl std::error::Error for BatchDriveError {}
+
+pub fn lane_max_tokens(key: &AttemptKey, sched: &ContinuousBatchScheduler) -> usize {
+    sched.pending.get(key).map(|r| r.max_tokens).unwrap_or(4096)
+}
+
+pub fn batch_finite_rate(count: usize, seconds: f64) -> f64 {
+    if seconds <= 0.0 || !seconds.is_finite() {
+        return 0.0;
+    }
+    let rate = count as f64 / seconds;
+    if rate.is_finite() {
+        rate
+    } else {
+        0.0
+    }
+}
+
+pub struct BatchLaneDoneMetrics {
+    pub latency_ms: f64,
+    pub ttft_ms: f64,
+    pub prefill_ms: f64,
+    pub prefill_tok_s: f64,
+    pub tok_s: f64,
+    pub decode_tok_s: f64,
+}
+
+pub fn batch_lane_done_metrics(
+    created_at: Instant,
+    prefill_done_at: Option<Instant>,
+    first_token_at: Option<Instant>,
+    finished_at: Instant,
+    prompt_len: usize,
+    generated: usize,
+) -> BatchLaneDoneMetrics {
+    let wall_s = finished_at
+        .saturating_duration_since(created_at)
+        .as_secs_f64();
+    let latency_ms = if wall_s.is_finite() && wall_s > 0.0 {
+        wall_s * 1000.0
+    } else {
+        0.0
+    };
+
+    let prefill_s = prefill_done_at
+        .map(|t| t.saturating_duration_since(created_at).as_secs_f64())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(0.0);
+    let prefill_ms = prefill_s * 1000.0;
+    let prefill_tok_s = batch_finite_rate(prompt_len, prefill_s);
+
+    let ttft_s = first_token_at
+        .map(|t| t.saturating_duration_since(created_at).as_secs_f64())
+        .filter(|s| s.is_finite() && *s > 0.0)
+        .unwrap_or(prefill_s);
+    let ttft_ms = if ttft_s > 0.0 {
+        ttft_s * 1000.0
+    } else {
+        prefill_ms
+    };
+    let tok_s = batch_finite_rate(generated, wall_s);
+
+    // Decode rate over the post-first-token interval. Zero/one-token and missing
+    // first-token stamps stay finite zero (no positive span to amortize).
+    let decode_tok_s = match first_token_at {
+        Some(ft) if generated > 0 => {
+            let decode_s = finished_at.saturating_duration_since(ft).as_secs_f64();
+            batch_finite_rate(generated, decode_s)
+        }
+        _ => 0.0,
+    };
+
+    BatchLaneDoneMetrics {
+        latency_ms: if latency_ms.is_finite() {
+            latency_ms
+        } else {
+            0.0
+        },
+        ttft_ms: if ttft_ms.is_finite() { ttft_ms } else { 0.0 },
+        prefill_ms: if prefill_ms.is_finite() {
+            prefill_ms
+        } else {
+            0.0
+        },
+        prefill_tok_s,
+        tok_s,
+        decode_tok_s,
+    }
+}
+
+/// Attach actual continuous-batch route evidence to a batch-driver done envelope.
+/// Only the real batch driver emits this; sequential fallbacks must not call it.
+pub fn attach_continuous_batch_route_evidence(
+    envelope: &mut serde_json::Value,
+    slots: usize,
+    lane: usize,
+    lane_capacity: usize,
+    max_active_lanes: usize,
+) {
+    envelope["execution_mode"] = serde_json::json!("continuous_batch_independent");
+    envelope["continuous_batch"] = serde_json::json!({
+        "executed": true,
+        "slots": slots,
+        "lane": lane,
+        "lane_capacity": lane_capacity,
+        "max_active_lanes": max_active_lanes,
+        "refill": "continuous",
+    });
+}
+
+/// CPU-side attractor blocker for the AR generate path.
+pub fn block_attractor_unclosed_cpu(
+    logits: &mut [f32],
+    history: &[u32],
+    open_id: u32,
+    close_id: u32,
+    window: usize,
+    threshold: usize,
+) {
+    if window == 0 || threshold == 0 || open_id == close_id {
+        return;
+    }
+    let start = history.len().saturating_sub(window);
+    let mut depth: i32 = 0;
+    for &t in &history[start..] {
+        if t == open_id {
+            depth += 1;
+        } else if t == close_id && depth > 0 {
+            depth -= 1;
+        }
+    }
+    if depth >= threshold as i32 {
+        if let Some(slot) = logits.get_mut(open_id as usize) {
+            *slot = f32::NEG_INFINITY;
+        }
+    }
+}
+
+#[cfg(test)]
+mod request_seed_tests {
+    use super::*;
+
+    fn key(id: &str, attempt: u64) -> AttemptKey {
+        AttemptKey::new(id, attempt)
+    }
+
+    #[test]
+    fn explicit_seed_is_deterministic_regardless_of_attempt_identity() {
+        let a = request_seed_for(&key("r1", 7), Some(42));
+        assert_eq!(a, request_seed_for(&key("r1", 7), Some(42)));
+        assert_eq!(a, request_seed_for(&key("r1", 8), Some(42)));
+        assert_eq!(a, request_seed_for(&key("r2", 99), Some(42)));
+        assert_ne!(a, request_seed_for(&key("r1", 7), Some(43)));
+        assert_ne!(a, request_seed_for(&key("r1", 8), Some(43)));
+    }
+
+    #[test]
+    fn explicit_seed_boundaries_stay_in_tier1() {
+        // Wire seed 0 and u64::MAX are valid explicit seeds: tier 1 must win
+        // over the attempt-key entropy tiers and be deterministic per seed
+        // alone. request_seed_for never returns 0 (pinned separately below).
+        let z = request_seed_for(&key("b", 1), Some(0));
+        assert_eq!(z, request_seed_for(&key("b", 2), Some(0)));
+        assert_eq!(z, request_seed_for(&key("other", 9), Some(0)));
+        let m = request_seed_for(&key("m", 1), Some(u64::MAX));
+        assert_eq!(m, request_seed_for(&key("m", 2), Some(u64::MAX)));
+        assert_ne!(z, m);
+    }
+
+    #[test]
+    fn derived_seeds_distinct_for_reused_client_keys() {
+        let k = key("r1", 1);
+        let s0 = request_seed_for(&k, None);
+        let s1 = request_seed_for(&k, None);
+        assert_ne!(s0, s1);
+    }
+
+    #[test]
+    fn derived_seed_differs_across_attempt_ids_and_ids() {
+        let base = request_seed_for(&key("a", 1), None);
+        assert_ne!(base, request_seed_for(&key("a", 2), None));
+        assert_ne!(base, request_seed_for(&key("b", 1), None));
+    }
+
+    #[test]
+    fn seed_is_never_zero() {
+        for attempt in 0..4096u64 {
+            for cs in [None, Some(0), Some(u64::MAX)] {
+                assert_ne!(
+                    request_seed_for(&key("zero-probe", attempt), cs),
+                    0,
+                    "attempt={attempt} cs={cs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cb_lane_seeded_rng_is_deterministic_per_seed_alone() {
+        // The continuous-batch lane initializer must honor an explicit wire
+        // seed exactly like the sequential route: same seed reproduces the
+        // same lane RNG regardless of attempt identity or how many unseeded
+        // requests advanced REQUEST_COUNTER before it.
+        let _ = request_seed_for(&key("counter-burn", 1), None);
+        let a = request_rng_u64(&key("cb", 7), Some(42));
+        assert_eq!(a, request_rng_u64(&key("cb", 8), Some(42)));
+        assert_eq!(a, request_rng_u64(&key("other", 99), Some(42)));
+        assert_ne!(a, request_rng_u64(&key("cb", 7), Some(43)));
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn cb_lane_unseeded_rng_fresh_for_reused_client_keys() {
+        // Unseeded CB lanes draw fresh counter entropy per assignment, so a
+        // raw client reusing (id, attempt_id) across cohorts never replays.
+        let k = key("cb-reuse", 1);
+        assert_ne!(request_rng_u64(&k, None), request_rng_u64(&k, None));
+    }
+}

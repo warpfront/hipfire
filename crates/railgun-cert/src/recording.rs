@@ -1,0 +1,4342 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Recording-predicate inventory (railgun design §2.3, §5 G0, milestone MR).
+//!
+//! Authoring a program by recording only sees the kernels chosen while the
+//! runtime believes it is being recorded or captured. [`DECISIONS`] lists
+//! every runtime condition that consults that state, and [`SITES`] binds each
+//! `(file, function)` that consults it to one decision. [`scan_sources`] is
+//! the source scan that keeps the two in sync: a new `is_recording()`-style
+//! check without an inventory row fails `cargo test -p railgun-cert`.
+//!
+//! Verdicts are per decision, relative to the eager branch:
+//! - `Invariant`: kernel sequence, grids, blocks, LDS and argument values are
+//!   the same on both branches (launch mechanism, lifecycle, refusals).
+//! - `ByteExact`: a different kernel set or launch shape, with a cited
+//!   argument or oracle that every output byte is identical.
+//! - `NotEquivalent`: a different kernel set or shape with no byte-exactness
+//!   evidence (or measured drift).
+//!
+//! [`Decision::reaches`] names the default programs in which the branch the
+//! railgun recorder takes (`is_recording() == true`, `capture_mode == false`)
+//! differs from the eager branch or from the pre-railgun default process's
+//! branch. A `NotEquivalent` decision that reaches a program refuses that
+//! program as a railgun default over the stated domain
+//! ([`refused_default_programs`]).
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::Serialize;
+
+/// Runtime state a predicate consults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Predicate {
+    /// `ReplayController::is_recording()` (Redline/railgun recorder warmup).
+    IsRecording,
+    /// `GraphState::capture_mode` (HIP stream capture in flight).
+    CaptureMode,
+    /// `ReplayController::is_enabled()`: process-level backend request.
+    ReplayEnabled,
+    /// `ReplayController::state()` compared against a lifecycle state.
+    ReplayState,
+    /// `verify.capturing` / `replay.capturing` graph slots.
+    GraphSlotCapturing,
+    /// A body parameter the composer sets when the body is captured
+    /// (`capture_safe`, `graph_safe`).
+    DeclaredCaptureBody,
+    /// `ReplayController::is_g0_observing()` (the G0 eager arm).
+    G0Observing,
+}
+
+/// What the recording-dependent branch changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Effect {
+    /// Kernarg blob vs `kernelParams`, recorder bookkeeping, async vs sync H2D.
+    LaunchMechanism,
+    /// Capture begin/end/abort, invalidation and auto-finalize bookkeeping.
+    Lifecycle,
+    /// The recorded branch returns an error (or `false` from a `try_`) before
+    /// any launch; the caller's other branch is inventoried separately.
+    Refusal,
+    /// Different kernels (or a different number of launches).
+    KernelSelection,
+    /// Same kernels, different grid/LDS/argument values.
+    LaunchShape,
+    /// Decided once per process from the backend request, not per forward.
+    ProcessRoute,
+    /// A debug assertion only.
+    Assertion,
+    /// Diagnostic/oracle code that is not on a served path.
+    Oracle,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Invariant,
+    ByteExact,
+    NotEquivalent,
+}
+
+/// Programs the inventory classifies: the default Redline programs (design §0
+/// D10, §6 cutover list, §7 M0a) and the opt-in Raon railgun AR program.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Program {
+    /// gfx1201 Qwen3.5 dense MQ4 H2 plain-AR decode (Redline default).
+    H2Gfx1201,
+    /// Qwen3.5 MoE MQ4R plain-AR decode tapes (Redline default).
+    Mq4rGfx1201,
+    Mq4rGfx1100,
+    Mq4rGfx1151,
+    /// DeepSeek4 MQ2R gfx1151 plain-AR decode tape (Redline default).
+    Ds4Gfx1151,
+    /// DFlash2 B=16 cycle on gfx1201 (draft + verify + commit; pre-railgun
+    /// default: verify HipGraph after a direct warmup window).
+    DflashGfx1201,
+    /// Raon-1-mini-preview plain-AR decode on gfx1201 (singleton, mq4-xts, A8
+    /// attention) authored and executed by the Raon railgun owner
+    /// (an opt-in developer flag, default off, so not a default program). The
+    /// body is planned under the HIP-graph capture branch (`capture_mode`),
+    /// not the Redline recorder: it is compared with the Raon HIP graph arm
+    /// (the same branch) and with the eager control.
+    RaonArGfx1201,
+}
+
+pub const PROGRAMS: &[Program] = &[
+    Program::H2Gfx1201,
+    Program::Mq4rGfx1201,
+    Program::Mq4rGfx1100,
+    Program::Mq4rGfx1151,
+    Program::Ds4Gfx1151,
+    Program::DflashGfx1201,
+    Program::RaonArGfx1201,
+];
+
+/// A default program whose recorded branch differs, and where.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Reach {
+    pub program: Program,
+    /// The part of the program's domain where the branches differ.
+    pub domain: &'static str,
+    /// Which comparison sees the difference: `g0` (recorded vs eager),
+    /// `arm3` (railgun process vs pre-railgun default process), or both.
+    pub seen_by: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Decision {
+    pub id: &'static str,
+    pub predicates: &'static [Predicate],
+    /// The condition, with its location of record.
+    pub condition: &'static str,
+    pub effect: Effect,
+    /// Kernels or shapes the condition switches (recorded branch first).
+    pub switches: &'static str,
+    /// Kernel symbols whose selection or shape the G0 harness may see differ
+    /// because of this decision; the harness attributes differences with it.
+    pub kernels: &'static [&'static str],
+    pub verdict: Verdict,
+    pub evidence: &'static str,
+    pub reaches: &'static [Reach],
+}
+
+/// One `(file, function)` that consults recording state. `occurrences` is the
+/// number of predicate tokens [`scan_sources`] counts in that function (file
+/// relative to `crates/`; `<item>` = outside any function, e.g. a field).
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Site {
+    pub file: &'static str,
+    pub function: &'static str,
+    pub occurrences: u32,
+    /// The decisions the function's predicate tokens belong to.
+    pub decisions: &'static [&'static str],
+}
+
+/// A launch a default program's forward issues outside the recorder funnels
+/// on purpose: a host input the program consumes, launched before the
+/// program in every lowering (eager, recorded, HIP graph, PM4), so it is not
+/// part of the recorded program and not a recording-dependent decision. The
+/// G0 harness accepts an arm's non-funnel HIP launches (HIP launches minus
+/// funnel launches) only when they equal the declared `per_forward` sum of
+/// the program under test, in both arms; anything else is a bypass.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct PreProgramLaunch {
+    pub id: &'static str,
+    /// Kernel symbol the launch dispatches.
+    pub kernel: &'static str,
+    /// Launch site and caller, with line citations.
+    pub site: &'static str,
+    /// Launches per forward of each listed program.
+    pub per_forward: u32,
+    pub programs: &'static [Program],
+    pub evidence: &'static str,
+}
+
+// ── source scan ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, PartialEq)]
+enum Tok {
+    Ident(String),
+    Punct(char),
+}
+
+/// Rust tokens with comments, string/char literals and numbers removed.
+fn lex(src: &str) -> Vec<Tok> {
+    let b = src.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    let ident_start = |c: u8| c == b'_' || c.is_ascii_alphabetic();
+    let ident_cont = |c: u8| c == b'_' || c.is_ascii_alphanumeric();
+    while i < b.len() {
+        let c = b[i];
+        if c.is_ascii_whitespace() {
+            i += 1;
+        } else if c == b'/' && b.get(i + 1) == Some(&b'/') {
+            while i < b.len() && b[i] != b'\n' {
+                i += 1;
+            }
+        } else if c == b'/' && b.get(i + 1) == Some(&b'*') {
+            let mut depth = 0usize;
+            while i < b.len() {
+                if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+                    depth += 1;
+                    i += 2;
+                } else if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+                    depth -= 1;
+                    i += 2;
+                    if depth == 0 {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if c == b'"' {
+            i += 1;
+            while i < b.len() && b[i] != b'"' {
+                i += if b[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+        } else if (c == b'r' || (c == b'b' && b.get(i + 1) == Some(&b'r'))) && {
+            let s = if c == b'b' { i + 2 } else { i + 1 };
+            let mut j = s;
+            while b.get(j) == Some(&b'#') {
+                j += 1;
+            }
+            b.get(j) == Some(&b'"') && (j > s || c == b'r' || c == b'b')
+        } {
+            let s = if c == b'b' { i + 2 } else { i + 1 };
+            let mut j = s;
+            while b.get(j) == Some(&b'#') {
+                j += 1;
+            }
+            let hashes = j - s;
+            i = j + 1;
+            while i < b.len() {
+                if b[i] == b'"'
+                    && b[i + 1..]
+                        .iter()
+                        .take(hashes)
+                        .filter(|&&h| h == b'#')
+                        .count()
+                        == hashes
+                {
+                    i += 1 + hashes;
+                    break;
+                }
+                i += 1;
+            }
+        } else if c == b'b' && b.get(i + 1) == Some(&b'"') {
+            i += 1;
+        } else if c == b'\'' {
+            if b.get(i + 1) == Some(&b'\\') {
+                i += 2;
+                while i < b.len() && b[i] != b'\'' {
+                    i += 1;
+                }
+                i += 1;
+            } else if b.get(i + 2) == Some(&b'\'') {
+                i += 3;
+            } else {
+                // Lifetime or label: the identifier that follows is harmless.
+                i += 1;
+            }
+        } else if c.is_ascii_digit() {
+            while i < b.len()
+                && (ident_cont(b[i])
+                    || b[i] == b'.' && b.get(i + 1).is_some_and(u8::is_ascii_digit))
+            {
+                i += 1;
+            }
+        } else if ident_start(c) {
+            let s = i;
+            while i < b.len() && ident_cont(b[i]) {
+                i += 1;
+            }
+            out.push(Tok::Ident(src[s..i].to_owned()));
+        } else {
+            out.push(Tok::Punct(c as char));
+            i += 1;
+        }
+    }
+    out
+}
+
+fn ident(t: Option<&Tok>) -> Option<&str> {
+    match t {
+        Some(Tok::Ident(s)) => Some(s),
+        _ => None,
+    }
+}
+
+fn punct(t: Option<&Tok>, p: char) -> bool {
+    t == Some(&Tok::Punct(p))
+}
+
+/// The predicate a token at `i` consults, if any.
+fn predicate_at(t: &[Tok], i: usize) -> Option<Predicate> {
+    let name = ident(t.get(i))?;
+    let prev = i.checked_sub(1).and_then(|p| t.get(p));
+    let is_def = ident(prev) == Some("fn");
+    let replay_method = || {
+        punct(prev, '.')
+            && i >= 2
+            && ident(t.get(i - 2)) == Some("replay")
+            && punct(t.get(i + 1), '(')
+    };
+    match name {
+        "is_recording" | "should_auto_finalize_capture" if !is_def => Some(Predicate::IsRecording),
+        "replay_recording" | "redline_recording" => Some(Predicate::IsRecording),
+        "capture_mode" | "graph_capture" => Some(Predicate::CaptureMode),
+        "is_enabled" if replay_method() => Some(Predicate::ReplayEnabled),
+        "state" if replay_method() => Some(Predicate::ReplayState),
+        "capturing" => Some(Predicate::GraphSlotCapturing),
+        "capture_safe" | "graph_safe" => Some(Predicate::DeclaredCaptureBody),
+        "is_g0_observing" if !is_def => Some(Predicate::G0Observing),
+        _ => None,
+    }
+}
+
+/// Per-function predicate-token counts for one source file. Test-only code
+/// (`#[cfg(test)]` items) is skipped; tokens outside any function are keyed
+/// `<item>`.
+pub fn scan_file(src: &str) -> BTreeMap<String, u32> {
+    struct Frame {
+        name: Option<String>,
+        test: bool,
+        depth: usize,
+    }
+    let t = lex(src);
+    let mut counts = BTreeMap::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    let mut depth = 0usize;
+    let mut nest = 0usize;
+    let mut pending_fn: Option<(String, usize)> = None;
+    let mut pending_item: Option<usize> = None;
+    let mut pending_test = false;
+    let mut i = 0;
+    while i < t.len() {
+        match &t[i] {
+            Tok::Punct('#')
+                if punct(t.get(i + 1), '[')
+                    && ident(t.get(i + 2)) == Some("cfg")
+                    && punct(t.get(i + 3), '(')
+                    && ident(t.get(i + 4)) == Some("test")
+                    && punct(t.get(i + 5), ')') =>
+            {
+                pending_test = true;
+                i += 6;
+                continue;
+            }
+            Tok::Ident(k) if k == "fn" => {
+                if let Some(name) = ident(t.get(i + 1)) {
+                    pending_fn = Some((name.to_owned(), nest));
+                }
+            }
+            Tok::Ident(k) if k == "mod" || k == "impl" => pending_item = Some(nest),
+            Tok::Punct('(') | Tok::Punct('[') => nest += 1,
+            Tok::Punct(')') | Tok::Punct(']') => nest = nest.saturating_sub(1),
+            Tok::Punct(';') => {
+                if pending_fn.as_ref().is_some_and(|(_, n)| *n == nest) {
+                    pending_fn = None;
+                }
+                if pending_item == Some(nest) {
+                    pending_item = None;
+                }
+                if nest == 0 || stack.is_empty() {
+                    pending_test = false;
+                }
+            }
+            Tok::Punct('{') => {
+                depth += 1;
+                let fn_here = pending_fn
+                    .take()
+                    .filter(|(_, n)| *n == nest)
+                    .map(|(name, _)| name);
+                let item_here = pending_item.take().is_some();
+                if fn_here.is_some() || item_here || pending_test {
+                    stack.push(Frame {
+                        name: fn_here,
+                        test: std::mem::take(&mut pending_test),
+                        depth,
+                    });
+                }
+            }
+            Tok::Punct('}') => {
+                if stack.last().is_some_and(|f| f.depth == depth) {
+                    stack.pop();
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => {}
+        }
+        let in_test = stack.iter().any(|f| f.test) || (pending_test && pending_fn.is_some());
+        if !in_test && predicate_at(&t, i).is_some() {
+            // Signature tokens belong to the function being declared.
+            let function = pending_fn
+                .as_ref()
+                .map(|(name, _)| name.clone())
+                .or_else(|| stack.iter().rev().find_map(|f| f.name.clone()))
+                .unwrap_or_else(|| "<item>".to_owned());
+            *counts.entry(function).or_insert(0) += 1;
+        }
+        i += 1;
+    }
+    counts
+}
+
+/// Scan every `crates/<crate>/src/**/*.rs` below `crates_dir` (this crate
+/// excluded) and return `(file relative to crates_dir, function) → count`.
+pub fn scan_sources(crates_dir: &Path) -> std::io::Result<BTreeMap<(String, String), u32>> {
+    fn walk(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|n| n != "target") {
+                    walk(&path, files)?;
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    let mut crates: Vec<_> = std::fs::read_dir(crates_dir)?.collect::<Result<Vec<_>, _>>()?;
+    crates.sort_by_key(|e| e.file_name());
+    for krate in crates {
+        let src = krate.path().join("src");
+        if krate.file_name() == env!("CARGO_PKG_NAME") || !src.is_dir() {
+            continue;
+        }
+        walk(&src, &mut files)?;
+    }
+    let mut out = BTreeMap::new();
+    for file in files {
+        let rel = file
+            .strip_prefix(crates_dir)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        for (function, n) in scan_file(&std::fs::read_to_string(&file)?) {
+            out.insert((rel.clone(), function), n);
+        }
+    }
+    Ok(out)
+}
+
+// ── inventory queries ───────────────────────────────────────────────────────
+
+pub fn decision(id: &str) -> Option<&'static Decision> {
+    DECISIONS.iter().find(|d| d.id == id)
+}
+
+/// `(file, function) → occurrences` as the inventory declares them.
+pub fn inventory_counts() -> BTreeMap<(String, String), u32> {
+    SITES
+        .iter()
+        .map(|s| ((s.file.to_owned(), s.function.to_owned()), s.occurrences))
+        .collect()
+}
+
+/// Differences between a scan and the inventory, one line each; empty when
+/// they agree.
+pub fn check(scanned: &BTreeMap<(String, String), u32>) -> Vec<String> {
+    let declared = inventory_counts();
+    let mut out = Vec::new();
+    for ((file, function), n) in scanned {
+        match declared.get(&(file.clone(), function.clone())) {
+            None => out.push(format!("new recording predicate: {file} :: {function} ({n} token(s)) has no SITES row")),
+            Some(d) if d != n => out.push(format!("changed recording predicate: {file} :: {function} has {n} token(s), SITES says {d}")),
+            _ => {}
+        }
+    }
+    for (file, function) in declared.keys() {
+        if !scanned.contains_key(&(file.clone(), function.clone())) {
+            out.push(format!(
+                "stale SITES row: {file} :: {function} no longer consults recording state"
+            ));
+        }
+    }
+    out
+}
+
+/// The certificate field `recording_dependent_decisions` for one program:
+/// every decision that reaches it, with its call sites.
+#[derive(Debug, Serialize)]
+pub struct RecordingDependentDecision {
+    pub id: &'static str,
+    pub verdict: Verdict,
+    pub domain: &'static str,
+    pub seen_by: &'static str,
+    pub sites: Vec<String>,
+}
+
+pub fn recording_dependent_decisions(program: Program) -> Vec<RecordingDependentDecision> {
+    DECISIONS
+        .iter()
+        .flat_map(|d| {
+            d.reaches
+                .iter()
+                .filter(move |r| r.program == program)
+                .map(move |r| (d, r))
+        })
+        .map(|(d, r)| RecordingDependentDecision {
+            id: d.id,
+            verdict: d.verdict,
+            domain: r.domain,
+            seen_by: r.seen_by,
+            sites: SITES
+                .iter()
+                .filter(|s| s.decisions.contains(&d.id))
+                .map(|s| format!("{}::{}", s.file, s.function))
+                .collect(),
+        })
+        .collect()
+}
+
+/// Programs refused as a railgun default: a `NotEquivalent` decision reaches
+/// them. Each entry carries the refusing decisions and their domains.
+pub fn refused_default_programs() -> BTreeMap<Program, Vec<(&'static str, &'static str)>> {
+    let mut out: BTreeMap<Program, Vec<(&'static str, &'static str)>> = BTreeMap::new();
+    for d in DECISIONS
+        .iter()
+        .filter(|d| d.verdict == Verdict::NotEquivalent)
+    {
+        for r in d.reaches {
+            out.entry(r.program).or_default().push((d.id, r.domain));
+        }
+    }
+    out
+}
+
+/// Declared pre-program launches of `program` ([`PreProgramLaunch`]).
+pub fn pre_program_launches(program: Program) -> Vec<&'static PreProgramLaunch> {
+    PRE_PROGRAM_LAUNCHES
+        .iter()
+        .filter(|l| l.programs.contains(&program))
+        .collect()
+}
+
+pub fn inventory_json() -> serde_json::Value {
+    let programs: serde_json::Map<String, serde_json::Value> = PROGRAMS
+        .iter()
+        .map(|&p| {
+            let refused = refused_default_programs().remove(&p).unwrap_or_default();
+            (
+                serde_json::to_value(p).unwrap().as_str().unwrap().to_owned(),
+                serde_json::json!({
+                    "recording_dependent_decisions": recording_dependent_decisions(p),
+                    "refused_as_default": !refused.is_empty(),
+                    "refused_by": refused.iter().map(|(id, domain)| serde_json::json!({"decision": id, "domain": domain})).collect::<Vec<_>>(),
+                    "pre_program_launches": pre_program_launches(p).iter().map(|l| l.id).collect::<Vec<_>>(),
+                }),
+            )
+        })
+        .collect();
+    serde_json::json!({
+        "schema": "railgun-recording-inventory",
+        "version": 1,
+        "decisions": DECISIONS,
+        "sites": SITES,
+        "pre_program_launches": PRE_PROGRAM_LAUNCHES,
+        "programs": programs,
+    })
+}
+
+fn md_cell(s: &str) -> String {
+    s.replace('|', "\\|").replace('\n', " ")
+}
+
+pub fn inventory_markdown() -> String {
+    let mut s = String::new();
+    s.push_str("| # | decision | predicates | condition (location) | effect | switches | verdict | evidence | reaches (program: domain [seen by]) | sites |\n");
+    s.push_str("|---|---|---|---|---|---|---|---|---|---|\n");
+    for (n, d) in DECISIONS.iter().enumerate() {
+        let preds: Vec<String> = d
+            .predicates
+            .iter()
+            .map(|p| {
+                serde_json::to_value(p)
+                    .unwrap()
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        let reaches: Vec<String> = d
+            .reaches
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}: {} [{}]",
+                    serde_json::to_value(r.program).unwrap().as_str().unwrap(),
+                    r.domain,
+                    r.seen_by
+                )
+            })
+            .collect();
+        let sites: Vec<String> = SITES
+            .iter()
+            .filter(|x| x.decisions.contains(&d.id))
+            .map(|x| format!("`{}::{}`×{}", x.file, x.function, x.occurrences))
+            .collect();
+        s.push_str(&format!(
+            "| {} | `{}` | {} | {} | {} | {} | **{}** | {} | {} | {} |\n",
+            n + 1,
+            d.id,
+            preds.join(", "),
+            md_cell(d.condition),
+            serde_json::to_value(d.effect).unwrap().as_str().unwrap(),
+            md_cell(d.switches),
+            serde_json::to_value(d.verdict).unwrap().as_str().unwrap(),
+            md_cell(d.evidence),
+            if reaches.is_empty() {
+                "none".to_owned()
+            } else {
+                md_cell(&reaches.join("; "))
+            },
+            sites.join("<br>"),
+        ));
+    }
+    s
+}
+
+/// `railgun-cert recording-inventory json|markdown|scan|check [CRATES_DIR]`.
+pub fn cli(args: &[std::path::PathBuf]) -> Result<(), String> {
+    let mode = args
+        .first()
+        .and_then(|a| a.to_str())
+        .ok_or("usage: railgun-cert recording-inventory json|markdown|scan|check [CRATES_DIR]")?;
+    let crates_dir = args
+        .get(1)
+        .cloned()
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
+    match mode {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&inventory_json()).map_err(|e| e.to_string())?
+            );
+            Ok(())
+        }
+        "markdown" => {
+            print!("{}", inventory_markdown());
+            Ok(())
+        }
+        "scan" => {
+            for ((file, function), n) in scan_sources(&crates_dir).map_err(|e| e.to_string())? {
+                println!("{file}\t{function}\t{n}");
+            }
+            Ok(())
+        }
+        "check" => {
+            let problems = check(&scan_sources(&crates_dir).map_err(|e| e.to_string())?);
+            for p in &problems {
+                eprintln!("{p}");
+            }
+            if problems.is_empty() {
+                Ok(())
+            } else {
+                Err(format!("{} inventory mismatch(es)", problems.len()))
+            }
+        }
+        other => Err(format!("unknown recording-inventory mode {other}")),
+    }
+}
+
+// ── the inventory ───────────────────────────────────────────────────────────
+//
+// Line numbers are at `13cd404c3` (the base of this inventory). Default
+// programs and their pre-railgun mechanisms: H2 / MQ4R / DS4 are Redline
+// tapes (recorded with `is_recording()`, `capture_mode == false`; the AR
+// HipGraph is off whenever `replay.is_enabled()`, qwen35/forward.rs:1712-1716);
+// the DFlash gfx1201 verify replays a HipGraph (`capture_mode == true`) after
+// a direct warmup window (speculative.rs:263-293 admits MQ4G256V2 on gfx1201),
+// its dense draft runs direct (draft FFN graph is MoE-only,
+// speculative.rs:232-247). The railgun recorder is `Gpu::replay` (design §6),
+// so railgun authoring sees `is_recording() == true, capture_mode == false`.
+
+use Effect::*;
+use Predicate::*;
+use Program::*;
+use Verdict::*;
+
+const fn reach(program: Program, domain: &'static str, seen_by: &'static str) -> Reach {
+    Reach {
+        program,
+        domain,
+        seen_by,
+    }
+}
+
+pub const DECISIONS: &[Decision] = &[
+    Decision {
+        id: "mq6-explicit-railgun-refusal",
+        predicates: &[IsRecording, CaptureMode, G0Observing],
+        condition: "rdna-compute mq6_railgun::check_gpu rejects Redline recording, G0 observation and HIP graph capture before preparing or replaying an explicit fixed-binding MQ6 program; an active stream capture is also refused",
+        effect: Refusal,
+        switches: "error before authoring/submission; the explicit railgun API never becomes a node of an enclosing recorder or captured graph",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refusing branches submit no work. This API owns its independent certified program and PM4 transport; model dispatch, Redline recording/default admission and name-based pointer effects are unchanged",
+        reaches: &[],
+    },
+    Decision {
+        id: "launch-funnel-blob-path",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "`record || capture_mode || force_blob_path` in Gpu::launch_maybe_blob_bound (dispatch.rs:2416-2522) and scratch::launch_maybe_blob (scratch.rs:356-431); `use_blob_path` (scratch.rs:457); the recorder's own `if !is_recording() return` (replay.rs:6107, 6186)",
+        effect: LaunchMechanism,
+        switches: "kernarg blob (`extra`) vs `kernelParams`; recorded/captured copy of the blob. Same function, grid, block, LDS",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "both branches launch `self.functions[func_name]` with the caller's grid/block/shared_mem; the blob builder encodes the values `params` points at (dispatch.rs:2495-2497 contract). G0 compares the blob bytes of both arms",
+        reaches: &[],
+    },
+    Decision {
+        id: "g0-observation",
+        predicates: &[IsRecording, G0Observing],
+        condition: "`ReplayController::begin_g0_observation` refuses while recording; `begin_capture` refuses while observing; the launch funnels (Gpu::launch_maybe_blob_bound, Gpu::launch_blob_recorded, scratch::launch_maybe_blob) take the blob path while observing",
+        effect: LaunchMechanism,
+        switches: "observed copy of each funnel launch; `is_recording()` stays false",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "observation only reads the blob; `replay::tests::g0_observation_keeps_the_eager_branch_and_excludes_recording`",
+        reaches: &[],
+    },
+    Decision {
+        id: "scratch-launch-plumbing",
+        predicates: &[CaptureMode],
+        condition: "`capture_mode` forwarded into scratch::launch_maybe_blob by rotate_x_mq*/rotate_quantize_x_mq8, ensure_q8_1_mmq_x(128), ensure_int4/int8_mmq_x, prepare_mq4v2_fp8_x*, convert_fp16_x_uncached / convert_f32_to_f16_into / convert_f32_to_f16_to_ptr, fp8_verify_pack_x / pack_fp8_verify_rows (dispatch.rs, gemv.rs, gemm_fp8_verify.rs, scratch.rs)",
+        effect: LaunchMechanism,
+        switches: "launch mechanism only (see launch-funnel-blob-path); rotations and quantizers always run",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the flag reaches no condition other than the funnel's `record || capture_mode || force_blob_path` (e.g. scratch.rs:1859-1918 rotate_x_mq launches unconditionally)",
+        reaches: &[],
+    },
+    Decision {
+        id: "fp16-fp8-x-conversion-cache",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "`scratch_must_convert = is_recording || capture_mode || cached_ptr != src_ptr` (scratch.rs:445-452) in ScratchState::ensure_fp16_x (scratch.rs:994) and ensure_fp8_x (scratch.rs:1157)",
+        effect: KernelSelection,
+        switches: "recorded/captured: the F32→F16 (`convert_f32_to_f16`) or F32→FP8 (`pack_f32_to_fp8_gfx12`) conversion is launched before every consumer; eager: skipped when the cached source pointer matches (one launch fewer per cache hit)",
+        kernels: &["convert_f32_to_f16", "pack_f32_to_fp8_gfx12"],
+        verdict: ByteExact,
+        evidence: "the conversion is a pure elementwise function of the source bytes into the same scratch; the eager skip is taken only on the cache-coherence premise that the source is unchanged since the cached conversion (every producer invalidates via `invalidate_x_caches_for`, scratch.rs:1842-1849). Obligation: the premise itself (a stale-pointer hit is an eager-path bug, cf. muse-glimmer/forward.rs:3660-3668); G2 arm 3 confirms",
+        reaches: &[
+            reach(DflashGfx1201, "every verify window (MQ4V2 WMMA GEMMs take F16 x; `convert_f32_to_f16` is in the cycle's kernel list) and the direct draft GEMMs", "g0; arm3 in the pre-railgun direct warmup window"),
+            reach(RaonArGfx1201, "every decode GEMM that takes F16 x: `convert_f32_to_f16` is 75 of the 1207 launches of the ctx512 body (probe inventory, `sequence.jsonl`); the Raon owner plans the same capture branch as the Raon HIP graph, so only the eager control skips a cache hit", "g0"),
+        ],
+    },
+    Decision {
+        id: "graph-capture-lifecycle",
+        predicates: &[CaptureMode, GraphSlotCapturing],
+        condition: "HipGraph begin/end/abort/drop bookkeeping: graph.rs (begin/end_[verify_|replay_]graph_capture, abort, destroy), mtp_spec.rs:1063-1090, dflash.rs:2537-2564, speculative.rs:1707/3243 resets, dense-TP rank graph abort/drop (hipfire-runtime multi_gpu.rs `Gpus::abort_rank_graph_captures` / `drop_rank_graphs`, qwen35 `forward_scratch_dense_tp`), spec_impl.rs:423, `init_with_device` defaults",
+        effect: Lifecycle,
+        switches: "sets/clears `capture_mode`, capture slots and blob storage; no kernel choice",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "no launch is selected by these branches; the captured body's own predicates are inventoried separately",
+        reaches: &[],
+    },
+    Decision {
+        id: "replay-recorder-lifecycle",
+        predicates: &[IsRecording, ReplayState],
+        condition: "`should_auto_finalize_capture` (replay.rs:4586-4588) in qwen35 forward_scratch (forward.rs:1831), deepseek4 decode_step_with_graph (forward.rs:3642), lfm2moe decode_step_with_retained_replay (state checks, forward.rs:106-170); gemma4 `graph_exact` keeps its AR HipGraph off while `is_recording()` (forward.rs)",
+        effect: Lifecycle,
+        switches: "finish the one-shot capture after the recorded forward",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "runs after the forward body; selects no kernel",
+        reaches: &[],
+    },
+    Decision {
+        id: "capture-safe-invalidation",
+        predicates: &[IsRecording, CaptureMode, ReplayEnabled, ReplayState],
+        condition: "`scratch_growth_invalidates(graph_captured, capture_mode, recording)` (scratch.rs:573-579) via invalidate_for_scratch_growth (dispatch.rs:4648-4660); invalidate_for_kv_mode_switch poisons Redline when enabled (dispatch.rs:4610-4619)",
+        effect: Lifecycle,
+        switches: "defer graph/route invalidation while a capture or recording is in flight",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "invalidation drops executable state only; the launch that follows is the same kernel",
+        reaches: &[],
+    },
+    Decision {
+        id: "memcpy-htod-auto",
+        predicates: &[CaptureMode],
+        condition: "Gpu::memcpy_htod_auto: async H2D on the active stream while capturing, else synchronous (dispatch.rs:2336-2347); Gpu::htod_stream_ordered: async H2D on the active stream while capturing, else async H2D on the active stream plus one wait on it (blocking copy with no active stream)",
+        effect: LaunchMechanism,
+        switches: "hipMemcpyHtoDAsync vs hipMemcpyHtoD; same bytes",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "same source and destination bytes; ordering is stream order in both cases",
+        reaches: &[],
+    },
+    Decision {
+        id: "eager-only-refusals",
+        predicates: &[IsRecording, CaptureMode, ReplayEnabled, GraphSlotCapturing],
+        condition: "entry points that return an error (or `false`) when recorded/captured before any launch: prepare_mq4v2_fp8_x (dispatch.rs:2880), gfx12 FP8 WMMA GEMMs and producers (gemm.rs *_fp8*, gemv.rs *_fp8_gfx12_batched), F2 launch (gemm.rs:9782), Lloyd MMQ pad-to-128 (pad_f32_batch_to_128, gemm.rs:20157), wide gfx11 FA2 Q16 scratch growth (attention.rs:5895-5908), MQ8G256 activation-scratch growth (gemm_mq8g256.rs mq8_quantize_x / mq8_reserve_x; pre-sized at Raon load), DFlash gfx1100 bulk state copy (dflash_state_copy.rs:130), VMM KV growth (saddle-core kv.rs:1908), DS4 heterogeneous G4 (forward.rs:3267-3273), MoE CPU top-k fallback (pipeline/mod.rs:1914), batched spec serving bodies forward_prefill_batch_multi (qwen35 prefill_multi.rs:294) and dflash_cb_verify (qwen35 dflash_cb.rs:508), gfx1201 rows/segment twin table staging under graph capture (stage_rows_table, rows_batched.rs:251; stage_attention_fp8_e4m3_kv_batched_segs, verify_twins.rs:199), DFlash CB GDN lane-table staging (Gpu::upload_gdn_lane_table, lane_gdn.rs:378-380: `capture_mode` returns an error before the copy; callers stage_gdn_lane_table and stage_gdn_lane_table_from, qwen35 prefill_multi.rs:751, 853), sealed MoE expert-parallel row gather (hipfire-dispatch pipeline/moe_program.rs row_gather:1103-1106: `capture_mode`, a verify or replay `capturing` slot, or `is_recording()` returns an error before the gather exchange; EP decode is eager-only), the MoE CPU expert splice and the CPU transfer refuse capture or recording before any copy (hipfire-dispatch src/cpu_exec.rs moe_cpu_experts:619, with_cpu_transfer:1532), the Qwen35 placement and serve loaders refuse CPU-executed host weights with an enabled retained-replay backend before loading weights (qwen35 src/arch.rs load_weights_with_placement:108, src/serve_engine.rs build:1015), and the narrow MTP verify graph refuses a nested capture or replay recording (qwen35 src/mtp_spec.rs mtp_verify_graph_eligible:1517-1518), and a bounded-wait kernel launched under capture before its wait-error block exists (dispatch.rs Gpu::device_wait_block: `capture_mode` without a block returns an error before any allocation; the blocks are preallocated by Gpus::prepare_tp_graph_signals, gfx1100 wavegrid Gpu init and DS4 rsqrt_once control-state setup), and the diagnostic MoE route dump / activation capture readback (hipfire-dispatch pipeline/moe_capture.rs read_device: `capture_mode`, `is_recording()` or an active retained body returns an error before the device synchronize and copy; HIPFIRE_MOE_ROUTE_DUMP / HIPFIRE_MOE_ACT_CAPTURE are developer diagnostics, off by default)",
+        effect: Refusal,
+        switches: "error before any launch; the admission predicate that routes to the eager-only entry is inventoried at the caller",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refused branch launches nothing; a recording that reaches it fails loudly instead of recording a different body",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx906-mmq-debug-assert",
+        predicates: &[CaptureMode],
+        condition: "`debug_assert!(should_use_mmq(batch) || capture_mode)` in the gfx906 MMQ launchers (gemm.rs:18939, 19121, 19275)",
+        effect: Assertion,
+        switches: "nothing in release builds",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "debug assertion only",
+        reaches: &[],
+    },
+    Decision {
+        id: "mmq-screen-skipped-under-capture",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "mmq_screen_weight returns `false` without screening or caching when `capture_mode || is_recording()` and the weight has no cached verdict (dispatch.rs:3603)",
+        effect: KernelSelection,
+        switches: "eager: the synthetic WMMA-vs-MMQ screen decides MMQ vs WMMA and caches it; recorded/captured with no cached verdict: WMMA",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different GEMM kernels, no byte oracle. Only the gfx906/HFQ4 MMQ route screens (gemm.rs:4385, hipfire-runtime arch.rs:239); no railgun default program takes it",
+        reaches: &[],
+    },
+    Decision {
+        id: "prefill-producer-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "a8_prefill_active, iu4_producer_sidecar_active, iu4_silu_quant_fused_active, iu4_producer_quant_fused_active, iu4_gfx11_producer_quant_fused_active, fp8_stream_active: `!is_recording() && !capture_mode && batch >= 64 && k % 256 == 0` (dispatch.rs:3123-3208)",
+        effect: KernelSelection,
+        switches: "eager: A8/IU4/FP8 producer+quantize fusions and their MMQ consumers; recorded: the unfused producer + standalone quantizer + incumbent GEMM",
+        kernels: &["gemm_mq4g256v2_mmq*", "quantize*", "*_quant_fused*"],
+        verdict: NotEquivalent,
+        evidence: "different quantization/producer kernels; no byte-exact oracle. Unreachable from every default program: all require batch >= 64, decode members have b = 1 and the DFlash verify b = 16",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx12-mqv2-prefill-projection-routes",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "gfx1201 MQ*V2 projection dispatchers: IU4-direct MMQ and FP8-WMMA candidates (`!is_recording() && !capture_mode && batch >= 64`) and the BT8 weight-reuse tile (`mqv2_prefill_batch_tile`, gfx1201 Qkv N >= 96, gemm.rs:663-705) in gemm_{qkvza,qkv,gate_up}_hfq4g256_wmma_gfx12_mq4v2, gemm_hfq4g256_residual_wmma_gfx12_mq4v2, gemm_qkv_mq{2,5,6}g256v2_wmma_gfx12",
+        effect: KernelSelection,
+        switches: "eager: iu4/fp8/BT8 kernels; recorded: the historical base `*_mq4g256v2_wmma_gfx12` launch contract",
+        kernels: &["gemm_qkv_mq4g256v2_wmma_gfx1201_bt*", "gemm_*_mq4g256v2_wmma_gfx12", "gemm_*_fp8*"],
+        verdict: NotEquivalent,
+        evidence: "different tilings/quantization, no byte-exact oracle. Unreachable from defaults: every eager-only branch needs N >= 64 (BT8 N >= 96); the DFlash verify is N = 16",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx12-mq4v2-verify-tile-route",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "generic route: gfx12_verify_bt_active: `wmma_batch_tiles && gfx1201 && 16 < N < 64 && k % 256 == 0 && !is_recording() && !capture_mode` (gemm_vt.rs), consulted by gemm_{qkvza,qkv,gate_up}_hfq4g256_wmma_gfx12_mq4v2 and gemm_hfq4g256_residual_wmma_gfx12_mq4v2 (also the batched lm_head). Explicit exact route (not a recording decision): Gpu::gemm_{qkvza,qkv,gate_up}_mq4g256v2_verify_exact, gemm_mq4g256v2_{residual,lmhead}_verify_exact (gemm_vt.rs) pick their kernel by N alone (1..=16 one-tile, 17..=63 `_vt`, 64..=128 K32 wide, hipcc `_vt{4,8}w{4,8}_k32` or the PM bundle `mq4_verify_*_pm_gfx1201_bt{4,8}w{4,8}`) and never consult is_recording()/capture_mode; they launch through launch_maybe_blob, which records or captures that same kernel. Inventory, not an admission: whole-CB capture/recording stays refused by its callers",
+        effect: KernelSelection,
+        switches: "generic route, eager: the `*_mq4g256v2_wmma_gfx12_vt{2,3,4}w{4,8}` verify-tile GEMMs; recorded/captured: the one-tile `*_mq4g256v2_wmma_gfx12` launch contract. Explicit exact route: the same kernel eager, recorded and captured",
+        kernels: &["gemm_*_mq4g256v2_wmma_gfx12_vt*"],
+        verdict: ByteExact,
+        evidence: "by construction: each (weight row, batch row) output is the one-tile kernel's single WMMA chain (same K order, dual-half headers, dequant expression, C mapping and epilogue); only the B-operand source (an LDS copy of the same fp16 bytes) and the blocks/waves per launch differ. Oracle: `hipfire-arch-qwen35/examples/cb_spec_verify_probe.rs` PROBE_GEMM / PROBE_GEMM_TIME memcmp every row at N = 17..63; the K32 wide kernels (HIP and PM) are byte-compared against the singleton at every N = 1..128 by `hipfire-arch-qwen35/examples/cb_verify_gemm_oracle.rs` (eager and HIP-graph replay). Unreachable from defaults: the DFlash verify is N = 16 and decode members b = 1; the wide route is off unless HIPFIRE_CB_VERIFY_CHUNK128=1",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx11-mqv2-prefill-projection-routes",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "gfx1100/gfx1151 MQ*V2 dispatchers: MMQ/IU4 at batch >= 64, BT/MW weight-reuse tiles (`mqv2_prefill_batch_tile`/`mqv2_mw_waves`, N >= 96), IU4 column-adjacent route and V2B/V2C tiles (gemm.rs:20266-20300, 20500-20540), try_gemm_*_mqv2_gfx11_reuse, MQ2V2 gfx11 routes",
+        effect: KernelSelection,
+        switches: "eager: MMQ/IU4/BT/MW/column kernels; recorded: base `*_mq4g256v2_wmma` or the row-major IU4 wrapper",
+        kernels: &["gemm_*_mq*g256v2_*", "gemm_mq4g256v2_mmq*"],
+        verdict: NotEquivalent,
+        evidence: "different kernels; the IU4 row-major capture wrapper is called 'arithmetic-identical' only in a comment (gemm.rs:20520-20523), unproven. Unreachable from defaults: gfx11 MQ4R decodes HFQ4 with GEMVs (b = 1); every branch needs N >= 64",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1100-mq4v2-verify-tier",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "exact gfx1100 N <= 16 verify tiers: gate/up LDS-stage (`!is_recording() && !capture_mode`, gemm.rs:32712-32725); its F16 twin allows capture/recording only with split_verify_capture (mq_f16_producers.rs:504-512). Residual LDS-stage/split-K uses `!is_recording()` only (gemm.rs:34592-34610)",
+        effect: KernelSelection,
+        switches: "eager: *_gfx1100_ldsstage / ksplit kernels; recorded: base `gemm_*_mq4g256v2_wmma`, except the admitted split-verifier F16 gate/up preserves LDS-stage. The residual tier ignores capture_mode, so a HipGraph keeps it while a recording does not",
+        kernels: &["gemm_*_mq4g256v2_wmma*"],
+        verdict: NotEquivalent,
+        evidence: "different reduction order; no byte-exact oracle. Reaches no default program (gfx1100 MQ4V2 verify = DFlash on gfx1100, not a default)",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1151-mq4v2-verify-xlds",
+        predicates: &[IsRecording],
+        condition: "Gpu::gfx1151_xlds_active: `flags.gfx1151_xlds && exact gfx1151 && !is_recording() && 1 <= N <= 16 && k % 256 == 0` (gemm.rs), consulted by gemm_{gate_up,qkvza,qkv}_mq4g256v2_wmma and gemm_mq4g256v2_residual_wmma (also the verify lm_head) just before the base launch, by the HFQ4G256/MQ4G256 v1 gemm_{qkvza,qkv}_hfq4g256_wmma, gemm_gate_up_hfq4g256_wmma and gemm_hfq4g256_residual_wmma (also gemm_hfq4g256_batched_lmhead; the last two only without a HIPFIRE_GATE_UP_VARIANT / HIPFIRE_WO_WMMA_VARIANT pin), and by gemm_q8_0_wmma (Q8_0 DFlash draft/verify lm_head; also needs a 16 B aligned weight base); eager and HipGraph capture both take the route (it ignores capture_mode), only Redline recording keeps the base contract. Kill switch HIPFIRE_GFX1151_XLDS=0",
+        effect: KernelSelection,
+        switches: "eager/captured: `gemm_*_{mq4g256v2,hfq4g256}_wmma_gfx1151_xlds` / `gemm_q8_0_wmma_gfx1151_xlds` (128-thread blocks, 4 waves x 16 rows, X slab staged in LDS); recorded: base one-wave `gemm_*_mq4g256v2_wmma` / `gemm_*_hfq4g256_wmma{,_ldscoop_nosync,_k2}` / `gemm_q8_0_wmma`",
+        kernels: &[
+            "gemm_*_mq4g256v2_wmma_gfx1151_xlds",
+            "gemm_*_mq4g256v2_wmma",
+            "gemm_*_hfq4g256_wmma_gfx1151_xlds",
+            "gemm_*_hfq4g256_wmma",
+            "gemm_gate_up_hfq4g256_wmma_ldscoop_nosync",
+            "gemm_hfq4g256_residual_wmma_k2",
+            "gemm_q8_0_wmma_gfx1151_xlds",
+            "gemm_q8_0_wmma",
+        ],
+        verdict: ByteExact,
+        evidence: "by construction: each (weight row, batch row) output is the base kernel's single WMMA chain (same K order from acc = 0, same header selection (MQ4V2 dual-half; v1 group f32 (scale, zero) cast to f16), dequant value fma_f16(scale, nibble, zero) and epilogue); only the X-tile source (an LDS copy of the same fp16 bytes) and the waves per block differ. Oracle: `rdna-compute/examples/test_mq4v2_xlds_gfx1151.rs` compares raw f32 bits of every output element against the base dispatcher for gate_up/qkvza/qkv/residual in both formats at the 27B and 9B shapes and odd shapes, N = 1, 5, 16; `rdna-compute/examples/bench_q8_lmhead_rows.rs` does the same for gemm_q8_0_wmma on a real 248320 x 5120 Q8 head and odd shapes. Reaches no default Redline program (gfx1151 4-bit verify = DFlash)",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx906-cdna3-prefill-routes",
+        predicates: &[CaptureMode],
+        condition: "gfx906 dp4a, CDNA3 rocBLAS/MFMA and gfx942 E8 rocBLAS branches gated `!capture_mode` in gemm_{qkvza,qkv,gate_up}_hfq{4,6}g256, gemm_hfq4g256(_residual), gemm_hfq6g256_{residual,batched_lmhead}, rocblas_gemm_mfp4e8_soa_prefill_auto",
+        effect: KernelSelection,
+        switches: "eager: dp4a/rocBLAS/MFMA; captured: fp16 wave64 / WMMA fallbacks",
+        kernels: &["gemm_*dp4a*", "gemm_*mfma*"],
+        verdict: NotEquivalent,
+        evidence: "different arithmetic. Arch-unreachable: no default program runs on gfx906/CDNA3",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1201-fp8-f2-row-route",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "fp8_f2_row_active: `G12_FP8_F2 && gfx1201 && !is_recording() && !capture_mode && n >= 512` (gemm.rs:9655-9670)",
+        effect: KernelSelection,
+        switches: "eager: fragment-repacked FP8 F2 row GEMM; recorded: FP16 MQ4V2 WMMA",
+        kernels: &["mq4v2_fp8_fragment_repack_gfx1201", "gemm_mq4g256v2_wmma_fp8_gfx12*"],
+        verdict: NotEquivalent,
+        evidence: "different precision path. Unreachable: n >= 512 (G12_FP8_F2_MIN_N, gemm.rs:418)",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1100-f16-projection-fast-route",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "mq_f16_projection_fast_route: chain verify && gfx1100 && 1 <= n <= 16 && dim % 256 == 0 && !fp8_verify_scope && !mq_f16_projection_off; capture/recording additionally requires ChainVerifySplit and preloaded partial/merge/preconvert kernels with sufficient existing Q16 scratch (prefill.rs:5806-5818; attention.rs:7912-7924)",
+        effect: KernelSelection,
+        switches: "eager and admitted split capture/recording: fused_rmsnorm_rotate_mq[_awq]_f16_batched + *_mq4g256v2_wmma_f16; other recorded windows: F32 producer + convert_f32_to_f16 + base *_mq4g256v2_wmma",
+        kernels: &["fused_rmsnorm_rotate_mq*_f16_batched", "gemm_*_mq4g256v2_wmma_f16", "convert_f32_to_f16"],
+        verdict: ByteExact,
+        evidence: "operation-order-exact F16 producers (mq_f16_producers.rs:5-20); GPU oracle `hipfire-arch-qwen35/examples/test_mq_f16_projection_producers_gfx1100.rs` memcmps the F16 bytes and the projection outputs; design §2.3 (prefill.rs:6020-6022). Reaches no default program (gfx1100 DFlash); design §7 counts it as the gfx1100 DFlash graph-lowering loss",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1100-q8x-verify-gemv",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "q8x_verify_active: gfx1100_q8x_verify flag (default on, exact gfx1100) && arch == gfx1100 && 2 <= batch <= Q8X_MAX_BATCH && k % 256 == 0 && k <= Q8X_MAX_K && !is_recording() && !capture_mode && !fp8_verify_scope (gemv_q8x.rs:192-202)",
+        effect: KernelSelection,
+        switches: "eager: int8-activation small-batch GEMV (quantize activations to Q8 + mq4v2_q8x_*); recorded/captured: base *_mq4g256v2_wmma",
+        kernels: &["mq4v2_q8x_*"],
+        verdict: NotEquivalent,
+        evidence: "int8-quantized activations, numeric not byte-identical (CHANGELOG 0.4.4, PR #987 KLD verify-shaped deltas <= 1e-4). Recorded windows keep the WMMA route; reaches no default recorded program",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1201-fp8-fa2-split-verify",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "fp8_fa2_split_verify_admitted (fp8_fa2_split_verify_route(): HIPFIRE_GFX12_FA2_SPLIT_VERIFY_FP8 unset = 16 splits from 8192 LIVE context for 2..=16 rows, =<2..=64> = that many splits, no floor, 2..=32 rows, =0 off) && gfx1201 && H24/KV4/D256 && no tree bias && block_cols == 0 && !is_recording() && partials large enough, and under capture additionally live_ctx given (DFlash ChainVerify only; pos + batch) && fp8_fa2_split_verify_capture_ready (module + merge + pre-convert loaded, Q16 scratch grown) (attention.rs attention_flash_fp8_e4m3_tile_batched)",
+        effect: KernelSelection,
+        switches: "eager and captured (route-class graph, re-captured when the live context crosses the floor): native-fp8 split-KV FA2 verifier; recorded: VerifyAttn and the existing tile routes",
+        kernels: &["attention_fp8_e4m3_fa2_gqa_*_gfx1201"],
+        verdict: NotEquivalent,
+        evidence: "f16 Q/K/V/P operands, not byte-identical to VerifyAttn (verify_route_logits B=16 KL pooled 1.0e-4 nats, max 9.2e-3); below the floor and above 16 rows byte-identical. Recorded windows keep VerifyAttn, so a railgun recording of an fp8 DFlash verify at live context >= 8192 differs from the eager window",
+        reaches: &[reach(DflashGfx1201, "live context >= 8192 (default 16 splits), 2..=16 rows, native fp8 KV, H24/KV4/D256 (the stock 27B DFlash B=16 verify window)", "g0; arm3")],
+    },
+    Decision {
+        id: "gfx1100-wmma-verify-attn",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "wmma_verify_attn_active: gfx1100_wmma_verify_attn flag (default on, exact gfx1100) && verify_attn && arch == gfx1100 && 1 <= rows <= WMMA_VERIFY_ATTN_MAX_ROWS && n_heads == GQA * n_kv_heads && n_kv_heads == 4 && head_dim == 256 && !is_recording() && !capture_mode; caller checks the Q8_0 KV codec (attention_wmma_verify.rs:94-111)",
+        effect: KernelSelection,
+        switches: "eager: attention_verify_wmma_q8_qt*_gfx1100 split-K + attention_verify_wmma_reduce_gfx1100; recorded/captured: existing verify attention route",
+        kernels: &["attention_verify_wmma_q8_qt*_gfx1100", "attention_verify_wmma_reduce_gfx1100"],
+        verdict: NotEquivalent,
+        evidence: "split-K WMMA, different summation order; PR #989 verify-shaped KLD ON-OFF |d| <= 6e-4, standard pins byte-identical. Recorded windows keep the existing route; reaches no default recorded program",
+        reaches: &[],
+    },
+    Decision {
+        id: "widened-prefill-batching",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "wide_candidate: ordinary whole-stack prefill with no PBS/cap/tree/tape/hidden ring/fusion and `!capture_mode && !recording`; the facts come from `ordinary_call_facts` (`gpu.graphs.capture_mode`, `gpu.replay.is_recording()`) into `OrdinaryCallFacts::wide_candidate` (prefill.rs)",
+        effect: LaunchShape,
+        switches: "eager: widened chunk rows (up to 8192); recorded: legacy 512-row chunk cadence",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "a different chunk partition changes every chunked kernel's batch; no byte-exact oracle. Unreachable: the DFlash verify passes gdn_tape/hidden_rb (never a wide candidate) and prefill is not a railgun default member",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1151-fa-pair-merge",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "fa_pair_merge_admitted: two full 512-row chunks on gfx1151, `!capture_mode && !replay_recording` (prefill.rs:12062-12073, 2955-2975)",
+        effect: KernelSelection,
+        switches: "eager: one merged 1024-row FA2 pair; recorded: two 512-row attends",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different attention batching; no oracle. Unreachable: prefill-only",
+        reaches: &[],
+    },
+    Decision {
+        id: "q8-multirow-verify-attention",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "q8_multirow_attn_admitted: gfx1100|gfx1151|gfx1201 && Q8 KV && head_dim ∈ {128, 256} && 4 <= n <= 32 && logical ctx > HIPFIRE_FA_PERTOKEN_MIN_CTX (default 4096) && !tree && !independent && ((!capture_mode && !replay_recording) || capture_safe_fixed_grid) (prefill.rs:9700-9722). The fixed-grid exception requires the admitted gfx1100 split verifier; after a split miss the launcher refuses recording, or admitted gfx1100 split capture (attention.rs:743-749, 9592-9598)",
+        effect: KernelSelection,
+        switches: "eager: kv_cache_write_q8_0_batched + attention_flash_q8_0_rows{4,8}_d{4,8} + attention_flash_asym_reduce_batched; recorded: the batched masked attend (attention_q8_0_kv_batched / attention_flash_q8_0_tile_batched), except admitted gfx1100 split windows use Q16 preconvert + fixed S=8 partial + merge in both arms",
+        kernels: &["attention_flash_q8_0_rows*", "attention_flash_asym_reduce_batched", "attention_q8_0_kv_batched*", "attention_flash_q8_0_tile_batched*", "attention_flash_q8_0_reduce*", "kv_cache_write_q8_0_batched", "attention_fa2_q_preconvert_gfx1100", "attention_q8_0_fa2_gqa_partial_gfx1100", "attention_q8_0_fa2_gqa_merge_gfx1100"],
+        verdict: NotEquivalent,
+        evidence: "measured not bit-exact: worst relative error 4.222e-7 vs the batched attend (commit de2448f07 kernel oracle); excluded from recording by c90252322 because its tile grid is sized from the host logical context",
+        reaches: &[reach(DflashGfx1201, "logical context > 4096 (every verify window past the default HIPFIRE_FA_PERTOKEN_MIN_CTX; Q8 KV, B = 16, head_dim 256)", "g0; arm3 in the pre-railgun direct warmup window")],
+    },
+    Decision {
+        id: "captured-batch-attention-physical-cap",
+        predicates: &[CaptureMode],
+        condition: "`max_ctx_len = if capture_mode { kv_cache.physical_cap } else { logical_max_ctx }` (qwen35 prefill.rs forward_batch_chunk_impl; llama.rs forward_prefill_chunk), feeding the batched Q8 and fp8 attend crossover `max_ctx_len <= 4096` on gfx1200/gfx1201 (hipfire-dispatch families/attention.rs `AttnQ8_0KvBatchedMasked` / `AttnFp8E4m3KvBatchedMasked`) for every attend except DFlash chain-verify blocks (`DflashFusionCtx::ChainVerify`), which never take the crossover (`DispatchCtx::verify_tile_attend`; see captured-verify-attention-physical-cap); MTP verify keeps the crossover",
+        effect: KernelSelection,
+        switches: "captured: attention sized by physical_cap (attention_flash_{q8_0,fp8_e4m3}_tile_batched when physical_cap > 4096); recorded or eager: sized by the logical context (attention_{q8_0,fp8_e4m3}_kv_batched at ctx <= 4096) and a logical `max_ctx_len` kernarg",
+        kernels: &["attention_q8_0_kv_batched*", "attention_fp8_e4m3_kv_batched*", "attention_flash_q8_0_tile_batched*", "attention_flash_fp8_e4m3_tile_batched*", "attention_flash_asym_reduce_batched*"],
+        verdict: NotEquivalent,
+        evidence: "different attention kernels (different fp32 reduction order; cb/VERIFY-GRAPH-DIFF.md measured the fp8 pair differing in every output row at B=16). No default program captures a Standard-workload batched forward: the qwen35 captured forwards are speculative verify (DFlash verify graph), and llama's forward_prefill_batch_chunk_captured has no caller",
+        reaches: &[],
+    },
+    Decision {
+        id: "captured-verify-attention-physical-cap",
+        predicates: &[CaptureMode],
+        condition: "the same `max_ctx_len = physical_cap` under capture (qwen35 prefill.rs forward_batch_chunk_impl) for DFlash chain-verify blocks (`DflashFusionCtx::ChainVerify`, `DispatchCtx::verify_tile_attend`), which on gfx1200/gfx1201 skip the LDS crossover in both batched attend arms and always run the tile + reduce (hipfire-dispatch families/attention.rs); MTP verify is not captured and keeps the crossover",
+        effect: LaunchShape,
+        switches: "captured: tile + reduce (gfx1201: the VerifyAttn twin try_attention_verify_gqa) with max_tiles = ceil(physical_cap / tile) and its split count; eager or recorded: the same kernels with max_tiles from the logical context",
+        kernels: &["attention_flash_fp8_e4m3_tile_batched*", "attention_flash_q8_0_tile_batched*", "attention_flash_asym_reduce_batched*", "attention_verify_gqa*"],
+        verdict: ByteExact,
+        evidence: "by construction: each tile covers fixed key positions bounded by the device `positions`, the reduce walks n_tiles = ceil((positions[row]+1)/tile) from `positions` (attention_flash_asym_reduce_batched.hip), and the VerifyAttn split count never changes output bytes (attention.rs verify_gqa_splits). Oracles: rdna-compute examples/verify_attn_oracle.rs (twin vs tile + reduce at eager and cap-262144 capture max_ctx_len); vg_attn_bench (cb/VERIFY-GRAPH-DIFF.md: tile at max_ctx_len 262144 == tile at the logical context, byte for byte, B=16, L 64..4096). End to end: DFlash 27B graph text == HIPFIRE_VERIFY_GRAPH=0 text 64/64, and == batched K=8",
+        reaches: &[reach(DflashGfx1201, "every verify window replayed by the pre-railgun HipGraph (max_tiles from physical_cap vs the logical context)", "arm3")],
+    },
+    Decision {
+        id: "gdn-chunk-scan",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "gdn_chunk_scan admission in forward_batch_chunk_impl, two routes sharing the same recording clauses. Dense (`gdn_chunk_scan_common_admitted`): gfx12_gdn_chunk_scan && MQ4V2 dense && Q8 state && sequential, no tree/tape/hidden ring/fusion && !capture_mode && !is_recording() && gdn_chunk_scan_rows_admitted(n, commit_stride) (prefill.rs:17263-17351). Default-resolved MoE (`gdn_moe_chunk_scan_common_admitted`, GdnMoeChunkScanInputs; explicit HIPFIRE_GDN_MOE_CHUNK_SCAN wins, unset follows the prefill route capabilities): `capable` = gfx12_gdn_chunk_scan && gfx1201 && !fp8_verify_scope && !capture_mode && !is_recording(), plus supported head geometry, Q8 state, sequential, no tree/tape and the plain-forward clauses, then a per-layer projection-dtype gate (prefill.rs:16639-16670, 16800-16809; gdn_moe_chunk_scan_layer_admitted:13173)",
+        effect: KernelSelection,
+        switches: "eager: chunked GatedDeltaNet scan (dense MQ4V2 layers, and DeltaNetMoe layers when the MoE route is admitted); recorded or captured: per-token GDN",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different recurrence evaluation order; no byte-exact oracle. Reaches no default program: both routes need gdn_tape None (the DFlash verify carries a GDN tape), the MoE route also needs a plain forward (no DFlash fusion, hidden-ring capture, band, max_layer, routed_out or mask override), and prefill never records into a Redline tape or captures a graph on this path",
+        reaches: &[],
+    },
+    Decision {
+        id: "kv-tier-capture-forces-flash",
+        predicates: &[CaptureMode],
+        condition: "`use_flash = capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048)` in KvTierPlan q8/fp8/bf16_attend_key (hipfire-dispatch kv_tier.rs:460-490) and the ep_batch twin (ep_batch.rs:3826, 4531); callers forward `capture_mode` into KvTierInputs (hipfire-dispatch pipeline/hybrid.rs AttentionKv::tier_plan for every qwen35 decode attention, prefill.rs:9529, prefill_multi.rs:155 attn_fp8_twin_eligible and :602 lane_fa_plan_ok, which derives the plan the lane-batched FullAttention admission must reproduce, gemma4, llama, qwen2, hipfire-runtime llama.rs). GatedAttentionOp::attend also uses the selected flash key to admit the opt-in single-token Q8 KV-write fold",
+        effect: KernelSelection,
+        switches: "captured: flash tile attention; eager/recorded with flash_mode 0|1 at short context: non-flash attention_*_kv. With HIPFIRE_FA_KVWRITE_FOLD=1 on the supported non-compact gfx1100 decode shape, capture-forced Q8 flash also admits qwen35_fa_prep_kvwrite_gfx1100 in place of qwen35_fa_prep_gfx1100 + kv_cache_write_q8_0_pair",
+        kernels: &["attention_q8_0_kv", "attention_fp8_e4m3_kv", "attention_bf16_kv", "attention_flash_q8_0_tile", "attention_flash_fp8_e4m3_tile", "attention_flash_bf16_tile", "attention_flash_q8_0_reduce", "qwen35_fa_prep_kvwrite_gfx1100", "qwen35_fa_prep_gfx1100", "kv_cache_write_q8_0_pair"],
+        verdict: NotEquivalent,
+        evidence: "non-flash vs flash differ in fp32 reduction order (~0.44 logit delta, qwen35 forward.rs:1296-1311). Unreachable under the default configuration: flash_mode = 2 on every gfx11/gfx12 arch (hipfire-runtime llama.rs:3972-3979), which dominates the capture term; HIPFIRE_ATTN_FLASH=0|1 makes it reachable (and must refuse the railgun default)",
+        reaches: &[],
+    },
+    Decision {
+        id: "attention-tile-grid-superset",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "replay_stable_tile_count(actual, max, capture_mode, is_recording()) = max_tiles when captured or recorded (attention.rs:214-225) in attention_flash_fp8_e4m3_tile (7613), attention_flash_q8_0_windowed_impl (7429), attention_flash_bf16_windowed (2377), attention_flash_fwht{2,3,4}",
+        effect: LaunchShape,
+        switches: "grid.y = ceil(max_seq / tile) (GQA fp8 tile: min(that, 512)) when recorded; ceil(seq_len / tile) eager",
+        kernels: &["attention_flash_fp8_e4m3_tile*", "attention_flash_q8_0_tile*", "attention_flash_bf16_tile", "attention_flash_fwht*_tile", "attention_flash_asym*_tile"],
+        verdict: ByteExact,
+        evidence: "by construction: the dynamic length comes from pos_buf; a tile workgroup with tile_start >= seq_len returns before any store (attention_flash_q8_0_tile.hip:103-113); the GQA fp8 tile computes each tile_id < n_tiles once whatever gridDim.y is (attention_flash_fp8_e4m3_tile_gqa.gfx1201.hip:281-294); the reduce bounds tiles by pos_buf (attention_flash_q8_0_reduce.hip:45-46). Grid only; no kernarg depends on launch_tiles. Redline already records the superset, so arm 3 sees no difference",
+        reaches: &[
+            reach(H2Gfx1201, "every position with ceil(seq_len/128) < min(ceil(max_seq/128), 512): grid.y of attention_flash_fp8_e4m3_tile_gqa_gfx1201", "g0"),
+            reach(Mq4rGfx1201, "every position with seq_len < max_seq - tile: grid.y of attention_flash_q8_0_tile", "g0"),
+            reach(Mq4rGfx1100, "every position with seq_len < max_seq - tile: grid.y of attention_flash_q8_0_tile", "g0"),
+            reach(Mq4rGfx1151, "every position with seq_len < max_seq - tile: grid.y of attention_flash_q8_0_tile", "g0"),
+        ],
+    },
+    Decision {
+        id: "asym-attention-tile-grid-capture-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "`launch_tiles = if capture_mode { max_tiles } else { actual_tiles }` without the recording term in attention_flash_asym{2,3,4} (attention.rs:10470, 10862, 11201) and gemma4_ext fwht3_hd512 (gemma4_ext.rs:174); asym3_hd512 consults both (gemma4_ext.rs:39)",
+        effect: LaunchShape,
+        switches: "captured: max-tile grid; eager and recorded: actual-tile grid (a recording freezes the grid at the recording length)",
+        kernels: &["attention_flash_asym*_tile", "attention_flash_fwht3_tile*"],
+        verdict: NotEquivalent,
+        evidence: "tile early-exit not verified for the asym kernels; the missing is_recording term is a length hazard for any recorded asym route (G1). Unreachable: no default program uses asym KV",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1100-asym3-q8-pair-write",
+        predicates: &[IsRecording],
+        condition: "gfx1100_asym3_q8_pair_enabled: gfx1100 && head_dim == 256 && !is_recording() (attention.rs:177-185)",
+        effect: KernelSelection,
+        switches: "eager: kv_cache_write_asym3_q8_pair_gfx1100 (16 dispatches/token fewer); recorded: separate K/V writes",
+        kernels: &["kv_cache_write_asym3_q8_pair_gfx1100", "kv_cache_write_*"],
+        verdict: NotEquivalent,
+        evidence: "no byte-exact oracle cited. Unreachable: asym3 KV on gfx1100 is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "fa2-prefill-attention",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "gfx1201/gfx11 GQA-fused FA2 prefill: `!is_recording() && !capture_mode && 64 <= batch <= 512` (attention.rs:3703-3745)",
+        effect: KernelSelection,
+        switches: "eager: attention_q8_0_fa2_gqa_*; recorded: incumbent batched attend",
+        kernels: &["attention_q8_0_fa2_gqa*"],
+        verdict: NotEquivalent,
+        evidence: "different attention kernel. Unreachable: batch >= 64",
+        reaches: &[],
+    },
+    Decision {
+        id: "flash-attn-ck-prefill",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "optional CK flash-attention prefill: refused when recording or capturing (flash_attn_ck.rs:675-681, 995-1001, select_packed_prefill_capabilities:221-226); needs HIPFIRE_FLASH_ATTN_CK_LIB and flash-prefill opt-in",
+        effect: KernelSelection,
+        switches: "eager: CK library launches (outside the recorder funnels); recorded: native attend",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different kernels, launched outside the funnels. Unreachable by default: no CK library is loaded and flash-prefill is declined for speculative verify on gfx12 (families/attention.rs:898-900)",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-gfx1100-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "DFlash fusions refused under capture/recording: pure-copy fused 5-way hidden commit/scatter (exact gfx1100/gfx1151/gfx1201; dflash_hidden_scatter.rs:73, 206), and gfx1100-only draft collapse split-K route (dflash_draft_fusion.rs:122)",
+        effect: KernelSelection,
+        switches: "eager: dflash_hidden_scatter5 / overwrite split-K draft GEMM; recorded: per-layer copy loop / base GEMM",
+        kernels: &["dflash_hidden_scatter5*", "gemm_mq4g256v2_overwrite_ksplit*"],
+        verdict: NotEquivalent,
+        evidence: "the hidden commit/scatter is a pure F32 row copy (no arithmetic, exact on every admitted arch: gfx1100, gfx1151, gfx1201) but the split-K draft GEMM (gfx1100 only) changes reduction order; not separately proven. The split-K draft route is arch-unreachable from the gfx1201 DFlash default",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-gfx1100-shared-rotation",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "gemm_dispatch_shared (hipfire-runtime dflash.rs, #838), the DFlash draft's shared-input projection groups (noise Q/K/V, FFN gate/up, incremental context K/V): the group's kernel.draft_shared_{qkv,ffn,ctx_kv}_rotation switch (default on exact gfx1100), exact gfx1100, `!is_recording() && !capture_mode`, 2 <= rows <= 16, no HIPFIRE_DRAFT_GEMM_DUMP, every weight MQ4G256V2 with one k (k % 256 == 0) and no AWQ sidecar, rotation scratch for all rows. Host-only; decided before any launch",
+        effect: KernelSelection,
+        switches: "eager: one rotation of the shared input (mq_rotate_x_f16_dflash_gfx1100 on the S7 split-K route, else mq_rotate_x) feeding every projection's GEMM; recorded/captured/refused: gemm_dispatch once per projection in order, one rotation each. Only the gfx1100-only F16 rotation symbol is listed: the generic mq_rotate_x is shared by every arch's routes, and attributing it here would let an unrelated mq_rotate_x difference pass G0 on another arch",
+        kernels: &["mq_rotate_x_f16_dflash_gfx1100"],
+        verdict: ByteExact,
+        evidence: "every projection in a group rotates the same input bytes into the same scratch with the same kernel, so the repeated rotations rewrite identical bytes; each projection keeps the GEMM route gemm_dispatch picks for it (draft_collapse_mq4v2_route depends only on k, rows and AWQ, equal across the group). Per CHANGELOG, maintainer gfx1100 7900 XTX on the integrated ordered-draft beta: Qwen3.8-27B XTS plus MQ4V2 draft, greedy default-on/all-switches-off/beta batteries match text, token counts, tau and cycle counts (5/5), on/off chain also matches (5/5), VMM throughout. This is sharing-vs-per-projection evidence, not eager-vs-recorded GEMM parity. Arch-unreachable from the gfx1201 DFlash default (exact gfx1100 only); the recorded branch's split-K vs base GEMM difference is inventoried under dflash-gfx1100-fusions",
+        reaches: &[],
+    },
+    Decision {
+        id: "ds4-gfx942-compressor-sentinel-gate",
+        predicates: &[CaptureMode],
+        condition: "DS4 compressor host gate: gfx942 && !capture_mode && (pos + 1) % ratio != 0 skips the compressor (forward.rs compressor_op)",
+        effect: KernelSelection,
+        switches: "eager: compressor kernels skipped on non-boundary tokens; captured: launched and sentinel-early-returned",
+        kernels: &["compressor_*"],
+        verdict: ByteExact,
+        evidence: "the host condition equals the device sentinel `commit_slot = -1` that every buf-variant commit kernel early-returns on (forward.rs:2238-2243): skipped launches are no-ops. Arch-unreachable (gfx942 only; the DS4 default is gfx1151)",
+        reaches: &[],
+    },
+    Decision {
+        id: "ds4-gfx942-ffn-overlap",
+        predicates: &[CaptureMode],
+        condition: "gfx942_ffn_overlap_on && !capture_mode (forward.rs expert_ffn_schedule)",
+        effect: KernelSelection,
+        switches: "eager: shared/routed FFN on two streams; captured: serial FFN",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "stream overlap not proven order-independent. Arch-unreachable (gfx942)",
+        reaches: &[],
+    },
+    Decision {
+        id: "replay-enabled-process-route",
+        predicates: &[ReplayEnabled],
+        condition: "process-level `replay.is_enabled()`: qwen35 AR HipGraph off (forward.rs:1712-1716), DS4 retained FFN split tape (forward.rs:4402-4417) and eligibility (3487-3500), lfm2moe eligibility (forward.rs:57)",
+        effect: ProcessRoute,
+        switches: "Redline process: split-FFN tape body, no AR HipGraph; HIP process: ffn_stub + routed FFN, AR HipGraph",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "fixed by the backend request for the whole process, so the eager and recorded forward of one process agree. Arm-3 condition: a railgun process must present the same `is_enabled()` as the pre-railgun default (true for H2/MQ4R/DS4 Redline defaults)",
+        reaches: &[],
+    },
+    Decision {
+        id: "raon-decode-mode-retained-replay",
+        predicates: &[ReplayEnabled],
+        condition: "hipfire-arch-raon bundle.rs DecodeMode::resolve, run once at bundle load: `HIPFIRE_GRAPH=0` selects Eager; otherwise an enabled retained-replay controller (`gpu.replay.is_enabled()`, which owns the launch stream) selects Eager; CPU-executed host weights select Eager; else Graph (whole decode step captured once per context bucket and replayed)",
+        effect: ProcessRoute,
+        switches: "Graph: decode step recorded in gpu.graphs and replayed per token; Eager: per-launch dispatch of the same kernels (the oracle/control route)",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "decided once at load from the process backend request and never re-read per forward, so the eager and recorded forward of one process agree; both modes dispatch the same launchers on the same buffers. The Raon AR program (`RaonArGfx1201`, opt-in developer flag) is not a default and runs only in Graph mode: this decision does not reach it",
+        reaches: &[],
+    },
+    Decision {
+        id: "raon-dflash-verify-graph-abort",
+        predicates: &[GraphSlotCapturing],
+        condition: "hipfire-arch-raon verify_graph.rs record_verify_graph: a failed DFlash verify-body capture aborts the stream capture and clears `gpu.graphs.verify.capturing` before returning the error",
+        effect: Lifecycle,
+        switches: "failed capture: abort + clear the capturing slot + Err (no eager fallback); success: end_verify_graph_capture",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "capture bookkeeping only: no kernel, shape or argument depends on it; the recorded verify body is the eager body launch for launch (raon_dflash_oracle verifygraph: logits, features, argmax and RDA/conv/seq_len state bit-identical eager vs graph for K = 1..16 on R9700 and 7900 XTX)",
+        reaches: &[],
+    },
+    Decision {
+        id: "raon-railgun-plan-capture-route",
+        predicates: &[CaptureMode],
+        condition: "hipfire-arch-raon railgun_decode.rs plan_body: the Raon railgun owner sets `gpu.graphs.capture_mode = true` for the duration of `decode_body` under the plan sink and restores the prior value afterwards; nothing executes and no stream capture begins",
+        effect: KernelSelection,
+        switches: "planned (capture route flags): every launcher takes its captured branch (F32 to F16 `convert_f32_to_f16` before each consumer, blob-path launches); eager: the cache-hit conversion skip",
+        kernels: &["convert_f32_to_f16"],
+        verdict: ByteExact,
+        evidence: "the body under the plan sink takes exactly the branches the Raon HIP graph capture takes (the probe inventory phase compared the plan sink of the ctx512 body, 1132 kernel launches and 75 fills, op for op with the launch witness of an actual HIP-graph capture of the same step: symbol, geometry, LDS, kernarg bytes and object digest equal, 0 mismatches, `raon-railgun/PROBE.md` section 1), so the owner is invariant against the HIP graph arm (arm 3); against eager the only kernel-set difference is the conversion cache of `fp16-fp8-x-conversion-cache`, whose argument applies unchanged. State parity of the graph route against eager: `raon_oracle state --mode graph`; of the railgun route against the graph route: `raon_oracle railgun-state --compare`",
+        reaches: &[reach(RaonArGfx1201, "every decode body the owner plans (the whole body shares the capture-route flag; the observable kernel-set difference from eager is the F16 conversion)", "g0")],
+    },
+    Decision {
+        id: "raon-railgun-owner-replay-decline",
+        predicates: &[ReplayEnabled],
+        condition: "hipfire-arch-raon railgun_decode.rs try_step admission: `retained_replay: gpu.replay.is_enabled()` (a retained-replay controller owns the launch stream)",
+        effect: Refusal,
+        switches: "retained replay enabled: the owner declines (`RetainedReplay` refusal) before any launch and the HIP graph step runs once; disabled: the owner continues its other admission checks",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "a pre-submit decline launches nothing and consumes no token, position or RDA state (the owner's Declined contract); the step then takes the unchanged HIP-graph route, which `raon-decode-mode-retained-replay` already classifies. No kernel, shape or argument depends on it",
+        reaches: &[],
+    },
+    Decision {
+        id: "dspark-capture-safe-verify-body",
+        predicates: &[DeclaredCaptureBody, IsRecording, CaptureMode],
+        condition: "DS4 DSpark verify body parameter `capture_safe` (spec_impl.rs:155-230; forward.rs forward_prefill_batch_chunk_impl, carried by rows_program.rs RowsWindow into push_attention / compressed_attention_rows and the hipfire-dispatch pipeline/mla/{rows,attention}.rs operations) and dspark_requires_typed_device_copy = is_recording() || capture_mode || force_blob_path (forward.rs)",
+        effect: KernelSelection,
+        switches: "capture_safe: fixed-node body (host-sized compressed/top-k grids at max, typed device copies); ordinary: host-sized grids, direct top-k",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "an oracle exists (redline_dspark_shadow_pm4 `direct_capture_exact`, hipfire-generate redline.rs:2121) but no result is cited here. Unreachable: DSpark is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-draft-graph-safe-body",
+        predicates: &[DeclaredCaptureBody],
+        condition: "draft_ffn_layer(graph_safe) (hipfire-runtime dflash.rs:2566-2630): `memcpy_dtod_auto` + `add_f32_graph_safe` when captured, `hip.memcpy_dtod` + `add_f32` otherwise",
+        effect: LaunchMechanism,
+        switches: "same `add_f32` function, grid and arguments; funnel launch on the active stream vs a raw `hip.launch_kernel` on the null stream",
+        kernels: &["add_f32"],
+        verdict: Invariant,
+        evidence: "rdna-compute norm.rs:308-374: identical kernel, grid, block and argument values. Recorder coverage gap, not a selection difference: with graph_safe = false (the dense DFlash default; the draft FFN graph is MoE-only, speculative.rs:232-247) the add bypasses the funnels, so a recording of the draft misses one launch per draft layer and G0 reports the bypass until the railgun draft is authored with graph_safe = true",
+        reaches: &[],
+    },
+    Decision {
+        id: "tp-graph-capture-barrier",
+        predicates: &[CaptureMode],
+        condition: "barrier_rank_streams_reuse: all ranks of an admitted signal topology (gfx1100 or gfx1201 TP2, gfx1201 TP3/TP4) capturing → capture_tp_graph_barrier (hipfire-runtime multi_gpu.rs)",
+        effect: LaunchMechanism,
+        switches: "captured cross-rank signal barrier vs event barrier",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "synchronisation only; multi-GPU TP is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "tp2-graph-fused-reduce",
+        predicates: &[CaptureMode],
+        condition: "all_reduce_sum_f32_peer_direct_add_impl: alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph: default on a gfx1201 pair, `HIPFIRE_TP_FULL_GRAPH=1` on gfx1100, `=0` off) → `tp2_peer_push_reduce_gfx1201` on a gfx1201 pair once the load-time peer-push qualification passed (`HIPFIRE_TP_PEER_PUSH=0` and any gfx1100 pair use `tp_graph_signal_reduce_gfx1100`) (hipfire-runtime multi_gpu.rs)",
+        effect: KernelSelection,
+        switches: "captured: one fused peer exchange + residual add kernel per rank (gfx1201: tagged peer-VRAM granules; otherwise signal barrier + coherent payload exchange); eager: event record/wait + `add_peer_residual_f32` reading the peer partial",
+        kernels: &[
+            "tp2_peer_push_reduce_gfx1201",
+            "tp_graph_signal_reduce_gfx1100",
+            "add_peer_residual_f32",
+        ],
+        verdict: ByteExact,
+        evidence: "all three kernels compute `x + (p0 + p1)` per element in rank order with fp32 adds only (no contraction), from the same partial bytes; the payload exchange copies bits (the peer-push kernel tags every 8-byte half with the generation and folds only granules whose tags match); `tp2_cross_device_graph_reduce` (lab) checks exact results on every replay; multi-GPU TP is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "tp4-graph-peer-push-reduce16",
+        predicates: &[CaptureMode],
+        condition: "peer_reduce (hipfire-runtime multi_gpu/executor.rs): decode `AllReduceAdd` on 3 or 4 gfx1201 ranks, bf16 exchange, every rank capturing (the TP3/TP4 whole-token graph: `HIPFIRE_TP_FULL_GRAPH` default on, `HIPFIRE_TP_PEER_PUSH=0` and `HIPFIRE_TP_FULL_GRAPH=0` off) with the load-time peer-push qualification passed → `tp_peer_pushn_reduce_bf16_gfx1201`",
+        effect: KernelSelection,
+        switches: "captured: one bf16 peer-push kernel per rank (tagged 16-byte granules in the peers' fine-grained VRAM, device-resident generations); eager: `tp_pack16_bf16` + peer copies + event record/wait + `tp_fold16_bf16`",
+        kernels: &[
+            "tp_peer_pushn_reduce_bf16_gfx1201",
+            "tp_pack16_bf16",
+            "tp_fold16_bf16",
+        ],
+        verdict: ByteExact,
+        evidence: "both routes compute `x + (r(p0) + r(p1) + ... + r(p_{n-1}))` per element, r = the shared round-to-nearest-even bf16 round trip of kernels/src/tp_exchange16.h applied to every rank's term (the rank's own included), left-associated in rank order with fp32 adds only; the peer-push kernel accepts a granule only when both 8-byte halves carry the current generation. The load qualifies it with 64 exchanges compared bit for bit with a host replay and greedy token IDs match the eager route on 3 prompts; multi-GPU TP is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "tp2-graph-fused-reduce16",
+        predicates: &[CaptureMode],
+        condition: "direct_add16 (hipfire-runtime multi_gpu/tp_exchange.rs): `HIPFIRE_TP_EXCHANGE=bf16|f16` (default bf16) alternating-slot reduction with both ranks of an exact gfx1100 or exact gfx1201 TP2 pair capturing (the whole-token graph) → `tp_graph_signal_reduce16_{bf16,f16}_gfx1100`",
+        effect: KernelSelection,
+        switches: "captured: one fused signal barrier + 16-bit coherent payload exchange + rank-ordered residual add kernel per rank; eager: `tp_pack16_*` + event record/wait + `tp_fold16_*` reading both ranks' 16-bit slots",
+        kernels: &[
+            "tp_graph_signal_reduce16_bf16_gfx1100",
+            "tp_graph_signal_reduce16_f16_gfx1100",
+            "tp_pack16_bf16",
+            "tp_pack16_f16",
+            "tp_fold16_bf16",
+            "tp_fold16_f16",
+        ],
+        verdict: ByteExact,
+        evidence: "both routes compute `x + (r(p0) + r(p1))` per element, r = the shared round-to-nearest-even 16-bit round trip of kernels/src/tp_exchange16.h, with fp32 adds only (no contraction) in rank order on every rank; the captured payload exchange copies the packed 16-bit bits. Capture and eager agree bit for bit; the 16-bit sum itself is a numeric route against the f32 exchange (KLD-judged, see docs/multi-gpu.md); multi-GPU TP is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "redline-oracle-diagnostics",
+        predicates: &[DeclaredCaptureBody, ReplayState],
+        condition: "hipfire-generate redline.rs and hipfire-daemon oracle handlers: capture_safe arms of the DSpark oracle, replay state in JSON responses",
+        effect: Oracle,
+        switches: "which body an oracle arm runs; route state reporting",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "diagnostic requests only, never on a served path",
+        reaches: &[],
+    },
+    Decision {
+        id: "verify-attention-wmma-gqa",
+        predicates: &[IsRecording],
+        condition: "launch_verify_gqa and attention_verify_wmma_with return `false` when `!flags.verify_attn || is_recording()` (attention.rs:7860, 8062)",
+        effect: KernelSelection,
+        switches: "eager or HipGraph: the verify GQA / WMMA attention tables; recorded: the caller's incumbent verify attend",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different attention kernels, no byte oracle. Unreachable by default: `HIPFIRE_VERIFY_ATTN` / `kernel.verify_attn` is opt-in (feature_flags.rs verify_attn default false)",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-gdn-replay-multilayer",
+        predicates: &[IsRecording],
+        condition: "gdn_replay_ml_eligible: exact gfx1201 && !gdn_replay_ml_off && !is_recording() && fast GDN requant && head_dim 128 && 1 <= n_steps <= 16 (dflash_gdn_replay.rs:145-160), consulted by the DFlash commit's GDN replay (speculative.rs:1792)",
+        effect: KernelSelection,
+        switches: "eager or HipGraph: the two-launch multi-layer GDN replay; recorded: per-layer GDN replay launches",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different launch set with no cited byte oracle. Default-on on gfx1201 (opt-out HIPFIRE_GDN_REPLAY_ML_OFF); the condition ignores capture_mode, so the pre-railgun DFlash HipGraph keeps it while a railgun recording does not",
+        reaches: &[reach(Program::DflashGfx1201, "DFlash commit GDN replay, 1 <= accepted steps <= 16", "arm3")],
+    },
+    Decision {
+        id: "select-regrid-row-selectors",
+        predicates: &[IsRecording],
+        condition: "select_regrid_enabled: (exact gfx1201 || exact gfx1151 || exact gfx1100) && !select_regrid_off && !is_recording() (select_regrid.rs:64-70), consulted by the batched top-K and argmax selectors (sampling.rs:129, 838) and the developer online draft tuner (dflash_online.rs)",
+        effect: KernelSelection,
+        switches: "eager or HipGraph: select_regrid 1024-thread row selectors (+ topk_values_tie_exact_f32 on tied rows); recorded: topk_values_batched_f32 / argmax_f32_batched",
+        kernels: &["topk_values_batched_f32", "argmax_f32_batched"],
+        verdict: ByteExact,
+        evidence: "select_regrid.rs module header: outputs byte-identical to the shipping kernels for every input, ties and NaNs included; examples/test_select_regrid checks it on gfx1201, gfx1151 and gfx1100",
+        reaches: &[reach(Program::DflashGfx1201, "DFlash2 selector top-K and verify argmax", "arm3")],
+    },
+    Decision {
+        id: "qwen4-f16-wmma-prefill",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "QWEN4_F16_WMMA routes at rows >= QWEN4_F16_WMMA_MIN_TOKENS and `!is_recording() && !capture_mode`: qwen4_f16_wmma_applies, qwen4_bf16_streams (gemm.rs:27873-27902), gated_delta_chunk_route (tensor_ops.rs:559), qsa_dense_wmma_applies (tensor_ops.rs:3685), qsa_gathered_wmma_applies (tensor_ops.rs:3858, on unless HIPFIRE_QWEN4_QSA_WMMA_GATHER=0); gfx1201 fn_gdn_dense::applies (fn_gdn_dense.rs:46, rows >= 64, on unless HIPFIRE_FN_GDN_DENSE_SCAN=0)",
+        effect: KernelSelection,
+        switches: "eager: F16 WMMA BF16 GEMM / chunked GDN / dense C64 GDN chunk scan (gfx1201) / dense or gathered QSA WMMA; recorded: incumbent qwen4 kernels",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different kernels, no byte oracle. Prefill-only (row threshold), and no railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-lane-rows-pm",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::lane_rows_pm_enabled (lane_rows_pm.rs): HIPFIRE_FN_LANE_PM_ROWS (gfx1151 default on, 0 kills), exact gfx1151, Gpu::lane_rows_scope (set by forward_lanes, the qwen4 speculative verify forward in forward_chunk_inner and the DFlash2 draft head dflash_lm_head) and `!is_recording() && !capture_mode`",
+        effect: KernelSelection,
+        switches: "eager lane step, speculative verify and DFlash2 draft head: qwen4_lane_rows_pm (gemv_mq6g256v2_xbatch_pm, its x4 form, gemv_q8_0_k8_xbatch_pm, gemv_q8_0_k320_xbatch_pm) at rows 2..=8; recorded: incumbent rows kernels",
+        kernels: &["gemm_mq6g256v2_f32_rows", "gemm_mq6g256v2_f32_rows_x4", "gemv_q8_0_k8_rows", "gemv_q8_0_staged_rows"],
+        verdict: ByteExact,
+        evidence: "rdna-compute examples/lane_rows_pm_oracle on gfx1151 (fn-batch S7 r1-rows): 15 shapes x B=1..8, 225 launches, 0 bad bytes PM vs 1-row incumbent and vs incumbent rows (output allocation and guards)",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-gdn-core-lanes",
+        predicates: &[IsRecording],
+        condition: "gated_delta_core_lanes (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive one-row GDN Core steps with Q8 states, HIPFIRE_QWEN4_GDN_LANES (exact gfx1151 and exact gfx1201 default on, 0 kills) and `!is_recording()`",
+        effect: KernelSelection,
+        switches: "eager lane step: gdn_lanes (gated_delta_conv_params_bf16_f32_lanes, gated_delta_step_gate_norm128_q8_lanes), one launch per kernel for every lane; recorded: the per-lane incumbent launches",
+        kernels: &["gated_delta_conv_params_bf16_f32", "gated_delta_step_gate_norm128_q8"],
+        verdict: ByteExact,
+        evidence: "gfx1151: fn_lane_oracle (Flash-Next GPTQ3 MQ4): k = 1/2/8 lanes, every lane step and state checkpoint byte-identical to the singleton forward. gfx1201 (default on): the same device bodies in the same translation unit and compile recipe (the `gdn_lanes` module = `tensor_ops` + gdn_lanes.hip); kernel byte oracle rdna-compute examples/gdn_lanes_oracle (N = 1..8 lanes, ragged cursors and Q8 frames, carried state) PASSED on gfx1201 (20 cases, 12 controls, mgmtp/gdnbatch/runs/oracle-k1-gdn; EP2 mq4 and PP2 mq3 A/B text md5 identical)",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-qsa-core-lanes",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "qsa_core_lanes_min (qsa_core_lanes.rs): 2..=QSA_CORE_LANES_MAX consecutive QSA Core steps (fp8 K/V, BF16 index keys, 1..=8 rows per lane, fused LDS-resident select below QSA_BF16_SPLIT_MIN_BLOCKS, per-head attention), HIPFIRE_QWEN4_QSA_LANES (exact gfx1201, default on, 0 kills) and `!is_recording() && !capture_mode`",
+        effect: KernelSelection,
+        switches: "eager lane step: qsa_lanes (indexed_attention_decode_prologue_fp8_lanes, indexed_attention_pool_rope_bf16_lanes, indexed_attention_select_bf16_lanes, indexed_attention_attention_fp8_lanes), one launch per kernel for every lane; recorded or captured: the per-lane incumbent launches",
+        kernels: &["indexed_attention_decode_prologue_fp8", "indexed_attention_pool_rope_bf16", "indexed_attention_select_bf16_batched", "indexed_attention_attention_fp8_batched"],
+        verdict: ByteExact,
+        evidence: "by construction: the lane kernels call the incumbent device templates (qsa_decode_prologue, qsa_pool_rope, qsa_select_batched, qsa_attention_row_parallel) on lane-derived pointers, positions and rows; the GPU byte oracle rdna-compute examples/qsa_lanes_oracle (per-lane singleton launches vs the grouped launches, N = 1..8 lanes, rows 1..8, cross-block-boundary and budget-saturating contexts, negative controls) PASSED on gfx1201 (126/126 cases, 3 controls detected, mgmtp/gdnbatch/runs/oracle-k1-qsa), and the EP2 mq4 / PP2 mq3 A/B text md5s are identical",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-moe-down-r4",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded (moe.rs): K = 640, HIPFIRE_QWEN4_MOE_DOWN_R4 (exact gfx1151 default on, 0 kills) and `!is_recording() && !capture_mode`",
+        effect: KernelSelection,
+        switches: "eager: the _k640_r4 twin (four weight rows per wave, grid ceil(M/4)); recorded: the one-row incumbent",
+        kernels: &["gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded"],
+        verdict: ByteExact,
+        evidence: "isolated A/B on gfx1151 (N = 1/2/4/8, expert pools 40-512): every expanded row byte-identical; fn_lane_oracle k = 1/8 and MTP k = 3 PASS; autoresearch serve hashes 13/13",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-shared-down-scaled-add",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::gemv_q8_0_k640_bf16_scaled_add (gemv.rs), single-token BF16-recipe Q8_0 K = 640 shared down: HIPFIRE_QWEN4_SHARED_DOWN_FUSE (exact gfx1151 default on, 0 kills) and `!is_recording() && !capture_mode`",
+        effect: KernelSelection,
+        switches: "eager: gemv_q8_0_wide_k640_staged_bf16_scaled_add (GEMV + bf16_scaled_add_f32 in one launch); recorded: gemv_q8_0_wide_k640_staged + bf16_scaled_add_f32",
+        kernels: &["gemv_q8_0_wide_k640_staged", "bf16_scaled_add_f32"],
+        verdict: ByteExact,
+        evidence: "fn_lane_oracle on gfx1151: singleton (fused) vs lane rows (unfused rows kernels) byte-identical at k = 1/8; autoresearch serve hashes 13/13",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-indexed-attention-lds-bound",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "indexed_attention_attention_batch_launch (tensor_ops.rs) chooses shape_selected through qsa_decode_reference_eager: actual recording/capture or a bound Recorded singleton AR reference keeps p.shape_selected; otherwise eager uses the policy run's live max_selected; the direct recorder/capture predicates are in qsa_decode_splitk_eager",
+        effect: LaunchShape,
+        switches: "recorded/captured launches and eager verify bound to Recorded AR: position-independent LDS bound; eager reference: live bound for the adjacent equal-policy row run; reference binding changes arithmetic/shape, not verify's eager launch mechanism",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different launch shape remains NotEquivalent without an all-width actual-singleton byte oracle; binding Recorded AR is not itself a parity receipt, and widened qualification is pending; no railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-qsa-bf16-split-bound",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "qsa_bf16_split_route (tensor_ops.rs): HIPFIRE_QWEN4_QSA_BF16_SPLIT (default on, `=0` kill switch) on exact gfx1201 and exact gfx1100 (gfx1100 also killed by HIPFIRE_QWEN4_QSA_SPLIT_GFX1100=0) with BF16 pooled keys; `bounded = is_recording()` makes the fused-vs-split crossover (2048 blocks up to 256 rows, 8192 above) read `shape_blocks` instead of the live block count, and `capture_mode` (hipGraph, which cannot patch kernargs) keeps the fused selector. indexed_attention_select_bf16_split(bounded): score stride, score grid ceil(shape_blocks/256) and filter compact grid ceil(shape_blocks/4096) come from `shape_blocks`; block_count (PositionDivU32 {rows, compress}) and position_start (PositionPlusU32 {group row offset}) of every score/threshold/compact/finish launch are declared to the recorder; scratch is the dedicated qsa_select_scores slot reserved before capture (bundle.rs)",
+        effect: LaunchShape,
+        switches: "recorded: hipcc BF16 rows8/rows16 scores + exact filter trio at the shape bound; eager: the same kernels at live-count grids above the crossover, fused indexed_attention_select_bf16_batched below it; captured (hipGraph): fused",
+        kernels: &[
+            "indexed_attention_select_scores_rows8_bf16",
+            "indexed_attention_select_scores_rows16_bf16",
+            "qsa_filter_threshold",
+            "qsa_filter_compact",
+            "qsa_filter_finish",
+        ],
+        verdict: ByteExact,
+        evidence: "rdna-compute tests/qsa_bf16_scores.rs on gfx1201 (HIPFIRE_QWEN4_QSA_BF16_SPLIT on, the default) and on gfx1100 (7900 XTX; production route, recorded replay and arms end-to-end tests, plus the exhaustive score bit-for-bit gate at 255/257/2048/8192/32768/65536 blocks): split arms eager and at the shape bound vs the fused BF16 incumbent over 2048..65536 blocks, rows 1/8/17, dense and tied keys, partial blocks, forced filter repair (selection, mirror, persisted flag and canaries identical); recorded tapes at three capture positions replayed through the recorded-HIP oracle at positions 0..capacity vs the fused incumbent run eagerly at that position",
+        reaches: &[],
+    },
+    Decision {
+        id: "packed-mq4-prefill",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "packed_mq4_admitted: packed_mq4_prefill && gfx1100 && !(capture_mode || is_recording()) && n % 256 == 0 && listed (m, k) (packed_mq4.rs:16-42)",
+        effect: KernelSelection,
+        switches: "eager: PR #616 packed MQ4 Q8-group32 GEMM; recorded: incumbent MQ4 GEMM",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different numerics (Q8 activations). Unreachable by default: packed_mq4_prefill is default-off and n % 256 == 0 excludes decode",
+        reaches: &[],
+    },
+    Decision {
+        id: "prefill-act-tier-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "quantized-activation prefill tiers (A4/A8/FP8), taken only eagerly: hipfire-dispatch q8_prefill.rs prefill_quant_admitted admits a caller's tier only when rows >= 64, `!gpu.graphs.capture_mode` and `!gpu.replay.is_recording()`; it gates the grouped routed-expert sites (moe_program.rs grouped_moe_site_tiers, plus load-verified symmetric qt44 experts and the grouped IU4 shape), the shared/dense gated FFN (gated_ffn_from_basis) and the tiered Q8_0 GEMM (q8_0_prefill_gemm); the arch half is per call site (grouped_sym_tier_admits: grouped W4A8 on gfx1201/gfx1100/gfx1151, W4A4/FP8 on gfx1201; q8_0_weight_admits / q8_0_prefill_runs: W8A8 on gfx1201 and, for K % 128 == 0, gfx1100 and gfx1151 (i8-MMQ), FP8 on exact gfx1201); otherwise every site runs its F16 route",
+        effect: KernelSelection,
+        switches: "eager: moe_grouped_qt44_{iu4,a8,fp8}_sym with their int4/int8/e4m3 activation producers (routed, shared, dense qt44 FFN) and gemm_q8_0_mmq_{i8,fp8} with quantize_x_{q8,fp8}_blk32 (Q8_0 projections), per the Raon per-site policy on gfx1201; hipGraph capture or a live Redline recording: the F16 grouped WMMA core / gemm_q8_0_batched_chunked for the same site",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "the quantized tiers quantize the GEMM activations, so their output differs from the F16 route's (code24/WT2 KLD deltas per site recorded in the CHANGELOG entry for the Raon per-site precision policy); the only callers are the Raon batched prefill sites, which are never graph-captured or Redline-recorded, so no recorded program reaches the quantized tiers; the excluded branch is the unchanged F16 route",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-opt-in-eager-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "opt-in Qwen4 prefill fusions and exact-gfx1151 single-token decode fusions taken only with `!is_recording() && !capture_mode`: hyper_read_pairs_write (HIPFIRE_QWEN4_HC_FUSE >= 1, layer_ops.rs), gemm_mq6g256v2_hcw_applies (HC_FUSE >= 2, gemm.rs), absorbs_clear (HIPFIRE_QWEN4_MOE_COMBINE_ZINIT, moe_program.rs; also not under a retained body), indexed_attention_select_batch_impl (HIPFIRE_QWEN4_QSA_SELECT_EXACT, and the default rows8/rows16 scoring route for F32 pooled keys, 4 index heads, budget <= 512, tensor_ops.rs), execute_grouped_depthwise (HIPFIRE_QWEN4_PLE_FUSE, layer_ops.rs), gemm_bf16_xf16_f16_wmma's gfx1201 and gfx1151 arms through hc_down_tile_selected (HIPFIRE_QWEN4_HC_DOWN_TILE, gemm.rs; recording/capture gate the gfx1151 arm only), qwen4_trunk_iu4_applies (HIPFIRE_QWEN4_TRUNK_IU4, gemm.rs), gemm_mq4g256v2_xf16_applies (the gfx1151 MQ4G256V2 shared-F16 prefill route and, under HIPFIRE_QWEN4_MQ4_X4_PM, its BF16-out / regions / HC-write entries, gemm.rs), hc_row_fold_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs), moe_router_softmax_top10_f32 (HIPFIRE_QWEN4_ROUTER_FAST, moe.rs), project_trunk_masked_inner (HIPFIRE_QWEN4_DECODE_ZBA_X3, layer_ops.rs: exact gfx1151, one-row F32 FN GDN decode with an MQ6G256V2 qkv and MQ4G256V2 a/b/z, no trunk IU4), decode_gate_side_stage (HIPFIRE_QWEN4_DECODE_HEAD_FUSE, pipeline/mod.rs: exact gfx1151, batch 1, K = 2560, Q8_0 shared gate/up, and additionally no active_capture, hessian_capture, MoE dump, hidden dump or EP)",
+        effect: KernelSelection,
+        switches: "eager: fused HC read/write gates, MQ6 attention-output GEMM with the HC write epilogue, zero-init grouped combine without the moe_output fill, exact tile-sort QSA selector or rows8/rows16 scoring + select_from_scores, fused PLE block, 160x64 HC-down tile, masked trunk IU4 / exact-activation MQ4 trunk GEMMs, HC row fold, fast router top-10; gfx1151 single-token decode: one gemv_mq4g256v2_multirow_r2_x3 for the three GDN a/b/z launches (ZBA_X3), one gemv_bf16_xf32_x2_q8_0_k2560_staged_pair for gemv_bf16_xf32_x4 + gemv_q8_0_k2560_staged_pair (HEAD_FUSE); recorded/captured: the incumbent unfused launches",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "scoped rdna-compute tests on gfx1151 and gfx1201 compare each fused arm with the unfused launches byte for byte (CHANGELOG 0.4.1, Flash-Next performance); the QSA select tests compare the rows8/rows16 route with the serial selection sort byte for byte; HC_FUSE (level 3), HC_ROW_FOLD and the 160x64 HC_DOWN_TILE default on for exact gfx1151 only (the gfx1201 HC_DOWN_TILE split-K tile is not eager-gated: recorded and eager launches take it alike), MOE_COMBINE_ZINIT, ROUTER_FAST and PLE_FUSE for exact gfx1151 and gfx1201, QSA_SELECT_EXACT is default off, DECODE_ZBA_X3 and DECODE_HEAD_FUSE default on for exact gfx1151 only (each keeps its incumbent per-row arithmetic and reduction order verbatim; byte-exact hardware checks: rdna-compute lib mq4v2_multirow_r2_x3_tests and tests/qwen4_decode_head_fuse.rs), and no railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-flash-next-gfx1201-eager-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Fn10k exact-gfx1201 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_MIN_ROWS), Gpu::qwen4_moe_front_fuse_applies (HIPFIRE_QWEN4_MOE_FRONT_FUSE, gemm.rs: symmetric IU4 descriptor present), Gpu::hc_row_fold_gfx1201_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs: hidden 2560, rows >= 16, 16-byte aligned streams/mixed), hc_up_v2_selected (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: low_rank 320, rows >= HC_UP_V2_MIN_ROWS) and its sole caller hyper_read_up_wmma_launch, which feeds the recorder/capture state into it for the Auto select (the Forced test route skips the gates)",
+        effect: KernelSelection,
+        switches: "eager: split-K HC-down GEMM + hc_activation_fused_f32 replaced by one fused launch; mq_rotate_x + convert_f32_to_f16 + mq_rotate_x_i4 replaced by the MoE front producer; HC write/norm/gate chains replaced by the row folds; the retiled _t128 HC up+mix replaced by the persistent _v2 entry; recorded/captured: the incumbent unfused launches (for HC up, the _t128 chain)",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "GPU byte oracles of every output byte against the unfused kernels, random and adversarial rows (NaN/inf/zero/subnormal): HC down 14/14 (fn-10k/hc-down-fused-oracle.txt), MoE front 28/28 (fn-10k/runs/moefront/oracle-final.jsonl), row folds 32/32 (fn-10k/rowfold-receipts/oracle.txt), HC up v2 128/128 (fn-10k/hcup-receipts/hc-up-v2-oracle.txt); fn-10k/LAND-W1.md records qwen4_kld prefill .kldseq hashes of the four-lever land-w1 build (row folds, GDN i8, MoE front, HC down) identical to the prior route. HC up v2 has no such model-level hash in the cited receipts (oracle and bench only). All are eager exact-gfx1201 prefill arms; the recorded body keeps the unfused launches. No railgun default program is a qwen4 program, so nothing reaches one",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-flash-next-gfx1151-eager-fusions",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Flash-Next exact-gfx1151 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_GFX1151_MIN_ROWS), hc_up_v2_selected / hyper_read_up_wmma_launch (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: retiled HC read admitted, low_rank 320, hidden % 16 == 0, rows >= HC_UP_V2_MIN_ROWS), Gpu::qwen4_moe_front_fuse_applies (HIPFIRE_QWEN4_MOE_FRONT_FUSE, gemm.rs: exact gfx1201 or exact gfx1151, symmetric IU4 descriptor present; on gfx1151 the producer also feeds the fused shared gate/up PeaceMaker launch's router + selector groups)",
+        effect: KernelSelection,
+        switches: "eager: ascending-K 160x64 HC-down GEMM + hc_activation_fused_f32 replaced by one fused qwen4_hc_down_fused_gfx1151 launch; the retiled hyper_read_up_wmma_bf16_swap HC up+mix launch replaced by the persistent W-stationary hyper_read_up_wmma_bf16_gfx1151_v2; convert_f32_to_f16 + mq_rotate_x_i4 replaced by the MoE front producer mq_rotate_x_i4_f16out; recorded/captured: the incumbent launches",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "GPU byte oracles on Halo (gfx1151) of every output byte against the incumbent launches: HC down 36/36 vs the unfused chain, random and adversarial rows (NaN/inf/zero/subnormal), halo-prefill-044/a-down/ORACLE.md; HC up v2 152/152 vs hyper_read_up_wmma_bf16_swap, random, adversarial, NaN-payload fuzz, exhaustive 65536-pattern BF16 gate sweep per branch, ragged rows, guard region, halo-prefill-044/a-up/ORACLE.md; MoE front 55/55 (examples/qwen4_moe_front_oracle.rs) over rows 1..16384 with ragged tails and adversarial rows, F16 X and IU4 sidecar vs convert_f32_to_f16 + mq_rotate_x_i4 and the router/selector/gate/up and shared gate/up PM outputs vs the chain, halo-prefill-044/a-front/ORACLE.md. Eager exact-gfx1151 prefill arms; the recorded body keeps the incumbent launches. No railgun default program is a qwen4 program, so nothing reaches one",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-shared-int8-prefill",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::qwen4_shared_i8_applies (HIPFIRE_QWEN4_SHARED_INT8, shared_i8.rs): exact gfx1201, BF16 shared-expert weights, hidden % 256 == 0, intermediate % 128 == 0, route rows >= QWEN4_F16_WMMA_MIN_TOKENS, and `!is_recording() && !capture_mode`",
+        effect: KernelSelection,
+        switches: "eager: the shared expert gate/up/down run the INT8 (iu8 WMMA) route on the model-lifetime INT8 weight shadows; recorded/captured: the F16 WMMA shadow route (qwen4-f16-wmma-prefill)",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different numerics (int8 x int8 vs F16 WMMA); CHANGELOG marks it NUMERIC, not byte-identical. Receipts: fn-10k/shared-i8-receipts/oracle-v3-16k.txt checks the down GEMM against its int8 reference (mismatches=0) and reports int8 rel_rms 1.467e-2 vs f16 1.469e-3 against the reference; the bench-v2 receipts are timing only. No KLD receipt is cited here. Prefill-only (row threshold) and no railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-g2-expert-stage",
+        predicates: &[GraphSlotCapturing],
+        condition: "G2 long-prefill expert staging in hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): a chunk of >= HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS rows stages host-mapped expert layers into borrowed VRAM only when the active stream is not capturing (`stream_is_capturing`)",
+        effect: LaunchShape,
+        switches: "eager: host layers' QT44/QT53 expert bytes DMA-copied into the donor layers' VRAM, the MoE launches read them through the stage pointer tables, donors restored before the forward returns; stream capture: the same MoE kernels read the host-mapped experts",
+        kernels: &[],
+        verdict: ByteExact,
+        evidence: "no arithmetic changes, only where the unchanged expert bytes are read from; Flash-Next 16K logits on gfx1201 are byte-identical with HIPFIRE_QWEN4_EXPERT_STAGE on and off (CHANGELOG 0.4.1, Flash-Next performance); default on for exact gfx1201 and, for the borrowed-donor packed stage, for any discrete device whose load-time measured host-to-device link is narrow (< 16 GB/s, measured after the expert placement is frozen so it never changes the resident layers; unified memory and an unmeasured link stay off; dedicated slab and tier stages stay on only for gfx1201 or an explicit 1), and no railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-decode-share-loan-capture-guard",
+        predicates: &[GraphSlotCapturing],
+        condition: "hipfire-arch-qwen4 decode-share donor loan (decode_share_loan.rs LoanController::{acquire, finish_prompt, require_resident, recover}, through the LoanOps::capturing seam whose GPU implementation GpuLoanOps::capturing in gpu_forward.rs is `stream_is_capturing(active_stream)`): a borrowed prompt tile (>= 512 rows, never retained-eligible) refuses before its first write into the donor tail when the active stream is capturing; a dirty tail met under capture at a prompt end or a resident-bank entry poisons the loan; error recovery (drain + blocking restore) runs only outside capture, otherwise the loan is poisoned",
+        effect: Refusal,
+        switches: "outside capture: zero-fill, scratch writes into the donor tail and the restore copy (compute stream) proceed; under capture: an error (refusal or poison) before any donor write, restore or recovery launch",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the capturing branch launches nothing and only returns an error, so no recorded or captured body can contain a borrow, a restore or a recovery. Decode, verify and retained replay run on the resident bank behind require_resident, which host-waits the restore before any replay submit. Redline `redline_daemon_harness.py --qwen4 --pm4` on gfx1201 Flash-Next with decode-share on (borrow/restore engaged) keeps the beta decode hash 16b0944ce452884d with shadow bit_exact and blob_bit_exact (release-0.4.3/decode-share/runs/redline/{land-on,lazy-on,shadows-on}). No railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "vl-batched-prefill-capture-refusal",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Qwen3.5/3.8 batched image-token prefill (qwen35 vl_prefill.rs `vl_batched_prefill_admitted`, evaluated by generate_vl before any prefill work, and `ChunkRoute::refusal`, whose `capturing` input is `gpu.graphs.capture_mode || gpu.replay.is_recording()` in forward_batch_chunk_impl before any scratch, KV or recurrent write): a VL prompt refuses the batched route when HIP graph capture or Redline recording is active",
+        effect: Refusal,
+        switches: "outside capture and recording: the image prompt prefills in batched chunks (tower embeddings spliced over the image-pad rows, batched M-RoPE); under capture or recording: the batched route is refused up front and generate_vl falls back to the per-token VL prefill path (forward_scratch_embed_mrope)",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refusing branch launches nothing and returns Err (admission) or the refusal string (chunk route) before any prefill work, so no captured or recorded body can contain a batched image prefill; the fallback is the existing per-token VL path, which is unchanged. No railgun default program is a batched-VL prefill",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-prefill-token-id-reuse",
+        predicates: &[CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): the device `token_ids` rows of a chunk's whole-row host upload are recorded as reusable by the MTP prompt-fill head Append (HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS) only when the upload ran outside graph capture (`!capture_mode`)",
+        effect: LaunchMechanism,
+        switches: "the batched head Append embeds from the trunk's uploaded ids in place, or from its own upload of the same ids; a captured upload is never reused",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the reused buffer holds the same i32 ids (checked against the chunk's tokens before use) and the embedding gather runs the same kernel on them; no launch or output byte changes",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-ple-async-upload",
+        predicates: &[CaptureMode, GraphSlotCapturing],
+        condition: "hipfire-arch-qwen4 ple_async_upload (ple_stage.rs), consulted by forward_chunk_scoped (gpu_forward.rs), the exact lane step forward_lanes_scoped (gpu_forward_lanes.rs), and the S1 layer-major tile step stage_tile (slowlink_prefill.rs) with `gpu.graphs.capture_mode`: the deferred PLE rows upload with a fenced asynchronous copy (HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD) only when no graph capture is open; under capture the blocking `memcpy_htod_auto` path (async on the active stream while capturing) runs. A pipeline-parallel mesh band forward (forward_chunk_scoped under a mesh epoch) takes the same fenced `upload_async` only when `!gpu.graphs.capture_mode`, so the mesh never blocks the host on the device queue outside capture. The S1 tile step passes the same `gpu.graphs.capture_mode` through the same helper into the same `stage_ple_rows` upload-mode branches, so the recorded and eager tiles stage identical bytes to the identical device buffer",
+        effect: LaunchMechanism,
+        switches: "hipMemcpyAsync on the compute stream from pinned staging with a hip-event fence over the host staging buffer, vs the blocking or capture-aware upload; same bytes to the same device buffer",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "same staged PLE bytes, destination and stream order before the unchanged PLE apply kernels; the fence retires before the staging buffer is next written, torn down or dropped, so no copy reads rewritten bytes",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-lane-token-ids-async",
+        predicates: &[CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs): on the input band the lane step's token ids are staged in the pinned, fenced lane token ring (`fwd.lane_tokens.stage` / `.upload`) and enqueued on the active stream without a host wait only when no graph capture is open (`band_scope.input && !gpu.graphs.capture_mode`); under capture the blocking `memcpy_htod_auto` copy from `host_token_bytes` runs",
+        effect: LaunchMechanism,
+        switches: "an asynchronous host-to-device copy from a pinned ring slot fenced by a hip event vs the blocking or capture-aware upload; same i32 ids to the same `token_ids` device buffer",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "same ids in lane order, same destination and stream order before the unchanged embedding launch; a ring slot is rewritten only after its own earlier copy's fence completes; PP2 mq2-xts hold j1574 (ids and every logits row byte-identical to the serialized PP singleton at K=1..8 under adaptive, 1 and 4 micro-batches and overlap off) ran with the ring",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-wide-verify-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::few_row_limit (prefill_invariant.rs): admitted qwen4 verify may use singleton-derived PM rowtiles only while `!(is_recording() || capture_mode)`; physical capacity is 64 total logical rows with fixed eight-row tiles, but qwen4_row_exact_verify_rows still reports the shipping proven table (8), CPU-owned-expert admission remains at most 4, and actual scratch/capture capacity also bounds the window; recording/capture retains FEW_ROW_ROUTE_ROWS (8), not wide-verify eligibility",
+        effect: KernelSelection,
+        switches: "admitted eager wide verify: same-singleton arithmetic in fixed rowtiles with full-window addressing; recorded/captured: no wide admission, so >8 rows retain the incumbent prefill routes; a Recorded AR reference does not record or capture verify",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "inventory contract, not a new qualification receipt: physical64, tile8 and shipping8 are distinct; widened actual-singleton byte/state/ID and paired full-window cost gates are pending, and PM C1 alone is not singleton evidence; no table promotion or performance claim; no railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-wide-verify-recorded-ar-guard",
+        predicates: &[ReplayState, IsRecording, CaptureMode],
+        condition: "Qwen4GpuForward::guarded_wide_verify_rows retains physical/CPU admission guards and qwen4_row_tile_reference_supported's actual MQ4 singleton recipe guard (exact gfx1151 resolved GEMV rows2, exact gfx1201 resolved rows2 plus PM decode, or exact gfx1100 native resolved rows1; unsupported overrides stay8); ar_launch_reference calls qwen4_ar_launch with actual singleton eligibility, replay state and capture state; window entry binds Qwen4VerifyReference to that Eager/Recorded mode and restores both reference and row scope on success/error; tensor_ops.rs selects QSA attention policy at each row's own absolute position and groups only adjacent equal-policy rows",
+        effect: KernelSelection,
+        switches: "Eager reference preserves the singleton eager split-K/split-KV/per-head recipe; Recorded reference uses singleton recorded arithmetic while verify still launches eagerly; actual recorder/capture stays ineligible for wide verify; the reference is recomputed after AR replay-state transitions rather than forcing a policy-mismatch cap8",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "reference-binding contract replaces the eager-versus-recorded QSA mismatch fallback, not a retained-AR parity certificate; shipping proven rows remain 8 (CPU-owned experts at most 4) pending all-width byte/state/ID and full-window cost qualification; diagnostic taps that disable retained eligibility cannot certify recorded AR; no railgun default program is a qwen4 program",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-draft-overwrite-gfx12",
+        predicates: &[IsRecording, CaptureMode, G0Observing],
+        condition: "Gpu::draft_overwrite_gfx12_admitted (dflash_draft_fusion.rs:166-185), the device-free admission of gemm_mq4g256v2_overwrite_gfx12_dflash (which returns `Ok(false)` before any launch when it is false): exact gfx1201, HIPFIRE_DRAFT_COLLAPSE_OFF unset, no fp8/iu4 verify scope, 2 <= batch <= 63 (exactly 64 only inside draft_rows64_enter, which also needs wmma_batch_tiles), k % 256 == 0, gfx12 WMMA, fp16 and lm_head WMMA enabled, no a8_prefill_active, not the hfq4g256 ldsstage arm, and `!is_recording() && !capture_mode && !is_g0_observing()`. Consulted by the singleton draft (hipfire-runtime dflash.rs draft_lm_head_overwrite:2341 and gemm_dispatch's MQ4V2 arm:2520) and by the CB lane draft (dflash/lanes.rs pool_admitted:443, 450; pool_gemm:479)",
+        effect: KernelSelection,
+        switches: "eager (unobserved): the in-kernel-zeroing overwrite WMMA twins (gemm_mq4g256v2_overwrite_wmma_gfx12, one-tile for batch <= 16, `_vt*` verify tiles above), no pre-zero; recorded/captured/G0-observed: the caller's legacy tail, gemm_mq4g256v2_batched_lmhead (hipMemset y = +0.0 then gemm_mq4g256v2_residual_wmma_gfx12 Y += acc)",
+        kernels: &["gemm_mq4g256v2_overwrite_wmma_gfx12*", "gemm_mq4g256v2_residual_wmma_gfx12*"],
+        verdict: ByteExact,
+        evidence: "the overwrite kernels store `acc + 0.0f` once per output, bit-identical to legacy memset(+0.0f) then `Y += acc`, signed zero included (dflash_draft_fusion.rs, gemm_mq4g256v2_overwrite_gfx12_dflash documentation). rdna-compute examples/draft_overwrite_gfx12_oracle compares both arms as u32 bit patterns (5 (m, k) shapes x batch 2..63, NaN-prefilled overwrite output, N = 64 inside and outside the rows64 scope; 40/40 per CHANGELOG, with serve C8 greedy md5 equal). The separate generic verify-tile admission above 16 rows is inventoried under gfx12-mq4v2-verify-tile-route; this verdict covers eliminating the pre-zero, not certifying that independent tile-selection decision. G0 observation closes the overwrite predicate, so the G0 eager arm already takes the legacy tail; the pre-railgun default process (direct, unobserved dense draft) takes the overwrite twin, so arm3 differs",
+        reaches: &[reach(Program::DflashGfx1201, "DFlash2 B=16 draft MQ4G256V2 lm_head and draft GEMMs on exact gfx1201, admitted 2..=16-row chunks, k % 256 == 0", "arm3")],
+    },
+    Decision {
+        id: "dflash-cb-lane-draft-batching",
+        predicates: &[IsRecording, CaptureMode, G0Observing],
+        condition: "exact-gfx1201 lane-batched DFlash CB draft admissions, each requiring `!is_recording() && !capture_mode && !is_g0_observing()`: hipfire-runtime lane_rows_admitted (dflash/lanes.rs:412-422: HIPFIRE_CB_DRAFT_LANE_CTX, ordered_draft, gpu.arch == \"gfx1201\", no active_capture, shared lane_ws and mq_x_rot present; gates the batched ctx/fc row packing in draft_forward_lanes:862), Gpu::draft_lane_conv_admitted (draft_lane_conv.rs:62-67, with HIPFIRE_CB_DRAFT_LANE_CONV and lanes <= DRAFT_CONV_LANES_MAX at lanes.rs:939) and Gpu::draft_lane_rows_admitted (draft_lane_rows.rs:207-212, the device-level twin of lane_rows_admitted's arch/capture/recording/G0 terms; its only caller is the draft_lane_rows_oracle example). The by-value span and lane tables of these kernels are retained only by the blob launch path, and product replay admission of them is not claimed",
+        effect: KernelSelection,
+        switches: "eager: ctx/fc rows packed through draft_rows_gather_f32, shared overwrite-WMMA chunks of 2..=63 rows and one gemv_mq4g256v2_multirow_r2_lanes launch for the 1-row segments, then draft_rows_scatter_f32; one dynamic_causal_conv_f32_lanes launch per phase per layer for all lanes; recorded/captured/observed: the per-lane loops (per-lane rotate + GEMV/GEMM + norm + RoPE, one dynamic_causal_conv_f32 per lane)",
+        kernels: &["draft_rows_gather_f32", "draft_rows_scatter_f32", "gemv_mq4g256v2_multirow_r2_lanes", "gemm_mq4g256v2_overwrite_wmma_gfx12*", "dynamic_causal_conv_f32_lanes"],
+        verdict: ByteExact,
+        evidence: "per CHANGELOG: draft_lane_rows_oracle 640/640 (R2 twin bit-identical to the R2 GEMV per row on real draft shapes, gather/scatter bit copies with guards, R2-vs-WMMA negative control differs as expected), draft_lane_conv_oracle 854/854 bit-identical to the per-lane launches (k 1/2/3/5, unequal lane rows, both phases, poisoned guards, cross-lane negative control), serve C8 greedy md5 equal to the per-lane arm and C1, cb_vmm_state_oracle passes. Unreachable from a default program: only the continuous-batching draft (dflash_cb_draft via draft_forward_lanes, speculative.rs:6842) consults these, and the singleton DFlash2 B=16 cycle never packs lanes",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-cb-lane-verify-batching",
+        predicates: &[IsRecording, CaptureMode, G0Observing],
+        condition: "device halves of the lane-batched DFlash CB verify admissions, each requiring `!is_recording() && !capture_mode && !is_g0_observing()`: Gpu::lane_gdn_batch_admitted (lane_gdn.rs:350-367: exact gfx1201, fast single-end-requant GDN kernel, head dims 128, GQA layout with exact division; the multi-lane GDN kernel reads its pointers from a device table, which a recording could not attribute) and Gpu::lane_fa_batch_admitted (lane_fa.rs:180-198: exact gfx1201, flags.verify_attn, attn_tile_size == 128, head_dim 256, n_heads == 6 * n_kv_heads, 1..=LANE_FA_MAX lanes of 1..=LANE_FA_MAX_ROWS rows). Consulted by lane_gdn_batch_ready (qwen35 prefill_multi.rs:523, shared with the save-free admission) and lane_fa_chunk_admitted (prefill_multi.rs:633, 651), both after forward_prefill_batch_multi's own refusal (prefill_multi.rs:1048)",
+        effect: KernelSelection,
+        switches: "admitted eager: one conv1d_silu_split_f32_lanes + gated_delta_net_q8_fast_lanes_varrows set per DeltaNet layer for all lanes and one kv_cache_write_fp8_e4m3_lanes + attention_verify_gqa_fp8_lanes_gfx1201 + attention_verify_reduce_lanes_gfx1201 set per FullAttention layer; failed admission: the per-request singleton-kernel loop. G0 observation disables batching; recorded/captured CB entry points refuse before reaching that loop",
+        kernels: &["conv1d_silu_split_f32_lanes", "gated_delta_net_q8_fast_lanes_varrows", "gated_delta_net_q8_fast_lanes_varrows_from", "kv_cache_write_fp8_e4m3_lanes", "attention_verify_gqa_fp8_lanes_gfx1201", "attention_verify_reduce_lanes_gfx1201"],
+        verdict: ByteExact,
+        evidence: "per CHANGELOG: lane_gdn_oracle bit-identical to the per-lane sequence for every output row and conv/Q8/scale/EF state byte (18/18 equal-row cases; 74 cases with ragged lane rows, frame bases near u32 wrap, sourced arm and negative controls), lane_fa_oracle 18/18 bit-identical outputs and KV rows, serve C8 greedy md5 equal to the per-request arm and C1, BetterBench sampled md5 equal, cb_vmm_state_oracle passes. Unreachable under a recording: the callers run inside forward_prefill_batch_multi and dflash_cb_verify, which refuse `capture_mode || is_recording()` before any admission (inventoried under eager-only-refusals), and the CB verify is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-cb-dn-save-free-owner-exchange",
+        predicates: &[ReplayEnabled],
+        condition: "cb_dn_save_free_admitted (hipfire-arch-qwen35 dflash_cb.rs:851-893), the per-chunk all-or-nothing admission of the save-free DeltaNet verify: HIPFIRE_CB_DN_SAVE_FREE, exact gfx1201, the snapshot-source lane table armed, lane_gdn_batch_ready (its recording/capture/G0 terms are inventoried under dflash-cb-lane-verify-batching), `gpu.replay.is_enabled()` false (no enabled retained Redline controller), no existing replay graph (replay_graph_count() == 0, a graph's fast launch bypasses the table re-fingerprinting an owner exchange relies on), and the per-lane tape, snapshot, KV and pairwise-distinct-owner conditions. Host-only; decided before any owner is exchanged",
+        effect: KernelSelection,
+        switches: "admitted: the lane owners of live state A and the snapshot bank are exchanged on the host, the verify reads A and writes the other bank (ring copy inside tape_copy_batched, gated_delta_net_q8_fast_lanes_varrows_from), no whole-state SAVE copy; failed admission (incl. any process with the Redline controller enabled): the SAVE copy into target_snap and the in-place verify. Commit replay and terminal repair continue to use the canonical snapshot/live fields",
+        kernels: &["gated_delta_net_q8_fast_lanes_varrows_from"],
+        verdict: ByteExact,
+        evidence: "every byte the live bank ends with is the byte the in-place verify of a SAVEd lane leaves; CHANGELOG: lane_gdn_oracle 40/40 (ring copy + in-place conv + `_from` recurrence from a separate source bank against the per-lane sequence, every output row and state byte, source bank untouched), cb_vmm_state_oracle (block 8, IU4, 8 lanes) passes. ReplayEnabled is a process-level veto, while existing replay graphs also veto the owner exchange; this does not imply the graph set is immutable. dflash_cb_verify refuses recording and capture before the admission (dflash_cb.rs:666), and the CB verify is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-cb-sampled-packed-head",
+        predicates: &[IsRecording, CaptureMode, G0Observing],
+        condition: "cb_sampled_packed_head_admitted (hipfire-arch-qwen35 dflash_cb.rs:351-379), the host-only, per-chunk admission of one shared exact F16 head for a chunk that contains sampled lanes: HIPFIRE_CB_SAMPLED_PACKED_HEAD, more than one lane and at least one sampled lane, mq4_verify_singleton_chain, an MQ4G256V2 head with k == dim (k % 256 == 0) and m == vocab, 1..=128 rows, no fp8/iu4 verify scope, every lane window 2..=16 with no a8_prefill_active, and `!capture_mode && !is_recording() && !is_g0_observing()`. Decided before any head launch",
+        effect: KernelSelection,
+        switches: "admitted eager: one gemm_mq4g256v2_lmhead_verify_exact (DenseBatchMath::SingletonWmma) over all chunk rows, then each sampled lane's target rows from its (offset, b) view; refused: the greedy packed head plus one Product-b head per sampled lane (gemm_mq4g256v2_batched_lmhead -> gemm_mq4g256v2_residual_wmma_gfx12)",
+        kernels: &["gemm_mq4g256v2_residual_wmma_gfx12*", "mq4_verify_residual_pm_gfx1201_bt*"],
+        verdict: ByteExact,
+        evidence: "per CHANGELOG: cb_verify_gemm_oracle --tests sampled-head 373/373 with HIPFIRE_CB_VERIFY_PM=1 and =0 in the product env (every logit bit and argmax of the exact-S head against each lane's generic Product-b head, b 2..=16 partitions up to S = 128, residual and overwrite, captured graph replays), BetterBench sampled md5 equal at C8 and C1, cb_vmm_state_oracle passes. Unreachable under a recording: dflash_cb_verify refuses `capture_mode || is_recording()` before it (eager-only-refusals), and the CB verify is not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-cb-dn-save-free-diag",
+        predicates: &[IsRecording, CaptureMode, G0Observing, ReplayEnabled],
+        condition: "HIPFIRE_CB_DN_SAVE_FREE_DIAG (default off) first-refusal report of cb_dn_save_free_admitted: dn_sf_log (dflash_cb.rs:1062-1100) prints `replay.is_enabled()`, dn_sf_replay_detail (:1104-1135) prints `replay.is_recording()`, and the lane_gdn_unready arm of cb_dn_save_free_admitted (:1292-1313) prints `is_recording() / capture_mode / is_g0_observing()` inside its eprintln arguments",
+        effect: Oracle,
+        switches: "what an opt-in diagnostic eprintln reports; the tokens are format arguments evaluated only after the admission already refused (and only with the diag switch on), never a branch condition",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "diagnostic-only: each token is read inside a `dn_sf_refuse!`/eprintln argument list after the refusing predicate decided; the admission value, launches and recorded work are identical with the diag switch on or off (BetterBench sampled md5 equal with HIPFIRE_CB_DN_SAVE_FREE_DIAG=1)",
+        reaches: &[],
+    },
+    Decision {
+        id: "gfx1100-split-verify-capture-readiness",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "try_attention_q8_0_fa2_gqa_split_gfx1100 requires gfx1100_q8_fa2_split_capture_ready while capture_mode || is_recording(): partial/merge/preconvert loaded, existing Q16 scratch sufficient, and caller partial workspace sufficient (attention.rs:7912-7962)",
+        effect: Refusal,
+        switches: "unready capture/recording returns false before launching; after a split miss q8_multirow_fail_closed_after_split_miss vetoes incumbent rows/VerifyGQA for recording or admitted gfx1100 split capture",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "readiness is a pure loaded-function/scratch/capacity check; its refusing branch launches nothing (attention.rs:7912-7940, 7959-7973). Caller kernel selection is inventoried under q8-multirow-verify-attention; gfx1100 split is opt-in and not a default program",
+        reaches: &[],
+    },
+    Decision {
+        id: "dflash-hidden-staging-recorded-copy",
+        predicates: &[IsRecording],
+        condition: "HiddenStateRingBuffer::write_rows_to_staging uses copy_f32_buffer when is_recording(), otherwise native D2D memcpy (speculative.rs:3471-3485)",
+        effect: KernelSelection,
+        switches: "recorded: one typed copy_f32_buffer launch per extraction layer, grid ceil(n * hidden_dim / 256), block 256; eager/HipGraph: D2D memcpy of the same n * hidden_dim * 4 bytes at offset zero",
+        kernels: &["copy_f32_buffer"],
+        verdict: ByteExact,
+        evidence: "copy-only assignment dst[i] = src[i], bounded by n, with no arithmetic (kernels/src/copy_f32_buffer.hip:7-12); dispatch.rs:6773-6807 records the same source/destination pointers and element count through the blob funnel",
+        reaches: &[reach(DflashGfx1201, "verify hidden extraction into each fixed staging buffer before ring commit", "g0; arm3")],
+    },
+    Decision {
+        id: "qwen4-mesh-refuses-retained-replay",
+        predicates: &[ReplayState],
+        condition: "hipfire-arch-qwen4 check_mesh_admission (gpu_forward.rs), run by every pipeline-parallel mesh band forward and by prepare_mesh_capacity: the band forward is refused unless `gpu.replay.state()` is Hip or Fallback, i.e. no retained replay body is armed on that band's device",
+        effect: Refusal,
+        switches: "error before any launch; the mesh band forward runs only eager (HIP launches), never a retained replay body",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refused branch launches nothing; topology.pp admission never arms retained replay on a band device, so a mesh forward that would reach a recorded body fails loudly instead of replaying a different program",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-cpu-splice-eager-only",
+        predicates: &[IsRecording, CaptureMode, GraphSlotCapturing, ReplayState],
+        condition: "the host-executed CPU routed-expert splice and the D2 CPU tier split are eager-only. D1 admission: hipfire-arch-qwen4 ensure_cpu_splice_eager (run before a forward that executes a CPU routed-expert splice) and Qwen4GpuForward::new_inner (when trunk layers are armed with `cpu_deferred_experts`, gpu_forward.rs) error when `gpu.graphs.capture_mode || gpu.replay.is_recording() || stream_is_capturing(active_stream)`, because a host-executed splice cannot be retained in a captured or recorded tape. D2 admission: when `cpu_split_layers > 0` ensure_cpu_splice_eager additionally refuses a specialized verify/replay `capturing` slot, a retained body, AQL/PM4 routing, a shadow body route or `replay.state() == ShadowValidated` (so it consults capture_mode, is_recording, the verify and replay `capturing` slots and `replay.state()`: 5 tokens), at admission instead of at the first split call. Scope per call: D1 and an explicit-mode (`memory.offload_exec=cpu`) D2 split run these checks for every forward of the load; a D2 split armed only by the per-load measured default runs them only for a call that executes it (`d2_call`: a whole <=4-row non-prefill window, `call_executes_host_arith` / a non-prefill lane step), so its wide verify and prefill calls, which bind the executor-less view and run no host arithmetic, keep the unarmed rules. D2 execution: the same refusal set is enforced again before any state of a split call is mutated by cpu_split.rs CpuSplitExecutor::gate (capture_mode, verify/replay `capturing` slots, active-stream capture, is_recording, retained body, AQL/PM4, shadow body, `replay.state()`: 5 predicate tokens; run by the prepare/join/finish split entries) and by hipfire-dispatch pipeline/moe_program.rs CpuSplitRunGate (the `graph_capture` struct field; `observe`, which snapshots capture_mode, the verify/replay `capturing` slots, is_recording and `replay.state()` into the fields; and `refusal`, which maps graph_capture to a named refusal reason; consumed by split_run_gate before the split's host-synchronous router wait)",
+        effect: Refusal,
+        switches: "error before any launch (message names replay.backend=hip or memory.offload_exec=pcie, or the refusing state: graph capture, replay recording, retained PM4/AQL body, shadow-validated body); the CPU splice and the D2 split's host slot arithmetic run only eager (HIP launches)",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "the refused branches launch nothing and mutate no split state; the D2 split blocks the host between the router and the routed tail and a CPU routed-expert forward never runs recorded, captured, replayed or shadow-validated, so no recorded program is produced that differs from the eager one. The D2 gate sites only widen the same refusal to the specialized capture slots and retained transports; there is no arithmetic or lifecycle change",
+        reaches: &[],
+    },
+    Decision {
+        id: "a3b-expert-iu4-redline-exclusion",
+        predicates: &[IsRecording],
+        condition: "symmetric IU4 expert prefill route (HIPFIRE_MOE_SYM_IU4, on by capability unless killed; bound only to qt44/qt53 `.mq4rs` artifacts whose symmetric headers verified at load), excluded per call under a live Redline recording: hipfire-dispatch moe_program.rs expert_iu4_facts sets ExpertIu4CallShape::redline_recording (field :3649) from expert_iu4_redline_active (`replay.is_recording()` alone, not `retained_body_active()`, :3900-3902), and decide_expert_iu4 (:3842) returns the RedlineRecording exclusion",
+        effect: KernelSelection,
+        switches: "eager and hipGraph capture: grouped IU4 PM gate_up/SiLU and down GEMMs plus the BF16 ordered combine (qwen4_moe_iu4_sym_pm_gfx1201, moe_slot_ops_pm_gfx1201; the qualified HIPFIRE_MOE_COMBINE_V2 route (unset on at exact gfx1201, `0` kills) swaps only that combine for the v2 twin moe_slot_ops_v2_pm_gfx1201, selected after this admission by moe_program.rs expert_iu4_combine_v2_selected, which reads no recording state); a live Redline recording: the incumbent Path-2 expert route for the same artifact (qt53 down on its typed F32 fallback), with a WARNING (first, then every 1000)",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "the IU4 route quantizes the expert activations to int4 and combines in BF16, so its output differs from the incumbent route's; it binds only to verified symmetric `.mq4rs` artifacts, while the Redline default programs are plain-AR decode tapes on `.mq4r` and dense artifacts where the capability is unbound and the MoE prefill program does not run, so no default program reaches it; the excluded branch is the unchanged incumbent route",
+        reaches: &[],
+    },
+    Decision {
+        id: "fa-prefill-pm-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::fa_prefill_pm_require_eager refuses capture_mode || is_recording() before loading, scratch growth or launch (rdna-compute/src/fa_prefill_pm.rs:255-261)",
+        effect: KernelSelection,
+        switches: "eager: embedded PM f32-to-f16 preconvert followed by direct H16/KV2/D256 Q8_0 attention; recorded/captured: launcher refuses before either launch",
+        kernels: &["attention_fa2_q_preconvert_pm_gfx1201", "attention_q8_0_fa2_gqa_pm_gfx1201"],
+        verdict: NotEquivalent,
+        evidence: "eager-only production prefill requires 64..8192 rows and changes no dispatch/default in this launcher commit; 1..63-row exact primitives are guarded lab-oracle probes only. No railgun default program reaches this prefill launcher",
+        reaches: &[],
+    },
+    Decision {
+        id: "fa-prefill-pm-attention",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::fa_prefill_pm_admitted forwards replay.is_recording() and graphs.capture_mode (rdna-compute/src/attention.rs:5848-5849) into pure fa_prefill_pm_admission: HIPFIRE_FA_PREFILL_PM enabled, raw exact-gfx1201 inventory, !recording && !capture, H16/KV2/D256 Q8_0, rows 64..8192 and host context 1..262144. Shared by the Q8 WMMA wrapper, batched full-causal dispatch and whole-chunk resident-MoE prefill before commit-stride segmentation",
+        effect: KernelSelection,
+        switches: "admitted eager: PM preconvert + direct A3B attention, including a whole widened 4096-row chunk; recorded/captured or refused: unchanged incumbent attention and legacy chunk segmentation; enabled refusals log once per typed reason",
+        kernels: &["attention_fa2_q_preconvert_pm_gfx1201", "attention_q8_0_fa2_gqa_pm_gfx1201"],
+        verdict: NotEquivalent,
+        evidence: "qualified kernel/launch selection, not a claim of byte equivalence to the incumbent: exact-gfx1201 FaPrefillPm row cites a3b-pp-hold/s4a-run2, s4b-run1, s4k-run1 and s4s-run1. Requires at least 64 query rows, so no retained single-row decode default program reaches this prefill route. Recording and all hipGraph captures still keep the incumbent",
+        reaches: &[],
+    },
+    Decision {
+        id: "fa-prefill-pm-qprep-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::fa_pm_qprep_require_eager refuses capture_mode || is_recording() before loading or launch (rdna-compute/src/fa_qprep_pm.rs)",
+        effect: KernelSelection,
+        switches: "eager: embedded PM Q-prep launch (interleaved projection to gate f32 + final f16 Q); recorded/captured: the exact primitive refuses before launching",
+        kernels: &["attention_fa2_qprep_pm_gfx1201"],
+        verdict: NotEquivalent,
+        evidence: "eager-only exact primitive consumed by the qualified F5 route; production reaches it only through fa_prefill_pm_qprep_admitted, which refuses recording and capture first. No railgun default program reaches it",
+        reaches: &[],
+    },
+    Decision {
+        id: "fa-prefill-pm-qprep-admission",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::fa_prefill_pm_qprep_admitted forwards replay.is_recording() and graphs.capture_mode into pure fa_prefill_pm_qprep_admission: the RESOLVED HIPFIRE_FA_PREFILL_PM_QPREP flag (unset follows the FaPrefillPmQprep qualification, i.e. on only on exact gfx1201; explicit 0 kills) and the RESOLVED HIPFIRE_FA_PREFILL_PM flag (unset follows the FaPrefillPm qualification, i.e. on only on exact gfx1201; explicit 0 refuses) both enabled, raw exact-gfx1201 inventory of both routes, !recording && !capture, non-legacy half-split RoPE, H16/KV2/D256 Q8_0 with n_rot 64, rows 64..8192 and host context 1..262144. The arch route (single-chunk execute_attention_moe_layer_batched and batch_chunk_full_attn_attn) additionally requires the whole-chunk PM attend conditions, no tree/independent lanes/triattn tap, for the dense wrapper no DFlash fusion/fp8q/A4 epilogue, and the plain full-causal Q8 KV tier plan",
+        effect: KernelSelection,
+        switches: "admitted eager: K rmsnorm, K-only half-split RoPE launch with angle capture, PM Q prep, Q8 K/V writes and the PM direct attention (no Q normalization/RoPE/preconvert launch); recorded/captured or refused: unchanged incumbent prepare + attend; enabled refusals log once per typed reason",
+        kernels: &["rope_partial_halfsplit_batched_f32", "attention_fa2_qprep_pm_gfx1201", "attention_q8_0_fa2_gqa_pm_gfx1201"],
+        verdict: NotEquivalent,
+        evidence: "qualified kernel/launch selection, not a claim of byte equivalence to the incumbent launch sequence (Q-prep arithmetic is certified exact against the incumbent by the byte oracle): the exact-gfx1201 FaPrefillPmQprep row cites a3b-pp-hold/p31-run1. It requires FaPrefillPm and at least 64 query rows, so no retained single-row decode default program reaches this prefill route. Recording and all hipGraph captures keep the incumbent",
+        reaches: &[],
+    },
+    Decision {
+        id: "iu4-c8-pm-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::iu4_c8_pm_eager is !(replay.is_recording() || graphs.capture_mode) (rdna-compute/src/iu4_c8_pm.rs); the standalone PM C8 launchers refuse when false before loading or launching, and Gpu::iu4_c8_pm_admitted (the gate of the production exact F3 wrappers) forwards it into pure c8_pm_admission together with the RESOLVED HIPFIRE_PREFILL_IU4_C8_PM flag (qualified on exact gfx1201: unset follows the qualification, explicit 0 kills), the RESOLVED HIPFIRE_PREFILL_IU4_PRODUCER_FUSED flag, raw exact-gfx1201 inventory of both routes, rotate K 2048/4096 or norm K 2048, rows 1..8192 and valid F32 operands",
+        effect: KernelSelection,
+        switches: "admitted eager (default on exact gfx1201): the byte-oracle-certified PeaceMaker C8 rotate / RMSNorm-rotate twin replaces the HIP exact (cand_mode 8) producer in the F3 route; recorded/captured, 0 or refused: the unchanged HIP exact producer, with its own recorder/capture funnel; enabled refusals log once per typed reason",
+        kernels: &["iu4_c8_rotate_pm_gfx1201", "iu4_c8_rmsnorm_rotate_pm_gfx1201"],
+        verdict: NotEquivalent,
+        evidence: "kernel/launch selection, not a claim of byte equivalence to the incumbent launch (the iu4_c8_pm_oracle GPU byte oracle compares payload, scales, integer sums and the f32 rotated output against the HIP exact C8 producer). Unset configurations reach it only in eager prefill on exact gfx1201; recording and all hipGraph captures keep the incumbent, so no recorded program reaches it",
+        reaches: &[],
+    },
+    Decision {
+        id: "a3b-shared-prepared-iu4-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "the A3B shared-expert quantize-once IU4 prefill route (router, shared selector, gate and up read one `quantize_int4_mmq_ds128` of the activation) is taken only with `!is_recording() && !capture_mode`, plus the flag (HIPFIRE_MOE_SHARED_PREPARED_IU4, typed boolean: an explicit value wins, unset follows `prefill_route_capabilities` qualification, which is exact gfx1201 today), exact gfx1201 WMMA with IU4 prefill, no FP8 verify scope or A8 prefill precedence, all three projections MQ4G256V2 with one k, k % 256 == 0 and batch >= 64: hipfire-dispatch pipeline/mod.rs `prefill_shared_prepared_iu4_admitted` passes `gpu.replay.is_recording()` and `gpu.graphs.capture_mode` to `shared_prepared_iu4_admitted`, and rdna-compute gemm.rs `mq4g256v2_shared_iu4_supported` (the gate of try_gemm_mq4g256v2_shared_router_iu4 and try_gemm_mq4g256v2_shared_iu4) repeats the pair. The router stage (moe_program.rs) and `prefill_shared_gate_up_stage` read the same verdict",
+        effect: KernelSelection,
+        switches: "eager: one quantize_int4_mmq_ds128 plus the IU4 MMQ ADD (router, selector) and SET (gate, up) consumers on the prepared token; recorded/captured: the incumbent per-projection route (gemm_mq4g256v2 and the fused gate/up GEMM, which under recording take the historical base `*_mq4g256v2_wmma_gfx12` launches)",
+        kernels: &["quantize_int4_mmq_ds128*", "gemm_mq4g256v2_mmq*", "gemm_*_mq4g256v2_wmma_gfx12"],
+        verdict: NotEquivalent,
+        evidence: "the eager prepared route is byte-identical to the eager incumbent (rdna-compute example moe_shared_prepared_iu4_oracle compares router, selector, gate and up bit-for-bit for 6 cases, k 2048/4096 x rows 64/512/4096, right after the first run and after the 60-run timing loop), but no oracle compares it with the recorded branch, which runs the base wmma kernels; that comparison is the already NotEquivalent gfx12-mqv2-prefill-projection-routes pair. Unreachable from every default program: every branch needs batch >= 64 (decode members have b = 1, the DFlash verify b = 16) and the decision lives in the MoE prefill program",
+        reaches: &[],
+    },
+
+    Decision {
+        id: "a3b-expert-iu4-capture-admitted",
+        predicates: &[CaptureMode, GraphSlotCapturing],
+        condition: "hipfire-dispatch moe_program.rs expert_iu4_graph_capturing (`graphs.capture_mode || graphs.verify.capturing || graphs.replay.capturing`, :3884-3888) fills ExpertIu4Facts::capturing_graph; expert_iu4_admission (families/moe_expert_iu4.rs) treats it as informational, never a rejection, and expert_iu4_log_line prints it as `graph_capture=`",
+        effect: Oracle,
+        switches: "only the `graph_capture=` field of the IU4 admission stderr line; a captured call takes the same IU4 launches as an eager one",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "no admission, plan or launch reads capturing_graph: the route is admitted under hipGraph capture (one cached plan, a preflight that never grows scratch, fixed-pointer launches), so the token only changes the logged value",
+        reaches: &[],
+    },
+];
+pub const SITES: &[Site] = &[
+    Site {
+        file: "hipfire-arch-raon/src/bundle.rs",
+        function: "resolve",
+        occurrences: 1,
+        decisions: &["raon-decode-mode-retained-replay"],
+    },
+    Site {
+        file: "hipfire-arch-raon/src/railgun_decode.rs",
+        function: "plan_body",
+        occurrences: 3,
+        decisions: &["raon-railgun-plan-capture-route"],
+    },
+    Site {
+        file: "hipfire-arch-raon/src/railgun_decode.rs",
+        function: "try_step",
+        occurrences: 1,
+        decisions: &["raon-railgun-owner-replay-decline"],
+    },
+    Site {
+        file: "hipfire-arch-raon/src/verify_graph.rs",
+        function: "record_verify_graph",
+        occurrences: 1,
+        decisions: &["raon-dflash-verify-graph-abort"],
+    },
+    Site {
+        file: "rdna-compute/src/mq6_railgun.rs",
+        function: "check_gpu",
+        occurrences: 3,
+        decisions: &["mq6-explicit-railgun-refusal"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "compressor_op",
+        occurrences: 1,
+        decisions: &["ds4-gfx942-compressor-sentinel-gate"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "decode_step_heterogeneous",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "decode_step_with_graph",
+        occurrences: 2,
+        decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "expert_ffn_schedule",
+        occurrences: 2,
+        decisions: &["ds4-gfx942-ffn-overlap", "replay-enabled-process-route"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "dspark_requires_typed_device_copy",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/forward.rs",
+        function: "forward_prefill_batch_chunk_impl",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/rows_program.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/rows_program.rs",
+        function: "compressed_attention_rows",
+        occurrences: 9,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/rows_program.rs",
+        function: "new",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/rows_program.rs",
+        function: "push_attention",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "<item>",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "batched_indexer_scores",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "execute_batched_indexer",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "execute_sparse_attention",
+        occurrences: 3,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/attention.rs",
+        function: "execute_swa_ring_write",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/rows.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mla/rows.rs",
+        function: "execute_swa_stage",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/spec_impl.rs",
+        function: "dspark_verify_forward",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body", "graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/spec_impl.rs",
+        function: "redline_dspark_verify_direct",
+        occurrences: 2,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-deepseek4/src/spec_impl.rs",
+        function: "redline_dspark_verify_pm4",
+        occurrences: 1,
+        decisions: &["dspark-capture-safe-verify-body"],
+    },
+    Site {
+        file: "hipfire-arch-gemma4/src/forward.rs",
+        function: "decode_step_with_graph",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-gemma4/src/forward.rs",
+        function: "graph_exact",
+        occurrences: 1,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-lfm2moe/src/forward.rs",
+        function: "decode_step",
+        occurrences: 1,
+        decisions: &["replay-enabled-process-route"],
+    },
+    Site {
+        file: "hipfire-arch-lfm2moe/src/forward.rs",
+        function: "decode_step_with_retained_replay",
+        occurrences: 3,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-llama/src/arch.rs",
+        function: "forward_scratch_layers",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen2/src/qwen2.rs",
+        function: "attend_plan",
+        occurrences: 1,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/dflash_verify_emit.rs",
+        function: "plan_phases",
+        occurrences: 6,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/dflash_cb.rs",
+        function: "dflash_cb_verify",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/dflash_cb.rs",
+        function: "cb_dn_save_free_admitted",
+        occurrences: 4,
+        decisions: &[
+            "dflash-cb-dn-save-free-owner-exchange",
+            "dflash-cb-dn-save-free-diag",
+        ],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/dflash_cb.rs",
+        function: "cb_sampled_packed_head_admitted",
+        occurrences: 3,
+        decisions: &["dflash-cb-sampled-packed-head"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/dflash_cb.rs",
+        function: "dn_sf_log",
+        occurrences: 1,
+        decisions: &["dflash-cb-dn-save-free-diag"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/dflash_cb.rs",
+        function: "dn_sf_replay_detail",
+        occurrences: 1,
+        decisions: &["dflash-cb-dn-save-free-diag"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/mtp_spec.rs",
+        function: "mtp_graph_abort_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/mtp_spec.rs",
+        function: "mtp_graph_begin_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/mtp_spec.rs",
+        function: "mtp_graph_end_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/mtp_spec.rs",
+        function: "mtp_verify_graph_eligible",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/ep_batch.rs",
+        function: "forward_scratch_layers_multi",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "forward_scratch",
+        occurrences: 2,
+        decisions: &["replay-enabled-process-route", "replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/forward.rs",
+        function: "forward_scratch_dense_tp",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["widened-prefill-batching"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "fa_pair_merge_admitted",
+        occurrences: 4,
+        decisions: &["gfx1151-fa-pair-merge"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "forward_batch_chunk_impl",
+        occurrences: 10,
+        decisions: &[
+            "q8-multirow-verify-attention",
+            "captured-batch-attention-physical-cap",
+            "captured-verify-attention-physical-cap",
+            "gdn-chunk-scan",
+            "vl-batched-prefill-capture-refusal",
+        ],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "forward_prefill_batch_with_pbs_opts_inner",
+        occurrences: 2,
+        decisions: &["gfx1151-fa-pair-merge"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "forward_prefill_chunk_pair",
+        occurrences: 2,
+        decisions: &["q8-multirow-verify-attention"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+
+        function: "ordinary_call_facts",
+        occurrences: 3,
+        decisions: &["widened-prefill-batching"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill.rs",
+        function: "wide_candidate",
+        occurrences: 1,
+        decisions: &["widened-prefill-batching"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill_multi.rs",
+        function: "attn_fp8_twin_eligible",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill_multi.rs",
+        function: "forward_prefill_batch_multi",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/prefill_multi.rs",
+        function: "lane_fa_plan_ok",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["vl-batched-prefill-capture-refusal"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "refusal",
+        occurrences: 1,
+        decisions: &["vl-batched-prefill-capture-refusal"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/qwen35/vl_prefill.rs",
+        function: "vl_batched_prefill_admitted",
+        occurrences: 2,
+        decisions: &["vl-batched-prefill-capture-refusal"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/arch.rs",
+        function: "load_weights_with_placement",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/serve_engine.rs",
+        function: "build",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "replay_gdn",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "rides_ordinary_prefill",
+        occurrences: 2,
+        decisions: &["widened-prefill-batching", "gdn-chunk-scan"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "verify_dflash_block_inner_body",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-arch-qwen35/src/speculative.rs",
+        function: "write_rows_to_staging",
+        occurrences: 1,
+        decisions: &["dflash-hidden-staging-recorded-copy"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "check_mesh_admission",
+        occurrences: 1,
+        decisions: &["qwen4-mesh-refuses-retained-replay"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "forward_chunk_scoped",
+        occurrences: 11,
+        decisions: &[
+            "replay-recorder-lifecycle",
+            "qwen4-g2-expert-stage",
+            "qwen4-prefill-token-id-reuse",
+            "qwen4-ple-async-upload",
+            "qwen4-wide-verify-recorded-ar-guard",
+        ],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "acquire",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward/ep_reserve_loan.rs",
+        function: "capturing",
+        occurrences: 4,
+        // The EP reserve loan drives the same LoanController through ExtentLoanOps.
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "capturing",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "finish_prompt",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "recover",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/decode_share_loan.rs",
+        function: "require_resident",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "capturing",
+        occurrences: 1,
+        decisions: &["qwen4-decode-share-loan-capture-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "qwen4_ar_launch",
+        occurrences: 2,
+        decisions: &["qwen4-wide-verify-recorded-ar-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "ensure_cpu_splice_eager",
+        occurrences: 5,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "new_inner_with_reserve",
+        occurrences: 2,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
+        function: "forward_lanes_scoped",
+        occurrences: 2,
+        decisions: &["qwen4-ple-async-upload", "qwen4-lane-token-ids-async"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/ple_stage.rs",
+        function: "ple_async_upload",
+        occurrences: 2,
+        decisions: &["qwen4-ple-async-upload"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/ple_stage.rs",
+        function: "upload_blocking",
+        occurrences: 1,
+        decisions: &["qwen4-ple-async-upload"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/slowlink_prefill.rs",
+        function: "stage_tile",
+        occurrences: 1,
+        decisions: &["qwen4-ple-async-upload"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mod.rs",
+        function: "prefill_shared_prepared_iu4_admitted",
+        occurrences: 2,
+        decisions: &["a3b-shared-prepared-iu4-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "fa_prefill_pm_admitted",
+        occurrences: 2,
+        decisions: &["fa-prefill-pm-attention"],
+    },
+    Site {
+        file: "rdna-compute/src/fa_prefill_pm.rs",
+        function: "fa_prefill_pm_require_eager",
+        occurrences: 2,
+        decisions: &["fa-prefill-pm-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/fa_qprep_pm.rs",
+        function: "fa_pm_qprep_require_eager",
+        occurrences: 2,
+        decisions: &["fa-prefill-pm-qprep-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/fa_qprep_pm.rs",
+        function: "fa_prefill_pm_qprep_admitted",
+        occurrences: 2,
+        decisions: &["fa-prefill-pm-qprep-admission"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "mq4g256v2_shared_iu4_supported",
+        occurrences: 2,
+        decisions: &["a3b-shared-prepared-iu4-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/iu4_c8_pm.rs",
+        function: "iu4_c8_pm_eager",
+        occurrences: 2,
+        decisions: &["iu4-c8-pm-eager-only"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/mtp_gpu.rs",
+        function: "ensure_mapped_capacity",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/state.rs",
+        function: "ensure_mapped_capacity",
+        occurrences: 3,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/state_parity.rs",
+        function: "run_mtp_head_d2_probe",
+        occurrences: 2,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-daemon/src/bench.rs",
+        function: "handle_bench_decode",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-dispatch-tests/src/llama.rs",
+        function: "tier_inputs_base",
+        occurrences: 1,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "bf16_attend_key",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "derive",
+        occurrences: 5,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "fp8_attend_key",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/kv_tier.rs",
+        function: "q8_attend_key",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched.rs",
+        function: "mq_f16_projection_fast_route",
+        occurrences: 2,
+        decisions: &["gfx1100-f16-projection-fast-route"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "batch_chunk_fa_attend_ragged_fp8q",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "execute_fa_attend_step",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "gfx12_fa_prep_fp8q_admitted",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/batched_attention.rs",
+        function: "q8_multirow_attn_admitted",
+        occurrences: 4,
+        decisions: &["q8-multirow-verify-attention"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/hybrid.rs",
+        function: "tier_plan",
+        occurrences: 2,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
+        function: "hyper_read_pairs_write",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
+        function: "project_trunk_masked_inner",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/layer_ops.rs",
+        function: "execute_grouped_depthwise",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mod.rs",
+        function: "decode_gate_side_stage",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/mod.rs",
+        function: "dump_hidden_localize",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/cpu_split.rs",
+        function: "gate",
+        occurrences: 5,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_capture.rs",
+        function: "read_device",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "<item>",
+        occurrences: 2,
+        decisions: &[
+            "qwen4-cpu-splice-eager-only",
+            "a3b-expert-iu4-redline-exclusion",
+        ],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "absorbs_clear",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/q8_prefill.rs",
+        function: "prefill_quant_admitted",
+        occurrences: 2,
+        decisions: &["prefill-act-tier-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "decide_expert_iu4",
+        occurrences: 1,
+        decisions: &["a3b-expert-iu4-redline-exclusion"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "expert_iu4_facts",
+        occurrences: 1,
+        decisions: &["a3b-expert-iu4-redline-exclusion"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "expert_iu4_graph_capturing",
+        occurrences: 3,
+        decisions: &["a3b-expert-iu4-capture-admitted"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "expert_iu4_redline_active",
+        occurrences: 1,
+        decisions: &["a3b-expert-iu4-redline-exclusion"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "owner_assign",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "observe",
+        occurrences: 6,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "refusal",
+        occurrences: 1,
+        decisions: &["qwen4-cpu-splice-eager-only"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/moe_program.rs",
+        function: "row_gather",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/qt44_qt53_prefill.rs",
+        function: "tile_exchange_eager_only",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/pipeline/sealed_moe.rs",
+        function: "validate_for_gpu",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    // Loader-independent qualification launcher refuses before submission under recording/capture.
+    Site {
+        file: "hipfire-dispatch/src/pipeline/slab_moe_decode.rs",
+        function: "launch",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/cpu_exec.rs",
+        function: "moe_cpu_experts",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/cpu_exec.rs",
+        function: "with_cpu_transfer",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_bench_decode_deepseek4",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_bench_decode_lfm2moe",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_greedy_trace",
+        occurrences: 2,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_qwen4_replay_failure",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_run_dspark_direct_arm",
+        occurrences: 2,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_shadow_dspark_verify_pm4",
+        occurrences: 12,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-generate/src/redline.rs",
+        function: "redline_shadow_qwen4",
+        occurrences: 1,
+        decisions: &["redline-oracle-diagnostics"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "abort_draft_ffn_graph_capture",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "admit",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "begin_draft_ffn_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "draft_ffn_layer",
+        occurrences: 3,
+        decisions: &["dflash-draft-graph-safe-body"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "draft_layer_post",
+        occurrences: 1,
+        decisions: &["dflash-draft-graph-safe-body"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "end_draft_ffn_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash.rs",
+        function: "gemm_dispatch_shared",
+        occurrences: 2,
+        decisions: &["dflash-gfx1100-shared-rotation"],
+    },
+    Site {
+        file: "hipfire-runtime/src/dflash/lanes.rs",
+        function: "lane_rows_admitted",
+        occurrences: 3,
+        decisions: &["dflash-cb-lane-draft-batching"],
+    },
+    Site {
+        file: "hipfire-runtime/src/llama.rs",
+        function: "forward_prefill_chunk",
+        occurrences: 3,
+        decisions: &[
+            "captured-batch-attention-physical-cap",
+            "kv-tier-capture-forces-flash",
+        ],
+    },
+    Site {
+        file: "hipfire-runtime/src/llama.rs",
+        function: "tier_inputs",
+        occurrences: 1,
+        decisions: &["kv-tier-capture-forces-flash"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu.rs",
+        function: "abort_rank_graph_captures",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu/executor.rs",
+        function: "peer_reduce",
+        occurrences: 1,
+        decisions: &["tp4-graph-peer-push-reduce16"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu.rs",
+        function: "all_reduce_sum_f32_peer_direct_add_impl",
+        occurrences: 1,
+        decisions: &["tp2-graph-fused-reduce"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu.rs",
+        function: "barrier_rank_streams_reuse",
+        occurrences: 1,
+        decisions: &["tp-graph-capture-barrier"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu.rs",
+        function: "drop_rank_graphs",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "hipfire-runtime/src/multi_gpu/tp_exchange.rs",
+        function: "direct_add16",
+        occurrences: 1,
+        decisions: &["tp2-graph-fused-reduce16"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_asym2",
+        occurrences: 1,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_asym3_impl",
+        occurrences: 1,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_asym4",
+        occurrences: 1,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_bf16_windowed",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fp8_e4m3_tile",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fwht2",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fwht3",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fwht4",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_q8_0_rows_masked_logical",
+        occurrences: 2,
+        decisions: &[
+            "q8-multirow-verify-attention",
+            "gfx1100-split-verify-capture-readiness",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_q8_0_windowed_impl",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_q8_0_fa2_gqa_gfx11",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_q8_0_flash_prefill_wmma",
+        occurrences: 2,
+        decisions: &["fa2-prefill-attention"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_verify_wmma_with",
+        occurrences: 1,
+        decisions: &["verify-attention-wmma-gqa"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "gfx1100_asym3_q8_pair_enabled",
+        occurrences: 1,
+        decisions: &["gfx1100-asym3-q8-pair-write"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "gfx12_q8_fa2_prefill_admitted",
+        occurrences: 2,
+        decisions: &["fa2-prefill-attention"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "launch_verify_gqa",
+        occurrences: 1,
+        decisions: &["verify-attention-wmma-gqa"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "replay_stable_tile_count",
+        occurrences: 4,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "q8_multirow_fail_closed_after_split_miss",
+        occurrences: 4,
+        decisions: &[
+            "q8-multirow-verify-attention",
+            "gfx1100-split-verify-capture-readiness",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "try_attention_q8_0_fa2_gqa_split_gfx1100",
+        occurrences: 4,
+        decisions: &["gfx1100-split-verify-capture-readiness"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_draft_fusion.rs",
+        function: "draft_collapse_mq4v2_route",
+        occurrences: 2,
+        decisions: &["dflash-gfx1100-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_hidden_scatter.rs",
+        function: "dflash_hidden_commit5_applicable",
+        occurrences: 2,
+        decisions: &["dflash-gfx1100-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_hidden_scatter.rs",
+        function: "dflash_hidden_scatter5_try",
+        occurrences: 2,
+        decisions: &["dflash-gfx1100-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_state_copy.rs",
+        function: "dflash_state_bulk_copy_gfx1100_on_stream",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "a8_prefill_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "convert_fp16_x_uncached",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "convert_f32_to_f16_into",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "device_wait_block",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_fp16_x",
+        occurrences: 3,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_fp8_x",
+        occurrences: 3,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_int4_mmq_x",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_int8_mmq_x",
+        occurrences: 1,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_fp8_mmq_x",
+        occurrences: 1,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_q8_1_mmq_x",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "ensure_q8_1_mmq_x128",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "fp8_stream_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "init_with_device",
+        occurrences: 3,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "invalidate_for_kv_mode_switch",
+        occurrences: 2,
+        decisions: &["capture-safe-invalidation"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "invalidate_for_scratch_growth",
+        occurrences: 2,
+        decisions: &["capture-safe-invalidation"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "iu4_gfx11_producer_quant_fused_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "iu4_producer_quant_fused_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "iu4_producer_sidecar_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "htod_stream_ordered",
+        occurrences: 1,
+        decisions: &["memcpy-htod-auto"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "iu4_silu_quant_fused_active",
+        occurrences: 2,
+        decisions: &["prefill-producer-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "launch_blob_recorded",
+        occurrences: 3,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "launch_maybe_blob_bound",
+        occurrences: 4,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "memcpy_dtoh_auto",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "memcpy_htod_auto",
+        occurrences: 1,
+        decisions: &["memcpy-htod-auto"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "mmq_screen_weight",
+        occurrences: 2,
+        decisions: &["mmq-screen-skipped-under-capture"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "prepare_mq4v2_fp8_x",
+        occurrences: 6,
+        decisions: &["eager-only-refusals", "scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "refuse_vmm_prefix_op_while_armed",
+        occurrences: 4,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "refuse_qsa_gather_growth_while_armed",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    // Loader-independent E8P MoE decode launcher refuses before submission under recording/capture (e8p_moe_decode.rs:670).
+    Site {
+        file: "rdna-compute/src/e8p_moe_decode.rs",
+        function: "launch_kernargs",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/flash_attn_ck.rs",
+        function: "<item>",
+        occurrences: 2,
+        decisions: &["flash-attn-ck-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/flash_attn_ck.rs",
+        function: "select_packed_prefill_capabilities",
+        occurrences: 2,
+        decisions: &["flash-attn-ck-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/flash_attn_ck.rs",
+        function: "try_flash_attn_ck_q8_d256_prefill",
+        occurrences: 6,
+        decisions: &["flash-attn-ck-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/flash_attn_ck.rs",
+        function: "try_flash_attn_ck_transformed_prefill_impl",
+        occurrences: 6,
+        decisions: &["flash-attn-ck-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/fn_gdn_dense.rs",
+        function: "applies",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "fp8_f2_row_active",
+        occurrences: 2,
+        decisions: &["gfx1201-fp8-f2-row-route"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv_q8x.rs",
+        function: "q8x_verify_active",
+        occurrences: 2,
+        decisions: &["gfx1100-q8x-verify-gemv"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_fp8_e4m3_tile_batched",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "fp8_fa2_split_verify_admitted",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
+    },
+    Site {
+        file: "hipfire-dispatch/src/families/attention.rs",
+        function: "dispatch_attend",
+        occurrences: 1,
+        decisions: &["gfx1201-fp8-fa2-split-verify"],
+    },
+    Site {
+        file: "rdna-compute/src/attention_wmma_verify.rs",
+        function: "wmma_verify_attn_active",
+        occurrences: 2,
+        decisions: &["gfx1100-wmma-verify-attn"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "fp8_f2_row_launch",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "pad_f32_batch_to_128",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256",
+        occurrences: 2,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256_mmq_gfx906_prequant",
+        occurrences: 2,
+        decisions: &["gfx906-mmq-debug-assert"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2",
+        occurrences: 4,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_hfq6g256",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_mq2g256v2_wmma_gfx11",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_gate_up_mq4g256v2_wmma",
+        occurrences: 6,
+        decisions: &[
+            "gfx11-mqv2-prefill-projection-routes",
+            "gfx1100-mq4v2-verify-tier",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256",
+        occurrences: 2,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_mmq_set_gfx906",
+        occurrences: 2,
+        decisions: &["gfx906-mmq-debug-assert"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual",
+        occurrences: 3,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2",
+        occurrences: 4,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq6g256_batched_lmhead",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_hfq6g256_residual",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq2g256v2_residual_wmma_gfx11",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq4g256v2_mmq_prequant_iu4",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq4g256v2_residual_wmma",
+        occurrences: 5,
+        decisions: &[
+            "gfx11-mqv2-prefill-projection-routes",
+            "gfx1100-mq4v2-verify-tier",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256",
+        occurrences: 2,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_mmq_gfx906",
+        occurrences: 2,
+        decisions: &["gfx906-mmq-debug-assert"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2",
+        occurrences: 6,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_hfq6g256",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq2g256v2_wmma_gfx11",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq2g256v2_wmma_gfx12",
+        occurrences: 2,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq4g256v2_wmma",
+        occurrences: 4,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq5g256v2_wmma_gfx12",
+        occurrences: 2,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkv_mq6g256v2_wmma_gfx12",
+        occurrences: 2,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256",
+        occurrences: 3,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2",
+        occurrences: 4,
+        decisions: &["gfx12-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_hfq6g256",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_mq2g256v2_wmma_gfx11",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_qkvza_mq4g256v2_wmma",
+        occurrences: 4,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gfx1151_xlds_active",
+        occurrences: 1,
+        decisions: &["gfx1151-mq4v2-verify-xlds"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "iu4_v2_tile",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "rocblas_gemm_mfp4e8_soa_prefill_auto",
+        occurrences: 1,
+        decisions: &["gfx906-cdna3-prefill-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "try_gemm_gate_up_mqv2_gfx11_reuse",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "try_gemm_mqv2_residual_gfx11_reuse",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "try_gemm_qkv_mqv2_gfx11_reuse",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "try_gemm_qkvza_mqv2_gfx11_reuse",
+        occurrences: 2,
+        decisions: &["gfx11-mqv2-prefill-projection-routes"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_fp8_verify.rs",
+        function: "fp8_verify_pack_x",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_vt.rs",
+        function: "gfx12_verify_bt_active",
+        occurrences: 2,
+        decisions: &["gfx12-mq4v2-verify-tile-route"],
+    },
+    Site {
+        file: "rdna-compute/src/gemma4_ext.rs",
+        function: "attention_flash_asym3_hd512",
+        occurrences: 2,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/gemma4_ext.rs",
+        function: "attention_flash_fwht3_hd512",
+        occurrences: 1,
+        decisions: &["asym-attention-tile-grid-capture-only"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "fused_rmsnorm_rotate_mq_fp8_gfx12_batched",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "fused_silu_rotate_mq_fp8_gfx12_batched_impl",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "gated_norm_rotate_mq_fp8_gfx12_batched",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_quantize_x_mq8",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_128",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_awq",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_awq_batched",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_dual_fp8",
+        occurrences: 3,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "rotate_x_mq_fp8_gfx12_batched",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "<item>",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "abort_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "begin_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "begin_graph_capture_relaxed",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "begin_replay_graph_capture",
+        occurrences: 5,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "begin_verify_graph_capture",
+        occurrences: 5,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "end_graph_capture",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "end_graph_capture_segment",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "end_replay_graph_capture",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "end_verify_graph_capture",
+        occurrences: 2,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "holds_captured_graph_state",
+        occurrences: 3,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "replay_graph_destroy_all",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/graph.rs",
+        function: "verify_graph_destroy_all",
+        occurrences: 1,
+        decisions: &["graph-capture-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/lane_rows_pm.rs",
+        function: "lane_rows_pm_enabled",
+        occurrences: 2,
+        decisions: &["qwen4-lane-rows-pm"],
+    },
+    Site {
+        file: "rdna-compute/src/mq_f16_producers.rs",
+        function: "gemm_gate_up_mq4g256v2_wmma_f16",
+        occurrences: 2,
+        decisions: &["gfx1100-mq4v2-verify-tier"],
+    },
+    Site {
+        file: "rdna-compute/src/packed_mq4.rs",
+        function: "packed_mq4_admitted",
+        occurrences: 2,
+        decisions: &["packed-mq4-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/prefill_invariant.rs",
+        function: "few_row_limit",
+        occurrences: 2,
+        decisions: &["qwen4-wide-verify-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/prefill_invariant.rs",
+        function: "row_tile_twin_enabled",
+        occurrences: 2,
+        decisions: &["qwen4-wide-verify-eager-only"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "begin_g0_observation",
+        occurrences: 1,
+        decisions: &["g0-observation"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "retained_body_active",
+        occurrences: 1,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "record_hip_launch_typed_bound",
+        occurrences: 1,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "record_hip_launch_with_accesses",
+        occurrences: 1,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
+        function: "should_auto_finalize_capture",
+        occurrences: 1,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/rows_batched.rs",
+        function: "stage_rows_table",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "convert_fp16_x_uncached",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "convert_f32_to_f16_to_ptr",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_fp16_x",
+        occurrences: 4,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_fp8_x",
+        occurrences: 4,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_int4_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_int8_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_fp8_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_q8_1_mmq_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "ensure_q8_1_mmq_x128",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "launch_maybe_blob",
+        occurrences: 5,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "pack_fp8_verify_rows",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "prepare_mq4v2_fp8_x",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "prepare_mq4v2_fp8_x_f32",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "prepare_mq4v2_fp8_x_impl",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_quantize_x_mq8",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_128",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_awq",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_awq_batched",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_batched",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "rotate_x_mq_dual_fp8",
+        occurrences: 2,
+        decisions: &["scratch-launch-plumbing"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "scratch_growth_invalidates",
+        occurrences: 2,
+        decisions: &["capture-safe-invalidation"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "scratch_must_convert",
+        occurrences: 4,
+        decisions: &["fp16-fp8-x-conversion-cache"],
+    },
+    Site {
+        file: "rdna-compute/src/scratch.rs",
+        function: "use_blob_path",
+        occurrences: 4,
+        decisions: &["launch-funnel-blob-path"],
+    },
+    Site {
+        file: "rdna-compute/src/select_regrid.rs",
+        function: "select_regrid_enabled",
+        occurrences: 1,
+        decisions: &["select-regrid-row-selectors"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "gated_delta_chunk_route",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/gemv.rs",
+        function: "gemv_q8_0_k640_bf16_scaled_add",
+        occurrences: 2,
+        decisions: &["qwen4-shared-down-scaled-add"],
+    },
+    Site {
+        file: "rdna-compute/src/moe.rs",
+        function: "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
+        occurrences: 2,
+        decisions: &["qwen4-moe-down-r4"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "gated_delta_core_lanes",
+        occurrences: 1,
+        decisions: &["qwen4-gdn-core-lanes"],
+    },
+    Site {
+        file: "rdna-compute/src/qsa_core_lanes.rs",
+        function: "qsa_core_lanes_min",
+        occurrences: 2,
+        decisions: &["qwen4-qsa-core-lanes"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_select_batch_impl",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_select_fused",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_select_batch_pm_arm",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_decode_splitk_eager",
+        occurrences: 2,
+        decisions: &[
+            "qwen4-opt-in-eager-fusions",
+            "qwen4-indexed-attention-lds-bound",
+            "qwen4-wide-verify-recorded-ar-guard",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_dense_wmma_applies",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_gathered_wmma_applies",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_f16_arena_sync",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/qsa_pooled_mirror.rs",
+        function: "qsa_pooled_bf16_sync",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/qsa_pooled_mirror.rs",
+        function: "qsa_pooled_bf16_low_nonzero_count",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_filter_production",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_select_batch_filter_arm",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_bf16_split_route",
+        occurrences: 2,
+        decisions: &["qwen4-qsa-bf16-split-bound"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "indexed_attention_select_batch_bf16_split_arm",
+        occurrences: 3,
+        decisions: &["eager-only-refusals", "qwen4-qsa-bf16-split-bound"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "qsa_from_scores_check",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/verify_twins.rs",
+        function: "stage_attention_fp8_e4m3_kv_batched_segs",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/attention.rs",
+        function: "attention_flash_f16_windowed",
+        occurrences: 2,
+        decisions: &["attention-tile-grid-superset"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_gdn_replay.rs",
+        function: "gdn_replay_ml_eligible",
+        occurrences: 1,
+        decisions: &["dflash-gdn-replay-multilayer"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_gdn_replay.rs",
+        function: "dflash_gdn_replay_scratch_order",
+        occurrences: 3,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dflash_draft_fusion.rs",
+        function: "draft_overwrite_gfx12_admitted",
+        occurrences: 3,
+        decisions: &["dflash-draft-overwrite-gfx12"],
+    },
+    Site {
+        file: "rdna-compute/src/draft_lane_conv.rs",
+        function: "draft_lane_conv_admitted",
+        occurrences: 3,
+        decisions: &["dflash-cb-lane-draft-batching"],
+    },
+    Site {
+        file: "rdna-compute/src/draft_lane_rows.rs",
+        function: "draft_lane_rows_admitted",
+        occurrences: 3,
+        decisions: &["dflash-cb-lane-draft-batching"],
+    },
+    Site {
+        file: "rdna-compute/src/lane_fa.rs",
+        function: "lane_fa_batch_admitted",
+        occurrences: 3,
+        decisions: &["dflash-cb-lane-verify-batching"],
+    },
+    Site {
+        file: "rdna-compute/src/lane_gdn.rs",
+        function: "lane_gdn_batch_admitted",
+        occurrences: 3,
+        decisions: &["dflash-cb-lane-verify-batching"],
+    },
+    Site {
+        file: "rdna-compute/src/lane_gdn.rs",
+        function: "upload_gdn_lane_table",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq6g256v2_hcw_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_bf16_xf16_f16_wmma",
+        occurrences: 4,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "hc_down_tile_selected",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq4g256v2_xf16_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_trunk_iu4_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_trunk_iu4_ragged",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/hc_row_fold.rs",
+        function: "hc_row_fold_applies",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/moe.rs",
+        function: "moe_router_softmax_top10_f32",
+        occurrences: 2,
+        decisions: &["qwen4-opt-in-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "hc_down_fused_selected",
+        occurrences: 2,
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_hc_down_fused_applies",
+        occurrences: 2,
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_moe_front_fuse_applies",
+        occurrences: 2,
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/hc_row_fold.rs",
+        function: "hc_row_fold_gfx1201_applies",
+        occurrences: 2,
+        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "hc_up_v2_selected",
+        occurrences: 2,
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "hyper_read_up_wmma_launch",
+        occurrences: 2,
+        decisions: &[
+            "qwen4-flash-next-gfx1201-eager-fusions",
+            "qwen4-flash-next-gfx1151-eager-fusions",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/shared_i8.rs",
+        function: "qwen4_shared_i8_applies",
+        occurrences: 2,
+        decisions: &["qwen4-shared-int8-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_mq6g256v2_xf16_applies",
+        occurrences: 2,
+        decisions: &[
+            "gfx12-mqv2-prefill-projection-routes",
+            "gfx11-mqv2-prefill-projection-routes",
+        ],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_bf16_streams",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "qwen4_f16_wmma_applies",
+        occurrences: 2,
+        decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "hip-bridge/src/ffi/kernel_timing/tests.rs",
+        function: "<item>",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hip-bridge/src/ffi/kernel_timing/tests.rs",
+        function: "capture_mode_rejects_launch",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hip-bridge/src/ffi/kernel_timing/tests.rs",
+        function: "mock_is_capturing",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hip-bridge/src/ffi/kernel_timing/tests.rs",
+        function: "new",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hip-bridge/src/ffi/kernel_timing/tests.rs",
+        function: "reset",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/gpu_forward.rs",
+        function: "ar_launch_reference",
+        occurrences: 2,
+        decisions: &["qwen4-wide-verify-recorded-ar-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/mtp_spec.rs",
+        function: "dev_run_forced_window",
+        occurrences: 2,
+        decisions: &["qwen4-wide-verify-recorded-ar-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/mtp_spec.rs",
+        function: "mtp_step",
+        occurrences: 2,
+        decisions: &["qwen4-wide-verify-recorded-ar-guard"],
+    },
+    Site {
+        file: "hipfire-arch-qwen4/src/state.rs",
+        function: "ensure_row_capture",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/dispatch.rs",
+        function: "lab_begin_kernel_timing",
+        occurrences: 3,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm.rs",
+        function: "gemm_q8_0_batched_f32_chunked",
+        occurrences: 2,
+        decisions: &["qwen4-wide-verify-recorded-ar-guard"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq6_fp8.rs",
+        function: "gemm_mq6g256v2_fp8_applies",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq6_fp8.rs",
+        function: "gemm_mq6g256v2_fp8_prepared",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq6_fp8.rs",
+        function: "mq6_fp8_prepare_x",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq6_i8.rs",
+        function: "gemm_mq6g256v2_i8_applies",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq6_i8.rs",
+        function: "gemm_mq6g256v2_i8_prequant",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq6_i8.rs",
+        function: "mq6_i8_prepare_x",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq8g256.rs",
+        function: "mq8_quantize_x",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq8g256.rs",
+        function: "mq8_reserve_x",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "saddle-core/src/kv.rs",
+        function: "grow_vmm_tensors",
+        occurrences: 1,
+        decisions: &["eager-only-refusals"],
+    },
+];
+
+// Line numbers at `7454b5f64` (railgun/m2).
+pub const PRE_PROGRAM_LAUNCHES: &[PreProgramLaunch] = &[PreProgramLaunch {
+    id: "qwen35-token-embedding-q8",
+    kernel: "embedding_q8",
+    site: "rdna-compute/src/embedding.rs:37-64 (Gpu::embedding_lookup_q8: raw hip.launch_kernel, null stream, token id as a by-value kernarg), called from hipfire-arch-qwen35/src/qwen35/forward.rs:1719-1734 (forward_scratch, before the AQL/PM4/HIP-graph/direct route branches at :1737-1830)",
+    per_forward: 1,
+    programs: &[H2Gfx1201],
+    evidence: "railgun G01 G0 (gfx1201 card B, H2 group-alpha-refit, Q8 token embedding): 900 HIP launches vs 899 funnel launches per forward in both arms at 10 contexts; rocprofv3 kernel trace shows embedding_q8 dispatched immediately before the pos H2D copy and the 899-launch program in each decode forward; the recorded 899-launch program contains no embedding kernel",
+}];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn crates_dir() -> std::path::PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("..")
+    }
+
+    /// The MR gate: every function in `crates/*/src` that consults recording
+    /// or capture state has an inventory row with the same token count, and
+    /// no row is stale. Adding an `is_recording()`-style check fails here
+    /// until the decision it changes is classified in `DECISIONS`.
+    #[test]
+    fn every_recording_predicate_in_the_tree_has_an_inventory_row() {
+        let scanned = scan_sources(&crates_dir()).unwrap();
+        let problems = check(&scanned);
+        assert!(
+            problems.is_empty(),
+            "recording inventory out of date:\n{}",
+            problems.join("\n")
+        );
+    }
+
+    #[test]
+    fn inventory_rows_are_consistent() {
+        let mut ids = std::collections::BTreeSet::new();
+        for d in DECISIONS {
+            assert!(ids.insert(d.id), "duplicate decision {}", d.id);
+            assert!(
+                SITES.iter().any(|s| s.decisions.contains(&d.id)),
+                "decision {} has no site",
+                d.id
+            );
+            assert!(!d.evidence.is_empty(), "decision {} has no evidence", d.id);
+            match d.verdict {
+                // An invariant decision by definition changes nothing a
+                // program could observe, so it cannot reach one.
+                Verdict::Invariant => {
+                    assert!(d.reaches.is_empty(), "invariant {} reaches a program", d.id)
+                }
+                Verdict::ByteExact | Verdict::NotEquivalent => {
+                    assert!(
+                        matches!(d.effect, Effect::KernelSelection | Effect::LaunchShape),
+                        "{} verdict needs a selection/shape effect",
+                        d.id
+                    )
+                }
+            }
+        }
+        for s in SITES {
+            assert!(!s.decisions.is_empty());
+            for id in s.decisions {
+                assert!(
+                    decision(id).is_some(),
+                    "{}::{} names unknown decision {id}",
+                    s.file,
+                    s.function
+                );
+            }
+        }
+        let mut launch_ids = std::collections::BTreeSet::new();
+        for l in PRE_PROGRAM_LAUNCHES {
+            assert!(
+                launch_ids.insert(l.id),
+                "duplicate pre-program launch {}",
+                l.id
+            );
+            assert!(
+                l.per_forward > 0 && !l.programs.is_empty(),
+                "{} declares no launch",
+                l.id
+            );
+            assert!(
+                !l.site.is_empty() && !l.evidence.is_empty(),
+                "{} has no site or evidence",
+                l.id
+            );
+        }
+    }
+
+    /// The Raon AR program is in the inventory the recording-inventory CLI emits (G0 selects it by name),
+    /// is classified without being refused, and names only decisions the inventory knows.
+    #[test]
+    fn raon_ar_program_is_inventoried_by_name_and_not_refused() {
+        assert!(PROGRAMS.contains(&Program::RaonArGfx1201));
+        assert_eq!(
+            serde_json::to_value(Program::RaonArGfx1201).unwrap(),
+            "raon_ar_gfx1201"
+        );
+        let inventory = inventory_json();
+        let programs = inventory["programs"].as_object().unwrap();
+        assert_eq!(programs.len(), PROGRAMS.len());
+        let raon = &programs["raon_ar_gfx1201"];
+        assert_eq!(raon["refused_as_default"], false);
+        assert!(raon["refused_by"].as_array().unwrap().is_empty());
+        let decisions = recording_dependent_decisions(Program::RaonArGfx1201);
+        assert!(
+            decisions
+                .iter()
+                .any(|d| d.id == "fp16-fp8-x-conversion-cache" && d.seen_by == "g0"),
+            "{decisions:?}"
+        );
+        // The owner's own predicate sites are classified: the plan's capture-route flag reaches the
+        // program (ByteExact, g0), the retained-replay decline reaches nothing.
+        assert!(decisions
+            .iter()
+            .any(|d| d.id == "raon-railgun-plan-capture-route" && d.verdict == Verdict::ByteExact));
+        assert!(decision("raon-railgun-owner-replay-decline")
+            .is_some_and(|d| d.verdict == Verdict::Invariant && d.reaches.is_empty()));
+        for d in &decisions {
+            assert!(decision(d.id).is_some(), "{}", d.id);
+            assert_ne!(d.verdict, Verdict::NotEquivalent, "{}", d.id);
+        }
+        assert!(!refused_default_programs().contains_key(&Program::RaonArGfx1201));
+        // No pre-program launch: the AR token is a device input and every launch is inside the body.
+        assert!(pre_program_launches(Program::RaonArGfx1201).is_empty());
+        // The other programs' rows are unchanged by adding it.
+        assert_eq!(
+            recording_dependent_decisions(Program::DflashGfx1201)
+                .iter()
+                .filter(|d| d.id == "fp16-fp8-x-conversion-cache")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn scan_counts_code_tokens_only() {
+        let src = r##"
+            // gpu.replay.is_recording() in a comment
+            /* capture_mode in a /* nested */ block */
+            fn decide(gpu: &Gpu, capture_mode: bool) -> bool {
+                let s = "capture_mode"; let r = r#"is_recording()"#; let c = '"';
+                let _ = gpu.graphs.capture_mode;
+                gpu.replay.is_enabled() && !gpu.replay.is_recording()
+            }
+            pub fn is_recording(&self) -> bool { self.state == 1 }
+            struct GraphState { pub capture_mode: bool, capturing: Option<usize> }
+            #[cfg(test)]
+            mod tests { fn t() { let _ = capture_mode; } }
+            #[cfg(test)]
+            fn helper(capture_mode: bool) {}
+            impl X { fn other(&self) { let _ = self.x.state(); let _ = gpu.replay.state(); } }
+        "##;
+        let counts = scan_file(src);
+        assert_eq!(counts.get("decide"), Some(&4), "{counts:?}");
+        assert_eq!(counts.get("<item>"), Some(&2), "{counts:?}");
+        assert_eq!(counts.get("other"), Some(&1), "{counts:?}");
+        assert_eq!(counts.get("is_recording"), None);
+        assert_eq!(counts.get("t"), None);
+        assert_eq!(counts.get("helper"), None);
+    }
+}

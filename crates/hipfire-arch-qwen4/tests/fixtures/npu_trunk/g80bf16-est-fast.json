@@ -1,0 +1,55 @@
+{
+ "gpu": {
+  "trunk_in_ms_per_8192": {
+   "qkv": 370.0,
+   "zab": 228.0,
+   "q": 150.0,
+   "kvidx": 27.0
+  },
+  "uniform_per_layer_ms": 59.4,
+  "gdn_core_per_layer_ms": 5.63,
+  "qsa_per_layer_ms": 35.0,
+  "qsa_growth_per_layer_ms_per_8192_prefix": 14.1,
+  "fixed_per_chunk_ms": 0.0,
+  "boundary_tax_ms": 350.0,
+  "min_bank_rows": 2048
+ },
+ "families": {
+  "qkv": {
+   "layer": "gdn",
+   "cols": 10240
+  },
+  "zab": {
+   "layer": "gdn",
+   "cols": 6400
+  },
+  "q": {
+   "layer": "qsa",
+   "cols": 12288
+  },
+  "kvidx": {
+   "layer": "qsa",
+   "cols": 1792
+  }
+ },
+ "glue": {
+  "pack_ms_8192": 0.407,
+  "sync_ms": 0.1
+ },
+ "key": {
+  "device": "hipx gfx1151 c0:00.0 + XDNA2 c1:00.1",
+  "kernel": "7.3.0-rc7-perfopt+ PerfOpt armed",
+  "build": "lab/npu-a8emu bins (hipfire 6327b4b1, daemon 64ee2f06)",
+  "npu_design": "g80bf16-est-fast"
+ },
+ "npu": {
+  "tops_corun": 29.0,
+  "bytes_per_kop": 0.842,
+  "epilogue": "bf16",
+  "panel_cols": 1280
+ },
+ "contention": {
+  "alpha_overlap": 1.077323916,
+  "model": "slowdown% = 0.2062*GBps + 0.0546*TOPS + 1.114 (4-source fit, residual <0.3 pt)"
+ }
+}

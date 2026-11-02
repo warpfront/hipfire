@@ -1,0 +1,78 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The native-fp8 `fa_prefill` module (E4M3 K/V rows of 516 bytes, one f16 scale per token and KV head;
+// gfx1201 GQA-fused FA2 prefill attention, H = 16, Hkv = 2, D = 256): one direct export
+// `attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201`, composed in `.rip` from the `fa::*` natives of
+// `fa_prefill::blocks`.
+//
+// `fa_prefill::emit` with `FaKv::Fp8E4M3` is written over exactly the blocks this script calls, so the
+// script re-emits the production kernel's bytes (`s_text` and proof); `fa_prefill_fp8_twin_matches_the_rust_emit`
+// requires it. Edit the composition here and re-run: no rebuild.
+//
+// The kernel reuses ONE 32-KiB LDS stage sequentially (slot 0): fill K -> Ready -> QK -> Retire -> fill V ->
+// Ready -> softmax/PV -> Retire, four barrier pairs per tile. Every barrier, branch label and the tile loop is
+// a `Builder` statement (no `Workgroup`), checked by the builder's slot machine, wait ledger and loop
+// fixpoint: drop the Retire before the V fill and the stage is refused (`stage cannot be stored while Reading`).
+//
+// Variant: `direct`. gfx1201 only, exactly H16 / KV2 / D256 (the Rust gate).
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &["direct"];
+
+fn fa_spec() -> FaSpec {
+    FaSpec { heads: 16, kv_heads: 2, head_dim: 256, kv: FaKv::Fp8E4M3 }
+}
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    if spec.variant != "direct" {
+        return Err(format!("variant `{}`: expected direct", spec.variant));
+    }
+    let g = FaGen::new(spec.arch, fa_spec())?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    b.enable_delay_alu();
+    declare_lds(&mut b, &g)?;
+    fa::prologue(&mut b, &g)?;
+    b.loop_(fa::LOOP, |b| tile(b, &g))?;
+    fa::epilogue(&mut b, &g)?;
+    b.finish()
+}
+
+fn declare_lds(b: &mut Builder, g: &FaGen) -> Result<(), String> {
+    let slots = g.lds_slots();
+    for i in 0..slots.len() {
+        let (name, base, bytes) = slots[i];
+        let id = b.lds_slot(name, base, bytes)?;
+        if id != i {
+            return Err(format!("LDS slot {name} got id {id}"));
+        }
+    }
+    Ok(())
+}
+
+// One KT64 tile, all five waves joining every barrier; causal exits target TURN, which retires the
+// stage after the final tile's V use.
+fn tile(b: &mut Builder, g: &FaGen) -> Result<(), String> {
+    fa::tile_setup(b, g)?;
+    fa::fill_k(b, g)?;
+    fa::label(b, fa::KFILL_DONE)?;
+    b.barrier_with_scope([ready(0)], "lds_only")?;
+    fa::label(b, fa::KREADY)?;
+    fa::skip_if_helper(b, fa::QK_DONE)?;
+    fa::qk(b, g)?;
+    fa::label(b, fa::QK_DONE)?;
+    b.barrier_with_scope([retire(0)], "lds_only")?;
+    fa::fill_v(b, g)?;
+    fa::label(b, fa::VFILL_DONE)?;
+    b.barrier_with_scope([ready(0)], "lds_only")?;
+    fa::label(b, fa::VREADY)?;
+    fa::skip_if_helper(b, fa::TURN)?;
+    for sub in 0..4 {
+        fa::softmax_sub(b, g, sub)?;
+    }
+    fa::label(b, fa::TURN)?;
+    b.barrier_with_scope([retire(0)], "lds_only")?;
+    fa::next_tile(b)
+}

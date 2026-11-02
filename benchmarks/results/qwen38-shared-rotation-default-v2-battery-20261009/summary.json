@@ -1,0 +1,6 @@
+{
+  "default_explicit_on_parity": true,
+  "cases": 5,
+  "daemon_sha256": "a6fdc0de4bcb20caecbbff80f5b8158f1900e0da98122d1071e8a51f3a55c845",
+  "cli_sha256": "9d81c3bcf01bf62d32ab20a1aa8bfaef42ff8a10d748c9ab477fd34386f2e651"
+}

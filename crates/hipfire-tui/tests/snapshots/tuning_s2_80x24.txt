@@ -1,0 +1,24 @@
+         hipfire · control panel    serve: offline    model: qwen3.8:27b
+
+ Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
+
+────────────────────────────────────────────────────────────────────────────────
+ ┌ Tuning for gfx1151 · all models ───────────────────────────────────────────┐
+ │Pick how hipfire should trade speed for answer quality on this machine.     │
+ │You will see every change before anything is saved.                         │
+ │                                                                            │
+ │  ● Balanced       What hipfire ships for this GPU. Fast, good answers.     │
+ │                   Removes settings a preset added; keeps yours.            │
+ │> ○ Quality-first  More accurate answers. Long prompts take longer to read. │
+ │                   Typing speed after that is about the same.               │
+ │  ○ Low-power      Less work per answer: shorter thinking. Keeps the fastest│
+ │                   prompt math. Does not change your GPU's power limit.     │
+ │                                                                            │
+ │Current: Balanced (no preset-owned settings in config.toml).                │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ └────────────────────────────────────────────────────────────────────────────┘
+Enter preview · ↑↓ choose · u undo last tuning · Esc close
+

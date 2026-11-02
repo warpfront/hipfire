@@ -1,0 +1,18 @@
+[package]
+name = "hipfire-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Architecture-neutral daemon machinery — scheduler, terminal control, emit, prompt framing, and bench helpers that sit above hipfire-loader and below the product binary"
+
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+hipfire-loader = { path = "../hipfire-loader" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+rdna-compute = { path = "../rdna-compute" }
+saddle-core = { path = "../saddle-core" }
+# preserve_order: choice criteria keys (and question names) keep request order,
+# so option codes map to keys in the caller's order without relying on
+# feature unification from another crate.
+serde_json = { workspace = true, features = ["preserve_order"] }

@@ -1,5 +1,25 @@
 # Upstream Merge Journal — feature/dispatch-unification
 
+> **Lifecycle: historical (point-in-time merge-planning journal,
+> 2026-06-05).** Retained for provenance of the dispatch-unification merge.
+> It is **not** current procedure, a to-do list, or acceptance. SHAs, branch
+> names, "commits ahead/behind" counts, and the cherry-pick recipe describe
+> the repository as of that date and are not re-validated; the
+> cherry-pick recipe has been carried out or superseded and must not be
+> re-run; the "Required adaptations" are not re-validated here. In particular, the closing
+> `./scripts/coherence-gate.sh` step is a retired battery: per
+> [`VALIDATION.md`](VALIDATION.md) § "Retired coherence-gate scripts" that
+> family is historical reproduction only, never promotion or acceptance;
+> use the routes in `VALIDATION.md` for dispatch changes.
+>
+> Current-tree evidence for action item #1 (checked against the beta
+> source): the `GemvResidual` else-branch in
+> `crates/hipfire-dispatch/src/pipeline/steps.rs` calls
+> `gemv.run_auto(...)` (with a comment that `Plain` would skip the Givens
+> rotation for `ParoQ4G128`), and `families/gemv.rs` no longer carries the
+> `ParoQ4G128` arm in `dispatch_residual`. The guardrail test
+> `crates/hipfire-dispatch/src/coverage_tests.rs` is in tree.
+
 **Date:** 2026-06-05  
 **Upstream remote:** https://github.com/warpfront/hipfire.git  
 **Upstream/master HEAD:** `02634f4c` (same as our local master — fully in sync)  

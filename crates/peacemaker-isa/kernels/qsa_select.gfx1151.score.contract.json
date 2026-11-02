@@ -1,0 +1,10 @@
+{
+  "symbol": "indexed_attention_select_scores_rows16_f32_pm_gfx1151",
+  "counts": {"buffer_load_b128": 32, "buffer_store_b32": 1, "s_load_b256": 69, "s_load_b128": 1, "s_load_b32": 1,
+    "v_div_scale_f32": 8, "v_div_fmas_f32": 4, "v_div_fixup_f32": 4, "s_barrier": 0, "s_endpgm": 1},
+  "forbidden": ["scratch_*", "flat_*", "global_*", "ds_*", "buffer_atomic_*", "v_readlane*", "v_writelane*", "s_setpc*", "s_swappc*"],
+  "vgpr_max": 152, "sgpr_max": 105,
+  "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 0,
+  "group_segment_fixed_bytes": 0
+}

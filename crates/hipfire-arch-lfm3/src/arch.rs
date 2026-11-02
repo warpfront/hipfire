@@ -2,12 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! `Architecture` trait impl for LFM3 (arch_id = 13).
+//! `Architecture` trait impl for LFM3 (arch_id = 24).
 //!
 //! Thin marker + delegation, mirroring `hipfire-arch-lfm2moe`'s `arch.rs`.
 //! The forward pass is NOT on the trait — it lives as free functions in
 //! `crate::forward` (hot-path static dispatch), called directly by the
-//! daemon's `arch_id == 13` generate branch.
+//! daemon's `arch_id == 24` generate branch.
 
 use crate::config::Lfm3Config;
 use crate::lfm3::{Lfm3State, Lfm3Weights};
@@ -25,7 +25,7 @@ impl Architecture for Lfm3 {
 
     /// Canonical architecture ID for LFM3.
     fn arch_id() -> u32 {
-        13
+        24
     }
 
     fn name() -> &'static str {
@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn lfm3_arch_id_and_name() {
-        assert_eq!(Lfm3::arch_id(), 13);
+        assert_eq!(Lfm3::arch_id(), 24);
         assert_eq!(Lfm3::name(), "lfm3");
     }
 }

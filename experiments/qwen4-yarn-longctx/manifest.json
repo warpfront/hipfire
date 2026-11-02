@@ -1,0 +1,44 @@
+{
+ "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+ "fixtures": [
+  {
+   "file": "niah_long_48k.jsonl",
+   "sha256": "ff8766c0c66a892b17c6a1ff17297f9527504e413ad49bc6b04a7179d0f7f775",
+   "filler_tokens": 47914,
+   "chars_per_token": 5.3013,
+   "needle_token_offsets": [
+    4809,
+    19144,
+    33579,
+    45517
+   ],
+   "needles_past_native": 0
+  },
+  {
+   "file": "niah_long_300k.jsonl",
+   "sha256": "3c4c8dbdfa1f50e92350ef3a0e0ffa2801fabd8809d52b10980317762ed5463e",
+   "filler_tokens": 299820,
+   "chars_per_token": 5.3151,
+   "needle_token_offsets": [
+    29985,
+    149923,
+    269662,
+    290792
+   ],
+   "needles_past_native": 2
+  },
+  {
+   "file": "niah_long_500k.jsonl",
+   "sha256": "c49774e59a4f01fcf085e3c2418151ff84a8beb650a0e314f133044dad087759",
+   "filler_tokens": 499724,
+   "chars_per_token": 5.3181,
+   "needle_token_offsets": [
+    49937,
+    224855,
+    349957,
+    474876
+   ],
+   "needles_past_native": 2
+  }
+ ]
+}

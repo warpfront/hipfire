@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: hipfire
+    type: file
+    folder: hipfire
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /var/lib/grafana/dashboards

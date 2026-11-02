@@ -10,7 +10,7 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-11-carrier-registry-unified-design.md` (read it; this plan implements its §1–4 + migration order).
 
-**Worktree:** `/home/bjoern/hipfire/.worktrees/feature-paro-transparent-loading` (branch `feature/paro-transparent-loading`).
+**Worktree:** `<repo>/.worktrees/feature-paro-transparent-loading` (branch `feature/paro-transparent-loading`).
 
 ---
 
@@ -18,7 +18,7 @@
 
 - **"Move verbatim X→Y"** means cut the existing block at the cited `lib.rs` line range and paste it unchanged into the new location, fixing only `use`/visibility. Line numbers are from HEAD `ffbe3bcb`; re-grep if they drift.
 - After **every** task: `cargo build --example daemon -p hipfire-runtime` must finish with warnings-only. A non-exhaustive match or dropped field is a compile error — that is the safety net.
-- Coherence gates write reports to `/home/bjoern/hipfire/.scratch/` (absolute path; the worktree-relative `.scratch` does not exist). Gates manage their own GPU lock.
+- Coherence gates write reports to `$REPO_ROOT/.scratch/` (absolute path; the worktree-relative `.scratch` does not exist). Gates manage their own GPU lock.
 - Commit after each task. The pre-commit coherence hook is NOT active in this worktree (`core.hooksPath = .git/hooks`), so gates are run manually per the steps.
 
 ## File structure
@@ -130,7 +130,7 @@ Expected: warnings-only. (A field-count mismatch is a compile error here.)
 
 - [ ] **Step 4: Coherence gate (no behavior change expected)**
 
-Run: `HIPFIRE_COHERENCE_OUT=/home/bjoern/hipfire/.scratch/cg-t1.md ./scripts/coherence-gate.sh`
+Run: `HIPFIRE_COHERENCE_OUT=$REPO_ROOT/.scratch/cg-t1.md ./scripts/coherence-gate.sh`
 Expected: "no hard errors". Eyeball the report — every model still fluent.
 
 - [ ] **Step 5: Commit**
@@ -270,8 +270,8 @@ Expected: warnings-only. Fix visibility (`pub(crate)` on `load_*`, `finish_qwen3
 - [ ] **Step 7: Coherence gates (dispatch changed)**
 
 ```bash
-HIPFIRE_COHERENCE_OUT=/home/bjoern/hipfire/.scratch/cg-t2.md ./scripts/coherence-gate.sh
-HIPFIRE_COHERENCE_OUT=/home/bjoern/hipfire/.scratch/cgd-t2.md ./scripts/coherence-gate-dflash.sh
+HIPFIRE_COHERENCE_OUT=$REPO_ROOT/.scratch/cg-t2.md ./scripts/coherence-gate.sh
+HIPFIRE_COHERENCE_OUT=$REPO_ROOT/.scratch/cgd-t2.md ./scripts/coherence-gate-dflash.sh
 ```
 Expected: both "no hard errors". Eyeball both reports (qwen35 fluent; dflash no tier breaches).
 
@@ -418,7 +418,7 @@ Expected: loads as qwen35 (MoE/A3B), fluent output. If it loads as llama or erro
 
 - [ ] **Step 6: Coherence gate**
 
-Run: `HIPFIRE_COHERENCE_OUT=/home/bjoern/hipfire/.scratch/cg-t5.md ./scripts/coherence-gate.sh`
+Run: `HIPFIRE_COHERENCE_OUT=$REPO_ROOT/.scratch/cg-t5.md ./scripts/coherence-gate.sh`
 Expected: "no hard errors".
 
 - [ ] **Step 7: Commit**
@@ -459,9 +459,9 @@ Expected: warnings-only.
 
 - [ ] **Step 4: Coherence gate (single-GPU) + note pp validation gap**
 
-Run: `HIPFIRE_COHERENCE_OUT=/home/bjoern/hipfire/.scratch/cg-t6.md ./scripts/coherence-gate.sh`
+Run: `HIPFIRE_COHERENCE_OUT=$REPO_ROOT/.scratch/cg-t6.md ./scripts/coherence-gate.sh`
 Expected: "no hard errors" (single-GPU qwen35 path unaffected).
-⚠️ **pp>1 functional validation requires hiptrx (4×R9700)** — mark required-before-merge. On hiptrx: `HIP_VISIBLE_DEVICES=0,1,2,3` load a qwen35 model with `pp=4`, confirm fluent generate + clean unload (no VRAM leak: `rocm-smi` before/after).
+⚠️ **pp>1 functional validation requires the 4×R9700 (gfx1201) multi-GPU box** — mark required-before-merge. On that box: `HIP_VISIBLE_DEVICES=0,1,2,3` load a qwen35 model with `pp=4`, confirm fluent generate + clean unload (no VRAM leak: `rocm-smi` before/after).
 ⚠️ **VL** has no local model — compile-coverage only unless one is sourced.
 
 - [ ] **Step 5: Commit**
@@ -494,8 +494,8 @@ Expected: CLEAN (or only pre-existing daemon warnings unrelated to this work).
 - [ ] **Step 4: Full gate battery + perf sanity**
 
 ```bash
-HIPFIRE_COHERENCE_OUT=/home/bjoern/hipfire/.scratch/cg-final.md ./scripts/coherence-gate.sh
-HIPFIRE_COHERENCE_OUT=/home/bjoern/hipfire/.scratch/cgd-final.md ./scripts/coherence-gate-dflash.sh
+HIPFIRE_COHERENCE_OUT=$REPO_ROOT/.scratch/cg-final.md ./scripts/coherence-gate.sh
+HIPFIRE_COHERENCE_OUT=$REPO_ROOT/.scratch/cgd-final.md ./scripts/coherence-gate-dflash.sh
 scripts/probe_commits.sh HEAD~1 HEAD   # expect Δ≈0% — dispatch is once-per-call
 ```
 Expected: gates "no hard errors"; perf Δ within ±5% (investigate per CLAUDE.md if not).
@@ -516,6 +516,6 @@ git commit -m "cleanup(loader): remove orphaned fns + unused daemon imports post
 - [ ] `coherence-gate-dflash.sh` green + three-tier eyeball.
 - [ ] Safetensors smoke routes to qwen35 (Task 5 Step 5) — captured log.
 - [ ] Perf Δ≈0% fresh-process (Task 7 Step 4).
-- [ ] **pp>1 functional smoke on hiptrx** (4×R9700) — code lands here, validation is remote, not skippable.
+- [ ] **pp>1 functional smoke on the 4×R9700 (gfx1201) multi-GPU box** — code lands here, validation is remote, not skippable.
 - [ ] qwen2 (arch 7) + llama (arch <5) functional smoke — needs sourced models (compile-coverage only otherwise; note in PR).
 - [ ] VL smoke — needs a model (compile-coverage only otherwise; note in PR).

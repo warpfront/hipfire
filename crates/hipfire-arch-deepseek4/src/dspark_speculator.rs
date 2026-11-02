@@ -39,12 +39,23 @@
 
 use crate::deepseek4::{DeepseekV4Config, DeepseekV4State, DeepseekV4Weights};
 use crate::forward;
+use hipfire_runtime::dspark_block_controller::WindowCost;
 use hipfire_runtime::dspark_core::{
     build_dspark_speculator, main_proj_ingest, main_proj_ingest_batched, DsparkBody,
     DsparkConfig as CoreDsparkConfig, DsparkWeights as CoreDsparkWeights,
 };
 use hipfire_runtime::spec::Speculator;
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// DSpark window cost for the block controller: `dt / t_ar`, the window time one
+/// more draft adds relative to a draft-less window. Fixed rather than timed so the draft-block
+/// schedule, and with it greedy output, repeats across processes (HIPF-78:
+/// the live fit landed at 0.390-0.423 on warm gfx1151 processes and the chosen
+/// verify widths, hence the text, changed between runs). 0.40 is the median of
+/// those fits.
+// ponytail: one gfx1151 number for every device; measure gfx1201/TP routes
+// and key it by arch if their verify cost curve differs.
+const DS4_DSPARK_WINDOW_COST: WindowCost = WindowCost::Fixed { ratio: 0.40 };
 
 // ── Deepseek4DsparkBody ───────────────────────────────────────────────────────
 
@@ -123,6 +134,7 @@ impl DsparkBody for Deepseek4DsparkBody {
             markov_w1: weights.markov_w1.as_ref().map(|t| t.shallow_clone()),
             markov_w2: weights.markov_w2.as_ref().map(|t| t.shallow_clone()),
             confidence_proj: weights.confidence_proj.as_ref().map(|t| t.shallow_clone()),
+            draft_head: None,
         };
 
         forward::dspark_run_body_and_hc_gate(
@@ -152,6 +164,10 @@ impl DsparkBody for Deepseek4DsparkBody {
         // only advisory (DsparkDrafter uses its own stored block). Return the
         // V4-Flash default (5) as a safe fallback.
         5
+    }
+
+    fn persistent_verify_context_scratch(&self) -> bool {
+        true
     }
 
     fn reset_for_retry(&mut self, gpu: &mut Gpu) {
@@ -315,6 +331,7 @@ pub fn build_deepseek4_dspark_speculator(
         ctx_capacity,
         conf_threshold,
         supports_temp,
+        DS4_DSPARK_WINDOW_COST,
     ))
 }
 
@@ -364,6 +381,9 @@ mod tests {
             num_hash_layers: 0,
             reap_keep: None,
             load_dspark: true,
+            load_mtp: true,
+            mq2r: false,
+            mq2rxt: false,
         }
     }
 
@@ -474,8 +494,17 @@ mod tests {
             d2t: None,
         };
 
-        let mut spec =
-            build_dspark_speculator(body, core_weights, stage_norm, lm_head, 2, 8, 0.3, false);
+        let mut spec = build_dspark_speculator(
+            body,
+            core_weights,
+            stage_norm,
+            lm_head,
+            2,
+            8,
+            0.3,
+            false,
+            DS4_DSPARK_WINDOW_COST,
+        );
         // Dirtied rings are inside the body; reset must free them (no panic).
         let _ = spec.reset(&mut gpu);
         spec.free(&mut gpu);

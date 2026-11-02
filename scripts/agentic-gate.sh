@@ -20,11 +20,12 @@
 #     2. Tool-call structural validation (JSON.parse + schema match)
 #
 # What this gate does NOT cover (by design, today):
-#   - Jinja chat-template rendering. Master hardcodes AssistantPrefix::Plain
-#     at 4 daemon sites; there is no HIPFIRE_JINJA_CHAT toggle on master.
-#     PR #175 ships that toggle (gated 1=on, default off + Plain). When #175
-#     lands, this gate should grow a `jinja=1` axis so we exercise both
-#     framing paths. Until then, every cell uses the Plain scaffold.
+#   - Jinja chat-template rendering beyond what the daemon does for a request.
+#     Each generate carries `thinking_enabled` and `assistant_prefix` exactly as
+#     `hipfire serve` sends them: think-on cells `open_think`, the clamped cell
+#     and every second turn `closed_think`, never `max_think_tokens`. (Until
+#     the 2026-10 protocol repair the cells used the Plain scaffold, so think-on
+#     cells are framed differently from reports made before it.)
 #   - OpenAI HTTP path. Cells drive the daemon over stdin JSONL; the
 #     `serve` HTTP path runs additional Node-side Jinja rendering that
 #     this harness skips. OpenAI-shaped tool-call regressions need a
@@ -52,6 +53,9 @@
 #                                            for your host)
 #
 # Report destination: /tmp/agentic-gate-<timestamp>.md (or $HIPFIRE_AGENTIC_GATE_OUT)
+# Raw archive: with HIPFIRE_AGENTIC_GATE_RAW_DIR=<absolute dir> set, each model's raw
+# daemon output is kept as <dir>/<model>.daemon-output.jsonl and the driver's
+# machine-readable terminal record as <dir>/<model>.driver.json (logs only).
 
 set -u
 cd "$(dirname "$0")/.."
@@ -155,7 +159,10 @@ PY
 fi
 
 # ---- Setup -----------------------------------------------------------------
-EXE="./target/release/examples/daemon"
+# HIPFIRE_AGENTIC_GATE_EXE / HIPFIRE_AGENTIC_GATE_DRIVER_ARGS exist only for the
+# CPU tests (scripts/test_agentic_gate_driver.py): they point the gate at a fake
+# daemon (never rebuilt) and add driver flags such as short deadlines.
+EXE="${HIPFIRE_AGENTIC_GATE_EXE:-./target/release/daemon}"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_AGENTIC_GATE_OUT:-/tmp/agentic-gate-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -207,7 +214,7 @@ model_fits_vram() {
     [ "${HIPFIRE_AGENTIC_GATE_NO_VRAM_CHECK:-0}" = "1" ] && return 0
     [ -f "$REGISTRY" ] || return 0
     [ "$VRAM_BYTES" -gt 0 ] || return 0
-    # python3 is a hard script-wide dep (self-check + JSONL builder). No guard.
+    # python3 is a hard script-wide dep (self-check + session driver). No guard.
 
     local fname min_gb min_bytes
     fname="$(basename "$model_path")"
@@ -259,13 +266,33 @@ for f in "$PI_SYS" "$HERMES_SYS" "$USER_READ"; do
     fi
 done
 
-# Rebuild daemon if any tracked source is newer than the binary.
+# HIPFIRE_AGENTIC_GATE_RAW_DIR (absolute, created here) archives, per model, the
+# driver's raw daemon output and its terminal record. Unset: nothing is written.
+RAW_DIR="${HIPFIRE_AGENTIC_GATE_RAW_DIR:-}"
+if [ -n "$RAW_DIR" ]; then
+    case "$RAW_DIR" in
+        /*) ;;
+        *) echo "agentic-gate: HIPFIRE_AGENTIC_GATE_RAW_DIR must be absolute: $RAW_DIR" >&2; exit 2 ;;
+    esac
+    if ! mkdir -p -- "$RAW_DIR"; then
+        echo "agentic-gate: cannot create HIPFIRE_AGENTIC_GATE_RAW_DIR: $RAW_DIR" >&2
+        exit 2
+    fi
+fi
+
+# Rebuild daemon if any tracked source is newer than the binary. A test-supplied
+# HIPFIRE_AGENTIC_GATE_EXE is a test double and is never rebuilt.
 rebuild=0
-if [ ! -x "$EXE" ]; then
+if [ -n "${HIPFIRE_AGENTIC_GATE_EXE:-}" ]; then
+    if [ ! -x "$EXE" ]; then
+        echo "agentic-gate: HIPFIRE_AGENTIC_GATE_EXE is not executable: $EXE" >&2
+        exit 2
+    fi
+elif [ ! -x "$EXE" ]; then
     rebuild=1
 else
     for src in crates/hipfire-arch-qwen35/src/qwen35.rs crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/src/hfq.rs crates/hipfire-runtime/examples/daemon.rs \
+               crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
                crates/rdna-compute/src/dispatch.rs; do
         if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
             rebuild=1; break
@@ -274,32 +301,29 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "agentic-gate: rebuilding daemon..."
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "agentic-gate: build failed" >&2
         exit 2
     fi
 fi
 
-# Concurrency policy: the gate uses the daemon's existing singleton flock
-# at $HOME/.hipfire/daemon.pid (daemon.rs:171). If a user daemon is already
-# running, the gate's daemon will exit with FATAL; we detect that in the
-# per-cell parser and surface it as a hard fail. We do NOT override $HOME
-# or rm the pid file — both would either bypass the singleton (allowing two
-# 35B daemons on one GPU) or break a parallel user daemon's lock. When the
-# gate's daemon dies via SIGKILL (cleanup path), the kernel auto-releases
-# the flock; the stale pid-file content is harmless (next daemon truncates
-# and overwrites at startup).
-DAEMON_PID=""
+# The daemon reserves physical GPU UUIDs independently of HOME. A daemon
+# already using this card makes the gate fail before loading the model;
+# never unlink a GPU lock file (the active inode must remain).
+DRIVER_PID=""
 
 cleanup() {
-    # Kill ONLY the daemon we spawned, by tracked PID. Never pkill -f.
-    if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill "$DAEMON_PID" 2>/dev/null
-        # Give it a beat, then SIGKILL if still alive.
-        sleep 1
-        kill -9 "$DAEMON_PID" 2>/dev/null
+    # TERM only the driver we spawned, by tracked PID; it kills the daemon
+    # process group it started. Never pkill -f.
+    if [ -n "$DRIVER_PID" ] && kill -0 "$DRIVER_PID" 2>/dev/null; then
+        kill "$DRIVER_PID" 2>/dev/null
+        for _ in $(seq 1 20); do
+            kill -0 "$DRIVER_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -9 "$DRIVER_PID" 2>/dev/null
     fi
-    DAEMON_PID=""
+    DRIVER_PID=""
     gpu_release 2>/dev/null || true
 }
 
@@ -392,6 +416,9 @@ fi
 
 # ---- Run cells -------------------------------------------------------------
 HARD_FAIL=0
+DRIVER_FAIL=0
+ARCHIVE_FAIL=0
+read -r -a driver_extra <<< "${HIPFIRE_AGENTIC_GATE_DRIVER_ARGS:-}"
 SOFT_WARN_TOTAL=0
 
 # Group cells by model for single-load efficiency.
@@ -401,138 +428,56 @@ for cell in "${CELLS[@]}"; do
     MODEL_CELLS["$model"]+="${cell}"$'\n'
 done
 
-# Iterate models; per model, build a single JSONL session.
+# Iterate models; per model, drive a single daemon session.
 for model in "${!MODEL_CELLS[@]}"; do
     model_short="$(basename "$model" .mq4)"
     echo "## $model_short" >> "$OUT"
     echo >> "$OUT"
     echo "agentic-gate: model $model_short ($(echo "${MODEL_CELLS[$model]}" | grep -c '|') cells)..."
 
-    # Build JSONL: load + (per cell: generate, optional second-turn generate) + unload
-    # Each cell gets a unique id ${prefix}_${cellnum}_t1 (and _t2 for multi-turn).
-    # NOTE: never touch $HOME/.hipfire/daemon.pid here. The daemon's lock at
-    # daemon.rs:142 always opens that path under $HOME — we override $HOME
-    # for the daemon child below so its pid lives at $GATE_HIPFIRE_DIR/.hipfire/
-    # daemon.pid instead. Removing the user's pid file would unlink an active
-    # user daemon's flock target.
-    JSONL_FILE="$(mktemp /tmp/agentic-gate-jsonl.XXXXXX)"
-
-    python3 - "$model" "$JSONL_FILE" <<'PY' >/dev/null
-import sys, json, os
-
-model_path = sys.argv[1]
-jsonl_path = sys.argv[2]
-
-# 4-second pacing between sends; daemon will buffer.
-# load
-print_load = json.dumps({"type": "load", "model": model_path,
-                         "params": {"max_seq": 4096}})
-
-with open(jsonl_path, "w") as f:
-    f.write(print_load + "\n")
-PY
-
-    # Read cells back for this model and build the JSONL body in Python (cleanest
-    # JSON escaping). Pass cells as repeated args.
+    # Cell ids are c${idx}_t1 (and c${idx}_t2 for multi-turn). The driver
+    # (scripts/agentic_gate_driver.py) owns the daemon session: it sends load,
+    # then each generate with a unique nonzero attempt_id, answers the daemon's
+    # commit_ready with the matching commit, and waits for done before the next
+    # request, with per-step deadlines. The daemon's stdout and stderr land in
+    # $OUTPUT_FILE for the parser below.
+    # Private HOME directories isolate config and caches, not GPU reservations.
+    # The daemon's UUID lock still conflicts with any other user on this card.
     cell_args=()
     while IFS= read -r line; do
         [ -n "$line" ] && cell_args+=("$line")
     done <<< "${MODEL_CELLS[$model]}"
 
-    python3 - "$JSONL_FILE" "$USER_READ" "${cell_args[@]}" <<'PY' >/dev/null
-import sys, json
-
-jsonl = sys.argv[1]
-user_file = sys.argv[2]
-cells = sys.argv[3:]
-
-with open(user_file) as f:
-    user_prompt = f.read()
-
-with open(jsonl, "a") as out:
-    for idx, cell in enumerate(cells):
-        model, sys_path, clamp, multi, label = cell.split("|")
-        with open(sys_path) as f:
-            system = f.read()
-        max_think = 1 if clamp == "1" else 0
-        gen_msg = {
-            "type": "generate",
-            "id": f"c{idx}_t1",
-            "prompt": user_prompt,
-            "system": system,
-            "max_tokens": 256,
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "repeat_penalty": 1.0,
-            "thinking": False if clamp == "1" else True,
-            "max_think_tokens": max_think,
-        }
-        out.write(json.dumps(gen_msg) + "\n")
-        if multi == "1":
-            # Synthesize a tool_response then ask the model to continue.
-            tool_resp_text = (
-                "<tool_response>\n"
-                "{\"contents\": \"int main() { return 0; }\"}\n"
-                "</tool_response>\n"
-                "Now describe what the file does in one sentence."
-            )
-            out.write(json.dumps({
-                "type": "generate", "id": f"c{idx}_t2",
-                "prompt": tool_resp_text, "system": "",
-                "max_tokens": 128, "temperature": 0.0, "top_p": 1.0,
-                "repeat_penalty": 1.0, "thinking": False, "max_think_tokens": 1,
-            }) + "\n")
-    # unload at end
-    out.write(json.dumps({"type": "unload"}) + "\n")
-PY
-
-    # Pace JSONL into the daemon. The daemon blocks on stdin readline, so we
-    # need a slow producer to allow load + each generate to complete in order.
-    # We use named-pipe + background daemon so we can capture the daemon's
-    # exact PID and kill ONLY that PID at end-of-cell. Never pkill -f.
     OUTPUT_FILE="$(mktemp /tmp/agentic-gate-out.XXXXXX)"
-    STDIN_FIFO="$(mktemp -u /tmp/agentic-gate-fifo.XXXXXX)"
-    mkfifo "$STDIN_FIFO"
 
-    # Spawn daemon in background, redirected stdin from FIFO, stdout to file.
-    # The daemon's flock at $HOME/.hipfire/daemon.pid (daemon.rs:171) acts
-    # as the singleton: if another daemon is already running, this child
-    # will exit with "FATAL: hipfire daemon already running" and the
-    # detector picks it up. No HOME override here — that bypasses the
-    # singleton and risks two 35B daemons on one GPU.
+    record_args=()
+    if [ -n "$RAW_DIR" ]; then
+        record_args=(--record "$RAW_DIR/$model_short.driver.json")
+    fi
+
+    # The driver is backgrounded so cleanup can signal it by exact PID; on
+    # TERM it kills only the daemon process group it spawned. Any overlapping
+    # physical GPU UUID produces a FATAL contention message with the holder
+    # PID, regardless of HOME; the driver records the daemon's stderr for it.
     env HIPFIRE_KV_MODE=asym3 \
         HIPFIRE_GRAPH=1 \
-        "$EXE" < "$STDIN_FIFO" > "$OUTPUT_FILE" 2>&1 &
-    DAEMON_PID=$!
-
-    # Producer: pace each JSONL line. The daemon reads-and-blocks per
-    # newline, so we sleep after each send to let it complete.
-    (
-        while IFS= read -r line; do
-            printf '%s\n' "$line"
-            type="$(echo "$line" | python3 -c 'import sys,json;d=json.loads(sys.stdin.read());print(d["type"])' 2>/dev/null)"
-            case "$type" in
-                load)     sleep 90 ;;
-                generate) sleep 60 ;;
-                unload)   sleep 2  ;;
-            esac
-        done < "$JSONL_FILE"
-    ) > "$STDIN_FIFO"
-
-    # Producer is done; daemon will see EOF on stdin after unload. Wait
-    # briefly for graceful exit, then kill by tracked PID if still alive.
-    for _ in 1 2 3 4 5; do
-        if ! kill -0 "$DAEMON_PID" 2>/dev/null; then break; fi
-        sleep 1
-    done
-    if kill -0 "$DAEMON_PID" 2>/dev/null; then
-        kill "$DAEMON_PID" 2>/dev/null
-        sleep 1
-        kill -9 "$DAEMON_PID" 2>/dev/null
+        python3 scripts/agentic_gate_driver.py \
+            --exe "$EXE" --model "$model" --user-file "$USER_READ" \
+            --out "$OUTPUT_FILE" ${record_args[@]+"${record_args[@]}"} \
+            ${driver_extra[@]+"${driver_extra[@]}"} \
+            "${cell_args[@]}" &
+    DRIVER_PID=$!
+    wait "$DRIVER_PID"
+    driver_rc=$?
+    DRIVER_PID=""
+    if [ "$driver_rc" -ne 0 ]; then
+        # A nonzero driver exit (deadline, daemon error/EOF/nonzero exit, failed
+        # unload, killed by a signal) can never PASS, whatever the parser sees.
+        DRIVER_FAIL=1
+        echo "agentic-gate: DRIVER FAILURE for $model_short (rc=$driver_rc)" >&2
+        echo "- **DRIVER FAILURE**: the session driver for $model_short exited rc=$driver_rc; the gate HARD_FAILs" >> "$OUT"
+        echo >> "$OUT"
     fi
-    wait "$DAEMON_PID" 2>/dev/null || true
-    DAEMON_PID=""
-    rm -f "$STDIN_FIFO" "$JSONL_FILE"
 
     # Parse output, run detectors per cell, append to report.
     python3 - "$OUTPUT_FILE" "$OUT" "${cell_args[@]}" <<'PY'
@@ -558,15 +503,44 @@ for ev in events:
     if ev.get("type") == "token":
         by_id.setdefault(ev["id"], []).append(ev["text"])
 
-# Detect daemon panic / error (JSON error events).
-panic = any(ev.get("type") == "error" for ev in events)
-panic_msg = next((ev["message"] for ev in events if ev.get("type") == "error"), "")
+# Per-request terminal bookkeeping. Requests are sent strictly in cell order
+# (c{idx}_t1, then c{idx}_t2 for a multi-turn cell) with attempt_ids 1, 2, ...
+# in send order (scripts/agentic_gate_driver.py build_requests), so the parser
+# derives each request's expected (id, attempt_id) from the cell list alone.
+seq = []
+_attempt = 0
+for _idx, _cell in enumerate(cells):
+    _attempt += 1
+    seq.append((f"c{_idx}_t1", _attempt))
+    if _cell.split("|")[3] == "1":
+        _attempt += 1
+        seq.append((f"c{_idx}_t2", _attempt))
+expected = dict(seq)
+done_ok = set()
+req_errors = {rid: [] for rid, _ in seq}
+session_errors = []
+for ev in events:
+    et = ev.get("type")
+    if et == "done":
+        a = ev.get("attempt_id")
+        if ev.get("id") in expected and type(a) is int and a == expected[ev["id"]]:
+            done_ok.add(ev["id"])
+    elif et == "error":
+        # Daemon error events and the driver's synthetic ones (source
+        # agentic_gate_driver) alike. An error naming a request belongs to it;
+        # one with no id belongs to the request in flight (the first without a
+        # done yet); anything else is a session error and fails every cell.
+        msg = str(ev.get("message", ""))
+        rid = ev.get("id")
+        if rid is None:
+            rid = next((r for r, _ in seq if r not in done_ok), None)
+        if rid in req_errors:
+            req_errors[rid].append(msg)
+        else:
+            session_errors.append(msg)
 
-# Detect singleton-collision FATAL. The Rust daemon emits this as plain
-# text on stderr (now merged into stdout) when another daemon already
-# holds $HOME/.hipfire/daemon.pid (daemon.rs:178-182). It is NOT a JSON
-# event, so it slips past the panic check above.
-fatal_singleton = "FATAL: hipfire daemon already running" in raw_text
+# GPU contention is printed on stderr (merged into stdout), not as a JSON event.
+fatal_singleton = "already reserved by holder PID" in raw_text
 
 def extract_tool_call_body(text):
     # Use minimal regex; the body extraction is the same as coherence-gate.
@@ -653,6 +627,23 @@ with open(report_path, "a") as report:
                 notes.append("soft: <tool_call> inside <think>...</think>")
                 if verdict == "PASS": verdict = "SOFT_WARN"
 
+        # Every request of the cell must end in an actual matching `done`
+        # (same id and attempt_id) with no error event naming or in flight for
+        # it; tokens seen never excuse a missing done or a present error.
+        for rid in [cid_t1] + ([cid_t2] if multi == "1" else []):
+            if rid not in done_ok:
+                verdict = "HARD_FAIL"
+                notes.append(f"{rid}: no matching done (attempt_id {expected[rid]})")
+                hard_fail = True
+            for msg in req_errors[rid]:
+                verdict = "HARD_FAIL"
+                notes.append(f"{rid}: error event: {msg}")
+                hard_fail = True
+        for msg in session_errors:
+            verdict = "HARD_FAIL"
+            notes.append(f"session error event: {msg}")
+            hard_fail = True
+
         # Multi-turn t2 evaluation if applicable
         if multi == "1":
             toks_t2 = by_id.get(cid_t2, [])
@@ -696,7 +687,20 @@ PY
     # Read per-model summary written to stderr by the python detector.
     # (We didn't capture stderr above; instead recompute by running a thin checker.)
     # For simplicity, re-run a quick aggregator from the report file.
-    rm -f "$OUTPUT_FILE"
+    # HIPFIRE_AGENTIC_GATE_RAW_DIR: keep the raw daemon record (logs only, never
+    # a model file) before the temp file goes. A failed copy keeps the temp file.
+    if [ -n "$RAW_DIR" ]; then
+        if cp -- "$OUTPUT_FILE" "$RAW_DIR/$model_short.daemon-output.jsonl"; then
+            rm -f "$OUTPUT_FILE"
+        else
+            ARCHIVE_FAIL=1
+            echo "agentic-gate: could not archive the raw daemon output for $model_short; kept $OUTPUT_FILE" >&2
+            echo "- **ARCHIVE FAILURE**: could not copy the raw daemon output for $model_short to $RAW_DIR; kept $OUTPUT_FILE" >> "$OUT"
+            echo >> "$OUT"
+        fi
+    else
+        rm -f "$OUTPUT_FILE"
+    fi
 done
 
 # ---- Aggregate verdict -----------------------------------------------------
@@ -712,6 +716,23 @@ total_cells=${#CELLS[@]}
     echo "- soft warns: $soft_count"
 } >> "$OUT"
 
+if [ "$ARCHIVE_FAIL" -eq 1 ]; then
+    echo "agentic-gate: HARD FAIL (the raw daemon output could not be archived)"
+    echo "report: $OUT"
+    exit 1
+fi
+if [ "$DRIVER_FAIL" -eq 1 ]; then
+    {
+        echo
+        echo "## Driver failure"
+        echo
+        echo "The session driver exited nonzero for one or more models (see the"
+        echo "DRIVER FAILURE lines above). Exit code 1 regardless of the cells' verdicts."
+    } >> "$OUT"
+    echo "agentic-gate: HARD FAIL (the session driver exited nonzero)"
+    echo "report: $OUT"
+    exit 1
+fi
 if [ "$HARD_FAIL" -eq 1 ]; then
     {
         echo

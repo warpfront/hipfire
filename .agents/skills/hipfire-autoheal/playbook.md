@@ -44,6 +44,7 @@ top-down unless evidence uniquely matches a later row.
 | Multi-turn name/recall wrong on old installs | log / version; see **historical** known-issues | 5 (legacy only) |
 | Mid-gen `HipError` 700 illegal memory access | Confirm whether path is legacy/direct without auto-bump; else kernel/KV bisection — **not** automatic `max_seq` repair | 6 (legacy only) or bisection C |
 | `HipError` 2 OOM on load | `rocm-smi` VRAM; model size; idle other GPU holders | 8, 10 |
+| Load never finishes; every restart re-wedges, `serve.log` frozen mid-layer | daemon spinning in `R`, VRAM held, threads in `kfd_wait_on_events` | 11 |
 | Prefill ~1 tok/s on non-Qwen-3.5 with asym KV | model family + `kv_cache` | 9 |
 | `HipError` 101 invalid device / 201 invalid context | Map code correctly; require independent process/VRAM/port evidence before foreign-holder path | 10 |
 | Bench OK, HTTP/serve broken | bisection A/G | bisection.md |
@@ -347,6 +348,61 @@ sudo fuser -v /dev/kfd /dev/dri/renderD128
 Do not kill unknown PIDs without user confirmation of what they are.
 
 **Verify:** device opens; daemon starts; VRAM coherent with `rocm-smi`.
+
+---
+
+### 11. Loader wedge → degraded GPU/driver state (needs a GPU reset)
+
+> Evidence status: observed **once**, on a single gfx1100 (Navi31) box. The
+> symptom signature is machine-independent but the numbers below are from
+> that one observation — treat as a pattern, not a spec.
+
+**Symptom:** Loads never finish, and every restart reproduces it. The daemon
+main thread spins in `R` state, `~/.hipfire/serve.log` freezes mid-layer (seen
+at 62/64, 54, 49, 41, 33, 10 …), the model reports `null`, VRAM stays held
+(11–15 GB), and `/health` may still answer. Thread wait channels show the main
+thread spinning in userspace (`wchan 0`) with two threads parked in
+`kfd_wait_on_events` — a GPU completion that never arrives.
+
+**Diagnosis:** This is **not** a stale pidfile (catalog 1) or cold JIT
+(catalog 7). Confirm first: the log freezes while the daemon spins, the same
+mid-layer position recurs across attempts, and VRAM is held. When restarts
+stop helping and wedges repeat, the GPU/driver state itself is degraded —
+another serve restart cannot clear it, a reset can.
+
+**Minimal repair (privileged — approval + owner inspection first):**
+
+All commands below must be adapted to the actual host: DRM node indexes
+and service-unit names are machine-specific. Do not copy a card index
+from a note.
+
+```bash
+# 1) Identify the AMD DRM node first — do NOT assume a card index
+for c in /sys/class/drm/card*/device; do
+  echo "$(basename "$(dirname "$c")"): vendor=$(cat "$c/vendor")"
+done   # AMD = 0x1002
+
+# 2) Stop whatever supervises the daemon so nothing holds VRAM across
+#    the reset (service unit, container, or process — match the host)
+systemctl --user stop hipfire.service   # or the unit/container in use
+
+# 3) Reset the GPU identified in step 1
+echo 1 | sudo tee /sys/class/drm/<card-of-amd>/device/reset
+
+# 4) Start the daemon again (same supervision as stopped in step 2)
+systemctl --user start hipfire.service
+```
+
+A reboot also clears the state. Do **not** loop restarts: if the same
+mid-layer wedge returns on every restart, restarts cannot clear it — go
+straight to the reset path above (with owner approval), and if wedges
+re-occur over sessions, that is the escalation signal to file an issue
+with the full evidence bundle rather than automating resets.
+
+**Verify:** the model loads past the previously frozen layer and
+`rocm-smi --showmeminfo vram` reflects a resident model; a later cold start
+succeeds without re-wedging. For generation/state-lifecycle claims, route
+through `scripts/serve_harness.py` ([`docs/VALIDATION.md`](../../../docs/VALIDATION.md)).
 
 ---
 

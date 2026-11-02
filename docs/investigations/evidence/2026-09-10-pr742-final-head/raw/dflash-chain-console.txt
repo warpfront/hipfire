@@ -1,0 +1,29 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/bjoern/.hipfire/models/qwen3.5-27b.mq4
+  registry tag  : qwen3.5:27b
+  kv_mode       : q8 [explicit(--kv)]   kv_backend: vmm [explicit(--kv-backend)]   mtp_mode: off   mode: chain
+  max_seq       : 4096 [explicit(--max-seq)]
+  dflash        : on   draft: /home/bjoern/.hipfire/models/qwen35-27b-dflash-mq4.hfq
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: /tmp/g4-dflash-prompts.json
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [named-budget(off)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 24 [explicit(--max-tokens)]  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.5-27b.mq4|off|chain  kv=q8 sampling={'temperature': 0.0} seed=None ###
+  [dflash-resident]t1  finish=length ctx=26     cached=0      gen=24   (think 0/ans 23w) prefill=213.0ms/122.1tok/s decode=27.0tok/s tau=2.29 !RUNAWAY | 'The first and most important reason for the decline of the Roman Empire is widely consider'
+  [merge-sort-thinking-off]t2  finish=length ctx=86     cached=0      gen=24   (think 0/ans 9w) prefill=578.2ms/148.7tok/s decode=63.1tok/s tau=6.67 !RUNAWAY | '```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr'
+[qwen3.5-27b.mq4|off|chain DONE] turns=2 runaway=2 empty=0 attractor=0 retrieval_miss=0 avg_prefill=135.4tok/s avg_decode=45.0tok/s
+  prompt_md5=085ecf774d8f35719d9c39b1867d9533 request_md5=4e373f913eb6674c81b474bddccf2234 step=
+  prompt_md5=253c7ac50857fe6d0e10fb0d2c5e35c0 request_md5=dab9b52b1d5ea3fe87187576f1c28b2c step=
+  daemon_binary_md5=281d08a2d1975976f1bb8af8c070eb06 path=/tmp/hipfire-g4-e786-target/release/daemon

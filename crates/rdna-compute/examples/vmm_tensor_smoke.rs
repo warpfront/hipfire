@@ -11,11 +11,15 @@
 //! - unload/recreate (free then alloc) works
 //! - a deterministic map failure leaves no leaked tracked allocation and is
 //!   followed by a successful allocation
+//! On Windows the reservation is mapped in one full segment up front
+//! (ROCm-Windows growth workaround); segment-growth coverage below is
+//! non-Windows, while mapping/readback assertions hold on both.
 //!
 //! Device selection (parent GPU-2 route):
 //!   HIPFIRE_VMM_SMOKE_DEVICE=2 cargo run -p rdna-compute --example vmm_tensor_smoke
 //! Optional knobs: HIPFIRE_VMM_CHUNK_BYTES (default 2 MiB)
 
+use hip_bridge::HIP_MEM_LOCATION_TYPE_DEVICE;
 use rdna_compute::{DType, Gpu};
 
 const DEFAULT_CHUNK_BYTES: usize = 2 << 20;
@@ -43,28 +47,64 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(gpu.device_id, device);
     assert_eq!(gpu.vmm_allocation_count(), 0);
 
-    // --- alloc + boundary growth preserves prior bytes ---
+    // --- alloc + full-prefix readback (segment growth on non-Windows, ---
+    // --- full reservation mapped up front on Windows) ---
     let mut tensor = unsafe { gpu.alloc_vmm_tensor(&[chunk * 2], DType::Raw, chunk, &access)? };
     assert_eq!(gpu.vmm_allocation_count(), 1);
-    assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk));
-    assert_eq!(tensor.buf.size(), chunk);
-    assert!(tensor.buf.is_vmm_owner());
+    #[cfg(not(windows))]
+    let readback = {
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk));
+        assert_eq!(tensor.buf.size(), chunk);
+        assert!(tensor.buf.is_vmm_owner());
 
-    let first = pattern(chunk, 1, 0);
-    gpu.hip.memcpy_htod(&tensor.buf, &first)?;
+        let first = pattern(chunk, 1, 0);
+        gpu.hip.memcpy_htod(&tensor.buf, &first)?;
 
-    let mapped = gpu.grow_vmm_tensor(&mut tensor, chunk, &access)?;
-    assert_eq!(mapped, chunk * 2);
-    assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk * 2));
-    assert_eq!(tensor.buf.size(), chunk * 2);
-    let second = pattern(chunk, 17, 3);
-    gpu.hip.memcpy_htod_offset(&tensor.buf, chunk, &second)?;
+        let mapped = gpu.grow_vmm_tensor(&mut tensor, chunk, &access)?;
+        assert_eq!(mapped, chunk * 2);
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk * 2));
+        assert_eq!(tensor.buf.size(), chunk * 2);
+        let second = pattern(chunk, 17, 3);
+        gpu.hip.memcpy_htod_offset(&tensor.buf, chunk, &second)?;
 
-    let mut readback = vec![0u8; chunk * 2];
-    gpu.hip.memcpy_dtoh(&mut readback, &tensor.buf)?;
-    assert_eq!(&readback[..chunk], first.as_slice());
-    assert_eq!(&readback[chunk..], second.as_slice());
-    println!("vmm_tensor_smoke: BOUNDARY_GROWTH PASS (mapped={mapped})");
+        let mut readback = vec![0u8; chunk * 2];
+        gpu.hip.memcpy_dtoh(&mut readback, &tensor.buf)?;
+        assert_eq!(&readback[..chunk], first.as_slice());
+        assert_eq!(&readback[chunk..], second.as_slice());
+        println!("vmm_tensor_smoke: BOUNDARY_GROWTH PASS (mapped={mapped})");
+        readback
+    };
+    #[cfg(windows)]
+    let readback = {
+        // Single-segment workaround: the full reservation is already mapped,
+        // so any further growth must fail and the whole prefix reads back.
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk * 2));
+        assert_eq!(tensor.buf.size(), chunk * 2);
+        assert!(tensor.buf.is_vmm_owner());
+        let over_err = gpu
+            .grow_vmm_tensor(&mut tensor, chunk, &access)
+            .expect_err("windows full-map must already cover the reservation");
+        assert!(
+            over_err.to_string().contains("exceed reserve"),
+            "unexpected full-map growth error: {over_err}"
+        );
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk * 2));
+
+        let first = pattern(chunk, 1, 0);
+        gpu.hip.memcpy_htod(&tensor.buf, &first)?;
+        let second = pattern(chunk, 17, 3);
+        gpu.hip.memcpy_htod_offset(&tensor.buf, chunk, &second)?;
+
+        let mut readback = vec![0u8; chunk * 2];
+        gpu.hip.memcpy_dtoh(&mut readback, &tensor.buf)?;
+        assert_eq!(&readback[..chunk], first.as_slice());
+        assert_eq!(&readback[chunk..], second.as_slice());
+        println!(
+            "vmm_tensor_smoke: FULLMAP_PREFIX PASS (mapped={})",
+            chunk * 2
+        );
+        readback
+    };
 
     // --- grow past reservation fails; prior mapping + tracking intact ---
     let gran = gpu
@@ -109,25 +149,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("vmm_tensor_smoke: UNLOAD_RELOAD PASS");
 
     // --- deterministic allocation/map failure: no leaked tracking; next alloc ok ---
-    // Non-granular initial map size is rejected before the arena is registered.
-    // Fall back to mapping more than the reserved logical size when granularity == 1.
-    let fail_err = if gran > 1 {
+    #[cfg(windows)]
+    let fail_err = {
+        // The requested initial size is shadowed by the full reservation, so a
+        // non-granular initial still succeeds with the whole reservation mapped.
         let bad_initial = gran.saturating_sub(1).max(1);
-        match unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, bad_initial, &access) } {
-            Ok(_) => panic!("non-granular initial map must fail"),
+        let absorbed = unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, bad_initial, &access) }
+            .expect("windows full-map absorbs non-granular initial");
+        assert_eq!(gpu.vmm_mapped_bytes(&absorbed), Some(chunk));
+        assert_eq!(absorbed.buf.size(), chunk);
+        gpu.free_tensor(absorbed).expect("free absorbed tensor");
+        // Genuine alloc failure on this path: a zero-byte reserve is rejected
+        // before any arena exists, so nothing may leak.
+        match unsafe { gpu.alloc_vmm_tensor(&[0], DType::Raw, 0, &access) } {
+            Ok(_) => panic!("zero-byte reserve must fail"),
             Err(err) => err,
         }
-    } else {
-        // Reserve `chunk` but ask to map `chunk + gran` up front.
-        match unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, chunk + gran, &access) } {
-            Ok(_) => panic!("initial map past reserve must fail"),
+    };
+    // A non-granular initial map size is ROUNDED UP to the allocation granularity
+    // rather than rejected: `hipMemMap` requires a granularity-aligned length, and
+    // rounding is what lets an arbitrary tensor length map at all. This branch used
+    // to assert a rejection, which stopped being true when that rounding landed, so
+    // it had been failing ever since; the Windows branch below already asserts the
+    // post-rounding contract.
+    #[cfg(not(windows))]
+    let fail_err = {
+        let unaligned = gran.saturating_sub(1).max(1);
+        let absorbed = unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, unaligned, &access) }
+            .expect("non-granular initial map is rounded up, not rejected");
+        let expect = unaligned
+            .next_multiple_of(gran)
+            .min(chunk.next_multiple_of(gran));
+        assert_eq!(
+            gpu.vmm_mapped_bytes(&absorbed),
+            Some(expect),
+            "non-granular initial map must round up to the granularity"
+        );
+        gpu.free_tensor(absorbed).expect("free absorbed tensor");
+        // Genuine alloc failure on this path: a zero-byte reserve is rejected
+        // before any arena exists, so nothing may leak.
+        match unsafe { gpu.alloc_vmm_tensor(&[0], DType::Raw, 0, &access) } {
+            Ok(_) => panic!("zero-byte reserve must fail"),
             Err(err) => err,
         }
     };
     assert!(
-        fail_err.to_string().contains("multiple of granularity")
-            || fail_err.to_string().contains("exceed reserve")
-            || fail_err.to_string().contains("VMM map"),
+        fail_err.to_string().contains("greater than zero"),
         "unexpected deterministic failure: {fail_err}"
     );
     // Successful cleanup path must not leave a tracked/orphan arena behind.
@@ -149,6 +216,66 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(gpu.vmm_allocation_count(), 0);
     println!("vmm_tensor_smoke: CLEANUP_AFTER_FAILURE PASS");
 
+    // --- Partial-offload host-location verification ---
+    // Negative control: a device-resident VMM tensor must read back as NOT
+    // host-located, and its handle must report DEVICE to ROCm. This proves
+    // host_located() is not trivially always-true before the positive case.
+    let host_elems = 1 << 10; // 1024 F32 = 4 KiB, fully mapped up front
+    let dev_tensor =
+        unsafe { gpu.alloc_vmm_tensor(&[host_elems], DType::F32, host_elems * 4, &access)? };
+    assert_eq!(gpu.vmm_allocation_count(), 1);
+    assert!(
+        !gpu.host_located(&dev_tensor),
+        "device tensor must not be host-located"
+    );
+    let dev_handle = gpu
+        .vmm_handle(&dev_tensor)
+        .expect("device tensor exposes a primary handle");
+    let dev_prop = gpu.hip.mem_get_handle_properties(dev_handle)?;
+    assert_eq!(
+        dev_prop.location.type_, HIP_MEM_LOCATION_TYPE_DEVICE,
+        "device VMM handle must report DEVICE to ROCm"
+    );
+    gpu.free_tensor(dev_tensor)?;
+    assert_eq!(gpu.vmm_allocation_count(), 0);
+
+    // Positive control: the production offload upload must read back as
+    // host-located, survive a PCIe round-trip through its mapped VA, register
+    // exactly one host-mapped owner, and leave NO VMM arena behind — offloaded
+    // weights are `hipHostMalloc` memory now, not a host-located VMM arena, and a
+    // host-located VMM arena is precisely what silently charged the device heap
+    // 1:1 and made offload net-zero for VRAM. (The invariant itself — host bytes
+    // must not consume device headroom — is asserted by
+    // `examples/host_offload_headroom.rs`.)
+    let host_f32: Vec<f32> = (0..host_elems).map(|i| (i % 17) as f32 * 0.5).collect();
+    let host_tensor = gpu.upload_f32_host(&host_f32, &[host_elems])?;
+    assert!(
+        gpu.host_located(&host_tensor),
+        "offloaded tensor must be host-located"
+    );
+    assert_eq!(
+        gpu.vmm_allocation_count(),
+        0,
+        "host-mapped weights must not register a VMM arena"
+    );
+    assert_eq!(
+        gpu.host_mapped_count(),
+        1,
+        "host-mapped owner not registered"
+    );
+    let rb = gpu.download_f32(&host_tensor)?;
+    assert_eq!(
+        rb, host_f32,
+        "host-located tensor must survive a PCIe read/write round-trip"
+    );
+    println!("vmm_tensor_smoke: HOST_OFFLOAD PASS");
+    gpu.free_tensor(host_tensor)?;
+    assert_eq!(
+        gpu.host_mapped_count(),
+        0,
+        "host-mapped owner leaked after free"
+    );
+    assert_eq!(gpu.vmm_allocation_count(), 0);
     println!("vmm_tensor_smoke: PASS");
     Ok(())
 }

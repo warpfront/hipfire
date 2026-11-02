@@ -1,0 +1,100 @@
+# gfx1201 H2 A4 pp8192: four activation producer traffic screens (card C)
+
+**Traffic verdict:** No bit-exact producer rewrite admitted. Each producer already delivers 568–580 GB/s of *minimum required* bytes in isolated N8192 launches, within 1.6–3.0% of the independently measured same-shape device-copy comparator. That is not a proof of a hardware limit or of identical power/clock in the full model; it is a narrow stop signal for attempting more producer byte/pass or coalescing rewrites now. No bit-exact performance code changed; the separate opt-in bf16-H *quality-only* diagnostic is described below.
+
+## Measured traffic versus required bytes
+
+Card C `GPU-085289909a86cc63` (physical GPU[4]); `HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES` both set to this UUID, as was `HIPFIRE_DEVICES`; isolated `HOME` at `/home/kaden/qcal/perf/iu4-6k/producers/home` has no `hardware.devices`. The card's used VRAM rose from ~59.9 MB idle to 2,065.9 MB while HIN ran and reported power rose from ~25 to 156 W. This is a **standalone** producer traffic measurement, not a 300-W paired model-kernel or end-to-end experiment. The 300-W model attribution below comes from `/home/kaden/qcal/perf/iu4-6k/reprofile.md`, not these standalone runs.
+
+The existing `scratch-a4c2/gen_prod.py` expands the four exact `kernels.rs` JIT concatenations; `scratch-a4c2/build.sh` compiles gfx1201 with production hipcc flags plus `-DIU4_A4_CANDIDATES=2`. The unmodified HIP harness, compiled `hipcc -O2 -std=c++17 --offload-arch=gfx1201`, launches the production N8192 geometries and compares each kernel against repeated device-to-device copies of its one-input byte count in the same process. Timing is the median of 20 batches of 24 HIP-event-timed launches per case, after warmups; a further HIN run of 500 batches of 24 replicated 1.1456 ms and 578.3 GB/s copy (initial 1.1453 ms and 578.7 GB/s). Pinned harness MD5 `dad4e60227290c8874f584799b95d321`; four hsaco MD5s in table order `97bb913e1a99bccd9398a96433147074`, `50869137fca9a4dabfeeaa232f469e16`, `d4f839a19a2dd035e2f15458ca80537c`, `356e7caca2056d8ecf843cc3cbdc202d`. Reproducer `/home/kaden/qcal/perf/iu4-6k/producers/timing.sh` (`./timing.sh base hin|rms|gated|sig`), with the compiled objects and harness beside it.
+
+For K features and N=8192, each required f32 input is `4NK` bytes and the packed A4 output is `72N(K/128)` bytes; the AWQ/sign/weight vectors are K- or 256-element *reused* side inputs, rather than another per-token off-card stream. The denominator below is required per-token streams **only** (not all cache traffic or physical HBM transactions). The copy bandwidth counts both its read and write; floor = required bytes / measured same-shape copy bandwidth. GB/s is decimal.
+
+| Producer (calls/forward) | K, minimum main inputs + packed output | Required MB/call | Standalone ms | Copy GB/s | Achieved required GB/s | Copy-referenced floor ms | Excess over floor | In-model ms/call from trace |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| HIN SiLU→A4 (64) | 17408, 570.425 h read + 80.216 A4 write | 650.641 | 1.1453 | 578.7 | 568.1 | 1.1243 | 0.0210 (1.87%) | 1.1467 |
+| RMSNorm→A4 (128) | 5120, 167.772 x read + 23.593 A4 write | 191.365 | 0.3338 | 590.3 | 573.3 | 0.3242 | 0.0096 (2.97%) | 0.4141 |
+| Gated norm→A4 (48) | 6144, 201.327 x + 201.327 z reads + 28.312 A4 write | 430.965 | 0.7445 | 589.9 | 578.9 | 0.7306 | 0.0139 (1.91%) | 0.7640 |
+| Sigmoid-mul→A4 (16) | 6144, 201.327 x + 201.327 gate reads + 28.312 A4 write | 430.965 | 0.7427 | 589.4 | 580.3 | 0.7312 | 0.0115 (1.57%) | 0.7138 |
+
+In-model exclusive attribution is HIN 73.39, RMSNorm 53.01, gated 36.67, sigmoid 11.42 ms/forward (174.49 total); dividing by 64/128/48/16 gives last column. In-model RMSNorm is notably slower than its standalone run (0.414 versus 0.334 ms) despite identical required bytes. Clock/power/neighbor interference are **[INFERENCE]**, not measured causal attributions. Sigmoid's in-model apparent required-byte rate would be 604 GB/s, *higher* than its standalone 589-GB/s copy comparator: the copy is an empirical, condition-specific comparator, **not** a physical bandwidth theorem. It is invalid to multiply the 1.6–3.0% isolated margins into a guaranteed model saving or to treat the 174.5-ms attribution as recoverable time.
+
+## Pass and coalescing diagnosis, not an added optimization
+
+- **HIN:** the gate/up GEMM already forms h = SiLU(gate)×up as one f32 stream, so the producer reads h once and writes A4 once. The earlier pair of gate/up input streams is *already gone*. The optional x_rot f32 write is null in the selected route; no intermediate f32 write to remove here. Scalar expressions in `fused_silu_mul_mq_rotate_awq.hip` access 8 adjacent floats per lane (32-byte lane span), not contiguous single-float lane indexing, but the built gfx1201 ISA already uses b128 loads. The achieved 568 GB/s and 1.9% isolated comparator margin do not justify a packing rewrite.
+- **RMSNorm:** `fused_rmsnorm_mq_rotate.hip` reads x in the reduction pass, then reloads x in the rotation pass, a genuine *logical* duplicate read; only one read was charged to the minimum floor. Adding this extra 167.772 MB to the required 191.365 MB would imply >1 TB/s from the measured 0.3338 ms. **[INFERENCE]** L2 reuse and/or overlap absorb much of the second pass, so replacing it with row-wide register/LDS retention is unlikely to improve the observed 0.0096-ms standalone margin and risks occupancy/latency. Keeping 20 f32 values per thread through reduction would raise live registers from an already substantial baseline; a 20-KiB row LDS cache introduces additional LDS traffic and changes residency. The selected producer writes no optional f32 x_rot intermediate. The 0.414-ms *in-model* time is a separate unexplained discrepancy, not evidence of off-card duplicate reads.
+- **Gated norm:** both x and z must be read once, and the 256-float normalized handoff is existing *on-chip LDS*, not a VRAM intermediate. `_v2` batches element loads before the norm/reduction, uses one wave per 256-group, and writes only A4. Read ownership (`lane + 32*k`) is coalesced within each instruction. More CTA packing is the closed experiment, not a new byte reduction. The 1.9% standalone comparator gap gives no useful bounded uncoalesced-HBM opportunity.
+- **Sigmoid-mul:** x and gate are necessary f32 inputs, the sigmoid result stays in registers through the FWHT/A4 emit, and optional f32 x_out is null. The final sidecar is the only per-token write. Scalar source indexing is 8 neighboring floats per lane; b128 loading is already produced in the compiled ISA. 1.6% comparator gap leaves no meaningful standalone byte/pass headroom.
+
+All four retain AWQ, sign and quantization arithmetic in f32 to maintain existing A4 bytes; changing that precision does **not** meet the original bit-exact assignment. The AWQ K-vector can generate cache traffic but does not constitute another unique N×K off-card stream. Existing source implements on-chip transforms; no avoidable global intermediate write remains on the selected route. Compiler resource reports show substantial RMS/gated registers; occupancy *causality* was not measured here. No peacemaker candidate was profiled: after the first required traffic screen, there was no justified bit-exact candidate with a targeted phase to shrink. In that **traffic-only stage**, no ≥10-s A/B/B/A + B/A/A/B paired kernel timing, repeat-stress, quality or ≥4-process end-to-end gates were run. Quality follow-up appears below; no performance claim is made from it.
+
+## bf16-H quality emulation
+
+**[INFERENCE: bandwidth comparator ceiling, not an observed speedup.]** Changing just HIN's h read from f32 to bf16 halves its 570.425-MB input, saving 285.213 MB per call; at ~579 GB/s this corresponds to ~0.493 ms/call ×64 = **~31.5 ms/forward producer-side** in the optimistic pure-traffic model. The upstream gate/up GEMM would also write half as many H bytes, but its perturbative peacemaker epilogue is only ~1.9% of gate/up's 629-ms in-model time, **up to ~12 ms** for the entire epilogue as an optimistic affected-phase bound. Do **not** add the two estimates as independent guaranteed savings: fused GEMM could simply downclock or be compute-bound, and the epilogue includes non-store work.
+
+After user approval, `HIPFIRE_EMU_BF16_H=1` (default off, gfx1201 only)
+launches `round_h_bf16_quality_gfx12` immediately after the gate/up GEMM
+materializes h and before either route's HIN producer reads it. A4 and fp8
+both materialize h in f32 on the selected routes; their actual B1 GEMMs are
+embedded code objects, so modifying the corresponding HIP epilogues would
+*not* affect the evaluated model. The diagnostic instead converts the existing
+f32 h buffer in place via HIP's `hip_bfloat16::round_to_bfloat16`, which uses
+round-to-nearest-even, then converts to f32. This is the same values the
+producers would read from a physically bf16 h buffer, but uses an **extra
+global read/write pass** (1,140.851 MB of extra f32 traffic per pp8192 HIN
+call) and retains the full-size f32 buffer. It does not measure a physical
+bf16 implementation, HBM savings, or performance.
+
+Default-off never launches or compiles the rounder. Both producer paths
+otherwise remain unchanged. The user-approved follow-up is **quality only**:
+run H2 WT2/code24 on card D for both routes, require pinned `.kldseq` identity
+for all four off controls *before* considering on arms; use isolated HOME,
+`HIPFIRE_GRAPH=0`, fp8 KV/q8 V, 24 prefill chunks and no small-N override.
+For fp8, the absolute acceptance limits are WT2 ≤0.045 and code24 ≤0.034;
+A4 controls pin WT2 0.069250 and code24 0.054174. A failed pin invalidates
+the corresponding comparison. Even a quality pass would not authorize a
+physical bf16 traffic rewrite without a separate user decision.
+
+Only card D `GPU-6109a4cb5f833235` (GPU[2], Thunderbolt) is used
+for quality; its observed allocation rose from ~60 MB idle to >17 GB
+during evaluation and observed board power reached 229 W. These are
+device-identity/residency checks, **not throughput measurements**.
+
+The fp8 H path admits N≥256; code24's 256/255 forward pair therefore
+emulates h at 256 only, while WT2's 1024/1023 pair admits both.
+
+Evaluator for the quality experiment:
+`/home/kaden/qcal/perf/iu4-6k/producers/target/release/examples/eval_hipfire`,
+MD5 `cbf44202c9a4403929114e338b6a357f`,
+SHA-256 `a5611d6598497f866b5b9aea82e126ea550314bd2fa55a0175a1c3b6eeaef7e4`.
+H2 SHA-256 `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae`;
+WT2 reference `8c545178fb43647499c4c7bdd33178c24fd402615c641add9ed51a0c9a43234a`,
+code24 reference `43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582`.
+Runner and raw `.kldseq`, logs and JSON receipts:
+`/home/kaden/qcal/perf/iu4-6k/producers/run_bf16_quality.py` and
+`/home/kaden/qcal/perf/iu4-6k/producers/bf16-quality/`.
+
+The four flag-OFF checks ran before any flag-ON check, and all four OFF
+`.kldseq` SHA-256 digests reproduced the pins above byte for byte. The
+evaluated binary SHA-256 remained unchanged throughout the run.
+
+### H2 quality result, 24 prefill chunks
+
+| Route / reference | Flag OFF KLD (pin reproduced) | Flag ON KLD | ON − OFF | Flag ON `.kldseq` SHA-256 | Quality decision |
+|---|---:|---:|---:|---|---|
+| A4 / WT2 | 0.069250 | **0.070351** | **+0.001101** | `c41cbb7b4ffc27bd5fd1d3e998016d803822e0dde5a4d2bccfdec63af6178469` | **fails A4 pinned WT2** |
+| A4 / code24 | 0.054174 | 0.050996 | −0.003178 | `a14e7503d546892e074d1ec4304d2f753eb69b08d7a08b437b08af9d4daeb1d6` | improves |
+| fp8 / WT2 | 0.041546 | 0.041859 | +0.000313 | `19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508` | passes ≤0.045 |
+| fp8 / code24 | 0.029864 | 0.029867 | +0.000003 | `5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a` | passes ≤0.034 |
+
+**Decision:** This precision change fails the A4 WT2 pin by +0.001101,
+despite improving A4 code24. The fp8 route passes *both* specified absolute
+limits, but its altered `.kldseq` files are not byte-identical to control.
+Do not pursue physical bf16-H on A4 under the current quality gate. A
+physical fp8 bf16-H implementation requires a **separate user decision**
+and performance validation; approval here covered quality emulation only.
+The diagnostic's extra f32 pass cannot justify any throughput conclusion.
+
+All eight runs used card D only. After completion GPU[2] had ~60 MB used
+VRAM and **no KFD processes**, confirming release; the power meter was
+still decaying from the final kernel run.

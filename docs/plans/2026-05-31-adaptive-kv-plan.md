@@ -652,7 +652,7 @@ RDNA fleet.
 
 - [ ] **Step 1: Update the design doc** with the final pattern, measured
   transcode cost, and any deviations.
-- [ ] **Step 2: Write `NEXT-STEPS.md`** (or update) — adaptive-KV follow-ups
+- [ ] **Step 2: Write `docs/plans/historical/2026-05-31-adaptive-kv-next-steps.md`** (or update) — adaptive-KV follow-ups
   (default-on decision, multi-GPU, K-floor=fwht3 perf, recency-tiered precision).
 - [ ] **Step 3: Update memory** (`project_hipfire_adaptive_kv`,
   `project_hipfire_vquant_status`) — adaptive shipped, results.

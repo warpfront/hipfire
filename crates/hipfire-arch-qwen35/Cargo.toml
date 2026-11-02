@@ -10,16 +10,34 @@ description = "Qwen3.5 architecture (dense + MoE) for hipfire"
 # because qwen35 is a hybrid arch (DeltaNet + FullAttention layers).
 default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+flash-attn-ck = ["hipfire-dispatch/flash-attn-ck", "rdna-compute/flash-attn-ck"]
+moe-oracle = []
+# GPU bring-up probes (host-mapped/offloaded weights); build with `--features lab`.
+lab = []
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
-hipfire-reap = { path = "../hipfire-reap" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+railgun = { path = "../railgun" }
+hipfire-reap = { path = "../hipfire-reap", default-features = false }
+saddle-core = { path = "../saddle-core" }
+sha2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[build-dependencies]
+# build.rs: shared-weight loader ABI identity (hashes the loader closure).
+sha2.workspace = true
+
+[dev-dependencies]
+# `tests/gpu_gemv_parity.rs`: drives the production GEMV launcher against the
+# CPU transcription on identical inputs. Lives here (not in hipfire-cpu) so the
+# CPU crate keeps a GPU-free dependency list.
+hipfire-cpu = { path = "../hipfire-cpu" }
 
 [[example]]
 name = "test_qwen35_load_multi"
@@ -32,6 +50,154 @@ path = "examples/test_qwen35_state_multi.rs"
 required-features = ["deltanet"]
 
 [[example]]
+# CPU-only: builds/checks the committed MTP draft-vocab subset (src/draft_vocab.rs).
+name = "mtp_draft_vocab"
+path = "examples/mtp_draft_vocab.rs"
+required-features = ["deltanet"]
+
+[[example]]
 name = "mtp_head_smoke"
 path = "examples/mtp_head_smoke.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "cb_vmm_state_oracle"
+path = "examples/cb_vmm_state_oracle.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "cb_verify_gemm_oracle"
+path = "examples/cb_verify_gemm_oracle.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "pm_fp8_verify_oracle"
+path = "examples/pm_fp8_verify_oracle.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "pm_fp8_verify_kld"
+path = "examples/pm_fp8_verify_kld.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "iu4_verify_oracle"
+path = "examples/iu4_verify_oracle.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "iu4_verify_kld"
+path = "examples/iu4_verify_kld.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "qwen_dense_tp2_parity"
+path = "examples/qwen_dense_tp2_parity.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_gdn_pre_gfx1100"
+path = "examples/test_dflash_gdn_pre_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_gdn_pre_batched_gfx1201"
+path = "examples/test_gdn_pre_batched_gfx1201.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_draft_collapse_gfx1100"
+path = "examples/test_dflash_draft_collapse_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "dflash_draft_graph_replay"
+path = "examples/dflash_draft_graph_replay.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_hidden_scatter_gfx1100"
+path = "examples/test_dflash_hidden_scatter_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_snapshot_bulk_gfx1100"
+path = "examples/test_dflash_snapshot_bulk_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_replay_ml"
+path = "examples/test_dflash_replay_ml.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_replay_from_snapshot"
+path = "examples/test_dflash_replay_from_snapshot.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_select_regrid"
+path = "examples/test_select_regrid.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_mq_f16_projection_producers_gfx1100"
+path = "examples/test_mq_f16_projection_producers_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_mq_f16_residual_producers_gfx1100"
+path = "examples/test_mq_f16_residual_producers_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_qwen35_fa_batch_fusion_gfx1100"
+path = "examples/test_qwen35_fa_batch_fusion_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "qwen35_sealed_moe_oracle"
+path = "examples/qwen35_sealed_moe_oracle.rs"
+required-features = ["deltanet", "moe-oracle"]
+
+[[example]]
+name = "host_offload_smoke"
+path = "examples/host_offload_smoke.rs"
+required-features = ["lab"]
+
+[[example]]
+name = "shared_weight_state_oracle"
+path = "examples/shared_weight_state_oracle.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "prefill_ragged_oracle"
+path = "examples/prefill_ragged_oracle.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "mq4v2_moe_down_parity"
+path = "examples/mq4v2_moe_down_parity.rs"
+required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "dflash_draft_emit_oracle"
+path = "examples/dflash_draft_emit_oracle.rs"
+required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "dflash_verify_emit_oracle"
+path = "examples/dflash_verify_emit_oracle.rs"
+required-features = ["lab"]
+
+[[test]]
+name = "gpu_moe_cpu_parity"
+path = "tests/gpu_moe_cpu_parity.rs"
+required-features = ["lab"]
+
+[[test]]
+name = "dflash_lookup_state_oracle"
+path = "tests/dflash_lookup_state_oracle.rs"
 required-features = ["deltanet"]

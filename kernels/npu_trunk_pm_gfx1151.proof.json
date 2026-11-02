@@ -1,0 +1,2120 @@
+{
+  "module": "npu_trunk_pm_gfx1151",
+  "arch": "gfx1151",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "01adb8036db7df655ff5b356e4aee9001cd4a8c06a5687b7626de7739c233072",
+  "kernels": [
+    {
+      "kernel_id": "npu_trunk",
+      "variant": "npu_trunk_consume_bf16_pm",
+      "arch": "gfx1151",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "reg_plan": [
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 4,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 5,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 6,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 7,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 8,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 9,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 10,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 11,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 32,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 33,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 34,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 35,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 36,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 37,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 38,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 39,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment",
+          "kind": "v",
+          "base": 16,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment",
+          "kind": "v",
+          "base": 20,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "accumulator",
+          "kind": "v",
+          "base": 24,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "kernargs",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 12,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 20,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 21,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 22,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 23,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 24,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 25,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 26,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 27,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 28,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 29,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 30,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 31,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 32,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 33,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 34,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 35,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 36,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 37,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 38,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 39,
+          "len": 1,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 40,
+      "next_free_sgpr": 40,
+      "waits": [
+        {
+          "pc_index": 11,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s14"
+            }
+          }
+        },
+        {
+          "pc_index": 124,
+          "insn": "s_waitcnt vmcnt(0)",
+          "counter": "Vm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v9"
+            }
+          }
+        },
+        {
+          "pc_index": 126,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 12,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 15,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 17,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 19,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 21,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 23,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 25,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 27,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 29,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 31,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 33,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 35,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 37,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 39,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 41,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 43,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 45,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 47,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 49,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 51,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 53,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 55,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 57,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 59,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 61,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 63,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 65,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 67,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 69,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 71,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 73,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 75,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 78,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 81,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 83,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 85,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 90,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 94,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 97,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 99,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 103,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 106,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 108,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 112,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 115,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 117,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 122,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "57f42cd76975e28667c8a0fed560732384f8e8d697ffe9c2f95dff888dcaabb4"
+    },
+    {
+      "kernel_id": "npu_trunk",
+      "variant": "npu_trunk_consume_f32_pm",
+      "arch": "gfx1151",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "reg_plan": [
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 4,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 5,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 6,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 7,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 8,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 9,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 10,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 11,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 32,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 33,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 34,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 35,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 36,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 37,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 38,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 39,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment",
+          "kind": "v",
+          "base": 16,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment",
+          "kind": "v",
+          "base": 20,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "accumulator",
+          "kind": "v",
+          "base": 24,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "kernargs",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 12,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 20,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 21,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 22,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 23,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 24,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 25,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 26,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 27,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 28,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 29,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 30,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 31,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 32,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 33,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 34,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 35,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 36,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 37,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 38,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 39,
+          "len": 1,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 40,
+      "next_free_sgpr": 40,
+      "waits": [
+        {
+          "pc_index": 11,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s14"
+            }
+          }
+        },
+        {
+          "pc_index": 124,
+          "insn": "s_waitcnt vmcnt(0)",
+          "counter": "Vm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v9"
+            }
+          }
+        },
+        {
+          "pc_index": 127,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 12,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 15,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 17,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 19,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 21,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 23,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 25,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 27,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 29,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 31,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 33,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 35,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 37,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 39,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 41,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 43,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 45,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 47,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 49,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 51,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 53,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 55,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 57,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 59,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 61,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 63,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 65,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 67,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 69,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 71,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 73,
+          "insn": "s_delay_alu instid0(VALU_DEP_4)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 75,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 78,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 81,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 83,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 85,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 90,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 94,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 97,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 99,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 103,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 106,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 108,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 112,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 115,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 117,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 122,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "8a0cb77362b0c6db9bdd99309cf0adb82b5e712ebd9af5cec55925207f3aa1af"
+    },
+    {
+      "kernel_id": "npu_trunk",
+      "variant": "npu_trunk_i8_gemm_pm",
+      "arch": "gfx1151",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "reg_plan": [
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 4,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 5,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 6,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 7,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 8,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 9,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 10,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 11,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 32,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 33,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 34,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 35,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 36,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 37,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 38,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "work",
+          "kind": "v",
+          "base": 39,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment",
+          "kind": "v",
+          "base": 16,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment",
+          "kind": "v",
+          "base": 20,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "accumulator",
+          "kind": "v",
+          "base": 24,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "kernargs",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 8,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "descriptor",
+          "kind": "s",
+          "base": 12,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 20,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 21,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 22,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 23,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 24,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 25,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 26,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 27,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 28,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 29,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 30,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 31,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 32,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 33,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 34,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 35,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 36,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 37,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 38,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar",
+          "kind": "s",
+          "base": 39,
+          "len": 1,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 40,
+      "next_free_sgpr": 40,
+      "waits": [
+        {
+          "pc_index": 21,
+          "insn": "s_waitcnt lgkmcnt(0)",
+          "counter": "Lgkm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s18"
+            }
+          }
+        },
+        {
+          "pc_index": 79,
+          "insn": "s_waitcnt vmcnt(0)",
+          "counter": "Vm",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[20:23]"
+            }
+          }
+        },
+        {
+          "pc_index": 105,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v11"
+            }
+          }
+        },
+        {
+          "pc_index": 116,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v11"
+            }
+          }
+        },
+        {
+          "pc_index": 127,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v11"
+            }
+          }
+        },
+        {
+          "pc_index": 138,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v11"
+            }
+          }
+        },
+        {
+          "pc_index": 149,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v11"
+            }
+          }
+        },
+        {
+          "pc_index": 160,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v11"
+            }
+          }
+        },
+        {
+          "pc_index": 171,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v11"
+            }
+          }
+        },
+        {
+          "pc_index": 178,
+          "insn": "s_waitcnt_vscnt null, 0x0",
+          "counter": "Vs",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 15,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 19,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 23,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 25,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 32,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 35,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 37,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 40,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 42,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 44,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 47,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 49,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 52,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 54,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 88,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 90,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 92,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 95,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 97,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 102,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 106,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 108,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 113,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 117,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 119,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 124,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 128,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 130,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 135,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 139,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 141,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 146,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 150,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 152,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 157,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 161,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 163,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 168,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 172,
+          "insn": "s_delay_alu instid0(VALU_DEP_2)",
+          "rule": "VALU dependency issue hint"
+        },
+        {
+          "pc_index": 174,
+          "insn": "s_delay_alu instid0(VALU_DEP_1)",
+          "rule": "VALU dependency issue hint"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [
+        {
+          "head": ".Lnpu_k",
+          "iterations": 2
+        }
+      ],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "72d9b2e2ffb2f19e0537c4c8cd86f969d2e4153f8082638c7c987bdc983b86eb"
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{"type": "load", "model": "/models/m.mq4", "params": {"max_seq": 4096}}
+{"type": "generate", "id": "c0_t1", "attempt_id": 1, "prompt": "USER PROMPT", "system": "SYS-1", "max_tokens": 256, "temperature": 0.0, "top_p": 1.0, "repeat_penalty": 1.0, "thinking_enabled": false, "assistant_prefix": "closed_think"}
+{"type": "generate", "id": "c0_t2", "attempt_id": 2, "prompt": "<tool_response>\n{\"contents\": \"int main() { return 0; }\"}\n</tool_response>\nNow describe what the file does in one sentence.", "system": "", "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "repeat_penalty": 1.0, "thinking_enabled": false, "assistant_prefix": "closed_think"}
+{"type": "generate", "id": "c1_t1", "attempt_id": 3, "prompt": "USER PROMPT", "system": "SYS-2", "max_tokens": 256, "temperature": 0.0, "top_p": 1.0, "repeat_penalty": 1.0, "thinking_enabled": true, "assistant_prefix": "open_think"}
+{"type": "generate", "id": "c2_t1", "attempt_id": 4, "prompt": "USER PROMPT", "system": "SYS-3", "max_tokens": 256, "temperature": 0.0, "top_p": 1.0, "repeat_penalty": 1.0, "thinking_enabled": true, "assistant_prefix": "open_think"}
+{"type": "generate", "id": "c2_t2", "attempt_id": 5, "prompt": "<tool_response>\n{\"contents\": \"int main() { return 0; }\"}\n</tool_response>\nNow describe what the file does in one sentence.", "system": "", "max_tokens": 128, "temperature": 0.0, "top_p": 1.0, "repeat_penalty": 1.0, "thinking_enabled": false, "assistant_prefix": "closed_think"}
+{"type": "unload"}

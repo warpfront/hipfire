@@ -18,6 +18,9 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     const float* __restrict__ x,
     const float* __restrict__ z,
     const float* __restrict__ weight,
+#ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
+    const float* __restrict__ awq_scale,
+#endif
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     float* __restrict__ x_rot,
@@ -55,7 +58,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     }
     __syncthreads();
 
-    // Each 256-value MQ group spans exactly four normalized heads. One wave
+    // Each 256-value MQ group spans exactly two normalized heads. One wave
     // consumes the LDS row using mq_rotate_x's original lane ownership.
     if (wave != 0) return;
     const int d0 = lane * 8;
@@ -66,14 +69,23 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     const float4 s20 = *reinterpret_cast<const float4*>(signs2 + d0);
     const float4 s21 = *reinterpret_cast<const float4*>(signs2 + d0 + 4);
 
-    float v0 = x0.x * s10.x;
-    float v1 = x0.y * s10.y;
-    float v2 = x0.z * s10.z;
-    float v3 = x0.w * s10.w;
-    float v4 = x1.x * s11.x;
-    float v5 = x1.y * s11.y;
-    float v6 = x1.z * s11.z;
-    float v7 = x1.w * s11.w;
+#ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
+    // AWQ twin: (normalized / awq_scale) * signs1 before the FWHT, exactly the
+    // standalone rotate_x_mq_awq order. awq_scale is [K] in flattened
+    // head-major order, so group * 256 + lane offset matches its indexing.
+#define HIPFIRE_GATED_PRESCALE(v, i) ((v) / awq_scale[group * 256 + (i)])
+#else
+#define HIPFIRE_GATED_PRESCALE(v, i) (v)
+#endif
+    float v0 = HIPFIRE_GATED_PRESCALE(x0.x, d0) * s10.x;
+    float v1 = HIPFIRE_GATED_PRESCALE(x0.y, d0 + 1) * s10.y;
+    float v2 = HIPFIRE_GATED_PRESCALE(x0.z, d0 + 2) * s10.z;
+    float v3 = HIPFIRE_GATED_PRESCALE(x0.w, d0 + 3) * s10.w;
+    float v4 = HIPFIRE_GATED_PRESCALE(x1.x, d0 + 4) * s11.x;
+    float v5 = HIPFIRE_GATED_PRESCALE(x1.y, d0 + 5) * s11.y;
+    float v6 = HIPFIRE_GATED_PRESCALE(x1.z, d0 + 6) * s11.z;
+    float v7 = HIPFIRE_GATED_PRESCALE(x1.w, d0 + 7) * s11.w;
+#undef HIPFIRE_GATED_PRESCALE
 
     float t;
     t = v0; v0 = v0 + v1; v1 = t - v1;

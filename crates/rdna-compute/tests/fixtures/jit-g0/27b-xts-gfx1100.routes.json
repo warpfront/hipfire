@@ -1,0 +1,1479 @@
+{
+  "schema": 1,
+  "baseline": "83cb363e8a",
+  "family": "27b-xts",
+  "arch": "gfx1100",
+  "header": {
+    "model": "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts",
+    "file_size": 14987185152,
+    "arch_id": 5,
+    "header_sha256": "2a4f495e9077a1c68ec4b923b00b7fba5a2206acdad17c7c73ede9ea934a5de0",
+    "header_bytes": 14430208,
+    "quant_census": {
+      "44": 497,
+      "3": 49,
+      "1": 801
+    }
+  },
+  "toolchain": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg\n",
+  "effective_policy": {
+    "spec": "ar",
+    "kv_k": "q8",
+    "kv_v": "q8",
+    "state_quant": "q8",
+    "prefill_chunk_rows": 8192,
+    "max_seq": 262144,
+    "tp": 1,
+    "pp": 1,
+    "audit_graph": false,
+    "audit_temperature": 0
+  },
+  "evidence_status": "observed-point-routes",
+  "mixed_fixture_role": "superset only; not default route membership",
+  "g0_gate": "PASS",
+  "g0_fixture_exclusion": null,
+  "is_closed_ready_plan": false,
+  "a3_coverage_not_proven": [
+    "ordinary decode and graph audit reset during hipx outage; reset runs are excluded",
+    "A3 owns all-row/tail/max-context/graph selector closure; point observations are not its executable oracle",
+    "explicit drafter-specific spec admission requires a separately pinned drafter header"
+  ],
+  "default_entries": [
+    {
+      "arch": "gfx1100",
+      "kind": "embedded",
+      "module": "gemm_mq4g256v2_residual_iu4_pm_gfx1100",
+      "path": "/home/kaden/ClaudeCode/warpfront/wt-jit/kernels/gemm_mq4g256v2_residual_iu4_pm_gfx1100.hxaco",
+      "sha256": "32b64fe30b7bcf630ae69b4aa01d79e4427b8d27275f70359c5419d1a2cde776",
+      "symbols": [
+        "gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100",
+        "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
+        "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100"
+      ],
+      "symbol_evidence": {
+        "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ],
+        "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ],
+        "gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "repo_image": "kernels/gemm_mq4g256v2_residual_iu4_pm_gfx1100.hxaco",
+      "image_exports": [
+        "gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100",
+        "gemm_mq4g256v2_gate_up_silu_iu4_pm_gfx1100.kd",
+        "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100",
+        "gemm_mq4g256v2_residual_iu4_pm_add_gfx1100.kd",
+        "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
+        "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100.kd"
+      ],
+      "targets": [
+        "hipv4-amdgcn-amd-amdhsa--gfx1100"
+      ],
+      "cache_abi": null,
+      "flags": [],
+      "scheduler_profile": null
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "attention_flash_asym_reduce_batched",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/attention_flash_asym_reduce_batched.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "c5aa6b1c05f04b38f108ea69d8c4c7e14312075db72e457e1072692eeaab8506",
+      "symbols": [
+        "attention_flash_asym_reduce_batched"
+      ],
+      "symbol_evidence": {
+        "attention_flash_asym_reduce_batched": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "attention_flash_asym_reduce_batched"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "attention_flash_asym_reduce_batched"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/attention_flash_asym_reduce_batched/rep-1/kernel.hsaco",
+        "sha256": "47085dbea1de49bad8d81534213d39d0baabfcfaaf8717dec4c29b2bb439864e"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "attention_q8_0_fa2_gqa_gfx1100",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/attention_q8_0_fa2_gqa_gfx1100.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2",
+        "-mcumode"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "6300ab0e4bc073ffed0df40328f01775eee9e68a3c8596c68120ce668fd9178e",
+      "symbols": [
+        "attention_fa2_q_preconvert_gfx1100",
+        "attention_q8_0_fa2_gqa_gfx1100"
+      ],
+      "symbol_evidence": {
+        "attention_q8_0_fa2_gqa_gfx1100": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ],
+        "attention_fa2_q_preconvert_gfx1100": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "attention_fa2_q_preconvert_gfx1100",
+        "attention_q8_0_fa2_gqa_gfx1100"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "attention_fa2_q_preconvert_gfx1100",
+        "attention_q8_0_fa2_gqa_gfx1100"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/attention_q8_0_fa2_gqa_gfx1100/rep-1/kernel.hsaco",
+        "sha256": "976064223cf439859c551673ff4e060cac7144e0b5fc2a39fad8a6cbccd7964d"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "conv1d_silu_split",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/conv1d_silu_split.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "221f16bed0ee49e41ae7ac6c58510299cbed366177941f83ca24f4fa745e1004",
+      "symbols": [
+        "conv1d_silu_split_f32"
+      ],
+      "symbol_evidence": {
+        "conv1d_silu_split_f32": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "conv1d_silu_split_f32"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "conv1d_silu_split_f32",
+        "conv1d_silu_split_f32_masked"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/conv1d_silu_split/rep-1/kernel.hsaco",
+        "sha256": "26631f0bdb1d5bc2ebcef5b157deae06d5aec6493206f341633bea05d21001a5"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "embedding_q8_batched",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/embedding_q8_batched.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "c0c2ecaeeae83d88fad9e5af82c6d521ee5b06492a563a95561677aadf4bf6ce",
+      "symbols": [
+        "embedding_q8_batched"
+      ],
+      "symbol_evidence": {
+        "embedding_q8_batched": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "embedding_q8_batched"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "embedding_q8_batched"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/embedding_q8_batched/rep-1/kernel.hsaco",
+        "sha256": "113451e99ef2ef8a1aa6599a5cf8dd47c2fec26b76aed4e065535007828915bc"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "fused_qk_l2_norm_scale_interleave_f32_batched",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/fused_qk_l2_norm_scale_interleave_f32_batched.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "55debd36a331318dc558612874ef16721019ebbb700725cb3f4f3be44fdc38b4",
+      "symbols": [
+        "fused_qk_l2_norm_scale_interleave_f32_batched"
+      ],
+      "symbol_evidence": {
+        "fused_qk_l2_norm_scale_interleave_f32_batched": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "fused_qk_l2_norm_scale_interleave_f32_batched"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "fused_qk_l2_norm_scale_interleave_f32_batched"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/fused_qk_l2_norm_scale_interleave_f32_batched/rep-1/kernel.hsaco",
+        "sha256": "cdf95dbf647778f7031d2857affb1315ad940c16c8da0811e94d7c8bf51b0f71"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "fused_rmsnorm_mq_rotate_awq_i4_b8",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/fused_rmsnorm_mq_rotate_awq_i4_b8.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "161d57416cc277379f38d207cd59f59d5d6d80902b306a3bb5bca3825043155d",
+      "symbols": [
+        "fused_rmsnorm_mq_rotate_awq_i4_b8"
+      ],
+      "symbol_evidence": {
+        "fused_rmsnorm_mq_rotate_awq_i4_b8": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "fused_rmsnorm_mq_rotate_awq_i4_b8"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "fused_rmsnorm_mq_rotate_awq_i4_b8"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/fused_rmsnorm_mq_rotate_awq_i4_b8/rep-1/kernel.hsaco",
+        "sha256": "efedbe5de5d7acb54a4c6d397a30d7b8badc1915a2bf5f61deef2bb3f7467b81"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "fused_sigmoid_alpha_gate",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/fused_sigmoid_alpha_gate.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "3ebcf504abca0f8c492099f21a720b0b78f8b4b4fd9abf87bb2c77e2197a89d6",
+      "symbols": [
+        "fused_sigmoid_alpha_gate_f32"
+      ],
+      "symbol_evidence": {
+        "fused_sigmoid_alpha_gate_f32": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "fused_sigmoid_alpha_gate_f32"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "fused_sigmoid_alpha_gate_f32"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/fused_sigmoid_alpha_gate/rep-1/kernel.hsaco",
+        "sha256": "81d29b1f2e29c6223e0d6c5258afb7578d57b112f6a8cefdab2e6a09687d419f"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "fused_silu_mul_mq_rotate_awq_i4",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/fused_silu_mul_mq_rotate_awq_i4.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "b2d74f270036bcb489529dddda4de6e06aa7d7473a021dec39dd53623e87ac8b",
+      "symbols": [
+        "fused_silu_mul_mq_rotate_awq_i4"
+      ],
+      "symbol_evidence": {
+        "fused_silu_mul_mq_rotate_awq_i4": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "fused_silu_mul_mq_rotate_awq_i4"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "fused_silu_mul_mq_rotate_awq_i4"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/fused_silu_mul_mq_rotate_awq_i4/rep-1/kernel.hsaco",
+        "sha256": "5f2fa009a54ca30837d7f26e8d16595b709acb1577db1d7d24ac5781deabf3d1"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "fused_silu_mul_mq_rotate_awq_i4_hin",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/fused_silu_mul_mq_rotate_awq_i4_hin.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "431e43b18499f80a2d0503385f172c23c9a568a1e20c54382a8884c88c8163dc",
+      "symbols": [
+        "fused_silu_mul_mq_rotate_awq_i4_hin"
+      ],
+      "symbol_evidence": {
+        "fused_silu_mul_mq_rotate_awq_i4_hin": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "fused_silu_mul_mq_rotate_awq_i4_hin"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "fused_silu_mul_mq_rotate_awq_i4_hin"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/fused_silu_mul_mq_rotate_awq_i4_hin/rep-1/kernel.hsaco",
+        "sha256": "7152c2c5ca15674d902710c4f44d93f240d5bc5d8ed517583465910b4e3484d9"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "gated_delta_net_q8_fast",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/gated_delta_net_q8_fast.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "0cbfc2d3cc51bd4b74441caf3e0a6286983ff172a40f1c3b9614c267888bbe94",
+      "symbols": [
+        "gated_delta_net_q8_fast"
+      ],
+      "symbol_evidence": {
+        "gated_delta_net_q8_fast": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gated_delta_net_q8_fast",
+        "gated_delta_net_q8_fast_independent_masked"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gated_delta_net_q8_fast",
+        "gated_delta_net_q8_fast_independent_masked"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/gated_delta_net_q8_fast/rep-1/kernel.hsaco",
+        "sha256": "3cdc61363c4fe57ebe08f687029b2a33dca5e50d1b9a1a8853da4d911a0afeb1"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "gated_norm_mq_rotate_awq_i4_gfx1100_v2",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/gated_norm_mq_rotate_awq_i4_gfx1100_v2.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "d3e235184b5e69d51de1a9f35d6b263c824ce811ddfc3e191d0360bf770b698a",
+      "symbols": [
+        "gated_norm_mq_rotate_awq_i4_gfx1100_v2"
+      ],
+      "symbol_evidence": {
+        "gated_norm_mq_rotate_awq_i4_gfx1100_v2": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gated_norm_mq_rotate_awq_i4_gfx1100_v2"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gated_norm_mq_rotate_awq_i4_gfx1100_v2"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/gated_norm_mq_rotate_awq_i4_gfx1100_v2/rep-1/kernel.hsaco",
+        "sha256": "dc1c0c9a39bc3f7197d44b1734b5c274098189f3731d58a5b4a6244f6786368a"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "gdn_chunk_kkt_solve_gfx1100",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/gdn_chunk_kkt_solve_gfx1100.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2",
+        "-ffp-contract=off"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "8a7690c29511327a384d87b4dc184fec85fc016f376f83639d18b7e1e1016551",
+      "symbols": [
+        "gdn_chunk_kkt_solve_gfx1100"
+      ],
+      "symbol_evidence": {
+        "gdn_chunk_kkt_solve_gfx1100": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gdn_chunk_kkt_solve_gfx1100"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gdn_chunk_kkt_solve_gfx1100"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/gdn_chunk_kkt_solve_gfx1100/rep-1/kernel.hsaco",
+        "sha256": "a682423436276d0dd1dc039e3b035b8b783fbe260f4e0d007e2793020fd1cc16"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "gdn_chunk_prep_gfx11",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/gdn_chunk_prep_gfx11.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2",
+        "-ffp-contract=off"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "d83cb836e8e57df1cc971899242891df5457e95f3801e0aa8c5c3ef97295741d",
+      "symbols": [
+        "gdn_chunk_prep_gfx11"
+      ],
+      "symbol_evidence": {
+        "gdn_chunk_prep_gfx11": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gdn_chunk_prep_gfx11"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gdn_chunk_prep_gfx11"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/gdn_chunk_prep_gfx11/rep-1/kernel.hsaco",
+        "sha256": "ec85c76cc41d23f79208bc38b81dad532ce2ee26d8ad7fea6d4c68a7bd56e227"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "gdn_chunk_scan",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/gdn_chunk_scan.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2",
+        "-ffp-contract=off"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "db7137fc6f2a9cc2af0726d4f9d466e5326c43056d7216126f844157986cedb9",
+      "symbols": [
+        "gdn_chunk_scan"
+      ],
+      "symbol_evidence": {
+        "gdn_chunk_scan": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gdn_chunk_scan"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gdn_chunk_scan"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/gdn_chunk_scan/rep-1/kernel.hsaco",
+        "sha256": "0f2dbfec47436e9736a52517dd742f0c851787327bee17381f987482fbb5a31e"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "9aae9505c4797d48a4f4f22432bfd787345b41e35e0ec3442a7c6e885b93ba40",
+      "symbols": [
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec"
+      ],
+      "symbol_evidence": {
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ],
+        "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ],
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gemm_mq4g256v2_residual_mmq_iu4",
+        "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec",
+        "quantize_int4_mmq_ds128"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gemm_mq4g256v2_residual_mmq_iu4",
+        "gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
+        "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec",
+        "quantize_int4_mmq_ds128"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold/rep-1/kernel.hsaco",
+        "sha256": "17c6a527032860ac7af2de856e5cf8891ab2d0163d6b8bdab515cb69e773cf2e"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "gemm_mqv2_wmma_gfx1100_mw_lds",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/gemm_mqv2_wmma_gfx1100_mw_lds.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "87d51439f8a66da4f8ef068fa629468a04a5a3198f8922a88d131458d63ae2fa",
+      "symbols": [
+        "gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds"
+      ],
+      "symbol_evidence": {
+        "gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gemm_gate_up_mq3g256v2_wmma_gfx11_mw4_lds",
+        "gemm_gate_up_mq3g256v2_wmma_gfx11_mw8_lds",
+        "gemm_gate_up_mq4g256v2_wmma_gfx11_mw4_lds",
+        "gemm_gate_up_mq4g256v2_wmma_gfx11_mw8_lds",
+        "gemm_gate_up_mq5g256v2_wmma_gfx11_mw4_lds",
+        "gemm_gate_up_mq5g256v2_wmma_gfx11_mw8_lds",
+        "gemm_gate_up_mq6g256v2_wmma_gfx11_mw4_lds",
+        "gemm_gate_up_mq6g256v2_wmma_gfx11_mw8_lds",
+        "gemm_mq3g256v2_residual_wmma_gfx11_mw4_lds",
+        "gemm_mq3g256v2_residual_wmma_gfx11_mw8_lds",
+        "gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds",
+        "gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds",
+        "gemm_mq5g256v2_residual_wmma_gfx11_mw4_lds",
+        "gemm_mq5g256v2_residual_wmma_gfx11_mw8_lds",
+        "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
+        "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gemm_gate_up_mq3g256v2_wmma_gfx11_mw4_lds",
+        "gemm_gate_up_mq3g256v2_wmma_gfx11_mw8_lds",
+        "gemm_gate_up_mq4g256v2_wmma_gfx11_mw4_lds",
+        "gemm_gate_up_mq4g256v2_wmma_gfx11_mw8_lds",
+        "gemm_gate_up_mq5g256v2_wmma_gfx11_mw4_lds",
+        "gemm_gate_up_mq5g256v2_wmma_gfx11_mw8_lds",
+        "gemm_gate_up_mq6g256v2_wmma_gfx11_mw4_lds",
+        "gemm_gate_up_mq6g256v2_wmma_gfx11_mw8_lds",
+        "gemm_mq3g256v2_residual_wmma_gfx11_mw4_lds",
+        "gemm_mq3g256v2_residual_wmma_gfx11_mw8_lds",
+        "gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds",
+        "gemm_mq4g256v2_residual_wmma_gfx11_mw8_lds",
+        "gemm_mq5g256v2_residual_wmma_gfx11_mw4_lds",
+        "gemm_mq5g256v2_residual_wmma_gfx11_mw8_lds",
+        "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
+        "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/gemm_mqv2_wmma_gfx1100_mw_lds/rep-1/kernel.hsaco",
+        "sha256": "c81a1c46757a4c9c27ae696a750534d4d70e301d4716be45d5b8491f3b7c27da"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "gemv_mq4g256v2_rdna3_mq4v2",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/gemv_mq4g256v2_rdna3_mq4v2.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "34abe17f6f057aeedc4eba707617535adf84eb9aaa07326435f9c4fcd79d2749",
+      "symbols": [
+        "gemv_mq4g256v2"
+      ],
+      "symbol_evidence": {
+        "gemv_mq4g256v2": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gemv_mq4g256v2"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gemv_mq4g256v2"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/gemv_mq4g256v2_rdna3_mq4v2/rep-1/kernel.hsaco",
+        "sha256": "30189165f8995537a765867cf897d0413f62e5003f26e66fff2f18794fa8becb"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "kv_cache_write_q8_0_pair_batched_gfx1100",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/kv_cache_write_q8_0_pair_batched_gfx1100.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "0642d2e10ce7898be6024c219d1a4712abc74edac47dc33ee2295ecc6bd42484",
+      "symbols": [
+        "kv_cache_write_q8_0_pair_batched_gfx1100"
+      ],
+      "symbol_evidence": {
+        "kv_cache_write_q8_0_pair_batched_gfx1100": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "kv_cache_write_q8_0_pair_batched_gfx1100"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "kv_cache_write_q8_0_pair_batched_gfx1100"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/kv_cache_write_q8_0_pair_batched_gfx1100/rep-1/kernel.hsaco",
+        "sha256": "ebb70551bebe6a186dfd633acea3e2ac9d55381e7c179d01bf090ebf247cd28d"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "mq_rotate_x",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/mq_rotate_x.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "0f4efbebb43c5d7b630c6383e9048549b18a338699b39411c8151dbb6061b51b",
+      "symbols": [
+        "mq_rotate_x"
+      ],
+      "symbol_evidence": {
+        "mq_rotate_x": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "gemv_mq4g256",
+        "mq_rotate_x"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "gemv_mq4g256",
+        "mq_rotate_x"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/mq_rotate_x/rep-1/kernel.hsaco",
+        "sha256": "e346ad5686cfcd36711a330e4930b81e09b3f0c7b634fb07261f1688128f56af"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "qwen35_fa_prep_batched_gfx1100",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/qwen35_fa_prep_batched_gfx1100.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "7d1fb01e961af87244b944163ddeb9d5ae090587529084d6bf974f5ecc5febf1",
+      "symbols": [
+        "qwen35_fa_prep_batched_gfx1100"
+      ],
+      "symbol_evidence": {
+        "qwen35_fa_prep_batched_gfx1100": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "qwen35_fa_prep_batched_gfx1100"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "qwen35_fa_prep_batched_gfx1100"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/qwen35_fa_prep_batched_gfx1100/rep-1/kernel.hsaco",
+        "sha256": "317864fee0d510c0aa4e112fcf6423e9ab57e595004263901c2f893f2010ebcb"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "rmsnorm",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/rmsnorm.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "4cac09faa9d0883e6ca9d100bb13455ae88cfb8984e2ea68250ee2e3f64777f1",
+      "symbols": [
+        "rmsnorm_f32"
+      ],
+      "symbol_evidence": {
+        "rmsnorm_f32": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "rmsnorm_f32"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "rmsnorm_f32",
+        "rmsnorm_f32_warp_reduce"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/rmsnorm/rep-1/kernel.hsaco",
+        "sha256": "9525dc11581a4448b62284f397e37536863a5c220b2df8b78f9554e8db0bc20f"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "rmsnorm_f32_rowsplit",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/rmsnorm_f32_rowsplit.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "2923d5361f5e68971f0124d1a16dd8f78ea4fe00aba02fe6ffee3649982d19a9",
+      "symbols": [
+        "rmsnorm_f32_rowsplit"
+      ],
+      "symbol_evidence": {
+        "rmsnorm_f32_rowsplit": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "rmsnorm_f32_rowsplit"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "rmsnorm_f32_rowsplit"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/rmsnorm_f32_rowsplit/rep-1/kernel.hsaco",
+        "sha256": "1a8a4eb8e2ca2f8e784709f92eb8ade6a1305dfb03b9bdf1d6f9e4311db681cd"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "sigmoid_mul_rotate_x_mq_awq_i4_gfx11",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/sigmoid_mul_rotate_x_mq_awq_i4_gfx11.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "e6fcf0ba2b87fcd27b58a8b5731585a0fa18ff7c914e00a11860ad8d8463cd4f",
+      "symbols": [
+        "sigmoid_mul_rotate_x_mq_awq_i4_gfx11"
+      ],
+      "symbol_evidence": {
+        "sigmoid_mul_rotate_x_mq_awq_i4_gfx11": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "sigmoid_mul_rotate_x_mq_awq_i4_gfx11"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "sigmoid_mul_rotate_x_mq_awq_i4_gfx11"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/sigmoid_mul_rotate_x_mq_awq_i4_gfx11/rep-1/kernel.hsaco",
+        "sha256": "28ff55027f1ef40a04e46ebff480474764ab578e93267b5962e58cf0dbea13eb"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "split_mq4v2_z_betaalpha",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/split_mq4v2_z_betaalpha.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "345e13274e1cb3d5ee93f86955295f93c936d424ba564d58c54de395303e2c93",
+      "symbols": [
+        "split_mq4v2_z_betaalpha"
+      ],
+      "symbol_evidence": {
+        "split_mq4v2_z_betaalpha": [
+          {
+            "selection_authority": "observed-successful-process",
+            "observation": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/audit-27b-gfx1100",
+            "resolved_process_success": true
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "split_mq4v2_z_betaalpha"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "split_mq4v2_z_betaalpha"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/split_mq4v2_z_betaalpha/rep-1/kernel.hsaco",
+        "sha256": "fff7affacabab45d1bbb7692057e1608ebb22f6050c60d154c32a52c2e49468f"
+      },
+      "registry_missing_symbols": []
+    }
+  ],
+  "alternate_arms": [
+    {
+      "name": "serial-compiler-kill-arm",
+      "current_pack_override": {
+        "HIPFIRE_PACK_JOBS": "1"
+      },
+      "planned_jit_override": {
+        "HIPFIRE_JIT_JOBS": "1"
+      },
+      "planned_jit_override_status": "A1/A2-owned; not implemented by G0",
+      "entries_ref": "default_entries",
+      "note": "concurrency-only switch; same source/image/symbol identities"
+    },
+    {
+      "name": "explicit-spec-helper-superset",
+      "entries_ref": "explicit_spec_helper_inventory",
+      "note": "historical mixed-fixture helpers only; no admitted drafter/header policy inferred"
+    }
+  ],
+  "explicit_spec_helper_inventory": [
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "argmax_f32_batched",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/argmax_f32_batched.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "435dd520f811cc41df0a0c61b149259ca3dfc6ac4e3de3499d8c2530928729fe",
+      "symbols": [
+        "argmax_f32_batched"
+      ],
+      "symbol_evidence": {
+        "argmax_f32_batched": [
+          {
+            "selection_authority": "source-predicted",
+            "source_anchor": "historical mixed explicit-helper superset; drafter/header/replay policy unresolved"
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "argmax_f32_batched"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "argmax_f32_batched"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/argmax_f32_batched/rep-1/kernel.hsaco",
+        "sha256": "464775349376706daa81de02dbcc28ed2835b1b766fa3703c1615acf987745d4"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "attention_verify_gqa_gfx1100",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/attention_verify_gqa_gfx1100.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "192606dbd706dfe1c3bedb765e8bf85313035a8d0fc80419ae30e4562b2ddb1c",
+      "symbols": [
+        "attention_verify_gqa_q8_gfx1100",
+        "attention_verify_reduce_gfx1100"
+      ],
+      "symbol_evidence": {
+        "attention_verify_gqa_q8_gfx1100": [
+          {
+            "selection_authority": "source-predicted",
+            "source_anchor": "historical mixed explicit-helper superset; drafter/header/replay policy unresolved"
+          }
+        ],
+        "attention_verify_reduce_gfx1100": [
+          {
+            "selection_authority": "source-predicted",
+            "source_anchor": "historical mixed explicit-helper superset; drafter/header/replay policy unresolved"
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "attention_verify_gqa_q8_gfx1100",
+        "attention_verify_gqa_q8_rows_gfx1100",
+        "attention_verify_reduce_gfx1100"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "attention_verify_gqa_q8_gfx1100",
+        "attention_verify_gqa_q8_rows_gfx1100",
+        "attention_verify_reduce_gfx1100"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/attention_verify_gqa_gfx1100/rep-1/kernel.hsaco",
+        "sha256": "7734d208cf42d89c93780b623477b0a263087ae58fcc0deefd46f8d5fe04600a"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "dflash_gdn_pre_gfx1100",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/dflash_gdn_pre_gfx1100.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "3f99bfca12fef6bf392bfa9f4686f8300e4c0ebfcc44b2c2c1075b52b8608e2b",
+      "symbols": [
+        "dflash_gdn_pre_capture_gfx1100",
+        "dflash_gdn_pre_replay_gfx1100"
+      ],
+      "symbol_evidence": {
+        "dflash_gdn_pre_capture_gfx1100": [
+          {
+            "selection_authority": "source-predicted",
+            "source_anchor": "historical mixed explicit-helper superset; drafter/header/replay policy unresolved"
+          }
+        ],
+        "dflash_gdn_pre_replay_gfx1100": [
+          {
+            "selection_authority": "source-predicted",
+            "source_anchor": "historical mixed explicit-helper superset; drafter/header/replay policy unresolved"
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "dflash_gdn_pre_capture_gfx1100",
+        "dflash_gdn_pre_replay_gfx1100"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "dflash_gdn_pre_capture_gfx1100",
+        "dflash_gdn_pre_replay_gfx1100"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/dflash_gdn_pre_gfx1100/rep-1/kernel.hsaco",
+        "sha256": "d6333bcf7b0d011f592071253a478348c748080560e73a50f1af712b6fae1766"
+      },
+      "registry_missing_symbols": []
+    },
+    {
+      "arch": "gfx1100",
+      "kind": "hip",
+      "module": "greedy_accept",
+      "path": "/home/kaden/qcal/release-0.4.2/parallel-packs/registry/gfx1100/greedy_accept.hip",
+      "flags": [
+        "--genco",
+        "--offload-arch=gfx1100",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "scheduler_profile": "default",
+      "cache_abi": 6,
+      "sha256": "09c3a20cd11d1e330087448d7d7ccae643717a15ac3ff6b2d6e3144fe6cd53b1",
+      "symbols": [
+        "greedy_accept_from_argmax_i32"
+      ],
+      "symbol_evidence": {
+        "greedy_accept_from_argmax_i32": [
+          {
+            "selection_authority": "source-predicted",
+            "source_anchor": "historical mixed explicit-helper superset; drafter/header/replay policy unresolved"
+          }
+        ]
+      },
+      "source_factory": "rdna_compute::kernel_registry::corpus_entries",
+      "declared_exports": [
+        "greedy_accept_from_argmax_i32"
+      ],
+      "exports": [
+        "__hip_cuid_",
+        "greedy_accept_from_argmax_i32"
+      ],
+      "export_receipt": {
+        "path": "/home/kaden/qcal/release-0.4.2/jit-peacemaker/hipcc/gfx1100/greedy_accept/rep-1/kernel.hsaco",
+        "sha256": "b269f696feb627a7c9a79ee954000d300287a8cad220c8ad73f57dda725e2745"
+      },
+      "registry_missing_symbols": []
+    }
+  ],
+  "explicit_spec_inventory_role": "historical helper superset only; never default membership or an admitted drafter ready plan",
+  "shape_probe_rows": [
+    1,
+    2,
+    3,
+    4,
+    8,
+    127,
+    128,
+    129,
+    255,
+    256,
+    257,
+    511,
+    512,
+    513,
+    1023,
+    1024,
+    1025,
+    2047,
+    2048,
+    2049,
+    2559,
+    2560,
+    2561,
+    8191,
+    8192,
+    8193,
+    262143,
+    262144
+  ],
+  "shape_probe_status": "A3-owned; no new selector execution runtime added",
+  "resource_policy": "CPU gate uses MemAvailable/cgroup budget, conservative loader reserve and 1536 MiB/job. A4 owns production load admission/reserves; inadmissible FN-gfx1100 host excluded."
+}

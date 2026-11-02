@@ -58,7 +58,7 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_fused_acc(
     const float* __restrict__ topk_weights,              // [N × K_TOP]
     const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
     float*       __restrict__ x_residual,                // [N × M] += result
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     constexpr int NR = MOE_DOWN_FUSED_NUM_ROWS;
     const int row_base = blockIdx.x * NR;
@@ -79,6 +79,7 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_fused_acc(
 
     for (int krank = 0; krank < K_TOP; krank++) {
         const int expert_id = topk_indices[routing_base + krank];
+            if ((unsigned)expert_id >= (unsigned)n_experts) continue;
         const char* __restrict__ A =
             reinterpret_cast<const char*>(expert_ptrs[expert_id]);
         const float* __restrict__ x =

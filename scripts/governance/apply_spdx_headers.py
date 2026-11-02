@@ -107,6 +107,8 @@ EXCLUDE_DIR_NAMES = {
     ".hipfire_kernels",
     "node_modules",
     "vendored",
+    # Verbatim upstream snapshots (third_party/ggml: MIT, SHA-256-pinned in its PIN
+    # file): never headered, never relabelled Apache-2.0 (NOTICE, ggml section).
     "third_party",
     "third-party",
     "thirdparty",

@@ -38,6 +38,63 @@
 
 // ── Phase 0: repeat / presence / frequency penalty, in place (1 block) ──
 // Byte-identical to sample_top_p.hip Phase 0.
+//
+// Semantics: for every DISTINCT token `tok` (< vocab) in repeat_tokens[0..W),
+// let i = the LAST index holding `tok` and count = number of occurrences of
+// `tok` in [0..W). The token's logit is updated once, by the update below,
+// which depends only on (tok, i, count). Non-last occurrences and tok >= vocab
+// do nothing.
+//
+// Fast path (W <= PENALTY_LDS_CAP): stage (tok, i) as 64-bit keys
+// `(tok << 32) | i` in static LDS, padded to a power of two N with all-ones,
+// and bitonic-sort them ascending in LDS. Exactness argument:
+//   * Keys are pairwise distinct (i is unique; pads are 0xFFFF..FF with
+//     i = 0xFFFFFFFF which no real index reaches), so the sorted order is a
+//     total order independent of the sorting network's tie behavior.
+//   * Sorted order is (tok, i) lexicographic, so equal tokens form one
+//     contiguous run in increasing i. The LAST element of a run has the
+//     maximum i = the last occurrence (the original kernel's "no later
+//     duplicate" condition), and run length = occurrences in [0..W) =
+//     the original `count` (1 + earlier duplicates, with none later).
+//   * Run length is recovered as p - lower_bound(tok<<32) + 1 (binary
+//     search over the sorted keys; exact integer arithmetic).
+//   * Each distinct token's run has exactly one last element, so exactly one
+//     thread writes logits[tok] — the same single writer-per-token as the
+//     original — and the written value is a function of (i, count) through
+//     the shared `sample_penalty_update` below, whose float expression order
+//     is copied verbatim from the original loop. Thread->token assignment
+//     therefore cannot change the result bits.
+//   * Pads (tok = 0xFFFFFFFF) are skipped by the unsigned vocab check.
+//     (The original signed check `(int)tok >= vocab` would treat ids >= 2^31
+//     as in range and read logits out of bounds — undefined; callers never
+//     pass them.)
+// Fallback (W > PENALTY_LDS_CAP): the original O(W^2) global-memory loop.
+//
+// Works for any blockDim.x (256 default variant, 128 wide/fast variants).
+#define PENALTY_LDS_CAP 2048
+
+__device__ __forceinline__ void sample_penalty_update(
+    float* __restrict__ logits,
+    unsigned int tok,
+    int i,
+    int count,
+    float window_len,
+    float repeat_penalty,
+    float presence_penalty,
+    float frequency_penalty
+) {
+    if (repeat_penalty > 1.0f) {
+        float recency = ((float)i + 1.0f) / window_len;
+        float effective = powf(repeat_penalty, (float)count * recency);
+        if (effective > 1.5f) effective = 1.5f;
+        float v = logits[tok];
+        logits[tok] = (v > 0.0f) ? (v / effective) : (v * effective);
+    }
+    if (presence_penalty > 0.0f || frequency_penalty > 0.0f) {
+        logits[tok] -= frequency_penalty * (float)count + presence_penalty;
+    }
+}
+
 extern "C" __global__ void sample_apply_repeat_penalty(
     float* __restrict__ logits,
     const unsigned int* __restrict__ repeat_tokens,
@@ -47,10 +104,59 @@ extern "C" __global__ void sample_apply_repeat_penalty(
     float presence_penalty,
     float frequency_penalty
 ) {
+    __shared__ unsigned long long pen_keys[PENALTY_LDS_CAP];
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
     if (repeat_window <= 0) return;
     float window_len = (float)repeat_window;
+
+    if (repeat_window <= PENALTY_LDS_CAP) {
+        int n = 1;
+        while (n < repeat_window) n <<= 1;
+        for (int t = tid; t < n; t += nthreads) {
+            pen_keys[t] = (t < repeat_window)
+                ? (((unsigned long long)repeat_tokens[t] << 32) | (unsigned int)t)
+                : 0xFFFFFFFFFFFFFFFFull;
+        }
+        __syncthreads();
+        // Bitonic sort, ascending.
+        for (int k = 2; k <= n; k <<= 1) {
+            for (int j = k >> 1; j > 0; j >>= 1) {
+                for (int t = tid; t < (n >> 1); t += nthreads) {
+                    int lo = ((t & ~(j - 1)) << 1) | (t & (j - 1));
+                    int hi = lo + j;
+                    unsigned long long a = pen_keys[lo];
+                    unsigned long long b = pen_keys[hi];
+                    bool asc = ((lo & k) == 0);
+                    if ((a > b) == asc) {
+                        pen_keys[lo] = b;
+                        pen_keys[hi] = a;
+                    }
+                }
+                __syncthreads();
+            }
+        }
+        for (int p = tid; p < repeat_window; p += nthreads) {
+            unsigned long long key = pen_keys[p];
+            unsigned int tok = (unsigned int)(key >> 32);
+            if (tok >= (unsigned int)vocab_size) continue;
+            // Last of its run iff the next key has a different token.
+            if (p + 1 < n && (unsigned int)(pen_keys[p + 1] >> 32) == tok) continue;
+            int i = (int)(unsigned int)key;
+            // lower_bound of (tok << 32): first key with this token.
+            unsigned long long first_key = (unsigned long long)tok << 32;
+            int lo = 0, hi = p;
+            while (lo < hi) {
+                int mid = (lo + hi) >> 1;
+                if (pen_keys[mid] < first_key) lo = mid + 1; else hi = mid;
+            }
+            int count = p - lo + 1;
+            sample_penalty_update(logits, tok, i, count, window_len,
+                                  repeat_penalty, presence_penalty, frequency_penalty);
+        }
+        return;
+    }
+
     for (int i = tid; i < repeat_window; i += nthreads) {
         unsigned int tok = repeat_tokens[i];
         if ((int)tok >= vocab_size) continue;
@@ -64,16 +170,8 @@ extern "C" __global__ void sample_apply_repeat_penalty(
             }
         }
         if (has_later) continue;
-        if (repeat_penalty > 1.0f) {
-            float recency = ((float)i + 1.0f) / window_len;
-            float effective = powf(repeat_penalty, (float)count * recency);
-            if (effective > 1.5f) effective = 1.5f;
-            float v = logits[tok];
-            logits[tok] = (v > 0.0f) ? (v / effective) : (v * effective);
-        }
-        if (presence_penalty > 0.0f || frequency_penalty > 0.0f) {
-            logits[tok] -= frequency_penalty * (float)count + presence_penalty;
-        }
+        sample_penalty_update(logits, tok, i, count, window_len,
+                              repeat_penalty, presence_penalty, frequency_penalty);
     }
 }
 

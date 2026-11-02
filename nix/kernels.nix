@@ -1,49 +1,57 @@
+let
+  # rdna-compute kernel_registry::SUPPORTED_ARCHES. Other targets (gfx1200,
+  # gfx1030, ...) have no registry to package; the daemon JIT-compiles them.
+  registryArchs = [ "gfx1201" "gfx1100" "gfx1151" "gfx906" "gfx942" ];
+in
 { lib
-, stdenv
+, rustPlatform
+, symlinkJoin
 , rocmPackages
-, gpuTargets ? []
+, src ? lib.cleanSource ./..
+, cargoLockFile ? ../Cargo.lock
+, gpuTargets ? registryArchs
 }:
 
 let
-  src = lib.cleanSource ./..;
   cargoToml = builtins.fromTOML (builtins.readFile (src + "/Cargo.toml"));
+  dropped = lib.subtractLists registryArchs gpuTargets;
+  packagedTargets = lib.warnIf (dropped != [ ])
+    "hipfire-kernels: no kernel registry for ${lib.concatStringsSep ", " dropped}; packaging none for them, the daemon JIT-compiles their kernels (check the target name if unexpected)"
+    (lib.concatStringsSep " " (lib.intersectLists gpuTargets registryArchs));
 in
-stdenv.mkDerivation {
+rustPlatform.buildRustPackage {
   pname = "hipfire-kernels";
   version = cargoToml.workspace.package.version or cargoToml.package.version;
 
   inherit src;
+  cargoLock.lockFile = cargoLockFile;
+  doCheck = false;
+  dontCargoInstall = true;
 
-  nativeBuildInputs = [
-    rocmPackages.clr
-    rocmPackages.llvm.clang
-  ];
+  nativeBuildInputs = [ rocmPackages.clr rocmPackages.llvm.clang ];
 
   buildPhase = ''
     runHook preBuild
     export HOME=$TMPDIR
-    # Allow partial failures — some kernels are arch-specific and won't
-    # compile for every target. The daemon JIT-compiles missing kernels.
-    bash scripts/compile-kernels.sh ${lib.concatStringsSep " " gpuTargets} || {
-      echo "WARNING: some kernels failed to compile (see above). Daemon will JIT-compile them on first use."
-    }
+    export HIPFIRE_ROCM_PATH=${import ./rocm-root.nix { inherit symlinkJoin rocmPackages; }}
+    # No arguments would make the script package every registry arch.
+    ${lib.optionalString (packagedTargets != "") "bash scripts/compile-kernels.sh ${packagedTargets}"}
     runHook postBuild
   '';
 
   installPhase = ''
     runHook preInstall
-    mkdir -p $out/kernels/compiled
-    for arch in ${lib.concatStringsSep " " gpuTargets}; do
-      if [ -d "kernels/compiled/$arch" ]; then
-        cp -r "kernels/compiled/$arch" "$out/kernels/compiled/"
-      fi
+    mkdir -p "$out/kernels/compiled"
+    for arch in ${packagedTargets}; do
+      test -f "kernels/compiled/$arch/rmsnorm.index.json"
+      cp -r "kernels/compiled/$arch" "$out/kernels/compiled/"
     done
     runHook postInstall
   '';
 
   meta = with lib; {
     description = "Pre-compiled GPU kernels for hipfire";
-    license = licenses.mit;
+    license = [ licenses.asl20 licenses.mit ];
     platforms = [ "x86_64-linux" ];
   };
 }

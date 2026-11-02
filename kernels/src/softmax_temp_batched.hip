@@ -73,31 +73,29 @@ extern "C" __global__ void softmax_temp_batched_f32(
     }
 }
 
-// Variant that additionally emits the per-row nucleus (top_p) threshold and
-// kept mass, WITHOUT modifying `probs` (host applies the truncation). For each
-// row r it writes:
+// Variant that additionally emits the per-row truncation threshold and kept
+// mass of the AR sampler's law, WITHOUT modifying `probs` (consumers apply
+// `p >= tau_cut ? p / Z : 0`). For each row r it writes:
 //
-//   tau_cut[r] = the inclusive nucleus probability threshold: the value of the
-//                crossing token's softmax probability. Host keeps tokens with
-//                p_i >= tau_cut[r].
-//   Z[r]       = the kept mass = sum of p_i for p_i >= tau_cut[r]. Host renorms
-//                kept tokens by 1/Z[r].
+//   tau_cut[r] = probability of the last kept token; consumers keep tokens
+//                with p_i >= tau_cut[r].
+//   Z[r]       = the kept mass = sum of p_i for p_i >= tau_cut[r].
 //
-// When top_p >= 1.0 the nucleus phase is skipped and tau_cut=0, Z=1 (host
-// truncation collapses to identity, byte-path unchanged vs the no-top_p path).
+// The kept set is EXACTLY `llama::sample_top_k_p`'s (the AR producer's host
+// sampler; the GPU `sample_top_p` kernel shares its semantics):
 //
-// tau_cut is found by bisection over [0, p_max] on the monotone predicate
-// mass(tau) = sum_{p_i >= tau} p_i, which increases as tau decreases. The AR
-// nucleus rule (sort desc, accumulate, cut at the FIRST prefix whose cumulative
-// >= top_p, INCLUSIVE crossing token, renorm by kept mass) is reproduced in
-// threshold form: find the largest tau whose mass(tau) >= top_p. Because the
-// full softmax already sums to 1, the kept-set sum used by AR is 1, so the
-// cumulative target is exactly top_p. No sort: each bisection iteration is one
-// strided pass over row_out + a block tree-reduce. A final exact pass recomputes
-// Z = mass(tau_cut) from the converged threshold rather than trusting the
-// interpolated mass. Comparator is `>=` (inclusive crossing token); exact float
-// ties at the boundary are kept together (measure-zero divergence from AR's
-// sort-position tie-break — see speculative.rs apply_topp_trunc doc).
+//   1. cap = top_k, the caller's AR candidate cap (`llama::ar_candidate_cap`:
+//      absent top_k → 20, 0 → 64, k → min(k, 64)); `top_k <= 0` here → 64.
+//   2. The cap largest probabilities, sorted descending — selected EXACTLY by
+//      an 8-bit-digit radix select on the (non-negative) float bit patterns.
+//   3. min_p > 0: cap shrinks to the first rank i >= 1 whose prob is below
+//      min_p * p_max.
+//   4. Nucleus over the cap's OWN mass: keep the shortest descending prefix
+//      whose cumulative mass reaches top_p * mass(cap), crossing token
+//      included. The full-vocab mass never enters (AR samples from its pool).
+//
+// Exact float ties at the cap boundary or at tau keep every tied token
+// (measure-zero divergence from AR's index-order tie-break).
 extern "C" __global__ void softmax_temp_topp_batched_f32(
     const float* __restrict__ logits,
     float* __restrict__ probs,
@@ -153,100 +151,124 @@ extern "C" __global__ void softmax_temp_topp_batched_f32(
     }
     __syncthreads();
 
-    // ── top_p >= 1.0 guard: nucleus disabled → identity truncation. With a
-    // top_k OR min_p cutoff the truncation is NOT identity (each still limits the
-    // candidate set), so only short-circuit when ALL three are disabled.
-    if (top_p >= 1.0f && top_k <= 0 && min_p <= 0.0f) {
-        if (threadIdx.x == 0) {
-            tau_cut[row] = 0.0f;
-            Z[row] = 1.0f;
-        }
-        return;
-    }
+    // ── Phase 4: exact radix select of the cap-th largest probability ──────
+    // p_max == inv_sum (the max logit's exp is 1). Non-negative floats order
+    // like their bit patterns, so four 8-bit digit passes (MSB first) find the
+    // exact bits of the cap-th largest prob. Tokens below p_max * 2^-20 are
+    // skipped (they would only pile atomics on a few low bins) unless fewer
+    // than `cap` tokens clear that floor, in which case no floor is used.
+    const int MAX_CAP = 64;
+    __shared__ unsigned int s_hist[256];
+    __shared__ unsigned int s_digit;
+    __shared__ unsigned int s_need;     // tokens still to take at the current prefix
+    __shared__ unsigned int s_count;    // tokens clearing the floor
+    __shared__ unsigned int s_n_gt;
+    __shared__ unsigned int s_n_eq;
+    __shared__ float s_cand_p[MAX_CAP];
+    __shared__ int   s_cand_i[MAX_CAP];
+    __shared__ float s_tau;
 
-    // ── Phase 4: p_max over the normalized row (bisection upper bound) ──────
-    float pmax = 0.0f;
+    int cap = (top_k <= 0 || top_k > MAX_CAP) ? MAX_CAP : top_k;
+    if (cap > n) cap = n;
+    const float pmax = inv_sum;
+
+    if (threadIdx.x == 0) s_count = 0u;
+    __syncthreads();
+    float floor_p = pmax * (1.0f / 1048576.0f);
+    unsigned int local_cnt = 0u;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        pmax = fmaxf(pmax, row_out[i]);
+        if (row_out[i] >= floor_p) ++local_cnt;
     }
-    sdata[threadIdx.x] = pmax;
+    atomicAdd(&s_count, local_cnt);
     __syncthreads();
-    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-        if (threadIdx.x < s)
-            sdata[threadIdx.x] = fmaxf(sdata[threadIdx.x], sdata[threadIdx.x + s]);
-        __syncthreads();
-    }
-    pmax = sdata[0];
-    __syncthreads();
+    if (s_count < (unsigned int)cap) floor_p = 0.0f;
+    const unsigned int floor_bits = __float_as_uint(floor_p);
 
-    // ── Phase 5': histogram nucleus (replaces the 20-iteration bisection) ───
-    // The bisection re-read all `n` probs ~20× — the dominant cost when the
-    // trunk forward is cheap (MoE A3B: 665µs/call, 13% of GPU time). Instead,
-    // ONE pass bins each SIGNIFICANT prob's MASS into NBINS linear buckets over
-    // [0, pmax]; thread 0 then scans buckets top-down (highest prob first) for
-    // the crossing where cumulative kept-mass >= top_p. tau = the lower edge of
-    // that bucket — the largest bucket-resolution threshold whose kept mass
-    // still covers top_p, matching the bisection's intent at bucket precision.
-    // Probs below pmax*1e-5 carry negligible mass AND sit far below any
-    // realistic nucleus threshold, so they're skipped — which also kills the
-    // atomic contention the 248K-long tail would otherwise put on the low bins.
-    // Phase 6 recomputes the exact kept mass Z from this tau, so only the
-    // threshold (not Z) is bucket-approximate.
-    const int NBINS = 512;
-    __shared__ float shist[512];     // per-bin prob MASS  (→ top_p threshold)
-    __shared__ float shist_cnt[512]; // per-bin prob COUNT (→ top_k threshold)
-    for (int b = threadIdx.x; b < NBINS; b += blockDim.x) {
-        shist[b] = 0.0f;
-        shist_cnt[b] = 0.0f;
+    unsigned int prefix = 0u, mask = 0u;
+    if (threadIdx.x == 0) s_need = (unsigned int)cap;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        for (int b = threadIdx.x; b < 256; b += blockDim.x) s_hist[b] = 0u;
+        __syncthreads();
+        for (int i = threadIdx.x; i < n; i += blockDim.x) {
+            unsigned int bits = __float_as_uint(row_out[i]);
+            if (bits >= floor_bits && (bits & mask) == prefix) {
+                atomicAdd(&s_hist[(bits >> shift) & 255u], 1u);
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            unsigned int need = s_need, above = 0u;
+            int d = 255;
+            for (; d > 0; --d) {
+                if (above + s_hist[d] >= need) break;
+                above += s_hist[d];
+            }
+            s_digit = (unsigned int)d;
+            s_need = need - above;
+        }
+        __syncthreads();
+        prefix |= s_digit << shift;
+        mask |= 255u << shift;
     }
+    const float vk = __uint_as_float(prefix);   // exact cap-th largest prob
+    const unsigned int ties_needed = s_need;    // of the tokens equal to vk
+
+    // ── Phase 5: gather the cap candidates, sort, apply AR's cut ────────────
+    if (threadIdx.x == 0) { s_n_gt = 0u; s_n_eq = 0u; }
     __syncthreads();
-    float floor_p = pmax * 1e-5f;
-    float inv_pmax_bins = (pmax > 0.0f) ? ((float)NBINS / pmax) : 0.0f;
+    const unsigned int n_gt_total = (unsigned int)cap - ties_needed;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float p = row_out[i];
-        if (p < floor_p) continue;
-        int bin = (int)(p * inv_pmax_bins);
-        if (bin >= NBINS) bin = NBINS - 1;
-        atomicAdd(&shist[bin], p);
-        atomicAdd(&shist_cnt[bin], 1.0f);
+        if (p > vk) {
+            unsigned int slot = atomicAdd(&s_n_gt, 1u);
+            s_cand_p[slot] = p;
+            s_cand_i[slot] = i;
+        } else if (p == vk) {
+            unsigned int slot = atomicAdd(&s_n_eq, 1u);
+            if (slot < ties_needed) {
+                s_cand_p[n_gt_total + slot] = p;
+                s_cand_i[n_gt_total + slot] = i;
+            }
+        }
     }
     __syncthreads();
     if (threadIdx.x == 0) {
-        // Scan buckets top-down (highest prob first). tau_p = lower edge of the
-        // bucket where cumulative MASS first reaches top_p (the nucleus cut).
-        // tau_k = lower edge of the bucket where cumulative COUNT first reaches
-        // top_k (the k-th largest prob, at bucket precision). top_k AND top_p
-        // keep tokens above BOTH thresholds, so the effective cutoff is the
-        // tighter (higher) of the two. The pmax*1e-5 floor skipped the long tail,
-        // which sits below the top-k for any realistic k, so the count is exact.
-        float cum_mass = 0.0f;
-        float cum_cnt = 0.0f;
-        float tau_p = 0.0f;
-        float tau_k = 0.0f;
-        bool found_p = (top_p >= 1.0f); // top_p disabled → no mass cut (tau_p=0)
-        bool found_k = (top_k <= 0);    // top_k disabled → no count cut (tau_k=0)
-        for (int b = NBINS - 1; b >= 0 && !(found_p && found_k); --b) {
-            cum_mass += shist[b];
-            cum_cnt += shist_cnt[b];
-            if (!found_p && cum_mass >= top_p) {
-                tau_p = ((float)b / (float)NBINS) * pmax;
-                found_p = true;
+        // Insertion sort, descending prob, ascending id on ties.
+        for (int a = 1; a < cap; ++a) {
+            float p = s_cand_p[a];
+            int id = s_cand_i[a];
+            int j = a;
+            while (j > 0 && (s_cand_p[j - 1] < p || (s_cand_p[j - 1] == p && s_cand_i[j - 1] > id))) {
+                s_cand_p[j] = s_cand_p[j - 1];
+                s_cand_i[j] = s_cand_i[j - 1];
+                --j;
             }
-            if (!found_k && cum_cnt >= (float)top_k) {
-                tau_k = ((float)b / (float)NBINS) * pmax;
-                found_k = true;
+            s_cand_p[j] = p;
+            s_cand_i[j] = id;
+        }
+        int kept_cap = cap;
+        if (min_p > 0.0f) {
+            float floor_min = fminf(min_p, 1.0f) * s_cand_p[0];
+            for (int a = 1; a < cap; ++a) {
+                if (s_cand_p[a] < floor_min) { kept_cap = a; break; }
             }
         }
-        // min_p: keep tokens with p >= min_p * pmax (relative-to-peak floor).
-        // Folded as the tighter (higher) of the three thresholds — no histogram
-        // needed since pmax is already known. min_p<=0 → tau_minp=0 (no cut).
-        float tau_minp = (min_p > 0.0f) ? (min_p * pmax) : 0.0f;
-        sdata[0] = fmaxf(fmaxf(tau_p, tau_k), tau_minp);
+        float mass = 0.0f;
+        for (int a = 0; a < kept_cap; ++a) mass += s_cand_p[a];
+        float threshold = fminf(fmaxf(top_p, 0.0f), 1.0f) * mass;
+        float cum = 0.0f;
+        int m = kept_cap;
+        for (int a = 0; a < kept_cap; ++a) {
+            cum += s_cand_p[a];
+            if (cum >= threshold) { m = a + 1; break; }
+        }
+        // A zero (underflowed) last kept prob must not read as "no cut".
+        s_tau = fmaxf(s_cand_p[m - 1], 1.17549435e-38f);
     }
     __syncthreads();
-    float tau = sdata[0];
+    const float tau = s_tau;
 
-    // ── Phase 6: exact Z = mass(tau) from the converged threshold ──────────
+    // ── Phase 6: exact Z = mass(tau) ────────────────────────────────────────
     float kept = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float p = row_out[i];
@@ -259,7 +281,6 @@ extern "C" __global__ void softmax_temp_topp_batched_f32(
         __syncthreads();
     }
     kept = sdata[0];
-    __syncthreads();
 
     if (threadIdx.x == 0) {
         tau_cut[row] = tau;

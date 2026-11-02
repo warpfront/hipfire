@@ -1,0 +1,84 @@
+# SPDX-License-Identifier: Apache-2.0
+# Rejected designs; report paths are relative to /home/kaden/qcal/release-0.4.1.
+# Missing commit means an uncommitted experiment, not a production deprecation.
+
+[[killed]]
+id = "moe-k1"
+design = "LDS weight slab, heaviest-first, block256/ns2"
+gate = "real-route NT4 pair speedup >= 1.25 on L4/L24/L44"
+report = "fn-wmo/moe-k1/report.md"
+base_commit = "fddd7ada5707daff9e52eeda2f60625f6d33a210"
+measured_combined_tops = 54.27
+measured_pair_ms_l4_nt4 = 17.7107
+measured_pair_ms_l4_candidate = 34.1613
+measured_pair_ms_l24_nt4 = 16.8993
+measured_pair_ms_l24_candidate = 32.5699
+measured_pair_ms_l44_nt4 = 17.2117
+measured_pair_ms_l44_candidate = 31.8961
+
+[[killed]]
+id = "moe-v2"
+design = "gfx1201 Q128 dense panels and Halo hybrid dense/NT4 tails"
+gate = "complete path >= 1.25x on gfx1201; Halo byte identity"
+report = "fn-wmo/moe-v2-kill/report.md"
+base_commit = "fddd7ada5707daff9e52eeda2f60625f6d33a210"
+measured_gfx1201_best_baseline_over_worst_candidate_l4 = 1.004753
+measured_gfx1201_best_baseline_over_worst_candidate_l24 = 1.011675
+measured_gfx1201_best_baseline_over_worst_candidate_l44 = 0.996460
+halo_changed_path_mismatched_gate_up_bytes = 2879401
+halo_changed_path_mismatched_down_bytes = 12493475
+
+[[killed]]
+id = "moe-astat"
+design = "asymmetric F16 activation-stationary MoE"
+gate = "pair >= 1.15x speedup on every real route and byte-identical"
+report = "fn-wmo/moe-astat.md"
+base_commit = "fe77c083756a8815ce8aa341da572d91b1104efc"
+measured_pair_speedup_l4 = 0.227
+measured_pair_speedup_l24 = 0.225
+measured_pair_speedup_l44 = 0.230
+measured_full_work_byte_diffs = 0
+
+[[killed]]
+id = "qsa-f32-kill"
+design = "source-F32 tiled QSA R1/R2"
+gate = "full-output matched SYM elapsed time and per-element numerical envelope"
+report = "fn-wmo/qsa-f32-kill/report.md"
+measured_halo_hg4_ms = 32.572
+measured_halo_r2_ms = 65.936
+measured_gfx1201_hg4_ms = 19.052
+measured_gfx1201_r2_ms = 44.900
+measured_halo_r2_envelope_violations = 46066
+measured_gfx1201_r2_envelope_violations = 45467
+
+[[killed]]
+id = "pm-wait-delete"
+design = "delete eager waits and insert replacements"
+gate = "NT4/NT8 timed regression despite byte identity"
+report = "pm-wait-delete/three-process-timings.json"
+counts_report = "pm-wait-delete/wait-counts.tsv"
+measured_halo_nt4_gate_up_regression_percent_min = 12.2
+measured_halo_nt4_down_regression_percent_max = 15.5
+measured_gfx1201_nt4_regression_percent_max = 24.2
+measured_gfx1201_nt8_regression_percent_max = 23.1
+regressed_symbols = 6
+neutral_symbols = 20
+
+[[killed]]
+id = "wmo-qsa"
+design = "gathered QSA prefetch pipe, depth 1/2"
+gate = ">= 15% improvement versus current gathered while byte-identical"
+report = "fn-wmo/unit2-pipe/result.json"
+measured_halo_all72_baseline_ms_process1 = 438.0005784034729
+measured_halo_all72_depth1_ms_process1 = 419.6411814689636
+measured_halo_all72_depth2_ms_process1 = 509.63849401474
+measured_byte_diffs = 0
+
+[[killed]]
+id = "sparse24"
+design = "2:4 sparse expert weights for swmmac, rotated/original bases, with or without SparseGPT"
+gate = "routed relative SSE versus shipped asymmetric RTN F16"
+report = "fn-requant/sparse24/report.md"
+measured_magnitude_rotated_error_ratio = 14.697
+measured_sparsegpt_rotated_error_ratio = 12.142
+measured_sparsegpt_original_error_ratio = 11.383

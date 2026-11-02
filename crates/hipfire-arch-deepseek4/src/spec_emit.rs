@@ -17,7 +17,7 @@ use hipfire_runtime::prompt_frame::{ThinkMode, ToolCall};
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, FinishSummary, SpecEmit, SpecEmitCtx, SpecGrammar, StopReason,
 };
-use hipfire_runtime::tokenizer::Tokenizer;
+use hipfire_runtime::tokenizer::{TokenTextStream, Tokenizer};
 
 pub struct Deepseek4Emit<'a> {
     tokenizer: &'a Tokenizer,
@@ -39,6 +39,11 @@ pub struct Deepseek4Emit<'a> {
     /// matcher and never calls `grammar()`). The matcher advances inside the
     /// spec step ONLY — `observe` must NOT touch it (single-advance invariant).
     grammar: Option<Deepseek4SpecGrammar>,
+    /// Incremental token → text decoder. Byte-level BPE and byte-fallback
+    /// spread one character across several tokens, so decoding per token would
+    /// hand the DSML parser (and the client) a U+FFFD per fragment. Holds back
+    /// only the trailing incomplete codepoint; drained in `finish`.
+    text_stream: TokenTextStream,
 }
 
 /// Map a visible DSML channel event into a client event. ToolCalls/Malformed
@@ -108,7 +113,7 @@ impl<'a> Deepseek4Emit<'a> {
     /// built from `ctx.tools` + `ctx.decoded_vocab`.
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
         let parser = match ctx.think_mode {
-            ThinkMode::High | ThinkMode::Max => dsml::StreamParser::new_in_think(),
+            ThinkMode::Low | ThinkMode::High | ThinkMode::Max => dsml::StreamParser::new_in_think(),
             ThinkMode::NonThink => dsml::StreamParser::new(),
         };
         let grammar = build_grammar(ctx.tools, ctx.decoded_vocab);
@@ -120,6 +125,7 @@ impl<'a> Deepseek4Emit<'a> {
             streamed_tokens: Vec::new(),
             visible_acc: String::new(),
             grammar,
+            text_stream: TokenTextStream::new(),
         })
     }
 
@@ -131,13 +137,19 @@ impl<'a> Deepseek4Emit<'a> {
     fn feed_and_emit(&mut self, token: u32) -> Vec<ClientEvent> {
         let mut events = Vec::new();
         self.streamed_tokens.push(token);
-        let frag = self.tokenizer.decode(&[token]);
-        for ev in self.deferred.absorb_all(self.parser.feed(&frag)) {
-            if let Some(ce) = visible_client_event(ev) {
-                if let ClientEvent::Token(ref t) = ce {
-                    self.visible_acc.push_str(t);
+        // Never `self.tokenizer.decode(&[token])` — that is lossy per token and
+        // turns any character whose UTF-8 spans several tokens (emoji,
+        // byte-fallback CJK) into U+FFFD. `frag` is empty while a character is
+        // still split; the tail is drained in `finish`.
+        let frag = self.text_stream.push(self.tokenizer, token);
+        if !frag.is_empty() {
+            for ev in self.deferred.absorb_all(self.parser.feed(&frag)) {
+                if let Some(ce) = visible_client_event(ev) {
+                    if let ClientEvent::Token(ref t) = ce {
+                        self.visible_acc.push_str(t);
+                    }
+                    events.push(ce);
                 }
-                events.push(ce);
             }
         }
         events.push(ClientEvent::Committed {
@@ -200,6 +212,20 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
         // held finish events for the wrapper — the generic generate_spec core
         // must NOT render them before length/malformed is known.
         let mut events = Vec::new();
+        // Generation can stop mid-character (max_tokens reached between two
+        // byte-fallback tokens). Feed the held-back tail through the DSML
+        // parser before finishing it, or those bytes vanish silently.
+        let tail = self.text_stream.flush();
+        if !tail.is_empty() {
+            for ev in self.deferred.absorb_all(self.parser.feed(&tail)) {
+                if let Some(ce) = visible_client_event(ev) {
+                    if let ClientEvent::Token(ref t) = ce {
+                        self.visible_acc.push_str(t);
+                    }
+                    events.push(ce);
+                }
+            }
+        }
         let parser = std::mem::replace(&mut self.parser, dsml::StreamParser::new());
         for ev in self.deferred.absorb_all(parser.finish()) {
             if let Some(ce) = visible_client_event(ev) {
@@ -233,8 +259,10 @@ impl<'a> SpecEmit for Deepseek4Emit<'a> {
                 let held: Vec<ToolCall> = calls
                     .into_iter()
                     .map(|c| ToolCall {
+                        id: None,
                         name: c.name,
                         arguments: c.arguments,
+                        rendered_body: None,
                     })
                     .collect();
                 events.push(ClientEvent::ToolCalls(held));

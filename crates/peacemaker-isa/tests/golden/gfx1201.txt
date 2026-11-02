@@ -1,0 +1,19 @@
+s_wait_loadcnt 0x3
+s_wait_dscnt 0x1
+s_wait_loadcnt_dscnt 0x205
+s_wait_kmcnt 0x0
+s_wait_alu depctr_sa_sdst(0)
+s_wait_alu depctr_va_sdst(0)
+s_barrier_signal -1
+s_barrier_wait 0xffff
+global_inv scope:SCOPE_SE
+v_wmma_i32_16x16x32_iu4 v[57:64], v[71:72], v[1:2], 0 neg_lo:[1,1,0]
+v_swmmac_i32_16x16x64_iu4 v[0:7], v[8:9], v[10:13], v14
+v_dual_mul_f32 v83, v97, v81 :: v_dual_mul_f32 v84, v98, v81
+v_dual_fmac_f32 v163, v83, v57 :: v_dual_fmac_f32 v166, v84, v58
+buffer_load_b64 v[0:1], v2, s[4:7], s8 offen
+ds_load_2addr_stride64_b64 v[71:74], v81 offset1:1
+s_clause 0x1
+v_cvt_f32_i32_e32 v57, v57
+s_sendmsg sendmsg(MSG_DEALLOC_VGPRS)
+s_endpgm

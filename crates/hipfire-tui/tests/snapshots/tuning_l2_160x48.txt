@@ -1,0 +1,48 @@
+                                                 hipfire · control panel    serve: offline    model: qwen3.8:27b
+
+ Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ┌   Balanced  (current) ────────────────────────────┐┌ > Quality-first ─────────────────────────────────┐┌   Low-power ──────────────────────────────────────┐
+ │What hipfire ships for this GPU. Fast, good        ││More accurate answers. Long prompts take longer to││Less work per answer: shorter thinking.            │
+ │answers.                                           ││read.                                             ││Keeps the fastest prompt math. Does not change your│
+ │Removes settings a preset added; keeps yours.      ││Typing speed after that is about the same.        ││GPU's power limit.                                 │
+ │in effect now                                      ││2 changes · preview below                         ││1 change                                           │
+ │                                                   ││                                                  ││                                                   │
+ └───────────────────────────────────────────────────┘└──────────────────────────────────────────────────┘└───────────────────────────────────────────────────┘
+ ┌ Preview · Quality-first · gfx1201 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+ │Only the ticked rows are written to ~/.hipfire/config.toml (all models). Nothing else you set is touched; u undoes it later.                                │
+ │                                                                                                                                                            │
+ │    Setting                 Change                                    Closer to full model          Prompt speed                  Typing speed              │
+ │[x] Prompt processing       Fast (4-bit math) → Accurate (fp8)        40% closer                    4,641 → 3,852 tok/s           unchanged                 │
+ │      writes                kernel.iu4_prefill = false                WT2 KLD 0.0696 → 0.0419       pp8192 · 1.2× slower                                    │
+ │      measured: AGENTS.md:639-642; CHANGELOG.md:1770 · cross-card: A4 on card C vs fp8 on card A, 300 W                                                     │
+ │[x] Flash-Next experts      Fast (4-bit) → Accurate (16-bit)          not measured here             not measured here             unchanged                 │
+ │      writes                developer.qwen4_moe_sym_iu4 = false                                                                                             │
+ │      measured: only Strix Halo measured                                                                                                                    │
+ │                                                                                                                                                            │
+ │Not changed, and why                                                                                                                                        │
+ │    KV cache                             fp8 vs exact within noise                                                                                          │
+ │    speculation                          designed lossless                                                                                                  │
+ │    context, devices, offload, model     yours; presets never change them                                                                                   │
+ │                                                                                                                                                            │
+ │Checks                                                                                                                                                      │
+ │  ok  No environment variable overrides developer.qwen4_moe_sym_iu4, kernel.iu4_prefill in this shell.                                                      │
+ │  ok  No model has its own value for these keys (models.toml).                                                                                              │
+ │                                                                                                                                                            │
+ │After saving, these rows show ● and From "preset". Changing one by hand makes the tuning read "Quality-first (edited)".                                     │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ │                                                                                                                                                            │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+←→ preset · y save 2 changes · Y save and restart serve · Space tick/untick · ↑↓ move · u undo last tuning · Esc back to Settings    loaded hipfire state
+

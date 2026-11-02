@@ -81,7 +81,29 @@ fn main() {
     // mirrors daemon.rs:1500-1504 and eval_hipfire's load path. HFQ files
     // take the canonical HFQ path below.
     let t_load = Instant::now();
-    let (config, weights, model_bytes) = if model_path_buf.is_dir() {
+    let (config, weights, model_bytes) = if model_path_buf.extension().is_some_and(|e| e == "gguf")
+    {
+        // GGUF-native (`HIPFIRE_GGUF_NATIVE=1`): ggml block bytes served as-is.
+        let m = hipfire_loader::gguf_native::GgufNativeModel::open(model_path_buf).unwrap_or_else(
+            |e| {
+                eprintln!("{e}");
+                std::process::exit(1)
+            },
+        );
+        let config = m.hparams.config.clone();
+        eprintln!(
+            "Config: dim={} layers={} heads={} kv_heads={} vocab={}",
+            config.dim, config.n_layers, config.n_heads, config.n_kv_heads, config.vocab_size
+        );
+        let bytes = std::fs::metadata(model_path).map(|m| m.len()).unwrap_or(0);
+        eprintln!(
+            "Model size: {:.3} GiB ({} bytes, GGUF)",
+            bytes as f64 / (1024.0 * 1024.0 * 1024.0),
+            bytes
+        );
+        let weights = m.load_qwen35_weights(&mut gpu).expect("load GGUF weights");
+        (config, weights, bytes)
+    } else if model_path_buf.is_dir() {
         use hipfire_runtime::safetensors_source::SafetensorsSource;
         let source = SafetensorsSource::open(model_path_buf).expect("safetensors open");
         let config = qwen35::config_from_safetensors(&source).expect("config_from_safetensors");
@@ -137,7 +159,7 @@ fn main() {
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
     // KV cache mode via resolved TOML policy:
-    //   q8 (default) | asym4 | asym3 | asym2
+    //   q8 (default) | asym4 | asym3 | fwht3 | asym2
     let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
         "auto" => "q8".to_string(),
         mode => mode.to_string(),
@@ -168,6 +190,14 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
+        "fwht3" => KvCache::new_gpu_fwht3_filtered(
+            &mut gpu,
+            &vec![true; config.n_layers],
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
         "asym2" | "turbo2" => KvCache::new_gpu_asym2(
             &mut gpu,
             config.n_layers,
@@ -176,7 +206,7 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|asym2)"),
+        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|fwht3|asym2)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
@@ -250,6 +280,14 @@ fn main() {
             "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
                 &mut gpu,
                 config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap(),
+            "fwht3" => KvCache::new_gpu_fwht3_filtered(
+                &mut gpu,
+                &vec![true; config.n_layers],
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
@@ -426,6 +464,14 @@ fn main() {
                     "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
                         &mut gpu,
                         config.n_layers,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_seq,
+                    )
+                    .unwrap(),
+                    "fwht3" => KvCache::new_gpu_fwht3_filtered(
+                        &mut gpu,
+                        &vec![true; config.n_layers],
                         config.n_kv_heads,
                         config.head_dim,
                         kv_seq,
@@ -676,6 +722,7 @@ fn main() {
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
+    eprintln!("PREFILL_NEXT_TOKEN  token_id={next_token}");
 
     // === WARMUP ===
     eprintln!("\n=== warmup ({warmup_len} tokens — untimed, lets JIT settle) ===");
@@ -745,6 +792,9 @@ fn main() {
         .expect("gen forward failed");
         let logits = gpu.download_f32(&scratch.logits).unwrap();
         let t_ms = t.elapsed().as_secs_f64() * 1000.0;
+        if std::env::var("HIPFIRE_SLOW_TOKEN_LOG").ok().as_deref() == Some("1") && t_ms > 50.0 {
+            eprintln!("  [slow-token] step={step} pos={pos} t_ms={t_ms:.1}");
+        }
         per_token_ms.push(t_ms);
         next_token = llama::argmax(&logits);
     }

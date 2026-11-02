@@ -1,0 +1,20 @@
+{"header":1,"tag":"27b","layers":64,"budgets":"56 48","head":"a7e3e1c33a58ccdee0ebb73f28f76c200d084947","daemon_md5":"b35c25f032f80882d757512d0f8ee98a","hipfire_md5":"ee24d2671dc3480ac8949a43df71b156","model_md5":"d1292b4d5bd6046693604201a6ca8074","prompt_md5":"5835c71e471849b4a72e1dc8e39695e7","load_start":4.45}
+{"tag":"27b","budget":56,"round":1,"arm":"cpu","decode":15.0,"wall":13.9}
+{"tag":"27b","budget":56,"round":1,"arm":"passback","decode":17.0,"wall":15.6}
+{"tag":"27b","budget":56,"round":1,"arm":"pcie","decode":11.7,"wall":11.0}
+{"tag":"27b","budget":56,"round":2,"arm":"passback","decode":16.6,"wall":15.2}
+{"tag":"27b","budget":56,"round":2,"arm":"pcie","decode":11.7,"wall":11.0}
+{"tag":"27b","budget":56,"round":2,"arm":"cpu","decode":15.0,"wall":13.9}
+{"tag":"27b","budget":56,"round":3,"arm":"pcie","decode":11.7,"wall":11.0}
+{"tag":"27b","budget":56,"round":3,"arm":"cpu","decode":14.9,"wall":13.9}
+{"tag":"27b","budget":56,"round":3,"arm":"passback","decode":16.9,"wall":15.5}
+{"tag":"27b","budget":48,"round":1,"arm":"cpu","decode":9.6,"wall":8.8}
+{"tag":"27b","budget":48,"round":1,"arm":"passback","decode":11.2,"wall":10.1}
+{"tag":"27b","budget":48,"round":1,"arm":"pcie","decode":6.9,"wall":6.5}
+{"tag":"27b","budget":48,"round":2,"arm":"passback","decode":11.4,"wall":10.3}
+{"tag":"27b","budget":48,"round":2,"arm":"pcie","decode":6.9,"wall":6.5}
+{"tag":"27b","budget":48,"round":2,"arm":"cpu","decode":9.6,"wall":8.8}
+{"tag":"27b","budget":48,"round":3,"arm":"pcie","decode":6.9,"wall":6.5}
+{"tag":"27b","budget":48,"round":3,"arm":"cpu","decode":9.6,"wall":8.8}
+{"tag":"27b","budget":48,"round":3,"arm":"passback","decode":11.3,"wall":10.2}
+{"footer":1,"tag":"27b","load_end":6.58}

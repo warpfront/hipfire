@@ -1,0 +1,254 @@
+{
+  "kernel_id": "fused_gate_up_hfq4g256_mq4v2",
+  "variant": "gfx1201",
+  "arch": "gfx1201",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "unknown",
+  "reg_plan": [
+    {
+      "name": "lane",
+      "kind": "v",
+      "base": 0,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "scratch",
+      "kind": "v",
+      "base": 4,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "x_lo",
+      "kind": "v",
+      "base": 8,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "x_hi",
+      "kind": "v",
+      "base": 12,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "levels_lo",
+      "kind": "v",
+      "base": 16,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "levels_hi",
+      "kind": "v",
+      "base": 20,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "accumulators",
+      "kind": "v",
+      "base": 24,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "addresses",
+      "kind": "v",
+      "base": 28,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "abi",
+      "kind": "s",
+      "base": 0,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "pointers0",
+      "kind": "s",
+      "base": 4,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "pointers1",
+      "kind": "s",
+      "base": 8,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "resource",
+      "kind": "s",
+      "base": 12,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "shape",
+      "kind": "s",
+      "base": 16,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "loop",
+      "kind": "s",
+      "base": 20,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "masks",
+      "kind": "s",
+      "base": 24,
+      "len": 4,
+      "live": "Whole"
+    },
+    {
+      "name": "temps",
+      "kind": "s",
+      "base": 28,
+      "len": 4,
+      "live": "Whole"
+    }
+  ],
+  "next_free_vgpr": 32,
+  "next_free_sgpr": 32,
+  "waits": [
+    {
+      "pc_index": 5,
+      "insn": "s_wait_kmcnt 0x0",
+      "counter": "Km",
+      "count": 0,
+      "reason": {
+        "Use": {
+          "reg": "s[4:5]"
+        }
+      }
+    },
+    {
+      "pc_index": 8,
+      "insn": "s_wait_loadcnt 0x0",
+      "counter": "Load",
+      "count": 0,
+      "reason": {
+        "Use": {
+          "reg": "v[6:7]"
+        }
+      }
+    },
+    {
+      "pc_index": 14,
+      "insn": "s_wait_loadcnt 0x2",
+      "counter": "Load",
+      "count": 2,
+      "reason": {
+        "Use": {
+          "reg": "v4"
+        }
+      }
+    },
+    {
+      "pc_index": 39,
+      "insn": "s_wait_loadcnt 0x1",
+      "counter": "Load",
+      "count": 1,
+      "reason": {
+        "Use": {
+          "reg": "v[8:11]"
+        }
+      }
+    },
+    {
+      "pc_index": 44,
+      "insn": "s_wait_loadcnt 0x0",
+      "counter": "Load",
+      "count": 0,
+      "reason": {
+        "Use": {
+          "reg": "v[12:15]"
+        }
+      }
+    },
+    {
+      "pc_index": 57,
+      "insn": "s_wait_dscnt 0x0",
+      "counter": "Ds",
+      "count": 0,
+      "reason": "Barrier"
+    },
+    {
+      "pc_index": 64,
+      "insn": "s_wait_dscnt 0x0",
+      "counter": "Ds",
+      "count": 0,
+      "reason": "Barrier"
+    },
+    {
+      "pc_index": 71,
+      "insn": "s_wait_dscnt 0x0",
+      "counter": "Ds",
+      "count": 0,
+      "reason": "Barrier"
+    },
+    {
+      "pc_index": 78,
+      "insn": "s_wait_dscnt 0x0",
+      "counter": "Ds",
+      "count": 0,
+      "reason": "Barrier"
+    },
+    {
+      "pc_index": 85,
+      "insn": "s_wait_dscnt 0x0",
+      "counter": "Ds",
+      "count": 0,
+      "reason": "Barrier"
+    },
+    {
+      "pc_index": 88,
+      "insn": "s_wait_storecnt 0x0",
+      "counter": "Store",
+      "count": 0,
+      "reason": "Barrier"
+    }
+  ],
+  "hazards": [
+    {
+      "pc_index": 60,
+      "insn": "s_wait_alu depctr_va_sdst(0)",
+      "rule": "gfx12 SGPR read-after-write"
+    },
+    {
+      "pc_index": 67,
+      "insn": "s_wait_alu depctr_va_sdst(0)",
+      "rule": "gfx12 SGPR read-after-write"
+    },
+    {
+      "pc_index": 74,
+      "insn": "s_wait_alu depctr_va_sdst(0)",
+      "rule": "gfx12 SGPR read-after-write"
+    },
+    {
+      "pc_index": 81,
+      "insn": "s_wait_alu depctr_va_sdst(0)",
+      "rule": "gfx12 SGPR read-after-write"
+    }
+  ],
+  "clauses": [],
+  "vopd_pairs": 0,
+  "lds_slots": [],
+  "barriers": [],
+  "loop_fixpoints": [],
+  "forbidden_mnemonics_checked": [
+    "s_waitcnt (gfx12)",
+    "scratch_*"
+  ],
+  "s_text_sha256": "71058b2263a35fb020d53ee68f1387237236a16b268349d35e938842643e7bad"
+}

@@ -245,7 +245,7 @@ so they can't be set piecemeal. The VL arm must likewise set `vision_config`/`vi
 5. **Fold pp>1** — move `load_model_pp` into `Qwen35Carrier` `pp>1` arm, reproducing the
    draft/cask/kv_adaptive drop (S3) and setting all four pp fields + the
    `pp>1 ⇒ pp_gpus.is_some()` debug-assert (S4); delete `pp>1` pre-branch. Build + coherence.
-   ⚠️ pp>1 functional validation requires hiptrx (4×R9700) — required-before-merge, not skippable.
+   ⚠️ pp>1 functional validation requires the 4×R9700 (gfx1201) multi-GPU box — required-before-merge, not skippable.
 6. **Fold VL** — move vision detection into `Qwen35Carrier`. Build + VL smoke if a model is
    present.
 7. **Dead-code sweep** — delete orphaned `parse_kv_adaptive` / `screen_weights_qwen35` /
@@ -258,9 +258,9 @@ so they can't be set piecemeal. The VL arm must likewise set `vision_config`/`vi
 - `coherence-gate.sh` green (qwen35 arch 5/6 covered) + human eyeball.
 - `coherence-gate-dflash.sh` green (spec path) + three-tier eyeball.
 - Fresh-process perf A/B (`scripts/probe_commits.sh`) Δ≈0% — dispatch is once-per-call.
-- **Functional smoke gaps to close (cannot run on k9lin):**
+- **Functional smoke gaps to close (cannot run on the gfx1100 dev workstation):**
   - qwen2 (arch 7) + llama (arch <5): no local models — source one each.
-  - pp>1: hiptrx only.
+  - pp>1: the 4×R9700 (gfx1201) multi-GPU box only.
   - VL: no local model.
 
 ### Tier 2: unified loader (WeightSource + device slice) — added 2026-06-12

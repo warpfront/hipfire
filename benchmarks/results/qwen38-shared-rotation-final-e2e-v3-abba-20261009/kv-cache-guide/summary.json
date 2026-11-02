@@ -1,0 +1,17 @@
+{
+  "scenario": "kv-cache-guide",
+  "A_decode_median": 61.5,
+  "B_decode_median": 61.85,
+  "speedup": 1.005691056910569,
+  "A_range": [
+    61.5,
+    63.8
+  ],
+  "B_range": [
+    61.6,
+    62.4
+  ],
+  "text_parity": true,
+  "tau_parity": true,
+  "cycles_parity": true
+}

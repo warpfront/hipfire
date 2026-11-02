@@ -17,7 +17,8 @@
 // Each token writes to its own M-column slice of x_residual, so no
 // cross-token atomicAdd is needed. Each thread owns one output cell.
 //
-// Grid: ((M + BLOCK_M - 1) / BLOCK_M, N). Block: BLOCK_M = 256 threads.
+// Grid: (N, (M + BLOCK_M - 1) / BLOCK_M). Block: BLOCK_M = 256 threads.
+// Token on x (limit 2^31); the column tile on y stays far below 65535.
 
 extern "C" __global__ void moe_down_combine_k8_batched(
     const float* __restrict__ expert_outputs, // [N × K_TOP × M]
@@ -25,8 +26,8 @@ extern "C" __global__ void moe_down_combine_k8_batched(
     float*       __restrict__ x_residual,     // [N × M] accumulated in place
     int M, int K_TOP
 ) {
-    const int bid = blockIdx.y;          // token id
-    const int col = blockIdx.x * blockDim.x + threadIdx.x; // m column
+    const int bid = blockIdx.x;          // token id
+    const int col = blockIdx.y * blockDim.x + threadIdx.x; // m column
     if (col >= M) return;
 
     const long long token_base   = (long long)bid * K_TOP * M;

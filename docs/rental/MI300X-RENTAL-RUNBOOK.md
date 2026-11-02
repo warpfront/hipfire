@@ -54,11 +54,11 @@ running the v3 model sweep + sub-0.10 KLD attempt. Estimated total cost:
 
 ## Why this runbook exists
 
-Running the v3 recipe across the full Qwen3.5/3.6 model lineup on hiptrx
+Running the v3 recipe across the full Qwen3.5/3.6 model lineup on the gfx1201 box
 requires queuing against a shared workstation (4× R9700, 16GB each, TP-
 required for BF16 27B). On 1× MI300x (192GB HBM3) every model fits solo,
 the iterate pipeline runs 4× faster, and we get production-side validation
-on a CDNA3 target. Total clock: ~10h compressed from hiptrx's ~30h
+on a CDNA3 target. Total clock: ~10h compressed from the workstation's ~30h
 contested. Plus MI300x is a real deploy target for hipfire (CHANGELOG: 10
 hot HFQ4 kernels wave64-ported, matches 7900 XTX baseline).
 
@@ -229,15 +229,15 @@ plan needs revision — power off and report.
 
 | Model | Expected v3 KLD | Comparison anchor |
 |---|---|---|
-| Qwen3.5-0.8B | ~0.10-0.13 | KMD2-q8conv1d on hiptrx was 0.0804 (different recipe though) |
-| Qwen3.5-9B | 0.1257 | hiptrx anchor — should match within 1% |
+| Qwen3.5-0.8B | ~0.10-0.13 | KMD2-q8conv1d on the gfx1201 workstation was 0.0804 (different recipe though) |
+| Qwen3.5-9B | 0.1257 | gfx1201 workstation anchor — should match within 1% |
 | Qwen3.5-27B | unknown | first measurement on this branch |
 | Qwen3.6-27B | unknown | first measurement |
 | Qwen3.6-35B-A3B | unknown | first measurement; router-AWQ risk |
 
 **Caveat:** these KLDs are produced by `eval_hipfire` against `kldref.bin`
 generated on the MI300x (via PyTorch BF16 forward). Cross-machine comparison
-with hiptrx numbers is only valid if the same BF16 source revision was used —
+with gfx1201 workstation numbers is only valid if the same BF16 source revision was used —
 which is what `MODEL_REVISIONS` in bootstrap pins.
 
 ## When you're done

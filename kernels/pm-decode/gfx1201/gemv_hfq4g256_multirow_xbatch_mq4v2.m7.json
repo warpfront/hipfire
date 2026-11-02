@@ -1,0 +1,18 @@
+{
+  "gemv_mq4g256v2_multirow_r2_xbatch_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 1513,
+    "instructions": 5756,
+    "lds_accesses": 360,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 360,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 48,
+    "table": "gfx1201",
+    "vgpr_high_water": 121,
+    "wait_facts": 529
+  }
+}

@@ -1,0 +1,5 @@
+# W8c: down n=1024 x3 (coarse, v2), plus L42
+--mode coop --layer 2 --xq $DATA/L2.down.a4.bin --npu-cols 1024 --iters 6 --pack wb --reg coarse --glue v2
+--mode coop --layer 2 --xq $DATA/L2.down.a4.bin --npu-cols 1024 --iters 6 --pack wb --reg coarse --glue v2
+--mode coop --layer 2 --xq $DATA/L2.down.a4.bin --npu-cols 1024 --iters 6 --pack wb --reg coarse --glue v2
+--mode coop --layer 42 --xq $DATA/L42.down.a4.bin --npu-cols 1024 --iters 6 --pack wb --reg coarse --glue v2

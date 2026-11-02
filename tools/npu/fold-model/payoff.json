@@ -1,0 +1,3427 @@
+{
+  "measured_halo_gemm_ms": 5287.407999999999,
+  "measured_halo_remainder_ms": 1523.2820000000002,
+  "note": "ALL gains/shares ESTIMATES. Mixed mode keeps current GPU fold; split is numeric identity. Full mode transfers gfx1151 measuredGPU1.57 penalty to gfx1152, not a gfx1152 measurement. NPU beta/GPU slowdown copied from drift-flaggedHalo; V8traffic2.44B/kop or25%retile3.05;55GB/s cap;submit0.215ms;GPUring0.020ms. gfx1152 assumes8CU3GHz,70%IU4efficiency,128GB/sLPDDR5X,identicalNPUrate/port. Metadata/epilogue200GB/s assumed. Actual NPUIEF15/retile traffic and currentfoldstridedGPU speed unmeasured.",
+  "rows": [
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6589.168941517573,
+      "gain_pct": 3.3618967801333444,
+      "gemms": [
+        {
+          "call_ms": 11.025175113038248,
+          "fraction": 0.175,
+          "kind": "qkv",
+          "npu_gbps": 39.54507999999999
+        },
+        {
+          "call_ms": 7.293515941447524,
+          "fraction": 0.2,
+          "kind": "zba",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 13.054560582086406,
+          "fraction": 0.1875,
+          "kind": "fa_q",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 1.386,
+          "fraction": 0.0,
+          "kind": "fa_kv",
+          "npu_gbps": 0.0
+        },
+        {
+          "call_ms": 6.558483082635339,
+          "fraction": 0.15,
+          "kind": "o",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 36.88085115152712,
+          "fraction": 0.19117647058823528,
+          "kind": "gate_up",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 18.019490790663692,
+          "fraction": 0.15,
+          "kind": "down",
+          "npu_gbps": 39.54507999999999
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.17558039552880478
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6635.257154250128,
+      "gain_pct": 2.643949460760542,
+      "gemms": [
+        {
+          "call_ms": 11.18856304975655,
+          "fraction": 0.175,
+          "kind": "qkv",
+          "npu_gbps": 49.431349999999995
+        },
+        {
+          "call_ms": 7.293515941447524,
+          "fraction": 0.2,
+          "kind": "zba",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 13.247183754925969,
+          "fraction": 0.1875,
+          "kind": "fa_q",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 1.386,
+          "fraction": 0.0,
+          "kind": "fa_kv",
+          "npu_gbps": 0.0
+        },
+        {
+          "call_ms": 6.656963577517475,
+          "fraction": 0.15,
+          "kind": "o",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 37.053674872395064,
+          "fraction": 0.19117647058823528,
+          "kind": "gate_up",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 18.297618153111166,
+          "fraction": 0.15,
+          "kind": "down",
+          "npu_gbps": 49.43135
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.17558039552880478
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8635.969575419049,
+      "gain_pct": -21.13578052213645,
+      "gemms": [
+        {
+          "call_ms": 15.722204543518227,
+          "fraction": 0.25,
+          "kind": "qkv",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 10.111357390026534,
+          "fraction": 0.28,
+          "kind": "zba",
+          "npu_gbps": 39.54507999999999
+        },
+        {
+          "call_ms": 18.564881735763553,
+          "fraction": 0.2708333333333333,
+          "kind": "fa_q",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 1.913254384733165,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 9.142414019062485,
+          "fraction": 0.25,
+          "kind": "o",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 52.00936240073941,
+          "fraction": 0.2647058823529412,
+          "kind": "gate_up",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 25.0109478696547,
+          "fraction": 0.25,
+          "kind": "down",
+          "npu_gbps": 39.54508
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.2596732588134136
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8727.96776267108,
+      "gain_pct": -21.96705825233619,
+      "gemms": [
+        {
+          "call_ms": 15.747040287184548,
+          "fraction": 0.275,
+          "kind": "qkv",
+          "npu_gbps": 49.431349999999995
+        },
+        {
+          "call_ms": 10.22599928520882,
+          "fraction": 0.28,
+          "kind": "zba",
+          "npu_gbps": 49.431349999999995
+        },
+        {
+          "call_ms": 18.677851987825182,
+          "fraction": 0.2708333333333333,
+          "kind": "fa_q",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 1.9414506698606306,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 9.27883846932568,
+          "fraction": 0.25,
+          "kind": "o",
+          "npu_gbps": 49.43135000000001
+        },
+        {
+          "call_ms": 52.778172492418406,
+          "fraction": 0.2647058823529412,
+          "kind": "gate_up",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 25.396236068809877,
+          "fraction": 0.25,
+          "kind": "down",
+          "npu_gbps": 49.43135000000001
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.2622527944969905
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6470.1252120373965,
+      "gain_pct": 5.263650652834295,
+      "gemms": [
+        {
+          "call_ms": 10.860496866678057,
+          "fraction": 0.2,
+          "kind": "qkv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 7.190007718201166,
+          "fraction": 0.2,
+          "kind": "zba",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 13.076181806428849,
+          "fraction": 0.20833333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 1.386,
+          "fraction": 0.0,
+          "kind": "fa_kv",
+          "npu_gbps": 0.0
+        },
+        {
+          "call_ms": 6.3408588894858475,
+          "fraction": 0.2,
+          "kind": "o",
+          "npu_gbps": 43.70772000000001
+        },
+        {
+          "call_ms": 36.28183184029766,
+          "fraction": 0.20588235294117646,
+          "kind": "gate_up",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 17.17181056803418,
+          "fraction": 0.2,
+          "kind": "down",
+          "npu_gbps": 43.70772
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.20171969045571797
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6545.323265587112,
+      "gain_pct": 4.054295313542244,
+      "gemms": [
+        {
+          "call_ms": 11.035611210337862,
+          "fraction": 0.2,
+          "kind": "qkv",
+          "npu_gbps": 54.63465000000001
+        },
+        {
+          "call_ms": 7.306170107557282,
+          "fraction": 0.2,
+          "kind": "zba",
+          "npu_gbps": 54.63465000000001
+        },
+        {
+          "call_ms": 13.110407443691745,
+          "fraction": 0.20833333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 1.386,
+          "fraction": 0.0,
+          "kind": "fa_kv",
+          "npu_gbps": 0.0
+        },
+        {
+          "call_ms": 6.414960392403884,
+          "fraction": 0.2,
+          "kind": "o",
+          "npu_gbps": 54.63465000000001
+        },
+        {
+          "call_ms": 36.86636462203684,
+          "fraction": 0.20588235294117646,
+          "kind": "gate_up",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 17.461131911013595,
+          "fraction": 0.2,
+          "kind": "down",
+          "npu_gbps": 54.63464999999999
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.20171969045571797
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8599.260308206407,
+      "gain_pct": -20.799118111351355,
+      "gemms": [
+        {
+          "call_ms": 15.406025719720375,
+          "fraction": 0.275,
+          "kind": "qkv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 10.140022522458246,
+          "fraction": 0.28,
+          "kind": "zba",
+          "npu_gbps": 43.707719999999995
+        },
+        {
+          "call_ms": 18.20708960100039,
+          "fraction": 0.2916666666666667,
+          "kind": "fa_q",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 1.925126504786835,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 9.199855892857515,
+          "fraction": 0.25,
+          "kind": "o",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 51.5152588587648,
+          "fraction": 0.27941176470588236,
+          "kind": "gate_up",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 25.173174479825303,
+          "fraction": 0.25,
+          "kind": "down",
+          "npu_gbps": 43.70772
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.26999140154772144
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8638.676690431283,
+      "gain_pct": -21.16049432034042,
+      "gemms": [
+        {
+          "call_ms": 15.641635703714618,
+          "fraction": 0.3,
+          "kind": "qkv",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 10.304159978618438,
+          "fraction": 0.28,
+          "kind": "zba",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 18.39897323470172,
+          "fraction": 0.2916666666666667,
+          "kind": "fa_q",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 1.9562908199277182,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 54.63465000000001
+        },
+        {
+          "call_ms": 9.350640811569466,
+          "fraction": 0.25,
+          "kind": "o",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 51.55799026571541,
+          "fraction": 0.29411764705882354,
+          "kind": "gate_up",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 25.23217548031485,
+          "fraction": 0.3,
+          "kind": "down",
+          "npu_gbps": 54.63465000000001
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.29114359415305247
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6462.775487209024,
+      "gain_pct": 5.383360654869729,
+      "gemms": [
+        {
+          "call_ms": 10.855231569282836,
+          "fraction": 0.225,
+          "kind": "qkv",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 7.234260057003494,
+          "fraction": 0.2,
+          "kind": "zba",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 12.981991995132034,
+          "fraction": 0.20833333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 1.386,
+          "fraction": 0.0,
+          "kind": "fa_kv",
+          "npu_gbps": 0.0
+        },
+        {
+          "call_ms": 6.351542612417864,
+          "fraction": 0.2,
+          "kind": "o",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 36.04039818422284,
+          "fraction": 0.22058823529411764,
+          "kind": "gate_up",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 17.282028222502525,
+          "fraction": 0.2,
+          "kind": "down",
+          "npu_gbps": 47.87036
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.21117798796216683
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6547.990883190223,
+      "gain_pct": 4.011904132062383,
+      "gemms": [
+        {
+          "call_ms": 11.041466288155338,
+          "fraction": 0.2,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 7.310054083106795,
+          "fraction": 0.2,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 13.11734336514563,
+          "fraction": 0.20833333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.386,
+          "fraction": 0.0,
+          "kind": "fa_kv",
+          "npu_gbps": 0.0
+        },
+        {
+          "call_ms": 6.418385686990292,
+          "fraction": 0.2,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 36.88590890865791,
+          "fraction": 0.20588235294117646,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.47080558446602,
+          "fraction": 0.2,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.20171969045571797
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8357.103732620475,
+      "gain_pct": -18.50418257445248,
+      "gemms": [
+        {
+          "call_ms": 15.083300954980942,
+          "fraction": 0.3,
+          "kind": "qkv",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 9.754135146231162,
+          "fraction": 0.32,
+          "kind": "zba",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 17.92611106880473,
+          "fraction": 0.3125,
+          "kind": "fa_q",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 1.9369986248405044,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 8.754384582209042,
+          "fraction": 0.3,
+          "kind": "o",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 50.183919691792525,
+          "fraction": 0.3088235294117647,
+          "kind": "gate_up",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 23.76205614266284,
+          "fraction": 0.3,
+          "kind": "down",
+          "npu_gbps": 47.87035999999999
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.3055889939810834
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8621.607444413785,
+      "gain_pct": -21.00440615151339,
+      "gemms": [
+        {
+          "call_ms": 15.54607282850909,
+          "fraction": 0.3,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 10.3096480360699,
+          "fraction": 0.28,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.40871637910194,
+          "fraction": 0.2916666666666667,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.9573328218932036,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 9.328511409105452,
+          "fraction": 0.3,
+          "kind": "o",
+          "npu_gbps": 55.00000000000001
+        },
+        {
+          "call_ms": 51.540468913238136,
+          "fraction": 0.29411764705882354,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 25.069718592465453,
+          "fraction": 0.3,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.2952708512467756
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6376.62217807159,
+      "gain_pct": 6.807174861655052,
+      "gemms": [
+        {
+          "call_ms": 10.614791485672725,
+          "fraction": 0.25,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 7.051104594951456,
+          "fraction": 0.24,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 12.68796731880727,
+          "fraction": 0.25,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.289476375728155,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 6.386519819403636,
+          "fraction": 0.25,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 35.492901483287284,
+          "fraction": 0.25,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.887866901643637,
+          "fraction": 0.25,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.24935511607910577
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6547.990883190223,
+      "gain_pct": 4.011904132062383,
+      "gemms": [
+        {
+          "call_ms": 11.041466288155338,
+          "fraction": 0.2,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 7.310054083106795,
+          "fraction": 0.2,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 13.11734336514563,
+          "fraction": 0.20833333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.386,
+          "fraction": 0.0,
+          "kind": "fa_kv",
+          "npu_gbps": 0.0
+        },
+        {
+          "call_ms": 6.418385686990292,
+          "fraction": 0.2,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 36.88590890865791,
+          "fraction": 0.20588235294117646,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.47080558446602,
+          "fraction": 0.2,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.20171969045571797
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8245.424738362395,
+      "gain_pct": -17.400373951473902,
+      "gemms": [
+        {
+          "call_ms": 14.761143151941816,
+          "fraction": 0.35,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 9.578203569105453,
+          "fraction": 0.36,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.564700366213593,
+          "fraction": 0.3333333333333333,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.9573328218932036,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 8.84077638716509,
+          "fraction": 0.35,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 49.03434080616077,
+          "fraction": 0.3382352941176471,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 23.534011550301095,
+          "fraction": 0.35,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.3437661220980224
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8621.607444413785,
+      "gain_pct": -21.00440615151339,
+      "gemms": [
+        {
+          "call_ms": 15.54607282850909,
+          "fraction": 0.3,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 10.3096480360699,
+          "fraction": 0.28,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.40871637910194,
+          "fraction": 0.2916666666666667,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.9573328218932036,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 9.328511409105452,
+          "fraction": 0.3,
+          "kind": "o",
+          "npu_gbps": 55.00000000000001
+        },
+        {
+          "call_ms": 51.540468913238136,
+          "fraction": 0.29411764705882354,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 25.069718592465453,
+          "fraction": 0.3,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.2952708512467756
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6376.62217807159,
+      "gain_pct": 6.807174861655052,
+      "gemms": [
+        {
+          "call_ms": 10.614791485672725,
+          "fraction": 0.25,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 7.051104594951456,
+          "fraction": 0.24,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 12.68796731880727,
+          "fraction": 0.25,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.289476375728155,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 6.386519819403636,
+          "fraction": 0.25,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 35.492901483287284,
+          "fraction": 0.25,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.887866901643637,
+          "fraction": 0.25,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.24935511607910577
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 6547.990883190223,
+      "gain_pct": 4.011904132062383,
+      "gemms": [
+        {
+          "call_ms": 11.041466288155338,
+          "fraction": 0.2,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 7.310054083106795,
+          "fraction": 0.2,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 13.11734336514563,
+          "fraction": 0.20833333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.386,
+          "fraction": 0.0,
+          "kind": "fa_kv",
+          "npu_gbps": 0.0
+        },
+        {
+          "call_ms": 6.418385686990292,
+          "fraction": 0.2,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 36.88590890865791,
+          "fraction": 0.20588235294117646,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.47080558446602,
+          "fraction": 0.2,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.20171969045571797
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8245.424738362395,
+      "gain_pct": -17.400373951473902,
+      "gemms": [
+        {
+          "call_ms": 14.761143151941816,
+          "fraction": 0.35,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 9.578203569105453,
+          "fraction": 0.36,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.564700366213593,
+          "fraction": 0.3333333333333333,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.9573328218932036,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 8.84077638716509,
+          "fraction": 0.35,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 49.03434080616077,
+          "fraction": 0.3382352941176471,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 23.534011550301095,
+          "fraction": 0.35,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.3437661220980224
+    },
+    {
+      "arch": "gfx1151 Halo",
+      "baseline_ms": 6810.69,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 8621.607444413785,
+      "gain_pct": -21.00440615151339,
+      "gemms": [
+        {
+          "call_ms": 15.54607282850909,
+          "fraction": 0.3,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 10.3096480360699,
+          "fraction": 0.28,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.40871637910194,
+          "fraction": 0.2916666666666667,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 1.9573328218932036,
+          "fraction": 0.25,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 9.328511409105452,
+          "fraction": 0.3,
+          "kind": "o",
+          "npu_gbps": 55.00000000000001
+        },
+        {
+          "call_ms": 51.540468913238136,
+          "fraction": 0.29411764705882354,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 25.069718592465453,
+          "fraction": 0.3,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 1.0,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.2952708512467756
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 16520.7295895153,
+      "gain_pct": 60.68391512175309,
+      "gemms": [
+        {
+          "call_ms": 29.736038588116497,
+          "fraction": 0.5,
+          "kind": "qkv",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 18.970865118396887,
+          "fraction": 0.52,
+          "kind": "zba",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 35.47193042723762,
+          "fraction": 0.5208333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 3.590136444582524,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 17.26937042257605,
+          "fraction": 0.5,
+          "kind": "o",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 98.87336302026532,
+          "fraction": 0.5147058823529411,
+          "kind": "gate_up",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 47.197875284349514,
+          "fraction": 0.5,
+          "kind": "down",
+          "npu_gbps": 39.54508
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.5090283748925193
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 16603.709273696855,
+      "gain_pct": 59.880871638512765,
+      "gemms": [
+        {
+          "call_ms": 29.836247530079596,
+          "fraction": 0.525,
+          "kind": "qkv",
+          "npu_gbps": 49.431349999999995
+        },
+        {
+          "call_ms": 19.251129930811643,
+          "fraction": 0.52,
+          "kind": "zba",
+          "npu_gbps": 49.43135000000001
+        },
+        {
+          "call_ms": 35.47193042723762,
+          "fraction": 0.5208333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 3.6433495328155336,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 17.526835768673134,
+          "fraction": 0.5,
+          "kind": "o",
+          "npu_gbps": 49.43135000000001
+        },
+        {
+          "call_ms": 98.87336302026532,
+          "fraction": 0.5147058823529411,
+          "kind": "gate_up",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 47.92500564368932,
+          "fraction": 0.5,
+          "kind": "down",
+          "npu_gbps": 49.43135000000001
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.5116079105760963
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 19535.50575086874,
+      "gain_pct": 35.886705210744864,
+      "gemms": [
+        {
+          "call_ms": 35.47193042723762,
+          "fraction": 0.625,
+          "kind": "qkv",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 22.791643908632075,
+          "fraction": 0.64,
+          "kind": "zba",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 42.516534048685145,
+          "fraction": 0.625,
+          "kind": "fa_q",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 4.475674492868513,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 21.63416817555552,
+          "fraction": 0.6,
+          "kind": "o",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 120.22206137059773,
+          "fraction": 0.6176470588235294,
+          "kind": "gate_up",
+          "npu_gbps": 39.54507999999999
+        },
+        {
+          "call_ms": 59.21883380066299,
+          "fraction": 0.6,
+          "kind": "down",
+          "npu_gbps": 39.54507999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.6154772141014618
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 19689.055561192596,
+      "gain_pct": 34.826960229793634,
+      "gemms": [
+        {
+          "call_ms": 35.64802114124806,
+          "fraction": 0.625,
+          "kind": "qkv",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 22.791643908632075,
+          "fraction": 0.64,
+          "kind": "zba",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 42.67259901217184,
+          "fraction": 0.625,
+          "kind": "fa_q",
+          "npu_gbps": 49.431349999999995
+        },
+        {
+          "call_ms": 4.475674492868513,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 49.43135000000001
+        },
+        {
+          "call_ms": 21.95754465025346,
+          "fraction": 0.6,
+          "kind": "o",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 121.41609460889738,
+          "fraction": 0.6323529411764706,
+          "kind": "gate_up",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 59.92955559759611,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 49.431349999999995
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.6340498710232159
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 16065.069742729527,
+      "gain_pct": 65.24145575605078,
+      "gemms": [
+        {
+          "call_ms": 28.468905190143474,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 18.207089601000394,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 43.707719999999995
+        },
+        {
+          "call_ms": 33.59981298471501,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 43.707719999999995
+        },
+        {
+          "call_ms": 3.6125419554174756,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 16.99832474608608,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 95.17070651957349,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 46.03190064724391,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 43.70772
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 16068.612399832702,
+      "gain_pct": 65.20502486815536,
+      "gemms": [
+        {
+          "call_ms": 28.468905190143474,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 54.634649999999986
+        },
+        {
+          "call_ms": 18.207089601000394,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 33.703600121779935,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 3.6713564213592234,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 54.63465000000001
+        },
+        {
+          "call_ms": 16.99832474608608,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 95.17070651957349,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 46.03190064724391,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 54.63465
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 18493.66286785422,
+      "gain_pct": 43.54190027576299,
+      "gemms": [
+        {
+          "call_ms": 33.599812984715015,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 22.055270446929047,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 40.1882845924255,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 43.707719999999995
+        },
+        {
+          "call_ms": 4.097093165928655,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 20.043314990829003,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 113.1288838005739,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 54.35179071401552,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 43.707719999999995
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 18589.976521961806,
+      "gain_pct": 42.79821752195354,
+      "gemms": [
+        {
+          "call_ms": 33.75200780311476,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 22.055270446929047,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 40.835838121559384,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 4.097093165928655,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 20.043314990829003,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 114.35775014992164,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 54.634649999999986
+        },
+        {
+          "call_ms": 54.35179071401552,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 54.63464999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 15428.006016816904,
+      "gain_pct": 72.06471842294559,
+      "gemms": [
+        {
+          "call_ms": 27.353950401500583,
+          "fraction": 0.575,
+          "kind": "qkv",
+          "npu_gbps": 47.870360000000005
+        },
+        {
+          "call_ms": 17.7838931526752,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 32.06787006784852,
+          "fraction": 0.5625,
+          "kind": "fa_q",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 3.634947466252427,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 15.908925011044657,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 90.66058386974298,
+          "fraction": 0.5588235294117647,
+          "kind": "gate_up",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 43.2026987162563,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 47.87036
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.5575236457437661
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 15991.695107014615,
+      "gain_pct": 65.99963251842436,
+      "gemms": [
+        {
+          "call_ms": 28.293706585599995,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.095599579927274,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 33.721446937216825,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.6733229266019416,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.893205583359997,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 94.58140212247271,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 45.73406301952001,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 17866.68343545046,
+      "gain_pct": 48.5790869190593,
+      "gemms": [
+        {
+          "call_ms": 32.067870067848524,
+          "fraction": 0.675,
+          "kind": "qkv",
+          "npu_gbps": 47.870360000000005
+        },
+        {
+          "call_ms": 20.386269402836415,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 38.29529356342888,
+          "fraction": 0.6666666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 3.784352069760946,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 19.382374556020086,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 108.66906464600235,
+          "fraction": 0.6764705882352942,
+          "kind": "gate_up",
+          "npu_gbps": 47.870360000000005
+        },
+        {
+          "call_ms": 52.706322948139636,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 47.87035999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.6682717110920035
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 18557.319074801046,
+      "gain_pct": 43.04951595706565,
+      "gemms": [
+        {
+          "call_ms": 33.7698820545631,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 21.919889707054548,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.857489553559866,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.99999999999999
+        },
+        {
+          "call_ms": 4.073202447127272,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 19.919083253061814,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 114.41836156719589,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 53.999800790341816,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 14622.500807491137,
+      "gain_pct": 81.5431947010833,
+      "gemms": [
+        {
+          "call_ms": 25.127022317614543,
+          "fraction": 0.6,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.529339882459542,
+          "fraction": 0.6,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 30.309961900450904,
+          "fraction": 0.6041666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.358676069701818,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 14.976417806568724,
+          "fraction": 0.6,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 85.24912147851637,
+          "fraction": 0.6029411764705882,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.149373171944724,
+          "fraction": 0.6,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.6025795356835769
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 15991.695107014615,
+      "gain_pct": 65.99963251842436,
+      "gemms": [
+        {
+          "call_ms": 28.293706585599995,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.095599579927274,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 33.721446937216825,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.6733229266019416,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.893205583359997,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 94.58140212247271,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 45.73406301952001,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 16537.321385678486,
+      "gain_pct": 60.52270190564472,
+      "gemms": [
+        {
+          "call_ms": 29.4298068353398,
+          "fraction": 0.7,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.907494818210907,
+          "fraction": 0.72,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 35.492901483287284,
+          "fraction": 0.7083333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.358676069701818,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.430674374330177,
+          "fraction": 0.7,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 99.7613523104582,
+          "fraction": 0.7058823529411765,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 46.79551782060219,
+          "fraction": 0.7,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.7047291487532245
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 18557.319074801046,
+      "gain_pct": 43.04951595706565,
+      "gemms": [
+        {
+          "call_ms": 33.7698820545631,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 21.919889707054548,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.857489553559866,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.99999999999999
+        },
+        {
+          "call_ms": 4.073202447127272,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 19.919083253061814,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 114.41836156719589,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 53.999800790341816,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 14622.500807491137,
+      "gain_pct": 81.5431947010833,
+      "gemms": [
+        {
+          "call_ms": 25.127022317614543,
+          "fraction": 0.6,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.529339882459542,
+          "fraction": 0.6,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 30.309961900450904,
+          "fraction": 0.6041666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.358676069701818,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 14.976417806568724,
+          "fraction": 0.6,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 85.24912147851637,
+          "fraction": 0.6029411764705882,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.149373171944724,
+          "fraction": 0.6,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.6025795356835769
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 15991.695107014615,
+      "gain_pct": 65.99963251842436,
+      "gemms": [
+        {
+          "call_ms": 28.293706585599995,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.095599579927274,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 33.721446937216825,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.6733229266019416,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.893205583359997,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 94.58140212247271,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 45.73406301952001,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 16537.321385678486,
+      "gain_pct": 60.52270190564472,
+      "gemms": [
+        {
+          "call_ms": 29.4298068353398,
+          "fraction": 0.7,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.907494818210907,
+          "fraction": 0.72,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 35.492901483287284,
+          "fraction": 0.7083333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.358676069701818,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.430674374330177,
+          "fraction": 0.7,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 99.7613523104582,
+          "fraction": 0.7058823529411765,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 46.79551782060219,
+          "fraction": 0.7,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.7047291487532245
+    },
+    {
+      "arch": "gfx1152 860M memory-scaled remainder",
+      "baseline_ms": 26546.15511111111,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 18557.319074801046,
+      "gain_pct": 43.04951595706565,
+      "gemms": [
+        {
+          "call_ms": 33.7698820545631,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 21.919889707054548,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.857489553559866,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.99999999999999
+        },
+        {
+          "call_ms": 4.073202447127272,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 19.919083253061814,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 114.41836156719589,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 53.999800790341816,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 20244.307811737526,
+      "gain_pct": 49.52219465751813,
+      "gemms": [
+        {
+          "call_ms": 29.736038588116497,
+          "fraction": 0.5,
+          "kind": "qkv",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 18.970865118396887,
+          "fraction": 0.52,
+          "kind": "zba",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 35.47193042723762,
+          "fraction": 0.5208333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 3.590136444582524,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 17.26937042257605,
+          "fraction": 0.5,
+          "kind": "o",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 98.87336302026532,
+          "fraction": 0.5147058823529411,
+          "kind": "gate_up",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 47.197875284349514,
+          "fraction": 0.5,
+          "kind": "down",
+          "npu_gbps": 39.54508
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.5090283748925193
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 20327.28749591908,
+      "gain_pct": 48.91181786753547,
+      "gemms": [
+        {
+          "call_ms": 29.836247530079596,
+          "fraction": 0.525,
+          "kind": "qkv",
+          "npu_gbps": 49.431349999999995
+        },
+        {
+          "call_ms": 19.251129930811643,
+          "fraction": 0.52,
+          "kind": "zba",
+          "npu_gbps": 49.43135000000001
+        },
+        {
+          "call_ms": 35.47193042723762,
+          "fraction": 0.5208333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 3.6433495328155336,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 17.526835768673134,
+          "fraction": 0.5,
+          "kind": "o",
+          "npu_gbps": 49.43135000000001
+        },
+        {
+          "call_ms": 98.87336302026532,
+          "fraction": 0.5147058823529411,
+          "kind": "gate_up",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 47.92500564368932,
+          "fraction": 0.5,
+          "kind": "down",
+          "npu_gbps": 49.43135000000001
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.5116079105760963
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 23259.083973090965,
+      "gain_pct": 30.141554019724804,
+      "gemms": [
+        {
+          "call_ms": 35.47193042723762,
+          "fraction": 0.625,
+          "kind": "qkv",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 22.791643908632075,
+          "fraction": 0.64,
+          "kind": "zba",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 42.516534048685145,
+          "fraction": 0.625,
+          "kind": "fa_q",
+          "npu_gbps": 39.54508
+        },
+        {
+          "call_ms": 4.475674492868513,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 21.63416817555552,
+          "fraction": 0.6,
+          "kind": "o",
+          "npu_gbps": 39.545080000000006
+        },
+        {
+          "call_ms": 120.22206137059773,
+          "fraction": 0.6176470588235294,
+          "kind": "gate_up",
+          "npu_gbps": 39.54507999999999
+        },
+        {
+          "call_ms": 59.21883380066299,
+          "fraction": 0.6,
+          "kind": "down",
+          "npu_gbps": 39.54507999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.6154772141014618
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 23412.633783414818,
+      "gain_pct": 29.288031467762465,
+      "gemms": [
+        {
+          "call_ms": 35.64802114124806,
+          "fraction": 0.625,
+          "kind": "qkv",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 22.791643908632075,
+          "fraction": 0.64,
+          "kind": "zba",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 42.67259901217184,
+          "fraction": 0.625,
+          "kind": "fa_q",
+          "npu_gbps": 49.431349999999995
+        },
+        {
+          "call_ms": 4.475674492868513,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 49.43135000000001
+        },
+        {
+          "call_ms": 21.95754465025346,
+          "fraction": 0.6,
+          "kind": "o",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 121.41609460889738,
+          "fraction": 0.6323529411764706,
+          "kind": "gate_up",
+          "npu_gbps": 49.43135
+        },
+        {
+          "call_ms": 59.92955559759611,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 49.431349999999995
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 19.0,
+      "optimal_ops_share": 0.6340498710232159
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 19788.64796495175,
+      "gain_pct": 52.965141362587985,
+      "gemms": [
+        {
+          "call_ms": 28.468905190143474,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 18.207089601000394,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 43.707719999999995
+        },
+        {
+          "call_ms": 33.59981298471501,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 43.707719999999995
+        },
+        {
+          "call_ms": 3.6125419554174756,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 16.99832474608608,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 95.17070651957349,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 46.03190064724391,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 43.70772
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 19792.190622054924,
+      "gain_pct": 52.93776172306579,
+      "gemms": [
+        {
+          "call_ms": 28.468905190143474,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 54.634649999999986
+        },
+        {
+          "call_ms": 18.207089601000394,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 33.703600121779935,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 3.6713564213592234,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 54.63465000000001
+        },
+        {
+          "call_ms": 16.99832474608608,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 95.17070651957349,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 46.03190064724391,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 54.63465
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 22217.241090076444,
+      "gain_pct": 36.24433929761701,
+      "gemms": [
+        {
+          "call_ms": 33.599812984715015,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 22.055270446929047,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 40.1882845924255,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 43.707719999999995
+        },
+        {
+          "call_ms": 4.097093165928655,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 20.043314990829003,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 113.1288838005739,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 43.70772
+        },
+        {
+          "call_ms": 54.35179071401552,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 43.707719999999995
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 22313.554744184028,
+      "gain_pct": 35.65625773375738,
+      "gemms": [
+        {
+          "call_ms": 33.75200780311476,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 22.055270446929047,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 40.835838121559384,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.63464999999999
+        },
+        {
+          "call_ms": 4.097093165928655,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 20.043314990829003,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 54.63465
+        },
+        {
+          "call_ms": 114.35775014992164,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 54.634649999999986
+        },
+        {
+          "call_ms": 54.35179071401552,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 54.63464999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 21.0,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 19151.584239039126,
+      "gain_pct": 58.05341717700128,
+      "gemms": [
+        {
+          "call_ms": 27.353950401500583,
+          "fraction": 0.575,
+          "kind": "qkv",
+          "npu_gbps": 47.870360000000005
+        },
+        {
+          "call_ms": 17.7838931526752,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 32.06787006784852,
+          "fraction": 0.5625,
+          "kind": "fa_q",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 3.634947466252427,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 15.908925011044657,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 90.66058386974298,
+          "fraction": 0.5588235294117647,
+          "kind": "gate_up",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 43.2026987162563,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 47.87036
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.5575236457437661
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 19715.27332923684,
+      "gain_pct": 53.534434079819306,
+      "gemms": [
+        {
+          "call_ms": 28.293706585599995,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.095599579927274,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 33.721446937216825,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.6733229266019416,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.893205583359997,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 94.58140212247271,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 45.73406301952001,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 21590.261657672687,
+      "gain_pct": 40.200863765706885,
+      "gemms": [
+        {
+          "call_ms": 32.067870067848524,
+          "fraction": 0.675,
+          "kind": "qkv",
+          "npu_gbps": 47.870360000000005
+        },
+        {
+          "call_ms": 20.386269402836415,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 38.29529356342888,
+          "fraction": 0.6666666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 3.784352069760946,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 47.87036
+        },
+        {
+          "call_ms": 19.382374556020086,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 47.87035999999999
+        },
+        {
+          "call_ms": 108.66906464600235,
+          "fraction": 0.6764705882352942,
+          "kind": "gate_up",
+          "npu_gbps": 47.870360000000005
+        },
+        {
+          "call_ms": 52.706322948139636,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 47.87035999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.6682717110920035
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 22280.89729702327,
+      "gain_pct": 35.85509115639329,
+      "gemms": [
+        {
+          "call_ms": 33.7698820545631,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 21.919889707054548,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.857489553559866,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.99999999999999
+        },
+        {
+          "call_ms": 4.073202447127272,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 19.919083253061814,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 114.41836156719589,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 53.999800790341816,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 23.0,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 18346.07902971336,
+      "gain_pct": 64.9929300114122,
+      "gemms": [
+        {
+          "call_ms": 25.127022317614543,
+          "fraction": 0.6,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.529339882459542,
+          "fraction": 0.6,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 30.309961900450904,
+          "fraction": 0.6041666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.358676069701818,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 14.976417806568724,
+          "fraction": 0.6,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 85.24912147851637,
+          "fraction": 0.6029411764705882,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.149373171944724,
+          "fraction": 0.6,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.6025795356835769
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 19715.27332923684,
+      "gain_pct": 53.534434079819306,
+      "gemms": [
+        {
+          "call_ms": 28.293706585599995,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.095599579927274,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 33.721446937216825,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.6733229266019416,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.893205583359997,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 94.58140212247271,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 45.73406301952001,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 20260.89960790071,
+      "gain_pct": 49.39974985873625,
+      "gemms": [
+        {
+          "call_ms": 29.4298068353398,
+          "fraction": 0.7,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.907494818210907,
+          "fraction": 0.72,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 35.492901483287284,
+          "fraction": 0.7083333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.358676069701818,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.430674374330177,
+          "fraction": 0.7,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 99.7613523104582,
+          "fraction": 0.7058823529411765,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 46.79551782060219,
+          "fraction": 0.7,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.7047291487532245
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 22280.89729702327,
+      "gain_pct": 35.85509115639329,
+      "gemms": [
+        {
+          "call_ms": 33.7698820545631,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 21.919889707054548,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.857489553559866,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.99999999999999
+        },
+        {
+          "call_ms": 4.073202447127272,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 19.919083253061814,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 114.41836156719589,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 53.999800790341816,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 26.9,
+      "optimal_ops_share": 0.6510748065348237
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 18346.07902971336,
+      "gain_pct": 64.9929300114122,
+      "gemms": [
+        {
+          "call_ms": 25.127022317614543,
+          "fraction": 0.6,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.529339882459542,
+          "fraction": 0.6,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 30.309961900450904,
+          "fraction": 0.6041666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.358676069701818,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 14.976417806568724,
+          "fraction": 0.6,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 85.24912147851637,
+          "fraction": 0.6029411764705882,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.149373171944724,
+          "fraction": 0.6,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.6025795356835769
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "mixed-current-gpu-ief15-npu",
+      "coop_ms": 19715.27332923684,
+      "gain_pct": 53.534434079819306,
+      "gemms": [
+        {
+          "call_ms": 28.293706585599995,
+          "fraction": 0.55,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.095599579927274,
+          "fraction": 0.56,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 33.721446937216825,
+          "fraction": 0.5416666666666666,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.6733229266019416,
+          "fraction": 0.5,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 16.893205583359997,
+          "fraction": 0.55,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 94.58140212247271,
+          "fraction": 0.5441176470588235,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 45.73406301952001,
+          "fraction": 0.55,
+          "kind": "down",
+          "npu_gbps": 54.99999999999999
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.0,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.5472055030094582
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 20260.89960790071,
+      "gain_pct": 49.39974985873625,
+      "gemms": [
+        {
+          "call_ms": 29.4298068353398,
+          "fraction": 0.7,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 18.907494818210907,
+          "fraction": 0.72,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 35.492901483287284,
+          "fraction": 0.7083333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 3.358676069701818,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 17.430674374330177,
+          "fraction": 0.7,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 99.7613523104582,
+          "fraction": 0.7058823529411765,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 46.79551782060219,
+          "fraction": 0.7,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 2.44,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.7047291487532245
+    },
+    {
+      "arch": "gfx1152 860M compute-scaled remainder",
+      "baseline_ms": 30269.733333333334,
+      "contract_mode": "full-ief15-transferred-g0-penalty",
+      "coop_ms": 22280.89729702327,
+      "gain_pct": 35.85509115639329,
+      "gemms": [
+        {
+          "call_ms": 33.7698820545631,
+          "fraction": 0.65,
+          "kind": "qkv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 21.919889707054548,
+          "fraction": 0.68,
+          "kind": "zba",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 40.857489553559866,
+          "fraction": 0.6458333333333334,
+          "kind": "fa_q",
+          "npu_gbps": 54.99999999999999
+        },
+        {
+          "call_ms": 4.073202447127272,
+          "fraction": 0.75,
+          "kind": "fa_kv",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 19.919083253061814,
+          "fraction": 0.65,
+          "kind": "o",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 114.41836156719589,
+          "fraction": 0.6470588235294118,
+          "kind": "gate_up",
+          "npu_gbps": 55.0
+        },
+        {
+          "call_ms": 53.999800790341816,
+          "fraction": 0.65,
+          "kind": "down",
+          "npu_gbps": 55.0
+        }
+      ],
+      "gpu_compute_ratio": 0.225,
+      "gpu_fold_ratio": 1.57,
+      "npu_beta_assumed": 0.853,
+      "npu_bytes_per_kop": 3.05,
+      "npu_raw_tops_assumed": 30.2,
+      "optimal_ops_share": 0.6510748065348237
+    }
+  ]
+}

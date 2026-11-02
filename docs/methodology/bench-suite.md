@@ -26,7 +26,7 @@ Then run the exact same arguments with an output path:
 
 ```bash
 HIPFIRE_CLI_BIN=./target/release/hipfire \
-HIPFIRE_DAEMON_BIN=./target/release/examples/daemon \
+HIPFIRE_DAEMON_BIN=./target/release/daemon \
 python3 scripts/serve_harness.py \
   --model ~/.hipfire/models/qwen3.6-35b-a3b.mq4r \
   --tag qwen3.6:35b-a3b-mq4r \
@@ -90,7 +90,7 @@ declared interleave when thermal/order bias matters.
 
 ```bash
 cargo build --release -p hipfire-cli
-cargo build --release -p hipfire-runtime --example daemon --features deltanet
+cargo build --release -p hipfire-daemon
 ```
 
 By default the harness starts its own loopback service and kills only that

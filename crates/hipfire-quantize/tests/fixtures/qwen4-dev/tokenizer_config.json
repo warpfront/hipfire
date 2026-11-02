@@ -1,0 +1,8 @@
+{
+  "bos_token": "<|bos|>",
+  "eos_token": "<|endoftext|>",
+  "hipfire_note": "deterministic developer-only word-level tokenizer; no chat template",
+  "model_max_length": 64,
+  "pad_token": "<|pad|>",
+  "tokenizer_class": "PreTrainedTokenizerFast"
+}

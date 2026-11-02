@@ -1,0 +1,2 @@
+# Preserve byte-identical benchmark prompts whose whitespace is part of the fixture.
+benchmarks/prompts/qwen38_issue693_longcode_20676.txt whitespace=-trailing-space

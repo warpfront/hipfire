@@ -1,0 +1,7 @@
+# W8b: gate_up J=1, J=2 interleaved x3 (coarse, v2)
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 1024 --iters 5 --pack wb --reg coarse --glue v2
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 2048 --iters 5 --pack wb --reg coarse --glue v2
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 1024 --iters 5 --pack wb --reg coarse --glue v2
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 2048 --iters 5 --pack wb --reg coarse --glue v2
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 1024 --iters 5 --pack wb --reg coarse --glue v2
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --hid 2048 --iters 5 --pack wb --reg coarse --glue v2

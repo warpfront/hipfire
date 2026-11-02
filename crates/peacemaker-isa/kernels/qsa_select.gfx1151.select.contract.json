@@ -1,0 +1,11 @@
+{
+  "symbol": "indexed_attention_select_from_scores_pm_gfx1151",
+  "counts": {"buffer_load_b32": 20, "buffer_store_b32": 8, "s_load_b256": 2,
+    "ds_load_b32": 4, "ds_load_b64": 52, "ds_load_b128": 4, "ds_load_2addr_b32": 4, "ds_store_b32": 3, "ds_store_b64": 53,
+    "s_barrier": 30, "v_permlane16_b32": 378, "v_permlanex16_b32": 82, "v_readlane_b32": 2, "v_mov_b32_dpp": 0, "s_endpgm": 1},
+  "forbidden": ["scratch_*", "flat_*", "global_*", "buffer_atomic_*", "ds_add_*", "ds_sub_*", "ds_rsub_*", "ds_inc_*", "ds_dec_*", "ds_min_*", "ds_max_*", "ds_and_*", "ds_or_*", "ds_xor_*", "ds_mskor_*", "ds_cmpst*", "ds_cmpstore*", "ds_wrxchg*", "ds_append", "ds_consume", "ds_gws_*", "ds_bpermute*", "ds_permute*", "v_writelane*", "s_setpc*", "s_swappc*"],
+  "vgpr_max": 112, "sgpr_max": 104,
+  "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 0,
+  "group_segment_fixed_bytes": 10304
+}

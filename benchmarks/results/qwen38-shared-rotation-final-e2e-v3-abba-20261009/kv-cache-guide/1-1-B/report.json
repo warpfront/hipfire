@@ -1,0 +1,202 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/media/990Pro/hipfire/models/qwen3.8-27b.mq4-xts",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 16384,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": 262144,
+    "card_cap": 870671,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 28370,
+    "vram_total_mb": 46064,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 46016,
+  "max_seq": {
+    "effective": 16384,
+    "requested": 16384,
+    "source": "flag",
+    "run_need": null,
+    "model_limit": null
+  },
+  "max_tokens": 8192,
+  "runs": 1,
+  "warmups": 2,
+  "batch": 1,
+  "prompt_tokens": 122,
+  "prompt_md5": "e904061d1e1cd2cec5bb3729bd287182",
+  "prompt_chars": 216,
+  "warnings": [
+    "prompt is 122 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "power_device": {
+    "card": "card0",
+    "pci": "0000:9e:00.0",
+    "arch": "gfx1100",
+    "selected_by": "ROCR_VISIBLE_DEVICES=1",
+    "sample_period_ms": 500
+  },
+  "power": [
+    {
+      "samples": 107,
+      "duration_s": 53.01,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 58.6,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 82.0
+          },
+          "junction": {
+            "max": 98.0
+          },
+          "mem": {
+            "max": 89.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 2005.4,
+            "min": 868.0,
+            "max": 2247.0
+          },
+          "mclk": {
+            "avg": 1124.0,
+            "min": 1124.0,
+            "max": 1124.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 46064.0,
+        "vram_used_mib": 18094.2,
+        "vram_free_mib": 27969.8,
+        "gtt_total_mib": 112655.5,
+        "gtt_used_mib": 17.1,
+        "gtt_free_mib": 112638.4,
+        "mem_total_mib": 225310.9,
+        "mem_available_mib": 207494.1
+      }
+    }
+  ],
+  "decode_tok_s": {
+    "median": 61.7,
+    "mean": 61.7,
+    "min": 61.7,
+    "max": 61.7,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 638.2,
+    "mean": 638.2,
+    "min": 638.2,
+    "max": 638.2,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 61.4,
+    "mean": 61.4,
+    "min": 61.4,
+    "max": 61.4,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 191.2,
+    "mean": 191.2,
+    "min": 191.2,
+    "max": 191.2,
+    "stdev": 0.0
+  },
+  "spec_requested": "dflash",
+  "spec_route": [
+    "dflash"
+  ],
+  "spec_tau": [
+    2.45
+  ],
+  "run_events": [
+    {
+      "type": "done",
+      "id": "chatcmpl-976419-3",
+      "tokens": 3257,
+      "tok_s": 61.4,
+      "prefill_tokens": 122,
+      "prefill_ms": 191.2,
+      "prefill_tok_s": 638.2,
+      "decode_tok_s": 61.7,
+      "ttft_ms": 191.2,
+      "dflash": true,
+      "tau": 2.45,
+      "cycles": 943,
+      "cached_tokens": 0,
+      "finish_reason": "stop",
+      "attempt_id": 1,
+      "bench_output": "# 大语言模型推理中的 KV Cache：从原理到工程权衡\n\n对于拥有工程背景的读者而言，大语言模型（LLM）推理的核心挑战往往不在于计算矩阵乘法（GEMM），而在于**内存带宽**和**显存管理**。KV Cache（Key-Value Cache）正是这一挑战的核心载体。\n\n本文将系统拆解 KV Cache 的机制、显存估算、优化技术（MQA/GQA、PagedAttention、Prefix Caching、量化）以及工程上的取舍策略。\n\n---\n\n## 1. 为什么需要缓存 K/V？\n\n在 Transformer 架构中，自注意力机制（Self-Attention）的计算公式为：\n\n$$\n\\text{Attention}(Q, K, V) = \\text{softmax}\\left(\\frac{QK^T}{\\sqrt{d_k}}\\right)V\n$$\n\n其中 $Q$（Query）、$K$（Key）、$V$（Value）均由输入序列经过线性变换得到。\n\n### 1.1 计算冗余与因果性\n在生成式任务中，模型是**自回归（Autoregressive）**的。当生成第 $t$ 个 token 时，我们需要计算它与之前所有 $t-1$ 个 token 的注意力。\n- **无缓存情况**：每次生成新 token，都需要重新计算所有历史 token 的 $K$ 和 $V$。计算复杂度为 $O(t^2)$，且随着序列变长，重复计算量巨大。\n- **有缓存情况**：由于 Transformer 的因果掩码（Causal Mask）特性，历史 token 的 $K$ 和 $V$ 值**不随新 token 的加入而改变**。因此，我们可以将历史 token 的 $K$ 和 $V$ 存储在显存中，仅计算新 token 的 $Q$，并与缓存中的 $K, V$ 进行交互。\n\n### 1.2 核心收益\n- **时间复杂度降低**：从每步 $O(t^2)$ 降至 $O(t)$（仅计算新 token 与历史缓存的注意力）。\n- **避免重复计算**：节省大量 GPU 算力，使推理速度提升数倍至数十倍。\n\n> **已知事实**：KV Cache 是 LLM 推理加速的基石。没有它，长文本生成在工程上几乎不可行。\n\n---\n\n## 2. Prefill 与 Decode：两种截然不同的阶段\n\nLLM 推理分为两个阶段，其计算特性截然不同，对 KV Cache 的使用方式也不同。\n\n| 特性 | Prefill（预填充） | Decode（解码） |\n|------|-------------------|----------------|\n| **输入** | 完整 Prompt（长度 $L$） | 单个新 Token |\n| **计算瓶颈** | **计算密集型（Compute-bound）** | **内存带宽密集型（Memory-bound）** |\n| **KV Cache 操作** | 批量计算 $L$ 个 token 的 $K, V$ 并写入缓存 | 读取全部历史 $K, V$，计算新 token 的注意力，追加新 $K, V$ |\n| **GPU 利用率** | 高（大矩阵乘法） | 低（小矩阵乘法，受限于显存读取速度） |\n| **延迟特征** | 一次性高延迟（TTFT, Time To First Token） | 每 token 低延迟（TPOT, Time Per Output Token） |\n\n### 工程启示\n- **Prefill** 阶段可以充分利用 GPU 的 Tensor Core，适合高吞吐批处理。\n- **Decode** 阶段受限于显存带宽（HBM Bandwidth），因为每生成一个 token 都需要读取整个 KV Cache。因此，**减少 KV Cache 的大小**直接提升 Decode 速度。\n\n> **经验判断**：在长上下文场景下，Decode 阶段的延迟主要由 KV Cache 的读取时间决定，而非计算时间。\n\n---\n\n## 3. 显存占用估算：一个具体算例\n\nKV Cache 的显存占用是推理系统规划的核心指标。\n\n### 3.1 公式推导\n对于单个 token，KV Cache 的大小为：\n\n$$\n\\text{Size}_{\\text{token}} = 2 \\times N_{\\text{layers}} \\times N_{\\text{heads}} \\times d_{\\text{head}} \\times \\text{bytes\\_per\\_element}\n$$\n\n其中：\n- $2$：Key 和 Value 各一份。\n- $N_{\\text{layers}}$：Transformer 层数。\n- $N_{\\text{heads}}$：注意力头数。\n- $d_{\\text{head}}$：每个头的维度（通常 $d_{\\text{model}} / N_{\\text{heads}}$）。\n- $\\text{bytes\\_per\\_element}$：数据类型大小（FP16=2 bytes, FP8=1 byte, INT8=1 byte）。\n\n对于序列长度 $L$，总大小为：\n\n$$\n\\text{Total Size} = L \\times \\text{Size}_{\\text{token}}\n$$\n\n### 3.2 具体算例：Llama-2-7B\n假设模型参数如下：\n- $N_{\\text{layers}} = 32$\n- $N_{\\text{heads}} = 32$\n- $d_{\\text{head}} = 128$\n- 数据类型：FP16（2 bytes）\n- 序列长度 $L = 4096$\n\n计算单个 token 的 KV Cache 大小：\n$$\n\\text{Size}_{\\text{token}} = 2 \\times 32 \\times 32 \\times 128 \\times 2 \\text{ bytes} = 524,288 \\text{ bytes} = 0.5 \\text{ MB}\n$$\n\n总 KV Cache 大小：\n$$\n\\text{Total Size} = 4096 \\times 0.5 \\text{ MB} = 2048 \\text{ MB} = 2 \\text{ GB}\n$$\n\n> **已知事实**：对于 7B 模型，4K 上下文的 KV Cache 占用约 2GB 显存。若使用 A100 80GB，理论上可支持约 40 个并发请求（仅考虑 KV Cache，未计模型权重和激活值）。\n\n### 3.3 常见误区\n- **误区**：“KV Cache 大小与模型参数量成正比。”\n  - **纠正**：KV Cache 大小与**序列长度**和**注意力头配置**成正比，与模型总参数量无直接线性关系。小模型（如 7B）在长上下文下 KV Cache 可能比大模型（如 70B）在短上下文下更大。\n\n---\n\n## 4. 优化技术：从架构到系统\n\n### 4.1 MQA 与 GQA：减少头数\n\n#### Multi-Query Attention (MQA)\n- **原理**：所有 Query 头共享**同一个** Key 和 Value 头。\n- **效果**：KV Cache 大小减少 $N_{\\text{heads}}$ 倍。\n- **代价**：精度略有下降，尤其在复杂推理任务中。\n\n#### Grouped-Query Attention (GQA)\n- **原理**：将 Query 头分组，每组共享一对 Key 和 Value 头。例如，32 个 Query 头分为 8 组，每组 4 个 Query 头共享 1 对 KV 头。\n- **效果**：KV Cache 大小减少 $N_{\\text{groups}}$ 倍（而非 $N_{\\text{heads}}$ 倍）。\n- **优势**：在精度和效率之间取得平衡。Llama-2-70B 和 Llama-3 均采用 GQA。\n\n> **经验判断**：GQA 是当前主流选择。MQA 过于激进，GQA 的分组数（如 8 或 16）可根据精度需求调整。\n\n### 4.2 Paged KV Cache：解决内存碎片\n\n#### 问题\n传统 KV Cache 为每个请求分配连续显存块。由于请求长度动态变化，导致**内存碎片**和**预分配浪费**（需预留最大长度空间）。\n\n#### 解决方案：PagedAttention（vLLM 提出）\n- **原理**：借鉴操作系统的**虚拟内存分页**机制。\n  - 将 KV Cache 划分为固定大小的**块（Block）**，如 16 个 token 为一块。\n  - 每个请求维护一个**块表（Block Table）**，指向物理块。\n  - 块可非连续分配，支持**共享**（如 Prefix Caching）。\n- **效果**：\n  - 内存利用率从 ~20-40% 提升至 >90%。\n  - 支持动态批处理（Continuous Batching）。\n\n> **已知事实**：PagedAttention 是现代推理引擎（vLLM, SGLang, TensorRT-LLM）的核心特性。\n\n### 4.3 Prefix Caching：复用公共前缀\n\n#### 场景\n多个请求共享相同的前缀（如系统提示词、文档摘要）。\n\n#### 原理\n- 在 PagedAttention 框架下，相同前缀的 KV Cache 块可被**多个请求共享**。\n- 新请求只需计算其独有部分的 KV Cache。\n\n#### 效果\n- 显著降低 Prefill 延迟和显存占用。\n- 特别适用于多轮对话、RAG（检索增强生成）场景。\n\n> **经验判断**：Prefix Caching 在系统提示词较长的场景下收益巨大，但在短提示词场景下收益有限。\n\n### 4.4 KV 量化：降低精度以节省显存\n\n#### 原理\n将 KV Cache 从 FP16 量化为 FP8、INT8 或 INT4。\n\n#### 效果\n- **显存节省**：FP8 节省 50%，INT4 节省 75%。\n- **精度影响**：\n  - FP8：精度损失极小，几乎无感知。\n  - INT8：轻微精度下降，通常可接受。\n  - INT4：精度下降明显，需配合校准（Calibration）或仅对部分层量化。\n\n#### 工程实践\n- **动态量化**：在运行时对 KV Cache 进行量化，避免离线校准。\n- **混合精度**：对敏感层（如前几层）使用 FP16，其余层使用 FP8/INT8。\n\n> **常见误区**：“KV 量化会显著降低模型精度。”\n  - **纠正**：FP8 量化在大多数场景下精度损失可忽略。INT4 需谨慎使用，但并非不可行。\n\n---\n\n## 5. 长上下文中的主要瓶颈\n\n当序列长度 $L$ 达到 32K、128K 甚至 1M 时，KV Cache 成为主要瓶颈：\n\n1. **显存容量**：\n   - 128K 上下文下，7B 模型的 KV Cache 可达 64GB（FP16），超出单卡容量。\n   - **解决方案**：多卡并行、KV 量化、GQA/MQA。\n\n2. **内存带宽**：\n   - Decode 阶段需读取整个 KV Cache。128K 上下文下，每生成一个 token 需读取数十 GB 数据，远超 HBM 带宽（~2TB/s）。\n   - **解决方案**：\n     - **稀疏注意力（Sparse Attention）**：仅关注部分历史 token（如 Sliding Window, StreamingLLM）。\n     - **KV 压缩**：仅保留重要 token 的 KV（如 H2O, SnapKV）。\n\n3. **计算延迟**：\n   - Prefill 阶段计算量随 $L^2$ 增长，导致 TTFT 极高。\n   - **解决方案**：FlashAttention-2/3、PagedAttention 优化。\n\n> **经验判断**：长上下文推理的瓶颈已从“计算”转向“内存带宽”和“容量”。优化重点应放在减少 KV Cache 读取量和大小上。\n\n---\n\n## 6. 工程取舍：吞吐、延迟、容量、精度\n\n在实际部署中，需在以下维度间权衡：\n\n| 维度 | 优化策略 | 代价 |\n|------|----------|------|\n| **吞吐（Throughput）** | 增大 Batch Size、PagedAttention、Prefix Caching | 单请求延迟可能增加 |\n| **延迟（Latency）** | 减小 Batch Size、KV 量化、GQA/MQA、稀疏注意力 | 吞吐下降、精度可能损失 |\n| **容量（Capacity）** | KV 量化、GQA/MQA、多卡并行、KV 压缩 | 精度损失、系统复杂度增加 |\n| **精度（Accuracy）** | 避免激进量化、使用 FP16、完整注意力 | 显存占用高、速度慢 |\n\n### 典型场景建议\n\n1. **高吞吐在线服务（如 Chatbot）**\n   - **策略**：PagedAttention + GQA + FP8 KV Cache + Prefix Caching。\n   - **目标**：最大化并发请求数，接受轻微精度损失。\n\n2. **低延迟实时应用（如语音助手）**\n   - **策略**：小 Batch Size + GQA + FP16 KV Cache + 稀疏注意力（如 Sliding Window）。\n   - **目标**：最小化 TPOT，确保实时性。\n\n3. **长文档分析（如 RAG、代码审查）**\n   - **策略**：多卡并行 + KV 量化（FP8/INT8） + 稀疏注意力 + Prefix Caching。\n   - **目标**：支持长上下文，平衡显存占用和精度。\n\n> **经验判断**：没有“最优”配置，只有“最适合”场景的配置。建议通过 A/B 测试和 Profiling 工具（如 PyTorch Profiler, Nsight）进行调优。\n\n---\n\n## 7. 总结\n\nKV Cache 是 LLM 推理的核心数据结构，其管理效率直接决定推理性能。关键要点：\n\n1. **KV Cache 是内存带宽瓶颈**，而非计算瓶颈（Decode 阶段）。\n2. **显存估算**需基于序列长度、头数、数据类型，而非模型参数量。\n3. **GQA** 是精度与效率的平衡点，**PagedAttention** 是解决内存碎片的关键。\n4. **Prefix Caching** 和 **KV 量化** 是提升吞吐和容量的有效手段。\n5. **长上下文** 需结合稀疏注意力、多卡并行和量化技术。\n\n工程实践中，应根据具体场景（吞吐、延迟、精度、成本）选择合适的优化组合，并通过 Profiling 验证效果。"
+    }
+  ],
+  "samples": {
+    "decode": [
+      61.7
+    ],
+    "prefill": [
+      638.2
+    ],
+    "wall": [
+      61.4
+    ],
+    "ttft_ms": [
+      191.2
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}

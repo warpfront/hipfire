@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-diffusion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Latent image diffusion architectures for hipfire: FLUX.1 and FLUX.2 Klein MMDiT trunks, T5-XXL / CLIP-L / Qwen3 conditioning encoders, VAE"
+
+[features]
+# Parity gates and end-to-end runs that need real weights or a GPU (see the
+# [[example]] list). Same policy as hipfire-arch-minimax: a gate should not be
+# type-checked on every workspace build.
+lab = []
+default = []
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+libm.workspace = true
+regex.workspace = true
+fancy-regex.workspace = true
+image.workspace = true
+rayon.workspace = true
+
+[dev-dependencies]
+safetensors.workspace = true
+half.workspace = true
+memmap2.workspace = true
+
+# CPU fixture gate: full CPU txt2img vs the diffusers capture of the tiny pipe.
+[[example]]
+name = "flux_pipeline_parity"
+required-features = ["lab"]
+
+# Streaming f16 upload puts the same bits on the device as the f32 path.
+[[example]]
+name = "gpu_flux_stream_upload"
+required-features = ["lab"]
+
+# GPU-vs-CPU parity for the assembled MMDiT forward (synthetic geometry).
+[[example]]
+name = "gpu_flux_forward"
+required-features = ["lab"]
+
+# GPU-vs-CPU block parity on the real FLUX.1 weights.
+[[example]]
+name = "gpu_flux_block_parity"
+required-features = ["lab"]
+
+# GPU txt2img vs CPU txt2img on the tiny pipe (byte-identical PNG).
+[[example]]
+name = "gpu_pipeline_parity"
+required-features = ["lab"]
+
+# End-to-end FLUX.1 txt2img on the GPU: prompt to PNG.
+[[example]]
+name = "flux_txt2img"
+required-features = ["lab"]
+
+# Whole denoise loop vs the ComfyUI golden latent (FLUX.1).
+[[example]]
+name = "gpu_flux_golden_latent"
+required-features = ["lab"]
+
+# VAE decode parity vs a ComfyUI `.latent`, CPU and GPU.
+[[example]]
+name = "flux_vae_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "gpu_flux_vae_parity"
+required-features = ["lab"]
+
+# GPU vs host text-encoder parity.
+[[example]]
+name = "gpu_t5_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "gpu_clip_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "gpu_qwen3_parity"
+required-features = ["lab"]
+
+# FLUX.2 Klein: manifest check, block parity, VAE parity, golden latent,
+# end-to-end txt2img / reference edit.
+[[example]]
+name = "klein_manifest_check"
+required-features = ["lab"]
+
+[[example]]
+name = "gpu_klein_block_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "gpu_klein_vae_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "gpu_klein_golden_latent"
+required-features = ["lab"]
+
+[[example]]
+name = "klein_txt2img"
+required-features = ["lab"]

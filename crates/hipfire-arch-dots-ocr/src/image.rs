@@ -382,12 +382,12 @@ impl PreprocessedImage {
 /// Load an image from disk, run the full dots.ocr preprocessing
 /// pipeline, and return patches ready for the vision tower.
 ///
-/// Path can point at PNG or JPEG (the only decoders compiled in via
-/// the `image` crate feature set). RGBA inputs are composited onto a
-/// white background before normalisation.
+/// Path can point at PNG or JPEG (PNG via the `image` crate, JPEG via
+/// `hipfire_runtime::imagedec`/libjpeg-turbo-rs). RGBA inputs are
+/// composited onto a white background before normalisation.
 pub fn preprocess_image(path: &Path) -> Result<PreprocessedImage, String> {
-    let dyn_img = image::open(path)
-        .map_err(|e| format!("dots-ocr: failed to open {}: {e}", path.display()))?;
+    let dyn_img = hipfire_runtime::imagedec::decode_dynamic_path(path)
+        .map_err(|e| format!("dots-ocr: {e}"))?;
     preprocess_dynamic_image(&dyn_img)
 }
 
@@ -395,7 +395,7 @@ pub fn preprocess_image(path: &Path) -> Result<PreprocessedImage, String> {
 /// memory (e.g. a base64-decoded payload off the daemon's request).
 /// The format is sniffed from the byte content.
 pub fn preprocess_image_bytes(bytes: &[u8]) -> Result<PreprocessedImage, String> {
-    let dyn_img = image::load_from_memory(bytes)
+    let dyn_img = hipfire_runtime::imagedec::decode_dynamic(bytes)
         .map_err(|e| format!("dots-ocr: failed to decode image bytes: {e}"))?;
     preprocess_dynamic_image(&dyn_img)
 }

@@ -4,14 +4,19 @@
 # Copyright (c) 2026 Kaden Schutt
 # hipfire — see LICENSE and NOTICE in the project root.
 
-# Thin bootstrap: obtain source, build hipfire-cli, hand off to `hipfire setup`.
+# Thin bootstrap: obtain source, build hipfire-cli, hand off to `hipfire setup`
+# for exact-registry indexed kernels beside the installed daemon: the tag's
+# prebuilt release kernel pack when it verifies, local hipcc compilation otherwise.
 # Usage: curl -fsSL https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.sh | bash
-# Branch: curl -fsSL .../master/scripts/install.sh | bash -s -- --branch beta
+#   (default: the latest published release tag and its prebuilt kernel pack)
+# Branch: curl -fsSL .../master/scripts/install.sh | bash -s -- --branch master
 set -euo pipefail
 
 HIPFIRE_HOME="${HIPFIRE_HOME:-$HOME/.hipfire}"
 # Internal override for deterministic local-remote tests; default is the official repo.
 GITHUB_URL="${HIPFIRE_GITHUB_URL:-https://github.com/warpfront/hipfire.git}"
+# Internal override for tests; default is the official repo's latest-release endpoint.
+RELEASES_LATEST_API="${HIPFIRE_RELEASES_LATEST_API:-https://api.github.com/repos/warpfront/hipfire/releases/latest}"
 
 # Managed-source transaction state (curl|bash reusing $HIPFIRE_HOME/src).
 _TX_ARMED=0
@@ -176,11 +181,19 @@ usage() {
 Usage: install.sh [options]
 
 Options:
-  --branch NAME              Install from branch NAME
-  --ref REF                  Install from git ref REF
-  --tag TAG                  Install from tag TAG
+  --branch NAME              Install from branch NAME (e.g. master, beta)
+  --ref REF                  Install from git ref REF (a tag also selects its kernel pack)
+  --tag TAG                  Install from tag TAG and its prebuilt kernel pack
+                             (default: latest published release tag; master if the
+                             GitHub releases API is unreachable)
+  --print-selection          Print the resolved source selector and exit (no install)
   --commit SHA               Install from commit SHA
+  --compile-kernels          Compile kernels locally with hipcc even when a kernel pack exists
+  --kernel-pack-url URL      Directory or URL (https://, file://, path) holding the kernel pack
+                             assets (default: the tag's GitHub release; forwarded to setup)
   --rocm-root PATH           ROCm installation root (forwarded to setup)
+  --hipcc PATH               ROCm device compiler (hipcc) when in different prefix (forwarded to setup)
+  --strict-rocm              Disable cross-root compiler fallback (forwarded to setup)
   --gpu-arch ARCH            GPU architecture (forwarded to setup)
   --profile auto|hip|redline Replay profile (forwarded to setup)
   --yes, -y, --non-interactive
@@ -191,6 +204,7 @@ Bootstrap only initializes source and builds hipfire-cli, then execs:
   hipfire setup --source <repo> [original args...]
 
 Examples:
+  bash -s -- --tag v0.4.2.1
   bash -s -- --branch beta
   HIPFIRE_INSTALL_REF=beta bash install.sh --yes
 EOF
@@ -201,6 +215,7 @@ REF=""
 TAG=""
 COMMIT=""
 YES=0
+PRINT_SELECTION=0
 SELECTOR=""
 SELECTOR_KIND=""
 SELECTOR_COUNT=0
@@ -250,9 +265,16 @@ while [ "$#" -gt 0 ]; do
             esac
             shift 2
             ;;
-        --rocm-root|--gpu-arch)
+        --rocm-root|--gpu-arch|--hipcc|--kernel-pack-url)
             [ "$#" -ge 2 ] || { echo "ERROR: $1 requires a value" >&2; exit 1; }
             shift 2
+            ;;
+        --strict-rocm|--compile-kernels)
+            shift
+            ;;
+        --print-selection)
+            PRINT_SELECTION=1
+            shift
             ;;
         --yes|-y|--non-interactive)
             YES=1
@@ -268,7 +290,6 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
-
 if [ "$SELECTOR_COUNT" -gt 1 ]; then
     echo "ERROR: choose only one of --branch, --ref, --tag, or --commit" >&2
     exit 2
@@ -348,6 +369,37 @@ validate_revision() {
     esac
 }
 
+# Resolve the latest published release tag via the GitHub releases API.
+# Prints the tag on success; returns non-zero on any failure (network, parse, unsafe tag).
+resolve_latest_tag() {
+    local body=""
+    if command -v curl >/dev/null 2>&1; then
+        body="$(curl -fsSL --max-time 15 -H 'Accept: application/vnd.github+json' "$RELEASES_LATEST_API" 2>/dev/null)" || body=""
+    fi
+    if [ -z "$body" ] && command -v wget >/dev/null 2>&1; then
+        body="$(wget -qO- --timeout=15 --header='Accept: application/vnd.github+json' "$RELEASES_LATEST_API" 2>/dev/null)" || body=""
+    fi
+    [ -n "$body" ] || return 1
+    local tag
+    tag="$(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | sed -n 1p)"
+    [[ "$tag" =~ ^v[0-9][0-9A-Za-z._-]*$ ]] || return 1
+    git check-ref-format "refs/tags/$tag" >/dev/null 2>&1 || return 1
+    printf '%s\n' "$tag"
+}
+
+# Default selector when none was given: latest release tag, else master with a warning.
+select_default_source() {
+    local latest=""
+    if latest="$(resolve_latest_tag)"; then
+        SELECTOR="$latest"
+        SELECTOR_KIND="tag"
+    else
+        echo "WARNING: could not resolve the latest hipfire release from $RELEASES_LATEST_API; falling back to the master branch" >&2
+        SELECTOR="master"
+        SELECTOR_KIND="branch"
+    fi
+}
+
 # CLI selector wins; otherwise HIPFIRE_INSTALL_REF is generic --ref for automation.
 ENV_REF_APPLIED=0
 if [ "$SELECTOR_COUNT" -eq 0 ] && [ -n "${HIPFIRE_INSTALL_REF:-}" ]; then
@@ -370,25 +422,33 @@ fi
 
 if [ -f "$REPO_DIR/Cargo.toml" ]; then
     # Local checkout (including `hipfire update`): use as-is, never fetch/switch.
-    :
+    if [ "$PRINT_SELECTION" -eq 1 ]; then
+        echo "local $REPO_DIR"
+        exit 0
+    fi
 else
     # curl|bash path: managed install under $HIPFIRE_HOME/src
     REPO_DIR="$HIPFIRE_HOME/src"
 
     if [ -z "$SELECTOR" ]; then
+        select_default_source
         if [ "$YES" -eq 0 ] && [ -t 0 ]; then
-            printf 'Source channel [master/beta/<branch>] (master): '
+            printf 'Source [%s/master/beta/<branch>] (%s): ' "$SELECTOR" "$SELECTOR"
             read -r answer || true
-            answer="${answer:-master}"
-            SELECTOR="$answer"
-            SELECTOR_KIND="branch"
-        else
-            SELECTOR="master"
-            SELECTOR_KIND="branch"
+            if [ -n "${answer:-}" ] && [ "$answer" != "$SELECTOR" ]; then
+                SELECTOR="$answer"
+                SELECTOR_KIND="branch"
+            fi
         fi
         validate_revision "$SELECTOR" "$SELECTOR_KIND"
-        # Include the chosen/default branch in forwarded args for install metadata.
-        FORWARDED_ARGS=("--branch" "$SELECTOR" "${ORIGINAL_ARGS[@]}")
+        # Include the chosen/default selector in forwarded args so setup records it
+        # (a tag also selects that release's prebuilt kernel pack).
+        FORWARDED_ARGS=("--$SELECTOR_KIND" "$SELECTOR" "${ORIGINAL_ARGS[@]}")
+    fi
+
+    if [ "$PRINT_SELECTION" -eq 1 ]; then
+        echo "$SELECTOR_KIND $SELECTOR"
+        exit 0
     fi
 
     mkdir -p "$REPO_DIR"
@@ -530,21 +590,46 @@ if [ ! -x "$HIPFIRE_BIN" ]; then
     exit 1
 fi
 
-if [ "${_TX_ARMED:-0}" -eq 1 ]; then
-    # Do not exec while rollback is armed: run setup, restore on failure, disarm only on success.
-    set +e
-    "$HIPFIRE_BIN" setup --source "$REPO_DIR" "${FORWARDED_ARGS[@]}"
-    setup_status=$?
-    set -e
-    if [ "$setup_status" -ne 0 ]; then
+# After a successful setup: offer `hipfire calibrate` when interactive and no fresh record covers
+# this host; otherwise only hint. A calibrate failure is a warning, never an install failure.
+_offer_calibrate() {
+    if "$HIPFIRE_BIN" calibrate --check >/dev/null 2>&1; then
+        return 0
+    fi
+    if [ "$YES" -ne 0 ] || [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "Run 'hipfire calibrate' to tune hipfire to this host."
+        return 0
+    fi
+    local reply=""
+    printf 'Calibrate hipfire for this host now? Measures link, CPU and GPU rates; takes up to 60 s. [Y/n] '
+    read -r reply || reply=""
+    case "$reply" in
+        ""|[Yy]|[Yy][Ee][Ss])
+            if ! "$HIPFIRE_BIN" calibrate; then
+                echo "WARNING: hipfire calibrate failed; the install is unaffected. Re-run 'hipfire calibrate' later." >&2
+            fi
+            ;;
+        *)
+            echo "Skipped. Run 'hipfire calibrate' to tune hipfire to this host."
+            ;;
+    esac
+    return 0
+}
+
+# setup runs as a child (not exec) so the calibrate offer can follow it. While rollback is armed
+# a failed setup restores the checkpoint; the setup exit status is the script's status either way.
+set +e
+"$HIPFIRE_BIN" setup --source "$REPO_DIR" "${FORWARDED_ARGS[@]}"
+setup_status=$?
+set -e
+if [ "$setup_status" -ne 0 ]; then
+    if [ "${_TX_ARMED:-0}" -eq 1 ]; then
         _tx_fail "$setup_status"
     fi
-    _tx_disarm
-    # Clear EXIT trap noise; setup already succeeded.
-    trap - EXIT
-    exit 0
+    exit "$setup_status"
 fi
-
-# Clear EXIT trap so exec does not remove state the child never needs.
+_tx_disarm
+# Setup succeeded: nothing left for the EXIT trap to restore.
 trap - EXIT
-exec "$HIPFIRE_BIN" setup --source "$REPO_DIR" "${FORWARDED_ARGS[@]}"
+_offer_calibrate
+exit 0

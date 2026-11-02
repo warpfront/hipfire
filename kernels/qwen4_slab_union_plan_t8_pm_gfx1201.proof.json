@@ -1,0 +1,457 @@
+{
+  "module": "qwen4_slab_union_plan_t8_pm_gfx1201",
+  "arch": "gfx1201",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "unknown",
+  "s_text_sha256": "7cad29ef3ccde077761d06308fe359cd38b3dd312c12156b1ce3d1ee9605fea4",
+  "kernels": [
+    {
+      "kernel_id": "qwen4_slab_union_plan",
+      "variant": "t8",
+      "arch": "gfx1201",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "unknown",
+      "reg_plan": [
+        {
+          "name": "kernarg",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "workgroup_x",
+          "kind": "s",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "args_0",
+          "kind": "s",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "n_experts",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "tile",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "absolute_base",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "limit",
+          "kind": "s",
+          "base": 19,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "temporary",
+          "kind": "s",
+          "base": 20,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "scan_index",
+          "kind": "s",
+          "base": 21,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "saved_exec",
+          "kind": "s",
+          "base": 26,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "mask",
+          "kind": "s",
+          "base": 22,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "mask2",
+          "kind": "s",
+          "base": 24,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "slot_state",
+          "kind": "v",
+          "base": 0,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "slot_state",
+          "kind": "v",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "slot_state",
+          "kind": "v",
+          "base": 16,
+          "len": 8,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 24,
+      "next_free_sgpr": 27,
+      "waits": [
+        {
+          "pc_index": 3,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 34,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 40,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 54,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 64,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 90,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 106,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 145,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 148,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 159,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 162,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 171,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 177,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 184,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 189,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 192,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 203,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 206,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 215,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 221,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": {
+            "War": {
+              "reg": "v4"
+            }
+          }
+        },
+        {
+          "pc_index": 225,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [
+        {
+          "pc_index": 68,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 75,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 79,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 83,
+          "insn": "s_wait_alu depctr_va_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 101,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 110,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 118,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 127,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 129,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 135,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 157,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 169,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 201,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        },
+        {
+          "pc_index": 213,
+          "insn": "s_wait_alu depctr_sa_sdst(0)",
+          "rule": "gfx12 SGPR read-after-write"
+        }
+      ],
+      "clauses": [],
+      "vopd_pairs": 0,
+      "lds_slots": [
+        {
+          "name": "ids",
+          "base": 0,
+          "len": 320,
+          "state": "Reading"
+        },
+        {
+          "name": "buckets",
+          "base": 320,
+          "len": 320,
+          "state": "Reading"
+        },
+        {
+          "name": "heads",
+          "base": 640,
+          "len": 320,
+          "state": "Reading"
+        },
+        {
+          "name": "totals",
+          "base": 960,
+          "len": 320,
+          "state": "Reading"
+        }
+      ],
+      "barriers": [
+        {
+          "pc_index": 56,
+          "transitions": [
+            "Ready(0)",
+            "Ready(1)"
+          ]
+        },
+        {
+          "pc_index": 92,
+          "transitions": [
+            "Ready(2)",
+            "Ready(3)"
+          ]
+        }
+      ],
+      "loop_fixpoints": [
+        {
+          "head": ".Lunion_matches",
+          "iterations": 2
+        },
+        {
+          "head": ".Lunion_heads",
+          "iterations": 2
+        }
+      ],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "7cad29ef3ccde077761d06308fe359cd38b3dd312c12156b1ce3d1ee9605fea4"
+    }
+  ]
+}

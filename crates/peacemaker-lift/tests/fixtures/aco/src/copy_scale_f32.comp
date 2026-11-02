@@ -1,0 +1,38 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// P0 gate shader #1 (PM-ACO-PARITY.md section 6, P0): wave32 copy/scale.
+//   dst[i] = src[i] * scale   for i < n
+// Push block (inline, 24 bytes): src u64 @0, dst u64 @8, n u32 @16, scale f32 @20.
+// Both buffers are reached through full 64-bit buffer device addresses (no descriptor sets).
+#version 460
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_EXT_spirv_intrinsics : require
+
+// FP32 denormals preserved and signed-zero/Inf/NaN preserved: the HIP incumbent runs with fp32
+// denormals enabled on gfx12 and no fast-math NaN assumptions.
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4464], 4459, 32); // DenormPreserve, width 32
+spirv_execution_mode(extensions = ["SPV_KHR_float_controls"], capabilities = [4466], 4461, 32); // SignedZeroInfNanPreserve, width 32
+
+layout(local_size_x = 32, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer SrcF { float v[]; };
+layout(buffer_reference, std430, buffer_reference_align = 4) writeonly buffer DstF { float v[]; };
+
+layout(push_constant, std430) uniform PushBlock {
+    uint64_t src;
+    uint64_t dst;
+    uint n;
+    float scale;
+} pc;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i < pc.n) {
+        SrcF s = SrcF(pc.src);
+        DstF d = DstF(pc.dst);
+        d.v[i] = s.v[i] * pc.scale;
+    }
+}

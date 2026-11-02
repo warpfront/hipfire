@@ -1,0 +1,12 @@
+{
+  "symbol": "indexed_attention_gathered_wmma_f16_pm_gfx1151",
+  "counts": {"v_wmma_f32_16x16x16_f16": 32, "s_barrier": 4, "v_exp_f32_e32": 25, "v_div_fmas_f32": 32, "v_permlanex16_b32": 2,
+    "buffer_load_b128": 36, "buffer_load_b64": 64, "buffer_load_u16": 256, "buffer_load_b32": 17, "buffer_store_b32": 16,
+    "ds_load_b128": 80, "ds_load_2addr_b32": 12, "ds_load_b32": 1, "ds_store_b16": 4, "ds_store_b16_d16_hi": 4, "ds_store_b32": 3, "ds_store_b64": 4,
+    "s_endpgm": 1},
+  "forbidden": ["scratch_*", "flat_*", "global_*", "v_readlane*", "v_writelane*", "s_setpc*", "s_swappc*"],
+  "vgpr_max": 160, "sgpr_max": 104,
+  "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 47104,
+  "group_segment_fixed_bytes": 18432
+}

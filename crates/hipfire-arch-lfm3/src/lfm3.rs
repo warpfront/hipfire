@@ -142,6 +142,9 @@ fn wt_from_raw(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -542,6 +545,9 @@ fn wt_from_source_raw(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -824,13 +830,8 @@ impl Lfm3State {
             physical_cap: None,
         };
         let kv = KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve(
-                "",
-                &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,
-                cfg.head_dim,
-            )
-            .mode,
-            hipfire_runtime::llama::KvTarget::Single(gpu),
+            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY).mode,
+            gpu,
             &dims,
         )
         .map_err(|e| format!("lfm3: kv cache: {e:?}"))?;

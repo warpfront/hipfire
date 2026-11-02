@@ -1,0 +1,259 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Fold wiring for the K-loop: which physical ranges hold the scale rows and
+//! products at fold time, the phase-B placement of the two fold stages, and
+//! the (closed, never emitted into a product module) `K256Pow2` re-seed.
+use super::{FoldOp, FoldSched, Gen};
+use crate::kernels::common::{op, v};
+use crate::kernels::iu4_fold::MAGIC;
+use crate::{
+    kernels::iu4_k1::{self, FoldRegisters},
+    vopd::{Operand, VopdF32, VopdOp},
+    Builder, V,
+};
+
+/// Accumulator order of a WMMA bundle: row group 0 over the four column
+/// blocks, then row group 1 (`k = nb * 2 + rg`).
+pub(crate) const BUNDLE_ORDER: [usize; 8] = [0, 2, 4, 6, 1, 3, 5, 7];
+/// A stage-1 (`subrev`) group trails the WMMA that completed its accumulator
+/// by this many WMMAs, so the dependent VALU does not wait on WMMA latency.
+pub(crate) const UNBIAS_LAG: usize = 2;
+/// The first `PAIRED` accumulators of `BUNDLE_ORDER` (row group 0) take
+/// stage 1 between the slab-1 WMMAs; the last `PAIRED` (row group 1) take it
+/// inside the first ones' stage-2 fmac packets, as their literal-subrev half.
+pub(crate) const PAIRED: usize = 4;
+
+/// Registers of one block's fold. Scale rows of row group 0 alias F0's A
+/// fragments, row group 1 aliases F0's and F1's W fragments, products alias
+/// F1's A fragments: every alias is written only after the WMMAs that read
+/// the fragment have issued (proved by per-block lifetimes in `kloop`).
+/// Stage 1 reads the magic as a literal; `magic8` only seeds the WMMAs.
+pub(crate) fn registers(g: &Gen) -> FoldRegisters {
+    let [f0, f1] = g.f;
+    FoldRegisters {
+        cacc: std::array::from_fn(|k| V(g.cacc + 8 * k as u8)),
+        acc: std::array::from_fn(|k| V(g.acc + 8 * k as u8)),
+        sc: [[V(f0 + 4), V(f0 + 8)], [V(f0), V(f1)]],
+        t: V(f1 + 4),
+        d: std::array::from_fn(|nb| V(g.d + nb as u8)),
+    }
+}
+
+/// Stage 1 for the accumulator completed `UNBIAS_LAG` WMMAs ago, if it is
+/// one of the first `PAIRED`; called after each phase-B slab-1 WMMA `i` of
+/// `BUNDLE_ORDER`.
+pub(crate) fn unbias_after_wmma(b: &mut Builder, g: &Gen, i: usize) -> Result<(), String> {
+    if g.spec.tune.fold_sched == FoldSched::Chain {
+        return chain_unbias_after_wmma(b, g, i);
+    }
+    if (UNBIAS_LAG..UNBIAS_LAG + PAIRED).contains(&i) {
+        iu4_k1::emit_fold_unbias(b, registers(g), BUNDLE_ORDER[i - UNBIAS_LAG])?;
+    }
+    Ok(())
+}
+/// Stage 2 (80 packets: 32 mul, 32 fmac::subrev, 16 fmac): row group 0
+/// first, whose scale rows landed during the slab-1 WMMAs, each carrying
+/// stage 1 of its row-group-1 partner; then row group 1.
+pub(crate) fn scale(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    if g.spec.tune.fold_sched == FoldSched::Chain {
+        return chain(b, g);
+    }
+    if g.spec.tune.fold_op == FoldOp::MulAdd {
+        return scale_muladd(b, g);
+    }
+    for i in 0..PAIRED {
+        iu4_k1::emit_fold_scale_paired(b, registers(g), BUNDLE_ORDER[i], BUNDLE_ORDER[i + PAIRED])?;
+    }
+    for &k in &BUNDLE_ORDER[PAIRED..] {
+        iu4_k1::emit_fold_scale(b, registers(g), k)?;
+    }
+    Ok(())
+}
+
+// ---- `FoldSched::Chain` (F3-01-lead1rot-prio) ---------------------------------------
+//
+// Fold registers of the 128x128x8 tile (`registers`): cacc k at `cacc + 8k`, acc k at
+// `acc + 8k`, scale quads of row group rg in `sc[rg]`, products `t` (element j at `t + (j ^ 2)`),
+// `d[nb]`. Element j of an accumulator sits in VGPR bank j % 4 for both its acc and cacc.
+
+/// The bundle position of accumulator `k` in `BUNDLE_ORDER`'s second-stage order.
+const CHAIN_POS: [usize; 8] = [0, 3, 2, 5, 4, 1, 6, 7];
+/// Element visited at step `n` of a chain group's eight packets (stage 1 of the next accumulator).
+const CHAIN_SIG: [usize; 8] = [0, 5, 2, 1, 4, 3, 6, 7];
+/// Element whose `fmac` rides step `n`.
+const CHAIN_XA: [usize; 8] = [2, 3, 0, 7, 6, 1, 4, 5];
+/// Element order of a chain group's four `mul` packets.
+const CHAIN_MUL: [usize; 8] = [3, 2, 7, 0, 1, 6, 5, 4];
+/// Product registers (offset from `t`) of group 0 and of groups 1..6.
+const CHAIN_T_G0: [u8; 8] = [3, 2, 1, 0, 7, 6, 5, 4];
+const CHAIN_T_REST: [u8; 8] = [1, 0, 3, 2, 7, 6, 5, 4];
+
+fn vopd(
+    b: &mut Builder,
+    x: (VopdF32, u8, Operand, u8),
+    y: (VopdF32, u8, Operand, u8),
+) -> Result<(), String> {
+    let o = |(op, dst, src0, src1)| VopdOp {
+        op,
+        dst,
+        src0,
+        src1,
+    };
+    b.vopd(o(x), o(y))
+}
+
+/// `s_setprio n`: scheduling only (the wave's issue arbitration against co-resident waves).
+pub(crate) fn set_prio(b: &mut Builder, n: u32) -> Result<(), String> {
+    op(b, format!("s_setprio {n}"), &[], &[])
+}
+
+/// Stage 1 of the first accumulator only, after WMMA 2 of the bundle: pair-swapped, i.e.
+/// `R[j] <- float(C[j+1]) - magic, R[j+1] <- float(C[j]) - magic` (both reads before both
+/// writes), so `float(C[j])` ends up in slot `j ^ 1`, a bank next to its acc.
+fn chain_unbias_after_wmma(b: &mut Builder, g: &Gen, i: usize) -> Result<(), String> {
+    if i != UNBIAS_LAG {
+        return Ok(());
+    }
+    let c = registers(g).cacc[BUNDLE_ORDER[0]].base();
+    for h in 0..4u8 {
+        let j = c + 2 * h;
+        vopd(
+            b,
+            (VopdF32::Subrev, j, Operand::Lit(MAGIC), j + 1),
+            (VopdF32::Subrev, j + 1, Operand::Lit(MAGIC), j),
+        )?;
+    }
+    Ok(())
+}
+
+/// Four `mul` packets of accumulator `k` into the product registers `t[element]`:
+/// `t = RN(sc * d)`, elements in `order` (`d` is the packets' shared src1).
+fn chain_products(
+    b: &mut Builder,
+    r: &FoldRegisters,
+    k: usize,
+    t: impl Fn(usize) -> u8,
+    order: [usize; 8],
+) -> Result<(), String> {
+    let (nb, rg) = (k / 2, k % 2);
+    let d = r.d[nb].base();
+    let sc = |j: usize| r.sc[rg][j / 4].base() + (j % 4) as u8;
+    for h in 0..4 {
+        let (ex, ey) = (order[2 * h], order[2 * h + 1]);
+        vopd(
+            b,
+            (VopdF32::Mul, t(ex), Operand::V(sc(ex)), d),
+            (VopdF32::Mul, t(ey), Operand::V(sc(ey)), d),
+        )?;
+    }
+    Ok(())
+}
+
+/// Chained stage 2 with bank-clean packets, in `BUNDLE_ORDER`. Group `g` (accumulator
+/// `k = k_g`) issues four `mul` packets, then eight packets pairing the `fmac` of element
+/// `XA[n]` of `k` with the stage-1 `subrev` of element `SIG[n]` of the NEXT accumulator `k2`:
+/// the `subrev`s ROTATE `k2`'s unbiased values one slot down the `SIG` order (the first goes to
+/// a spare VGPR of `k_0`'s dead cacc, `cacc[0] + 3` / `+ 7` alternating by group; the rest to
+/// the slot of `SIG[n - 1]`, already read by the previous packet), so every `fmac` reads its
+/// acc, `x` and product from three banks and the paired `subrev` reads the fourth. `k_0` was
+/// unbiased pair-swapped between the WMMAs; `k_1` is unbiased by group 0's `subrev`s. The last
+/// accumulator has no partner: four `fmac::fmac` packets. Per element the operations are the
+/// paired schedule's: `x = C - magic`, `t = RN(sc * d)`, `acc = fma(t, x, acc)`.
+/// Wave priority drops from 2 to 1 first (the WMMA groups ran at 2).
+fn chain(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    set_prio(b, 1)?;
+    let r = registers(g);
+    let cacc = |k: usize| r.cacc[k].base();
+    let acc = |k: usize| r.acc[k].base();
+    let spare = |n: usize| cacc(BUNDLE_ORDER[0]) + if n % 2 == 0 { 3 } else { 7 };
+    let magic = Operand::Lit(MAGIC);
+    for n_g in 0..BUNDLE_ORDER.len() - 1 {
+        let (k, k2) = (BUNDLE_ORDER[n_g], BUNDLE_ORDER[n_g + 1]);
+        let toff = if n_g == 0 { CHAIN_T_G0 } else { CHAIN_T_REST };
+        let t = |j: usize| r.t.base() + toff[j];
+        chain_products(b, &r, k, t, CHAIN_MUL)?;
+        for n in 0..8 {
+            let a = CHAIN_XA[n];
+            let m = CHAIN_POS[a];
+            let xr = if n_g == 0 {
+                cacc(k) + (a ^ 1) as u8
+            } else if m == 0 {
+                spare(n_g + 1)
+            } else {
+                cacc(k) + CHAIN_SIG[m - 1] as u8
+            };
+            let ysrc = cacc(k2) + CHAIN_SIG[n] as u8;
+            let ydst = if n == 0 {
+                spare(n_g)
+            } else {
+                cacc(k2) + CHAIN_SIG[n - 1] as u8
+            };
+            vopd(
+                b,
+                (VopdF32::Fmac, acc(k) + a as u8, Operand::V(t(a)), xr),
+                (VopdF32::Subrev, ydst, magic, ysrc),
+            )?;
+        }
+    }
+    let k = BUNDLE_ORDER[BUNDLE_ORDER.len() - 1];
+    let t = |j: usize| r.t.base() + (j ^ 2) as u8;
+    chain_products(b, &r, k, t, [0, 1, 2, 3, 4, 5, 6, 7])?;
+    let x = |a: usize| {
+        if CHAIN_POS[a] == 0 {
+            spare(0)
+        } else {
+            cacc(k) + CHAIN_SIG[CHAIN_POS[a] - 1] as u8
+        }
+    };
+    for h in 0..4 {
+        let (a, c) = (2 * h, 2 * h + 1);
+        vopd(
+            b,
+            (VopdF32::Fmac, acc(k) + a as u8, Operand::V(t(a)), x(a)),
+            (VopdF32::Fmac, acc(k) + c as u8, Operand::V(t(c)), x(c)),
+        )?;
+    }
+    Ok(())
+}
+
+/// Stage 2 as the non-fused `FoldOp::MulAdd` twin of [`scale`]: the same
+/// accumulator order, each element `acc = RN(acc + RN(t * x))`
+/// ([`iu4_k1::emit_fold_scale_muladd`]); the stage-1 `subrev` packets of the
+/// row-group-1 partners, which `scale` rides in the fmac packets, issue after
+/// their partner's stage 2 instead.
+fn scale_muladd(b: &mut Builder, g: &Gen) -> Result<(), String> {
+    for i in 0..PAIRED {
+        iu4_k1::emit_fold_scale_muladd(b, registers(g), BUNDLE_ORDER[i])?;
+        iu4_k1::emit_fold_unbias(b, registers(g), BUNDLE_ORDER[i + PAIRED])?;
+    }
+    for &k in &BUNDLE_ORDER[PAIRED..] {
+        iu4_k1::emit_fold_scale_muladd(b, registers(g), k)?;
+    }
+    Ok(())
+}
+
+/// `K256Pow2` half-B re-seed: `cacc = (cacc << s) + magic` for every element
+/// after half A accumulated from zero (plan §3.3). The fold-256 track is
+/// closed at Q0; this body exists for the record and `Spec::validate` keeps
+/// it out of every product module.
+pub fn emit_pow2_reseed(
+    b: &mut Builder,
+    cacc: [V<8>; 8],
+    shift: [V<1>; 8],
+    magic: V<8>,
+) -> Result<(), String> {
+    for c in cacc {
+        for j in 0..8u8 {
+            let (r, sh, m) = (c.base() + j, shift[usize::from(j)], magic.base() + j);
+            op(
+                b,
+                format!("v_lshl_add_u32 v{r}, v{r}, v{}, v{m}", sh.base()),
+                &[v(r)],
+                &[v(r), sh.reg(), v(m)],
+            )?;
+        }
+    }
+    Ok(())
+}

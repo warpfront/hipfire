@@ -1,0 +1,18 @@
+{
+  "attention_fp8_e4m3_fa2_gqa_f16_pm_gfx1201": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 4,
+    "clauses": 0,
+    "delays": 796,
+    "instructions": 3750,
+    "lds_accesses": 224,
+    "lds_max_known_end": 32768,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 82,
+    "table": "gfx1201",
+    "vgpr_high_water": 224,
+    "wait_facts": 279
+  }
+}

@@ -194,7 +194,7 @@ Fold Dir into `load_bundle` for **minimax** (create it, option M-a) and
 - **Con:** `carriers.rs` still imports the qwen35 Dir recipe; GGUF-for-qwen35
   would still touch the carrier. Partial win.
 - **Validation gap:** llama (arch <5) and Dir paths are not locally testable on
-  k9lin (same gaps Approach A documents); build + clippy + minimax HFQ smoke
+  the gfx1100 dev workstation (same gaps Approach A documents); build + clippy + minimax HFQ smoke
   are the local gates, with the Dir/llama paths covered by code review +
   coherence-gate where a model is reachable.
 
@@ -310,6 +310,6 @@ This staging keeps every commit independently gated and preserves the project's
 - Minimax HFQ smoke (Dir smoke if a safetensors MiniMax dir is available).
 - `scripts/probe_commits.sh` perf A/B: Δ≈0% (load-time structure refactor).
 - Registry disjointness tests (`registry_tests`) unaffected (dispatch untouched).
-- **Cannot validate locally (k9lin):** llama (arch <5) and Dir/ParoQuant paths —
+- **Cannot validate locally (gfx1100 dev workstation):** llama (arch <5) and Dir/ParoQuant paths —
   same gaps Approach A flags; not regressed. Covered by code review of the
   verbatim moves + gates where a model is reachable.

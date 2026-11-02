@@ -1,0 +1,1486 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Few-row exact MQ4G256V2 GEMV over four matrices (`gemv_mq4g256v2_rows_x4_pm_<arch>`,
+//! gfx1151 and gfx1201), plus fixed-eight-row tiles (also gfx1100):
+//! emission, ABI, paired/scalar CPU oracles and committed bundles.
+use peacemaker_isa::kernels::mq4_rows_x4::{self, Spec};
+use peacemaker_isa::Arch;
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
+
+const ARCHES: [Arch; 2] = [Arch::Gfx1151, Arch::Gfx1201];
+
+/// Contract ABI: `A0..A3 x y0..y3` pointers, then `M0 M1 M2 M3 K B` i32.
+const ARGS: &[(u32, u32)] = &[
+    (0, 8),
+    (8, 8),
+    (16, 8),
+    (24, 8),
+    (32, 8),
+    (40, 8),
+    (48, 8),
+    (56, 8),
+    (64, 8),
+    (72, 4),
+    (76, 4),
+    (80, 4),
+    (84, 4),
+    (88, 4),
+    (92, 4),
+];
+
+#[test]
+fn names_follow_the_arch() {
+    for arch in ARCHES {
+        assert_eq!(
+            Spec { arch }.symbol(),
+            format!("gemv_mq4g256v2_rows_x4_pm_{}", arch.name())
+        );
+        assert_eq!(
+            Spec::module(arch),
+            format!("mq4_rows_x4_pm_{}", arch.name())
+        );
+        let (emitted, text, proof) = mq4_rows_x4::emit_module(arch).unwrap();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(proof.module, Spec::module(arch));
+        assert!(text.contains(&format!(".amdhsa_kernel {}\n", Spec { arch }.symbol())));
+        assert!(text.contains(&format!(
+            ".amdhsa_kernel gemv_mq4g256v2_rows_x4_t8_pm_{}\n",
+            arch.name()
+        )));
+        assert!(!text.contains("rows_x4_wide_r"));
+        assert_eq!(text.matches(".amdhsa_kernel ").count(), 2);
+    }
+}
+
+#[test]
+fn emission_is_deterministic_and_refuses_other_arches() {
+    for arch in ARCHES {
+        let spec = Spec { arch };
+        let (a, b) = (
+            mq4_rows_x4::emit(spec).unwrap(),
+            mq4_rows_x4::emit(spec).unwrap(),
+        );
+        assert_eq!(a.proof.s_text_sha256, b.proof.s_text_sha256, "{arch:?}");
+        assert_eq!(a.s_text, b.s_text, "{arch:?}");
+        let (_, ta, pa) = mq4_rows_x4::emit_module(arch).unwrap();
+        let (_, tb, pb) = mq4_rows_x4::emit_module(arch).unwrap();
+        assert_eq!((ta, pa.module), (tb, pb.module));
+    }
+    assert!(mq4_rows_x4::emit(Spec {
+        arch: Arch::Gfx1100
+    })
+    .is_err());
+    let (entries, text, _) = mq4_rows_x4::emit_module(Arch::Gfx1100).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(text.matches(".amdhsa_kernel ").count(), 1);
+    assert!(text.contains(".amdhsa_kernel gemv_mq4g256v2_rows_x4_t8_pm_gfx1100\n"));
+    assert!(!text.contains(".amdhsa_kernel gemv_mq4g256v2_rows_x4_pm_gfx1100\n"));
+}
+
+/// The kernarg block is the contract's: 96 bytes and every (offset, size).
+#[test]
+fn kernarg_abi_matches_the_contract() {
+    assert_eq!(mq4_rows_x4::KERNARG_BYTES, 96);
+    for arch in ARCHES {
+        let e = mq4_rows_x4::emit(Spec { arch }).unwrap();
+        assert!(
+            e.s_text.contains(".kernarg_segment_size: 96\n"),
+            "{arch:?}: kernarg size"
+        );
+        let field = |key: &str| -> Vec<u32> {
+            e.s_text
+                .lines()
+                .filter_map(|l| l.trim().strip_prefix(key))
+                .map(|v| v.trim().parse().unwrap())
+                .collect()
+        };
+        let want: Vec<u32> = ARGS.iter().map(|a| a.0).collect();
+        assert_eq!(field(".offset:"), want, "{arch:?}: kernarg offsets");
+        let want: Vec<u32> = ARGS.iter().map(|a| a.1).collect();
+        assert_eq!(field(".size:"), want, "{arch:?}: kernarg sizes");
+        assert!(
+            e.s_text.contains(".max_flat_workgroup_size: 32\n")
+                && e.s_text.contains(".group_segment_fixed_size: 0\n"),
+            "{arch:?}: block 32, no LDS"
+        );
+    }
+}
+
+/// Every gfx12-only spelling is gated: gfx1151 emits none of them; gfx1201
+/// keeps the reference twin's.
+#[test]
+fn gfx12_spellings_are_arch_gated() {
+    let g11 = mq4_rows_x4::emit(Spec {
+        arch: Arch::Gfx1151,
+    })
+    .unwrap()
+    .s_text;
+    for gfx12_only in [
+        "scope:SCOPE",
+        "s_add_nc_u64",
+        "s_wait_alu",
+        "s_add_co_",
+        "s_sub_co_",
+        "s_wait_loadcnt",
+        "s_wait_dscnt",
+        "s_wait_kmcnt",
+        "s_wait_storecnt",
+        "ttmp",
+    ] {
+        assert!(!g11.contains(gfx12_only), "gfx1151 emits {gfx12_only}");
+    }
+    let g12 = mq4_rows_x4::emit(Spec {
+        arch: Arch::Gfx1201,
+    })
+    .unwrap()
+    .s_text;
+    for gfx12 in [
+        "scope:SCOPE_DEV",
+        "s_add_nc_u64",
+        "s_wait_alu depctr_va_vcc(0)",
+        "ttmp9",
+        "s_wait_loadcnt",
+    ] {
+        assert!(g12.contains(gfx12), "gfx1201 lacks {gfx12}");
+    }
+    assert!(g11.contains("s_waitcnt vmcnt(") && g11.contains("s_waitcnt lgkmcnt("));
+}
+
+/// The runtime embeds one certified module per arch: its `.text` must be
+/// exactly what the builder emits today (`.hxaco` generated by
+/// `peacemaker-isa emit --kernel mq4_rows_x4 --arch <arch> ... --bundle`).
+#[test]
+fn committed_bundles_equal_fresh_emission() {
+    let _ = require_rocm_tool!("llvm-mc");
+    let _ = require_rocm_tool!("ld.lld");
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    for arch in ARCHES {
+        let module = Spec::module(arch);
+        let committed = std::fs::read(format!("{root}/{module}.hxaco")).unwrap();
+        let text = mq4_rows_x4::emit_module(arch).unwrap().1;
+        assert!(
+            text_section(&link(&text, arch.name(), &module)) == text_section(&committed),
+            "{module}: fresh emission differs from the committed bundle"
+        );
+    }
+}
+
+/// The same bytes through the native writer (no ROCm tools).
+#[test]
+fn committed_bundles_equal_native_emission() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels");
+    for arch in ARCHES {
+        let module = Spec::module(arch);
+        let committed = std::fs::read(format!("{root}/{module}.hxaco")).unwrap();
+        let text = mq4_rows_x4::emit_module(arch).unwrap().1;
+        let elf = peacemaker_isa::native::assemble(&text, arch).unwrap();
+        assert!(
+            text_section(&elf) == text_section(&committed),
+            "{module}: native emission differs from the committed bundle"
+        );
+    }
+}
+
+fn link(text: &str, arch: &str, stem: &str) -> Vec<u8> {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(format!("peacemaker-isa-mq4rx4-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (s, o, co) = (
+        dir.join(format!("{stem}.s")),
+        dir.join(format!("{stem}.o")),
+        dir.join(format!("{stem}.co")),
+    );
+    std::fs::write(&s, text).unwrap();
+    let llvm_mc = rocm::rocm_tool("llvm-mc").expect("ROCm llvm-mc");
+    let linker = rocm::rocm_tool("ld.lld").expect("ROCm ld.lld");
+    assert!(Command::new(llvm_mc)
+        .args([
+            "-triple=amdgcn-amd-amdhsa",
+            &format!("-mcpu={arch}"),
+            "-filetype=obj"
+        ])
+        .arg(&s)
+        .arg("-o")
+        .arg(&o)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new(linker)
+        .arg("-shared")
+        .arg(&o)
+        .arg("-o")
+        .arg(&co)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::read(co).unwrap()
+}
+
+/// `.text` of an ELF, or of the device ELF inside a clang offload bundle.
+fn text_section(bytes: &[u8]) -> Vec<u8> {
+    let start = bytes.windows(4).position(|w| w == b"\x7fELF").unwrap();
+    let e = &bytes[start..];
+    let u16_ = |o: usize| u16::from_le_bytes([e[o], e[o + 1]]) as usize;
+    let u32_ = |o: usize| u32::from_le_bytes(e[o..o + 4].try_into().unwrap()) as usize;
+    let u64_ = |o: usize| u64::from_le_bytes(e[o..o + 8].try_into().unwrap()) as usize;
+    let (shoff, shentsize, shnum, shstrndx) = (u64_(0x28), u16_(0x3a), u16_(0x3c), u16_(0x3e));
+    let sh = |i: usize| shoff + i * shentsize;
+    let names = u64_(sh(shstrndx) + 24);
+    (0..shnum)
+        .find_map(|i| {
+            let name = &e[names + u32_(sh(i))..];
+            name.starts_with(b".text\0")
+                .then(|| e[u64_(sh(i) + 24)..u64_(sh(i) + 24) + u64_(sh(i) + 32)].to_vec())
+        })
+        .unwrap()
+}
+
+// -------------------------------------------------------------- narrow identity
+
+/// SHA-256 of the narrow entry's emitted source before the wide twins landed
+/// (`peacemaker-isa emit --kernel mq4_rows_x4 --epi entry`): the narrow symbol
+/// must stay byte-for-byte what it was.
+const NARROW_SHA: [(Arch, &str); 2] = [
+    (
+        Arch::Gfx1151,
+        "06a7a3872841a28fa74264e097e864e57f38c182837922a20141705601d70fe5",
+    ),
+    (
+        Arch::Gfx1201,
+        "1256f4978f97c2fc9c0df40c965852867ead4068217b614ad6e4b533eddbac4d",
+    ),
+];
+
+#[test]
+fn narrow_entry_is_unchanged_and_embedded_verbatim_in_the_module() {
+    for (arch, sha) in NARROW_SHA {
+        let narrow = mq4_rows_x4::emit(Spec { arch }).unwrap();
+        assert_eq!(
+            narrow.proof.s_text_sha256, sha,
+            "{arch:?}: the narrow entry changed"
+        );
+        let body = narrow
+            .s_text
+            .split_once(".text\n")
+            .unwrap()
+            .1
+            .split_once(".amdgpu_metadata\n")
+            .unwrap()
+            .0;
+        let (_, text, proof) = mq4_rows_x4::emit_module(arch).unwrap();
+        assert!(
+            text.contains(body),
+            "{arch:?}: module does not carry the narrow body verbatim"
+        );
+        assert_eq!(proof.kernels[0].s_text_sha256, sha);
+    }
+}
+
+// --------------------------------------------------------------- rowtile entry
+
+const TILE_ARCHES: [Arch; 3] = [Arch::Gfx1151, Arch::Gfx1201, Arch::Gfx1100];
+
+fn metadata_numbers(text: &str, key: &str) -> Vec<u32> {
+    text.lines()
+        .filter_map(|line| line.trim().strip_prefix(key))
+        .map(|value| value.trim().parse().unwrap())
+        .collect()
+}
+
+fn rowtile_symbol(arch: Arch) -> String {
+    format!("gemv_mq4g256v2_rows_x4_t8_pm_{}", arch.name())
+}
+
+#[test]
+fn rowtile_name_determinism_abi_and_fixed_eight_row_resources() {
+    assert_eq!(mq4_rows_x4::ROW_TILE, 8);
+    assert_eq!(mq4_rows_x4::MAX_ROWS, 64);
+    assert_eq!(mq4_rows_x4::ROWS_PER_WORKGROUP, 2);
+    for arch in TILE_ARCHES {
+        let tile = mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap();
+        let again = mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap();
+        let text = &tile.s_text;
+        assert_eq!(text, &again.s_text);
+        assert_eq!(tile.proof.s_text_sha256, again.proof.s_text_sha256);
+        assert!(text.contains(&format!(".amdhsa_kernel {}\n", rowtile_symbol(arch))));
+        assert_eq!(metadata_numbers(text, ".kernarg_segment_size:"), [96]);
+        assert_eq!(
+            metadata_numbers(text, ".offset:"),
+            ARGS.iter().map(|arg| arg.0).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            metadata_numbers(text, ".size:"),
+            ARGS.iter().map(|arg| arg.1).collect::<Vec<_>>()
+        );
+        assert!(text.contains(".name: R\n        .offset: 92\n        .size: 4\n"));
+        for (key, expected) in [
+            (".max_flat_workgroup_size:", 32),
+            (".group_segment_fixed_size:", 0),
+            (".private_segment_fixed_size:", 0),
+            (".wavefront_size:", 32),
+            (".vgpr_spill_count:", 0),
+            (".sgpr_spill_count:", 0),
+            (".vgpr_count:", 121),
+            // gfx1100: the A0..A3 block s[80:87] clears the workgroup ids s14/s15
+            // (`FeatureUserSGPRInit16Bug`), so next_free_sgpr is 88.
+            (".sgpr_count:", if arch == Arch::Gfx1100 { 90 } else { 82 }),
+        ] {
+            assert_eq!(metadata_numbers(text, key), [expected], "{arch:?}: {key}");
+        }
+        assert_eq!(tile.proof.next_free_vgpr, 121);
+        if arch != Arch::Gfx1100 {
+            let narrow = mq4_rows_x4::emit(Spec { arch }).unwrap();
+            assert_eq!(tile.proof.next_free_vgpr, narrow.proof.next_free_vgpr);
+            assert!(!narrow
+                .s_text
+                .contains(".amdhsa_system_sgpr_workgroup_id_y 1\n"));
+        }
+        assert!(text.contains(".amdhsa_group_segment_fixed_size 0\n"));
+        assert!(text.contains(".amdhsa_system_sgpr_workgroup_id_y 1\n"));
+        assert!(text.contains(".amdhsa_wavefront_size32 1\n"));
+        assert!(!text.lines().any(|line| {
+            let line = line.trim();
+            line.starts_with("scratch_")
+                || line.starts_with("flat_")
+                || line.starts_with("s_barrier")
+        }));
+    }
+    assert!(mq4_rows_x4::emit(Spec {
+        arch: Arch::Gfx1100
+    })
+    .is_err());
+}
+
+/// Compare complete scheduled per-column bodies, including operand orientation,
+/// VOPD parity/skew, group-tail branches, folds, shuffles, waits and stores.
+/// This is PM-narrow equivalence, NOT an actual product-singleton object proof.
+#[test]
+fn rowtile_reuses_every_narrow_pair_arithmetic_section_verbatim() {
+    for arch in ARCHES {
+        let narrow = mq4_rows_x4::emit(Spec { arch }).unwrap();
+        let tile = mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap();
+        let narrow_body = narrow
+            .s_text
+            .split_once(".Lmq4rx_b1_start:")
+            .unwrap()
+            .1
+            .split_once(".Lmq4rx_end:")
+            .unwrap()
+            .0;
+        let tile_paired_end = if arch == Arch::Gfx1151 {
+            ".Lmq4rxt8_b9_start:"
+        } else {
+            ".Lmq4rxt8_end:"
+        };
+        let tile_body = tile
+            .s_text
+            .split_once(".Lmq4rxt8_b1_start:")
+            .unwrap()
+            .1
+            .split_once(tile_paired_end)
+            .unwrap()
+            .0;
+        assert_eq!(
+            narrow_body.replace(".Lmq4rx_", ".Lmq4rxt8_"),
+            tile_body,
+            "{arch:?}"
+        );
+        for rows in 1..=8 {
+            assert_eq!(
+                tile.s_text
+                    .matches(&format!(".Lmq4rxt8_b{rows}_start:"))
+                    .count(),
+                1
+            );
+        }
+        let labels = |text: &str| -> std::collections::BTreeSet<String> {
+            text.lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with(".L") && line.ends_with(':'))
+                .map(str::to_owned)
+                .collect()
+        };
+        assert!(labels(&narrow.s_text).is_disjoint(&labels(&tile.s_text)));
+    }
+}
+
+#[test]
+fn rowtile_arch_y_register_domain_guards_and_full_window_rebasing() {
+    for arch in TILE_ARCHES {
+        let tile = mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap();
+        let lines: Vec<&str> = tile.s_text.lines().map(str::trim).collect();
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| *line == needle)
+                .unwrap_or_else(|| panic!("{arch:?}: missing {needle}"))
+        };
+        let first_data_load = lines
+            .iter()
+            .position(|line| line.starts_with("buffer_load_") || line.starts_with("global_load_"))
+            .unwrap();
+        for guard in [
+            "s_cmp_eq_u32 s57, 0",
+            "s_cmp_gt_u32 s57, 64",
+            "s_cmp_le_i32 s30, 0",
+            "s_cmp_lg_u32 s45, 0",
+            "s_cmp_lt_i32 s26, 0",
+            "s_cmp_lt_i32 s27, 0",
+            "s_cmp_lt_i32 s28, 0",
+            "s_cmp_lt_i32 s29, 0",
+            "s_cmp_ge_u32 s56, 8",
+            "s_cmp_ge_u32 s56, s57",
+        ] {
+            let i = at(guard);
+            assert_eq!(lines[i + 1], "s_cbranch_scc1 .Lmq4rxt8_end");
+            assert!(i < first_data_load, "{arch:?}: {guard} after data load");
+        }
+        assert!(at("s_and_b32 s45, s30, 0xff") < at("s_cmp_lg_u32 s45, 0"));
+        // gfx1100: the Y workgroup id follows the 14 declared user SGPRs (s15).
+        let y_id = if arch == Arch::Gfx1100 { 15 } else { 3 };
+        let y_read = if arch.gfx12() {
+            "s_and_b32 s56, ttmp7, 0xffff".to_string()
+        } else {
+            format!("s_mov_b32 s56, s{y_id}")
+        };
+        assert!(at(&y_read) < at("s_cmp_ge_u32 s56, 8"));
+        assert!(at("s_cmp_ge_u32 s56, 8") < at("s_lshl_b32 s56, s56, 3"));
+        assert!(at("s_lshl_b32 s56, s56, 3") < at("s_cmp_ge_u32 s56, s57"));
+        assert!(at("s_cmp_gt_u32 s31, 8") < at("s_cselect_b32 s31, 8, s31"));
+        let sub = if arch.gfx12() {
+            "s_sub_co_i32"
+        } else {
+            "s_sub_i32"
+        };
+        assert!(at(&format!("{sub} s31, s57, s56")) < at("s_cmp_gt_u32 s31, 8"));
+        assert!(at("s_lshl_b32 s52, s30, 2") < at("s_mul_i32 s55, s56, s52"));
+        assert!(at("s_lshl_b32 s53, s34, 2") < at("s_mul_i32 s55, s56, s53"));
+        for rebase in ["s_mul_i32 s55, s56, s52", "s_mul_i32 s55, s56, s53"] {
+            assert!(at(rebase) < first_data_load);
+        }
+        if arch.gfx12() {
+            assert!(!tile.s_text.contains("s_mov_b32 s56, s3"));
+            assert!(!tile.s_text.contains("s_mov_b32 s56, s15"));
+        } else {
+            assert!(!tile.s_text.contains("ttmp"));
+            assert!(!tile.s_text.contains("scope:SCOPE"));
+            assert!(!tile.s_text.contains("s_add_nc_u64"));
+        }
+    }
+}
+
+// -------------------------------------------------------- independent CPU DAGs
+//
+// These finite-input, source-derived models exercise packed weights and actual
+// f32 mul / fused mul_add / add rounding. They do not lift the runtime singleton
+// object and cannot certify its architecture-specific exceptional-input behavior.
+// Actual product-singleton object identity remains a mandatory hardware gate.
+
+const TILE_GUARD: usize = 16;
+const TILE_POISON: u8 = 0xa5;
+const CPU_KARG: u64 = 0x1_0000;
+const CPU_X: u64 = 0x1_ffff_f000;
+const CPU_A: u64 = 0x3_0000_0000;
+const CPU_Y: u64 = 0x5_ffff_f000;
+const CPU_MATRIX_GAP: u64 = 0x100_0000;
+
+struct TileRng(u64);
+impl TileRng {
+    fn next(&mut self) -> u32 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0 as u32
+    }
+    fn finite(&mut self) -> f32 {
+        let bits = self.next();
+        f32::from_bits((bits & 0x807f_ffff) | ((119 + (bits >> 24) % 17) << 23))
+    }
+}
+
+fn normal_half(bits: u16) -> f32 {
+    let exp = u32::from((bits >> 10) & 31);
+    assert!(
+        (1..31).contains(&exp),
+        "fixture headers are normal finite f16"
+    );
+    f32::from_bits(
+        (u32::from(bits & 0x8000) << 16) | ((exp + 112) << 23) | (u32::from(bits & 1023) << 13),
+    )
+}
+
+fn tile_weights(rng: &mut TileRng, m: usize, groups: usize) -> Vec<u8> {
+    let mut bytes = vec![0; m * groups * 136];
+    for group in bytes.chunks_exact_mut(136) {
+        for h in 0..4 {
+            let bits = rng.next();
+            let half = ((bits as u16) & 0x83ff) | ((9 + (bits >> 16) % 10) as u16) << 10;
+            group[2 * h..2 * h + 2].copy_from_slice(&half.to_le_bytes());
+        }
+        for byte in &mut group[8..] {
+            *byte = rng.next() as u8;
+        }
+    }
+    bytes
+}
+
+fn decoded_weight(bytes: &[u8], groups: usize, output: usize, g: usize, e: usize) -> f32 {
+    let base = (output * groups + g) * 136;
+    let header = base + 4 * (e / 128);
+    let half = |off| normal_half(u16::from_le_bytes([bytes[off], bytes[off + 1]]));
+    let nibble = (bytes[base + 8 + e / 2] >> (4 * (e % 2))) & 15;
+    half(header).mul_add(f32::from(nibble), half(header + 2))
+}
+
+fn pair_dot(weights: &[f32; 8], x: &[f32; 8], odd: bool) -> f32 {
+    let (first, second) = if odd { (1, 0) } else { (0, 1) };
+    let mut dot = weights[first] * x[first];
+    dot = weights[second].mul_add(x[second], dot);
+    for term in 2..8 {
+        dot = weights[term].mul_add(x[term], dot);
+    }
+    dot
+}
+
+/// One output of the paired singleton transcription, indexed from an independent
+/// full-window row slice rather than the tile's byte bases.
+fn paired_singleton(weights: &[u8], x: &[f32], output: usize, wrong_odd_order: bool) -> u32 {
+    let groups = x.len() / 256;
+    assert_eq!(x.len() % 256, 0);
+    let mut lanes = [0.0f32; 32];
+    for (lane, value) in lanes.iter_mut().enumerate() {
+        let mut streams = [0.0f32; 4];
+        for g in 0..groups {
+            let mut w = [0.0; 8];
+            let mut a = [0.0; 8];
+            for term in 0..8 {
+                w[term] = decoded_weight(weights, groups, output, g, 8 * lane + term);
+                a[term] = x[256 * g + 8 * lane + term];
+            }
+            streams[g & 3] += pair_dot(&w, &a, output % 2 == 1 && !wrong_odd_order);
+        }
+        *value = (streams[0] + streams[1]) + (streams[2] + streams[3]);
+    }
+    // Lane zero's down-shuffle tree; other tail lanes cannot influence it.
+    for distance in [16, 8, 4, 2, 1] {
+        for lane in 0..distance {
+            lanes[lane] += lanes[lane + distance];
+        }
+    }
+    lanes[0].to_bits()
+}
+
+struct TileCase {
+    rows: usize,
+    k: usize,
+    m: [usize; 4],
+    weights: [Vec<u8>; 4],
+    x: Vec<f32>,
+    scalar: bool,
+}
+impl TileCase {
+    fn new(rows: usize, m: [usize; 4], groups: usize, seed: u64) -> Self {
+        let mut rng = TileRng(seed | 1);
+        Self {
+            rows,
+            k: groups * 256,
+            m,
+            weights: std::array::from_fn(|i| tile_weights(&mut rng, m[i], groups)),
+            x: (0..rows * groups * 256).map(|_| rng.finite()).collect(),
+            scalar: false,
+        }
+    }
+    fn blank_outputs(&self) -> [Vec<u8>; 4] {
+        std::array::from_fn(|i| {
+            // An additional full tile of poison catches inactive-row stores.
+            vec![TILE_POISON; 2 * TILE_GUARD + (self.rows + 8) * self.m[i] * 4]
+        })
+    }
+    fn reference(&self) -> [Vec<u8>; 4] {
+        let mut y = self.blank_outputs();
+        for i in 0..4 {
+            for row in 0..self.rows {
+                for output in 0..self.m[i] {
+                    let x = &self.x[row * self.k..(row + 1) * self.k];
+                    let value = if self.scalar {
+                        scalar_singleton(&self.weights[i], x, output)
+                    } else {
+                        paired_singleton(&self.weights[i], x, output, false)
+                    };
+                    let off = TILE_GUARD + 4 * (row * self.m[i] + output);
+                    y[i][off..off + 4].copy_from_slice(&value.to_le_bytes());
+                }
+            }
+        }
+        y
+    }
+}
+
+fn read_cpu_f32(x: &[f32], byte_offset: usize) -> f32 {
+    assert_eq!(byte_offset % 4, 0);
+    x[byte_offset / 4]
+}
+
+/// Independent tile schedule: cumulative x4 pair routing, clamped odd loads,
+/// shared dequant per group, fixed eight-row accumulators, and absolute byte
+/// rebasing. No precomputed/reference outputs are read by this model.
+fn model_rowtile(
+    case: &TileCase,
+    gx: usize,
+    gy: usize,
+    y: &mut [Vec<u8>; 4],
+    ownership: &mut [Vec<u8>; 4],
+) -> usize {
+    if !(1..=64).contains(&case.rows) || gy >= 8 || 8 * gy >= case.rows {
+        return 0;
+    }
+    let mut pair = gx;
+    let mut matrix = 0;
+    while matrix < 4 && pair >= case.m[matrix].div_ceil(2) {
+        pair -= case.m[matrix].div_ceil(2);
+        matrix += 1;
+    }
+    if matrix == 4 {
+        return 0;
+    }
+    let r0 = 8 * gy;
+    let count = (case.rows - r0).min(8);
+    let outputs = [2 * pair, (2 * pair + 1).min(case.m[matrix] - 1)];
+    let groups = case.k / 256;
+    let mut acc = [[[[0.0f32; 4]; 32]; 2]; 8];
+    for g in 0..groups {
+        for lane in 0..32 {
+            let mut w = [[0.0; 8]; 2];
+            for p in 0..2 {
+                for term in 0..8 {
+                    w[p][term] = decoded_weight(
+                        &case.weights[matrix],
+                        groups,
+                        outputs[p],
+                        g,
+                        8 * lane + term,
+                    );
+                }
+            }
+            for local in 0..count {
+                let x_base_bytes = r0 * case.k * 4 + local * case.k * 4;
+                for p in 0..2 {
+                    // Transcribe the emitted dot independently of pair_dot.
+                    let first = if case.scalar { 1 } else { p };
+                    let second = 1 - first;
+                    let load = |term| {
+                        read_cpu_f32(&case.x, x_base_bytes + 4 * (g * 256 + lane * 8 + term))
+                    };
+                    let tail = case.scalar && g >= (groups & !3);
+                    let mut dot = if tail {
+                        load(first) * w[p][first]
+                    } else {
+                        w[p][first] * load(first)
+                    };
+                    for term in std::iter::once(second).chain(2..8) {
+                        dot = if tail {
+                            load(term).mul_add(w[p][term], dot)
+                        } else {
+                            w[p][term].mul_add(load(term), dot)
+                        };
+                    }
+                    acc[local][p][lane][g & 3] += dot;
+                }
+            }
+        }
+    }
+    let mut writes = 0;
+    for local in 0..count {
+        for p in 0..2 {
+            if 2 * pair + p >= case.m[matrix] {
+                continue;
+            }
+            let mut wave = [0.0f32; 32];
+            for lane in 0..32 {
+                let a = acc[local][p][lane];
+                wave[lane] = if case.scalar {
+                    (a[0] + a[1]) + (a[3] + a[2])
+                } else {
+                    (a[0] + a[1]) + (a[2] + a[3])
+                };
+            }
+            // Full-wave swizzle/bpermute semantics, including out-of-range
+            // lanes reading themselves; unlike the singleton's lane-zero tree.
+            let old = wave;
+            for lane in 0..32 {
+                wave[lane] = old[lane] + old[lane | 16];
+            }
+            for distance in [8, 4, 2, 1] {
+                let old = wave;
+                for lane in 0..32 {
+                    let other = if lane + distance < 32 {
+                        lane + distance
+                    } else {
+                        lane
+                    };
+                    wave[lane] = old[lane] + old[other];
+                }
+            }
+            let index = (r0 + local) * case.m[matrix] + 2 * pair + p;
+            ownership[matrix][index] += 1;
+            let off = TILE_GUARD
+                + r0 * case.m[matrix] * 4
+                + local * case.m[matrix] * 4
+                + (2 * pair + p) * 4;
+            y[matrix][off..off + 4].copy_from_slice(&wave[0].to_bits().to_le_bytes());
+            writes += 1;
+        }
+    }
+    writes
+}
+
+fn check_model(case: &TileCase) {
+    let weights_before = case.weights.clone();
+    let x_before: Vec<u32> = case.x.iter().map(|value| value.to_bits()).collect();
+    let mut got = case.blank_outputs();
+    let want = case.reference();
+    let mut ownership: [Vec<u8>; 4] = std::array::from_fn(|i| vec![0; case.rows * case.m[i]]);
+    let grid_x: usize = case.m.iter().map(|m| m.div_ceil(2)).sum();
+    let mut writes = 0;
+    // Deliberately overlaunch both dimensions; dead groups must be no-ops.
+    for gy in 0..case.rows.div_ceil(8) + 2 {
+        for gx in 0..grid_x + 2 {
+            writes += model_rowtile(case, gx, gy, &mut got, &mut ownership);
+        }
+    }
+    assert_eq!(writes, case.rows * case.m.iter().sum::<usize>());
+    for i in 0..4 {
+        assert_eq!(
+            got[i], want[i],
+            "R={} K={} M={:?} matrix={i}",
+            case.rows, case.k, case.m
+        );
+        assert!(ownership[i].iter().all(|&count| count == 1));
+    }
+    assert_eq!(case.weights, weights_before);
+    assert_eq!(
+        case.x
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        x_before
+    );
+}
+
+#[test]
+fn rowtile_cpu_dag_all_widths_empty_live_routes_ragged_pairs_and_k_stream_tails() {
+    const SHAPES: [usize; 7] = [1, 2, 3, 7, 8, 9, 17];
+    for rows in 1..=64 {
+        for mask in 0..16 {
+            let m = std::array::from_fn(|i| {
+                if mask & (1 << i) == 0 {
+                    0
+                } else {
+                    SHAPES[(rows + i) % SHAPES.len()]
+                }
+            });
+            // Ascending group counts exercise all four stream remainders,
+            // repeated chains, one group, and non-padded final groups.
+            let groups = 1 + (rows + mask) % 9;
+            check_model(&TileCase::new(
+                rows,
+                m,
+                groups,
+                (rows * 31 + mask * 719) as u64,
+            ));
+        }
+    }
+}
+
+#[test]
+fn rowtile_cpu_negative_controls_distinguish_odd_order_and_fused_rounding() {
+    let mut w = [0.0f32; 8];
+    let mut x = [0.0f32; 8];
+    w[0] = 1.000_976_562_5;
+    w[1] = -1.0;
+    x[0] = f32::from_bits(0x3f80_0001);
+    x[1] = w[0] * x[0];
+    assert_eq!(pair_dot(&w, &x, false).to_bits(), 0.0f32.to_bits());
+    assert_eq!(
+        pair_dot(&w, &x, true).to_bits(),
+        (2.0f32).powi(-33).to_bits()
+    );
+    assert_ne!(
+        w[0].mul_add(x[0], -x[1]).to_bits(),
+        ((w[0] * x[0]) - x[1]).to_bits()
+    );
+    // Real packed MQ4 can encode both weights in one header: scale=1366/2048,
+    // zero=-1, nibbles [3,0]. No probabilistic search is needed for this control.
+    let case = packed_odd_order_witness();
+    assert_eq!(decoded_weight(&case.weights[0], 1, 1, 0, 0), w[0]);
+    assert_eq!(decoded_weight(&case.weights[0], 1, 1, 0, 1), w[1]);
+    assert_eq!(
+        paired_singleton(&case.weights[0], &case.x, 1, false),
+        (2.0f32).powi(-33).to_bits()
+    );
+    assert_eq!(
+        paired_singleton(&case.weights[0], &case.x, 1, true),
+        0.0f32.to_bits()
+    );
+    check_model(&case);
+}
+
+fn packed_odd_order_witness() -> TileCase {
+    let mut case = TileCase::new(1, [2, 0, 0, 0], 1, 0xd061_3379);
+    case.x.fill(0.0);
+    case.x[0] = f32::from_bits(0x3f80_0001);
+    case.x[1] = 1.000_976_562_5f32 * case.x[0];
+    case.weights[0][136..138].copy_from_slice(&0x3956u16.to_le_bytes());
+    case.weights[0][138..140].copy_from_slice(&0xbc00u16.to_le_bytes());
+    case.weights[0][144] = 0x03;
+    case
+}
+
+// ----------------------------------------------- emitted native ISA execution
+//
+// Native-assemble/lift both PM entries and execute their instructions with the
+// existing descriptor-driven interpreter. No hipcc/ROCm tools or GPU are needed.
+// This proves neither the runtime's selected singleton SHA nor hardware parity;
+// those remain separate qualification gates, with no unsupported-op fallback.
+
+fn cpu_program(arch: Arch, text: &str) -> peacemaker_ir::Program {
+    let elf = peacemaker_isa::native::assemble(text, arch).unwrap();
+    peacemaker_lift::lift_object(
+        &elf,
+        peacemaker_lift::Options {
+            frontend: peacemaker_ir::inst::Frontend::Builder,
+        },
+    )
+    .unwrap()
+    .program
+}
+
+struct TileIsaRig {
+    arch: Arch,
+    tile: peacemaker_ir::Program,
+    narrow: peacemaker_ir::Program,
+}
+impl TileIsaRig {
+    fn new(arch: Arch) -> Self {
+        Self {
+            arch,
+            tile: cpu_program(
+                arch,
+                &mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap().s_text,
+            ),
+            narrow: cpu_program(arch, &mq4_rows_x4::emit(Spec { arch }).unwrap().s_text),
+        }
+    }
+}
+
+fn cpu_args(m: [i32; 4], k: i32, rows: u32, x_row: usize, k_stride: usize) -> Vec<u8> {
+    let mut args = Vec::new();
+    for i in 0..4 {
+        args.extend((CPU_A + CPU_MATRIX_GAP * i as u64 + TILE_GUARD as u64).to_le_bytes());
+    }
+    args.extend((CPU_X + TILE_GUARD as u64 + (x_row * k_stride * 4) as u64).to_le_bytes());
+    for i in 0..4 {
+        args.extend(
+            (CPU_Y
+                + CPU_MATRIX_GAP * i as u64
+                + TILE_GUARD as u64
+                + (x_row * m[i].max(0) as usize * 4) as u64)
+                .to_le_bytes(),
+        );
+    }
+    for value in m {
+        args.extend(value.to_le_bytes());
+    }
+    args.extend(k.to_le_bytes());
+    args.extend(rows.to_le_bytes());
+    assert_eq!(args.len(), 96);
+    args
+}
+
+fn cpu_region<'a>(mem: &'a peacemaker_ir::emu::Memory, name: &str) -> &'a [u8] {
+    &mem.regions
+        .iter()
+        .find(|region| region.name == name)
+        .unwrap()
+        .bytes
+}
+
+fn cpu_set_args(mem: &mut peacemaker_ir::emu::Memory, args: Vec<u8>) {
+    mem.regions
+        .iter_mut()
+        .find(|region| region.name == "args")
+        .unwrap()
+        .bytes = args;
+}
+
+fn cpu_workgroup(
+    emu: &peacemaker_ir::emu::Emulator<'_>,
+    mem: &mut peacemaker_ir::emu::Memory,
+    workgroup: [u32; 3],
+    tag: &str,
+) {
+    emu.run_workgroup(
+        &peacemaker_ir::emu::Launch {
+            kernarg_ptr: CPU_KARG,
+            workgroup,
+            block: [32, 1, 1],
+            dynamic_lds: 0,
+        },
+        mem,
+    )
+    .unwrap_or_else(|error| panic!("{tag} wg={workgroup:?}: {error}"));
+}
+
+fn cpu_memory(case: &TileCase) -> peacemaker_ir::emu::Memory {
+    let mut mem = peacemaker_ir::emu::Memory::default();
+    let guarded = |bytes: &[u8]| {
+        let mut out = vec![TILE_POISON; TILE_GUARD];
+        out.extend_from_slice(bytes);
+        out.resize(out.len() + TILE_GUARD, TILE_POISON);
+        out
+    };
+    for i in 0..4 {
+        mem.map(
+            format!("a{i}"),
+            CPU_A + i as u64 * CPU_MATRIX_GAP,
+            guarded(&case.weights[i]),
+        )
+        .unwrap();
+    }
+    let x: Vec<u8> = case
+        .x
+        .iter()
+        .flat_map(|x| x.to_bits().to_le_bytes())
+        .collect();
+    mem.map("x".into(), CPU_X, guarded(&x)).unwrap();
+    let outputs = case.blank_outputs();
+    for (i, bytes) in outputs.into_iter().enumerate() {
+        mem.map(format!("y{i}"), CPU_Y + i as u64 * CPU_MATRIX_GAP, bytes)
+            .unwrap();
+    }
+    mem.map(
+        "args".into(),
+        CPU_KARG,
+        cpu_args(
+            case.m.map(|m| m as i32),
+            case.k as i32,
+            case.rows as u32,
+            0,
+            case.k,
+        ),
+    )
+    .unwrap();
+    mem
+}
+
+fn check_emitted_case(rig: &TileIsaRig, case: &TileCase) {
+    let tag = format!("{:?} R={} M={:?} K={}", rig.arch, case.rows, case.m, case.k);
+    let mut tile_mem = cpu_memory(case);
+    let mut narrow_mem = cpu_memory(case);
+    let before_x = cpu_region(&tile_mem, "x").to_vec();
+    let before_a: [Vec<u8>; 4] =
+        std::array::from_fn(|i| cpu_region(&tile_mem, &format!("a{i}")).to_vec());
+    let tile = peacemaker_ir::emu::Emulator::new(&rig.tile, &rowtile_symbol(rig.arch)).unwrap();
+    let narrow =
+        peacemaker_ir::emu::Emulator::new(&rig.narrow, &Spec { arch: rig.arch }.symbol()).unwrap();
+    let grid_x: usize = case.m.iter().map(|m| m.div_ceil(2)).sum();
+    for gy in 0..case.rows.div_ceil(8) + 1 {
+        for gx in 0..grid_x + 1 {
+            cpu_workgroup(&tile, &mut tile_mem, [gx as u32, gy as u32, 0], &tag);
+        }
+    }
+    for row in 0..case.rows {
+        cpu_set_args(
+            &mut narrow_mem,
+            cpu_args(case.m.map(|m| m as i32), case.k as i32, 1, row, case.k),
+        );
+        for gx in 0..grid_x + 1 {
+            cpu_workgroup(&narrow, &mut narrow_mem, [gx as u32, 0, 0], &tag);
+        }
+    }
+    let expected = case.reference();
+    for i in 0..4 {
+        let name = format!("y{i}");
+        assert_eq!(
+            cpu_region(&tile_mem, &name),
+            expected[i],
+            "{tag}: DAG matrix {i}"
+        );
+        assert_eq!(
+            cpu_region(&tile_mem, &name),
+            cpu_region(&narrow_mem, &name),
+            "{tag}: PM singleton matrix {i}"
+        );
+        let name = format!("a{i}");
+        assert_eq!(
+            cpu_region(&tile_mem, &name),
+            before_a[i],
+            "{tag}: weights changed"
+        );
+        assert_eq!(
+            cpu_region(&narrow_mem, &name),
+            before_a[i],
+            "{tag}: narrow weights changed"
+        );
+    }
+    assert_eq!(cpu_region(&tile_mem, "x"), before_x, "{tag}: X changed");
+    assert_eq!(
+        cpu_region(&narrow_mem, "x"),
+        before_x,
+        "{tag}: narrow X changed"
+    );
+}
+
+fn check_emitted_arch(arch: Arch) {
+    let rig = TileIsaRig::new(arch);
+    check_emitted_case(&rig, &packed_odd_order_witness());
+    const SHAPES: [usize; 7] = [1, 2, 3, 7, 8, 9, 17];
+    // Every logical width executes the actual grid-y ISA, with all local tail
+    // counts, odd/even pairs and all K-stream tails distributed across widths.
+    for rows in 1..=64 {
+        let m = std::array::from_fn(|i| SHAPES[(rows + 2 * i) % SHAPES.len()]);
+        check_emitted_case(
+            &rig,
+            &TileCase::new(rows, m, 1 + rows % 9, 0x36fe_1179 + rows as u64),
+        );
+    }
+    // All sixteen empty/live matrix combinations, including the whole-dead
+    // x dimension, at the first boundary, row32 boundary and full capacity.
+    for rows in [9, 33, 64] {
+        for mask in 0..16 {
+            let m = std::array::from_fn(|i| {
+                if mask & (1 << i) == 0 {
+                    0
+                } else {
+                    SHAPES[(mask + i) % SHAPES.len()]
+                }
+            });
+            check_emitted_case(
+                &rig,
+                &TileCase::new(
+                    rows,
+                    m,
+                    1 + mask % 5,
+                    0xd203_7681 + (rows * 19 + mask) as u64,
+                ),
+            );
+        }
+    }
+}
+
+#[test]
+fn rowtile_emitted_gfx1151_matches_pm_singletons_and_independent_cpu_dag() {
+    check_emitted_arch(Arch::Gfx1151);
+}
+
+#[test]
+fn rowtile_emitted_gfx1201_matches_pm_singletons_and_independent_cpu_dag() {
+    check_emitted_arch(Arch::Gfx1201);
+}
+
+#[test]
+fn rowtile_emitted_invalid_domains_and_dead_workgroups_never_access_data() {
+    for arch in TILE_ARCHES {
+        let program = cpu_program(
+            arch,
+            &mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap().s_text,
+        );
+        let emu = peacemaker_ir::emu::Emulator::new(&program, &rowtile_symbol(arch)).unwrap();
+        let mut cases = Vec::new();
+        for rows in [0, 65, 0xffff_ffff] {
+            cases.push(([1; 4], 256, rows, [0, 0, 0]));
+        }
+        for k in [-256, 0, 1, 255, 257, 511] {
+            cases.push(([1; 4], k, 9, [0, 0, 0]));
+        }
+        for i in 0..4 {
+            let mut m = [1; 4];
+            m[i] = -1;
+            cases.push((m, 256, 9, [0, 0, 0]));
+        }
+        cases.push(([0; 4], 256, 64, [0, 0, 0]));
+        cases.push(([1, 0, 3, 0], 256, 64, [3, 0, 0]));
+        for (rows, gy) in [(1, 1), (8, 1), (9, 2), (33, 5), (64, 8), (64, 0xffff)] {
+            cases.push(([1; 4], 256, rows, [0, gy, 0]));
+        }
+        for (m, k, rows, group) in cases {
+            let mut mem = peacemaker_ir::emu::Memory::default();
+            // Only kernargs are mapped. Any accidental data load/store is a
+            // hard interpreter error rather than a poison value passed along.
+            let args = cpu_args(m, k, rows, 0, 0);
+            mem.map("args".into(), CPU_KARG, args.clone()).unwrap();
+            cpu_workgroup(
+                &emu,
+                &mut mem,
+                group,
+                &format!("{arch:?} invalid/dead R={rows} M={m:?} K={k}"),
+            );
+            assert_eq!(cpu_region(&mem, "args"), args);
+        }
+    }
+}
+
+/// Actual scalar recipe transcribed from the pinned object contract: both
+/// outputs start term1, term0 then 2..7; full quads use (w,x), group tails
+/// use (x,w), and the final stream fold is (a0+a1)+(a3+a2).
+/// This source-derived model is not execution of the pinned product object.
+fn scalar_singleton(weights: &[u8], x: &[f32], output: usize) -> u32 {
+    let groups = x.len() / 256;
+    let mut wave = [0.0f32; 32];
+    for lane in 0..32 {
+        let mut streams = [0.0f32; 4];
+        for g in 0..groups {
+            let w = |term| decoded_weight(weights, groups, output, g, lane * 8 + term);
+            let a = |term| x[g * 256 + lane * 8 + term];
+            let mut dot;
+            if g < (groups & !3) {
+                dot = w(1) * a(1);
+                for term in [0, 2, 3, 4, 5, 6, 7] {
+                    dot = w(term).mul_add(a(term), dot);
+                }
+            } else {
+                dot = a(1) * w(1);
+                for term in [0, 2, 3, 4, 5, 6, 7] {
+                    dot = a(term).mul_add(w(term), dot);
+                }
+            }
+            streams[g & 3] += dot;
+        }
+        wave[lane] = (streams[0] + streams[1]) + (streams[3] + streams[2]);
+    }
+    for distance in [16, 8, 4, 2, 1] {
+        for lane in 0..distance {
+            wave[lane] += wave[lane + distance];
+        }
+    }
+    wave[0].to_bits()
+}
+
+#[test]
+fn rowtile_scalar_cpu_dag_every_width_routes_and_k_quad_remainder() {
+    const SHAPES: [usize; 7] = [1, 2, 3, 7, 8, 9, 17];
+    for rows in 1..=64 {
+        for mask in 0..16 {
+            let m = std::array::from_fn(|i| {
+                if mask & (1 << i) == 0 {
+                    0
+                } else {
+                    SHAPES[(rows + i) % 7]
+                }
+            });
+            let mut case = TileCase::new(
+                rows,
+                m,
+                1 + (rows + mask) % 9,
+                0xa81d_9743 + (rows * 17 + mask) as u64,
+            );
+            case.scalar = true;
+            check_model(&case);
+        }
+    }
+    // The packed cancellation witness must distinguish scalar output0 from
+    // the paired-even chain as well as distinguishing correct odd ordering.
+    let mut witness = packed_odd_order_witness();
+    witness.weights[0].copy_within(136..272, 0);
+    witness.scalar = true;
+    assert_eq!(
+        scalar_singleton(&witness.weights[0], &witness.x, 0),
+        (2.0f32).powi(-33).to_bits()
+    );
+    assert_eq!(
+        paired_singleton(&witness.weights[0], &witness.x, 0, false),
+        0.0f32.to_bits()
+    );
+    check_model(&witness);
+}
+
+fn run_emitted_scalar_case(program: &peacemaker_ir::Program, arch: Arch, case: &TileCase) {
+    assert!(case.scalar);
+    let emu = peacemaker_ir::emu::Emulator::new(program, &rowtile_symbol(arch)).unwrap();
+    let mut mem = cpu_memory(case);
+    let before: Vec<(String, Vec<u8>)> = mem
+        .regions
+        .iter()
+        .filter(|region| region.name == "x" || region.name.starts_with('a'))
+        .map(|region| (region.name.clone(), region.bytes.clone()))
+        .collect();
+    let grid_x: usize = case.m.iter().map(|m| m.div_ceil(2)).sum();
+    let tag = format!(
+        "{arch:?} scalar R={} M={:?} K={}",
+        case.rows, case.m, case.k
+    );
+    for gy in 0..case.rows.div_ceil(8) + 1 {
+        for gx in 0..grid_x + 1 {
+            cpu_workgroup(&emu, &mut mem, [gx as u32, gy as u32, 0], &tag);
+        }
+    }
+    for (i, expected) in case.reference().iter().enumerate() {
+        assert_eq!(
+            cpu_region(&mem, &format!("y{i}")),
+            expected,
+            "{tag}: matrix {i}"
+        );
+    }
+    for (name, bytes) in before {
+        assert_eq!(cpu_region(&mem, &name), bytes, "{tag}: {name} changed");
+    }
+}
+
+#[test]
+fn rowtile_emitted_gfx1100_scalar_matches_cpu_dag_every_width_and_route() {
+    let arch = Arch::Gfx1100;
+    let program = cpu_program(
+        arch,
+        &mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap().s_text,
+    );
+    const SHAPES: [usize; 7] = [1, 2, 3, 7, 8, 9, 17];
+    for rows in 1..=64 {
+        let mut case = TileCase::new(
+            rows,
+            std::array::from_fn(|i| SHAPES[(rows + i) % 7]),
+            1 + rows % 9,
+            0xfe11_3571 + rows as u64,
+        );
+        case.scalar = true;
+        run_emitted_scalar_case(&program, arch, &case);
+    }
+    for rows in [9, 33, 64] {
+        for mask in 0..16 {
+            let mut case = TileCase::new(
+                rows,
+                std::array::from_fn(|i| {
+                    if mask & (1 << i) == 0 {
+                        0
+                    } else {
+                        SHAPES[(mask + i) % 7]
+                    }
+                }),
+                1 + mask % 9,
+                0xe174_3149 + (mask + rows * 37) as u64,
+            );
+            case.scalar = true;
+            run_emitted_scalar_case(&program, arch, &case);
+        }
+    }
+    let mut witness = packed_odd_order_witness();
+    witness.weights[0].copy_within(136..272, 0);
+    witness.scalar = true;
+    run_emitted_scalar_case(&program, arch, &witness);
+}
+
+/// Exercise the real large-M scalar branch without materializing 270 MB of
+/// weights: only the selected pair's weights and full-stride Y destinations
+/// are mapped. Any wrong pair, inactive-row access or local/full stride mixup
+/// faults or changes guard bytes rather than reading a permissive flat buffer.
+fn check_sparse_halo_scalar(
+    program: &peacemaker_ir::Program,
+    rows: usize,
+    pair: usize,
+    matrix: usize,
+) {
+    const M: usize = 248_320;
+    let mut m = [1usize, 3, 7, 9];
+    m[matrix] = M;
+    let first_pair: usize = m[..matrix].iter().map(|m| m.div_ceil(2)).sum();
+    let grid_x: usize = m.iter().map(|m| m.div_ceil(2)).sum();
+    let mut case = TileCase::new(rows, [2, 0, 0, 0], 8, 0x75ee_3281 + rows as u64);
+    case.scalar = true;
+    let emu = peacemaker_ir::emu::Emulator::new(program, &rowtile_symbol(Arch::Gfx1151)).unwrap();
+    let mut mem = peacemaker_ir::emu::Memory::default();
+    let first_output = pair * 2;
+    let guarded = |bytes: &[u8]| {
+        let mut out = vec![TILE_POISON; TILE_GUARD];
+        out.extend_from_slice(bytes);
+        out.resize(out.len() + TILE_GUARD, TILE_POISON);
+        out
+    };
+    let weight_bytes = guarded(&case.weights[0]);
+    mem.map(
+        "a0".into(),
+        CPU_A + matrix as u64 * CPU_MATRIX_GAP + (first_output * 8 * 136) as u64,
+        weight_bytes.clone(),
+    )
+    .unwrap();
+    let x_bytes = guarded(
+        &case
+            .x
+            .iter()
+            .flat_map(|x| x.to_bits().to_le_bytes())
+            .collect::<Vec<_>>(),
+    );
+    mem.map("x".into(), CPU_X, x_bytes.clone()).unwrap();
+    for row in 0..rows {
+        mem.map(
+            format!("y{row}"),
+            CPU_Y + matrix as u64 * CPU_MATRIX_GAP + (4 * (row * M + first_output)) as u64,
+            vec![TILE_POISON; 2 * TILE_GUARD + 8],
+        )
+        .unwrap();
+    }
+    let args = cpu_args(m.map(|m| m as i32), 2048, rows as u32, 0, 2048);
+    mem.map("args".into(), CPU_KARG, args.clone()).unwrap();
+    let tag = format!("gfx1151 scalar sparse R={rows} M={M} matrix={matrix} pair={pair}");
+    for gy in 0..rows.div_ceil(8) + 1 {
+        cpu_workgroup(
+            &emu,
+            &mut mem,
+            [(first_pair + pair) as u32, gy as u32, 0],
+            &tag,
+        );
+        // A whole-dead x group must not touch any unmapped matrix data.
+        cpu_workgroup(&emu, &mut mem, [grid_x as u32, gy as u32, 0], &tag);
+    }
+    let expected = case.reference();
+    for row in 0..rows {
+        let off = TILE_GUARD + row * 8;
+        assert_eq!(
+            cpu_region(&mem, &format!("y{row}")),
+            guarded(&expected[0][off..off + 8]),
+            "{tag}: row {row}"
+        );
+    }
+    assert_eq!(
+        cpu_region(&mem, "a0"),
+        weight_bytes,
+        "{tag}: weights changed"
+    );
+    assert_eq!(cpu_region(&mem, "x"), x_bytes, "{tag}: X changed");
+    assert_eq!(cpu_region(&mem, "args"), args, "{tag}: kernargs changed");
+}
+
+#[test]
+fn rowtile_emitted_halo_scalar_lm_full_row_strides_first_and_last_pairs() {
+    let arch = Arch::Gfx1151;
+    let program = cpu_program(
+        arch,
+        &mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap().s_text,
+    );
+    for rows in 1..=64 {
+        for pair in [0, 248_320 / 2 - 1] {
+            check_sparse_halo_scalar(&program, rows, pair, rows % 4);
+        }
+    }
+}
+
+#[test]
+fn rowtile_scalar_emission_keeps_object_order_orientation_streams_and_fold() {
+    for arch in [Arch::Gfx1151, Arch::Gfx1100] {
+        let tile = mq4_rows_x4::emit_rowtiles(Spec { arch }).unwrap();
+        let text = &tile.s_text;
+        assert!(text.contains("s_and_b32 s59, s43, -4"));
+        assert!(text.contains("s_cbranch_scc1 .Lmq4rxt8_scalar_dispatch"));
+        if arch == Arch::Gfx1151 {
+            let required = [
+                "s_cmp_eq_u32 s34, 0x3ca00",
+                "s_cselect_b32 s58, 1, 0",
+                "s_cmp_eq_u32 s30, 0x800",
+                "s_cselect_b32 s58, s58, 0",
+            ];
+            let mut previous = 0;
+            for instruction in required {
+                let position = text.find(instruction).unwrap();
+                assert!(position > previous);
+                previous = position;
+            }
+        } else {
+            assert!(text.contains("s_mov_b32 s58, 1"));
+            assert!(!text.contains(".Lmq4rxt8_b1_start:"));
+        }
+        for rows in 1..=8 {
+            let label = rows + 8;
+            assert!(text.contains(&format!("s_cbranch_scc1 .Lmq4rxt8_b{label}_start")));
+            for stream in 0..4 {
+                let block = text
+                    .split_once(&format!(".Lmq4rxt8_b{label}_s{stream}:"))
+                    .unwrap()
+                    .1;
+                let (main, rest) = block
+                    .split_once(&format!(".Lmq4rxt8_b{label}_s{stream}_tail:"))
+                    .unwrap();
+                let tail = rest
+                    .split_once(&format!(".Lmq4rxt8_b{label}_s{stream}_dot_done:"))
+                    .unwrap()
+                    .0;
+                assert!(main.contains("s_cmp_ge_u32 s50, s59"));
+                assert!(main.contains(&format!("s_cbranch_scc1 .Lmq4rxt8_b{label}_s{stream}_tail")));
+                for (is_tail, body) in [(false, main), (true, tail)] {
+                    let actual: Vec<&str> = body
+                        .lines()
+                        .map(str::trim)
+                        .filter(|line| {
+                            line.starts_with("v_mul_f32_e32 ")
+                                || line.starts_with("v_fmac_f32_e32 ")
+                        })
+                        .collect();
+                    let mut expected = Vec::new();
+                    for column in 0..rows {
+                        let x = 105 + 8 * (column % 2);
+                        for p in 0..2 {
+                            let w = [16, 26][p];
+                            let dst = 24 + p;
+                            for (index, term) in [1, 0, 2, 3, 4, 5, 6, 7].into_iter().enumerate() {
+                                let (lhs, rhs) = if is_tail {
+                                    (x + term, w + term)
+                                } else {
+                                    (w + term, x + term)
+                                };
+                                let op = if index == 0 {
+                                    "v_mul_f32_e32"
+                                } else {
+                                    "v_fmac_f32_e32"
+                                };
+                                expected.push(format!("{op} v{dst}, v{lhs}, v{rhs}"));
+                            }
+                        }
+                        let a = 40 + column * 8 + stream * 2;
+                        assert!(body.contains(&format!(
+                            "v_dual_add_f32 v{a}, v{a}, v24 :: v_dual_add_f32 v{}, v{}, v25",
+                            a + 1,
+                            a + 1
+                        )));
+                    }
+                    assert_eq!(
+                        actual, expected,
+                        "{arch:?} b{label} stream{stream} tail={is_tail}"
+                    );
+                }
+            }
+            let fold = text
+                .split_once(&format!(".Lmq4rxt8_b{label}_fold:"))
+                .unwrap()
+                .1
+                .split_once("ds_swizzle_b32")
+                .unwrap()
+                .0;
+            let actual: Vec<&str> = fold
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("v_dual_add_f32 "))
+                .collect();
+            let mut expected = Vec::new();
+            for column in 0..rows {
+                for (lhs, rhs) in [(0, 1), (3, 2), (0, 3)] {
+                    let a = 40 + column * 8 + lhs * 2;
+                    let b = 40 + column * 8 + rhs * 2;
+                    expected.push(format!(
+                        "v_dual_add_f32 v{a}, v{a}, v{b} :: v_dual_add_f32 v{}, v{}, v{}",
+                        a + 1,
+                        a + 1,
+                        b + 1
+                    ));
+                }
+            }
+            assert_eq!(actual, expected, "{arch:?} b{label} scalar fold");
+        }
+    }
+    let paired = mq4_rows_x4::emit_rowtiles(Spec {
+        arch: Arch::Gfx1201,
+    })
+    .unwrap();
+    assert!(!paired.s_text.contains(".Lmq4rxt8_scalar_dispatch:"));
+    assert!(!paired.s_text.contains(".Lmq4rxt8_b9_start:"));
+}

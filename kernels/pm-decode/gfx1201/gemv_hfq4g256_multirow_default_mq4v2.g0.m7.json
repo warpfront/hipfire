@@ -1,0 +1,16 @@
+{
+  "ambiguous_delays": 0,
+  "barrier_pairs": 0,
+  "clauses": 0,
+  "delays": 49,
+  "instructions": 134,
+  "lds_accesses": 0,
+  "lds_max_known_end": 0,
+  "lds_unknown_addresses": 0,
+  "lift": "byte-exact",
+  "obligations": {},
+  "sgpr_high_water": 10,
+  "table": "gfx1201",
+  "vgpr_high_water": 20,
+  "wait_facts": 5
+}

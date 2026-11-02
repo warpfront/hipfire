@@ -1,0 +1,126 @@
+name: container-image
+
+# Container image build for a release tag (Containerfile; docs/CONTAINER.md).
+#
+# Builds the `runtime` (slim, default) or `full` (adds hipcc for JIT of
+# unregistered routes) target with the release kernel packs baked in for
+# gfx1100, gfx1151 and gfx1201, then runs two GPU-free smoke checks: the
+# CLI answers --version, and the baked arch directories exist.
+#
+# Publishing is enabled (Kaden, decision ede09c6dce74): pushing a `v*` tag
+# builds the `full` image and pushes ghcr.io/warpfront/hipfire:<version> and
+# :latest. A manual workflow_dispatch builds an existing tag's `full` or
+# `runtime` image (the slim `runtime` image is dispatch-only) and pushes it
+# the same way.
+#
+# GPU validation stays manual: a hosted runner has no AMD GPU, so serving,
+# model loading and the compose stack are checked by hand on real hardware
+# (docs/CONTAINER.md).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build (for example v0.4.3)
+        required: true
+        type: string
+      target:
+        description: Image variant to build
+        required: false
+        type: choice
+        options:
+          - full
+          - runtime
+        default: full
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-image-${{ inputs.tag || github.ref_name }}-${{ inputs.target || 'full' }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: write
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
+      TARGET: ${{ inputs.target || 'full' }}
+      IMAGE: ghcr.io/warpfront/hipfire
+      GPU_ARCHES: gfx1100 gfx1151 gfx1201
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+
+      # The ROCm layers unpack to tens of GB, more than a hosted runner's root
+      # volume has free, so Docker stores images on the /mnt scratch disk.
+      - name: Move Docker storage to the scratch disk
+        run: |
+          df -h / /mnt
+          conf=/etc/docker/daemon.json
+          sudo systemctl stop docker.socket docker.service
+          sudo mkdir -p /mnt/docker
+          { sudo cat "$conf" 2>/dev/null || echo '{}'; } \
+            | jq '. + {"data-root": "/mnt/docker"}' | sudo tee "$conf.new" >/dev/null
+          sudo mv "$conf.new" "$conf"
+          sudo systemctl start docker.service
+          df -h / /mnt
+
+      - name: Compute version, revision and tags
+        run: |
+          version="${TAG#v}"
+          revision="$(git rev-parse HEAD)"
+          # full is the compose default (ghcr.io/warpfront/hipfire:latest).
+          if [ "$TARGET" = full ]; then
+            suffix=""; moving="latest"
+          else
+            suffix="-runtime"; moving="runtime"
+          fi
+          {
+            echo "VERSION=$version"
+            echo "REVISION=$revision"
+            echo "VERSION_TAG=$IMAGE:$version$suffix"
+            echo "MOVING_TAG=$IMAGE:$moving"
+          } >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: |
+          docker buildx build \
+            -f Containerfile \
+            --target "$TARGET" \
+            --build-arg HIPFIRE_VERSION="$VERSION" \
+            --build-arg HIPFIRE_REVISION="$REVISION" \
+            --build-arg HIPFIRE_GPU_ARCHES="$GPU_ARCHES" \
+            -t "$VERSION_TAG" \
+            -t "$MOVING_TAG" \
+            --load \
+            .
+          docker image ls "$IMAGE"
+
+      # No GPU on the runner: only the CLI and the baked kernel packs can be
+      # checked here.
+      - name: Smoke test (no GPU)
+        run: |
+          docker run --rm --entrypoint hipfire "$VERSION_TAG" --version
+          docker run --rm --entrypoint sh "$VERSION_TAG" \
+            -c 'ls /opt/hipfire/bin/kernels/compiled'
+
+      # The repository's Actions allowlist admits only GitHub-owned and a few
+      # named third-party actions, so login and build use the runner's docker
+      # CLI (buildx ships with it) instead of docker/* actions.
+      - name: Log in to ghcr.io
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: echo "$GH_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push image tags
+        run: |
+          docker push "$VERSION_TAG"
+          docker push "$MOVING_TAG"

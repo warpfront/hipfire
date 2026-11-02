@@ -1,0 +1,39 @@
+{
+  "module": "fused_qkv_hfq4g256_mq4v2",
+  "symbol": "fused_qkv_mq4g256v2",
+  "arch": "gfx1201",
+  "source_commit": "69d1dd4ea392201f4bc3d253997f46e932292c39",
+  "artifact_set_atomic": true,
+  "code_object_sha256": "22c665a2548ad0a13d3b2a77212914d8ca42c3af4872dc9c394a3b0a70dbc4cb",
+  "bundle_sha256": "9e4f53092542077b6b97d4b462cfb5be0f58f109b4deba65d3a1892c8402420b",
+  "assembly_sha256": "2ecbe594223526c724df00c7b8efb198aa658b9710e14c59fdaa261b18954fc9",
+  "proof_sha256": "ad27d2ddb1cd05ec40e7db268e8ea396fffb56c4ffa4f207593fca8456bf0e8b",
+  "bundle_consistency": {
+    "target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
+    "extracted_elf_sha256": "22c665a2548ad0a13d3b2a77212914d8ca42c3af4872dc9c394a3b0a70dbc4cb",
+    "method": "/opt/rocm/llvm/bin/clang-offload-bundler --unbundle; sha256sum; cmp",
+    "byte_identical_to_co": true
+  },
+  "custom_build": "PASS",
+  "m7": {"lift": "byte-exact", "obligations": {}, "instructions": 385, "clauses": 2, "delays": 16, "ambiguous_delays": 0, "vgpr_high_water": 80, "sgpr_high_water": 41, "wait_facts": 20},
+  "full_oracle": [
+    {"capture": "occ0", "report": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/fused_qkv_hfq4g256_mq4v2/full-occ0-22c665a2548ad0a1/report.json", "pass": true, "mismatch_bytes": 0, "incumbent_vs_captured_callsite_mismatch_bytes": 0, "edge_shapes": 88, "edge_mismatch_bytes": 0},
+    {"capture": "occ15", "report": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/fused_qkv_hfq4g256_mq4v2/full-occ15-22c665a2548ad0a1/report.json", "pass": true, "mismatch_bytes": 0, "incumbent_vs_captured_callsite_mismatch_bytes": 0, "edge_shapes": 88, "edge_mismatch_bytes": 0}
+  ],
+  "timing": {
+    "harness": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/opt-probe/profile.py",
+    "gpu_uuid": "GPU-05f92432f2312a0e",
+    "fresh_processes": 3,
+    "hipcc_sha256": "dbf87c6e7df677fc27b64b9a480f12ce275d1e165bace5da326e4441a9be457e",
+    "hipcc_medians_us": [46.960, 47.001, 46.921],
+    "native_medians_us": [49.000, 49.121, 49.120],
+    "reports": [
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/opt-probe/qkv-r80-compact-waits/process-1.json",
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/opt-probe/qkv-r80-compact-waits/process-2.json",
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/opt-probe/qkv-r80-compact-waits/process-3.json"
+    ],
+    "post_mismatch_bytes": 0,
+    "parity_pass": false
+  },
+  "scope": "Standalone symbol exactness only; no graph, whole-model, toolchain-removal, or performance-promotion claim."
+}

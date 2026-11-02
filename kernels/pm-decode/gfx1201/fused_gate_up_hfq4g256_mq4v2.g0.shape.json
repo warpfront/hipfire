@@ -1,0 +1,20 @@
+{
+  "counts": {
+    "ds_bpermute_b32": 4,
+    "ds_swizzle_b32": 1,
+    "v_fma_mix_f32": 8,
+    "v_fmac_f32_e32": 7
+  },
+  "forbidden": [
+    "scratch_*",
+    "s_waitcnt",
+    "v_wmma_*"
+  ],
+  "launch_dynamic_lds_bytes": 0,
+  "require_wave32": true,
+  "require_zero_private": true,
+  "require_zero_spills": true,
+  "sgpr_max": 32,
+  "symbol": "fused_gate_up_mq4g256v2_g0",
+  "vgpr_max": 32
+}

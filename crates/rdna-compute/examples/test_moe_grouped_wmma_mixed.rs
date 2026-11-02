@@ -535,6 +535,10 @@ fn cpu_reference_mixed(
 // ── Run one test case ──────────────────────────────────────────────────────
 
 fn check(label: &str, y_ref: &[f32], y_gpu: &[f32]) -> bool {
+    if y_ref.len() != y_gpu.len() || y_ref.iter().chain(y_gpu).any(|v| !v.is_finite()) {
+        println!("    {label} FAIL — nonfinite values or length mismatch");
+        return false;
+    }
     let max_abs_y: f32 = y_ref.iter().map(|v| v.abs()).fold(0f32, f32::max);
     let large_thresh = max_abs_y * 0.1_f32;
     let mut max_abs = 0f32;
@@ -713,8 +717,173 @@ fn run_case(
     all_pass
 }
 
+/// Consumer-visible candidate channel: every tag supported by this generator,
+/// sparse slots, row-tail/sentinel tiles, PCIe owners, and reused X storage.
+fn run_coalesced_channel(n: usize) -> bool {
+    let mut gpu = Gpu::init().expect("Gpu::init");
+    if !gpu.arch_caps.is_gfx1201() {
+        println!("coalesced channel SKIP — requires gfx1201");
+        return true;
+    }
+    let (m, k, m_total, k_top) = (19, 768, 144, 8);
+    let tags_host = vec![0, 1, 2, 3, 0, 1, 2, 3];
+    let mut packed = Vec::new();
+    let mut offsets = Vec::new();
+    let mut weights = Vec::new();
+    for (expert, &tag) in tags_host.iter().enumerate() {
+        let seed = 101 + 97 * expert as u32;
+        let bytes = match tag {
+            0 => build_expert_weight_mq6(m, k, seed),
+            1 => build_expert_weight_mq2lloyd(m, k, seed),
+            2 => build_expert_weight_mq4(m, k, seed),
+            3 => build_expert_weight_mq3lloyd(m, k, seed),
+            _ => unreachable!(),
+        };
+        offsets.push(packed.len());
+        packed.extend_from_slice(&bytes);
+        weights.push(bytes);
+    }
+    let owner = gpu
+        .upload_raw_host_mapped(&packed, &[packed.len()])
+        .expect("packed host-mapped expert upload");
+    assert!(owner.buf.is_host_mapped());
+    let ptrs_host: Vec<u64> = offsets
+        .iter()
+        .map(|offset| owner.buf.as_ptr() as u64 + *offset as u64)
+        .collect();
+    let ptrs = upload_u64(&mut gpu, &ptrs_host);
+    let tags = upload_u8(&mut gpu, &tags_host);
+    // Global expert IDs are permuted across tiles, as with a compact binding.
+    // Each expert owns one sparse tile; live flat slots are deliberately reversed.
+    let tile_ids_host = vec![7, 2, 5, 0, 6, 3, 1, 4, -1];
+    let mut sorted = vec![-1; m_total];
+    let mut inverse = vec![-1; n * k_top];
+    for token in 0..n {
+        for (tile, &expert) in tile_ids_host[..k_top].iter().enumerate() {
+            let flat = token * k_top + expert as usize;
+            let grouped = tile * 16 + (3 - token) * 3;
+            sorted[grouped] = flat as i32;
+            inverse[flat] = grouped as i32;
+        }
+    }
+    let sorted_gpu = upload_i32(&mut gpu, &sorted);
+    let tile_ids = upload_i32(&mut gpu, &tile_ids_host);
+    let inverse_gpu = upload_i32(&mut gpu, &inverse);
+    let topk: Vec<f32> = (0..n * k_top).map(|i| (i % 4 + 1) as f32 / 10.0).collect();
+    let topk_gpu = upload_f32(&mut gpu, &topk);
+    let x = alloc_f32_zeros(&mut gpu, n * k_top * k);
+    let mut passed = true;
+    for iteration in 0..2 {
+        // Same pointer, different values: catches pointer-keyed FP16 caching.
+        let input = build_x_f32(n * k_top, k, 505 + iteration);
+        let input_bytes =
+            unsafe { std::slice::from_raw_parts(input.as_ptr() as *const u8, input.len() * 4) };
+        gpu.hip
+            .memcpy_htod(&x.buf, input_bytes)
+            .expect("refresh reused activation");
+        for div in [k_top, 1] {
+            let baseline = alloc_f32_zeros(&mut gpu, m_total * m);
+            let candidate = alloc_f32_zeros(&mut gpu, m_total * m);
+            // Candidate first: the baseline must not refresh shared FP16
+            // scratch on its behalf after the activation pointer is reused.
+            gpu.gemm_mixed_moe_grouped_wmma_coalesced(
+                &ptrs,
+                &tags,
+                &tile_ids,
+                &sorted_gpu,
+                &x,
+                &candidate,
+                m,
+                k,
+                div,
+                m_total,
+                n * k_top,
+            )
+            .expect("coalesced grouped launch");
+            gpu.gemm_mixed_moe_grouped_wmma(
+                &ptrs,
+                &tags,
+                &tile_ids,
+                &sorted_gpu,
+                &x,
+                &baseline,
+                m,
+                k,
+                div,
+                m_total,
+                n * k_top,
+            )
+            .expect("baseline grouped launch");
+            gpu.hip.device_synchronize().expect("grouped channel sync");
+            let a = download_f32(&gpu, &baseline, m_total * m);
+            let b = download_f32(&gpu, &candidate, m_total * m);
+            let oracle = cpu_reference_mixed(
+                &weights,
+                &tags_host,
+                &input,
+                div,
+                &sorted,
+                &tile_ids_host,
+                m,
+                k,
+                m_total,
+            );
+            passed &= check("coalesced CPU oracle", &oracle, &b);
+            passed &= a
+                .iter()
+                .zip(&b)
+                .all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits());
+            if div == 1 {
+                let residual = build_x_f32(n, m, 606 + iteration);
+                let ra = upload_f32(&mut gpu, &residual);
+                let rb = upload_f32(&mut gpu, &residual);
+                for (values, out) in [(&baseline, &ra), (&candidate, &rb)] {
+                    gpu.moe_down_combine_grouped_k8(
+                        values,
+                        &inverse_gpu,
+                        &topk_gpu,
+                        out,
+                        m,
+                        k_top,
+                        n,
+                    )
+                    .expect("weighted residual combine");
+                }
+                gpu.hip.device_synchronize().expect("combine channel sync");
+                let ca = download_f32(&gpu, &ra, n * m);
+                let cb = download_f32(&gpu, &rb, n * m);
+                let mut expected = residual;
+                for token in 0..n {
+                    for row in 0..m {
+                        for slot in 0..k_top {
+                            let flat = token * k_top + slot;
+                            expected[token * m + row] +=
+                                topk[flat] * oracle[inverse[flat] as usize * m + row];
+                        }
+                    }
+                }
+                passed &= check("weighted residual CPU oracle", &expected, &cb);
+                passed &= ca
+                    .iter()
+                    .zip(&cb)
+                    .all(|(a, b)| a.is_finite() && b.is_finite() && a.to_bits() == b.to_bits());
+                gpu.free_tensor(ra).expect("free baseline residual");
+                gpu.free_tensor(rb).expect("free candidate residual");
+            }
+            gpu.free_tensor(baseline).expect("free baseline output");
+            gpu.free_tensor(candidate).expect("free candidate output");
+        }
+    }
+    gpu.free_tensor(owner).expect("free packed host experts");
+    println!("coalesced channel {}", if passed { "PASS" } else { "FAIL" });
+    passed
+}
+
 fn main() {
     let mut all_pass = true;
+    for n in [2, 3, 4] {
+        all_pass &= run_coalesced_channel(n);
+    }
 
     // Smoke case: M=64, K=512, m_total=32, E=4 — one expert per tag, fast.
     all_pass &= run_case("smoke", 64, 512, 32, 4, 4, 0xDEAD_BEEF, 0xCAFE_BABE);

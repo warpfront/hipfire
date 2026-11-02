@@ -6,10 +6,1287 @@ license.workspace = true
 description = "Compute kernel dispatch for RDNA GPUs"
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+# Explicit timing instrumentation opt-in; neither default builds nor lab alone
+# enable timing state or launch-path hooks.
+kernel-timing = ["lab", "hip-bridge/kernel-timing"]
 deltanet = []
+flash-attn-ck = ["dep:libloading"]
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
+hipfire-kernel-abi = { path = "../hipfire-kernel-abi" }
 redline-dispatch = { path = "../redline-dispatch" }
+radiowave = { path = "../radiowave" }
+railgun = { path = "../railgun" }
+railgun-corpus = { path = "../railgun-corpus" }
+libloading = { workspace = true, optional = true }
 rayon = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+redline-rocr = { path = "../redline-rocr" }
+half.workspace = true
+peacemaker-npu = { path = "../peacemaker-npu" }
+peacemaker-isa = { path = "../peacemaker-isa", features = ["toolchain"] }
+peacemaker-ir = { path = "../peacemaker-ir" }
+peacemaker-lift = { path = "../peacemaker-lift" }
+peacemaker-rip = { path = "../peacemaker-rip" }
+[[example]]
+name = "bench_stream_mix_chain_gfx1201"
+required-features = ["lab"]
+[[example]]
+name = "bench_moe_grouped_qt44_iu4"
+required-features = ["lab"]
+[[example]]
+name = "npu_trunk_glue_check"
+required-features = ["lab"]
+[[example]]
+name = "npu_trunk_consumers_check"
+required-features = ["lab"]
+[[example]]
+name = "qwen4_moe_front_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_moe_cn_tiled_numeric_oracle"
+required-features = ["lab"]
+
+# Single-card gfx1201 GPU gate for the bounded device spin waits
+# (crate::device_wait): forced timeout, host error path, fail-fast, recovery.
+[[example]]
+name = "device_wait_deadline"
+required-features = ["lab"]
+
+# Hardware smoke of weight slabs (HIPFIRE_WEIGHT_SLAB): packing, readback,
+# alignment, ledger split, free/unload cycles.
+[[example]]
+name = "weight_slab_smoke"
+required-features = ["lab"]
+
+# MQ8G256 decode / verify lab (M2): identity of the row-exact multi-row GEMV vs the
+# single-row decode GEMV, and Q8_0 vs MQ8G256 node timing at the Raon attention shapes.
+[[example]]
+name = "mq8_decode_lab"
+required-features = ["lab"]
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "pm_mtp_gemm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_fp8_gemm_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_aco_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq8_prefill_lab"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq4v2_gate_up_a4_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq4v2_xlds_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_down_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_gateup_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hc_read_up_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_qsa_hg12_twin_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fp8_moe_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_sym"
+required-features = ["lab"]
+
+# NT4 vs NT8 byte oracle; includes qwen4_moe_sym.rs by path (child module).
+[[example]]
+name = "moe_iu4_wide_tiles_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_f16_lds_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_scatter_scan_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_mq6_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "mtp_dense_det_pm"
+required-features = ["lab"]
+
+[[example]]
+name = "mtp_q8_det_byte_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_shared_gu_pm"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_trunk_iu4"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_trunk_zba_ragged"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_packed_mq4_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_argmax_vs_download_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_hc_row_fold_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_attention_vision"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_decode_attention"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_dflash_verify_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_flash_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_verify_attn_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq4v2_residual_ksplit_gfx1100"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_dispatch_floor"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_attn_scoregrid_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_dense_tp_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_e8_late_scale_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_e8_mixed_jobs_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_e8_prefetch4_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_e8_shared_pair_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_hc_control_batched_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_hc_control_t1024_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_indexer_rope_heads_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_ds4_topk_gather_batched_tiled_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_dsa_direct_decode"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_dsa_direct_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_dsa_gathered_wmma_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_dsa_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_e8_soa_correctness"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_e8_verify_tiles"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_fused_qkvza_lowbit"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gate_up_hfq4_variants"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gate_up_nosync"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv_bf16"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv_hfp4g32_bw"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv_lowbit"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv_lowbit_xbatch"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv_mfp4g32_rotate"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemv_paired_throughput"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_glimmer_prefill_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_glimmer_verify_attention"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_indexed_moe_keystone"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_lowbit_prefill_route"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mfp4g32_e8_residual"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_moe_e8_prefill"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_moe_expert_gemv"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_qwen4_hc_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_down_fused_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "shared_i8_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "shared_i8_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_down_fused_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_up_v2_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "hc_up_v2_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq2g256_lloyd_grouped_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq2g256_lloyd_moe_4w"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq2g256_lloyd_moe_n32_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq2g256_lloyd_moe_prequant_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq2g256_lloyd_residual"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq2g256gl_moe_down"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq2gl_symmetric"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq2gl_vs_mq2l"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3g256_lloyd_down_batched"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3g256_lloyd_gate_up_batched"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3g256gl_moe_down"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3g256gl_moe_gate_up"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_a8"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_iu4"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq3v25_iu4_g11"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq4_gate_up"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_mq4c_slab_alignment"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8_0_batched"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8_wmma_4w"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8_raon_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8_wmma_variants"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_qkvza_q8_vs_mq4"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_qkvza_ternary_vs_mq4"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_rocblas_vs_wmma_f16"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_stream_overlap"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vgpr_cap_sweep"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vision_gemm_rocblas"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_wo_per_group_q8_4w"
+required-features = ["lab"]
+
+[[example]]
+name = "burst_real_kernels"
+required-features = ["lab"]
+
+[[example]]
+name = "channel_q8_mmq_gfx1030"
+required-features = ["lab"]
+
+[[example]]
+name = "channel_test_hfq4g128_batched"
+required-features = ["lab"]
+
+[[example]]
+name = "ddtree_gumbel_check"
+required-features = ["lab"]
+
+[[example]]
+name = "ddtree_swor_kernel_check"
+required-features = ["lab"]
+
+[[example]]
+name = "dual_gpu_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_chunk_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_chunk_generalized_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_state_precision_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gfx11_generic_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "hetero_gfx11_cooperative"
+required-features = ["lab"]
+
+[[example]]
+name = "hip_graph_poc"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4c_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "parity_causal_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "probe_batching_ceiling"
+required-features = ["lab"]
+
+[[example]]
+name = "q8_batched_attn_microbench"
+required-features = ["lab"]
+
+[[example]]
+name = "q8_windowed_attn_test"
+required-features = ["lab"]
+
+[[example]]
+name = "rocblas_sanity"
+required-features = ["lab"]
+
+[[example]]
+name = "rope_compact_offset_check"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "sample_accept_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "sample_parallel_stable_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "sample_slot_rng_advance"
+required-features = ["lab"]
+
+[[example]]
+name = "test_attention_dflash"
+required-features = ["lab"]
+
+[[example]]
+name = "test_conv1d_tree"
+required-features = ["lab"]
+
+[[example]]
+name = "test_dequant_bq1g128"
+required-features = ["lab"]
+
+[[example]]
+name = "test_dequant_tq2g128"
+required-features = ["lab"]
+
+[[example]]
+name = "test_dots_ocr_wmma_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_ds4_compressor_cache_f16_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "test_ds4_compressor_sharded_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "test_ds4_fused_rmsnorm_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fused_gate_up_dp4a"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fused_q8_0_decode"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fused_qkv_bias_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fwht512_scalar_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_fwht_128_gpu_vs_cpu"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gated_delta_net_f32_tree"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gated_delta_net_tree"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_fused_mq3g256_lloyd_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_fused_mq4g256_lloyd_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_hfp4g32"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_hfp4g32_fp8"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_hfq3g256_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_hfq4_dp4a"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_hfq4g256_residual"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_mq3g256_lloyd_residual_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_mq4g256_lloyd_residual_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_q8_0_wmma_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_q8_gate_up_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_q8_qkv_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_q8_qkvza_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_q8_residual_wmma"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_qkv_and_gate_up"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_qkvza_hfq4g256"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemvQA"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_bq1g128"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_hfp4g32"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_hfp4g32_dot2"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_hfp4g32_fp8"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_hfq4g256_xbatch"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_lowbit_xbatch"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_mfp4g32"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_mfp4g32_e8"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_mfp4g32_lloyd"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_mfp4g32_p"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_mq3g256_lloyd_tail"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_mq4g256_lloyd_tail"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemv_tq2g128"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gfx12_ds4_prefill_native"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gfx906_mmq_correctness"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gfx906_mmq_realdata"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hc_finalize_control_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq4_fused_dp4a"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq4_residual_dp4a"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq4g256_mmq_portable"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq6_residual_wmma_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_hfq6_sigmoid_scaled"
+required-features = ["lab"]
+
+[[example]]
+name = "test_indexer_relu_score_wmma_klds_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_indexer_top_k_batched_bounded"
+required-features = ["lab"]
+
+[[example]]
+name = "test_indexer_top_k_buf"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_grouped_gfx1100"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_grouped_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_grouped_wave64x4_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_lds8_family_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_shared_jobs_gfx1100"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_soa_pair_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_soa_rocblas_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_soa_rocblas_solutions_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_soa_w128_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mfp4e8_twojob_lds8_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_mmq_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_mmq_gfx11_dgpu"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_mmq_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_mmq_k4_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_mmq_k4_gfx12"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_mmq_k8_gfx1151"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_e8"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_hfp4"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_hfq3"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_hfq6"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_hfq6_k2"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_hfq6_v2"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_m2"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_mixed"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_grouped_wmma_mq3lloyd"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_router_wave64_exact"
+required-features = ["lab"]
+
+[[example]]
+name = "test_moe_scatter_permute_k8"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq2g256_lloyd_moe_grouped_mmq_gfx1030"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq2lloyd_ep_skip_gfx1201"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq2lloyd_gate_up_wave64x8_gfx942"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq4g256_lloyd_fused_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mrope_rope_parity"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "test_multislot_ops"
+required-features = ["lab"]
+
+[[example]]
+name = "verify_attention_independent_windowed"
+required-features = ["lab"]
+
+[[example]]
+name = "verify_mq6g256_batched"
+required-features = ["lab"]
+
+[[example]]
+name = "vmm_tensor_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "host_kernel_access"
+required-features = ["lab"]
+
+[[example]]
+name = "host_offload_headroom"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4v2_moe_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6v2_moe_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_vae_lds"
+required-features = ["lab"]
+
+[[example]]
+name = "test_attention_text_gqa"
+required-features = ["lab"]
+
+[[example]]
+name = "test_rope_2d_flux"
+required-features = ["lab"]
+
+[[example]]
+name = "test_modulate_f32"
+required-features = ["lab"]
+
+[[example]]
+name = "test_layernorm_modulate_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_qk_rmsnorm_rope_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_copy_rows_strided_f32_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_wide_lds_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_epilogue_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_attention_flux_vt_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_f16_x_f16_wmma_lds_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_attention_flux_vt"
+required-features = ["lab"]
+
+[[example]]
+name = "tmp_scratch_leak_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "test_kv_slot_desc_ports"
+required-features = ["lab"]
+
+[[example]]
+name = "test_bf16_slots_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "vit_qtiled_parity_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "vit_attention_hd72_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vit_attention_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_qsa_indexed"
+required-features = ["lab"]
+
+[[example]]
+name = "qsa_pm_check"
+required-features = ["lab"]
+
+[[example]]
+name = "qsa_code_check_selftest"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_residual_xbatch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_decode_twins"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_loop"
+required-features = ["lab"]
+
+[[example]]
+name = "hip_loop"
+required-features = ["lab"]
+
+[[example]]
+name = "emu_race_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "decode_audit_compile"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_emu_check"
+required-features = ["lab"]
+
+[[example]]
+name = "lift_probe_compile"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_xbatch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq2_xbatch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_rows_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "bf16_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_wide_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_lm_head_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_rows_split_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "bf16_rows_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "q8_wide_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "draft_overwrite_gfx12_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "draft_lane_conv_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "draft_lane_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "head_batch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_lanes_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_gdn_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "lane_fa_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "qsa_lanes_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_mq4_x4_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "cb_rows_twins_gate"
+required-features = ["deltanet"]
+
+
+[[example]]
+name = "moe_router_topk_multirow_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_shared_prepared_iu4_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_combine_v2_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "prefill_iu4_producer_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "zba_fold_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "shared_down_sigmoid_epi_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_a3b_screen"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fa_pm_fp8_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "fa_pm_qprep_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "a3b_gqa8_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "moe_rotate_i4_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "iu4_c8_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_chunk_prep_pm_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gdn_qk_indexed_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "gdn_moe_pre_fused_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "gemma4_kernel_f64_check"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_q8_lmhead_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_rows_pm_gfx1201_h0"
+required-features = ["lab"]
+
+[[example]]
+name = "gate_up_tiles_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq6_railgun_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vit_gemm_shapes"
+required-features = ["lab"]
+
+# DFlash railgun window GPU oracle (design A); `--features lab`.
+[[example]]
+name = "railgun_copy_fill_oracle"
+required-features = ["lab"]
+
+# Peer-VRAM push + flag collective vs the incumbent TP2 graph collective
+# (two gfx1201 cards); `--features lab`.
+[[example]]
+name = "tp_peer_push_probe"
+required-features = ["lab"]
+
+# TP4 bf16 peer-push collective chain on four gfx1201 cards; `--features lab`.
+[[example]]
+name = "tp_peer_pushn_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_absorb_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_absorb_check"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_decode_check"
+required-features = ["lab"]
+
+[[example]]
+name = "latent_attention_flash_check"
+required-features = ["lab"]
+
+# W8A8 Q8_0 gfx12 node bench + accuracy (needs a gfx12 GPU).
+[[example]]
+name = "bench_q8_0_a8_gfx12"
+required-features = ["lab"]
+
+# Chunked RDA node gate/bench (needs a gfx1201 GPU).
+[[example]]
+name = "gated_delta_vector_chunk_node"
+required-features = ["deltanet"]

@@ -21,7 +21,7 @@
       "n_ctx": 2048,
       "n_vocab": 248320,
       "n_chunk": 1175,
-      "producer_cmd": "LD_LIBRARY_PATH=/opt/rocm-7.12/lib cargo run --release -p hipfire-runtime --example build_kld_ref --features deltanet -- --bf16-gguf /data/models/unsloth/Qwen3.5-0.8B/Qwen3.5-0.8B-BF16.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.bin --llama-perplexity-bin /home/kread/git/llm/llama.cpp/build-strix/bin/llama-perplexity",
+      "producer_cmd": "LD_LIBRARY_PATH=/opt/rocm-7.12/lib cargo run --release -p hipfire-runtime --example build_kld_ref --features deltanet -- --bf16-gguf <models>/unsloth/Qwen3.5-0.8B/Qwen3.5-0.8B-BF16.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.5-0.8b-bf16.kldref.bin --llama-perplexity-bin <llama.cpp-build>/bin/llama-perplexity",
       "source_gguf": "unsloth/Qwen3.5-0.8B-GGUF :: Qwen3.5-0.8B-BF16.gguf",
       "source_gguf_sha256": "cedf89af31c9041b601fa58303285bc46d99c51baee1b13f5e919626ca526ee5",
       "hf_repo": null,
@@ -38,7 +38,7 @@
       "n_ctx": 2048,
       "n_vocab": 248320,
       "n_chunk": 1175,
-      "producer_cmd": "cargo run --release -p hipfire-runtime --example build_kld_ref --features deltanet -- --bf16-gguf /data/models/unsloth/Qwen3.5-9B/Qwen3.5-9B-BF16.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
+      "producer_cmd": "cargo run --release -p hipfire-runtime --example build_kld_ref --features deltanet -- --bf16-gguf <models>/unsloth/Qwen3.5-9B/Qwen3.5-9B-BF16.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.5-9b-bf16.kldref.bin",
       "hf_repo": "hipfire-models/qwen-kldref",
       "hf_repo_type": "dataset",
       "comment": "9B BF16 reference dump, 2026-05-08, ~53 min wall, 375 reduced tok/s. Uploaded to hipfire-models/qwen-kldref 2026-05-11."
@@ -53,10 +53,10 @@
       "n_ctx": 2048,
       "n_vocab": 248320,
       "n_chunk": 1175,
-      "producer_cmd": "LD_LIBRARY_PATH=/opt/rocm-7.12/lib cargo run --release -p hipfire-runtime --example build_kld_ref -- --bf16-gguf /home/kread/models-local/Qwen3.6-27B/Qwen3.6-27B-BF16-00001-of-00002.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin --llama-perplexity-bin /home/kread/git/llm/llama.cpp/build-strix/bin/llama-perplexity",
+      "producer_cmd": "LD_LIBRARY_PATH=/opt/rocm-7.12/lib cargo run --release -p hipfire-runtime --example build_kld_ref -- --bf16-gguf <models>/Qwen3.6-27B/Qwen3.6-27B-BF16-00001-of-00002.gguf --slice benchmarks/quality-baselines/slice/wikitext2-1024s-2048ctx.txt --top-k 256 --output benchmarks/quality-baselines/refs/qwen3.6-27b-bf16.kldref.bin --llama-perplexity-bin <llama.cpp-build>/bin/llama-perplexity",
       "hf_repo": "hipfire-models/qwen-kldref",
       "hf_repo_type": "dataset",
-      "comment": "27B BF16 reference dump, 2026-05-09, 2h 3m wall, 162 reduced tok/s. Required --no-mmap flag (passed automatically by build_kld_ref) — without it, demand-paging on 50 GB BF16 weights caused eviction-cycle stall on 124 GB UMA. GGUF copied locally to /home/kread/models-local/ from NFS to reduce per-page-fault read time. VM (enertree) shut down to free working-set RAM. Uploaded to hipfire-models/qwen-kldref 2026-05-11."
+      "comment": "27B BF16 reference dump, 2026-05-09, 2h 3m wall, 162 reduced tok/s. Required --no-mmap flag (passed automatically by build_kld_ref) — without it, demand-paging on 50 GB BF16 weights caused eviction-cycle stall on 124 GB UMA. GGUF copied locally to <models>/ from NFS to reduce per-page-fault read time. a VM was shut down to free working-set RAM. Uploaded to hipfire-models/qwen-kldref 2026-05-11."
     }
   }
 }

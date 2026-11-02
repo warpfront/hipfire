@@ -1,22 +1,41 @@
-# hipfire installer for Windows — detects GPU, installs deps, downloads binary + kernels.
+# hipfire installer for Windows - detects GPU, builds binaries + indexed kernels.
 # Usage: irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1 | iex
+# A -Tag (or a tag-named -Ref) installs that release's prebuilt kernel pack when it
+# verifies against the checkout; otherwise, or with -CompileKernels, hipcc compiles them.
 param(
     [string]$Ref,
     [string]$Branch,
     [string]$Tag,
-    [string]$Commit
+    [string]$Commit,
+    [switch]$CompileKernels,
+    [string]$KernelPackUrl
 )
 
 $ErrorActionPreference = "Stop"
 
-# ─── Paths ───────────────────────────────────────────────
+# Windows PowerShell 5.1 turns native stderr into a terminating error under
+# EAP=Stop, and git prints its normal progress (fetch etc.) on stderr. Scope
+# the relaxation to git invocations via this wrapper instead of weakening the
+# whole script; real failures are still caught by explicit $LASTEXITCODE
+# checks and try/catch at every call site.
+function Invoke-Git {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & git @args
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
+
+# --- Paths -----------------------------------------------
 $HipfireDir  = "$env:USERPROFILE\.hipfire"
 $BinDir      = "$HipfireDir\bin"
 $RuntimeDir  = "$HipfireDir\runtime"
 $ModelsDir   = "$HipfireDir\models"
 $SrcDir      = "$HipfireDir\src"
 
-# ─── Constants ───────────────────────────────────────────
+# --- Constants -------------------------------------------
 $GithubRepo = "warpfront/hipfire"
 $InstallRef = if ($env:HIPFIRE_INSTALL_REF) { $env:HIPFIRE_INSTALL_REF } else { "master" }
 $InstallRefKind = if ($env:HIPFIRE_INSTALL_REF) { "auto" } else { "branch" }
@@ -55,7 +74,7 @@ if ($InstallRefKind -eq "commit" -and $InstallRef -notmatch '^[0-9a-fA-F]{7,40}$
 }
 
 function Test-RemoteRef([string]$Repo, [string]$RemoteRef) {
-    & git -C $Repo ls-remote --exit-code origin $RemoteRef 2>&1 | Out-Null
+    Invoke-Git -C $Repo ls-remote --exit-code origin $RemoteRef 2>&1 | Out-Null
     return $LASTEXITCODE -eq 0
 }
 
@@ -75,24 +94,24 @@ function Checkout-InstallRef([string]$Repo) {
             if (-not (Test-RemoteRef $Repo "refs/heads/$script:InstallRef")) {
                 throw "Origin has no branch '$script:InstallRef'."
             }
-            & git -C $Repo fetch --depth 1 origin "+refs/heads/$script:InstallRef`:refs/remotes/origin/$script:InstallRef"
+            Invoke-Git -C $Repo fetch --depth 1 origin "+refs/heads/$script:InstallRef`:refs/remotes/origin/$script:InstallRef"
             if ($LASTEXITCODE -ne 0) { throw "git fetch branch failed." }
-            & git -C $Repo checkout -B $script:InstallRef "refs/remotes/origin/$script:InstallRef"
+            Invoke-Git -C $Repo checkout -B $script:InstallRef "refs/remotes/origin/$script:InstallRef"
             if ($LASTEXITCODE -ne 0) { throw "git checkout branch failed." }
         }
         "tag" {
             if (-not (Test-RemoteRef $Repo "refs/tags/$script:InstallRef")) {
                 throw "Origin has no tag '$script:InstallRef'."
             }
-            & git -C $Repo fetch --depth 1 origin "refs/tags/$script:InstallRef"
+            Invoke-Git -C $Repo fetch --depth 1 origin "refs/tags/$script:InstallRef"
             if ($LASTEXITCODE -ne 0) { throw "git fetch tag failed." }
-            & git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
+            Invoke-Git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
             if ($LASTEXITCODE -ne 0) { throw "git checkout tag failed." }
         }
         "commit" {
-            & git -C $Repo fetch --depth 1 origin $script:InstallRef
+            Invoke-Git -C $Repo fetch --depth 1 origin $script:InstallRef
             if ($LASTEXITCODE -ne 0) { throw "git fetch commit failed." }
-            & git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
+            Invoke-Git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
             if ($LASTEXITCODE -ne 0) { throw "git checkout commit failed." }
         }
         default { throw "Unsupported revision kind '$kind'." }
@@ -104,13 +123,20 @@ Write-Host "=== hipfire installer ===" -ForegroundColor Cyan
 Write-Host "Requested source: $InstallRefKind '$InstallRef'"
 Write-Host ""
 
-# ─── GPU Detection ───────────────────────────────────────
+# --- GPU Detection ---------------------------------------
 Write-Host "Checking for AMD GPU..." -ForegroundColor Cyan
 
 $GpuArch = "unknown"
 try {
     $VideoControllers = Get-CimInstance Win32_VideoController -ErrorAction Stop
-    $AmdGpu = $VideoControllers | Where-Object { $_.Name -match "AMD|Radeon" } | Select-Object -First 1
+    # Prefer the most capable AMD adapter: on APU + discrete-GPU systems the
+    # integrated controller enumerates first, and its name often matches no
+    # arch regex below. Largest reported memory is a reliable discrete signal
+    # across RX / AI PRO / embedded naming.
+    $AmdGpu = $VideoControllers |
+        Where-Object { $_.Name -match "AMD|Radeon" } |
+        Sort-Object { if ($null -eq $_.AdapterRAM) { [uint64]0 } else { [uint64]$_.AdapterRAM } } -Descending |
+        Select-Object -First 1
     if ($AmdGpu) {
         $GpuName = $AmdGpu.Name
         Write-Host "  Found: $GpuName"
@@ -126,6 +152,15 @@ try {
             $GpuArch = "gfx1201"
         } elseif ($GpuName -match "9060|RX 9[0-9]{3}") {
             $GpuArch = "gfx1200"
+        # Integrated Radeon names carry no family; map them by APU: Phoenix/Hawk Point, Strix Point, Strix Halo, Krackan.
+        } elseif ($GpuName -match "\b(780|760|740)M\b") {
+            $GpuArch = "gfx1103"
+        } elseif ($GpuName -match "\b(890|880)M\b") {
+            $GpuArch = "gfx1150"
+        } elseif ($GpuName -match "\b80[4-6]0S\b") {
+            $GpuArch = "gfx1151"
+        } elseif ($GpuName -match "\b(860|840|820)M\b") {
+            $GpuArch = "gfx1152"
         }
     } else {
         Write-Host "  WARNING: No AMD/Radeon GPU found in Win32_VideoController." -ForegroundColor Yellow
@@ -136,13 +171,16 @@ try {
 
 if ($GpuArch -eq "unknown") {
     Write-Host "  WARNING: Could not detect GPU architecture." -ForegroundColor Yellow
-    Write-Host "  Supported: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9060), gfx1201 (RX 9070)"
+    Write-Host "  Detected-name mappings: gfx1010 (RX 5700), gfx1030 (RX 6800), gfx1100 (RX 7900), gfx1200 (RX 9060), gfx1201 (RX 9070),"
+    Write-Host "                          gfx1103 (Radeon 780M), gfx1150 (Radeon 890M), gfx1151 (Radeon 8060S), gfx1152 (Radeon 860M)"
+    Write-Host "  Name detection is not hardware validation; gfx1103, gfx1150 and gfx1152 have no shipped prebuilt pack."
+    Write-Host "  Release packs: gfx1100, gfx1151, gfx1201, gfx906, gfx942; other arches require local hipcc."
     $GpuArch = Read-Host "  Enter your GPU arch [or Enter to skip]"
     if ([string]::IsNullOrWhiteSpace($GpuArch)) { $GpuArch = "unknown" }
 }
 Write-Host "  GPU arch: $GpuArch" -ForegroundColor Green
 
-# ─── Create directories ──────────────────────────────────
+# --- Create directories ----------------------------------
 Write-Host ""
 Write-Host "Creating directories..." -ForegroundColor Cyan
 New-Item -ItemType Directory -Force -Path $BinDir    | Out-Null
@@ -152,7 +190,7 @@ Write-Host "  $BinDir" -ForegroundColor Green
 Write-Host "  $RuntimeDir" -ForegroundColor Green
 Write-Host "  $ModelsDir" -ForegroundColor Green
 
-# ─── HIP DLL (amdhip64.dll) ──────────────────────────────
+# --- HIP DLL (amdhip64.dll) ------------------------------
 Write-Host ""
 Write-Host "Checking HIP runtime (amdhip64.dll)..." -ForegroundColor Cyan
 
@@ -161,7 +199,7 @@ $HipDllDest  = "$RuntimeDir\amdhip64.dll"
 
 # Check RuntimeDir first (idempotent re-runs)
 if (Test-Path $HipDllDest) {
-    Write-Host "  amdhip64.dll: found in RuntimeDir ✓" -ForegroundColor Green
+    Write-Host "  amdhip64.dll: found in RuntimeDir OK" -ForegroundColor Green
     $HipDllFound = $true
 }
 
@@ -170,7 +208,7 @@ if (-not $HipDllFound -and $env:HIP_PATH) {
     foreach ($dllName in @("amdhip64.dll", "amdhip64_7.dll", "amdhip64_6.dll")) {
         $candidate = Join-Path $env:HIP_PATH "bin\$dllName"
         if (Test-Path $candidate) {
-            Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
+            Write-Host "  ${dllName}: found at $candidate OK" -ForegroundColor Green
             Copy-Item $candidate $HipDllDest -Force
             $HipDllFound = $true
             break
@@ -187,7 +225,7 @@ if (-not $HipDllFound) {
             foreach ($verDir in (Get-ChildItem $rocmBase -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending)) {
                 $candidate = Join-Path $verDir.FullName "bin\$dllName"
                 if (Test-Path $candidate) {
-                    Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
+                    Write-Host "  ${dllName}: found at $candidate OK" -ForegroundColor Green
                     Copy-Item $candidate $HipDllDest -Force
                     $HipDllFound = $true
                     break
@@ -198,7 +236,7 @@ if (-not $HipDllFound) {
         # Also check flat layout
         $candidate = "C:\Program Files\AMD\ROCm\bin\$dllName"
         if (Test-Path $candidate) {
-            Write-Host "  ${dllName}: found at $candidate ✓" -ForegroundColor Green
+            Write-Host "  ${dllName}: found at $candidate OK" -ForegroundColor Green
             Copy-Item $candidate $HipDllDest -Force
             $HipDllFound = $true
             break
@@ -212,7 +250,7 @@ if (-not $HipDllFound) {
     $DllUrl = "https://github.com/$GithubRepo/releases/download/hip-runtime/amdhip64.dll"
     try {
         Invoke-WebRequest -Uri $DllUrl -OutFile $HipDllDest -UseBasicParsing
-        Write-Host "  amdhip64.dll: downloaded ✓" -ForegroundColor Green
+        Write-Host "  amdhip64.dll: downloaded OK" -ForegroundColor Green
         $HipDllFound = $true
     } catch {
         Write-Host "  amdhip64.dll: download failed: $_" -ForegroundColor Red
@@ -234,7 +272,7 @@ if ($HipDllFound) {
     $env:PATH = "$RuntimeDir;$env:PATH"
 }
 
-# ─── HIP version vs GPU arch check ──────────────────────
+# --- HIP version vs GPU arch check ----------------------
 if ($HipDllFound -and $GpuArch -ne "unknown") {
     # Try to get HIP version from the DLL or hipconfig
     $HipVer = ""
@@ -277,14 +315,9 @@ if ($HipDllFound -and $GpuArch -ne "unknown") {
     }
 }
 
-# ─── Clone / update repo ─────────────────────────────────
+# --- Clone / update repo ---------------------------------
 Write-Host ""
 Write-Host "Setting up hipfire source..." -ForegroundColor Cyan
-
-# INSTALL-F1: tracks whether the source tree was (re)fetched/cloned/reset this
-# run. When source changed, a repo-side target\release\examples\daemon.exe from
-# a prior build is STALE and must not be reused — we force a rebuild.
-$SourceUpdated = $false
 
 if (-not (Test-Path "$SrcDir\.git")) {
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
@@ -297,30 +330,29 @@ if (-not (Test-Path "$SrcDir\.git")) {
             throw "$SrcDir exists but is not a git checkout; move it aside and retry."
         }
         New-Item -ItemType Directory -Force -Path $SrcDir | Out-Null
-        & git -C $SrcDir init --quiet
+        Invoke-Git -C $SrcDir init --quiet
         if ($LASTEXITCODE -ne 0) { throw "git init failed." }
-        & git -C $SrcDir remote add origin "https://github.com/$GithubRepo.git"
+        Invoke-Git -C $SrcDir remote add origin "https://github.com/$GithubRepo.git"
         if ($LASTEXITCODE -ne 0) { throw "git remote add failed." }
         Checkout-InstallRef $SrcDir
-        Write-Host "  Checked out $InstallRefKind '$InstallRef' ✓" -ForegroundColor Green
-        $SourceUpdated = $true
+        Write-Host "  Checked out $InstallRefKind '$InstallRef' OK" -ForegroundColor Green
     } catch {
         Write-Host "  Checkout failed: $_" -ForegroundColor Red
         exit 1
     }
 } else {
     Write-Host "  Existing clone found at $SrcDir"
-    $PreviousCommit = (& git -C $SrcDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
+    $PreviousCommit = (Invoke-Git -C $SrcDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
     if ($PreviousCommit) {
         $stamp = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
         $shortCommit = $PreviousCommit.Substring(0, [Math]::Min(12, $PreviousCommit.Length))
         $backupRef = "refs/hipfire/backups/pre-install-$stamp-$shortCommit"
-        & git -C $SrcDir update-ref $backupRef $PreviousCommit
+        Invoke-Git -C $SrcDir update-ref $backupRef $PreviousCommit
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  Previous source retained at $backupRef" -ForegroundColor Yellow
         }
     }
-    $status = & git -C $SrcDir status --porcelain 2>&1 | Out-String
+    $status = Invoke-Git -C $SrcDir status --porcelain 2>&1 | Out-String
     $ProceedWithUpdate = $true
     if ($status.Trim()) {
         Write-Host "  WARNING: local modifications detected." -ForegroundColor Yellow
@@ -328,7 +360,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
         if ($reply -match "^[Yy]$") {
             $stamp = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
             $stashMessage = "hipfire-install-$stamp"
-            & git -C $SrcDir stash push --include-untracked -m $stashMessage
+            Invoke-Git -C $SrcDir stash push --include-untracked -m $stashMessage
             if ($LASTEXITCODE -ne 0) {
                 throw "git stash failed; source checkout was not changed."
             }
@@ -343,8 +375,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
         try {
             $env:GIT_TERMINAL_PROMPT = "0"
             Checkout-InstallRef $SrcDir
-            Write-Host "  Checked out $InstallRefKind '$InstallRef' ✓" -ForegroundColor Green
-            $SourceUpdated = $true
+            Write-Host "  Checked out $InstallRefKind '$InstallRef' OK" -ForegroundColor Green
         } catch {
             Write-Host "  Update failed (non-fatal). Using existing checkout." -ForegroundColor Yellow
         }
@@ -352,204 +383,50 @@ if (-not (Test-Path "$SrcDir\.git")) {
 }
 
 $RepoDir = $SrcDir
-$ResolvedCommit = (& git -C $RepoDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
-$ResolvedRef = (& git -C $RepoDir describe --tags --exact-match HEAD 2>$null | Out-String).Trim()
+$ResolvedCommit = (Invoke-Git -C $RepoDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
+$ResolvedRef = (Invoke-Git -C $RepoDir describe --tags --exact-match HEAD 2>$null | Out-String).Trim()
 if (-not $ResolvedRef) {
-    $ResolvedRef = (& git -C $RepoDir symbolic-ref --short HEAD 2>$null | Out-String).Trim()
+    $ResolvedRef = (Invoke-Git -C $RepoDir symbolic-ref --short HEAD 2>$null | Out-String).Trim()
 }
 if (-not $ResolvedRef) { $ResolvedRef = "detached" }
 Write-Host "Source resolved: $ResolvedRef @ $ResolvedCommit" -ForegroundColor Green
 
-# ─── Build / install binaries ────────────────────────────
+# --- Build / install binaries ----------------------------
 Write-Host ""
 Write-Host "Installing hipfire binaries..." -ForegroundColor Cyan
 
-# Resolve cargo's actual target directory. Honors CARGO_TARGET_DIR and any
-# workspace target overrides — without this, users with a shared target
-# directory (common when juggling several Rust projects) would see install
-# fail because the binaries we expect at $RepoDir\target\... actually live
-# elsewhere. Falls back to the conventional location when cargo is not yet
-# installed, since pre-built binaries can only sit at the default path in
-# that case.
-$TargetDir = "$RepoDir\target"
-if (Get-Command cargo -ErrorAction SilentlyContinue) {
-    try {
-        $Meta = cargo metadata --format-version 1 --manifest-path "$RepoDir\Cargo.toml" 2>$null | ConvertFrom-Json
-        if ($Meta.target_directory) { $TargetDir = $Meta.target_directory }
-    } catch {}
-}
-
-# Source preference order — the prior install's $BinDir\daemon.exe is NOT
-# a source. Including it would re-use stale binaries forever. The repo-side
-# paths (only meaningful when running install.ps1 from a checkout) are
-# treated as developer-authoritative and used if present; everyone else
-# always pulls the latest release asset.
-# INSTALL-F1: when the source tree was updated this run, any repo-side build
-# artifact is stale — drop those candidates so we rebuild (or pull a release).
-if ($SourceUpdated) {
-    Write-Host "  Source updated — ignoring any prior repo build artifact (will rebuild)." -ForegroundColor Yellow
-    $PreBuilt = $null
-} else {
-    $PreBuilt = @(
-        "$TargetDir\release\examples\daemon.exe",
-        "$RepoDir\bin\daemon.exe"
-    ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-}
-
-if (-not $PreBuilt) {
-    # Query the latest GitHub release dynamically — never pin to an old tag.
-    # If the latest release has a daemon.exe asset, use it; otherwise fall
-    # through to the source-build path below. This way every Windows install
-    # tracks current master without requiring a script bump per release.
-    Write-Host "  Querying latest GitHub release..."
-    try {
-        $LatestRelease = Invoke-RestMethod -Uri "https://api.github.com/repos/$GithubRepo/releases/latest" -UseBasicParsing
-        $DaemonAsset = $LatestRelease.assets | Where-Object { $_.name -eq "daemon.exe" } | Select-Object -First 1
-        if ($DaemonAsset) {
-            $ReleaseDest = "$BinDir\daemon.exe"
-            # Cache discipline: store the asset id (immutable per upload) of
-            # whatever we last downloaded as a sidecar. Refresh whenever the
-            # current asset id differs — catches both new tags and re-uploaded
-            # binaries on the same tag. Size-only matching was insufficient
-            # because two builds can share a byte count.
-            $StampPath = "$BinDir\daemon.exe.release-id"
-            $CurrentAssetId = "$($DaemonAsset.id)"
-            $NeedsDownload = $true
-            if ((Test-Path $ReleaseDest) -and (Test-Path $StampPath)) {
-                $StoredAssetId = (Get-Content $StampPath -Raw -ErrorAction SilentlyContinue).Trim()
-                if ($StoredAssetId -eq $CurrentAssetId) {
-                    Write-Host "  daemon.exe already at latest release $($LatestRelease.tag_name) (asset id $CurrentAssetId) — keeping" -ForegroundColor Green
-                    $PreBuilt = $ReleaseDest
-                    $NeedsDownload = $false
-                } else {
-                    Write-Host "  daemon.exe is stale (local id $StoredAssetId, latest id $CurrentAssetId) — refreshing" -ForegroundColor Yellow
-                }
-            } elseif (Test-Path $ReleaseDest) {
-                Write-Host "  daemon.exe present but no release-id stamp — refreshing to be safe" -ForegroundColor Yellow
-            }
-            if ($NeedsDownload) {
-                Write-Host "  Pulling daemon.exe from release $($LatestRelease.tag_name)..." -ForegroundColor Cyan
-                $TempDest = "$ReleaseDest.download"
-                try {
-                    # Stage to a temp file so a partial / failed download
-                    # doesn't corrupt the existing daemon.exe.
-                    Invoke-WebRequest -Uri $DaemonAsset.browser_download_url -OutFile $TempDest -UseBasicParsing
-                    if ((Get-Item $TempDest).Length -ne $DaemonAsset.size) {
-                        Remove-Item $TempDest -Force -ErrorAction SilentlyContinue
-                        throw "downloaded size mismatch (got $((Get-Item $TempDest).Length), expected $($DaemonAsset.size))"
-                    }
-                    Move-Item -Path $TempDest -Destination $ReleaseDest -Force
-                    Set-Content -Path $StampPath -Value $CurrentAssetId -NoNewline
-                    $PreBuilt = $ReleaseDest
-                    Write-Host "  Downloaded ✓" -ForegroundColor Green
-                } catch {
-                    Remove-Item $TempDest -Force -ErrorAction SilentlyContinue
-                    Write-Host "  Download failed: $_" -ForegroundColor Yellow
-                    Write-Host "  Existing daemon.exe (if any) is unchanged. Falling through to source build." -ForegroundColor Yellow
-                }
-            }
-        } else {
-            Write-Host "  No daemon.exe in release $($LatestRelease.tag_name) — falling through to source build" -ForegroundColor Yellow
-        }
-    } catch {
-        Write-Host "  Could not query GitHub release API: $_ — falling through to source build" -ForegroundColor Yellow
-    }
-}
-
-if ($PreBuilt -and $PreBuilt -ne "$BinDir\daemon.exe") {
-    Copy-Item $PreBuilt "$BinDir\daemon.exe" -Force
-    Write-Host "  daemon.exe installed ✓" -ForegroundColor Green
-} elseif ($PreBuilt) {
-    Write-Host "  daemon.exe ready ✓" -ForegroundColor Green
-} else {
-    Write-Host "  No pre-built binaries available. Building from source..." -ForegroundColor Yellow
-
-    if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-        Write-Host "  Installing Rust via rustup..." -ForegroundColor Yellow
-        $RustupUrl  = "https://win.rustup.rs/x86_64"
-        $RustupExe  = "$env:TEMP\rustup-init.exe"
-        Invoke-WebRequest -Uri $RustupUrl -OutFile $RustupExe -UseBasicParsing
-        & $RustupExe -y --default-toolchain stable
-        # Add cargo to PATH for this session
-        $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
-    }
-
-    Write-Host "  cargo build --release (this may take several minutes)..."
-    Push-Location $RepoDir
-    try {
-        cargo build --release --features deltanet --example daemon --example infer --example infer_hfq -p hipfire-runtime
-        cargo build --release -p hipfire-cli
-        # OPTIONAL build (terminal UI). Must NOT abort the install if it fails:
-        # the mandatory daemon/CLI are installed regardless. Under PowerShell 7
-        # `$PSNativeCommandUseErrorActionPreference` a native non-zero exit from
-        # cargo throws a NativeCommandExitException, so guard BOTH the exception
-        # path (try/catch) AND the plain non-zero-exit path ($LASTEXITCODE);
-        # either way warn + continue down to the daemon copy.
-        Write-Host "  cargo build --release -p hipfire-tui (terminal UI)..."
-        try {
-            cargo build --release -p hipfire-tui
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "hipfire-tui (terminal UI) build failed — continuing without it."
-            }
-        } catch {
-            Write-Warning "hipfire-tui (terminal UI) build failed — continuing without it. ($_)"
-        }
-    } finally {
-        Pop-Location
-    }
-
-    # Re-resolve TargetDir now that cargo is guaranteed available — covers the
-    # case where rustup was just installed above and the initial probe fell
-    # back to the default path.
-    try {
-        $Meta = cargo metadata --format-version 1 --manifest-path "$RepoDir\Cargo.toml" 2>$null | ConvertFrom-Json
-        if ($Meta.target_directory) { $TargetDir = $Meta.target_directory }
-    } catch {}
-
-    $BuiltExe = "$TargetDir\release\examples\daemon.exe"
-    if (-not (Test-Path $BuiltExe)) {
-        Write-Host ""
-        Write-Host "  BUILD FAILED." -ForegroundColor Red
-        Write-Host "  Common causes:"
-        Write-Host "    - Missing ROCm SDK (needed to compile)"
-        Write-Host "    - Missing Visual C++ build tools"
-        Write-Host ""
-        Write-Host "  After fixing, re-run this installer or build manually:"
-        Write-Host "    cd $RepoDir"
-        Write-Host "    cargo build --release --features deltanet --example daemon -p hipfire-runtime"
-        exit 1
-    }
-    Copy-Item $BuiltExe "$BinDir\daemon.exe" -Force
-    Write-Host "  Build complete ✓" -ForegroundColor Green
-}
-
-# The release API currently distributes the daemon independently. The control
-# plane is always built from the checked-out source so its config and registry
-# schemas cannot drift from the installed daemon.
+# Compile the daemon from this checkout: a release binary built at a different
+# revision may embed a different kernel registry and reject its sidecar indexes.
 if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
-    Write-Host "  Installing Rust via rustup for the native CLI..." -ForegroundColor Yellow
-    $RustupUrl  = "https://win.rustup.rs/x86_64"
-    $RustupExe  = "$env:TEMP\rustup-init.exe"
-    Invoke-WebRequest -Uri $RustupUrl -OutFile $RustupExe -UseBasicParsing
+    $RustupExe = "$env:TEMP\rustup-init.exe"
+    Invoke-WebRequest -Uri "https://win.rustup.rs/x86_64" -OutFile $RustupExe -UseBasicParsing
     & $RustupExe -y --default-toolchain stable
+    if ($LASTEXITCODE -ne 0) { throw "Rust installation failed" }
     $env:PATH = "$env:USERPROFILE\.cargo\bin;$env:PATH"
 }
-# Cargo may have been installed after the initial target-directory probe, and
-# CARGO_TARGET_DIR/workspace overrides must also apply when the daemon came
-# from a prebuilt release asset.
+Push-Location $RepoDir
 try {
-    $Meta = cargo metadata --format-version 1 --manifest-path "$RepoDir\Cargo.toml" 2>$null | ConvertFrom-Json
-    if ($Meta.target_directory) { $TargetDir = $Meta.target_directory }
-} catch {}
+    cargo build --release -p hipfire-daemon
+    if ($LASTEXITCODE -ne 0) { throw "daemon source build failed" }
+} finally {
+    Pop-Location
+}
+$Meta = cargo metadata --format-version 1 --manifest-path "$RepoDir\Cargo.toml" 2>$null | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or -not $Meta.target_directory) { throw "could not resolve Cargo target directory" }
+$TargetDir = $Meta.target_directory
+$BuiltExe = "$TargetDir\release\daemon.exe"
+if (-not (Test-Path $BuiltExe)) { throw "daemon source build did not produce $BuiltExe" }
+Copy-Item $BuiltExe "$BinDir\daemon.exe" -Force
+Write-Host "  daemon.exe built from selected revision OK" -ForegroundColor Green
+
+# Build the native CLI from the same checkout and revision as the daemon.
 $CliExe = "$TargetDir\release\hipfire.exe"
-if (-not (Test-Path $CliExe) -or $SourceUpdated) {
-    Push-Location $RepoDir
-    try {
-        cargo build --release -p hipfire-cli
-        if ($LASTEXITCODE -ne 0) { throw "native CLI build failed" }
-    } finally {
-        Pop-Location
-    }
+Push-Location $RepoDir
+try {
+    cargo build --release -p hipfire-cli
+    if ($LASTEXITCODE -ne 0) { throw "native CLI build failed" }
+} finally {
+    Pop-Location
 }
 if (-not (Test-Path $CliExe)) {
     Write-Host "  Native CLI binary not found at $CliExe" -ForegroundColor Red
@@ -563,9 +440,9 @@ foreach ($exe in @("infer.exe", "infer_hfq.exe")) {
     if (Test-Path $src) { Copy-Item $src "$BinDir\$exe" -Force }
 }
 
-# Terminal UI (workspace bin — lives under target\release\, not examples\).
+# Terminal UI (workspace bin - lives under target\release\, not examples\).
 # Build on demand if the pre-built tree didn't include it. The TUI is
-# OPTIONAL — a failed build (or absent cargo) must NOT abort the install,
+# OPTIONAL - a failed build (or absent cargo) must NOT abort the install,
 # but it must NOT be swallowed silently either: warn clearly so the user
 # knows the terminal UI won't be available and how to get it.
 $TuiExe = "$TargetDir\release\hipfire-tui.exe"
@@ -577,12 +454,12 @@ if (-not (Test-Path $TuiExe)) {
 }
 if (Test-Path $TuiExe) {
     Copy-Item $TuiExe "$BinDir\hipfire-tui.exe" -Force
-    Write-Host "  hipfire-tui (terminal UI) installed ✓" -ForegroundColor Green
+    Write-Host "  hipfire-tui (terminal UI) installed OK" -ForegroundColor Green
 } else {
     # Windows remedy: `hipfire update` is NOT Windows-aware (its GPU-arch +
     # git-reset path is Linux/sysfs-only), so recommend the direct cargo build
     # as the PRIMARY fix on Windows, then re-running this installer to copy it.
-    Write-Warning "hipfire-tui (terminal UI) was not built — it will be unavailable. To get it: install Rust, then ``cargo build --release -p hipfire-tui`` and re-run scripts\install.ps1 (copies it into ~/.hipfire/bin/)."
+    Write-Warning "hipfire-tui (terminal UI) was not built - it will be unavailable. To get it: install Rust, then ``cargo build --release -p hipfire-tui`` and re-run scripts\install.ps1 (copies it into ~/.hipfire/bin/)."
 }
 
 # CPU quantizer (optional, but build it on demand so `hipfire quantize` works
@@ -598,84 +475,90 @@ if (Test-Path $QuantExe) {
     Write-Warning "hipfire-quantize was not built; the quantize subcommand will be unavailable."
 }
 
-# ─── Native CLI ──────────────────────────────────────────
+# --- Native CLI ------------------------------------------
 Write-Host ""
 Write-Host "Installing CLI..." -ForegroundColor Cyan
 $LegacyCliDir = "$HipfireDir\cli"
 if (Test-Path $LegacyCliDir) { Remove-Item $LegacyCliDir -Recurse -Force }
 $LegacyWrapper = "$BinDir\hipfire.cmd"
 if (Test-Path $LegacyWrapper) { Remove-Item $LegacyWrapper -Force }
-Write-Host "  Native CLI: $BinDir\hipfire.exe ✓" -ForegroundColor Green
+Write-Host "  Native CLI: $BinDir\hipfire.exe OK" -ForegroundColor Green
 
-# ─── Kernels ─────────────────────────────────────────────
-# kernels/compiled/<arch>/ is gitignored, so a fresh git clone never ships
-# .hsaco blobs. We mirror the Linux flow (install.sh): seed any blobs that
-# happen to be present in the checkout (developer case), then run
-# daemon.exe --precompile to JIT-compile the default Qwen3.5 kernel set
-# into ~/.hipfire/bin/kernels/compiled/<arch>/. First `hipfire run` is then
-# instant instead of a multi-minute hipcc wall.
-Write-Host ""
-if ($GpuArch -ne "unknown") {
-    Write-Host "Setting up kernels for $GpuArch..." -ForegroundColor Cyan
-    $KernelSrc  = "$RepoDir\kernels\compiled\$GpuArch"
-    $KernelDest = "$BinDir\kernels\compiled\$GpuArch"
-    New-Item -ItemType Directory -Force -Path $KernelDest | Out-Null
-
-    if (Test-Path $KernelSrc) {
-        $Hsacos = Get-ChildItem "$KernelSrc\*.hsaco" -ErrorAction SilentlyContinue
-        if ($Hsacos -and $Hsacos.Count -gt 0) {
-            Copy-Item "$KernelSrc\*.hsaco" $KernelDest -Force
-            Copy-Item "$KernelSrc\*.hash" $KernelDest -Force -ErrorAction SilentlyContinue
-            Write-Host "  Seeded $($Hsacos.Count) kernels from repo checkout to $KernelDest ✓" -ForegroundColor Green
-        } else {
-            Write-Host "  No pre-compiled .hsaco found in repo (gitignored). Will JIT-compile below." -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "  No pre-compiled kernels for $GpuArch in repo (gitignored). Will JIT-compile below." -ForegroundColor Yellow
-    }
-} else {
-    Write-Host "Skipping kernel setup (GPU arch unknown)." -ForegroundColor Yellow
-    Write-Host "  Re-run installer after fixing GPU detection, or run scripts\compile-kernels.ps1 manually."
-}
-
-# ─── Pre-compile via daemon (parity with install.sh) ─────
-# Fills in any missing kernels for the active GPU. Uses hipcc in the
-# background; writes back to ~/.hipfire/bin/kernels/compiled/<arch>/.
-# Runs even when GpuArch is "unknown"; Gpu::init resolves the active arch
-# at runtime regardless of install-time detection.
+# --- Indexed kernel package ------------------------------
+# A release tag's prebuilt pack is used when `hipfire kernel-pack install`
+# verifies its SHA-256, manifest, ROCm range and every index against this
+# checkout. Otherwise the daemon resolves the active GPU architecture and
+# builds the exact Rust registry using the same pack_to implementation as
+# hipfire-kernel-pack. Never seed unindexed .hsaco files from an unrelated
+# source checkout.
 $DaemonExe = "$BinDir\daemon.exe"
+$AdmittedArches = @("gfx1201", "gfx1100", "gfx1151", "gfx906", "gfx942")
 if (Test-Path $DaemonExe) {
-    Write-Host ""
-    Write-Host "Pre-compiling GPU kernels (first run will be instant afterward)..." -ForegroundColor Cyan
-    $hipccAvailable = $false
-    if ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.bat"))) { $hipccAvailable = $true }
-    elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.exe"))) { $hipccAvailable = $true }
-    elseif (Get-Command hipcc -ErrorAction SilentlyContinue) { $hipccAvailable = $true }
-    elseif (Test-Path "C:\Program Files\AMD\ROCm") {
-        $rocmHipcc = Get-ChildItem "C:\Program Files\AMD\ROCm" -Recurse -Filter "hipcc.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($rocmHipcc) { $hipccAvailable = $true }
-    }
-
-    if (-not $hipccAvailable) {
-        Write-Host "  hipcc not found in PATH or `$env:HIP_PATH; skipping pre-compile." -ForegroundColor Yellow
-        Write-Host "  Install the AMD HIP SDK to enable JIT compilation:" -ForegroundColor Yellow
-        Write-Host "    https://www.amd.com/en/developer/resources/rocm-hub/hip-sdk.html" -ForegroundColor Yellow
-        Write-Host "  Pre-compiled blobs in the repo will still load if available."
+    $PackInstalled = $false
+    # Tag whose prebuilt pack to try: the requested tag, or (for a branch/ref)
+    # a release tag (vN...) pointing at the checked-out HEAD.
+    $PackTag = $null
+    if ($InstallRefKind -eq "tag") {
+        $PackTag = $InstallRef
     } else {
+        $headTags = @((Invoke-Git -C $RepoDir tag --points-at HEAD 2>$null) | ForEach-Object { "$_".Trim() } | Where-Object { $_ -match '^v\d' })
+        if ($headTags.Count -gt 0) { $PackTag = $headTags[0] }
+    }
+    if ($PackTag -and -not $CompileKernels -and $GpuArch -in $AdmittedArches) {
+        Write-Host ""
+        Write-Host "Installing prebuilt kernel pack $PackTag for $GpuArch..." -ForegroundColor Cyan
+        $PackArgs = @(
+            "kernel-pack", "install",
+            "--tag", $PackTag,
+            "--arch", $GpuArch,
+            "--source", $RepoDir,
+            "--dest", "$BinDir\kernels\compiled\$GpuArch"
+        )
+        if ($KernelPackUrl) { $PackArgs += @("--url", $KernelPackUrl) }
+        # Native stderr must not become a terminating error (see Invoke-Git).
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         try {
+            & "$BinDir\hipfire.exe" @PackArgs
+            $PackInstalled = ($LASTEXITCODE -eq 0)
+        } finally {
+            $ErrorActionPreference = $prev
+        }
+        if ($PackInstalled) {
+            Write-Host "  Kernel pack verified and installed OK" -ForegroundColor Green
+        } else {
+            Write-Warning "Kernel pack not used (reason above); compiling kernels locally."
+        }
+    }
+    if (-not $PackInstalled) {
+        Write-Host ""
+        Write-Host "Packaging indexed GPU kernels from the exact-source registry..." -ForegroundColor Cyan
+        $hipccAvailable = $false
+        if ($env:HIPFIRE_HIPCC -and (Test-Path $env:HIPFIRE_HIPCC)) { $hipccAvailable = $true }
+        elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.bat"))) { $hipccAvailable = $true }
+        elseif ($env:HIP_PATH -and (Test-Path (Join-Path $env:HIP_PATH "bin\hipcc.exe"))) { $hipccAvailable = $true }
+        elseif (Get-Command hipcc -ErrorAction SilentlyContinue) { $hipccAvailable = $true }
+        elseif (Test-Path "C:\Program Files\AMD\ROCm") {
+            $rocmHipcc = Get-ChildItem "C:\Program Files\AMD\ROCm" -Recurse -Filter "hipcc.bat" -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($rocmHipcc) { $hipccAvailable = $true }
+        }
+
+        if (-not $hipccAvailable) {
+            throw "hipcc is required to build indexed kernel packages. Install the AMD HIP SDK and re-run this installer; unindexed .hsaco files cannot load compiler-free."
+        }
+        if ($GpuArch -in $AdmittedArches) {
             & $DaemonExe --precompile
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "  Pre-compile complete ✓" -ForegroundColor Green
-            } else {
-                Write-Host "  Pre-compile finished with warnings; missing kernels will JIT on first use." -ForegroundColor Yellow
+            if ($LASTEXITCODE -ne 0) {
+                throw "Indexed kernel packaging failed (exit $LASTEXITCODE). No compiler-free install was produced."
             }
-        } catch {
-            Write-Host "  Pre-compile failed: $_; missing kernels will JIT on first use." -ForegroundColor Yellow
+            Write-Host "  Indexed kernel package complete OK" -ForegroundColor Green
+        } else {
+            Write-Warning "No indexed kernel registry for $GpuArch; this GPU requires hipcc JIT. Compiler-free operation is unavailable."
         }
     }
 }
 
-# ─── Config ──────────────────────────────────────────────
+# --- Config ----------------------------------------------
 $ConfigFile = "$HipfireDir\config.toml"
 $LegacyConfigFile = "$HipfireDir\config.json"
 if (-not (Test-Path $ConfigFile) -and -not (Test-Path $LegacyConfigFile)) {
@@ -684,7 +567,7 @@ if (-not (Test-Path $ConfigFile) -and -not (Test-Path $LegacyConfigFile)) {
     Write-Host "Config written: $ConfigFile" -ForegroundColor Green
 }
 
-# ─── PATH ────────────────────────────────────────────────
+# --- PATH ------------------------------------------------
 Write-Host ""
 $NoPath = $args -contains "--no-path"
 $CurrentUserPath = [Environment]::GetEnvironmentVariable("PATH", "User")
@@ -707,16 +590,59 @@ if ($NoPath) {
         } else {
             [Environment]::SetEnvironmentVariable("PATH", $NewPath, "User")
             $env:PATH = "$BinDir;$env:PATH"
-            Write-Host "  PATH updated ✓ (restart your shell to apply)" -ForegroundColor Green
+            Write-Host "  PATH updated OK (restart your shell to apply)" -ForegroundColor Green
         }
     } else {
         Write-Host "  Add manually to user PATH: $BinDir" -ForegroundColor Yellow
     }
 } else {
-    Write-Host "hipfire already in PATH ✓" -ForegroundColor Green
+    Write-Host "hipfire already in PATH OK" -ForegroundColor Green
 }
 
-# ─── Quick start ─────────────────────────────────────────
+# --- Calibration offer -----------------------------------
+# Offer `hipfire calibrate` only on an interactive console and only when no fresh record covers
+# this host (`calibrate --check` fails). Never fatal: a calibrate failure is a warning.
+$HipfireExe = "$BinDir\hipfire.exe"
+if (Test-Path $HipfireExe) {
+    $CalibrateFresh = $false
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $HipfireExe calibrate --check *> $null
+        $CalibrateFresh = ($LASTEXITCODE -eq 0)
+    } catch {
+        $CalibrateFresh = $false
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
+    if (-not $CalibrateFresh) {
+        $AssumeYes = ($args -contains "--yes") -or ($args -contains "-y")
+        $CanPrompt = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected -and -not $AssumeYes
+        Write-Host ""
+        if ($CanPrompt) {
+            $reply = Read-Host "Calibrate hipfire for this host now? Measures link, CPU and GPU rates; takes up to 60 s. [Y/n]"
+            if ($reply -notmatch "^[Nn]") {
+                $ErrorActionPreference = "Continue"
+                try {
+                    & $HipfireExe calibrate
+                    if ($LASTEXITCODE -ne 0) {
+                        Write-Host "WARNING: hipfire calibrate failed (exit $LASTEXITCODE); the install is unaffected. Re-run 'hipfire calibrate' later." -ForegroundColor Yellow
+                    }
+                } catch {
+                    Write-Host "WARNING: hipfire calibrate failed: $_; the install is unaffected. Re-run 'hipfire calibrate' later." -ForegroundColor Yellow
+                } finally {
+                    $ErrorActionPreference = $prevEap
+                }
+            } else {
+                Write-Host "Skipped. Run 'hipfire calibrate' to tune hipfire to this host."
+            }
+        } else {
+            Write-Host "Run 'hipfire calibrate' to tune hipfire to this host."
+        }
+    }
+}
+
+# --- Quick start -----------------------------------------
 Write-Host ""
 Write-Host "=== hipfire installed ===" -ForegroundColor Cyan
 if (Test-Path "$BinDir\hipfire.exe") {

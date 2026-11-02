@@ -20,6 +20,8 @@ pub struct RegistryState {
     pub selected: usize,
     pub expanded_groups: BTreeSet<String>,
     pub loaded_path: Option<PathBuf>,
+    pub bundled: bool,
+    pub generated_at: String,
     pub warning: Option<String>,
 }
 
@@ -28,7 +30,6 @@ pub struct ModelRow {
     pub tag: String,
     pub entry: ModelEntry,
     pub downloaded: bool,
-    pub has_triattn: bool,
     pub has_mtp: bool,
 }
 
@@ -60,17 +61,38 @@ pub enum RegistryAction {
 
 impl RegistryState {
     pub fn load(paths: &HipfirePaths) -> Self {
-        let mut warning = None;
-        let local_files = list_local_models(paths);
-        let local_names = local_files
-            .iter()
-            .map(|m| m.file.as_str())
-            .collect::<std::collections::BTreeSet<_>>();
-
         let registry_paths = hipfire_registry::RegistryPaths {
             cache: paths.root.join("registry.cache.json"),
         };
         let loaded = hipfire_registry::load(&registry_paths);
+        Self::from_loaded(paths, registry_paths.cache, loaded)
+    }
+
+    /// The bundled registry only: no `HIPFIRE_REGISTRY_URL` /
+    /// `HIPFIRE_NO_REGISTRY_FETCH` process env, no cache read, no network.
+    /// Local model files under `paths` still apply.
+    pub fn load_bundled(paths: &HipfirePaths) -> Self {
+        let loaded = hipfire_registry::LoadedRegistry {
+            registry: hipfire_registry::bundled()
+                .expect("checked-in registry/v1.json must validate"),
+            source: hipfire_registry::RegistrySource::Bundled,
+            warnings: Vec::new(),
+        };
+        Self::from_loaded(paths, paths.root.join("registry.cache.json"), loaded)
+    }
+
+    fn from_loaded(
+        paths: &HipfirePaths,
+        cache_path: PathBuf,
+        loaded: hipfire_registry::LoadedRegistry,
+    ) -> Self {
+        let mut warning = None;
+        let local_files = list_local_models(paths);
+        // Keep sidecar presence available separately from the selectable model list.
+        let local_names = local_files
+            .iter()
+            .map(|m| m.file.clone())
+            .collect::<BTreeSet<_>>();
         if !loaded.warnings.is_empty() {
             warning = Some(loaded.warnings.join("; "));
         }
@@ -78,8 +100,21 @@ impl RegistryState {
             loaded.source,
             hipfire_registry::RegistrySource::Cache | hipfire_registry::RegistrySource::StaleCache
         )
-        .then_some(registry_paths.cache);
+        .then_some(cache_path);
         let registry = loaded.registry;
+        let bundled = loaded.source == hipfire_registry::RegistrySource::Bundled;
+        let generated_at = registry.generated_at.clone();
+        let local_files = local_files
+            .into_iter()
+            .filter(|local| {
+                hipfire_registry::is_standalone_model(
+                    &paths.models.join(&local.file),
+                    &local.file,
+                    &registry,
+                    hipfire_registry::GRANDFATHERED_MONOLITHICS,
+                )
+            })
+            .collect::<Vec<_>>();
 
         let registry_file_keys = registry
             .models
@@ -92,11 +127,6 @@ impl RegistryState {
             .into_iter()
             .map(|(tag, entry)| {
                 let downloaded = local_names.contains(entry.file.as_str());
-                let has_triattn = entry
-                    .triattn
-                    .as_ref()
-                    .map(|s| local_names.contains(s.file.as_str()))
-                    .unwrap_or(false);
                 let has_mtp = entry
                     .mtp
                     .as_ref()
@@ -106,7 +136,6 @@ impl RegistryState {
                     tag,
                     entry,
                     downloaded,
-                    has_triattn,
                     has_mtp,
                 }
             })
@@ -114,7 +143,6 @@ impl RegistryState {
         models.extend(
             local_files
                 .iter()
-                .filter(|local| is_selectable_model_file(&local.file))
                 .filter(|local| !registry_file_keys.contains(&normalized_file_key(&local.file)))
                 .map(|local| ModelRow {
                     tag: local.file.clone(),
@@ -125,7 +153,6 @@ impl RegistryState {
                         ..ModelEntry::default()
                     },
                     downloaded: true,
-                    has_triattn: false,
                     has_mtp: false,
                 }),
         );
@@ -138,6 +165,8 @@ impl RegistryState {
             selected: 0,
             expanded_groups: BTreeSet::new(),
             loaded_path,
+            bundled,
+            generated_at,
             warning,
         }
     }
@@ -157,6 +186,11 @@ impl RegistryState {
             }
             ModelListItem::Group { .. } => None,
         }
+    }
+
+    /// The registry entry for `tag`, if listed.
+    pub fn entry(&self, tag: &str) -> Option<&ModelEntry> {
+        self.models.iter().find(|m| m.tag == tag).map(|m| &m.entry)
     }
 
     /// Whether `tag` resolves to a known model (a registry/local entry or an
@@ -284,22 +318,6 @@ fn normalized_file_key(file: &str) -> String {
         .replace(".hfq", ".hf4")
 }
 
-fn is_selectable_model_file(file: &str) -> bool {
-    let lower = file.to_ascii_lowercase();
-    if lower.ends_with(".bin")
-        || lower.ends_with(".mtp")
-        || lower.ends_with("-mtp")
-        || lower.contains(".triattn.")
-    {
-        return false;
-    }
-    [
-        ".hf4", ".hf6", ".hfq", ".mq2", ".mq3", ".mq4", ".mq6", ".q8", ".q8f16", ".hfp4", ".mfp4",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle))
-}
-
 fn list_local_models(paths: &HipfirePaths) -> Vec<LocalModel> {
     let mut out = Vec::new();
     let Ok(entries) = fs::read_dir(&paths.models) else {
@@ -337,7 +355,7 @@ fn format_bytes(bytes: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{group_key, is_selectable_model_file, normalized_file_key};
+    use super::{group_key, normalized_file_key};
 
     #[test]
     fn groups_registry_tags_and_local_files_by_family() {
@@ -348,12 +366,68 @@ mod tests {
     }
 
     #[test]
-    fn filters_model_files_without_showing_sidecars() {
-        assert!(is_selectable_model_file("qwopus-27b.mq6"));
-        assert!(is_selectable_model_file("qwen3.5-9b.hfp4"));
-        assert!(is_selectable_model_file("lfm2.5-350m.q8"));
-        assert!(!is_selectable_model_file("qwen3.5-27b.mq4.triattn.bin"));
-        assert!(!is_selectable_model_file("qwen3.6-27b.mq4-mtp"));
+    fn local_models_exclude_sidecars_and_non_trunk_hfq_files() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-tui-model-classification-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let paths = super::HipfirePaths::under(root.clone());
+        std::fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "x.mq4",
+            "x.mq4.ple-q4",
+            "x.mq4.expert-hotset",
+            "y-dflash.hfq",
+        ] {
+            std::fs::write(paths.models.join(file), []).unwrap();
+        }
+        for (file, arch) in [("z.hfq", 20_u32), ("w.hfq", 5_u32)] {
+            let mut header = [0_u8; 32];
+            header[..4].copy_from_slice(b"HFQM");
+            header[4..8].copy_from_slice(&1_u32.to_le_bytes());
+            header[8..12].copy_from_slice(&arch.to_le_bytes());
+            std::fs::write(paths.models.join(file), header).unwrap();
+        }
+        let registry = hipfire_registry::RegistryV1::parse(
+            r#"{
+                "schema_version":1,
+                "generated_at":"2026-09-01T00:00:00Z",
+                "models":{"x:small":{
+                    "repo":"test/models","file":"x.mq4",
+                    "size_gb":1,"min_vram_gb":1,"desc":"test",
+                    "dflash":{"file":"y-dflash.hfq"}
+                }},
+                "aliases":{}
+            }"#,
+            "test registry",
+        )
+        .unwrap();
+        let state = super::RegistryState::from_loaded(
+            &paths,
+            root.join("registry.cache.json"),
+            hipfire_registry::LoadedRegistry {
+                registry,
+                source: hipfire_registry::RegistrySource::Bundled,
+                warnings: Vec::new(),
+            },
+        );
+        assert_eq!(
+            state
+                .local_files
+                .iter()
+                .map(|m| m.file.as_str())
+                .collect::<Vec<_>>(),
+            ["w.hfq", "x.mq4"]
+        );
+        assert_eq!(state.models.len(), 2);
+        assert!(state.models.iter().all(|model| model.downloaded));
+        assert!(state.bundled);
+        assert_eq!(state.generated_at, "2026-09-01T00:00:00Z");
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

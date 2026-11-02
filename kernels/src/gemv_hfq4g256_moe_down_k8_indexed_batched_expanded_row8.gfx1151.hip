@@ -16,7 +16,7 @@ gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151(
     const int*   __restrict__ topk_indices,
     const float* __restrict__ rot_batch,
     float*       __restrict__ expert_outputs,
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     (void)K;
     const int row0 = blockIdx.x << 3;
@@ -27,6 +27,14 @@ gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151(
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            const long long out_inv = ((long long)routing_base + krank) * (long long)M + row0;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) expert_outputs[out_inv + i] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x =

@@ -1,0 +1,486 @@
+{
+ "control_rate_def": "trace-off control tok_s = generated tokens / (prefill+decode) wall, excl load/spawn/handshake; trace-arm tok_s diagnostic only",
+ "fixture": {
+  "model_md5": "f9b5b13eb24ecbe4b39f3a3f4a297645",
+  "model_sidecar_mtp_md5": "51076bfb5b489832f2f6c4191b9799b0",
+  "prompt": "benchmarks/prompts/merge_sort_thinking_off.txt",
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "cpu": "AMD Ryzen 7 7800X3D, default 16 workers, RAYON unset",
+  "gpu": "RX 9070 XT gfx1201 HIP 7.2",
+  "env": "HIPFIRE_OFFLOAD_EXEC=cpu HIPFIRE_MOE_EXPERT_BUDGET=24 HIPFIRE_GRAPH=0 HIPFIRE_REPLAY_BACKEND=hip HIPFIRE_DPM_WARMUP_SECS=10 HIP_VISIBLE_DEVICES=0 thinking off",
+  "flags": "--spec off --max-tokens 256 --kv-mode q8 --kv-backend vmm -j, scoped max_seq=4096 restored to 200000 (verified)",
+  "coverage": "16/16 spilled layers CPU-covered, 0 host-mapped left on GPU, uncovered quants none (all runs)"
+ },
+ "runs": [
+  {
+   "stamp": "035214",
+   "arm": "baseline",
+   "batch": "initial",
+   "binary": {
+    "cli": "c068a289d2e3ad8ff83cb6f3354e4075",
+    "daemon": "9595741f965d6aa8266fe78428b0c162"
+   },
+   "control": {
+    "tokens": 166,
+    "tok_s": 48.6,
+    "finish": "stop",
+    "clen": 594,
+    "md5": "71305ea4f716de61d73efdac4ad7e87f",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 160,
+    "tok_s": 48.7,
+    "finish": "stop",
+    "clen": 570,
+    "md5": "f5538f0896615ccbcdf19b75462f208c",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```"
+   },
+   "splice_agg": {
+    "n": 37,
+    "gu_med_ms": 0.27,
+    "dn_med_ms": 0.14,
+    "tot_med_ms": 0.67
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-035214.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-035214.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-035214.trace.log"
+   }
+  },
+  {
+   "stamp": "035404",
+   "arm": "baseline",
+   "batch": "initial",
+   "binary": {
+    "cli": "c068a289d2e3ad8ff83cb6f3354e4075",
+    "daemon": "9595741f965d6aa8266fe78428b0c162"
+   },
+   "control": {
+    "tokens": 166,
+    "tok_s": 49.7,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 49.6,
+    "finish": "stop",
+    "clen": 601,
+    "md5": "6dddd3d2f960c53b50800ef4e4dc2b43",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n            \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "splice_agg": {
+    "n": 38,
+    "gu_med_ms": 0.25,
+    "dn_med_ms": 0.14,
+    "tot_med_ms": 0.655
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-035404.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-035404.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-035404.trace.log"
+   }
+  },
+  {
+   "stamp": "035536",
+   "arm": "baseline",
+   "batch": "initial",
+   "binary": {
+    "cli": "c068a289d2e3ad8ff83cb6f3354e4075",
+    "daemon": "9595741f965d6aa8266fe78428b0c162"
+   },
+   "control": {
+    "tokens": 166,
+    "tok_s": 46.2,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 50.1,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "splice_agg": {
+    "n": 38,
+    "gu_med_ms": 0.28,
+    "dn_med_ms": 0.14,
+    "tot_med_ms": 0.69
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-035536.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-035536.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-035536.trace.log"
+   }
+  },
+  {
+   "stamp": "040206",
+   "arm": "candidate",
+   "batch": "first",
+   "binary": {
+    "cli": "b64efa93867c7ef39c4b37224c0dde2c",
+    "daemon": "34fad9e1adaa0e6c204228363e4ea483"
+   },
+   "control": {
+    "tokens": 166,
+    "tok_s": 50.2,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 156,
+    "tok_s": 50.5,
+    "finish": "stop",
+    "clen": 558,
+    "md5": "b64591a20eb796dc225ff6c254c36bf3",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])\n    \n    return merge(left, right)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n            \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```"
+   },
+   "splice_agg": {
+    "n": 36,
+    "gu_med_ms": 0.27,
+    "dn_med_ms": 0.14,
+    "tot_med_ms": 0.69
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-040206.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-040206.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-040206.trace.log"
+   }
+  },
+  {
+   "stamp": "040335",
+   "arm": "candidate",
+   "batch": "first",
+   "binary": {
+    "cli": "b64efa93867c7ef39c4b37224c0dde2c",
+    "daemon": "34fad9e1adaa0e6c204228363e4ea483"
+   },
+   "control": {
+    "tokens": 187,
+    "tok_s": 52.0,
+    "finish": "stop",
+    "clen": 677,
+    "md5": "c681b42fbc34eaecf1489530daa896f5",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n            \n    while i < len(left):\n        merged.append(left[i])\n        i += 1\n        \n    while j < len(right):\n        merged.append(right[j])\n        j += 1\n        \n    return merged\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 50.6,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "splice_agg": {
+    "n": 38,
+    "gu_med_ms": 0.25,
+    "dn_med_ms": 0.13,
+    "tot_med_ms": 0.645
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-040335.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-040335.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-040335.trace.log"
+   }
+  },
+  {
+   "stamp": "040506",
+   "arm": "candidate",
+   "batch": "first",
+   "binary": {
+    "cli": "b64efa93867c7ef39c4b37224c0dde2c",
+    "daemon": "34fad9e1adaa0e6c204228363e4ea483"
+   },
+   "control": {
+    "tokens": 162,
+    "tok_s": 50.8,
+    "finish": "stop",
+    "clen": 573,
+    "md5": "87f44dbbdde3d1a5ff22d8d0d27cdddf",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])\n    \n    return merge(left, right)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 50.8,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "splice_agg": {
+    "n": 38,
+    "gu_med_ms": 0.24,
+    "dn_med_ms": 0.12,
+    "tot_med_ms": 0.64
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-040506.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-040506.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-040506.trace.log"
+   }
+  },
+  {
+   "stamp": "040819",
+   "arm": "baseline",
+   "batch": "sandwich",
+   "binary": {
+    "cli": "c068a289d2e3ad8ff83cb6f3354e4075",
+    "daemon": "9595741f965d6aa8266fe78428b0c162"
+   },
+   "control": {
+    "tokens": 151,
+    "tok_s": 47.1,
+    "finish": "stop",
+    "clen": 544,
+    "md5": "105542e769c40b85f58a02c64c918547",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    merged = []\n    i = j = 0\n    \n    while i < len(left_half) and j < len(right_half):\n        if left_half[i] < right_half[j]:\n            merged.append(left_half[i])\n            i += 1\n        else:\n            merged.append(right_half[j])\n            j += 1\n    \n    merged.extend(left_half[i:])\n    merged.extend(right_half[j:])\n    \n    return merged\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 49.6,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "splice_agg": {
+    "n": 38,
+    "gu_med_ms": 0.28,
+    "dn_med_ms": 0.15,
+    "tot_med_ms": 0.69
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-040819.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-040819.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-040819.trace.log"
+   }
+  },
+  {
+   "stamp": "040948",
+   "arm": "baseline",
+   "batch": "sandwich",
+   "binary": {
+    "cli": "c068a289d2e3ad8ff83cb6f3354e4075",
+    "daemon": "9595741f965d6aa8266fe78428b0c162"
+   },
+   "control": {
+    "tokens": 166,
+    "tok_s": 48.4,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 50.4,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "splice_agg": {
+    "n": 38,
+    "gu_med_ms": 0.24,
+    "dn_med_ms": 0.13,
+    "tot_med_ms": 0.645
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-040948.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-040948.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-040948.trace.log"
+   }
+  },
+  {
+   "stamp": "041107",
+   "arm": "baseline",
+   "batch": "sandwich",
+   "binary": {
+    "cli": "c068a289d2e3ad8ff83cb6f3354e4075",
+    "daemon": "9595741f965d6aa8266fe78428b0c162"
+   },
+   "control": {
+    "tokens": 156,
+    "tok_s": 50.0,
+    "finish": "stop",
+    "clen": 550,
+    "md5": "e8b8bea2ee3497096a2ab0b9c0ece198",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])\n    \n    return merge(left, right)\n\ndef merge(left, right):\n    result = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            result.append(left[i])\n            i += 1\n        else:\n            result.append(right[j])\n            j += 1\n    \n    result.extend(left[i:])\n    result.extend(right[j:])\n    \n    return result\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 44.9,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "splice_agg": {
+    "n": 38,
+    "gu_med_ms": 0.27,
+    "dn_med_ms": 0.15,
+    "tot_med_ms": 0.68
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-041107.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-041107.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-041107.trace.log"
+   }
+  },
+  {
+   "stamp": "041409",
+   "arm": "candidate",
+   "batch": "restored",
+   "binary": {
+    "cli": "b64efa93867c7ef39c4b37224c0dde2c",
+    "daemon": "34fad9e1adaa0e6c204228363e4ea483"
+   },
+   "control": {
+    "tokens": 166,
+    "tok_s": 50.7,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 160,
+    "tok_s": 50.0,
+    "finish": "stop",
+    "clen": 569,
+    "md5": "1b197fe3266f26abd4a251c6d279cfa7",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    result = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            result.append(left[i])\n            i += 1\n        else:\n            result.append(right[j])\n            j += 1\n    \n    result.extend(left[i:])\n    result.extend(right[j:])\n    \n    return result\n```"
+   },
+   "splice_agg": {
+    "n": 37,
+    "gu_med_ms": 0.25,
+    "dn_med_ms": 0.13,
+    "tot_med_ms": 0.64
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-041409.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-041409.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-041409.trace.log"
+   }
+  },
+  {
+   "stamp": "041543",
+   "arm": "candidate",
+   "batch": "restored",
+   "binary": {
+    "cli": "b64efa93867c7ef39c4b37224c0dde2c",
+    "daemon": "34fad9e1adaa0e6c204228363e4ea483"
+   },
+   "control": {
+    "tokens": 160,
+    "tok_s": 50.8,
+    "finish": "stop",
+    "clen": 569,
+    "md5": "130d41724e0fcc29d014a12906ab1105",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```"
+   },
+   "trace": {
+    "tokens": 160,
+    "tok_s": 51.3,
+    "finish": "stop",
+    "clen": 569,
+    "md5": "130d41724e0fcc29d014a12906ab1105",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```"
+   },
+   "splice_agg": {
+    "n": 37,
+    "gu_med_ms": 0.24,
+    "dn_med_ms": 0.13,
+    "tot_med_ms": 0.64
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-041543.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-041543.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-041543.trace.log"
+   }
+  },
+  {
+   "stamp": "041716",
+   "arm": "candidate",
+   "batch": "restored",
+   "binary": {
+    "cli": "b64efa93867c7ef39c4b37224c0dde2c",
+    "daemon": "34fad9e1adaa0e6c204228363e4ea483"
+   },
+   "control": {
+    "tokens": 166,
+    "tok_s": 50.9,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 141,
+    "tok_s": 50.4,
+    "finish": "stop",
+    "clen": 495,
+    "md5": "e4da6cca5d5131098afd4ddfd62f7e09",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])\n    \n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```"
+   },
+   "splice_agg": {
+    "n": 36,
+    "gu_med_ms": 0.235,
+    "dn_med_ms": 0.12,
+    "tot_med_ms": 0.63
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-041716.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-041716.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-041716.trace.log"
+   }
+  }
+ ],
+ "baseline_pooled_splice_median_of_medians": {
+  "gu_med_ms": 0.27,
+  "dn_med_ms": 0.14,
+  "tot_med_ms": 0.675
+ },
+ "candidate_pooled_splice_median_of_medians": {
+  "gu_med_ms": 0.245,
+  "dn_med_ms": 0.13,
+  "tot_med_ms": 0.64
+ },
+ "splice_delta_pct_candidate_vs_baseline": {
+  "gu_med_ms": -9.26,
+  "dn_med_ms": -7.14,
+  "tot_med_ms": -5.19
+ },
+ "token166_secondary_check": {
+  "note": "secondary only; all-12 primary, no selection",
+  "baseline_166_tok_s": [
+   46.2,
+   48.4,
+   48.6,
+   49.7
+  ],
+  "baseline_166_median": 48.5,
+  "baseline_166_n": 4,
+  "candidate_166_tok_s": [
+   50.2,
+   50.7,
+   50.9
+  ],
+  "candidate_166_median": 50.7,
+  "candidate_166_n": 3
+ },
+ "identity_full": {
+  "model_md5": "f9b5b13eb24ecbe4b39f3a3f4a297645",
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "disposition": "provisional KEEP, qualified: replicated direction, not portable/admitted win"
+ }
+}

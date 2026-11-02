@@ -1,0 +1,59 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-qwen35-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3.5 multi-vector embedding architecture (bidirectional full attention + causal GatedDeltaNet hybrid, SigLIP-2 tower, 128-d late-interaction head) for hipfire"
+
+[features]
+default = ["deltanet"]
+# Archived validation probes: `cargo run -p <crate> --example vision_smoke
+# --features lab`. Gated so `cargo build --all-targets` does not type-check a
+# GPU-only smoke on every build (the leanup ungated-examples ratchet).
+lab = []
+# The GDN / partial-RoPE / mRoPE kernels in rdna-compute are deltanet-gated,
+# matching hipfire-arch-qwen35 and hipfire-arch-qwen35-vl.
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet", "hipfire-arch-qwen35-vl/deltanet"]
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+half.workspace = true
+serde_json.workspace = true
+
+# GPU validation probe (see the module doc): loads only the vision tower out of
+# a checkpoint dir and encodes one image.
+[[example]]
+name = "vision_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "inspect_source"
+required-features = ["lab"]
+
+[[example]]
+name = "compare_tensor"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_attn_gemm"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemm_tiles"
+required-features = ["lab"]
+
+[[example]]
+name = "attn_eager_parity"
+required-features = ["lab"]
+
+# Batch parity probe: one forward over several sequences vs encoding them one at
+# a time — the acceptance test for the batched forward the slot engine uses.
+[[example]]
+name = "batch_parity"
+required-features = ["lab"]

@@ -1,5 +1,36 @@
 # Multi-GPU bring-up lessons (dev log)
 
+> **Lifecycle: historical (2026-05 bring-up dev log).** Retained for
+> provenance. It is **not** current procedure, a support matrix, or a
+> performance baseline: "this branch" means the bring-up branch, and the
+> throughput numbers in §8 are one-machine `measured` observations from that
+> time. The operator guide with current behavior is
+> [`multi-gpu.md`](multi-gpu.md); env knobs live in
+> [`env-vars.md`](env-vars.md); validation routes live only in
+> [`VALIDATION.md`](VALIDATION.md).
+>
+> Where the narrative has drifted from the tree (checked against the beta
+> source, no history rewritten):
+> - §1: the fix is in tree — `KernelCompiler` uses `cache_root.join(arch)`
+>   as its cache dir (`crates/rdna-compute/src/compiler.rs`).
+> - §2/§3: `preflight_vram_with_opts(devices, check_vram_delta)` exists;
+>   `init_layers` passes `false`, and `HIPFIRE_ALLOW_MIXED_ARCH=1` downgrades
+>   the arch-mismatch error to a warning
+>   (`crates/hipfire-runtime/src/multi_gpu.rs`,
+>   `crates/hipfire-runtime/src/config.rs`). The `docs/env-vars.md:230` and
+>   `docs/plans/hetero-pflash-dflash.prd` line references are bring-up-era.
+> - §5: `Gpu::bind_thread()` is now at
+>   `crates/rdna-compute/src/dispatch.rs` and delegates to
+>   `crate::graph::bind_thread` (`crates/rdna-compute/src/graph.rs`, which
+>   owns `LAST_BOUND_DEVICE`); the `dispatch.rs:846` line number is stale.
+> - §6: `Gpu::ensure_draft_stream()` was a bring-up-branch helper and is
+>   not in the tree; the `bind_thread()`-before-`stream_create()` rule
+>   stands as a lesson, not as an API.
+> - §9: `CHAIN_DRAIN_INTERVAL` / the periodic-sync fix described there is
+>   PR #204 prototype code and is not in the tree;
+>   `scatter_hidden_block_to_interleaved` now lives in
+>   `crates/hipfire-arch-qwen35/src/speculative.rs`.
+
 Captures non-obvious gotchas and root-causes from bringing up hetero
 PP=2 across a cross-arch AMD pair (gfx906 MI50 CDNA1 + gfx1031 RX 6700 XT
 RDNA2). Companion to the operational `docs/multi-gpu.md` — that one

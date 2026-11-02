@@ -1,0 +1,45 @@
+[package]
+name = "peacemaker-rip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Standalone .rip front end: a runtime parser, elaborator and lowering of Rust-shaped kernel scripts onto the peacemaker-isa builder (no rustc)"
+
+[features]
+default = ["certify"]
+# Object-level certification of emitted modules (llvm-mc, ld.lld, parse-back, M7).
+certify = ["peacemaker-isa/toolchain"]
+# The `hw_diff` example only. Keeps the GPU launcher and its `hip-bridge`
+# dev-dependency out of the default build (`ungated_examples` ratchet).
+hw-diff = []
+# The `rip_l1` example only: the edit -> offline-ready latency probe of a
+# script-native body (emit, link, M7, twin, CPU-emulator differential).
+l1 = ["certify"]
+
+[dependencies]
+peacemaker-isa = { path = "../peacemaker-isa" }
+peacemaker-author = { path = "../peacemaker-author" }
+peacemaker-lift = { path = "../peacemaker-lift" }
+peacemaker-ir = { path = "../peacemaker-ir" }
+syn = { version = "2", features = ["full", "visit-mut"] }
+quote = "1"
+proc-macro2 = { version = "1", features = ["span-locations"] }
+serde_json.workspace = true
+
+[dev-dependencies]
+hip-bridge = { path = "../hip-bridge" }
+sha2.workspace = true
+
+[[bin]]
+name = "peacemaker-rip"
+path = "src/bin/peacemaker-rip.rs"
+
+[[example]]
+name = "hw_diff"
+path = "examples/hw_diff.rs"
+required-features = ["hw-diff"]
+
+[[example]]
+name = "rip_l1"
+path = "examples/rip_l1.rs"
+required-features = ["l1"]

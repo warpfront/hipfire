@@ -1,0 +1,30 @@
+{
+  "counts": {
+    "buffer_load_b32": 2,
+    "buffer_store_b32": 1,
+    "s_barrier_signal": 0,
+    "s_barrier_wait": 0,
+    "s_endpgm": 1,
+    "s_load_b256": 1,
+    "s_load_b32": 1,
+    "s_load_b64": 0
+  },
+  "forbidden": [
+    "scratch_*",
+    "flat_*",
+    "global_*",
+    "buffer_atomic_*",
+    "ds_*",
+    "v_writelane*",
+    "s_setpc*",
+    "s_swappc*"
+  ],
+  "group_segment_fixed_bytes": 0,
+  "launch_dynamic_lds_bytes": 0,
+  "require_wave32": true,
+  "require_zero_private": true,
+  "require_zero_spills": true,
+  "sgpr_max": 104,
+  "symbol": "ep_tile_mask_pm_gfx1201",
+  "vgpr_max": 16
+}

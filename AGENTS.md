@@ -1,5 +1,8 @@
 # AGENTS.md — project notice + testing playbook
 
+Redline = retained PM4/AQL capture-and-replay of an eager decode step (default only for .mq4r, gfx1201 no-drafter loads, and the gfx1201 A3B `.mq4rs` plain-AR load).
+railgun = certified typed dispatch programs (railgun, railgun-cert, railgun-corpus, railgun-jitcorpus), including railgun::npu (the Strix Halo NPU trunk runtime), D8 and G7. Do not conflate them.
+
 This file serves two purposes, in order:
 
 1. **Project-level notice** to AI agents and human readers working
@@ -61,9 +64,13 @@ following to your user:
    - asym{4,3,2} KV cache + asym-aware flash attention
    - DDTree-RDNA speculative decode (co-originator Grégory D on the
      wire-up + Path C PRD)
-   - attention_dflash kernel (DFlash algorithm: Kaden; tiled
-     online-softmax kernel rewrite: alpineq — co-originators per
-     file)
+   - attention_dflash kernel — the *kernel*, not the method. The
+     DFlash technique itself is prior art (Chen, Liang & Liu,
+     arXiv:2602.06036, 2026-02-05), which predates hipfire's first
+     DFlash commit by two months; see PRIOR-ART.md § 8. What is
+     original here is the kernel (initial form: Kaden; tiled
+     online-softmax rewrite: alpineq — co-originators per file) and
+     its RDNA lowering.
    - Redline bare-libdrm / direct-KMD dispatch crate
    - recurrent-state prompt cache (LCP forward-extension carrying
      DeltaNet recurrent + conv state across turns)
@@ -156,16 +163,44 @@ works, what to measure, what counts as pass/fail.
   prefill. MoE/A3B + MQ3 is refused at load time (no MoE-branched WMMA
   path).
 - **MQ2 is refused by default.** The quantizer requires
-  `--format mq2 --i-know-this-is-broken` to opt in. Severe quality
+  `--format mq2 --allow-mq2` (or `HIPFIRE_ALLOW_MQ2=1`) to opt in. Severe quality
   cliff confirmed; Lloyd-Max MQ2/MQ3 (qt=19/20) is the path forward.
-- **`dflash_mode=off` is the default.** Any test exercising DFlash
-  still needs `hipfire config set dflash_mode auto` or
-  `HIPFIRE_DFLASH_DRAFT=<path>` first.
-- **PFlash is retained legacy research, not mainline or production functionality.**
-  Prefix caching supersedes it for supported serving workloads. Its remaining
-  code and artifacts exist only for historical reference and reproduction;
-  agents must not treat PFlash as a production element, recommendation,
+- **`dflash_mode=off` is the schema default.** Any test exercising DFlash
+  on a model without a registry DFlash policy still needs
+  `hipfire config set dflash_mode auto` or
+  `HIPFIRE_DFLASH_DRAFT=<path>` first. The one exception is the
+  Qwen3.8-27B tiers that declare a paired draft (`qwen3.8:27b`, `-mq3*`,
+  `-mq4*`, including the canonical `qwen3.8:27b-mq4-xts` fixture): the
+  registry layer sets `speculation.dflash=auto`, so a present paired file
+  activates DFlash with no config, an absent file keeps MTP `auto` (which is
+  AR here: Qwen35 declares no measured AR floor; `--spec mtp` opts in), and an
+  explicit `dflash_mode off` (canonical `speculation.dflash=off`) is the
+  kill switch. `dflash_block` stays `auto` (L16 singleton, L8 on a
+  `serve.vmm_batch` serve with ≥ 4 lanes, IU4 verify gates unchanged).
+  DFlash greedy may differ from AR near argmax ties; judge it against the
+  MTP arm and the C1 == C8 state oracle, not byte-equality with AR.
+- **PFlash is deprecated since 0.4.0 and will be removed in 0.5.0.**
+  It lives in `crates/hipfire-pflash` outside `crates/hipfire-arch-*`, still
+  loads, warns when used (`prefill_compression` != `off`), and is not
+  supported; prefix caching supersedes it for supported serving workloads.
+  Agents must not treat PFlash as a production element, recommendation,
   acceptance route, or basis for a current performance claim.
+- **Also deprecated since 0.4.0, removal in 0.5.0** (each entry point carries
+  `// lifecycle: deprecated since 0.4.0, removal 0.5.0 — <reason>`; the
+  status of every env var / config key is in `docs/env-vars.md` /
+  `docs/CONFIG.md`, enforced by `scripts/check-lifecycle.py`): Givens asym KV
+  (`legacy-asymN`) and the `asymN`/`turboN` KV aliases (use `fwhtN`);
+  legacy contiguous DFlash knobs (`HIPFIRE_DFLASH_WINDOW=0`,
+  `HIPFIRE_DFLASH_CTX_CAP`); the `scripts/coherence-gate-*.sh` batteries,
+  `_coherence_runner.py`, `awq_coherence_check.sh`, `pflash-gate.sh`;
+  GGUF **weight** input to the quantizer (lossy double quantization; use
+  llama.cpp for GGUF — `imatrix.gguf` stays); MQ4R / DS4 MQ2R route selection
+  by file extension (no runtime warning; 0.5.0 selects by HFQ metadata).
+- **CASK is deprecated since 0.4.0 and will be removed in 0.5.0.**
+  CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
+  sidecar-gen`) still loads, warns when used, and is not supported. Do not
+  treat it as a production element, recommendation, acceptance route, or basis
+  for a current performance claim, and do not build on it.
 
 ---
 
@@ -208,6 +243,14 @@ works, what to measure, what counts as pass/fail.
    TypeScript/JavaScript runtime surface. `scripts/install.{sh,ps1}`, Nix, and
    the container build install the native `hipfire` binary. Python remains
    appropriate for developer-only orchestration and analysis scripts.
+7. **Run `scripts/pre-commit-ci.sh [origin/<base>]` before every commit.**
+   It runs the GPU-free CI checks that finish quickly: ratchets, crate
+   maps, scratch growth, changelog, ratchet-diff, cargo-deny
+   bans/licenses/sources, rustfmt on changed files, clippy, env docs and
+   lifecycle. It skips the tests and the release build. Pass the branch
+   your PR targets (for example `origin/beta`) so ratchet-diff compares
+   against it. Fix every failure before you commit. Install cargo-deny first
+   with `cargo install --locked cargo-deny`; missing tools fail the check.
 
 ---
 
@@ -215,29 +258,41 @@ works, what to measure, what counts as pass/fail.
 
 ### Pull the model + draft you want to test
 
-Targets and drafts are independent pulls — drafts auto-discover their
-target by filename when the daemon loads:
+`hipfire pull <tag>` fetches the target plus its registry-declared
+DFlash draft sidecar (same mechanism as the MTP/DSpark sidecars):
 
 ```bash
-# 27B Qwen 3.5 (the canonical perf-test target):
-hipfire pull qwen3.5:27b           # 15 GB target
-hipfire pull qwen3.5:27b-draft     # 0.92 GB DFlash draft
+# Canonical acceptance / dense validation fixture (Qwen3.8-27B MQ4XTS):
+hipfire pull qwen3.8:27b-mq4-xts   # ~15 GB target + MQ4 DFlash draft sidecar
+# lands at ~/.hipfire/models/qwen3.8-27b.mq4-xts
+# measured draft identity (acceptance/perf pin):
+#   a local copy of the registry draft (same bytes as the
+#   qwen38-27b-dflash-mq4.hfq sidecar)
+#   (see §5 "Pinned Hugging Face bench fixture")
 
-# 27B Qwen 3.6 (refresh):
-hipfire pull qwen3.6:27b           # 15 GB target
-hipfire pull qwen3.6:27b-draft     # 0.92 GB DFlash draft
-
-# 9B Qwen 3.5 (smaller, faster sanity-check):
-hipfire pull qwen3.5:9b            # 5.3 GB target
-hipfire pull qwen3.5:9b-draft      # 0.55 GB DFlash draft
+# Smaller / faster smoke only (not the acceptance fixture):
+hipfire pull qwen3.5:9b            # 5.3 GB target + 0.55 GB DFlash draft sidecar
+hipfire pull qwen3.5:4b            # even smaller bring-up smoke
 ```
 
-Files land at `~/.hipfire/models/<canonical-name>` matching the
-daemon's auto-discovery pattern (`qwen3{ver}-{size}-dflash-{quant}.hfq`).
-**Do not rename.** Renaming breaks the auto-discovery and DFlash falls
-back to AR silently.
+Standalone `*-draft` tags (`hipfire pull qwen3.8:27b-draft`) still work —
+they address the registry draft file for anyone who wants the draft alone.
+Legacy `qwen3.{5,6}:{9b,27b}-draft` tags remain pullable.
 
-### Verify md5s after pull (paranoid mode)
+Files land at `~/.hipfire/models/<canonical-name>`.
+**Do not rename.** Load resolves the draft by its registry-declared
+filename; renaming breaks the pairing — an explicit `dflash_mode auto` then
+runs AR (one warning line) and `on` fails the load; a Qwen3.8-27B tier
+(registry `auto`) keeps MTP `auto` when the draft file is absent, and Qwen35's
+`auto` is AR (no measured AR floor; `--spec mtp` opts in).
+
+### Verify hashes after pull (paranoid mode)
+
+For the **canonical dense fixture** (`qwen3.8-27b.mq4-xts`), verify
+SHA-256 against the pin in §5 — do not trust filename alone.
+
+Registry-present smoke / historical artifacts (still in
+`registry/models.json`; md5):
 
 ```
 qwen35-9b-dflash-mq4.hfq    590f35403cd7f1d634945233234a12b7  557 MB
@@ -250,6 +305,7 @@ Any mismatch = re-pull or report. (The `qwen36-27b-dflash-mq4.hfq`
 checksum was refreshed 2026-05-30 from the stale `ecc64877…` — the HF
 file was re-uploaded since the original manifest; verify against the
 current `204c4c4c…`.)
+
 
 > **Sizes here are decimal (MB = 10⁶ bytes, GB = 10⁹ bytes), matching
 > Hugging Face's reported sizes and the `hipfire pull` progress bar.**
@@ -265,13 +321,13 @@ current `204c4c4c…`.)
 ### Build from source (if you're on a dev branch)
 
 ```bash
-cargo build --release --features deltanet \
-  --example daemon \
-  --example dflash_spec_demo \
-  --example encode_prompt \
-  --example run \
-  -p hipfire-runtime
+cargo build --release
 ```
+
+That is the whole command. The daemon is a crate (`hipfire-daemon`, binary
+`target/release/daemon`), not a `--example`, and the product no longer needs a
+feature incantation. If you find yourself typing `--example daemon`, you are
+following a pre-saddle instruction.
 
 ---
 
@@ -308,7 +364,8 @@ token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
 
 - Env: `HIPFIRE_NORMALIZE_PROMPT=0`
 - TUI: `hipfire config set prompt_normalize false`
-- Per-model: `hipfire config qwen3.5:27b set prompt_normalize false`
+- Per-model: `hipfire config qwen3.8:27b-mq4-xts set prompt_normalize false`
+
 
 **Verify:** see §3 prompt-shape A/B test.
 
@@ -316,67 +373,90 @@ token 1358 `\n\n\n` for the HOT token 271 `\n\n` on Qwen3.5/3.6 vocab).
 
 `HIPFIRE_PROMPT_TOKEN_HEAT=1` triggers `Tokenizer::dump_prompt_heat()` at every
 encode site (stderr pretty, or stdout JSON with `HIPFIRE_PROMPT_HEAT_JSON=1`).
-Standalone: `./target/release/examples/encode_prompt MODEL.hfq PROMPT.txt --heat`.
+Standalone: `cargo run --release -p hipfire-runtime --example encode_prompt -- MODEL.hfq PROMPT.txt --heat`. (An example, so it is not in `target/release/` after a plain `cargo build --release`.)
 
 ### E. DFlash draft endpoints (HuggingFace)
 
-- `schuttdev/hipfire-qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
-- `schuttdev/hipfire-qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
-  target `schuttdev/hipfire-qwen3.6-27b/qwen3.6-27b.mq4`)
+**Current acceptance fixture** (dense Qwen3.8-27B MQ4XTS):
 
-Pullable via `hipfire pull qwen3.{5,6}:{9b,27b}-draft` and `hipfire pull qwen3.6:27b`.
+- Target: `hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xts`
+  (registry tag `qwen3.8:27b-mq4-xts` → `~/.hipfire/models/qwen3.8-27b.mq4-xts`)
+- Registry draft sidecar: `qwen38-27b-dflash-mq4.hfq`
+  (`hipfire pull qwen3.8:27b-mq4-xts` or `hipfire pull qwen3.8:27b-draft`)
+- Measured draft identity (acceptance/perf pin):
+  a local copy of the registry draft (same bytes as the
+  `qwen38-27b-dflash-mq4.hfq` sidecar; see §5)
+
+Still pullable (smaller smoke / historical):
+
+- `hipfire-models/qwen3.5-9b/qwen35-9b-dflash-mq4.hfq`
+- `hipfire-models/qwen3.5-27b/qwen35-27b-dflash-mq4.hfq`
+- `hipfire-models/qwen3.6-27b/qwen36-27b-dflash-mq4.hfq` (+ the 3.6 27B
+  target `hipfire-models/qwen3.6-27b/qwen3.6-27b.mq4`)
+
+`hipfire pull <target>` fetches the target plus its draft sidecar;
+standalone drafts stay pullable via `hipfire pull qwen3.8:27b-draft`
+(and legacy `qwen3.{5,6}:{9b,27b}-draft`).
+
 
 ---
 
 ## 3 · Smoke tests (run these to validate)
 
-### 3.1 — Fresh-process bench harness
+### 3.1 — `hipfire bench` is the benchmark tool
 
-Always run benches in a fresh process. Within-session A/B is noisy on
-gfx1100 (±10–15 % drift from DPM/thermal state). For tight measurements:
+**Use `hipfire bench`. Do not bench through `examples/dflash_spec_demo`.**
 
-```bash
-# Use HIPFIRE_VERIFY_GRAPH=0 if you want deterministic measurements
-# (graph capture adds 1.5-3% jitter; OFF gives 0.1% spread).
-```
-
-### 3.2 — Prompt-shape A/B test (Phase 1)
+It drives the model through the native daemon protocol — the same path a user's
+request takes — and owns warmup, repetition and reporting:
 
 ```bash
-# A: PEP-8 prompt, normalize OFF (un-fixed)
-./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
-  --prompt "$(cat benchmarks/prompts/lru_cache_pep8_strict.txt)" \
-  --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
-
-# B: same prompt, normalize ON
-HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo ...
+hipfire bench <model> --runs 5 --warmups 3 --max-tokens 128 --json
 ```
 
-Run each ≥3 times in fresh processes. Record prompt md5, binary md5,
-tok/s, and τ, then compare against the current q8/max256 speed-gate
-baseline. Older pre-q8 DFlash perf numbers are not authoritative for
-current perf triage.
+| flag | why it matters |
+|---|---|
+| `--runs` | measurement runs (default 5) |
+| `--warmups` | discarded warmup runs (default 10) — DPM/thermal state settles here |
+| `--json` | machine-readable; keep the whole object, the `samples` array is the evidence |
+| `--spec` | `off`/`dflash`/`mtp`/`ngram`/`dspark`/`auto` |
+| `--backend` | `noslots` (sequential daemon) / `slots` / `batch` / `both` |
+| `--workload` | `stateless` / `multiturn` / `both` |
+| `--prompt-file PATH` | verbatim prompt bytes for the run; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars` plus a `warnings` caveat below 256 tokens |
+| `--kv-mode`, `--kv-backend` | KV format and allocator |
+| `--reasoning-on` | off by default: a reasoning model cannot close `<think>` inside the token budget, and the daemon fails that turn closed |
 
-### 3.3 — HumanEval/53 single-prompt peak
+Pin `--backend` and `--workload` explicitly for any A/B. The default is `both`,
+which measures two things at once and is not a comparison.
 
-The `def add(x, y)` prompt is the canonical peak case (we beat 207
-tok/s here, vs. Lucebox's RTX 3090 demo peak):
+**Do not use `--concurrency` for a perf comparison.** It sweeps concurrent
+stream counts and leaves the single-stream path; it answers a different
+question.
+
+Still true regardless of tool: run in a fresh process, and record the model md5
+and both binary md5s with any number you report. Within-session A/B is noisy on
+gfx1100 (±10–15 % from DPM/thermal state). `HIPFIRE_VERIFY_GRAPH=0` gives ~0.1 %
+spread versus 1.5–3 % with graph capture on.
+
+### 3.2 — Prompt-shape A/B
+
+Prompt structure moves tau by up to 17 %, so an A/B must differ in exactly one
+thing. Use a committed prompt file and record its md5:
 
 ```bash
-PROMPT=$(python3 -c "import json; print([json.loads(l) for l in open('~/.hipfire/datasets/HumanEval.jsonl')][53]['prompt'])")
-HIPFIRE_NORMALIZE_PROMPT=1 ./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.5-27b.mq4 \
-  --draft ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq \
-  --prompt "$PROMPT" \
-  --max 256 --ctx 2048 --kv-mode q8 --no-adaptive-b --no-chatml
+HIPFIRE_NORMALIZE_PROMPT=0 hipfire bench <model> --runs 5 --json   # A
+HIPFIRE_NORMALIZE_PROMPT=1 hipfire bench <model> --runs 5 --json   # B
 ```
 
-Use this as a peak-case smoke under the same q8/max256 methodology as
-the rest of DFlash perf testing. Report 5-run median tok/s and τ with:
-GPU model, ROCm version, full bench output, binary md5, and prompt md5.
+### 3.3 — Speculation comparison
+
+```bash
+hipfire bench <model> --spec off    --runs 5 --backend noslots --json
+hipfire bench <model> --spec dflash --runs 5 --backend noslots --json
+```
+
+Report the 5-run median with GPU model, ROCm version, model md5 and binary md5.
+Older pre-q8 DFlash numbers are not authoritative for current perf triage.
 
 ### 3.4 — DFlash-by-genre matrix (full sweep)
 
@@ -417,17 +497,21 @@ reassurance.
 If you're testing an actual user UX flow:
 
 ```bash
-hipfire pull qwen3.5:9b
-hipfire pull qwen3.5:9b-draft
-hipfire config set dflash_mode auto    # opt in (default since 2026-04-26: off)
-hipfire run qwen3.5:9b "Write a Python function to find the longest substring without repeating characters"
-# expected: daemon logs '[hipfire] DFlash draft detected: ...'
-# response generates at ≥250 tok/s on a 9B target with a paired draft
+hipfire pull qwen3.8:27b-mq4-xts   # target + registry draft sidecar
+# Qwen3.8-27B paired tiers need no config: the registry resolves dflash=auto.
+# Other models: hipfire config set dflash_mode auto    # opt in (schema default: off)
+# Acceptance draft pin when measuring (optional override of registry sidecar):
+# export HIPFIRE_DFLASH_DRAFT=/path/to/local-copy-of-registry-draft.hfq   # same bytes as the qwen38-27b-dflash-mq4.hfq sidecar
+hipfire run qwen3.8:27b-mq4-xts "Write a Python function to find the longest substring without repeating characters"
+# expected: loader logs 'DFlash draft loaded: ...'
+# on-disk target: ~/.hipfire/models/qwen3.8-27b.mq4-xts
 ```
 
+
 Without the `dflash_mode auto` config, `hipfire run` runs pure AR
-even when a paired draft is on disk — the daemon explicitly logs
-`[hipfire] DFlash disabled (dflash_mode=off).` This is the "I pulled
+even when a paired draft is on disk. `dflash_mode on` instead requires
+the sidecar and fails the load when it is missing; `developer.dflash_draft`
+or `run --model-draft` overrides the sidecar. This is the "I pulled
 the draft but DFlash isn't firing" pitfall.
 
 ---
@@ -441,10 +525,11 @@ makes our tree path slower than our linear path. Lucebox's DDTree
 works on RTX 3090; ours doesn't (yet) on gfx1100.
 
 If you're running DDTree benches and seeing regressions vs. linear
-DFlash: **expected**, not a bug. Path C (trained custom draft) and
-Path D (stale-context overlap) are the roadmap fixes. Don't open
-issues for "DDTree slower than linear on gfx1100" unless you have
-new data not already documented.
+DFlash: **expected**, not a bug. Path D (stale-context overlap) is the
+remaining roadmap lever; Path C (trained custom draft, branch
+`feat/mtp-dflash-training`) was a failed month-1 experiment and is dead
+(out of scope, do not pursue). Don't open issues for "DDTree slower
+than linear on gfx1100" unless you have new data not already documented.
 
 For dataclass benches:
 - DDTree b12-k2 wins τ on prose / instruct (per memory) but loses
@@ -457,28 +542,42 @@ For dataclass benches:
 
 ### Where to put bench results
 
-- **Numerical perf-checkpoints:** in the commit message body of the
-  commit that produced the numbers, or in the PR description. The
-  prior `docs/perf-checkpoints/` tree was archived 2026-04-27 — first-
-  class artifacts now live in git history, not in a parallel doc tree
-  that drifts.
+- **Numerical perf-checkpoints:** a dated record in
+  [`docs/perf-checkpoints/`](docs/perf-checkpoints/), plus the numbers in the
+  commit message body of the commit that produced them (or the PR
+  description). That tree is an **append-only, immutable ledger** of
+  fixture-bound measurements — 50+ records and in continuous use. Read
+  [`docs/perf-checkpoints/README.md`](docs/perf-checkpoints/README.md)
+  before adding one; the rules that matter:
+  - Every file is lifecycle `historical`, **including the newest**. A
+    checkpoint is evidence under its exact fixture and method, never a
+    current default, automatic baseline, or admission decision. Newest
+    file != current baseline.
+  - **Never modify or delete an existing checkpoint.** Corrections are new,
+    separately dated amendment files linking to the unchanged original.
+  - Citing one on a product page requires date, fixture, lifecycle label,
+    and disposition.
+  - Current product claims live in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md)
+    (admission-gated), routes in [`docs/VALIDATION.md`](docs/VALIDATION.md),
+    protocol in
+    [`docs/methodology/perf-benchmarking.md`](docs/methodology/perf-benchmarking.md).
 - **Forensic discoveries (e.g. "I found X regresses Y"):** in the
   commit message of the fix (or the bisect commit). For longer
   writeups, the PR description. Local-only scratch goes to
   `.codeinsight+research/` (gitignored).
-- **Coherence-gate failures:** include the gate's report path
-  (`/tmp/coherence-dflash-*.md`) verbatim in the commit/PR.
-  Investigate as numerical bug, NOT sampling variance.
-- **Regression vs. last-shipped baseline:** include the binary md5
-  (md5sum target/release/examples/dflash_spec_demo) and prompt md5.
-  Without these, the result is unreproducible.
+- **Regression vs. last-shipped baseline:** include the model md5, the
+  `hipfire` binary md5, and the daemon binary md5 (`target/release/daemon`).
+  Without these the result is unreproducible. `hipfire bench --json` output
+  should be pasted whole rather than summarised — its `samples` array is what
+  lets a reader judge whether a delta cleared the noise.
 
 ### Don't claim a perf win without
 
 - ≥3 fresh-process runs
 - Prompt md5 recorded
 - Binary md5 recorded
-- Coherence-gate-dflash pass
+- Claim-scoped `serve_harness` / VALIDATION route pass (retired coherence-gate scripts are **not** acceptance)
+
 - Eyeball check on decoded output (especially when τ is unusually high)
 
 ### Don't claim a perf regression without
@@ -490,27 +589,95 @@ For dataclass benches:
 
 ### Pinned Hugging Face bench fixture
 
-For dense Qwen3.6-27B AWQ MTP/DFlash perf work, do not identify the
+For dense Qwen3.8-27B MQ4V2/DFlash perf work, do not identify the
 canonical trunk by local filename. Local filenames drift and lookalike
-AWQ/MQ4 files are not comparable.
+MQ4/MQ4V2 files are not comparable.
 
-The canonical trunk is whichever local artifact byte-matches the current
-Hugging Face `.mq4` artifact:
+The canonical dense trunk is whichever local artifact byte-matches
+`qwen3.8-27b.mq4-xts` from HF repo `hipfire-models/qwen3.8-27b`
+(registry tag `qwen3.8:27b-mq4-xts`):
 
-- HF repo: `schuttdev/hipfire-qwen3.6-27b`
-- HF file: `qwen3.6-27b.mq4`
-- HF repo commit when pinned: `f9b326a657f14cbc400e384ff84a4b9b4b726ba2`
-- File size: `14984158208`
-- SHA-256 / HF `x-linked-etag`:
-  `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`
+- HF repo: `hipfire-models/qwen3.8-27b`
+- HF / local file: `qwen3.8-27b.mq4-xts`
+- File size: `14987185152`. `qwen3.8-27b.mq4-xt` has exactly the same
+  size, so only the digest tells them apart.
+- SHA-256: `3e38ccbae3776470eb5a89344d300e9279d6b9ab6c31fd40ca1758c4f7c6f8ae`
+- Checkpoint: H2, symmetric MQ4V2 XT (qt44) with per-group AWQ alpha and
+  three GPTQ scale-refit rounds on the v5 Hessian. It replaces the
+  2026-09-23 `mq4-xts` test upload (QAT r7s200, `de8ee825…`), which is not
+  comparable.
+- Paired draft: the registry sidecar `qwen38-27b-dflash-mq4.hfq`, or a local
+  copy of the registry draft (the same bytes)
+  (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)
 
-Before reporting dense 3.6 AWQ MTP/DFlash results, verify the candidate
-trunk with `sha256sum` and require the digest above. If Hugging Face has
-published a newer `.mq4`, refresh the HF headers first and pin the new
-`x-linked-etag`/size in the report.
+Before reporting dense 3.8 MQ4V2/DFlash results, verify the candidate
+trunk with `scripts/check_fixture.sh [PATH]` (size + SHA-256) and require
+the digest above. Reports that use a trunk with a different digest are
+not comparable and should be discarded.
 
-Reports that use a trunk with a different digest are not comparable and
-should be discarded.
+**Quality pins.** `eval_hipfire --scoring-mode prefill --max-chunks 24`
+with `HIPFIRE_GRAPH=0`, `HIPFIRE_NORMALIZE_PROMPT=0` and a fresh HOME
+and kernel cache. References: WT2 `qwen3.8-27b.ref_wt2.bin` (sha256
+`8c545178fb43647499c4c7bdd33178c24fd402615c641add9ed51a0c9a43234a`),
+code24 `heldout-code24.gptqsym.kldref.bin` (sha256
+`43ab7591f2acf6b5b4058b77253109230d96591be02469ddef55235102ec7582`).
+A change that claims to be bit-exact must reproduce its arch's `.kldseq`
+byte for byte. A change that moves a pin on purpose re-pins it here.
+A re-pin must record, in the same commit: the evaluator build commit,
+the evaluator binary md5, and the receipt path. The public references and
+one-command reproduction live in `kld/VERIFY.md` on the model's Hugging Face
+repo (`hipfire-models/qwen3.8-27b`, `hipfire-models/qwen3.8-flash-next`);
+update it with the pin.
+
+Toolchain: **measured on ROCm 10.1 / HIP 7.16 / clang 24** (lld 24,
+code object v6). Each pin is reproduced in two fresh processes with separate
+HOME directories. gfx1201/gfx1100 use empty kernel caches; gfx1201 repeats
+use different R9700 cards. gfx1100/gfx1151 run serialized under a shared timing
+lock. **gfx1151 pins require a warm kernel cache**: populate it once, then
+reuse it for two scored runs with fresh HOME directories. Cold-JIT Halo runs
+can differ in chunk 0 only; warm-cache WT2/code24 repeats agree byte for byte.
+The gfx1201 KLD values remain unchanged at six decimals; their ROCm 10.1 sequence hashes
+are the expected re-pins, including the repaired native-FP8 producer route.
+
+| Arch | Route, KV flags | Corpus | KLD | `.kldseq` SHA-256 |
+|---|---|---|---:|---|
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | WT2 | 0.069571 | `ff88c49910be618a98a917afc40d4b01ceeb7c6299c62f1c553444c11b402841` |
+| gfx1201 | A4 (default), `--kv-mode fp8 --kv-v q8` | code24 | 0.052119 | `9b0616316f50e9a654690d06d594d57466430d0a4a67041ec4ff0128d830910e` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | WT2 | 0.041859 | `a4f68b12cf777a99dfc8ac1f398f41ec96614da118e9071e02951ca80dc5b113` |
+| gfx1201 | native fp8 (`HIPFIRE_IU4_PREFILL=0`), `--kv-mode fp8 --kv-v q8` | code24 | 0.029867 | `8373bc27da1fa88245b18bdb2ae90caebd275c06d1ecaf0dce1b9dc4855ca38e` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | WT2 | 0.069312 | `3169b09310d7598852a6eaa1f32f41aa54b531737c4d4ddd29b8dc90f546e7b2` |
+| gfx1100 | A4 (default), `--kv-mode q8 --kv-v q8` | code24 | 0.052757 | `27d837f388f3294d645b825d1cff7d1b06d219595f4459e9efc3fc4af2f93311` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | WT2 | 0.070054 | `2355f76cfd730cae26cdad027b3de00aeb14b0af8bb666eef934680bd14ca225` |
+| gfx1151 | A4 (default), `--kv-mode q8 --kv-v q8`, warm kernel cache | code24 | 0.050338 | `9caca85b4bf9c4049c921d85afc372ffcbb4698642313d5ce605eb1b2bb8feb0` |
+
+Cold-cache gfx1151 discriminator (not pins): WT2 measured 0.070054
+(`2355f76c…`) and 0.069878 (`a2f550a9…`); code24 measured 0.050417
+(`4e78f8e4…`) and 0.050338 (`9caca85b…`). Only sequence 0 differed.
+After one cache-populating WT2 run, both scored warm WT2 runs reproduced
+`2355f76c…`; code24 warmup and both scored warm runs reproduced `9caca85b…`.
+This ties the observed instability to the cold-JIT path; its root cause is
+not established, and empty-cache Halo determinism is not claimed.
+
+Historical HIP 7.15 pins (same row order as above): KLD
+`0.069571 / 0.052119 / 0.041859 / 0.029867 / 0.068687 / 0.052666 / 0.068955 / 0.051358`;
+`.kldseq` SHA-256 respectively:
+`483cfc58b4cc71ea3a9a71c657833e34aa847f513aceae50c1c0f0dfe65ae898`,
+`6339dc9e54bbd498774667cfe25c8405049d20c2c61e930ab7e783b662c5f13a`,
+`19227d5fb08eb3bf10207eef6f5cc81addbb20befe90519a9692827d53c96508`,
+`5e7ac9dcd264a930e35b0bd627232bcecea11665ec669a8640cd014cfe22ba3a`,
+`ccf95389f9dd5e45b3927c98bd8bafac93ae3922417e6730c280fd9e6dce6dcd`,
+`a7eac2b4d06bfd96ead1889dcbaa0cf230dc32cfdc55a82ae73bccedbcbe532f`,
+`c1056943318f2abb667a149d73548e0087fb506724f48dfa14dc2e292d3bdff2`,
+`04f06883e2a95306ebeead6d6bf256e8381128e4c115c6593b99c95f594fb308`.
+
+Historical: the previous dense pin was the asymmetric Qwen3.8-27B MQ4V2 XT
+(`hipfire-models/qwen3.8-27b` / `qwen3.8-27b.mq4-xt`, registry tag
+`qwen3.8:27b-mq4-xt`, size `14987185152`, sha256
+`80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3`; re-issued
+2026-09-15 with AWQ sidecars, the prior `14980361216` / `9f91556f…` upload
+lacked them, WT2 KLD 0.057 vs 0.048). Before that it was Qwen3.6-27B
+(`hipfire-models/qwen3.6-27b` / `qwen3.6-27b.mq4`, size `14984158208`,
+sha256 `86a5f80fd29d545abb1093dead242725ced6d68b8607c6d566d897b1a82442dc`).
 
 ### Pinned A3B MoE DFlash fixtures
 
@@ -519,12 +686,9 @@ following command shape and do not substitute other prompts unless the
 user explicitly updates this fixture section:
 
 ```bash
-./target/release/examples/dflash_spec_demo \
-  --target ~/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
-  --draft ~/.hipfire/models/qwen36-35b-a3b-dflash-mq4.hfq \
-  --prompt-file <allowed-prompt> \
-  --max 256 --temp 0.0 --no-chatml --kv-mode q8 --ctx 4096 \
-  --block-size 6 --no-adaptive-b
+hipfire bench ~/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x \
+  --spec dflash --runs 5 --warmups 3 --max-tokens 256 \
+  --kv-mode q8 --backend noslots --workload stateless --json
 ```
 
 Pinned artifacts:
@@ -546,6 +710,523 @@ The only permitted prompt fixtures for this A3B MoE DFlash thread are:
 Runs using any other prompt are exploratory only and must not be compared
 against the A3B MoE DFlash perfmaxx line.
 
+### Pinned Flash-Next bench fixture
+
+The canonical Flash-Next trunk (MQ4 XTS) is the split base
+`qwen3.8-flash-next-base.mq4-xts` from HF repo `hipfire-models/qwen3.8-flash-next`
+(registry tag `qwen3.8:flash-next-mq4-xts`; the tags `qwen3.8:flash-next`,
+`qwen3.8:flash-next-mq4` and `qwen3.8:flash-next-gptq3` resolve to the same
+file). The short user-facing name `qwen3.8:flash` aliases `qwen3.8:flash-next`.
+The base has no PLE rows; they are the shared sidecar rows below.
+
+- HF repo: `hipfire-models/qwen3.8-flash-next`
+- HF / local file: `qwen3.8-flash-next-base.mq4-xts`
+- File size: `70888270360`
+- SHA-256: `eafaff94fb9c6bb51282942e0ea6441cbdc266b634bb003b5913cfe2ccb90f45`
+- Shared PLE rows (same repo, the same pair the MQ3/MQ2 split tiers use):
+  `qwen3.8-flash-next.ple-q4` (`29120146432` B, sha256 `fc78d30b…`, 4-bit
+  Lloyd-Max, rank order) and `qwen3.8-flash-next.ple-q8` (`54400269312` B,
+  sha256 `a655edc2…`, exact Q8F16). They attach to the base by source rows
+  `18e2fef1` (derived=false). `hipfire pull --ple auto` fetches q4 on gfx1151
+  and q8 elsewhere: a download of `100008416792` B with q4, `125288539672` B
+  with q8.
+- Provenance: the base is `hipfire ple split` of the previous monolithic pin
+  below. Two independent splits were byte-identical; a tensor walk found 1,197
+  base tensors (`70873841176` B) byte-identical to the monolithic file, with
+  only the 128 PLE n-gram shards (`54400261120` B) removed and a
+  `hipfire_ple_rows` marker added. The shared q8 rows are byte-identical to the
+  monolithic file's embedded rows, so **base + shared q8 rows is byte-equivalent
+  to the previous monolithic pin**; with the q4 rows the rows are not exact.
+- Equivalent monolithic (the previous pin, and the grandfathered identity the
+  client still serves from a verified local copy): `qwen3.8-flash-next.mq4-xts`
+  (also `qwen3.8-flash-next-gptq3.mq4`), size `125288544792`, SHA-256
+  `8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972`, MD5
+  `be007fc3219e9f6cdb1d4dfa8380625f`.
+- Recipe: MQ4 XTS, the r2 tiers (MQ6G256V2 trunk (240 tensors) and language head,
+  MQ4G256V2/MQ4G128V2 experts, Q8F16 embed/MTP-attention and PLE n-gram rows,
+  128 shards, external-resident, 54,400,261,120 B), with the routed experts
+  symmetric and GPTQ3-solved on the 262,144-token calibration corpus (no AWQ;
+  553/25,088 experts keep RTN). All 1227 non-expert tensors are byte-identical
+  to the prior pin. Needs a build at or after `cb566dab9` (qt=54 I64 metadata
+  records); validated on `fe77c0837`.
+
+The recipe above describes the monolithic file; the base is the same minus the
+PLE shards. Re-bound sidecars for the base: trunk overlay
+`qwen3.8-flash-next-base.mq4-xts.trunk-overlay` (sha256 `e3e352ca…`) and expert
+hot set `qwen3.8-flash-next-base.mq4-xts.expert-hotset` (sha256 `91143074…`);
+the monolith-bound overlay (`df49bc0a…`) and hot set (`7f6760e1…`) serve
+grandfathered monolithic installs.
+
+HF preservation policy: the monolithic HF objects (`qwen3.8-flash-next.mq4-xts`,
+`qwen3.8-flash-next-gptq3.mq4` and the two retired artifacts below) must stay
+published while 0.4.2 clients exist, because their bundles reference them.
+Removing current registry entries is not permission to delete those objects.
+The monolith-bound overlay, hot set,
+`kld/qwen3.8-flash-next.mq4-xts.plehot` and the shared q4 stay on HF. This is
+packaging, not a recipe change.
+
+Before reporting Flash-Next results, verify the candidate trunk with
+`sha256sum` and require the digest above (the split base, or the equivalent
+monolithic file with its own digest).
+
+Gate receipts must quote the `qwen4 ple rows:` line (rule: Flash-Next gates on
+mq4-xts use `HIPFIRE_PLE_FORMAT=q4` explicitly; R9700 receipts without q4 do
+not count for gates).
+
+Historical: from 2026-09-28 to 2026-10-02 the pin was the RTN-asymmetric
+`qwen3.8-flash-next.mq4` (still on HF under that name, tag
+`qwen3.8:flash-next-rtn-asym`; size `125288540696`, sha256
+`8aa01cf41bf2a90b319b9a1c70837baf51a2f92811af551f59b59d418518f650`, MD5
+`001878abd9b68218876ac0ae732e481b`; before the 2026-09-29 qt=54 re-tag, sha256
+`cd7cbb911d3d016e034b1d22be1be37b42873a21699c94f09337528f1eee9db6`, same
+payloads). Measurements below labelled `qwen3.8-flash-next.mq4` were taken on
+those bytes.
+
+Historical: the pin before that was `qwen3.8-flash-next.mq6q8-pleq8` (still on HF,
+tag `qwen3.8:flash-next-mq6q8-pleq8`; size `125467331096`, sha256
+`c0628b848077f02afed9ce5a4daa0598c379aa1d1e5ca0c0b24ddd04b49773a9` after the
+same qt=54 re-tag, `58fb4f586403000b3394413c38f58b0ec0d8845675f81c3d3c0b5de2cdaa4aed`
+before it); it differs from the RTN-asymmetric pin only in its Q8F16 head.
+Caveats and measurements below without a date were taken on that pin unless
+they say otherwise.
+
+These two historical tags (`qwen3.8:flash-next-rtn-asym` and
+`qwen3.8:flash-next-mq6q8-pleq8`) are retired, not deleted fixtures.
+New `hipfire pull` requests refuse them and name `qwen3.8:flash-next` as the
+replacement. Existing SHA-256- and size-verified installed files remain
+supported by old tag, bare filename or installed path in `run`/`serve`, without
+redownload; missing files error rather than auto-download. Explicit paths to
+copies elsewhere remain ordinary plain-file loads. Local `list` marks installed
+models retired; the new available view excludes them. Compiled `RETIRED_MODELS`
+pins retain repo/file/SHA-256/size, reusing `VerifiedCache` rather than rehashing
+unchanged files. Neither artifact had sidecar, overlay or hotset pins.
+No overlay/hotset pins are invented, and no Hugging Face files are deleted or
+altered by retirement. Both retired entries are removed from the raw remote
+registry and new bundled/loaded available views, without new wire fields.
+Code inspection shows 0.4.2 rejects the generic `ple` schema and falls back
+to cache or bundle; this is not an exercised old-binary test. Monolithic HF
+files **must stay published while 0.4.2 clients exist**, because their bundled
+entries still reference them.
+The obsolete local-only `qwen3.8:flash-next-mq4-xts-zab` entry is removed
+outright from the registry with no retired pin (its trunk tier ships as the
+default overlay on the stock tags); the canonical split-base aliases, MQ2/MQ3
+fixture rows and all overlay pins are unchanged.
+
+Caveats that are part of the fixture, not trivia:
+
+- Loading it needs a build whose qwen4 trunk source contract admits **both**
+  packed trunk tiers and whose external-PLE admission accepts both PLE tiers.
+  Older builds refuse at load; that refusal is correct, not a corrupt file.
+- **Flash-Next row-exact wide verify (arch 16, eager single target):** the
+  physical executor/storage bound is **64 total rows** (seed plus at most 63
+  native drafts), not a default tuning cap, a forced K=63 or a new algorithmic
+  tuning cap; feasible offer depths and full-window costs still govern selection.
+  Fixed eight-token PM tiles cover logical rows 1..64, including partial tiles;
+  tile8 is not admission8. The global shipping qualified capability remains
+  **8 GPU rows**, and CPU-owned-expert loads retain their independent **4-row**
+  qualification. Actual allocated scratch/logit/capture capacity can narrow a
+  window further. Explicit lab CPU reserve supports 64 rows through the common
+  D1/D2 capacity and census, with exact input/mask/output/scratch slots (640
+  slots); it is not CPU64 qualification. CPU routing stays per-call eager with
+  whole-window forward/capture; the proven CPU default stays 4 until hardware,
+  state and performance proof land. No PP/EP,
+  lane-executor, codec or model-family widening follows from this contract.
+  Verify remains eager: actual recording or graph capture is ineligible
+  for wide verify. At each window entry bind its QSA reference to the
+  **actual singleton AR execution mode** (Eager or Recorded), not just the
+  backend request flag; Recorded selects the recorded singleton arithmetic
+  without recording verify. Select attention policy per row's own position,
+  batch only adjacent equal-policy rows, and restore the reference and row
+  scope on success and error. Recompute after AR replay-state transitions.
+  Qualification must compare raw bytes against the same architecture's
+  actual singleton object for **every width 1..64**, with poisoned guards
+  and tails; PM C1 or a CPU DAG transcription alone is not that proof.
+  Stateful stages require sequential singleton transitions, all logit words
+  and logical-state bytes, every kept prefix through both native repair and
+  generic commit, abort and subsequent continuation; greedy MTP/copy needs
+  identical token IDs and receipts proving the requested widths executed.
+  Missing devices, unsupported instructions/arches, refused widths and
+  missing cells are refusals, never passing skips. Finite-input CPU evidence
+  does not prove arbitrary exceptional inputs or GPU behavior.
+  The dedicated legacy aggregate qt44 gate/up `[512,1280,2560]` and qt53 down
+  `[512,2560,640]` source targets rows 1..64 using a fixed **8-token** tile:
+  C1 GU ROWS8 denotes eight output rows, not eight tokens. GU's 56-byte ABI
+  preserves the original 52-byte prefix and adds total R at offset 52
+  (M=1280); down keeps its original 52-byte ABI with total R in N at offset 40
+  (M=2560, K=640). Each architecture (gfx1151/gfx1201) has two distinct exports
+  in one image; GU uses block 256/static LDS 10,240 B and down block 32/LDS 0.
+  This is neither Slab K1 nor descriptor reinterpretation, and changes no
+  weights, math, codec or precision. The source G1 consumer keeps the real
+  model alive, borrows immutable weights and compares original C1 with the
+  candidate at every R=1..64 on real inputs plus two pathologies (192 cells),
+  wordwise through GU, activation, down and combine; missing cells or mismatches
+  fail. Source implementation is not exercised proof: assets/native CPU G0
+  and G1–G4 remain pending, with no new emitted-image or whole-route PASS claim
+  and no default promotion. Private frozen Slab 1928/96 native two-architecture
+  all-row proofs do not qualify legacy aggregate or whole-model execution.
+  Native capture COMMIT-TICKET/state coverage remains required by G2/G3;
+  eager projection eligibility does not qualify HIP recording or graph capture.
+  The existing `bf16_rows_oracle` accepts repeatable
+  `--captured-ordinary MANIFEST` inputs: real canonical BF16 single/x4
+  eager64 AR captures feed its R=1..64, full-word, poisoned-guard and actual
+  C1 raw-code-object checks; the legacy HC input path remains available.
+  The QSA pool primitive covers every kept prefix 0..R and GPU continuation
+  at actual head dimension 128 and compression 4/8. Its raw 8193 and pooled
+  2049 boundaries are distinct from selected 2051; this is not full
+  selector/attention or captured-ticket G2 qualification.
+  Qualification requires genuine `VerifiedCache` provenance for the prior
+  payload SHA: exact canonical path, device/inode, size and mtime seconds/
+  nanoseconds must match; missing, stale or wrong-digest records refuse.
+  SHA-pin the cache artifact itself and record payload recomputation as false;
+  do not repeat the consumed one-time full-model/Q4 hash or fall back to a
+  fresh payload hash. Every submitted qualified-family launch must bind its
+  actual loaded device ELF to the original G1 raw-code-object pins, not merely
+  a container digest or source/module label. These consumers do not complete
+  original G1–G4 qualification or promote the GPU8/CPU4 defaults.
+  For partial G1 runs, use explicit `--rows 1-16`, `--rows 17-32`,
+  `--rows 33-48` and `--rows 49-64` shards, with capture high-water rows
+  16/32/48/64 respectively. Each shard covers 48 cells (real inputs plus
+  two pathologies per width); one shard is not whole G1, nor evidence that
+  four full models fit concurrently. The original 12 CPU producer cases
+  compose nine prior passes with three affected-case passes; native legacy
+  GU/down M7 is byte-exact on both gfx1151/gfx1201. These are software
+  producer proofs, not a fresh all-12 run, whole FN G0 or hardware G1–G4.
+  Shipping eight-GPU-row/four-CPU-row bounds remain qualification bounds,
+  not arbitrary economic caps; the physical 64-row extent is not a K63 policy.
+  Use `--preload-plan-only` for an unmeasured source plan before full load,
+  not the post-load production RAW from `--resource-plan-only`. For the
+  accepted bench PP512/context128/TG1 invocation, max sequence and placement
+  chunk are both 544, not assumed 32768/4096; the plan does not qualify
+  actual allocation, capture or runtime resource use.
+  S1 `--execution-recipe` must bind the explicit target, tool/source ELF,
+  source-bound sealed pack, reference origin and expected placement/resource
+  contract. Keep genuine verified-model provenance in `HIPFIRE_HOME` while
+  the kernel resolver uses its cold private `HOME`; never seed, copy or
+  freshly hash a payload to manufacture a cache hit. The original gfx1100
+  teacher and seven primitive cases remain unchanged: a gfx1201 target is
+  not a new teacher or cross-architecture greedy proof. Keep original KL
+  limits (16K: 0.03948458079446915; 4K: 0.027284316982763658), not +0.010.
+  Symmetric IU4 is requested ON by default on gfx1100, gfx1151 and gfx1201;
+  pending qualification never justifies switching it OFF (`=0` is an isolated
+  control). Active execution still requires actual eligible headers,
+  descriptor, row and resource admission; a request is not an active-route
+  receipt. The gfx1100 default (regular prefill and the S1 `aggregate-sym-iu4`
+  window read the same `Gpu::qwen4_moe_sym_iu4_requested`) was flipped on
+  with its numeric acceptance recorded in the CHANGELOG entry (S1 context-mean
+  KL within the limits above; WT2/code24 BF16-teacher KLD deltas +0.0293 /
+  +0.0296 vs gfx1201 +0.0306 / +0.0285, the code24 excess of 0.0011 waived by
+  Kaden 2026-10-29; pp8192/pp32768 A/B +1.2 / +1.4%). FP8 KV and FA2 are
+  independent, stackable choices; A3B H16/KV2/D256 FA2 work is not an applied
+  Flash-Next H24/KV2/D256 QSA FA2 port or a Flash-Next performance gain.
+  **Widened byte/state/ID and performance qualification is pending.** Before
+  any per-architecture table promotion, require pinned source/object/model
+  receipts and paired full-window cost curves against incumbent
+  prefill-kernel-routed verify at identical widths and starting state, with
+  an uncertainty-supported cost-per-row win at each promoted cell. A host
+  singleton loop, faster component kernel or MTP tok/s is not that result.
+  Keep the per-architecture widened qualification cells in
+  `docs/design/qwen4-program-retained-pm4.md`'s eager-wide-verify section
+  separate from its historical single-token retained receipts.
+
+- **MTP `auto` (`speculation.mtp = auto`, the schema default) arms native MTP
+  only for a producer that declares a measured AR floor. Today that is Qwen4
+  (Flash-Next, arch 16), except on `.mq4r` loads, which keep the retained
+  Redline AR route. Qwen3.5-class (arch 5/6, dense and MoE), DeepSeek V4 and
+  Gemma 4 declare no floor (the DS4 native-MTP audit found none), so `auto`
+  resolves to AR there even when a head is present. An explicit
+  `speculation.mtp = on` / `--spec mtp` still attaches any present head on
+  every producer, and DSpark / DFlash selection is unchanged. Qwen4 MTP serves greedy and sampled
+  requests: `speculation.mtp_sampled` (`HIPFIRE_MTP_SAMPLED`, default on since
+  0.4.1; `0` sends sampled requests to AR) verifies sampled requests by
+  speculative rejection sampling against the AR sampler's distribution
+  (oracle: `crates/hipfire-arch-qwen4/tests/sampled_mtp_distribution_hw.rs`).
+  Sampled MTP output matches AR in distribution, not byte for byte.
+  Non-neutral penalties keep native MTP for sampled requests when
+  `supports_temp_swor` is true (since `9f1ea2171`, shipped in v0.4.1);
+  greedy requests with penalties run AR
+  (`crates/hipfire-generate/src/ar.rs:1715–1734`).
+  Flash-Next batch lanes refuse non-neutral repeat/presence/frequency penalties
+  (`crates/hipfire-generate/src/batch.rs`, `qwen4_lane_request_supported`), but
+  batch sampled neutral-penalty requests under `serve.batch_sampled`: AR lanes
+  draw with the AR singleton sampler and request seed, MTP lanes verify sampled
+  windows with naive acceptance.** Each MTP
+  window picks its verification route: a batched `(K+1)`-row verify at the
+  draft depth `K` (up to the `mtp_k` cap; `auto` for native Qwen4 MTP =
+  `min(GPU row-exact verify rows, CPU-owned-expert window) − 1` resolved after
+  placement: 7 today, 3 on a CPU-placed load; else 3) that maximizes expected emitted tokens per window cost
+  (per-depth draft agreement, decayed), or the interleaved route (one target
+  row per draft, stop at the first rejection) when no depth pays.
+  A same-request AR floor guards the default route: the request's first
+  window is one ordinary target-only token, timed (a sampled draw included)
+  as the AR price and followed by one head append (the drafter's first such
+  token pays the decode route's one-time kernel binds, so it prices nothing
+  and the next window calibrates again); up to three speculative
+  probe windows then run under the table-ordered route. A batched depth is
+  priced by the depth (cap) it was routed at: the cap's decayed mean window
+  time over the agreement-predicted tokens of its windows' drafted-depth mix,
+  so the windows the margin prune cuts short count at their real, lower, cost
+  and yield (the drafted-depth model kept Halo prose at depth 2 while forced
+  K=4 with the prune ran +8.4%); interleaved by its time per emitted token.
+  The AR verdict (retire or keep drafting) then reads only options measured on
+  this request; once a measured option beats AR the window runs the cheapest
+  candidate: every cap, its evidence blended with the neighbouring cap's
+  (d±1, the one with more windows) for what that neighbour holds beyond it,
+  shifted by one row on the neighbour's windows that drafted its whole cap.
+  The row is the request's own window-cost fit (a decayed least-squares line
+  of each priced batched window's wall time on its drafted depth, ridge-pulled
+  toward `MTP_ROW_COST_PRIOR`, 0.27 AR steps per row, until windows at two
+  depths are priced), and every cap's evidence decays with every batched
+  window, so an unmeasured cap or one measured only during a poor start is
+  priced from the cap that runs. A request climbs one cap at a time, up to 7
+  (the 8-row verify), while the next row pays, and stays shallow where it does
+  not. On the singleton drafter the first batched window at each drafted
+  depth (across requests) is observed unpriced and spends a probe: the
+  process's first speculative window binds the whole verify route's kernels
+  (gfx1151: ~+17-20 ms once per process). Chooser candidates and the fitted
+  per-row cost appear in `HIPFIRE_MTP_FLOOR_TRACE` lines (`capN`, `modeled`,
+  `drafted`, `row_us`). When none costs
+  strictly less per emitted token than AR (a
+  tie, or an invalid AR timing, counts as no win) the request retires to
+  head-free AR for good, unless n-gram windows keep it alive: a request stays
+  alive on a losing native route only while external (n-gram) windows are
+  measured and unblocked (cost per token below AR) and the decayed realized
+  per-token cost of all its windows, native and external, is strictly below
+  AR; it retires at the first window where that stops holding.
+  Before that sticky retirement of a request (singleton or continuous-batching
+  lane floor) whose draft budget is above 3 and that has run a deep (cap > 3)
+  window (it runs after the AR re-price probes where they exist; a budget of 3
+  or less never re-probes), the floor requires fresh shallow (K ≤ 3: batched
+  cap ≤ 3 or interleaved) native evidence: 3 priced shallow windows since that
+  last deep window. Without them it routes the request at cap ≤ 3 for a
+  bounded re-probe from the existing probe budget, which ends at 3 priced
+  windows or 6 in all (a first-use unpriced window and external windows spend
+  the bound; no new environment switch). AR is re-priced first where it can
+  be; a lane with a 0 AR probe budget still gets the bounded shallow control,
+  starting at its first would-be retirement. A shallow cost
+  below AR holds the request on its best measured shallow depth, route capped
+  at 3 until a deeper candidate prices below both the shallow depth and AR for
+  3 consecutive windows (positive evidence); a shallow cost at or above AR, or
+  no priced shallow window at all (fail closed), retires it.
+  `HIPFIRE_MTP_FLOOR_TRACE` lines carry `budget_k`, `deep_seen`,
+  `shallow_state` (`idle|probing|holding|lost|unpriced`), `shallow_windows`,
+  `shallow_priced`, `shallow_budget`, `shallow_since_deep`,
+  `shallow_us_per_tok` and `climb_streak`. The `auto` cap rule above is
+  unchanged, as are explicit `mtp_k` overrides and the D1/D2 hard gates.
+  A retired request runs with no head append, copy, snapshot or replay, forced
+  advances fall back to the target alone, and only `configure_request`
+  (a new request) resets it, not `mtp_reset` or a prefill realign. At most one
+  calibration head append and three probe windows precede the first measured
+  decision; this bounds the speculation work, not the full-request time. A
+  floor-observed native window is priced from its start to the next window's
+  plan, an interval that holds its whole GPU tail without a device sync at
+  every window end, and the retired token host-syncs its top-1, which the AR
+  producer does not.
+  With `HIPFIRE_MTP_PHASE_TIMING=1`, batched `window_us` includes the snapshot
+  and commit tail; diagnostic forced routes synchronize for cost accuracy.
+  `HIPFIRE_MTP_INCREMENTAL=0` forces batched at the full `mtp_k`; `1` forces
+  interleaved; either forced route is a diagnostic override that bypasses the
+  floor entirely. `HIPFIRE_MTP_AR_FLOOR=0` opts out of the floor (diagnostic
+  A/B): no calibration token, probe windows or retirement, and the
+  per-window chooser routes as before the floor; the forced routes win if both
+  are set. Interleaved verification (`HIPFIRE_MTP_INCREMENTAL=1`) uses the
+  AR target's single-row route. With Q8 GDN recurrent state, the row-capture
+  verify/rollback kernel (gfx11+ SIMT, `kCapture && kQ8`) applies AR's
+  per-token Q8 boundary at each row's absolute position, so every captured
+  verify row, the final slot and every rollback keep-prefix equal sequential
+  single-row decode. Oracles: `gdn_q8_verify_matches_single_row`
+  (rdna-compute) and the ignored
+  `crates/hipfire-arch-qwen4/tests/greedy_mtp_identity_hw.rs` (canonical
+  GPTQ3 MQ4 Flash-Next, p1, 1200 greedy IDs): on gfx1151 forced batched,
+  forced interleaved, adaptive and full-head batched MTP all match AR in
+  three fresh-process runs (before the repair, batched first differed at
+  index 112 and adaptive at 130). This guarantee covers only that capture
+  path: it is not a claim for the unarmed few-row Q8 prefill/replay route
+  (used where rows are not captured) or for architectures the oracle has not
+  run on. The captured gfx11+ SIMT kernel writes only the final recurrent
+  state, not a retained state for every row: native partial acceptance
+  reruns the kept prefix's recurrence from the saved live slot and repairs
+  causal histories/marks. Generic restore-and-replay commit is a separate
+  path and needs its own token-canonical capture gate.
+  Drafts rank the vocabulary with an MQ2 copy of the LM head and re-score its top 8 exactly
+  against the head's own Q8_0 or MQ6G256V2 rows (`HIPFIRE_MTP_DRAFT_HEAD`,
+  default `mq2r`).
+  Teacher-forced prompt and replay steps advance MTP state without computing
+  an unused language-head prediction; prompt target chunks emit only their
+  final logit row while retaining every wide hidden row.
+- **MTP + ngram-mod takeover (`speculation.mtp_ngram`, `HIPFIRE_MTP_NGRAM`,
+  default `auto`):** on for native Qwen4 MTP (arch 16) on gfx1151 and gfx1201
+  and off for every other producer; `on`/`1` arms every MTP producer that
+  supports it, `off`/`0` is the opt-out (env beats TOML beats default). It
+  serves greedy and sampled requests, thinking on or off (Qwen4 and
+  Qwen3.5/3.x). The Qwen4 proposal source is switched by
+  `speculation.mtp_ngram_copy` / `HIPFIRE_MTP_NGRAM_COPY` (`on`/`off`/`auto`,
+  also `1`/`0`; default `auto`, which is **on for native Qwen4 MTP (arch 16)
+  on gfx1151 and gfx1201** and off on every other GPU; `off`/`0` is the kill
+  switch; env beats TOML beats default). **Off is the 5/3/3 pool lane
+  exactly.** On Qwen4 a pool
+  hit (`MtpNgramContext`, the 5/3/3 pool; request-local, cleared and reseeded
+  from the full prompt every request, so earlier requests never influence
+  candidates, and cleared after five low-acceptance windows) takes the window
+  only when the head's own first draft (row-0 argmax, before any sampled draw)
+  equals the first candidate (the row-0 confirmation runs on every takeover)
+  and the takeover's decayed emitted tokens per window over its verify cost
+  (the measured mean, else the request's window-cost fit, not the static
+  per-arch row table; the yield gate, `ngram_yield` / `ngram_wins` /
+  `ngram_takeover_depth`) is at least the native chooser's expected rate (the
+  floor's cheapest candidate once the floor is measured); otherwise the window
+  is native (the batched route reuses that row-0 step). A takeover ends when
+  the AR floor retires the request, and load admission sizes the verify rows
+  and row capture by `max_k`. The drafter holds `ngram:
+  Option<MtpNgramContext>` in this lane and the floor observes takeovers
+  through `MtpFloor::observe_external`; no `ngram_plan` / `ngram_confirm`
+  trace events are emitted.
+  **`on` arms the copy lane** (`Qwen4MtpDrafter::with_copy_lane(true)`, the
+  drafter's `ngram_copy: Option<MtpCopyContext>` instead of `ngram`, floor
+  observation through `MtpFloor::observe_external_copy`, triple 5/1/63). In
+  that lane the proposal source is `MtpCopyContext`
+  (`hipfire_runtime::ngram_mod`), a request-local verbatim-copy
+  (prompt-lookup) matcher: one direct-mapped table per key length (32, 16, 8
+  and `n_match`, longest first), each hash → the position just past the key's
+  most recent occurrence in the request's history (prompt plus retained
+  output), the match checked token for token (a hash collision never
+  proposes), and the proposal copies `history[pos..]`. It is seeded from the
+  full prompt every request and its tables are never cleared (a slot from an
+  earlier request can never propose, so earlier requests never influence
+  candidates); there is no low-acceptance clear on Qwen4 (the old pool's
+  five-low-window clear wiped a request's seeded prompt, up to 200K tokens,
+  for the rest of the request), the take-length chooser backs off on measured
+  acceptance instead. On a CPU proxy of the agentic code-edit chain
+  (`release-0.4.3/ngram-copy-research`; proxy, not a hardware measurement)
+  conditional per-depth acceptance was 0.991-0.997 with these keys against
+  0.90-0.96 for the 5-token chain of the earlier pool. Each window with a
+  proposal (up to `n_max` tokens) takes a length `d` in `1..take_cap` chosen
+  from the request's own shadow-measured per-depth n-gram acceptance `a_j`
+  (the proposal is compared with the tokens the window committed, whichever
+  source ran it: on a greedy stream exactly the verify's acceptance, on a
+  sampled stream an unbiased point-mass estimate) and measured takeover costs:
+  the `d` maximizing `(1 + Σ_i Π_{j<=i} a_j)` over the takeover's window cost
+  (the request's measured mean for that candidate count, else the nearest
+  measured count moved by the fit's per-row slope, else the native window
+  cost model; a drafter's first takeover of a row count is observed unpriced
+  like the first native window of a depth), taken when at least the native
+  chooser's rate; otherwise the window is native. The head's own first draft
+  (row-0 argmax, before any sampled draw) must equal the first candidate only
+  until the copy source is established: a take of at least 5 candidates with
+  depth-1 acceptance at least 0.9 over at least 4 windows of evidence
+  (checked against agentic-chain replays, `NGRAM_UNCONFIRMED_MIN_*`)
+  **and** the last shadow observation having accepted
+  its first candidate (`ngram_last_first_accepted`, so a divergence costs at
+  most one blind window) runs with no head row-0 step.
+  `take_cap = min(n_max, row-exact verify rows - 1)`, where the rows are the
+  per-GPU `rdna_compute::prefill_invariant::qwen4_row_exact_verify_rows` (8
+  on every GPU today, so 7) narrowed per window by
+  `Qwen4Bundle::row_exact_verify_rows`: a verify forward is row-exact against
+  single-row decode (Q8 decode copy, K1 lane-union MoE, rows_x4 GEMV, k4 HC
+  gate, QSA prologue, fused router+shared) only up to those rows; more run
+  prefill kernels, which break greedy byte-identity. Raising the one per-GPU
+  value raises the cap.
+  Admission sizes the verify rows and the GDN row capture for `take_cap + 1`
+  rows when the n-gram source arms (`native_mtp_proposal_drafts`, which the
+  loader passes to `native_mtp_device_bytes` / `native_mtp_request_bytes`),
+  and the drafter grows its row capture and verify scratch to the armed cap.
+  The capture ring itself is charged at the wider of that window and the
+  arch's row-exact verify rows (`native_mtp_capture`, shared with the
+  runtime's `native_mtp_capture_rows`).
+  **A request the floor retired keeps the copy lane.** Retirement says native
+  drafting loses to AR, nothing about the copy source, whose acceptance the
+  shadow table measures independently (on R9700 at the agentic chain's
+  sampling, T1.0 thinking on, the floor retired every request during the
+  thinking prose and the answer's verbatim code copy ran as AR; smoke:
+  `release-0.4.3/agentchain/runs/smoke-r9700/def/res.json`). Only the floor's
+  AR calibration (and its probes) bars the pool; on a retired request the
+  comparator is AR itself (1.0 token per AR step) instead of the native rate.
+  A retired takeover first catches the head up (`catch_up_head`: the rows the
+  retired AR tokens owe are appended teacher-forced exactly as a forced
+  advance does), then confirms the first candidate with the head's row-0
+  probe unless the source is established, falling back to the retired AR step
+  on a mismatch, else runs the takeover with no head step. The floor keeps
+  pricing external windows after retirement (`external`, `external_depth`,
+  `external_blocked`) without un-retiring, counting probes or changing native
+  routing, and reports `external_blocked` alone, so the lane disarms only when
+  takeovers themselves cost at least AR per token. `stats.mtp_retired` stays
+  true and the `ngram_mod_*` counters count retired takeovers.
+  A takeover verifies `[seed, candidates..]` on the same batched verify
+  executor as native MTP windows (interleaved one-row route under
+  `HIPFIRE_MTP_INCREMENTAL=1`), rolls the target back to the consumed rows,
+  and appends exactly those rows to the head teacher-forced (token p, hidden
+  p). Greedy takeovers are exact;
+  sampled takeovers verify each candidate with the point-mass draft
+  distribution δ(candidate) through the shared rejection verify, so output
+  matches MTP-only in distribution, not byte for byte. The native chooser's
+  per-depth agreement relaxes, for depths a window did not compare, toward the
+  next-shallower depth's agreement (depth 0 toward the 0.8 prior): at
+  `MTP_AGREEMENT_RELAX_UP` (0.8) per window while that agreement is above the
+  depth's own, `MTP_AGREEMENT_RELAX` (0.95) when below, so a depth rejected
+  once is re-explored instead of staying frozen below its threshold, and an
+  unreached depth is priced at the request's own deepest observed acceptance
+  (conditional acceptance is flat in depth past the first draft); with the
+  copy lane on the n-gram table uses the same rule. Triple
+  `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` is 5/3/3 on admitted Qwen4
+  targets with the copy lane off and 5/1/63 with it on (24/48/64 elsewhere;
+  per-component overrides; Qwen4 `n_max` capped at 63, the 64-row spec verify
+  capacity; with the copy lane on it is the proposal and observation length
+  and the take cap is `min(n_max, 7)`). The load log prints
+  `qwen4 native MTP n-gram: on|off (n_match=.. n_min=.. n_max=..)`, plus
+  `qwen4 native MTP n-gram copy lane: on (take_cap=N)` only when the n-gram
+  source is on and the copy lane is armed;
+  `HIPFIRE_MTP_TRACE=1` window events carry `source` (`ngram`/`mtp`) and
+  `verify_route`; with the copy lane on they also carry `ngram_plan`
+  (`emitted`, `available`, `take`, `confirm`, `rate`, `native_rate`, `a1`,
+  `plan_us`, `retired`) per window with a proposal (retired plans included)
+  and `ngram_confirm` (`position`, `match`) wherever the row-0 confirmation
+  ran; with it off neither event is emitted.
+- **Measured, not an 80% claim:** on 2026-09-23, gfx1151, HIP 7.2, greedy,
+  KV q8, `max_seq=2048`, graph off, three fresh daemon processes per mode and
+  byte-identical committed prompts, median code decode was AR 19.4 versus
+  MTP 20.1 tok/s (end-to-end 17.1 versus 17.2); prose decode was AR 17.9
+  versus MTP 18.0 (end-to-end 15.6 versus 17.1, with large run-to-run
+  spread). Daemon md5 `d09ff1d3220b818c4f4d06a3c60cc85b`; prompt md5s:
+  code `df5dedc8040ce70ba55080c4548e6024`, prose
+  `07a7880965142971dbb3cc7493f8fb94`. All three MTP runs emitted AR's
+  exact 227 code and 256 prose token IDs. Local raw reports:
+  `.codeinsight+research/qwen4/mtp-parity/runs/moe-buffer-fix/perf-v2/`.
+- After fixing routed/shared MoE scratch aliasing, restoring the learned final
+  HC mixer, and reselecting QSA at source-correct boundaries, conditional
+  draft agreement was 0.708/0.532/0.476 for prose and
+  0.922/0.932/0.889 for code at steps 1/2/3. The remaining throughput gap
+  to a claimed 80% gain is verifier/replay cost, not evidence that the
+  trained drafter is defective. Do not extrapolate these fixture-bound
+  measurements to other architectures or prompts.
+- **Later measurement (2026-09-28, same prompts, fixture-bound):** after the
+  few-row verify, rollback and draft-head work in
+  [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-decode-autoresearch-gfx1151.md),
+  MTP decode was code ~55 and prose ~37 tok/s against AR ~33 on the same
+  build, with greedy MTP ids equal to AR's. The GPU was shared with external
+  processes; read the checkpoint's method before citing a number.
+- **On `qwen3.8-flash-next.mq4` (2026-09-28, fixture-bound):** with the
+  MQ6G256V2 head's re-score, greedy MTP geomean over nine committed prompts
+  was 59.5 tok/s against AR 33.7 (55.4 without the re-score); the same file
+  with a Q8_0 head reached 59.2 at AR 33.1. Method and caveats:
+  [`docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md`](docs/perf-checkpoints/2026-09-28-qwen4-mtp-mq6-rescore-gfx1151.md).
+- `hipfire bench` measures this model. The old fail-closed load had two
+  causes, both gone. The qwen4 contract admitted exactly `max_seq` 2048
+  (lifted in `432fa5c68`; the limit is now 262144, and an omitted value gets
+  32768). Bench's `load_params` also sent
+  `max(memory.max_seq, generation.max_tokens + 1024)` — the configured 32768,
+  or 4096 + 1024 = 5120 with `memory.max_seq` forced to 2048
+  (`822b48fb5:crates/hipfire-cli/src/main.rs:3000-3001`, removed in
+  `294c4ad9d`). `--matrix` now sizes the load to the run (largest `--pp`, or
+  `--ctx` + `--tg`, plus 32), and `--max-seq N` overrides it
+  ([CLI.md](docs/CLI.md#bench-context-max_seq)). Measured on 2026-10-04 on
+  a Strix Halo (gfx1151) host (one card, `qwen3.8-flash-next-gptq3.mq4`
+  `8b15b6fe…00972`): `--matrix --pp 8192 --tg 32 --runs 3 --warmups 1` loads
+  `max_seq` 20064 (the default `--ctx` tops out at 20000). pp8192 was
+  1927.3 / 1921.8 / 1918.3 tok/s, fast-PPT-limited for 48–55 % of each run.
+  The standard path keeps the automatic 32768.
+- Decode numbers are not comparable across instruments: the raw decode probe
+  measured 22.74 tok/s (ctx128, graph off, kv q8), the serve path ~19.9 tok/s.
+  Same model, different measurement; never average or compare them across.
+
 ---
 
 ## 6 · Common pitfalls (history of what bit us)
@@ -554,16 +1235,18 @@ against the A3B MoE DFlash perfmaxx line.
 |---|---|---|
 | "DFlash got slower overnight" | Prompt structure changed (one newline added/removed) | Use byte-identical prompts via `benchmarks/prompts/*.txt` |
 | `τ=9.42` on first run, `τ=8.07` on next | Different prompt — see above | Same fix |
-| "0 evictions even though sidecar loaded" | `cask_beta` too high (default 128) means trigger is at budget+128 | Lower beta to 16 to actually exercise the eviction policy |
-| "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | This is expected with z-lab drafts; fix is Path C (train custom draft) |
-| 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B until Path C (custom 3.6 draft training) completes. 3.5-A3B DFlash works (τ=4.91) |
-| `hipMalloc out of memory` at hidden_rb | Long ctx (≥16K real tokens) + 27B + asym3 = tight on 24 GB | Reduce ctx, use a smaller target, or wait for the bounded-rolling-buffer trick (roadmap) |
+| "DFlash 102 tok/s on prose vs 124 AR" | Draft-target argmax disagreement on prose tokens, τ collapses to ~1.2 | Expected with z-lab drafts; no retraining fix is planned — Path C (custom draft training, `feat/mtp-dflash-training`) was a failed month-1 experiment and is dead. Use AR or accept the genre-conditional behaviour. |
+| 3.6-A3B DFlash 68.6 tok/s vs AR 135 tok/s (50% loss) | 3.6 draft trained on 3.5 traces; target distribution mismatch on code. τ=1.22 on hard code. | Use AR mode for 3.6-A3B. Draft mismatch is expected and no 3.6 retrain is planned — Path C (`feat/mtp-dflash-training`) is dead/out-of-scope, not a forthcoming fix. 3.5-A3B DFlash works (τ=4.91). |
+| `hipMalloc out of memory` at hidden_rb | Legacy contiguous DFlash (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`) sizes the draft context structures to the context; long ctx + 27B can exhaust 24 GB | Use the default windowed draft (draft VRAM pinned at W); otherwise lower `HIPFIRE_DFLASH_CTX_CAP` or ctx. KV headroom: `fwht3` is the optional compact mode on every arch |
 | `tok/s` below expected on long-ctx | KV cache growth — prefill is fine but decode slows past ~2K | Test at small ctx first, then scale |
-| daemon doesn't auto-find draft | Filename doesn't match `qwen3{ver}-{size}-dflash-{quant}.hfq` | Don't rename the file after pull |
-| `[hipfire] DFlash disabled (dflash_mode=off)` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.5:9b set dflash_mode on` |
+| daemon doesn't pair a pulled draft | Renamed draft file, or pulled before the sidecar existed | Don't rename files after pull; re-run `hipfire pull <tag>` to fetch the registry-declared sidecar |
+| `[hipfire-daemon] dflash_mode=off — skipping draft load` | Default flipped to `off` in 35265c6 (post-2026-04-26). Pulling a draft does NOT auto-enable DFlash anymore. | `hipfire config set dflash_mode auto` (or `on`); or per-model `hipfire config qwen3.8:27b-mq4-xts set dflash_mode on` |
 | "Numbers don't match the README" | Forgot `HIPFIRE_NORMALIZE_PROMPT=1` (pre-2026-04-26) | Now default ON. Pull latest. If you opted out via `prompt_normalize=false`, that overrides the default — flip back. |
 | "27B DFlash regressed 30-40% suddenly" | PR #32 (cleanup-dead-wmma-kernels) on master removed `gemm_hfq4g256_residual_wmma{,2,_k4}.hip` thinking dead. Dispatch fell back to slower variants. | Verify against canonical 199 tok/s @ max=120 with default flags. If kernel files missing in `kernels/src/`, `git checkout` from a known-good commit (see commit 9a2c667 for the full recovery context). |
-| `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always coherence-gate or eyeball under `HIPFIRE_GRAPH=1`. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
+| `HIPFIRE_GRAPH=1` reports plausible tok/s but output is garbage | Dangling stack-pointer kernargs from raw `self.hip.launch_kernel(...)` calls in `forward_scratch_layers` (kv_cache_write_*, attention_flash_*, fused_qkv_hfq4g256, rmsnorm_batched, rope_partial_interleaved_f32, gated_delta_net_q8, etc.) — captured pointers dangle past `end_graph_capture` | Bench tok/s alone never proves graph correctness. Always eyeball under `HIPFIRE_GRAPH=1` and run the claim-scoped VALIDATION serve route — never retired coherence-gate scripts as acceptance. Fix: migrate every raw-launch helper used in forward_scratch_layers to `launch_maybe_blob` (model after `conv1d_silu_split_f32_n`). |
+| `memory.offload_exec` modes disagree on greedy output, or `passback` differs between two identical runs | Expected: the modes run different GEMV engines, and `passback`'s row split is scheduled per process (probe + online arm timings). Measured (2B): `cpu`×2 and `pcie`×2 byte-identical; `cpu` vs `pcie` differ; `passback`×2 differ; `HIPFIRE_OFFLOAD_PASSBACK_SHARE=0` byte-identical to `cpu` | NEVER assert a greedy/golden reference across a mode pair (`cpu` vs `pcie` is not bit-identical either), and NEVER assert `passback` output with the share on `auto` — pin `memory.offload_passback_share`, or use `0` to reach the exact `cpu` twin. See [`docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md`](docs/perf-checkpoints/2026-10-02-offload-passback-model-spread-gfx1201-amendment-1.md) § 5. |
+| Qwen3.5-class (arch 5/6) model with `speculation.mtp=auto` runs AR, resident or offloaded (bench `spec_route` null, serve `timings.tau`/`mtp` null, no `MTP head loaded` line) | Native MTP `auto` arms only a producer that declares a measured AR floor, and Qwen35 declares none, so the load logs `MTP: off by default (no measured AR floor); opt in with --spec mtp` and no head is loaded. Where a floor-declaring producer (Qwen4) does attach under `auto`, a host-mapped routed-expert spill still declines it on any arch but its admitted ones (gfx1100, gfx1201) (the `pcie`/`cpu` decline line logs the count, seam and `opt in with --spec mtp`). Unset/null layer/expert budgets keep all weights resident; only explicit `auto`/`-1` or manual `N` requests placement changes | Use `--spec mtp` / `speculation.mtp=on`, subject to metadata-based refusal of uniform MQ6G256 V1 (qt15) Qwen35 MoE on gfx1200/gfx1201 with FP16 WMMA enabled whenever a head would attach. `--spec off` / `speculation.mtp=off`, `auto` and an auto-declined spill remain AR; `HIPFIRE_FP16=0` permits explicit MTP. Mixed/graded MQ4+MQ6, MQ6V2, gfx1151 and dense are outside the refusal. `speculation.dflash=on` still refuses without a DFlash draft and never aliases to MTP. No root WMMA fix is claimed |
+
 
 ---
 
@@ -575,18 +1258,23 @@ against the A3B MoE DFlash perfmaxx line.
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | Per-position BPE merge-rank dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_JSON` | JSON output for heat dump | OFF |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | Max rows in heat dump | 64 |
-| `HIPFIRE_KV_MODE` | Override kv_cache config | (config) |
+| `HIPFIRE_KV_MODE` | Override `kv_cache` config. `fwht3` is the optional compact mode; `asymN`/`turboN` on Qwen are aliases of `fwhtN`, and Givens asym is `legacy-asymN` only | `auto`: fp8 on gfx1201 (Qwen H24/Hkv4/D256, single GPU, no adaptive/CASK), q8 otherwise incl. gfx1100/gfx1151 (`kv_mode.rs:28-46,194-215`) |
 | `HIPFIRE_ATTN_FLASH` | Override flash_mode config | (config) |
-|`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path. Empty string = explicit opt-out|(filename auto-match alongside target)|
-|`HIPFIRE_DFLASH_CTX_CAP`|Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring). Bounds draft-side VRAM on large-`max_seq` serve loads; over-cap requests fall back to AR (identical output, slower). `0` = uncapped legacy.|8192|
-|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context (NInfer pattern): SWA over the last W rows on draft layers 0..n-2 + full-attention last layer reaching min(physical_cap, 4W). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Refused with CASK eviction. `0`/unset = Legacy (cap + AR fallback).|0 (off)|
+| `HIPFIRE_OOM_GUARD` | Memory preflight OOM guard (`kv_slots::preflight_alloc`, SlotPool arena, bench-sweep headroom check). `auto`: on for unified-memory APUs (Strix Halo — overshoot is a global OOM), off for discrete GPUs, swap-decided for GPU-less processes | `auto` (`memory.oom_guard`) |
+|`HIPFIRE_DFLASH_DRAFT`|Force a specific draft path, overriding the registry sidecar. Empty string = explicit opt-out|(unset: registry sidecar when `dflash_mode` is `auto`/`on`)|
+|`HIPFIRE_DFLASH_CTX_CAP`|**Legacy contiguous DFlash only** (draft declares no window or `HIPFIRE_DFLASH_WINDOW=0`). Max rows for draft context-indexed structures (target_hidden, draft K/V caches, hidden ring); over-cap requests fall back to AR (identical output, slower). `0` = uncapped. Ignored in windowed mode.|8192|
+|`HIPFIRE_DFLASH_WINDOW`|Windowed draft context: sliding attention over the last W rows (DFlash2: every layer; otherwise layers 0..n-2 plus a full-attention last layer). Draft VRAM pins at W regardless of `max_seq`; past-W requests degrade τ instead of falling back to AR. Unset = the draft's declared `sliding_window` (`dflash_spec.rs:170-200`); `<rows>` = override (warns on mismatch); `0` = legacy contiguous.|draft-declared window (legacy contiguous if none)|
 | `HIPFIRE_LM_HEAD_F16` | `auto`/`native` keeps qt=1 lm_head as F16; `f32`/`legacy` expands to F32 | auto/native |
 | `HIPFIRE_LOCAL` | Force local-spawn (skip serve HTTP) | OFF |
 | `HIPFIRE_HOST_TIMING` | Per-cycle host timing probe | OFF |
 | `HIPFIRE_VERIFY_GRAPH` | Verify-forward graph capture (0 = off) | ON |
+| `HIPFIRE_GPU_LAYER_BUDGET` | Resident-layer budget for partial GPU offload: `N` keeps the last `N` layers on the GPU and spills the prefix to host RAM. Counts layers **on** the GPU — `3` on a 64-layer model spills 61. Unset/null/empty/unparseable leaves weights device-resident on every model. Explicit `auto`/`-1` opts into fit-capacity placement, routed experts before whole layers. Manual `N` remains a hard pin. Sibling of `HIPFIRE_OFFLOAD_EXEC` (unchanged default `pcie`). See [docs/CONFIG.md](docs/CONFIG.md#memory). | unset (fully resident) |
+| `HIPFIRE_OFFLOAD_EXEC` | Which engine multiplies a spilled layer's host-mapped weights: `pcie` (default), `cpu`, or `passback` (scheduled co-inference — both engines run the same spilled step concurrently, divided by output rows). Sibling of `memory.gpu_layer_budget`; `cpu` executes the weight-reading GEMVs on the CPU instead of reading them over PCIe, and `passback` runs the `pcie` path on the step's first output rows and the `cpu` path on the rest, concurrently. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.1 and § 6.2.2. | `pcie` |
+| `HIPFIRE_OFFLOAD_PASSBACK_SHARE` | Schedule of a spilled step's output rows between the two engines under co-inference (`memory.offload_exec=passback` only): the GPU takes the first rows (the `pcie` arm), the CPU the rest (the `cpu` arm). `auto` (default) schedules it from this host's measured engine rates and refines it online; a number in `(0, 0.5]` pins it; `0` collapses it onto the CPU engine alone, so the mode is byte-identical to `cpu`. Inert (one notice at load) in any other mode. Measure or override with `hipfire offload-bench`. See [docs/plans/partial-gpu-offload-design.md](docs/plans/partial-gpu-offload-design.md) § 6.2.2. | `auto` |
 | `HIPFIRE_DDTREE_*` | Various DDTree diagnostics | various |
+| `HIPFIRE_SERVE_UI` | Serve the embedded chat UI at `/ui` on the serve listener (same as `hipfire serve --ui`; `--open` also launches the browser). Unauthenticated — warn-level on non-loopback binds. Chat history lives in the browser's IndexedDB; nothing is stored server-side. | OFF |
 
-| dflash_spec_demo flag | Purpose |
+| `hipfire bench` flag | Purpose |
 |---|---|
 | `--ar-baseline` | Skip DFlash, greedy-decode via target only |
 | `--no-chatml` | Bare prompts (raw-text drafts) |
@@ -594,9 +1282,13 @@ against the A3B MoE DFlash perfmaxx line.
 | `--ddtree-batched` | Use batched tree verify (research) |
 | `--ddtree-budget N` | Tree node budget |
 | `--ddtree-topk K` | Tree fan-out |
-| `--cask-sidecar PATH` | Load TriAttention sidecar |
-| `--cask-budget N` | KV eviction target |
-| `--cask-beta N` | Hysteresis (lower = more aggressive eviction) |
+
+**Deprecation note — CASK.** CASK / TriAttention KV eviction (`memory.cask.*`
+config keys, `hipfire sidecar-gen`, and the `dflash_spec_demo --cask-*`
+flags; FlashCASK) is deprecated since 0.4.0 and will be removed in 0.5.0.
+It prints a deprecation warning when used, forces legacy contiguous DFlash
+(windowed draft disabled), and is not a flag, fix or pitfall workaround to
+reach for.
 
 ---
 
@@ -607,8 +1299,7 @@ If you want to actively contribute findings, these are open:
 1. **Phase 3 prompt-shape rules** — what other rare BPE tokens depress
    τ? Run `encode_prompt --heat` on a wide variety of prompts and look
    for patterns.
-2. **Path C training**: a target-aligned custom DFlash draft. Recipe at
-   an out-of-repo recipe (ask the maintainer).
+2. **Path C training — DEAD**: target-aligned custom DFlash draft (`feat/mtp-dflash-training`) was a failed month-1 experiment and is out of scope. Do not pursue; no recipe is forthcoming. (Historical note: prior revisions listed this as an open investigation.)
 3. **Path D engineering**: stale-context overlap pipelining — the only
    structural lever still on the table for 27B-3.5 code beyond +8.2%.
 4. **DDTree gfx1100 fix**: linearization-slot RoPE phase delta skew
@@ -618,50 +1309,58 @@ If you want to actively contribute findings, these are open:
 
 ---
 
-*Last updated: 2026-06-22. When this doc gets stale (more than 1-2
-releases behind HEAD), update it as part of the release PR.*
+*Last updated: 2026-09-30 (0.4.0 cycle: DFlash window default, KV docs; fixture pin: Qwen3.8-27B MQ4XTS). When this
+doc gets stale (more than 1-2 releases behind HEAD), update it as part of the release PR.*
 
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
 
-This project is indexed by GitNexus as **hipfire** (31703 symbols, 108481 relationships, 275 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+# Code intelligence — CodeGraph
 
-> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+GitNexus is **removed** from this project. The code-intelligence tool for
+hipfire is **CodeGraph**: a per-project SQLite graph of symbols, edges,
+and call paths, queried through the `codegraph_explore` MCP tool (or the
+`codegraph` CLI, which prints the same output).
 
-## Always Do
+## Always
 
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
-- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
+- **`codegraph_explore` FIRST, before a grep/read loop or an edit.** Ask
+  it how an area works, or hand it a bag of symbol/file names (`"MoE tape
+  replay dflash_spec_demo verify_block"`). It returns the relevant
+  symbols' verbatim, line-numbered source grouped by file, plus the call
+  paths between them, in one capped call. Source it shows is *already
+  read* — do not re-open those files.
+- **Point it at an index that exists.** Not every checkout carries a
+  `.codegraph/` — fresh worktrees start without one. In an unindexed
+  checkout either run `codegraph init .` (the index is per-checkout,
+  machine-local, and gitignored) or pass `projectPath` at a sibling
+  checkout that is indexed.
+- **Treat a foreign `projectPath` as orientation only.** Its source and
+  line numbers belong to that checkout's commit, not yours. Re-`read` the
+  file in *this* worktree before editing it.
+- **Keep the index honest.** `codegraph status` for freshness,
+  `codegraph sync` after a large rebase or a big kernel/dispatch change.
+- **Respect the explore budget.** Every call reports how many explores
+  remain for that project and how many files each covers. Spend the
+  remaining calls on areas an earlier call did not reach, then
+  synthesize — dropping back to a grep/read loop is the more expensive
+  option, not the safer one.
 
-## Never Do
+## Never
 
-- NEVER edit a function, class, or method without first running `impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
-- NEVER commit changes without running `detect_changes()` to check affected scope.
+- NEVER cite a symbol, caller, or line number from CodeGraph that you
+  have not seen in its output — the index can be stale, and a stale
+  callsite claim is the same failure class as an invented one.
+- NEVER use CodeGraph as the authority for "did I get every callsite" on
+  an exported symbol. Use `lsp references` for that; CodeGraph shows the
+  call *paths*, the language server shows the *set*.
+- NEVER rename across files with find-and-replace. Use `lsp rename`.
 
-## Resources
+## CLI (same index, when MCP is unavailable)
 
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/hipfire/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/hipfire/clusters` | All functional areas |
-| `gitnexus://repo/hipfire/processes` | All execution flows |
-| `gitnexus://repo/hipfire/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
+| Task | Command |
+|------|---------|
+| Explore an area | `codegraph explore "<symbols or question>"` |
+| One symbol's source + caller/callee trail | `codegraph node <name>` |
+| Who calls / what it calls | `codegraph callers <sym>` · `codegraph callees <sym>` |
+| Blast radius of a change | `codegraph impact <sym>` |
+| Tests touched by changed files | `codegraph affected <files...>` |
+| Index state / rebuild / incremental | `codegraph status` · `index` · `sync` |

@@ -1,0 +1,21 @@
+[package]
+name = "pm-census"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Developer tooling for the PM/railgun bedrock: WorkloadCaseV1 extraction from real routes, time-weighted PM/hipcc/railgun kernel census from profiler output, and the pm_loop measurement-noise harness"
+publish = false
+
+# Developer-only: never a runtime dependency (it reaches peacemaker-lift for
+# offload-bundle / ELF symbol identity).
+[dependencies]
+hipfire-atlas = { path = "../hipfire-atlas" }
+hipfire-kernel-abi = { path = "../hipfire-kernel-abi" }
+peacemaker-lift = { path = "../peacemaker-lift" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+
+[[bin]]
+name = "pm-census"
+path = "src/main.rs"

@@ -1,0 +1,483 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! S6-fa-prep-q8-pair launchers: batched full-attention prep and paired Q8
+//! K/V cache writes for validated wave32 DFlash verify devices.
+//!
+//! Both kernels are bit-exact folds of the launches they replace (see the
+//! `.hip` headers); admission (gfx1100, `DflashFusionCtx::ChainVerify`,
+//! exact 16Q/2K or 24Q/4K + HD256 + NROT64 shapes, kill switch) is enforced
+//! by the `batch_chunk_full_attn_prepare` caller and the `KvWriteQ8_0Batched`
+//! dispatch arm. The launchers only validate shapes and enqueue via
+//! `launch_maybe_blob` with a retained `KernargBlob`, so they stay
+//! hipGraph-capture safe.
+//!
+//! Kernel sources are `include_str!`'d here (not via `crate::kernels`) so
+//! this slice never edits the shared kernel registry owned by the scaffold.
+
+use std::ffi::c_void;
+
+use crate::dispatch::{Gpu, GpuTensor};
+use hip_bridge::HipResult;
+
+pub(crate) const FA_PREP_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip");
+/// gfx1151 twin: the same source under its own symbol, so either arch's
+/// kernel can change without touching the other's object.
+pub(crate) const FA_PREP_BATCHED_GFX1151_SRC: &str = concat!(
+    "#define QWEN35_FA_PREP_BATCHED_KERNEL qwen35_fa_prep_batched_gfx1151\n",
+    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip")
+);
+pub(crate) const KV_PAIR_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_q8_0_pair_batched.gfx1100.hip");
+pub(crate) const FA_PREP_BATCHED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1201.hip");
+
+/// Output of the gfx1201 fused FA prep for the Q rows.
+pub enum FaPrepQOut<'a> {
+    /// Row-major `[batch × n_q × 256]` F32 Q (post norm + RoPE).
+    F32(&'a GpuTensor),
+    /// `DType::Raw` view: `[batch × n_q × 256]` permuted E4M3 codes followed
+    /// by `[batch × n_q]` f32 row scales at byte offset `batch × n_q × 256`
+    /// (the layout `attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201`
+    /// reads).
+    Fp8Codes(&'a GpuTensor),
+}
+/// Admitted prep geometries (Q heads, K heads): 16/2 and 24/4, head_dim 256,
+/// n_rot 64. The kernel takes the Q-head split as a grid-uniform arg, so one
+/// symbol serves both; the launcher validates the pair.
+pub const FA_PREP_BATCHED_GEOMETRIES: [(usize, usize); 2] = [(16, 2), (24, 4)];
+
+#[cfg(feature = "deltanet")]
+impl Gpu {
+    /// Batched gfx1100 full-attention prep. Folds deinterleave + Q/K rmsnorm
+    /// + partial half-split RoPE (4 launches) into one `[n_q+n_kv,
+    /// batch_size]` grid of 256-thread blocks.
+    ///
+    /// `k` is read pre-norm and written post-norm+rope in place. `positions`
+    /// carries the physical KV slots; `pos_offset` (`compact_offset`) shifts
+    /// only the RoPE phase. Buffers are `[batch × heads × 256]` row-major
+    /// F32; weights are `[256]` F32.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_fa_prep_batched_gfx1100(
+        &mut self,
+        q_interleaved: &GpuTensor,
+        q: &GpuTensor,
+        gate: &GpuTensor,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        positions: &GpuTensor,
+        eps: f32,
+        freq_base: f32,
+        pos_offset: i32,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.supports_dflash_fa_batch_fusions() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx1100 is not certified on this architecture",
+            ));
+        }
+        self.qwen35_fa_prep_batched_gfx11(
+            "qwen35_fa_prep_batched_gfx1100",
+            FA_PREP_BATCHED_SRC,
+            q_interleaved,
+            q,
+            gate,
+            k,
+            q_weight,
+            k_weight,
+            positions,
+            eps,
+            freq_base,
+            pos_offset,
+            n_q_heads,
+            n_kv_heads,
+            batch_size,
+        )
+    }
+
+    /// gfx1151 twin of [`Self::qwen35_fa_prep_batched_gfx1100`]: same kernel
+    /// source and contract, compiled under `qwen35_fa_prep_batched_gfx1151`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_fa_prep_batched_gfx1151(
+        &mut self,
+        q_interleaved: &GpuTensor,
+        q: &GpuTensor,
+        gate: &GpuTensor,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        positions: &GpuTensor,
+        eps: f32,
+        freq_base: f32,
+        pos_offset: i32,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1151() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx1151 is certified only on gfx1151",
+            ));
+        }
+        self.qwen35_fa_prep_batched_gfx11(
+            "qwen35_fa_prep_batched_gfx1151",
+            FA_PREP_BATCHED_GFX1151_SRC,
+            q_interleaved,
+            q,
+            gate,
+            k,
+            q_weight,
+            k_weight,
+            positions,
+            eps,
+            freq_base,
+            pos_offset,
+            n_q_heads,
+            n_kv_heads,
+            batch_size,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn qwen35_fa_prep_batched_gfx11(
+        &mut self,
+        name: &'static str,
+        src: &'static str,
+        q_interleaved: &GpuTensor,
+        q: &GpuTensor,
+        gate: &GpuTensor,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        positions: &GpuTensor,
+        eps: f32,
+        freq_base: f32,
+        pos_offset: i32,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if !FA_PREP_BATCHED_GEOMETRIES.contains(&(n_q_heads, n_kv_heads)) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx11 requires 16Q/2K or 24Q/4K heads",
+            ));
+        }
+        if batch_size == 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx11 requires batch_size >= 1",
+            ));
+        }
+        self.ensure_kernel(name, src, name)?;
+        let qip = q_interleaved.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let qwp = q_weight.buf.as_ptr();
+        let kwp = k_weight.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let ep = eps;
+        let fb = freq_base;
+        let po = pos_offset;
+        let nq = n_q_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qip as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &qwp as *const _ as *mut c_void,
+            &kwp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+            &po as *const _ as *mut c_void,
+            &nq as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        // Per (head, token): interleaved read + norm read + q/gate/k writes.
+        let bytes = batch_size * ((n_q_heads + n_kv_heads) * 256 * 4 * 2);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", name, bytes);
+        let result = self.launch_maybe_blob(
+            name,
+            [(n_q_heads + n_kv_heads) as u32, batch_size as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qip);
+                b.push_ptr(qp);
+                b.push_ptr(gp);
+                b.push_ptr(kp);
+                b.push_ptr(qwp);
+                b.push_ptr(kwp);
+                b.push_ptr(pp);
+                b.push_f32(ep);
+                b.push_f32(fb);
+                b.push_i32(po);
+                b.push_i32(nq);
+                b.push_i32(nkv);
+                b.push_i32(bs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Paired gfx1100 Q8 K/V batched write. Folds the two
+    /// `kv_cache_write_q8_0_batched` launches (K, then V) into one
+    /// `[2 * total_blocks, batch_size]` grid. Legacy single-arena addressing
+    /// only (`dst + pos * per_pos_bytes + gid * 34`), matching the dispatch
+    /// arm it serves; slot/independent variants keep their own launchers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn kv_cache_write_q8_0_pair_batched(
+        &mut self,
+        k_dst: &GpuTensor,
+        v_dst: &GpuTensor,
+        k_src: &GpuTensor,
+        v_src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.supports_dflash_fa_batch_fusions() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "kv_cache_write_q8_0_pair_batched is not certified on this architecture",
+            ));
+        }
+        if batch_size == 0 || n_kv_heads == 0 || head_dim % 32 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "kv_cache_write_q8_0_pair_batched requires batch>=1, kv_heads>=1, head_dim%32==0",
+            ));
+        }
+        self.ensure_kernel(
+            "kv_cache_write_q8_0_pair_batched_gfx1100",
+            KV_PAIR_BATCHED_SRC,
+            "kv_cache_write_q8_0_pair_batched_gfx1100",
+        )?;
+
+        let mut kd = k_dst.buf.as_ptr();
+        let mut vd = v_dst.buf.as_ptr();
+        let mut ks = k_src.buf.as_ptr();
+        let mut vs = v_src.buf.as_ptr();
+        let mut p = positions.buf.as_ptr();
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut kd as *mut _ as *mut c_void,
+            &mut vd as *mut _ as *mut c_void,
+            &mut ks as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut p as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let total_blocks = (n_kv_heads * head_dim / 32) as u32;
+        let bytes = batch_size * n_kv_heads * head_dim * 4 * 2;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "kv_write",
+            "kv_cache_write_q8_0_pair_batched_gfx1100",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "kv_cache_write_q8_0_pair_batched_gfx1100",
+            [total_blocks * 2, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kd);
+                b.push_ptr(vd);
+                b.push_ptr(ks);
+                b.push_ptr(vs);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1201 full-attention prep: deinterleave + Q/K rmsnorm + partial
+    /// half-split RoPE in one wave-per-row launch, bit-exact to the
+    /// three-launch sequence (see the `.hip` header). With
+    /// [`FaPrepQOut::Fp8Codes`] the Q rows are emitted as the exact E4M3
+    /// codes and row scales the Q-resident attention prologue derives.
+    /// `k` is read pre-norm and written post-norm+rope in place. `gate` is
+    /// the compact `[batch × n_q × 256]` gate copy; `None` (fp8 codes only)
+    /// leaves the gate in `q_interleaved` for
+    /// `SigmoidGate::QGateInterleaved` and skips the copy.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_fa_prep_batched_gfx1201(
+        &mut self,
+        q_interleaved: &GpuTensor,
+        q_out: FaPrepQOut<'_>,
+        gate: Option<&GpuTensor>,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        positions: &GpuTensor,
+        eps: f32,
+        freq_base: f32,
+        pos_offset: i32,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx1201 requires gfx1201",
+            ));
+        }
+        if !FA_PREP_BATCHED_GEOMETRIES.contains(&(n_q_heads, n_kv_heads)) || batch_size == 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx1201 requires 16Q/2K or 24Q/4K heads and batch >= 1",
+            ));
+        }
+        let q_elems = batch_size * n_q_heads * 256;
+        let (symbol, qp, sp) = match (q_out, gate.is_some()) {
+            (FaPrepQOut::F32(q), true) => {
+                if q.numel() < q_elems {
+                    return Err(hip_bridge::HipError::new(1, "fa prep: Q output too small"));
+                }
+                ("qwen35_fa_prep_batched_gfx1201", q.buf.as_ptr(), None)
+            }
+            (FaPrepQOut::F32(_), false) => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "fa prep: the F32 Q output requires a gate copy",
+                ));
+            }
+            (FaPrepQOut::Fp8Codes(codes), copy_gate) => {
+                let need = q_elems + batch_size * n_q_heads * 4;
+                if codes.dtype != crate::DType::Raw || codes.buf.size() < need {
+                    return Err(hip_bridge::HipError::new(
+                        1,
+                        "fa prep: fp8 Q output must be a Raw view of >= codes + scales bytes",
+                    ));
+                }
+                let base = codes.buf.as_ptr();
+                let scales = unsafe { (base as *mut u8).add(q_elems) as *mut c_void };
+                let symbol = if copy_gate {
+                    "qwen35_fa_prep_fp8q_batched_gfx1201"
+                } else {
+                    "qwen35_fa_prep_fp8q_nogate_batched_gfx1201"
+                };
+                (symbol, base, Some(scales))
+            }
+        };
+        if gate.is_some_and(|g| g.numel() < q_elems) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "fa prep: gate output too small",
+            ));
+        }
+        self.ensure_kernel(symbol, FA_PREP_BATCHED_GFX1201_SRC, symbol)?;
+
+        let qip = q_interleaved.buf.as_ptr();
+        let gp = gate.map(|g| g.buf.as_ptr());
+        let kp = k.buf.as_ptr();
+        let qwp = q_weight.buf.as_ptr();
+        let kwp = k_weight.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let ep = eps;
+        let fb = freq_base;
+        let po = pos_offset;
+        let nq = n_q_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qip as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+        ];
+        if let Some(sp) = sp.as_ref() {
+            params.push(sp as *const _ as *mut c_void);
+        }
+        if let Some(gp) = gp.as_ref() {
+            params.push(gp as *const _ as *mut c_void);
+        }
+        params.extend_from_slice(&[
+            &kp as *const _ as *mut c_void,
+            &qwp as *const _ as *mut c_void,
+            &kwp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+            &po as *const _ as *mut c_void,
+            &nq as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+        ]);
+        let rows = (n_q_heads + n_kv_heads) * batch_size;
+        let q_bytes = if sp.is_some() { 256 + 4 } else { 256 * 4 };
+        let gate_bytes = if gp.is_some() { 256 * 4 * 2 } else { 0 };
+        let bytes =
+            batch_size * (n_q_heads * (256 * 4 + gate_bytes + q_bytes) + n_kv_heads * 256 * 4 * 2);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", symbol, bytes);
+        let result = self.launch_maybe_blob(
+            symbol,
+            [rows.div_ceil(8) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qip);
+                b.push_ptr(qp);
+                if let Some(sp) = sp {
+                    b.push_ptr(sp);
+                }
+                if let Some(gp) = gp {
+                    b.push_ptr(gp);
+                }
+                b.push_ptr(kp);
+                b.push_ptr(qwp);
+                b.push_ptr(kwp);
+                b.push_ptr(pp);
+                b.push_f32(ep);
+                b.push_f32(fb);
+                b.push_i32(po);
+                b.push_i32(nq);
+                b.push_i32(nkv);
+                b.push_i32(bs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+}

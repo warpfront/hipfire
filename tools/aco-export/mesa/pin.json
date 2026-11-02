@@ -1,0 +1,46 @@
+{
+  "schema": "pm-aco-mesa-pin-v1",
+  "tag": "mesa-26.0.8",
+  "commit": "60e95b787857afbc9a00b693b91c0d9c8923a430",
+  "upstream": "https://gitlab.freedesktop.org/mesa/mesa.git",
+  "note": "The pristine original checkout /home/kaden/qcal/peacemaker/mesa (with the local aco-shim integration) is never modified. The patch applies to a separate isolated detached worktree of this exact commit.",
+  "patch": {
+    "file": "0001-radv-aco-export-hook.patch",
+    "sha256": "bd1fe30ee0c0aea47c8bf37255ce5a1b55b585a85ff14831c7b80943b9286a2d",
+    "description": "Developer-only export hook: RADV radv_shader.c shader_compile() captures the final ACO output (raw code, aco_callback config/symbols, post-radv_postprocess_binary_config RSRC1/2/3, ac_shader_args slot table with field names, RADV compute regs, aco options/info, device identity, final NIR) when RADV_ACO_EXPORT_DIR is set; ACO register allocation records max-used VGPR/SGPR (aco_export_ra_max_used_*); aco_interface.cpp measures ordinary SGPR/VGPR use, per-SGPR read/def masks and typed entry liveness from the final typed post-RA instructions (aco_export_typed_*). No codegen change."
+  },
+  "patched_files_sha256": {
+    "src/amd/vulkan/radv_shader.c": "5a9edec983b226f40afbc1b21c3ab93806ca008d1e5479fa31b894e5b1c92030",
+    "src/amd/vulkan/radv_aco_export.inc": "afaa934a2acdf02dd552d116ac267511733112cea7dacbd4c1797ac503fab81b",
+    "src/amd/compiler/aco_interface.h": "20eca52cccdafbf3fdc8af439e9ccd5ee6119b0c1e57462e81ef00fe40bd7d11",
+    "src/amd/compiler/aco_interface.cpp": "8049fe70121a95ede9bf8c490dc94f24b09e49e14ec93250b45be7fb3486f17e",
+    "src/amd/compiler/aco_register_allocation.cpp": "da998b83f65dff34ff0a89ff5ee252bdf2e2a7cc46c52e145cc4cbf082b97bda"
+  },
+  "meson_options": [
+    "-Dbuildtype=debugoptimized",
+    "-Dvulkan-drivers=amd",
+    "-Dgallium-drivers=",
+    "-Dllvm=disabled",
+    "-Dplatforms=",
+    "-Dglx=disabled",
+    "-Degl=disabled",
+    "-Dgbm=disabled",
+    "-Dgles1=disabled",
+    "-Dgles2=disabled",
+    "-Dopengl=false",
+    "-Dvulkan-layers=",
+    "-Dvideo-codecs=",
+    "-Dtools=drm-shim",
+    "-Dbuild-tests=false",
+    "-Dbuild-aco-tests=false",
+    "-Dshader-cache=disabled",
+    "-Dvalgrind=disabled",
+    "-Dlibunwind=disabled",
+    "-Dlmsensors=disabled"
+  ],
+  "build_targets": [
+    "src/amd/vulkan/libvulkan_radeon.so",
+    "src/amd/vulkan/radeon_devenv_icd.x86_64.json",
+    "src/amd/drm-shim/libamdgpu_noop_drm_shim.so"
+  ]
+}

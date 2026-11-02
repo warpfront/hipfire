@@ -23,7 +23,7 @@
 //!   * **Projector** (`Lfm3AudioProjector`) — LayerNorm(768) + GELU(erf) MLP
 //!     768→2048→2048. Runs on GPU (reuses `layernorm_batched` / `gelu_erf_f32`).
 //!
-//! arch_id stays 13 (audio detected by `encoder.downsample.*` /
+//! arch_id stays 24 (audio detected by `encoder.downsample.*` /
 //! `model.audio_encoder.downsample.*` tensors — see AUDIO-NAME-1 below).
 //! presence). The text decoder is owned by `hipfire-arch-lfm3::Lfm3`.
 
@@ -33,7 +33,7 @@ use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, Step};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, weight_gemv, KvCache, WeightTensor};
+use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, weight_gemv, KvCache, KvCacheExt, WeightTensor};
 use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -518,7 +518,7 @@ fn load_wt(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> Resu
         other => return Err(format!("lfm3-audio: unsupported quant_type {other} for {name}")),
     };
     let buf = gpu.upload_raw(&data, &[data.len()]).map_err(|e| format!("upload_raw: {e:?}"))?;
-    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0, paro: None, awq_scale: None })
+    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0, paro: None, awq_scale: None, lloyd_lut_e4m3: None, lloyd_lut_f16: None, lloyd_lut_c16: None })
 }
 
 /// Load a downsampler weight (F16/F32/Q8) → host F32 Vec + shape.
@@ -864,8 +864,8 @@ impl AudioEncoderState {
             physical_cap: None,
         };
         let kv = KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY, head_dim).mode,
-            hipfire_runtime::llama::KvTarget::Single(gpu),
+            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY).mode,
+            gpu,
             &dims,
         )
         .map_err(|e| format!("lfm3-audio: kv cache: {e:?}"))?;
@@ -1019,6 +1019,7 @@ fn enc_attn_mixer(
         block_start: 0,
         block_cols: 0,
         output_gate: None,
+        output_awq_scale: None,
         output: &st.fa_attn_out,
     };
     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])

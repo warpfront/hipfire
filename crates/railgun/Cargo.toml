@@ -1,0 +1,61 @@
+[package]
+name = "railgun"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "railgun certified dispatch programs: program model (design §1.1); MC copy nodes and copy kernels; M1 kernel nodes from certified facts, the gfx12 cache table, PM4 boundary plan and the G7 shadow diff"
+publish = false
+
+# A runtime crate: it must never reach peacemaker, dev-dependencies included
+# (checked by peacemaker-ir's `runtime_dependency_graph_does_not_include_peacemaker`).
+[dependencies]
+# `railgun::contract`: KernelAbiV1 node checks (layer 0; no peacemaker, no GPU).
+hipfire-kernel-abi = { path = "../hipfire-kernel-abi" }
+railgun-corpus = { path = "../railgun-corpus" }
+serde = { workspace = true, features = ["derive"] }
+sha2.workspace = true
+thiserror.workspace = true
+parking_lot = { version = "0.12", optional = true }
+# `railgun::npu` HIP interop resolves libamdhip64 through the shared ROCm candidate list (layer 0).
+hipfire-config = { path = "../hipfire-config", optional = true }
+
+# GPU examples (`examples/mc_g2.rs`, `--features mc-g2`; `examples/g4_probe.rs`,
+# `--features g4-probe`; `examples/boundary_bench.rs`, `--features boundary-bench`).
+[dev-dependencies]
+hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+rdna-compute = { path = "../rdna-compute" }
+redline-rocr = { path = "../redline-rocr" }
+# `tests/kernel_abi_contract.rs` certifies the committed PM objects (offline; dev edge only).
+railgun-cert = { path = "../railgun-cert" }
+serde_json.workspace = true
+sha2.workspace = true
+
+[features]
+# `examples/mc_g2.rs`: the MC G2 gate on a GPU (copies-only program).
+mc-g2 = []
+# `examples/g4_probe.rs`: the G4 cache-visibility silicon probe (design §5 G4).
+g4-probe = []
+# `examples/boundary_bench.rs`: the gfx11 PM4 boundary-cost microbenchmark.
+boundary-bench = []
+# `examples/cond_probe.rs`: #867 conditional nodes (IF, bounded WHILE) on a gfx1151 compute queue.
+cond-probe = []
+# `railgun::npu`: the XDNA2 / AIE2P NPU runtime (amdxdna DRM ioctls, BOs, submit, ring, tape, FCLK guard,
+# dlopen'd HIP interop). Experimental and dark: no hipfire runtime path enables it.
+npu = ["dep:parking_lot", "dep:hipfire-config"]
+
+[[example]]
+name = "g4_probe"
+required-features = ["g4-probe"]
+
+[[example]]
+name = "mc_g2"
+required-features = ["mc-g2"]
+
+[[example]]
+name = "boundary_bench"
+required-features = ["boundary-bench"]
+
+[[example]]
+name = "cond_probe"
+required-features = ["cond-probe"]

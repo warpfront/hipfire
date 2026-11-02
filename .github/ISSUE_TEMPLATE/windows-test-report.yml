@@ -1,0 +1,116 @@
+name: Windows test report
+description: Report the result of scripts/windows-check.ps1 on native Windows (AMD GPU)
+title: "[Windows test report] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing hipfire on native Windows. We have no Windows GPU machine, so reports like this are how Windows support gets validated.
+
+        **How to produce the report**
+
+        1. Install hipfire with `scripts/install.ps1` (see the README / docs for the install command).
+        2. Run the check script from a normal (non-admin) PowerShell window:
+
+           ```powershell
+           powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\windows-check.ps1
+           ```
+
+           It only reads system state and runs hipfire. It downloads the 0.55 GB model `qwen3.5:0.8b` (use `-SkipModel` to skip). With a 24 GB or larger card you can add `-Include27B` (about 16 GB more download).
+        3. The script prints a report folder (default `%USERPROFILE%\hipfire-windows-report-<timestamp>`). **Drag `report.json` and `report.txt` from that folder into the "Attach the report files" box below.**
+
+        The script replaces your Windows user name, profile path and computer name with `<user>`, `%USERPROFILE%` and `<host>`. Please skim the files before attaching them.
+
+        Most wanted: RX 7900 XTX (gfx1100), Radeon AI PRO R9700 (gfx1201), Strix Halo / Ryzen AI Max (gfx1151).
+  - type: dropdown
+    id: gpu
+    attributes:
+      label: GPU model
+      options:
+        - RX 7900 XTX
+        - Radeon AI PRO R9700
+        - Strix Halo (Ryzen AI Max)
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: gpu_other
+    attributes:
+      label: Other GPU
+      description: Only if you chose "Other" above. Exact card name and VRAM.
+      placeholder: "e.g. RX 7900 XT 20 GB"
+  - type: input
+    id: windows_build
+    attributes:
+      label: Windows build
+      description: Windows edition and build, e.g. "Windows 11 24H2 build 26100.2605". `winver` shows it; the script also records it in report.txt.
+    validations:
+      required: true
+  - type: input
+    id: driver_version
+    attributes:
+      label: AMD driver version
+      description: Adrenalin / PRO driver version, e.g. "25.10.2" (Radeon Software, About tab). The script records the Windows driver version too.
+    validations:
+      required: true
+  - type: input
+    id: hip_sdk_version
+    attributes:
+      label: HIP SDK version
+      description: AMD HIP SDK for Windows version, e.g. "6.4" or "7.1". Write "none installed" if you have no HIP SDK.
+    validations:
+      required: true
+  - type: input
+    id: install_command
+    attributes:
+      label: Install command used
+      description: The exact command you ran to install hipfire, including any flags such as -Tag, -Ref or -CompileKernels.
+      placeholder: ".\\scripts\\install.ps1"
+    validations:
+      required: true
+  - type: dropdown
+    id: install_finished
+    attributes:
+      label: Did install.ps1 finish?
+      options:
+        - Yes, with no errors
+        - Yes, with warnings
+        - No, it stopped with an error
+        - I did not run install.ps1 (other install method)
+    validations:
+      required: true
+  - type: dropdown
+    id: generation
+    attributes:
+      label: Did the small model (qwen3.5:0.8b) generate correct text?
+      description: See "MODEL SMOKE TEST" in report.txt. The prompt is "Count from 1 to 10." with greedy decoding.
+      options:
+        - "Yes: sensible text"
+        - "No: garbled or wrong output"
+        - "No: crash, error or hang"
+        - "Not tested (-SkipModel or the pull failed)"
+    validations:
+      required: true
+  - type: input
+    id: bench_tok_s
+    attributes:
+      label: tok/s from the bench
+      description: "Decode tok/s (median) from the bench line in report.txt, plus prefill tok/s if you like, e.g. \"decode 250, prefill 4000\". Leave empty if the bench did not run."
+  - type: textarea
+    id: attachments
+    attributes:
+      label: Attach the report files
+      description: Drag `report.json` and `report.txt` here. GitHub shows them as links once uploaded.
+    validations:
+      required: true
+  - type: textarea
+    id: report_txt
+    attributes:
+      label: report.txt (paste, optional)
+      description: Paste the contents of report.txt if you cannot attach files.
+      render: text
+  - type: textarea
+    id: notes
+    attributes:
+      label: Notes
+      description: Anything else we should know (other GPUs installed, antivirus prompts, odd behavior, steps you tried).

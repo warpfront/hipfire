@@ -96,6 +96,8 @@ extern "C" __global__ void moe_scatter_fused_k8(
             const int sorted_pos = base + pos_in_bucket;
             sorted_slot_index[sorted_pos] = i;
             inverse_perm[i] = sorted_pos;
+        } else {
+            inverse_perm[i] = -1;  // unrouted slot (id outside [0, E)): no grouped row
         }
     }
     __syncthreads();

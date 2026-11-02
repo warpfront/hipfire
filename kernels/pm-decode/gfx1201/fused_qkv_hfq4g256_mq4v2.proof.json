@@ -1,0 +1,397 @@
+{
+  "module": "fused_qkv_hfq4g256_mq4v2",
+  "arch": "gfx1201",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "bfe282eb4b998d2fa9a10e48b1d53e03b869572dab379ff6914985ce88d15bf6",
+  "kernels": [
+    {
+      "kernel_id": "fused_qkv_hfq4g256_mq4v2",
+      "variant": "four-stream-quad-ilp",
+      "arch": "gfx1201",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "reg_plan": [
+        {
+          "name": "workitem",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "address_or_packed_1",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "address_or_packed_2",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "address_or_packed_3",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "address_or_packed_4",
+          "kind": "v",
+          "base": 4,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "address_or_packed_5",
+          "kind": "v",
+          "base": 5,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "address_or_packed_6",
+          "kind": "v",
+          "base": 6,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "address_or_packed_7",
+          "kind": "v",
+          "base": 7,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment_8",
+          "kind": "v",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment_16",
+          "kind": "v",
+          "base": 16,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "fragment_24",
+          "kind": "v",
+          "base": 24,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_32",
+          "kind": "v",
+          "base": 32,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_40",
+          "kind": "v",
+          "base": 40,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_48",
+          "kind": "v",
+          "base": 48,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_56",
+          "kind": "v",
+          "base": 56,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_64",
+          "kind": "v",
+          "base": 64,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x_72",
+          "kind": "v",
+          "base": 72,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar_0",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar_4",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar_8",
+          "kind": "s",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar_16",
+          "kind": "s",
+          "base": 16,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar_24",
+          "kind": "s",
+          "base": 24,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar_32",
+          "kind": "s",
+          "base": 32,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "scalar_40",
+          "kind": "s",
+          "base": 40,
+          "len": 2,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 80,
+      "next_free_sgpr": 42,
+      "waits": [
+        {
+          "pc_index": 15,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 74,
+          "insn": "s_wait_loadcnt 0x11",
+          "counter": "Load",
+          "count": 17,
+          "reason": {
+            "Use": {
+              "reg": "v[8:9]"
+            }
+          }
+        },
+        {
+          "pc_index": 76,
+          "insn": "s_wait_loadcnt 0xc",
+          "counter": "Load",
+          "count": 12,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 80,
+          "insn": "s_wait_loadcnt 0x8",
+          "counter": "Load",
+          "count": 8,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 177,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 225,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": {
+            "Use": {
+              "reg": "v6"
+            }
+          }
+        },
+        {
+          "pc_index": 250,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v[8:11]"
+            }
+          }
+        },
+        {
+          "pc_index": 255,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[12:15]"
+            }
+          }
+        },
+        {
+          "pc_index": 269,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": {
+            "Use": {
+              "reg": "v6"
+            }
+          }
+        },
+        {
+          "pc_index": 294,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v[8:11]"
+            }
+          }
+        },
+        {
+          "pc_index": 299,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[12:15]"
+            }
+          }
+        },
+        {
+          "pc_index": 313,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": {
+            "Use": {
+              "reg": "v6"
+            }
+          }
+        },
+        {
+          "pc_index": 338,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v[8:11]"
+            }
+          }
+        },
+        {
+          "pc_index": 343,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[12:15]"
+            }
+          }
+        },
+        {
+          "pc_index": 354,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 360,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 366,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 372,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 378,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 386,
+          "insn": "s_wait_storecnt 0x0",
+          "counter": "Store",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [],
+      "clauses": [
+        {
+          "start": 50,
+          "len": 10,
+          "class": "VmemLoad"
+        },
+        {
+          "start": 61,
+          "len": 8,
+          "class": "VmemLoad"
+        }
+      ],
+      "vopd_pairs": 16,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [
+        {
+          "head": ".Lqkv_quads",
+          "iterations": 2
+        }
+      ],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "bfe282eb4b998d2fa9a10e48b1d53e03b869572dab379ff6914985ce88d15bf6"
+    }
+  ]
+}

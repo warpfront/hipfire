@@ -1,5 +1,24 @@
 # Dependency adoption log
 
+> **Lifecycle: historical (dated change log).** Entries record what was
+> adopted on the stated date and why; they are provenance, not a current
+> dependency inventory, support policy, or to-do list. Current dependency
+> truth is `Cargo.toml` / `Cargo.lock` / `deny.toml`. Drift checked against
+> the beta source (entries themselves are left as written):
+> - The 2026-07-16 Bun / `@types/bun` / TypeScript pins in `cli/`
+>   describe the former TypeScript CLI. That directory is no longer in the
+>   tree; the user-facing CLI is the native Rust `crates/hipfire-cli`.
+> - `tracing` / `tracing-subscriber` are now regular dependencies of
+>   `crates/hipfire-daemon` (the daemon is no longer an example of
+>   `hipfire-runtime`); `hipfire-runtime` keeps `tracing` and lists
+>   `tracing-subscriber` as a dev-dependency.
+> - `libloading` is now also used by crates added after the 2026-07-16
+>   refresh (for example `hipfire-arch-deepseek4`, `va-bridge`); all use the
+>   workspace version.
+> - "Future beta follow-ups" and "Validation recorded" are the
+>   2026-07-16 plan and results (including the Bun and test counts). They
+>   are not re-run and not a current tracker.
+
 This log records dependency and developer-tool changes that materially affect
 Hipfire's build, runtime, or maintenance surface. Add entries when a dependency
 is introduced, removed, centralized, or given a new production use.
@@ -60,6 +79,46 @@ Implemented by commit `b15e6f884`.
   `redline-dispatch` only and remain excluded from release artifacts.
 - Centralized `libloading`, `half`, and `safetensors` in
   `[workspace.dependencies]` because each has multiple direct consumers.
+
+## 2026-10-07 — HF tokenizer differential oracle (dev-only)
+
+- `hipfire-runtime` `[dev-dependencies]` gained `tokenizers =0.22.2`
+  (`default-features = false`, `fancy-regex` only: pure Rust, no `onig`/C++)
+  and `md5 0.7`. They are used solely by
+  `tests/hf_tokenizer_differential.rs`, which compares
+  `Tokenizer::from_hf_json` to HF for every manifest tokenizer. Nothing is
+  linked into shipped binaries and no runtime code depends on them.
+- `tokenizers`, `esaxx-rs` and `spm_precompiled` are Apache-2.0, which the
+  `deny.toml` allowlist already permits. The remaining new transitive crates
+  (`dary_heap`, `derive_builder`, `monostate`, `rayon-cond`,
+  `unicode_categories`, …) were not individually re-audited here; `cargo-deny`
+  CI is the authority for them.
+- Commands, fixtures, report layout and env knobs: `CONTRIBUTING.md`
+  § Tokenizer differential test.
+
+## 2026-10-07 — exact HF NFC normalization (runtime)
+
+- `hipfire-runtime` replaced `icu_normalizer` 2 with
+  `unicode-normalization-alignments =0.1.12` for the tokenizer `NFC`
+  normalizer. HF `tokenizers` 0.22.2 normalizes with this crate, whose tables
+  are Unicode 9.0.0; ICU's newer data reorders post-Unicode-9 marks that HF
+  leaves untouched (observed: U+0302 U+089B and U+065D U+1DF7). Using the same
+  crate and data makes encoding identical to HF by construction.
+- `icu_normalizer` had no other user in the workspace and is removed, along
+  with its `icu_*`/`zerovec`-family transitive crates that nothing else
+  required. The new crate is MIT/Apache-2.0 (both in the `deny.toml`
+  allowlist) and adds no crate beyond `smallvec`, which is already a runtime
+  dependency; the dev-only `tokenizers` oracle already resolved the same
+  version. No runtime dependency on HF `tokenizers` is introduced.
+- The borrowed (no-allocation) fast path for already-NFC text is kept. The
+  crate's own `is_nfc` falls back on a quick-check `Maybe` to an iterator that
+  buffers marks in a 4-slot `SmallVec` and heap-allocates on long combining
+  runs, so `tokenizer.rs` uses the crate's allocation-free quick check plus a
+  streaming starter/last-class composition check, then
+  `text.nfc().map(|c| c.0).collect::<String>()` only when the text changes.
+- Cache identity: `Tokenizer::config_digest` now hashes the NFC implementation
+  label and Unicode version for NFC tokenizers only, invalidating NFC-keyed
+  caches while leaving non-NFC tokenizer identities unchanged.
 
 ## Deferred after inspection
 

@@ -1,0 +1,41 @@
+{
+  "symbol": "gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151",
+  "counts": {
+    "v_wmma_i32_16x16x16_iu4": 1024,
+    "vopd_packets": 1600,
+    "v_dual_mul_f32": 1024,
+    "v_dual_fmac_f32": 512,
+    "v_dual_add_f32": 64,
+    "v_mov_b32_dpp": 0,
+    "ds_swizzle_b32": 256,
+    "v_cvt_f32_f16_e64": 16,
+    "v_xor_b32_e32": 64,
+    "ds_load_2addr_b64": 640,
+    "ds_store_b64": 64,
+    "global_load_b64": 64,
+    "global_load_b32": 36,
+    "global_load_u16": 16,
+    "global_load_b128": 32,
+    "global_store_b128": 32,
+    "s_barrier": 8,
+    "buffer_gl0_inv": 0
+  },
+  "forbidden": [
+    "s_wait_loadcnt*",
+    "s_wait_dscnt*",
+    "s_wait_storecnt*",
+    "s_wait_kmcnt*",
+    "s_wait_alu",
+    "scratch_*",
+    "flat_*",
+    "buffer_*",
+    "v_readlane*",
+    "s_nop"
+  ],
+  "vgpr_max": 256,
+  "sgpr_max": 104,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 65536
+}

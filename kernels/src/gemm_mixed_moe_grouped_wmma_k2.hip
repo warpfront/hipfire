@@ -3,17 +3,36 @@
 
 // Merged dtype-tag MoE batched-prefill grouped-WMMA kernel — gfx11 (RDNA3/3.5).
 //
-// Serves ALL four per-expert quantization formats in a single kernel via a
-// block-uniform tag branch (zero warp divergence): each block's 16 slots all
-// belong to the same expert, so tag = dtype_tags[expert_id] is the same for
-// every thread in the block.
+// Serves per-expert quantization formats in a single kernel via a block-uniform
+// tag branch (zero warp divergence): each block's 16 slots all belong to the
+// same expert, so tag = dtype_tags[expert_id] is the same for every thread.
 //
 // Tag map (same as the decode merged kernel + load-time tag table):
-//   0 = MQ6 / HFQ6-G256  — 200 B/group, 6-bit affine (sc*q+zp)
+//   0 = MQ6 / HFQ6-G256  — 200 B/group, 6-bit affine (sc*q+zp)  [V1 f32 header]
 //   1 = MQ2-Lloyd-G256   —  72 B/group, 4-entry fp16 codebook (2-bit)
-//   2 = MQ4 / HFQ4-G256  — 136 B/group, 4-bit affine (sc*q+zp)
+//   2 = MQ4 / HFQ4-G256  — 136 B/group, 4-bit affine (sc*q+zp)  [V1 f32 header]
 //   3 = MQ3-Lloyd-G256   — 112 B/group, 8-entry fp16 codebook (3-bit)
 //   4 = mfp4-E8          — 16 B row hdr + (K/32)*17 B; 136 B/group, E8 VQ
+//   5 = mfp3-E8          — 16 B row hdr + (K/32)*13 B; 104 B/group
+//   6 = mfp2-E8          — 16 B row hdr + (K/32)* 9 B;  72 B/group
+//
+// Pair tags 7..18 encode (gate_dtype, down_dtype). V1/V2 headers MUST NOT
+// collapse — qt13 f32 scale/zero vs qt44 dual-f16, qt15 f32 vs qt47 dual-f16:
+//   7  = MQ4V2/MQ4V2
+//   8  = MQ6V2/MQ6V2
+//   9  = MQ4V2/MQ6V1
+//   10 = MQ4V2/MQ2L
+//   11 = MQ4V2/MQ4V1
+//   12 = MQ4V1/MQ4V2
+//   13 = MQ4V2/MQ3L
+//   14 = MQ4V2/MFP4E8
+//   15 = MQ4V2/MFP3E8
+//   16 = MQ4V2/MFP2E8
+//   17 = MQ4V2/MQ6V2
+//   18 = MQ4V1/MQ6V2
+// Gate-side decode: 7,9,10,11,13,14,15,16,17 → MQ4V2; 12,18 → MQ4V1; 8 → MQ6V2.
+// Down-side decode: 7,12 → MQ4V2; 8,17,18 → MQ6V2; 9..11,13..16 → named down.
+// Side selected by x_row_div (gate_up: K_TOP>1, down: 1). Mapped to dec 0..8.
 //
 // CRITICAL (MQ2L/MQ3L tags 1 & 3): Per-lane REGISTER bilinear/trilinear
 // decomposition — never LDS broadcast. Each lane handles a different M-row
@@ -26,13 +45,16 @@
 //   down:    x_row_div = 1      → x_row = flat
 //
 // Dequant lifted verbatim from committed per-dtype grouped kernels:
-//   tag 0: gemm_hfq6g256_moe_grouped_wmma_k2.hip
-//   tag 1: gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip
-//   tag 2: gemm_hfq4g256_moe_grouped_wmma_k2.hip
-//   tag 3: gemm_mq3g256_lloyd_moe_grouped_wmma_k2.hip
+//   dec 0: gemm_hfq6g256_moe_grouped_wmma_k2.hip
+//   dec 1: gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip
+//   dec 2: gemm_hfq4g256_moe_grouped_wmma_k2.hip
+//   dec 3: gemm_mq3g256_lloyd_moe_grouped_wmma_k2.hip
+//   dec 7: gemm_mq4g256v2_moe_grouped_wmma_k2.hip   (dual-f16 header)
+//   dec 8: gemm_mq6g256v2_moe_grouped_wmma_k2.hip   (dual-f16 header)
 //
 // WMMA builtin: __builtin_amdgcn_wmma_f32_16x16x16_f16_w32 (gfx11 _w32).
 // Grid: [ceil(M/16), m_total/16]. Block: [32]. LDS: 0.
+
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8)))  float8_t;
@@ -104,7 +126,8 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
     const int*                __restrict__ sorted_slot_index,  // [m_total]
     const _Float16*           __restrict__ X_src,              // [n_rows × K]
     float*                    __restrict__ Y_grouped,          // [m_total × M]
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total,
+    int n_experts
 ) {
     const int tid = threadIdx.x;
     const int row_start = blockIdx.x * 16;
@@ -117,13 +140,42 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
     // beyond the live m_total (the dispatcher may launch up to
     // m_total_max/16 tiles to skip the m_total dtoh sync).
     const int expert_id = expert_tile_ids[tile_y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
 
     // BLOCK-UNIFORM tag read — all 32 threads in the block share one expert,
     // so this branch has zero warp divergence.
     const unsigned char tag = dtype_tags[expert_id];
+    // Pair tags 7..18 encode (gate, down). Resolve to effective decoder dec
+    // 0..8 for this launch. Tags 0..6 keep single-format meaning on both sides.
+    // gate_up: x_row_div = K_TOP > 1; down: x_row_div = 1.
+    const bool is_gate = (x_row_div > 1);
+    unsigned char dec;
+    if (tag <= 6u) {
+        dec = tag;
+    } else if (is_gate) {
+        // Gate-side: 8→MQ6V2; 12,18→MQ4V1; else MQ4V2 (7,9-11,13-17).
+        if (tag == 8u) dec = 8u;
+        else if (tag == 12u || tag == 18u) dec = 2u;
+        else dec = 7u;
+    } else {
+        // Down-side pair map (frozen contract).
+        if (tag == 7u || tag == 12u) dec = 7u;                 // MQ4V2
+        else if (tag == 8u || tag == 17u || tag == 18u) dec = 8u; // MQ6V2
+        else if (tag == 9u) dec = 0u;   // MQ6V1
+        else if (tag == 10u) dec = 1u;  // MQ2L
+        else if (tag == 11u) dec = 2u;  // MQ4V1
+        else if (tag == 13u) dec = 3u;  // MQ3L
+        else if (tag == 14u) dec = 4u;  // MFP4E8
+        else if (tag == 15u) dec = 5u;  // MFP3E8
+        else if (tag == 16u) dec = 6u;  // MFP2E8
+        else dec = tag; // unknown — no branch match
+    }
     // group_bytes MUST be computed before row_base (row_base depends on it).
-    const int group_bytes = (tag == 0) ? 200 : (tag == 1) ? 72 : (tag == 2) ? 136 : 112;
+    // E8 family (dec 4/5/6) builds its own header-aware pointers and ignores this.
+    const int group_bytes = (dec == 0 || dec == 8) ? 200
+                          : (dec == 1) ? 72
+                          : (dec == 2 || dec == 7) ? 136
+                          : 112;
 
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 
@@ -153,7 +205,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
     // Each branch is lifted verbatim from the matching per-dtype grouped kernel.
     // -------------------------------------------------------------------------
 
-    if (tag == 0) {
+    if (dec == 0) {
         // ----- MQ6 / HFQ6-G256 (200 B/group) --------------------------------
         // Source: gemm_hfq6g256_moe_grouped_wmma_k2.hip, lines 84–136.
         // Layout: 4 B scale + 4 B zero + 192 B packed 6-bit (16 values per K-tile
@@ -211,7 +263,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
             }
         }
 
-    } else if (tag == 1) {
+    } else if (dec == 1) {
         // ----- MQ2-Lloyd-G256 (72 B/group) -----------------------------------
         // Source: gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip, lines 85–146.
         // Layout: 8 B (4×fp16 codebook, ascending) + 64 B 2-bit packed.
@@ -271,7 +323,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
             }
         }
 
-    } else if (tag == 2) {
+    } else if (dec == 2) {
         // ----- MQ4 / HFQ4-G256 (136 B/group) --------------------------------
         // Source: gemm_hfq4g256_moe_grouped_wmma_k2.hip, lines 93–139.
         // Layout: 4 B scale + 4 B zero + 128 B 4-bit packed (2 uint32s per K-tile).
@@ -318,7 +370,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
             }
         }
 
-    } else if (tag == 3) {
+    } else if (dec == 3) {
         // ----- MQ3-Lloyd-G256 (112 B/group) ---------------------------------
         // Source: gemm_mq3g256_lloyd_moe_grouped_wmma_k2.hip, lines 96–166.
         // Layout: 16 B (8×fp16 codebook) + 96 B 3-bit packed (6 B per K-tile).
@@ -397,7 +449,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
                 acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_b, acc);
             }
         }
-    } else if (tag == 4) {
+    } else if (dec == 4) {
         // ----- mfp4-E8 (16 B row hdr + (K/32)*17 B; 136 B/group) ------------
         // Source: gemm_mfp4g32_e8_moe_grouped_wmma.gfx1151.hip (lines 101–131).
         // E8 carries a 16-byte row header (f16 row_scale) before the groups, so
@@ -435,7 +487,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
                 acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b, acc);
             }
         }
-    } else if (tag == 5) {
+    } else if (dec == 5) {
         // ----- mfp3-E8 (16 B row hdr + (K/32)*13 B; 104 B/group) ------------
         // Same structure as tag 4 but block_stride=13, group_stride=104,
         // codewords are 3 bytes each (narrow assembly read, no over-read).
@@ -475,7 +527,7 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
                 acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b, acc);
             }
         }
-    } else if (tag == 6) {
+    } else if (dec == 6) {
         // ----- mfp2-E8 (16 B row hdr + (K/32)*9 B; 72 B/group) -------------
         // Same structure as tag 4 but block_stride=9, group_stride=72,
         // codewords are 2 bytes each (narrow assembly read, no over-read).
@@ -511,6 +563,129 @@ extern "C" __global__ void gemm_mixed_moe_grouped_wmma_k2(
                 }
                 half16_t b = (xg != nullptr) ? *(const half16_t*)(xg + k_off) : zero_b;
                 acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b, acc);
+            }
+        }
+    } else if (dec == 7) {
+        // ----- MQ4G256V2 (136 B/group, dual-f16 header) ---------------------
+        // Source: gemm_mq4g256v2_moe_grouped_wmma_k2.hip.
+        // Layout: [0..2) s0 f16, [2..4) z0 f16, [4..6) s1 f16, [6..8) z1 f16,
+        //         [8..136) 128 B 4-bit nibbles (identical packing to V1).
+        // K-tiles 0..7 use (s0,z0); tiles 8..15 use (s1,z1). Pair (kt,kt+1)
+        // always stays inside one grid so the header is selected once per pair.
+        // V1 f32 header (dec 2) is wire-incompatible — do not collapse.
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* gp = row_base + g * 136;
+            const unsigned int hdr_lo = *(const unsigned int*)(gp);
+            const unsigned int hdr_hi = *(const unsigned int*)(gp + 4);
+            const _Float16 sc_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo & 0xFFFFu));
+            const _Float16 zp_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo >> 16));
+            const _Float16 sc_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi & 0xFFFFu));
+            const _Float16 zp_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi >> 16));
+            const _Float16* xg = (x_base != nullptr) ? (x_base + g * 256) : nullptr;
+
+            for (int kt = 0; kt < 16; kt += 2) {
+                const int k_off_a = kt * 16;
+                const int k_off_b = (kt + 1) * 16;
+
+                const bool upper = (k_off_a >= 128);
+                const _Float16 sc_h = upper ? sc_1 : sc_0;
+                const _Float16 zp_h = upper ? zp_1 : zp_0;
+
+                unsigned int pk0a = *(const unsigned int*)(gp + 8 + k_off_a / 2);
+                unsigned int pk1a = *(const unsigned int*)(gp + 8 + k_off_a / 2 + 4);
+                unsigned int pk0b = *(const unsigned int*)(gp + 8 + k_off_b / 2);
+                unsigned int pk1b = *(const unsigned int*)(gp + 8 + k_off_b / 2 + 4);
+
+                half16_t b_a, b_b;
+                if (xg != nullptr) {
+                    b_a = *(const half16_t*)(xg + k_off_a);
+                    b_b = *(const half16_t*)(xg + k_off_b);
+                } else {
+                    b_a = zero_b;
+                    b_b = zero_b;
+                }
+
+                half16_t a_a;
+                #define DQ(reg, i, pk, sh) reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
+                DQ(a_a, 0,  pk0a,  0); DQ(a_a, 1,  pk0a,  4); DQ(a_a, 2,  pk0a,  8); DQ(a_a, 3,  pk0a, 12);
+                DQ(a_a, 4,  pk0a, 16); DQ(a_a, 5,  pk0a, 20); DQ(a_a, 6,  pk0a, 24); DQ(a_a, 7,  pk0a, 28);
+                DQ(a_a, 8,  pk1a,  0); DQ(a_a, 9,  pk1a,  4); DQ(a_a, 10, pk1a,  8); DQ(a_a, 11, pk1a, 12);
+                DQ(a_a, 12, pk1a, 16); DQ(a_a, 13, pk1a, 20); DQ(a_a, 14, pk1a, 24); DQ(a_a, 15, pk1a, 28);
+
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc);
+
+                DQ(a_a, 0,  pk0b,  0); DQ(a_a, 1,  pk0b,  4); DQ(a_a, 2,  pk0b,  8); DQ(a_a, 3,  pk0b, 12);
+                DQ(a_a, 4,  pk0b, 16); DQ(a_a, 5,  pk0b, 20); DQ(a_a, 6,  pk0b, 24); DQ(a_a, 7,  pk0b, 28);
+                DQ(a_a, 8,  pk1b,  0); DQ(a_a, 9,  pk1b,  4); DQ(a_a, 10, pk1b,  8); DQ(a_a, 11, pk1b, 12);
+                DQ(a_a, 12, pk1b, 16); DQ(a_a, 13, pk1b, 20); DQ(a_a, 14, pk1b, 24); DQ(a_a, 15, pk1b, 28);
+                #undef DQ
+
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_b, acc);
+            }
+        }
+
+    } else if (dec == 8) {
+        // ----- MQ6G256V2 (200 B/group, dual-f16 header) ---------------------
+        // Source: gemm_mq6g256v2_moe_grouped_wmma_k2.hip.
+        // Layout: [0..2) s0 f16, [2..4) z0 f16, [4..6) s1 f16, [6..8) z1 f16,
+        //         [8..200) 192 B packed 6-bit (identical packing to V1).
+        // K-tiles 0..7 use (s0,z0); tiles 8..15 use (s1,z1).
+        // V1 f32 header (dec 0) is wire-incompatible — do not collapse.
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* gp = row_base + g * 200;
+            const unsigned int hdr_lo = *(const unsigned int*)(gp);
+            const unsigned int hdr_hi = *(const unsigned int*)(gp + 4);
+            const _Float16 sc_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo & 0xFFFFu));
+            const _Float16 zp_0 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_lo >> 16));
+            const _Float16 sc_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi & 0xFFFFu));
+            const _Float16 zp_1 = __builtin_bit_cast(_Float16, (unsigned short)(hdr_hi >> 16));
+            const _Float16* xg = (x_base != nullptr) ? (x_base + g * 256) : nullptr;
+
+            for (int kt = 0; kt < 16; kt += 2) {
+                const int k_off_a = kt * 16;
+                const int k_off_b = (kt + 1) * 16;
+
+                const bool upper = (k_off_a >= 128);
+                const _Float16 sc_h = upper ? sc_1 : sc_0;
+                const _Float16 zp_h = upper ? zp_1 : zp_0;
+
+                const unsigned char* wa = (const unsigned char*)(gp + 8 + kt * 12);
+                const unsigned char* wb = (const unsigned char*)(gp + 8 + (kt + 1) * 12);
+                // a3/c3: 3-byte narrow read — avoid 1 B past last group (same as dec 0).
+                unsigned int a0 = *(const unsigned int*)(wa);
+                unsigned int a1 = *(const unsigned int*)(wa + 3);
+                unsigned int a2 = *(const unsigned int*)(wa + 6);
+                unsigned int a3 = (unsigned int)wa[9] | ((unsigned int)wa[10] << 8) | ((unsigned int)wa[11] << 16);
+                unsigned int c0 = *(const unsigned int*)(wb);
+                unsigned int c1 = *(const unsigned int*)(wb + 3);
+                unsigned int c2 = *(const unsigned int*)(wb + 6);
+                unsigned int c3 = (unsigned int)wb[9] | ((unsigned int)wb[10] << 8) | ((unsigned int)wb[11] << 16);
+
+                half16_t b_a, b_b;
+                if (xg != nullptr) {
+                    b_a = *(const half16_t*)(xg + k_off_a);
+                    b_b = *(const half16_t*)(xg + k_off_b);
+                } else {
+                    b_a = zero_b;
+                    b_b = zero_b;
+                }
+
+                half16_t a_a;
+                #define DQ6(reg, i, dw, sh) reg[i] = sc_h * (_Float16)(float)(((dw) >> (sh)) & 63u) + zp_h
+                DQ6(a_a, 0,  a0, 0); DQ6(a_a, 1,  a0, 6); DQ6(a_a, 2,  a0, 12); DQ6(a_a, 3,  a0, 18);
+                DQ6(a_a, 4,  a1, 0); DQ6(a_a, 5,  a1, 6); DQ6(a_a, 6,  a1, 12); DQ6(a_a, 7,  a1, 18);
+                DQ6(a_a, 8,  a2, 0); DQ6(a_a, 9,  a2, 6); DQ6(a_a, 10, a2, 12); DQ6(a_a, 11, a2, 18);
+                DQ6(a_a, 12, a3, 0); DQ6(a_a, 13, a3, 6); DQ6(a_a, 14, a3, 12); DQ6(a_a, 15, a3, 18);
+
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_a, acc);
+
+                DQ6(a_a, 0,  c0, 0); DQ6(a_a, 1,  c0, 6); DQ6(a_a, 2,  c0, 12); DQ6(a_a, 3,  c0, 18);
+                DQ6(a_a, 4,  c1, 0); DQ6(a_a, 5,  c1, 6); DQ6(a_a, 6,  c1, 12); DQ6(a_a, 7,  c1, 18);
+                DQ6(a_a, 8,  c2, 0); DQ6(a_a, 9,  c2, 6); DQ6(a_a, 10, c2, 12); DQ6(a_a, 11, c2, 18);
+                DQ6(a_a, 12, c3, 0); DQ6(a_a, 13, c3, 6); DQ6(a_a, 14, c3, 12); DQ6(a_a, 15, c3, 18);
+                #undef DQ6
+
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_a, b_b, acc);
             }
         }
     }

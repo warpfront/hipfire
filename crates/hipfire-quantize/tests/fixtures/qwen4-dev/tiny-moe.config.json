@@ -1,0 +1,128 @@
+{
+  "architectures": [
+    "Qwen4ExpForConditionalGeneration"
+  ],
+  "dtype": "bfloat16",
+  "hipfire_profile": {
+    "developer_only": true,
+    "equation_source": "pinned-upstream",
+    "ffn": {
+      "intermediate_size": 8,
+      "kind": "moe",
+      "norm_topk_prob": true,
+      "num_experts": 3,
+      "shared_intermediate_size": 8,
+      "top_k": 2
+    },
+    "id": "tiny-moe",
+    "ple": {
+      "valid_rows": 18
+    }
+  },
+  "image_token_id": 31,
+  "model_type": "qwen4_exp",
+  "qwen4_ple": {
+    "head_offsets": [
+      0,
+      7
+    ],
+    "head_vocab_sizes": [
+      7,
+      11
+    ],
+    "multipliers": [
+      256496738022509279,
+      251627398771002343,
+      55314113489879221
+    ],
+    "padded_rows": 24,
+    "version": 1
+  },
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "dtype": "bfloat16",
+    "eos_token_id": 2,
+    "full_attention_interval": 2,
+    "hc_count": 2,
+    "hc_lowrank": 4,
+    "head_dim": 8,
+    "heads_per_ngram": 1,
+    "hidden_act": "silu",
+    "hidden_size": 16,
+    "indexer_budget": 4,
+    "indexer_compress_ratio": 2,
+    "indexer_head_dim": 4,
+    "indexer_kv_heads": 1,
+    "indexer_n_heads": 1,
+    "initializer_range": 0.02,
+    "layer_types": [
+      "linear_attention",
+      "full_attention"
+    ],
+    "linear_conv_kernel_dim": 2,
+    "linear_key_head_dim": 8,
+    "linear_num_key_heads": 1,
+    "linear_num_value_heads": 2,
+    "linear_value_head_dim": 8,
+    "make_ngram_vocab_size_divisible_by": 8,
+    "mamba_ssm_dtype": "float32",
+    "max_position_embeddings": 64,
+    "model_type": "qwen4_exp_text",
+    "moe_intermediate_size": 8,
+    "mtp": {
+      "hybrid": true,
+      "layer_types": [
+        "full_attention"
+      ],
+      "num_hidden_layers": 1,
+      "rope_theta": 10000.0
+    },
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": false,
+    "ngram_size": 3,
+    "ngram_vocab_size_base": 7,
+    "norm_topk_prob": true,
+    "num_attention_heads": 2,
+    "num_experts": 3,
+    "num_experts_per_tok": 2,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 1,
+    "output_gate_type": "sigmoid",
+    "ple_conv_kernel_size": 2,
+    "ple_embed_dim": 16,
+    "ple_layer_ids": [
+      1
+    ],
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "partial_rotary_factor": 0.5,
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    },
+    "seed": 1234,
+    "shared_expert_intermediate_size": 8,
+    "split_ngram_parts": 1,
+    "tie_word_embeddings": false,
+    "use_cache": true,
+    "vocab_size": 32
+  },
+  "tie_word_embeddings": false,
+  "video_token_id": 30,
+  "vision_config": {
+    "depth": 1,
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 8,
+    "in_channels": 3,
+    "intermediate_size": 8,
+    "model_type": "qwen4_exp_vision",
+    "num_heads": 2,
+    "num_position_embeddings": 4,
+    "out_hidden_size": 16,
+    "patch_size": 2,
+    "spatial_merge_size": 1,
+    "temporal_patch_size": 1
+  },
+  "vision_end_token_id": 28,
+  "vision_start_token_id": 29
+}

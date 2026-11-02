@@ -7,6 +7,7 @@
 | `HFP4G32` | 21 | **shipped / ref-pinned** — encoder, GEMV, WMMA prefill on RDNA3/4 |
 | `MFP4G32` | 24 | **shipped / ref-pinned** — HFP4G32 + offline FWHT (MQ4-class drop-in) |
 | `MFP4G32Lloyd` / `MFP4G32P` / `MFP4G32E8` (+ SoA) / `MFP3G32E8` / `MFP2G32E8` | 32–37 | **shipped / ref-pinned** encoders + selective kernels; experimental opt-in qualifier — not CLI defaults |
+| `MFP4G32E8G128` | 42 | wire id assigned (register: arch-loaded); byte layout identical to qt 34, 128-wide FWHT segmentation; loader geometry owned by the emitting model family; no `--format` alias in `hipfire-quantize` — not a CLI default |
 | HFP4G16 / G64 / MX / NV aliases, online rotation (`MFP4G32R`), HFP8 | see ID table | **planned** (unbuilt) or **reassigned** wire slots — do not claim shipped |
 
 Broader production index: [`docs/QUANTIZATION.md`](../QUANTIZATION.md).
@@ -36,6 +37,7 @@ HFP4G32   — E2M1 + UE8M0 g32 + FP16 row scale       canonical (qt 21)
 MFP4G32   — HFP4G32 + offline FWHT-256              drop-in MQ4-class (qt 24)
 MFP4G32P  — MFP4 with E4M3 (non-PoT) block scale    experimental (qt 33)
 MFP4G32E8 — E8 lattice codewords in MFP4+P frame    experimental (qt 34+)
+MFP4G32E8G128 — qt 34 bytes, 128-wide FWHT groups     experimental (qt 42)
 MFP4G32Lloyd — per-tensor 16-entry Lloyd codebook   experimental (qt 32)
 
 # Reserved / not product defaults
@@ -180,6 +182,7 @@ signs1/signs2) unchanged.
 | 35 | `MFP4G32E8SOA` | **shipped / ref-pinned** impl; experimental opt-in |
 | 36 | `MFP3G32E8` | **shipped / ref-pinned** impl; experimental cold-tier opt-in |
 | 37 | `MFP2G32E8` | **shipped / ref-pinned** impl; experimental cold-tier opt-in |
+| 42 | `MFP4G32E8G128` | arch-loaded (see [`qt-register.txt`](qt-register.txt)); wire layout byte-identical to qt 34, rotation group 128 instead of 256 |
 
 **Current reserved wire IDs:** 23 and 25–27. IDs 22, 29, and 30 were reassigned.
 Planned online-R / HFP8 variants have no reserved ID beyond this table.

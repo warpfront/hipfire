@@ -6,8 +6,9 @@ use crate::types::*;
 
 /// Register all MoE kernel variants into the registry.
 ///
-/// Covers 4 kernel keys: MoeIndexedGateUpLloyd, MoeIndexedDownLloyd,
-/// MoeGroupedGemm, and MoeGroupedI8.
+/// Covers 6 kernel keys: MoeIndexedGateUpLloyd, MoeIndexedDownLloyd,
+/// MoeGroupedGemm, MoeGroupedI8, MoeGroupedFp8B128Bf16Mfma and
+/// DequantFp8B128ToBf16.
 ///
 /// # Prefill coverage (Ship 4.2)
 ///
@@ -54,6 +55,30 @@ pub fn populate(registry: &mut KernelRegistry) {
         arch_required: ArchPredicate::HasWmma,
         // Ship 4.2: same documentation-only pattern as MoeGroupedGemm above.
         shape_gate: Some(ShapePredicate::BatchGt(1)),
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+
+    // qt=55 FP8E4M3B128 grouped MoE GEMM (gfx942 BF16 MFMA). Same
+    // documentation-only role as MoeGroupedGemm: the sealed Qwen4 route calls
+    // `Gfx942Device::gemm_fp8b128_moe_grouped_bf16mfma` directly. No shape
+    // gate on purpose — decode (one live slot per tile) and prefill share the
+    // kernel so a row's bytes do not depend on the batch.
+    registry.register(KernelVariant {
+        key: KernelKey::MoeGroupedFp8B128Bf16Mfma,
+        arch_required: ArchPredicate::IsGfx942,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+
+    // qt=55 -> BF16 model-lifetime decode (gfx942), Tier C / oracle twin.
+    registry.register(KernelVariant {
+        key: KernelKey::DequantFp8B128ToBf16,
+        arch_required: ArchPredicate::IsGfx942,
+        shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,
         tile: TileImpl::None,

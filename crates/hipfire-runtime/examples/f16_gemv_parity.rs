@@ -29,7 +29,7 @@
 //! genuinely broken kernel (e.g. the old ~10x blowup) still reports
 //! errors >> 1.
 //!
-//! Run: cargo run --release -p hipfire-runtime --example f16_gemv_parity
+//! Run: cargo run --release -p hipfire-runtime --features lab --example f16_gemv_parity
 //! Bench section: append `--bench` for 200-iter us/call timings.
 
 fn f32_to_f16_bits(v: f32) -> u16 {
@@ -206,6 +206,9 @@ fn main() {
                 row_stride: 0,
                 rotation: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             };
             gemv.run_auto(&ctx, &mut gpu, &wr, &x_t, &y_t)
                 .expect("run_auto");

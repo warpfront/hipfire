@@ -6,17 +6,38 @@ license.workspace = true
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
+hipfire-cpu = { path = "../hipfire-cpu" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
+smallvec = "1.15.2"
+
+[dev-dependencies]
+# Worker-count determinism tests build their own pools.
+rayon.workspace = true
 
 [features]
 default = []
-test-utils = []
-new-rotation = []
+# Tools-only S1 validation surface (CPU byte ledger): existing feature only,
+# never a new feature. The arch `lab` feature enables this.
+test-utils = ["rdna-compute/lab"]
 new-gemv = []
 new-gemm = []
 new-fused-qkv = []
 new-attention = []
 new-moe = []
+serve-fault-inject = []
 from-hip-error = []
 deltanet = ["rdna-compute/deltanet"]
+# Lab examples (CPU microbenchmarks); off by default.
+lab = []
+flash-attn-ck = ["rdna-compute/flash-attn-ck"]
+# Developer-only observer channel for the `moe-oracle` report (router route label).
+moe-oracle = []
+
+[[example]]
+name = "d2_cpu_arm_bench"
+required-features = ["lab"]
+
+[[example]]
+name = "d2_mapped_return_pilot"
+required-features = ["lab"]

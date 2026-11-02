@@ -29,7 +29,7 @@ extern "C" __global__ void gemv_hfq4g256_moe_ninepath_d3(
     const float* __restrict__ x,                         // [K]
     float* __restrict__ y_gate,                          // [8 × mi]
     float* __restrict__ y_up,                            // [8 × mi]
-    int mi, int K
+    int mi, int K, int n_experts
 ) {
     constexpr int RPB = 8;
     __shared__ float xs[2048];
@@ -47,6 +47,16 @@ extern "C" __global__ void gemv_hfq4g256_moe_ninepath_d3(
     const int warp = tid >> 5;   // 0..7 = krank
     const int lane = tid & 31;
     const int expert_id = topk_indices[warp];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (lane == 0) {
+            const int r0_inv = blockIdx.x * RPB;
+            for (int r = 0; r < RPB; r++) {
+                y_gate[warp * mi + r0_inv + r] = 0.0f;
+                y_up[warp * mi + r0_inv + r] = 0.0f;
+            }
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const int groups_per_row = K / 256;

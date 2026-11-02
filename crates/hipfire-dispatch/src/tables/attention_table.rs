@@ -42,6 +42,18 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::Always,
             Some(ShapePredicate::BatchEq(1)),
         ),
+        // Native fp8 E4M3 write (gfx1201-only: device builtins are
+        // gfx1201-guarded; any other arch fails closed at resolve).
+        (
+            KernelKey::KvWriteFp8E4m3,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::KvWriteBf16,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
         (
             KernelKey::KvWriteF32,
             ArchPredicate::Always,
@@ -117,6 +129,17 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::Always,
             Some(ShapePredicate::BatchGt(1)),
         ),
+        // Native fp8 E4M3 batched write (gfx1201-only).
+        (
+            KernelKey::KvWriteFp8E4m3Batched,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        (
+            KernelKey::KvWriteBf16Batched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
     ];
     for (key, arch, shape) in kv_write_batched {
         registry.register(KernelVariant {
@@ -172,7 +195,35 @@ pub fn populate(registry: &mut KernelRegistry) {
             Some(ShapePredicate::BatchEq(1)),
         ),
         (
+            KernelKey::AttnFlashBf16Windowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
             KernelKey::AttnQ8_0Kv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        // Native fp8 E4M3 decode (gfx1201-only).
+        (
+            KernelKey::AttnFp8E4m3Kv,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashFp8E4m3,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        // Flat-bf16 non-windowed (Qwen dense): same portable tile kernels as
+        // maple's windowed keys, hence `Always` like those registrations.
+        (
+            KernelKey::AttnBf16Kv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashBf16,
             ArchPredicate::Always,
             Some(ShapePredicate::BatchEq(1)),
         ),
@@ -319,6 +370,23 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::Always,
             Some(ShapePredicate::BatchGt(1)),
         ),
+        (
+            KernelKey::AttnBf16KvBatchedMaskedWindowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        // Native fp8 E4M3 batched prefill / tree-verify (gfx1201-only).
+        (
+            KernelKey::AttnFp8E4m3KvBatchedMasked,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        // Flat-bf16 non-windowed batched (Qwen dense, window=0).
+        (
+            KernelKey::AttnBf16KvBatchedMasked,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
     ];
     for (key, arch, shape) in attn_batched {
         registry.register(KernelVariant {
@@ -386,7 +454,17 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     // No scalar floor for F16 — fall to AttnFullF32 at caller level.
 
-    // AttnFullF32: non-causal, F32 K/V
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF32,
+        arch_required: ArchPredicate::HasWmmaW32,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::BatchEq(16),
+            ShapePredicate::HeadDimEq(128),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashN64,
+    });
     registry.register(KernelVariant {
         key: KernelKey::AttnFullF32,
         arch_required: ArchPredicate::HasWmma,

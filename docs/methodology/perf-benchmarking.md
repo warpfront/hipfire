@@ -32,6 +32,7 @@ number is exploratory only.
 | GPU | Product, gfx arch, PCI/visible-device selection, ROCm/driver identity |
 | Config | KV mode, context, gen length, sampler/seed, graph/spec flags, every route-affecting `HIPFIRE_*` (set or unset) |
 | Policy | Fresh-process vs resident-daemon; warmup policy; run order; run count |
+| Power / memory | Per measured run: the `hipfire bench` `power` fields (clocks, socket/gfx power, temperatures, throttle residency, perf level, OD_SCLK, VRAM/GTT and host memory), plus host power limits — see [GPU power and memory state](#gpu-power-and-memory-state) |
 
 Hash basis is **md5** for model, prompt, and binary — one convention
 across harness, ledger, and report. Do not mix sha256 on one side and
@@ -51,6 +52,33 @@ single-blank vs PEP-8 triple-blank on 27B). Rules:
 4. Engine entry may collapse `\n{3,}` → `\n\n` when
    `prompt_normalize=true`. Paths that bypass engine entry still need
    fixture discipline.
+
+## GPU power and memory state
+
+A throughput number is only comparable with another taken under the same
+power, thermal and memory configuration. Record it for every kept claim:
+
+1. **Per measured run:** keep the `power` and `power_device` objects of
+   `hipfire bench --json` with the result (fields:
+   [CLI.md § Bench power and memory state](../CLI.md#bench-power-and-memory-state)).
+   Other harnesses record the same fields from the same world-readable
+   sysfs files: `gpu_metrics`, the amdgpu hwmon, k10temp `Tctl`,
+   `power_dpm_force_performance_level`, `pp_od_clk_voltage`,
+   `mem_info_{vram,gtt}_{total,used}` and `/proc/meminfo`.
+2. **Per session:** the host power limits, which sysfs does not expose on
+   APUs (on Strix Halo, `ryzenadj --info` STAPM/fast/slow/APU limits, as
+   root), the BIOS version and UMA carve-out setting, and the idle time
+   and preceding load before the first run.
+3. **A throttle warning is a confounder, not noise.** A run whose
+   `throttle_pct` exceeds the bench's 10 % warning is power- or
+   thermal-limited. Compare it only against runs with matching limits and
+   residencies, and treat a change in `thm_*` residency between arms as a
+   reason to re-measure. Heat soak alone moved burst prefill 2–5 % on
+   Strix Halo between runs minutes apart (HaloPower study, 2026-10-03,
+   `qcal/release-0.4.1/power/report.md` §4).
+4. **VRAM carve-out vs GTT:** on an APU, a different `vram_total_mib` or
+   `gtt_total_mib` is a different configuration; do not mix samples
+   across them.
 
 ## Warmup (DPM + JIT)
 
@@ -119,6 +147,8 @@ Route selection for “must I run X?” stays in
 
 On thinking models, probe TTFT can include the full think phase when
 visible tokens are stripped — that is not prefill. Prefer daemon fields.
+
+`hipfire bench --ttft` reports the competitor-comparable prefill number: client-side wall clock from generate request send to first streamed token with `max_tokens=1` and thinking off, plus `prompt_tokens / TTFT` (median/stdev over `--runs` after `--warmups`, prompt from `--prompt-file`, identity in the `ttft` JSON block). It differs from `--matrix`, which drives synthetic `bench_prefill` device-timer probes outside the generate path; cite the `--ttft` number when comparing against HTTP-client TTFT figures such as radiance's `prompt_tokens/TTFT p50`.
 
 ## Noise and confounders
 

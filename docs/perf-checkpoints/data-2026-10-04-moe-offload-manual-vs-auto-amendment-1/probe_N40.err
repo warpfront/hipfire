@@ -1,0 +1,10 @@
+[gpu-lock] directory=/tmp/hipfire-locks
+[hipfire] host-memory reclaim mitigation armed: GPU_PINNED_MIN_XFER_SIZE=100000
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-GPU-0c088c33052923ba.lock
+[gpu-lock] reserved /tmp/hipfire-locks/gpu-pci-0000:14:00.0.lock
+[devices] logical 0: HIP gfx1201 0000:03:00.0 = index 0 GPU-0c088c33052923ba
+[devices] logical 1: HIP gfx1036 0000:14:00.0 = index 1 pci-0000:14:00.0
+GPU dev 0: gfx1201 (17.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: /home/avery/.hipfire_kernels/gfx1201
+  KV cache: requested mode=q8, effective K=q8, effective V=q8
+hipfire: daemon error: [gpu retryable=false rolled_back=false attempt=0] load failed: load refused: this placement needs 18827 MiB of device weights but only 13067 MiB is available after the KV reservation and the prefill floor (5760 MiB over); lower memory.max_seq, or use a smaller quantization. GPU: gfx1201 (16152 MB free / 16304 MB total)

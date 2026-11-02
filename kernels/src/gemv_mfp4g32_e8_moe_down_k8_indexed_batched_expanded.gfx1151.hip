@@ -93,7 +93,7 @@ extern "C" __global__ void gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
     const int*   __restrict__ topk_indices,              // [N × K_TOP]
     const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
     float*       __restrict__ expert_outputs,            // [N × K_TOP × M] (pure store)
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -103,6 +103,11 @@ extern "C" __global__ void gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded(
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0)
+            expert_outputs[((long long)bid * K_TOP + krank) * (long long)M + row] = 0.0f;
+        return;
+    }
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + ((long long)bid * K_TOP + krank) * K;
 

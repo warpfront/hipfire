@@ -1,0 +1,16 @@
+{
+  "symbol": "fused_qkv_mq4g256v2_g0_group",
+  "start_label": null,
+  "end_label": null,
+  "counts": {},
+  "forbidden": [
+    "scratch_*"
+  ],
+  "vgpr_max": 32,
+  "sgpr_max": 16,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 0,
+  "group_segment_fixed_bytes": 0
+}

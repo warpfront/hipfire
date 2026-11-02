@@ -1,0 +1,12 @@
+{
+  "symbol": "gemm_mq4g256v2_residual_iu4_pm_set_gfx1100",
+  "rules": [
+    {"name": "bar.post_wait", "after": "s_barrier"},
+    {"name": "epoch", "before": "global_load_u16 v149"},
+    {"name": "pass", "before": "v_wmma_i32_16x16x16_iu4 v[0:7], v[104:105], v[112:113], v[96:103]"},
+    {"name": "fold", "before": "v_dual_mul_f32 v138, v144, v128"},
+    {"name": "stage", "before": "v_xor_b32_e32 v150,"},
+    {"name": "bar.pre_signal", "before": "s_barrier"},
+    {"name": "epilogue", "label": ".Lv2c_epilogue"}
+  ]
+}

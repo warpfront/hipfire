@@ -1,0 +1,12 @@
+{
+  "symbol": "gemm_mq4g256v2_fp8_silu_row_b1",
+  "rules": [
+    {"name": "kblock", "before": "s_add_co_i32 s90, s94, s85"},
+    {"name": "w0.pre", "before": "s_wait_loadcnt_dscnt", "first_after": "s_add_co_i32 s90, s94, s85"},
+    {"name": "w0.post", "after": "s_wait_loadcnt_dscnt", "first_after": "s_add_co_i32 s90, s94, s85"},
+    {"name": "bar.pre_signal", "before": "s_barrier_signal"},
+    {"name": "bar.post_signal", "after": "s_barrier_signal"},
+    {"name": "bar.post_wait", "after": "s_barrier_wait"},
+    {"name": "epilogue", "label": ".Lfp8_ratio_256x128x8_row_silu_epilogue"}
+  ]
+}

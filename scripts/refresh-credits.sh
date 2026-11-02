@@ -66,18 +66,41 @@ if ! gh auth status >/dev/null 2>&1; then
   exit 0
 fi
 
+TMP_MERGED="$( mktemp -t hipfire-credits-merged.XXXXXX )"
+TMP_CLOSED="$( mktemp -t hipfire-credits-closed.XXXXXX )"
 TMP_PRS="$( mktemp -t hipfire-credits-prs.XXXXXX )"
 TMP_BLOCK="$( mktemp -t hipfire-credits-block.XXXXXX )"
 TMP_OUT="$( mktemp -t hipfire-credits-out.XXXXXX )"
-trap 'rm -f "$TMP_PRS" "$TMP_BLOCK" "$TMP_OUT"' EXIT
+trap 'rm -f "$TMP_MERGED" "$TMP_CLOSED" "$TMP_PRS" "$TMP_BLOCK" "$TMP_OUT"' EXIT
 
 if ! gh pr list \
     --state merged \
     --base master \
     --limit 200 \
     --json number,headRefName,author,title,mergedAt \
-    > "$TMP_PRS"; then
-  die "gh pr list failed (non-zero exit). aborting refresh."
+    > "$TMP_MERGED"; then
+  die "gh pr list --state merged failed (non-zero exit). aborting refresh."
+fi
+
+# A PR manually closed before its exact head reaches master cannot be reopened
+# or marked merged through GitHub's API ("These commits are already merged").
+# Maintainers apply `merged-via-master` only after verifying the head commit is
+# an ancestor of master. Include those visibly-labelled PRs in durable credits.
+if ! gh pr list \
+    --state closed \
+    --base master \
+    --label merged-via-master \
+    --limit 200 \
+    --json number,headRefName,author,title,closedAt \
+    > "$TMP_CLOSED"; then
+  die "gh pr list --state closed --label merged-via-master failed. aborting refresh."
+fi
+
+if ! jq -s '
+    .[0] + (.[1] | map(.mergedAt = .closedAt))
+    | unique_by(.number)
+  ' "$TMP_MERGED" "$TMP_CLOSED" > "$TMP_PRS"; then
+  die "failed to combine merged and merged-via-master PRs."
 fi
 
 if [[ ! -s "$TMP_PRS" ]]; then
@@ -92,7 +115,7 @@ fi
 # brace-block would otherwise emit only the two sentinels, which the
 # splice below would then write back, wiping the contributors section.
 TMP_JQ="$( mktemp -t hipfire-credits-jq.XXXXXX )"
-trap 'rm -f "$TMP_PRS" "$TMP_BLOCK" "$TMP_OUT" "$TMP_JQ"' EXIT
+trap 'rm -f "$TMP_MERGED" "$TMP_CLOSED" "$TMP_PRS" "$TMP_BLOCK" "$TMP_OUT" "$TMP_JQ"' EXIT
 
 if ! jq -r --arg owner "$OWNER_LOGIN" '
     map(select(.author.login != $owner))

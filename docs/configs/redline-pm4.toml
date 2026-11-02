@@ -32,5 +32,4 @@ pm4_dynamic_grid = false
 gfx1151_initiator = "legacy"
 gfx1151_interleave = "inherit"
 gfx1151_resource_limits = "legacy"
-gfx1151_cu_count = "all"
 gfx1151_entry_acquire = "system"

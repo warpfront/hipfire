@@ -1,0 +1,442 @@
+[
+ {
+  "name": "think_on_user",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "tools": null,
+  "enable_thinking": true,
+  "expected": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "think_off_user",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hello"
+   }
+  ],
+  "tools": null,
+  "enable_thinking": false,
+  "expected": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+ },
+ {
+  "name": "think_on_system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are helpful.  "
+   },
+   {
+    "role": "user",
+    "content": "  Hi there\n"
+   }
+  ],
+  "tools": null,
+  "enable_thinking": true,
+  "expected": "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "think_off_system",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are helpful."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null,
+  "enable_thinking": false,
+  "expected": "<|im_start|>system\nYou are helpful.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+ },
+ {
+  "name": "tools_think_on",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be terse."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Seoul?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get weather for a city. 날씨 조회",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "add",
+     "description": "Add numbers",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ]
+     }
+    }
+   }
+  ],
+  "enable_thinking": true,
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather for a city. 날씨 조회\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"integer\"}, \"b\": {\"type\": \"integer\"}}, \"required\": [\"a\", \"b\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe terse.<|im_end|>\n<|im_start|>user\nWeather in Seoul?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tools_no_system_think_off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Seoul?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get weather for a city. 날씨 조회",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "add",
+     "description": "Add numbers",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ]
+     }
+    }
+   }
+  ],
+  "enable_thinking": false,
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather for a city. 날씨 조회\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"integer\"}, \"b\": {\"type\": \"integer\"}}, \"required\": [\"a\", \"b\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWeather in Seoul?<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+ },
+ {
+  "name": "multi_turn_reasoning_field",
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4",
+    "reasoning_content": "Simple arithmetic.\n"
+   },
+   {
+    "role": "user",
+    "content": "And 3+3?"
+   }
+  ],
+  "tools": null,
+  "enable_thinking": true,
+  "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\nSimple arithmetic.\n</think>\n\n4<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "multi_turn_inline_think",
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "<think>\nadd them\n</think>\n\nIt is 4."
+   },
+   {
+    "role": "user",
+    "content": "thanks"
+   }
+  ],
+  "tools": null,
+  "enable_thinking": false,
+  "expected": "<|im_start|>user\n2+2?<|im_end|>\n<|im_start|>assistant\n<think>\nadd them\n</think>\n\nIt is 4.<|im_end|>\n<|im_start|>user\nthanks<|im_end|>\n<|im_start|>assistant\n<think></think>\n\n"
+ },
+ {
+  "name": "multi_turn_no_reasoning",
+  "messages": [
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "assistant",
+    "content": "b"
+   },
+   {
+    "role": "user",
+    "content": "c"
+   },
+   {
+    "role": "assistant",
+    "content": "d"
+   },
+   {
+    "role": "user",
+    "content": "e"
+   }
+  ],
+  "tools": null,
+  "enable_thinking": true,
+  "expected": "<|im_start|>user\na<|im_end|>\n<|im_start|>assistant\n<think></think>\n\nb<|im_end|>\n<|im_start|>user\nc<|im_end|>\n<|im_start|>assistant\n<think></think>\n\nd<|im_end|>\n<|im_start|>user\ne<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_history",
+  "messages": [
+   {
+    "role": "system",
+    "content": "sys"
+   },
+   {
+    "role": "user",
+    "content": "Weather in Seoul and 1+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "Let me check.",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": {
+       "city": "서울",
+       "unit": "celsius"
+      }
+     },
+     {
+      "name": "add",
+      "arguments": {
+       "a": 1,
+       "b": 2,
+       "meta": {
+        "k": [
+         1,
+         "x",
+         null,
+         true
+        ],
+        "u": "é"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "{\"temp\": 21}"
+   },
+   {
+    "role": "tool",
+    "content": "3"
+   },
+   {
+    "role": "assistant",
+    "content": "It is 21C and 3."
+   },
+   {
+    "role": "user",
+    "content": "ok"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get weather for a city. 날씨 조회",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "add",
+     "description": "Add numbers",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ]
+     }
+    }
+   }
+  ],
+  "enable_thinking": true,
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather for a city. 날씨 조회\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"integer\"}, \"b\": {\"type\": \"integer\"}}, \"required\": [\"a\", \"b\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nsys<|im_end|>\n<|im_start|>user\nWeather in Seoul and 1+2?<|im_end|>\n<|im_start|>assistant\n<think></think>\n\nLet me check.\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\n서울\n</parameter>\n<parameter=unit>\ncelsius\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=add>\n<parameter=a>\n1\n</parameter>\n<parameter=b>\n2\n</parameter>\n<parameter=meta>\n{\"k\": [1, \"x\", null, true], \"u\": \"é\"}\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\": 21}\n</tool_response>\n<tool_response>\n3\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>\n\nIt is 21C and 3.<|im_end|>\n<|im_start|>user\nok<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "name": "tool_history_reasoning_empty_content",
+  "messages": [
+   {
+    "role": "user",
+    "content": "go"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "think first",
+    "tool_calls": [
+     {
+      "name": "add",
+      "arguments": {
+       "a": 1,
+       "b": 2
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "3"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get weather for a city. 날씨 조회",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string",
+        "description": "City name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "add",
+     "description": "Add numbers",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "a": {
+        "type": "integer"
+       },
+       "b": {
+        "type": "integer"
+       }
+      },
+      "required": [
+       "a",
+       "b"
+      ]
+     }
+    }
+   }
+  ],
+  "enable_thinking": true,
+  "expected": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get weather for a city. 날씨 조회\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\", \"description\": \"City name\"}, \"unit\": {\"type\": \"string\", \"enum\": [\"celsius\", \"fahrenheit\"]}}, \"required\": [\"city\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"add\", \"description\": \"Add numbers\", \"parameters\": {\"type\": \"object\", \"properties\": {\"a\": {\"type\": \"integer\"}, \"b\": {\"type\": \"integer\"}}, \"required\": [\"a\", \"b\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\ngo<|im_end|>\n<|im_start|>assistant\n<think>\nthink first\n</think>\n\n<tool_call>\n<function=add>\n<parameter=a>\n1\n</parameter>\n<parameter=b>\n2\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n3\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]

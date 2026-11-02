@@ -1,0 +1,1 @@
+HOME=/tmp/hipfire-g4-dots-home HIPFIRE_LOCAL=1 HIPFIRE_NO_REGISTRY_FETCH=1 HIPFIRE_DAEMON_BIN=/tmp/hipfire-g4-e786-target/release/daemon /tmp/hipfire-g4-e786-target/release/hipfire run /home/bjoern/.hipfire/models/dots-ocr.q8.hfq --image benchmarks/images/dots_ocr_smoke_001.jpg --max-tokens 128 --no-stream -j "Extract the text."

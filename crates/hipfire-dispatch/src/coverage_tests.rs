@@ -27,7 +27,7 @@
 //! #397 Phase-0.4 should adopt — a single coverage gate over (op × dtype × arch).
 
 use crate::context::DispatchCtx;
-use crate::families::moe::{MoeDtypes, MoeResolution};
+use crate::families::moe::{MoeDtypes, MoeResolution, MoeSharedDtypes};
 use crate::types::*;
 use rdna_compute::DType::{self, *};
 
@@ -197,19 +197,105 @@ const FLEET: &[OpUse] = &[
         dtype: MQ6G256,
         archs: &["gfx1200", "gfx1201"],
     },
+    // ── MQ4G256V2 / MQ6G256V2 (qt44/qt47 dual-half): dense residual + prerotated ──
+    // Plain role is satisfied via prerotated (V2 has no KernelKey::for_gemv Plain arm;
+    // rotation is external and run_auto selects Prerotated). Residual/Swiglu are fused.
+    OpUse {
+        model: "ornith1.5-35b-a3b.mq4v2",
+        role: Role::Plain,
+        dtype: MQ4G256V2,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "ornith1.5-35b-a3b.mq4v2",
+        role: Role::Residual,
+        dtype: MQ4G256V2,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "ornith1.5-35b-a3b.mq4v2",
+        role: Role::SwigluResidual,
+        dtype: MQ4G256V2,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.5-moe.mq6v2",
+        role: Role::Plain,
+        dtype: MQ6G256V2,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.5-moe.mq6v2",
+        role: Role::Residual,
+        dtype: MQ6G256V2,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.5-moe.mq6v2",
+        role: Role::SwigluResidual,
+        dtype: MQ6G256V2,
+        archs: WAVE32,
+    },
+    // RDNA4 anchors — V2 dual-half must not re-acquire a gfx11-only gate.
+    OpUse {
+        model: "ornith-mq4v2-rdna4",
+        role: Role::Plain,
+        dtype: MQ4G256V2,
+        archs: &["gfx1200", "gfx1201"],
+    },
+    OpUse {
+        model: "qwen-mq6v2-rdna4",
+        role: Role::Plain,
+        dtype: MQ6G256V2,
+        archs: &["gfx1200", "gfx1201"],
+    },
+    // ── MQ4G256V2Lloyd (qt52): same dual-half wire + per-tensor Lloyd LUT ──
+    // Plain/residual/swiglu share the V2 prerotated GEMV keys; fused QKV/QKVZA/
+    // GateUp have dedicated Always-gated Lloyd keys (see mqv2_fused test).
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::Plain,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::Residual,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::SwigluResidual,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    // RDNA4 anchors — Lloyd V2 must not re-acquire a gfx11-only gate.
+    OpUse {
+        model: "qwen-mq4v2-lloyd-rdna4",
+        role: Role::Plain,
+        dtype: MQ4G256V2Lloyd,
+        archs: &["gfx1200", "gfx1201"],
+    },
 ];
 
 /// Does the forward lowering for (role, dtype) have ANY dispatch plan (so it
 /// cannot hit an `UnsupportedVariant` panic)? Mirrors the real lowering:
-/// - Plain          → needs a plain GEMV.
-/// - Residual       → fused `gemv_*_residual` kernel OR plain-GEMV-into-temp + add.
-/// - SwigluResidual → fused swiglu-residual kernel OR plain-GEMV fallback.
+/// - Plain          → plain GEMV OR prerotated (V2 has no Plain arm).
+/// - Residual       → fused `gemv_*_residual` kernel OR plain/prerot fallback.
+/// - SwigluResidual → fused swiglu-residual kernel OR plain/prerot fallback.
 fn has_dispatch_plan(role: Role, dtype: DType) -> bool {
     let plain = KernelKey::for_gemv(dtype, GemvVariant::Plain, false).is_ok();
+    // V2 MQ formats (and other prerotated-only dtypes) have no Plain GEMV key —
+    // rotation is external and run_auto selects Prerotated. A Plain role is still
+    // dispatchable when that path exists.
+    let prerot = KernelKey::for_gemv_prerotated(dtype).is_ok();
     match role {
-        Role::Plain => plain,
-        Role::Residual => KernelKey::for_gemv_residual(dtype).is_ok() || plain,
-        Role::SwigluResidual => KernelKey::for_gemv_swiglu_residual(dtype).is_ok() || plain,
+        Role::Plain => plain || prerot,
+        Role::Residual => KernelKey::for_gemv_residual(dtype).is_ok() || plain || prerot,
+        Role::SwigluResidual => {
+            KernelKey::for_gemv_swiglu_residual(dtype).is_ok() || plain || prerot
+        }
     }
 }
 
@@ -304,17 +390,18 @@ fn confirmed_oproj_dtypes_have_a_plan() {
 
 /// LAYER 1d — MoE CPU-top-K fallback coverage (catches the #393 regression).
 /// `run_moe_decode`'s GPU-top-K fast path only serves `k == 8` MoE layers whose
-/// routed experts are `{MQ4G256, MQ6G256, ParoQ4G128}`. Every OTHER MoE layer
-/// (`k != 8`, or a routed dtype like Q8_0) MUST take the generic CPU-top-K
-/// per-expert fallback — #393 deleted that fallback so those layers hit
+/// routed experts are indexable — today `{MQ4G256, MQ4G256V2, MQ6G256,
+/// MQ6G256V2, ParoQ4G128, …}`. Every OTHER MoE layer (`k != 8`, or a routed
+/// dtype like Q8_0) MUST take the generic CPU-top-K per-expert fallback —
+/// #393 deleted that fallback so those layers hit
 /// `UnsupportedVariant{cpu-topk-fallback}` and HARD-PANIC on decode.
 ///
 /// GPU-free assertion in two parts, mirroring the runtime guarantees:
 ///   (a) The eligibility lattice routes these layers to the fallback, NOT the
 ///       k8 indexed path: `MoeResolution::resolve(..).use_gpu_topk == false`.
 ///   (b) The fallback's per-expert loop dispatches gate_up + down through
-///       `GemvFamily::run_auto`, so the routed dtype MUST have a plain-GEMV
-///       dispatch plan (else `run_auto` → `UnsupportedVariant`).
+///       `GemvFamily::run_auto`, so the routed dtype MUST have a post-rotation
+///       GEMV plan (Plain OR Prerotated — V2 uses Prerotated only).
 #[test]
 fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
     // A representative non-indexable / non-k8 MoE matrix the fallback must serve.
@@ -324,6 +411,11 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
         routed_gate_up: DType,
         routed_down: DType,
         k: usize,
+    }
+    /// run_auto needs Plain OR Prerotated (dtype_post_rotation_variant).
+    fn has_run_auto_plan(dtype: DType) -> bool {
+        KernelKey::for_gemv(dtype, GemvVariant::Plain, false).is_ok()
+            || KernelKey::for_gemv_prerotated(dtype).is_ok()
     }
     let mut failures = Vec::new();
     for u in [
@@ -341,6 +433,19 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
             routed_down: MQ4G256,
             k: 4,
         },
+        // MQ4V2 / MQ6V2 uniform but k != 8 → indexable flag stays true, GPU-top-K off.
+        MoeUse {
+            name: "mq4v2-routed-moe (k=4)",
+            routed_gate_up: MQ4G256V2,
+            routed_down: MQ4G256V2,
+            k: 4,
+        },
+        MoeUse {
+            name: "mq6v2-routed-moe (k=4)",
+            routed_gate_up: MQ6G256V2,
+            routed_down: MQ6G256V2,
+            k: 4,
+        },
         // F32 routed experts, k=2 → fallback.
         MoeUse {
             name: "f32-routed-moe (k=2)",
@@ -351,10 +456,12 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
     ] {
         let d = MoeDtypes {
             router: Q8_0,
-            shared_gate: Q8_0,
-            shared_expert_gate: Q8_0,
-            shared_expert_up: Q8_0,
-            shared_expert_down: Q8_0,
+            shared: Some(MoeSharedDtypes {
+                selector: Q8_0,
+                gate: Q8_0,
+                up: Q8_0,
+                down: Q8_0,
+            }),
             experts_all_gate_up_mq4: u.routed_gate_up == MQ4G256,
             routed_gate_up: u.routed_gate_up,
             routed_down: u.routed_down,
@@ -371,16 +478,16 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
                 u.name
             ));
         }
-        // (b) The fallback's run_auto needs a plain-GEMV plan for both halves.
-        if !KernelKey::for_gemv(u.routed_gate_up, GemvVariant::Plain, false).is_ok() {
+        // (b) The fallback's run_auto needs a GEMV plan for both halves.
+        if !has_run_auto_plan(u.routed_gate_up) {
             failures.push(format!(
-                "  {}: routed gate_up {:?} has no plain GEMV → fallback run_auto → UnsupportedVariant panic",
+                "  {}: routed gate_up {:?} has no plain/prerot GEMV → fallback run_auto → UnsupportedVariant panic",
                 u.name, u.routed_gate_up
             ));
         }
-        if !KernelKey::for_gemv(u.routed_down, GemvVariant::Plain, false).is_ok() {
+        if !has_run_auto_plan(u.routed_down) {
             failures.push(format!(
-                "  {}: routed down {:?} has no plain GEMV → fallback run_auto → UnsupportedVariant panic",
+                "  {}: routed down {:?} has no plain/prerot GEMV → fallback run_auto → UnsupportedVariant panic",
                 u.name, u.routed_down
             ));
         }
@@ -411,10 +518,12 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     // (op=moe, dtype=MQ4G256, k=4) → resolves to the CPU fallback, NOT GPU-top-K.
     let mq4_k4 = MoeDtypes {
         router: Q8_0,
-        shared_gate: Q8_0,
-        shared_expert_gate: Q8_0,
-        shared_expert_up: Q8_0,
-        shared_expert_down: Q8_0,
+        shared: Some(MoeSharedDtypes {
+            selector: Q8_0,
+            gate: Q8_0,
+            up: Q8_0,
+            down: Q8_0,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: MQ4G256,
         routed_down: MQ4G256,
@@ -471,6 +580,43 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
         check_moe_decode_supported(/*use_gpu_topk=*/ false, 4, 64, /*resident=*/ false).is_err(),
         "non-fast-path dtype with no resident experts has no runnable path — reject gracefully"
     );
+}
+
+/// #651: ParoQ4G64 (40-byte groups, 64-channel Givens blocks) and ParoQ4G128
+/// (72-byte groups, 128-channel blocks) must never share a GEMV route, in
+/// either direction, while keeping the same Givens-then-plain-GEMV contract.
+#[test]
+fn paro_g64_and_g128_never_share_a_route() {
+    use crate::families::gemv::GemvFamily;
+    let fam = GemvFamily::new();
+    let ctx = DispatchCtx::for_test("gfx1151");
+    for (dtype, key, group, row) in [
+        (ParoQ4G64, KernelKey::GemvParoQ4G64, 64, 40),
+        (ParoQ4G128, KernelKey::GemvParoQ4G128, 128, 72),
+    ] {
+        assert_eq!(
+            KernelKey::for_gemv(dtype, GemvVariant::Plain, false).unwrap(),
+            key
+        );
+        // Prerotated (decode QKV/FFN) and Plain must land on the same kernel.
+        assert_eq!(KernelKey::for_gemv_prerotated(dtype).unwrap(), key);
+        assert_eq!(
+            fam.resolve(dtype, GemvVariant::Plain, false, &ctx, None)
+                .unwrap()
+                .key,
+            key
+        );
+        assert_eq!(dtype_rotation_plan(dtype), RotationPlan::Givens);
+        assert_eq!(dtype_post_rotation_variant(dtype), GemvVariant::Plain);
+        assert_eq!(dtype.paro_group_size(), Some(group));
+        assert_eq!(dtype.row_bytes(group), Some(row));
+    }
+    assert_ne!(KernelKey::GemvParoQ4G64, KernelKey::GemvParoQ4G128);
+    // No fused residual twin: both take the plain GEMV + add fallback.
+    assert!(KernelKey::for_gemv_residual(ParoQ4G64).is_err());
+    assert!(has_dispatch_plan(Role::Residual, ParoQ4G64));
+    // Only the G128 dtype is admitted into the G128-only MoE tier list.
+    assert!(!crate::families::moe::MIXED_SUPPORTED_TIERS.contains(&ParoQ4G64));
 }
 
 /// LAYER 1c — Q8/Paro were gapped in MULTIPLE GEMV variants: o_proj used Residual,
@@ -876,19 +1022,72 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         // ── HFQ6G256 fused — cross-arch (batched gemm_*_hfq6g256 ladder:
         //    wmma_gfx12/wmma/dp4a/dot2/fp16/scalar). Was wrongly gfx906-only
         //    (HasDp4a), which dead-gated the AWQ A3B trunk on RDNA3/4. ──
-        FusedKeyUse { key: KernelKey::FusedQkvHfq6G256,     archs: ALL },
-        FusedKeyUse { key: KernelKey::FusedQkvzaHfq6G256,   archs: ALL },
-        FusedKeyUse { key: KernelKey::FusedGateUpHfq6G256,  archs: ALL },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvHfq6G256,
+            archs: ALL,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaHfq6G256,
+            archs: ALL,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpHfq6G256,
+            archs: ALL,
+        },
         // ── MQ3/MQ4-Lloyd fused (W4: WMMA-free [32,1,1] wave32 scalar, run on
         //    every RDNA gen). Gate is HasWave32 (was a HasWmma dead-gate). Listed
         //    on WMMA_ARCHS here as a MUST-resolve floor; w4_* tests below assert
         //    the full RDNA1/2 admit + CDNA rejection on the GEMV-side siblings. ──
-        FusedKeyUse { key: KernelKey::FusedQkvMq3G256Lloyd,  archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedQkvMq4G256Lloyd,  archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedQkvzaMq3G256Lloyd, archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedQkvzaMq4G256Lloyd, archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedGateUpMq3G256Lloyd, archs: WMMA_ARCHS },
-        FusedKeyUse { key: KernelKey::FusedGateUpMq4G256Lloyd, archs: WMMA_ARCHS },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq3G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq3G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq3G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256Lloyd,
+            archs: WMMA_ARCHS,
+        },
+        // ── MQ4G256V2 / MQ4G256V2Lloyd fused (qt44/qt52 dual-half): Always ──
+        // Same gate as table rows; WAVE32 floor like the V2 GEMV path.
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256V2Lloyd,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256V2Lloyd,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256V2Lloyd,
+            archs: WAVE32,
+        },
         // ── #397 Ship 5.2 slice 2: prefill gate+up dtypes ──
         // HFQ3G256: Always — base `gemm_gate_up_hfq3g256` carries a full
         // cross-arch internal ladder (MMQ→dp4a→dot2→fp16→scalar gfx1010), and
@@ -944,6 +1143,21 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         FusedKeyUse {
             key: KernelKey::FusedGateUpParo4G128T,
             archs: ALL,
+        },
+        // ── Exact verify fused (MQ4G256V2, singleton F16-WMMA chain): explicit
+        //    key only, IsGfx1201-gated; fail-closed elsewhere is pinned by
+        //    mq4v2_verify_exact_keys_resolve_on_gfx1201_only. ──
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256V2VerifyExact,
+            archs: &["gfx1201"],
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256V2VerifyExact,
+            archs: &["gfx1201"],
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256V2VerifyExact,
+            archs: &["gfx1201"],
         },
     ];
 
@@ -1157,13 +1371,19 @@ fn w4_lloyd_fused_keys_un_bricked_on_rdna2_not_cdna() {
     for &key in lloyd_fused {
         // RDNA1/2 must now resolve.
         for arch in ["gfx1010", "gfx1030", "gfx1031", "gfx1032"] {
-            if family.resolve(key, &DispatchCtx::for_test(arch), None).is_err() {
+            if family
+                .resolve(key, &DispatchCtx::for_test(arch), None)
+                .is_err()
+            {
                 failures.push(format!("  {:?} dead-gated on {} (FIX B)", key, arch));
             }
         }
         // CDNA wave64 must still Err.
         for arch in ["gfx906", "gfx942"] {
-            if family.resolve(key, &DispatchCtx::for_test(arch), None).is_ok() {
+            if family
+                .resolve(key, &DispatchCtx::for_test(arch), None)
+                .is_ok()
+            {
                 failures.push(format!("  {:?} wrongly admitted on CDNA {}", key, arch));
             }
         }
@@ -1227,7 +1447,10 @@ fn w4_mq3_lloyd_still_rejected_on_cdna_wave64() {
             let ctx = DispatchCtx::for_test(arch);
             for variant in [GemvVariant::Plain, GemvVariant::Prerotated] {
                 if fam.resolve(d, variant, false, &ctx, None).is_ok() {
-                    admitted.push(format!("  {:?} / {:?} wrongly admitted on {}", d, variant, arch));
+                    admitted.push(format!(
+                        "  {:?} / {:?} wrongly admitted on {}",
+                        d, variant, arch
+                    ));
                 }
             }
         }
@@ -1236,5 +1459,554 @@ fn w4_mq3_lloyd_still_rejected_on_cdna_wave64() {
         admitted.is_empty(),
         "\nW4: CDNA wave64 wrongly admitted to wave32 [32,1,1] kernel:\n{}\n",
         admitted.join("\n")
+    );
+}
+
+// ── MQV2 completeness — every admitted uniform/mixed route has exact keys ─────
+//
+// Pins the structural contract for MQ4G256V2 (qt44) and MQ6G256V2 (qt47):
+//   * dense KernelKey mappings never alias V1 HFQ4/HFQ6 siblings
+//   * uniform MoE resolution claims the V2 indexable arm only when BOTH halves match
+//   * pipeline route-kind helpers return exact "mq4v2"/"mq6v2" identities
+//   * mixed tags 7..18 are complete and never collapse onto V1 tags 0..6
+//   * fused/GEMM keys resolve on gfx11 + gfx12
+// GPU-free; no product logic.
+
+fn moe_dtypes_uniform(gate_up: DType, down: DType) -> MoeDtypes<'static> {
+    MoeDtypes {
+        router: Q8_0,
+        shared: Some(MoeSharedDtypes {
+            selector: Q8_0,
+            gate: Q8_0,
+            up: Q8_0,
+            down: Q8_0,
+        }),
+        experts_all_gate_up_mq4: false,
+        routed_gate_up: gate_up,
+        routed_down: down,
+        routed_has_mixed_experts: false,
+        has_paro_shared: false,
+        per_expert_gate_up: None,
+        per_expert_down: None,
+    }
+}
+
+/// LAYER MQV2-1 — exact dense KernelKey identity for every admitted V2 role.
+/// Catches a missing residual/prerotated/swiglu arm AND a silent V1 alias.
+#[test]
+fn mqv2_uniform_dense_keys_are_exact_not_v1() {
+    let cases: &[(DType, KernelKey, KernelKey, KernelKey)] = &[
+        (
+            MQ4G256V2,
+            KernelKey::GemvMq4G256V2Prerotated,
+            KernelKey::GemvMq4G256V2Residual,
+            KernelKey::GemvMq4G256V2SwiGLUResidual,
+        ),
+        (
+            MQ6G256V2,
+            KernelKey::GemvMq6G256V2Prerotated,
+            KernelKey::GemvMq6G256V2Residual,
+            KernelKey::GemvMq6G256V2SwiGLUResidual,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for &(dtype, want_prerot, want_res, want_swiglu) in cases {
+        // No Plain arm — V2 is prerotated-only at the KernelKey layer.
+        if KernelKey::for_gemv(dtype, GemvVariant::Plain, false).is_ok() {
+            failures.push(format!(
+                "  {:?}: unexpectedly has Plain GEMV key (must stay prerotated-only)",
+                dtype
+            ));
+        }
+        match KernelKey::for_gemv_prerotated(dtype) {
+            Ok(k) if k == want_prerot => {}
+            Ok(k) => failures.push(format!(
+                "  {:?}: prerotated key {:?} ≠ exact {:?}",
+                dtype, k, want_prerot
+            )),
+            Err(_) => failures.push(format!("  {:?}: missing prerotated key", dtype)),
+        }
+        match KernelKey::for_gemv_residual(dtype) {
+            Ok(k) if k == want_res => {}
+            Ok(k) => failures.push(format!(
+                "  {:?}: residual key {:?} ≠ exact {:?}",
+                dtype, k, want_res
+            )),
+            Err(_) => failures.push(format!("  {:?}: missing residual key", dtype)),
+        }
+        match KernelKey::for_gemv_swiglu_residual(dtype) {
+            Ok(k) if k == want_swiglu => {}
+            Ok(k) => failures.push(format!(
+                "  {:?}: swiglu key {:?} ≠ exact {:?}",
+                dtype, k, want_swiglu
+            )),
+            Err(_) => failures.push(format!("  {:?}: missing swiglu residual key", dtype)),
+        }
+        // V1 residual keys must NOT be returned for V2 dtypes.
+        let v1_res = match dtype {
+            MQ4G256V2 => KernelKey::GemvMq4G256Residual,
+            MQ6G256V2 => KernelKey::GemvMq6G256Residual,
+            _ => unreachable!(),
+        };
+        if matches!(KernelKey::for_gemv_residual(dtype), Ok(k) if k == v1_res) {
+            failures.push(format!(
+                "  {:?}: residual collapsed onto V1 key {:?}",
+                dtype, v1_res
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n{} MQV2 dense key identity failures:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// LAYER MQV2-2 — uniform MoE decode resolution + GPU-top-K positive controls.
+/// k=8 both-sides-V2 → indexable + use_gpu_topk; split V1/V2 → neither arm.
+#[test]
+fn mqv2_uniform_moe_routes_are_indexable_and_exact() {
+    let mut failures = Vec::new();
+
+    // Positive: uniform MQ4V2 / MQ6V2 at k=8 take the native V2 indexed path.
+    for (name, gu, dn, want_mq4v2, want_mq6v2) in [
+        ("mq4v2-uniform-k8", MQ4G256V2, MQ4G256V2, true, false),
+        ("mq6v2-uniform-k8", MQ6G256V2, MQ6G256V2, false, true),
+    ] {
+        let r = MoeResolution::resolve(&moe_dtypes_uniform(gu, dn), 8);
+        if r.routed_indexable_mq4v2 != want_mq4v2 {
+            failures.push(format!(
+                "  {}: routed_indexable_mq4v2={} want {}",
+                name, r.routed_indexable_mq4v2, want_mq4v2
+            ));
+        }
+        if r.routed_indexable_mq6v2 != want_mq6v2 {
+            failures.push(format!(
+                "  {}: routed_indexable_mq6v2={} want {}",
+                name, r.routed_indexable_mq6v2, want_mq6v2
+            ));
+        }
+        // Must never claim the V1 sibling arm.
+        if r.routed_indexable_mq4 {
+            failures.push(format!("  {}: wrongly claimed routed_indexable_mq4", name));
+        }
+        if r.routed_indexable_mq6 {
+            failures.push(format!("  {}: wrongly claimed routed_indexable_mq6", name));
+        }
+        if !r.use_gpu_topk {
+            failures.push(format!(
+                "  {}: use_gpu_topk=false — uniform V2 k=8 must take indexed path",
+                name
+            ));
+        }
+        if !r.needs_x_rot_local {
+            failures.push(format!(
+                "  {}: needs_x_rot_local=false — V2 kernels read ROTATED x",
+                name
+            ));
+        }
+        if !r.routed_indexable() {
+            failures.push(format!("  {}: routed_indexable() false", name));
+        }
+    }
+
+    // Negative: any V1/V2 or cross-V2 split is not indexable on either arm.
+    for (name, gu, dn) in [
+        ("mq4v2/mq4v1", MQ4G256V2, MQ4G256),
+        ("mq4v1/mq4v2", MQ4G256, MQ4G256V2),
+        ("mq6v2/mq6v1", MQ6G256V2, MQ6G256),
+        ("mq6v1/mq6v2", MQ6G256, MQ6G256V2),
+        ("mq4v2/mq6v2", MQ4G256V2, MQ6G256V2),
+        ("mq6v2/mq4v2", MQ6G256V2, MQ4G256V2),
+    ] {
+        let r = MoeResolution::resolve(&moe_dtypes_uniform(gu, dn), 8);
+        if r.routed_indexable_mq4v2
+            || r.routed_indexable_mq6v2
+            || r.routed_indexable_mq4
+            || r.routed_indexable_mq6
+        {
+            failures.push(format!(
+                "  {}: split pair claimed a uniform indexable arm (mq4v2={} mq6v2={} mq4={} mq6={})",
+                name,
+                r.routed_indexable_mq4v2,
+                r.routed_indexable_mq6v2,
+                r.routed_indexable_mq4,
+                r.routed_indexable_mq6
+            ));
+        }
+        if r.use_gpu_topk {
+            failures.push(format!(
+                "  {}: use_gpu_topk=true on split pair — must fall back, not guess layout",
+                name
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\n{} MQV2 uniform MoE resolution failures:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// LAYER MQV2-3 — pipeline route-kind helpers admit exact V2 identities.
+/// Decode down / Path1 gate+down / grouped GEMM / ninepath D4 / shared dense.
+/// Tag-aware Path1 mixed precedence is pinned here too.
+#[test]
+fn mqv2_admitted_route_kinds_are_exact() {
+    use crate::pipeline::{
+        decode_expanded_down_kind, decode_gate_uses_mixed, gate_up_varies, grouped_gemm_kind,
+        ninepath_d4_family, prefill_path1_down_kind, prefill_path1_down_kind_tag_aware,
+        prefill_path1_gate_up_kind, prefill_path1_gate_up_kind_tag_aware, shared_dense_down_kind,
+    };
+
+    let mut failures = Vec::new();
+
+    // Uniform decode / prefill / grouped kinds.
+    for (dtype, kind) in [(MQ4G256V2, "mq4v2"), (MQ6G256V2, "mq6v2")] {
+        for (label, got) in [
+            ("decode_expanded_down", decode_expanded_down_kind(dtype)),
+            ("path1_gate_up", prefill_path1_gate_up_kind(dtype)),
+            ("path1_down", prefill_path1_down_kind(dtype)),
+            ("grouped_gemm", grouped_gemm_kind(dtype)),
+        ] {
+            if got != Some(kind) {
+                failures.push(format!(
+                    "  {}({:?}) = {:?} want Some({:?})",
+                    label, dtype, got, kind
+                ));
+            }
+        }
+        // Must never share the V1 kind string.
+        let v1_kind = match dtype {
+            MQ4G256V2 => "hfq4",
+            MQ6G256V2 => "hfq6",
+            _ => unreachable!(),
+        };
+        if decode_expanded_down_kind(dtype) == Some(v1_kind) {
+            failures.push(format!(
+                "  decode_expanded_down({:?}) collapsed to V1 {:?}",
+                dtype, v1_kind
+            ));
+        }
+    }
+
+    // Ninepath D4: only exact both-sides uniform pairs.
+    if ninepath_d4_family(MQ4G256V2, MQ4G256V2) != Some("mq4v2") {
+        failures.push("  ninepath_d4(MQ4V2,MQ4V2) ≠ Some(mq4v2)".into());
+    }
+    if ninepath_d4_family(MQ6G256V2, MQ6G256V2) != Some("mq6v2") {
+        failures.push("  ninepath_d4(MQ6V2,MQ6V2) ≠ Some(mq6v2)".into());
+    }
+    for (gu, dn) in [
+        (MQ4G256V2, MQ4G256),
+        (MQ4G256, MQ4G256V2),
+        (MQ6G256V2, MQ6G256),
+        (MQ4G256V2, MQ6G256V2),
+    ] {
+        if ninepath_d4_family(gu, dn).is_some() {
+            failures.push(format!(
+                "  ninepath_d4({:?},{:?}) wrongly admitted {:?}",
+                gu,
+                dn,
+                ninepath_d4_family(gu, dn)
+            ));
+        }
+    }
+
+    // Shared dense down: V2 prerotated, never V1 sigmoid_scaled.
+    if shared_dense_down_kind(MQ4G256V2) != Some("mq4v2_prerotated") {
+        failures.push(format!(
+            "  shared_dense_down(MQ4V2) = {:?} want Some(mq4v2_prerotated)",
+            shared_dense_down_kind(MQ4G256V2)
+        ));
+    }
+    if shared_dense_down_kind(MQ6G256V2) != Some("mq6v2_prerotated") {
+        failures.push(format!(
+            "  shared_dense_down(MQ6V2) = {:?} want Some(mq6v2_prerotated)",
+            shared_dense_down_kind(MQ6G256V2)
+        ));
+    }
+    if shared_dense_down_kind(MQ4G256V2) == shared_dense_down_kind(MQ4G256) {
+        failures.push("  shared_dense_down MQ4V2 collapsed onto MQ4V1".into());
+    }
+
+    // Mixed Path1: tags + varying gate_up → mixed gate; tags alone → mixed down;
+    // uniform (no tags / no variation) keeps exact V2 kinds.
+    if !decode_gate_uses_mixed(true, true) {
+        failures.push("  decode_gate_uses_mixed(tags, varies) must be true".into());
+    }
+    if decode_gate_uses_mixed(true, false) {
+        failures.push(
+            "  decode_gate_uses_mixed(tags, !varies) must be false (uniform shortcut)".into(),
+        );
+    }
+    if gate_up_varies(Some(&[MQ4G256V2, MQ4G256])) != true {
+        failures.push("  gate_up_varies(MQ4V2,MQ4V1) must be true".into());
+    }
+    if gate_up_varies(Some(&[MQ4G256V2, MQ4G256V2])) {
+        failures.push("  gate_up_varies(all MQ4V2) must be false".into());
+    }
+    if prefill_path1_gate_up_kind_tag_aware(MQ4G256V2, true, true) != Some("mixed") {
+        failures.push("  path1 gate tag-aware varies → mixed".into());
+    }
+    if prefill_path1_gate_up_kind_tag_aware(MQ4G256V2, true, false) != Some("mq4v2") {
+        failures.push("  path1 gate tag-aware uniform MQ4V2 → mq4v2".into());
+    }
+    if prefill_path1_gate_up_kind_tag_aware(MQ6G256V2, false, false) != Some("mq6v2") {
+        failures.push("  path1 gate no-tags MQ6V2 → mq6v2".into());
+    }
+    if prefill_path1_down_kind_tag_aware(MQ4G256V2, true) != Some("mixed") {
+        failures.push("  path1 down has_tags → mixed (no representative dispatch)".into());
+    }
+    if prefill_path1_down_kind_tag_aware(MQ6G256V2, false) != Some("mq6v2") {
+        failures.push("  path1 down no-tags MQ6V2 → mq6v2".into());
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\n{} MQV2 route-kind failures:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// LAYER MQV2-4 — mixed tag matrix completeness (frozen tags 7..18).
+/// Every admitted pair has its exact tag; unknown pairs refuse; no V1 overlap.
+#[test]
+fn mqv2_mixed_routes_have_exact_tags_and_admission() {
+    use crate::families::moe::MIXED_SUPPORTED_TIERS;
+    use crate::pipeline::mixed_expert_dtype_tag;
+
+    // Exact frozen pairs from mqv2-kernel-contracts.md.
+    let admitted: &[(DType, DType, u8)] = &[
+        (MQ4G256V2, MQ4G256V2, 7),
+        (MQ6G256V2, MQ6G256V2, 8),
+        (MQ4G256V2, MQ6G256, 9),
+        (MQ4G256V2, MQ2G256Lloyd, 10),
+        (MQ4G256V2, MQ4G256, 11),
+        (MQ4G256, MQ4G256V2, 12),
+        (MQ4G256V2, MQ3G256Lloyd, 13),
+        (MQ4G256V2, MFP4G32E8, 14),
+        (MQ4G256V2, MFP3G32E8, 15),
+        (MQ4G256V2, MFP2G32E8, 16),
+        (MQ4G256V2, MQ6G256V2, 17),
+        (MQ4G256, MQ6G256V2, 18),
+    ];
+    let mut failures = Vec::new();
+    let mut seen_tags = std::collections::HashSet::new();
+    for &(gate, down, tag) in admitted {
+        match mixed_expert_dtype_tag(gate, down) {
+            Some(got) if got == tag => {
+                seen_tags.insert(got);
+            }
+            Some(got) => failures.push(format!(
+                "  tag({:?},{:?}) = {} want {}",
+                gate, down, got, tag
+            )),
+            None => failures.push(format!(
+                "  tag({:?},{:?}) = None want Some({})",
+                gate, down, tag
+            )),
+        }
+        // Tags 7..18 must never collide with V1 0..6.
+        if tag <= 6 {
+            failures.push(format!(
+                "  admitted pair ({:?},{:?}) assigned V1-range tag {}",
+                gate, down, tag
+            ));
+        }
+    }
+    // Completeness: every tag in 7..=18 appears exactly once.
+    for t in 7u8..=18 {
+        if !seen_tags.contains(&t) {
+            failures.push(format!("  missing admitted tag {t} in frozen matrix"));
+        }
+    }
+
+    // Loud reject: reverse MQ6V2/MQ4V2 and GL pairs.
+    for (gate, down) in [
+        (MQ6G256V2, MQ4G256V2),
+        (MQ6G256V2, MQ4G256),
+        (MQ6G256V2, MQ6G256),
+        (MQ2G256GL, MQ4G256V2),
+        (MQ4G256V2, MQ2G256GL),
+    ] {
+        if mixed_expert_dtype_tag(gate, down).is_some() {
+            failures.push(format!(
+                "  tag({:?},{:?}) should refuse (None), got {:?}",
+                gate,
+                down,
+                mixed_expert_dtype_tag(gate, down)
+            ));
+        }
+    }
+
+    // MIXED_SUPPORTED_TIERS must list exactly the dtypes mixed kernels consume.
+    for dt in [MQ4G256, MQ6G256, ParoQ4G128, MQ4G256V2, MQ6G256V2] {
+        if !MIXED_SUPPORTED_TIERS.contains(&dt) {
+            failures.push(format!(
+                "  MIXED_SUPPORTED_TIERS missing {:?} (mixed branches consume it)",
+                dt
+            ));
+        }
+    }
+    if MIXED_SUPPORTED_TIERS.len() != 5 {
+        failures.push(format!(
+            "  MIXED_SUPPORTED_TIERS len={} want 5 (no MQ2/3/5V2 widen)",
+            MIXED_SUPPORTED_TIERS.len()
+        ));
+    }
+    for dt in [MQ5G256V2, MQ2G256V2, MQ3G256V2] {
+        if MIXED_SUPPORTED_TIERS.contains(&dt) {
+            failures.push(format!("  MIXED_SUPPORTED_TIERS wrongly admits {:?}", dt));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\n{} MQV2 mixed-route completeness failures:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// LAYER MQV2-5 — fused QKV/QKVZA/GateUp + GEMM keys resolve on gfx11/gfx12.
+/// Completeness over every admitted dense shared V2 dispatch key.
+#[test]
+fn mqv2_fused_and_gemm_keys_resolve_on_gfx11_gfx12() {
+    use crate::families::fused_qkv::FusedQkvFamily;
+    use crate::families::gemm::GemmFamily;
+
+    let fused_keys: &[KernelKey] = &[
+        KernelKey::FusedQkvMq4G256V2,
+        KernelKey::FusedQkvzaMq4G256V2,
+        KernelKey::FusedGateUpMq4G256V2,
+        KernelKey::FusedQkvMq4G256V2Lloyd,
+        KernelKey::FusedQkvzaMq4G256V2Lloyd,
+        KernelKey::FusedGateUpMq4G256V2Lloyd,
+        KernelKey::FusedQkvMq6G256V2,
+        KernelKey::FusedQkvzaMq6G256V2,
+        KernelKey::FusedGateUpMq6G256V2,
+    ];
+    let gemm_keys: &[KernelKey] = &[
+        KernelKey::GemmMq4G256V2,
+        KernelKey::GemmMq4G256V2Residual,
+        KernelKey::GemmMq4G256V2BatchedLmhead,
+        KernelKey::GemmMq6G256V2,
+        KernelKey::GemmMq6G256V2Residual,
+        KernelKey::GemmMq6G256V2BatchedLmhead,
+    ];
+    // Fused V2 table entries are Always-gated; GEMM V2 is HasWmma.
+    let fused_archs: &[&str] = WAVE32;
+    let gemm_archs: &[&str] = WMMA_ARCHS;
+
+    let fused = FusedQkvFamily::new();
+    let gemm = GemmFamily::new();
+    let mut failures = Vec::new();
+
+    for &key in fused_keys {
+        for &arch in fused_archs {
+            let ctx = DispatchCtx::for_test(arch);
+            if fused.resolve(key, &ctx, None).is_err() {
+                failures.push(format!("  fused {:?} dead-gated on {}", key, arch));
+            }
+        }
+    }
+    for &key in gemm_keys {
+        for &arch in gemm_archs {
+            let ctx = DispatchCtx::for_test(arch);
+            // GemmFamily::resolve is dtype-keyed; residual/lmhead keys are
+            // registered for explicit run_key and must resolve via the registry.
+            if gemm.registry().resolve(key, &ctx, None).is_err() {
+                failures.push(format!("  gemm {:?} dead-gated on {}", key, arch));
+            }
+        }
+    }
+
+    // Also pin GemmFamily dtype→key selection for uniform V2 prefill.
+    for (dtype, want) in [
+        (MQ4G256V2, KernelKey::GemmMq4G256V2),
+        (MQ6G256V2, KernelKey::GemmMq6G256V2),
+    ] {
+        for arch in ["gfx1100", "gfx1201"] {
+            let ctx = DispatchCtx::for_test(arch);
+            match gemm.resolve(dtype, &ctx, None) {
+                Ok(v) if v.key == want => {}
+                Ok(v) => failures.push(format!(
+                    "  GemmFamily::resolve({:?}, {}) key {:?} ≠ {:?}",
+                    dtype, arch, v.key, want
+                )),
+                Err(e) => failures.push(format!(
+                    "  GemmFamily::resolve({:?}, {}) Err({e:?})",
+                    dtype, arch
+                )),
+            }
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "\n{} MQV2 fused/GEMM resolve failures:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// Exact verify keys (MQ4G256V2, 1..=128 rows, singleton F16-WMMA chain) are
+/// explicit-key-only and IsGfx1201-gated: they resolve on gfx1201, fail closed
+/// everywhere else, and are never produced by the dtype→key selectors.
+#[test]
+fn mq4v2_verify_exact_keys_resolve_on_gfx1201_only() {
+    use crate::families::fused_qkv::{fused_gate_up_key_for, FusedQkvFamily};
+    use crate::families::gemm::{residual_gemm_key_for, GemmFamily};
+
+    let fused = FusedQkvFamily::new();
+    let gemm = GemmFamily::new();
+    let fused_keys = [
+        KernelKey::FusedQkvMq4G256V2VerifyExact,
+        KernelKey::FusedQkvzaMq4G256V2VerifyExact,
+        KernelKey::FusedGateUpMq4G256V2VerifyExact,
+    ];
+    let gemm_keys = [
+        KernelKey::GemmMq4G256V2ResidualVerifyExact,
+        KernelKey::GemmMq4G256V2LmheadVerifyExact,
+    ];
+    let mut failures = Vec::new();
+    for &arch in ALL {
+        let ctx = DispatchCtx::for_test(arch);
+        let admitted = arch == "gfx1201";
+        for &key in &fused_keys {
+            if fused.resolve(key, &ctx, None).is_ok() != admitted {
+                failures.push(format!(
+                    "  fused {:?} on {} admitted != {}",
+                    key, arch, admitted
+                ));
+            }
+        }
+        for &key in &gemm_keys {
+            if gemm.registry().resolve(key, &ctx, None).is_ok() != admitted {
+                failures.push(format!(
+                    "  gemm {:?} on {} admitted != {}",
+                    key, arch, admitted
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n{} verify-exact key × arch failures:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert_eq!(
+        residual_gemm_key_for(MQ4G256V2),
+        KernelKey::GemmMq4G256V2Residual
+    );
+    assert_eq!(
+        fused_gate_up_key_for(MQ4G256V2),
+        KernelKey::FusedGateUpMq4G256V2
     );
 }

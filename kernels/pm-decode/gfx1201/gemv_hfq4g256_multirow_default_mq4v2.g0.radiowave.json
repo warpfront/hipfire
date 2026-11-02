@@ -1,0 +1,179 @@
+{
+  "schema_version": 5,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1791509098,
+  "source": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.g0.s",
+  "output": "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.g0.hxaco",
+  "arch": "gfx1201",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.16.26385-0000000\nAMD clang version 24.0.0git (https://github.com/ROCm/llvm-project.git d6f6cb691863e9258034ab48c1dfce21689d5606)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.1/lib/llvm/bin\nConfiguration file: /opt/rocm/core-10.1/lib/llvm/bin/clang++.cfg",
+  "command": [
+    "/home/kaden/qcal/release-0.4.2/target-pmdt-PmMultirow/debug/peacemaker",
+    "native",
+    "--arch=gfx1201",
+    "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.g0.s",
+    "--co=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.co",
+    "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.g0.hxaco",
+    "--host-target=host-x86_64-unknown-linux-gnu"
+  ],
+  "source_sha256": "3189855adf036e39172a051cb29b113accc10d532a319a6a525bdfc4e1970636",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "55ffb7ffebe5adf148710b802899cf7be1ce2a0e4f5e9e0e7f29985a9267cc92",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
+    "identity": {
+      "architecture": "gfx1201",
+      "elf_machine_id": 78,
+      "isa": {
+        "major": 12,
+        "minor": 0,
+        "stepping": 1
+      }
+    },
+    "kernels": [
+      {
+        "name": "gemv_mq4g256v2_multirow_r2_dog_g0",
+        "wavefront_size": 32,
+        "vgpr_count": 20,
+        "sgpr_count": 10,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 134,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 6,
+          "global_stores": 2,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 2,
+          "kernarg_scalar_loads": 2,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 54,
+          "delay_alu_instructions": 49,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 2
+        }
+      }
+    ]
+  },
+  "peacemaker": {
+    "arm": "custom-isa",
+    "producer": {
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "4bd3e4ae11",
+      "proof_sha256": "a6c9643727979551014ad16cac42987418411e2e3fbea1c5d7a502f3f8be051f"
+    },
+    "tools": [
+      {
+        "role": "native",
+        "path": "/home/kaden/qcal/release-0.4.2/target-pmdt-PmMultirow/debug/peacemaker",
+        "version": "hipfire-isa 0.4.1 native code object v6 writer (ld.lld 24.0.0 layout)",
+        "argv": [
+          "/home/kaden/qcal/release-0.4.2/target-pmdt-PmMultirow/debug/peacemaker",
+          "native",
+          "--arch=gfx1201",
+          "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.g0.s",
+          "--co=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.co",
+          "--bundle=/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/gemv_hfq4g256_multirow_default_mq4v2.g0.hxaco",
+          "--host-target=host-x86_64-unknown-linux-gnu"
+        ],
+        "sha256": "db7ab2e2ed98f59dd77929b84d6b25b10e8fbc0fce0f8a74256638fde550db48"
+      }
+    ],
+    "s_text_sha256": "3189855adf036e39172a051cb29b113accc10d532a319a6a525bdfc4e1970636",
+    "text_section_sha256": "cbee5d9b786d483994fc328bfe52c64e2a6f859fb210bc0aac2a58f2741b61f1",
+    "shape_contract": {
+      "counts": {
+        "v_fma_mix_f32": 16,
+        "v_fmac_f32_e32": 14,
+        "v_mul_f32_e32": 2
+      },
+      "end_label": null,
+      "forbidden": [
+        "scratch_load_b32",
+        "scratch_store_b32"
+      ],
+      "group_segment_fixed_bytes": 0,
+      "launch_dynamic_lds_bytes": 0,
+      "require_wave32": true,
+      "require_zero_private": true,
+      "require_zero_spills": true,
+      "sgpr_max": 10,
+      "start_label": null,
+      "symbol": "gemv_mq4g256v2_multirow_r2_dog_g0",
+      "vgpr_max": 20
+    },
+    "shape_result": {
+      "counts": {
+        "global_load_b128": 2,
+        "global_load_b32": 4,
+        "global_store_b32": 2,
+        "s_delay_alu": 49,
+        "s_endpgm": 1,
+        "s_load_b128": 1,
+        "s_load_b64": 1,
+        "s_wait_kmcnt": 1,
+        "s_wait_loadcnt": 3,
+        "s_wait_storecnt": 1,
+        "v_bfe_u32": 16,
+        "v_cvt_f32_ubyte0_e32": 16,
+        "v_fma_mix_f32": 16,
+        "v_fmac_f32_e32": 14,
+        "v_lshlrev_b32_e32": 4,
+        "v_lshrrev_b32_e32": 1,
+        "v_mul_f32_e32": 2,
+        "valu_slots": 69
+      },
+      "private_segment_fixed_size": 0,
+      "sgpr_count": 10,
+      "sgpr_spill_count": 0,
+      "vgpr_count": 20,
+      "vgpr_spill_count": 0,
+      "wavefront_size": 32
+    },
+    "oracle_receipt": null
+  }
+}

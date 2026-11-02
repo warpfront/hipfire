@@ -28,8 +28,8 @@ CHANGED=$(git diff --cached --name-only --diff-filter=ACM)
 
 # ── rustfmt-changed gate (every commit, GPU-free, ~instant) ─────────────
 # Mirror CI's changed-file rustfmt check (scripts/ci-rustfmt-changed.sh) on
-# the staged Rust files. The repo carries historical format debt so we only
-# check files in THIS commit, not the workspace. Fix with:
+# the staged Rust files (fast; the land gate scripts/pre-commit-ci.sh checks
+# the whole workspace, clean on beta since the 0.4.3 sweep). Fix with:
 #   scripts/fmt-changed.sh <master|beta>   # the ref THIS branch was cut from
 # Bypass (e.g. mid-rebase) with: SKIP_FMT_CHECK=1 git commit ...
 if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
@@ -40,12 +40,31 @@ if [[ -z "${SKIP_FMT_CHECK:-}" ]]; then
             echo "✗ rustfmt: staged Rust file(s) are not formatted (CI's changed-file gate will flag this)." >&2
             echo "  Fix:    scripts/fmt-changed.sh <master|beta> && git add -u" >&2
             echo "  Bypass: SKIP_FMT_CHECK=1 git commit ..." >&2
-            echo "  Do NOT run 'cargo fmt' — it reformats the whole workspace's format debt." >&2
+            echo "  Do NOT run 'cargo fmt' — on master and pre-sweep branches it reformats 1000+ files of old debt." >&2
             exit 1
         fi
     fi
 fi
 
+# ── crate-map + ratchets (every commit touching crates/ or kernels/, GPU-free, <1s) ──
+# Mirrors CI `gates` job (ci.yml:89-98) which fails PRs on stale maps or
+# ratchet regressions. Bypass with SKIP_GATES_CHECK=1 if mid-rebase.
+if [[ -z "${SKIP_GATES_CHECK:-}" ]]; then
+    if echo "$CHANGED" | grep -qE 'crates/.*\.rs$|crates/.*/map\.md|kernels/.*\.hip$'; then
+        echo "=== Crate maps ===" >&2
+        if ! python3 scripts/check-crate-maps.py --check; then
+            echo "" >&2
+            echo "✗ crate maps stale — run scripts/check-crate-maps.py <crate> and git add the map.md" >&2
+            exit 1
+        fi
+        echo "=== Leanup ratchets ===" >&2
+        if ! bash scripts/leanup-ratchets.sh; then
+            echo "" >&2
+            echo "✗ leanup-ratchets failed — see output above" >&2
+            exit 1
+        fi
+    fi
+fi
 # Hotspots that can affect forward-pass output or speed.
 #
 # Updated for post-0.1.20 modular topology (PR 7+):

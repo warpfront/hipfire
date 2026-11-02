@@ -16,25 +16,31 @@
 //! on [`FinishSummary`] until the daemon wrapper classifies a tool-safe terminal.
 
 use crate::grammar;
-use hipfire_runtime::emit_text::{currently_in_think, ToolOutputRouter, ToolRouteEvent};
-use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
+use hipfire_runtime::emit_text::{
+    currently_in_think, ThinkBudget, ThinkBudgetStep, ThinkOutputRouter, ThinkRouteEvent,
+    ToolOutputRouter, ToolRouteEvent, QWEN_TEMPLATE_THINK_CLOSE,
+};
+use hipfire_runtime::eos_filter::{EosFilter, FilterAction};
 use hipfire_runtime::prompt_frame::AssistantPrefix;
 use hipfire_runtime::spec::{
     ClientEvent, EmitOutcome, FinishSummary, SpecEmit, SpecEmitCtx, StopReason,
 };
+use hipfire_runtime::stop_sequence::StopMatcher;
 use hipfire_runtime::tokenizer::Tokenizer;
 
 pub struct Qwen35Emit<'a> {
     tokenizer: &'a Tokenizer,
     filter: EosFilter,
-    /// Index into the freshly-decoded byte stream past which bytes have not yet
-    /// been fed to the filter (the daemon's old `bytes_fed_to_filter`).
-    bytes_fed_to_filter: usize,
+    /// Raw bytes of `streamed_tokens`, grown one token at a time; its length
+    /// is the offset past which bytes have not yet been fed to the filter.
+    stream_bytes: Vec<u8>,
     /// Every committed token in order, for byte decoding + the cache-store the
     /// daemon does after the loop (exposed via [`Self::streamed_tokens`]).
     streamed_tokens: Vec<u32>,
     /// Incremental tool-protocol authority. Fed only EosFilter-emitted UTF-8.
     router: ToolOutputRouter,
+    /// Incremental reasoning/content authority, upstream of tool routing.
+    think_router: ThinkOutputRouter,
     /// Classifier-authorized visible prose accumulated this turn (cache fp).
     visible_acc: String,
     /// Latched when the router fails closed mid-stream or at finish.
@@ -48,17 +54,16 @@ pub struct Qwen35Emit<'a> {
     grammar_violated: bool,
     eos_token: u32,
     im_end_token: Option<u32>,
-    stop: Vec<String>,
-    max_think_tokens: usize,
+    /// User `stop` sequences, matched on answer text before it is emitted.
+    stop: StopMatcher,
+    /// Explicit `max_think_tokens` accounting (shared with the AR producer).
+    think_budget: ThinkBudget,
     open_think_prefix: bool,
-    think_count: usize,
-    prev_in_think: bool,
+    /// Text spliced when the think budget runs out.
+    think_close: String,
     /// Think-budget force-close continuation drained by `take_forced` so the
     /// target advances over `</think>` and continues into visible output.
     forced: Vec<u32>,
-    /// Prevent an endlessly re-opened reasoning span from being force-closed
-    /// repeatedly. A second cap hit hard-stops through `ThinkCap`.
-    think_force_closed: bool,
     /// `generated` counter at the point of the most recent `observe` — only used
     /// for the attractor-detect log message (byte-for-byte stderr parity).
     generated_hint: usize,
@@ -69,27 +74,29 @@ fn think_continuation_text() -> String {
         .unwrap_or_else(|_| "</think>\n\n".to_string())
 }
 
-/// EosFilter config for the Qwen DFlash/spec semantic-v2 producer: strip think
-/// spans (including `started_in_think` / orphan closer) and stop without
-/// emitting decoded ChatML / aux EOT marker bytes.
-fn qwen_dflash_eos_filter_config(started_in_think: bool) -> EosFilterConfig {
-    EosFilterConfig {
-        strip_think: true,
-        started_in_think,
-        stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
-        holdback_prefixes: Vec::new(),
-    }
-}
-
 impl<'a> Qwen35Emit<'a> {
     /// Build the qwen35 emitter from the model-independent [`SpecEmitCtx`],
     /// extracting the grammar `ToolSchema` list from the request's raw tool JSON
     /// (`ctx.tools`). Returns the arch-erased `Box<dyn SpecEmit>` the daemon
     /// drives. The JSON→schema extraction mirrors the daemon's old
-    /// `tool_schemas_dflash` builder.
+    /// `tool_schemas_dflash` builder. A spent think budget splices
+    /// `HIPFIRE_THINK_CONTINUATION` (default `</think>\n\n`).
     pub fn from_ctx(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+        Self::with_think_close(ctx, think_continuation_text())
+    }
+
+    /// [`Self::from_ctx`] for Qwen4, whose AR producer splices the template's
+    /// own close ([`QWEN_TEMPLATE_THINK_CLOSE`]) when the think budget runs
+    /// out; MTP must splice the same tokens to produce the same text.
+    pub fn from_ctx_template_think_close(ctx: SpecEmitCtx<'a>) -> Box<dyn SpecEmit + 'a> {
+        Self::with_think_close(ctx, QWEN_TEMPLATE_THINK_CLOSE.to_string())
+    }
+
+    fn with_think_close(ctx: SpecEmitCtx<'a>, think_close: String) -> Box<dyn SpecEmit + 'a> {
+        let tool_protocol_enabled = ctx.tools.is_some();
         let tool_schemas: Vec<grammar::ToolSchema> = ctx
             .tools
+            .filter(|_| ctx.enable_grammar)
             .map(|arr| {
                 arr.iter()
                     .filter_map(|t| {
@@ -121,33 +128,39 @@ impl<'a> Qwen35Emit<'a> {
         let open_think_prefix = matches!(ctx.assistant_prefix, AssistantPrefix::OpenThink);
         Box::new(Self {
             tokenizer: ctx.tokenizer,
-            filter: EosFilter::new(qwen_dflash_eos_filter_config(open_think_prefix)),
-            bytes_fed_to_filter: 0,
+            filter: EosFilter::new(hipfire_runtime::eos_filter::qwen35_eos_filter_config()),
+            stream_bytes: Vec::new(),
             streamed_tokens: Vec::new(),
-            router: ToolOutputRouter::new(),
+            router: if tool_protocol_enabled {
+                ToolOutputRouter::new()
+            } else {
+                ToolOutputRouter::disabled()
+            },
+            think_router: ThinkOutputRouter::new(open_think_prefix),
             visible_acc: String::new(),
             router_malformed: false,
             filter_stopped: false,
             grammar_active,
-            grammar_matcher: grammar::Matcher::new(tool_schemas),
+            grammar_matcher: grammar::Matcher::with_config(
+                tool_schemas,
+                crate::grammar_config::resolve_qwen35_grammar_config(),
+            ),
             grammar_violated: false,
             eos_token: ctx.eos,
             im_end_token: ctx.im_end,
-            stop: ctx.stop,
-            max_think_tokens: ctx.max_think,
+            stop: StopMatcher::new(&ctx.stop),
+            think_budget: ThinkBudget::new(ctx.max_think),
             open_think_prefix,
-            think_count: 0,
-            prev_in_think: false,
+            think_close,
             forced: Vec::new(),
-            think_force_closed: false,
             generated_hint: 0,
         })
     }
 
-    /// Route one EosFilter-emitted UTF-8 chunk. Visible prose becomes
+    /// Route one content chunk. Visible prose becomes
     /// `ClientEvent::Token`; complete tool calls stay buffered in the router
     /// until [`SpecEmit::finish`]. Malformed protocol latches fail-closed.
-    fn route_filter_text(&mut self, text: &str, events: &mut Vec<ClientEvent>) {
+    fn route_content_text(&mut self, text: &str, events: &mut Vec<ClientEvent>) {
         if text.is_empty() || self.router_malformed {
             return;
         }
@@ -169,6 +182,41 @@ impl<'a> Qwen35Emit<'a> {
                 self.router_malformed = true;
             }
         }
+    }
+
+    /// Route classified reasoning/content events. Content passes the user
+    /// `stop` matcher, then the tool protocol router; reasoning bypasses both
+    /// and is never cached as visible prose. Once a stop sequence matches,
+    /// nothing after it is routed.
+    fn route_think_events(
+        &mut self,
+        channel_events: Vec<ThinkRouteEvent>,
+        events: &mut Vec<ClientEvent>,
+    ) {
+        for channel_event in channel_events {
+            if self.router_malformed || self.stop.matched() {
+                break;
+            }
+            match channel_event {
+                ThinkRouteEvent::Reasoning(text) => {
+                    events.push(ClientEvent::Reasoning(text));
+                }
+                ThinkRouteEvent::Content(text) => {
+                    let text = self.stop.push(&text);
+                    self.route_content_text(&text, events);
+                }
+            }
+        }
+    }
+
+    /// Route one EosFilter-emitted UTF-8 chunk through reasoning classification.
+    fn route_filter_text(&mut self, text: &str, events: &mut Vec<ClientEvent>) {
+        if text.is_empty() {
+            return;
+        }
+        let mut channel_events = Vec::new();
+        self.think_router.push_into(text, &mut channel_events);
+        self.route_think_events(channel_events, events);
     }
 
     /// Apply one filter observe step into the semantic router.
@@ -200,26 +248,28 @@ impl<'a> Qwen35Emit<'a> {
             id: token,
             idx: self.streamed_tokens.len() - 1,
         });
-        let all_bytes = self.tokenizer.decode_bytes(&self.streamed_tokens);
-        let new_bytes = &all_bytes[self.bytes_fed_to_filter..];
-        self.bytes_fed_to_filter = all_bytes.len();
-        let action = self.filter.observe(new_bytes);
+        let fed = self.stream_bytes.len();
+        self.tokenizer
+            .decode_token_bytes_into(token, &mut self.stream_bytes);
+        let action = self.filter.observe(&self.stream_bytes[fed..]);
         self.apply_filter_action(action, &mut events);
         events
     }
 
-    /// Drain ordinary pending filter prose into the router (not open-think).
+    /// Drain pending EOT-prefix prose, finalize partial think markers, then
+    /// release answer text held back as a possible stop prefix.
     fn drain_pending_into_router(&mut self, events: &mut Vec<ClientEvent>) {
-        if self.filter.in_think() {
-            let _ = self.filter.flush_pending();
-            return;
-        }
         let pending = self.filter.flush_pending();
-        if pending.is_empty() {
-            return;
+        if !pending.is_empty() {
+            let text = std::str::from_utf8(&pending).unwrap_or("");
+            self.route_filter_text(text, events);
         }
-        let text = std::str::from_utf8(&pending).unwrap_or("");
-        self.route_filter_text(text, events);
+
+        let mut channel_events = Vec::new();
+        self.think_router.finish_into(&mut channel_events);
+        self.route_think_events(channel_events, events);
+        let held = self.stop.finish();
+        self.route_content_text(&held, events);
     }
 
     /// Whether a streamed token id is a decoded EOT / terminator.
@@ -227,18 +277,6 @@ impl<'a> Qwen35Emit<'a> {
         token == self.eos_token
             || self.im_end_token == Some(token)
             || self.tokenizer.is_terminator(token)
-    }
-
-    /// User stop-sequence match against the decoded streamed suffix.
-    /// Shared by `begin` (first token) and `observe` (later tokens).
-    fn matches_stop_sequence(&self) -> bool {
-        if self.stop.is_empty() {
-            return false;
-        }
-        let decoded_suffix = self.tokenizer.decode(&self.streamed_tokens);
-        self.stop
-            .iter()
-            .any(|s| decoded_suffix.ends_with(s.as_str()))
     }
 
     /// True when this turn ended on a decoded EOT (token id or filter stop_at).
@@ -250,6 +288,30 @@ impl<'a> Qwen35Emit<'a> {
                 .copied()
                 .map(|t| self.token_is_eot(t))
                 .unwrap_or(false)
+    }
+
+    /// Count the just-pushed token against the think budget. Queues the close
+    /// on the first exhaustion; a second one (span re-opened) is a stop.
+    fn think_budget_stop(&mut self) -> Option<StopReason> {
+        if !self.think_budget.enabled() {
+            return None;
+        }
+        let raw_str = std::str::from_utf8(&self.stream_bytes).unwrap_or("");
+        let in_think = currently_in_think(raw_str, self.open_think_prefix);
+        match self.think_budget.observe(in_think) {
+            ThinkBudgetStep::Continue => None,
+            ThinkBudgetStep::ForceClose => {
+                self.forced = self.tokenizer.encode(&self.think_close);
+                self.think_budget.closing(self.forced.len());
+                eprintln!(
+                    "[think-cap] route=spec think budget reached; closing with tokens {:?}",
+                    self.forced
+                );
+                None
+            }
+            // A pathological re-open after the injected close hard-stops.
+            ThinkBudgetStep::Exhausted => Some(StopReason::ThinkCap),
+        }
     }
 
     /// Producer-authorized visible text for asst-turn cache fingerprinting.
@@ -278,18 +340,37 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
                 stop: Some(StopReason::Eos),
             };
         }
-        if self.matches_stop_sequence() {
+        if self.stop.matched() {
             return EmitOutcome {
                 events,
                 stop: Some(StopReason::StopSequence),
             };
         }
-        EmitOutcome { events, stop: None }
+        // The first token counts against the think budget like every later one.
+        let stop = self.think_budget_stop();
+        EmitOutcome { events, stop }
     }
 
     fn observe(&mut self, token: u32) -> EmitOutcome {
         // Grammar pre-check (POST-acceptance, before emit). A rejected token is
         // NOT emitted; treat as a grammar violation → stop. Mirrors 4565-4584.
+        //
+        // This is the **tool-call grammar** guard (the `<tool_call>` format), NOT
+        // the JSON Schema `response_format` constraint (spec §7 G1/G2). The
+        // `response_format` constraint is applied as a pre-sampling mask in
+        // the slot engine's `run_loop` (serve_engine.rs) BEFORE the GPU
+        // sampler, so no forbidden token can be sampled — this guard never
+        // sees a `response_format` violation (spec §7.2 G2: "the hard
+        // grammar mask participates before probability-dependent
+        // filtering/renormalization").
+        //
+        // For the slots path: `tools: None` is passed (slots.rs), so
+        // `grammar_active` is false and this guard is inactive. When tools
+        // are eventually supported on the slots path, the tool-call grammar
+        // mask should also be applied pre-sampling in serve_engine.rs
+        // rather than post-acceptance here (spec §7.2 G2: "Constrained slot
+        // requests use AR until the verifier applies constraints before
+        // acceptance, not only after a bad token has advanced state").
         if self.grammar_active {
             let text = self.tokenizer.decode(&[token]);
             if !self.grammar_matcher.is_token_allowed(&text) {
@@ -331,44 +412,18 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
             };
         }
 
-        // User stop-sequence match against the decoded suffix. Mirrors 4622-4628.
-        if self.matches_stop_sequence() {
+        // User stop sequence matched in the answer text this token completed.
+        if self.stop.matched() {
             return EmitOutcome {
                 events,
                 stop: Some(StopReason::StopSequence),
             };
         }
 
-        // max_think_tokens enforcement. Mirrors 4632-4664.
-        if self.max_think_tokens > 0 {
-            let raw_so_far = self.tokenizer.decode_bytes(&self.streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
-            let in_think = currently_in_think(raw_str, self.open_think_prefix);
-            if in_think && !self.prev_in_think {
-                self.think_count = 0;
-            }
-            if in_think {
-                self.think_count += 1;
-            }
-            self.prev_in_think = in_think;
-
-            if in_think && self.think_count >= self.max_think_tokens {
-                if !self.think_force_closed {
-                    self.forced = self.tokenizer.encode(&think_continuation_text());
-                    self.think_force_closed = true;
-                    return EmitOutcome { events, stop: None };
-                }
-                // A pathological re-open after the injected close hard-stops.
-                // Do not push raw "</think>\n" as a Token — think is stripped;
-                // surface stop only.
-                return EmitOutcome {
-                    events,
-                    stop: Some(StopReason::ThinkCap),
-                };
-            }
-        }
-
-        EmitOutcome { events, stop: None }
+        // max_think_tokens enforcement: a spent budget queues the close
+        // (`take_forced`); a re-opened span spending it again stops.
+        let stop = self.think_budget_stop();
+        EmitOutcome { events, stop }
     }
 
     fn finish(mut self: Box<Self>) -> FinishSummary {
@@ -376,22 +431,28 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
         // ToolCalls are held on FinishSummary for the wrapper — generate_spec
         // must NOT render them before length/malformed/open-think is known.
         let mut events = Vec::new();
-        let open_think = self.filter.in_think();
         self.drain_pending_into_router(&mut events);
-        // Sticky: drain never leaves think; open_think remains if still open.
-        let open_think = open_think || self.filter.in_think();
+        let open_think = self.think_router.in_think();
         let decoded_eot = self.decoded_eot();
 
-        if open_think {
-            // Unsafe terminal: drop pending (already flushed/dropped), no calls,
-            // no safe stop. Daemon emits error-only (no done/cache).
-            let _ = self.router.finish();
+        if open_think && !self.stop.matched() {
+            // The turn ended inside `<think>`: release the drained reasoning and
+            // any held answer prose, never a tool call. The wrapper ends it as
+            // a reasoning-only `stop` (or `length`) with no cache store.
+            if let Ok(evs) = self.router.finish() {
+                for ev in evs {
+                    if let ToolRouteEvent::VisibleText(vt) = ev {
+                        self.visible_acc.push_str(vt.as_str());
+                        events.push(ClientEvent::Token(vt.into_string()));
+                    }
+                }
+            }
             return FinishSummary {
-                events: Vec::new(),
+                events,
                 finish_reason: "open_think",
                 tool_calls: 0,
-                visible_text: String::new(),
-                decoded_eot: false,
+                visible_text: std::mem::take(&mut self.visible_acc),
+                decoded_eot,
                 open_think: true,
             };
         }
@@ -410,9 +471,24 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
         let buffered_before = self.router.tool_calls().to_vec();
         match self.router.finish() {
+            // A stop sequence that cut a tool call short leaves no call and
+            // no malformed verdict: the call text was never part of the answer.
+            Err(_) if self.stop.matched() => FinishSummary {
+                events,
+                finish_reason: "stop",
+                tool_calls: 0,
+                visible_text: std::mem::take(&mut self.visible_acc),
+                decoded_eot,
+                open_think: false,
+            },
+            // The output ended inside a tool call (unclosed span, or a body the
+            // final flush rejects). Like an open think span, this is its own
+            // reason: the wrapper lets a pure length exit win (AR's rule in
+            // `qwen_ar_finish_route`) and fails closed only when the model
+            // ended the turn there. A mid-stream latch stays `malformed_protocol`.
             Err(_) => FinishSummary {
                 events,
-                finish_reason: "malformed_protocol",
+                finish_reason: "truncated_tool_call",
                 tool_calls: 0,
                 visible_text: std::mem::take(&mut self.visible_acc),
                 decoded_eot,
@@ -482,6 +558,15 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
     fn take_forced(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.forced)
+    }
+
+    fn window_cap(&self) -> Option<usize> {
+        if !self.think_budget.enabled() {
+            return None;
+        }
+        let raw_str = std::str::from_utf8(&self.stream_bytes).unwrap_or("");
+        let in_think = currently_in_think(raw_str, self.open_think_prefix);
+        self.think_budget.window_cap(in_think)
     }
 }
 
@@ -573,7 +658,8 @@ mod tests {
             tokenizer: tok,
             eos: 9,
             im_end: Some(1),
-            tools: None,
+            tools: Some(&[]),
+            enable_grammar: true,
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,
@@ -613,6 +699,16 @@ mod tests {
         let mut s = String::new();
         for ev in events {
             if let ClientEvent::Token(t) = ev {
+                s.push_str(t);
+            }
+        }
+        s
+    }
+
+    fn reasoning_text(events: &[ClientEvent]) -> String {
+        let mut s = String::new();
+        for ev in events {
+            if let ClientEvent::Reasoning(t) = ev {
                 s.push_str(t);
             }
         }
@@ -661,6 +757,57 @@ mod tests {
     }
 
     #[test]
+    fn xml_tool_call_held_when_tools_present_and_grammar_off() {
+        // Qwen3.5/3.8 XML-native: grammar stays off, but tools must still
+        // enable ToolOutputRouter or `<tool_call>` leaks as assistant text.
+        let tok = test_tokenizer();
+        let tools = [serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "get_time",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        })];
+        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+            tokenizer: &tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: Some(&tools),
+            enable_grammar: false,
+            stop: Vec::new(),
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+        let text = "<tool_call>\n<function=get_time>\n</function>\n</tool_call>";
+        let ids = tok.encode(text);
+        assert!(!ids.is_empty());
+        let mut stream = Vec::new();
+        let mut first = true;
+        for id in &ids {
+            let outcome = if first {
+                first = false;
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            stream.extend(outcome.events);
+            if outcome.stop.is_some() {
+                break;
+            }
+        }
+        let finish = emit.finish();
+        assert!(!tokens_text(&stream).contains("<tool_call>"));
+        assert_eq!(finish.finish_reason, "tool_calls");
+        assert_eq!(finish.tool_calls, 1);
+        let calls = held_calls(&finish);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_time");
+    }
+
+    #[test]
     fn multiple_calls_and_surrounding_prose() {
         let body = format!(
             "A{}B{}",
@@ -688,10 +835,10 @@ mod tests {
     }
 
     #[test]
-    fn malformed_unclosed_span_is_fail_closed() {
+    fn unclosed_span_is_truncated_tool_call_with_no_calls() {
         let (stream, finish, _) = drive_text("pre<tool_call>{\"name\":\"x\"");
         assert!(!tokens_text(&stream).contains("<tool_call>"));
-        assert_eq!(finish.finish_reason, "malformed_protocol");
+        assert_eq!(finish.finish_reason, "truncated_tool_call");
         assert_eq!(finish.tool_calls, 0);
         assert!(held_calls(&finish).is_empty());
     }
@@ -712,6 +859,7 @@ mod tests {
         assert!(!visible.contains("<think>"));
         assert!(!visible.contains("secret"));
         assert!(visible.contains("answer"));
+        assert_eq!(reasoning_text(&stream), "secret");
         assert_eq!(finish.finish_reason, "stop");
     }
 
@@ -768,7 +916,7 @@ mod tests {
     fn finish_does_not_use_whole_output_extraction_authority() {
         let open = "<tool_call>{\"name\": \"recovered\", \"arguments\": {}}";
         let (_stream, finish, _) = drive_text(open);
-        assert_eq!(finish.finish_reason, "malformed_protocol");
+        assert_eq!(finish.finish_reason, "truncated_tool_call");
         assert_eq!(finish.tool_calls, 0);
         assert!(held_calls(&finish).is_empty());
     }
@@ -787,6 +935,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            enable_grammar: false,
             stop: vec![first_text.clone()],
             max_think: 0,
             max_tokens: 256,
@@ -815,6 +964,7 @@ mod tests {
             eos: 9,
             im_end: Some(1),
             tools: None,
+            enable_grammar: false,
             stop: vec!["STOP".to_string()],
             max_think: 0,
             max_tokens: 256,
@@ -848,11 +998,139 @@ mod tests {
     }
 
     #[test]
+    fn stop_sequence_text_is_never_a_token_event() {
+        let tok = test_tokenizer();
+        let ids = tok.encode("ab STOP cd");
+        let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+            tokenizer: &tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: None,
+            enable_grammar: false,
+            stop: vec!["STOP".to_string()],
+            max_think: 0,
+            max_tokens: 256,
+            assistant_prefix: AssistantPrefix::Plain,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        });
+        let mut tokens = String::new();
+        let mut saw_stop = false;
+        for (i, id) in ids.iter().enumerate() {
+            let outcome = if i == 0 {
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            for e in &outcome.events {
+                if let ClientEvent::Token(t) = e {
+                    tokens.push_str(t);
+                }
+            }
+            if outcome.stop == Some(StopReason::StopSequence) {
+                saw_stop = true;
+                break;
+            }
+        }
+        assert!(saw_stop);
+        let fin = emit.finish();
+        for e in &fin.events {
+            if let ClientEvent::Token(t) = e {
+                tokens.push_str(t);
+            }
+        }
+        assert_eq!(tokens, "ab ");
+        assert_eq!(fin.finish_reason, "stop");
+        assert_eq!(fin.visible_text, "ab ");
+    }
+
+    #[test]
     fn filter_config_matches_ar_semantic_v2() {
-        let cfg = qwen_dflash_eos_filter_config(true);
-        assert!(cfg.strip_think);
-        assert!(cfg.started_in_think);
+        let cfg = hipfire_runtime::eos_filter::qwen35_eos_filter_config();
+        assert!(!cfg.strip_think);
+        assert!(!cfg.started_in_think);
         assert!(cfg.stop_at.iter().any(|s| s == b"<|im_end|>"));
         assert!(cfg.stop_at.iter().any(|s| s == b"<|endoftext|>"));
+    }
+
+    /// A Qwen4-framed emitter (template think close) with a think budget.
+    fn budget_emit<'a>(
+        tok: &'a Tokenizer,
+        max_think: usize,
+        assistant_prefix: AssistantPrefix,
+    ) -> Box<dyn SpecEmit + 'a> {
+        Qwen35Emit::from_ctx_template_think_close(SpecEmitCtx {
+            tokenizer: tok,
+            eos: 9,
+            im_end: Some(1),
+            tools: None,
+            enable_grammar: false,
+            stop: Vec::new(),
+            max_think,
+            max_tokens: 256,
+            assistant_prefix,
+            think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+            decoded_vocab: None,
+        })
+    }
+
+    /// Thinking off reaches the emitter as `max_think_tokens == 1` behind a
+    /// closed-think prefix. `window_cap` is the per-window emit clamp of
+    /// native Qwen4 MTP, so the answer must never be capped: a cap of 1 turns
+    /// every window into one token (τ 0).
+    #[test]
+    fn thinking_off_never_caps_mtp_windows() {
+        let tok = test_tokenizer();
+        let mut emit = budget_emit(&tok, 1, AssistantPrefix::ClosedThink);
+        assert_eq!(emit.window_cap(), None);
+        let ids = tok.encode("Hello world, a plain answer with no thinking.");
+        for (i, id) in ids.iter().enumerate() {
+            let outcome = if i == 0 {
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            assert!(outcome.stop.is_none(), "token {i}");
+            assert_eq!(emit.window_cap(), None, "token {i}");
+        }
+        assert!(emit.take_forced().is_empty());
+    }
+
+    /// An explicit budget still caps windows inside the span, so the
+    /// force-close lands on a window's last token, and over the queued close
+    /// tokens; the answer after the close is uncapped.
+    #[test]
+    fn think_budget_caps_windows_in_span_and_over_close() {
+        const MAX: usize = 4;
+        let tok = test_tokenizer();
+        let mut emit = budget_emit(&tok, MAX, AssistantPrefix::OpenThink);
+        assert_eq!(emit.window_cap(), Some(MAX));
+        let ids = tok.encode("abcd");
+        assert_eq!(ids.len(), MAX);
+        for (i, id) in ids.iter().enumerate() {
+            let outcome = if i == 0 {
+                emit.begin(*id)
+            } else {
+                emit.observe(*id)
+            };
+            assert!(outcome.stop.is_none(), "token {i}");
+            if i + 1 < MAX {
+                assert_eq!(emit.window_cap(), Some(MAX - 1 - i), "token {i}");
+            }
+        }
+        // The MAX-th thinking token forced the close.
+        let forced = emit.take_forced();
+        assert!(!forced.is_empty());
+        assert_eq!(emit.window_cap(), Some(forced.len() + 1));
+        for (j, id) in forced.iter().enumerate() {
+            assert!(emit.observe(*id).stop.is_none(), "close token {j}");
+            let left = forced.len() - 1 - j;
+            let want = (left > 0).then_some(left + 1);
+            assert_eq!(emit.window_cap(), want, "close token {j}");
+        }
+        for id in tok.encode("The answer.") {
+            assert!(emit.observe(id).stop.is_none());
+            assert_eq!(emit.window_cap(), None);
+        }
     }
 }

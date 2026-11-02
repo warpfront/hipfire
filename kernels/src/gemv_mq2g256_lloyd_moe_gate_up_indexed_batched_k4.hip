@@ -31,7 +31,7 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4(
     const float* __restrict__ x_rot,                     // [N × K] FWHT-rotated
     float* __restrict__ y_gate,                          // [N × K_TOP × MI]
     float* __restrict__ y_up,                            // [N × K_TOP × MI]
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -40,6 +40,15 @@ extern "C" __global__ void gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_batched_k4(
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[bid * K_TOP + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) {
+            const int mi_inv = M >> 1;
+            const long long base_inv = (long long)bid * K_TOP * mi_inv + (long long)krank * mi_inv;
+            if (row < mi_inv) y_gate[base_inv + row] = 0.0f;
+            else              y_up[base_inv + (row - mi_inv)] = 0.0f;
+        }
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x_row = x_rot + (long long)bid * K;

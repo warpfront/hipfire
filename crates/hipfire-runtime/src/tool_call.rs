@@ -412,17 +412,12 @@ fn parse_one_qwen35_xml(body: &str) -> Option<ParsedToolCall> {
             Some(i) => i,
             None => after_arg_open.len(),
         };
-        // Value may have a leading + trailing newline (template
-        // emits `<parameter=ARG>\nVALUE\n</parameter>`); strip them.
-        let value_str = after_arg_open[..p_close]
-            .trim_matches('\n')
-            .trim()
-            .to_string();
-        // If the value parses as a JSON value (e.g., model emitted
-        // `{"key": "..."}` because the parameter is structured), use
-        // that. Otherwise treat as a raw string.
-        let value_json: serde_json::Value = serde_json::from_str(&value_str)
-            .unwrap_or_else(|_| serde_json::Value::String(value_str));
+        // Strip only the template's formatting newline on each side and keep
+        // the value as a string; the serve gateway types it against the
+        // declared schema (see `emit_text::strip_template_newlines`).
+        let value_json = serde_json::Value::String(
+            crate::emit_text::strip_template_newlines(&after_arg_open[..p_close]).to_string(),
+        );
         if !arg_name.is_empty() {
             args.insert(arg_name.to_string(), value_json);
         }
@@ -664,6 +659,25 @@ mod tests {
         assert!(args_eq(
             &r.tool_calls[0].arguments,
             serde_json::json!({"expr":"x<5"})
+        ));
+    }
+
+    #[test]
+    fn qwen35_xml_values_are_exact_strings() {
+        // One template newline per side goes; the file's own trailing `\n`,
+        // leading indent, and JSON spacing stay; nothing is typed.
+        let p = Qwen35XmlParser::new();
+        let text = "<tool_call>\n<function=write_file>\n<parameter=content>\n    x = 1\n\n</parameter>\n<parameter=json>\n{\"sum\": 10}\n</parameter>\n<parameter=count>\n42\n</parameter>\n<parameter=empty></parameter>\n</function>\n</tool_call>";
+        let r = p.parse(text);
+        assert_eq!(r.tool_calls.len(), 1);
+        assert!(args_eq(
+            &r.tool_calls[0].arguments,
+            serde_json::json!({
+                "content": "    x = 1\n",
+                "json": "{\"sum\": 10}",
+                "count": "42",
+                "empty": ""
+            })
         ));
     }
 

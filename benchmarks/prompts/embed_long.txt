@@ -1,0 +1,879 @@
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.
+
+Retrieval-augmented generation grounds a language model's answer in
+documents fetched at query time. The retriever encodes the query and each
+candidate passage into vectors, ranks the passages by similarity, and hands the
+top few to the generator as context. Dense dual encoders dominate this design
+because both sides can be embedded independently and compared with a single dot
+product, which makes indexing a corpus an embarrassingly parallel batch job.
+
+Late interaction, introduced with ColBERT, keeps one vector per token instead
+of pooling a passage into a single embedding. Scoring is then a sum over query
+tokens of the maximum dot product against any document token, a function known
+as MaxSim. Keeping per-token vectors preserves the fine-grained lexical signal
+that pooling discards, at the cost of storing an order of magnitude more data
+per passage and of a scoring pass that is quadratic in the two lengths rather
+than a single inner product.
+
+Production systems trade between the two. They retrieve a candidate set with an
+approximate nearest-neighbour index over a compressed representation, then
+rescore only those candidates with the expensive late-interaction scorer. The
+compression step, which maps each token vector into a small number of bits,
+dominates the memory budget of a large index and is where most of the
+engineering effort goes.

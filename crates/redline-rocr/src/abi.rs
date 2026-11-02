@@ -34,6 +34,8 @@ pub const AGENT_INFO_QUEUE_TYPE: u32 = 15;
 pub const AGENT_INFO_DEVICE: u32 = 17;
 pub const AMD_AGENT_INFO_BDFID: u32 = 0xA006;
 pub const AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
+pub const AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
+pub const AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT: u32 = 0xA014;
 pub const AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: u32 = 0xA016;
 
 pub const PROFILE_BASE: u32 = 0;
@@ -75,6 +77,12 @@ pub const AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_GRANULE: u32 = 6;
 pub const AMD_MEMORY_POOL_INFO_RUNTIME_ALLOC_ALIGNMENT: u32 = 7;
 pub const AMD_MEMORY_POOL_STANDARD_FLAG: u32 = 0;
 pub const AMD_MEMORY_POOL_EXECUTABLE_FLAG: u32 = 1 << 2;
+/// `HSA_AMD_AGENT_MEMORY_POOL_INFO_ACCESS` (`hsa_amd_agent_memory_pool_info_t`).
+pub const AMD_AGENT_MEMORY_POOL_INFO_ACCESS: u32 = 0;
+/// `hsa_amd_memory_pool_access_t`.
+pub const AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED: u32 = 0;
+pub const AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT: u32 = 1;
+pub const AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT: u32 = 2;
 
 pub const EXECUTABLE_SYMBOL_INFO_TYPE: u32 = 0;
 pub const SYMBOL_KIND_KERNEL: u32 = 1;
@@ -134,6 +142,14 @@ pub struct ProfilingDispatchTime {
     pub end: u64,
 }
 
+/// Public `hsa_amd_profiling_async_copy_time_t` layout.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProfilingAsyncCopyTime {
+    pub start: u64,
+    pub end: u64,
+}
+
 pub type AgentCallback = unsafe extern "C" fn(Agent, *mut c_void) -> Status;
 pub type MemoryPoolCallback = unsafe extern "C" fn(MemoryPool, *mut c_void) -> Status;
 pub type QueueErrorCallback = unsafe extern "C" fn(Status, *mut Queue, *mut c_void);
@@ -167,20 +183,50 @@ pub type QueueInactivateFn = unsafe extern "C" fn(*mut Queue) -> Status;
 pub type QueueLoadReadIndexRelaxedFn = unsafe extern "C" fn(*const Queue) -> u64;
 pub type QueueLoadReadIndexScAcquireFn = unsafe extern "C" fn(*const Queue) -> u64;
 pub type QueueLoadWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue) -> u64;
-pub type QueueAddWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue, u64) -> u64;
 pub type QueueCuSetMaskFn = unsafe extern "C" fn(*const Queue, u32, *const u32) -> Status;
+pub type QueueCuGetMaskFn = unsafe extern "C" fn(*const Queue, u32, *mut u32) -> Status;
+pub type QueueAddWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue, u64) -> u64;
 pub type ProfilingSetProfilerEnabledFn = unsafe extern "C" fn(*mut Queue, i32) -> Status;
 pub type ProfilingGetDispatchTimeFn =
     unsafe extern "C" fn(Agent, Signal, *mut ProfilingDispatchTime) -> Status;
+pub type ProfilingAsyncCopyEnableFn = unsafe extern "C" fn(bool) -> Status;
+pub type ProfilingGetAsyncCopyTimeFn =
+    unsafe extern "C" fn(Signal, *mut ProfilingAsyncCopyTime) -> Status;
 
 pub type AgentIterateMemoryPoolsFn =
     unsafe extern "C" fn(Agent, Option<MemoryPoolCallback>, *mut c_void) -> Status;
 pub type MemoryPoolGetInfoFn = unsafe extern "C" fn(MemoryPool, u32, *mut c_void) -> Status;
+pub type AgentMemoryPoolGetInfoFn =
+    unsafe extern "C" fn(Agent, MemoryPool, u32, *mut c_void) -> Status;
 pub type MemoryPoolAllocateFn =
     unsafe extern "C" fn(MemoryPool, usize, u32, *mut *mut c_void) -> Status;
 pub type MemoryPoolFreeFn = unsafe extern "C" fn(*mut c_void) -> Status;
 pub type AgentsAllowAccessFn =
     unsafe extern "C" fn(u32, *const Agent, *const u32, *const c_void) -> Status;
+pub type MemoryAsyncCopyFn = unsafe extern "C" fn(
+    *mut c_void,
+    Agent,
+    *const c_void,
+    Agent,
+    usize,
+    u32,
+    *const Signal,
+    Signal,
+) -> Status;
+pub type MemoryAsyncCopyOnEngineFn = unsafe extern "C" fn(
+    *mut c_void,
+    Agent,
+    *const c_void,
+    Agent,
+    usize,
+    u32,
+    *const Signal,
+    Signal,
+    u32,
+    bool,
+) -> Status;
+pub type MemoryCopyEngineStatusFn = unsafe extern "C" fn(Agent, Agent, *mut u32) -> Status;
+pub type MemoryGetPreferredCopyEngineFn = unsafe extern "C" fn(Agent, Agent, *mut u32) -> Status;
 
 pub type CodeObjectReaderCreateFromMemoryFn =
     unsafe extern "C" fn(*const c_void, usize, *mut CodeObjectReader) -> Status;
@@ -227,13 +273,27 @@ pub struct Symbols {
     pub queue_load_write_index_relaxed: QueueLoadWriteIndexRelaxedFn,
     pub queue_add_write_index_relaxed: QueueAddWriteIndexRelaxedFn,
     pub queue_cu_set_mask: QueueCuSetMaskFn,
+    /// `hsa_amd_queue_cu_get_mask`, present on ROCm back to 7.14-era
+    /// runtimes. Optional so CU-affinity read-back degrades to the
+    /// post-set effective cache instead of breaking symbol loading on
+    /// older libraries; creation-time masking itself stays required.
+    pub queue_cu_get_mask: Option<QueueCuGetMaskFn>,
     pub profiling_set_profiler_enabled: ProfilingSetProfilerEnabledFn,
     pub profiling_get_dispatch_time: ProfilingGetDispatchTimeFn,
+    pub profiling_async_copy_enable: Option<ProfilingAsyncCopyEnableFn>,
+    pub profiling_get_async_copy_time: Option<ProfilingGetAsyncCopyTimeFn>,
     pub agent_iterate_memory_pools: AgentIterateMemoryPoolsFn,
     pub memory_pool_get_info: MemoryPoolGetInfoFn,
+    /// `hsa_amd_agent_memory_pool_get_info`; optional so its absence only
+    /// disables device-local retained kernargs (host-pool fallback).
+    pub agent_memory_pool_get_info: Option<AgentMemoryPoolGetInfoFn>,
     pub memory_pool_allocate: MemoryPoolAllocateFn,
     pub memory_pool_free: MemoryPoolFreeFn,
     pub agents_allow_access: AgentsAllowAccessFn,
+    pub memory_async_copy: MemoryAsyncCopyFn,
+    pub memory_async_copy_on_engine: MemoryAsyncCopyOnEngineFn,
+    pub memory_copy_engine_status: MemoryCopyEngineStatusFn,
+    pub memory_get_preferred_copy_engine: MemoryGetPreferredCopyEngineFn,
     pub code_object_reader_create_from_memory: CodeObjectReaderCreateFromMemoryFn,
     pub code_object_reader_destroy: CodeObjectReaderDestroyFn,
     pub executable_create_alt: ExecutableCreateAltFn,
@@ -277,6 +337,21 @@ impl Symbols {
                 unsafe { std::mem::transmute::<*const c_void, $ty>(pointer) }
             }};
         }
+        macro_rules! optional_symbol {
+            ($name:literal, $ty:ty) => {{
+                let name = CStr::from_bytes_with_nul(concat!($name, "\0").as_bytes())
+                    .expect("symbol name has one trailing NUL");
+                let pointer = resolve(name);
+                if pointer.is_null() {
+                    None
+                } else {
+                    // SAFETY: same contract as `symbol!`; absence remains a
+                    // runtime capability error instead of breaking all ROCr
+                    // users on older libraries.
+                    Some(unsafe { std::mem::transmute::<*const c_void, $ty>(pointer) })
+                }
+            }};
+        }
 
         Ok(Arc::new(Self {
             _keepalive: keepalive,
@@ -311,6 +386,7 @@ impl Symbols {
                 QueueAddWriteIndexRelaxedFn
             ),
             queue_cu_set_mask: symbol!("hsa_amd_queue_cu_set_mask", QueueCuSetMaskFn),
+            queue_cu_get_mask: optional_symbol!("hsa_amd_queue_cu_get_mask", QueueCuGetMaskFn),
             profiling_set_profiler_enabled: symbol!(
                 "hsa_amd_profiling_set_profiler_enabled",
                 ProfilingSetProfilerEnabledFn
@@ -319,14 +395,39 @@ impl Symbols {
                 "hsa_amd_profiling_get_dispatch_time",
                 ProfilingGetDispatchTimeFn
             ),
+            profiling_async_copy_enable: optional_symbol!(
+                "hsa_amd_profiling_async_copy_enable",
+                ProfilingAsyncCopyEnableFn
+            ),
+            profiling_get_async_copy_time: optional_symbol!(
+                "hsa_amd_profiling_get_async_copy_time",
+                ProfilingGetAsyncCopyTimeFn
+            ),
             agent_iterate_memory_pools: symbol!(
                 "hsa_amd_agent_iterate_memory_pools",
                 AgentIterateMemoryPoolsFn
             ),
             memory_pool_get_info: symbol!("hsa_amd_memory_pool_get_info", MemoryPoolGetInfoFn),
+            agent_memory_pool_get_info: optional_symbol!(
+                "hsa_amd_agent_memory_pool_get_info",
+                AgentMemoryPoolGetInfoFn
+            ),
             memory_pool_allocate: symbol!("hsa_amd_memory_pool_allocate", MemoryPoolAllocateFn),
             memory_pool_free: symbol!("hsa_amd_memory_pool_free", MemoryPoolFreeFn),
             agents_allow_access: symbol!("hsa_amd_agents_allow_access", AgentsAllowAccessFn),
+            memory_async_copy: symbol!("hsa_amd_memory_async_copy", MemoryAsyncCopyFn),
+            memory_async_copy_on_engine: symbol!(
+                "hsa_amd_memory_async_copy_on_engine",
+                MemoryAsyncCopyOnEngineFn
+            ),
+            memory_copy_engine_status: symbol!(
+                "hsa_amd_memory_copy_engine_status",
+                MemoryCopyEngineStatusFn
+            ),
+            memory_get_preferred_copy_engine: symbol!(
+                "hsa_amd_memory_get_preferred_copy_engine",
+                MemoryGetPreferredCopyEngineFn
+            ),
             code_object_reader_create_from_memory: symbol!(
                 "hsa_code_object_reader_create_from_memory",
                 CodeObjectReaderCreateFromMemoryFn
@@ -373,4 +474,5 @@ const _: () = {
     assert!(std::mem::size_of::<Queue>() == 40);
     assert!(std::mem::align_of::<Queue>() == 8);
     assert!(std::mem::size_of::<ProfilingDispatchTime>() == 16);
+    assert!(std::mem::size_of::<ProfilingAsyncCopyTime>() == 16);
 };

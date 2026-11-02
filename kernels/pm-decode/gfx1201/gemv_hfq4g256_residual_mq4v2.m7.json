@@ -1,0 +1,18 @@
+{
+  "gemv_mq4g256v2_residual": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 0,
+    "instructions": 686,
+    "lds_accesses": 10,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 10,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 28,
+    "table": "gfx1201",
+    "vgpr_high_water": 108,
+    "wait_facts": 39
+  }
+}

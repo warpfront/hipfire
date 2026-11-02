@@ -1,0 +1,44 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The `moe_rotate_i4_pm` generator (row-local R128 `block_i4_128` producer with a runtime row width,
+// gfx1201) and its grouped-position twin, composed in `.rip` from the `rot::*` natives of
+// `moe_rotate_i4_pm::blocks`.
+//
+// `moe_rotate_i4_pm::emit(spec)` / `emit_gp(spec)` are written over exactly the blocks this script
+// calls, so for both variants the script re-emits the production kernel's bytes (`s_text` and
+// proof). A test in peacemaker-rip (`rotate_twin_matches_the_rust_emit`) requires it and the
+// digests in peacemaker-isa (`producers_pinned`) pin the Rust side. Edit the composition and
+// re-run: no rebuild.
+//
+// An untyped-`Builder` kernel with no LDS and no barrier: every block emits straight into the
+// builder. The sequence is the whole kernel: the prologue (kernel arguments, the workgroup's row
+// and group with their exits, the slot, the h / xq pointers, the lane setup and loads), the FWHT128
+// rotation, the `{5,7}` two-candidate quantizer and the record store. `gp` selects the record index
+// `g * P + row` (the grouped plane the down GEMM reads) instead of `g * L + sorted[row]`.
+//
+// Variant grammar:
+//
+//     rows | gp
+//
+// gfx1201 only.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &["rows", "gp"];
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let gp = spec.variant == "gp";
+    if !gp && spec.variant != "rows" {
+        return Err(format!("variant `{}`: expected rows or gp", spec.variant));
+    }
+    let g = RotGen::new(spec.arch, gp)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    b.enable_delay_alu();
+    rot::prologue(&mut b, &g)?;
+    let e = rot::rotate(&mut b)?;
+    rot::quantize(&mut b, e)?;
+    rot::store(&mut b)?;
+    b.finish()
+}

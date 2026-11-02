@@ -6,26 +6,30 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{
+        Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Sparkline, Table, Tabs, Wrap,
+    },
     Frame,
 };
 
 use crate::{
     app::{App, Tab},
     hipfire::dashboard::{LoadState, VramState},
-    hipfire::knobs,
+    hipfire::metrics::MetricsView,
+    hipfire::pull_choice::PullChoice,
     hipfire::registry::ModelListItem,
+    hipfire::serve_ctrl::ServeAction,
 };
 
-const BG: Color = Color::Rgb(7, 7, 9);
-const PANEL: Color = Color::Rgb(18, 16, 18);
-const PANEL_2: Color = Color::Rgb(40, 24, 27);
-const TEXT: Color = Color::Rgb(222, 226, 232);
-const MUTED: Color = Color::Rgb(142, 150, 163);
-const ACCENT: Color = Color::Rgb(237, 45, 57);
-const GREEN: Color = Color::Rgb(102, 217, 139);
-const YELLOW: Color = Color::Rgb(238, 190, 95);
-const RED: Color = Color::Rgb(255, 95, 104);
+pub(crate) const BG: Color = Color::Rgb(7, 7, 9);
+pub(crate) const PANEL: Color = Color::Rgb(18, 16, 18);
+pub(crate) const PANEL_2: Color = Color::Rgb(40, 24, 27);
+pub(crate) const TEXT: Color = Color::Rgb(222, 226, 232);
+pub(crate) const MUTED: Color = Color::Rgb(142, 150, 163);
+pub(crate) const ACCENT: Color = Color::Rgb(237, 45, 57);
+pub(crate) const GREEN: Color = Color::Rgb(102, 217, 139);
+pub(crate) const YELLOW: Color = Color::Rgb(238, 190, 95);
+pub(crate) const RED: Color = Color::Rgb(255, 95, 104);
 
 /// Tab-bar divider, shared between the renderer (`Tabs::divider`) and the mouse
 /// hit-test math in `draw_header` so the two cannot drift (the hit-test advances
@@ -34,6 +38,7 @@ const TAB_DIVIDER: &str = " | ";
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.tuning_wide = crate::ui_tuning::is_wide(area);
     frame.render_widget(Clear, area);
     let root = Layout::default()
         .direction(Direction::Vertical)
@@ -45,14 +50,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .split(area);
 
     draw_header(frame, app, root[0]);
-    match app.tab {
-        Tab::Home => draw_home(frame, app, root[1]),
-        Tab::Dashboard => draw_dashboard(frame, app, root[1]),
-        Tab::Chat => draw_chat(frame, app, root[1]),
-        Tab::Models => draw_models(frame, app, root[1]),
-        Tab::Settings => draw_settings(frame, app, root[1]),
-        Tab::System => draw_system(frame, app, root[1]),
-        Tab::Logs => draw_logs(frame, app, root[1]),
+    if crate::ui_scope::draws_screen(app, root[1]) {
+        crate::ui_scope::draw_screen(frame, app, root[1]);
+    } else {
+        match app.tab {
+            Tab::Home => draw_home(frame, app, root[1]),
+            Tab::Dashboard => draw_dashboard(frame, app, root[1]),
+            Tab::Chat => draw_chat(frame, app, root[1]),
+            Tab::Models => draw_models(frame, app, root[1]),
+            Tab::Settings => crate::ui_settings::draw_settings(frame, app, root[1]),
+            Tab::System => draw_system(frame, app, root[1]),
+            Tab::Logs => draw_logs(frame, app, root[1]),
+        }
+        crate::ui_scope::draw_picker_popup(frame, app, root[1]);
     }
     draw_footer(frame, app, root[2]);
 
@@ -63,8 +73,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 }
 
 /// Centered modal listing the global + active-tab keybindings. Dismissed by any
-/// key (handled in main::handle_key). Reuses `footer_hints` for the per-tab line
-/// so there is a single source of truth for tab keys.
+/// key (handled in main::handle_key). Reuses `footer_segments` for the per-tab
+/// lines so there is a single source of truth for tab keys.
 fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = vec![
         Line::from(Span::styled(
@@ -72,7 +82,8 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
             Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         )),
         Line::from("  Tab / Shift+Tab  switch tabs"),
-        Line::from("  ?                toggle this help"),
+        Line::from("  ?                toggle this help (in Chat: Esc first)"),
+        Line::from("  Esc              close / cancel (never quits)"),
         Line::from("  r                refresh live data"),
         Line::from("  q                quit"),
         Line::from("  mouse            click a tab · scroll to move in a list"),
@@ -84,13 +95,22 @@ fn draw_help_overlay(frame: &mut Frame, app: &App, area: Rect) {
     ];
     // The active-tab keys, one per line — keeps each short so nothing wraps and
     // clips inside the modal, and makes the line count (hence height) exact. The
-    // globally-listed keys (Tab/Shift+Tab, q) are skipped to avoid duplication.
-    for part in footer_hints(app).split('·') {
+    // globally-listed keys (Tab/Shift+Tab, ?, r, q) are skipped to avoid
+    // duplication.
+    for part in footer_segments(app) {
         let part = part.trim();
-        if part.is_empty() || part.starts_with("Tab/Shift+Tab") || part == "q quit" {
+        if part.is_empty()
+            || part.starts_with("Tab/Shift+Tab")
+            || part == "q quit"
+            || part == "r refresh"
+            || part.contains("? help")
+        {
             continue;
         }
         lines.push(Line::from(format!("  {part}")));
+    }
+    if app.tab == Tab::Dashboard {
+        lines.push(Line::from("  x / R ask y / n first; R force-reaps serve"));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -169,7 +189,7 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
         .divider(Span::styled(TAB_DIVIDER, Style::default().fg(PANEL_2)));
     frame.render_widget(tabs, chunks[1]);
 
-    // Record per-tab hit regions for mouse clicks. ratatui 0.29's Tabs layout:
+    // Record per-tab hit regions for mouse clicks. ratatui 0.30's Tabs layout:
     // from the inner left, each tab cell is 1 (left pad) + title + 1 (right pad),
     // with a 3-col " | " divider between cells. The block has only a BOTTOM
     // border, so inner.x == area.x and titles sit on the area's top row.
@@ -188,57 +208,311 @@ fn draw_header(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// Per-tab keybind hints shown in the footer. Each tab lists ITS relevant keys;
-/// the global `Tab/Shift+Tab switch · q quit` suffix is appended for non-edit
-/// states. Kept here (not in App) so the hint text lives next to the renderer.
-fn footer_hints(app: &App) -> String {
-    let global = "Tab/Shift+Tab switch · q quit";
+/// Separator between footer segments.
+const FOOTER_SEP: &str = " · ";
+
+/// The quit-while-pulling y/n prompt (shown while `confirm_quit` is armed).
+fn quit_confirm_prompt(app: &App) -> String {
+    let tag = app.pull.as_ref().map_or("", |job| job.tag.as_str());
+    format!("A pull of {tag} is running. Quit and cancel it?  y / n")
+}
+
+/// What the footer shows for the current tab/state: an ordered list of whole
+/// segments, highest priority first. [`fit_segments`] drops the ones that do not
+/// fit the footer width (never cutting one mid-word), so list order IS priority
+/// order: put the keys that matter most (and `? help`) near the front. Other
+/// slices extend a tab by inserting one segment into its arm.
+///
+/// Segments must not contain the ` · ` separator themselves.
+fn footer_segments(app: &App) -> Vec<String> {
+    fn segs(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+    if app.confirm_quit {
+        return vec![quit_confirm_prompt(app)];
+    }
+    if let Some(segments) = crate::ui_scope::footer_segments(app) {
+        return segments;
+    }
     match app.tab {
-        Tab::Home => format!("r refresh · {global}"),
+        Tab::Home => segs(&["? help", "r refresh", "Tab/Shift+Tab switch", "q quit"]),
         Tab::Dashboard => {
-            if app.serve_cmd_running() {
-                format!("serve {}\u{2026} · {global}", app.serve_cmd_label)
+            if let Some(action) = app.confirm_serve {
+                vec![serve_confirm_prompt(action).to_string()]
+            } else if app.serve_cmd_running() {
+                vec![
+                    format!("serve {}\u{2026}", app.serve_cmd_label),
+                    "? help".to_string(),
+                    "Tab/Shift+Tab switch".to_string(),
+                    "q quit".to_string(),
+                ]
             } else {
-                format!("s start · x stop · R restart · r refresh · {global}")
+                segs(&[
+                    "s start",
+                    "x stop",
+                    "R restart",
+                    "? help",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             }
         }
         Tab::Chat => {
-            // Chat owns q/r as text input, so it has its own exit hints.
-            "Enter send (/help for commands) · Ctrl+O newline · Up/Down scroll · Esc stop / blur"
-                .to_string()
+            // Chat owns q/r/? as text input while the input is focused, so help
+            // is reached via Esc (blur) first.
+            if app.chat.sending {
+                segs(&["Esc stop reply", "Up/Down/PgUp/PgDn scroll", "End follow"])
+            } else if app.chat.is_input_focused() {
+                segs(&[
+                    "Enter send",
+                    "Esc then ? help",
+                    "Ctrl+O newline",
+                    "Up/Down/PgUp/PgDn scroll",
+                    "End follow",
+                    "/help commands",
+                    "Esc stop / blur",
+                ])
+            } else {
+                segs(&[
+                    "Enter send",
+                    "? help",
+                    "Up/Down/PgUp/PgDn scroll",
+                    "End follow",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
+            }
         }
         Tab::Models => {
-            if app.confirm_delete.is_some() {
-                "Delete this model?  y confirm · n / Esc cancel".to_string()
+            if app.pull_choice.is_some() {
+                segs(&[
+                    "Up/Down row",
+                    "Left/Right change",
+                    "Enter pull",
+                    "Esc cancel",
+                ])
+            } else if app.confirm_delete.is_some() {
+                segs(&["Delete this model?", "y confirm", "n / Esc cancel"])
+            } else if app.pull.is_some() {
+                segs(&[
+                    "c cancel pull",
+                    "Up/Down select",
+                    "Enter open/expand",
+                    "d delete",
+                    "o overrides",
+                    "? help",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             } else {
-                format!(
-                    "Up/Down select · Enter open/expand · p pull · d delete · r refresh · {global}"
-                )
+                segs(&[
+                    "Up/Down select",
+                    "Enter open/expand",
+                    "p pull",
+                    "d delete",
+                    "o overrides",
+                    "? help",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             }
         }
         Tab::Settings => {
-            if app.confirm_reset_all {
-                "Reset ALL settings to defaults?  y confirm · n / Esc cancel".to_string()
+            if let Some(view) = &app.tuning_view {
+                crate::ui_tuning::footer_segments(app, view)
+            } else if app.confirm_reset_all {
+                match app.scope_model() {
+                    Some(model) => vec![
+                        format!("Remove all of {model}'s own values?"),
+                        "y confirm".to_owned(),
+                        "n / Esc cancel".to_owned(),
+                    ],
+                    None => segs(&[
+                        "Reset ALL settings to defaults?",
+                        "y confirm",
+                        "n / Esc cancel",
+                    ]),
+                }
             } else if app.settings_pending.is_some() {
-                "Preview: Left/Right/Space change · Enter commit · Esc cancel".to_string()
+                segs(&[
+                    "Preview: Left/Right/Space change",
+                    "Enter commit",
+                    "Esc cancel",
+                ])
             } else if app.settings_edit.is_some() {
-                "Editing: type value · Enter save · Backspace delete · Esc cancel".to_string()
+                segs(&[
+                    "Editing: type value",
+                    "Enter save",
+                    "Backspace delete",
+                    "Esc cancel",
+                ])
+            } else if app.settings_search_typing() {
+                segs(&[
+                    "type to filter",
+                    "↑↓ move",
+                    "Enter results",
+                    "Esc clear search",
+                ])
+            } else if app.settings_search.is_some() {
+                segs(&[
+                    "↑↓ move",
+                    "←→ change",
+                    "Enter save",
+                    "Esc clear search",
+                    "/ edit search",
+                    "? help",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
+            } else if app.scope_model().is_some() {
+                segs(&[
+                    "↑↓ move",
+                    "←→ change",
+                    "Del follow all-models",
+                    "m scope",
+                    "o overrides",
+                    "? help",
+                    "Enter save",
+                    "1-6 group",
+                    "/ search",
+                    "c changed",
+                    "h hide unused",
+                    "R remove all values",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             } else {
-                format!("e easy · a advanced · Up/Down select · Left/Right/Space change · Enter commit/edit · Del reset · R reset-all · r refresh · {global}")
+                segs(&[
+                    "↑↓ move",
+                    "←→ change",
+                    "Del default",
+                    "/ search",
+                    "? help",
+                    "p tuning",
+                    "m scope",
+                    "o overrides",
+                    "R reset-all",
+                    "1-6 group",
+                    "Enter save",
+                    "c changed",
+                    "h hide unused",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             }
         }
         Tab::System => {
             if app.doctor_running() {
-                format!("doctor running… · live diagnostics · r refresh · {global}")
+                segs(&[
+                    "doctor running\u{2026}",
+                    "? help",
+                    "live diagnostics",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             } else {
-                format!("d doctor · live diagnostics (auto ~1.5s) · r refresh · {global}")
+                segs(&[
+                    "d doctor",
+                    "? help",
+                    "live diagnostics (auto ~1.5s)",
+                    "r refresh",
+                    "Tab/Shift+Tab switch",
+                    "q quit",
+                ])
             }
         }
-        Tab::Logs => format!("serve.log tail (auto ~1s) · r refresh · {global}"),
+        Tab::Logs => segs(&[
+            "? help",
+            "serve.log tail (auto ~1s)",
+            "r refresh",
+            "Tab/Shift+Tab switch",
+            "q quit",
+        ]),
     }
 }
 
+/// Prompt shown while a Dashboard stop/restart confirm is armed.
+fn serve_confirm_prompt(action: ServeAction) -> &'static str {
+    match action {
+        ServeAction::Restart => {
+            "Restart runs `hipfire stop --force` (force-reaps this install's serve daemons), then starts serve. y / n"
+        }
+        _ => "Stop hipfire serve? y / n",
+    }
+}
+
+/// Display width of `s` in terminal columns (all footer text is single-width).
+fn text_cols(s: &str) -> usize {
+    s.chars().count()
+}
+
+/// Join the leading-priority segments that fit in `width` columns, keeping list
+/// order and skipping (not cutting) any segment that does not fit.
+fn fit_segments(segs: &[String], width: usize) -> String {
+    let mut out = String::new();
+    for seg in segs {
+        let extra = if out.is_empty() {
+            text_cols(seg)
+        } else {
+            text_cols(FOOTER_SEP) + text_cols(seg)
+        };
+        if text_cols(&out) + extra <= width {
+            if !out.is_empty() {
+                out.push_str(FOOTER_SEP);
+            }
+            out.push_str(seg);
+        }
+    }
+    out
+}
+
+/// The footer's hint text for `width` columns plus the status text, which is
+/// `Some` only when it fits entirely in the room left after the hints.
+fn footer_text(app: &App, width: u16) -> (String, Option<String>) {
+    let width = width as usize;
+    let hints = fit_segments(&footer_segments(app), width);
+    let gap = "    ";
+    let status = (!app.last_reload.is_empty()
+        && text_cols(&hints) + text_cols(gap) + text_cols(&app.last_reload) <= width)
+        .then(|| format!("{gap}{}", app.last_reload));
+    (hints, status)
+}
+
 fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
+    // An armed quit confirm outranks everything (it is modal on every tab and
+    // must stay visible even while a toast is live).
+    if app.confirm_quit {
+        frame.render_widget(
+            Paragraph::new(quit_confirm_prompt(app))
+                .wrap(Wrap { trim: true })
+                .style(
+                    Style::default()
+                        .fg(YELLOW)
+                        .bg(BG)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            area,
+        );
+        return;
+    }
+    // An armed serve stop/restart confirm owns the whole footer (wrapped over
+    // both rows) and outranks any toast, so the prompt cannot be hidden.
+    if let (Tab::Dashboard, Some(action)) = (app.tab, app.confirm_serve) {
+        frame.render_widget(
+            Paragraph::new(serve_confirm_prompt(action))
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(YELLOW).bg(BG)),
+            area,
+        );
+        return;
+    }
     // A live toast takes over the footer line entirely (colored by severity);
     // otherwise show the per-tab hints + the last persistent status line.
     if let Some(toast) = &app.toast {
@@ -257,21 +531,20 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
                     Style::default().fg(fg).add_modifier(Modifier::BOLD),
                 ),
             ]))
+            .wrap(Wrap { trim: false })
             .style(Style::default().bg(BG)),
             area,
         );
         return;
     }
 
+    let (hints, status) = footer_text(app, area.width);
+    let mut spans = vec![Span::styled(hints, Style::default().fg(MUTED))];
+    if let Some(status) = status {
+        spans.push(Span::styled(status, Style::default().fg(Color::DarkGray)));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled(footer_hints(app), Style::default().fg(MUTED)),
-            Span::styled(
-                format!("    {}", app.last_reload),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]))
-        .style(Style::default().bg(BG)),
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(BG)),
         area,
     );
 }
@@ -279,85 +552,115 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
     let cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+        .constraints([Constraint::Percentage(52), Constraint::Percentage(48)])
         .split(pad(area, 1, 0));
-    let left = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(8)])
-        .split(cols[0]);
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(12), Constraint::Min(6)])
+        .constraints([Constraint::Min(8), Constraint::Length(7)])
         .split(cols[1]);
 
     let serve_color = if app.status.serve_http_ok {
         GREEN
-    } else if app.status.serve_pid_alive || app.status.serve_pid.is_some() {
+    } else if !app.status.health_known
+        || app.status.serve_pid_alive
+        || app.status.serve_pid.is_some()
+    {
         YELLOW
     } else {
         RED
     };
-    let mut status = vec![
-        Line::from(vec![
-            Span::raw("Serve      "),
-            Span::styled(app.status.serve_label(), Style::default().fg(serve_color)),
-        ]),
-        Line::from(format!(
-            "Endpoint   {}:{}",
-            app.config.probe_host(),
-            app.config.port
-        )),
-        Line::from(format!(
-            "PID        {}",
-            app.status
+    // Lines are laid out here to fit the card's inner width (long values keep
+    // their tail, long warnings wrap under their label), so the card height is
+    // exactly the line count and nothing is cut off at the bottom.
+    let inner_w = (cols[0].width as usize).saturating_sub(2);
+    let plain = Style::default();
+    let mut status = wrap_labeled(
+        "Serve      ",
+        &app.status.serve_label(),
+        inner_w,
+        Style::default().fg(serve_color),
+    );
+    status.extend([
+        fit_line(
+            "Endpoint   ",
+            &format!("{}:{}", app.config.probe_host(), app.config.port),
+            inner_w,
+            plain,
+        ),
+        fit_line(
+            "PID        ",
+            &app.status
                 .serve_pid
                 .map(|p| p.to_string())
-                .unwrap_or_else(|| "-".into())
-        )),
-        Line::from(format!("Active     {}", app.active_model)),
-        Line::from(format!(
-            "Config     {} ({})",
-            app.config.default_model,
-            if app.config.loaded_from_disk {
-                "custom"
-            } else {
-                "defaults"
-            }
-        )),
-        Line::from(format!(
-            "Overrides  {} model overlays",
-            app.config.per_model_count
-        )),
-        Line::from(format!(
-            "Models     {} local / {} registry",
-            app.registry.local_files.len(),
-            app.registry.models.len()
-        )),
-    ];
+                .unwrap_or_else(|| "-".into()),
+            inner_w,
+            plain,
+        ),
+        fit_line("Active     ", &app.active_model, inner_w, plain),
+        fit_line(
+            "Config     ",
+            &format!(
+                "{} · {} overlays",
+                if app.config.loaded_from_disk {
+                    "custom"
+                } else {
+                    "defaults"
+                },
+                app.config.per_model_count
+            ),
+            inner_w,
+            plain,
+        ),
+        fit_line(
+            "Models     ",
+            &format!(
+                "{} local / {} registry",
+                app.registry.local_files.len(),
+                app.registry.models.len()
+            ),
+            inner_w,
+            plain,
+        ),
+    ]);
+    // The registry line shows the same short label as the Models header; a
+    // registry warning (e.g. bundled copy newer than the cache) only tints it,
+    // the full text lives on the Models tab. Config warnings wrap but are
+    // capped at two rows so they cannot push the Tabs list off a short terminal.
+    let warn = Style::default().fg(YELLOW);
     if let Some(warning) = &app.config.warning {
-        status.push(Line::from(vec![
-            Span::styled("Config     ", Style::default().fg(YELLOW)),
-            Span::styled(warning.clone(), Style::default().fg(YELLOW)),
-        ]));
+        let mut rows = wrap_labeled("Config     ", warning, inner_w, warn);
+        rows.truncate(2);
+        status.extend(rows);
     }
-    if let Some(warning) = &app.registry.warning {
-        status.push(Line::from(vec![
-            Span::styled("Registry   ", Style::default().fg(YELLOW)),
-            Span::styled(warning.clone(), Style::default().fg(YELLOW)),
-        ]));
-    }
+    status.push(fit_line(
+        "Registry   ",
+        &registry_label(app),
+        inner_w,
+        if app.registry.warning.is_some() {
+            warn
+        } else {
+            plain
+        },
+    ));
+    // Size the Runtime card from its line count (+2 borders); the Tabs list
+    // takes whatever height is left.
+    let runtime_h = (status.len() as u16).saturating_add(2);
+    let left = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(runtime_h), Constraint::Min(0)])
+        .split(cols[0]);
     frame.render_widget(card("Runtime", status), left[0]);
 
     let actions = vec![
-        ListItem::new("Dashboard — live serve status, queue depth, tok/s, VRAM."),
-        ListItem::new("Chat — stream a conversation through your local serve."),
-        ListItem::new("Models — browse the registry and your downloads."),
-        ListItem::new("Settings — edit config (easy/advanced); persists to ~/.hipfire."),
-        ListItem::new("System — GPU, HIP, kernel cache, and path checks."),
+        ListItem::new("Dashboard — serve status, tok/s, VRAM"),
+        ListItem::new("Chat — talk to your local serve"),
+        ListItem::new("Models — registry, downloads, pulls"),
+        ListItem::new("Settings — edit ~/.hipfire config"),
+        ListItem::new("System / Logs — GPU, paths, serve.log"),
     ];
     frame.render_widget(
         List::new(actions)
-            .block(block("Tabs  (Tab / Shift+Tab to switch)"))
+            .block(block("Tabs  (Tab / Shift+Tab, ? help)"))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         left[1],
     );
@@ -371,12 +674,9 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
         Line::from("2. Start serving  ·  hipfire serve -d"),
         Line::from("3. Chat           ·  open the Chat tab and type"),
         Line::from(""),
+        Line::from("Press ? on any tab for its keys."),
         Line::from(Span::styled(
-            "Everything here reads your live local state and the",
-            Style::default().fg(MUTED),
-        )),
-        Line::from(Span::styled(
-            "running daemon — edits persist to ~/.hipfire.",
+            "(in Chat, press Esc first)",
             Style::default().fg(MUTED),
         )),
     ]);
@@ -390,13 +690,12 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
 
     let keys = vec![
         Row::new(["Tab / Shift+Tab", "switch tabs"]),
-        Row::new(["\u{2191}  \u{2193}", "move within a tab"]),
-        Row::new(["Enter", "select / send"]),
-        Row::new(["r", "refresh live data"]),
-        Row::new(["q", "quit"]),
+        Row::new(["\u{2191}  \u{2193} · Enter", "move · select"]),
+        Row::new(["?", "help for this tab"]),
+        Row::new(["r · q", "refresh · quit"]),
     ];
     frame.render_widget(
-        Table::new(keys, [Constraint::Length(16), Constraint::Min(20)])
+        Table::new(keys, [Constraint::Length(15), Constraint::Min(17)])
             .header(Row::new(["Key", "Action"]).style(Style::default().fg(MUTED)))
             .block(block("Keys  (full list in each tab's footer)"))
             .style(Style::default().fg(TEXT).bg(PANEL))
@@ -406,10 +705,20 @@ fn draw_home(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
+    // One extra line for the multi-slot engine row, only when serve exports it.
+    let card_height = match &app.live_metrics {
+        MetricsView::Live(m) if m.engine.is_some() => 9,
+        _ => 8,
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(8), Constraint::Length(card_height)])
+        .split(pad(area, 1, 0));
+    draw_live_metrics(frame, app, rows[1]);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(pad(area, 1, 0));
+        .split(rows[0]);
 
     // ── Serve panel ─────────────────────────────────────────────────────
     let mut serve_lines: Vec<Line> = Vec::new();
@@ -534,7 +843,7 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => {
             vram_lines.push(Line::from(Span::styled(
-                "Probing rocm-smi…",
+                "Probing GPU stats…",
                 Style::default().fg(MUTED),
             )));
         }
@@ -583,7 +892,109 @@ fn draw_dashboard(frame: &mut Frame, app: &App, area: Rect) {
         }
         None => {}
     }
-    frame.render_widget(card("GPU (rocm-smi)", vram_lines), cols[1]);
+    frame.render_widget(card("GPU", vram_lines), cols[1]);
+}
+
+/// "Live metrics" card: windowed rates and quantiles from the worker's
+/// background `/metrics` ring. Every row is one short line so narrow terminals
+/// truncate a row instead of reflowing the card.
+fn draw_live_metrics(frame: &mut Frame, app: &App, area: Rect) {
+    let outer = block("Live metrics");
+    let inner = outer.inner(area);
+    frame.render_widget(outer, area);
+    let message = |text: &str, color: Color| {
+        Paragraph::new(Span::styled(text.to_string(), Style::default().fg(color)))
+    };
+    let m = match &app.live_metrics {
+        MetricsView::Live(m) => m,
+        MetricsView::Collecting => {
+            frame.render_widget(message("collecting…", MUTED), inner);
+            return;
+        }
+        MetricsView::Unavailable => {
+            frame.render_widget(message("metrics unavailable (older serve)", YELLOW), inner);
+            return;
+        }
+        MetricsView::Offline => {
+            frame.render_widget(message("serve offline", MUTED), inner);
+            return;
+        }
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(0),
+        ])
+        .split(inner);
+    for (row, label, series, color) in [
+        (
+            rows[0],
+            format!("tok/s {:>8.1}", m.tok_s),
+            &m.tok_s_series,
+            GREEN,
+        ),
+        (
+            rows[1],
+            format!("req/s {:>8.2}", m.req_s),
+            &m.req_s_series,
+            ACCENT,
+        ),
+    ] {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(16), Constraint::Min(0)])
+            .split(row);
+        frame.render_widget(Paragraph::new(label), cols[0]);
+        // Sparkline draws from the first point; keep the newest that fit.
+        let tail = &series[series.len().saturating_sub(cols[1].width as usize)..];
+        frame.render_widget(
+            Sparkline::default()
+                .data(tail)
+                .style(Style::default().fg(color)),
+            cols[1],
+        );
+    }
+    let quantiles = |label: &str, q: Option<(f64, f64)>| match q {
+        Some((p50, p95)) => format!("{label}  p50 {p50:.0} ms · p95 {p95:.0} ms"),
+        None => format!("{label}  —"),
+    };
+    let mut extra = vec![format!("{} window", fmt_uptime(m.window_s as u64))];
+    if let Some(pct) = m.cache_hit_pct {
+        extra.insert(0, format!("cache hit {pct:.0}%"));
+    }
+    if let Some(tau) = m.tau {
+        extra.push(format!("tau {tau:.2}"));
+    }
+    let mut lines = vec![
+        Line::from(quantiles("TTFT", m.ttft_ms)),
+        Line::from(quantiles("TPOT", m.tpot_ms)),
+        Line::from(Span::styled(
+            format!(
+                "errors {:.1}/min · rejects {:.1}/min",
+                m.errors_per_min, m.rejects_per_min
+            ),
+            Style::default().fg(if m.errors_per_min + m.rejects_per_min > 0.0 {
+                YELLOW
+            } else {
+                TEXT
+            }),
+        )),
+        Line::from(Span::styled(extra.join(" · "), Style::default().fg(MUTED))),
+    ];
+    if let Some(e) = &m.engine {
+        let mut row = vec![format!("slots {:.0}/{:.0}", e.slots_active, e.slots_total)];
+        if let Some((free, total)) = e.kv_pages {
+            row.push(format!("KV free {free:.0}/{total:.0} pages"));
+        }
+        row.push(format!(
+            "evict {:.0} · restore {:.0} · prefix hits {:.0}",
+            e.evictions, e.restores, e.prefix_hits
+        ));
+        lines.push(Line::from(row.join(" · ")));
+    }
+    frame.render_widget(Paragraph::new(lines), rows[2]);
 }
 
 fn fmt_uptime(secs: u64) -> String {
@@ -597,6 +1008,36 @@ fn fmt_uptime(secs: u64) -> String {
     } else {
         format!("{s}s")
     }
+}
+
+/// Hard-wrap chat input to `width` display columns. Returns the rows to draw;
+/// the cursor sits at the end of the last row (a trailing newline, or a last
+/// row that exactly fills the width, yields a fresh empty row for it). Wrapping
+/// is by character (not word) so the cursor position is exact.
+fn wrap_input_rows(input: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut col = 0usize;
+    for c in input.chars() {
+        if c == '\n' {
+            rows.push(String::new());
+            col = 0;
+            continue;
+        }
+        let w = Span::raw(c.to_string()).width();
+        if col + w > width && col > 0 {
+            rows.push(String::new());
+            col = 0;
+        }
+        if let Some(row) = rows.last_mut() {
+            row.push(c);
+        }
+        col += w;
+    }
+    if col >= width {
+        rows.push(String::new());
+    }
+    rows
 }
 
 fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
@@ -625,21 +1066,81 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
             comment: MUTED,
             fence: YELLOW,
         };
-        for msg in &app.chat.messages {
+        let thinking = Style::default().fg(MUTED).add_modifier(Modifier::ITALIC);
+        for (idx, msg) in app.chat.messages.iter().enumerate() {
             let color = if msg.role == "user" { ACCENT } else { GREEN };
             lines.push(Line::from(Span::styled(
                 format!("{}:", msg.role),
                 Style::default().fg(color).add_modifier(Modifier::BOLD),
             )));
+            // Reasoning is rendered before content in the same bubble, in a
+            // muted italic style under a `thinking` label so it reads apart from
+            // the answer.
+            if let Some(rc) = msg.reasoning_content.as_deref().filter(|s| !s.is_empty()) {
+                lines.push(Line::from(Span::styled(
+                    "thinking",
+                    thinking.add_modifier(Modifier::DIM),
+                )));
+                lines.extend(
+                    rc.lines()
+                        .map(|l| Line::from(Span::styled(l.to_string(), thinking))),
+                );
+                // Thin separator when both channels present.
+                if !msg.content.is_empty() {
+                    lines.push(Line::from(""));
+                }
+            }
             lines.extend(crate::ui_chat::render_body(&msg.content, &code_theme));
+            if app.chat.stopped.contains(&idx) {
+                lines.push(Line::from(Span::styled(
+                    "[stopped]",
+                    Style::default().fg(YELLOW).add_modifier(Modifier::DIM),
+                )));
+            }
             lines.push(Line::from(""));
         }
     }
+    if let Some(notice) = &app.chat.notice {
+        let dim = Style::default().fg(MUTED).add_modifier(Modifier::DIM);
+        lines.extend(
+            notice
+                .lines()
+                .map(|l| Line::from(Span::styled(l.to_string(), dim))),
+        );
+    }
+
+    // Scroll is measured from the bottom (0 = follow the newest output): measure
+    // the wrapped transcript at the current inner width, then offset from the end.
+    let transcript_block = block("Chat shell");
+    let inner = transcript_block.inner(chunks[0]);
+    let para = Paragraph::new(lines).wrap(Wrap { trim: false });
+    let total = if inner.width == 0 {
+        0
+    } else {
+        para.line_count(inner.width)
+    };
+    let max_scroll = total
+        .saturating_sub(usize::from(inner.height))
+        .min(usize::from(u16::MAX)) as u16;
+    app.chat.view.set(Some(crate::app::ChatView {
+        viewport: inner.height,
+        max_scroll,
+    }));
+    let scroll = app.chat.scroll.min(max_scroll);
+    let transcript_block = if scroll > 0 {
+        transcript_block.title_bottom(
+            Line::from(Span::styled(
+                format!(" \u{2193} {scroll} more (End to follow) "),
+                Style::default().fg(YELLOW),
+            ))
+            .right_aligned(),
+        )
+    } else {
+        transcript_block
+    };
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(block("Chat shell"))
-            .scroll((app.chat.scroll, 0))
-            .wrap(Wrap { trim: false })
+        para.block(transcript_block)
+            .scroll((max_scroll - scroll, 0))
             .style(Style::default().fg(TEXT).bg(PANEL)),
         chunks[0],
     );
@@ -658,15 +1159,51 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
             extras.push(format!("top_p {p}"));
         }
         if let Some(s) = app.chat.last_stats {
-            extras.push(format!("{} tok @ {:.0} tok/s", s.tokens, s.tps));
+            let unit = s.unit();
+            extras.push(format!("{} {unit} @ {:.0} {unit}/s", s.tokens, s.tps));
         }
         format!("Input - {} - {}", app.chat.status, extras.join(" · "))
     };
-    let input = Paragraph::new(app.chat.input.as_str())
-        .block(block(&input_title))
-        .wrap(Wrap { trim: false })
-        .style(Style::default().fg(TEXT).bg(PANEL_2));
+    let input_block = block(&input_title);
+    let input_inner = input_block.inner(chunks[1]);
+    // Pre-wrapped rows: show the tail so the cursor row is always visible.
+    let rows = wrap_input_rows(&app.chat.input, usize::from(input_inner.width));
+    let visible = usize::from(input_inner.height).max(1);
+    let first = rows.len().saturating_sub(visible);
+    let input = Paragraph::new(
+        rows[first..]
+            .iter()
+            .map(|r| Line::from(r.as_str()))
+            .collect::<Vec<_>>(),
+    )
+    .block(input_block)
+    .style(Style::default().fg(TEXT).bg(PANEL_2));
     frame.render_widget(input, chunks[1]);
+    if app.chat.is_input_focused()
+        && !app.show_help
+        && input_inner.width > 0
+        && input_inner.height > 0
+    {
+        let last = rows.len() - 1;
+        let col = Span::raw(rows[last].as_str()).width();
+        let x = input_inner.x + (col as u16).min(input_inner.width - 1);
+        let y = input_inner.y + (last - first) as u16;
+        frame.set_cursor_position((x, y));
+    }
+}
+
+/// Short registry source label shared by the Models header and Home: the
+/// fetched cache path, `bundled (<date>)` for the compiled-in copy, or
+/// `missing` when there really is none.
+fn registry_label(app: &App) -> String {
+    match (&app.registry.loaded_path, app.registry.bundled) {
+        (Some(path), _) => path.display().to_string(),
+        (None, true) => match app.registry.generated_at.get(..10) {
+            Some(date) => format!("bundled ({date})"),
+            None => "bundled".into(),
+        },
+        (None, false) => "missing".into(),
+    }
 }
 
 fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
@@ -686,17 +1223,21 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints(constraints)
         .split(pad(area, 1, 0));
-    let summary = format!(
-        "active: {}    {} downloaded / {} available    registry: {}    aliases: {}",
-        app.active_model,
-        app.registry.downloaded_count(),
-        app.registry.models.len(),
-        app.registry
-            .loaded_path
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "missing".into()),
-        app.registry.aliases.len(),
+    let registry_label = registry_label(app);
+    // Whole parts only, most useful first: at 80 columns `aliases` drops out
+    // instead of the registry label being cut mid-date.
+    let summary = fit_segments(
+        &[
+            format!("active: {}", app.active_model),
+            format!(
+                "{} of {} downloaded",
+                app.registry.downloaded_count(),
+                app.registry.models.len()
+            ),
+            format!("registry: {registry_label}"),
+            format!("aliases: {}", app.registry.aliases.len()),
+        ],
+        chunks[0].width.saturating_sub(2) as usize,
     );
     frame.render_widget(
         Paragraph::new(summary)
@@ -734,6 +1275,31 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
         );
         return;
     }
+    // Fixed-width columns; the Tag column grows to the longest visible tag (up to
+    // what leaves Notes a usable remainder) so wide terminals show full tags.
+    const TAG_MIN: usize = 24;
+    const HAVE_W: usize = 11; // fits "NN/NN local" group counts
+    const SIZE_W: usize = 9;
+    const VRAM_W: usize = 7;
+    const COL_GAPS: usize = 4;
+    // Notes is the most expendable column: at 80 columns the full tag
+    // (`qwen3.8:flash-next-mq3-xts`) matters more than the description.
+    const NOTES_MIN: usize = 14;
+    let inner_w = chunks[1].width.saturating_sub(2) as usize;
+    let longest_tag = visible_items
+        .iter()
+        .map(|item| match item {
+            ModelListItem::Group { name, .. } => 2 + name.chars().count(),
+            ModelListItem::Model { model_index } => {
+                4 + app.registry.models[*model_index].tag.chars().count()
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    let tag_cap = inner_w
+        .saturating_sub(HAVE_W + SIZE_W + VRAM_W + COL_GAPS + NOTES_MIN)
+        .max(TAG_MIN);
+    let tag_w = longest_tag.clamp(TAG_MIN, tag_cap);
     let rows = visible_items
         .iter()
         .enumerate()
@@ -749,43 +1315,58 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
                     expanded,
                 } => {
                     let marker = if *expanded { "v" } else { ">" };
+                    // The action hint belongs to the selected group only, and
+                    // stays short enough for the 80-column Notes cell (Enter
+                    // toggles too; the footer says so).
+                    let hint = match (selected, *expanded) {
+                        (false, _) => "",
+                        (true, false) => "\u{2192} expand",
+                        (true, true) => "\u{2190} collapse",
+                    };
                     Row::new([
                         format!("{marker} {name}"),
                         format!("{downloaded}/{count} local"),
                         String::new(),
                         String::new(),
-                        String::new(),
-                        "Enter/Right to expand, Left to collapse".into(),
+                        hint.into(),
                     ])
                 }
                 ModelListItem::Model { model_index } => {
                     let row = &app.registry.models[*model_index];
-                    let status = if row.tag == app.active_model {
-                        "active"
-                    } else if row.downloaded {
-                        "local"
-                    } else if row.entry.repo.is_empty() {
-                        "local-only"
+                    let active = if row.tag == app.active_model {
+                        "*"
                     } else {
-                        "remote"
+                        " "
                     };
-                    let extras = match (row.has_triattn, row.has_mtp) {
-                        (true, true) => "triattn mtp",
-                        (true, false) => "triattn",
-                        (false, true) => "mtp",
-                        _ => "",
+                    let have = if row.downloaded { "local" } else { "remote" };
+                    let mtp = if row.has_mtp { "[mtp] " } else { "" };
+                    let own = crate::hipfire::scope_view::own_count(
+                        &app.scope.catalog,
+                        &row.tag,
+                        &row.entry.file,
+                    );
+                    let own = if own > 0 {
+                        format!("{} · ", crate::hipfire::scope_view::own_values_text(own))
+                    } else {
+                        String::new()
+                    };
+                    let notes = if row.entry.repo.is_empty() {
+                        format!("{own}{mtp}{} (no remote repo)", row.entry.desc)
+                    } else {
+                        format!("{own}{mtp}{}", row.entry.desc)
                     };
                     Row::new([
-                        format!("  {}", row.tag),
-                        status.into(),
+                        format!("  {active} {}", row.tag),
+                        have.into(),
                         format!("{:.1} GB", row.entry.size_gb),
-                        format!("{:.0} GB", row.entry.min_vram_gb),
-                        extras.into(),
-                        if row.entry.repo.is_empty() {
-                            format!("{} (no remote repo)", row.entry.desc)
+                        // Local files outside the registry carry no VRAM
+                        // estimate; say so instead of a fake "0 GB".
+                        if row.entry.min_vram_gb > 0.0 {
+                            format!("{:.0} GB", row.entry.min_vram_gb)
                         } else {
-                            row.entry.desc.clone()
+                            "\u{2014}".into()
                         },
+                        notes,
                     ])
                 }
             };
@@ -811,18 +1392,14 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Length(24),
-            Constraint::Length(8),
-            Constraint::Length(9),
-            Constraint::Length(8),
-            Constraint::Length(12),
-            Constraint::Min(20),
+            Constraint::Length(tag_w as u16),
+            Constraint::Length(HAVE_W as u16),
+            Constraint::Length(SIZE_W as u16),
+            Constraint::Length(VRAM_W as u16),
+            Constraint::Min(10),
         ],
     )
-    .header(
-        Row::new(["Tag", "Have", "Size", "VRAM", "Sidecars", "Notes"])
-            .style(Style::default().fg(MUTED)),
-    )
+    .header(Row::new(["Tag", "Have", "Size", "VRAM", "Notes"]).style(Style::default().fg(MUTED)))
     .block(block("Registry browser"))
     .style(Style::default().bg(PANEL));
     frame.render_widget(table, chunks[1]);
@@ -830,6 +1407,108 @@ fn draw_models(frame: &mut Frame, app: &App, area: Rect) {
     if show_status {
         draw_models_status(frame, app, chunks[2]);
     }
+    if let Some(choice) = &app.pull_choice {
+        draw_pull_choice(frame, choice, area);
+    }
+}
+
+/// The `p` pull chooser popup, centered over the Models tab: a `PLE rows` line
+/// (auto / q4 / q8 with sizes) and a `Draft sidecars` line (yes / no with the
+/// kinds and sizes), the focused row marked with `>`.
+fn draw_pull_choice(frame: &mut Frame, choice: &PullChoice, area: Rect) {
+    use crate::hipfire::pull_choice::{format_size, ChoiceRow};
+
+    let selected = Style::default().fg(GREEN).add_modifier(Modifier::BOLD);
+    let plain = Style::default().fg(MUTED);
+    let label_style = |focused: bool| {
+        if focused {
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(TEXT)
+        }
+    };
+    let marker = |row: ChoiceRow| if choice.row == row { "> " } else { "  " };
+    let option = |text: String, on: bool| {
+        if on {
+            Span::styled(format!("[{text}]"), selected)
+        } else {
+            Span::styled(format!(" {text} "), plain)
+        }
+    };
+
+    let mut lines: Vec<Line> = vec![Line::from(""), {
+        Line::from(Span::styled(
+            format!("  {}", choice.tag),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ))
+    }];
+    lines.push(Line::from(""));
+    if let Some(ple) = &choice.ple {
+        let mut spans = vec![Span::styled(
+            format!("{}PLE rows        ", marker(ChoiceRow::Ple)),
+            label_style(choice.row == ChoiceRow::Ple),
+        )];
+        for (i, opt) in ple.options.iter().enumerate() {
+            let size = format_size(opt.size_bytes);
+            let text = if size.is_empty() {
+                opt.label.to_string()
+            } else {
+                format!("{} {size}", opt.label)
+            };
+            spans.push(option(text, i == ple.selected));
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some(draft) = &choice.draft {
+        let kinds = draft
+            .kinds
+            .iter()
+            .map(|k| {
+                let size = format_size(k.size_bytes);
+                if size.is_empty() {
+                    k.label.to_string()
+                } else {
+                    format!("{} {size}", k.label)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{}Draft sidecars  ", marker(ChoiceRow::Draft)),
+                label_style(choice.row == ChoiceRow::Draft),
+            ),
+            option("yes".into(), draft.yes),
+            option("no".into(), !draft.yes),
+            Span::styled(format!("  {kinds}"), plain),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Up/Down row \u{b7} Left/Right/Space change \u{b7} Enter pull \u{b7} Esc cancel",
+        plain,
+    )));
+
+    let w = 78u16.min(area.width);
+    let h = (lines.len() as u16 + 2).min(area.height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(ACCENT))
+                    .title(" Pull options "),
+            )
+            .style(Style::default().fg(TEXT).bg(PANEL)),
+        rect,
+    );
 }
 
 /// The Models-tab bottom strip: a delete-confirm prompt (takes priority) or the
@@ -851,7 +1530,9 @@ fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
         );
     } else if let Some(job) = &app.pull {
         let ratio = job.percent.unwrap_or(0.0).clamp(0.0, 100.0) / 100.0;
-        let label = if job.line.is_empty() {
+        let label = if job.handle.cancel_requested() {
+            "cancelling\u{2026}".to_string()
+        } else if job.line.is_empty() {
             format!("pulling {}\u{2026}", job.tag)
         } else {
             job.line.clone()
@@ -861,353 +1542,13 @@ fn draw_models_status(frame: &mut Frame, app: &App, area: Rect) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!(" Pulling {} ", job.tag)),
+                        .title(format!(" Pulling {} · c cancel ", job.tag)),
                 )
                 .gauge_style(Style::default().fg(GREEN).bg(PANEL_2))
                 .ratio(ratio)
                 .label(label),
             area,
         );
-    }
-}
-
-/// Action hint for the SELECTED settings row, accurate to its field kind: enums
-/// preview-then-commit, booleans toggle immediately, numbers/strings open an
-/// editor (5b — the copy must not promise preview semantics for booleans).
-fn selected_action_hint(app: &App) -> &'static str {
-    use crate::hipfire::writer::{self, FieldKind};
-    match app
-        .selected_setting_key()
-        .and_then(|k| writer::field_spec(&k).map(|s| s.kind))
-    {
-        Some(FieldKind::Enum(_)) => "Left/Right/Space preview values, Enter commits.",
-        Some(FieldKind::Bool) => "Left/Right/Space toggles on/off (applies immediately).",
-        Some(FieldKind::Int { .. })
-        | Some(FieldKind::Float { .. })
-        | Some(FieldKind::FreeStr { .. }) => "Enter to edit the value.",
-        None => "This row is set elsewhere (Models tab / serve).",
-    }
-}
-
-/// The staged enum-preview value for `key`, if a preview (5b) is active for it.
-/// `None` when there's no preview or it targets a different key.
-fn preview_for(app: &App, key: Option<&str>) -> Option<String> {
-    let key = key?;
-    match &app.settings_pending {
-        Some(p) if p.key == key => Some(p.value.clone()),
-        _ => None,
-    }
-}
-
-/// Value cell + row style for one settings row, encoding the 5b preview state and
-/// the 5c override-vs-default distinction at a glance:
-///   * staged preview   → "● {v} (preview)", YELLOW italic (a pending override)
-///   * committed override → "● {v}", bright + bold (this is yours)
-///   * inherited default → "  {v}", dimmed (untouched)
-///   * composite row     → "  {v}", neutral (set elsewhere, no override status)
-/// A staged preview takes precedence (it IS the active, uncommitted row) and uses
-/// the highlight background (PANEL_2) with a distinct YELLOW italic, so it reads
-/// as both selected and unsaved. For non-preview rows the cursor highlight
-/// (ACCENT on PANEL_2) wins so the selected row stays legible.
-/// `override_state`: Some(true)=override, Some(false)=default, None=composite.
-fn settings_row_display(
-    committed: &str,
-    preview: Option<&str>,
-    override_state: Option<bool>,
-    selected: bool,
-) -> (String, Style) {
-    if let Some(pv) = preview {
-        return (
-            format!("● {pv} (preview)"),
-            Style::default()
-                .fg(YELLOW)
-                .bg(PANEL_2)
-                .add_modifier(Modifier::ITALIC),
-        );
-    }
-    let is_override = override_state == Some(true);
-    let marker = if is_override { "● " } else { "  " };
-    let shown = format!("{marker}{committed}");
-    let style = if selected {
-        Style::default().fg(ACCENT).bg(PANEL_2)
-    } else {
-        match override_state {
-            Some(true) => Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            Some(false) => Style::default().fg(MUTED),
-            None => Style::default().fg(TEXT),
-        }
-    };
-    (shown, style)
-}
-
-fn draw_settings(frame: &mut Frame, app: &App, area: Rect) {
-    // header · table · explainer-for-selected-key (5e). The explainer takes a
-    // fixed slice; the table keeps the elastic middle so it never disappears.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Min(8),
-        ])
-        .split(pad(area, 1, 0));
-    if app.confirm_reset_all {
-        // Destructive: clears all overrides in config.toml (default_model / host / port
-        // included). RED-bordered, like the Models delete-confirm.
-        frame.render_widget(
-            Paragraph::new(
-                "Reset ALL settings to defaults? This clears ~/.hipfire/config.toml.  \
-                 y = confirm · n / Esc = cancel",
-            )
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(RED))
-                    .title(" Confirm reset-all "),
-            )
-            .style(Style::default().fg(TEXT).bg(PANEL)),
-            chunks[0],
-        );
-    } else {
-        let mode = if app.settings_easy {
-            "Easy settings"
-        } else {
-            "Advanced settings"
-        };
-        let note = if let Some(p) = &app.settings_pending {
-            // 5b: a staged enum preview is not yet written.
-            format!(
-                "preview {} = {} (uncommitted) — Enter commit, Esc cancel",
-                p.key, p.value
-            )
-        } else if let Some(edit) = &app.settings_edit {
-            // Show the live edit buffer.
-            format!(
-                "editing {} = {}_  (Enter save, Esc cancel)",
-                edit.key, edit.buffer
-            )
-        } else {
-            // Tailor the hint to the SELECTED row's kind so the copy never
-            // overstates preview semantics (booleans toggle immediately; only
-            // enums preview-then-commit).
-            let action = selected_action_hint(app);
-            let switch = if app.settings_easy {
-                "a for advanced"
-            } else {
-                "e for easy"
-            };
-            format!("{action}  Del resets. Press {switch}.")
-        };
-        frame.render_widget(
-            Paragraph::new(format!("{mode}    {note}"))
-                .block(block("Settings"))
-                .style(Style::default().fg(TEXT).bg(PANEL)),
-            chunks[0],
-        );
-    }
-
-    if app.settings_easy {
-        let easy_keys = app.config.easy_keys();
-        // Override status for EVERY easy row (incl. the composite Model/Serve rows
-        // whose editable key is None) so the 5c marker matches the advanced view.
-        let override_states = app.config.easy_override_state();
-        let rows_all = app
-            .config
-            .easy_rows()
-            .into_iter()
-            .enumerate()
-            .collect::<Vec<_>>();
-        let start = scroll_start(app.settings_selected, chunks[1].height, 3);
-        let rows = rows_all
-            .into_iter()
-            .skip(start)
-            .take(visible_rows(chunks[1].height, 3))
-            .map(|(idx, (label, value, desc))| {
-                let row_key = easy_keys.get(idx).and_then(|k| *k);
-                let preview = preview_for(app, row_key);
-                // Every easy row has a definite override status (composite rows
-                // resolve theirs from default_model / host|port).
-                let override_state = override_states.get(idx).copied();
-                let (shown, style) = settings_row_display(
-                    &value,
-                    preview.as_deref(),
-                    override_state,
-                    idx == app.settings_selected,
-                );
-                Row::new([label.to_string(), shown, desc.to_string()]).style(style)
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Table::new(
-                rows,
-                [
-                    Constraint::Length(16),
-                    Constraint::Length(24),
-                    Constraint::Min(30),
-                ],
-            )
-            .header(Row::new(["Setting", "Value", "Meaning"]).style(Style::default().fg(MUTED)))
-            .block(block("User-safe controls  (● = your override)"))
-            .style(Style::default().fg(TEXT).bg(PANEL)),
-            chunks[1],
-        );
-    } else {
-        let rows_all = app.config.values.iter().enumerate().collect::<Vec<_>>();
-        let start = scroll_start(app.settings_selected, chunks[1].height, 3);
-        let rows = rows_all
-            .into_iter()
-            .skip(start)
-            .take(visible_rows(chunks[1].height, 3))
-            .map(|(idx, (k, v))| {
-                let preview = preview_for(app, Some(k.as_str()));
-                // Every advanced row maps to a real config key.
-                let override_state = Some(app.config.is_override(k));
-                let (shown, style) = settings_row_display(
-                    v,
-                    preview.as_deref(),
-                    override_state,
-                    idx == app.settings_selected,
-                );
-                Row::new([k.clone(), shown]).style(style)
-            })
-            .collect::<Vec<_>>();
-        frame.render_widget(
-            Table::new(rows, [Constraint::Length(28), Constraint::Min(20)])
-                .header(Row::new(["Key", "Value"]).style(Style::default().fg(MUTED)))
-                .block(block("Advanced config.toml view  (● = your override)"))
-                .style(Style::default().fg(TEXT).bg(PANEL)),
-            chunks[1],
-        );
-    }
-
-    draw_settings_explainer(frame, app, chunks[2]);
-}
-
-/// The 5e explainer pane: for the selected settings row, show what the key is,
-/// what it does (with its tradeoff), the default, when to use it, and any
-/// load-bearing interaction. Falls back to an honest "no extended help" line for
-/// keys without a curated entry (e.g. low-level advanced keys).
-fn draw_settings_explainer(frame: &mut Frame, app: &App, area: Rect) {
-    // Resolve the key to explain. Easy mode maps every row (incl. the composite
-    // Model/Serve rows) via easy_help_keys; advanced uses the selected key.
-    let help_key: Option<String> = if app.settings_easy {
-        app.config
-            .easy_help_keys()
-            .get(app.settings_selected)
-            .map(|k| k.to_string())
-    } else {
-        app.selected_setting_key()
-    };
-
-    // Current committed value + any staged 5b preview for the selected key, so the
-    // options list can mark "where you are" and "what you're about to commit".
-    let cur = help_key
-        .as_deref()
-        .map(|k| app.config.values.get(k).cloned().unwrap_or_default())
-        .unwrap_or_default();
-    let pending = help_key.as_deref().and_then(|k| preview_for(app, Some(k)));
-
-    let mut lines: Vec<Line> = Vec::new();
-    match help_key.as_deref().and_then(knobs::knob_info) {
-        Some(info) => {
-            let mut head = vec![
-                Span::styled(
-                    info.title,
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!("  ({})", info.key), Style::default().fg(MUTED)),
-                Span::styled(
-                    format!("   default: {}", default_display(info.default)),
-                    Style::default().fg(MUTED),
-                ),
-            ];
-            if !cur.is_empty() {
-                head.push(Span::styled(
-                    format!("   now: {cur}"),
-                    Style::default().fg(TEXT),
-                ));
-            }
-            lines.push(Line::from(head));
-            lines.push(Line::from(Span::styled(
-                info.summary,
-                Style::default().fg(TEXT),
-            )));
-            lines.push(Line::from(vec![
-                Span::styled("Effect: ", Style::default().fg(YELLOW)),
-                Span::styled(info.effect, Style::default().fg(TEXT)),
-            ]));
-            // Per-option help: what each selectable value does, with the current
-            // value marked "▸" (accent) and a staged preview marked "●" (yellow).
-            if !info.options.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    "Options:",
-                    Style::default().fg(YELLOW),
-                )));
-                for (val, desc) in info.options {
-                    let is_pending = pending.as_deref() == Some(*val);
-                    let is_current = !is_pending && cur == *val;
-                    let (marker, vstyle) = if is_pending {
-                        (
-                            "● ",
-                            Style::default().fg(YELLOW).add_modifier(Modifier::BOLD),
-                        )
-                    } else if is_current {
-                        (
-                            "▸ ",
-                            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-                        )
-                    } else {
-                        ("  ", Style::default().fg(TEXT))
-                    };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{marker}{val}"), vstyle),
-                        Span::styled(format!(" — {desc}"), Style::default().fg(MUTED)),
-                    ]));
-                }
-            }
-            lines.push(Line::from(vec![
-                Span::styled("When: ", Style::default().fg(YELLOW)),
-                Span::styled(info.when, Style::default().fg(TEXT)),
-            ]));
-            if let Some(note) = info.note {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "Note: ",
-                        Style::default().fg(RED).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(note, Style::default().fg(TEXT)),
-                ]));
-            }
-        }
-        None => {
-            let label = help_key.unwrap_or_else(|| "this row".into());
-            lines.push(Line::from(Span::styled(
-                format!("No extended help for {label}."),
-                Style::default().fg(MUTED),
-            )));
-            lines.push(Line::from(Span::styled(
-                "It is a low-level / advanced key — edit only if you know what it does.",
-                Style::default().fg(MUTED),
-            )));
-        }
-    }
-
-    frame.render_widget(
-        Paragraph::new(lines)
-            // trim:false so the per-option indent / markers keep their column.
-            .wrap(Wrap { trim: false })
-            .block(block("About this setting"))
-            .style(Style::default().fg(TEXT).bg(PANEL)),
-        area,
-    );
-}
-
-/// Render a default value for display: an empty default reads as "(unset)".
-fn default_display(default: &str) -> String {
-    if default.is_empty() {
-        "(unset)".to_string()
-    } else {
-        default.to_string()
     }
 }
 
@@ -1324,8 +1665,13 @@ fn draw_system(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         for r in app.request_log.iter().take(8) {
             diagnostic_lines.push(Line::from(format!(
-                "{}  {} tok · {:.0} tok/s · {:.1}s",
-                r.model, r.tokens, r.tps, r.secs
+                "{}  {} {} · {:.0} {}/s · {:.1}s",
+                r.model,
+                r.tokens,
+                r.unit(),
+                r.tps,
+                r.unit(),
+                r.secs
             )));
         }
     }
@@ -1401,6 +1747,47 @@ fn probe_line(label: &str, probe: &crate::hipfire::dashboard::Probe) -> Line<'st
     ])
 }
 
+/// `label` + `value` on one row `width` columns wide. An over-long value keeps
+/// its tail (`…` prefix), which is the informative end of a path or tag.
+fn fit_line(label: &str, value: &str, width: usize, style: Style) -> Line<'static> {
+    let room = width.saturating_sub(label.chars().count()).max(1);
+    let n = value.chars().count();
+    let shown: String = if n <= room {
+        value.to_string()
+    } else {
+        let tail: String = value.chars().skip(n - (room - 1)).collect();
+        format!("\u{2026}{tail}")
+    };
+    Line::from(vec![
+        Span::raw(label.to_string()),
+        Span::styled(shown, style),
+    ])
+}
+
+/// `label` + `value` wrapped to `width` columns, continuation rows indented
+/// under the value, so the returned line count is the exact rendered height.
+fn wrap_labeled(label: &str, value: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    let indent = label.chars().count();
+    let room = width.saturating_sub(indent).max(1);
+    let chars: Vec<char> = value.chars().collect();
+    let mut out = Vec::new();
+    for (i, chunk) in chars.chunks(room).enumerate() {
+        let lead = if i == 0 {
+            label.to_string()
+        } else {
+            " ".repeat(indent)
+        };
+        out.push(Line::from(vec![
+            Span::styled(lead, style),
+            Span::styled(chunk.iter().collect::<String>(), style),
+        ]));
+    }
+    if out.is_empty() {
+        out.push(Line::from(Span::styled(label.to_string(), style)));
+    }
+    out
+}
+
 fn card(title: &str, lines: Vec<Line<'static>>) -> Paragraph<'static> {
     Paragraph::new(lines)
         .block(block(title))
@@ -1465,7 +1852,7 @@ fn draw_logs(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn block(title: &str) -> Block<'static> {
+pub(crate) fn block(title: &str) -> Block<'static> {
     Block::default()
         .title(Span::styled(
             format!(" {title} "),
@@ -1476,7 +1863,7 @@ fn block(title: &str) -> Block<'static> {
         .style(Style::default().bg(PANEL))
 }
 
-fn pad(area: Rect, x: u16, y: u16) -> Rect {
+pub(crate) fn pad(area: Rect, x: u16, y: u16) -> Rect {
     Rect {
         x: area.x.saturating_add(x),
         y: area.y.saturating_add(y),
@@ -1502,11 +1889,11 @@ mod render_tests {
     use ratatui::{backend::TestBackend, Terminal};
 
     /// Render the whole UI for the Dashboard tab with the given snapshot and
-    /// return the flattened buffer text. App::load() reads ~/.hipfire but is
-    /// tolerant of missing files (same path as `--check`); the Dashboard panel
-    /// itself draws purely from `app.dashboard`, which we inject here.
+    /// return the flattened buffer text. The app is hermetic (an empty temp
+    /// home); the Dashboard panel itself draws purely from `app.dashboard`,
+    /// which we inject here.
     fn render_dashboard(dash: Option<Dashboard>) -> String {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         app.tab = Tab::Dashboard;
         app.dashboard = dash;
         let backend = TestBackend::new(110, 30);
@@ -1516,6 +1903,69 @@ mod render_tests {
             .expect("draw must not panic");
         let buf = terminal.backend().buffer().clone();
         buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    fn render_metrics(view: crate::hipfire::metrics::MetricsView, width: u16) -> String {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Dashboard;
+        app.live_metrics = view;
+        let mut terminal = Terminal::new(TestBackend::new(width, 30)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn live_metrics_card_states() {
+        use crate::hipfire::metrics::{EngineRow, LiveMetrics, MetricsView};
+        let live = MetricsView::Live(LiveMetrics {
+            window_s: 180.0,
+            req_s: 0.33,
+            tok_s: 47.2,
+            errors_per_min: 0.0,
+            rejects_per_min: 0.0,
+            cache_hit_pct: Some(50.0),
+            ttft_ms: Some((62.5, 100.0)),
+            tpot_ms: None,
+            tau: Some(3.0),
+            tok_s_series: (0..119).collect(),
+            req_s_series: vec![0; 119],
+            engine: None,
+        });
+        let text = render_metrics(live.clone(), 110);
+        assert!(text.contains("Live metrics"));
+        assert!(text.contains("tok/s     47.2"));
+        assert!(text.contains("TTFT  p50 62 ms · p95 100 ms"));
+        assert!(text.contains("TPOT  —"));
+        assert!(text.contains("cache hit 50% · 3m 0s window · tau 3.00"));
+        assert!(
+            !text.contains("slots "),
+            "standard route shows no engine row"
+        );
+        // Narrow terminal: rows truncate instead of panicking or reflowing.
+        assert!(render_metrics(live.clone(), 40).contains("tok/s     47.2"));
+        let MetricsView::Live(mut multi) = live else {
+            unreachable!()
+        };
+        multi.engine = Some(EngineRow {
+            slots_active: 1.0,
+            slots_total: 4.0,
+            kv_pages: Some((90.0, 128.0)),
+            evictions: 2.0,
+            restores: 1.0,
+            prefix_hits: 3.0,
+        });
+        let text = render_metrics(MetricsView::Live(multi), 110);
+        assert!(
+            text.contains("slots 1/4 · KV free 90/128 pages · evict 2 · restore 1 · prefix hits 3")
+        );
+        // The engine row is extra: the existing rows stay visible.
+        assert!(text.contains("cache hit 50% · 3m 0s window · tau 3.00"));
+        assert!(render_metrics(MetricsView::Collecting, 110).contains("collecting…"));
+        assert!(render_metrics(MetricsView::Unavailable, 110)
+            .contains("metrics unavailable (older serve)"));
     }
 
     #[test]
@@ -1531,6 +1981,7 @@ mod render_tests {
                 queue_depth: 1,
                 requests_served: 7,
                 recent_tok_s: Some(151.2),
+                loaded_config: None,
             }),
             model_ids: vec!["qwen3.5:9b".into(), "qwen3.5:27b".into()],
             vram: VramState::Available(vec![GpuMem {
@@ -1563,15 +2014,22 @@ mod render_tests {
     fn renders_offline_state_without_panic_or_stale_numbers() {
         let dash = Dashboard::offline(
             "127.0.0.1:11435".into(),
-            VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into()),
-            LoadState::Unavailable("GPU load unavailable: rocm-smi not installed".into()),
+            VramState::Unavailable(
+                "GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: none)"
+                    .into(),
+            ),
+            LoadState::Unavailable("GPU load unavailable: no GPU stats tool".into()),
         );
         let text = render_dashboard(Some(dash));
         assert!(text.contains("offline"), "expected offline marker");
         assert!(text.contains("hipfire serve"), "expected start hint");
         assert!(
-            text.contains("VRAM unavailable"),
-            "expected honest VRAM-unavailable line"
+            text.contains("GPU stats unavailable"),
+            "expected honest GPU-stats-unavailable line"
+        );
+        assert!(
+            !text.contains("No GPU detected") && !text.contains("not installed"),
+            "a missing stats tool must not read as a missing GPU"
         );
         // No fabricated telemetry: offline must not invent a tok/s or queue.
         assert!(!text.contains("tok/s"), "offline must not show tok/s");
@@ -1594,7 +2052,7 @@ mod render_tests {
     /// passed closure first (set tab / inject dashboard / toast). CPU-only, no
     /// TTY, no GPU, no serve.
     fn render_with(setup: impl FnOnce(&mut App)) -> String {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         setup(&mut app);
         let backend = TestBackend::new(120, 32);
         let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1608,8 +2066,11 @@ mod render_tests {
     fn dash_with_system(system: SystemInfo) -> Dashboard {
         let mut d = Dashboard::offline(
             "127.0.0.1:11435".into(),
-            VramState::Unavailable("VRAM unavailable: rocm-smi not installed".into()),
-            LoadState::Unavailable("GPU load unavailable: rocm-smi not installed".into()),
+            VramState::Unavailable(
+                "GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: none)"
+                    .into(),
+            ),
+            LoadState::Unavailable("GPU load unavailable: no GPU stats tool".into()),
         );
         d.system = Some(system);
         d
@@ -1648,9 +2109,12 @@ mod render_tests {
     #[test]
     fn system_tab_renders_unavailable_states_honestly() {
         let sys = SystemInfo {
-            gpu_name: Probe::Unavailable("unavailable: rocm-smi not installed".into()),
-            gpu_arch: Probe::Unavailable("unavailable: rocminfo not installed".into()),
-            hip_version: Probe::Unavailable("unavailable: hipconfig absent".into()),
+            gpu_name: Probe::Unavailable(
+                "GPU stats unavailable: neither amd-smi nor rocm-smi found (ROCm root: none)"
+                    .into(),
+            ),
+            gpu_arch: Probe::Unavailable("unavailable: rocminfo not found".into()),
+            hip_version: Probe::Unavailable("unavailable: hipconfig not found".into()),
             kernel_cache: Probe::Unavailable(
                 "/home/u/.hipfire_kernels (absent — populated on first run)".into(),
             ),
@@ -1689,7 +2153,10 @@ mod render_tests {
             settings.contains("change"),
             "settings footer mentions change"
         );
-        assert!(settings.contains("easy"), "settings footer mentions easy");
+        assert!(
+            settings.contains("search"),
+            "settings footer mentions search"
+        );
 
         let models = render_with(|app| app.tab = Tab::Models);
         assert!(models.contains("select"), "models footer mentions select");
@@ -1727,7 +2194,7 @@ mod render_tests {
 
     #[test]
     fn models_empty_state_guides_to_pull() {
-        // App::load with no registry / no local models yields empty visible
+        // A hermetic app with no registry / no local models yields empty visible
         // items; the Models tab must render pull guidance, not an empty table.
         let text = render_with(|app| {
             app.tab = Tab::Models;
@@ -1751,7 +2218,7 @@ mod render_tests {
 
     #[test]
     fn header_records_ordered_tab_hitboxes() {
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -1773,7 +2240,7 @@ mod render_tests {
         // drew the tab title in the buffer — the only check that catches a real
         // off-by-one in draw_header's cell-width / divider math (the fabricated-
         // hitbox click tests cannot).
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         let backend = TestBackend::new(110, 30);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -1806,7 +2273,7 @@ mod render_tests {
         // At a width where not all tabs fit, the hit regions must not register a
         // tab ratatui didn't draw, every region is clamped to the area, and a
         // click well past the visible tabs resolves to nothing.
-        let mut app = App::load().expect("App::load");
+        let (mut app, _home) = crate::test_support::hermetic_app();
         let backend = TestBackend::new(20, 12);
         let mut terminal = Terminal::new(backend).expect("terminal");
         terminal
@@ -1830,7 +2297,7 @@ mod render_tests {
     fn help_overlay_does_not_panic_at_tiny_geometry() {
         // Locks in the saturating-sub underflow guards in draw_help_overlay.
         for (w, h) in [(4u16, 3u16), (2, 2), (1, 1)] {
-            let mut app = App::load().expect("App::load");
+            let (mut app, _home) = crate::test_support::hermetic_app();
             app.show_help = true;
             let backend = TestBackend::new(w, h);
             let mut terminal = Terminal::new(backend).expect("terminal");
@@ -1878,240 +2345,8 @@ mod render_tests {
     fn settings_footer_shows_reset_controls() {
         // 5a: reset + reset-all are discoverable in the Settings footer.
         let text = render_with(|app| app.tab = Tab::Settings);
-        assert!(text.contains("Del reset"), "single-key reset hint");
+        assert!(text.contains("Del default"), "single-key reset hint");
         assert!(text.contains("R reset-all"), "reset-all hint");
-    }
-
-    #[test]
-    fn settings_row_display_encodes_override_state() {
-        use ratatui::style::Modifier;
-        // 5c: override -> "● " marker + bold; default -> "  " (no marker) + dim
-        // MUTED; composite (None) -> neutral, no marker; preview wins (5b).
-        let (s, st) = settings_row_display("q8", None, Some(true), false);
-        assert_eq!(s, "● q8");
-        assert!(st.add_modifier.contains(Modifier::BOLD), "override is bold");
-        assert_eq!(st.fg, Some(TEXT));
-
-        let (s, st) = settings_row_display("auto", None, Some(false), false);
-        assert_eq!(s, "  auto", "default has no bullet");
-        assert_eq!(st.fg, Some(MUTED), "default is dimmed");
-
-        let (s, st) = settings_row_display("qwen3.5:9b", None, None, false);
-        assert_eq!(s, "  qwen3.5:9b", "composite row has no bullet");
-        assert_eq!(st.fg, Some(TEXT), "composite row is neutral, not dimmed");
-
-        // Selected override stays marked but uses the cursor highlight.
-        let (s, st) = settings_row_display("q8", None, Some(true), true);
-        assert_eq!(s, "● q8");
-        assert_eq!(st.fg, Some(ACCENT), "selected row uses the cursor color");
-
-        // Preview overrides everything.
-        let (s, st) = settings_row_display("auto", Some("on"), Some(false), false);
-        assert_eq!(s, "● on (preview)");
-        assert_eq!(st.fg, Some(YELLOW));
-        assert!(st.add_modifier.contains(Modifier::ITALIC));
-
-        // Preview on the SELECTED row still reads as highlighted: it keeps the
-        // PANEL_2 highlight background (not just yellow text floating on PANEL).
-        let (_s, st) = settings_row_display("auto", Some("on"), Some(false), true);
-        assert_eq!(st.fg, Some(YELLOW), "preview keeps its distinct yellow");
-        assert_eq!(
-            st.bg,
-            Some(PANEL_2),
-            "preview row uses the highlight background"
-        );
-    }
-
-    #[test]
-    fn easy_override_state_is_row_parallel() {
-        // 5c review #1: easy_override_state must stay aligned with easy_rows /
-        // easy_keys so the marker lands on the right row.
-        let app = App::load().expect("App::load");
-        let rows = app.config.easy_rows().len();
-        assert_eq!(app.config.easy_override_state().len(), rows);
-        assert_eq!(app.config.easy_keys().len(), rows);
-    }
-
-    #[test]
-    fn settings_marks_overrides_with_legend() {
-        // 5c render: an override row carries the ● marker and the table titles
-        // explain what it means.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.config.overrides.clear();
-            app.config.overrides.insert("kv_cache".into());
-            // Put the override row under the cursor so it is on-screen.
-            app.settings_selected = app
-                .config
-                .values
-                .keys()
-                .position(|k| k == "kv_cache")
-                .unwrap();
-        });
-        assert!(text.contains("● "), "override row marked with a bullet");
-        assert!(text.contains("your override"), "legend explains the marker");
-    }
-
-    #[test]
-    fn easy_model_row_marks_default_model_override() {
-        // 5c review #1: the composite Model row (editable key None) must still
-        // show the override marker when default_model is set — consistent with
-        // the advanced view, where the same key is marked.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-            app.config.overrides.clear();
-            app.config.overrides.insert("default_model".into());
-            app.settings_selected = 0; // Model row
-        });
-        // Only default_model is overridden, so the single bullet is the Model row.
-        assert!(
-            text.contains("● "),
-            "Model composite row marked via default_model override"
-        );
-    }
-
-    #[test]
-    fn settings_explainer_shows_selected_key_help() {
-        // 5e: selecting dflash_mode shows its explainer incl. the load-bearing
-        // thinking interaction and its default.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app
-                .config
-                .values
-                .keys()
-                .position(|k| k == "dflash_mode")
-                .unwrap();
-        });
-        assert!(
-            text.contains("About this setting"),
-            "explainer pane present"
-        );
-        assert!(text.contains("Spec decode"), "shows the knob title");
-        assert!(
-            text.contains("thinking"),
-            "surfaces the thinking↔dflash interaction"
-        );
-        assert!(text.contains("default:"), "shows the default");
-    }
-
-    #[test]
-    fn settings_explainer_lists_options_with_current_marked() {
-        // 5e+: selecting an enum shows each option's meaning in the in-tab pane,
-        // marking the current value with the ▸ pointer.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app
-                .config
-                .values
-                .keys()
-                .position(|k| k == "kv_adaptive")
-                .unwrap();
-        });
-        assert!(text.contains("Options:"), "options section present");
-        assert!(text.contains("aggressive"), "an option value is listed");
-        // The three presets are now distinct tiers — balanced is the middle floor.
-        assert!(
-            text.contains("Middle floor"),
-            "an option description is shown"
-        );
-        assert!(
-            text.contains("▸"),
-            "the current option is marked with a pointer"
-        );
-    }
-
-    #[test]
-    fn settings_explainer_easy_composite_row_has_help() {
-        // The composite Model row (no inline-editable key) still gets help via
-        // easy_help_keys -> default_model.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = true;
-            app.settings_selected = 0; // Model row
-        });
-        assert!(
-            text.contains("Default model"),
-            "Model row resolves to default_model help"
-        );
-    }
-
-    #[test]
-    fn settings_explainer_falls_back_for_uncurated_key() {
-        // An advanced key without a curated entry shows an honest fallback, not a
-        // blank pane.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            // cask_budget has no curated knob entry.
-            app.config.values.clear();
-            app.config.values.insert("cask_budget".into(), "512".into());
-            app.settings_selected = 0;
-        });
-        assert!(
-            text.contains("No extended help"),
-            "honest fallback for uncurated key"
-        );
-    }
-
-    #[test]
-    fn settings_hint_is_honest_per_row_kind() {
-        // 5b review: the action hint must NOT promise preview semantics on a
-        // boolean row (it toggles immediately), but must on an enum row.
-        let bool_text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app.config.values.keys().position(|k| k == "cask").unwrap();
-        });
-        assert!(
-            bool_text.contains("toggles on/off") && bool_text.contains("immediately"),
-            "boolean row advertises immediate toggle, not preview"
-        );
-
-        let enum_text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            app.settings_selected = app
-                .config
-                .values
-                .keys()
-                .position(|k| k == "kv_cache")
-                .unwrap();
-        });
-        assert!(
-            enum_text.contains("preview values") && enum_text.contains("Enter commits"),
-            "enum row advertises preview-then-commit"
-        );
-    }
-
-    #[test]
-    fn settings_enum_preview_renders_distinctly() {
-        // 5b: a staged preview shows the value with "(preview)" + a commit/cancel
-        // footer, signalling it is NOT yet written.
-        let text = render_with(|app| {
-            app.tab = Tab::Settings;
-            app.settings_easy = false;
-            // Select the previewed row so it's on-screen (scroll follows selection).
-            app.settings_selected = app
-                .config
-                .values
-                .keys()
-                .position(|k| k == "dflash_mode")
-                .unwrap();
-            app.settings_pending = Some(crate::app::PendingEnum {
-                key: "dflash_mode".into(),
-                value: "auto".into(),
-            });
-        });
-        assert!(text.contains("auto (preview)"), "previewed value is marked");
-        assert!(
-            text.contains("Enter commit"),
-            "commit/cancel guidance shown"
-        );
     }
 
     #[test]
@@ -2126,6 +2361,33 @@ mod render_tests {
         });
         assert!(text.contains("Pulling"), "gauge title shows the model");
         assert!(text.contains("37"), "percent in the gauge label");
+    }
+
+    #[test]
+    fn models_footer_offers_cancel_while_pulling() {
+        let text = render_with(|app| {
+            app.tab = Tab::Models;
+            let (_tx, rx) = std::sync::mpsc::channel();
+            app.inject_pull("qwen3.5:9b".into(), rx);
+        });
+        assert!(text.contains("c cancel"), "footer/gauge advertise c cancel");
+    }
+
+    #[test]
+    fn quit_confirm_prompt_is_visible_on_every_tab() {
+        for tab in [Tab::Home, Tab::Chat, Tab::Models, Tab::Logs] {
+            let text = render_with(|app| {
+                app.tab = tab;
+                let (_tx, rx) = std::sync::mpsc::channel();
+                app.inject_pull("qwen3.5:9b".into(), rx);
+                app.toast_info("a toast that must not hide the prompt");
+                assert!(!app.request_quit());
+            });
+            assert!(
+                text.contains("A pull of qwen3.5:9b is running. Quit and cancel it?"),
+                "prompt missing on {tab:?}"
+            );
+        }
     }
 
     #[test]
@@ -2153,6 +2415,7 @@ mod render_tests {
                 tokens: 128,
                 tps: 151.0,
                 secs: 0.85,
+                exact: true,
             }];
         });
         assert!(
@@ -2195,6 +2458,7 @@ mod render_tests {
             app.chat.messages = vec![crate::hipfire::chat::ChatMessage {
                 role: "assistant".into(),
                 content: "here:\n```rust\nlet x = 1;\n```".into(),
+                reasoning_content: None,
             }];
         });
         assert!(text.contains("let x = 1;"), "code line is rendered");
@@ -2215,6 +2479,571 @@ mod render_tests {
         assert!(
             text.contains("last 2 lines"),
             "title reflects the line count"
+        );
+    }
+    /// Render at `w`x`h` and return each buffer row as a string.
+    fn render_rows(w: u16, h: u16, setup: impl FnOnce(&mut App)) -> Vec<String> {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        setup(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The footer's first row (the hints row) of a render.
+    fn footer_row(rows: &[String]) -> String {
+        rows[rows.len() - 2].trim_end().to_string()
+    }
+
+    #[test]
+    fn footers_fit_whole_segments_and_advertise_help_at_80x24() {
+        let mut checked = 0;
+        for tab in Tab::ALL {
+            let mut segs = Vec::new();
+            let rows = render_rows(80, 24, |app| {
+                app.tab = tab;
+                app.last_reload.clear();
+                segs = footer_segments(app);
+            });
+            let row = footer_row(&rows);
+            assert!(
+                row.contains("? help"),
+                "{tab:?} footer advertises help: {row:?}"
+            );
+            assert!(
+                row.chars().count() <= 80,
+                "{tab:?} footer fits the width: {row:?}"
+            );
+            for part in row.split(FOOTER_SEP) {
+                assert!(
+                    segs.iter().any(|s| s == part),
+                    "{tab:?} footer piece {part:?} is not a whole segment of {segs:?}"
+                );
+            }
+            checked += 1;
+        }
+        assert_eq!(checked, Tab::ALL.len());
+    }
+
+    #[test]
+    fn chat_footer_variant_advertises_help_via_esc() {
+        let rows = render_rows(80, 24, |app| {
+            app.tab = Tab::Chat;
+            app.chat.focus_input();
+            app.last_reload.clear();
+        });
+        assert!(footer_row(&rows).contains("Esc then ? help"));
+        let rows = render_rows(80, 24, |app| {
+            app.tab = Tab::Chat;
+            app.chat.blur_input();
+            app.last_reload.clear();
+        });
+        assert!(footer_row(&rows).contains("? help"));
+    }
+
+    #[test]
+    fn footer_status_text_only_appears_when_it_fits() {
+        let status = "STATUS-MARKER reloaded config";
+        let wide = render_rows(160, 48, |app| {
+            app.tab = Tab::Dashboard;
+            app.last_reload = status.into();
+        });
+        let row = footer_row(&wide);
+        let help = row.find("? help").expect("hints present");
+        let at = row.find(status).expect("status renders when room remains");
+        assert!(at > help, "status comes after the hints: {row:?}");
+
+        let narrow = render_rows(80, 24, |app| {
+            app.tab = Tab::Dashboard;
+            app.last_reload = status.into();
+        });
+        assert!(
+            !footer_row(&narrow).contains("STATUS-MARKER"),
+            "status is dropped, never cut, when the hints use the width"
+        );
+    }
+
+    #[test]
+    fn segments_are_dropped_not_cut() {
+        let segs: Vec<String> = ["alpha one", "beta", "gamma three"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(fit_segments(&segs, 80), "alpha one · beta · gamma three");
+        assert_eq!(fit_segments(&segs, 14), "alpha one");
+        assert_eq!(fit_segments(&segs, 18), "alpha one · beta");
+        // A later, shorter segment still fits after a long one is skipped.
+        let mixed: Vec<String> = ["alpha one", "a long segment here", "b"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(fit_segments(&mixed, 16), "alpha one · b");
+        assert_eq!(fit_segments(&segs, 0), "");
+    }
+
+    #[test]
+    fn serve_confirm_prompts_render_in_footer() {
+        use crate::hipfire::serve_ctrl::ServeAction;
+        let rows = render_rows(80, 24, |app| {
+            app.tab = Tab::Dashboard;
+            app.confirm_serve = Some(ServeAction::Stop);
+        });
+        assert!(footer_row(&rows).contains("Stop hipfire serve? y / n"));
+        let rows = render_rows(80, 24, |app| {
+            app.tab = Tab::Dashboard;
+            app.confirm_serve = Some(ServeAction::Restart);
+        });
+        let both = format!("{} {}", rows[22], rows[23]);
+        assert!(both.contains("hipfire stop --force"), "{both:?}");
+        assert!(both.contains("force-reaps"), "{both:?}");
+        assert!(both.contains("y / n"), "{both:?}");
+    }
+
+    #[test]
+    fn home_lists_logs_and_shows_runtime_models_and_registry_lines() {
+        for (w, h) in [(80u16, 24u16), (160, 48)] {
+            let rows = render_rows(w, h, |app| {
+                app.tab = Tab::Home;
+                app.registry.warning = Some("registry note".into());
+            });
+            let text = rows.join("\n");
+            assert!(text.contains("Logs"), "{w}x{h}: Home tab list names Logs");
+            assert!(
+                text.contains("Models     "),
+                "{w}x{h}: Runtime Models line visible"
+            );
+            assert!(
+                text.contains("Registry   "),
+                "{w}x{h}: Runtime Registry line visible"
+            );
+            assert!(
+                text.contains("? help") || text.contains("? help for"),
+                "{w}x{h}: Home mentions ? help"
+            );
+        }
+    }
+
+    #[test]
+    fn help_overlay_documents_esc_confirms_and_help_key() {
+        let text = render_rows(80, 30, |app| {
+            app.tab = Tab::Dashboard;
+            app.show_help = true;
+        })
+        .join("\n");
+        assert!(text.contains("close / cancel"), "Esc is close / cancel");
+        assert!(!text.contains("Esc              quit"));
+        assert!(text.contains("ask y / n"), "x / R confirms are documented");
+        assert!(text.contains("this help"), "? is documented");
+    }
+
+    fn chat_key(app: &mut App, code: crossterm::event::KeyCode) {
+        app.handle_tab_key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+
+    /// Draw `app` at `w`×`h`; return the flattened buffer text and the terminal
+    /// cursor position set by the frame.
+    fn draw_at(app: &mut App, w: u16, h: u16) -> (String, ratatui::layout::Position) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, app))
+            .expect("draw must not panic");
+        let cursor = terminal.get_cursor_position().expect("cursor");
+        let buf = terminal.backend().buffer().clone();
+        (buf.content().iter().map(|c| c.symbol()).collect(), cursor)
+    }
+
+    fn msg(role: &str, content: &str) -> crate::hipfire::chat::ChatMessage {
+        crate::hipfire::chat::ChatMessage {
+            role: role.into(),
+            content: content.into(),
+            reasoning_content: None,
+        }
+    }
+
+    fn long_reply_app() -> App {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Chat;
+        let mut body: Vec<String> = (1..=40).map(|i| format!("line {i:02} xxxx")).collect();
+        body.push("END-OF-REPLY".into());
+        app.chat.messages = vec![msg("user", "go"), msg("assistant", &body.join("\n"))];
+        app
+    }
+
+    fn visible_lines(text: &str) -> Vec<usize> {
+        (1..=40)
+            .filter(|i| text.contains(&format!("line {i:02} x")))
+            .collect()
+    }
+
+    fn chat_follows_and_scrolls_from_bottom(w: u16, h: u16) {
+        let mut app = long_reply_app();
+        let (text, _) = draw_at(&mut app, w, h);
+        assert!(
+            text.contains("END-OF-REPLY"),
+            "{w}x{h}: newest output visible with no key presses"
+        );
+        assert!(
+            !text.contains("more (End to follow)"),
+            "no hint while following"
+        );
+        let before = visible_lines(&text);
+
+        for _ in 0..5 {
+            chat_key(&mut app, crossterm::event::KeyCode::Up);
+        }
+        assert_eq!(app.chat.scroll, 5, "Up scrolls toward older text");
+        let (scrolled, _) = draw_at(&mut app, w, h);
+        let after = visible_lines(&scrolled);
+        assert!(
+            after.first() < before.first(),
+            "{w}x{h}: an older line is visible after Up (before {before:?}, after {after:?})"
+        );
+        assert!(
+            !scrolled.contains("END-OF-REPLY"),
+            "{w}x{h}: end of reply scrolled out of view"
+        );
+        assert!(scrolled.contains("5 more (End to follow)"), "hint shown");
+
+        chat_key(&mut app, crossterm::event::KeyCode::Down);
+        assert_eq!(app.chat.scroll, 4, "Down scrolls toward newer text");
+
+        chat_key(&mut app, crossterm::event::KeyCode::End);
+        assert_eq!(app.chat.scroll, 0);
+        let (followed, _) = draw_at(&mut app, w, h);
+        assert!(followed.contains("END-OF-REPLY"), "End resumes following");
+    }
+
+    #[test]
+    fn chat_scrolls_from_bottom_80x24() {
+        chat_follows_and_scrolls_from_bottom(80, 24);
+    }
+
+    #[test]
+    fn chat_scrolls_from_bottom_160x48() {
+        chat_follows_and_scrolls_from_bottom(160, 48);
+    }
+
+    #[test]
+    fn chat_scroll_clamps_pages_and_jumps_home() {
+        let mut app = long_reply_app();
+        let (_, _) = draw_at(&mut app, 80, 24);
+        let view = app.chat.view.get().expect("view recorded by draw");
+        assert!(view.max_scroll > 0 && view.viewport > 0);
+
+        for _ in 0..500 {
+            chat_key(&mut app, crossterm::event::KeyCode::Up);
+        }
+        assert_eq!(app.chat.scroll, view.max_scroll, "Up clamps at the top");
+        let (top, _) = draw_at(&mut app, 80, 24);
+        assert!(top.contains("line 01 x"), "oldest text visible at the top");
+
+        chat_key(&mut app, crossterm::event::KeyCode::PageDown);
+        assert_eq!(
+            app.chat.scroll,
+            view.max_scroll - view.viewport.min(view.max_scroll)
+        );
+        chat_key(&mut app, crossterm::event::KeyCode::End);
+        chat_key(&mut app, crossterm::event::KeyCode::PageUp);
+        assert_eq!(app.chat.scroll, view.viewport.min(view.max_scroll));
+        chat_key(&mut app, crossterm::event::KeyCode::Home);
+        assert_eq!(app.chat.scroll, view.max_scroll);
+    }
+
+    #[test]
+    fn chat_long_input_tail_and_cursor_visible() {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Chat;
+        app.chat.input = format!("{}END", "x".repeat(400));
+        let (text, cursor) = draw_at(&mut app, 80, 24);
+        assert!(text.contains("END"), "tail of a long input is visible");
+        // Input box: rows h-7..h-3 (footer takes the last 2), inner rows h-6..=h-4.
+        assert!(
+            (18..=20).contains(&cursor.y),
+            "cursor row {} inside the input box",
+            cursor.y
+        );
+        assert!(cursor.x >= 2 && cursor.x < 79, "cursor col {}", cursor.x);
+    }
+
+    #[test]
+    fn wrap_input_rows_places_cursor_row() {
+        assert_eq!(wrap_input_rows("abcdefgh", 4), vec!["abcd", "efgh", ""]);
+        assert_eq!(wrap_input_rows("ab\n", 4), vec!["ab", ""]);
+        assert_eq!(wrap_input_rows("", 4), vec![""]);
+    }
+
+    #[test]
+    fn chat_help_goes_to_transcript_not_input_title() {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![msg("user", "hi"), msg("assistant", "hello")];
+        app.chat.input = "/help".into();
+        chat_key(&mut app, crossterm::event::KeyCode::Enter);
+        assert_eq!(app.chat.messages.len(), 2, "help is not a message");
+        assert!(app.chat.input.is_empty());
+        assert!(
+            !app.chat.status.contains("/model"),
+            "status/input title carries no command list"
+        );
+        let (text, _) = draw_at(&mut app, 80, 24);
+        assert!(
+            text.contains("/regen"),
+            "help text rendered in the transcript"
+        );
+        assert!(text.contains("Commands"));
+        assert!(
+            !text.contains("/model · /system"),
+            "old one-line title is gone"
+        );
+    }
+
+    #[test]
+    fn chat_reasoning_is_labelled_and_styled_apart() {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![
+            msg("user", "hi"),
+            crate::hipfire::chat::ChatMessage {
+                role: "assistant".into(),
+                content: "the answer".into(),
+                reasoning_content: Some("pondering".into()),
+            },
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        assert!(text.contains("thinking"), "reasoning label shown");
+        let find = |needle: &str| {
+            buf.content()
+                .iter()
+                .enumerate()
+                .find(|(i, _)| {
+                    let start = *i;
+                    let w = needle.chars().count();
+                    start + w <= buf.content().len()
+                        && buf.content()[start..start + w]
+                            .iter()
+                            .map(|c| c.symbol())
+                            .collect::<String>()
+                            == needle
+                })
+                .map(|(_, c)| c.style())
+                .expect("needle on screen")
+        };
+        let think = find("pondering");
+        let answer = find("the answer");
+        assert!(think.add_modifier.contains(Modifier::ITALIC));
+        assert!(!answer.add_modifier.contains(Modifier::ITALIC));
+        assert_ne!(think.fg, answer.fg, "reasoning uses the muted colour");
+    }
+
+    #[test]
+    fn chat_input_title_shows_prefill_progress_while_sending() {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Chat;
+        app.chat.sending = true;
+        app.chat.status = "prefilling 512/2048 (25%) · ETA 6s".into();
+        let (text, _) = draw_at(&mut app, 100, 24);
+        assert!(
+            text.contains("prefilling 512/2048 (25%) · ETA 6s"),
+            "prefill readout in the chat view: {text}"
+        );
+    }
+
+    #[test]
+    fn chat_abort_marks_stopped_in_transcript_only() {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Chat;
+        app.chat.messages = vec![msg("user", "hi"), msg("assistant", "partial reply")];
+        app.chat.sending = true;
+        app.chat.request_abort();
+        assert!(!app.chat.sending);
+        assert_eq!(app.chat.messages[1].content, "partial reply");
+        assert!(!app.chat.messages[1].content.contains("[stopped]"));
+        let (text, _) = draw_at(&mut app, 80, 24);
+        assert!(text.contains("[stopped]"), "stopped marker rendered");
+    }
+
+    #[test]
+    fn chat_stats_label_is_honest_about_chunks() {
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Chat;
+        app.chat.last_stats = Some(crate::app::GenStats {
+            tokens: 7,
+            tps: 3.0,
+            exact: false,
+        });
+        let (text, _) = draw_at(&mut app, 160, 24);
+        assert!(text.contains("7 chunks @ 3 chunks/s"));
+        assert!(!text.contains("7 tok"));
+        app.chat.last_stats = Some(crate::app::GenStats {
+            tokens: 5,
+            tps: 2.0,
+            exact: true,
+        });
+        let (text, _) = draw_at(&mut app, 160, 24);
+        assert!(text.contains("5 tok @ 2 tok/s"));
+    }
+
+    /// Render the Models tab at `width`x`height` over a fixed registry: two
+    /// all-remote groups (`0/2 local`), and an expanded `qwen3.8` group holding
+    /// a long tag that is the active (local) model.
+    fn render_models(width: u16, height: u16) -> String {
+        use crate::hipfire::registry::{LocalModel, ModelEntry, ModelRow};
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Models;
+        let row = |tag: &str, downloaded: bool, has_mtp: bool| ModelRow {
+            tag: tag.into(),
+            entry: ModelEntry {
+                repo: "org/repo".into(),
+                size_gb: 1.5,
+                min_vram_gb: 8.0,
+                desc: "test row".into(),
+                ..ModelEntry::default()
+            },
+            downloaded,
+            has_mtp,
+        };
+        app.active_model = "qwen3.8:local-fixture-long-tag".into();
+        app.registry.models = vec![
+            row("alpha:a", false, false),
+            row("alpha:b", false, false),
+            row("beta:a", false, false),
+            row("beta:b", false, false),
+            row("qwen3.8:local-fixture-long-tag", true, true),
+            row("qwen3.8:flash-next-mq3-xts", false, false),
+        ];
+        // The `.ple-q4` row file is on disk but is a sidecar, never a Models row.
+        app.registry.local_files = vec![LocalModel {
+            file: "qwen3.8.mq4.ple-q4".into(),
+            size: "29.1 GiB".into(),
+            bytes: 31_243_000_000,
+        }];
+        app.registry.expanded_groups = ["qwen3.8".to_string()].into_iter().collect();
+        app.registry.selected = 0;
+        app.registry.loaded_path = None;
+        app.registry.bundled = true;
+        app.registry.generated_at = "2026-10-01T00:00:00Z".into();
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        buf.content().iter().map(|c| c.symbol()).collect()
+    }
+
+    #[test]
+    fn models_tab_groups_and_header_are_fully_visible_at_80_and_160() {
+        for (w, h) in [(80, 24), (160, 48)] {
+            let text = render_models(w, h);
+            assert_eq!(
+                text.matches("0/2 local").count(),
+                2,
+                "{w}x{h}: both all-remote groups show their full `0/2 local` count"
+            );
+            assert!(text.contains("1/2 local"), "{w}x{h}: expanded group count");
+            assert!(!text.contains(".ple-q4"), "{w}x{h}: no .ple-q4 rows");
+            assert!(
+                !text.contains("triattn"),
+                "{w}x{h}: no triattn sidecar display"
+            );
+            assert!(
+                !text.contains("local-only"),
+                "{w}x{h}: Have is local/remote only"
+            );
+            assert_eq!(
+                text.matches("\u{2192} expand").count(),
+                1,
+                "{w}x{h}: only the selected group carries the action hint"
+            );
+        }
+    }
+
+    #[test]
+    fn models_tab_wide_screen_shows_long_tag_and_separate_active_marker() {
+        let text = render_models(160, 48);
+        assert!(
+            text.contains("* qwen3.8:local-fixture-long-tag"),
+            "the long tag is fully visible with the active marker beside it"
+        );
+        assert!(
+            text.contains("qwen3.8:flash-next-mq3-xts"),
+            "the second long tag is visible"
+        );
+        assert!(
+            text.contains("registry: bundled (2026-10-01)"),
+            "a bundled registry is named with its date, not `missing`"
+        );
+        assert!(text.contains("remote") && text.contains("local"));
+    }
+
+    #[test]
+    fn pull_chooser_renders_ple_and_draft_rows_at_80x24() {
+        use crate::hipfire::pull_choice::PullChoice;
+        use crate::hipfire::registry::ModelEntry;
+        use hipfire_registry::Sidecar;
+        let sc = |size| Sidecar {
+            file: "x".into(),
+            sha256: None,
+            size_bytes: Some(size),
+        };
+        let mut entry = ModelEntry::default();
+        entry.ple.insert("q4".into(), sc(1_500_000_000));
+        entry.ple.insert("q8".into(), sc(3_000_000_000));
+        entry.mtp = Some(sc(400_000_000));
+        entry.dflash = Some(sc(1_200_000_000));
+        let (mut app, _home) = crate::test_support::hermetic_app();
+        app.tab = Tab::Models;
+        app.pull_choice = PullChoice::for_entry("qwen3.8:flash-next-mq4-xts", &entry);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .expect("draw must not panic");
+        let buf = terminal.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        for needle in [
+            "PLE rows",
+            "auto",
+            "q4 1.5 GB",
+            "q8 3.0 GB",
+            "Draft sidecars",
+            "yes",
+            "MTP 400 MB",
+            "Enter pull",
+            "Esc cancel",
+        ] {
+            assert!(
+                text.contains(needle),
+                "missing {needle:?} in:\n{}",
+                text.as_bytes()
+                    .chunks(80)
+                    .map(|c| String::from_utf8_lossy(c).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        let segs = footer_segments(&app);
+        assert_eq!(
+            segs,
+            [
+                "Up/Down row",
+                "Left/Right change",
+                "Enter pull",
+                "Esc cancel"
+            ]
         );
     }
 }

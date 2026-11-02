@@ -1,0 +1,218 @@
+{
+  "qualified_commit": "e13aca05b",
+  "base_commit": "f32d2da2662da159f0a447d910dbf66b09aaf424",
+  "carryover_allowed": false,
+  "reason": "38ce67a44 adds n_experts ABI and consumer bounds instructions; all entry prefixes differ; new GPU bitwise gate required",
+  "objects": [
+    {
+      "module": "qwen4_moe_iu4_sym_w3_pm_gfx1151",
+      "old_sha": "24292e2d1e9dade4b840857b95fee93312caf9f926fca36bd39b584ead3afd16",
+      "new_sha": "69df2d67c6dfe0f28d8c4a80fd50b648c244b03a848e52cddedc0867656e8f66",
+      "changed_sections": {
+        ".symtab": {
+          "old_bytes": 240,
+          "new_bytes": 240,
+          "old_sha": "01952747bfa3129ca22d891834c05009ba3fa86823302e401669ae8f7a082a5d",
+          "new_sha": "dd09b14b49be9f1acb2e3ea065e63d77b774e1cbe0d199ac189f8388c2b01ce1"
+        },
+        ".dynamic": {
+          "old_bytes": 112,
+          "new_bytes": 112,
+          "old_sha": "6f50b08c9a5750aa7d059e5eed9398f68e1a8bb65ce56fcae972b0e4d34f054a",
+          "new_sha": "87b2b70f46949746ae966a38827b2794ecef36bacda53df1d2b61d2d92c8bb08"
+        },
+        ".text": {
+          "old_bytes": 61312,
+          "new_bytes": 61568,
+          "old_sha": "d948bdd3ab8af9edbfa3a2736deffbb28d641c18cd9a47ffa805de1625bee3d2",
+          "new_sha": "9231d4d7b635485ff6c0fd62b468920f474ac0b601f965cb81d85418ea15ec15"
+        },
+        ".note": {
+          "old_bytes": 4396,
+          "new_bytes": 4612,
+          "old_sha": "68dd9a6fcda541eb29a771f97a4067c14d86f79a2dd76f62d16cfdbb80bb8e18",
+          "new_sha": "9fc66f0a35dfef74f2dcfe0e6e27420003a479a2144641558faa242f2a492b9a"
+        },
+        ".rodata": {
+          "old_bytes": 256,
+          "new_bytes": 256,
+          "old_sha": "fa70ebf87b6095cedf7933f13b591f3ac97415e4594e645084d6dc8a8364f083",
+          "new_sha": "3682f10d7101227fe77dedca12d8b6edf139aa62c20023b41fa0391e42bb23de"
+        },
+        ".dynsym": {
+          "old_bytes": 216,
+          "new_bytes": 216,
+          "old_sha": "1e68301333e75a5fdb5bbe4b8f4f4500e2c872d023715587e8c536fc1ffe4b4d",
+          "new_sha": "bb7c9d96e5849858cc7a1a65754477e3de468a438387cbbe945b2fb4ee627100"
+        }
+      },
+      "current_beta_sha": "b5cc3ffc0cce03b9e15261620eaf1e4e859da4d57660d36a4f3e7863829502fb"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+      "old_sha": "59d12577f6d06f1b35a7df357460c89d0e241ea1e1bafd71284b37c322fac03c",
+      "new_sha": "676bdbe4cea8440b02d63b82789fcabca3afb164306dccc1e7ae21070182b29a",
+      "changed_sections": {
+        ".symtab": {
+          "old_bytes": 336,
+          "new_bytes": 336,
+          "old_sha": "4ccf67d8fa283d4877fb862503a79f8771b278a4e6aa805a755df6ba5fa3f38d",
+          "new_sha": "128ce1eebf9949252a8f15ed9c44755b8326fec7fe20c9047ca113e1b3b0ca73"
+        },
+        ".dynamic": {
+          "old_bytes": 112,
+          "new_bytes": 112,
+          "old_sha": "9bec8912dc6c691fd1385cf58521af800f42e7101f5091f568e437b672991424",
+          "new_sha": "47fec48154ddca075806bd47fd7841a56f102f9efaf08efeb3b383b7b20e40c9"
+        },
+        ".text": {
+          "old_bytes": 182400,
+          "new_bytes": 182400,
+          "old_sha": "dbffcbd096bd56dbc1c26a14fb1ddda70f389bb15f296021335d102efd3deafd",
+          "new_sha": "50c95d988e6340674f82dc1b5e7b07ebb12a06da8090c0af218667aa49a29a5e"
+        },
+        ".note": {
+          "old_bytes": 6580,
+          "new_bytes": 6904,
+          "old_sha": "d473ec08cddb4bb8c846861602bd594a0c487421f774b203803ab1f7b6f380a1",
+          "new_sha": "eb9235c67eaadead3455bcc72e8c70a26c14157b7246864c1fed20c5c2e3ce5f"
+        },
+        ".rodata": {
+          "old_bytes": 384,
+          "new_bytes": 384,
+          "old_sha": "8cde2e70a83007e1be7dd6e2dbccc8b27e08a7a9c9a3f28fdf20836ad7b66d47",
+          "new_sha": "b8f6ee6fd4e2c775099e01423c410f871753eeffe5a9648e5f95a5c150ce333d"
+        },
+        ".dynsym": {
+          "old_bytes": 312,
+          "new_bytes": 312,
+          "old_sha": "20e451cdb37dd74f8c076d4c1a9ff4612e354441fdbc50069e7f8bf0db970b97",
+          "new_sha": "c56c01f76793fc03b7cebf572821ad20f77966fd857e2d112516e6fe36d0a79e"
+        }
+      },
+      "current_beta_sha": "fc8b81629022aac2b2b168dda882ffda6257561347185373b064f701795b2080"
+    }
+  ],
+  "entries": [
+    {
+      "module": "qwen4_moe_iu4_sym_w3_pm_gfx1151",
+      "kernel": "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1151",
+      "old_value": 10240,
+      "new_value": 10240,
+      "old_size": 20588,
+      "new_size": 20596,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bf0214a2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bf0414a2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_pm_gfx1151",
+      "kernel": "qwen4_moe_down_iu4_sym_w3_pm_gfx1151",
+      "old_value": 30976,
+      "new_value": 30976,
+      "old_size": 11772,
+      "new_size": 11780,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bf660ba2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bf680ba2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_pm_gfx1151",
+      "kernel": "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1151_acc",
+      "old_value": 42752,
+      "new_value": 43008,
+      "old_size": 17144,
+      "new_size": 17152,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bfa510a2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bfa710a2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_pm_gfx1151",
+      "kernel": "qwen4_moe_down_iu4_sym_w3_pm_gfx1151_acc",
+      "old_value": 59904,
+      "new_value": 60160,
+      "old_size": 11160,
+      "new_size": 11168,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bfcd0aa2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bfcf0aa2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+      "kernel": "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1151_nt4",
+      "old_value": 12800,
+      "new_value": 13056,
+      "old_size": 26232,
+      "new_size": 26240,
+      "old_prefix_identical": false,
+      "first_difference": 104,
+      "old_bytes_at_difference": "07fc89bf2f1503bf8219a2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bf8419a2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+      "kernel": "qwen4_moe_down_iu4_sym_w3_pm_gfx1151_nt4",
+      "old_value": 39168,
+      "new_value": 39424,
+      "old_size": 18628,
+      "new_size": 18636,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bf1812a2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bf1a12a2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+      "kernel": "qwen4_moe_down_iu4_sym_w3_pm_gfx1151_nt4r2",
+      "old_value": 57856,
+      "new_value": 58112,
+      "old_size": 35916,
+      "new_size": 35924,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bffa22a2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bffc22a2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+      "kernel": "qwen4_moe_down_iu4_sym_w3_pm_gfx1151_nt4r4",
+      "old_value": 93952,
+      "new_value": 94208,
+      "old_size": 70492,
+      "new_size": 70500,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bfbe44a2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bfc044a2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+      "kernel": "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1151_nt4_acc",
+      "old_value": 164608,
+      "new_value": 164864,
+      "old_size": 13732,
+      "new_size": 13740,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bf500da2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bf520da2bf338204840a0406800b800782c30500f4000000f8"
+    },
+    {
+      "module": "qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151",
+      "kernel": "qwen4_moe_down_iu4_sym_w3_pm_gfx1151_nt4_acc",
+      "old_value": 178432,
+      "new_value": 178688,
+      "old_size": 16272,
+      "new_size": 16280,
+      "old_prefix_identical": false,
+      "first_difference": 92,
+      "old_bytes_at_difference": "07fc89bf2f1503bfcb0fa2bf338204840a0406800b800782c30500f4000000f8",
+      "new_bytes_at_difference": "07fc89bf2f1503bfcd0fa2bf338204840a0406800b800782c30500f4000000f8"
+    }
+  ]
+}

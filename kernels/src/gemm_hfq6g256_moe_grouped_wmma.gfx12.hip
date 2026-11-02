@@ -49,7 +49,8 @@ extern "C" __global__ void gemm_hfq6g256_moe_grouped_wmma_gfx12(
     const int*                __restrict__ sorted_slot_index,  // [m_total]
     const _Float16*           __restrict__ X_src,              // [n_rows × K]
     float*                    __restrict__ Y_grouped,          // [m_total × M]
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total,
+    int n_experts
 ) {
     const int tid = threadIdx.x;
     const int row_start = blockIdx.x * 16;
@@ -63,7 +64,7 @@ extern "C" __global__ void gemm_hfq6g256_moe_grouped_wmma_gfx12(
     // m_total_max/16 tiles to skip the m_total dtoh sync, since the
     // scatter pre-fills the upper-bound range with -1).
     const int expert_id = expert_tile_ids[tile_y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
 
     const int m_lane = tid & 15;
     const int k_grp  = tid >> 4;

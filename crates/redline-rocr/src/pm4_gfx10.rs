@@ -25,6 +25,17 @@ const PACKET3_RELEASE_MEM: u32 = 0x49;
 const PACKET3_EVENT_WRITE: u32 = 0x46;
 const PACKET3_ACQUIRE_MEM: u32 = 0x58;
 const PACKET3_WAIT_REG_MEM: u32 = 0x3c;
+const PACKET3_COND_EXEC: u32 = 0x22;
+/// Largest `COND_EXEC` count railgun emits: 14 bits, a conservative bound
+/// (the probe in `railgun/examples/cond_probe.rs` stays far below it).
+pub const COND_EXEC_MAX_DWORDS: u32 = 0x3fff;
+
+/// An open `COND_EXEC` region: the stream position its count covers from.
+#[derive(Debug)]
+#[must_use = "close the region with end_cond_exec"]
+pub struct CondExec {
+    count_at: usize,
+}
 
 // GFX10/GFX11 SET_SH_REG offsets, matching ROCr's legacy compute command
 // builder and Hipfire's independently exercised gfx1010 implementation.
@@ -206,6 +217,9 @@ impl Gfx11ComputeResourceLimitsPolicy {
 pub struct Gfx10Pm4CommandBuffer {
     dwords: Vec<u32>,
     register_state: Option<BTreeMap<u32, u32>>,
+    /// `dwords.len()` at the last [`Self::end_cond_exec`]: a flush right
+    /// before it may be skipped, so it does not make the tail idle.
+    cond_exec_end: usize,
     dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
     resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
 }
@@ -213,6 +227,25 @@ pub struct Gfx10Pm4CommandBuffer {
 /// GFX11 uses the same legacy compute-register map as GFX10. The replay API
 /// still selects the device family explicitly before submission.
 pub type Gfx11Pm4CommandBuffer = Gfx10Pm4CommandBuffer;
+
+/// One retained `SET_SH_REG` packet and how much of its payload restates live SH state.
+///
+/// `following_dispatch` is the zero-based count of valid `DISPATCH_DIRECT`
+/// packets that precede this packet, so it names the dispatch the state feeds.
+/// `repeated_value_dwords` counts emitted values equal to the last visible
+/// value for that register; the stream itself is never rewritten.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gfx10SetShRegRecord {
+    pub packet_dword: u32,
+    pub following_dispatch: u32,
+    pub first_register: u32,
+    pub value_dwords: u32,
+    pub repeated_value_dwords: u32,
+}
+
+/// Flat SH-register shadow used only while attributing restated values.
+/// Covers the compute window this encoder emits (`0x200`..`USER_DATA+n`).
+const SH_REG_STATE_WORDS: usize = 0x300;
 
 impl Gfx10Pm4CommandBuffer {
     pub fn new() -> Self {
@@ -225,6 +258,7 @@ impl Gfx10Pm4CommandBuffer {
         Self {
             dwords: Vec::new(),
             register_state: Some(BTreeMap::new()),
+            cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
         }
@@ -238,20 +272,14 @@ impl Gfx10Pm4CommandBuffer {
 
     /// Select the resource-distribution bits used by subsequently encoded
     /// dispatches. Occupancy limits remain unlimited for every policy.
-    pub fn with_resource_limits_policy(
-        mut self,
-        policy: Gfx11ComputeResourceLimitsPolicy,
-    ) -> Self {
+    pub fn with_resource_limits_policy(mut self, policy: Gfx11ComputeResourceLimitsPolicy) -> Self {
         self.resource_limits_policy = policy;
         self
     }
 
     /// Program a GFX11 dispatch-interleave queue preamble when requested.
     /// `None` preserves the queue/firmware value byte-for-byte.
-    pub fn with_dispatch_interleave(
-        mut self,
-        interleave: Option<Gfx11DispatchInterleave>,
-    ) -> Self {
+    pub fn with_dispatch_interleave(mut self, interleave: Option<Gfx11DispatchInterleave>) -> Self {
         if let Some(interleave) = interleave {
             self.set_sh_regs(COMPUTE_DISPATCH_INTERLEAVE, &[interleave.threads()]);
         }
@@ -336,6 +364,72 @@ impl Gfx10Pm4CommandBuffer {
         timed.dwords.extend_from_slice(&self.dwords);
         timed.release_gpu_timestamp(end_address);
         timed
+    }
+
+    /// Diagnostic copy with one GPU-clock stamp before the stream, one after
+    /// every `DISPATCH_DIRECT` (dispatch issued) and one after every
+    /// `EVENT_WRITE CS_PARTIAL_FLUSH` (every earlier wave drained). Consecutive
+    /// stamps therefore split each dispatch into issue-to-idle (kernel) and
+    /// idle-to-next-issue (boundary packets) spans. Stamps are written without
+    /// write confirmation so the command processor never stalls on the
+    /// host-memory write. Attribution only: the tape and its hash change.
+    /// `Err` carries the offending source dword of a malformed stream.
+    pub fn with_boundary_timestamps(&self, base_address: u64) -> Result<Self, usize> {
+        let mut timed = Self::new();
+        let mut slot = 0_u64;
+        timed.copy_gpu_timestamp_unconfirmed(base_address);
+        slot += 1;
+        let mut cursor = 0_usize;
+        while cursor < self.dwords.len() {
+            let (next, stamp) = self.boundary_stamp_packet(cursor)?;
+            timed.dwords.extend_from_slice(&self.dwords[cursor..next]);
+            if stamp {
+                timed.copy_gpu_timestamp_unconfirmed(base_address + slot * 8);
+                slot += 1;
+            }
+            cursor = next;
+        }
+        Ok(timed)
+    }
+
+    /// Slots [`Self::with_boundary_timestamps`] writes: the baseline plus one
+    /// per dispatch and one per compute-idle packet.
+    pub fn boundary_timestamp_slot_count(&self) -> Result<usize, usize> {
+        let mut slots = 1_usize;
+        let mut cursor = 0_usize;
+        while cursor < self.dwords.len() {
+            let (next, stamp) = self.boundary_stamp_packet(cursor)?;
+            slots += usize::from(stamp);
+            cursor = next;
+        }
+        Ok(slots)
+    }
+
+    fn boundary_stamp_packet(&self, cursor: usize) -> Result<(usize, bool), usize> {
+        let header = self.dwords[cursor];
+        if header >> 30 != 3 {
+            return Err(cursor);
+        }
+        let next = cursor + 2 + ((header >> 16) & 0x3fff) as usize;
+        if next > self.dwords.len() {
+            return Err(cursor);
+        }
+        let opcode = (header >> 8) & 0xff;
+        let stamp = opcode == PACKET3_DISPATCH_DIRECT
+            || (opcode == PACKET3_EVENT_WRITE && self.dwords[cursor + 1] == 0x407);
+        Ok((next, stamp))
+    }
+
+    fn copy_gpu_timestamp_unconfirmed(&mut self, address: u64) {
+        const COPY_DATA_TIMESTAMP_TO_MEMORY_64: u32 = 9 | (5 << 8) | (1 << 16);
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_COPY_DATA, 5, false),
+            COPY_DATA_TIMESTAMP_TO_MEMORY_64,
+            0,
+            0,
+            address as u32,
+            (address >> 32) as u32,
+        ]);
     }
 
     fn copy_gpu_timestamp(&mut self, address: u64) {
@@ -430,6 +524,58 @@ impl Gfx10Pm4CommandBuffer {
             u32::MAX,
             4,
         ]);
+    }
+
+    /// Publish `value` at `address` after prior compute completes, then stall
+    /// this queue until the word equals `value`.
+    ///
+    /// Emits Mesa's RELEASE_MEM fence shape followed by WAIT_REG_MEM on the
+    /// same word. Does not emit EVENT_WRITE / CS_PARTIAL_FLUSH.
+    pub fn dependency_fence(&mut self, address: u64, value: u32) {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        self.release_memory_value(address, value);
+        self.wait_memory_value(address, value);
+    }
+
+    /// Open a `COND_EXEC` region (PM4 0x22, Mesa's GFX7+ compute shape): the
+    /// CP discards every dword up to [`Self::end_cond_exec`] when the `u32`
+    /// at `address` reads zero. The caller orders the flag's producer first
+    /// (e.g. [`Self::dependency_fence`]). Register-state elision restarts at
+    /// both edges, since `SET_SH_REG`s inside may not execute.
+    pub fn begin_cond_exec(&mut self, address: u64) -> CondExec {
+        debug_assert_ne!(address, 0);
+        debug_assert_eq!(address & 3, 0);
+        self.clear_register_state();
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_COND_EXEC, 4, false),
+            address as u32,
+            (address >> 32) as u32,
+            0,
+            0,
+        ]);
+        CondExec {
+            count_at: self.dwords.len() - 1,
+        }
+    }
+
+    /// Close `region`, patching its count; `Err(count)` past
+    /// [`COND_EXEC_MAX_DWORDS`].
+    pub fn end_cond_exec(&mut self, region: CondExec) -> Result<(), u32> {
+        let count = (self.dwords.len() - region.count_at - 1) as u32;
+        if count > COND_EXEC_MAX_DWORDS {
+            return Err(count);
+        }
+        self.dwords[region.count_at] = count;
+        self.cond_exec_end = self.dwords.len();
+        self.clear_register_state();
+        Ok(())
+    }
+
+    fn clear_register_state(&mut self) {
+        if let Some(register_state) = self.register_state.as_mut() {
+            register_state.clear();
+        }
     }
 
     /// Append one HSA-ABI dispatch, explicitly materializing gfx10's enabled
@@ -527,8 +673,10 @@ impl Gfx10Pm4CommandBuffer {
     }
 
     pub fn ends_with_compute_idle(&self) -> bool {
-        self.dwords
-            .ends_with(&[packet3(PACKET3_EVENT_WRITE, 1, false), 0x407])
+        self.dwords.len() != self.cond_exec_end
+            && self
+                .dwords
+                .ends_with(&[packet3(PACKET3_EVENT_WRITE, 1, false), 0x407])
     }
 
     pub fn len_dwords(&self) -> u32 {
@@ -548,6 +696,98 @@ impl Gfx10Pm4CommandBuffer {
 
     pub fn dwords(&self) -> &[u32] {
         &self.dwords
+    }
+
+    /// Count retained type-3 packets by `(opcode, packet_dwords)`.
+    ///
+    /// This is diagnostic-only: it parses the already-built stream and never
+    /// changes packet selection or register state.
+    pub fn packet_census(&self) -> Result<BTreeMap<(u32, u32), usize>, usize> {
+        let mut census = BTreeMap::new();
+        let mut cursor = 0usize;
+        while cursor < self.dwords.len() {
+            let header = self.dwords[cursor];
+            if header >> 30 != 3 {
+                return Err(cursor);
+            }
+            let body_dwords = ((header >> 16) & 0x3fff) + 1;
+            let packet_dwords = body_dwords + 1;
+            let next = cursor.checked_add(packet_dwords as usize).ok_or(cursor)?;
+            if next > self.dwords.len() {
+                return Err(cursor);
+            }
+            let opcode = (header >> 8) & 0xff;
+            *census.entry((opcode, packet_dwords)).or_default() += 1;
+            cursor = next;
+        }
+        Ok(census)
+    }
+
+    /// Attribute every retained `SET_SH_REG` packet and count restated values.
+    ///
+    /// Diagnostic-only walk of the final dword stream: packet selection and
+    /// register state are never mutated. Malformed headers, truncated packets,
+    /// empty `SET_SH_REG` bodies, and `DISPATCH_DIRECT` packets that are not
+    /// exactly five dwords fail at the offending source dword.
+    pub fn set_sh_reg_records(&self) -> Result<Vec<Gfx10SetShRegRecord>, usize> {
+        let mut records = Vec::new();
+        let mut following_dispatch = 0_u32;
+        let mut seen = [false; SH_REG_STATE_WORDS];
+        let mut last_value = [0_u32; SH_REG_STATE_WORDS];
+        let mut cursor = 0usize;
+        while cursor < self.dwords.len() {
+            let header = self.dwords[cursor];
+            if header >> 30 != 3 {
+                return Err(cursor);
+            }
+            let body_dwords = ((header >> 16) & 0x3fff) + 1;
+            let packet_dwords = body_dwords + 1;
+            let next = cursor.checked_add(packet_dwords as usize).ok_or(cursor)?;
+            if next > self.dwords.len() {
+                return Err(cursor);
+            }
+            let opcode = (header >> 8) & 0xff;
+            match opcode {
+                PACKET3_SET_SH_REG => {
+                    // Body must carry the first-register offset plus ≥1 value.
+                    if body_dwords < 2 {
+                        return Err(cursor);
+                    }
+                    let first_register = self.dwords[cursor + 1];
+                    let values = &self.dwords[cursor + 2..next];
+                    let mut repeated_value_dwords = 0_u32;
+                    for (offset, value) in values.iter().copied().enumerate() {
+                        let register = first_register as usize + offset;
+                        if register < SH_REG_STATE_WORDS
+                            && seen[register]
+                            && last_value[register] == value
+                        {
+                            repeated_value_dwords += 1;
+                        }
+                        if register < SH_REG_STATE_WORDS {
+                            seen[register] = true;
+                            last_value[register] = value;
+                        }
+                    }
+                    records.push(Gfx10SetShRegRecord {
+                        packet_dword: cursor as u32,
+                        following_dispatch,
+                        first_register,
+                        value_dwords: values.len() as u32,
+                        repeated_value_dwords,
+                    });
+                }
+                PACKET3_DISPATCH_DIRECT => {
+                    if packet_dwords != 5 {
+                        return Err(cursor);
+                    }
+                    following_dispatch = following_dispatch.checked_add(1).ok_or(cursor)?;
+                }
+                _ => {}
+            }
+            cursor = next;
+        }
+        Ok(records)
     }
 
     fn set_sh_regs(&mut self, first: u32, values: &[u32]) {
@@ -765,8 +1005,7 @@ mod tests {
             (Gfx11DispatchInterleave::Threads256, 256),
             (Gfx11DispatchInterleave::Threads512, 512),
         ] {
-            let commands =
-                Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(Some(policy));
+            let commands = Gfx10Pm4CommandBuffer::new().with_dispatch_interleave(Some(policy));
             assert_eq!(
                 commands.dwords(),
                 &[
@@ -898,6 +1137,39 @@ mod tests {
     }
 
     #[test]
+    fn dependency_fence_is_release_then_wait_without_event_write() {
+        let address = 0x1234_5678_9abc_def0;
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands.dependency_fence(address, 7);
+        assert_eq!(
+            commands.dwords(),
+            &[
+                0xc006_4900,
+                0x528,
+                0x2300_0000,
+                0x9abc_def0,
+                0x1234_5678,
+                7,
+                0,
+                0,
+                0xc005_3c00,
+                0x13,
+                0x9abc_def0,
+                0x1234_5678,
+                7,
+                u32::MAX,
+                4,
+            ]
+        );
+        assert!(
+            !commands
+                .dwords()
+                .contains(&packet3(PACKET3_EVENT_WRITE, 1, false))
+        );
+        assert!(!commands.ends_with_compute_idle());
+    }
+
+    #[test]
     fn confirmed_write_reuses_an_explicit_compute_idle_boundary() {
         let address = 0x1234_5678_9abc_def0;
         let mut commands = Gfx10Pm4CommandBuffer::new();
@@ -906,13 +1178,7 @@ mod tests {
         commands.write_memory_value_after_idle(address, 9);
         assert_eq!(
             &commands.dwords()[2..],
-            &[
-                0xc003_3700,
-                0x0010_0500,
-                0x9abc_def0,
-                0x1234_5678,
-                9,
-            ]
+            &[0xc003_3700, 0x0010_0500, 0x9abc_def0, 0x1234_5678, 9,]
         );
         assert!(!commands.ends_with_compute_idle());
     }
@@ -931,5 +1197,211 @@ mod tests {
             .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
             .unwrap();
         assert_eq!(commands.len_dwords(), first * 2);
+    }
+
+    #[test]
+    fn packet_census_accounts_for_every_type3_dword() {
+        let geometry = LaunchGeometry::new([1, 1, 1], [1, 1, 1]).unwrap();
+        let image = image(0x409);
+        let mut commands = Gfx10Pm4CommandBuffer::new_stateful();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+        commands.wait_compute_idle();
+
+        let census = commands.packet_census().unwrap();
+        let accounted = census
+            .iter()
+            .map(|((_, packet_dwords), count)| *packet_dwords as usize * count)
+            .sum::<usize>();
+        assert_eq!(accounted, commands.dwords().len());
+        assert_eq!(census.get(&(PACKET3_DISPATCH_DIRECT, 5)), Some(&1));
+        assert_eq!(census.get(&(PACKET3_EVENT_WRITE, 2)), Some(&1));
+    }
+
+    #[test]
+    fn set_sh_reg_records_stateful_emits_no_restatements() {
+        let geometry = LaunchGeometry::new([1, 1, 1], [1, 1, 1]).unwrap();
+        let image = image(0x409);
+        let mut commands = Gfx10Pm4CommandBuffer::new_stateful();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+
+        let records = commands.set_sh_reg_records().unwrap();
+        assert!(!records.is_empty());
+        assert!(records.iter().all(|r| r.repeated_value_dwords == 0));
+        assert!(records.iter().all(|r| r.following_dispatch == 0));
+    }
+
+    #[test]
+    fn set_sh_reg_records_legacy_restates_second_dispatch() {
+        let geometry = LaunchGeometry::new([1, 1, 1], [1, 1, 1]).unwrap();
+        let image = image(0x409);
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+
+        let records = commands.set_sh_reg_records().unwrap();
+        let first_wave: Vec<_> = records
+            .iter()
+            .filter(|r| r.following_dispatch == 0)
+            .collect();
+        let second_wave: Vec<_> = records
+            .iter()
+            .filter(|r| r.following_dispatch == 1)
+            .collect();
+        assert_eq!(first_wave.len(), second_wave.len());
+        assert!(!first_wave.is_empty());
+        assert!(first_wave.iter().all(|r| r.repeated_value_dwords == 0));
+        assert!(
+            second_wave
+                .iter()
+                .all(|r| r.repeated_value_dwords == r.value_dwords && r.value_dwords > 0)
+        );
+    }
+
+    #[test]
+    fn set_sh_reg_records_exact_offset_and_value_counts() {
+        let geometry = LaunchGeometry::new([1, 1, 1], [1, 1, 1]).unwrap();
+        let image = image(0x409);
+        let user = [0_u32, 0, 0, 0, 4, 5];
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands.dispatch_image(&image, geometry, 0, &user).unwrap();
+
+        let records = commands.set_sh_reg_records().unwrap();
+        let expected = [
+            (COMPUTE_PGM_LO, 2_u32),
+            (COMPUTE_PGM_RSRC1, 2),
+            (COMPUTE_PGM_RSRC3_GFX10, 1),
+            (COMPUTE_TMPRING_SIZE_GFX10, 1),
+            (COMPUTE_NUM_THREAD_X, 3),
+            (COMPUTE_RESOURCE_LIMITS, 1),
+            (COMPUTE_USER_DATA_0, user.len() as u32),
+        ];
+        assert_eq!(records.len(), expected.len());
+        for (record, (first, values)) in records.iter().zip(expected) {
+            assert_eq!(record.following_dispatch, 0);
+            assert_eq!(record.first_register, first);
+            assert_eq!(record.value_dwords, values);
+            assert_eq!(record.repeated_value_dwords, 0);
+            assert_eq!(commands.dwords()[record.packet_dword as usize + 1], first);
+        }
+    }
+
+    #[test]
+    fn set_sh_reg_records_rejects_malformed_set_sh_shape_and_length() {
+        // Offset only — body lacks a value dword.
+        let empty_value = Gfx10Pm4CommandBuffer {
+            dwords: vec![packet3(PACKET3_SET_SH_REG, 1, true), COMPUTE_PGM_LO],
+            register_state: None,
+            cond_exec_end: 0,
+            dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
+            resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+        };
+        assert_eq!(empty_value.set_sh_reg_records(), Err(0));
+
+        // Truncated multi-value body.
+        let truncated = Gfx10Pm4CommandBuffer {
+            dwords: vec![
+                packet3(PACKET3_SET_SH_REG, 3, true),
+                COMPUTE_NUM_THREAD_X,
+                1,
+            ],
+            register_state: None,
+            cond_exec_end: 0,
+            dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
+            resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+        };
+        assert_eq!(truncated.set_sh_reg_records(), Err(0));
+
+        // DISPATCH_DIRECT must be exactly five dwords.
+        let short_dispatch = Gfx10Pm4CommandBuffer {
+            dwords: vec![packet3(PACKET3_DISPATCH_DIRECT, 2, true), 1, 1],
+            register_state: None,
+            cond_exec_end: 0,
+            dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
+            resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+        };
+        assert_eq!(short_dispatch.set_sh_reg_records(), Err(0));
+    }
+
+    #[test]
+    fn set_sh_reg_records_reconciles_every_stream_dword() {
+        let geometry = LaunchGeometry::new([1, 1, 1], [1, 1, 1]).unwrap();
+        let image = image(0x409);
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+        commands.wait_compute_idle();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+
+        let records = commands.set_sh_reg_records().unwrap();
+        let census = commands.packet_census().unwrap();
+        let set_sh_packets = census
+            .iter()
+            .filter(|((opcode, _), _)| *opcode == PACKET3_SET_SH_REG)
+            .map(|((_, packet_dwords), count)| *packet_dwords as usize * count)
+            .sum::<usize>();
+        let from_records = records
+            .iter()
+            .map(|r| 2 + r.value_dwords as usize)
+            .sum::<usize>();
+        assert_eq!(from_records, set_sh_packets);
+
+        let accounted = census
+            .iter()
+            .map(|((_, packet_dwords), count)| *packet_dwords as usize * count)
+            .sum::<usize>();
+        assert_eq!(accounted, commands.dwords().len());
+        assert_eq!(records.iter().map(|r| r.following_dispatch).max(), Some(1));
+    }
+
+    #[test]
+    fn set_sh_reg_records_does_not_mutate_command_bytes() {
+        let geometry = LaunchGeometry::new([1, 1, 1], [1, 1, 1]).unwrap();
+        let image = image(0x409);
+        let mut commands = Gfx10Pm4CommandBuffer::new();
+        commands
+            .dispatch_image(&image, geometry, 0, &[0, 0, 0, 0, 4, 5])
+            .unwrap();
+        let before = commands.dwords().to_vec();
+        let _ = commands.set_sh_reg_records().unwrap();
+        assert_eq!(commands.dwords(), before.as_slice());
+        let _ = commands.packet_census().unwrap();
+        assert_eq!(commands.dwords(), before.as_slice());
+    }
+
+    /// The region is one well-formed 5-dword packet whose count spans
+    /// exactly the commands up to its end, and stateful elision restarts on
+    /// both sides (a skipped `SET_SH_REG` must not be assumed set).
+    #[test]
+    fn cond_exec_counts_the_skipped_dwords_and_resets_register_state() {
+        let mut c = Gfx10Pm4CommandBuffer::new_stateful();
+        c.set_sh_regs(COMPUTE_USER_DATA_0, &[7]);
+        let region = c.begin_cond_exec(0x1000);
+        c.set_sh_regs(COMPUTE_USER_DATA_0, &[7]);
+        c.wait_compute_idle();
+        assert!(c.ends_with_compute_idle());
+        c.end_cond_exec(region).unwrap();
+        assert!(
+            !c.ends_with_compute_idle(),
+            "a flush inside the region may be skipped"
+        );
+        c.set_sh_regs(COMPUTE_USER_DATA_0, &[7]);
+        let d = c.dwords();
+        assert_eq!(&d[3..8], [0xc003_2200, 0x1000, 0, 0, 5]);
+        assert_eq!(c.packet_census().unwrap()[&(0x22, 5)], 1);
+        assert_eq!(c.packet_census().unwrap()[&(0x76, 3)], 3);
     }
 }

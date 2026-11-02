@@ -1,5 +1,7 @@
 # LFM2.5 350M MQ4 decode optimization on gfx1201
 
+> **Historical-design notice (2026-10):** this document is a historical proposal. `HIPFIRE_LFM2_PREFILL_BATCH`, `HIPFIRE_LFM2_PREFILL_MAX_BATCH` and `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` named below have **no readers in crate sources** and no current runtime effect; the batched-prefill/decode-fusion routes described here are not selectable. The text is kept unchanged as design evidence.
+
 ## Status
 
 Approved 2026-07-18. This design supersedes the decode exclusions in the prefill campaign only for the exact target below. The prefill implementation and its admissions remain unchanged.

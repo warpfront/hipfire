@@ -1,0 +1,99 @@
+G4 final-head GPU fault-seam receipt
+====================================
+UTC start: 2026-09-10T17:05:52Z (metadata capture)
+Worktree: /home/bjoern/hipfire/.claude/worktrees/g4-next-integration
+Branch: replan/g4-next-integration
+HEAD: e78694c85c09e3c0db747e2abb89aa24eff6c586
+Source status: clean before and after tests (target/ evidence is ignored)
+
+Hardware/runtime
+----------------
+GPU: AMD Radeon 8060S Graphics, gfx1151 (rocminfo Agent 2)
+VRAM reported by test harness: 131.1 GB; rocminfo GPU pool: 128000000 KB
+HIP: 7.2 (test output); hipconfig: 7.2.53211-9999
+HSA runtime: 1.18
+Kernel path reported by tests: /home/bjoern/.hipfire_kernels/gfx1151
+rocm-smi emitted a libdrm_amdgpu.so open warning and only reported the system row; rocminfo successfully identified gfx1151.
+Protected listener observation: 127.0.0.1:11524 was recorded as PID 1278900 in the post-run socket capture; no independent before capture is present in this committed receipt.
+The campaign launched and cleaned only isolated daemon processes it owned. Before/unchanged/no-signal for the protected listener is an operator observation, not independently established by this committed evidence.
+
+Execution contract
+-------------------
+Every accepted test was run serially with RUST_BACKTRACE=1 and:
+  cargo test <package> --lib <module-qualified-name> -- --ignored --exact --nocapture
+Each accepted receipt had `running 1 test` and `test result: ok. 1 passed; 0 failed`.
+The initial unqualified runtime name matched 0 tests and is explicitly not evidence; the corrected module-qualified rerun is the accepted result.
+
+Accepted tests and results
+--------------------------
+1. hipfire-runtime
+   Command: cargo test -p hipfire-runtime --lib dflash::construction_tests::late_weight_failure_reuses_every_staged_owner -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 663 filtered
+   Allocation proof: staged-owner late-weight failure/retry test passed its reuse assertions.
+   Log: 01-runtime-dflash-construction-late_weight_failure_reuses_every_staged_owner.log
+
+2. hipfire-runtime
+   Command: cargo test -p hipfire-runtime --lib dflash::construction_tests::late_layer_failure_reuses_every_completed_layer -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 663 filtered
+   Allocation proof: completed-layer late-failure/retry test passed its reuse assertions.
+   Log: 02-runtime-dflash-construction-late_layer_failure_reuses_every_completed_layer.log
+
+3. hipfire-runtime
+   Command: cargo test -p hipfire-runtime --lib dflash::construction_tests::late_base_scratch_failure_reuses_every_staged_owner -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 663 filtered
+   Allocation proof: base-scratch late-failure/retry test passed its staged-owner reuse assertions.
+   Log: 03-runtime-dflash-construction-late_base_scratch_failure_reuses_every_staged_owner.log
+
+4. hipfire-runtime
+   Command: cargo test -p hipfire-runtime --lib dflash::construction_tests::late_window_extension_failure_reuses_base_and_extensions -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 663 filtered
+   Allocation proof: window-extension late-failure/retry test passed its base/extension reuse assertions.
+   Log: 04-runtime-dflash-construction-late_window_extension_failure_reuses_base_and_extensions.log
+
+5. hipfire-arch-deepseek4
+   Command: cargo test -p hipfire-arch-deepseek4 --lib arch::tests::dspark_after_layer_fault_rolls_back_and_retries -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 54 filtered
+   Allocation proof: DSpark layer rollback/retry test passed its pool reuse/drain assertions.
+   Log: 06-deepseek4-arch-tests-dspark_after_layer_fault_rolls_back_and_retries.log
+
+6. hipfire-arch-deepseek4
+   Command: cargo test -p hipfire-arch-deepseek4 --lib arch::tests::dspark_after_head_helper_fault_rolls_back_and_retries -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 54 filtered
+   Allocation proof: DSpark head-helper rollback/retry test passed its pool reuse/drain assertions.
+   Log: 07-deepseek4-arch-tests-dspark_after_head_helper_fault_rolls_back_and_retries.log
+
+7. hipfire-arch-deepseek4
+   Command: cargo test -p hipfire-arch-deepseek4 --lib arch::tests::dspark_after_main_proj_fault_rolls_back_and_retries -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 54 filtered
+   Allocation proof: DSpark main-projection rollback/retry test passed its pool reuse/drain assertions.
+   Log: 08-deepseek4-arch-tests-dspark_after_main_proj_fault_rolls_back_and_retries.log
+
+8. hipfire-arch-deepseek4
+   Command: cargo test -p hipfire-arch-deepseek4 --lib arch::tests::dspark_after_global_fault_rolls_back_and_retries -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 54 filtered
+   Allocation proof: DSpark global rollback/retry test passed its pool reuse/drain assertions.
+   Log: 09-deepseek4-arch-tests-dspark_after_global_fault_rolls_back_and_retries.log
+
+9. hipfire-arch-qwen35
+   Command: cargo test -p hipfire-arch-qwen35 --lib layer_driver::tests::dense_layer_failure_reclaims_owners_and_retry_succeeds -- --ignored --exact --nocapture
+   Result: 1 passed, 0 failed, 194 filtered
+   Allocation proof: dense-layer owner-reclaim/retry test passed its allocation assertions.
+   Log: 11-qwen35-layer_driver-dense_layer_failure_reclaims_owners_and_retry_succeeds.log
+
+10. hipfire-arch-qwen35
+    Command: cargo test -p hipfire-arch-qwen35 --lib layer_driver::tests::moe_boundary_failure_reclaims_attention_owners_and_retry_succeeds -- --ignored --exact --nocapture
+    Result: 1 passed, 0 failed, 194 filtered
+    Allocation proof: MoE-boundary attention-owner reclaim/retry test passed its allocation assertions.
+    Log: 12-qwen35-layer_driver-moe_boundary_failure_reclaims_attention_owners_and_retry_succeeds.log
+
+Discovery logs
+--------------
+00-runtime-ignored-list.log: corrected runtime module path discovery; four matching tests.
+05-deepseek4-ignored-list.log: corrected DeepSeek module path discovery; four matching tests.
+10-qwen35-ignored-list.log: corrected Qwen35 module path discovery; two requested tests plus two additional ignored tests.
+01-runtime-late_weight_failure_reuses_every_staged_owner.log: initial unqualified invocation, 0 matched; rejected and not counted.
+
+Other captured metadata
+-----------------------
+metadata.txt
+rocminfo.txt

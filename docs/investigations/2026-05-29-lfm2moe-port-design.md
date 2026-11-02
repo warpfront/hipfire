@@ -158,7 +158,7 @@ quant was produced from an incomplete HF download that lacked this file, so the
 format. Fixed end-to-end (mirrors how MiniMax-M2 serves jinja):
 
 1. **Embedded** the upstream `chat_template.jinja` into every shipped variant
-   (`mq4`/`mq4p`/`mq6e`/`mq4-awq`) via `scripts/hfq_inject_chat_template.py` (no
+   (`mq4`/`mq4p`/`mq6e`/`mq4-awq`) via `python3 -m tools.hfq.inject_chat_template` (no
    re-quantize — only grows `tokenizer_config.chat_template` in the HFQ metadata).
    A fresh quantize from a *complete* HF checkout embeds it automatically (the
    quantizer already folds `chat_template.jinja`).

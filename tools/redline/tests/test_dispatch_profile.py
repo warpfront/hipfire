@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 
 
-SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "redline_dispatch_profile.py"
-SPEC = importlib.util.spec_from_file_location("redline_dispatch_profile", SCRIPT)
+SCRIPT = Path(__file__).resolve().parents[1] / "dispatch_profile.py"
+SPEC = importlib.util.spec_from_file_location("tools.redline.dispatch_profile", SCRIPT)
 profile_tool = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(profile_tool)
 

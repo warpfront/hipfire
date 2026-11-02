@@ -1,0 +1,77 @@
+diff --git a/crates/hipfire-cli/src/main.rs b/crates/hipfire-cli/src/main.rs
+index eef3ece74..1fe58ad8b 100644
+--- a/crates/hipfire-cli/src/main.rs
++++ b/crates/hipfire-cli/src/main.rs
+@@ -4971,9 +4971,11 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
+     } else {
+         // The warmup exists to populate kernel caches and its output is
+         // discarded, so it stays in answer mode even under --reasoning-on: a
+-        // 16-token budget cannot close a think span, and letting the warmup
++        // short budget cannot close a think span, and letting the warmup
+         // think would abort the run before a single measured sample.
+-        let _ = bench_generate(&mut engine, "Hello", 16)?;
++        for _ in 0..args.warmups {
++            let _ = bench_generate(&mut engine, &prompt, 128)?;
++        }
+         let mut decode = Vec::new();
+         let mut prefill = Vec::new();
+         let mut wall = Vec::new();
+@@ -4982,6 +4984,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
+         let mut spec_routes: Vec<Option<String>> = Vec::new();
+         let mut spec_tau: Vec<Option<f64>> = Vec::new();
+         let mut power_runs = Vec::new();
++        let mut run_events = Vec::new();
+         for _ in 0..args.runs {
+             let sampler = power.start_run();
+             let done = bench_generate_with_reasoning(
+@@ -5021,6 +5024,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
+             if let Some(value) = done.get("ttft_ms").and_then(serde_json::Value::as_f64) {
+                 ttft.push(value);
+             }
++            run_events.push(done);
+             eprint!(".");
+             std::io::stderr().flush()?;
+         }
+@@ -5050,6 +5054,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
+                 "max_seq": max_seq_json,
+                 "max_tokens": args.max_tokens,
+                 "runs": args.runs,
++                "warmups": args.warmups,
+                 "batch": 1,
+                 "prompt_tokens": prompt_tokens,
+                 "prompt_md5": prompt_md5,
+@@ -5064,6 +5069,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
+                 "spec_requested": args.speculation,
+                 "spec_route": spec_routes,
+                 "spec_tau": spec_tau,
++                "run_events": run_events,
+                 "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
+             }),
+             &loaded,
+@@ -5558,6 +5564,7 @@ fn open_bench_engine(
+     }
+     // Registry sidecar for a final auto/on selector the config-time
+     // load_params could not see (config-off + `bench --spec dflash`).
++    project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
+     resolve_dflash_sidecar(
+         &mut params,
+         entry.as_ref(),
+@@ -5691,7 +5698,17 @@ fn bench_generate_with_reasoning(
+     reasoning_on: bool,
+ ) -> Result<serde_json::Value> {
+     let request = bench_generate_request_reasoning(prompt, max_tokens, reasoning_on);
+-    Ok(engine.generate(&request, |_| Ok(()))?)
++    let mut output = String::new();
++    let mut done = engine.generate(&request, |event| {
++        if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
++            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
++                output.push_str(text);
++            }
++        }
++        Ok(())
++    })?;
++    done["bench_output"] = serde_json::json!(output);
++    Ok(done)
+ }
+ 
+ fn bench_probe(

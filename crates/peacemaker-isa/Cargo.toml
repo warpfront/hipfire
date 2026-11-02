@@ -1,0 +1,99 @@
+[package]
+name = "peacemaker-isa"
+# Pinned, not workspace: the crate version is embedded in every native-emitted
+# code object (ELF comment + builder proof). Keep the 0.4.1 stamp stable;
+# the 0.4.2 re-emission updates the native layout string to ld.lld 24.
+version = "0.4.1"
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "peacemaker"
+path = "src/bin/peacemaker.rs"
+required-features = ["toolchain"]
+
+[[example]]
+name = "hip_twin"
+required-features = ["lab"]
+
+[[example]]
+name = "pm_r4_screen"
+required-features = ["toolchain"]
+
+[[example]]
+name = "aco_hsa_emit"
+required-features = ["toolchain"]
+
+# Research harness: MI300X card Tier C. Explicit opt-in (`--features lab`);
+# it needs a gfx942 device and the HIP runtime, so it must not be type-checked
+# by the default `cargo build --all-targets`.
+[[example]]
+name = "cdna_card_tierc"
+required-features = ["lab"]
+
+# Native gfx1100 emitters that also run the ROCm oracle/certify path (M7, radiowave): need `--features toolchain`.
+[[example]]
+name = "e8p_i4_moe_gemv_gfx1100_emit"
+required-features = ["toolchain"]
+
+[[example]]
+name = "emit_qwen4_moe_sym_gfx1100"
+required-features = ["toolchain"]
+
+[[example]]
+name = "mq_i4_a4_gfx1100_emit"
+required-features = ["toolchain"]
+
+[[example]]
+name = "mq_i4_moe_gemv_gfx1100_emit"
+required-features = ["toolchain"]
+
+[[example]]
+name = "mq_i4_moe_gemv_mq4only_gfx1100_emit"
+required-features = ["toolchain"]
+
+[[example]]
+name = "mq6_resid_gfx1100_emit"
+required-features = ["toolchain"]
+
+# gfx1100 research probes / fixture emitters (native writer only, no ROCm tools): opt-in `--features lab`.
+[[example]]
+name = "gfx1100_divide_cases_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "gfx1100_epilogue_intrinsic_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "gfx1100_intrinsic_keys_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_epilogue_fixture_gfx1100_emit"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_moe_sym_gfx1100_p1"
+required-features = ["lab"]
+
+[features]
+# Opt-in research harnesses (examples). Not part of any product build; the
+# UNGATED example count is ratcheted, see scripts/leanup-ratchets.sh.
+lab = []
+# The ROCm assembler/linker/bundler oracle and certification (`toolchain`):
+# the native writer (`native`) is the default path; ROCm is a test oracle.
+toolchain = ["dep:radiowave"]
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+peacemaker-author = { path = "../peacemaker-author" }
+radiowave = { path = "../radiowave", optional = true }
+peacemaker-lift = { path = "../peacemaker-lift" }
+peacemaker-ir = { path = "../peacemaker-ir" }
+peacemaker-cdna = { path = "../peacemaker-cdna" }
+
+[dev-dependencies]
+hip-bridge = { path = "../hip-bridge" }

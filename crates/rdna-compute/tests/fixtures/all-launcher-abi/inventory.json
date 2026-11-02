@@ -1,0 +1,499 @@
+{
+  "scope": "Kernels and launchers changed by 38ce67a44 (fix/moe-router-nonfinite) plus the S1 slow-link kernels moved to kernels/src/slowlink_prefill.hip. hip_sources/pm_emitters/pm_images are the closed lists below, not a counted receipt: the tests derive their sizes from these lists. Launchers under crates/*/src, examples/, tests/ and benches/ are all checked; only the OLD-ABI call variants in old_variants are exempt, one per call.",
+  "hip_sources": [
+    "kernels/src/ep_gather_rows_by_owner.hip",
+    "kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip",
+    "kernels/src/gemm_fp8b128_moe_grouped_bf16mfma.gfx942.hip",
+    "kernels/src/gemm_hfp4g32_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_hfq3g256_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_hfq4g128_moe_down_grouped_wmma.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_mmq.gfx1151.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_mmq.gfx11_dgpu.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_mmq.gfx12.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_mmq_k4.gfx1151.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_mmq_k4.gfx11_dgpu.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_mmq_k4.gfx12.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_mmq_k8.gfx1151.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_wmma_k2.hip",
+    "kernels/src/gemm_hfq4g256_moe_grouped_wmma_m2.gfx12.hip",
+    "kernels/src/gemm_hfq6g256_moe_grouped_mmq.gfx1151.hip",
+    "kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx1151.hip",
+    "kernels/src/gemm_hfq6g256_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_hfq6g256_moe_grouped_wmma_k2.hip",
+    "kernels/src/gemm_hfq6g256_moe_grouped_wmma_v2.gfx12.hip",
+    "kernels/src/gemm_mfp4g32_e8_moe_grouped_wmma.gfx1151.hip",
+    "kernels/src/gemm_mfp4g32_e8_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_mfp4g32_e8g128_moe_grouped_wmma.gfx1151.hip",
+    "kernels/src/gemm_mixed_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_mixed_moe_grouped_wmma_4w_k2.hip",
+    "kernels/src/gemm_mixed_moe_grouped_wmma_k2.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_mfma.gfx942.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1030.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_mmq.gfx1151.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.gfx12.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_cnd.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload_nosync.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.gfx12.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_8w_k2.hip",
+    "kernels/src/gemm_mq2g256_lloyd_moe_grouped_wmma_k2.hip",
+    "kernels/src/gemm_mq3g256_lloyd_moe_grouped_mmq.gfx1151.hip",
+    "kernels/src/gemm_mq3g256_lloyd_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_mq3g256_lloyd_moe_grouped_wmma_k2.hip",
+    "kernels/src/gemm_mq4g128v2_moe_grouped_wmma.gfx1151.hip",
+    "kernels/src/gemm_mq4g256v2_moe_grouped_top10_o2_r8.gfx1151.hip",
+    "kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r8_pipe.gfx1151.hip",
+    "kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4.gfx1151.hip",
+    "kernels/src/gemm_mq4g256v2_moe_grouped_top10_simt.hip",
+    "kernels/src/gemm_mq4g256v2_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_mq4g256v2_moe_grouped_wmma_k2.hip",
+    "kernels/src/gemm_mq6g256v2_moe_grouped_wmma.gfx12.hip",
+    "kernels/src/gemm_mq6g256v2_moe_grouped_wmma_k2.hip",
+    "kernels/src/gemm_paro_q4g128_moe_grouped_mmq.gfx1151.hip",
+    "kernels/src/gemm_paro_q4g128_moe_grouped_mmq_k8.gfx1151.hip",
+    "kernels/src/gemm_paro_q4g128_moe_grouped_wmma_k2.hip",
+    "kernels/src/gemv_hfq4g128_moe_down_grouped.hip",
+    "kernels/src/gemv_hfq4g128_moe_down_residual_scaled_k8_indexed.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_indexed.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_indexed_batched.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_indexed_batched_wave64.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_indexed_wave64.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row1_buffer.gfx1151.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row2_buffer.gfx1151.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8.gfx1151.hip",
+    "kernels/src/gemv_hfq4g256_moe_down_k8_indexed_fused_acc.hip",
+    "kernels/src/gemv_hfq4g256_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched.hip",
+    "kernels/src/gemv_hfq4g256_moe_gate_up_indexed_batched_wave64.hip",
+    "kernels/src/gemv_hfq4g256_moe_gate_up_indexed_rowtile.hip",
+    "kernels/src/gemv_hfq4g256_moe_gate_up_indexed_wave64.hip",
+    "kernels/src/gemv_hfq4g256_moe_gate_up_k8_indexed.hip",
+    "kernels/src/gemv_hfq4g256_moe_gate_up_persistent_rank8.gfx1151.hip",
+    "kernels/src/gemv_hfq4g256_moe_ninepath_d3.hip",
+    "kernels/src/gemv_hfq4g256_moe_ninepath_d4.hip",
+    "kernels/src/gemv_hfq4g256_moe_projection_indexed_gfx1151.hip",
+    "kernels/src/gemv_hfq5g256_moe_down_k8_indexed_batched_expanded.hip",
+    "kernels/src/gemv_hfq5g256_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_hfq5g256_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/gemv_hfq6g256_moe_down_k8_indexed_batched_expanded.hip",
+    "kernels/src/gemv_hfq6g256_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_hfq6g256_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx1151.hip",
+    "kernels/src/gemv_mfp4g32_e8_moe_down_k8_indexed_batched_expanded.gfx11_dgpu.hip",
+    "kernels/src/gemv_mfp4g32_e8_moe_down_residual_scaled_k8_indexed_batched.gfx1151.hip",
+    "kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx1151.hip",
+    "kernels/src/gemv_mfp4g32_e8_moe_gate_up_k8_indexed_batched.gfx11_dgpu.hip",
+    "kernels/src/gemv_mfp4g32_e8_soa_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/gemv_mfp4g32_e8g128_moe_down_k8_indexed_batched_expanded.hip",
+    "kernels/src/gemv_mfp4g32_e8g128_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/gemv_mixed_moe_down_k8_indexed_batched_expanded.hip",
+    "kernels/src/gemv_mixed_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_allranks.gfx942.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.gfx942.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4_compact_ep.gfx1201.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4_ep.gfx1201.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_expanded_k4_lds_ep.gfx1201.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.gfx942.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_indexed.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k4.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_batched_k8all.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma.gfx942.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_mfma_f16.gfx942.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_down_indexed_r4.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.gfx942.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_batched_k4096_lds.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_compact_ep.gfx1201.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_ep.gfx1201.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma.gfx942.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_indexed_mfma_f16.gfx942.hip",
+    "kernels/src/gemv_mq2g256_lloyd_moe_gate_up_wave64x8.gfx942.hip",
+    "kernels/src/gemv_mq2g256gl_moe_down_indexed.hip",
+    "kernels/src/gemv_mq2g256gl_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_mq2g256gl_moe_gate_up_sym_indexed.hip",
+    "kernels/src/gemv_mq3g256_lloyd_moe_down_indexed.hip",
+    "kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_batched_k4.hip",
+    "kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_r4.hip",
+    "kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed_batched_k4.hip",
+    "kernels/src/gemv_mq3g256_lloyd_moe_ninepath_d4.hip",
+    "kernels/src/gemv_mq3g256gl_moe_down_indexed.hip",
+    "kernels/src/gemv_mq3g256gl_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_mq4g128v2_moe_ninepath_d4.hip",
+    "kernels/src/gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded.hip",
+    "kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed.hip",
+    "kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/gemv_mq4g256v2_moe_ninepath_d4.hip",
+    "kernels/src/gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded.hip",
+    "kernels/src/gemv_mq6g256v2_moe_gate_up_k8_indexed.hip",
+    "kernels/src/gemv_mq6g256v2_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/gemv_mq6g256v2_moe_ninepath_d4.hip",
+    "kernels/src/gemv_paro_q4g128_moe_down_k8_indexed_batched.hip",
+    "kernels/src/gemv_paro_q4g128_moe_gate_up_indexed.hip",
+    "kernels/src/gemv_paro_q4g128_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/gemv_q8_0_moe_down_residual_scaled_k8_indexed.hip",
+    "kernels/src/gemv_q8_0_moe_gate_up_k8_indexed.hip",
+    "kernels/src/moe_down_combine_grouped_k8.hip",
+    "kernels/src/moe_down_combine_grouped_top10.hip",
+    "kernels/src/moe_down_combine_top10_batched.hip",
+    "kernels/src/moe_down_unscatter_k8.hip",
+    "kernels/src/moe_router_softmax_top10_f32.hip",
+    "kernels/src/moe_router_softmax_top10_f32_fast.hip",
+    "kernels/src/moe_router_softmax_top10_masked_f32.hip",
+    "kernels/src/moe_scatter_fused_k8.hip",
+    "kernels/src/moe_scatter_permute_k8.hip",
+    "kernels/src/moe_topk_renorm_top10_batched.hip",
+    "kernels/src/pm_cdna/fp8_moe_gate_up.gfx942.hip",
+    "kernels/src/qwen4_gemm_mq4g256v2_moe_grouped_wmma_k2.hip",
+    "kernels/src/qwen4_gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip",
+    "kernels/src/qwen4_moe_iu4_sym.gfx1151.hip",
+    "kernels/src/qwen4_moe_scatter_fused_k8.hip",
+    "kernels/src/qwen4_moe_scatter_stable_top10.hip",
+    "kernels/src/qwen4_slab_union_plan.hip",
+    "kernels/src/slowlink_prefill.hip"
+  ],
+  "pm_emitters": [
+    "crates/peacemaker-isa/src/kernels/cdna/fp8_moe_gate_up.rs",
+    "crates/peacemaker-isa/src/kernels/ep_gather_grouped_rows_by_tile_owner.rs",
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs",
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs",
+    "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv.rs",
+    "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv/wide.rs",
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rs",
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3.rs",
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3_gfx1151.rs",
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3_nt4_gfx1151.rs"
+  ],
+  "pm_images": [
+    "kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1100.hxaco",
+    "kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1201.hxaco",
+    "kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco",
+    "kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco",
+    "kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco",
+    "kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco",
+    "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
+    "kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco",
+    "kernels/qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151.hxaco",
+    "kernels/qwen4_moe_iu4_sym_w3_pm_gfx1151.hxaco",
+    "kernels/qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco"
+  ],
+  "pm_related_images": [
+    "kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1100.hxaco",
+    "kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1201.hxaco"
+  ],
+  "emitter_images": {
+    "crates/peacemaker-isa/src/kernels/cdna/fp8_moe_gate_up.rs": [],
+    "crates/peacemaker-isa/src/kernels/ep_gather_grouped_rows_by_tile_owner.rs": [
+      "kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1100.hxaco",
+      "kernels/ep_gather_grouped_rows_by_tile_owner_pm_gfx1201.hxaco",
+      "kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1100.hxaco",
+      "kernels/ep_gather_grouped_rows_by_tile_owner_n8_pm_gfx1201.hxaco"
+    ],
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs": [
+      "kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco",
+      "kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco"
+    ],
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs": [
+      "kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco",
+      "kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco"
+    ],
+    "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv.rs": [
+      "kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco",
+      "kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco"
+    ],
+    "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv/wide.rs": [],
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rs": [
+      "kernels/qwen4_moe_iu4_sym_pm_gfx1151.hxaco",
+      "kernels/qwen4_moe_iu4_sym_pm_gfx1201.hxaco"
+    ],
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3.rs": [
+      "kernels/qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco"
+    ],
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3_gfx1151.rs": [
+      "kernels/qwen4_moe_iu4_sym_w3_pm_gfx1151.hxaco"
+    ],
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3_nt4_gfx1151.rs": [
+      "kernels/qwen4_moe_iu4_sym_w3_nt4_pm_gfx1151.hxaco"
+    ]
+  },
+  "image_symbol_owners": {
+    "kernels/legacy_mq4_rowtiles_pm_gfx1201.hxaco": {
+      "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched_t8_pm_gfx1201": "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs",
+      "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_gfx1201": "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs"
+    },
+    "kernels/legacy_mq4_rowtiles_pm_gfx1151.hxaco": {
+      "gemv_mq4g256v2_moe_gate_up_top10_indexed_batched_t8_pm_gfx1151": "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs",
+      "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_t8_pm_gfx1151": "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs"
+    }
+  },
+  "emitter_abi": {
+    "crates/peacemaker-isa/src/kernels/cdna/fp8_moe_gate_up.rs": "hip_twin:kernels/src/pm_cdna/fp8_moe_gate_up.gfx942.hip#gemm_fp8b128_moe_grouped_fp8mfma",
+    "crates/peacemaker-isa/src/kernels/ep_gather_grouped_rows_by_tile_owner.rs": "image-metadata (48-byte plain and 104-byte n8 variants are per image)",
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/gate_up.rs": "const:KERNARG_BYTES",
+    "crates/peacemaker-isa/src/kernels/legacy_mq4_rowtiles/down.rs": "const:KERNARG_BYTES",
+    "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv.rs": "const:KERNARG_BYTES (96, the K1 ABI: 17 arguments, reserved at byte 92)",
+    "crates/peacemaker-isa/src/kernels/mq_i4_moe_gemv/wide.rs": "image-metadata (wide entries live in the mq_i4_moe_gemv images owned by mq_i4_moe_gemv.rs)",
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym.rs": "const:KERNARG_BYTES (64)",
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3.rs": "image-metadata",
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3_gfx1151.rs": "image-metadata",
+    "crates/peacemaker-isa/src/kernels/qwen4_moe_sym_w3_nt4_gfx1151.rs": "image-metadata"
+  },
+  "family": {
+    "substrings": [
+      "moe",
+      "top10",
+      "router",
+      "slab",
+      "ep_gather",
+      "scatter",
+      "grouped"
+    ],
+    "reviewed_unchanged": {
+      "moe_grouped_qt44_a8_sym.gfx11.hip": "new capability kernel (gfx1100/gfx1151 twin of moe_grouped_qt44_a8_sym.gfx12.hip, same ABI and fold), not part of the 38ce67a44 catalogue; launched only by rdna-compute/src/moe_grouped_qt44_iu4.rs (12 kernargs: 6 pointers + M,K,x_row_div,m_total,x_src_rows,n_experts); every entry bit-checked against a CPU recompute in examples/bench_moe_grouped_qt44_iu4.rs",
+      "moe_grouped_qt44_a8_sym.gfx12.hip": "new capability kernel, not part of the 38ce67a44 catalogue; launched only by rdna-compute/src/moe_grouped_qt44_iu4.rs (12 kernargs: 6 pointers + M,K,x_row_div,m_total,x_src_rows,n_experts); every entry bit-checked against a CPU recompute in examples/bench_moe_grouped_qt44_iu4.rs",
+      "moe_grouped_qt44_a8_sym_xlds.gfx12.hip": "new capability kernel (GEN-MOE packet A M3, X-in-LDS body of moe_grouped_qt44_a8_sym.gfx12.hip, same 72-byte ABI and arithmetic), not part of the 38ce67a44 catalogue; launched only by rdna-compute/src/moe_grouped_qt44_iu4.rs behind HIPFIRE_MOE_A8_XLDS (12 kernargs: 6 pointers + M,K,x_row_div,m_total,x_src_rows,n_experts); bit-identical to the incumbent in hip_loop --identity full at every receipt row class (j6313)",
+      "moe_grouped_qt44_fp8_sym.gfx12.hip": "new capability kernel, not part of the 38ce67a44 catalogue; launched only by rdna-compute/src/moe_grouped_qt44_iu4.rs (12 kernargs: 6 pointers + M,K,x_row_div,m_total,x_src_rows,n_experts); every entry bit-checked against a CPU recompute in examples/bench_moe_grouped_qt44_iu4.rs",
+      "quantize_fp8_mmq_ds128.gfx12.hip": "new capability kernel, not part of the 38ce67a44 catalogue; launched only by Gpu::ensure_fp8_mmq_x in scratch.rs (4 kernargs: X,Y,K,N); bit-checked against the CPU contract in examples/bench_moe_grouped_qt44_iu4.rs",
+      "moe_grouped_qt44_iu4_sym.gfx12.hip": "new capability kernel, not part of the 38ce67a44 catalogue; launched only by rdna-compute/src/moe_grouped_qt44_iu4.rs (12 kernargs: 6 pointers + M,K,x_row_div,m_total,x_src_rows,n_experts); every entry bit-checked against a CPU recompute in examples/bench_moe_grouped_qt44_iu4.rs",
+      "deepseek4_moe_topk_bias_aware.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "deepseek4_moe_topk_bias_aware_batched.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "dflash_hidden_scatter.gfx1100.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "embedding_scatter_ext.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "ep_gather_rows_by_slot_owner.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "ffn_grouped_activation_pad.hip": "new Raon FFN/MoE kernel (a672a16763), absent from the ABI-change receipt of 38ce67a44; launcher in rdna-compute ffn_activation.rs reviewed: params order, count and types match the kernarg order in the source header; no existing ABI changed, so it stays outside the changed catalogue",
+      "ffn_grouped_activation_rotate_i8.gfx1201.hip": "new Raon fused W4A8 down producer (pfx G5); launchers ffn_activation_grouped_rotate_i8_f32 / ffn_activation_rows_rotate_i8_f32 in rdna-compute ffn_activation.rs reviewed against FFN_GROUPED_ROTATE_I8_ENTRY / FFN_ROWS_ROTATE_I8_ENTRY: 8 / 7 pointers then 8 / 7 i32 then 2 f32, order, count and types match in both the params array and the KernargBlob; no existing ABI changed, so it stays outside the changed catalogue",
+      "ffn_moe_combine_policy.hip": "new Raon FFN/MoE kernel (a672a16763), absent from the ABI-change receipt of 38ce67a44; launcher in rdna-compute ffn_activation.rs reviewed: params order, count and types match the kernarg order in the source header; no existing ABI changed, so it stays outside the changed catalogue",
+      "ffn_moe_combine_policy_w2.hip": "new capability kernel (GEN-MOE packet D combine C2, the gfx1201 two-column float2 export `ffn_moe_combine_f32_w2` of ffn_moe_combine_policy.hip, same 92-byte kernarg ABI and output bits, block 128, same grid); launched only by Gpu::ffn_moe_combine_f32 in rdna-compute ffn_activation.rs (exact gfx1201 via combine_w2_route), the same params array and KernargBlob as the incumbent entry: 7 pointers then rows, hidden, top_k, n_experts, order, round_expert_outputs, round_routed_sum, round_final, n_down_rows; ffn_moe_combine_policy.hip itself is unchanged (its code is byte-identical on every arch); bit-identical to the incumbent in hip_loop --identity full at every row class (j6433)",
+      "ffn_router_renorm.hip": "new Raon FFN/MoE kernel (a672a16763), absent from the ABI-change receipt of 38ce67a44; launcher in rdna-compute ffn_activation.rs reviewed: params order, count and types match the kernarg order in the source header; no existing ABI changed, so it stays outside the changed catalogue",
+      "fp8b128_moe_shared_activation.gfx942.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "fp8b128_moe_unscatter_silu.gfx942.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemm_mfp4g32_e8_soa_grouped_wmma.gfx1151.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemm_mfp4g32_e8_soa_grouped_wmma.gfx12.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemm_mq4g128v2_moe_grouped_top10_multirow.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemm_mq4g128v2_moe_grouped_top10_o16_r16.gfx1151.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemm_mq4g128v2_moe_grouped_top10_o8_r16.gfx1151.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemm_mq4g128v2_moe_grouped_top10_o8_r16_xs.gfx1151.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemm_mq4g128v2_moe_grouped_top10_o8_r8.gfx1151.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemm_q8_0_moe_grouped_top10.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_hfq4g256_moe_down.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_hfq4g256_moe_gate_up.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_mfp4g32_e8_soa_grouped.gfx1151.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_mfp4g32_e8_soa_grouped.gfx1201.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_mfp4g32_e8_soa_grouped.gfx942.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_mfp4g32_e8_soa_grouped_batched.gfx1151.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_mfp4g32_e8_soa_grouped_wave64x4.gfx942.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "gemv_q8_0_moe_down_top10_indexed_batched_expanded.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "grouped_ops.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "hash_router_normalize_f32.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "hash_router_normalize_f32_batched.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "hash_router_normalize_f32_buf.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_down_combine_k8_batched.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_down_combine_k8_batched_vec4.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_down_combine_rmsnorm_mq_rotate_vecsum.gfx1100.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_gate_up_unscatter_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_gate_up_unscatter_silu_top10.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_router_softmax_topk_k8_wave64.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_router_softmax_topk_k8_wave64_exact.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_scatter_histogram_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_scatter_offsets_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_scatter_stable_k8.hip": "new multi-workgroup twin of moe_scatter_fused_k8 (absent from the 38ce67a44 touched-kernels receipt: it does not exist there); MoE-family source reviewed and left outside the changed catalogue; its three launches are in Gpu::moe_scatter_stable_k8_launch",
+      "moe_softmax_topk_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_softmax_topk_k8_batched.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_topk_renorm_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_topk_renorm_k8_batched.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_unscatter_silu_clamp_k8.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "qwen4_moe_rotate128_i4.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "qwen4_moe_sym_check.gfx1201.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "qwen4_slab_tile_mask.hip": "not modified by 38ce67a44 (absent from the landed touched-kernels receipt); MoE-family source reviewed and left outside the changed catalogue",
+      "moe_decode_lanes_mq4rs.gfx1201.hip": "new A3B exact-VMM lane twins (lane-batched wrappers of the singleton MoE kernels); not part of the changed-kernel catalogue, validated by tests/moe_decode_lanes.rs",
+      "moe_dedup_mq4rs.gfx1201.hip": "new A3B exact-VMM expert-deduplicating routed gate/up and down + combine kernels; not part of the changed-kernel catalogue, validated by tests/moe_dedup.rs",
+      "gemm_mq4g128v2p_moe_grouped_top10_o8_r16.gfx1201.hip": "DESIGN F1 drop-zero planar twin (MQ4G256V2P/MQ4G128V2P) of the shipped expert reader, same kernargs/grid/ABI as its shipped sibling; launched only through the Gpu::mq4_experts_planar branches of the matching rdna-compute launcher (gemv.rs/moe.rs/gemm.rs); outputs bit-identical, CPU oracle hipfire-runtime mq4_planar, card byte oracle pending",
+      "gemm_mq4g256v2p_moe_grouped_top10_o4_r8_x4.gfx1201.hip": "DESIGN F1 drop-zero planar twin (MQ4G256V2P/MQ4G128V2P) of the shipped expert reader, same kernargs/grid/ABI as its shipped sibling; launched only through the Gpu::mq4_experts_planar branches of the matching rdna-compute launcher (gemv.rs/moe.rs/gemm.rs); outputs bit-identical, CPU oracle hipfire-runtime mq4_planar, card byte oracle pending",
+      "gemm_mq4g256v2p_moe_grouped_wmma.gfx12.hip": "DESIGN F1 drop-zero planar twin (MQ4G256V2P/MQ4G128V2P) of the shipped expert reader, same kernargs/grid/ABI as its shipped sibling; launched only through the Gpu::mq4_experts_planar branches of the matching rdna-compute launcher (gemv.rs/moe.rs/gemm.rs); outputs bit-identical, CPU oracle hipfire-runtime mq4_planar, card byte oracle pending",
+      "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded.hip": "DESIGN F1 drop-zero planar twin (MQ4G256V2P/MQ4G128V2P) of the shipped expert reader, same kernargs/grid/ABI as its shipped sibling; launched only through the Gpu::mq4_experts_planar branches of the matching rdna-compute launcher (gemv.rs/moe.rs/gemm.rs); outputs bit-identical, CPU oracle hipfire-runtime mq4_planar, card byte oracle pending",
+      "qwen4_gemv_mq4g256v2p_moe_gate_up_k8_indexed_batched.hip": "DESIGN F1 drop-zero planar twin (MQ4G256V2P/MQ4G128V2P) of the shipped expert reader, same kernargs/grid/ABI as its shipped sibling; launched only through the Gpu::mq4_experts_planar branches of the matching rdna-compute launcher (gemv.rs/moe.rs/gemm.rs); outputs bit-identical, CPU oracle hipfire-runtime mq4_planar, card byte oracle pending"
+    }
+  },
+  "old_fixtures": {
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs": "Hosts deliberate OLD-ABI source copies (OLD_*) used as negative controls against the guarded kernels. Its launches are still checked call by call; only the variants listed in old_variants are exempt."
+  },
+  "inert": {
+    "crates/rdna-compute/src/gemma4_ext.rs::gemv_mq4g256_moe_gate_up_k8_indexed": "`#[cfg(any())]` duplicate of the live gemma4 launcher in gemm.rs; never compiled (the live analogue is checked as a normal launcher)",
+    "crates/rdna-compute/src/gemma4_ext.rs::gemv_q8_0_moe_gate_up_k8_indexed": "`#[cfg(any())]` duplicate of the live gemma4 launcher in gemm.rs; never compiled",
+    "crates/rdna-compute/src/gemma4_ext.rs::gemv_q8_0_moe_down_residual_scaled_k8_indexed": "`#[cfg(any())]` duplicate of the live gemma4 launcher in gemm.rs; never compiled"
+  },
+  "non_launching": {
+    "crates/rdna-compute/src/cdna/gfx942.rs::fp8b128_moe_grouped_build_identity": "records the JIT build identity (source/object hashes) of the FP8 MoE module; compiles, never launches",
+    "crates/rdna-compute/src/dispatch.rs::recorded_launch_artifact": "replay artifact lookup: maps a launched symbol name to its module; names only",
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_w3_gemm_symbols": "selector of the MQ3-I4 NT1 anchor names used by oracles; production launches the NT4 entries through qwen4_moe_sym_w3_gemm",
+    "crates/rdna-compute/src/gemm.rs::ensure_qwen4_moe_sym_w3_pm_entry": "module loader (ensure_embedded_kernel) for the W3 PM entries; loads, never launches",
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gfx1151_hipcc_src": "C++ source factory returning kernels::QWEN4_MOE_IU4_SYM_GFX1151_SRC; compiles, never launches — the gfx1151 hipcc-twin entries load through qwen4_moe_sym_gemm's ensure_kernel(twin.module, (twin.source)(), func) arm, a checked site",
+    "crates/rdna-compute/src/gemm.rs::moe_sym_iu4_checker_gfx1151": "per-arch descriptor getter returning the MoeSymIu4Checker (module qwen4_moe_iu4_sym_gfx1151, source qwen4_moe_sym_gfx1151_hipcc_src, symbol qwen4_moe_sym_check_gfx1151); stored as the gfx1151 row's checker function pointer in MOE_SYM_IU4_KERNELS, never launches",
+    "crates/rdna-compute/src/gemm.rs::moe_sym_iu4_kernel": "aggregate descriptor getter returning the MOE_SYM_IU4_KERNELS row for (arch, qt) gated on has_iu4_wmma and the K2 raw inventory; names and admission only, the GEMM launches live in qwen4_moe_sym_gemm, a checked launcher",
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_group_module_src": "module/source selector returning (module key, HIP source) by arch for the stable grouping kernels (gfx1100 binds the registered canonical twin module qwen4_moe_scatter_stable_top10_gfx1100, other arches the bare module); no launch, ensure or compile call — the three grouping launches live in moe_scatter_stable_top10_with, a checked launcher",
+    "crates/rdna-compute/src/kernel_registry.rs::entries": "kernel registry table (module, symbols, source); compile inventory only",
+    "crates/rdna-compute/src/kernel_registry.rs::default_route_entries": "kernel registry table of the default Redline routes; compile inventory only",
+    "crates/rdna-compute/src/kernel_registry.rs::raon_entries": "kernel registry table of the Raon plain-AR decode body's JIT modules (railgun JIT receipt corpus inventory); compile inventory only, the launches live in the launchers that pass the same module and source to ensure_kernel",
+    "crates/rdna-compute/src/kernel_registry.rs::legacy_mq4_rowtile_image": "pure architecture-specific image factory returning the legacy GU/Down module, image, qualification pin and actual export names; no launch or compilation call, with the real launch sites checked independently",
+    "crates/rdna-compute/src/moe.rs::ep_tile_pull_kernel": "returns (image, symbol) of the EP tile pull; Gpu::ep_gather_grouped_rows_by_tile_owner launches through it and is checked",
+    "crates/rdna-compute/src/replay.rs::pointer_effects": "retained-replay classification by symbol name; reads recorded launches, never issues one",
+    "crates/rdna-compute/src/replay.rs::expected_kernarg_bytes": "retained-replay table of expected kernarg byte sizes by symbol; names and sizes only",
+    "crates/rdna-compute/src/replay.rs::pm4_ds4_ffn_branch_plan": "PM4 branch planner over recorded launches; names only",
+    "crates/rdna-compute/src/replay.rs::pm4_ds4_batched_ffn_branch_plan": "PM4 branch planner over recorded launches; names only",
+    "crates/rdna-compute/src/replay.rs::independent_sibling": "PM4 sibling classification by symbol name; names only",
+    "crates/rdna-compute/src/slab_moe.rs::ensure_qwen4_slab_kernels": "loads the K1 PM images and the union-plan module; the launches are mq_i4_moe_gemv_slab and qwen4_slab_union_plan",
+    "crates/hipfire-dispatch/src/pipeline/slab_moe_decode.rs::symbol": "const fn naming the K1 symbol of a bucket key for the planner; the launch goes through Gpu::mq_i4_moe_gemv_slab",
+    "crates/railgun-cert/src/recording.rs::inventory_counts": "railgun certification report over recorded kernel names; reporting only",
+    "crates/railgun-cert/src/recording.rs::recording_dependent_decisions": "railgun certification report over recorded kernel names; reporting only",
+    "crates/railgun-cert/src/recording.rs::inventory_json": "railgun certification report over recorded kernel names; reporting only",
+    "crates/railgun-cert/src/recording.rs::inventory_markdown": "railgun certification report over recorded kernel names; reporting only",
+    "crates/rdna-compute/src/slab_moe.rs::plan_src_shared": "returns the shared union-plan HIP source (QWEN4_SLAB_UNION_PLAN_SRC) through the SlabArchKernels.plan_src function pointer; the planner launcher compiles it with ensure_kernel and launches qwen4_slab_union_plan, which is a checked site",
+    "crates/rdna-compute/src/slab_moe.rs::slab_arch_kernels": "per-arch slab table lookup returning &'static SlabArchKernels (module, image and symbol names, plan source); names only, the launchers mq_i4_moe_gemv_slab, qwen4_moe_rotate128_i4_slab and the planner are checked sites",
+    "crates/rdna-compute/src/slab_moe.rs::slab_cold_k1_metadata": "cold K1 table lookup by (arch, cold codec) returning &'static SlabCold (module, image and symbol names); names only, mq_i4_moe_gemv_slab launches through it and is a checked site",
+    "crates/rdna-compute/src/gemm.rs::slab_k2_raw": "ungated K2 inventory selector keyed by (arch, slab codec) returning (module name, [gate/up, down] symbol names) from slab_k2_metadata and the QWEN4_MOE_SYM_PM_*/QWEN4_MOE_SYM_W3_* name constants; names only, it has no launch, ensure or compile call and its only caller is expert_capabilities::k2_raw, which builds a RawKernel name pair for the admission matrix",
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gate_up_symbol": "pure gate/up name selector over the canonical descriptor pair and the gfx1151 stream8 allowlist; contains no launch, ensure or compile call. The returned name is consumed by qwen4_moe_sym_gemm, whose real params/blob launch sites remain checked",
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols_wide": "reporting-only twin of qwen4_moe_sym_gemm_symbols: returns the canonical native pair except the F2 widened resident NT8 gate/up entry; names only, never launches (launchers call qwen4_moe_sym_gemm)",
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm_symbols": "reporting-only twin target of qwen4_moe_sym_gemm_symbols_wide: returns the canonical native pair over the descriptor entries; names only, never launches (launchers call qwen4_moe_sym_gemm)",
+    "crates/rdna-compute/src/moe_decode_lanes.rs::moe_lane_module_source": "assembles the lane-twin module source strings from the singleton kernels' sources (and names the singleton symbols in the entry-header rewrite); compiles source text, never launches the singleton kernel"
+  },
+  "forwarders": {
+    "crates/hipfire-runtime/examples/mq_i4_moe_gemv_byte_oracle.rs::run_whole_chain": {
+      "checked_chain": [
+        "crates/hipfire-runtime/examples/mq_i4_moe_gemv_byte_oracle.rs::run_whole_chain",
+        "crates/rdna-compute/src/moe.rs::moe_router_softmax_top10_f32"
+      ],
+      "flow": "calls",
+      "reason": "the whole-chain oracle calls the production router for batched and singleton rows; its two router identity names must both be covered by that callee's real checked params/blob launch variants"
+    },
+    "crates/rdna-compute/src/slab_moe.rs::slab_rowtile_k1": {
+      "checked_chain": [
+        "crates/rdna-compute/src/slab_moe.rs::slab_rowtile_k1",
+        "crates/rdna-compute/src/slab_moe.rs::slab_rowtile_pick",
+        "crates/rdna-compute/src/slab_moe.rs::mq_i4_moe_gemv_slab_with"
+      ],
+      "flow": "returns",
+      "reason": "the rowtile selector returns SlabK1 metadata consumed by slab_rowtile_pick, whose symbol and launch geometry reach mq_i4_moe_gemv_slab_with; every mentioned K1 export must already be covered by that launcher's checked 17-argument params/blob ABI"
+    },
+    "crates/rdna-compute/src/gemm.rs::gemm_mq4g256v2_moe_grouped_top10_bf16out": {
+      "to": "gemm_mq4g256v2_moe_grouped_wmma_k2_impl",
+      "reason": "passes its BF16-output entry name to the shared launcher through the gfx11_entry parameter"
+    },
+    "crates/rdna-compute/src/gemm.rs::gemm_mq4g256v2_moe_grouped_top10_silu_bf16out": {
+      "to": "gemm_mq4g256v2_moe_grouped_wmma_k2_impl",
+      "reason": "passes its BF16-output entry name to the shared launcher through the gfx11_entry parameter"
+    },
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_w3_gemm": {
+      "to": "qwen4_moe_sym_nt1_gemm",
+      "reason": "passes the W3 PM gfx1201 entry symbol (QWEN4_MOE_SYM_W3_DOWN / QWEN4_MOE_SYM_W3_GATE_UP) to the shared NT1 launcher through its [module, func] parameter; the gfx1151 arm tail-calls qwen4_moe_sym_w3_nt4_gfx1151_gemm, a launcher checked on its own"
+    },
+    "crates/rdna-compute/src/gemm.rs::qwen4_moe_sym_gemm": {
+      "to": "qwen4_moe_sym_nt1_gemm",
+      "reason": "forwards the changed-kernel name to the parameter-named shared NT1 launcher qwen4_moe_sym_nt1_gemm through its [module, func] parameter on the NT1-descriptor arm (tiles_per_cta == 1); the NT4/NT8 arm launches the descriptor's own builder or hipcc-twin entry directly via launch_maybe_blob in this same function, a checked launch site"
+    }
+  },
+  "unlaunched": {
+    "gemm_mq4g256v2_moe_grouped_top10_o4_r2_x4_inverse": "generic-K inverse arithmetic sibling exported by the shared HIP module; no production launcher or example calls it (only its source declaration and registry export inventory mention it). The measured production route uses inverse_k2560 through gemm_mq4g256v2_moe_grouped_top10_inverse, whose actual params/blob ABI is checked",
+    "HIPFIRE_MOE_PROJECTION_KERNEL": "the raw source declares its entry through a macro that only the Rust-side #define prefixes of the _SRC constants give a name; those constants' real symbols are checked through their const origins",
+    "gemm_fp8b128_moe_grouped_fp8mfma": "HIP twin of the PM emitter kernel; the emitter ABI is cross-checked against it in pm_emitters_agree_with_image_metadata and no production launcher exists",
+    "gemm_mq4g256v2_moe_grouped_top10_o2_r8": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it",
+    "gemv_mfp4g32_e8_moe_down_residual_scaled_k8_indexed_batched": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it",
+    "gemv_mq2g256_lloyd_moe_down_residual_scaled_allranks_gfx942": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it (gfx942 probe kernel)",
+    "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_f16_gfx942": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it (gfx942 probe kernel)",
+    "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed_mfma_gfx942": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it (gfx942 probe kernel)",
+    "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_mfma_f16_gfx942": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it (gfx942 probe kernel)",
+    "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_mfma_gfx942": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it (gfx942 probe kernel)",
+    "gemv_mq2g256_lloyd_moe_down_residual_scaled_rankpair_indexed": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it",
+    "gemv_mq2g256_lloyd_moe_down_residual_scaled_rowtile2_indexed": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it",
+    "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed_wavecb": "no production launcher or loader reaches this symbol: only its HIP source constant in kernels.rs, research probes under examples/ and tests/, or registry/replay name tables reference it",
+    "qwen4_moe_down_iu4_sym_w3_pm_gfx1151": "MQ4/MQ3-I4 NT1 or accumulator-twin entry: oracle anchors and qualification only; the production route launches the NT4/NT8 expert-run entries",
+    "qwen4_moe_down_iu4_sym_w3_pm_gfx1151_acc": "MQ4/MQ3-I4 NT1 or accumulator-twin entry: oracle anchors and qualification only; the production route launches the NT4/NT8 expert-run entries",
+    "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1151": "MQ4/MQ3-I4 NT1 or accumulator-twin entry: oracle anchors and qualification only; the production route launches the NT4/NT8 expert-run entries",
+    "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1151_acc": "MQ4/MQ3-I4 NT1 or accumulator-twin entry: oracle anchors and qualification only; the production route launches the NT4/NT8 expert-run entries",
+    "qwen4_moe_down_iu4_sym_w3_pm_gfx1151_nt4_acc": "MQ4/MQ3-I4 NT1 or accumulator-twin entry: oracle anchors and qualification only; the production route launches the NT4/NT8 expert-run entries",
+    "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1151_nt4_acc": "MQ4/MQ3-I4 NT1 or accumulator-twin entry: oracle anchors and qualification only; the production route launches the NT4/NT8 expert-run entries"
+  },
+  "old_variants": {},
+  "probe_candidates": {
+    "crates/hipfire-runtime/examples/mq_i4_moe_gemv_byte_oracle.rs::run_kind": {
+      "images": [
+        "kernels/mq_i4_moe_gemv_pm_gfx1151.hxaco",
+        "kernels/mq_i4_moe_gemv_pm_gfx1201.hxaco"
+      ],
+      "reason": "Hand-handle launch_kernel_blob of K1 images: the kernel symbol is chosen by ctx.func(codec, kind) from a loaded module, so no literal name is in the function; the blob is the 96-byte kernarg() array."
+    }
+  },
+  "old_consts": {
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::OLD_COMBINE": "Historical baseline source FILE name for the OLD-kernel fixture loader (load_old -> git show <OLD_REF_PIN>:kernels/src/<file>), compiled only as <sym>__beta behind an OLD_SUFFIX #define prelude. Not current JIT source; verified per const by the test (bare .hip literal, loader renames symbols, every use is load_old(&X)/&X list/X.syms).",
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::OLD_COMBINE_GROUPED": "Historical baseline source FILE name for the OLD-kernel fixture loader (load_old -> git show <OLD_REF_PIN>:kernels/src/<file>), compiled only as <sym>__beta behind an OLD_SUFFIX #define prelude. Not current JIT source; verified per const by the test (bare .hip literal, loader renames symbols, every use is load_old(&X)/&X list/X.syms).",
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::OLD_FUSED": "Historical baseline source FILE name for the OLD-kernel fixture loader (load_old -> git show <OLD_REF_PIN>:kernels/src/<file>), compiled only as <sym>__beta behind an OLD_SUFFIX #define prelude. Not current JIT source; verified per const by the test (bare .hip literal, loader renames symbols, every use is load_old(&X)/&X list/X.syms).",
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::OLD_RENORM": "Historical baseline source FILE name for the OLD-kernel fixture loader (load_old -> git show <OLD_REF_PIN>:kernels/src/<file>), compiled only as <sym>__beta behind an OLD_SUFFIX #define prelude. Not current JIT source; verified per const by the test (bare .hip literal, loader renames symbols, every use is load_old(&X)/&X list/X.syms).",
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::OLD_ROUTER": "Historical baseline source FILE name for the OLD-kernel fixture loader (load_old -> git show <OLD_REF_PIN>:kernels/src/<file>), compiled only as <sym>__beta behind an OLD_SUFFIX #define prelude. Not current JIT source; verified per const by the test (bare .hip literal, loader renames symbols, every use is load_old(&X)/&X list/X.syms).",
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::OLD_ROUTER_FAST": "Historical baseline source FILE name for the OLD-kernel fixture loader (load_old -> git show <OLD_REF_PIN>:kernels/src/<file>), compiled only as <sym>__beta behind an OLD_SUFFIX #define prelude. Not current JIT source; verified per const by the test (bare .hip literal, loader renames symbols, every use is load_old(&X)/&X list/X.syms).",
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::OLD_SLAB_PLAN": "Historical baseline source FILE name for the OLD-kernel fixture loader (load_old -> git show <OLD_REF_PIN>:kernels/src/<file>), compiled only as <sym>__beta behind an OLD_SUFFIX #define prelude. Not current JIT source; verified per const by the test (bare .hip literal, loader renames symbols, every use is load_old(&X)/&X list/X.syms).",
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::OLD_STABLE": "Historical baseline source FILE name for the OLD-kernel fixture loader (load_old -> git show <OLD_REF_PIN>:kernels/src/<file>), compiled only as <sym>__beta behind an OLD_SUFFIX #define prelude. Not current JIT source; verified per const by the test (bare .hip literal, loader renames symbols, every use is load_old(&X)/&X list/X.syms)."
+  },
+  "source_tables": {
+    "crates/rdna-compute/examples/test_moe_gateup_twin_gfx1151.rs::VARIANTS": "Table of Variant { label, module, func, src } rows (struct literal plus the const fn pipe()); not source text. Its rows reference SRC_INCUMBENT and SRC_PIPE, which are indexed as changed source consts; verified per const by the test."
+  },
+  "old_helpers": {
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::launch_old": "Launches only `<sym>__beta` OLD fixture kernels: its kernel name is format!(\"{sym}{OLD_SUFFIX}\") (verified from the launch site); callers that pass OLD symbol names to it do not launch the changed kernels."
+  },
+  "old_audited": {
+    "crates/hipfire-runtime/examples/moe_nan_guard_regress.rs::launch_raw": {
+      "reason": "launch_raw launches a hip_bridge::Function handle with the raw kernarg bytes it is handed. It is exempt ONLY because every function that creates an OLD handle (load_old_image, K1Path::OldImage) and every direct caller, in both provenance scopes (the f1 scope here and the rc4b scope below), is pinned by token fingerprint, and each loads a separately loaded historical module (old_dir/old_ref), never the current embedded image. The gate proves that source origin, not the bytes of the external artifact. The NEW launchers (K1Path::Raw and K1Path::Dev in k1_run, which launch by symbol through Gpu::launch_kernel_blob / the production mq_i4_moe_gemv_slab launcher) are not exempt and remain checked launch sites.",
+      "baseline": "f1a457b",
+      "callers": [
+        "k1_run",
+        "pm_iu4_case"
+      ],
+      "guard_idents": [
+        "load_old_image",
+        "OldImage"
+      ],
+      "fingerprints": {
+        "launch_raw": "5545ff04cb53dd6c",
+        "old_blob": "2d26ed612dec66c9",
+        "load_old_image": "0f7bcd62ef709ac2",
+        "k1_run": "75bf9207f2c9ee03",
+        "k1_blob": "89d02c25fac4d05e",
+        "pm_k1_case": "481f3abfb5f3b434",
+        "pm_iu4_case": "e2969332e01881fd"
+      },
+      "scopes": [
+        {
+          "name": "rc4b",
+          "reason": "e8p_containment loads historical OLD images through cx.load_old_image from mandatory old_dir: rc4b on gfx1201/gfx1100, plus the pre-rc5 gfx1151 baseline 11411610be74647b1855e6e37fddcd1178ca7881. Re-audited upstream e95865cf1fd864f453956d0bddb2426e98bf33fc adds only the gfx1151 historical K2 basename in k2_old_stem and two diagnostic strings in run; Main authorized exactly those two fingerprint updates, with no handle or ABI change. The handles go to k1_run as K1Path::OldImage, which builds the pre-guard 88-byte k1_blob(.., None) and calls launch_raw (k1_phase, k1_chain); k2_gemm launches the OLD K2 handle through launch_raw with a 60-byte NT1 blob (five pointers and five i32). run, run_body, phase, k2_old_stem, k2_run, k2_pipeline, k2_phase and k2_chain remain the pinned selectors and drivers. NEW paths remain independently checked. The report records only an image digest, with no expected-hash check, so this gate proves the separately loaded old_dir source origin and pinned call chain, not historical artifact authenticity.",
+          "file": "crates/hipfire-runtime/examples/moe_nan_guard_regress/e8p_containment.rs",
+          "callers": [
+            "k2_gemm"
+          ],
+          "fingerprints": {
+            "run": "1ee722e9c42a01ef",
+            "run_body": "ecbfbf58b3169dd1",
+            "phase": "8521ebaa2ba5af29",
+            "k2_old_stem": "6639cb2d5f3481ca",
+            "k1_phase": "b8bbeaa13918d9ac",
+            "k1_chain": "bd0d1ef8192d2d2a",
+            "k2_gemm": "fed4a86cbe254f14",
+            "k2_run": "82933ee545e75d79",
+            "k2_pipeline": "3dd9de7948d19e5a",
+            "k2_phase": "4189f717dc05f2a2",
+            "k2_chain": "8deed42ef11b46ac"
+          }
+        }
+      ]
+    }
+  },
+  "scan_files": [
+    "crates/hipfire-arch-qwen4/examples/e8p_gp/common.rs",
+    "crates/hipfire-arch-qwen4/examples/e8p_gp/hw.rs"
+  ]
+}

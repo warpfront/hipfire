@@ -1,0 +1,512 @@
+# hip-bridge — map
+
+> **Status:** `production` (vocabulary owned by [`docs/GLOSSARY.md`](../../docs/GLOSSARY.md)).
+> **Layer:** Device FFI — bottom of the stack, below `rdna-compute`; see the layering table in [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
+
+## Purpose
+
+Safe Rust FFI to the AMD HIP runtime via `dlopen` of `libamdhip64.so` — no link-time dependency. The authoritative design rationale is the `//!` docs in [`src/lib.rs`](src/lib.rs) (modeled after `rustane`'s `ane-bridge`); the public surface is the `HipRuntime` / `Module` / `Stream` / `Function` handles, `KernargBlob`, `VmmArena`, and the re-exported `Rccl`/`RocBlas` shims plus `DeviceBuffer` ownership helpers.
+
+## Gotchas
+
+- No link-time HIP. A missing or mismatched `libamdhip64.so` is a runtime `dlopen` failure, not a compile error.
+- `DeviceBuffer::from_raw` / `from_vmm_owner` are `unsafe` and do not own the backing memory — do not `drop` to free it.
+- VMM (`VmmArena`) reserves a stable VA range while paging physical backing; it keeps graph base pointers stable. See [`src/vmm.rs`](src/vmm.rs).
+- Weight slabs (`src/ffi/weight_slab.rs`, `HIPFIRE_WEIGHT_SLAB=off|2m|16m`): inside a load scope (`slab_scope_begin`/`slab_scope_end`) `HipRuntime::slab_alloc` sub-allocates small weight tensors at their exact size on a 4 KiB boundary from zero-filled, 2 MiB-multiple `hipMalloc` slabs. A view is a `DeviceBuffer` that reports `is_hip_allocation()` (so ownership checks accept it) and `is_slab_view()`; `HipRuntime::free` only releases it, and a sealed slab with no live view is freed by `free` at once or by `slab_flush` (the pool drain). `own_device_bytes` is charged at what ROCr occupies (`device_alloc_charge`: 4 KiB rounding up to 1 MiB, 2 MiB rounding above), a slab at its slab bytes.
+- `MappedHostBuffer` (`HipRuntime::mapped_host_buffer`) owns ONE `hipHostMalloc(Mapped | Coherent)` allocation (charged to the emu `HostPinned` class) and exposes its device alias only as a non-owning `Borrowed` `DeviceBuffer` — never register it as an owner or free it. Host bytes exist only inside a `MappedWrite` taken from the `Retired` phase; lifecycle `Retired → CpuWriting → Published → GpuReading → Retired` is a pure ledger (`MappedPhase`, one generation per `publish`). `publish` issues `fence(SeqCst)`, which orders host stores for other host threads only — it is NOT a GPU visibility proof; only an on-hardware oracle is (see `crates/hipfire-dispatch/examples/d2_mapped_return_pilot.rs`, built with `--features lab`). `mark_gpu_reading` (call right after enqueueing the consumer) records a timing-disabled retirement event; a failed record fails closed (only `retire`'s device synchronize retires it). `retire`/`try_retire` leave the phase unchanged on error, and Drop quiesces (event / device synchronize) or retains the allocation, mirroring `PinnedTransferBuffer`. A failed or null device alias refuses construction; there is no host-pointer fallback. Send, not Sync.
+- `PinnedTransferBuffer` readiness: after the queued downloads, `arm_ready` (event recorded on the buffer's stream) or `arm_ready_word` (`hipStreamWriteValue32` of a generation into a `SignalWord`) returns a non-`Clone` `#[must_use]` `InputReady`; `try_complete_ready` / `try_complete_ready_word` poll it and clear `pending` only for the matching, still-current token (a later enqueue or re-arm makes it stale; errors leave the accesses pending, fail closed), `complete_ready` is the blocking fallback. Every enqueue draws a process-wide monotonic sequence number and records its raw stream; `retire_behind(&proof)` retires ANOTHER buffer only when its last enqueue was on the proof's stream with a smaller sequence, otherwise it returns `false` and the caller must `complete()` it. `InputReady` and `MappedPublished` are distinct types (compile_fail doctest on `InputReady`); neither proves the other.
+- `SignalWord` (`HipRuntime::signal_word`) is 8 bytes of `hipExtMallocWithFlags(hipMallocSignalMemory = 0x2)`: host access ONLY through volatile `load`/`store` plus the explicit `load_acquire`/`store_release` fences, device view is a non-owning `Borrowed` `DeviceBuffer` (use `stream_write_signal` / `stream_wait_signal_gte`, which only accept 31-bit generations `1..=SIGNAL_GEN_MAX`, never `SIGNAL_ABORT`). `SIGNAL_ABORT` (`u32::MAX`) is `>=` every generation and releases any `Gte` wait; a word that holds it is dead (it would release every later wait), so abort poisons the owner. A queued wait means NO stream or device synchronize may run until the flag is stored: every error path between the wait enqueue and the flag store must store `SIGNAL_ABORT` first. `Drop` stores the abort value, drains the device, then `hipFree`s, and retains the allocation if the drain is not proved. `SignalGen` is the pure 31-bit counter and refuses wrap. `stream_wait_value32` (and `signal_word`) refuse unless `can_use_stream_wait_value(device)` — `hipDeviceGetAttribute(hipDeviceAttributeCanUseStreamWaitValue = 10013)` is non-zero; symbol presence alone is not capability. `10013` is the value in the ROCm header this bridge targets (`hip_runtime_api.h`, `hipDeviceAttributeAmdSpecificBegin = 10000` + 13).
+
+## Crate map
+
+<!-- crate-map:generated:begin -->
+
+_Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside the markers._
+
+### Modules and exported symbols
+
+- [`src/emu_budget.rs`](src/emu_budget.rs)
+- [`src/error.rs`](src/error.rs)
+  - `HIP_ERROR_ILLEGAL_ADDRESS`
+  - `HIP_ERROR_INVALID_IMAGE`
+  - `HIP_ERROR_OUT_OF_MEMORY`
+  - `HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED`
+  - `HIP_ERROR_PEER_ACCESS_NOT_ENABLED`
+  - `HIP_ERROR_PEER_ACCESS_UNSUPPORTED`
+  - `HipError`
+  - `HipErrorCode`
+  - `HipResult`
+  - `LaunchContext`
+  - `new`
+  - `register_first_illegal_address_hook`
+  - `with_kernel`
+- [`src/ffi.rs`](src/ffi.rs)
+  - `adopt_host_allocation`
+  - `alias`
+  - `arm_hip_fault`
+  - `arm_ready`
+  - `arm_ready_word`
+  - `as_bytes_mut`
+  - `as_raw`
+  - `begin_write`
+  - `bytes`
+  - `bytes_mut`
+  - `can_access_peer`
+  - `can_use_stream_wait_value`
+  - `complete`
+  - `complete_ready`
+  - `count`
+  - `current_device`
+  - `device`
+  - `device_buffer`
+  - `device_count`
+  - `device_pci_bus_id`
+  - `device_pinned`
+  - `device_pinned_posix_fd`
+  - `device_synchronize`
+  - `device_uuid`
+  - `download_async`
+  - `driver_version`
+  - `enable_peer_access`
+  - `Event`
+  - `event_create`
+  - `event_create_with_flags`
+  - `event_destroy`
+  - `event_elapsed_ms`
+  - `event_query`
+  - `event_record`
+  - `event_record_address`
+  - `event_synchronize`
+  - `f32_mut`
+  - `fn`
+  - `free`
+  - `Function`
+  - `generation`
+  - `get_arch`
+  - `get_device_attribute`
+  - `get_vram_info`
+  - `Graph`
+  - `graph_destroy`
+  - `graph_exec_destroy`
+  - `graph_instantiate`
+  - `graph_launch`
+  - `GraphExec`
+  - `HIP_DEVICE_ATTRIBUTE_CAN_USE_STREAM_WAIT_VALUE`
+  - `HIP_ERROR_NOT_READY`
+  - `HIP_EVENT_DISABLE_TIMING`
+  - `HIP_EVENT_RELEASE_TO_SYSTEM`
+  - `HIP_HOST_MALLOC_COHERENT`
+  - `HIP_HOST_MALLOC_MAPPED`
+  - `HIP_MEM_ACCESS_FLAGS_PROT_READ`
+  - `HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE`
+  - `HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM`
+  - `HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED`
+  - `HIP_MEM_ALLOCATION_TYPE_PINNED`
+  - `HIP_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR`
+  - `HIP_MEM_LOCATION_TYPE_DEVICE`
+  - `HIP_MEM_LOCATION_TYPE_HOST`
+  - `HIP_STREAM_WAIT_VALUE_GTE`
+  - `HIP_STREAM_WRITE_VALUE_DEFAULT`
+  - `HipMemAccessDesc`
+  - `HipMemAllocationFlags`
+  - `HipMemAllocationProp`
+  - `HipMemGenericAllocationHandle`
+  - `HipMemLocation`
+  - `HipPointerAttribute`
+  - `HipRuntime`
+  - `host`
+  - `host_buffer`
+  - `host_bytes`
+  - `host_free`
+  - `host_get_device_pointer`
+  - `host_malloc`
+  - `host_ptr`
+  - `HostAllocOwner`
+  - `InputReady`
+  - `is_complete`
+  - `is_pending`
+  - `keep_host_memory_out_of_reclaim`
+  - `kernel_timing`
+  - `last_error`
+  - `launch_counters`
+  - `launch_grid_yz_limit`
+  - `launch_kernel`
+  - `launch_kernel_blob`
+  - `launch_witness_begin`
+  - `launch_witness_end`
+  - `load`
+  - `load_acquire`
+  - `malloc`
+  - `malloc_peer_finegrained`
+  - `malloc_signal`
+  - `mapped_hip_library`
+  - `mapped_host_buffer`
+  - `MappedHostBuffer`
+  - `MappedPhase`
+  - `MappedPublished`
+  - `MappedWrite`
+  - `mark_gpu_reading`
+  - `mem_address_reserve`
+  - `mem_create`
+  - `mem_export_posix`
+  - `mem_get_access`
+  - `mem_get_address_range`
+  - `mem_get_allocation_granularity`
+  - `mem_get_handle_properties`
+  - `mem_import_posix`
+  - `mem_map`
+  - `mem_release`
+  - `mem_set_access`
+  - `mem_unmap`
+  - `memcpy_dtod`
+  - `memcpy_dtod_2d_async_at`
+  - `memcpy_dtod_async_at`
+  - `memcpy_dtod_async_default_at`
+  - `memcpy_dtod_async_raw`
+  - `memcpy_dtod_at`
+  - `memcpy_dtod_offset`
+  - `memcpy_dtod_raw`
+  - `memcpy_dtoh`
+  - `memcpy_dtoh_async`
+  - `memcpy_dtoh_at`
+  - `memcpy_htod`
+  - `memcpy_htod_async`
+  - `memcpy_htod_async_at`
+  - `memcpy_htod_async_default`
+  - `memcpy_htod_async_on`
+  - `memcpy_htod_offset`
+  - `memcpy_peer`
+  - `memcpy_peer_async`
+  - `memory_effects`
+  - `MemoryEffects`
+  - `memset`
+  - `memset_async`
+  - `memset_d32_async`
+  - `memset_d32_async_raw`
+  - `Module`
+  - `module_get_function`
+  - `module_load`
+  - `module_load_data`
+  - `next`
+  - `occupancy_max_active_blocks`
+  - `own_device_bytes`
+  - `phase`
+  - `PinnedHostBuffer`
+  - `PinnedTransferBuffer`
+  - `plan_active`
+  - `plan_begin`
+  - `plan_end`
+  - `plan_event_count`
+  - `plan_last_launch_index`
+  - `plan_refuse`
+  - `plan_set_label`
+  - `pointer_get_attributes`
+  - `publish`
+  - `QWEN4_EXPERT_VRAM_LAYERS_ENV`
+  - `raw_ptr`
+  - `read_only_device`
+  - `read_write_device`
+  - `record`
+  - `record_bytes`
+  - `replayable`
+  - `reset`
+  - `retire`
+  - `retire_behind`
+  - `runtime_version`
+  - `runtime_version_raw`
+  - `sequence`
+  - `set_device`
+  - `set_device_flags`
+  - `set_launch_grid_limit_for_arch`
+  - `SIGNAL_ABORT`
+  - `SIGNAL_GEN_MAX`
+  - `signal_word`
+  - `SignalGen`
+  - `SignalHostPtr`
+  - `SignalWord`
+  - `since`
+  - `size`
+  - `snapshot`
+  - `store`
+  - `store_release`
+  - `Stream`
+  - `stream_begin_capture`
+  - `stream_create`
+  - `stream_create_non_blocking`
+  - `stream_destroy`
+  - `stream_end_capture`
+  - `stream_is_capturing`
+  - `stream_synchronize`
+  - `stream_synchronize_default`
+  - `stream_wait_event`
+  - `stream_wait_event_on`
+  - `stream_wait_signal_gte`
+  - `stream_wait_value32`
+  - `stream_write_signal`
+  - `stream_write_value32`
+  - `time_ns`
+  - `transfer_buffer`
+  - `try_complete_ready`
+  - `try_complete_ready_word`
+  - `try_retire`
+  - `upload_async`
+  - `validate_launch_grid`
+- [`src/ffi/kernel_timing.rs`](src/ffi/kernel_timing.rs)
+  - `begin`
+  - `cancel`
+  - `close`
+  - `finish`
+  - `is_active`
+  - `kernel_timing_is_active`
+  - `kernel_timing_pool`
+  - `kernel_timing_reject_backend`
+  - `KernelTimingCoverage`
+  - `KernelTimingPool`
+  - `KernelTimingReport`
+  - `reject_kernel_timing_backend`
+- [`src/ffi/kernel_timing/tests.rs`](src/ffi/kernel_timing/tests.rs)
+- [`src/ffi/weight_slab.rs`](src/ffi/weight_slab.rs)
+  - `ALLOC_GRANULE`
+  - `DEFAULT_SLAB_MODE`
+  - `device_alloc_charge`
+  - `from_env`
+  - `from_env_explicit`
+  - `max_tensor_bytes`
+  - `name`
+  - `parse`
+  - `set_slab_mode`
+  - `SLAB_ALIGN`
+  - `slab_alloc`
+  - `slab_bytes`
+  - `slab_flush`
+  - `slab_mode`
+  - `slab_release`
+  - `slab_scope_active`
+  - `slab_scope_begin`
+  - `slab_scope_begin_with`
+  - `slab_scope_end`
+  - `slab_stats`
+  - `SlabMode`
+  - `SlabScopeSummary`
+  - `SlabStats`
+  - `SMALL_ALLOC_GRANULE`
+  - `SMALL_ALLOC_LIMIT`
+- [`src/kernarg.rs`](src/kernarg.rs)
+  - `as_bytes`
+  - `as_mut_slice`
+  - `into_vec`
+  - `is_empty`
+  - `KernargBlob`
+  - `len`
+  - `new`
+  - `pad_to`
+  - `push_f32`
+  - `push_i32`
+  - `push_ptr`
+  - `push_u32`
+  - `push_u64`
+  - `with_capacity`
+- [`src/launch_grid.rs`](src/launch_grid.rs)
+  - `check_launch_grid`
+  - `GFX1201_MAX_GRID_YZ`
+  - `grid_yz_limit_for_arch`
+- [`src/lib.rs`](src/lib.rs)
+  - `alias`
+  - `as_ptr`
+  - `byte_view`
+  - `DeviceBuffer`
+  - `error`
+  - `ffi`
+  - `from_host_mapped`
+  - `from_raw`
+  - `from_vmm_owner`
+  - `is_borrowed`
+  - `is_hip_allocation`
+  - `is_host_mapped`
+  - `is_slab_view`
+  - `is_vmm_owner`
+  - `kernarg`
+  - `launch_grid`
+  - `MemcpyKind`
+  - `MemoryType`
+  - `plan_tape`
+  - `rccl`
+  - `registry`
+  - `rocblas`
+  - `rocsolver`
+  - `size`
+  - `vmm`
+- [`src/plan_tape.rs`](src/plan_tape.rs)
+  - `active`
+  - `begin`
+  - `copy_range`
+  - `copy_raw`
+  - `end`
+  - `event_count`
+  - `last_launch_index`
+  - `launch`
+  - `memset_bytes`
+  - `memset_words`
+  - `PlanEvent`
+  - `PlanGate`
+  - `PlanTape`
+  - `refuse`
+  - `set_label`
+  - `witness_begin`
+  - `witness_end`
+  - `witness_launch`
+  - `witnessing`
+- [`src/rccl.rs`](src/rccl.rs)
+  - `all_reduce`
+  - `all_reduce_sum_f16`
+  - `all_reduce_sum_f32`
+  - `group`
+  - `group_end`
+  - `group_start`
+  - `init_all`
+  - `is_empty`
+  - `len`
+  - `NCCL_SUCCESS`
+  - `RcclComms`
+  - `RcclDataType`
+  - `RcclError`
+  - `RcclRedOp`
+  - `RcclResult`
+  - `recv`
+  - `send`
+  - `version`
+- [`src/registry.rs`](src/registry.rs)
+  - `AllocationKind`
+  - `AllocationRole`
+  - `enabled`
+  - `live_allocations`
+  - `live_allocations_with_role`
+  - `LiveAllocation`
+  - `role_scope`
+  - `RoleGuard`
+- [`src/rocblas.rs`](src/rocblas.rs)
+  - `dgemm`
+  - `enumerate_gemm_ex_solutions`
+  - `gemm_ex`
+  - `gemm_ex_with_solution`
+  - `handle`
+  - `has_dgemm`
+  - `has_gemm_ex_solution_enumeration`
+  - `load`
+  - `Rocblas`
+  - `ROCBLAS_STATUS_INVALID_VALUE`
+  - `ROCBLAS_STATUS_SUCCESS`
+  - `RocblasDatatype`
+  - `RocblasError`
+  - `RocblasGemmAlgo`
+  - `RocblasOperation`
+  - `RocblasResult`
+  - `set_stream`
+- [`src/rocsolver.rs`](src/rocsolver.rs)
+  - `dpotrf`
+  - `dpotri`
+  - `dtrtri`
+  - `has_dpotri`
+  - `load`
+  - `load_from_handle`
+  - `RocblasDiagonal`
+  - `RocblasFill`
+  - `Rocsolver`
+  - `ROCSOLVER_STATUS_SUCCESS`
+  - `RocsolverError`
+  - `RocsolverResult`
+- [`src/vmm.rs`](src/vmm.rs)
+  - `base_address`
+  - `buffer`
+  - `bytes`
+  - `clear_vmm_faults`
+  - `empty`
+  - `export_posix`
+  - `fn`
+  - `granule_bytes`
+  - `granule_prefix_bytes`
+  - `granules`
+  - `import_posix`
+  - `inject_vmm_fault`
+  - `is_read_only`
+  - `is_released`
+  - `map_next`
+  - `map_next_granules`
+  - `map_shared_prefix`
+  - `owner_access_flags`
+  - `owner_buffer`
+  - `physical_granules`
+  - `primary_handle`
+  - `publish_read_only`
+  - `release`
+  - `reserve`
+  - `reserve_exportable`
+  - `retired_va_bytes`
+  - `retry_pending_granule_releases`
+  - `sealed_bytes`
+  - `share_prefix`
+  - `vmm_live_granule_bytes`
+  - `VmmArena`
+  - `VmmDriver`
+  - `VmmFaultKind`
+  - `VmmPhysicalId`
+  - `VmmSharedPrefix`
+
+### Dependencies (from `Cargo.toml`)
+
+#### path
+
+- `hipfire-config`
+
+#### external
+
+- `libloading`
+
+#### dev
+
+- `redline-rocr`
+
+#### build
+
+—
+
+### Reverse dependencies
+
+Workspace crates with a path dependency on this crate:
+
+- `hipfire-arch-cohere2moe`
+- `hipfire-arch-deepseek4`
+- `hipfire-arch-diffusion`
+- `hipfire-arch-dots-ocr`
+- `hipfire-arch-embeddinggemma2`
+- `hipfire-arch-gemma4`
+- `hipfire-arch-lfm2-vl`
+- `hipfire-arch-lfm2moe`
+- `hipfire-arch-llama`
+- `hipfire-arch-maple`
+- `hipfire-arch-minimax`
+- `hipfire-arch-muse-glimmer`
+- `hipfire-arch-qwen2`
+- `hipfire-arch-qwen35`
+- `hipfire-arch-qwen35-embed`
+- `hipfire-arch-qwen35-vl`
+- `hipfire-arch-qwen4`
+- `hipfire-arch-raon`
+- `hipfire-daemon`
+- `hipfire-dispatch`
+- `hipfire-ds4-parent`
+- `hipfire-engine`
+- `hipfire-generate`
+- `hipfire-loader`
+- `hipfire-pflash`
+- `hipfire-runtime`
+- `hsa-bridge`
+- `npu-tools`
+- `peacemaker-isa`
+- `peacemaker-rip`
+- `railgun`
+- `rdna-compute`
+- `saddle-core`
+- `saddle-lab`
+
+<!-- crate-map:generated:end -->

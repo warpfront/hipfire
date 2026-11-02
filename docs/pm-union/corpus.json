@@ -1,0 +1,1739 @@
+{
+  "schema": "pm-union-corpus-v1",
+  "corpus_id": "pm-union-u0-mq4-residual-4cell-v1",
+  "freeze_date": "2026-10-11",
+  "path_placeholders": "Paths without a placeholder are repository-relative. <release-workdir>, <release-0.4.0-workdir> and <peacemaker-workdir> denote local working directories (local-only evidence, not tracked in this repository); <pci-bdf> and <device-uuid> are redacted device identifiers.",
+  "status": "Frozen DEFINITION plus observed pilot EXPORT pins. The pilot has exported the V0 SPIR-V and the ACO/RADV raw binary, ABI sidecar and rawspec (section `exported_artifacts`); that is an export only. No raw lift, HSA adapter, PM-HIP object, Vulkan reference receipt, binary-replay or equality/parity result exists, and none is claimed. Hpm and Vpm do not exist; no result digest exists for any arm.",
+  "plan": {
+    "path": "<release-workdir>/pm-programs/PM-UNION.md",
+    "sections": [
+      "5.1 (:170-185)",
+      "5.2 (:187-208)",
+      "7 (:263-317)",
+      "8 U0 (:323-327)"
+    ]
+  },
+  "provenance": {
+    "union_u0_worktree": "<release-workdir>/pm-union/u0/",
+    "union_u0_worktree_head": "2bb9670061a51aa4c4fbe9e802de8a44f7b6d795",
+    "original_repo_head": "2bb9670061a51aa4c4fbe9e802de8a44f7b6d795",
+    "pilot_worktree": "<release-workdir>/worktrees/pm-aco-pilot-20261011/",
+    "pilot_head": "d7ae3672b34f15b96500bfadc14334d58e2d355f",
+    "pilot_files_uncommitted_at_freeze": true,
+    "mesa_pin": {
+      "tag": "mesa-26.0.8",
+      "commit": "60e95b787857afbc9a00b693b91c0d9c8923a430",
+      "source": "<peacemaker-workdir>/aco-shim/pin.json:2-8",
+      "local_modifications_at_freeze": [
+        "src/amd/compiler/meson.build (modified)",
+        "src/amd/compiler/aco-shim (untracked)"
+      ]
+    },
+    "pilot_scope": "ACO pilot F1-F4 are untouched and referenced, not edited."
+  },
+  "kernel": {
+    "symbol": "gemv_mq4g256v2_residual",
+    "module": "gemv_hfq4g256_residual_mq4v2",
+    "qtype": "MQ4-G256 v2 (HFQ4-G256 layout, 136 bytes/group: 4B scale/zero header x2 + 128B packed nibbles)",
+    "op": "y[row] += dot(A[row], x), residual add into y (read-modify-write)",
+    "arch": "gfx1201",
+    "wave_size": 32,
+    "block": [
+      32,
+      1,
+      1
+    ],
+    "dynamic_lds": 0,
+    "kernarg_abi": {
+      "length": 32,
+      "A_ptr": 0,
+      "x_ptr": 8,
+      "y_ptr": 16,
+      "M_i32": 24,
+      "K_i32": 28,
+      "endian": "little"
+    },
+    "group_bytes": 136,
+    "rows_per_workgroup": 2,
+    "x_dtype": "f32",
+    "y_dtype": "f32",
+    "weight_header_dtype": "f16 scale,f16 zero (lane<16 reads u32@0, lane>=16 reads u32@4)",
+    "recipe_summary": "four independent group streams per row (acc[g%4]); acc=(a0+a1)+(a2+a3); shfl_down 16,8,4,2,1 tree; two-row epilogue y.x=acc+y.x,y.y=bcc+y.y, odd last row y=y+acc; second-row DOG starts x1 then x0 (builder/SPIR-V); no atomics/LDS/scratch",
+    "semantic_recipe_id": "gemv_mq4g256v2_residual/four_stream_dual_row_v1",
+    "semantic_recipe_id_note": "Name assigned by U0 for receipt binding; the exactness of arms to it is measured by oracle, not asserted"
+  },
+  "supported_domain": {
+    "finite_domain": "Exactly the real fixture bytes of C1/C2 and their deterministic real-prefix crops C3/C4, plus the island preimage pairing defined under `island`. All of x, y-pre and all f16 scale/zero header halves observed finite (scan below). Corpus promotes no claim about any other input.",
+    "observed_scan": {
+      "occ0": {
+        "x_f32": {
+          "count": 6144,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -0.09374862909317017,
+          "max": 0.09628701210021973,
+          "max_abs": 0.09628701210021973
+        },
+        "y_pre_f32": {
+          "count": 5120,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 33,
+          "min": -0.065887451171875,
+          "max": 0.05662202835083008,
+          "max_abs": 0.065887451171875
+        },
+        "A_header_f16_scale_lane_lt16": {
+          "count": 122880,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": 0.0020618438720703125,
+          "max": 0.230712890625,
+          "max_abs": 0.230712890625
+        },
+        "A_header_f16_zero_lane_lt16": {
+          "count": 122880,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -1.845703125,
+          "max": -0.0164947509765625,
+          "max_abs": 1.845703125
+        },
+        "A_header_f16_scale_lane_ge16": {
+          "count": 122880,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": 0.0015735626220703125,
+          "max": 0.2374267578125,
+          "max_abs": 0.2374267578125
+        },
+        "A_header_f16_zero_lane_ge16": {
+          "count": 122880,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -1.8994140625,
+          "max": -0.0125885009765625,
+          "max_abs": 1.8994140625
+        },
+        "A_groups": 122880,
+        "A_nibble_min_max": [
+          0,
+          15
+        ]
+      },
+      "occ127": {
+        "x_f32": {
+          "count": 17408,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -6.49258279800415,
+          "max": 6.5193772315979,
+          "max_abs": 6.5193772315979
+        },
+        "y_pre_f32": {
+          "count": 5120,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -50.52619934082031,
+          "max": 305.5853576660156,
+          "max_abs": 305.5853576660156
+        },
+        "A_header_f16_scale_lane_lt16": {
+          "count": 348160,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": 0.0018749237060546875,
+          "max": 0.044525146484375,
+          "max_abs": 0.044525146484375
+        },
+        "A_header_f16_zero_lane_lt16": {
+          "count": 348160,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -0.356201171875,
+          "max": -0.0149993896484375,
+          "max_abs": 0.356201171875
+        },
+        "A_header_f16_scale_lane_ge16": {
+          "count": 348160,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": 0.00167083740234375,
+          "max": 0.03936767578125,
+          "max_abs": 0.03936767578125
+        },
+        "A_header_f16_zero_lane_ge16": {
+          "count": 348160,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -0.31494140625,
+          "max": -0.01336669921875,
+          "max_abs": 0.31494140625
+        },
+        "A_groups": 348160,
+        "A_nibble_min_max": [
+          0,
+          15
+        ]
+      }
+    },
+    "scan_scope": "full fixtures; C3/C4 inputs are strict byte subsets so the finiteness holds for them",
+    "not_promoted": [
+      "NaN or Inf in x, y, or f16 headers",
+      "synthetic/random/constructed tensors",
+      "subnormal or signed-zero cases not present in the scan (negative zero count is 0 in every scanned tensor; subnormal non-zero count is 0)",
+      "scale extremes outside the scanned ranges",
+      "intermediate overflow behavior",
+      "K not a multiple of 256",
+      "M/K other than the four cells",
+      "tail_groups 1 and 2 (only 0 and 3 are covered)",
+      "other qtypes, other architectures (gfx1100/gfx1151 are separate cells), other drivers",
+      "FP exception/denormal-mode independence beyond the pinned modes"
+    ],
+    "rule": "Anything outside this list is unsupported and is neither measured nor promotable under this corpus_id; extending the domain requires a new corpus_id."
+  },
+  "fixtures": {
+    "occ0": {
+      "directory": "<release-workdir>/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ0/",
+      "schema": "pmdt-capture-v1",
+      "meta_json": {
+        "path": "<release-workdir>/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ0/meta.json",
+        "sha256": "22dead9e3a1887d15230d0653281724f52ac445ba155e206d224e6da831de0b6"
+      },
+      "files": {
+        "arg0.pre.bin": {
+          "bytes": 16711680,
+          "sha256": "81399d75f09fb226030f0dc836b0bb46bfc2c955d4008ffedf8cabf42386ac0a",
+          "hashed_with": "sha256sum"
+        },
+        "arg0.post.bin": {
+          "bytes": 16711680,
+          "sha256": "81399d75f09fb226030f0dc836b0bb46bfc2c955d4008ffedf8cabf42386ac0a",
+          "hashed_with": "sha256sum"
+        },
+        "arg8.pre.bin": {
+          "bytes": 24576,
+          "sha256": "afa96e019383b5f252d7a1eb77e634dba1328898ea0974a2efebff85351b4621",
+          "hashed_with": "sha256sum"
+        },
+        "arg8.post.bin": {
+          "bytes": 24576,
+          "sha256": "afa96e019383b5f252d7a1eb77e634dba1328898ea0974a2efebff85351b4621",
+          "hashed_with": "sha256sum"
+        },
+        "arg16.pre.bin": {
+          "bytes": 20480,
+          "sha256": "33bea66ece8108a06b4cdeb3409d20400b62794e0d13857cccb6ed3510eaec73",
+          "hashed_with": "sha256sum"
+        },
+        "arg16.post.bin": {
+          "bytes": 20480,
+          "sha256": "8c48e1e308ff86fd903baf1a72f516abeb0a21d0d505ed903466236711484827",
+          "hashed_with": "sha256sum"
+        }
+      },
+      "A_post_equals_pre": true,
+      "x_post_equals_pre": true,
+      "y_post_is_captured_callsite_result_not_an_arm_output": true,
+      "domain_scan_full_fixture": {
+        "x_f32": {
+          "count": 6144,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -0.09374862909317017,
+          "max": 0.09628701210021973,
+          "max_abs": 0.09628701210021973
+        },
+        "y_pre_f32": {
+          "count": 5120,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 33,
+          "min": -0.065887451171875,
+          "max": 0.05662202835083008,
+          "max_abs": 0.065887451171875
+        },
+        "A_header_f16_scale_lane_lt16": {
+          "count": 122880,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": 0.0020618438720703125,
+          "max": 0.230712890625,
+          "max_abs": 0.230712890625
+        },
+        "A_header_f16_zero_lane_lt16": {
+          "count": 122880,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -1.845703125,
+          "max": -0.0164947509765625,
+          "max_abs": 1.845703125
+        },
+        "A_header_f16_scale_lane_ge16": {
+          "count": 122880,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": 0.0015735626220703125,
+          "max": 0.2374267578125,
+          "max_abs": 0.2374267578125
+        },
+        "A_header_f16_zero_lane_ge16": {
+          "count": 122880,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -1.8994140625,
+          "max": -0.0125885009765625,
+          "max_abs": 1.8994140625
+        },
+        "A_groups": 122880,
+        "A_nibble_min_max": [
+          0,
+          15
+        ]
+      },
+      "M": 5120,
+      "K": 6144,
+      "launch_index": 6,
+      "launches_in_step": 755,
+      "occurrence_ordinal": 0,
+      "occurrences_in_step": 128,
+      "grid": [
+        5120,
+        1,
+        1
+      ],
+      "block": [
+        32,
+        1,
+        1
+      ],
+      "dynamic_lds": 0,
+      "arch": "gfx1201",
+      "captured_kernarg_hex": "0000207e917400000030dbac8d74000000b09fb18d7400000014000000180000",
+      "model": "<release-0.4.0-workdir>/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts",
+      "context_tokens": 512
+    },
+    "occ127": {
+      "directory": "<release-workdir>/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ127/",
+      "schema": "pmdt-capture-v1",
+      "meta_json": {
+        "path": "<release-workdir>/pm-decode-twins/oracle-inputs/gemv_mq4g256v2_residual/occ127/meta.json",
+        "sha256": "85062964edbd75e896f995628225c10c6be4a20a1c8f55785288598f357870af"
+      },
+      "files": {
+        "arg0.pre.bin": {
+          "bytes": 47349760,
+          "sha256": "ee203d35f31437865ba9dd311db8182a6d3d0438471133eba2ee56b4f1c25bbb",
+          "hashed_with": "sha256sum"
+        },
+        "arg0.post.bin": {
+          "bytes": 47349760,
+          "sha256": "ee203d35f31437865ba9dd311db8182a6d3d0438471133eba2ee56b4f1c25bbb",
+          "hashed_with": "sha256sum"
+        },
+        "arg8.pre.bin": {
+          "bytes": 69632,
+          "sha256": "e3d5e5cdf8e3e2ad1fca72c26b6422449598be83e7c153429848d05d0a714100",
+          "hashed_with": "sha256sum"
+        },
+        "arg8.post.bin": {
+          "bytes": 69632,
+          "sha256": "e3d5e5cdf8e3e2ad1fca72c26b6422449598be83e7c153429848d05d0a714100",
+          "hashed_with": "sha256sum"
+        },
+        "arg16.pre.bin": {
+          "bytes": 20480,
+          "sha256": "a6ca8432d95c2c99674b43244a7eb6670fdfaa69cf0ef974b3b8425b98aeeefc",
+          "hashed_with": "sha256sum"
+        },
+        "arg16.post.bin": {
+          "bytes": 20480,
+          "sha256": "4fb1147e09c3c306f91e8ae3c153b96a81403f833d1eb5ab9424424fb23b0ada",
+          "hashed_with": "sha256sum"
+        }
+      },
+      "A_post_equals_pre": true,
+      "x_post_equals_pre": true,
+      "y_post_is_captured_callsite_result_not_an_arm_output": true,
+      "domain_scan_full_fixture": {
+        "x_f32": {
+          "count": 17408,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -6.49258279800415,
+          "max": 6.5193772315979,
+          "max_abs": 6.5193772315979
+        },
+        "y_pre_f32": {
+          "count": 5120,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -50.52619934082031,
+          "max": 305.5853576660156,
+          "max_abs": 305.5853576660156
+        },
+        "A_header_f16_scale_lane_lt16": {
+          "count": 348160,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": 0.0018749237060546875,
+          "max": 0.044525146484375,
+          "max_abs": 0.044525146484375
+        },
+        "A_header_f16_zero_lane_lt16": {
+          "count": 348160,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -0.356201171875,
+          "max": -0.0149993896484375,
+          "max_abs": 0.356201171875
+        },
+        "A_header_f16_scale_lane_ge16": {
+          "count": 348160,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": 0.00167083740234375,
+          "max": 0.03936767578125,
+          "max_abs": 0.03936767578125
+        },
+        "A_header_f16_zero_lane_ge16": {
+          "count": 348160,
+          "nonfinite": 0,
+          "subnormal_nonzero": 0,
+          "negative_zero": 0,
+          "positive_zero": 0,
+          "min": -0.31494140625,
+          "max": -0.01336669921875,
+          "max_abs": 0.31494140625
+        },
+        "A_groups": 348160,
+        "A_nibble_min_max": [
+          0,
+          15
+        ]
+      },
+      "M": 5120,
+      "K": 17408,
+      "launch_index": 751,
+      "launches_in_step": 755,
+      "occurrence_ordinal": 127,
+      "occurrences_in_step": 128,
+      "grid": [
+        5120,
+        1,
+        1
+      ],
+      "block": [
+        32,
+        1,
+        1
+      ],
+      "dynamic_lds": 0,
+      "arch": "gfx1201",
+      "model": "<release-0.4.0-workdir>/fp8-tp-ep-geo/models/qwen3.8-27b.mq4-xts",
+      "context_tokens": 512
+    }
+  },
+  "recipe": {
+    "schema": "pm-union-fixture-recipe-v1",
+    "source": "pmdt-capture-v1 directories above; verify every .bin length and sha256 against `fixtures.*.files` before use (sha256 of file bytes, not of any decoded form)",
+    "full_cell": "payloads are arg0.pre.bin (A), arg8.pre.bin (x), arg16.pre.bin (y) verbatim",
+    "row_crop": {
+      "name": "real-prefix odd/tail crop",
+      "M_out": "M-1",
+      "groups_out": "G-1 where G=K/256",
+      "K_out": "256*(G-1)",
+      "A": "for r in 0..M_out: out += A_pre[r*G*136 : r*G*136 + (G-1)*136]",
+      "x": "x_pre[0 : (G-1)*1024]",
+      "y": "y_pre[0 : M_out*4]",
+      "kernarg": "template with pointer slots 0, M_out @24, K_out @28 (i32 LE)",
+      "grid": "[M_out,1,1] (captured launcher rule)",
+      "reference": "pm_aco_oracle.rs:342-383"
+    },
+    "framing": {
+      "guard_bytes_each_side": 4096,
+      "guard_byte_hex": "a5",
+      "frame": "0xA5*4096 ++ payload ++ 0xA5*4096, then 0xA5 padding up to the mapped length (next multiple of device VMM granularity)",
+      "pointer_passed_to_kernel": "frame_base + 4096",
+      "one_allocation_per_pointer_argument": true,
+      "granularity": "hardware property: recorded in each receipt as vmm_granularity_bytes, not frozen here",
+      "reference": "pm_aco_oracle.rs:25-28,66-67,395-399,702-734"
+    },
+    "independent_restored_preimages": "Every arm x mode x cell x repeat run allocates fresh frames and uploads the pristine pre-image frames from the fixture; no run consumes another run's post bytes. Graph replays reset all frames before each launch (pm_aco_oracle.rs:793-818). Preimage identity is asserted by hashing the uploaded frames (framed sha256 below) before launch.",
+    "fixtures_sha256_definition": "sha256 of the concatenation, in cell order C1..C4 and buffer order A,x,y, of lines `<cell_id>/<buf>.pre <payload_bytes> <payload_sha256>\\n`",
+    "fixtures_sha256_manifest_lines": [
+      "C1_occ0_full/A.pre 16711680 81399d75f09fb226030f0dc836b0bb46bfc2c955d4008ffedf8cabf42386ac0a",
+      "C1_occ0_full/x.pre 24576 afa96e019383b5f252d7a1eb77e634dba1328898ea0974a2efebff85351b4621",
+      "C1_occ0_full/y.pre 20480 33bea66ece8108a06b4cdeb3409d20400b62794e0d13857cccb6ed3510eaec73",
+      "C2_occ127_full/A.pre 47349760 ee203d35f31437865ba9dd311db8182a6d3d0438471133eba2ee56b4f1c25bbb",
+      "C2_occ127_full/x.pre 69632 e3d5e5cdf8e3e2ad1fca72c26b6422449598be83e7c153429848d05d0a714100",
+      "C2_occ127_full/y.pre 20480 a6ca8432d95c2c99674b43244a7eb6670fdfaa69cf0ef974b3b8425b98aeeefc",
+      "C3_odd_m5119_k5888/A.pre 16012232 4b55bc387c5682bc3b4ed88e7aaa13b2d4978fcfe66af6be093d8e010c5e9b31",
+      "C3_odd_m5119_k5888/x.pre 23552 a0aff443a398c7217d400deb8ea5fc02b1744d6c5f4fedb058eb51491f536c55",
+      "C3_odd_m5119_k5888/y.pre 20476 29db2d8a14bce4fad2dd4b5ec2a540a80177686f9acd71f0366f95b9245db1a6",
+      "C4_odd_m5119_k17152/A.pre 46644328 fa5e77962b875fc792912c3ac83da0b87fbe33f9e376d9dc6dd47165d55c0c4b",
+      "C4_odd_m5119_k17152/x.pre 68608 fde65a7ef0fd661fc5bc53aac0f5a7bc86979ceea3f14dd02681ceeb56e22231",
+      "C4_odd_m5119_k17152/y.pre 20476 dbab410b135081a905360076f273f2e64738aae988b80e1807a0b96b983b939d"
+    ],
+    "fixtures_sha256": "b44ee95d2bc5588cfb38f463dac9f9ec9dcc212d9be66fdf87ab8126800587ef"
+  },
+  "cells": [
+    {
+      "cell_id": "C1_occ0_full",
+      "fixture": "occ0",
+      "derived_from_real_prefix": false,
+      "M": 5120,
+      "K": 6144,
+      "groups_per_row": 24,
+      "quads": 6,
+      "tail_groups": 0,
+      "odd_M": false,
+      "launch": {
+        "grid": [
+          5120,
+          1,
+          1
+        ],
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "dynamic_lds": 0,
+        "rule": "grid.x = M (captured launcher rule, pm_aco_oracle.rs:350-355; workgroups with row0=2*wg>=M exit, hip:49-50)"
+      },
+      "buffer_bytes": {
+        "A": 16711680,
+        "x": 24576,
+        "y": 20480
+      },
+      "kernarg_template_hex_pointer_slots_zero": "0000000000000000000000000000000000000000000000000014000000180000",
+      "kernarg_template_sha256": "29cde049d8c0034138760e96e252bea5bf8092dd6e4e431e990979e1122fc3a2",
+      "pre_payload_sha256": {
+        "A": "81399d75f09fb226030f0dc836b0bb46bfc2c955d4008ffedf8cabf42386ac0a",
+        "x": "afa96e019383b5f252d7a1eb77e634dba1328898ea0974a2efebff85351b4621",
+        "y": "33bea66ece8108a06b4cdeb3409d20400b62794e0d13857cccb6ed3510eaec73"
+      },
+      "pre_framed_sha256": {
+        "A": "2be2589ca6432837d15868da4e46fdad77b10df831c2302406a20f90ee156516",
+        "x": "04427dda6ddcfe6ac168a8c2adca890d7c31b31464143baabafc987ff779c308",
+        "y": "6ea68012a8ee9dab118913d2d07368017ed37852728778dbcdb588da11856c33"
+      }
+    },
+    {
+      "cell_id": "C2_occ127_full",
+      "fixture": "occ127",
+      "derived_from_real_prefix": false,
+      "M": 5120,
+      "K": 17408,
+      "groups_per_row": 68,
+      "quads": 17,
+      "tail_groups": 0,
+      "odd_M": false,
+      "launch": {
+        "grid": [
+          5120,
+          1,
+          1
+        ],
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "dynamic_lds": 0,
+        "rule": "grid.x = M (captured launcher rule, pm_aco_oracle.rs:350-355; workgroups with row0=2*wg>=M exit, hip:49-50)"
+      },
+      "buffer_bytes": {
+        "A": 47349760,
+        "x": 69632,
+        "y": 20480
+      },
+      "kernarg_template_hex_pointer_slots_zero": "0000000000000000000000000000000000000000000000000014000000440000",
+      "kernarg_template_sha256": "5de2801046e49faf9beb785c1d9fa65ee84d1c3e332ddd785b4e07484de7148a",
+      "pre_payload_sha256": {
+        "A": "ee203d35f31437865ba9dd311db8182a6d3d0438471133eba2ee56b4f1c25bbb",
+        "x": "e3d5e5cdf8e3e2ad1fca72c26b6422449598be83e7c153429848d05d0a714100",
+        "y": "a6ca8432d95c2c99674b43244a7eb6670fdfaa69cf0ef974b3b8425b98aeeefc"
+      },
+      "pre_framed_sha256": {
+        "A": "22948db30c1dd77bbe2ebfe94a0669a891cd334fa78cc9614c8e9d81d079a2c1",
+        "x": "458e1916e82b6bb917ffc332052fbcab5b6578979c2752cec84a1fa34fb0e31a",
+        "y": "e5bb54175a7c43e735a8778afd6cd8a780017b192c467d6fc4e160fda166c5df"
+      }
+    },
+    {
+      "cell_id": "C3_odd_m5119_k5888",
+      "fixture": "occ0",
+      "derived_from_real_prefix": true,
+      "M": 5119,
+      "K": 5888,
+      "groups_per_row": 23,
+      "quads": 5,
+      "tail_groups": 3,
+      "odd_M": true,
+      "launch": {
+        "grid": [
+          5119,
+          1,
+          1
+        ],
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "dynamic_lds": 0,
+        "rule": "grid.x = M (captured launcher rule, pm_aco_oracle.rs:350-355; workgroups with row0=2*wg>=M exit, hip:49-50)"
+      },
+      "buffer_bytes": {
+        "A": 16012232,
+        "x": 23552,
+        "y": 20476
+      },
+      "kernarg_template_hex_pointer_slots_zero": "000000000000000000000000000000000000000000000000ff13000000170000",
+      "kernarg_template_sha256": "54fa1b74b91443848b712be4bb56dbc0bb7279513d51809b0be9e07570bfef75",
+      "pre_payload_sha256": {
+        "A": "4b55bc387c5682bc3b4ed88e7aaa13b2d4978fcfe66af6be093d8e010c5e9b31",
+        "x": "a0aff443a398c7217d400deb8ea5fc02b1744d6c5f4fedb058eb51491f536c55",
+        "y": "29db2d8a14bce4fad2dd4b5ec2a540a80177686f9acd71f0366f95b9245db1a6"
+      },
+      "pre_framed_sha256": {
+        "A": "0c64acb8997269d45fd1a5b0da9b556c0f74a0df04f3e5266d47944312595e01",
+        "x": "85aa9791745e2fec562c3009f86c60c65a3f0ba3c0a10484b39ea2e450c24b7b",
+        "y": "2b84bfecc64bffccd32d476dd241fc63d690783d8b515fc1dde5f9b40dbb1012"
+      }
+    },
+    {
+      "cell_id": "C4_odd_m5119_k17152",
+      "fixture": "occ127",
+      "derived_from_real_prefix": true,
+      "M": 5119,
+      "K": 17152,
+      "groups_per_row": 67,
+      "quads": 16,
+      "tail_groups": 3,
+      "odd_M": true,
+      "launch": {
+        "grid": [
+          5119,
+          1,
+          1
+        ],
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "dynamic_lds": 0,
+        "rule": "grid.x = M (captured launcher rule, pm_aco_oracle.rs:350-355; workgroups with row0=2*wg>=M exit, hip:49-50)"
+      },
+      "buffer_bytes": {
+        "A": 46644328,
+        "x": 68608,
+        "y": 20476
+      },
+      "kernarg_template_hex_pointer_slots_zero": "000000000000000000000000000000000000000000000000ff13000000430000",
+      "kernarg_template_sha256": "67a9a77e55e0ebdce4a1be936c87e9653220b390183c99629ae58910cc6bf92f",
+      "pre_payload_sha256": {
+        "A": "fa5e77962b875fc792912c3ac83da0b87fbe33f9e376d9dc6dd47165d55c0c4b",
+        "x": "fde65a7ef0fd661fc5bc53aac0f5a7bc86979ceea3f14dd02681ceeb56e22231",
+        "y": "dbab410b135081a905360076f273f2e64738aae988b80e1807a0b96b983b939d"
+      },
+      "pre_framed_sha256": {
+        "A": "259e91812289a8652934e9ce0a6d9e205a3b36c0e3930460bd747d095f89193b",
+        "x": "6a38a9f23e0138aecafa5f9ec2a12415c1fb978c72e61a77ec5bb0d938e92eb0",
+        "y": "0767835f063c2a969075cfc79148fe5f21f0fffd736126e2652d8f5b347191a1"
+      }
+    }
+  ],
+  "arms": [
+    {
+      "arm_id": "V0",
+      "role": "original SPIR-V pipeline executed under the producing Vulkan driver (reference arm) - NOTE exported SPIR-V and ACO binary exist (observed); the executed reference result does not",
+      "execution_api": "vulkan",
+      "pinned_now": [
+        {
+          "name": "spirv_source_glsl",
+          "sha256": "9d8b98b85de1b42d6836fa07949f40b071c1b2846c9dd69aaa7302c129ab90cb"
+        },
+        {
+          "name": "spirv_binary",
+          "sha256": "a551573300dc9db3771ebe9417d8503fbd1e720942c4835ee7cd0cc2a618e0fc"
+        },
+        {
+          "name": "aco_binary_shader_bin",
+          "sha256": "ff89b0579505459c566330ab4b259c293a8c825e324648d57a80fced81372670"
+        },
+        {
+          "name": "aco_executable_range_0_5456",
+          "sha256": "d860d885a18e49b748fbb4659735024d1f04fa090da6fb68cf25ecf97374a680"
+        },
+        {
+          "name": "abi_sidecar",
+          "sha256": "ffcce5e67ddf4435fc1ffc34719e3d544b1136d37f5a0bfd12883cdc8010f7dd"
+        },
+        {
+          "name": "rawspec",
+          "sha256": "b785dae525c27dadb5b3bd7cd664a9c77eb00525d20ce8b9a0d2aeb69a163413"
+        },
+        {
+          "name": "radv_driver_library_patched_build",
+          "sha256": "65bd3163bf8b1351237d59e5fc451b7a69cb24efab4a8861075a46469ec18118"
+        },
+        {
+          "name": "mesa_export_patch",
+          "sha256": "c258fbc927941534af7a444d41173aa97ae330b5d130156a0913e09e039812ee"
+        }
+      ],
+      "exists_now": false,
+      "required_before_use": [
+        "pipeline_key_global_key_hex_if_binary_import_is_used",
+        "framed_post_buffers_sha256_per_cell_and_buffer (aco-vulkan-ref-v1 reference receipt executed on the exact exported driver build 65bd3163... )",
+        "execution_receipt_for_each_mode_claimed"
+      ],
+      "artifact_exported": true,
+      "executed_reference_receipt_exists": false
+    },
+    {
+      "arm_id": "Hpm",
+      "role": "ACO-origin PM raw lift + HSA adapter executed through HIP",
+      "execution_api": "hip",
+      "pinned_now": [],
+      "exists_now": false,
+      "required_before_use": [
+        "object_sha256",
+        "manifest_aco-pm-candidate-v1_sha256",
+        "spirv_sha256",
+        "aco_binary_sha256",
+        "raw_stream_roundtrip_digest",
+        "static_certificate_digest",
+        "abi_adapter_digest_and_body_ranges",
+        "unchanged_body_digest",
+        "hsa_elf_sha256",
+        "entry_state_contract",
+        "shape_support_odd_tail_flag",
+        "loaded_executable_binding_proof"
+      ]
+    },
+    {
+      "arm_id": "Vpm",
+      "role": "PM-certified original Vulkan binary replay (private-import candidates are a separate later arm with their own envelope namespace)",
+      "execution_api": "vulkan",
+      "pinned_now": [],
+      "exists_now": false,
+      "required_before_use": [
+        "original_binary_blob_sha256_unmodified",
+        "envelope_kind=RadvOriginalBinary",
+        "global_key_and_binary_key_hex",
+        "extraction_mapping_code_config_abi",
+        "static_certificate_digest",
+        "loaded_executable_binding_proof(actual pipeline built from import path)",
+        "incompatible_key_rejection_receipt",
+        "note: exported shader.bin is the ACO callback code binary, not a RADV-serialized pipeline binary blob"
+      ]
+    },
+    {
+      "arm_id": "Hllvm",
+      "role": "tuned hipcc incumbent (reference for exact default replacement)",
+      "execution_api": "hip",
+      "pinned_now": [
+        {
+          "name": "source_snapshot",
+          "sha256": "869f4a4bdd33adc3e5a3aa9a6faa7584b53d50b0930f1d9e737e19a77975dc0e"
+        },
+        {
+          "name": "object_hsaco",
+          "sha256": "bd87c3e5a11ae57644a3e462af3398adea5da973cfc95789230d0e6d79b742ca"
+        },
+        {
+          "name": "device_elf_sha256_from_inventory",
+          "sha256": "9b42c676d8eb472e3af79bb05e26235f60a79950c3e8c885f9b9d58973ba59cd"
+        }
+      ],
+      "exists_now": true,
+      "compile_flags": [
+        "--genco",
+        "--offload-arch=gfx1201",
+        "-O3",
+        "--no-offload-compress",
+        "-fuse-cuid=none",
+        "-mcode-object-version=6",
+        "-DIU4_A4_CANDIDATES=2"
+      ],
+      "required_before_use": [
+        "loaded_executable_binding_proof(module bytes loaded == pinned object)",
+        "hipcc/rocm version recorded in receipt"
+      ]
+    },
+    {
+      "arm_id": "Hbuilder",
+      "role": "accepted builder twin, additional incumbent where already shipping",
+      "execution_api": "hip",
+      "pinned_now": [
+        {
+          "name": "co",
+          "sha256": "1214242d3c152aa7919182150c96c4b1033aadc312731171679948c50658c3f0",
+          "freeze_time_sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d"
+        },
+        {
+          "name": "hxaco",
+          "sha256": "7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d",
+          "freeze_time_sha256": "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757"
+        },
+        {
+          "name": "source_rs",
+          "sha256": "ebdbde12690c2542a5862d9fa1d5513cfa9193cc7364fed8ecc12e452596743d"
+        }
+      ],
+      "exists_now": true,
+      "code_end_tail_fill": "0.4.3 regeneration of the shipped builder twin (builder 19fc7e2c): sha256 above are the regenerated objects, freeze_time_sha256 the 2026-10-11 freeze-time objects. The regeneration only appended the emitter's code-end tail fill (s_code_end words) to .text (4296 -> 4736 bytes; the freeze-time .text is a byte prefix). Kernel body, descriptors, symbols and metadata are unchanged; only the added tail, the ELF layout fields derived from the new .text size (section addresses/offsets, .relro_padding) and the _DYNAMIC symbol value in .symtab differ. No GPU hardware oracle, timing or Vulkan measurement was repeated and none is claimed (CPU compiler, static, emulator and RIP oracle checks run on the new objects are not hardware remeasurement); acceptance/oracle/timing/perf/receipt records and the 2026-10-11 pilot results stay bound to the freeze-time objects.",
+      "required_before_use": [
+        "loaded_executable_binding_proof"
+      ]
+    }
+  ],
+  "arm_envelope_requirements": {
+    "rule": "Every arm result record MUST carry all fields below, bound to the exact artifact and exact execution plan; absent or mismatching fields are refused, never inferred. Digests are real sha256 values or the arm is not yet runnable; no placeholder digest is permitted. The generic OracleReceipt (radiowave lib.rs:480-487) does not identify this matrix and is not sufficient alone.",
+    "fields": [
+      "arm_id",
+      "artifact_kind",
+      "producer_kind_build_options",
+      "source_hashes",
+      "arch",
+      "wave_size",
+      "block",
+      "kernarg_abi_sha256",
+      "raw_executable_data_config_entry_sha256",
+      "static_certificate_digest",
+      "abi_adapter_digest",
+      "envelope_kind",
+      "blob_sha256",
+      "compat_or_global_key",
+      "loaded_executable_binding",
+      "corpus_id",
+      "fixtures_sha256",
+      "cell_id",
+      "execution_mode",
+      "state_surface_digest",
+      "paired_receipt_ids",
+      "device_uuid",
+      "driver_or_runtime_build",
+      "negative_control_results",
+      "differing_bytes"
+    ],
+    "per_claim_pair_binding": "each of the claims below names the pair of arm records it compares by receipt id"
+  },
+  "claims": [
+    {
+      "id": "K1",
+      "statement": "V0 == Hpm (foreign-body/ABI preservation)",
+      "status": "not_run"
+    },
+    {
+      "id": "K2",
+      "statement": "V0 == Vpm (Vulkan re-entry/envelope/loaded-code preservation)",
+      "status": "not_run"
+    },
+    {
+      "id": "K3",
+      "statement": "Hpm == Hllvm and Vpm == Hllvm (exact replacement of incumbent recipe); Hbuilder compared as additional incumbent",
+      "status": "not_run"
+    },
+    {
+      "id": "K4",
+      "statement": "eager == HIP graph == (admitted) retained/railgun == Vulkan command-buffer replay == mixed island, per mode actually claimed",
+      "status": "not_run"
+    },
+    {
+      "id": "K5",
+      "statement": "island dispatch == singleton dispatch for the same preimage, per buffer",
+      "status": "not_run"
+    }
+  ],
+  "comparison": {
+    "rule": "raw byte equality of the surface lists below; zero differing bytes; no ULP/KLD/tolerance; compare byte arrays not float values (NaN payload/-0 cannot hide)",
+    "same_logical_inputs_backend_correct_pointers": true
+  },
+  "surfaces": {
+    "output": [
+      {
+        "id": "y_payload",
+        "where": "y frame bytes [4096, 4096+4M)",
+        "note": "read-modify-write: pre-image content participates in the result"
+      }
+    ],
+    "input_unchanged": [
+      {
+        "id": "A_payload",
+        "where": "A frame payload; post == pre"
+      },
+      {
+        "id": "x_payload",
+        "where": "x frame payload; post == pre"
+      },
+      {
+        "id": "kernarg_blob",
+        "where": "32-byte blob padded to 16; post == pre"
+      }
+    ],
+    "guards": [
+      {
+        "id": "front_guard",
+        "where": "each of A,x,y frames bytes [0,4096) all 0xA5"
+      },
+      {
+        "id": "back_guard",
+        "where": "each frame bytes [4096+len, 8192+len) all 0xA5"
+      },
+      {
+        "id": "granule_tail",
+        "where": "each frame bytes from 8192+len to mapped end all 0xA5"
+      }
+    ],
+    "full_state": [
+      "A frame (whole mapped length)",
+      "x frame (whole mapped length)",
+      "y frame (whole mapped length)",
+      "kernarg blob",
+      "for island: the A/x frames once plus y1,y2 frames and both kernarg blobs"
+    ],
+    "model_state_touched": "none: no KV, GDN/recurrent, conv, PLE, RNG, accepted-token or cursor state exists in this corpus; the corpus claims nothing about them (corpus buffers are corpus-owned, not model-owned)",
+    "odd_M_note": "For odd M the last workgroup writes only y[M-1] with a 4-byte store; the first back-guard byte must remain 0xA5 (an erroneous y[M] write is a guard failure)",
+    "reference": "pm_aco_oracle.rs:743-766"
+  },
+  "negative_controls": {
+    "rule": "Each control is a deliberate single-field change that the comparison MUST report as a nonzero difference in exactly the changed surface; a missed control invalidates the receipt. Controls run on every cell unless a row says otherwise.",
+    "output_input_guard_tamper": [
+      "y[0] low bit flip (y_payload first byte ^= 0x01)",
+      "y[M-1] sign bit flip (last y byte ^= 0x80)",
+      "A unchanged-input byte flip (mid-payload byte ^= 0x01)",
+      "x unchanged-input byte flip (first payload byte ^= 0x01)",
+      "y front-guard byte flip (frame byte 0 ^= 0x01)",
+      "A back-guard last byte flip (^= 0x01)"
+    ],
+    "wrong_input_edits_cells_C1_C2_required_C3_C4_adapted_to_last_row_last_group": [
+      "A byte 8 ^= 0x10",
+      "all 128 nibble bytes of row 0 group 0 inverted",
+      "all nibble bytes of row M/2 group G/2 inverted",
+      "all nibble bytes of last row last group inverted",
+      "x byte 0 ^= 0x10",
+      "x last byte ^= 0x10"
+    ],
+    "cross_arm": "tampered reference y[1] (^= 0x01) vs candidate must differ",
+    "wrong_abi_artifact_epoch_controls": [
+      "swapped M/K in kernarg",
+      "wrong pointer slot order",
+      "wrong artifact digest",
+      "incompatible global/pipeline key",
+      "disabled candidate must not execute and must not fall back to baseline under a candidate receipt",
+      "stale/old-epoch preimage (post bytes reused as pre)"
+    ],
+    "wrong_abi_controls_owner": "U1/U-F2/U-F4 milestones define execution; U0 only freezes that they are required before promotion",
+    "reference": "pm_aco_oracle.rs:889-899,1000-1073; PM-UNION.md:204"
+  },
+  "repeat_sequence": {
+    "id": "S1",
+    "order": [
+      "C1_occ0_full",
+      "C2_occ127_full",
+      "C1_occ0_full"
+    ],
+    "rule": "Single process, per arm and per execution mode; the loaded executable handle is created once and reused across all three launches (no reload, no recompile between launches); kernarg rewritten per launch; fresh independent restored preimages every launch. Expected: launch 3 output frames byte-identical to launch 1 and to the cell's own arm result; launch 2 identical to its singleton. Catches stale pipeline/descriptor/specialization/kernarg/cache-state carry-over between K=6144 and K=17408.",
+    "not_frozen": "A comparable odd-cell sequence is not frozen by U0"
+  },
+  "execution_modes": {
+    "rule": "Each mode is admitted separately per arm; passing one mode never admits another, and graph/retained/mixed results must be compared to eager for the same cell.",
+    "modes": [
+      {
+        "id": "hip_eager",
+        "apis": "hip",
+        "admitted_by_u0": false,
+        "pilot_reference": "pm_aco_oracle.rs:780-788"
+      },
+      {
+        "id": "hip_graph_capture_replay_x2",
+        "apis": "hip",
+        "admitted_by_u0": false,
+        "detail": "capture, reset frames, replay twice from reset; both replays equal",
+        "pilot_reference": "pm_aco_oracle.rs:793-818"
+      },
+      {
+        "id": "railgun_retained",
+        "apis": "hip",
+        "admitted_by_u0": false,
+        "detail": "only if the arm is claimed on the retained PM4 route; whole-state twin check per railgun_check.rs:6-38"
+      },
+      {
+        "id": "vulkan_cmdbuf_replay",
+        "apis": "vulkan",
+        "admitted_by_u0": false
+      },
+      {
+        "id": "mixed_host_fenced_island",
+        "apis": "hip+vulkan",
+        "admitted_by_u0": false,
+        "detail": "host-fenced only; no semaphore/async claim"
+      }
+    ]
+  },
+  "island": {
+    "id": "I1_two_dispatch_duplicate_kernel",
+    "status": "PLAN ONLY: no GPU result, no model-state transfer, no runtime admission",
+    "cell": "C1_occ0_full geometry (M5120 K6144, grid [5120,1,1], block [32,1,1])",
+    "kernel": "one frozen arm artifact loaded twice into two independent executable handles (D1 and D2: separate module/pipeline instances of identical bytes; distinct kernarg blobs)",
+    "shared_immutable": {
+      "A": "C1 A pre payload (fixture arg0.pre.bin of occ0), single frame",
+      "x": "C1 x pre payload (arg8.pre.bin of occ0), single frame",
+      "rule": "A and x frames are read-only for both dispatches; their full frames are hashed before D1 and after D2 and must be byte-identical"
+    },
+    "disjoint": {
+      "y1": {
+        "preimage": "occ0 arg16.pre.bin",
+        "sha256": "33bea66ece8108a06b4cdeb3409d20400b62794e0d13857cccb6ed3510eaec73"
+      },
+      "y2": {
+        "preimage": "occ127 arg16.pre.bin (M=5120, length 20480, same M as C1; real fixture bytes used as an independent second y preimage)",
+        "sha256": "a6ca8432d95c2c99674b43244a7eb6670fdfaa69cf0ef974b3b8425b98aeeefc"
+      },
+      "guards": "each of y1,y2 has its own 4096+4096 0xA5 guard frame and its own mapped tail; no frame overlaps another",
+      "preimages": "independently restored per run; D2's preimage is never D1's output"
+    },
+    "kernarg": {
+      "D1": {
+        "A": "shared A",
+        "x": "shared x",
+        "y": "y1",
+        "M": 5120,
+        "K": 6144
+      },
+      "D2": {
+        "A": "shared A",
+        "x": "shared x",
+        "y": "y2",
+        "M": 5120,
+        "K": 6144
+      }
+    },
+    "orders": [
+      "D1 then D2",
+      "D2 then D1"
+    ],
+    "order_rule": "host-fenced between dispatches; both orders must give identical bytes; no concurrency/async claim",
+    "expected_equalities": [
+      "y1_post == singleton result for (A,x,y=occ0 y) in the same arm and mode",
+      "y2_post == singleton result for (A,x,y=occ127 y) in the same arm and mode",
+      "A,x frames unchanged; all guards/tails 0xA5"
+    ],
+    "island_negative_controls": [
+      "flip one byte of y1 post: caught only in y1 frame",
+      "pass y2 pointer to D1 (swap): caught as wrong-pointer, both y frames differ from expected",
+      "omit D2 (y2 stays pre): caught",
+      "re-run D1 without restoring y1 pre (double add): caught",
+      "write attempt visible as change of A or x: caught by pre/post frame hash"
+    ],
+    "state_surface": "A frame, x frame, y1 frame, y2 frame, both kernarg blobs",
+    "non_goals": [
+      "no tensor/model state transfer",
+      "no VMM/shared-handle or semaphore interop (U-F3)",
+      "no scheduling policy or route selection (U-F4)"
+    ]
+  },
+  "source_pins": [
+    {
+      "role": "hipcc incumbent source (compile input of the pinned object: weight-buffer preamble + kernel)",
+      "path": "<release-workdir>/parallel-packs/registry/gfx1201/gemv_hfq4g256_residual_mq4v2.hip",
+      "sha256": "869f4a4bdd33adc3e5a3aa9a6faa7584b53d50b0930f1d9e737e19a77975dc0e",
+      "hashed_with": "sha256sum",
+      "note": "inventory source_sha256 inventory.json:43159"
+    },
+    {
+      "role": "tree kernel source (kernel body only; text differs from registry snapshot by the 55-line preamble)",
+      "path": "kernels/src/gemv_mq4g256v2_residual.hip",
+      "sha256": "be1bc095db85d98b9665421093e0c06cd0b320610e4a58100e8f6c82d14094c2",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "hipcc incumbent object (Hllvm)",
+      "path": "<release-workdir>/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/kernel.hsaco",
+      "sha256": "bd87c3e5a11ae57644a3e462af3398adea5da973cfc95789230d0e6d79b742ca",
+      "hashed_with": "sha256sum",
+      "note": "inventory object_sha256 inventory.json:43194"
+    },
+    {
+      "role": "hipcc incumbent build command",
+      "path": "<release-workdir>/jit-peacemaker/hipcc/gfx1201/gemv_hfq4g256_residual_mq4v2/rep-1/command.json",
+      "sha256": "a0d1d53faef63691a0e00312e7360082fd57d2de60551381c4dc1edbbb78b19d",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "decode-twin inventory",
+      "path": "<release-workdir>/pm-decode-twins/inventory.json",
+      "sha256": "b17f6b13e0c740f40fd9a3090fa3e84603d378afb622671eb487583a70f85f10",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "accepted builder twin source (additional incumbent)",
+      "path": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
+      "sha256": "ebdbde12690c2542a5862d9fa1d5513cfa9193cc7364fed8ecc12e452596743d",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "accepted builder twin asm",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.s",
+      "sha256": "463cad60ff98ae9eec7ec9d52632745cd8d16acef672b057029cf8c7b42b28dd",
+      "freeze_time_sha256": "b320c9d07cebea702fc4bb206d3637505b363de9826fc739ce05ec16979c991f",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "accepted builder twin code object",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.co",
+      "sha256": "1214242d3c152aa7919182150c96c4b1033aadc312731171679948c50658c3f0",
+      "freeze_time_sha256": "bca8ec25b5fdf77147df2ac7a0b925d688fc550ce50090ba0bd8d20616585c7d",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "accepted builder twin hxaco",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.hxaco",
+      "sha256": "7c98a6a0071b28817224deeec6a28ffac1aeccab2286382377902e47e8df7f2d",
+      "freeze_time_sha256": "8e2cb8e6bbefeca5d996d274e06e37532140cf42ca65606a565404f6e3790757",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "accepted builder twin radiowave record",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.radiowave.json",
+      "sha256": "8ae44ce1fa2fef8a1cd9b3ee60c9b5b521b31951afa3d579d1eee26381f2a413",
+      "freeze_time_sha256": "9d5924ff7e7699493c48d610c0d9ce23bbf496001f5591a9081195a8de02bacf",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "accepted builder twin shape record",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.shape.json",
+      "sha256": "16dd862bd1ba296f48baaea43c97d90a003a326851237362cad45134e6f23847",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "accepted builder twin proof record",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.proof.json",
+      "sha256": "7841824b22f266904466041d1b8a2317358717baea2630dd60a55d894ea78cb4",
+      "freeze_time_sha256": "1b71bd5d8f82ce3bd74e47bb8cd67d7f45be951b367c8dfaba8f36b6e6b23a98",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "accepted builder twin m7 record",
+      "path": "kernels/pm-decode/gfx1201/gemv_hfq4g256_residual_mq4v2.m7.json",
+      "sha256": "8e036da174efbc71e40468ba2b292a7711300ef2402536611ff87fd32650ba41",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "SPIR-V source twin template (V0/Hpm/Vpm producer input; pilot-owned, uncommitted working tree)",
+      "path": "<release-workdir>/worktrees/pm-aco-pilot-20261011/crates/peacemaker-lift/tests/fixtures/aco/src/gemv_mq4g256v2_residual.comp",
+      "sha256": "9d8b98b85de1b42d6836fa07949f40b071c1b2846c9dd69aaa7302c129ab90cb",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pilot four-arm oracle harness (pilot-owned, uncommitted working tree)",
+      "path": "<release-workdir>/worktrees/pm-aco-pilot-20261011/crates/rdna-compute/examples/pm_aco_oracle.rs",
+      "sha256": "0b5e98bd947d1f486841f6b81328ffcaf83590b7e925868cc5cb1fd232fd7ead",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pilot Vulkan reference receipt consumer (pilot-owned, uncommitted working tree)",
+      "path": "<release-workdir>/worktrees/pm-aco-pilot-20261011/tools/aco-export/src/reference.rs",
+      "sha256": "c642bef439335978f8a1c7aa6c1943174be24f66e95de963cb1be6a0f6a10125",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "Mesa pin record",
+      "path": "<peacemaker-workdir>/aco-shim/pin.json",
+      "sha256": "c6c6942f845f75a306d8370d4864339113f2c41283d9ef70bcb1405f46fdeab7",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa file (also recorded in pin.json files_sha256)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/compiler/aco_opcodes.py",
+      "sha256": "d0ac25b0b52185c807b32acb751a4d96be9d5792e1ec4773835b64b191010e7e",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa file (also recorded in pin.json files_sha256)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/compiler/aco_assembler.cpp",
+      "sha256": "a2a35b4716206714ba0518e23985d7d51bad8d884c4106c969f0b23d7122d784",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa file (also recorded in pin.json files_sha256)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/compiler/aco_insert_waitcnt.cpp",
+      "sha256": "e84a9fb537fc05983b0bc5ce4282c2dc2b6fa0e2494ab9e6cd841abdc021ef87",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/compiler/aco_interface.cpp",
+      "sha256": "a19f1d12a9824cd39ba5a297c60fe3191dd3aa848b7117d566ddd5346d2dd428",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_pipeline_compute.c",
+      "sha256": "5fd82d7674abc36bc740e5049a95d6aaaf4e2ade41fd5ea12b2cc9d691662052",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_shader.c",
+      "sha256": "db5b23f445c9229535537b3fedfbdd3550c9d0720058ff53de7be03e0f856706",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_pipeline_binary.c",
+      "sha256": "81c652fe0613b0e567a86f9113ef8bec99891da899842c5d43447f5d76271599",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_pipeline_cache.c",
+      "sha256": "9dff38382af8be6f4f9c393c82b2d7282d0f53674a1cb4848a4641d007cb1b1f",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_shader_args.c",
+      "sha256": "e9165b77f105f19192dba05fa478c069de01556d4bb658a89c02b0ed196e39a7",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_device_memory.c",
+      "sha256": "e3d12ae5bbf93073e4cfc732a153d591b9e64c1c34c6c6f7df4eae1c2cb0e053",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "pinned Mesa plan source (tracked, unmodified vs commit 60e95b78 per git status at freeze)",
+      "path": "<peacemaker-workdir>/mesa/src/amd/vulkan/radv_physical_device.c",
+      "sha256": "9a4fbe36d5426aabb967410a06cb05a1f7387465a8917c72c09cb8def097d26d",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "H source: whole-state snapshot/twin/restore + negative-control methodology",
+      "path": "crates/rdna-compute/src/railgun_check.rs",
+      "sha256": "93f44ce2d6790d9520cc06c16f49371cd41805569d263d9ee9e27a3a5dbd2af3",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "H source: PeacemakerRecord/OracleReceipt vocabulary",
+      "path": "crates/radiowave/src/lib.rs",
+      "sha256": "302b8fbfe1390da0af10b0aec74600609aa2bf76e0466e0c15f62e477d552d1f",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "H source: ReplayQuiescence",
+      "path": "crates/rdna-compute/src/replay.rs",
+      "sha256": "2711fd12c1c5daa4478345bb443518bb03344056084f131d3b83ecdbac7dab4b",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "H source: launch_maybe_blob_bound capture boundary",
+      "path": "crates/rdna-compute/src/dispatch.rs",
+      "sha256": "bc27840992fb02b05e4b3550797dce797ead42cbb45af428077f77085c013e48",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "H source: load_kernel_module/load_embedded_module funnel",
+      "path": "crates/rdna-compute/src/scratch.rs",
+      "sha256": "2830287ff2144e4f90bc74f2aaa0683089c57e99fa6bf2aff5ad7691b53ce769",
+      "hashed_with": "sha256sum"
+    },
+    {
+      "role": "H source: m7 static check",
+      "path": "crates/peacemaker-isa/src/pm_check.rs",
+      "sha256": "33b12c3d37a7b2d4715f7a177273259e5ce1609c49cf31d55eec6fd90e2a04e2",
+      "hashed_with": "sha256sum"
+    }
+  ],
+  "citations": {
+    "pilot_oracle": {
+      "file": "<release-workdir>/worktrees/pm-aco-pilot-20261011/crates/rdna-compute/examples/pm_aco_oracle.rs",
+      "lines": {
+        "purpose_modes": "4-47",
+        "consts_abi": "62-76",
+        "length_checks": "215-219",
+        "shape_struct": "285-322",
+        "fixture_shape": "324-340",
+        "derived_shape_row_crop": "342-383",
+        "framed": "395-399",
+        "receipt_framing_checks": "646-647",
+        "mapped_frame_alloc": "702-734",
+        "readback_guard_check": "743-766",
+        "eager": "780-788",
+        "graph": "793-818",
+        "negative_control_detect": "889-899",
+        "negative_controls": "1000-1073"
+      }
+    },
+    "hip_kernel": {
+      "file": "kernels/src/gemv_mq4g256v2_residual.hip",
+      "lines": {
+        "launch_bounds": "35-42",
+        "signature": "43-48",
+        "row_pair_and_exit": "49-52",
+        "group_stride": "61-69",
+        "quads_tail": "77-78",
+        "dog_macro": "80-89",
+        "quad_loop": "114-193",
+        "tail_groups": "195-236",
+        "reduction": "242-247",
+        "epilogue": "249-258"
+      }
+    },
+    "spirv_source": {
+      "file": "<release-workdir>/worktrees/pm-aco-pilot-20261011/crates/peacemaker-lift/tests/fixtures/aco/src/gemv_mq4g256v2_residual.comp",
+      "lines": {
+        "float_controls": "33-34",
+        "local_size": "36",
+        "push_block": "43-49",
+        "main": "119-181",
+        "reduce": "164-167",
+        "epilogue": "169-180"
+      }
+    },
+    "builder_twin": {
+      "file": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
+      "lines": {
+        "recipe_header": "1-10",
+        "build_gfx1201": "20-50"
+      }
+    },
+    "inventory": {
+      "file": "<release-workdir>/pm-decode-twins/inventory.json",
+      "lines": {
+        "module_entry": "43136",
+        "source_sha256": "43159",
+        "object_sha256": "43194",
+        "device_elf_sha256": "43195"
+      }
+    },
+    "H_methodology": {
+      "railgun_check.rs": "6-38",
+      "replay.rs": "41-50",
+      "dispatch.rs": "3021 (launch_maybe_blob_bound)",
+      "scratch.rs": "564 (load_kernel_module), 615 (load_embedded_module)",
+      "radiowave_lib.rs": "429-438 PeacemakerRecord, 480-487 OracleReceipt",
+      "pm_check.rs": "35 (m7)"
+    },
+    "mesa_pinned": {
+      "root": "<peacemaker-workdir>/mesa/",
+      "commit": "60e95b787857afbc9a00b693b91c0d9c8923a430",
+      "lines": {
+        "src/amd/compiler/aco_interface.cpp": "102-174 pipeline (spill/schedule/RA/post-RA/waitcnt/delay_alu/clauses), 247-270 select+assemble+callback",
+        "src/amd/vulkan/radv_pipeline_compute.c": "93-132 radv_compile_cs, 248-307 binary import branch",
+        "src/amd/vulkan/radv_shader.c": "3284-3325 shader_compile (LLVM/ACO select, config postprocess)",
+        "src/amd/vulkan/radv_pipeline_binary.c": "73-96 global key, 130-156 create from data, 160-181 create from shader",
+        "src/amd/vulkan/radv_pipeline_cache.c": "66-81 deserialize, 95-119 serialize",
+        "src/amd/vulkan/radv_shader_args.c": "68-111 descriptor/push SGPR args, 540-595 compute SGPR/VGPR args",
+        "src/amd/vulkan/radv_device_memory.c": "173-182 fd/dma-buf import consumes fd (U-F3 context only)",
+        "src/amd/vulkan/radv_physical_device.c": "1739-1747 subgroup capabilities"
+      }
+    }
+  },
+  "limits": [
+    "Pilot-owned files cited above are an uncommitted working tree at freeze: their sha256 pins identify the frozen bytes; consumers must refuse a different digest rather than follow the live file.",
+    "The registry snapshot (compile input of the pinned hipcc object) and kernels/src differ in text; this corpus binds the incumbent to the registry snapshot + object digest. Recipe equality between the two texts is not asserted here.",
+    "Arms V0, Hpm, Vpm do not exist; this document is not evidence of any parity.",
+    "Observed export (rev 2) is an export only: no lift/equality/replay proof exists, claims K1-K5 remain not_run.",
+    "The export was compiled by a PATCHED Mesa build (hook patch sha256 c258fbc9..., patched aco_interface.cpp/radv_shader.c etc.); the Mesa plan-source pins in `source_pins` are the unpatched files, and their line numbers may differ in the patched files. The V0 reference arm must be executed on the exact exported driver build (libvulkan_radeon.so sha256 65bd3163...).",
+    "The export disassembly used ROCm 10.1 llvm-mc (sha256 9ff7bd4c...), whereas Mesa pin.json names core-10.0; instruction text is advisory and is not the byte identity (shader.bin is).",
+    "Source pins stay the frozen snapshot; the pilot files are not re-pinned. The pilot's current file bytes were not re-hashed in rev 2."
+  ],
+  "revision": 2,
+  "revision_notes": "Rev 2 (2026-10-11): added `exported_artifacts` (observed pilot export manifest pins) and updated arms V0/limits/status. Cells, fixture bytes, recipe, fixtures_sha256 and all source_pins are unchanged from rev 1.",
+  "exported_artifacts": {
+    "status": "exported; NO lift, NO equality, NO replay proof, NO Vulkan reference receipt (`aco-vulkan-ref-v1`), NO candidate manifest (`aco-pm-candidate-v1`) observed",
+    "observed_at": "2026-10-11 (files mtime Oct 11 07:27)",
+    "owner": "ACO pilot owner (pilot-owned; U0 records observations only, no edit)",
+    "directory": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/",
+    "files": [
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/artifact.json",
+        "bytes": 13425,
+        "sha256": "79214366483647be3b79700cdf9e02ac9e92c9e8a86ae835311eafdc65168cbd",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv",
+        "bytes": 18220,
+        "sha256": "a551573300dc9db3771ebe9417d8503fbd1e720942c4835ee7cd0cc2a618e0fc",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.bin",
+        "bytes": 5476,
+        "sha256": "ff89b0579505459c566330ab4b259c293a8c825e324648d57a80fced81372670",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.abi.json",
+        "bytes": 7516,
+        "sha256": "ffcce5e67ddf4435fc1ffc34719e3d544b1136d37f5a0bfd12883cdc8010f7dd",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.rawspec.json",
+        "bytes": 1548,
+        "sha256": "b785dae525c27dadb5b3bd7cd664a9c77eb00525d20ce8b9a0d2aeb69a163413",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.aco.dump",
+        "bytes": 38085,
+        "sha256": "1315fbca1e7d2ad5b174ee120c88a6f2ae45b6eaa61c7d946eb8a69439c575b2",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/capture.json",
+        "bytes": 6492,
+        "sha256": "975ce74211e0f632e07d39a1699c78fc0eb941a503feb014fd0c4ee4242938ef",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/identity.json",
+        "bytes": 446,
+        "sha256": "8bfcdba291d95458de7cf49df6bce40b5185469da92b9b7faf7d38a2a14a5ef1",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/aco.disasm.txt",
+        "bytes": 67214,
+        "sha256": "b841a8492aabf9c7495dc7dd1f7bd2a905c1aac93d60e501daa0379080b657a4",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/final.nir.txt",
+        "bytes": 54146,
+        "sha256": "bab2ff5d8532e498a0ac00d53f0d127a4cf1ac4d8042eaf14957545d808bb344",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host-stats.txt",
+        "bytes": 477,
+        "sha256": "ee131477bcb39587e5f1e1297d7ebdbae2ea3e5fc2fea5f08a5418caaedec83e",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      },
+      {
+        "path": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host.stderr.txt",
+        "bytes": 746,
+        "sha256": "4a7a9935ff78436aba3ae10a027d5c782c893967c3cee4465b8999c6f742ef7a",
+        "hashed_with": "sha256sum (re-verified by hashlib on the same bytes)"
+      }
+    ],
+    "binary": {
+      "file": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.bin",
+      "bytes": 5476,
+      "sha256": "ff89b0579505459c566330ab4b259c293a8c825e324648d57a80fced81372670",
+      "executable": {
+        "offset": 0,
+        "len": 5456,
+        "sha256": "d860d885a18e49b748fbb4659735024d1f04fa090da6fb68cf25ecf97374a680",
+        "range_hash_verified": true
+      },
+      "trailing": {
+        "offset": 5456,
+        "len": 20,
+        "sha256": "9754d4a15268314011364b6b4844cd5feab9e8c38efff00feba5290d39249f72",
+        "range_hash_verified": true,
+        "content": "5 x 0x9fbf0000 (observed: 00009fbf little-endian words) after the executable range; not part of exec range"
+      },
+      "relocations": [],
+      "symbols": [],
+      "note": "This is the ACO callback binary (code only), not a RADV-serialized pipeline binary: no vkGetPipelineBinaryData blob, pipeline key or global key exists in the export, so Vpm identity fields (blob_sha256, compat/global key) remain unfulfilled."
+    },
+    "rawspec": {
+      "file": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.rawspec.json",
+      "schema": "pm-raw-kernel-spec-v1",
+      "sha256": "b785dae525c27dadb5b3bd7cd664a9c77eb00525d20ce8b9a0d2aeb69a163413",
+      "binary_sha256": "ff89b0579505459c566330ab4b259c293a8c825e324648d57a80fced81372670",
+      "exec": {
+        "offset": 0,
+        "len": 5456
+      },
+      "exec_sha256": "d860d885a18e49b748fbb4659735024d1f04fa090da6fb68cf25ecf97374a680",
+      "sidecar": "shader.abi.json",
+      "sidecar_sha256": "ffcce5e67ddf4435fc1ffc34719e3d544b1136d37f5a0bfd12883cdc8010f7dd",
+      "entry_fact_records": 9,
+      "wave": 32,
+      "target": {
+        "abi_version": 0,
+        "arch": "gfx1201",
+        "sramecc": "any",
+        "xnack": "any"
+      }
+    },
+    "abi_sidecar": {
+      "file": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.abi.json",
+      "schema": "pm-aco-abi-v1",
+      "sha256": "ffcce5e67ddf4435fc1ffc34719e3d544b1136d37f5a0bfd12883cdc8010f7dd",
+      "push_block": {
+        "A": [
+          0,
+          8
+        ],
+        "x": [
+          8,
+          8
+        ],
+        "y": [
+          16,
+          8
+        ],
+        "M": [
+          24,
+          4
+        ],
+        "K": [
+          28,
+          4
+        ]
+      },
+      "note_unhandled_by_design": "ttmp8 and other ttmp reads are not declared; the lift is stated to reject an undefined read"
+    },
+    "spirv": {
+      "file": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv",
+      "bytes": 18220,
+      "sha256": "a551573300dc9db3771ebe9417d8503fbd1e720942c4835ee7cd0cc2a618e0fc",
+      "source_glsl_sha256": "9d8b98b85de1b42d6836fa07949f40b071c1b2846c9dd69aaa7302c129ab90cb",
+      "source_glsl_matches_u0_pin": true,
+      "glslang": {
+        "path": "/usr/bin/glslang",
+        "sha256": "bfcc2479c85bdab08c7f7e20425f35d8b9aad176ab5fbbbad3427166c7a259a5",
+        "argv": [
+          "-V",
+          "--target-env",
+          "vulkan1.3",
+          "-S",
+          "comp",
+          "-e",
+          "main",
+          "gemv_mq4g256v2_residual.comp",
+          "-o",
+          "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/shader.spv"
+        ]
+      },
+      "validator": {
+        "path": "/usr/bin/spirv-val",
+        "sha256": "85367fefdb7e93ae45654255ac2b7f8dc7056b6df78a6fdeb03ce395c7477239"
+      },
+      "float_controls": [
+        "DenormPreserve 32",
+        "SignedZeroInfNanPreserve 32"
+      ],
+      "addressing": "PhysicalStorageBufferAddresses (BDA, no descriptor sets)"
+    },
+    "pipeline": {
+      "layout_sha256": "990d3f894605cb220cf98b0e54ff61e06463bad48df1f8ffb267cc5c913d1b37",
+      "specialization_sha256": "6d1cd599435b59d038f9ad163f55470b4c77cb17bb15c8aac52ab96daabe5558",
+      "specialization_entries": 0,
+      "descriptor_set_layouts": 0,
+      "push_constant_range": {
+        "offset": 0,
+        "size": 32,
+        "stage": "COMPUTE"
+      },
+      "local_size": [
+        32,
+        1,
+        1
+      ],
+      "require_full_subgroups": true,
+      "required_subgroup_size": 32,
+      "create_flags": [
+        "CAPTURE_STATISTICS",
+        "CAPTURE_INTERNAL_REPRESENTATIONS"
+      ]
+    },
+    "config": {
+      "wave_size": 32,
+      "exec_size": 5456,
+      "code_size": 5476,
+      "vgprs_allocated": 96,
+      "sgprs_allocated": 108,
+      "sgprs_actual": 107,
+      "lds_bytes": 0,
+      "scratch_bytes_per_wave": 0,
+      "rsrc1": "0x200f000b",
+      "rsrc2": "0x00000094",
+      "rsrc3": "0x00000000",
+      "float_mode": 240,
+      "compute_resource_limits": 16777216,
+      "wgp_mode": true
+    },
+    "compiler_driver": {
+      "kind": "radv-aco (no LLVM in compiler)",
+      "backend_branch_executed": "ACO (capture exists only because the ACO callback ran)",
+      "exporter": {
+        "name": "aco-export",
+        "version": "0.1.0"
+      },
+      "driver_library": {
+        "path": "<release-workdir>/pm-aco-pilot/mesa-build/src/amd/vulkan/libvulkan_radeon.so",
+        "sha256": "65bd3163bf8b1351237d59e5fc451b7a69cb24efab4a8861075a46469ec18118",
+        "sha256_reverified_with_sha256sum": true
+      },
+      "icd_json": {
+        "path": "<release-workdir>/pm-aco-pilot/mesa-build/src/amd/vulkan/radeon_devenv_icd.x86_64.json",
+        "sha256": "b6230d88bdf42e25332ac7fb4dacb17c54b93099040776a969800a67e49885b1"
+      },
+      "vk_aco_host": {
+        "path": "<release-workdir>/pm-aco-pilot/bin/vk_aco_host",
+        "sha256": "f82dde11c4568afec55467d8599879a372f2fec7a2bb5bfe8833781836288021",
+        "source_sha256": "d02bb4593ad00d3efe88a8c36ba38390ab00eb4eece1f1bb7d7b6275acccf803"
+      },
+      "mesa": {
+        "tag": "mesa-26.0.8",
+        "commit": "60e95b787857afbc9a00b693b91c0d9c8923a430",
+        "patch_file": "tools/aco-export/mesa/0001-radv-aco-export-hook.patch",
+        "patch_sha256": "c258fbc927941534af7a444d41173aa97ae330b5d130156a0913e09e039812ee",
+        "patched_files_sha256": {
+          "src/amd/compiler/aco_interface.cpp": "96c9086271bdf555a39f40b99266196964cb7286bb0ce2b6c066139b7884eabf",
+          "src/amd/compiler/aco_interface.h": "2711adfe9da7a963ea9d9e24ce3d63577f602bfca6685a153e00ed47f8989298",
+          "src/amd/compiler/aco_register_allocation.cpp": "da998b83f65dff34ff0a89ff5ee252bdf2e2a7cc46c52e145cc4cbf082b97bda",
+          "src/amd/vulkan/radv_aco_export.inc": "bc3c896c9b04e0ad59400c2cdf6b538c8fed313fe11f9514196dfd50d93f3ace",
+          "src/amd/vulkan/radv_shader.c": "5a9edec983b226f40afbc1b21c3ab93806ca008d1e5479fa31b894e5b1c92030"
+        }
+      },
+      "meson_options": [
+        "-Dbuildtype=debugoptimized",
+        "-Dvulkan-drivers=amd",
+        "-Dgallium-drivers=",
+        "-Dllvm=disabled",
+        "-Dplatforms=",
+        "-Dglx=disabled",
+        "-Degl=disabled",
+        "-Dgbm=disabled",
+        "-Dgles1=disabled",
+        "-Dgles2=disabled",
+        "-Dopengl=false",
+        "-Dvulkan-layers=",
+        "-Dvideo-codecs=",
+        "-Dtools=drm-shim",
+        "-Dbuild-tests=false",
+        "-Dbuild-aco-tests=false",
+        "-Dshader-cache=disabled",
+        "-Dvalgrind=disabled",
+        "-Dlibunwind=disabled",
+        "-Dlmsensors=disabled"
+      ],
+      "env": {
+        "MESA_SHADER_CACHE_DISABLE": "true",
+        "RADV_DEBUG": "nocache",
+        "RADV_ACO_EXPORT_DIR": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/capture-tmp",
+        "VK_DRIVER_FILES": "<release-workdir>/pm-aco-pilot/mesa-build/src/amd/vulkan/radeon_devenv_icd.x86_64.json"
+      },
+      "disassembler": {
+        "path": "/opt/rocm/core-10.1/lib/llvm/bin/llvm-mc",
+        "sha256": "9ff7bd4cf95c171098c2c2f616b65152cb94812a11e86106d3afd0910a37f4cf",
+        "version": "AMD LLVM version 24.0.0git\n  Optimized build.\n",
+        "version_arg": "--version"
+      },
+      "disassembly_files": [
+        "shader.aco.dump",
+        "capture/aco.disasm.txt"
+      ]
+    },
+    "device": {
+      "name": "AMD Radeon AI PRO R9700 (RADV GFX1201)",
+      "pci_bdf": "<pci-bdf>",
+      "device_uuid": "<device-uuid>",
+      "driver_uuid": "414d442d4d4553412d44525600000000",
+      "driver_info": "Mesa 26.0.8 (git-60e95b7878)",
+      "api_version": "1.4.335",
+      "driver_version": 109051912,
+      "min_subgroup_size": 32,
+      "max_subgroup_size": 64,
+      "selection": "pci_bdf",
+      "host_enumerated_physical_devices": 4,
+      "note": "Compile capture only; a compile on this device is not an execution receipt."
+    },
+    "stats": {
+      "source": "<release-workdir>/pm-aco-pilot/artifacts/gemv_mq4g256v2_residual/capture/host-stats.txt",
+      "driver_pipeline_hash": 754289669937981336,
+      "instructions": 985,
+      "valu": 614,
+      "salu": 124,
+      "vmem": 32,
+      "smem": 14,
+      "vopd": 39,
+      "note": "driver statistics as printed; not a performance claim"
+    },
+    "pilot_prepare_cross_check": {
+      "file": "<release-workdir>/pm-aco-pilot/prepare/prepare.json",
+      "sha256": "86f1787d52c5e6a93782e51dc9e8f1b0287e96c08eb964a9bc369ac09c20fbc4",
+      "observation": "pilot `oracle prepare` framed pre-image digests equal U0's framed digests for C1 (fixture_m5120_k6144) and C3 (odd_tail_m5119_k5888, captured_grid and minimal_grid share the same buffers); C2/C4 (occ127) not prepared by the pilot at observation time",
+      "compared": {
+        "C1_occ0_full": {
+          "A": "2be2589ca6432837d15868da4e46fdad77b10df831c2302406a20f90ee156516",
+          "x": "04427dda6ddcfe6ac168a8c2adca890d7c31b31464143baabafc987ff779c308",
+          "y": "6ea68012a8ee9dab118913d2d07368017ed37852728778dbcdb588da11856c33"
+        },
+        "C3_odd_m5119_k5888": {
+          "A": "0c64acb8997269d45fd1a5b0da9b556c0f74a0df04f3e5266d47944312595e01",
+          "x": "85aa9791745e2fec562c3009f86c60c65a3f0ba3c0a10484b39ea2e450c24b7b",
+          "y": "2b84bfecc64bffccd32d476dd241fc63d690783d8b515fc1dde5f9b40dbb1012"
+        }
+      },
+      "matched": true,
+      "matched_basis": "full 64-hex framed digests equal for all three buffers of fixture_m5120_k6144 and odd_tail_m5119_k5888 (captured_grid and minimal_grid)"
+    },
+    "unfulfilled_for_other_arms": [
+      "Vulkan reference receipt aco-vulkan-ref-v1 (framed post buffers) for any cell",
+      "candidate manifest and PM-HIP object (Hpm)",
+      "RADV pipeline binary blob + pipeline/global key (Vpm)",
+      "raw round-trip, static certificate, adapter digest, loaded-executable binding",
+      "hipcc/V0/Hpm/Vpm equality or replay of any kind"
+    ]
+  }
+}

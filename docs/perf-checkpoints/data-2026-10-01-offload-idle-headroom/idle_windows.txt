@@ -1,0 +1,87 @@
+## 9b_res_cpu
+  partial offload: 0 offloaded (32 resident), i_gpu_start=0
+## 9b_sp8_cpu
+  partial offload: 24 resident / 8 offloaded, i_gpu_start=8
+cpu exec: idle 94.2% — window ending at step 2 covers 1 steps: 1ms wall, 1ms on CPU (545us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 78.6% — window ending at step 4 covers 2 steps: 0ms wall, 0ms on CPU (106us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 68.0% — window ending at step 8 covers 4 steps: 5ms wall, 4ms on CPU (905us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 96.6% — window ending at step 16 covers 8 steps: 5ms wall, 5ms on CPU (604us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 84.6% — window ending at step 32 covers 16 steps: 12ms wall, 10ms on CPU (623us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 70.2% — window ending at step 64 covers 32 steps: 28ms wall, 20ms on CPU (613us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 82.7% — window ending at step 128 covers 64 steps: 45ms wall, 37ms on CPU (586us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 80.8% — window ending at step 256 covers 128 steps: 82ms wall, 66ms on CPU (519us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 80.5% — window ending at step 512 covers 256 steps: 160ms wall, 129ms on CPU (503us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 43.0% — window ending at step 1024 covers 512 steps: 638ms wall, 274ms on CPU (536us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 79.0% — window ending at step 2048 covers 1024 steps: 640ms wall, 506ms on CPU (494us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 77.8% — window ending at step 4096 covers 2048 steps: 1186ms wall, 922ms on CPU (450us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 77.3% — window ending at step 8192 covers 4096 steps: 2340ms wall, 1808ms on CPU (441us CPU/step) — GPU-idle lower bound, see report_idle
+## 9b_sp16_cpu
+  partial offload: 16 resident / 16 offloaded, i_gpu_start=16
+cpu exec: idle 95.6% — window ending at step 2 covers 1 steps: 1ms wall, 0ms on CPU (489us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 79.0% — window ending at step 4 covers 2 steps: 0ms wall, 0ms on CPU (125us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 71.7% — window ending at step 8 covers 4 steps: 5ms wall, 4ms on CPU (919us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 96.4% — window ending at step 16 covers 8 steps: 5ms wall, 5ms on CPU (608us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 84.0% — window ending at step 32 covers 16 steps: 11ms wall, 9ms on CPU (571us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 97.4% — window ending at step 64 covers 32 steps: 17ms wall, 16ms on CPU (511us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 81.8% — window ending at step 128 covers 64 steps: 36ms wall, 30ms on CPU (467us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 90.0% — window ending at step 256 covers 128 steps: 66ms wall, 59ms on CPU (462us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 90.4% — window ending at step 512 covers 256 steps: 132ms wall, 120ms on CPU (468us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 90.2% — window ending at step 1024 covers 512 steps: 260ms wall, 234ms on CPU (457us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 42.0% — window ending at step 2048 covers 1024 steps: 1126ms wall, 473ms on CPU (462us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 89.7% — window ending at step 4096 covers 2048 steps: 1043ms wall, 935ms on CPU (457us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 89.8% — window ending at step 8192 covers 4096 steps: 2090ms wall, 1877ms on CPU (458us CPU/step) — GPU-idle lower bound, see report_idle
+## 9b_sp20_cpu
+  partial offload: 12 resident / 20 offloaded, i_gpu_start=20
+cpu exec: idle 94.7% — window ending at step 2 covers 1 steps: 1ms wall, 0ms on CPU (475us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 77.7% — window ending at step 4 covers 2 steps: 0ms wall, 0ms on CPU (94us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 69.1% — window ending at step 8 covers 4 steps: 4ms wall, 3ms on CPU (674us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 95.4% — window ending at step 16 covers 8 steps: 4ms wall, 4ms on CPU (520us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 81.2% — window ending at step 32 covers 16 steps: 10ms wall, 8ms on CPU (519us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 97.0% — window ending at step 64 covers 32 steps: 14ms wall, 14ms on CPU (432us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 97.8% — window ending at step 128 covers 64 steps: 29ms wall, 28ms on CPU (442us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 90.9% — window ending at step 256 covers 128 steps: 68ms wall, 61ms on CPU (479us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 91.7% — window ending at step 512 covers 256 steps: 128ms wall, 117ms on CPU (458us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 93.4% — window ending at step 1024 covers 512 steps: 255ms wall, 238ms on CPU (465us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 38.5% — window ending at step 2048 covers 1024 steps: 1227ms wall, 472ms on CPU (461us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 92.5% — window ending at step 4096 covers 2048 steps: 974ms wall, 901ms on CPU (440us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 92.6% — window ending at step 8192 covers 4096 steps: 1968ms wall, 1822ms on CPU (445us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 92.4% — window ending at step 16384 covers 8192 steps: 3955ms wall, 3656ms on CPU (446us CPU/step) — GPU-idle lower bound, see report_idle
+## 9b_sp24_cpu
+  partial offload: 8 resident / 24 offloaded, i_gpu_start=24
+cpu exec: idle 94.1% — window ending at step 2 covers 1 steps: 0ms wall, 0ms on CPU (438us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 76.4% — window ending at step 4 covers 2 steps: 0ms wall, 0ms on CPU (106us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 68.0% — window ending at step 8 covers 4 steps: 4ms wall, 3ms on CPU (669us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 95.5% — window ending at step 16 covers 8 steps: 4ms wall, 4ms on CPU (525us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 80.0% — window ending at step 32 covers 16 steps: 9ms wall, 8ms on CPU (472us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 97.4% — window ending at step 64 covers 32 steps: 15ms wall, 15ms on CPU (463us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 97.8% — window ending at step 128 covers 64 steps: 31ms wall, 30ms on CPU (467us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 92.1% — window ending at step 256 covers 128 steps: 64ms wall, 59ms on CPU (463us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 95.5% — window ending at step 512 covers 256 steps: 121ms wall, 115ms on CPU (450us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 94.3% — window ending at step 1024 covers 512 steps: 245ms wall, 231ms on CPU (452us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 34.3% — window ending at step 2048 covers 1024 steps: 1339ms wall, 460ms on CPU (449us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 94.9% — window ending at step 4096 covers 2048 steps: 1027ms wall, 975ms on CPU (476us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 94.6% — window ending at step 8192 covers 4096 steps: 1974ms wall, 1867ms on CPU (456us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 94.6% — window ending at step 16384 covers 8192 steps: 3913ms wall, 3701ms on CPU (452us CPU/step) — GPU-idle lower bound, see report_idle
+## 27b_sp8_cpu
+  partial offload: 56 resident / 8 offloaded, i_gpu_start=8
+cpu exec: idle 95.7% — window ending at step 2 covers 1 steps: 1ms wall, 1ms on CPU (747us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 87.4% — window ending at step 4 covers 2 steps: 0ms wall, 0ms on CPU (194us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 76.2% — window ending at step 8 covers 4 steps: 8ms wall, 6ms on CPU (1582us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 97.7% — window ending at step 16 covers 8 steps: 9ms wall, 8ms on CPU (1047us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 86.7% — window ending at step 32 covers 16 steps: 15ms wall, 13ms on CPU (795us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 51.9% — window ending at step 64 covers 32 steps: 48ms wall, 25ms on CPU (783us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 68.4% — window ending at step 128 covers 64 steps: 73ms wall, 50ms on CPU (778us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 67.7% — window ending at step 256 covers 128 steps: 141ms wall, 96ms on CPU (748us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 70.8% — window ending at step 512 covers 256 steps: 304ms wall, 216ms on CPU (842us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 35.5% — window ending at step 1024 covers 512 steps: 1195ms wall, 424ms on CPU (828us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 65.5% — window ending at step 2048 covers 1024 steps: 1114ms wall, 730ms on CPU (713us CPU/step) — GPU-idle lower bound, see report_idle
+cpu exec: idle 66.0% — window ending at step 4096 covers 2048 steps: 2209ms wall, 1459ms on CPU (712us CPU/step) — GPU-idle lower bound, see report_idle
+## 27b_res_cpu
+  partial offload: 0 offloaded (64 resident), i_gpu_start=0
+## contention probe: per-run A/B/C byte rates are tabulated in
+## ../2026-10-01-offload-passback-headroom-idle.md ("CPU stream vs the GPU's PCIe
+## read of the same host RAM"); the probe source is probe.rs in this directory.
+## The sub-45% windows above (step 1024 on the 9B arms, step 2048/1024 on the 27B)
+## are the prefill→decode and warmup→measured-run transitions, not steady state:
+## prefill is GPU-side and never enters the seam, so it dilutes the window it
+## lands in. Quote the last window of each run.

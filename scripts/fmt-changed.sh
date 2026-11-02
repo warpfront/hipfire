@@ -23,10 +23,11 @@ file_edition() {
 
 # Format ONLY the Rust files this branch touches, matching CI's rules.
 #
-# Why this exists: the repo carries historical rustfmt debt (most files are
-# not formatted), so CI only checks CHANGED files — see
-# scripts/ci-rustfmt-changed.sh. Running bare `cargo fmt` rewrites the whole
-# workspace's debt (100+ files) and buries your actual change. DO NOT run
+# Why this exists: master and branches cut before the 0.4.3 sweep carry
+# historical rustfmt debt (beta is rustfmt-clean since the sweep; a pre-sweep
+# branch replays onto it with scripts/fmt-sweep-rebase.sh). There, bare
+# `cargo fmt` rewrites the whole workspace's debt (1000+ files) and buries your
+# actual change. DO NOT run
 # `cargo fmt` here. Run this instead — it formats only what you changed, with
 # the same flags CI checks (`--edition 2021 --config skip_children=true`).
 #

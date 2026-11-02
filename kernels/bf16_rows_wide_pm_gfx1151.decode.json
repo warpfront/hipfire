@@ -1,0 +1,39 @@
+{
+  "schema": "hipfire.bf16_decode_dag.v1",
+  "arch": "gfx1151",
+  "source": "kernels/src/qwen4_gemv_bf16_xf32.hip",
+  "source_ranges": {"row_helper": [38,104], "k4": [173,208], "x4": [500,529]},
+  "compiler": "HIP 7.16.26385-0000000; AMD clang 24.0.0git d6f6cb691863e9258034ab48c1dfce21689d5606",
+  "compile_argv": ["/opt/rocm/core-10.1/bin/hipcc", "--genco", "--offload-arch=gfx1151", "-O3", "--no-offload-compress", "-fuse-cuid=none", "-mcode-object-version=6", "-I/opt/rocm/core-10.1/include", "-o", "/tmp/qwen4_bf16_decode_gfx1151.hsaco", "kernels/src/qwen4_gemv_bf16_xf32.hip"],
+  "reference_bundle_sha256": "f1be2cbe93f57e404414fc50d975d30926e439680b77bd54f1cfffca3d94e867",
+  "reference_elf_sha256": "406d16eab6c591302515a565abfcecf9906cc53e5ea3b56a7524588eb3d7fd52",
+  "unbundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1151",
+  "extraction": "clang-offload-bundler --type=o --unbundle --targets=hipv4-amdgcn-amd-amdhsa--gfx1151 --input=REFERENCE.hsaco --output=REFERENCE.elf; llvm-objdump -d --mcpu=gfx1151 REFERENCE.elf",
+  "isa_receipt": "kernels/bf16_rows_wide_pm_gfx1151.decode.isa",
+  "selected_singleton_symbols": ["gemv_bf16_xf32", "gemv_bf16_xf32_x4", "gemv_bf16_xf32_k4"],
+  "fp_mode": {"descriptor_float_mode_hex": "0xf0", "round32": 0, "round16_64": 0, "denorm32": 3, "denorm16_64": 3, "ieee_mode": 1, "dx10_clamp": 1},
+  "ordinary_dag": {
+    "lane_k": "256*t+8*lane+j when K%8==0; increasing t; skip the entire eight-element vector unless i+8<=K",
+    "widen": "u16 << 16, implemented packed-low shift / packed-high mask 0xffff0000",
+    "initial_chains": ["+0", "+0", "+0", "+0"],
+    "chain": "a[j%4] = fma(X_j, W_j, a[j%4]); j=0..7 increasing; no group dot or extra group add",
+    "x4_operand_evidence": ["0x1ad70: a0=v7, X0=v15, W0=v6", "0x1ad80: a3=v10, X3=v18, W3=v12", "0x1adb4: a0=v7, X4=v19, W4=v24"],
+    "scalar_domain": "When K%8!=0, all K uses k=lane+32*t and only a0=fma(X_k,W_k,a0). This is not a tail appended to the vector domain.",
+    "fold": "Actual x4 object operand order: b23=a3+a2 (0x1add8); b01=a1+a0 (0x1aef4); sum=b23+b01 (0x1af04). This is the source tree (a0+a1)+(a2+a3) with emitted commutations preserved, including NaN source order.",
+    "reduction": "snapshot own+other at 16 (ds_swizzle BITMASK_PERM 1pppp), then 8/4/2/1 (ds_bpermute); out-of-range source selects own lane; only lane0 stored",
+    "load_unroll": "The decode helper prefetches eight vectors; the wide schedule removes this load-only unroll without changing any chain's arithmetic subsequence."
+  },
+  "hc_k4_dag": {
+    "quarters": "Four wave32 partitions of contiguous K/4 elements per output; each quarter runs the same row DAG at local K=K/4.",
+    "quarter_fold": "s_add_f32 q0,q1 at 0xbe88; s_add_f32 q2,q3 at 0xbe8c; s_add_f32 first,second at 0xbe94. Scalar operations are retained, not replaced by VALU.",
+    "activation": "BF16 round trip; s_mul_f32(scale,value); BF16 round trip; value/(1+expf(-value)); BF16 round trip. hc_act=0 stores the unactivated quarter fold.",
+    "bf16_round": "Finite bits: (u32(value)+0x7fff+((u32(value)>>16)&1)) & 0xffff0000. Exp255: preserve original high16, set bit16 iff low16!=0 before masking (hip_bfloat16 NaN/Inf branch).",
+    "exp": "0xbfa0..0xc010: scalar multiply by 0xbfb8aa3b, negative-product XOR, s_rndne_f32, compensated s_fmamk_f32 with 0xbfb8aa3b and 0xb2a5705f, s_sub_f32 and s_add_f32, v_exp_f32 and v_ldexp_f32; exact comparisons/clamps against 0x42ce8ed0 and 0xc2b17218.",
+    "divide": "0xc01c..0xc07c: add(1,exp), v_div_scale_f32 denominator, v_rcp_f32, residual/refinement FMA, v_div_scale_f32 numerator with VCC output, product+residual refinements, v_div_fmas_f32, v_div_fixup_f32; no approximate reciprocal-only substitution.",
+    "encoder_coverage": "Native assembly calls peacemaker_lift::text::parse_line and peacemaker_ir gfx11::encode (peacemaker-isa/src/native/mod.rs:50-55). Scalar arithmetic entries are in peacemaker-ir/isa/gfx1151.tbl; v_div_fixup/fmas/scale entries are in gfx1100.tbl inherited by gfx1151. Initial inspection limited to src/native was insufficient; there is no missing epilogue opcode in the full table inventory.",
+    "builder_gate": "Arch::check_mnemonic previously rejected s_add_f32 and s_mul_f32 on gfx1151 despite the real gfx1151 table entries. This module corrects that gate for gfx1151 only; gfx1100 still rejects those two instructions. No arithmetic encoder shortcut was added.",
+    "text_parser": "The scalar s_fmamk_f32/s_fmaak_f32 text front end omitted the mandatory literal syntax even though the codec/table already encoded it. parse.rs/print.rs now preserve the four-operand literal slot; pinned BF16 decode words A3040400 BFB8AA3B are covered by regression tests. No codec change. Native BF16 emission passes; all44 re-emittable existing images remain byte-identical (identity.json).",
+    "implementation_decision": "PM-primary on gfx1151 when hardware byte gates admit it, preserving extracted scalar and vector FP instruction DAG; HIP twin remains fallback."
+  },
+  "evidence_scope": "CPU extraction and instruction/descriptor inspection only. These hashes identify the locally compiled reference object; runtime compiler/flags must match or re-extract. No GPU byte, graph replay, occupancy, latency or end-to-end admission result is claimed."
+}

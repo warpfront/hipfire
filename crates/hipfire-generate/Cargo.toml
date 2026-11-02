@@ -1,0 +1,94 @@
+[package]
+name = "hipfire-generate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-architecture generation bodies, lifted out of the daemon binary."
+
+# LAYERING — this crate exists to break a specific deadlock, documented in
+# docs/governance/2026-08-15-hipfire-leanup-map.md § 4.
+#
+# The per-architecture generation bodies need BOTH arch types AND the shared
+# daemon machinery. Neither existing layer can host them:
+#
+#   hipfire-loader  has 11 arch deps, but sits BELOW hipfire-engine
+#   hipfire-engine  sits above the loader, but has 0 arch deps by design
+#
+# So they live here, above both:
+#
+#   saddle-core -> hipfire-runtime -> hipfire-loader -> hipfire-engine
+#                  -> hipfire-generate -> hipfire-daemon
+#
+# This is what lets the daemon reach zero arch-crate references while the
+# generation code stays where it can actually see the architectures.
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+saddle-core = { path = "../saddle-core" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+# Re-added: S4 (#719) introduced hipfire_config readers in this crate after the
+# machete pass that removed it, so the "unused" finding is no longer true.
+hipfire-config = { path = "../hipfire-config" }
+hipfire-loader = { path = "../hipfire-loader" }
+hipfire-engine = { path = "../hipfire-engine" }
+hipfire-pflash = { path = "../hipfire-pflash" }
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-diffusion = { path = "../hipfire-arch-diffusion" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
+hipfire-arch-lfm3 = { path = "../hipfire-arch-lfm3" }
+hipfire-arch-lfm3-vl = { path = "../hipfire-arch-lfm3-vl" }
+hipfire-arch-lfm3-audio = { path = "../hipfire-arch-lfm3-audio" }
+hipfire-arch-lfm3-omni = { path = "../hipfire-arch-lfm3-omni" }
+hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
+hipfire-arch-maple = { path = "../hipfire-arch-maple" }
+hipfire-arch-raon = { path = "../hipfire-arch-raon" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+hipfire-arch-qwen35-embed = { path = "../hipfire-arch-qwen35-embed" }
+hipfire-arch-embeddinggemma2 = { path = "../hipfire-arch-embeddinggemma2" }
+base64 = "0.22"
+serde_json = { workspace = true, features = ["preserve_order"] }
+tracing = "0.1"
+
+[features]
+qwen4-dev-profiles = [
+    "hipfire-loader/qwen4-dev-profiles",
+    "hipfire-arch-qwen4/qwen4-dev-profiles",
+]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+serve-fault-inject = [
+    "hipfire-runtime/serve-fault-inject",
+    "hipfire-dispatch/serve-fault-inject",
+]
+# VCN JPEG decode for VL images (`image.decode = vcn|auto`): pooled libva
+# decode straight to device patches, skipping CPU decode and upload.
+# Default off; the CPU path below is unchanged when disabled.
+vcn-jpeg = ["hipfire-arch-qwen35-vl/vcn-jpeg"]
+
+# ---------------------------------------------------------------------------
+# Archived research probes (same convention as crates/hipfire-loader/Cargo.toml).
+# Gated so they are not type-checked on every build; they pin internal kernel
+# signatures. Run on demand:  cargo build -p hipfire-generate --examples --features lab
+#
+# split_prefill_probe is also gated, even though scripts/jev_eval/gates.py
+# runs it: gates.py builds it explicitly with `--features lab` (see PROBE /
+# measure_floor there), so the lab gate costs it nothing on the path that
+# needs it while keeping it off the default `cargo build --all-targets`.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "attn_wmma_row_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "split_prefill_probe"
+required-features = ["lab"]

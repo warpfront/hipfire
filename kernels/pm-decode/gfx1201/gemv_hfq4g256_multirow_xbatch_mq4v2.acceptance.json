@@ -1,0 +1,62 @@
+{
+  "module": "gemv_hfq4g256_multirow_xbatch_mq4v2",
+  "symbol": "gemv_mq4g256v2_multirow_r2_xbatch_pm",
+  "arch": "gfx1201",
+  "scope": "lab-gated exact-column lm_head twin; not default routing or whole-token throughput",
+  "source_commit": "f8866a05cb",
+  "incumbent_source_sha256": "64b1b7eededa4bce636b8799247d7a66e7ef045f32d1674d07180bd56b98c3af",
+  "elf_sha256": "07ea1deb45e546345567bf1e891923b0fcf05f7959be51448787059a6867c2e4",
+  "bundle_sha256": "b0481f359f78e31888825829f69b6fe27827eabbcb6cdef4ff66387b8b92fc85",
+  "m7": {"lift":"byte-exact", "obligations":{}, "ambiguous_delays":0, "instructions":5756, "vgpr_high_water":121, "sgpr_high_water":48},
+  "custom_certification": "gemv_hfq4g256_multirow_xbatch_mq4v2.radiowave.json",
+  "launcher": {
+    "abi_bytes":36,
+    "arguments":[{"name":"A","offset":0,"bytes":8,"access":"read_only"},{"name":"x","offset":8,"bytes":8,"access":"read_only"},{"name":"y","offset":16,"bytes":8,"access":"write_only"},{"name":"M","offset":24,"bytes":4,"type":"i32"},{"name":"K","offset":28,"bytes":4,"type":"i32"},{"name":"B","offset":32,"bytes":4,"type":"i32"}],
+    "grid":"[ceil(M/2),1,1]", "block":[32,1,1], "dynamic_lds":0,
+    "A_layout":"[M][K/256][136 bytes]", "x_layout":"[B][K] f32", "y_layout":"[B][M] f32",
+    "preconditions":"gfx1201; B=1..8; M,K positive i32; K%256=0; A, x and y buffer byte spans <= u32::MAX",
+    "kernarg_blob_backing_bytes":48,
+    "reference_implementation":"crates/rdna-compute/examples/pm_multirow_xbatch_oracle.rs:31-52"
+  },
+  "arithmetic": {
+    "weight_loads_per_group_per_wave":4,
+    "weight_reuse":"both rows dequantized once per increasing g, shared across all B columns",
+    "row0_dot":"mul(w0,x0), fmac terms 1..7",
+    "row1_dot":"mul(w1,x1), fmac(w0,x0), fmac terms 2..7",
+    "stream_update":"row0=dot+acc; row1=acc+dot; stream=g%4",
+    "combine":"(acc0+acc1)+(acc2+acc3)",
+    "fold":"swizzle16 then self-clamped bpermute8/4/2/1",
+    "odd_M":"row1 weight loads clamp to row0; row1 stores omitted",
+    "wait_policy":"explicit per-column waits in every dispatch arm, loadcnt2 retaining next x tile; last column loadcnt0"
+  },
+  "oracle": {
+    "owner":"PmMultirow", "capture_owner":"PmOracle",
+    "report":"/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/gemv_hfq4g256_multirow_xbatch_mq4v2/full-progressive-bank1/report.json",
+    "report_sha256":"48073a503004bfcae571fe4edd44e25e9223e807a9563c29b4fd8123d6478e5e",
+    "pass":true, "cases":632, "mismatch_bytes":0,
+    "real_shape":{"M":248320,"K":5120,"B":[1,2,3,4,5,6,7,8]},
+    "large_odd_shape":{"M":248319,"K":5120,"B":[1,2,3,4,5,6,7,8]},
+    "edge_group_counts":[1,2,3,4,5,6,7,8,9,19,20], "edge_row_counts":[1,2,3,31,32,33,65],
+    "edge_cases":616,
+    "capture_vectors":"eight pairwise-distinct real final-norm vectors, decode positions512..519; x and incumbent logits SHA checked per step",
+    "weight_sha256":"b4e9fa48bb95118002f4b3650550b5c80d6c6adef57e05d90f468ff1e5564ed3",
+    "comparison":"every column against unmodified hipcc singleton; full real and large-odd also against captured logits; all input/backing and 4096-byte guards checked"
+  },
+  "timing": {
+    "scope":"GPU event-timed batch launches only, real lm_head weights and distinct real x columns, not whole-token throughput",
+    "card":"A GPU-9eb7aeda51c88ffd", "fresh_processes":3, "warmups":5, "samples_per_process":9, "repetitions_per_sample":16,
+    "weight_bytes":675430400, "weights_exceed_cache":true,
+    "reports":[
+      {"label":"timing-process1","report_sha256":"650bef0b5e4e9512cba4da2c18547a75940acb4601bd2d1bc9d74a12edc667f7"},
+      {"label":"timing-process2","report_sha256":"6c5b8cde1901b707f931d81a3a1f811f4359577a3f32d73f66f9d184e9ccfff6"},
+      {"label":"timing-process3","report_sha256":"6e84d96b88c5853b363d89e5841c01e82d20dee337d0af268e81358ce627fa2c"}
+    ],
+    "B":[1,2,4,8],
+    "candidate_medians_ms":[[1.0822062492370605,1.1153666973114014,1.535536289215088,2.506134271621704],[1.0822017192840576,1.1152749061584473,1.5341495275497437,2.505378007888794],[1.0822621583938599,1.1156678199768066,1.5396779775619507,2.509627342224121]],
+    "B_singleton_medians_ms":[[1.0777517557144165,2.15582013130188,4.311485290527344,8.6229887008667],[1.0779167413711548,2.1561214923858643,4.3116631507873535,8.622814178466797],[1.0779345035552979,2.1559550762176514,4.311287879943848,8.623079299926758]],
+    "B1_note":"candidate is about0.4% slower; preserve accepted singleton for B1 routing",
+    "B8_speedup_range":[3.43599990119835,3.441721828528774]
+  },
+  "actual_removed_hip_jobs_in_this_slice":0,
+  "promotion":"routing and prepared CB graph integration belong to CbExec/Main; no default or pack changes in this author slice"
+}

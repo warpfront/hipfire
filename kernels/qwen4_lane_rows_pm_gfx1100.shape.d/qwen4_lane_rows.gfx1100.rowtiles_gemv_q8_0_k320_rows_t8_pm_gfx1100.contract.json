@@ -1,0 +1,6477 @@
+{
+  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: A\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: x\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: y\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: M\n        .offset: 24\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: K\n        .offset: 28\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: R\n        .offset: 32\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 8192\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 36\n    .max_flat_workgroup_size: 256\n    .name: gemv_q8_0_k320_rows_t8_pm_gfx1100\n    .private_segment_fixed_size: 0\n    .sgpr_count: 52\n    .sgpr_spill_count: 0\n    .symbol: gemv_q8_0_k320_rows_t8_pm_gfx1100.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 72\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1100\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
+  "arch": "gfx1100",
+  "arithmetic_recipe": "gfx1100 actual small-K four-chain singleton; not Halo K320",
+  "builder_proof": {
+    "arch": "gfx1100",
+    "barriers": [
+      {
+        "pc_index": 198,
+        "transitions": [
+          "Ready(0)"
+        ]
+      },
+      {
+        "pc_index": 440,
+        "transitions": [
+          "Retire(0)"
+        ]
+      },
+      {
+        "pc_index": 483,
+        "transitions": [
+          "Ready(0)"
+        ]
+      },
+      {
+        "pc_index": 541,
+        "transitions": [
+          "Retire(0)"
+        ]
+      },
+      {
+        "pc_index": 573,
+        "transitions": [
+          "Ready(0)"
+        ]
+      },
+      {
+        "pc_index": 671,
+        "transitions": [
+          "Retire(0)"
+        ]
+      },
+      {
+        "pc_index": 713,
+        "transitions": [
+          "Ready(0)"
+        ]
+      },
+      {
+        "pc_index": 851,
+        "transitions": [
+          "Retire(0)"
+        ]
+      },
+      {
+        "pc_index": 903,
+        "transitions": [
+          "Ready(0)"
+        ]
+      },
+      {
+        "pc_index": 1017,
+        "transitions": [
+          "Retire(0)"
+        ]
+      },
+      {
+        "pc_index": 1079,
+        "transitions": [
+          "Ready(0)"
+        ]
+      },
+      {
+        "pc_index": 1233,
+        "transitions": [
+          "Retire(0)"
+        ]
+      },
+      {
+        "pc_index": 1305,
+        "transitions": [
+          "Ready(0)"
+        ]
+      },
+      {
+        "pc_index": 1499,
+        "transitions": [
+          "Retire(0)"
+        ]
+      },
+      {
+        "pc_index": 1581,
+        "transitions": [
+          "Ready(0)"
+        ]
+      },
+      {
+        "pc_index": 1815,
+        "transitions": [
+          "Retire(0)"
+        ]
+      }
+    ],
+    "builder_crate_version": "0.4.1",
+    "builder_git_sha": "unknown",
+    "clauses": [],
+    "forbidden_mnemonics_checked": [
+      "s_waitcnt (gfx12)",
+      "scratch_*"
+    ],
+    "hazards": [
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 6,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_3)",
+        "pc_index": 8,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 11,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 15,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 19,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 23,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 68,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_2)",
+        "pc_index": 70,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 131,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 136,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 141,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 146,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 151,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 156,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 161,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 166,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 218,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 221,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 224,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 227,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 248,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 251,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 254,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 257,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 278,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 281,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 284,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 287,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 308,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 311,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 314,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 317,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 338,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 341,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 344,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 347,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 368,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 371,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 374,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 377,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 398,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 401,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 404,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 407,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 428,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 431,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 434,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_4)",
+        "pc_index": 437,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 472,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 489,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 496,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 503,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 510,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 517,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 524,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 531,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 538,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 554,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 559,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 580,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 584,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 592,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 596,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 604,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 608,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 616,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 620,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 628,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 632,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 640,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 644,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 652,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 656,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 664,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 668,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 686,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 691,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 696,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 721,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 725,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 729,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 738,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 742,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 746,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 755,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 759,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 763,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 772,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 776,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 780,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 789,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 793,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 797,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 806,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 810,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 814,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 823,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 827,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 831,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 840,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 844,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 848,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 868,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 873,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 878,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 883,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1036,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1041,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1046,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1051,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1056,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1097,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1116,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1135,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1154,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1173,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1192,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1211,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1230,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1254,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1259,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1264,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1269,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1274,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1279,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1324,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1328,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1348,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1352,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1372,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1376,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1396,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1400,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1420,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1424,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1444,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1448,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1468,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1472,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1492,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1496,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1522,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1527,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1532,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1537,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1542,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1547,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1552,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1601,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1605,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1609,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1630,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1634,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1638,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1659,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1663,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1667,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1688,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1692,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1696,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1717,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1721,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1725,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1746,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1750,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1754,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1775,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1779,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1783,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1804,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1808,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1812,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1825,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1829,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1833,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1837,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1841,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1845,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1852,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1856,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1860,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1864,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1868,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1872,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1879,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1883,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1887,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1891,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1895,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1899,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1906,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1910,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1914,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1918,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1922,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1926,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1933,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1937,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1941,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1945,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1949,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1953,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1960,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1964,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1968,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1972,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1976,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1980,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1987,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1991,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1995,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 1999,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 2003,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 2007,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 2014,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 2018,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 2022,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 2026,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 2030,
+        "rule": "VALU dependency issue hint"
+      },
+      {
+        "insn": "s_delay_alu instid0(VALU_DEP_1)",
+        "pc_index": 2034,
+        "rule": "VALU dependency issue hint"
+      }
+    ],
+    "kernel_id": "qwen4_lane_rows_q8_gfx1100",
+    "lds_slots": [
+      {
+        "base": 0,
+        "len": 8192,
+        "name": "x_tile",
+        "state": "Free"
+      }
+    ],
+    "loop_fixpoints": [
+      {
+        "head": ".Lgemv_q8_0_k320_rows_t8_pm_gfx1100_body_kloop",
+        "iterations": 2
+      }
+    ],
+    "next_free_sgpr": 50,
+    "next_free_vgpr": 72,
+    "reg_plan": [
+      {
+        "base": 0,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "kernarg_ptr0"
+      },
+      {
+        "base": 14,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "wg_x0"
+      },
+      {
+        "base": 4,
+        "kind": "s",
+        "len": 4,
+        "live": "Whole",
+        "name": "a_x_ptrs0"
+      },
+      {
+        "base": 8,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "y_ptr0"
+      },
+      {
+        "base": 10,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "m_k0"
+      },
+      {
+        "base": 15,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "wg_y0"
+      },
+      {
+        "base": 12,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "r0"
+      },
+      {
+        "base": 49,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 16,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 17,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 18,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 19,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 20,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 21,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 22,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 23,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 38,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 39,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 40,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 41,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 42,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 43,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 44,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 45,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 46,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 47,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 48,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scalar0"
+      },
+      {
+        "base": 0,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "tid0"
+      },
+      {
+        "base": 1,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "lane0"
+      },
+      {
+        "base": 2,
+        "kind": "v",
+        "len": 4,
+        "live": "Whole",
+        "name": "bpermute_addr0"
+      },
+      {
+        "base": 6,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "lds_store0"
+      },
+      {
+        "base": 7,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "lds_read0"
+      },
+      {
+        "base": 8,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "x_offset0"
+      },
+      {
+        "base": 9,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "x_addr0"
+      },
+      {
+        "base": 10,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "w_offset_d0"
+      },
+      {
+        "base": 11,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "w_offset_q0"
+      },
+      {
+        "base": 12,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "product0"
+      },
+      {
+        "base": 13,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "temp0"
+      },
+      {
+        "base": 14,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "partial_store0"
+      },
+      {
+        "base": 15,
+        "kind": "v",
+        "len": 1,
+        "live": "Whole",
+        "name": "y_offset0"
+      },
+      {
+        "base": 16,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "dq0"
+      },
+      {
+        "base": 24,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "q0"
+      },
+      {
+        "base": 32,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "x_slots0"
+      },
+      {
+        "base": 40,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "accumulators0"
+      },
+      {
+        "base": 48,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "accumulators8"
+      },
+      {
+        "base": 56,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "accumulators16"
+      },
+      {
+        "base": 64,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "accumulators24"
+      }
+    ],
+    "s_text_sha256": "0a8ddb1ec094322980ccbb14c6bc9b41d4451c2aef1cf011bfeb45b01d063320",
+    "variant": "rowtiles_gemv_q8_0_k320_rows_t8_pm_gfx1100",
+    "vopd_pairs": 0,
+    "waits": [
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 27,
+        "reason": "Barrier"
+      },
+      {
+        "count": 15,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(15)",
+        "pc_index": 128,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 14,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(14)",
+        "pc_index": 130,
+        "reason": {
+          "Use": {
+            "reg": "v16"
+          }
+        }
+      },
+      {
+        "count": 13,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(13)",
+        "pc_index": 133,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 12,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(12)",
+        "pc_index": 135,
+        "reason": {
+          "Use": {
+            "reg": "v17"
+          }
+        }
+      },
+      {
+        "count": 11,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(11)",
+        "pc_index": 138,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 10,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(10)",
+        "pc_index": 140,
+        "reason": {
+          "Use": {
+            "reg": "v18"
+          }
+        }
+      },
+      {
+        "count": 9,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(9)",
+        "pc_index": 143,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 8,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(8)",
+        "pc_index": 145,
+        "reason": {
+          "Use": {
+            "reg": "v19"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(7)",
+        "pc_index": 148,
+        "reason": {
+          "Use": {
+            "reg": "v28"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(6)",
+        "pc_index": 150,
+        "reason": {
+          "Use": {
+            "reg": "v20"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 153,
+        "reason": {
+          "Use": {
+            "reg": "v29"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 155,
+        "reason": {
+          "Use": {
+            "reg": "v21"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 158,
+        "reason": {
+          "Use": {
+            "reg": "v30"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 160,
+        "reason": {
+          "Use": {
+            "reg": "v22"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 163,
+        "reason": {
+          "Use": {
+            "reg": "v31"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 165,
+        "reason": {
+          "Use": {
+            "reg": "v23"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(7)",
+        "pc_index": 180,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(6)",
+        "pc_index": 182,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 184,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 186,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 188,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 190,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 192,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 194,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 197,
+        "reason": "Barrier"
+      },
+      {
+        "count": 7,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(7)",
+        "pc_index": 209,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 211,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 213,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 215,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 217,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 220,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 223,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 226,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(7)",
+        "pc_index": 239,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 241,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 243,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 245,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 247,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 250,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 253,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 256,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(7)",
+        "pc_index": 269,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 271,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 273,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 275,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 277,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 280,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 283,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 286,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(7)",
+        "pc_index": 299,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 301,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 303,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 305,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 307,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 310,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 313,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 316,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(7)",
+        "pc_index": 329,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 331,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 333,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 335,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 337,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 340,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 343,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 346,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(7)",
+        "pc_index": 359,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 361,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 363,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 365,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 367,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 370,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 373,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 376,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(7)",
+        "pc_index": 389,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 391,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 393,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 395,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 397,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 400,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 403,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 406,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(7)",
+        "pc_index": 419,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 421,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 423,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 425,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 427,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 430,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 433,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 436,
+        "reason": {
+          "Use": {
+            "reg": "v39"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 469,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 471,
+        "reason": {
+          "Use": {
+            "reg": "v16"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 479,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 482,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 487,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 494,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 501,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 508,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 515,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 522,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 529,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 536,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 551,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 553,
+        "reason": {
+          "Use": {
+            "reg": "v16"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 556,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 558,
+        "reason": {
+          "Use": {
+            "reg": "v17"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 567,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 569,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 572,
+        "reason": "Barrier"
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 578,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 582,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 590,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 594,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 602,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 606,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 614,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 618,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 626,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 630,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 638,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 642,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 650,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 654,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 662,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 666,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 683,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 685,
+        "reason": {
+          "Use": {
+            "reg": "v16"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 688,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 690,
+        "reason": {
+          "Use": {
+            "reg": "v17"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 693,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 695,
+        "reason": {
+          "Use": {
+            "reg": "v18"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 705,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 707,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 709,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 712,
+        "reason": "Barrier"
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 719,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 723,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 727,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 736,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 740,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 744,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 753,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 757,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 761,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 770,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 774,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 778,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 787,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 791,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 795,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 804,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 808,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 812,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 821,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 825,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 829,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 838,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 842,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 846,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(7)",
+        "pc_index": 865,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(6)",
+        "pc_index": 867,
+        "reason": {
+          "Use": {
+            "reg": "v16"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 870,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 872,
+        "reason": {
+          "Use": {
+            "reg": "v17"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 875,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 877,
+        "reason": {
+          "Use": {
+            "reg": "v18"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 880,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 882,
+        "reason": {
+          "Use": {
+            "reg": "v19"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 893,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 895,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 897,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 899,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 902,
+        "reason": "Barrier"
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 910,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 912,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 914,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 916,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 924,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 926,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 928,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 930,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 938,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 940,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 942,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 944,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 952,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 954,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 956,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 958,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 966,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 968,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 970,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 972,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 980,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 982,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 984,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 986,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 994,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 996,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 998,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1000,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1008,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1010,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1012,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1014,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 9,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(9)",
+        "pc_index": 1033,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 8,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(8)",
+        "pc_index": 1035,
+        "reason": {
+          "Use": {
+            "reg": "v16"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(7)",
+        "pc_index": 1038,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(6)",
+        "pc_index": 1040,
+        "reason": {
+          "Use": {
+            "reg": "v17"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 1043,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 1045,
+        "reason": {
+          "Use": {
+            "reg": "v18"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 1048,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 1050,
+        "reason": {
+          "Use": {
+            "reg": "v19"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 1053,
+        "reason": {
+          "Use": {
+            "reg": "v28"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 1055,
+        "reason": {
+          "Use": {
+            "reg": "v20"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 1067,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 1069,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 1071,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 1073,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 1075,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1078,
+        "reason": "Barrier"
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1087,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1089,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1091,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1093,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1095,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1106,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1108,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1110,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1112,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1114,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1125,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1127,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1129,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1131,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1133,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1144,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1146,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1148,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1150,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1152,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1163,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1165,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1167,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1169,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1171,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1182,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1184,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1186,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1188,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1190,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1201,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1203,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1205,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1207,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1209,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1220,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1222,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1224,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1226,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1228,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 11,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(11)",
+        "pc_index": 1251,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 10,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(10)",
+        "pc_index": 1253,
+        "reason": {
+          "Use": {
+            "reg": "v16"
+          }
+        }
+      },
+      {
+        "count": 9,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(9)",
+        "pc_index": 1256,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 8,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(8)",
+        "pc_index": 1258,
+        "reason": {
+          "Use": {
+            "reg": "v17"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(7)",
+        "pc_index": 1261,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(6)",
+        "pc_index": 1263,
+        "reason": {
+          "Use": {
+            "reg": "v18"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 1266,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 1268,
+        "reason": {
+          "Use": {
+            "reg": "v19"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 1271,
+        "reason": {
+          "Use": {
+            "reg": "v28"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 1273,
+        "reason": {
+          "Use": {
+            "reg": "v20"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 1276,
+        "reason": {
+          "Use": {
+            "reg": "v29"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 1278,
+        "reason": {
+          "Use": {
+            "reg": "v21"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 1291,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 1293,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 1295,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 1297,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 1299,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 1301,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1304,
+        "reason": "Barrier"
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1314,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1316,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1318,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1320,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1322,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1326,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1338,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1340,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1342,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1344,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1346,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1350,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1362,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1364,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1366,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1368,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1370,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1374,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1386,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1388,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1390,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1392,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1394,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1398,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1410,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1412,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1414,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1416,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1418,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1422,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1434,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1436,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1438,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1440,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1442,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1446,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1458,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1460,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1462,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1464,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1466,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1470,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1482,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1484,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1486,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1488,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1490,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1494,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 13,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(13)",
+        "pc_index": 1519,
+        "reason": {
+          "Use": {
+            "reg": "v24"
+          }
+        }
+      },
+      {
+        "count": 12,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(12)",
+        "pc_index": 1521,
+        "reason": {
+          "Use": {
+            "reg": "v16"
+          }
+        }
+      },
+      {
+        "count": 11,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(11)",
+        "pc_index": 1524,
+        "reason": {
+          "Use": {
+            "reg": "v25"
+          }
+        }
+      },
+      {
+        "count": 10,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(10)",
+        "pc_index": 1526,
+        "reason": {
+          "Use": {
+            "reg": "v17"
+          }
+        }
+      },
+      {
+        "count": 9,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(9)",
+        "pc_index": 1529,
+        "reason": {
+          "Use": {
+            "reg": "v26"
+          }
+        }
+      },
+      {
+        "count": 8,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(8)",
+        "pc_index": 1531,
+        "reason": {
+          "Use": {
+            "reg": "v18"
+          }
+        }
+      },
+      {
+        "count": 7,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(7)",
+        "pc_index": 1534,
+        "reason": {
+          "Use": {
+            "reg": "v27"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(6)",
+        "pc_index": 1536,
+        "reason": {
+          "Use": {
+            "reg": "v19"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 1539,
+        "reason": {
+          "Use": {
+            "reg": "v28"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 1541,
+        "reason": {
+          "Use": {
+            "reg": "v20"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 1544,
+        "reason": {
+          "Use": {
+            "reg": "v29"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 1546,
+        "reason": {
+          "Use": {
+            "reg": "v21"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 1549,
+        "reason": {
+          "Use": {
+            "reg": "v30"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 1551,
+        "reason": {
+          "Use": {
+            "reg": "v22"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(6)",
+        "pc_index": 1565,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(5)",
+        "pc_index": 1567,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(4)",
+        "pc_index": 1569,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(3)",
+        "pc_index": 1571,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(2)",
+        "pc_index": 1573,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(1)",
+        "pc_index": 1575,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vm",
+        "insn": "s_waitcnt vmcnt(0)",
+        "pc_index": 1577,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1580,
+        "reason": "Barrier"
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 1591,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1593,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1595,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1597,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1599,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1603,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1607,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 1620,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1622,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1624,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1626,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1628,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1632,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1636,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 1649,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1651,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1653,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1655,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1657,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1661,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1665,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 1678,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1680,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1682,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1684,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1686,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1690,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1694,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 1707,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1709,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1711,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1713,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1715,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1719,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1723,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 1736,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1738,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1740,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1742,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1744,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1748,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1752,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 1765,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1767,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1769,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1771,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1773,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1777,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1781,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 6,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(6)",
+        "pc_index": 1794,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 5,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(5)",
+        "pc_index": 1796,
+        "reason": {
+          "Use": {
+            "reg": "v33"
+          }
+        }
+      },
+      {
+        "count": 4,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(4)",
+        "pc_index": 1798,
+        "reason": {
+          "Use": {
+            "reg": "v34"
+          }
+        }
+      },
+      {
+        "count": 3,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(3)",
+        "pc_index": 1800,
+        "reason": {
+          "Use": {
+            "reg": "v35"
+          }
+        }
+      },
+      {
+        "count": 2,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(2)",
+        "pc_index": 1802,
+        "reason": {
+          "Use": {
+            "reg": "v36"
+          }
+        }
+      },
+      {
+        "count": 1,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(1)",
+        "pc_index": 1806,
+        "reason": {
+          "Use": {
+            "reg": "v37"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1810,
+        "reason": {
+          "Use": {
+            "reg": "v38"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1828,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1832,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1836,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1840,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1844,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1855,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1859,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1863,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1867,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1871,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1882,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1886,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1890,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1894,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1898,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1909,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1913,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1917,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1921,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1925,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1936,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1940,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1944,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1948,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1952,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1963,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1967,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1971,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1975,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1979,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1990,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1994,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 1998,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 2002,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 2006,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 2017,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 2021,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 2025,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 2029,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Lgkm",
+        "insn": "s_waitcnt lgkmcnt(0)",
+        "pc_index": 2033,
+        "reason": {
+          "Use": {
+            "reg": "v32"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Vs",
+        "insn": "s_waitcnt_vscnt null, 0x0",
+        "pc_index": 2084,
+        "reason": "Barrier"
+      }
+    ]
+  },
+  "group_segment_fixed_bytes": 8192,
+  "isa_shape": {
+    "barriers": 16,
+    "ds": 364,
+    "instructions": 2087,
+    "next_free_sgpr": 50,
+    "next_free_vgpr": 72,
+    "valu_slots": 592,
+    "vmem": 116,
+    "vopd_pairs": 0,
+    "waits": 666,
+    "wmma": 0
+  },
+  "kernarg_segment_bytes": 36,
+  "launch": {
+    "block": [
+      256,
+      1,
+      1
+    ],
+    "grid": [
+      "ceil(M/8)",
+      "ceil(R/8)",
+      "1"
+    ],
+    "row_domain": {
+      "logical_rows": {
+        "max": 64,
+        "min": 1
+      }
+    }
+  },
+  "launch_dynamic_lds_bytes": 0,
+  "module": "qwen4_lane_rows_pm_gfx1100",
+  "require_wave32": true,
+  "require_zero_private": true,
+  "require_zero_spills": true,
+  "sgpr_max": 50,
+  "shape_domain": {
+    "K": "K==320"
+  },
+  "symbol": "gemv_q8_0_k320_rows_t8_pm_gfx1100",
+  "vgpr_max": 72
+}

@@ -1,0 +1,533 @@
+{
+  "module": "fused_qkvza_hfq4g256_mq4v2",
+  "arch": "gfx1201",
+  "builder_crate_version": "0.4.1",
+  "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+  "s_text_sha256": "009f81286e26728257cee1187b7ea960c163547af4e27af75072a4b1c4a9b6d2",
+  "kernels": [
+    {
+      "kernel_id": "pm_decode_fused_qkvza_hfq4g256_mq4v2",
+      "variant": "four_stream",
+      "arch": "gfx1201",
+      "builder_crate_version": "0.4.1",
+      "builder_git_sha": "19fc7e2c68b35d32dc55fde7e20debdd2c2ee584",
+      "reg_plan": [
+        {
+          "name": "lane",
+          "kind": "v",
+          "base": 0,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "packed_offset",
+          "kind": "v",
+          "base": 1,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "zero",
+          "kind": "v",
+          "base": 2,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "x_offset",
+          "kind": "v",
+          "base": 3,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "streams",
+          "kind": "v",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x0_or_tail_x",
+          "kind": "v",
+          "base": 8,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x1_or_tail_scratch",
+          "kind": "v",
+          "base": 16,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x2",
+          "kind": "v",
+          "base": 24,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_x3",
+          "kind": "v",
+          "base": 32,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_headers_or_dots_and_dequant3",
+          "kind": "v",
+          "base": 40,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_packed_or_dequant3",
+          "kind": "v",
+          "base": 48,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "dequant0",
+          "kind": "v",
+          "base": 52,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "dequant1",
+          "kind": "v",
+          "base": 60,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "dequant2",
+          "kind": "v",
+          "base": 68,
+          "len": 8,
+          "live": "Whole"
+        },
+        {
+          "name": "kernarg",
+          "kind": "s",
+          "base": 0,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "weight_resource",
+          "kind": "s",
+          "base": 4,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "x",
+          "kind": "s",
+          "base": 8,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "output",
+          "kind": "s",
+          "base": 10,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "row",
+          "kind": "s",
+          "base": 12,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "groups",
+          "kind": "s",
+          "base": 13,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "quads",
+          "kind": "s",
+          "base": 14,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "tail",
+          "kind": "s",
+          "base": 15,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "quad_index",
+          "kind": "s",
+          "base": 16,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "weight_offset",
+          "kind": "s",
+          "base": 17,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "total_rows",
+          "kind": "s",
+          "base": 18,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "matrix_rows",
+          "kind": "s",
+          "base": 20,
+          "len": 4,
+          "live": "Whole"
+        },
+        {
+          "name": "k",
+          "kind": "s",
+          "base": 24,
+          "len": 1,
+          "live": "Whole"
+        },
+        {
+          "name": "row_address",
+          "kind": "s",
+          "base": 26,
+          "len": 2,
+          "live": "Whole"
+        },
+        {
+          "name": "row_product",
+          "kind": "s",
+          "base": 28,
+          "len": 2,
+          "live": "Whole"
+        }
+      ],
+      "next_free_vgpr": 76,
+      "next_free_sgpr": 30,
+      "waits": [
+        {
+          "pc_index": 4,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "s[20:23]"
+            }
+          }
+        },
+        {
+          "pc_index": 23,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": {
+            "Waw": {
+              "reg": "s[4:5]"
+            }
+          }
+        },
+        {
+          "pc_index": 28,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": {
+            "Waw": {
+              "reg": "s[4:5]"
+            }
+          }
+        },
+        {
+          "pc_index": 33,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": {
+            "Waw": {
+              "reg": "s[4:5]"
+            }
+          }
+        },
+        {
+          "pc_index": 38,
+          "insn": "s_wait_kmcnt 0x0",
+          "counter": "Km",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 83,
+          "insn": "s_wait_loadcnt 0xe",
+          "counter": "Load",
+          "count": 14,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 86,
+          "insn": "s_wait_loadcnt 0xc",
+          "counter": "Load",
+          "count": 12,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 89,
+          "insn": "s_wait_loadcnt 0xb",
+          "counter": "Load",
+          "count": 11,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 98,
+          "insn": "s_wait_loadcnt 0xa",
+          "counter": "Load",
+          "count": 10,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 139,
+          "insn": "s_wait_loadcnt 0x9",
+          "counter": "Load",
+          "count": 9,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 148,
+          "insn": "s_wait_loadcnt 0x6",
+          "counter": "Load",
+          "count": 6,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 195,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 211,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 214,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 243,
+          "insn": "s_wait_loadcnt 0x3",
+          "counter": "Load",
+          "count": 3,
+          "reason": {
+            "Use": {
+              "reg": "v[16:17]"
+            }
+          }
+        },
+        {
+          "pc_index": 245,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": {
+            "Use": {
+              "reg": "v18"
+            }
+          }
+        },
+        {
+          "pc_index": 249,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v[8:11]"
+            }
+          }
+        },
+        {
+          "pc_index": 266,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[12:15]"
+            }
+          }
+        },
+        {
+          "pc_index": 288,
+          "insn": "s_wait_loadcnt 0x3",
+          "counter": "Load",
+          "count": 3,
+          "reason": {
+            "Use": {
+              "reg": "v[16:17]"
+            }
+          }
+        },
+        {
+          "pc_index": 290,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": {
+            "Use": {
+              "reg": "v18"
+            }
+          }
+        },
+        {
+          "pc_index": 294,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v[8:11]"
+            }
+          }
+        },
+        {
+          "pc_index": 311,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[12:15]"
+            }
+          }
+        },
+        {
+          "pc_index": 333,
+          "insn": "s_wait_loadcnt 0x3",
+          "counter": "Load",
+          "count": 3,
+          "reason": {
+            "Use": {
+              "reg": "v[16:17]"
+            }
+          }
+        },
+        {
+          "pc_index": 335,
+          "insn": "s_wait_loadcnt 0x2",
+          "counter": "Load",
+          "count": 2,
+          "reason": {
+            "Use": {
+              "reg": "v18"
+            }
+          }
+        },
+        {
+          "pc_index": 339,
+          "insn": "s_wait_loadcnt 0x1",
+          "counter": "Load",
+          "count": 1,
+          "reason": {
+            "Use": {
+              "reg": "v[8:11]"
+            }
+          }
+        },
+        {
+          "pc_index": 356,
+          "insn": "s_wait_loadcnt 0x0",
+          "counter": "Load",
+          "count": 0,
+          "reason": {
+            "Use": {
+              "reg": "v[12:15]"
+            }
+          }
+        },
+        {
+          "pc_index": 376,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 382,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 388,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 394,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        },
+        {
+          "pc_index": 400,
+          "insn": "s_wait_dscnt 0x0",
+          "counter": "Ds",
+          "count": 0,
+          "reason": "Barrier"
+        }
+      ],
+      "hazards": [],
+      "clauses": [
+        {
+          "start": 64,
+          "len": 8,
+          "class": "VmemLoad"
+        },
+        {
+          "start": 73,
+          "len": 8,
+          "class": "VmemLoad"
+        }
+      ],
+      "vopd_pairs": 14,
+      "lds_slots": [],
+      "barriers": [],
+      "loop_fixpoints": [
+        {
+          "head": ".Lquad_loop",
+          "iterations": 2
+        }
+      ],
+      "forbidden_mnemonics_checked": [
+        "s_waitcnt (gfx12)",
+        "scratch_*"
+      ],
+      "s_text_sha256": "009f81286e26728257cee1187b7ea960c163547af4e27af75072a4b1c4a9b6d2"
+    }
+  ]
+}

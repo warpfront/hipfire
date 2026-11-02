@@ -1,0 +1,753 @@
+{
+  "input": "/home/kaden/qcal/release-0.4.3/consumer24-k1/kernels/mq_i4_moe_gemv_pm_gfx1100.co",
+  "arch": "gfx1100",
+  "profiles": [
+    {
+      "profile": "default",
+      "object": "/home/kaden/qcal/release-0.4.3/consumer24-k1/kernels/mq_i4_moe_gemv_pm_gfx1100.co",
+      "disassembly": "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b2.k1.audit.default.isa.txt",
+      "kernels": [
+        {
+          "symbol": "mq_i4_moe_gemv_mq2i4_r256_gate_up_pm_gfx1100",
+          "vgpr_count": 104,
+          "sgpr_count": 80,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0,
+          "sgpr_spill_count": 0,
+          "loops": [
+            {
+              "evidence": {
+                "start_line": 183,
+                "end_line": 852,
+                "start_pc": "0x324c",
+                "end_pc": "0x3db0"
+              },
+              "back_edge": {
+                "start_line": 852,
+                "end_line": 852,
+                "start_pc": "0x3db0",
+                "end_pc": "0x3db0"
+              },
+              "counts": {
+                "wmma": 0,
+                "swmmac": 0,
+                "matrix_forms": {},
+                "valu_slots": 288,
+                "vopd_packets": 0,
+                "fold_vopd_packets": 0,
+                "pairable_valu_pairs": 88,
+                "vopd_candidate_ops": 176,
+                "waits": {
+                  "s_waitcnt": 4
+                },
+                "s_wait_alu": 0,
+                "ds": 0,
+                "vmem": 40,
+                "barriers": 0
+              },
+              "findings": [
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 227,
+                    "end_line": 227,
+                    "start_pc": "0x3328",
+                    "end_pc": "0x3328"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 236,
+                    "end_line": 236,
+                    "start_pc": "0x3350",
+                    "end_pc": "0x3350"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 245,
+                    "end_line": 245,
+                    "start_pc": "0x3378",
+                    "end_pc": "0x3378"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 254,
+                    "end_line": 254,
+                    "start_pc": "0x33a0",
+                    "end_pc": "0x33a0"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 394,
+                    "end_line": 394,
+                    "start_pc": "0x3600",
+                    "end_pc": "0x3600"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 403,
+                    "end_line": 403,
+                    "start_pc": "0x3628",
+                    "end_pc": "0x3628"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 412,
+                    "end_line": 412,
+                    "start_pc": "0x3650",
+                    "end_pc": "0x3650"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 421,
+                    "end_line": 421,
+                    "start_pc": "0x3678",
+                    "end_pc": "0x3678"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 561,
+                    "end_line": 561,
+                    "start_pc": "0x38d8",
+                    "end_pc": "0x38d8"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 570,
+                    "end_line": 570,
+                    "start_pc": "0x3900",
+                    "end_pc": "0x3900"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 579,
+                    "end_line": 579,
+                    "start_pc": "0x3928",
+                    "end_pc": "0x3928"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 588,
+                    "end_line": 588,
+                    "start_pc": "0x3950",
+                    "end_pc": "0x3950"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 728,
+                    "end_line": 728,
+                    "start_pc": "0x3bb0",
+                    "end_pc": "0x3bb0"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 737,
+                    "end_line": 737,
+                    "start_pc": "0x3bd8",
+                    "end_pc": "0x3bd8"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 746,
+                    "end_line": 746,
+                    "start_pc": "0x3c00",
+                    "end_pc": "0x3c00"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 755,
+                    "end_line": 755,
+                    "start_pc": "0x3c28",
+                    "end_pc": "0x3c28"
+                  }
+                }
+              ]
+            }
+          ],
+          "hot_loop": 0,
+          "findings": []
+        },
+        {
+          "symbol": "mq_i4_moe_gemv_mq2i4_r128_down_pm_gfx1100",
+          "vgpr_count": 80,
+          "sgpr_count": 80,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0,
+          "sgpr_spill_count": 0,
+          "loops": [
+            {
+              "evidence": {
+                "start_line": 1897,
+                "end_line": 2065,
+                "start_pc": "0x50dc",
+                "end_pc": "0x53b8"
+              },
+              "back_edge": {
+                "start_line": 2065,
+                "end_line": 2065,
+                "start_pc": "0x53b8",
+                "end_pc": "0x53b8"
+              },
+              "counts": {
+                "wmma": 0,
+                "swmmac": 0,
+                "matrix_forms": {},
+                "valu_slots": 72,
+                "vopd_packets": 0,
+                "fold_vopd_packets": 0,
+                "pairable_valu_pairs": 22,
+                "vopd_candidate_ops": 44,
+                "waits": {
+                  "s_waitcnt": 1
+                },
+                "s_wait_alu": 0,
+                "ds": 0,
+                "vmem": 10,
+                "barriers": 0
+              },
+              "findings": [
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 1941,
+                    "end_line": 1941,
+                    "start_pc": "0x51b8",
+                    "end_pc": "0x51b8"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 1950,
+                    "end_line": 1950,
+                    "start_pc": "0x51e0",
+                    "end_pc": "0x51e0"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 1959,
+                    "end_line": 1959,
+                    "start_pc": "0x5208",
+                    "end_pc": "0x5208"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 1968,
+                    "end_line": 1968,
+                    "start_pc": "0x5230",
+                    "end_pc": "0x5230"
+                  }
+                }
+              ]
+            }
+          ],
+          "hot_loop": 0,
+          "findings": []
+        },
+        {
+          "symbol": "mq_i4_moe_gemv_mq4sym_r256_gate_up_pm_gfx1100",
+          "vgpr_count": 144,
+          "sgpr_count": 80,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0,
+          "sgpr_spill_count": 0,
+          "loops": [
+            {
+              "evidence": {
+                "start_line": 2538,
+                "end_line": 3519,
+                "start_pc": "0x5d44",
+                "end_pc": "0x6ee8"
+              },
+              "back_edge": {
+                "start_line": 3519,
+                "end_line": 3519,
+                "start_pc": "0x6ee8",
+                "end_pc": "0x6ee8"
+              },
+              "counts": {
+                "wmma": 0,
+                "swmmac": 0,
+                "matrix_forms": {},
+                "valu_slots": 440,
+                "vopd_packets": 0,
+                "fold_vopd_packets": 0,
+                "pairable_valu_pairs": 144,
+                "vopd_candidate_ops": 288,
+                "waits": {
+                  "s_waitcnt": 4
+                },
+                "s_wait_alu": 0,
+                "ds": 0,
+                "vmem": 72,
+                "barriers": 0
+              },
+              "findings": [
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2592,
+                    "end_line": 2592,
+                    "start_pc": "0x5e70",
+                    "end_pc": "0x5e70"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2597,
+                    "end_line": 2597,
+                    "start_pc": "0x5e8c",
+                    "end_pc": "0x5e8c"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2602,
+                    "end_line": 2602,
+                    "start_pc": "0x5ea8",
+                    "end_pc": "0x5ea8"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2607,
+                    "end_line": 2607,
+                    "start_pc": "0x5ec4",
+                    "end_pc": "0x5ec4"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2612,
+                    "end_line": 2612,
+                    "start_pc": "0x5ee0",
+                    "end_pc": "0x5ee0"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2617,
+                    "end_line": 2617,
+                    "start_pc": "0x5efc",
+                    "end_pc": "0x5efc"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2622,
+                    "end_line": 2622,
+                    "start_pc": "0x5f18",
+                    "end_pc": "0x5f18"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2627,
+                    "end_line": 2627,
+                    "start_pc": "0x5f34",
+                    "end_pc": "0x5f34"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2837,
+                    "end_line": 2837,
+                    "start_pc": "0x62d8",
+                    "end_pc": "0x62d8"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2842,
+                    "end_line": 2842,
+                    "start_pc": "0x62f4",
+                    "end_pc": "0x62f4"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2847,
+                    "end_line": 2847,
+                    "start_pc": "0x6310",
+                    "end_pc": "0x6310"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2852,
+                    "end_line": 2852,
+                    "start_pc": "0x632c",
+                    "end_pc": "0x632c"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2857,
+                    "end_line": 2857,
+                    "start_pc": "0x6348",
+                    "end_pc": "0x6348"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2862,
+                    "end_line": 2862,
+                    "start_pc": "0x6364",
+                    "end_pc": "0x6364"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2867,
+                    "end_line": 2867,
+                    "start_pc": "0x6380",
+                    "end_pc": "0x6380"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 2872,
+                    "end_line": 2872,
+                    "start_pc": "0x639c",
+                    "end_pc": "0x639c"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3082,
+                    "end_line": 3082,
+                    "start_pc": "0x6740",
+                    "end_pc": "0x6740"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3087,
+                    "end_line": 3087,
+                    "start_pc": "0x675c",
+                    "end_pc": "0x675c"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3092,
+                    "end_line": 3092,
+                    "start_pc": "0x6778",
+                    "end_pc": "0x6778"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3097,
+                    "end_line": 3097,
+                    "start_pc": "0x6794",
+                    "end_pc": "0x6794"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3102,
+                    "end_line": 3102,
+                    "start_pc": "0x67b0",
+                    "end_pc": "0x67b0"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3107,
+                    "end_line": 3107,
+                    "start_pc": "0x67cc",
+                    "end_pc": "0x67cc"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3112,
+                    "end_line": 3112,
+                    "start_pc": "0x67e8",
+                    "end_pc": "0x67e8"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3117,
+                    "end_line": 3117,
+                    "start_pc": "0x6804",
+                    "end_pc": "0x6804"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3327,
+                    "end_line": 3327,
+                    "start_pc": "0x6ba8",
+                    "end_pc": "0x6ba8"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3332,
+                    "end_line": 3332,
+                    "start_pc": "0x6bc4",
+                    "end_pc": "0x6bc4"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3337,
+                    "end_line": 3337,
+                    "start_pc": "0x6be0",
+                    "end_pc": "0x6be0"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3342,
+                    "end_line": 3342,
+                    "start_pc": "0x6bfc",
+                    "end_pc": "0x6bfc"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3347,
+                    "end_line": 3347,
+                    "start_pc": "0x6c18",
+                    "end_pc": "0x6c18"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3352,
+                    "end_line": 3352,
+                    "start_pc": "0x6c34",
+                    "end_pc": "0x6c34"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3357,
+                    "end_line": 3357,
+                    "start_pc": "0x6c50",
+                    "end_pc": "0x6c50"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 3362,
+                    "end_line": 3362,
+                    "start_pc": "0x6c6c",
+                    "end_pc": "0x6c6c"
+                  }
+                }
+              ]
+            }
+          ],
+          "hot_loop": 0,
+          "findings": []
+        },
+        {
+          "symbol": "mq_i4_moe_gemv_mq4sym_r128_down_pm_gfx1100",
+          "vgpr_count": 80,
+          "sgpr_count": 80,
+          "private_segment_fixed_size": 0,
+          "vgpr_spill_count": 0,
+          "sgpr_spill_count": 0,
+          "loops": [
+            {
+              "evidence": {
+                "start_line": 4798,
+                "end_line": 4952,
+                "start_pc": "0x86c8",
+                "end_pc": "0x8984"
+              },
+              "back_edge": {
+                "start_line": 4952,
+                "end_line": 4952,
+                "start_pc": "0x8984",
+                "end_pc": "0x8984"
+              },
+              "counts": {
+                "wmma": 0,
+                "swmmac": 0,
+                "matrix_forms": {},
+                "valu_slots": 66,
+                "vopd_packets": 0,
+                "fold_vopd_packets": 0,
+                "pairable_valu_pairs": 20,
+                "vopd_candidate_ops": 40,
+                "waits": {
+                  "s_waitcnt": 1
+                },
+                "s_wait_alu": 0,
+                "ds": 0,
+                "vmem": 10,
+                "barriers": 0
+              },
+              "findings": [
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 4844,
+                    "end_line": 4844,
+                    "start_pc": "0x87b4",
+                    "end_pc": "0x87b4"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 4849,
+                    "end_line": 4849,
+                    "start_pc": "0x87d0",
+                    "end_pc": "0x87d0"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 4854,
+                    "end_line": 4854,
+                    "start_pc": "0x87ec",
+                    "end_pc": "0x87ec"
+                  }
+                },
+                {
+                  "kind": "loop_invariant_rematerialization",
+                  "detail": "v_bfe_u32 reads no register defined in this loop",
+                  "evidence": {
+                    "start_line": 4859,
+                    "end_line": 4859,
+                    "start_pc": "0x8808",
+                    "end_pc": "0x8808"
+                  }
+                }
+              ]
+            }
+          ],
+          "hot_loop": 0,
+          "findings": []
+        }
+      ]
+    }
+  ]
+}

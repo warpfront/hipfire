@@ -73,3 +73,96 @@ extern "C" __global__ void gemm_mw16_residual_wmma(
         }
     }
 }
+
+// gfx1151 twin of gemm_mw16_residual_wmma for the 16-row DFlash draft GEMMs.
+// Per output tile the arithmetic is the base kernel's exactly (one wave owns
+// 16 weight rows x 16 batch rows and runs acc = wmma(A_t, B_t, acc) over
+// t = 0..K/16-1 in order from 0, then Y += acc), so Y is bitwise equal.
+// What differs is memory access only: a block runs 4 waves (64 weight rows)
+// and stages each 128-K slab of the 16 x K X panel in LDS once, double-
+// buffered, instead of every wave re-reading the whole panel from L2; each
+// lane loads its row's 256 B of the slab with sixteen b128 loads up front.
+// W rows are `ldw` halfs apart (ldw >= K, ldw % 8 == 0): with a power-of-two
+// row pitch (K = 4096 -> 8 KiB) every wave's rows hit the same DRAM channels at
+// the same k and gfx1151 streams ~50 GB/s instead of ~210, so the loader pads.
+// Grid: [ceil(M / 64), ceil(N / 16)]. Block: [128]. K % 128 == 0.
+// Waves past M run the loop on clamped rows (uniform barriers), stores masked.
+#define MWX_WAVES 4
+#define MWX_KS 128
+#define MWX_PITCH (MWX_KS + 8)
+typedef unsigned int __attribute__((ext_vector_type(4))) mwx_u4_t;
+typedef unsigned int __attribute__((ext_vector_type(8))) mwx_u8_t;
+
+__launch_bounds__(32 * MWX_WAVES, 1)
+extern "C" __global__ void gemm_mw16_residual_wmma_gfx1151_xlds(
+    const _Float16* __restrict__ W,
+    const _Float16* __restrict__ X,
+    float* __restrict__ Y,
+    int M, int K, int N, int ldw
+) {
+    __shared__ _Float16 xs_lds[2 * 16 * MWX_PITCH];
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int lane16 = lane & 15;
+    const int row_start = blockIdx.x * 16 * MWX_WAVES + (tid >> 5) * 16;
+    const int batch_start = blockIdx.y * 16;
+    if (batch_start >= N) return;
+
+    const int r = row_start + lane16;
+    const _Float16* wp = W + (long long)(r < M ? r : M - 1) * ldw;
+
+    // X slab: 16 rows x 128 halfs = 256 vectors of 8 halfs, 2 per thread.
+    // Invalid batch rows read batch row 0, as the base kernel does.
+    mwx_u4_t xr[2];
+    auto x_fetch = [&](int s) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int v = tid + i * 32 * MWX_WAVES;
+            const int b = v >> 4, c = v & 15;
+            const int sb = (batch_start + b < N) ? (batch_start + b) : 0;
+            xr[i] = *(const mwx_u4_t*)(X + (long long)sb * K + s * MWX_KS + c * 8);
+        }
+    };
+    auto x_store = [&](int buf) {
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int v = tid + i * 32 * MWX_WAVES;
+            const int b = v >> 4, c = v & 15;
+            *(mwx_u4_t*)(xs_lds + buf * 16 * MWX_PITCH + b * MWX_PITCH + c * 8) = xr[i];
+        }
+    };
+
+    const int S = K / MWX_KS;
+    float8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
+    x_fetch(0);
+    x_store(0);
+    __syncthreads();
+    for (int s = 0; s < S; ++s) {
+        const mwx_u4_t* wv = (const mwx_u4_t*)(wp + s * MWX_KS);
+        mwx_u4_t w[16];
+#pragma unroll
+        for (int i = 0; i < 16; ++i) w[i] = wv[i];
+        if (s + 1 < S) x_fetch(s + 1);
+        const _Float16* xs = xs_lds + (s & 1) * 16 * MWX_PITCH + lane16 * MWX_PITCH;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+            mwx_u8_t a8;
+            a8[0] = w[2 * t].x; a8[1] = w[2 * t].y; a8[2] = w[2 * t].z; a8[3] = w[2 * t].w;
+            a8[4] = w[2 * t + 1].x; a8[5] = w[2 * t + 1].y;
+            a8[6] = w[2 * t + 1].z; a8[7] = w[2 * t + 1].w;
+            acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                __builtin_bit_cast(half16_t, a8), *(const half16_t*)(xs + t * 16), acc);
+        }
+        if (s + 1 < S) x_store((s + 1) & 1);
+        __syncthreads();
+    }
+
+    const int out_col = batch_start + lane16;
+    if (out_col < N) {
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const int out_row = row_start + 2 * j + (lane >> 4);
+            if (out_row < M) Y[(long long)out_col * M + out_row] += acc[j];
+        }
+    }
+}

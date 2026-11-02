@@ -2,7 +2,7 @@
 
 **Status (2026-06-11):** quantizer side shipped + validated; runtime kernels designed, not built.
 **Branch:** `feat/moe-awq-experts` — sits **directly on master tip** (`e2d21ae2`),
-1 commit ahead (`6198851e`), 0 behind. Not stale. On mi300 at `/root/dflash`.
+1 commit ahead (`6198851e`), 0 behind. Not stale. On the MI300X rental box at `/root/dflash`.
 
 ---
 
@@ -233,7 +233,7 @@ kernel is written once.
 `gemv_hfq4g256_moe_down_*_indexed*.hip`, `fused_rmsnorm_rotate_mq_batched` (shared rotate).
 **Runtime:** `crates/hipfire-arch-qwen35/src/qwen35.rs` — `ExpertWeights` (~552),
 expert ptr tables (~579, built ~2105); `crates/rdna-compute/src/moe.rs` (dispatch).
-**Test model:** `/workspace/nex-n2-mq4awq.hfq` (19.7GB, on mi300); imatrix
+**Test model:** `/workspace/nex-n2-mq4awq.hfq` (19.7GB, on the MI300X rental box); imatrix
 `/workspace/nex-imatrix/imatrix_unsloth.gguf_file`; bf16 src `/workspace/nex-n2-mini`.
 **Memory:** `project_moe_awq_experts_2026_06_11`,
 `project_hfim_native_imatrix_2026_06_07` (dense HFIM), `ragged-k-g128-localized`

@@ -1,0 +1,17 @@
+{
+  "scenario": "tetris-python",
+  "A_decode_median": 113.85,
+  "B_decode_median": 114.15,
+  "speedup": 1.0026350461133071,
+  "A_range": [
+    113.7,
+    114.0
+  ],
+  "B_range": [
+    114.0,
+    114.3
+  ],
+  "text_parity": true,
+  "tau_parity": true,
+  "cycles_parity": true
+}

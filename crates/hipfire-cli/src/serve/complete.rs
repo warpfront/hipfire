@@ -1,0 +1,8521 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Completion pipeline and OpenAI translation.
+//!
+//! Concern: think-channel routing, semantic-event folding, stream-contract
+//! gating, retry latches, and OpenAI adaptation (tool-call lifting, message
+//! normalisation, finishing). Groups the deterministic, heavily-tested
+//! transformations that convert daemon events into OpenAI responses.
+
+use crate::serve::http::request_id;
+use crate::serve::{
+    bail_invalid, invalid_request, Admission, AdmissionGuard, ModelOrigin, ServeMeta, ServeShared,
+};
+use crate::{
+    apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
+    insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp,
+};
+use anyhow::{anyhow, bail, Context, Result};
+use hipfire_client::ClientError;
+use hipfire_runtime::prompt_frame::ToolCall;
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
+
+#[derive(Debug)]
+pub(crate) struct Completion {
+    pub(crate) id: String,
+    pub(crate) created: u64,
+    pub(crate) model: String,
+    pub(crate) content: String,
+    pub(crate) reasoning_content: String,
+    pub(crate) preserve_thinking: bool,
+    pub(crate) tool_calls: Vec<ToolCall>,
+    pub(crate) done: serde_json::Value,
+    pub(crate) logprobs: Option<Vec<serde_json::Value>>,
+    pub(crate) reasoning: Option<crate::ReasoningResolution>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ThinkFragment {
+    Content(String),
+    Reasoning(String),
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ThinkChannelRouter {
+    in_think: bool,
+    pending: String,
+    strip_answer_newlines: bool,
+    semantic_split: bool,
+    semantic_pending: String,
+    semantic_reasoning: Option<bool>,
+}
+
+impl ThinkChannelRouter {
+    pub(crate) fn set_started_in_think(&mut self, started: bool) {
+        self.in_think = started;
+    }
+
+    pub(crate) fn push(&mut self, text: &str) -> Vec<ThinkFragment> {
+        if self.semantic_split {
+            return self.push_semantic(text, false);
+        }
+        self.pending.push_str(text);
+        self.drain(false)
+    }
+
+    pub(crate) fn push_semantic(&mut self, text: &str, reasoning: bool) -> Vec<ThinkFragment> {
+        let mut out = if self.pending.is_empty() {
+            Vec::new()
+        } else {
+            self.drain(true)
+        };
+        self.semantic_split = true;
+        if self.semantic_reasoning != Some(reasoning) {
+            out.extend(self.drain_semantic(true));
+            self.semantic_reasoning = Some(reasoning);
+        }
+        self.semantic_pending.push_str(text);
+        out.extend(self.drain_semantic(false));
+        out
+    }
+
+    pub(crate) fn finish(&mut self) -> Vec<ThinkFragment> {
+        let mut out = self.drain(true);
+        out.extend(self.drain_semantic(true));
+        out
+    }
+
+    pub(crate) fn drain(&mut self, flush: bool) -> Vec<ThinkFragment> {
+        pub(crate) const OPEN: &str = "<think>";
+        pub(crate) const CLOSE: &str = "</think>";
+        let mut out = Vec::new();
+        loop {
+            if let Some((index, marker)) = next_control_marker(&self.pending) {
+                let before = self.pending[..index].to_owned();
+                self.emit(before, &mut out);
+                self.pending.drain(..index + marker.len());
+                match marker {
+                    OPEN => self.in_think = true,
+                    CLOSE => {
+                        self.in_think = false;
+                        self.strip_answer_newlines = true;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+
+            let held = if flush {
+                0
+            } else {
+                longest_control_prefix_suffix(&self.pending)
+            };
+            let emit_len = self.pending.len().saturating_sub(held);
+            if emit_len > 0 {
+                let text = self.pending[..emit_len].to_owned();
+                self.pending.drain(..emit_len);
+                self.emit(text, &mut out);
+            }
+            break;
+        }
+        out
+    }
+
+    pub(crate) fn drain_semantic(&mut self, flush: bool) -> Vec<ThinkFragment> {
+        let mut out = Vec::new();
+        loop {
+            if let Some((index, marker)) = next_control_marker(&self.semantic_pending) {
+                let before = self.semantic_pending[..index].to_owned();
+                self.emit_semantic(before, &mut out);
+                self.semantic_pending.drain(..index + marker.len());
+                continue;
+            }
+            let held = if flush {
+                0
+            } else {
+                longest_control_prefix_suffix(&self.semantic_pending)
+            };
+            let emit_len = self.semantic_pending.len().saturating_sub(held);
+            if emit_len > 0 {
+                let text = self.semantic_pending[..emit_len].to_owned();
+                self.semantic_pending.drain(..emit_len);
+                self.emit_semantic(text, &mut out);
+            }
+            break;
+        }
+        out
+    }
+
+    pub(crate) fn emit(&mut self, mut text: String, out: &mut Vec<ThinkFragment>) {
+        if !self.in_think && self.strip_answer_newlines {
+            let trimmed = text.trim_start_matches(['\r', '\n']);
+            if trimmed.is_empty() {
+                return;
+            }
+            text = trimmed.to_owned();
+            self.strip_answer_newlines = false;
+        }
+        if text.is_empty() {
+            return;
+        }
+        if self.in_think {
+            out.push(ThinkFragment::Reasoning(text));
+        } else {
+            out.push(ThinkFragment::Content(text));
+        }
+    }
+
+    pub(crate) fn emit_semantic(&self, text: String, out: &mut Vec<ThinkFragment>) {
+        if text.is_empty() {
+            return;
+        }
+        if self.semantic_reasoning == Some(true) {
+            out.push(ThinkFragment::Reasoning(text));
+        } else {
+            out.push(ThinkFragment::Content(text));
+        }
+    }
+}
+
+pub(crate) const OUTPUT_CONTROL_MARKERS: &[&str] = &[
+    "<think>",
+    "</think>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|end_of_text|>",
+    "<|eot_id|>",
+];
+
+pub(crate) fn next_control_marker(text: &str) -> Option<(usize, &'static str)> {
+    OUTPUT_CONTROL_MARKERS
+        .iter()
+        .filter_map(|marker| text.find(marker).map(|index| (index, *marker)))
+        .min_by_key(|(index, _)| *index)
+}
+
+pub(crate) fn longest_control_prefix_suffix(text: &str) -> usize {
+    OUTPUT_CONTROL_MARKERS
+        .iter()
+        .map(|marker| {
+            let max = text.len().min(marker.len().saturating_sub(1));
+            (1..=max)
+                .rev()
+                .find(|&len| text.ends_with(&marker[..len]))
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Convert a daemon v2 structured tool-call JSON object into canonical [`ToolCall`].
+pub(crate) fn tool_call_from_canonical_value(
+    value: &serde_json::Value,
+) -> Result<ToolCall, String> {
+    let obj = value
+        .as_object()
+        .ok_or_else(|| "tool call must be a JSON object".to_owned())?;
+    let name = obj
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .ok_or_else(|| "tool call missing non-empty name".to_owned())?
+        .to_owned();
+    let arguments = obj
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let id = obj
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    Ok(ToolCall {
+        id,
+        name,
+        arguments,
+        rendered_body: None,
+    })
+}
+
+/// Convert a retained legacy completion-boundary tool-call JSON value into
+/// canonical [`ToolCall`] without marker parsing.
+pub(crate) fn tool_call_from_legacy_value(value: &serde_json::Value) -> Result<ToolCall, String> {
+    // Legacy wire already used `{name, arguments}` objects (same shape as v2).
+    // Keep an explicit boundary so legacy retention never reintroduces text scans.
+    tool_call_from_canonical_value(value)
+}
+
+/// Absorb canonical `calls` staged on a legacy terminal payload
+/// (`commit_ready` / `done`) into the legacy tool-call buffer.
+///
+/// Legacy-contract daemons deliver tool calls two ways: a separate `tool_calls`
+/// event, or `calls` staged on the terminal payload. Routes that never
+/// advertise `contract_version: 2` (DeepSeek V4) only stage, so a buffer fed
+/// only by the separate event stays empty and the terminal drops the calls. A
+/// staged array is authoritative and *replaces* the buffer (same rule as
+/// [`SemanticEventFold::absorb_terminal_calls`]), so a daemon that both emits
+/// and stages never double-counts. A terminal without `calls` leaves the
+/// buffer untouched. Ported from #593.
+pub(crate) fn absorb_legacy_terminal_calls(
+    terminal: &serde_json::Value,
+    buffered: &mut Vec<ToolCall>,
+) -> Result<(), String> {
+    if terminal
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+        != Some("tool_calls")
+    {
+        return Ok(());
+    }
+    let Some(calls) = terminal.get("calls") else {
+        return Ok(());
+    };
+    let calls = calls
+        .as_array()
+        .ok_or_else(|| "tool_calls terminal `calls` must be a JSON array".to_owned())?;
+    *buffered = calls
+        .iter()
+        .map(tool_call_from_legacy_value)
+        .collect::<Result<_, _>>()?;
+    Ok(())
+}
+
+/// JSON kind label for diagnostic logging (no values).
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+/// Declared JSON-schema types of one parameter, in declaration order, read the
+/// way vLLM's `JsonParamType::from_schema` does: `type` (string or array), else
+/// the members of `anyOf`/`oneOf`, else `enum` (string; nullable when it lists
+/// `null`), `items` (array), `properties`/`additionalProperties` (object).
+/// Empty when the schema declares no known type.
+fn schema_types(schema: &serde_json::Value) -> Vec<&'static str> {
+    const KNOWN: [&str; 7] = [
+        "string", "integer", "number", "boolean", "object", "array", "null",
+    ];
+    let known = |name: &str| KNOWN.into_iter().find(|k| *k == name);
+    let mut types = Vec::new();
+    match schema.get("type") {
+        Some(serde_json::Value::String(name)) => types.extend(known(name)),
+        Some(serde_json::Value::Array(names)) => types.extend(
+            names
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .filter_map(known),
+        ),
+        Some(_) => {}
+        None => {
+            if let Some(members) = schema
+                .get("anyOf")
+                .or_else(|| schema.get("oneOf"))
+                .and_then(serde_json::Value::as_array)
+            {
+                for ty in members.iter().flat_map(schema_types) {
+                    if !types.contains(&ty) {
+                        types.push(ty);
+                    }
+                }
+            } else if let Some(values) = schema.get("enum").and_then(serde_json::Value::as_array) {
+                types.push("string");
+                if values.iter().any(serde_json::Value::is_null) {
+                    types.push("null");
+                }
+            } else if schema.get("items").is_some() {
+                types.push("array");
+            } else if schema.get("properties").is_some()
+                || schema.get("additionalProperties").is_some()
+            {
+                types.push("object");
+            }
+        }
+    }
+    types
+}
+
+/// Type one string argument by its declared types (vLLM
+/// `convert_with_optional_schema`): a `null`/`None` literal becomes JSON null
+/// unless the parameter is a plain `string`; otherwise the first declared type
+/// the text converts to wins, and reaching `string` first keeps the text
+/// verbatim. `None` means keep the string exactly as the model wrote it.
+fn type_string_arg(text: &str, types: &[&str]) -> Option<serde_json::Value> {
+    if types.is_empty() {
+        return None;
+    }
+    if types != ["string"]
+        && (text.eq_ignore_ascii_case("null") || text.eq_ignore_ascii_case("none"))
+    {
+        return Some(serde_json::Value::Null);
+    }
+    for ty in types {
+        let typed = match *ty {
+            "string" => return None,
+            "integer" => text.parse::<i64>().ok().map(serde_json::Value::from),
+            "number" => text
+                .parse::<i64>()
+                .ok()
+                .map(serde_json::Value::from)
+                .or_else(|| {
+                    text.parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                        .map(serde_json::Value::Number)
+                }),
+            "boolean" => match text.trim().to_ascii_lowercase().as_str() {
+                "true" | "1" => Some(serde_json::Value::Bool(true)),
+                "false" | "0" => Some(serde_json::Value::Bool(false)),
+                _ => None,
+            },
+            "object" if text.is_empty() => Some(serde_json::Value::Object(Default::default())),
+            "array" if text.is_empty() => Some(serde_json::Value::Array(Vec::new())),
+            "object" => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(serde_json::Value::is_object),
+            "array" => serde_json::from_str::<serde_json::Value>(text)
+                .ok()
+                .filter(serde_json::Value::is_array),
+            _ => None,
+        };
+        if typed.is_some() {
+            return typed;
+        }
+    }
+    None
+}
+
+/// Type tool-call arguments by the request's declared schema. Strings (every
+/// native-XML parameter arrives as one) are typed per [`type_string_arg`], so a
+/// `string` parameter keeps the exact text even when it looks like JSON. A
+/// structured value in a slot that accepts only `string` (a JSON-format model
+/// emitting an object for a string field) is serialized to its JSON text.
+fn normalize_value(
+    value: &mut serde_json::Value,
+    schema: &serde_json::Value,
+    tool_name: &str,
+    path: &str,
+) {
+    let before_kind = json_kind(value);
+    let types = schema_types(schema);
+    let repaired = match value {
+        serde_json::Value::String(s) => type_string_arg(s, &types),
+        serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Object(_)
+        | serde_json::Value::Array(_) => {
+            let accepts_own = match value {
+                serde_json::Value::Number(n) if n.is_i64() || n.is_u64() => {
+                    types.contains(&"integer") || types.contains(&"number")
+                }
+                _ => types.contains(&before_kind),
+            };
+            if types.contains(&"string") && !accepts_own {
+                serde_json::to_string(&*value)
+                    .ok()
+                    .map(serde_json::Value::String)
+            } else {
+                None
+            }
+        }
+        serde_json::Value::Null => None,
+    };
+    if let Some(new_value) = repaired {
+        *value = new_value;
+        let after_kind = json_kind(value);
+        let display_path = if path.is_empty() { "<root>" } else { path };
+        eprintln!(
+            "[hipfire] tool_args_normalize tool={} path={} expected={} {}->{}",
+            tool_name, display_path, after_kind, before_kind, after_kind
+        );
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                let keys: Vec<String> = map.keys().cloned().collect();
+                for k in keys {
+                    if let Some(subschema) = props.get(&k) {
+                        if let Some(child) = map.get_mut(&k) {
+                            let child_path = if path.is_empty() {
+                                k.clone()
+                            } else {
+                                format!("{path}.{k}")
+                            };
+                            normalize_value(child, subschema, tool_name, &child_path);
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            if let Some(items_schema) = schema.get("items") {
+                if items_schema.is_object() {
+                    for (idx, elem) in arr.iter_mut().enumerate() {
+                        let child_path = if path.is_empty() {
+                            format!("[{idx}]")
+                        } else {
+                            format!("{path}[{idx}]")
+                        };
+                        normalize_value(elem, items_schema, tool_name, &child_path);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_tool_calls(calls: &mut [ToolCall], body: &serde_json::Value) {
+    let tools = match body.get("tools").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return,
+    };
+    let mut schema_map: std::collections::HashMap<String, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for t in tools {
+        let func = t.get("function").unwrap_or(t);
+        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+            if let Some(params) = func.get("parameters") {
+                schema_map.insert(name.to_owned(), params);
+            }
+        }
+    }
+    if schema_map.is_empty() {
+        return;
+    }
+    for call in calls.iter_mut() {
+        if let Some(schema) = schema_map.get(&call.name) {
+            normalize_value(&mut call.arguments, schema, &call.name, "");
+        }
+    }
+}
+
+/// OpenAI `tool_choice` policy after request validation.
+///
+/// The daemon ignores raw `tool_choice`; the serve gateway projects it into
+/// tools/messages and enforces terminal postconditions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ToolChoicePolicy {
+    /// Absent, JSON null, or `"auto"` — tools unchanged, no extra instruction.
+    Auto,
+    /// `"none"` — do not forward tools or expose structured calls.
+    None,
+    /// `"required"` — tools unchanged; mandate at least one executable call.
+    Required,
+    /// Specific function object — forward only that tool; mandate a matching call.
+    Function(String),
+}
+
+impl ToolChoicePolicy {
+    fn daemon_projection(&self) -> serde_json::Value {
+        match self {
+            Self::Auto => serde_json::Value::String("auto".into()),
+            Self::None => serde_json::Value::String("none".into()),
+            Self::Required => serde_json::Value::String("required".into()),
+            Self::Function(name) => serde_json::json!({ "function": name }),
+        }
+    }
+}
+
+fn tool_schema_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.get("function")
+        .unwrap_or(tool)
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+}
+
+/// Parse OpenAI `tool_choice` against the request `tools` array.
+///
+/// Accepts absent/null/`"auto"`, `"none"`, `"required"`, and
+/// `{"type":"function","function":{"name":...}}`. Rejects unknown strings,
+/// malformed objects, required/specific without tools, and a named function
+/// absent from `tools`.
+fn parse_tool_choice_policy(
+    tool_choice: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
+) -> Result<ToolChoicePolicy> {
+    let tools_arr = tools.and_then(serde_json::Value::as_array);
+    let has_tools = tools_arr.is_some_and(|arr| !arr.is_empty());
+
+    let Some(choice) = tool_choice else {
+        return Ok(ToolChoicePolicy::Auto);
+    };
+    if choice.is_null() {
+        return Ok(ToolChoicePolicy::Auto);
+    }
+    if let Some(s) = choice.as_str() {
+        return match s {
+            "auto" => Ok(ToolChoicePolicy::Auto),
+            "none" => Ok(ToolChoicePolicy::None),
+            "required" => {
+                if !has_tools {
+                    bail_invalid!("tool_choice \"required\" requires a non-empty tools array");
+                }
+                Ok(ToolChoicePolicy::Required)
+            }
+            other => bail_invalid!("unsupported tool_choice value: {other}"),
+        };
+    }
+    let Some(obj) = choice.as_object() else {
+        bail_invalid!("tool_choice must be a string, null, or function object");
+    };
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("function") => {}
+        Some(other) => bail_invalid!("tool_choice object type must be \"function\", got {other}"),
+        None => bail_invalid!("tool_choice object requires type \"function\""),
+    }
+    let name = obj
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| invalid_request!("tool_choice function object requires function.name"))?;
+    if !has_tools {
+        bail_invalid!("tool_choice specific function requires a non-empty tools array");
+    }
+    let present = tools_arr
+        .expect("has_tools")
+        .iter()
+        .any(|tool| tool_schema_name(tool) == Some(name));
+    if !present {
+        bail_invalid!("tool_choice function `{name}` is not present in tools");
+    }
+    Ok(ToolChoicePolicy::Function(name.to_owned()))
+}
+
+fn filter_tools_to_function(tools: &serde_json::Value, name: &str) -> serde_json::Value {
+    let filtered = tools
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|tool| tool_schema_name(tool) == Some(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Array(filtered)
+}
+
+/// Append a concise mandatory-tool instruction to the leading system message,
+/// creating one when absent. Preserves all existing system text.
+fn inject_tool_choice_requirement(messages: &mut serde_json::Value, specific: Option<&str>) {
+    let instruction = match specific {
+        Some(name) => format!("You must call the `{name}` tool."),
+        None => "You must call a tool.".to_owned(),
+    };
+    let Some(arr) = messages.as_array_mut() else {
+        *messages = serde_json::json!([{ "role": "system", "content": instruction }]);
+        return;
+    };
+    if let Some(system) = arr
+        .iter_mut()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+    {
+        let existing = system
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if existing.is_empty() {
+            system["content"] = serde_json::Value::String(instruction);
+        } else {
+            system["content"] = serde_json::Value::String(format!("{existing}\n\n{instruction}"));
+        }
+    } else {
+        arr.insert(
+            0,
+            serde_json::json!({ "role": "system", "content": instruction }),
+        );
+    }
+}
+
+/// Project OpenAI `tool_choice` onto messages and the tools array forwarded to
+/// the daemon. Never forwards raw `tool_choice`.
+///
+/// - `none`: drop tools (no tool parser / template tools section)
+/// - `auto` / absent: preserve tools
+/// - specific function: filter tools to that name
+/// - `required` / specific: inject a short system-level requirement
+fn project_tool_choice(
+    tool_choice: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
+    messages: &mut serde_json::Value,
+) -> Result<(ToolChoicePolicy, Option<serde_json::Value>)> {
+    let policy = parse_tool_choice_policy(tool_choice, tools)?;
+    let forwarded = match &policy {
+        ToolChoicePolicy::None => None,
+        ToolChoicePolicy::Auto => tools.cloned(),
+        ToolChoicePolicy::Required => {
+            inject_tool_choice_requirement(messages, None);
+            tools.cloned()
+        }
+        ToolChoicePolicy::Function(name) => {
+            inject_tool_choice_requirement(messages, Some(name));
+            Some(filter_tools_to_function(
+                tools.expect("validated non-empty tools"),
+                name,
+            ))
+        }
+    };
+    Ok((policy, forwarded))
+}
+
+/// Normalize argument types, then enforce tool_choice terminal postconditions.
+///
+/// - `none`: strip all structured calls (and coerce a tool_calls finish to stop)
+/// - `required`: fail closed when zero executable calls
+/// - specific: keep only the named tool; fail closed when none remain
+/// - `auto`: identity beyond argument normalization
+pub(crate) fn finalize_tool_calls_for_choice(
+    policy: &ToolChoicePolicy,
+    tool_calls: &mut Vec<ToolCall>,
+    done: &mut serde_json::Value,
+    body: &serde_json::Value,
+) -> Result<()> {
+    normalize_tool_calls(tool_calls, body);
+    match policy {
+        ToolChoicePolicy::Auto => Ok(()),
+        ToolChoicePolicy::None => {
+            tool_calls.clear();
+            if done
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+                == Some("tool_calls")
+            {
+                done["finish_reason"] = serde_json::Value::String("stop".into());
+            }
+            Ok(())
+        }
+        ToolChoicePolicy::Required => {
+            if tool_calls.is_empty() {
+                bail!("tool_choice \"required\" produced no tool calls");
+            }
+            Ok(())
+        }
+        ToolChoicePolicy::Function(name) => {
+            tool_calls.retain(|call| call.name == *name);
+            if tool_calls.is_empty() {
+                bail!("tool_choice required tool `{name}` but no matching tool call was produced");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Endpoint adapter kinds known to the serve HTTP surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointAdapterKind {
+    OpenAiChatCompletions,
+    /// `/v1/messages`: lowered onto chat completions (`serve::anthropic`).
+    AnthropicMessages,
+    /// `/v1/responses`: lowered onto chat completions (`serve::responses`).
+    OpenAiResponses,
+}
+
+impl EndpointAdapterKind {
+    /// The HTTP path this adapter serves.
+    pub(crate) fn endpoint(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions => "/v1/chat/completions",
+            Self::AnthropicMessages => "/v1/messages",
+            Self::OpenAiResponses => "/v1/responses",
+        }
+    }
+}
+
+/// Capability status of an endpoint adapter for non-empty tools requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointAdapterStatus {
+    /// Adapter is present and preserves canonical tool-call semantics losslessly.
+    AvailableLossless,
+    /// No adapter is registered for this endpoint.
+    Unavailable,
+    /// Adapter exists but would drop or rewrite tool-call semantics.
+    Lossy,
+}
+
+/// Pre-generation denial when tools are requested without a safe adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum EndpointAdapterError {
+    Unavailable {
+        endpoint: &'static str,
+    },
+    Lossy {
+        endpoint: &'static str,
+    },
+    /// Tool list exceeds the grammar compiler's bounds — rejected before
+    /// admission so it is a typed 400, not a daemon-side panic.
+    TooManyTools {
+        count: usize,
+        max: usize,
+    },
+    ToolsTooLarge {
+        bytes: usize,
+        max: usize,
+    },
+}
+
+impl std::fmt::Display for EndpointAdapterError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable { endpoint } => {
+                write!(f, "endpoint adapter unavailable for tools on {endpoint}")
+            }
+            Self::Lossy { endpoint } => {
+                write!(f, "endpoint adapter lossy for tools on {endpoint}")
+            }
+            Self::TooManyTools { count, max } => {
+                write!(f, "too many tools: {count} exceeds the maximum of {max}")
+            }
+            Self::ToolsTooLarge { bytes, max } => {
+                write!(
+                    f,
+                    "tool definitions too large: {bytes} bytes exceeds the maximum of {max}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for EndpointAdapterError {}
+
+/// Typed registry of HTTP endpoint adapters and their tool-call capability.
+pub(crate) struct EndpointAdapterRegistry;
+
+impl EndpointAdapterRegistry {
+    pub(crate) fn status(kind: EndpointAdapterKind) -> EndpointAdapterStatus {
+        match kind {
+            // OpenAI chat completions lowering is present and lossless for ToolCall.
+            EndpointAdapterKind::OpenAiChatCompletions => EndpointAdapterStatus::AvailableLossless,
+            // Messages `tool_use` / Responses `function_call` carry the same
+            // canonical ToolCall (id, name, JSON arguments) both ways.
+            EndpointAdapterKind::AnthropicMessages | EndpointAdapterKind::OpenAiResponses => {
+                EndpointAdapterStatus::AvailableLossless
+            }
+        }
+    }
+}
+
+pub(crate) fn endpoint_adapter_status(kind: EndpointAdapterKind) -> EndpointAdapterStatus {
+    EndpointAdapterRegistry::status(kind)
+}
+
+/// Gate a generation endpoint when its lowered chat body carries a non-empty
+/// `tools` array. Tool-free requests are unchanged. Adapter availability never
+/// overrides producer safety.
+pub(crate) fn gate_endpoint_tools(
+    body: &serde_json::Value,
+    kind: EndpointAdapterKind,
+) -> Result<(), EndpointAdapterError> {
+    let has_tools = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty());
+    if !has_tools {
+        return Ok(());
+    }
+    // Grammar-compiler bounds (saddle-core MAX_TOOL_SCHEMAS=256,
+    // MAX_SCHEMA_BYTES=64 KiB per schema): reject oversized tool lists
+    // BEFORE admission so they are typed 400s, not a daemon-side
+    // construction panic on the DFlash path.
+    if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
+        if tools.len() > 256 {
+            return Err(EndpointAdapterError::TooManyTools {
+                count: tools.len(),
+                max: 256,
+            });
+        }
+        let total_bytes: usize = tools
+            .iter()
+            .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0))
+            .sum();
+        if total_bytes > 64 * 1024 * 4 {
+            return Err(EndpointAdapterError::ToolsTooLarge {
+                bytes: total_bytes,
+                max: 64 * 1024 * 4,
+            });
+        }
+    }
+    match endpoint_adapter_status(kind) {
+        EndpointAdapterStatus::AvailableLossless => Ok(()),
+        EndpointAdapterStatus::Unavailable => Err(EndpointAdapterError::Unavailable {
+            endpoint: kind.endpoint(),
+        }),
+        EndpointAdapterStatus::Lossy => Err(EndpointAdapterError::Lossy {
+            endpoint: kind.endpoint(),
+        }),
+    }
+}
+
+/// Errors from request+attempt correlated semantic event folding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SemanticFoldError {
+    /// Fold was used before `begin_attempt` established required ids.
+    NoActiveAttempt,
+    /// Event carried a different attempt id than the fold's active attempt.
+    StaleAttempt { current: u64, got: u64 },
+    /// Active attempt requires attempt_id on every subsequent event.
+    MissingAttemptId { current: u64 },
+    /// attempt_id was present but not a JSON number (u64 / non-neg i64).
+    MalformedAttemptId { current: u64 },
+    /// Event carried a different request id than the fold's active request.
+    StaleRequestId { current: String, got: String },
+    /// Active request requires nonempty string `id` on every subsequent event.
+    MissingRequestId { current: String },
+    /// `id` was present but empty or not a string.
+    MalformedRequestId { current: String },
+    /// Canonical tool-call payload failed structured conversion.
+    MalformedToolCall { detail: String },
+}
+
+impl std::fmt::Display for SemanticFoldError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoActiveAttempt => {
+                write!(f, "semantic fold requires begin_attempt before events")
+            }
+            Self::StaleAttempt { current, got } => {
+                write!(f, "stale attempt event: current={current} got={got}")
+            }
+            Self::MissingAttemptId { current } => {
+                write!(f, "missing attempt_id on event for attempt {current}")
+            }
+            Self::MalformedAttemptId { current } => {
+                write!(f, "malformed attempt_id on event for attempt {current}")
+            }
+            Self::StaleRequestId { current, got } => {
+                write!(f, "stale request id: current={current} got={got}")
+            }
+            Self::MissingRequestId { current } => {
+                write!(f, "missing request id on event for request {current}")
+            }
+            Self::MalformedRequestId { current } => {
+                write!(f, "malformed request id on event for request {current}")
+            }
+            Self::MalformedToolCall { detail } => {
+                write!(f, "malformed canonical tool call: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SemanticFoldError {}
+
+/// Attempt-local pure fold over daemon **contract v2** semantic JSON events.
+///
+/// Accumulates clean content/reasoning verbatim (no marker scanning), buffers
+/// structured tool calls until a tool-safe done, preserves the daemon
+/// finish_reason, and rejects stale/missing/malformed attempt correlation from
+/// the first event. Never invokes [`ThinkChannelRouter`].
+///
+/// Activate only when `gen_start.contract_version == 2`. Legacy (non-v2)
+/// MiniMax/Cohere raw-think streams stay on the explicit ThinkChannelRouter
+/// path outside this type.
+#[derive(Debug, Default)]
+pub(crate) struct SemanticEventFold {
+    content: String,
+    reasoning_content: String,
+    buffered_tool_calls: Vec<ToolCall>,
+    current_request_id: Option<String>,
+    current_attempt_id: Option<u64>,
+    done: Option<serde_json::Value>,
+}
+
+impl SemanticEventFold {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Start (or restart) a correlated request+attempt, clearing attempt-local state.
+    /// Must be called with the allocated wire ids before the first event.
+    pub(crate) fn begin_attempt(&mut self, request_id: impl Into<String>, attempt_id: u64) {
+        self.current_request_id = Some(request_id.into());
+        self.current_attempt_id = Some(attempt_id);
+        self.content.clear();
+        self.reasoning_content.clear();
+        self.buffered_tool_calls.clear();
+        self.done = None;
+    }
+
+    pub(crate) fn current_request_id(&self) -> Option<&str> {
+        self.current_request_id.as_deref()
+    }
+
+    pub(crate) fn current_attempt_id(&self) -> Option<u64> {
+        self.current_attempt_id
+    }
+
+    pub(crate) fn content(&self) -> &str {
+        &self.content
+    }
+
+    pub(crate) fn reasoning_content(&self) -> &str {
+        &self.reasoning_content
+    }
+
+    pub(crate) fn buffered_tool_calls(&self) -> &[ToolCall] {
+        &self.buffered_tool_calls
+    }
+
+    pub(crate) fn done(&self) -> Option<&serde_json::Value> {
+        self.done.as_ref()
+    }
+
+    /// Executable calls after a tool-safe terminal; empty otherwise.
+    /// Prefer canonical `calls` embedded on the staged/final done payload
+    /// (authoritative). Fall back to mid-stream buffered events only when the
+    /// terminal omits `calls` (legacy producers).
+    pub(crate) fn executable_tool_calls(&self) -> &[ToolCall] {
+        match self
+            .done
+            .as_ref()
+            .and_then(|done| done.get("finish_reason"))
+            .and_then(serde_json::Value::as_str)
+        {
+            // Only the daemon's tool_calls terminal may release calls.
+            Some("tool_calls") => &self.buffered_tool_calls,
+            _ => &[],
+        }
+    }
+
+    /// Parse canonical `calls` from a staged/final done envelope.
+    /// When `finish_reason=tool_calls`, missing/non-array/malformed fails closed.
+    /// Other finish reasons ignore `calls` (leave buffer untouched for withhold).
+    pub(crate) fn absorb_terminal_calls(
+        &mut self,
+        done: &serde_json::Value,
+    ) -> Result<(), SemanticFoldError> {
+        let finish = done
+            .get("finish_reason")
+            .and_then(serde_json::Value::as_str);
+        if finish != Some("tool_calls") {
+            return Ok(());
+        }
+        let Some(calls_val) = done.get("calls") else {
+            return Err(SemanticFoldError::MalformedToolCall {
+                detail: "tool_calls terminal requires `calls` array on staged done".to_owned(),
+            });
+        };
+        let Some(calls) = calls_val.as_array() else {
+            return Err(SemanticFoldError::MalformedToolCall {
+                detail: "tool_calls terminal `calls` must be a JSON array".to_owned(),
+            });
+        };
+        // Authoritative staged payload — replace any previously buffered calls
+        // so we never duplicate mid-stream + terminal arrays.
+        let mut parsed = Vec::with_capacity(calls.len());
+        for call in calls {
+            let tc = tool_call_from_canonical_value(call)
+                .map_err(|detail| SemanticFoldError::MalformedToolCall { detail })?;
+            parsed.push(tc);
+        }
+        self.buffered_tool_calls = parsed;
+        Ok(())
+    }
+
+    /// Parse attempt_id: JSON numbers only (u64 or non-neg i64). Distinguishes
+    /// missing vs malformed (string / null / negative / object).
+    pub(crate) fn parse_event_attempt_id(
+        event: &serde_json::Value,
+    ) -> Result<Option<u64>, SemanticFoldError> {
+        match event.get("attempt_id") {
+            None => Ok(None),
+            Some(value) => {
+                if let Some(n) = value.as_u64() {
+                    return Ok(Some(n));
+                }
+                if let Some(n) = value.as_i64() {
+                    if n >= 0 {
+                        return Ok(Some(n as u64));
+                    }
+                }
+                // Present but not a usable number — caller maps to Malformed.
+                Err(SemanticFoldError::MalformedAttemptId {
+                    current: 0, // placeholder; check_correlation overwrites with active id
+                })
+            }
+        }
+    }
+
+    /// Parse request `id`: nonempty JSON string only. Distinguishes missing vs
+    /// malformed (empty string / non-string).
+    pub(crate) fn parse_event_request_id(
+        event: &serde_json::Value,
+    ) -> Result<Option<String>, SemanticFoldError> {
+        match event.get("id") {
+            None => Ok(None),
+            Some(value) => match value.as_str() {
+                Some(s) if !s.is_empty() => Ok(Some(s.to_owned())),
+                Some(_) | None => Err(SemanticFoldError::MalformedRequestId {
+                    current: String::new(),
+                }),
+            },
+        }
+    }
+
+    pub(crate) fn check_correlation(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<(), SemanticFoldError> {
+        let current_attempt = self
+            .current_attempt_id
+            .ok_or(SemanticFoldError::NoActiveAttempt)?;
+        let current_request = self
+            .current_request_id
+            .as_deref()
+            .ok_or(SemanticFoldError::NoActiveAttempt)?;
+
+        match Self::parse_event_request_id(event) {
+            Ok(None) => {
+                return Err(SemanticFoldError::MissingRequestId {
+                    current: current_request.to_owned(),
+                });
+            }
+            Ok(Some(got)) if got != current_request => {
+                return Err(SemanticFoldError::StaleRequestId {
+                    current: current_request.to_owned(),
+                    got,
+                });
+            }
+            Ok(Some(_)) => {}
+            Err(SemanticFoldError::MalformedRequestId { .. }) => {
+                return Err(SemanticFoldError::MalformedRequestId {
+                    current: current_request.to_owned(),
+                });
+            }
+            Err(other) => return Err(other),
+        }
+
+        match Self::parse_event_attempt_id(event) {
+            Ok(None) => Err(SemanticFoldError::MissingAttemptId {
+                current: current_attempt,
+            }),
+            Ok(Some(got)) if got != current_attempt => Err(SemanticFoldError::StaleAttempt {
+                current: current_attempt,
+                got,
+            }),
+            Ok(Some(_)) => Ok(()),
+            Err(SemanticFoldError::MalformedAttemptId { .. }) => {
+                Err(SemanticFoldError::MalformedAttemptId {
+                    current: current_attempt,
+                })
+            }
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Fold one daemon v2 semantic event. Returns logical events the caller may
+    /// forward (token/reasoning fragments, done, …). Structured `tool_calls`
+    /// are buffered and never returned for mid-stream forwarding.
+    ///
+    /// Token and reasoning text are appended **verbatim** — no marker scan.
+    pub(crate) fn push(
+        &mut self,
+        event: &serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>, SemanticFoldError> {
+        self.check_correlation(event)?;
+        let mut forward = Vec::new();
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("gen_start") => {
+                // v2 channels are typed; started_in_think is ignored (no marker router).
+            }
+            Some("token") => {
+                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                    // Daemon may tag reasoning on the token envelope; still verbatim.
+                    if event.get("reasoning").and_then(serde_json::Value::as_bool) == Some(true) {
+                        self.reasoning_content.push_str(text);
+                        forward.push(serde_json::json!({ "type": "reasoning", "text": text }));
+                    } else {
+                        self.content.push_str(text);
+                        forward.push(serde_json::json!({ "type": "token", "text": text }));
+                    }
+                }
+            }
+            Some("reasoning") => {
+                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                    self.reasoning_content.push_str(text);
+                    forward.push(serde_json::json!({ "type": "reasoning", "text": text }));
+                }
+            }
+            Some("tool_calls") => {
+                let calls = event
+                    .get("calls")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| SemanticFoldError::MalformedToolCall {
+                        detail: "tool_calls event requires `calls` array".to_owned(),
+                    })?;
+                for call in calls {
+                    let tc = tool_call_from_canonical_value(call)
+                        .map_err(|detail| SemanticFoldError::MalformedToolCall { detail })?;
+                    self.buffered_tool_calls.push(tc);
+                }
+                // Intentionally not forwarded — release only after tool-safe done.
+            }
+            Some("done") => {
+                // Staged commit_ready is folded as type=done; absorb canonical
+                // calls from the terminal payload before latching done.
+                self.absorb_terminal_calls(event)?;
+                self.done = Some(event.clone());
+                forward.push(event.clone());
+            }
+            _ => {
+                // Pass through unknown/control events (committed, error envelopes, …).
+                forward.push(event.clone());
+            }
+        }
+        Ok(forward)
+    }
+}
+
+/// Allocate a fresh numeric generation attempt id (never 0 on success paths).
+pub(crate) fn next_attempt_id() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Latched daemon event-contract for one `complete_request` stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StreamContract {
+    /// Non-v2 / missing contract_version — ThinkChannelRouter path.
+    Legacy,
+    /// `gen_start.contract_version == 2` — SemanticEventFold path.
+    V2,
+}
+
+/// Fail-closed stream framing / contract-selection errors for `complete_request`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamContractError {
+    /// Stream opened with a non-`gen_start` event (no unchecked legacy default).
+    PreStartEvent { event_type: String },
+    /// More than one `gen_start` in a single attempt stream.
+    SecondGenStart,
+    /// `gen_start` lacked `attempt_id`.
+    MissingAttemptId { expected: u64 },
+    /// `gen_start.attempt_id` was present but not a usable number.
+    MalformedAttemptId { expected: u64 },
+    /// `gen_start.attempt_id` did not match the allocated wire id.
+    StaleAttempt { expected: u64, got: u64 },
+    /// `gen_start` lacked nonempty request `id`.
+    MissingRequestId { expected: String },
+    /// `gen_start.id` was present but empty or not a string.
+    MalformedRequestId { expected: String },
+    /// `gen_start.id` did not match the allocated wire request id.
+    StaleRequestId { expected: String, got: String },
+    /// Canonical tool-call payload failed structured conversion.
+    MalformedToolCall { detail: String },
+}
+
+impl std::fmt::Display for StreamContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::PreStartEvent { event_type } => {
+                write!(
+                    f,
+                    "stream must begin with gen_start; got {event_type} before contract latch"
+                )
+            }
+            Self::SecondGenStart => {
+                write!(f, "duplicate gen_start after contract already latched")
+            }
+            Self::MissingAttemptId { expected } => {
+                write!(
+                    f,
+                    "gen_start missing attempt_id (expected {expected}); contract not latched"
+                )
+            }
+            Self::MalformedAttemptId { expected } => {
+                write!(
+                    f,
+                    "gen_start malformed attempt_id (expected {expected}); contract not latched"
+                )
+            }
+            Self::StaleAttempt { expected, got } => {
+                write!(
+                    f,
+                    "gen_start stale attempt_id: expected={expected} got={got}; contract not latched"
+                )
+            }
+            Self::MissingRequestId { expected } => {
+                write!(
+                    f,
+                    "gen_start missing request id (expected {expected}); contract not latched"
+                )
+            }
+            Self::MalformedRequestId { expected } => {
+                write!(
+                    f,
+                    "gen_start malformed request id (expected {expected}); contract not latched"
+                )
+            }
+            Self::StaleRequestId { expected, got } => {
+                write!(
+                    f,
+                    "gen_start stale request id: expected={expected} got={got}; contract not latched"
+                )
+            }
+            Self::MalformedToolCall { detail } => {
+                write!(f, "malformed canonical tool call: {detail}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for StreamContractError {}
+
+/// One-shot contract latch for a generate stream.
+///
+/// Rules:
+/// - first event must be exactly one `gen_start` with the expected numeric `attempt_id`
+/// - correlation is validated **before** reading/latching `contract_version`
+/// - legacy or v2 is latched once; a second `gen_start` is always rejected
+/// - pre-start events never default to unchecked legacy
+/// - after v2 is latched, nothing may switch the stream to legacy
+#[derive(Debug)]
+pub(crate) struct StreamContractGate {
+    expected_request_id: String,
+    expected_attempt_id: u64,
+    latched: Option<StreamContract>,
+}
+
+impl StreamContractGate {
+    pub(crate) fn new(expected_request_id: impl Into<String>, expected_attempt_id: u64) -> Self {
+        Self {
+            expected_request_id: expected_request_id.into(),
+            expected_attempt_id,
+            latched: None,
+        }
+    }
+
+    pub(crate) fn contract(&self) -> Option<StreamContract> {
+        self.latched
+    }
+
+    pub(crate) fn is_v2(&self) -> bool {
+        self.latched == Some(StreamContract::V2)
+    }
+
+    /// Observe the next daemon event for framing/contract selection only.
+    ///
+    /// Returns the latched contract after a successful observe. Does not fold
+    /// payloads — callers route to `SemanticEventFold` or legacy separately.
+    pub(crate) fn observe(
+        &mut self,
+        event: &serde_json::Value,
+    ) -> Result<StreamContract, StreamContractError> {
+        let event_type = event
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<missing>");
+
+        if let Some(contract) = self.latched {
+            if event_type == "gen_start" {
+                // Never re-latch / never allow a stale or missing-id start to
+                // downgrade v2 → legacy (or flip legacy → v2).
+                return Err(StreamContractError::SecondGenStart);
+            }
+            return Ok(contract);
+        }
+
+        // Unlatched: first event must be gen_start. No pre-start legacy default.
+        if event_type != "gen_start" {
+            return Err(StreamContractError::PreStartEvent {
+                event_type: event_type.to_owned(),
+            });
+        }
+
+        // Correlation BEFORE contract_version read/latch (exact id + attempt).
+        let expected_request = self.expected_request_id.as_str();
+        match SemanticEventFold::parse_event_request_id(event) {
+            Ok(None) => {
+                return Err(StreamContractError::MissingRequestId {
+                    expected: expected_request.to_owned(),
+                });
+            }
+            Ok(Some(got)) if got != expected_request => {
+                return Err(StreamContractError::StaleRequestId {
+                    expected: expected_request.to_owned(),
+                    got,
+                });
+            }
+            Ok(Some(_)) => {}
+            Err(SemanticFoldError::MalformedRequestId { .. }) => {
+                return Err(StreamContractError::MalformedRequestId {
+                    expected: expected_request.to_owned(),
+                });
+            }
+            Err(_) => {
+                return Err(StreamContractError::MalformedRequestId {
+                    expected: expected_request.to_owned(),
+                });
+            }
+        }
+
+        let expected = self.expected_attempt_id;
+        match SemanticEventFold::parse_event_attempt_id(event) {
+            Ok(None) => {
+                return Err(StreamContractError::MissingAttemptId { expected });
+            }
+            Ok(Some(got)) if got != expected => {
+                return Err(StreamContractError::StaleAttempt { expected, got });
+            }
+            Ok(Some(_)) => {}
+            Err(SemanticFoldError::MalformedAttemptId { .. }) => {
+                return Err(StreamContractError::MalformedAttemptId { expected });
+            }
+            Err(_) => {
+                return Err(StreamContractError::MalformedAttemptId { expected });
+            }
+        }
+
+        let contract = if event
+            .get("contract_version")
+            .and_then(serde_json::Value::as_u64)
+            == Some(2)
+        {
+            StreamContract::V2
+        } else {
+            StreamContract::Legacy
+        };
+        self.latched = Some(contract);
+        Ok(contract)
+    }
+}
+
+/// Retry-disabling observations for one generation attempt.
+///
+/// Every event about to hit the client callback passes through [`Self::observe`]
+/// (v2 fold logicals and legacy router fragments alike), so latching is
+/// route-agnostic. `visible` matches exactly the wire-visible delta set of
+/// [`openai_stream_delta_for_event`] (token/reasoning).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttemptLatches {
+    visible: bool,
+    commit_ready_seen: bool,
+}
+
+impl AttemptLatches {
+    pub(crate) fn observe(&mut self, event: &serde_json::Value) {
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("token") | Some("reasoning") => self.visible = true,
+            Some("commit_ready") => self.commit_ready_seen = true,
+            _ => {}
+        }
+    }
+}
+
+/// Whether the failed attempt may be retried once server-side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryDecision {
+    Retry,
+    Fail,
+}
+
+/// Single enforced retry-eligibility decision for the serve retry driver.
+///
+/// Retry iff ALL hold: gate enabled; first attempt; no visible token/reasoning
+/// observed; commit_ready handshake never entered; daemon attested retry-reset
+/// eligibility; the error is a typed daemon error of class `transient` with
+/// `retryable=true` and an `attempt_id` matching the failed attempt. Every
+/// other failure — malformed/validation/context/schema/tool/cancel classes,
+/// callback/cancellation, I/O, EOF, invalid JSON, protocol/framing errors,
+/// untyped legacy errors — fails closed with no retry.
+pub(crate) fn decide_retry(
+    error: &anyhow::Error,
+    attempt_id: u64,
+    latches: &AttemptLatches,
+    eligible: bool,
+    enabled: bool,
+    attempt_index: u32,
+) -> RetryDecision {
+    if !enabled || attempt_index != 1 || latches.visible || latches.commit_ready_seen || !eligible {
+        return RetryDecision::Fail;
+    }
+    let Some(hipfire_client::ClientError::Daemon(typed)) =
+        error.downcast_ref::<hipfire_client::ClientError>()
+    else {
+        return RetryDecision::Fail;
+    };
+    if typed.class != hipfire_client::error_class::TRANSIENT
+        || !typed.retryable
+        || typed.attempt_id != attempt_id
+    {
+        return RetryDecision::Fail;
+    }
+    RetryDecision::Retry
+}
+
+/// Pure dual-route fold over a generate event sequence (test + `complete_request` core).
+///
+/// Applies [`StreamContractGate`] framing, then either [`SemanticEventFold`] (v2)
+/// or legacy ThinkChannelRouter accumulation. Used by focused stream-contract
+/// tests so production framing rules are exercised without a live Engine.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct FoldedStream {
+    contract: StreamContract,
+    content: String,
+    reasoning_content: String,
+    tool_calls: Vec<ToolCall>,
+    done: Option<serde_json::Value>,
+    #[allow(dead_code)]
+    forwarded: Vec<serde_json::Value>,
+}
+
+#[cfg(test)]
+pub(crate) fn fold_complete_request_stream(
+    expected_request_id: &str,
+    expected_attempt_id: u64,
+    events: &[serde_json::Value],
+) -> Result<FoldedStream, StreamContractError> {
+    let mut fold = SemanticEventFold::new();
+    fold.begin_attempt(expected_request_id, expected_attempt_id);
+    let mut gate = StreamContractGate::new(expected_request_id, expected_attempt_id);
+    let mut legacy_router = ThinkChannelRouter::default();
+    let mut legacy_content = String::new();
+    let mut legacy_reasoning = String::new();
+    let mut legacy_tool_calls: Vec<ToolCall> = Vec::new();
+    let mut legacy_done: Option<serde_json::Value> = None;
+    let mut forwarded = Vec::new();
+
+    for event in events {
+        let contract = gate.observe(event)?;
+        match contract {
+            StreamContract::V2 => {
+                // Map fold correlation errors onto stream framing errors for the
+                // shared test surface (gate already validated gen_start).
+                let logicals = fold.push(event).map_err(|err| match err {
+                    SemanticFoldError::MissingAttemptId { current } => {
+                        StreamContractError::MissingAttemptId { expected: current }
+                    }
+                    SemanticFoldError::MalformedAttemptId { current } => {
+                        StreamContractError::MalformedAttemptId { expected: current }
+                    }
+                    SemanticFoldError::StaleAttempt { current, got } => {
+                        StreamContractError::StaleAttempt {
+                            expected: current,
+                            got,
+                        }
+                    }
+                    SemanticFoldError::MissingRequestId { current } => {
+                        StreamContractError::MissingRequestId { expected: current }
+                    }
+                    SemanticFoldError::MalformedRequestId { current } => {
+                        StreamContractError::MalformedRequestId { expected: current }
+                    }
+                    SemanticFoldError::StaleRequestId { current, got } => {
+                        StreamContractError::StaleRequestId {
+                            expected: current,
+                            got,
+                        }
+                    }
+                    SemanticFoldError::NoActiveAttempt => StreamContractError::PreStartEvent {
+                        event_type: "no_active_attempt".into(),
+                    },
+                    SemanticFoldError::MalformedToolCall { detail } => {
+                        StreamContractError::MalformedToolCall { detail }
+                    }
+                })?;
+                for logical in logicals {
+                    let ty = logical.get("type").and_then(serde_json::Value::as_str);
+                    if ty == Some("done") || ty == Some("gen_start") {
+                        continue;
+                    }
+                    forwarded.push(logical);
+                }
+            }
+            StreamContract::Legacy => match event.get("type").and_then(serde_json::Value::as_str) {
+                Some("gen_start") => {
+                    if let Some(started) = event
+                        .get("started_in_think")
+                        .and_then(serde_json::Value::as_bool)
+                    {
+                        legacy_router.set_started_in_think(started);
+                    }
+                }
+                Some("token") => {
+                    if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                        let fragments =
+                            if event.get("reasoning").and_then(serde_json::Value::as_bool)
+                                == Some(true)
+                            {
+                                legacy_router.push_semantic(text, true)
+                            } else {
+                                legacy_router.push(text)
+                            };
+                        for fragment in fragments {
+                            match fragment {
+                                ThinkFragment::Content(t) => {
+                                    legacy_content.push_str(&t);
+                                    forwarded.push(serde_json::json!({
+                                        "type": "token",
+                                        "text": t
+                                    }));
+                                }
+                                ThinkFragment::Reasoning(t) => {
+                                    legacy_reasoning.push_str(&t);
+                                    forwarded.push(serde_json::json!({
+                                        "type": "reasoning",
+                                        "text": t
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("reasoning") => {
+                    if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                        for fragment in legacy_router.push_semantic(text, true) {
+                            match fragment {
+                                ThinkFragment::Content(t) => {
+                                    legacy_content.push_str(&t);
+                                    forwarded.push(serde_json::json!({
+                                        "type": "token",
+                                        "text": t
+                                    }));
+                                }
+                                ThinkFragment::Reasoning(t) => {
+                                    legacy_reasoning.push_str(&t);
+                                    forwarded.push(serde_json::json!({
+                                        "type": "reasoning",
+                                        "text": t
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("tool_calls") => {
+                    if let Some(calls) = event.get("calls").and_then(serde_json::Value::as_array) {
+                        for call in calls {
+                            let tc = tool_call_from_legacy_value(call).map_err(|detail| {
+                                StreamContractError::MalformedToolCall { detail }
+                            })?;
+                            legacy_tool_calls.push(tc);
+                        }
+                    }
+                }
+                Some("done") => {
+                    for fragment in legacy_router.finish() {
+                        match fragment {
+                            ThinkFragment::Content(t) => {
+                                legacy_content.push_str(&t);
+                                forwarded.push(serde_json::json!({
+                                    "type": "token",
+                                    "text": t
+                                }));
+                            }
+                            ThinkFragment::Reasoning(t) => {
+                                legacy_reasoning.push_str(&t);
+                                forwarded.push(serde_json::json!({
+                                    "type": "reasoning",
+                                    "text": t
+                                }));
+                            }
+                        }
+                    }
+                    legacy_done = Some(event.clone());
+                }
+                _ => {
+                    forwarded.push(event.clone());
+                }
+            },
+        }
+    }
+
+    let contract = gate
+        .contract()
+        .ok_or_else(|| StreamContractError::PreStartEvent {
+            event_type: "<empty stream>".into(),
+        })?;
+
+    match contract {
+        StreamContract::V2 => {
+            let finish = fold
+                .done()
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(serde_json::Value::as_str);
+            let tool_calls = if finish == Some("tool_calls") {
+                fold.executable_tool_calls().to_vec()
+            } else {
+                Vec::new()
+            };
+            Ok(FoldedStream {
+                contract,
+                content: fold.content().to_owned(),
+                reasoning_content: fold.reasoning_content().to_owned(),
+                tool_calls,
+                done: fold.done().cloned(),
+                forwarded,
+            })
+        }
+        StreamContract::Legacy => {
+            if let Some(terminal) = legacy_done.as_ref() {
+                absorb_legacy_terminal_calls(terminal, &mut legacy_tool_calls)
+                    .map_err(|detail| StreamContractError::MalformedToolCall { detail })?;
+            }
+            let finish = legacy_done
+                .as_ref()
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(serde_json::Value::as_str);
+            let tool_calls = if finish == Some("tool_calls") {
+                legacy_tool_calls
+            } else {
+                Vec::new()
+            };
+            Ok(FoldedStream {
+                contract,
+                content: legacy_content,
+                reasoning_content: legacy_reasoning,
+                tool_calls,
+                done: legacy_done,
+                forwarded,
+            })
+        }
+    }
+}
+
+/// One projection of the OpenAI request contract before it crosses the daemon
+/// wire. Validation, default-system injection and tool-choice lowering happen
+/// here exactly once for both ordinary and experimental daemon model owners.
+#[derive(Debug)]
+pub(crate) struct RequestContract {
+    pub max_tokens: u64,
+    /// The client omitted `max_tokens`: `max_tokens` is the configured
+    /// default and only a ceiling; the daemon fits it to the context left
+    /// after the prompt (wire `max_tokens_fit`).
+    pub max_tokens_fit: bool,
+    pub messages: serde_json::Value,
+    /// Multi-slot only: normalized/default-system-projected messages before
+    /// tool-choice prompt instructions are added. Slot ownership uses this
+    /// stable view so a normal tool-result request may change `tool_choice`
+    /// without changing conversation identity.
+    pub conversation_messages: Option<serde_json::Value>,
+    pub tool_choice_policy: ToolChoicePolicy,
+    pub forwarded_tools: Option<serde_json::Value>,
+    /// Validated `response_format` (spec §7 G1), multi-slot route only. A
+    /// `json_schema` value is parsed, validated against the supported subset,
+    /// and forwarded to the daemon so the slot engine can apply pre-sampling
+    /// grammar masks (`json_object` is refused there). On the standard route
+    /// this is always `None`: `response_format` is neither validated nor
+    /// forwarded, so it is not enforced.
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Validated OpenAI `response_format` for structured output (spec §7 G1).
+///
+/// Only `json_schema` is supported. The `schema` field carries the JSON
+/// Schema object validated against the strict subset (primitive types,
+/// objects, arrays, enum/const). Unsupported assertion keywords are rejected
+/// here so no intermediate wire adapter drops the constraint silently.
+#[derive(Debug, Clone)]
+pub(crate) struct ResponseFormat {
+    /// The raw JSON Schema object (validated subset).
+    pub schema: serde_json::Value,
+    /// Optional name from `json_schema.name` (OpenAI field, not a JSON
+    /// Schema keyword). Forwarded for diagnostics; not semantically
+    /// significant for mask construction.
+    pub name: Option<String>,
+}
+
+/// Whether the loaded architecture surfaces reasoning content in multi-turn
+/// message history ([`saddle_core::caps::arch_replays_history_reasoning`]).
+/// Single source of truth for daemon request projection.
+pub(crate) fn include_reasoning_content(arch: Option<&str>) -> bool {
+    arch.is_some_and(saddle_core::caps::arch_replays_history_reasoning)
+}
+
+/// Largest `max_tokens` a chat request may ask for.
+pub(crate) const MAX_TOKENS_CEILING: u64 = 393_216;
+
+/// Project the HTTP body into the typed request contract. `multi_slot` is the
+/// route: the multi-slot engine adds its field refusals and sampling-range
+/// checks and honors `response_format` (json_schema); the standard route
+/// keeps its historical acceptance and ignores `response_format`.
+pub(crate) fn project_request_contract(
+    body: &serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    include_reasoning: bool,
+    multi_slot: bool,
+) -> Result<RequestContract> {
+    let explicit_max_tokens = body
+        .get("max_tokens")
+        .or_else(|| body.get("max_completion_tokens"))
+        .and_then(serde_json::Value::as_u64);
+    let max_tokens = match explicit_max_tokens {
+        Some(max_tokens) => max_tokens,
+        None => config_u64(resolved, "generation.max_tokens")?,
+    };
+    if max_tokens == 0 || max_tokens > MAX_TOKENS_CEILING {
+        bail_invalid!("max_tokens must be between 1 and 393216");
+    }
+    validate_single_choice(body)?;
+    if multi_slot {
+        validate_multi_slot_request_fields(body)?;
+    }
+    let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
+    let default_system = request_string(resolved, "prompt.system", None)?;
+    inject_default_system_message(&mut messages, default_system.as_deref());
+    let conversation_messages = multi_slot.then(|| messages.clone());
+    let (tool_choice_policy, forwarded_tools) =
+        project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
+    let response_format = if multi_slot {
+        validate_response_format(body.get("response_format"))?
+    } else {
+        None
+    };
+    Ok(RequestContract {
+        max_tokens,
+        max_tokens_fit: explicit_max_tokens.is_none(),
+        messages,
+        conversation_messages,
+        tool_choice_policy,
+        forwarded_tools,
+        response_format,
+    })
+}
+
+/// Every serve route returns one completion per request: `n` other than 1
+/// is refused rather than silently answered with a single choice.
+fn validate_single_choice(body: &serde_json::Value) -> Result<()> {
+    if let Some(n) = body.get("n").filter(|n| !n.is_null()) {
+        if n.as_u64() != Some(1) {
+            bail_invalid!(
+                "n != 1 is not supported on this serve route (one completion per request)"
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Multi-slot request-field checks. Unsupported OpenAI request fields must be
+/// refused, never silently dropped. The daemon's `validate_generate_caps` has
+/// typed refusals for exactly these, but this gateway builds the generate
+/// message from scratch and would strip the fields first — an `n: 2` that
+/// returns a single completion is the "silent semantic downgrade" the spec
+/// forbids (§7.1), so mirror the refusal set here.
+fn validate_multi_slot_request_fields(body: &serde_json::Value) -> Result<()> {
+    // A PRESENT-but-malformed max_tokens (negative, float, string) is a 400,
+    // never a silent fallback to the fitted default.
+    for field in ["max_tokens", "max_completion_tokens"] {
+        if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
+            if value.as_u64().is_none() {
+                bail_invalid!("max_tokens must be an integer between 1 and 393216");
+            }
+        }
+    }
+    for field in ["best_of", "logit_bias", "echo", "suffix"] {
+        if let Some(v) = body.get(field) {
+            if !v.is_null() {
+                bail_invalid!("{field} is not supported on this serve route");
+            }
+        }
+    }
+    for (field, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
+        if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
+            let number = value
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| invalid_request!("{field} must be a finite number"))?;
+            if number < min || number > max || field == "top_p" && number == 0.0 {
+                bail_invalid!(
+                    "{field} must be within {}",
+                    if field == "top_p" { "(0, 1]" } else { "[0, 2]" }
+                );
+            }
+        }
+    }
+    if let Some(value) = body.get("repeat_window").filter(|v| !v.is_null()) {
+        match value.as_u64() {
+            Some(v) if v <= 2048 => {}
+            _ => bail_invalid!("repeat_window must be an integer between 0 and 2048"),
+        }
+    }
+    // Token penalties + min_p + top_k: the daemon's slot sampler honors
+    // these, so a malformed value must be a typed 400 — not silently dropped
+    // to the config default (a string "abc" would otherwise forward as the
+    // default, and a non-finite number would reach the sampler).
+    for (field, min, max) in [
+        ("repeat_penalty", 1.0, 2.0),
+        ("repetition_penalty", 1.0, 2.0),
+        ("presence_penalty", 0.0, 2.0),
+        ("frequency_penalty", 0.0, 2.0),
+        ("min_p", 0.0, 1.0),
+    ] {
+        if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
+            let number = value
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| invalid_request!("{field} must be a finite number"))?;
+            if number < min || number > max {
+                bail_invalid!("{field} must be within [{min}, {max}]");
+            }
+        }
+    }
+    if let Some(value) = body.get("top_k").filter(|v| !v.is_null()) {
+        match value.as_u64() {
+            Some(v) if v >= 1 => {}
+            _ => bail_invalid!("top_k must be a positive integer"),
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invalid_request!("each message must have a string role"))?;
+            if !matches!(
+                role,
+                "developer"
+                    | "system"
+                    | "user"
+                    | "assistant"
+                    | "tool"
+                    | "toolResult"
+                    | "tool_result"
+            ) {
+                bail_invalid!("unknown message role: {role}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate OpenAI `response_format` for structured output (spec §7 G1).
+///
+/// Accepts:
+/// - `None` / null / absent → no constraint.
+/// - `{"type": "json_schema", "json_schema": {"schema": {...}, ...}}` →
+///   validates the schema against the supported strict subset and returns
+///   a [`ResponseFormat``.
+///
+/// Rejects (HTTP 400 via `bail_invalid!`):
+/// - `{"type": "json_object"}`: the multi-slot serve route has no
+///   json_object enforcement — silently dropping the requested constraint
+///   and returning 200 would be exactly the "silent semantic downgrade"
+///   the spec forbids (§7.1/X2). A future change may supply enforcement
+///   and re-enable it with its own oracle.
+/// - Unknown `type` values.
+/// - Missing/malformed `json_schema` wrapper or `schema` object.
+/// - Unsupported JSON Schema keywords (external refs, regex, recursion,
+///   combinators, unsupported assertions).
+/// - Contradictory/unsatisfiable schemas.
+pub(crate) fn validate_response_format(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<ResponseFormat>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let ty = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| invalid_request!("response_format.type is required"))?;
+    match ty {
+        "json_object" => {
+            bail_invalid!(
+                "response_format type 'json_object' is not supported on this \
+                 serve route (no enforcement exists; only json_schema strict \
+                 output is supported)"
+            );
+        }
+        "json_schema" => {
+            let js = value
+                .get("json_schema")
+                .ok_or_else(|| invalid_request!("response_format.json_schema is required"))?;
+            if !js.is_object() {
+                bail_invalid!("response_format.json_schema must be an object");
+            }
+            let schema = js.get("schema").ok_or_else(|| {
+                invalid_request!("response_format.json_schema.schema is required")
+            })?;
+            if !schema.is_object() {
+                bail_invalid!("response_format.json_schema.schema must be an object");
+            }
+            // Validate the schema against the supported strict subset (spec
+            // §7.1 G1). Reject unsupported keywords before generation so no
+            // intermediate wire adapter drops the constraint silently.
+            validate_json_schema_subset(schema, "$")?;
+            let name = js
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+            Ok(Some(ResponseFormat {
+                schema: schema.clone(),
+                name,
+            }))
+        }
+        "text" => {
+            // OpenAI's DEFAULT response format: plain unconstrained text.
+            // An explicit `{"type": "text"}` is the same as omitting the
+            // field — accept it as "no constraint" instead of rejecting a
+            // payload shape the platform itself emits by default.
+            Ok(None)
+        }
+        other => {
+            bail_invalid!("response_format.type '{other}' is not supported");
+        }
+    }
+}
+
+/// Supported JSON Schema keywords (spec §7.1 G1 strict subset).
+const SUPPORTED_TYPE_VALUES: &[&str] = &[
+    "string", "number", "integer", "boolean", "null", "object", "array",
+];
+
+/// Assertion keywords that are NOT supported in the strict subset (spec
+/// §7.1 G1: reject unsupported assertion keywords, external references,
+/// regex assertions, recursion and combinators before generation).
+///
+/// MUST stay a superset of what the saddle-core compiler rejects
+/// (`grammar::json_schema::compile_node` default-deny): this validator is
+/// the operator-facing pre-flight, and the two layers must refuse the same
+/// schemas or a schema rejected here could compile to something else
+/// server-side (or vice versa).
+const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
+    "$ref",
+    "$id",
+    "$schema",
+    "pattern",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "additionalItems",
+    "dependentSchemas",
+    "dependentRequired",
+    "prefixItems",
+    "contains",
+    "maxContains",
+    "minContains",
+    "patternProperties",
+    "propertyNames",
+    "uniqueItems",
+    "multipleOf",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "minProperties",
+    "maxProperties",
+    "contentEncoding",
+    "contentMediaType",
+    "format",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+];
+
+/// Recursively validate a JSON Schema object against the strict subset
+/// (spec §7.1 G1).
+///
+/// Supported:
+/// - `type`: string, number, integer, boolean, null, object, array
+/// - `properties`, `required`, `additionalProperties` (boolean only)
+/// - `items`, `minItems`, `maxItems` (array)
+/// - `enum`, `const`
+/// - `description`, `title`, `default`, `examples`, `$comment` (annotations)
+///
+/// Rejected: external references (`$ref`), regex (`pattern`),
+/// combinators (`allOf`/`anyOf`/`oneOf`/`not`), conditional assertion
+/// (`if`/`then`/`else`), numeric/string bounds, and every other unknown
+/// keyword — the validator and the saddle-core compiler must refuse the
+/// same schemas (default-deny), or a "supported" schema would compile to
+/// different constraints server-side.
+fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result<()> {
+    if !schema.is_object() {
+        bail_invalid!("schema at {path} must be an object");
+    }
+    let obj = schema.as_object().unwrap();
+
+    // Check for rejected keywords first.
+    for &kw in REJECTED_ASSERTION_KEYWORDS {
+        if obj.contains_key(kw) {
+            bail_invalid!(
+                "unsupported JSON Schema keyword '{kw}' at {path} \
+                 (strict subset does not allow this assertion)"
+            );
+        }
+    }
+
+    // DEFAULT-DENY, matching the saddle-core compiler's keyword policy:
+    // the compiler refuses any keyword outside its allowlist, so the CLI
+    // pre-flight must refuse the same set — a schema the CLI passes but
+    // the compiler rejects surfaces as a late 400 at admit instead of an
+    // up-front validation error (the drift hid `deprecated`-style keys).
+    // Annotations are permitted exactly where the compiler permits them.
+    const KNOWN_KEYWORDS: &[&str] = &[
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minItems",
+        "maxItems",
+        "enum",
+        "const",
+        "description",
+        "title",
+        "default",
+        "examples",
+        "$comment",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_KEYWORDS.contains(&key.as_str()) {
+            bail_invalid!(
+                "unsupported JSON Schema keyword '{key}' at {path} \
+                 (strict subset default-deny: not in the compiler's allowlist)"
+            );
+        }
+    }
+
+    // Present-but-malformed keyword values are compiler typed errors
+    // (`.and_then(as_array)` here used to skip them silently, letting a
+    // pre-flighted schema die at admit). Match the compiler's refusals.
+    if let Some(v) = obj.get("enum") {
+        if !v.is_array() {
+            bail_invalid!("enum at {path} must be an array");
+        }
+    }
+    if let Some(v) = obj.get("properties") {
+        if !v.is_object() {
+            bail_invalid!("properties at {path} must be an object");
+        }
+    }
+    if let Some(v) = obj.get("required") {
+        if !v.is_array() {
+            bail_invalid!("required at {path} must be an array of strings");
+        }
+    }
+    for kw in ["minItems", "maxItems"] {
+        if let Some(v) = obj.get(kw) {
+            if v.as_u64().is_none() {
+                bail_invalid!("{kw} at {path} must be a non-negative integer");
+            }
+        }
+    }
+
+    // Validate `type` if present. A non-string, non-null `type` (the union
+    // form `["integer","null"]`) is outside the strict subset — it must be
+    // rejected, not silently skipped into the inference path (the compiler
+    // would fall through to an unconstrained Any).
+    if let Some(tv) = obj.get("type") {
+        match tv.as_str() {
+            Some(ty) => {
+                if !SUPPORTED_TYPE_VALUES.contains(&ty) {
+                    bail_invalid!(
+                        "unsupported JSON Schema type '{ty}' at {path} \
+                         (supported: {SUPPORTED_TYPE_VALUES:?})"
+                    );
+                }
+            }
+            None => bail_invalid!(
+                "unsupported JSON Schema 'type' at {path}: union/array forms \
+                 are outside the strict subset"
+            ),
+        }
+    }
+
+    // `enum` and `const` are terminal — no nested schema to recurse into.
+    // `enum` must be a non-empty array; `const` can be any value.
+    if let Some(arr) = obj.get("enum").and_then(|v| v.as_array()) {
+        if arr.is_empty() {
+            bail_invalid!("enum at {path} must be a non-empty array");
+        }
+    }
+
+    // Object type: validate `properties` and `additionalProperties`.
+    if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
+        for (key, sub) in props {
+            validate_json_schema_subset(sub, &format!("{path}.properties.{key}"))?;
+        }
+    }
+    if let Some(ap) = obj.get("additionalProperties") {
+        // Boolean only (spec §7.1 subset). The schema form is rejected here
+        // AND in the compiler — it used to be accepted by this validator
+        // while the compiler silently flattened it to `true`.
+        if !ap.is_boolean() {
+            bail_invalid!(
+                "additionalProperties at {path} must be a boolean (schema form \
+                 is outside the strict subset)"
+            );
+        }
+    }
+    if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
+        for item in req {
+            if !item.is_string() {
+                bail_invalid!("required at {path} must be an array of strings");
+            }
+        }
+    }
+
+    // Array type: validate `items`. The saddle-core compiler only accepts
+    // a schema OBJECT for `items` — the CLI validator must refuse exactly
+    // the same set (a boolean `items` accepted here would be rejected
+    // server-side, a 400 at the wrong layer; contract drift hides bugs).
+    if let Some(items) = obj.get("items") {
+        if items.is_object() {
+            validate_json_schema_subset(items, &format!("{path}.items"))?;
+        } else {
+            bail_invalid!("items at {path} must be a schema object (boolean form is outside the supported subset)");
+        }
+    }
+    if let Some(n) = obj.get("minItems").and_then(|v| v.as_u64()) {
+        if let Some(max) = obj.get("maxItems").and_then(|v| v.as_u64()) {
+            if n > max {
+                bail_invalid!("minItems ({n}) > maxItems ({max}) at {path}: contradictory schema");
+            }
+        }
+    }
+
+    // Numeric bounds (`minimum`/`maximum`) and string bounds
+    // (`minLength`/`maxLength`) are rejected outright by the keyword
+    // policy above — the compiler enforces the same subset, so there is
+    // no bounds cross-check to perform here anymore.
+
+    Ok(())
+}
+
+/// One correlated generation attempt under the shared serve runtime lock.
+///
+/// `identity` is the public completion identity (stable across retries);
+/// `attempt_id` is the freshly allocated wire attempt id for this attempt.
+/// `force_reset` (retry attempts) cold-resets before generate; a failed forced
+/// reset poisons cached model state so the next request full-reloads.
+/// `latches` records retry-disabling observations for the driver.
+pub(crate) fn complete_request_attempt(
+    shared: &ServeShared,
+    body: &serde_json::Value,
+    guard: AdmissionGuard,
+    identity: &(String, u64),
+    attempt_id: u64,
+    force_reset: bool,
+    latches: &std::cell::RefCell<AttemptLatches>,
+    cancelled: Option<&AtomicBool>,
+    event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
+    terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
+) -> Result<Completion> {
+    // Gateway-side timing. The daemon emits neither ttft_ms nor latency_ms --
+    // its `done` is {type,id,tokens,tok_s} -- so the gateway measures what it can
+    // actually observe. Measuring here is arguably more honest anyway: this
+    // interval includes admission queueing, which is exactly the component a
+    // serving operator needs when latency rises under load.
+    let attempt_started = std::time::Instant::now();
+    let first_token_at: std::cell::Cell<Option<std::time::Duration>> = std::cell::Cell::new(None);
+
+    // Latch retry-disabling observations on every event bound for the client.
+    let mut event_callback = |event: &serde_json::Value| {
+        // A reasoning token is a generated token. Counting only `token` made
+        // TTFT on a thinking model the time to the first answer token, and TPOT
+        // would spread only the answer span over all of `done.tokens`.
+        if first_token_at.get().is_none()
+            && matches!(
+                event.get("type").and_then(serde_json::Value::as_str),
+                Some("token" | "reasoning")
+            )
+        {
+            first_token_at.set(Some(attempt_started.elapsed()));
+        }
+        latches.borrow_mut().observe(event);
+        event_callback(event)
+    };
+    let model = body
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| invalid_request!("model is required"))?
+        .to_owned();
+    let image_base64 = request_image_base64(body.get("messages"))?;
+    // Acquire runtime, ensure model, and build the generate request while
+    // holding the lock. Clone the engine handle before dropping the lock so
+    // concurrent eligible requests can share the multiplexed transport.
+    let (generate, resolved, engine_clone, reasoning, tool_choice_policy) = {
+        let mut runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        // Attempt id is allocated by the retry driver before any cold reset /
+        // generate so reset ack, generate request, and the semantic fold share one
+        // wire id.
+        let resolved = runtime.ensure_model(&model, &shared.meta, ModelOrigin::Request)?;
+        if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
+            if let Err(error) = runtime.engine.reset(attempt_id) {
+                if force_reset {
+                    // Rollback could not be attested: model state is unknown, so
+                    // the next request must full-reload rather than trust it.
+                    runtime.clear_resident(&shared.meta);
+                }
+                return Err(error.into());
+            }
+        }
+        let contract = project_request_contract(
+            body,
+            &resolved,
+            include_reasoning_content(runtime.current_arch.as_deref()),
+            runtime.multi_slot_enabled,
+        )?;
+        let max_tokens = contract.max_tokens;
+        // The loaded context is fixed (a reload restores the same max_seq),
+        // and the prompt shares it. An explicit budget that cannot fit next
+        // to even a one-token prompt is refused here; a smaller one that does
+        // not fit the actual prompt is refused by the daemon (context_length).
+        let context = if runtime.multi_slot_enabled {
+            runtime.multi_slot_ctx
+        } else {
+            runtime.current_max_seq
+        };
+        if !contract.max_tokens_fit && context > 0 && max_tokens >= context {
+            bail_invalid!(
+                "max_tokens={max_tokens} does not fit the loaded context window of {context} \
+                 tokens, which the prompt shares; lower max_tokens, or omit it to use the room \
+                 left after the prompt"
+            );
+        }
+        // Configured penalty defaults ride along at tp>1 only where the daemon's
+        // tp>1 loop applies penalties (the Qwen family); DeepSeek4/MiniMax
+        // refuse any non-neutral penalty, so their defaults are not forwarded.
+        let penalty_defaults = runtime.tp.unwrap_or(1) <= 1
+            || runtime
+                .current_arch
+                .as_deref()
+                .is_some_and(|arch| arch.to_ascii_lowercase().contains("qwen"));
+        let normalized_messages = contract.messages;
+        let conversation_messages = contract.conversation_messages;
+        let tool_choice_policy = contract.tool_choice_policy;
+        let forwarded_tools = contract.forwarded_tools;
+        let response_format = contract.response_format;
+        let mut generate = serde_json::json!({
+            "type": "generate",
+            "id": identity.0.clone(),
+            "prompt": last_user_prompt(&normalized_messages).unwrap_or_else(|| "Hello".into()),
+            "messages": normalized_messages,
+            "max_tokens": max_tokens,
+            "attempt_id": attempt_id,
+        });
+        if contract.max_tokens_fit {
+            generate["max_tokens_fit"] = serde_json::Value::Bool(true);
+        }
+        if let Some(image) = image_base64 {
+            generate["image_base64"] = serde_json::Value::String(image);
+        }
+        for (key, config_key) in [
+            ("temperature", "generation.temperature"),
+            ("top_p", "generation.top_p"),
+            ("repeat_penalty", "generation.repeat_penalty"),
+        ] {
+            let explicit = body.get(key).and_then(serde_json::Value::as_f64);
+            let value = if key == "repeat_penalty" && !penalty_defaults {
+                explicit
+            } else {
+                request_f64(&resolved, config_key, explicit)?
+            };
+            insert_optional_f64(&mut generate, key, value);
+        }
+        // Validate OpenAI logprobs contract before forwarding; reject rather
+        // than silently clamping so callers notice a mismatch.
+        validate_logprobs_request(body)?;
+        // Project tools under tool_choice; never forward raw tool_choice (daemon
+        // ignores it). none drops tools so the template/parser stay inactive.
+        if let Some(tools) = forwarded_tools {
+            generate["tools"] = tools;
+        }
+        // Forward validated response_format so the daemon/slot engine can
+        // apply pre-sampling grammar masks (spec §7 G1/G2). The schema was
+        // already validated against the strict subset in
+        // [`validate_response_format`]; the daemon re-checks capability
+        // before attempting mask construction.
+        if let Some(rf) = response_format {
+            let mut js = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": rf.schema,
+                }
+            });
+            if let Some(name) = rf.name {
+                js["json_schema"]["name"] = serde_json::Value::String(name);
+            }
+            generate["response_format"] = js;
+        }
+        for name in [
+            "frequency_penalty",
+            "stop",
+            "reasoning_effort",
+            "logprobs",
+            "top_logprobs",
+        ] {
+            if let Some(value) = body.get(name) {
+                generate[name] = value.clone();
+            }
+        }
+        // OpenAI-compatible `seed`: forwarded to the daemon, which uses it as
+        // the deterministic per-request sampler seed (see request_seed_for).
+        if let Some(value) = body.get("seed") {
+            generate["seed"] = value.clone();
+        }
+        if let Some(value) = body.get("top_k") {
+            generate["top_k"] = value.clone();
+        } else {
+            insert_optional_u64(
+                &mut generate,
+                "top_k",
+                request_u64(&resolved, "generation.top_k", None)?,
+            );
+        }
+        for (key, config_key) in [
+            ("min_p", "generation.min_p"),
+            ("presence_penalty", "generation.presence_penalty"),
+        ] {
+            if let Some(value) = body.get(key) {
+                generate[key] = value.clone();
+            } else if key == "min_p" || penalty_defaults {
+                insert_optional_f64(
+                    &mut generate,
+                    key,
+                    request_f64(&resolved, config_key, None)?,
+                );
+            }
+        }
+        let contract = runtime.current_reasoning_contract;
+        let effort_native = runtime.current_reasoning_effort_native;
+        let supported_efforts = runtime.current_reasoning_efforts.clone();
+        let reasoning = apply_http_reasoning_request(
+            body,
+            &resolved,
+            &mut generate,
+            contract,
+            effort_native,
+            &supported_efforts,
+        )?;
+        if guard.is_eligible && !runtime.multi_slot_enabled {
+            generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
+        }
+        if runtime.multi_slot_enabled {
+            generate["experimental_multi_slot"] = serde_json::Value::Bool(true);
+            generate["conversation_messages"] = conversation_messages.unwrap_or_default();
+            // The gateway has already validated and projected the raw OpenAI
+            // choice. Carry only that typed decision across the slot wire;
+            // the daemon must never reinterpret the original HTTP body.
+            generate["tool_choice_policy"] = tool_choice_policy.daemon_projection();
+            // Penalty knobs are forwarded as-is: the slot sampler applies
+            // repeat/presence/frequency penalties and min_p exactly like the
+            // sequential path (repeat/presence/frequency in-kernel over a
+            // per-slot recent-token window; min_p in the top-p tail). A
+            // penalized request decodes as plain AR on the slot engine —
+            // MTP verify accept is a bare greedy argmax and cannot reproduce
+            // penalize-then-argmax — which is the same trade the sequential
+            // MTP path makes.
+            // Re-check the fully projected wire request, not only the raw HTTP
+            // body: registry/config defaults may have inserted a
+            // reasoning control the slot sampler cannot honor.
+            require_multi_slot_support(&generate)?;
+        }
+        let engine_clone = runtime.engine.clone();
+        (
+            generate,
+            resolved,
+            engine_clone,
+            reasoning,
+            tool_choice_policy,
+        )
+    };
+    let (id, created) = identity.clone();
+    // - first event must be gen_start with matching request id + attempt_id
+    // - contract_version is read only after correlation succeeds
+    // - legacy/v2 latched once; second gen_start and pre-start events rejected
+    // - v2 cannot be downgraded by a later stale/missing-id gen_start
+    // - commit_ready is staged done: folded once via terminal_callback before commit
+    let mut fold = SemanticEventFold::new();
+    fold.begin_attempt(&id, attempt_id);
+    let mut contract_gate = StreamContractGate::new(id.clone(), attempt_id);
+    let mut legacy_router = ThinkChannelRouter::default();
+    let mut legacy_content = String::new();
+    let mut legacy_reasoning = String::new();
+    let mut legacy_tool_calls: Vec<ToolCall> = Vec::new();
+    let mut legacy_done: Option<serde_json::Value> = None;
+    // The completion delivered at commit_ready; it is the attempt's result.
+    let mut committed: Option<Completion> = None;
+    let preserve_thinking = body
+        .pointer("/chat_template_kwargs/preserve_thinking")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let model_for_fold = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    // Logprobs are only assembled when the client asked; otherwise the
+    // behaviour must be byte-identical to today (no field, no allocation).
+    let logprobs_requested = body.get("logprobs").and_then(|v| v.as_bool()) == Some(true);
+    let mut logprobs_entries: Vec<serde_json::Value> = Vec::new();
+
+    let mut on_event = |event: &serde_json::Value| -> Result<(), hipfire_client::ClientError> {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str);
+
+        // Prefill progress is a display hint, not part of the response
+        // contract: it skips the semantic fold and gate (so it can never fail
+        // a request or become a delta) and is dropped if it somehow precedes
+        // `gen_start`. The stream sink frames it as an SSE comment.
+        if event_type == Some("prefill_progress") {
+            if contract_gate.contract().is_some() {
+                event_callback(event)?;
+            }
+            return Ok(());
+        }
+
+        // Staged terminal: commit_ready carries done fields with type != done.
+        // Fold/validate a type=done clone and deliver HTTP terminal before Ok.
+        if event_type == Some("commit_ready") {
+            latches.borrow_mut().commit_ready_seen = true;
+            if committed.is_some() {
+                return Err(hipfire_client::ClientError::Protocol(
+                    "duplicate commit_ready".into(),
+                ));
+            }
+            // Gate correlation on the raw envelope first (same id+attempt rules).
+            let contract = contract_gate
+                .observe(event)
+                .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
+
+            let mut staged = event.clone();
+            if let Some(obj) = staged.as_object_mut() {
+                obj.insert("type".into(), serde_json::Value::String("done".into()));
+            } else {
+                return Err(hipfire_client::ClientError::Protocol(
+                    "commit_ready must be a JSON object".into(),
+                ));
+            }
+
+            let preview = match contract {
+                StreamContract::V2 => {
+                    let forward = fold.push(&staged).map_err(|error| {
+                        hipfire_client::ClientError::Protocol(error.to_string())
+                    })?;
+                    // Staged done is held on the fold; do not forward mid-stream.
+                    let _ = forward;
+                    let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
+                        Some(logprobs_entries.clone())
+                    } else {
+                        None
+                    };
+                    let mut tool_calls = fold.executable_tool_calls().to_vec();
+                    let mut done = fold.done().cloned().unwrap_or(staged);
+                    finalize_tool_calls_for_choice(
+                        &tool_choice_policy,
+                        &mut tool_calls,
+                        &mut done,
+                        body,
+                    )
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
+                    Completion {
+                        id: id.clone(),
+                        created,
+                        model: model.clone(),
+                        content: fold.content().to_owned(),
+                        reasoning_content: fold.reasoning_content().to_owned(),
+                        preserve_thinking,
+                        tool_calls,
+                        done,
+                        logprobs,
+                        reasoning: Some(reasoning.clone()),
+                    }
+                }
+                StreamContract::Legacy => {
+                    forward_think_fragments(
+                        legacy_router.finish(),
+                        &mut legacy_content,
+                        &mut legacy_reasoning,
+                        &mut event_callback,
+                    )?;
+                    legacy_done = Some(staged.clone());
+                    // The HTTP terminal is delivered here, not on the
+                    // post-commit `done`, so calls staged on the payload must
+                    // be absorbed before the completion is built.
+                    absorb_legacy_terminal_calls(&staged, &mut legacy_tool_calls).map_err(
+                        |detail| {
+                            hipfire_client::ClientError::Protocol(format!(
+                                "malformed canonical tool call: {detail}"
+                            ))
+                        },
+                    )?;
+                    let finish = staged
+                        .get("finish_reason")
+                        .and_then(serde_json::Value::as_str);
+                    let mut tool_calls = if finish == Some("tool_calls") {
+                        legacy_tool_calls.clone()
+                    } else {
+                        Vec::new()
+                    };
+                    let mut done = staged;
+                    finalize_tool_calls_for_choice(
+                        &tool_choice_policy,
+                        &mut tool_calls,
+                        &mut done,
+                        body,
+                    )
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
+                    let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
+                        Some(logprobs_entries.clone())
+                    } else {
+                        None
+                    };
+                    Completion {
+                        id: id.clone(),
+                        created,
+                        model: model.clone(),
+                        content: legacy_content.clone(),
+                        reasoning_content: legacy_reasoning.clone(),
+                        preserve_thinking,
+                        tool_calls,
+                        done,
+                        logprobs,
+                        reasoning: Some(reasoning.clone()),
+                    }
+                }
+            };
+            terminal_callback(&preview)?;
+            committed = Some(preview);
+            return Ok(());
+        }
+
+        let contract = contract_gate
+            .observe(event)
+            .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
+
+        match contract {
+            StreamContract::V2 => {
+                // Accumulate logprobs when the client asked. If the daemon
+                // sends no `logprob` on a token event, the entry is None and
+                // we skip it — the response will omit logprobs rather than
+                // emit nulls. This preserves byte-identity when not requested.
+                if logprobs_requested && event_type == Some("token") {
+                    if let Some(entry) = logprob_entry_from_token_event(event) {
+                        logprobs_entries.push(entry);
+                    }
+                }
+                let forward = fold
+                    .push(event)
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
+                for logical in forward {
+                    // gen_start is consumed for latching; done is held on the fold.
+                    // Post-commit done is not callback-visible from Engine, but
+                    // still ignore if seen.
+                    let ty = logical.get("type").and_then(serde_json::Value::as_str);
+                    if ty == Some("done") || ty == Some("gen_start") {
+                        continue;
+                    }
+                    event_callback(&logical)?;
+                }
+            }
+            StreamContract::Legacy => {
+                match event_type {
+                    Some("gen_start") => {
+                        if let Some(started) = event
+                            .get("started_in_think")
+                            .and_then(serde_json::Value::as_bool)
+                        {
+                            legacy_router.set_started_in_think(started);
+                        }
+                    }
+                    Some("token") => {
+                        // Logprobs accumulation for legacy path. See V2 comment
+                        // about omitting rather than emitting nulls.
+                        if logprobs_requested {
+                            if let Some(entry) = logprob_entry_from_token_event(event) {
+                                logprobs_entries.push(entry);
+                            }
+                        }
+                        if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                            let fragments =
+                                if event.get("reasoning").and_then(serde_json::Value::as_bool)
+                                    == Some(true)
+                                {
+                                    legacy_router.push_semantic(text, true)
+                                } else {
+                                    legacy_router.push(text)
+                                };
+                            forward_think_fragments(
+                                fragments,
+                                &mut legacy_content,
+                                &mut legacy_reasoning,
+                                &mut event_callback,
+                            )?;
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                            let fragments = legacy_router.push_semantic(text, true);
+                            forward_think_fragments(
+                                fragments,
+                                &mut legacy_content,
+                                &mut legacy_reasoning,
+                                &mut event_callback,
+                            )?;
+                        }
+                    }
+                    Some("tool_calls") => {
+                        if let Some(calls) =
+                            event.get("calls").and_then(serde_json::Value::as_array)
+                        {
+                            for call in calls {
+                                let tc = tool_call_from_legacy_value(call).map_err(|detail| {
+                                    hipfire_client::ClientError::Protocol(format!(
+                                        "malformed canonical tool call: {detail}"
+                                    ))
+                                })?;
+                                legacy_tool_calls.push(tc);
+                            }
+                        }
+                    }
+                    Some("done") => {
+                        // Prefer staged commit_ready terminal; keep post-commit done
+                        // only as payload fill if staging was skipped (legacy path).
+                        if committed.is_none() {
+                            forward_think_fragments(
+                                legacy_router.finish(),
+                                &mut legacy_content,
+                                &mut legacy_reasoning,
+                                &mut event_callback,
+                            )?;
+                            legacy_done = Some(event.clone());
+                        }
+                    }
+                    _ => {
+                        event_callback(event)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+    let gen_result = match cancelled {
+        Some(flag) => engine_clone.generate_cancellable(&generate, flag, &mut on_event),
+        None => engine_clone.generate(&generate, &mut on_event),
+    };
+    if let Err(error) = &gen_result {
+        if error.to_string().contains("process restart required") {
+            // The daemon exits after reporting a sticky GPU fault. Reap it now
+            // so the next request respawns it instead of racing that exit.
+            drop(engine_clone);
+            shared
+                .runtime
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .engine
+                .terminate();
+        }
+    }
+    let done = gen_result?;
+    let mut meta = shared
+        .meta
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    meta.requests_served = meta.requests_served.saturating_add(1);
+    meta.recent_tok_s = done.get("tok_s").and_then(serde_json::Value::as_f64);
+    // Multi-slot `done` events carry the live swap-tier snapshot; publish it
+    // here (meta, not runtime) so `/health` stays lock-free.
+    if let Some(swap) = done.get("swap") {
+        meta.loaded.swap = swap.clone();
+    }
+    // Same payload the gateway already had; previously only `tok_s` survived, as a
+    // scalar overwritten by the next request. Distributions are what make a stall
+    // visible.
+    shared.metrics.observe_done(
+        &done,
+        first_token_at.get().map(|d| d.as_secs_f64() * 1000.0),
+        attempt_started.elapsed().as_secs_f64() * 1000.0,
+    );
+    if let Some(stats) = done.get("engine_stats") {
+        meta.engine_stats = serde_json::from_value(stats.clone()).ok();
+    }
+    meta.last_activity = Instant::now();
+    if let Some(message) = meta.spill.as_mut().and_then(|spill| spill.check()) {
+        crate::spill::emit(&message);
+    }
+
+    if let Some(completion) = committed {
+        return Ok(completion);
+    }
+    if contract_gate.is_v2() {
+        let mut done = fold.done().cloned().unwrap_or(done);
+        let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
+            Some(logprobs_entries)
+        } else {
+            None
+        };
+        let mut tool_calls = fold.executable_tool_calls().to_vec();
+        finalize_tool_calls_for_choice(&tool_choice_policy, &mut tool_calls, &mut done, body)?;
+        return Ok(Completion {
+            id,
+            created,
+            model,
+            content: fold.content().to_owned(),
+            reasoning_content: fold.reasoning_content().to_owned(),
+            preserve_thinking,
+            tool_calls,
+            done,
+            logprobs,
+            reasoning: Some(reasoning),
+        });
+    }
+
+    let mut done = legacy_done.unwrap_or(done);
+    // Idempotent after a staged commit_ready; the live absorb for a legacy
+    // stream that skipped staging and ended on a plain `done`.
+    absorb_legacy_terminal_calls(&done, &mut legacy_tool_calls)
+        .map_err(|detail| anyhow!("malformed canonical tool call: {detail}"))?;
+    let finish = done
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str);
+    let mut tool_calls = if finish == Some("tool_calls") {
+        legacy_tool_calls
+    } else {
+        Vec::new()
+    };
+    finalize_tool_calls_for_choice(&tool_choice_policy, &mut tool_calls, &mut done, body)?;
+    let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
+        Some(logprobs_entries)
+    } else {
+        None
+    };
+    Ok(Completion {
+        id,
+        created,
+        model,
+        content: legacy_content,
+        reasoning_content: legacy_reasoning,
+        preserve_thinking,
+        tool_calls,
+        done,
+        logprobs,
+        reasoning: Some(reasoning),
+    })
+}
+
+/// Whether the experimental multi-slot daemon path can honour this request.
+///
+/// Pure pre-send gate. Temperature / top_p / top_k remain supported, and
+/// token penalties (repeat/frequency/presence, min_p) are FORWARDED — the
+/// slot engine honours them via its penalize-then-argmax prepass (penalized
+/// requests decode AR; MTP stays off). Images are supported when the loaded
+/// model has a vision encoder (the daemon slot backend gates on is_vl).
+/// `response_format` (json_schema) is forwarded — the daemon slot backend
+/// validates grammar-compiler availability and refuses with a typed error
+/// when the compiled artifact or lossless token-byte table is unavailable
+/// (spec §7 G1/G2). Images and tools are each supported but not together —
+/// the VL prompt path cannot render a tool contract. Rejects non-null stop,
+/// logprobs, reasoning caps >= 2, and named thinking budgets other than
+/// `"off"`. Callers with `serve.multi_slot` enabled must surface the error —
+/// there is no ordinary-model fallback in that mode.
+fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if parts
+            .iter()
+            .any(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("image_url"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// [`multi_slot_request_supported`] as a typed client error (HTTP 400).
+fn require_multi_slot_support(request: &serde_json::Value) -> Result<()> {
+    multi_slot_request_supported(request).map_err(|reason| {
+        invalid_request!("experimental multi-slot does not support this request: {reason}")
+    })
+}
+
+pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
+    let has_image = multi_slot_request_has_image(body)
+        || body.get("image").is_some_and(|value| !value.is_null())
+        || body
+            .get("image_base64")
+            .is_some_and(|value| !value.is_null());
+    let has_tools = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                })
+            });
+    if has_image && has_tools {
+        return Err(
+            "images and tools together are not supported in experimental multi-slot".to_owned(),
+        );
+    }
+    // `stop` is unsupported, but an EMPTY stop (`[]` or `""`) is neutral —
+    // refusing it 400s a request that asks for nothing. Only a non-empty
+    // stop is refused (matches the daemon's `stop_nonempty` rule in
+    // slots.rs so the gateway and engine agree).
+    let stop_nonempty = match body.get("stop") {
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::String(t)) => !t.is_empty(),
+        Some(v) => !v.is_null(),
+        None => false,
+    };
+    if stop_nonempty {
+        return Err("stop sequences are not supported".to_owned());
+    }
+    if body.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true)
+        || body
+            .get("top_logprobs")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err("logprobs are not supported".to_owned());
+    }
+    // Penalties are supported end-to-end on the slot engine (in-kernel
+    // repeat/presence/frequency over a per-slot recent-token window, min_p in
+    // the top-p tail), so non-neutral values are forwarded, not refused or
+    // ignored. A penalized request decodes as plain AR (no MTP verify), see
+    // the multi-slot projection above.
+    if let Some(value) = body.get("min_p").and_then(serde_json::Value::as_f64) {
+        if !(0.0..=1.0).contains(&value) {
+            return Err("min_p must be within [0, 1]".to_owned());
+        }
+    }
+    // `reasoning_effort` is not refused here: `apply_http_reasoning_request`
+    // already owns the field end-to-end — it normalises qwen_jinja's
+    // vocabulary (low|medium|xhigh), maps the OpenAI spellings onto it, drops
+    // the dial with a warning when the loaded template does not natively
+    // honour it, and drops it when thinking is off. Refusing it here rejected
+    // requests the sequential route accepts, and pre-empted that logic.
+    // Finite caps (>= 2) are ENFORCED end-to-end on the multi-slot route
+    // (the grammar cursor force-closes the span at the budget —
+    // vLLM thinking_token_budget parity), so they are forwarded, not
+    // refused. `0` means UNCAPPED and `1` is the no-thinking sentinel
+    // (SERVE.md), so neither is a refusal here — the daemon owns the
+    // interpretation of the forwarded value.
+    if let Some(budget) = body
+        .get("thinking_budget")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !budget.eq_ignore_ascii_case("off") {
+            return Err("named thinking budget is not supported".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Server-owned retry driver with cooperative cancellation.
+///
+/// Daemon requests use [`hipfire_client::Engine::generate_cancellable`].
+/// Experimental multi-slot mode uses the same daemon wire path with
+/// `experimental_multi_slot=true`; unsupported request shapes are rejected
+/// before generate (no ordinary-model fallback while the mode is enabled).
+pub(crate) fn complete_request_cancellable(
+    shared: &ServeShared,
+    body: &serde_json::Value,
+    guard: AdmissionGuard,
+    request_identity: Option<(String, u64)>,
+    cancelled: &AtomicBool,
+    mut event_callback: impl FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
+    mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
+) -> Result<Completion> {
+    let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
+    // Retry must re-enter admission with the SAME eligibility the original
+    // request used: re-acquiring ineligible would park the retry until every
+    // eligible slot drains, and a multi-slot engine reset under concurrency
+    // is refused — either one made the single allowed retry a 500.
+    let retry_eligible = guard.is_eligible();
+    let retry_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let multi_slot_route = {
+        let runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        runtime.multi_slot_enabled
+    };
+
+    // Experimental multi-slot: fail closed on shapes the daemon slot engine
+    // cannot honour. Do not fall through to ordinary LoadedModel generate.
+    {
+        let runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if runtime.multi_slot_enabled {
+            require_multi_slot_support(body)?;
+        }
+    }
+
+    let mut attempt_index = 1u32;
+    let mut guard = guard;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::Error::new(ClientError::Cancelled));
+        }
+        let attempt_id = next_attempt_id();
+        let latches = std::cell::RefCell::new(AttemptLatches::default());
+        let outcome = complete_request_attempt(
+            shared,
+            body,
+            guard,
+            &identity,
+            attempt_id,
+            attempt_index > 1 && !multi_slot_route,
+            &latches,
+            Some(cancelled),
+            &mut event_callback,
+            &mut terminal_callback,
+        );
+        let latches = latches.into_inner();
+        match outcome {
+            Ok(completion) => {
+                if attempt_index > 1 {
+                    let mut meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    meta.retries_succeeded = meta.retries_succeeded.saturating_add(1);
+                }
+                return Ok(completion);
+            }
+            Err(error) => {
+                let was_cancelled = cancelled.load(Ordering::Relaxed)
+                    || error
+                        .downcast_ref::<ClientError>()
+                        .is_some_and(|err| matches!(err, ClientError::Cancelled));
+                if was_cancelled {
+                    return Err(error);
+                }
+                let eligible = {
+                    let runtime = shared
+                        .runtime
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    runtime.engine.last_retry_reset_eligible() == Some(true)
+                };
+                if decide_retry(
+                    &error,
+                    attempt_id,
+                    &latches,
+                    eligible,
+                    shared.retry_enabled,
+                    attempt_index,
+                ) == RetryDecision::Fail
+                {
+                    return Err(error);
+                }
+                {
+                    let mut meta = shared
+                        .meta
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner());
+                    meta.retries_attempted = meta.retries_attempted.saturating_add(1);
+                }
+                eprintln!(
+                    "[hipfire] {}: typed transient daemon failure on attempt {attempt_index}; \
+                     rolling back and retrying once",
+                    identity.0
+                );
+                let hook = shared
+                    .backoff_hook
+                    .lock()
+                    .ok()
+                    .and_then(|guard| guard.clone());
+                if let Some(hook) = hook {
+                    hook(shared.retry_backoff);
+                } else {
+                    std::thread::sleep(shared.retry_backoff);
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(anyhow::Error::new(ClientError::Cancelled));
+                }
+                guard = match shared.admission.acquire_for_with_bytes(
+                    retry_eligible,
+                    retry_model.as_deref(),
+                    0,
+                ) {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        return Err(error.context("retry aborted: admission re-acquire failed"));
+                    }
+                };
+                attempt_index = attempt_index.saturating_add(1);
+            }
+        }
+    }
+}
+
+pub(crate) fn forward_think_fragments(
+    fragments: Vec<ThinkFragment>,
+    content: &mut String,
+    reasoning_content: &mut String,
+    event_callback: &mut impl FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
+) -> Result<(), hipfire_client::ClientError> {
+    for fragment in fragments {
+        let logical = match fragment {
+            ThinkFragment::Content(text) => {
+                content.push_str(&text);
+                serde_json::json!({ "type": "token", "text": text })
+            }
+            ThinkFragment::Reasoning(text) => {
+                reasoning_content.push_str(&text);
+                serde_json::json!({ "type": "reasoning", "text": text })
+            }
+        };
+        event_callback(&logical)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn openai_content_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(parts)) => parts
+            .iter()
+            .filter(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect(),
+        Some(other) => other.to_string(),
+    }
+}
+
+pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let mut image = None;
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(serde_json::Value::as_str) != Some("image_url") {
+                continue;
+            }
+            let url = part
+                .pointer("/image_url/url")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invalid_request!("image_url content part requires image_url.url"))?;
+            let payload = ["data:image/png;base64,", "data:image/jpeg;base64,"]
+                .into_iter()
+                .find_map(|prefix| url.strip_prefix(prefix))
+                .ok_or_else(|| {
+                    if url.starts_with("data:") {
+                        invalid_request!(
+                            "only base64 PNG and JPEG image_url data URIs are supported"
+                        )
+                    } else {
+                        invalid_request!(
+                            "remote image_url values are unsupported; send a base64 data URI"
+                        )
+                    }
+                })?;
+            if payload.is_empty() {
+                bail_invalid!("image_url data URI has an empty base64 payload");
+            }
+            if image.replace(payload.to_owned()).is_some() {
+                bail_invalid!("at most one image_url is supported per request");
+            }
+        }
+    }
+    Ok(image)
+}
+
+pub(crate) fn strip_inline_thinking(text: &str) -> String {
+    pub(crate) const OPEN: &str = "<think>";
+    pub(crate) const CLOSE: &str = "</think>";
+    let mut visible = String::new();
+    let mut remaining = text;
+    while let Some(open) = remaining.find(OPEN) {
+        visible.push_str(&remaining[..open]);
+        let after_open = &remaining[open + OPEN.len()..];
+        let Some(close) = after_open.find(CLOSE) else {
+            return visible;
+        };
+        remaining = after_open[close + CLOSE.len()..].trim_start();
+    }
+    visible.push_str(remaining);
+    visible
+}
+
+pub(crate) fn inline_thinking(text: &str) -> Option<String> {
+    pub(crate) const OPEN: &str = "<think>";
+    pub(crate) const CLOSE: &str = "</think>";
+    let after_open = text.split_once(OPEN)?.1;
+    let reasoning = after_open.split_once(CLOSE)?.0.trim();
+    (!reasoning.is_empty()).then(|| reasoning.to_owned())
+}
+
+pub(crate) fn normalize_openai_tool_call(
+    call: &serde_json::Value,
+    include_reasoning_content: bool,
+) -> serde_json::Value {
+    let function = call.get("function").unwrap_or(call);
+    let name = function
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    let id = call
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty());
+    let arguments = match function.get("arguments") {
+        Some(serde_json::Value::String(raw)) => {
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                // Muse Glimmer's Onyx template requires a MAPPING and calls `raise_exception`
+                // otherwise, which would take the whole render down to a bare unframed prompt.
+                // Surface a parsed-but-not-object payload as the raw string so the daemon's
+                // `normalize_glimmer_tool_arguments` can refuse the request loudly instead.
+                Ok(parsed) if include_reasoning_content && !parsed.is_object() => {
+                    serde_json::Value::String(raw.clone())
+                }
+                // Every other architecture keeps whatever parsed — an array or scalar argument
+                // payload is legal for them, and `_raw`-wrapping it here would invent a tool
+                // parameter the model never saw. This arm is load-bearing for no-clobber.
+                Ok(parsed) => parsed,
+                Err(_) => {
+                    if include_reasoning_content {
+                        serde_json::Value::String(raw.clone())
+                    } else {
+                        serde_json::json!({ "_raw": raw })
+                    }
+                }
+            }
+        }
+        Some(value) => value.clone(),
+        None => serde_json::json!({}),
+    };
+    let mut obj = serde_json::json!({ "name": name, "arguments": arguments });
+    if let Some(id_str) = id {
+        obj["id"] = serde_json::Value::String(id_str.to_owned());
+    }
+    obj
+}
+
+pub(crate) fn normalize_openai_messages(
+    messages: Option<&serde_json::Value>,
+    include_reasoning_content: bool,
+) -> serde_json::Value {
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return serde_json::json!([]);
+    };
+    let normalized = messages
+        .iter()
+        .filter_map(|message| {
+            let role = match message.get("role").and_then(serde_json::Value::as_str)? {
+                "developer" => "system",
+                "toolResult" | "tool_result" => "tool",
+                role @ ("system" | "user" | "assistant" | "tool") => role,
+                _ => return None,
+            };
+            let raw_content = openai_content_text(message.get("content"));
+            let mut entry = serde_json::json!({
+                "role": role,
+                "content": if role == "assistant" {
+                    strip_inline_thinking(&raw_content)
+                } else {
+                    raw_content.clone()
+                },
+            });
+            if role == "assistant" {
+                let reasoning = message
+                    .get("reasoning")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|text| !text.is_empty())
+                    .or_else(|| {
+                        message
+                            .get("reasoning_content")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|text| !text.is_empty())
+                    })
+                    .map(str::to_owned)
+                    .or_else(|| inline_thinking(&raw_content));
+                if let Some(reasoning) = reasoning {
+                    if include_reasoning_content {
+                        entry["reasoning_content"] = serde_json::Value::String(reasoning.clone());
+                    }
+                    entry["tool_plan"] = serde_json::Value::String(reasoning);
+                }
+                if let Some(calls) = message
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .filter(|calls| !calls.is_empty())
+                {
+                    entry["tool_calls"] = serde_json::Value::Array(
+                        calls
+                            .iter()
+                            .map(|c| normalize_openai_tool_call(c, include_reasoning_content))
+                            .collect(),
+                    );
+                }
+            } else if role == "tool" {
+                if let Some(tool_call_id) = message
+                    .get("tool_call_id")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|id| !id.is_empty())
+                {
+                    entry["tool_call_id"] = serde_json::Value::String(tool_call_id.to_owned());
+                }
+                if let Some(name) = message
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|n| !n.is_empty())
+                {
+                    entry["name"] = serde_json::Value::String(name.to_owned());
+                }
+            }
+            Some(entry)
+        })
+        .collect();
+    serde_json::Value::Array(normalized)
+}
+
+pub(crate) fn inject_default_system_message(
+    messages: &mut serde_json::Value,
+    system: Option<&str>,
+) {
+    let Some(system) = system.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let Some(messages) = messages.as_array_mut() else {
+        return;
+    };
+    if messages
+        .iter()
+        .any(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+    {
+        return;
+    }
+    messages.insert(
+        0,
+        serde_json::json!({ "role": "system", "content": system }),
+    );
+}
+
+pub(crate) fn last_user_prompt(messages: &serde_json::Value) -> Option<String> {
+    messages
+        .as_array()?
+        .iter()
+        .rev()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("user"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+pub(crate) fn openai_finish_reason(done: &serde_json::Value) -> String {
+    // Only an explicit raw daemon finish_reason string is authoritative.
+    // Never synthesize "tool_calls" from buffered/leaked calls when the
+    // terminal is missing, null, non-string, or any other unsafe value.
+    match done
+        .get("finish_reason")
+        .and_then(serde_json::Value::as_str)
+    {
+        Some(reason) => reason.to_owned(),
+        // Missing/null/non-string → fail closed to stop (not tool_calls).
+        None => "stop".into(),
+    }
+}
+
+/// Validate OpenAI `logprobs` / `top_logprobs` contract before forwarding.
+/// `top_logprobs` must be integer 0..=20 and requires `logprobs == true`.
+/// Reject rather than silently clamping — a clamped value would make a caller
+/// think they got 20 when they got 5.
+pub(crate) fn validate_logprobs_request(body: &serde_json::Value) -> Result<()> {
+    if let Some(v) = body.get("top_logprobs") {
+        let logprobs_true = body.get("logprobs").and_then(|x| x.as_bool()) == Some(true);
+        if !logprobs_true {
+            bail_invalid!("top_logprobs requires logprobs to be true");
+        }
+        let n = if let Some(n) = v.as_u64() {
+            n
+        } else if let Some(n) = v.as_i64() {
+            if n < 0 {
+                bail_invalid!("top_logprobs must be an integer between 0 and 20");
+            }
+            n as u64
+        } else {
+            bail_invalid!("top_logprobs must be an integer between 0 and 20");
+        };
+        if n > 20 {
+            bail_invalid!("top_logprobs must be an integer between 0 and 20");
+        }
+    }
+    if let Some(v) = body.get("logprobs") {
+        if !v.is_boolean() {
+            bail_invalid!("logprobs must be a boolean");
+        }
+    }
+    Ok(())
+}
+
+/// Build one OpenAI logprobs content entry from a daemon token event.
+/// Returns None if the event lacks `logprob` — some paths do not yet compute
+/// it, and the response must omit `logprobs` entirely rather than emit entries
+/// with null logprob values. `bytes` is the UTF-8 bytes of the token text.
+pub(crate) fn logprob_entry_from_token_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    let text = event.get("text")?.as_str()?;
+    let logprob = event.get("logprob")?.as_f64()?;
+    let bytes: Vec<serde_json::Value> = text
+        .bytes()
+        .map(|b| serde_json::Value::Number(serde_json::Number::from(b as u64)))
+        .collect();
+    let top_logprobs = event.get("top_logprobs").and_then(|v| v.as_array());
+    let top_entries: Vec<serde_json::Value> = if let Some(arr) = top_logprobs {
+        arr.iter()
+            .filter_map(|e| {
+                let tok = e.get("token")?.as_str()?;
+                let lp = e.get("logprob")?.as_f64()?;
+                let b: Vec<serde_json::Value> = tok
+                    .bytes()
+                    .map(|b| serde_json::Value::Number(serde_json::Number::from(b as u64)))
+                    .collect();
+                Some(serde_json::json!({
+                    "token": tok,
+                    "logprob": lp,
+                    "bytes": b,
+                }))
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some(serde_json::json!({
+        "token": text,
+        "logprob": logprob,
+        "bytes": bytes,
+        "top_logprobs": top_entries,
+    }))
+}
+
+pub(crate) fn completion_json(completion: &Completion) -> serde_json::Value {
+    let finish_reason = openai_finish_reason(&completion.done);
+    // Structured calls only for a tool-safe terminal; never on length/error/cancel.
+    let tool_calls = if finish_reason == "tool_calls" {
+        openai_tool_calls(&completion.tool_calls)
+    } else {
+        Vec::new()
+    };
+    let visible_content =
+        if completion.preserve_thinking && !completion.reasoning_content.is_empty() {
+            format!(
+                "<think>{}</think>\n{}",
+                completion.reasoning_content, completion.content
+            )
+        } else {
+            completion.content.clone()
+        };
+    // Pure tool turns: OpenAI content is JSON null (not "").
+    let content_value = if visible_content.is_empty() && !tool_calls.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::Value::String(visible_content)
+    };
+    let mut message = serde_json::json!({
+        "role": "assistant",
+        "content": content_value,
+    });
+    if !completion.preserve_thinking && !completion.reasoning_content.is_empty() {
+        message["reasoning_content"] =
+            serde_json::Value::String(completion.reasoning_content.clone());
+    }
+    if !tool_calls.is_empty() {
+        message["tool_calls"] = serde_json::Value::Array(tool_calls);
+    }
+    let mut choice = serde_json::json!({
+        "index": 0,
+        "message": message,
+        "finish_reason": finish_reason,
+    });
+    // Attach logprobs only when the client requested it and the daemon
+    // actually produced per-token logprob entries. If the daemon sends no
+    // `logprob` on token events (paths that do not yet compute it), omit the
+    // field entirely rather than emitting nulls or an empty object.
+    if let Some(entries) = &completion.logprobs {
+        if !entries.is_empty() {
+            choice["logprobs"] = serde_json::json!({ "content": entries });
+        }
+    }
+    serde_json::json!({
+        "id": completion.id,
+        "object": "chat.completion",
+        "created": completion.created,
+        "model": completion.model,
+        "choices": [choice],
+        "usage": completion_usage(completion),
+        "timings": completion_timings(completion),
+        "hipfire": completion_hipfire(completion),
+    })
+}
+/// `completion_tokens` is the daemon's `done.tokens` verbatim (committed
+/// tokens; drafted/rejected spec tokens never count). Terminator policy is
+/// per arch and pinned, not unified, for 0.4.1: Qwen AR/spec/batch count the
+/// EOS token, DS4 AR/spec and LFM batch do not
+/// (`spec_usage_counts_eos_for_qwen_not_ds4`).
+pub(crate) fn completion_usage(completion: &Completion) -> serde_json::Value {
+    let cached_tokens = completion
+        .done
+        .get("cached_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let prompt_tokens = completion
+        .done
+        .get("prompt_tokens")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| {
+            completion
+                .done
+                .get("prefill_tokens")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(cached_tokens)
+        });
+    let completion_tokens = completion
+        .done
+        .get("tokens")
+        .or_else(|| completion.done.get("completion_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    serde_json::json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+        "prompt_tokens_details": { "cached_tokens": cached_tokens },
+    })
+}
+
+pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
+    let done = &completion.done;
+    serde_json::json!({
+        "ttft_ms": done.get("ttft_ms"),
+        "prefill_ms": done.get("prefill_ms"),
+        "prefill_tok_s": done.get("prefill_tok_s"),
+        // Pure passthrough: relaying the wall-inclusive `tok_s` under
+        // `decode_tok_s` (the slots route reports only the former) made
+        // clients present prefill time as decode speed — measured ~3x low
+        // on gfx1101 multi-slot. `hipfire.tok_s` carries the wall number
+        // for clients that want it.
+        "decode_tok_s": done.get("decode_tok_s"),
+        "latency_ms": done.get("latency_ms"),
+        "tau": done.get("tau"),
+        "cycles": done.get("cycles"),
+        "dflash": done.get("dflash"),
+        "mtp": done.get("mtp"),
+        "mtp_ngram": done.get("mtp_ngram"),
+        "ngram_mod_windows": done.get("ngram_mod_windows"),
+        "ngram_mod_drafts": done.get("ngram_mod_drafts"),
+        "ngram_mod_accepted": done.get("ngram_mod_accepted"),
+        "ngram_mod_accept_rate": done.get("ngram_mod_accept_rate"),
+        "mtp_windows": done.get("mtp_windows"),
+        "ar_windows": done.get("ar_windows"),
+        "mtp_retired": done.get("mtp_retired"),
+        "mtp_drafts": done.get("mtp_drafts"),
+        "mtp_accepted": done.get("mtp_accepted"),
+        "mtp_depth_offered": done.get("mtp_depth_offered"),
+        "mtp_depth_reached": done.get("mtp_depth_reached"),
+        "mtp_depth_accepted": done.get("mtp_depth_accepted"),
+        "mtp_copy_windows": done.get("mtp_copy_windows"),
+        "mtp_copy_drafts": done.get("mtp_copy_drafts"),
+        "mtp_copy_accepted": done.get("mtp_copy_accepted"),
+        "spec_retired": done.get("spec_retired"),
+        "spec_retired_at": done.get("spec_retired_at"),
+        "ar_tokens": done.get("ar_tokens"),
+        "mtp_window_timings": done.get("mtp_window_timings"),
+    })
+}
+
+/// Shared hipfire evidence projection for normal and streaming terminals.
+pub(crate) fn completion_hipfire(completion: &Completion) -> serde_json::Value {
+    let done = &completion.done;
+    let mut hip = serde_json::json!({
+        "tok_s": done.get("tok_s"),
+        "prefill_tok_s": done.get("prefill_tok_s"),
+        "decode_tok_s": done.get("decode_tok_s"),
+        "execution_mode": done.get("execution_mode"),
+        "continuous_batch": done.get("continuous_batch"),
+    });
+    if let Some(reasoning) = &completion.reasoning {
+        hip["reasoning"] = serde_json::json!({
+            "contract": reasoning.contract.wire_name(),
+            "mode": reasoning.effective_mode,
+            "effort": reasoning.effective_effort,
+            "max_think_tokens": reasoning.effective_cap,
+            "cap_source": reasoning.cap_source,
+        });
+        hip["config_warnings"] = serde_json::json!(reasoning.warnings);
+    } else {
+        hip["reasoning"] = serde_json::Value::Null;
+        hip["config_warnings"] = serde_json::json!([]);
+    }
+    hip
+}
+
+/// One OpenAI-lowered tool call from the shared canonical adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OpenAiToolCallAdapterResult {
+    pub(crate) index: usize,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    /// JSON-text arguments (OpenAI wire requires a string, not an object).
+    pub arguments: String,
+}
+
+/// Build the single shared OpenAI adapter result vector for a completion.
+/// Deterministic response-scoped ids `call_{index}`; no filtering/dropping.
+pub(crate) fn openai_tool_call_adapter_results(
+    calls: &[ToolCall],
+) -> Vec<OpenAiToolCallAdapterResult> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| OpenAiToolCallAdapterResult {
+            index,
+            id: call.id.clone().unwrap_or_else(|| format!("call_{index}")),
+            name: call.name.clone(),
+            arguments: serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into()),
+        })
+        .collect()
+}
+
+/// Lower shared adapter results into OpenAI `message.tool_calls` objects.
+pub(crate) fn openai_tool_calls_from_adapter(
+    adapted: &[OpenAiToolCallAdapterResult],
+) -> Vec<serde_json::Value> {
+    adapted
+        .iter()
+        .map(|call| {
+            serde_json::json!({
+                "id": call.id,
+                "type": "function",
+                "function": {
+                    "name": call.name,
+                    "arguments": call.arguments,
+                }
+            })
+        })
+        .collect()
+}
+
+/// Canonical → OpenAI non-stream tool_calls array (shared adapter path).
+pub(crate) fn openai_tool_calls(calls: &[ToolCall]) -> Vec<serde_json::Value> {
+    openai_tool_calls_from_adapter(&openai_tool_call_adapter_results(calls))
+}
+
+/// Map a folded callback event to an OpenAI stream delta.
+/// Only clean content/reasoning are forwarded mid-stream; structured tool
+/// calls release only via [`openai_stream_terminal_chunks`].
+pub(crate) fn openai_stream_delta_for_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
+    match event.get("type").and_then(serde_json::Value::as_str) {
+        Some("token") => event
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| serde_json::json!({ "content": text })),
+        Some("reasoning") => event
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| serde_json::json!({ "reasoning_content": text })),
+        // tool_calls are released only after a tool-safe terminal verdict.
+        Some("tool_calls") => None,
+        _ => None,
+    }
+}
+
+/// Lower shared adapter results into an OpenAI stream `delta` tool_calls object.
+pub(crate) fn openai_tool_call_delta_from_adapter(
+    adapted: &[OpenAiToolCallAdapterResult],
+) -> serde_json::Value {
+    serde_json::json!({
+        "tool_calls": adapted
+            .iter()
+            .map(|call| {
+                serde_json::json!({
+                    "index": call.index,
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.name,
+                        "arguments": call.arguments,
+                    }
+                })
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
+/// Post-completion SSE chunks: optional tool_calls release, terminal choice,
+/// then optional separate `choices: []` usage chunk (never on the terminal).
+pub(crate) fn openai_stream_terminal_chunks(
+    completion: &Completion,
+    include_usage: bool,
+) -> Vec<serde_json::Value> {
+    let finish_reason = openai_finish_reason(&completion.done);
+    let mut chunks = Vec::new();
+
+    // Release structured calls only on a tool-safe terminal.
+    // Same adapter vector as non-stream `openai_tool_calls`.
+    if finish_reason == "tool_calls" && !completion.tool_calls.is_empty() {
+        let adapted = openai_tool_call_adapter_results(&completion.tool_calls);
+        let delta = openai_tool_call_delta_from_adapter(&adapted);
+        chunks.push(serde_json::json!({
+            "id": completion.id,
+            "object": "chat.completion.chunk",
+            "created": completion.created,
+            "model": completion.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": null
+            }],
+        }));
+    }
+
+    chunks.push(serde_json::json!({
+        "id": completion.id,
+        "object": "chat.completion.chunk",
+        "created": completion.created,
+        "model": completion.model,
+        "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
+        "timings": completion_timings(completion),
+        "hipfire": completion_hipfire(completion),
+    }));
+
+    if include_usage {
+        chunks.push(serde_json::json!({
+            "id": completion.id,
+            "object": "chat.completion.chunk",
+            "created": completion.created,
+            "model": completion.model,
+            "choices": [],
+            "usage": completion_usage(completion),
+        }));
+    }
+
+    chunks
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::serve::complete::Completion;
+    use crate::{Paths, ServeArgs, StopArgs};
+    use hipfire_client::ClientError;
+    use hipfire_config::{
+        load_global, resolve, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer,
+    };
+    use hipfire_registry::{RegistryPaths, RegistryV1};
+    use hipfire_runtime::prompt_frame::ToolCall;
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
+    fn test_paths(label: &str) -> Paths {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "hipfire-cli-{label}-{}-{nonce}",
+            std::process::id()
+        ));
+        let config = ConfigPaths::under(&root);
+        Paths {
+            models: config.models.clone(),
+            registry: RegistryPaths {
+                cache: root.join("registry.cache.json"),
+            },
+            root,
+            config,
+        }
+    }
+
+    fn idle_test_meta() -> ServeMeta {
+        ServeMeta {
+            current_model: Some("model.hfq".to_owned()),
+            loading_model: Some("model.hfq".to_owned()),
+            last_activity: Instant::now() - Duration::from_secs(600),
+            ..ServeMeta::new("test".to_owned())
+        }
+    }
+
+    fn sample_completion(
+        content: &str,
+        tool_calls: Vec<ToolCall>,
+        finish_reason: &str,
+    ) -> Completion {
+        Completion {
+            id: "chatcmpl_test".into(),
+            created: 42,
+            model: "qwen:test".into(),
+            content: content.into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls,
+            done: serde_json::json!({
+                "finish_reason": finish_reason,
+                "prompt_tokens": 3,
+                "tokens": 5,
+                "cached_tokens": 1,
+                "tok_s": 10.0,
+            }),
+            logprobs: None,
+            reasoning: None,
+        }
+    }
+
+    fn sample_tc(name: &str, arguments: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: None,
+            name: name.into(),
+            arguments,
+            rendered_body: None,
+        }
+    }
+    fn sample_completion_with_done(
+        content: &str,
+        tool_calls: Vec<ToolCall>,
+        done: serde_json::Value,
+    ) -> Completion {
+        Completion {
+            id: "chatcmpl_test".into(),
+            created: 42,
+            model: "qwen:test".into(),
+            content: content.into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls,
+            done,
+            logprobs: None,
+            reasoning: None,
+        }
+    }
+
+    fn sample_tool_call(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "arguments": { "path": "README.md" }
+        })
+    }
+
+    fn task15_daemon_err(class: &str, retryable: bool, attempt_id: u64) -> anyhow::Error {
+        anyhow::Error::new(hipfire_client::ClientError::Daemon(
+            hipfire_client::TypedDaemonError {
+                message: format!("t15 {class}"),
+                class: class.to_owned(),
+                retryable,
+                rolled_back: false,
+                attempt_id,
+                id: Some("req-t15".into()),
+            },
+        ))
+    }
+
+    #[test]
+    fn completion_timings_preserves_speculator_identity() {
+        let completion = |done| Completion {
+            id: "req-test".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done,
+            logprobs: None,
+            reasoning: None,
+        };
+
+        let dflash = completion_timings(&completion(serde_json::json!({
+            "dflash": true,
+            "tau": 3.5,
+            "cycles": 4,
+        })));
+        assert_eq!(dflash["dflash"], true);
+        assert!(dflash["mtp"].is_null());
+
+        let mtp_window_timings = serde_json::json!([{
+            "kind": "mtp",
+            "wall_us": 1234,
+            "draft_lookup_us": 12,
+            "launch_us": 34,
+            "h2d_us": 56,
+            "d2h_us": 78,
+            "d2d_us": 90,
+            "memset_us": 11,
+            "stream_sync_us": 22,
+            "event_sync_us": 33,
+            "device_sync_us": 44,
+            "graph_launch_us": 55,
+        }]);
+        let mtp = completion_timings(&completion(serde_json::json!({
+            "mtp": true,
+            "tau": 2.0,
+            "cycles": 6,
+            "mtp_window_timings": mtp_window_timings,
+        })));
+        assert!(mtp["dflash"].is_null());
+        assert_eq!(mtp["mtp"], true);
+        assert_eq!(mtp["mtp_window_timings"], mtp_window_timings);
+        assert_eq!(mtp["mtp_window_timings"][0]["kind"], "mtp");
+        assert_eq!(mtp["mtp_window_timings"][0]["wall_us"], 1234);
+    }
+
+    #[test]
+    fn completion_timings_projects_latency_ms() {
+        let completion = Completion {
+            id: "req-lat".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "ttft_ms": 12.5,
+                "prefill_ms": 10.0,
+                "prefill_tok_s": 100.0,
+                "decode_tok_s": 40.0,
+                "latency_ms": 250.5,
+                "tok_s": 20.0,
+            }),
+            logprobs: None,
+            reasoning: None,
+        };
+        let timings = completion_timings(&completion);
+        assert_eq!(timings["latency_ms"], 250.5);
+        assert_eq!(timings["ttft_ms"], 12.5);
+        // Absent latency stays null-like (serde_json::Value::Null via .get).
+        let no_lat = completion_timings(&Completion {
+            id: "req-lat".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({"ttft_ms": 1.0}),
+            logprobs: None,
+            reasoning: None,
+        });
+        assert!(no_lat["latency_ms"].is_null());
+    }
+
+    #[test]
+    fn completion_hipfire_projects_batch_route_evidence() {
+        let batch = serde_json::json!({
+            "executed": true,
+            "slots": 4,
+            "lane": 1,
+            "lane_capacity": 4096,
+            "max_active_lanes": 2,
+            "refill": "continuous",
+        });
+        let completion = Completion {
+            id: "req-batch".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: "hi".into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "tok_s": 18.5,
+                "prefill_tok_s": 200.0,
+                "decode_tok_s": 22.0,
+                "latency_ms": 300.0,
+                "execution_mode": "continuous_batch_independent",
+                "continuous_batch": batch,
+                "finish_reason": "stop",
+                "tokens": 3,
+                "prefill_tokens": 8,
+            }),
+            logprobs: None,
+            reasoning: None,
+        };
+        let hip = completion_hipfire(&completion);
+        assert_eq!(hip["execution_mode"], "continuous_batch_independent");
+        assert_eq!(hip["continuous_batch"]["max_active_lanes"], 2);
+        assert_eq!(hip["continuous_batch"]["slots"], 4);
+        assert_eq!(hip["continuous_batch"]["lane"], 1);
+        assert_eq!(hip["tok_s"], 18.5);
+
+        let json = completion_json(&completion);
+        assert_eq!(json["timings"]["latency_ms"], 300.0);
+        assert_eq!(
+            json["hipfire"]["execution_mode"],
+            "continuous_batch_independent"
+        );
+        assert_eq!(json["hipfire"]["continuous_batch"]["refill"], "continuous");
+
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        let terminal = chunks.last().unwrap();
+        assert_eq!(terminal["timings"]["latency_ms"], 300.0);
+        assert_eq!(
+            terminal["hipfire"]["execution_mode"],
+            "continuous_batch_independent"
+        );
+        assert_eq!(
+            terminal["hipfire"]["continuous_batch"]["max_active_lanes"],
+            2
+        );
+
+        // Sequential done without route evidence stays null (unchanged fields).
+        let sequential = Completion {
+            id: "req-seq".into(),
+            created: 0,
+            model: "test-model".into(),
+            content: String::new(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "tok_s": 10.0,
+                "prefill_tok_s": 50.0,
+                "decode_tok_s": 12.0,
+                "finish_reason": "stop",
+                "tokens": 2,
+            }),
+            logprobs: None,
+            reasoning: None,
+        };
+        let seq_hip = completion_hipfire(&sequential);
+        assert!(seq_hip["execution_mode"].is_null());
+        assert!(seq_hip["continuous_batch"].is_null());
+        assert_eq!(seq_hip["tok_s"], 10.0);
+    }
+
+    #[test]
+    fn last_user_prompt_handles_text_parts() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "assistant", "content": "old" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "one" },
+                    { "type": "text", "text": "two" }
+                ] }
+            ]
+        });
+        let messages = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(last_user_prompt(&messages).as_deref(), Some("onetwo"));
+    }
+
+    #[test]
+    fn openai_images_forward_one_base64_payload_and_reject_unsafe_shapes() {
+        let messages = serde_json::json!([{
+            "role": "user",
+            "content": [
+                { "type": "text", "text": "describe" },
+                { "type": "image_url", "image_url": { "url": "data:image/png;base64,YWJj" } }
+            ]
+        }]);
+        assert_eq!(
+            request_image_base64(Some(&messages)).unwrap().as_deref(),
+            Some("YWJj")
+        );
+        let remote = serde_json::json!([{
+            "role": "user",
+            "content": [{ "type": "image_url", "image_url": { "url": "https://example/image.png" } }]
+        }]);
+        assert!(request_image_base64(Some(&remote))
+            .unwrap_err()
+            .to_string()
+            .contains("remote"));
+    }
+
+    #[test]
+    fn openai_messages_normalize_roles_content_and_tool_history() {
+        let body = serde_json::json!({
+            "messages": [
+                { "role": "developer", "content": "system policy" },
+                { "role": "user", "content": [
+                    { "type": "text", "text": "first" },
+                    { "type": "image_url", "image_url": { "url": "ignored" } },
+                    { "type": "text", "text": " second" }
+                ] },
+                {
+                    "role": "assistant",
+                    "content": null,
+                    "reasoning_content": "tool reasoning",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "read_file",
+                            "arguments": "{\"path\":\"README.md\"}"
+                        }
+                    }]
+                },
+                { "role": "toolResult", "tool_call_id": "call_1", "content": "done" },
+                { "role": "unsupported", "content": "drop me" }
+            ]
+        });
+        // Flag OFF — today's exact shape unchanged, no reasoning_content key
+        let normalized = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(normalized.as_array().unwrap().len(), 4);
+        assert_eq!(normalized[0]["role"], "system");
+        assert_eq!(normalized[1]["content"], "first second");
+        assert_eq!(normalized[2]["content"], "");
+        assert_eq!(normalized[2]["tool_plan"], "tool reasoning");
+        assert!(normalized[2].get("reasoning_content").is_none());
+        assert_eq!(normalized[2]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(normalized[2]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(
+            normalized[2]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "path": "README.md" })
+        );
+        assert_eq!(normalized[3]["role"], "tool");
+        assert_eq!(normalized[3]["tool_call_id"], "call_1");
+        // Flag ON — reasoning dual-written, content still visible-only
+        let normalized_on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(normalized_on[2]["content"], "");
+        assert_eq!(normalized_on[2]["tool_plan"], "tool reasoning");
+        assert_eq!(normalized_on[2]["reasoning_content"], "tool reasoning");
+        assert_eq!(
+            normalized_on[2]["reasoning_content"],
+            normalized_on[2]["tool_plan"]
+        );
+        assert_eq!(normalized_on[2]["tool_calls"][0]["id"], "call_1");
+    }
+
+    #[test]
+    fn reasoning_recogniser_accepts_slot_daemon_arch_spellings() {
+        // Slot backend (`slots.rs`) and non-slot daemon (`main.rs` arch match)
+        // both publish `qwen3_5` / `qwen3_5_moe` for the same models.
+        assert!(include_reasoning_content(Some("qwen3_5")));
+        assert!(include_reasoning_content(Some("qwen3_5_moe")));
+        assert!(!include_reasoning_content(Some("qwen3")));
+    }
+
+    #[test]
+    fn openai_assistant_history_strips_thinking_and_preserves_fallback_arguments() {
+        let body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": "<think>private plan</think>\n\nvisible answer",
+                "tool_calls": [{
+                    "function": { "name": "broken", "arguments": "not-json" }
+                }]
+            }]
+        });
+        // Flag OFF — repair into _raw
+        let normalized = normalize_openai_messages(body.get("messages"), false);
+        assert_eq!(normalized[0]["content"], "visible answer");
+        assert_eq!(normalized[0]["tool_plan"], "private plan");
+        assert_eq!(
+            normalized[0]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "_raw": "not-json" })
+        );
+        // Flag ON — string that does not parse to object is retained as string for daemon to reject
+        let normalized_on = normalize_openai_messages(body.get("messages"), true);
+        assert_eq!(normalized_on[0]["content"], "visible answer");
+        assert_eq!(normalized_on[0]["tool_plan"], "private plan");
+        assert_eq!(normalized_on[0]["reasoning_content"], "private plan");
+        assert_eq!(
+            normalized_on[0]["tool_calls"][0]["arguments"],
+            serde_json::Value::String("not-json".into())
+        );
+    }
+
+    #[test]
+    fn jinja_started_think_routes_reasoning_then_visible_answer() {
+        let mut router = ThinkChannelRouter::default();
+        router.set_started_in_think(true);
+        assert_eq!(
+            router.push("reasoning body"),
+            vec![ThinkFragment::Reasoning("reasoning body".into())]
+        );
+        assert!(router.push("</thi").is_empty());
+        assert_eq!(
+            router.push("nk>\n\nvisible answer"),
+            vec![ThinkFragment::Content("visible answer".into())]
+        );
+        assert!(router.finish().is_empty());
+    }
+
+    #[test]
+    fn plain_jinja_tail_keeps_output_in_content() {
+        let mut router = ThinkChannelRouter::default();
+        router.set_started_in_think(false);
+        assert_eq!(
+            router.push("direct answer"),
+            vec![ThinkFragment::Content("direct answer".into())]
+        );
+    }
+
+    #[test]
+    fn model_literal_think_frames_route_consistently() {
+        for family in ["qwen", "lfm", "minimax"] {
+            let mut router = ThinkChannelRouter::default();
+            router.set_started_in_think(true);
+            let mut fragments = router.push(&format!("{family} reasoning</thi"));
+            fragments.extend(router.push("nk>\n\nvisible<|im_"));
+            fragments.extend(router.push("end|>"));
+            fragments.extend(router.finish());
+            assert_eq!(
+                fragments,
+                vec![
+                    ThinkFragment::Reasoning(format!("{family} reasoning")),
+                    ThinkFragment::Content("visible".into()),
+                ],
+                "{family}"
+            );
+        }
+    }
+
+    #[test]
+    fn daemon_semantic_channels_override_literal_think_state() {
+        for family in ["deepseek", "cohere"] {
+            let mut router = ThinkChannelRouter::default();
+            router.set_started_in_think(true);
+            let mut fragments = router.push_semantic(&format!("{family} reason<|im_"), true);
+            fragments.extend(router.push_semantic("end|>", true));
+            fragments.extend(router.push("visible answer"));
+            fragments.extend(router.finish());
+            assert_eq!(
+                fragments,
+                vec![
+                    ThinkFragment::Reasoning(format!("{family} reason")),
+                    ThinkFragment::Content("visible answer".into()),
+                ],
+                "{family}"
+            );
+        }
+    }
+
+    #[test]
+    fn output_router_removes_orphan_close_and_split_terminators() {
+        let mut router = ThinkChannelRouter::default();
+        let mut fragments = router.push("</thi");
+        fragments.extend(router.push("nk>\n\nanswer<|endof"));
+        fragments.extend(router.push("text|>tail"));
+        fragments.extend(router.finish());
+        assert_eq!(
+            fragments,
+            vec![
+                ThinkFragment::Content("answer".into()),
+                ThinkFragment::Content("tail".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn request_sampling_omits_builtins_but_recovers_shadowed_registry_values() {
+        let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert_eq!(
+            request_f64(&builtins, "generation.temperature", None).unwrap(),
+            None
+        );
+
+        let mut registry = ConfigLayer::default();
+        registry.set_cli("generation.temperature", "1.0").unwrap();
+        registry.set_cli("generation.top_k", "40").unwrap();
+        registry.set_cli("generation.min_p", "0.05").unwrap();
+        registry
+            .set_cli("generation.presence_penalty", "1.5")
+            .unwrap();
+        registry
+            .set_cli("prompt.system", "registry identity")
+            .unwrap();
+        let mut global = ConfigLayer::default();
+        global.set_cli("generation.temperature", "0.7").unwrap();
+        global.set_cli("generation.top_k", "10").unwrap();
+        global.set_cli("generation.min_p", "0.1").unwrap();
+        global
+            .set_cli("generation.presence_penalty", "0.5")
+            .unwrap();
+        global.set_cli("prompt.system", "global identity").unwrap();
+        let resolved = resolve([
+            NamedLayer {
+                source: ConfigSource::RegistryModel {
+                    tag: "qwen:test".into(),
+                    revision: "v1".into(),
+                },
+                layer: registry,
+            },
+            NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: PathBuf::from("config.toml"),
+                },
+                layer: global,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            request_f64(&resolved, "generation.temperature", None).unwrap(),
+            Some(1.0)
+        );
+        assert_eq!(
+            request_f64(&resolved, "generation.temperature", Some(0.25)).unwrap(),
+            Some(0.25)
+        );
+        assert_eq!(
+            request_u64(&resolved, "generation.top_k", None).unwrap(),
+            Some(40)
+        );
+        assert_eq!(
+            request_f64(&resolved, "generation.min_p", None).unwrap(),
+            Some(0.05)
+        );
+        assert_eq!(
+            request_f64(&resolved, "generation.presence_penalty", None).unwrap(),
+            Some(1.5)
+        );
+        assert_eq!(
+            request_string(&resolved, "prompt.system", None).unwrap(),
+            Some("registry identity".into())
+        );
+        assert_eq!(
+            request_string(&resolved, "prompt.system", Some("explicit".into())).unwrap(),
+            Some("explicit".into())
+        );
+    }
+
+    #[test]
+    fn process_config_projects_only_explicit_arch_sensitive_config() {
+        const NAME: &str = "HIPFIRE_FP16";
+        let builtins = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let process = hipfire_config::ProcessConfig::from_resolved(&builtins).unwrap();
+        assert_eq!(process.legacy_value(NAME), None);
+
+        let mut global = ConfigLayer::default();
+        global.set_cli("kernel.fp16", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: global,
+        }])
+        .unwrap();
+        let process = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        assert_eq!(process.legacy_value(NAME).as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn process_config_projects_typed_scalar_and_variant_config() {
+        const NAMES: &[&str] = &[
+            "HIPFIRE_DEVICES",
+            "HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB",
+            "HIPFIRE_GEMV_ROWS",
+            "HIPFIRE_LM_HEAD_F16",
+        ];
+        let mut global = ConfigLayer::default();
+        global.set_cli("hardware.devices", "2,3").unwrap();
+        global
+            .set_cli("hardware.uniform_vram_tolerance_gb", "1.5")
+            .unwrap();
+        global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
+        global.set_cli("kernel.lm_head_f16", "f32").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: global,
+        }])
+        .unwrap();
+        let process = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
+        assert_eq!(process.legacy_value(NAMES[0]).as_deref(), Some("2,3"));
+        assert_eq!(process.legacy_value(NAMES[1]).as_deref(), Some("1.5"));
+        assert_eq!(process.legacy_value(NAMES[2]).as_deref(), Some("4"));
+        assert_eq!(process.legacy_value(NAMES[3]).as_deref(), Some("f32"));
+    }
+
+    #[test]
+    fn http_reasoning_and_completion_metadata_match_native_contract() {
+        use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer};
+        use saddle_core::caps::ReasoningContract;
+        use std::path::PathBuf;
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let qwen_supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for effort in ["low", "medium", "xhigh"] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": effort }),
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &qwen_supported,
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], effort);
+            assert_eq!(req["thinking_enabled"], true);
+            assert_eq!(req["assistant_prefix"], "open_think");
+            assert!(
+                req.get("max_think_tokens").is_none(),
+                "qwen {effort} must not invent max cap"
+            );
+            assert_eq!(res.effective_mode, "enabled");
+            assert_eq!(res.effective_effort.as_deref(), Some(effort));
+            assert_eq!(res.effective_cap, None);
+            assert_eq!(res.cap_source, "none");
+            assert!(res.warnings.is_empty());
+        }
+        let mut qwen_default = serde_json::json!({});
+        let res_default = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &resolved,
+            &mut qwen_default,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_default["reasoning_effort"], "medium");
+        assert_eq!(res_default.effective_effort.as_deref(), Some("medium"));
+        assert!(res_default.warnings.is_empty());
+        let mut qwen_capped = serde_json::json!({});
+        let res_capped = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low", "max_think_tokens": 2048 }),
+            &resolved,
+            &mut qwen_capped,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_capped["reasoning_effort"], "low");
+        assert_eq!(qwen_capped["max_think_tokens"], 2048);
+        assert_eq!(res_capped.effective_cap, Some(2048));
+        assert_eq!(res_capped.cap_source, "explicit:body:max_think_tokens");
+        let mut qwen36 = serde_json::json!({});
+        let res36 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut qwen36,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(qwen36.get("reasoning_effort").is_none());
+        assert!(!res36.warnings.is_empty());
+        assert!(res36
+            .warnings
+            .iter()
+            .any(|w| w.contains("does not natively support")));
+        assert_eq!(res36.effective_effort, None);
+        let mut qwen36_cap = serde_json::json!({});
+        let res36cap = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low", "max_think_tokens": 2048 }),
+            &resolved,
+            &mut qwen36_cap,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(qwen36_cap["max_think_tokens"], 2048);
+        assert_eq!(res36cap.effective_cap, Some(2048));
+        let mut budget_layer = ConfigLayer::default();
+        budget_layer.set_cli("reasoning.budget", "low").unwrap();
+        let budget_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: budget_layer,
+        }])
+        .unwrap();
+        let mut qwen_nat_budget = serde_json::json!({});
+        let res_nat_budget = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &budget_resolved,
+            &mut qwen_nat_budget,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert!(
+            qwen_nat_budget.get("max_think_tokens").is_none(),
+            "native budget must be dropped"
+        );
+        assert!(!res_nat_budget.warnings.is_empty());
+        assert!(res_nat_budget
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("ignored")));
+        let mut qwen_non_budget = serde_json::json!({});
+        let res_non_budget = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &budget_resolved,
+            &mut qwen_non_budget,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(qwen_non_budget["max_think_tokens"], 512);
+        assert_eq!(res_non_budget.effective_cap, Some(512));
+        assert_eq!(res_non_budget.cap_source, "config:reasoning.budget");
+        let mut qwen_native_body_budget = serde_json::json!({});
+        let native_body_budget = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "xhigh",
+                "thinking_budget": "high"
+            }),
+            &resolved,
+            &mut qwen_native_body_budget,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert!(qwen_native_body_budget.get("max_think_tokens").is_none());
+        assert_eq!(
+            native_body_budget.effective_effort.as_deref(),
+            Some("xhigh")
+        );
+        assert!(native_body_budget.effective_cap.is_none());
+        assert!(native_body_budget.warnings.iter().any(|warning| {
+            warning.contains("thinking_budget") && warning.contains("effort-native")
+        }));
+        let mut qwen36_body_budget = serde_json::json!({});
+        let qwen36_budget_resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "high" }),
+            &resolved,
+            &mut qwen36_body_budget,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(qwen36_body_budget["max_think_tokens"], 8192);
+        assert_eq!(qwen36_budget_resolution.effective_cap, Some(8192));
+        assert_eq!(
+            qwen36_budget_resolution.cap_source,
+            "explicit:body:thinking_budget"
+        );
+        let mut qwen_max_and_budget = serde_json::json!({});
+        let qwen_max_resolution = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "medium",
+                "thinking_budget": "high",
+                "max_think_tokens": 4096
+            }),
+            &resolved,
+            &mut qwen_max_and_budget,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_max_and_budget["max_think_tokens"], 4096);
+        assert_eq!(qwen_max_resolution.effective_cap, Some(4096));
+        assert_eq!(
+            qwen_max_resolution.cap_source,
+            "explicit:body:max_think_tokens"
+        );
+        assert!(qwen_max_resolution
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("takes precedence")));
+        let mut disabled = serde_json::json!({});
+        let res_dis = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" }, "reasoning_effort": "low", "max_think_tokens": 100 }),
+            &resolved,
+            &mut disabled,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(disabled["thinking_enabled"], false);
+        assert!(disabled.get("reasoning_effort").is_none());
+        assert!(disabled.get("max_think_tokens").is_none());
+        assert!(!res_dis.warnings.is_empty());
+        assert!(res_dis
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking disabled")));
+        assert_eq!(res_dis.effective_mode, "disabled");
+        for (input, expected) in [("minimal", "low"), ("medium", "high"), ("xhigh", "high")] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": input }),
+                &resolved,
+                &mut req,
+                ReasoningContract::DeepSeek4,
+                true,
+                &vec!["low".to_string(), "high".to_string(), "max".to_string()],
+            )
+            .unwrap();
+            assert_eq!(
+                req["reasoning_effort"], expected,
+                "deepseek {input} -> {expected}"
+            );
+            assert_eq!(res.effective_effort.as_deref(), Some(expected));
+        }
+        let mut ds_default = serde_json::json!({});
+        let res_ds_def = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &resolved,
+            &mut ds_default,
+            ReasoningContract::DeepSeek4,
+            true,
+            &vec!["low".to_string(), "high".to_string(), "max".to_string()],
+        )
+        .unwrap();
+        assert_eq!(ds_default["reasoning_effort"], "high");
+        assert_eq!(res_ds_def.effective_effort.as_deref(), Some("high"));
+        let mut gemma_effort = serde_json::json!({});
+        let res_gem_eff = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut gemma_effort,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(gemma_effort.get("reasoning_effort").is_none());
+        assert!(!res_gem_eff.warnings.is_empty());
+        assert!(res_gem_eff
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean")));
+        let mut gemma_max = serde_json::json!({});
+        let res_gem_max = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 100 }),
+            &resolved,
+            &mut gemma_max,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(gemma_max.get("max_think_tokens").is_none());
+        assert!(!res_gem_max.warnings.is_empty());
+        let mut glimmer_off = serde_json::json!({});
+        let res_glim_off = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" } }),
+            &resolved,
+            &mut glimmer_off,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(glimmer_off["thinking_enabled"], true);
+        assert!(!res_glim_off.warnings.is_empty());
+        assert!(res_glim_off
+            .warnings
+            .iter()
+            .any(|w| w.contains("muse_glimmer")));
+        assert_eq!(res_glim_off.effective_mode, "enabled");
+        let mut unsup = serde_json::json!({});
+        let res_unsup = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut unsup,
+            ReasoningContract::Unsupported,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(unsup.get("reasoning_effort").is_none());
+        assert!(!res_unsup.warnings.is_empty());
+        assert_eq!(res_unsup.effective_mode, "disabled");
+        let mut unsup_ok = serde_json::json!({});
+        let res_unsup_ok = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &resolved,
+            &mut unsup_ok,
+            ReasoningContract::Unsupported,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(unsup_ok.get("thinking_enabled").is_none());
+        assert!(res_unsup_ok.warnings.is_empty());
+        let mut qwen_unknown = serde_json::json!({});
+        let qwen_unknown_resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "ultra" }),
+            &resolved,
+            &mut qwen_unknown,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_unknown["reasoning_effort"], "medium");
+        assert_eq!(
+            qwen_unknown_resolution.effective_effort.as_deref(),
+            Some("medium")
+        );
+        assert!(!qwen_unknown_resolution.warnings.is_empty());
+        assert!(apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 999999 }),
+            &resolved,
+            &mut serde_json::json!({}),
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .is_err());
+        let mut maybe_req = serde_json::json!({});
+        let maybe_res = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "maybe" } }),
+            &resolved,
+            &mut maybe_req,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert!(
+            maybe_req.get("thinking_enabled").is_none()
+                || maybe_req["thinking_enabled"] == serde_json::json!(true)
+        );
+        assert!(!maybe_res.warnings.is_empty());
+        assert!(maybe_res
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking.type") && w.contains("dropped")));
+        let mut qwen_high = serde_json::json!({});
+        let res_qhigh = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "high" }),
+            &resolved,
+            &mut qwen_high,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_high["reasoning_effort"], "xhigh");
+        assert!(!res_qhigh.warnings.is_empty());
+        let completion = Completion {
+            id: "chatcmpl_test".into(),
+            created: 7,
+            model: "qwen:test".into(),
+            content: "answer".into(),
+            reasoning_content: "reason".into(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({
+                "prompt_tokens": 12,
+                "tokens": 7,
+                "cached_tokens": 4,
+                "ttft_ms": 8.5,
+                "decode_tok_s": 115.0,
+                "finish_reason": "stop",
+            }),
+            logprobs: None,
+            reasoning: Some(res_default.clone()),
+        };
+        let json = completion_json(&completion);
+        assert_eq!(json["hipfire"]["reasoning"]["contract"], "qwen_jinja");
+        assert_eq!(json["hipfire"]["reasoning"]["mode"], "enabled");
+        assert_eq!(json["hipfire"]["reasoning"]["effort"], "medium");
+        assert_eq!(
+            json["hipfire"]["config_warnings"],
+            serde_json::json!(res_default.warnings)
+        );
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        let terminal = chunks.last().unwrap();
+        assert_eq!(terminal["hipfire"]["reasoning"]["contract"], "qwen_jinja");
+        assert_eq!(
+            terminal["hipfire"]["config_warnings"],
+            serde_json::json!(res_default.warnings)
+        );
+    }
+
+    fn qwen_effort_resolved(
+        layers: Vec<(hipfire_config::ConfigSource, &str)>,
+    ) -> hipfire_config::ResolvedConfig {
+        use hipfire_config::{resolve, ConfigLayer, NamedLayer};
+        resolve(
+            layers
+                .into_iter()
+                .map(|(source, effort)| {
+                    let mut layer = ConfigLayer::default();
+                    layer.set_cli("reasoning.effort", effort).unwrap();
+                    NamedLayer { source, layer }
+                })
+                .collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn qwen_effort_request(
+        body: serde_json::Value,
+        resolved: &hipfire_config::ResolvedConfig,
+    ) -> (serde_json::Value, crate::ReasoningResolution) {
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut request = serde_json::json!({});
+        let resolution = apply_http_reasoning_request(
+            &body,
+            resolved,
+            &mut request,
+            saddle_core::caps::ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        (request, resolution)
+    }
+
+    #[test]
+    fn qwen_effort_native_default_and_auto_resolve_medium() {
+        use hipfire_config::{resolve, NamedLayer};
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (unset, unset_res) = qwen_effort_request(serde_json::json!({}), &builtin);
+        assert_eq!(unset["reasoning_effort"], "medium");
+        assert_eq!(unset_res.effective_effort.as_deref(), Some("medium"));
+        assert!(unset_res.warnings.is_empty());
+        // Request-level `auto` and config-level `auto` are both "no preference".
+        let (auto_body, auto_body_res) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "auto" }), &builtin);
+        assert_eq!(auto_body["reasoning_effort"], "medium");
+        assert_eq!(auto_body_res.effective_effort.as_deref(), Some("medium"));
+        let auto_cfg = qwen_effort_resolved(vec![(
+            hipfire_config::ConfigSource::GlobalUser {
+                path: std::path::PathBuf::from("config.toml"),
+            },
+            "auto",
+        )]);
+        let (auto_config, auto_config_res) = qwen_effort_request(serde_json::json!({}), &auto_cfg);
+        assert_eq!(auto_config["reasoning_effort"], "medium");
+        assert_eq!(auto_config_res.effective_effort.as_deref(), Some("medium"));
+    }
+
+    #[test]
+    fn qwen_effort_resolution_order_config_cli_request() {
+        use hipfire_config::ConfigSource;
+        let global = || ConfigSource::GlobalUser {
+            path: std::path::PathBuf::from("config.toml"),
+        };
+        let one_shot = || ConfigSource::OneShot {
+            argument: "--set reasoning.effort".into(),
+        };
+        // Explicit config wins over the built-in medium default.
+        for effort in ["low", "xhigh"] {
+            let cfg = qwen_effort_resolved(vec![(global(), effort)]);
+            let (req, res) = qwen_effort_request(serde_json::json!({}), &cfg);
+            assert_eq!(req["reasoning_effort"], effort);
+            assert_eq!(res.effective_effort.as_deref(), Some(effort));
+            assert!(res.warnings.is_empty());
+        }
+        // An explicit medium config is also honoured (not just the default).
+        let medium_cfg = qwen_effort_resolved(vec![(global(), "medium")]);
+        let (req_medium, _) = qwen_effort_request(serde_json::json!({}), &medium_cfg);
+        assert_eq!(req_medium["reasoning_effort"], "medium");
+        // One-shot CLI layer beats the global user config.
+        let layered = qwen_effort_resolved(vec![(global(), "low"), (one_shot(), "xhigh")]);
+        let (req_cli, res_cli) = qwen_effort_request(serde_json::json!({}), &layered);
+        assert_eq!(req_cli["reasoning_effort"], "xhigh");
+        assert_eq!(res_cli.effective_effort.as_deref(), Some("xhigh"));
+        // HTTP request beats the resolved config / CLI layer.
+        let (req_body, res_body) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "low" }), &layered);
+        assert_eq!(req_body["reasoning_effort"], "low");
+        assert_eq!(res_body.effective_effort.as_deref(), Some("low"));
+        // Request `auto` is no preference; the explicit config / CLI layer wins.
+        let (req_auto, _) =
+            qwen_effort_request(serde_json::json!({ "reasoning_effort": "auto" }), &layered);
+        assert_eq!(req_auto["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn qwen_effort_thinking_off_and_non_native_drop_effort() {
+        use hipfire_config::{resolve, NamedLayer};
+        use saddle_core::caps::ReasoningContract;
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (off, off_res) =
+            qwen_effort_request(serde_json::json!({ "enable_thinking": false }), &builtin);
+        assert!(off.get("reasoning_effort").is_none());
+        assert_eq!(off["thinking_enabled"], false);
+        assert_eq!(off_res.effective_mode, "disabled");
+        assert_eq!(off_res.effective_effort, None);
+        let cfg = qwen_effort_resolved(vec![(
+            hipfire_config::ConfigSource::GlobalUser {
+                path: std::path::PathBuf::from("config.toml"),
+            },
+            "xhigh",
+        )]);
+        let (off_cfg, off_cfg_res) = qwen_effort_request(
+            serde_json::json!({ "thinking": { "type": "disabled" }, "reasoning_effort": "low" }),
+            &cfg,
+        );
+        assert!(off_cfg.get("reasoning_effort").is_none());
+        assert_eq!(off_cfg_res.effective_effort, None);
+        // Non-effort-native Qwen keeps dropping the dial instead of defaulting it.
+        let mut qwen36 = serde_json::json!({});
+        let res36 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &builtin,
+            &mut qwen36,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(qwen36.get("reasoning_effort").is_none());
+        assert_eq!(res36.effective_effort, None);
+        assert!(res36.warnings.is_empty());
+        // Other contracts keep their own `high` default.
+        for contract in [ReasoningContract::DeepSeek4, ReasoningContract::MuseGlimmer] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({}),
+                &builtin,
+                &mut req,
+                contract,
+                true,
+                &[],
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], "high");
+            assert_eq!(res.effective_effort.as_deref(), Some("high"));
+        }
+    }
+
+    /// Raw-template layer stays `xhigh` when the variable is undefined; the
+    /// CLI resolver supplies a concrete `medium`, which must render exactly like
+    /// an explicit `reasoning_effort: "medium"` request and differently from
+    /// the raw (undefined) xhigh default.
+    #[test]
+    fn qwen_effort_resolved_medium_renders_like_explicit_medium() {
+        use hipfire_config::{resolve, NamedLayer};
+        use hipfire_runtime::prompt_frame::{JinjaChatFrame, Message, Role};
+        use hipfire_runtime::tokenizer::Tokenizer;
+        const TEMPLATE: &str = "\
+{%- set instructions = '' -%}\
+{%- if enable_thinking is undefined or enable_thinking is true -%}\
+{%- set resolved = reasoning_effort|default('xhigh') -%}\
+{%- if resolved not in ('xhigh', 'medium', 'low') -%}\
+{{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '.') -}}\
+{%- endif -%}\
+{%- set instructions = resolved|upper -%}\
+{%- endif -%}\
+{%- if instructions %}[I:{{ instructions }}]{%- endif -%}\
+{%- for m in messages %}[{{ m.role }}:{{ m.content }}]{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+{%- if enable_thinking is defined and enable_thinking is false -%}{{- '<think>\\n\\n</think>\\n\\n' -}}{%- else -%}{{- '<think>\\n' -}}{%- endif -%}\
+{%- endif -%}";
+        let tokenizer =
+            Tokenizer::from_hf_json(r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[]}}"#)
+                .unwrap();
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        // Mirrors the slot route: the resolved request carries the concrete
+        // rung; the frame receives it verbatim when thinking is enabled.
+        let render = |request: &serde_json::Value| {
+            let enabled = request["thinking_enabled"].as_bool().unwrap();
+            JinjaChatFrame {
+                tokenizer: &tokenizer,
+                template: TEMPLATE,
+                system: None,
+                user: "",
+                enable_thinking: enabled,
+                bos_token: Some(""),
+                reasoning_strength: None,
+                reasoning_effort: request
+                    .get("reasoning_effort")
+                    .and_then(serde_json::Value::as_str),
+            }
+            .render_messages(&messages, None, None)
+            .unwrap()
+        };
+        let builtin = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let (default_req, _) = qwen_effort_request(serde_json::json!({}), &builtin);
+        let (explicit_req, _) = qwen_effort_request(
+            serde_json::json!({ "reasoning_effort": "medium" }),
+            &builtin,
+        );
+        assert_eq!(default_req["reasoning_effort"], "medium");
+        let default_render = render(&default_req);
+        assert_eq!(default_render, render(&explicit_req));
+        assert!(default_render.contains("[I:MEDIUM]"));
+        // Raw template default (effort undefined) is untouched: xhigh.
+        let raw_render = render(&serde_json::json!({ "thinking_enabled": true }));
+        assert!(raw_render.contains("[I:XHIGH]"));
+        assert_ne!(default_render, raw_render);
+        // Thinking off: effort omitted, closed think block, no instructions.
+        let (off_req, _) =
+            qwen_effort_request(serde_json::json!({ "enable_thinking": false }), &builtin);
+        let off_render = render(&off_req);
+        assert!(!off_render.contains("[I:"));
+        assert!(off_render.ends_with("<think>\n\n</think>\n\n"));
+    }
+
+    #[test]
+    fn daemon_tool_calls_map_to_openai_shape() {
+        let calls = vec![
+            ToolCall {
+                id: None,
+                name: "read_file".into(),
+                arguments: serde_json::json!({ "path": "README.md" }),
+                rendered_body: None,
+            },
+            ToolCall {
+                id: None,
+                name: "write_file".into(),
+                arguments: serde_json::json!({ "path": "out.txt", "text": "hi" }),
+                rendered_body: None,
+            },
+        ];
+        let mapped = openai_tool_calls(&calls);
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(mapped[0]["id"], "call_0");
+        assert_eq!(mapped[1]["id"], "call_1");
+        assert_eq!(mapped[0]["type"], "function");
+        assert_eq!(mapped[0]["function"]["name"], "read_file");
+        assert_eq!(
+            mapped[0]["function"]["arguments"],
+            serde_json::json!(r#"{"path":"README.md"}"#)
+        );
+        assert_eq!(mapped[1]["function"]["name"], "write_file");
+    }
+
+    #[test]
+    fn completion_json_pure_tool_turn_uses_null_content() {
+        let completion = sample_completion(
+            "",
+            vec![sample_tc(
+                "read_file",
+                serde_json::json!({ "path": "a.rs" }),
+            )],
+            "tool_calls",
+        );
+        let json = completion_json(&completion);
+        assert!(json["choices"][0]["message"]["content"].is_null());
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            json["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_0"
+        );
+        assert_eq!(
+            json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "read_file"
+        );
+    }
+
+    #[test]
+    fn completion_json_preserves_daemon_length_without_calls() {
+        // Fold withholds calls on length; serializer must not invent tool_calls.
+        let completion = sample_completion("", Vec::new(), "length");
+        let json = completion_json(&completion);
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
+        assert!(json["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(json["choices"][0]["message"]["content"], "");
+    }
+
+    #[test]
+    fn completion_json_never_overrides_length_error_cancel_when_calls_present() {
+        // Defense in depth: even if tool_calls leaked onto Completion, daemon
+        // finish_reason wins and must not be rewritten to tool_calls; calls stay off wire.
+        for reason in ["length", "error", "cancelled", "aborted"] {
+            let completion = sample_completion(
+                "",
+                vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))],
+                reason,
+            );
+            let json = completion_json(&completion);
+            assert_eq!(
+                json["choices"][0]["finish_reason"], reason,
+                "must preserve daemon finish_reason={reason}"
+            );
+            assert!(
+                json["choices"][0]["message"].get("tool_calls").is_none(),
+                "{reason} must not expose message.tool_calls"
+            );
+            // empty content + withheld calls → empty string, not null pure-tool
+            assert_eq!(json["choices"][0]["message"]["content"], "");
+        }
+    }
+
+    #[test]
+    fn completion_json_stop_text_has_string_content_no_tool_calls() {
+        let completion = sample_completion("hello world", Vec::new(), "stop");
+        let json = completion_json(&completion);
+        assert_eq!(json["choices"][0]["message"]["content"], "hello world");
+        assert!(json["choices"][0]["message"].get("tool_calls").is_none());
+        assert_eq!(json["choices"][0]["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn openai_stream_delta_forwards_only_clean_content_reasoning() {
+        assert_eq!(
+            openai_stream_delta_for_event(&serde_json::json!({
+                "type": "token",
+                "text": "hi"
+            })),
+            Some(serde_json::json!({ "content": "hi" }))
+        );
+        assert_eq!(
+            openai_stream_delta_for_event(&serde_json::json!({
+                "type": "reasoning",
+                "text": "plan"
+            })),
+            Some(serde_json::json!({ "reasoning_content": "plan" }))
+        );
+        // Mid-stream tool_calls must never become an SSE delta.
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": [{ "name": "read_file", "arguments": {} }]
+        }))
+        .is_none());
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "stop"
+        }))
+        .is_none());
+    }
+
+    #[test]
+    fn openai_stream_tool_safe_terminal_releases_calls_then_usage_then_done_shape() {
+        let completion = sample_completion(
+            "",
+            vec![
+                sample_tc("read_file", serde_json::json!({ "path": "a.rs" })),
+                sample_tc("write_file", serde_json::json!({ "path": "b.rs" })),
+            ],
+            "tool_calls",
+        );
+        let chunks = openai_stream_terminal_chunks(&completion, true);
+        assert_eq!(chunks.len(), 3, "tool delta + terminal + usage");
+
+        // 1) tool_calls release with stable response-scoped ids/indices
+        let tool_delta = &chunks[0]["choices"][0]["delta"]["tool_calls"];
+        assert_eq!(tool_delta.as_array().map(|a| a.len()), Some(2));
+        assert_eq!(tool_delta[0]["id"], "call_0");
+        assert_eq!(tool_delta[0]["index"], 0);
+        assert_eq!(tool_delta[1]["id"], "call_1");
+        assert_eq!(tool_delta[1]["index"], 1);
+        assert!(chunks[0]["choices"][0]["finish_reason"].is_null());
+        assert!(chunks[0].get("usage").is_none());
+
+        // 2) terminal choice with empty delta
+        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(chunks[1]["choices"][0]["delta"], serde_json::json!({}));
+        assert!(
+            chunks[1].get("usage").is_none(),
+            "usage must not ride terminal"
+        );
+
+        // 3) separate choices:[] usage chunk
+        assert_eq!(chunks[2]["choices"], serde_json::json!([]));
+        assert_eq!(chunks[2]["usage"]["prompt_tokens"], 3);
+        assert_eq!(chunks[2]["usage"]["completion_tokens"], 5);
+
+        // Parity with non-stream ids/arguments
+        let nonstream = completion_json(&completion);
+        assert_eq!(
+            nonstream["choices"][0]["message"]["tool_calls"][0]["id"],
+            tool_delta[0]["id"]
+        );
+        assert_eq!(
+            nonstream["choices"][0]["message"]["tool_calls"][0]["function"],
+            tool_delta[0]["function"]
+        );
+        assert!(nonstream["choices"][0]["message"]["content"].is_null());
+    }
+
+    #[test]
+    fn openai_stream_length_terminal_exposes_no_call_deltas() {
+        let completion = sample_completion(
+            "partial",
+            // Even if present, non-tool-safe finish must not release.
+            vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))],
+            "length",
+        );
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "length");
+        assert!(chunks[0]["choices"][0]["delta"].get("tool_calls").is_none());
+        assert!(chunks[0].get("usage").is_none());
+    }
+
+    #[test]
+    fn openai_stream_include_usage_false_skips_usage_chunk() {
+        let completion = sample_completion("ok", Vec::new(), "stop");
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0]["choices"][0]["finish_reason"], "stop");
+        assert!(chunks[0].get("usage").is_none());
+    }
+
+    #[test]
+    fn openai_stream_and_nonstream_paired_transcript_tool_safe() {
+        // Paired transcript: fold-shaped Completion → both serializers agree.
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-7", 7);
+        fold.push(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": [
+                { "name": "read_file", "arguments": { "path": "a" } },
+                { "name": "write_file", "arguments": { "path": "b" } }
+            ],
+            "id": "req-7",
+            "attempt_id": 7
+        }))
+        .unwrap();
+        fold.push(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "tool_calls",
+            "prompt_tokens": 2,
+            "tokens": 4,
+            "id": "req-7",
+            "attempt_id": 7,
+            "calls": [
+                { "name": "read_file", "arguments": { "path": "a" } },
+                { "name": "write_file", "arguments": { "path": "b" } }
+            ]
+        }))
+        .unwrap();
+
+        let completion = Completion {
+            id: "chatcmpl_pair".into(),
+            created: 99,
+            model: "m".into(),
+            content: fold.content().to_owned(),
+            reasoning_content: fold.reasoning_content().to_owned(),
+            preserve_thinking: false,
+            tool_calls: fold.executable_tool_calls().to_vec(),
+            done: fold.done().cloned().unwrap(),
+            logprobs: None,
+            reasoning: None,
+        };
+        let nonstream = completion_json(&completion);
+        assert!(nonstream["choices"][0]["message"]["content"].is_null());
+        assert_eq!(nonstream["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            nonstream["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_0"
+        );
+        assert_eq!(
+            nonstream["choices"][0]["message"]["tool_calls"][1]["id"],
+            "call_1"
+        );
+
+        // Mid-stream fold forward never includes tool_calls.
+        assert!(openai_stream_delta_for_event(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": fold.executable_tool_calls()
+        }))
+        .is_none());
+
+        let stream_chunks = openai_stream_terminal_chunks(&completion, true);
+        assert_eq!(
+            stream_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
+            nonstream["choices"][0]["message"]["tool_calls"][0]["id"]
+        );
+        assert_eq!(
+            stream_chunks[0]["choices"][0]["delta"]["tool_calls"][1]["function"],
+            nonstream["choices"][0]["message"]["tool_calls"][1]["function"]
+        );
+        assert_eq!(
+            stream_chunks[1]["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+        assert_eq!(stream_chunks[2]["choices"], serde_json::json!([]));
+        assert!(stream_chunks[2].get("usage").is_some());
+    }
+
+    #[test]
+    fn openai_stream_and_nonstream_paired_transcript_length_no_calls() {
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-8", 8);
+        fold.push(&serde_json::json!({
+            "type": "token",
+            "text": "partial",
+            "id": "req-8",
+            "attempt_id": 8
+        }))
+        .unwrap();
+        fold.push(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": [{ "name": "read_file", "arguments": { "path": "x" } }],
+            "id": "req-8",
+            "attempt_id": 8
+        }))
+        .unwrap();
+        fold.push(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "length",
+            "id": "req-8",
+            "attempt_id": 8
+        }))
+        .unwrap();
+
+        let completion = Completion {
+            id: "chatcmpl_len".into(),
+            created: 1,
+            model: "m".into(),
+            content: fold.content().to_owned(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: fold.executable_tool_calls().to_vec(),
+            done: fold.done().cloned().unwrap(),
+            logprobs: None,
+            reasoning: None,
+        };
+
+        let nonstream = completion_json(&completion);
+        assert_eq!(nonstream["choices"][0]["finish_reason"], "length");
+        assert!(nonstream["choices"][0]["message"]
+            .get("tool_calls")
+            .is_none());
+        assert_eq!(nonstream["choices"][0]["message"]["content"], "partial");
+
+        let stream_chunks = openai_stream_terminal_chunks(&completion, true);
+        assert_eq!(stream_chunks.len(), 2); // terminal + usage, no tool release
+        assert_eq!(stream_chunks[0]["choices"][0]["finish_reason"], "length");
+        assert!(stream_chunks[0]["choices"][0]["delta"]
+            .get("tool_calls")
+            .is_none());
+        assert_eq!(stream_chunks[1]["choices"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn openai_stream_and_nonstream_paired_missing_finish_suppresses_leaked_calls() {
+        // Missing finish_reason must never synthesize tool_calls from buffered/leaked calls.
+        let leaked = vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))];
+        let completion = sample_completion_with_done(
+            "",
+            leaked,
+            serde_json::json!({
+                "prompt_tokens": 3,
+                "tokens": 5,
+                "cached_tokens": 1,
+                "tok_s": 10.0,
+            }),
+        );
+
+        let nonstream = completion_json(&completion);
+        assert_ne!(
+            nonstream["choices"][0]["finish_reason"], "tool_calls",
+            "missing finish_reason must not become tool_calls"
+        );
+        assert!(
+            nonstream["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none(),
+            "missing finish_reason must suppress structured calls"
+        );
+
+        let stream_chunks = openai_stream_terminal_chunks(&completion, false);
+        assert!(
+            stream_chunks.iter().all(|c| c["choices"][0]
+                .get("delta")
+                .and_then(|d| d.get("tool_calls"))
+                .is_none()),
+            "stream must not release tool deltas without explicit tool_calls terminal"
+        );
+        assert_ne!(
+            stream_chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+    }
+
+    #[test]
+    fn openai_stream_and_nonstream_paired_null_finish_suppresses_leaked_calls() {
+        // Null finish_reason is not an explicit tool_calls terminal.
+        let leaked = vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))];
+        let completion = sample_completion_with_done(
+            "",
+            leaked,
+            serde_json::json!({
+                "finish_reason": null,
+                "prompt_tokens": 3,
+                "tokens": 5,
+                "cached_tokens": 1,
+                "tok_s": 10.0,
+            }),
+        );
+
+        let nonstream = completion_json(&completion);
+        assert_ne!(
+            nonstream["choices"][0]["finish_reason"], "tool_calls",
+            "null finish_reason must not become tool_calls"
+        );
+        assert!(
+            nonstream["choices"][0]["message"]
+                .get("tool_calls")
+                .is_none(),
+            "null finish_reason must suppress structured calls"
+        );
+
+        let stream_chunks = openai_stream_terminal_chunks(&completion, false);
+        assert!(
+            stream_chunks.iter().all(|c| c["choices"][0]
+                .get("delta")
+                .and_then(|d| d.get("tool_calls"))
+                .is_none()),
+            "stream must not release tool deltas on null finish_reason"
+        );
+        assert_ne!(
+            stream_chunks.last().unwrap()["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+    }
+
+    #[test]
+    fn openai_stream_and_nonstream_paired_explicit_tool_calls_releases_calls() {
+        // Only an explicit raw daemon finish_reason of tool_calls may expose calls.
+        let calls = vec![sample_tc(
+            "read_file",
+            serde_json::json!({ "path": "a.rs" }),
+        )];
+        let completion = sample_completion("", calls, "tool_calls");
+
+        let nonstream = completion_json(&completion);
+        assert_eq!(nonstream["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            nonstream["choices"][0]["message"]["tool_calls"][0]["id"],
+            "call_0"
+        );
+        assert!(nonstream["choices"][0]["message"]["content"].is_null());
+
+        let stream_chunks = openai_stream_terminal_chunks(&completion, false);
+        assert_eq!(stream_chunks.len(), 2, "tool delta + terminal");
+        assert_eq!(
+            stream_chunks[0]["choices"][0]["delta"]["tool_calls"][0]["id"],
+            "call_0"
+        );
+        assert_eq!(
+            stream_chunks[1]["choices"][0]["finish_reason"],
+            "tool_calls"
+        );
+    }
+
+    #[test]
+    fn semantic_fold_accumulates_content_and_reasoning_without_marker_parse() {
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-1", 1);
+        // Classifier-authorized prose may quote protocol lexemes; fold must not
+        // invent tool calls or strip them — only daemon tool_calls count.
+        let forwarded = fold
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": "use <tool_call> as documentation",
+                "id": "req-1",
+                "attempt_id": 1
+            }))
+            .expect("token");
+        assert_eq!(
+            forwarded,
+            vec![serde_json::json!({
+                "type": "token",
+                "text": "use <tool_call> as documentation"
+            })]
+        );
+        let forwarded = fold
+            .push(&serde_json::json!({
+                "type": "reasoning",
+                "text": "plan step",
+                "id": "req-1",
+                "attempt_id": 1
+            }))
+            .expect("reasoning");
+        assert_eq!(
+            forwarded,
+            vec![serde_json::json!({ "type": "reasoning", "text": "plan step" })]
+        );
+        fold.push(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "stop",
+            "id": "req-1",
+            "attempt_id": 1
+        }))
+        .expect("done");
+        assert_eq!(fold.content(), "use <tool_call> as documentation");
+        assert_eq!(fold.reasoning_content(), "plan step");
+        assert!(fold.executable_tool_calls().is_empty());
+        assert_eq!(
+            fold.done()
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn semantic_fold_keeps_think_and_im_end_markers_verbatim_including_splits() {
+        // Critical: v2 fold must never invoke ThinkChannelRouter / marker scan.
+        // Recognized control literals must survive whole and across chunk boundaries.
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-42", 42);
+        let pieces = ["<thi", "nk>plan</thi", "nk>\nanswer<|im_", "end|>tail"];
+        let mut forwarded_text = String::new();
+        for piece in pieces {
+            let forwarded = fold
+                .push(&serde_json::json!({
+                    "type": "token",
+                    "text": piece,
+                    "id": "req-42",
+                    "attempt_id": 42
+                }))
+                .expect("chunk");
+            assert_eq!(forwarded.len(), 1);
+            assert_eq!(forwarded[0]["type"], "token");
+            assert_eq!(forwarded[0]["text"], piece);
+            forwarded_text.push_str(piece);
+        }
+        let expected = "<think>plan</think>\nanswer<|im_end|>tail";
+        assert_eq!(forwarded_text, expected);
+        assert_eq!(fold.content(), expected);
+
+        // Reasoning channel is also verbatim (no strip of </think> / <|im_end|>).
+        fold.begin_attempt("req-43", 43);
+        fold.push(&serde_json::json!({
+            "type": "reasoning",
+            "text": "r<think>x</think><|im_end|>",
+            "id": "req-43",
+            "attempt_id": 43
+        }))
+        .expect("reasoning markers");
+        assert_eq!(fold.reasoning_content(), "r<think>x</think><|im_end|>");
+        assert!(fold.content().is_empty());
+    }
+
+    #[test]
+    fn semantic_fold_buffers_tool_calls_until_tool_safe_done() {
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-2", 2);
+        let forwarded = fold
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": "calling",
+                "id": "req-2",
+                "attempt_id": 2
+            }))
+            .expect("token");
+        assert_eq!(forwarded.len(), 1);
+        let forwarded = fold
+            .push(&serde_json::json!({
+                "type": "tool_calls",
+                "calls": [sample_tool_call("read_file")],
+                "id": "req-2",
+                "attempt_id": 2
+            }))
+            .expect("tool_calls");
+        // Mid-stream: nothing forwarded; calls stay buffered and non-executable.
+        assert!(forwarded.is_empty());
+        assert_eq!(fold.buffered_tool_calls().len(), 1);
+        assert!(fold.executable_tool_calls().is_empty());
+
+        fold.push(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "tool_calls",
+            "tok_s": 12.5,
+            "id": "req-2",
+            "attempt_id": 2,
+            "calls": [sample_tool_call("read_file")]
+        }))
+        .expect("done");
+        assert_eq!(fold.executable_tool_calls().len(), 1);
+        assert_eq!(fold.executable_tool_calls()[0].name, "read_file");
+        assert_eq!(
+            fold.done()
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("tool_calls")
+        );
+        // Daemon finish_reason preserved verbatim (no fold-side rewrite).
+        assert_eq!(
+            fold.done()
+                .and_then(|d| d.get("tok_s"))
+                .and_then(|v| v.as_f64()),
+            Some(12.5)
+        );
+    }
+
+    #[test]
+    fn semantic_fold_length_terminal_exposes_no_executable_calls() {
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-3", 3);
+        fold.push(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": [sample_tool_call("write_file"), sample_tool_call("read_file")],
+            "id": "req-3",
+            "attempt_id": 3
+        }))
+        .expect("buffered");
+        assert_eq!(fold.buffered_tool_calls().len(), 2);
+        fold.push(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "length",
+            "id": "req-3",
+            "attempt_id": 3
+        }))
+        .expect("done");
+        assert!(
+            fold.executable_tool_calls().is_empty(),
+            "length must never release buffered calls"
+        );
+        assert_eq!(
+            fold.done()
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("length"),
+            "daemon finish_reason must not be rewritten to tool_calls"
+        );
+    }
+
+    #[test]
+    fn semantic_fold_error_and_abort_terminals_expose_no_calls() {
+        for reason in ["error", "aborted", "cancelled"] {
+            let mut fold = SemanticEventFold::new();
+            fold.begin_attempt("req-4", 4);
+            fold.push(&serde_json::json!({
+                "type": "tool_calls",
+                "calls": [sample_tool_call("read_file")],
+                "id": "req-4",
+                "attempt_id": 4
+            }))
+            .expect("buffered");
+            fold.push(&serde_json::json!({
+                "type": "done",
+                "finish_reason": reason,
+                "id": "req-4",
+                "attempt_id": 4
+            }))
+            .expect("done");
+            assert!(
+                fold.executable_tool_calls().is_empty(),
+                "{reason} must not expose executable calls"
+            );
+            assert_eq!(
+                fold.done()
+                    .and_then(|d| d.get("finish_reason"))
+                    .and_then(|v| v.as_str()),
+                Some(reason)
+            );
+        }
+    }
+
+    #[test]
+    fn semantic_fold_stop_with_empty_buffer_stays_empty() {
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-5", 5);
+        fold.push(&serde_json::json!({
+            "type": "token",
+            "text": "hello",
+            "id": "req-5",
+            "attempt_id": 5
+        }))
+        .expect("token");
+        fold.push(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "stop",
+            "id": "req-5",
+            "attempt_id": 5
+        }))
+        .expect("done");
+        assert!(fold.executable_tool_calls().is_empty());
+        assert_eq!(fold.content(), "hello");
+    }
+
+    #[test]
+    fn semantic_fold_rejects_stale_attempt_events() {
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-10", 10);
+        fold.push(&serde_json::json!({
+            "type": "token",
+            "text": "a1",
+            "id": "req-10",
+            "attempt_id": 10
+        }))
+        .expect("current");
+        let err = fold
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": "stale",
+                "id": "req-10",
+                "attempt_id": 9
+            }))
+            .expect_err("stale attempt");
+        assert_eq!(
+            err,
+            SemanticFoldError::StaleAttempt {
+                current: 10,
+                got: 9
+            }
+        );
+        // Current attempt state must remain intact after rejection.
+        assert_eq!(fold.content(), "a1");
+        assert_eq!(fold.current_attempt_id(), Some(10));
+    }
+
+    #[test]
+    fn semantic_fold_rejects_missing_malformed_from_first_event() {
+        // Critical: after begin_attempt, every event including the first must
+        // carry a matching numeric attempt_id. No lazy correlation / uncorrelated
+        // stream acceptance.
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-11", 11);
+
+        let missing = fold
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": "no id",
+                "id": "req-11"
+            }))
+            .expect_err("missing attempt_id");
+        assert_eq!(missing, SemanticFoldError::MissingAttemptId { current: 11 });
+        assert!(fold.content().is_empty());
+
+        let malformed_string = fold
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": "bad",
+                "id": "req-11",
+                "attempt_id": "11"
+            }))
+            .expect_err("string attempt_id");
+        assert_eq!(
+            malformed_string,
+            SemanticFoldError::MalformedAttemptId { current: 11 }
+        );
+
+        let malformed_null = fold
+            .push(&serde_json::json!({
+                "type": "gen_start",
+                "id": "req-11",
+                "attempt_id": null
+            }))
+            .expect_err("null attempt_id");
+        assert_eq!(
+            malformed_null,
+            SemanticFoldError::MalformedAttemptId { current: 11 }
+        );
+
+        // Without begin_attempt, push fails closed (no uncorrelated stream).
+        let mut cold = SemanticEventFold::new();
+        let err = cold
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": "uncorrelated",
+                "id": "req-1",
+                "attempt_id": 1
+            }))
+            .expect_err("no active attempt");
+        assert_eq!(err, SemanticFoldError::NoActiveAttempt);
+    }
+
+    #[test]
+    fn semantic_fold_begin_attempt_clears_attempt_local_state() {
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-1", 1);
+        fold.push(&serde_json::json!({
+            "type": "token",
+            "text": "first",
+            "id": "req-1",
+            "attempt_id": 1
+        }))
+        .expect("token");
+        fold.push(&serde_json::json!({
+            "type": "reasoning",
+            "text": "think1",
+            "id": "req-1",
+            "attempt_id": 1
+        }))
+        .expect("reasoning");
+        fold.push(&serde_json::json!({
+            "type": "tool_calls",
+            "calls": [sample_tool_call("read_file")],
+            "id": "req-1",
+            "attempt_id": 1
+        }))
+        .expect("calls");
+        fold.push(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "tool_calls",
+            "id": "req-1",
+            "attempt_id": 1,
+            "calls": [sample_tool_call("read_file")]
+        }))
+        .expect("done");
+        assert!(!fold.content().is_empty());
+        assert!(!fold.executable_tool_calls().is_empty());
+
+        fold.begin_attempt("req-2", 2);
+        assert_eq!(fold.current_attempt_id(), Some(2));
+        assert!(fold.content().is_empty());
+        assert!(fold.reasoning_content().is_empty());
+        assert!(fold.buffered_tool_calls().is_empty());
+        assert!(fold.executable_tool_calls().is_empty());
+        assert!(fold.done().is_none());
+
+        fold.push(&serde_json::json!({
+            "type": "token",
+            "text": "second",
+            "id": "req-2",
+            "attempt_id": 2
+        }))
+        .expect("retry token");
+        fold.push(&serde_json::json!({
+            "type": "done",
+            "finish_reason": "stop",
+            "id": "req-2",
+            "attempt_id": 2
+        }))
+        .expect("retry done");
+        assert_eq!(fold.content(), "second");
+        assert!(fold.executable_tool_calls().is_empty());
+        assert_eq!(
+            fold.done()
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("stop")
+        );
+    }
+
+    #[test]
+    fn producer_to_fold_contract_v2_verbatim_legacy_outside() {
+        // Important: gen_start.contract_version == 2 selects SemanticEventFold
+        // (verbatim text). Legacy non-tool raw-think stays on ThinkChannelRouter
+        // outside the fold — proved here without inventing a second fold path.
+
+        // --- v2 producer path (fold) ---
+        let mut v2 = SemanticEventFold::new();
+        v2.begin_attempt("req-100", 100);
+        v2.push(&serde_json::json!({
+            "type": "gen_start",
+            "contract_version": 2,
+            "started_in_think": true,
+            "id": "req-100",
+            "attempt_id": 100
+        }))
+        .expect("v2 gen_start");
+        // started_in_think must not open a think channel inside the fold.
+        let text = "visible <think>not-routed</think> <|im_end|>";
+        let fwd = v2
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": text,
+                "id": "req-100",
+                "attempt_id": 100
+            }))
+            .expect("v2 token");
+        assert_eq!(
+            fwd,
+            vec![serde_json::json!({ "type": "token", "text": text })]
+        );
+        assert_eq!(v2.content(), text);
+        assert!(v2.reasoning_content().is_empty());
+
+        // --- legacy producer path (ThinkChannelRouter only; outside fold) ---
+        let mut router = ThinkChannelRouter::default();
+        router.set_started_in_think(true);
+        let mut fragments = router.push("legacy reason</thi");
+        fragments.extend(router.push("nk>\n\nlegacy answer"));
+        fragments.extend(router.finish());
+        assert_eq!(
+            fragments,
+            vec![
+                ThinkFragment::Reasoning("legacy reason".into()),
+                ThinkFragment::Content("legacy answer".into()),
+            ],
+            "legacy MiniMax/Cohere-style markers still route outside SemanticEventFold"
+        );
+
+        // Fold must not be the home of that routing: pushing the same bytes
+        // through a correlated fold keeps them as content, not reasoning split.
+        let mut not_legacy = SemanticEventFold::new();
+        not_legacy.begin_attempt("req-101", 101);
+        not_legacy
+            .push(&serde_json::json!({
+                "type": "token",
+                "text": "legacy reason</think>\n\nlegacy answer",
+                "id": "req-101",
+                "attempt_id": 101
+            }))
+            .expect("fold token");
+        assert_eq!(
+            not_legacy.content(),
+            "legacy reason</think>\n\nlegacy answer"
+        );
+        assert!(not_legacy.reasoning_content().is_empty());
+    }
+
+    #[test]
+    fn next_attempt_id_is_nonzero_and_monotonic() {
+        let a = next_attempt_id();
+        let b = next_attempt_id();
+        assert_ne!(a, 0);
+        assert_ne!(b, 0);
+        assert!(b > a);
+    }
+
+    #[test]
+    fn task15_attempt_latches_truth_table() {
+        let cases: &[(&str, bool, bool)] = &[
+            ("token", true, false),
+            ("reasoning", true, false),
+            ("commit_ready", false, true),
+            ("tool_calls", false, false),
+            ("gen_start", false, false),
+            ("done", false, false),
+            ("error", false, false),
+        ];
+        for (ty, want_visible, want_commit) in cases {
+            let mut latches = AttemptLatches::default();
+            latches.observe(&serde_json::json!({ "type": ty }));
+            assert_eq!(latches.visible, *want_visible, "visible for {ty}");
+            assert_eq!(
+                latches.commit_ready_seen, *want_commit,
+                "commit_ready_seen for {ty}"
+            );
+        }
+    }
+
+    #[test]
+    fn task15_decide_retry_classifier_truth_table() {
+        let aid = 42u64;
+        let clean = AttemptLatches::default();
+        let mut visible = AttemptLatches::default();
+        visible.visible = true;
+        let mut committed = AttemptLatches::default();
+        committed.commit_ready_seen = true;
+
+        let ok_err = task15_daemon_err(hipfire_client::error_class::TRANSIENT, true, aid);
+        assert_eq!(
+            decide_retry(&ok_err, aid, &clean, true, true, 1),
+            RetryDecision::Retry
+        );
+
+        let denials: &[(&str, RetryDecision)] = &[
+            (
+                "gate_off",
+                decide_retry(&ok_err, aid, &clean, true, false, 1),
+            ),
+            (
+                "attempt_2",
+                decide_retry(&ok_err, aid, &clean, true, true, 2),
+            ),
+            (
+                "visible",
+                decide_retry(&ok_err, aid, &visible, true, true, 1),
+            ),
+            (
+                "commit_ready",
+                decide_retry(&ok_err, aid, &committed, true, true, 1),
+            ),
+            (
+                "ineligible",
+                decide_retry(&ok_err, aid, &clean, false, true, 1),
+            ),
+            (
+                "attempt_mismatch",
+                decide_retry(&ok_err, aid + 1, &clean, true, true, 1),
+            ),
+            (
+                "not_retryable",
+                decide_retry(
+                    &task15_daemon_err(hipfire_client::error_class::TRANSIENT, false, aid),
+                    aid,
+                    &clean,
+                    true,
+                    true,
+                    1,
+                ),
+            ),
+            (
+                "class_validation",
+                decide_retry(
+                    &task15_daemon_err(hipfire_client::error_class::VALIDATION, true, aid),
+                    aid,
+                    &clean,
+                    true,
+                    true,
+                    1,
+                ),
+            ),
+            (
+                "class_malformed",
+                decide_retry(
+                    &task15_daemon_err(hipfire_client::error_class::MALFORMED, true, aid),
+                    aid,
+                    &clean,
+                    true,
+                    true,
+                    1,
+                ),
+            ),
+            (
+                "class_internal",
+                decide_retry(
+                    &task15_daemon_err(hipfire_client::error_class::INTERNAL, true, aid),
+                    aid,
+                    &clean,
+                    true,
+                    true,
+                    1,
+                ),
+            ),
+            (
+                "class_cancel",
+                decide_retry(
+                    &task15_daemon_err(hipfire_client::error_class::CANCEL, true, aid),
+                    aid,
+                    &clean,
+                    true,
+                    true,
+                    1,
+                ),
+            ),
+            (
+                "non_daemon",
+                decide_retry(&anyhow::anyhow!("plain error"), aid, &clean, true, true, 1),
+            ),
+            (
+                "protocol",
+                decide_retry(
+                    &anyhow::Error::new(hipfire_client::ClientError::Protocol("x".into())),
+                    aid,
+                    &clean,
+                    true,
+                    true,
+                    1,
+                ),
+            ),
+        ];
+        for (name, decision) in denials {
+            assert_eq!(*decision, RetryDecision::Fail, "expected Fail for {name}");
+        }
+    }
+
+    #[test]
+    fn complete_request_fold_rejects_pre_start_token() {
+        // Critical: no unchecked legacy default before gen_start.
+        let err = fold_complete_request_stream(
+            "req-7",
+            7,
+            &[serde_json::json!({
+                "type": "token",
+                "text": "too early",
+                "id": "req-7",
+                "attempt_id": 7
+            })],
+        )
+        .expect_err("pre-start token must fail closed");
+        assert_eq!(
+            err,
+            StreamContractError::PreStartEvent {
+                event_type: "token".into()
+            }
+        );
+    }
+
+    #[test]
+    fn complete_request_fold_rejects_missing_id_gen_start() {
+        // Correlation before contract_version latch — missing id never selects legacy/v2.
+        let err = fold_complete_request_stream(
+            "req-7",
+            7,
+            &[serde_json::json!({
+                "type": "gen_start",
+                "contract_version": 2
+            })],
+        )
+        .expect_err("missing request id on gen_start");
+        assert_eq!(
+            err,
+            StreamContractError::MissingRequestId {
+                expected: "req-7".into()
+            }
+        );
+
+        let err_missing_attempt = fold_complete_request_stream(
+            "req-7",
+            7,
+            &[serde_json::json!({
+                "type": "gen_start",
+                "contract_version": 2,
+                "id": "req-7"
+            })],
+        )
+        .expect_err("missing attempt_id on gen_start");
+        assert_eq!(
+            err_missing_attempt,
+            StreamContractError::MissingAttemptId { expected: 7 }
+        );
+
+        let err_malformed = fold_complete_request_stream(
+            "req-7",
+            7,
+            &[serde_json::json!({
+                "type": "gen_start",
+                "contract_version": 2,
+                "id": "req-7",
+                "attempt_id": "7"
+            })],
+        )
+        .expect_err("string attempt_id on gen_start");
+        assert_eq!(
+            err_malformed,
+            StreamContractError::MalformedAttemptId { expected: 7 }
+        );
+
+        let err_stale_first = fold_complete_request_stream(
+            "req-7",
+            7,
+            &[serde_json::json!({
+                "type": "gen_start",
+                "contract_version": 2,
+                "id": "req-7",
+                "attempt_id": 99
+            })],
+        )
+        .expect_err("stale attempt_id on first gen_start");
+        assert_eq!(
+            err_stale_first,
+            StreamContractError::StaleAttempt {
+                expected: 7,
+                got: 99
+            }
+        );
+    }
+
+    #[test]
+    fn complete_request_fold_rejects_stale_second_start_downgrade() {
+        // Critical: after v2 is latched, a later stale/missing-id gen_start must
+        // NOT downgrade the stream to legacy or re-latch contract_version.
+        let events = [
+            serde_json::json!({
+                "type": "gen_start",
+                "contract_version": 2,
+                "id": "req-7",
+                "attempt_id": 7
+            }),
+            serde_json::json!({
+                "type": "token",
+                "text": "kept",
+                "id": "req-7",
+                "attempt_id": 7
+            }),
+            // Stale second start — previously could flip contract_v2 = Some(false).
+            serde_json::json!({
+                "type": "gen_start",
+                "id": "req-1",
+                "attempt_id": 1
+            }),
+            serde_json::json!({
+                "type": "token",
+                "text": "would-be-legacy",
+                "id": "req-7",
+                "attempt_id": 7
+            }),
+        ];
+        let err = fold_complete_request_stream("req-7", 7, &events)
+            .expect_err("second gen_start must reject without downgrade");
+        assert_eq!(err, StreamContractError::SecondGenStart);
+
+        // Gate unit: v2 stays latched even if observe is retried after error.
+        let mut gate = StreamContractGate::new("req-7", 7);
+        assert_eq!(gate.observe(&events[0]).expect("first"), StreamContract::V2);
+        assert_eq!(gate.observe(&events[1]).expect("token"), StreamContract::V2);
+        assert_eq!(
+            gate.observe(&events[2]).expect_err("second start"),
+            StreamContractError::SecondGenStart
+        );
+        assert_eq!(gate.contract(), Some(StreamContract::V2));
+        assert!(gate.is_v2());
+        // Subsequent non-start events would still be v2 if caller continued —
+        // production aborts the generate callback on SecondGenStart instead.
+        assert_eq!(
+            gate.observe(&events[3]).expect("still v2"),
+            StreamContract::V2
+        );
+
+        // Missing-id second start is also SecondGenStart (never re-reads version).
+        let mut gate2 = StreamContractGate::new("req-7", 7);
+        gate2
+            .observe(&serde_json::json!({
+                "type": "gen_start",
+                "contract_version": 2,
+                "id": "req-7",
+                "attempt_id": 7
+            }))
+            .unwrap();
+        assert_eq!(
+            gate2
+                .observe(&serde_json::json!({
+                    "type": "gen_start",
+                    "contract_version": 1
+                }))
+                .expect_err("missing-id second start"),
+            StreamContractError::SecondGenStart
+        );
+        assert_eq!(gate2.contract(), Some(StreamContract::V2));
+    }
+
+    #[test]
+    fn complete_request_fold_valid_legacy_and_v2_starts() {
+        // Valid v2 start → SemanticEventFold verbatim path.
+        let v2 = fold_complete_request_stream(
+            "req-42",
+            42,
+            &[
+                serde_json::json!({
+                    "type": "gen_start",
+                    "contract_version": 2,
+                    "started_in_think": true,
+                    "id": "req-42",
+                    "attempt_id": 42
+                }),
+                serde_json::json!({
+                    "type": "token",
+                    "text": "hi <think>raw</think>",
+                    "id": "req-42",
+                    "attempt_id": 42
+                }),
+                serde_json::json!({
+                    "type": "done",
+                    "finish_reason": "stop",
+                    "id": "req-42",
+                    "attempt_id": 42
+                }),
+            ],
+        )
+        .expect("valid v2 stream");
+        assert_eq!(v2.contract, StreamContract::V2);
+        assert_eq!(v2.content, "hi <think>raw</think>");
+        assert!(v2.reasoning_content.is_empty());
+        assert!(v2.tool_calls.is_empty());
+        assert_eq!(
+            v2.done
+                .as_ref()
+                .and_then(|d| d.get("finish_reason"))
+                .and_then(|v| v.as_str()),
+            Some("stop")
+        );
+
+        // Valid legacy start (missing/other contract_version) → ThinkChannelRouter.
+        let legacy = fold_complete_request_stream(
+            "req-42",
+            42,
+            &[
+                serde_json::json!({
+                    "type": "gen_start",
+                    "started_in_think": true,
+                    "id": "req-42",
+                    "attempt_id": 42
+                }),
+                serde_json::json!({
+                    "type": "token",
+                    "text": "plan</think>\n\nanswer",
+                    "id": "req-42",
+                    "attempt_id": 42
+                }),
+                serde_json::json!({
+                    "type": "done",
+                    "finish_reason": "stop",
+                    "id": "req-42",
+                    "attempt_id": 42
+                }),
+            ],
+        )
+        .expect("valid legacy stream");
+        assert_eq!(legacy.contract, StreamContract::Legacy);
+        assert_eq!(legacy.reasoning_content, "plan");
+        assert_eq!(legacy.content, "answer");
+
+        // Explicit non-2 contract_version is also legacy.
+        let legacy_v1 = fold_complete_request_stream(
+            "req-3",
+            3,
+            &[
+                serde_json::json!({
+                    "type": "gen_start",
+                    "contract_version": 1,
+                    "id": "req-3",
+                    "attempt_id": 3
+                }),
+                serde_json::json!({
+                    "type": "token",
+                    "text": "plain",
+                    "id": "req-3",
+                    "attempt_id": 3
+                }),
+                serde_json::json!({
+                    "type": "done",
+                    "finish_reason": "stop",
+                    "id": "req-3",
+                    "attempt_id": 3
+                }),
+            ],
+        )
+        .expect("contract_version 1 is legacy");
+        assert_eq!(legacy_v1.contract, StreamContract::Legacy);
+        assert_eq!(legacy_v1.content, "plain");
+    }
+
+    #[test]
+    fn legacy_terminal_staged_tool_calls_are_absorbed() {
+        let gen_start = serde_json::json!({"type": "gen_start", "id": "req-9", "attempt_id": 9});
+        let call = serde_json::json!({"name": "get_current_date_time", "arguments": {}});
+        let staged_done = serde_json::json!({
+            "type": "done", "finish_reason": "tool_calls", "calls": [call],
+            "id": "req-9", "attempt_id": 9
+        });
+        let separate_event = serde_json::json!({
+            "type": "tool_calls", "calls": [call], "id": "req-9", "attempt_id": 9
+        });
+        let fold = |events: &[serde_json::Value]| fold_complete_request_stream("req-9", 9, events);
+
+        // Staging only (DS4 shape): the terminal payload is the sole source.
+        let staged_only = fold(&[gen_start.clone(), staged_done.clone()]).unwrap();
+        assert_eq!(staged_only.contract, StreamContract::Legacy);
+        assert_eq!(staged_only.tool_calls.len(), 1);
+        assert_eq!(staged_only.tool_calls[0].name, "get_current_date_time");
+
+        // Emitted and staged: the staged array replaces the buffer, no double count.
+        let both = fold(&[gen_start.clone(), separate_event.clone(), staged_done]).unwrap();
+        assert_eq!(both.tool_calls.len(), 1);
+
+        // A separate event with no `calls` on the terminal keeps the legacy path.
+        let emitted_only = fold(&[
+            gen_start.clone(),
+            separate_event,
+            serde_json::json!({"type": "done", "finish_reason": "tool_calls",
+                               "id": "req-9", "attempt_id": 9}),
+        ])
+        .unwrap();
+        assert_eq!(emitted_only.tool_calls.len(), 1);
+
+        // A non-tool terminal never absorbs calls.
+        let stopped = fold(&[
+            gen_start.clone(),
+            serde_json::json!({"type": "token", "text": "answer", "id": "req-9", "attempt_id": 9}),
+            serde_json::json!({"type": "done", "finish_reason": "stop", "calls": [call],
+                               "id": "req-9", "attempt_id": 9}),
+        ])
+        .unwrap();
+        assert_eq!(stopped.content, "answer");
+        assert!(stopped.tool_calls.is_empty());
+
+        // Malformed staged payloads fail closed instead of dropping the call.
+        let malformed = fold(&[
+            gen_start,
+            serde_json::json!({"type": "done", "finish_reason": "tool_calls",
+                               "calls": [{"arguments": {}}], "id": "req-9", "attempt_id": 9}),
+        ])
+        .unwrap_err();
+        assert!(
+            matches!(malformed, StreamContractError::MalformedToolCall { .. }),
+            "{malformed:?}"
+        );
+        let mut buffered = Vec::new();
+        let non_array = absorb_legacy_terminal_calls(
+            &serde_json::json!({"finish_reason": "tool_calls", "calls": {}}),
+            &mut buffered,
+        )
+        .unwrap_err();
+        assert!(non_array.contains("must be a JSON array"), "{non_array}");
+        assert!(buffered.is_empty());
+    }
+
+    #[test]
+    fn openai_adapter_preserves_names_and_nested_arguments() {
+        let calls = vec![
+            sample_tc(
+                "search",
+                serde_json::json!({
+                    "query": "hipfire",
+                    "filters": { "lang": ["rust", "c"], "limit": 3 },
+                    "opts": { "nested": { "deep": true } }
+                }),
+            ),
+            sample_tc("ping", serde_json::json!({})),
+        ];
+        let adapted = openai_tool_call_adapter_results(&calls);
+        assert_eq!(adapted.len(), 2);
+        assert_eq!(adapted[0].name, "search");
+        assert_eq!(adapted[1].name, "ping");
+
+        let args0: serde_json::Value =
+            serde_json::from_str(&adapted[0].arguments).expect("args json");
+        assert_eq!(args0["filters"]["lang"][1], "c");
+        assert_eq!(args0["opts"]["nested"]["deep"], true);
+        assert_eq!(adapted[1].arguments, "{}");
+
+        let lowered = openai_tool_calls(&calls);
+        assert_eq!(lowered[0]["function"]["name"], "search");
+        assert_eq!(
+            lowered[0]["function"]["arguments"].as_str().unwrap(),
+            adapted[0].arguments
+        );
+    }
+
+    #[test]
+    fn openai_adapter_deterministic_stable_ids_and_indices() {
+        let calls = vec![
+            sample_tc("a", serde_json::json!({"n": 1})),
+            sample_tc("b", serde_json::json!({"n": 2})),
+            sample_tc("c", serde_json::json!({"n": 3})),
+        ];
+        let first = openai_tool_call_adapter_results(&calls);
+        let second = openai_tool_call_adapter_results(&calls);
+        assert_eq!(first, second, "adapter result must be deterministic");
+        for (i, row) in first.iter().enumerate() {
+            assert_eq!(row.index, i);
+            assert_eq!(row.id, format!("call_{i}"));
+            assert_eq!(row.name, calls[i].name);
+        }
+
+        let stream_delta = openai_tool_call_delta_from_adapter(&first);
+        let nonstream = openai_tool_calls_from_adapter(&first);
+        for i in 0..3 {
+            assert_eq!(stream_delta["tool_calls"][i]["index"], i);
+            assert_eq!(stream_delta["tool_calls"][i]["id"], format!("call_{i}"));
+            assert_eq!(nonstream[i]["id"], format!("call_{i}"));
+            assert!(
+                nonstream[i].get("index").is_none(),
+                "non-stream message.tool_calls must not carry stream index"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_adapter_preserves_daemon_owned_call_ids() {
+        let parsed = tool_call_from_canonical_value(&serde_json::json!({
+            "id": "call_hf_0001_0002_0",
+            "name": "echo",
+            "arguments": {"text":"hello"}
+        }))
+        .expect("canonical call");
+        assert_eq!(parsed.id.as_deref(), Some("call_hf_0001_0002_0"));
+        let adapted = openai_tool_call_adapter_results(&[parsed]);
+        assert_eq!(adapted[0].id, "call_hf_0001_0002_0");
+    }
+
+    #[test]
+    fn openai_stream_and_nonstream_share_one_adapter_result() {
+        let calls = vec![
+            sample_tc(
+                "read_file",
+                serde_json::json!({ "path": "a.rs", "meta": { "k": "v" } }),
+            ),
+            sample_tc("write_file", serde_json::json!({ "path": "b.rs" })),
+        ];
+        let adapted = openai_tool_call_adapter_results(&calls);
+        let completion = sample_completion("", calls.clone(), "tool_calls");
+
+        let nonstream = completion_json(&completion);
+        let stream = openai_stream_terminal_chunks(&completion, false);
+        let ns_calls = nonstream["choices"][0]["message"]["tool_calls"]
+            .as_array()
+            .expect("nonstream tool_calls");
+        let st_calls = stream[0]["choices"][0]["delta"]["tool_calls"]
+            .as_array()
+            .expect("stream tool_calls");
+
+        assert_eq!(ns_calls.len(), adapted.len());
+        assert_eq!(st_calls.len(), adapted.len());
+        for (i, row) in adapted.iter().enumerate() {
+            assert_eq!(ns_calls[i]["id"], row.id);
+            assert_eq!(ns_calls[i]["function"]["name"], row.name);
+            assert_eq!(ns_calls[i]["function"]["arguments"], row.arguments);
+            assert_eq!(st_calls[i]["id"], row.id);
+            assert_eq!(st_calls[i]["index"], row.index);
+            assert_eq!(st_calls[i]["function"]["name"], row.name);
+            assert_eq!(st_calls[i]["function"]["arguments"], row.arguments);
+            assert_eq!(ns_calls[i]["function"], st_calls[i]["function"]);
+            assert_eq!(ns_calls[i]["id"], st_calls[i]["id"]);
+        }
+    }
+
+    #[test]
+    fn openai_pure_tool_turn_content_is_null_not_empty_string() {
+        let completion = sample_completion(
+            "",
+            vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))],
+            "tool_calls",
+        );
+        let json = completion_json(&completion);
+        assert!(json["choices"][0]["message"]["content"].is_null());
+        assert!(json["choices"][0]["message"]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn openai_mixed_prose_and_calls_retains_prose_content() {
+        let completion = sample_completion(
+            "I'll look that up.",
+            vec![sample_tc("search", serde_json::json!({ "q": "docs" }))],
+            "tool_calls",
+        );
+        let json = completion_json(&completion);
+        assert_eq!(
+            json["choices"][0]["message"]["content"],
+            "I'll look that up."
+        );
+        assert_eq!(
+            json["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "search"
+        );
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        assert_eq!(
+            chunks[0]["choices"][0]["delta"]["tool_calls"][0]["function"]["name"],
+            "search"
+        );
+        assert_eq!(chunks[1]["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn openai_length_error_cancel_malformed_never_release_calls() {
+        let leaked = vec![sample_tc("read_file", serde_json::json!({ "path": "x" }))];
+        for reason in [
+            "length",
+            "error",
+            "cancelled",
+            "aborted",
+            "malformed_protocol",
+        ] {
+            let completion = sample_completion("partial", leaked.clone(), reason);
+            let nonstream = completion_json(&completion);
+            assert_eq!(
+                nonstream["choices"][0]["finish_reason"], reason,
+                "{reason}: finish_reason must stay authoritative"
+            );
+            assert!(
+                nonstream["choices"][0]["message"]
+                    .get("tool_calls")
+                    .is_none(),
+                "{reason}: must not release message.tool_calls"
+            );
+            assert_eq!(nonstream["choices"][0]["message"]["content"], "partial");
+
+            let stream = openai_stream_terminal_chunks(&completion, false);
+            assert!(
+                stream.iter().all(|c| {
+                    c["choices"]
+                        .as_array()
+                        .and_then(|choices| choices.first())
+                        .and_then(|ch| ch.get("delta"))
+                        .and_then(|d| d.get("tool_calls"))
+                        .is_none()
+                }),
+                "{reason}: stream must not emit tool_call deltas"
+            );
+            assert_eq!(stream[0]["choices"][0]["finish_reason"], reason);
+        }
+    }
+
+    #[test]
+    fn malformed_daemon_call_fails_at_canonical_boundary() {
+        let err = tool_call_from_canonical_value(&serde_json::json!("not-an-object"))
+            .expect_err("non-object");
+        assert!(
+            err.contains("JSON object") || err.contains("object"),
+            "detail={err}"
+        );
+
+        let err = tool_call_from_canonical_value(&serde_json::json!({
+            "arguments": { "path": "x" }
+        }))
+        .expect_err("missing name");
+        assert!(err.contains("name"), "detail={err}");
+
+        let err = tool_call_from_canonical_value(&serde_json::json!({
+            "name": "   ",
+            "arguments": {}
+        }))
+        .expect_err("empty name");
+        assert!(err.contains("name"), "detail={err}");
+
+        let legacy_err = tool_call_from_legacy_value(&serde_json::json!(null)).expect_err("null");
+        assert!(!legacy_err.is_empty());
+
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-11", 11);
+        let fold_err = fold
+            .push(&serde_json::json!({
+                "type": "tool_calls",
+                "calls": [{ "arguments": { "path": "x" } }],
+                "id": "req-11",
+                "attempt_id": 11
+            }))
+            .expect_err("malformed call must fail fold push");
+        match fold_err {
+            SemanticFoldError::MalformedToolCall { detail } => {
+                assert!(detail.contains("name"), "detail={detail}");
+            }
+            other => panic!("expected MalformedToolCall, got {other:?}"),
+        }
+        assert!(
+            fold.buffered_tool_calls().is_empty(),
+            "malformed must not buffer a call"
+        );
+        assert!(fold.executable_tool_calls().is_empty());
+    }
+
+    #[test]
+    fn semantic_fold_missing_calls_fails_closed_before_tool_terminal() {
+        // Canonical v2 tool_calls without `calls` must not succeed the fold or
+        // lower to finish_reason=tool_calls via the production stream boundary.
+        let mut fold = SemanticEventFold::new();
+        fold.begin_attempt("req-21", 21);
+        let err = fold
+            .push(&serde_json::json!({
+                "type": "tool_calls",
+                "id": "req-21",
+                "attempt_id": 21
+            }))
+            .expect_err("missing calls must fail fold push");
+        match err {
+            SemanticFoldError::MalformedToolCall { detail } => {
+                assert!(
+                    detail.contains("calls") && detail.contains("array"),
+                    "detail={detail}"
+                );
+            }
+            other => panic!("expected MalformedToolCall, got {other:?}"),
+        }
+        assert!(fold.buffered_tool_calls().is_empty());
+        assert!(fold.executable_tool_calls().is_empty());
+        assert!(fold.done().is_none());
+
+        let stream_err = fold_complete_request_stream(
+            "req-21",
+            21,
+            &[
+                serde_json::json!({
+                    "type": "gen_start",
+                    "id": "req-21",
+                    "attempt_id": 21,
+                    "contract_version": 2
+                }),
+                serde_json::json!({
+                    "type": "tool_calls",
+                    "id": "req-21",
+                    "attempt_id": 21
+                }),
+                serde_json::json!({
+                    "type": "done",
+                    "finish_reason": "tool_calls",
+                    "id": "req-21",
+                    "attempt_id": 21
+                }),
+            ],
+        )
+        .expect_err("missing calls must fail complete_request fold boundary");
+        match stream_err {
+            StreamContractError::MalformedToolCall { detail } => {
+                assert!(
+                    detail.contains("calls") && detail.contains("array"),
+                    "detail={detail}"
+                );
+            }
+            other => panic!("expected StreamContractError::MalformedToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn semantic_fold_non_array_calls_fails_closed_before_tool_terminal() {
+        // null / object / string `calls` are not arrays — fail closed before any
+        // successful tool_calls terminal lowering can be produced.
+        for calls in [
+            serde_json::Value::Null,
+            serde_json::json!({ "name": "read_file" }),
+            serde_json::json!("read_file"),
+        ] {
+            let mut fold = SemanticEventFold::new();
+            fold.begin_attempt("req-22", 22);
+            let err = fold
+                .push(&serde_json::json!({
+                    "type": "tool_calls",
+                    "calls": calls,
+                    "id": "req-22",
+                    "attempt_id": 22
+                }))
+                .expect_err("non-array calls must fail fold push");
+            match err {
+                SemanticFoldError::MalformedToolCall { detail } => {
+                    assert!(
+                        detail.contains("calls") && detail.contains("array"),
+                        "detail={detail}"
+                    );
+                }
+                other => panic!("expected MalformedToolCall, got {other:?}"),
+            }
+            assert!(fold.buffered_tool_calls().is_empty());
+            assert!(fold.executable_tool_calls().is_empty());
+            assert!(fold.done().is_none());
+        }
+
+        let stream_err = fold_complete_request_stream(
+            "req-22",
+            22,
+            &[
+                serde_json::json!({
+                    "type": "gen_start",
+                    "id": "req-22",
+                    "attempt_id": 22,
+                    "contract_version": 2
+                }),
+                serde_json::json!({
+                    "type": "tool_calls",
+                    "calls": null,
+                    "id": "req-22",
+                    "attempt_id": 22
+                }),
+                serde_json::json!({
+                    "type": "done",
+                    "finish_reason": "tool_calls",
+                    "id": "req-22",
+                    "attempt_id": 22
+                }),
+            ],
+        )
+        .expect_err("null calls must fail complete_request fold boundary");
+        match stream_err {
+            StreamContractError::MalformedToolCall { detail } => {
+                assert!(
+                    detail.contains("calls") && detail.contains("array"),
+                    "detail={detail}"
+                );
+            }
+            other => panic!("expected StreamContractError::MalformedToolCall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_or_lossy_endpoint_adapter_rejects_before_mutation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mutations = AtomicUsize::new(0);
+        let mut fire_if_allowed = |body: &serde_json::Value| -> Result<(), EndpointAdapterError> {
+            gate_endpoint_tools(body, EndpointAdapterKind::OpenAiChatCompletions)?;
+            mutations.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        };
+
+        let with_tools = serde_json::json!({
+            "model": "m",
+            "tools": [{ "type": "function", "function": { "name": "x" } }],
+            "messages": []
+        });
+
+        for kind in [
+            EndpointAdapterKind::OpenAiChatCompletions,
+            EndpointAdapterKind::AnthropicMessages,
+            EndpointAdapterKind::OpenAiResponses,
+        ] {
+            assert_eq!(
+                endpoint_adapter_status(kind),
+                EndpointAdapterStatus::AvailableLossless
+            );
+        }
+        fire_if_allowed(&with_tools).expect("lossless adapter allows tools");
+        assert_eq!(mutations.load(Ordering::SeqCst), 1);
+
+        let before = mutations.load(Ordering::SeqCst);
+        let deny_unavailable = |body: &serde_json::Value| -> Result<(), EndpointAdapterError> {
+            let _ = body;
+            Err(EndpointAdapterError::Unavailable {
+                endpoint: "/v1/chat/completions",
+            })
+        };
+        let deny_lossy = |body: &serde_json::Value| -> Result<(), EndpointAdapterError> {
+            let _ = body;
+            Err(EndpointAdapterError::Lossy {
+                endpoint: "/v1/chat/completions",
+            })
+        };
+
+        let run_gated =
+            |gate: &dyn Fn(&serde_json::Value) -> Result<(), EndpointAdapterError>| match gate(
+                &with_tools,
+            ) {
+                Ok(()) => {
+                    mutations.fetch_add(1, Ordering::SeqCst);
+                }
+                Err(_) => {}
+            };
+
+        run_gated(&deny_unavailable);
+        assert_eq!(
+            mutations.load(Ordering::SeqCst),
+            before,
+            "unavailable adapter must not fire mutation counter"
+        );
+        let msg = EndpointAdapterError::Unavailable {
+            endpoint: "/v1/chat/completions",
+        }
+        .to_string();
+        assert!(msg.contains("unavailable"), "{msg}");
+
+        run_gated(&deny_lossy);
+        assert_eq!(
+            mutations.load(Ordering::SeqCst),
+            before,
+            "lossy adapter must not fire mutation counter"
+        );
+        let msg = EndpointAdapterError::Lossy {
+            endpoint: "/v1/chat/completions",
+        }
+        .to_string();
+        assert!(msg.contains("lossy"), "{msg}");
+
+        assert!(gate_endpoint_tools(&with_tools, EndpointAdapterKind::AnthropicMessages).is_ok());
+    }
+
+    #[test]
+    fn tools_absent_bypasses_adapter_capability_gate() {
+        let mutations = std::sync::atomic::AtomicUsize::new(0);
+        let bodies = [
+            serde_json::json!({ "model": "m", "messages": [] }),
+            serde_json::json!({ "model": "m", "tools": [], "messages": [] }),
+            serde_json::json!({ "model": "m", "tools": null, "messages": [] }),
+        ];
+        for body in &bodies {
+            gate_endpoint_tools(body, EndpointAdapterKind::OpenAiResponses)
+                .expect("tool-free must bypass adapter capability");
+            mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        assert_eq!(
+            mutations.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "absent/empty tools must not block the mutation/dispatch path"
+        );
+    }
+
+    #[test]
+    fn endpoint_adapter_registry_covers_all_declared_kinds() {
+        const ALL_KINDS: &[EndpointAdapterKind] = &[
+            EndpointAdapterKind::OpenAiChatCompletions,
+            EndpointAdapterKind::AnthropicMessages,
+            EndpointAdapterKind::OpenAiResponses,
+        ];
+
+        for kind in ALL_KINDS {
+            let status = endpoint_adapter_status(*kind);
+            match kind {
+                EndpointAdapterKind::OpenAiChatCompletions
+                | EndpointAdapterKind::AnthropicMessages
+                | EndpointAdapterKind::OpenAiResponses => {
+                    assert_eq!(status, EndpointAdapterStatus::AvailableLossless);
+                }
+            }
+            assert_eq!(status, EndpointAdapterRegistry::status(*kind));
+        }
+
+        assert!(
+            ALL_KINDS
+                .iter()
+                .any(|k| endpoint_adapter_status(*k) == EndpointAdapterStatus::AvailableLossless),
+            "registry must declare at least one AvailableLossless adapter"
+        );
+    }
+
+    #[test]
+    fn logprob_validation_accepts_boundary_0_to_20() {
+        for n in [0, 1, 5, 20] {
+            let body = serde_json::json!({ "logprobs": true, "top_logprobs": n });
+            validate_logprobs_request(&body).unwrap_or_else(|e| panic!("{n} should be valid: {e}"));
+        }
+        // logprobs true alone without top_logprobs is also valid
+        validate_logprobs_request(&serde_json::json!({ "logprobs": true }))
+            .expect("logprobs true alone");
+        // absent fields are valid
+        validate_logprobs_request(&serde_json::json!({})).expect("empty");
+        validate_logprobs_request(&serde_json::json!({ "logprobs": false })).expect("false");
+    }
+
+    #[test]
+    fn logprob_validation_rejects_out_of_range_and_non_integer() {
+        // >20 must bail
+        let bad = serde_json::json!({ "logprobs": true, "top_logprobs": 21 });
+        assert!(validate_logprobs_request(&bad).is_err(), "21 should fail");
+        let bad_neg = serde_json::json!({ "logprobs": true, "top_logprobs": -1 });
+        assert!(
+            validate_logprobs_request(&bad_neg).is_err(),
+            "-1 should fail"
+        );
+        // float must fail even if integral value
+        let bad_float = serde_json::json!({ "logprobs": true, "top_logprobs": 5.0 });
+        assert!(
+            validate_logprobs_request(&bad_float).is_err(),
+            "5.0 float should fail"
+        );
+        let bad_str = serde_json::json!({ "logprobs": true, "top_logprobs": "5" });
+        assert!(
+            validate_logprobs_request(&bad_str).is_err(),
+            "string should fail"
+        );
+        // logprobs must be bool
+        let bad_logprob_type = serde_json::json!({ "logprobs": "true" });
+        assert!(
+            validate_logprobs_request(&bad_logprob_type).is_err(),
+            "string logprobs should fail"
+        );
+    }
+
+    #[test]
+    fn logprob_validation_rejects_top_without_logprobs() {
+        let cases = [
+            serde_json::json!({ "top_logprobs": 5 }),
+            serde_json::json!({ "logprobs": false, "top_logprobs": 5 }),
+            serde_json::json!({ "logprobs": null, "top_logprobs": 0 }),
+        ];
+        for body in &cases {
+            let err = validate_logprobs_request(body)
+                .expect_err("should reject top without logprobs true");
+            assert!(
+                err.to_string().contains("top_logprobs requires logprobs"),
+                "err={}",
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn logprob_absent_when_not_requested_is_byte_identical() {
+        let completion = Completion {
+            id: "chatcmpl_test".into(),
+            created: 42,
+            model: "qwen:test".into(),
+            content: "hello".into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({ "finish_reason": "stop", "tokens": 1 }),
+            logprobs: None,
+            reasoning: None,
+        };
+        let json = completion_json(&completion);
+        assert!(
+            json["choices"][0].get("logprobs").is_none(),
+            "logprobs must be absent, not null"
+        );
+        // empty vec also absent
+        let empty = Completion {
+            logprobs: Some(vec![]),
+            ..Completion {
+                id: "chatcmpl_test".into(),
+                created: 42,
+                model: "qwen:test".into(),
+                content: "hello".into(),
+                reasoning_content: String::new(),
+                preserve_thinking: false,
+                tool_calls: Vec::new(),
+                done: serde_json::json!({ "finish_reason": "stop", "tokens": 1 }),
+                logprobs: None,
+                reasoning: None,
+            }
+        };
+        let json2 = completion_json(&empty);
+        assert!(
+            json2["choices"][0].get("logprobs").is_none(),
+            "empty content must also be absent"
+        );
+    }
+
+    #[test]
+    fn logprob_entry_builds_bytes_and_top() {
+        let event = serde_json::json!({
+            "type": "token",
+            "text": "The",
+            "logprob": -0.31,
+            "top_logprobs": [
+                { "token": "The", "logprob": -0.31 },
+                { "token": "A", "logprob": -1.2 }
+            ]
+        });
+        let entry = logprob_entry_from_token_event(&event).expect("entry");
+        assert_eq!(entry["token"], "The");
+        assert!((entry["logprob"].as_f64().unwrap() - (-0.31)).abs() < 1e-6);
+        assert_eq!(entry["bytes"], serde_json::json!([84, 104, 101]));
+        assert_eq!(entry["top_logprobs"][0]["token"], "The");
+        assert_eq!(
+            entry["top_logprobs"][0]["bytes"],
+            serde_json::json!([84, 104, 101])
+        );
+        assert_eq!(entry["top_logprobs"][1]["token"], "A");
+        assert_eq!(entry["top_logprobs"][1]["bytes"], serde_json::json!([65]));
+        // UTF-8 multi-byte
+        let event2 = serde_json::json!({ "type": "token", "text": "é", "logprob": -0.5 });
+        let e2 = logprob_entry_from_token_event(&event2).unwrap();
+        assert_eq!(e2["bytes"], serde_json::json!([195, 169]));
+        assert_eq!(e2["top_logprobs"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn logprob_omits_when_daemon_sends_no_logprob() {
+        // If daemon sends no logprob, entry is None and completion must omit field.
+        let event_no_logprob = serde_json::json!({ "type": "token", "text": "hi" });
+        assert!(logprob_entry_from_token_event(&event_no_logprob).is_none());
+        // No entries => completion omits logprobs even when requested
+        let completion = Completion {
+            id: "chatcmpl_test".into(),
+            created: 42,
+            model: "qwen:test".into(),
+            content: "hi".into(),
+            reasoning_content: String::new(),
+            preserve_thinking: false,
+            tool_calls: Vec::new(),
+            done: serde_json::json!({ "finish_reason": "stop" }),
+            logprobs: None,
+            reasoning: None,
+        };
+        let json = completion_json(&completion);
+        assert!(json["choices"][0].get("logprobs").is_none());
+        // With entries => present
+        let entry = serde_json::json!({
+            "token": "hi",
+            "logprob": -0.1,
+            "bytes": [104, 105],
+            "top_logprobs": []
+        });
+        let with = Completion {
+            logprobs: Some(vec![entry]),
+            ..Completion {
+                id: "chatcmpl_test".into(),
+                created: 42,
+                model: "qwen:test".into(),
+                content: "hi".into(),
+                reasoning_content: String::new(),
+                preserve_thinking: false,
+                tool_calls: Vec::new(),
+                done: serde_json::json!({ "finish_reason": "stop" }),
+                logprobs: None,
+                reasoning: None,
+            }
+        };
+        let json2 = completion_json(&with);
+        assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["token"], "hi");
+        assert_eq!(
+            json2["choices"][0]["logprobs"]["content"][0]["bytes"],
+            serde_json::json!([104, 105])
+        );
+    }
+
+    fn tool_body(tools: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "tools": tools })
+    }
+
+    #[test]
+    fn tool_normalize_boolean_strings_case_insensitive() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "run",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "background": {"type": "boolean"},
+                        "full": {"type": "boolean"},
+                        "no_agent": {"type": "boolean"},
+                        "replace_all": {"type": "boolean"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "run",
+            serde_json::json!({
+                "background": "True",
+                "full": "TRUE",
+                "no_agent": "False",
+                "replace_all": "false"
+            }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["background"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["full"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["no_agent"], serde_json::json!(false));
+        assert_eq!(calls[0].arguments["replace_all"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn tool_normalize_numeric_strings() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "ratio": {"type": "number"},
+                        "already": {"type": "integer"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "calc",
+            serde_json::json!({ "count": "42", "ratio": "1.25", "already": 7 }),
+        )];
+        let before_already = calls[0].arguments["already"].clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["count"], serde_json::json!(42));
+        assert!(calls[0].arguments["count"].is_number());
+        assert_eq!(calls[0].arguments["ratio"], serde_json::json!(1.25));
+        assert_eq!(calls[0].arguments["already"], before_already);
+    }
+
+    #[test]
+    fn tool_normalize_json_strings_to_object_array() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "ingest",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "object"},
+                        "tags": {"type": "array"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "ingest",
+            serde_json::json!({ "payload": "{\"a\":1}", "tags": "[1,2,3]" }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["payload"], serde_json::json!({"a":1}));
+        assert_eq!(calls[0].arguments["tags"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn tool_normalize_object_to_compact_string() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "path": {"type": "string"}
+                    }
+                }
+            }
+        }]));
+        let content_obj = serde_json::json!({"text":"hello","x":1});
+        let content_str = serde_json::to_string(&content_obj).unwrap();
+        let mut calls = vec![sample_tc(
+            "write_file",
+            serde_json::json!({ "content": content_obj, "path": "/tmp/a" }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments["content"],
+            serde_json::Value::String(content_str)
+        );
+        assert_eq!(calls[0].arguments["path"], serde_json::json!("/tmp/a"));
+        // also scalar bool/number to string
+        let body2 = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": { "name": "patch", "parameters": { "type": "object", "properties": { "new_string": {"type":"string"} } } }
+        }]));
+        let mut calls2 = vec![sample_tc(
+            "patch",
+            serde_json::json!({ "new_string": {"a":1} }),
+        )];
+        let expected = serde_json::to_string(&serde_json::json!({"a":1})).unwrap();
+        normalize_tool_calls(&mut calls2, &body2);
+        assert_eq!(
+            calls2[0].arguments["new_string"],
+            serde_json::Value::String(expected)
+        );
+    }
+
+    #[test]
+    fn tool_normalize_recurses_into_objects_and_arrays() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "outer",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {"type":"boolean"},
+                                "count": {"type":"integer"}
+                            }
+                        },
+                        "items": {
+                            "type":"array",
+                            "items": {"type":"object","properties":{"flag":{"type":"boolean"}}}
+                        }
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "outer",
+            serde_json::json!({
+                "inner": {"enabled":"True","count":"7","extra":"keep"},
+                "items": [{"flag":"false"},{"flag":true}]
+            }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments["inner"]["enabled"],
+            serde_json::json!(true)
+        );
+        assert_eq!(calls[0].arguments["inner"]["count"], serde_json::json!(7));
+        assert_eq!(
+            calls[0].arguments["inner"]["extra"],
+            serde_json::json!("keep")
+        );
+        assert_eq!(
+            calls[0].arguments["items"][0]["flag"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            calls[0].arguments["items"][1]["flag"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn tool_normalize_idempotent_and_preserves_valid() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"run",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "background":{"type":"boolean"},
+                        "count":{"type":"integer"},
+                        "content":{"type":"string"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "run",
+            serde_json::json!({"background": true, "count": 5, "content": "hello"}),
+        )];
+        let before = calls[0].arguments.clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments, before);
+        // idempotence after repair
+        let mut calls2 = vec![sample_tc(
+            "run",
+            serde_json::json!({"background":"True","count":"5"}),
+        )];
+        normalize_tool_calls(&mut calls2, &body);
+        let after_first = calls2[0].arguments.clone();
+        normalize_tool_calls(&mut calls2, &body);
+        assert_eq!(calls2[0].arguments, after_first);
+    }
+
+    #[test]
+    fn tool_normalize_preserves_unknown_fields_and_no_schema_match() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"known",
+                "parameters":{"type":"object","properties":{"a":{"type":"boolean"}}}
+            }
+        }]));
+        let mut calls = vec![
+            sample_tc(
+                "known",
+                serde_json::json!({"a":"True","unknown":"True","extra":123}),
+            ),
+            sample_tc("unknown_tool", serde_json::json!({"a":"True"})),
+        ];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["a"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["unknown"], serde_json::json!("True"));
+        assert_eq!(calls[0].arguments["extra"], serde_json::json!(123));
+        assert_eq!(calls[1].arguments["a"], serde_json::json!("True"));
+    }
+
+    #[test]
+    fn tool_normalize_invalid_numeric_and_json_not_repaired() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"calc",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "count":{"type":"integer"},
+                        "ratio":{"type":"number"},
+                        "payload":{"type":"object"},
+                        "flag":{"type":"boolean"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "calc",
+            serde_json::json!({
+                "count":"12.3",
+                "ratio":"not-a-number",
+                "payload":"not json {",
+                "flag":"yes"
+            }),
+        )];
+        let before = calls[0].arguments.clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments, before);
+        // ambiguous free text for string field must not be parsed
+        let body2 = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{"name":"write_file","parameters":{"type":"object","properties":{"content":{"type":"string"}}}}
+        }]));
+        let mut calls2 = vec![sample_tc(
+            "write_file",
+            serde_json::json!({"content":"hello world"}),
+        )];
+        let before2 = calls2[0].arguments.clone();
+        normalize_tool_calls(&mut calls2, &body2);
+        assert_eq!(calls2[0].arguments, before2);
+    }
+
+    /// Parse native-XML tool-call text with the daemon's parser, then type
+    /// the arguments against `tools` the way the gateway does.
+    fn parse_and_normalize_xml(text: &str, tools: serde_json::Value) -> Vec<ToolCall> {
+        let mut calls = hipfire_runtime::emit_text::extract_tool_calls_from_text(text);
+        normalize_tool_calls(&mut calls, &tool_body(tools));
+        calls
+    }
+
+    /// HA-12 (hermesagent20 p1 `http/00201`): the `skill_manage` file must land
+    /// as the exact 88 bytes, final newline included. `parameters` is the
+    /// captured request's schema, descriptions dropped.
+    #[test]
+    fn tool_xml_ha12_file_content_exact_bytes() {
+        let text = "<tool_call>\n<function=skill_manage>\n<parameter=action>\nwrite_file\n</parameter>\n<parameter=name>\nrelease-check\n</parameter>\n<parameter=file_path>\nscripts/validate_release.py\n</parameter>\n<parameter=file_content>\ndef validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_and_normalize_xml(
+            text,
+            serde_json::json!([{"type":"function","function":{"name":"skill_manage","parameters":{
+                "type":"object",
+                "properties":{
+                    "action":{"type":"string","enum":["create","patch","edit","delete","write_file","remove_file"]},
+                    "name":{"type":"string"},
+                    "content":{"type":"string"},
+                    "old_string":{"type":"string"},
+                    "new_string":{"type":"string"},
+                    "replace_all":{"type":"boolean"},
+                    "category":{"type":"string"},
+                    "file_path":{"type":"string"},
+                    "file_content":{"type":"string"}
+                },
+                "required":["action","name"]
+            }}}]),
+        );
+        let file = calls[0].arguments["file_content"].as_str().expect("string");
+        assert_eq!(
+            file,
+            "def validate_release(tag: str) -> bool:\n    return tag.startswith('v') and len(tag) > 1\n"
+        );
+        assert_eq!(file.len(), 88);
+        assert_eq!(calls[0].arguments["action"], "write_file");
+    }
+
+    /// HA-17 (hermesagent20 p1 `http/00313-00324`): `{"sum": 10}` written to a
+    /// `string` parameter must not come back as `{"sum":10}`. Schemas are the
+    /// captured `write_file`/`patch` ones, descriptions dropped.
+    #[test]
+    fn tool_xml_ha17_json_text_in_string_param_is_verbatim() {
+        let tools = serde_json::json!([
+            {"type":"function","function":{"name":"write_file","parameters":{
+                "type":"object",
+                "properties":{"path":{"type":"string"},"content":{"type":"string"}},
+                "required":["path","content"]
+            }}},
+            {"type":"function","function":{"name":"patch","parameters":{
+                "type":"object",
+                "properties":{
+                    "mode":{"type":"string","enum":["replace","patch"],"default":"replace"},
+                    "path":{"type":"string"},
+                    "old_string":{"type":"string"},
+                    "new_string":{"type":"string"},
+                    "replace_all":{"type":"boolean"},
+                    "patch":{"type":"string"}
+                },
+                "required":["mode"]
+            }}}
+        ]);
+        let text = "<tool_call>\n<function=write_file>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=content>\n{\"sum\": 10}\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=patch>\n<parameter=mode>\nreplace\n</parameter>\n<parameter=path>\nresults/part_a.json\n</parameter>\n<parameter=old_string>\n{\"sum\":10}\n</parameter>\n<parameter=new_string>\n{\"sum\": 10}\n</parameter>\n<parameter=replace_all>\nfalse\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_and_normalize_xml(text, tools);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["content"], "{\"sum\": 10}");
+        assert_eq!(calls[1].arguments["old_string"], "{\"sum\":10}");
+        assert_eq!(calls[1].arguments["new_string"], "{\"sum\": 10}");
+        assert_eq!(calls[1].arguments["replace_all"], false);
+    }
+
+    #[test]
+    fn tool_xml_params_typed_by_declared_schema() {
+        let tools = serde_json::json!([{"type":"function","function":{"name":"probe","parameters":{
+            "type":"object",
+            "properties":{
+                "count":{"type":"integer"},
+                "ratio":{"type":"number"},
+                "whole":{"type":"number"},
+                "on":{"type":"boolean"},
+                "off":{"type":"boolean"},
+                "label":{"type":"string"},
+                "flag_text":{"type":"string"},
+                "nested_text":{"type":"string"},
+                "options":{"type":"object","properties":{"depth":{"type":"integer"}}},
+                "tags":{"type":"array","items":{"type":"string"}},
+                "no_options":{"type":"object"},
+                "maybe":{"type":["integer","null"]},
+                "literal_null":{"type":"string"},
+                "union_int_first":{"type":["integer","string"]},
+                "union_str_first":{"type":["string","integer"]},
+                "any_of":{"anyOf":[{"type":"integer"},{"type":"string"}]},
+                "any_of_text":{"anyOf":[{"type":"integer"},{"type":"string"}]},
+                "enum_null":{"enum":["a",null]},
+                "padded":{"type":"string"},
+                "bad_int":{"type":"integer"}
+            }
+        }}}]);
+        let p = |k: &str, v: &str| format!("<parameter={k}>\n{v}\n</parameter>\n");
+        let text = [
+            "<tool_call>\n<function=probe>\n".to_owned(),
+            p("count", "42"),
+            p("ratio", "1.25"),
+            p("whole", "3"),
+            p("on", "True"),
+            p("off", "0"),
+            p("label", "42"),
+            p("flag_text", "true"),
+            p("nested_text", "{\"a\": {\"b\": [1, 2]}}"),
+            p("options", "{\"depth\": 2}"),
+            p("tags", "[\"x\", \"y\"]"),
+            p("no_options", ""),
+            p("maybe", "null"),
+            p("literal_null", "null"),
+            p("union_int_first", "7"),
+            p("union_str_first", "7"),
+            p("any_of", "8"),
+            p("any_of_text", "eight"),
+            p("enum_null", "None"),
+            p("padded", "  two spaces\n"),
+            p("bad_int", "12.5"),
+            p("undeclared", "{\"keep\": true}"),
+            "</function>\n</tool_call>".to_owned(),
+        ]
+        .concat();
+        let calls = parse_and_normalize_xml(&text, tools);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({
+                "count": 42,
+                "ratio": 1.25,
+                "whole": 3,
+                "on": true,
+                "off": false,
+                "label": "42",
+                "flag_text": "true",
+                "nested_text": "{\"a\": {\"b\": [1, 2]}}",
+                "options": {"depth": 2},
+                "tags": ["x", "y"],
+                "no_options": {},
+                "maybe": null,
+                "literal_null": "null",
+                "union_int_first": 7,
+                "union_str_first": "7",
+                "any_of": 8,
+                "any_of_text": "eight",
+                "enum_null": null,
+                "padded": "  two spaces\n",
+                "bad_int": "12.5",
+                // No schema: the raw string, as vLLM.
+                "undeclared": "{\"keep\": true}"
+            })
+        );
+    }
+
+    #[test]
+    fn tool_normalize_keeps_structured_value_a_union_accepts() {
+        // JSON-format models emit typed values; only a slot that accepts
+        // nothing but `string` gets the value's JSON text.
+        let body = tool_body(
+            serde_json::json!([{"type":"function","function":{"name":"f","parameters":{
+                "type":"object",
+                "properties":{
+                    "n":{"type":["integer","string"]},
+                    "o":{"anyOf":[{"type":"object"},{"type":"string"}]},
+                    "s":{"type":"string"}
+                }
+            }}}]),
+        );
+        let mut calls = vec![sample_tc(
+            "f",
+            serde_json::json!({"n": 5, "o": {"k": 1}, "s": 5}),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments,
+            serde_json::json!({"n": 5, "o": {"k": 1}, "s": "5"})
+        );
+    }
+
+    #[test]
+    fn tool_normalize_parallel_calls_different_schemas() {
+        let body = tool_body(serde_json::json!([
+            {"type":"function","function":{"name":"tool_a","parameters":{"type":"object","properties":{"flag":{"type":"boolean"}}}}},
+            {"type":"function","function":{"name":"tool_b","parameters":{"type":"object","properties":{"flag":{"type":"string"}}}}}
+        ]));
+        let mut calls = vec![
+            sample_tc("tool_a", serde_json::json!({"flag":"True"})),
+            sample_tc("tool_b", serde_json::json!({"flag": true})),
+        ];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["flag"], serde_json::json!(true));
+        // tool_b expects string, true -> "true"
+        assert_eq!(
+            calls[1].arguments["flag"],
+            serde_json::Value::String("true".into())
+        );
+    }
+
+    #[test]
+    fn tool_normalize_preview_final_parity() {
+        // Simulate preview and final both normalizing the same raw calls via same helper.
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"write_file",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "content":{"type":"string"},
+                        "background":{"type":"boolean"}
+                    }
+                }
+            }
+        }]));
+        let raw = sample_tc(
+            "write_file",
+            serde_json::json!({"content": {"a":1}, "background":"True"}),
+        );
+        let mut preview_calls = vec![raw.clone()];
+        let mut final_calls = vec![raw.clone()];
+        normalize_tool_calls(&mut preview_calls, &body);
+        normalize_tool_calls(&mut final_calls, &body);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+        let expected_content = serde_json::to_string(&serde_json::json!({"a":1})).unwrap();
+        assert_eq!(
+            preview_calls[0].arguments["content"],
+            serde_json::Value::String(expected_content)
+        );
+        assert_eq!(
+            preview_calls[0].arguments["background"],
+            serde_json::json!(true)
+        );
+        // idempotent second pass on both
+        normalize_tool_calls(&mut preview_calls, &body);
+        normalize_tool_calls(&mut final_calls, &body);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+    }
+
+    fn echo_and_translate_tools() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "translate_text",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }
+                }
+            }
+        ])
+    }
+
+    fn calculator_tools() -> serde_json::Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": { "type": "string" }
+                    }
+                }
+            }
+        }])
+    }
+
+    #[test]
+    fn tool_choice_absent_and_auto_preserve_tools_identity() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([
+            { "role": "system", "content": "base system" },
+            { "role": "user", "content": "hi" }
+        ]);
+        let before = messages.clone();
+
+        let (policy, forwarded) =
+            project_tool_choice(None, Some(&tools), &mut messages).expect("absent");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages, before);
+
+        let mut messages_auto = before.clone();
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("auto")),
+            Some(&tools),
+            &mut messages_auto,
+        )
+        .expect("auto");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages_auto, before);
+
+        let mut messages_null = before.clone();
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::Value::Null),
+            Some(&tools),
+            &mut messages_null,
+        )
+        .expect("null");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages_null, before);
+    }
+
+    #[test]
+    fn tool_choice_none_strips_tools_and_terminal_calls() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("none")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect("none");
+        assert_eq!(policy, ToolChoicePolicy::None);
+        assert!(forwarded.is_none());
+        // no instruction injection for none
+        assert_eq!(messages.as_array().unwrap().len(), 1);
+
+        let body = tool_body(tools);
+        let mut calls = vec![sample_tc("echo", serde_json::json!({"text": "x"}))];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut calls, &mut done, &body).expect("finalize");
+        assert!(calls.is_empty());
+        assert_eq!(done["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn tool_choice_required_injects_instruction_and_keeps_tools() {
+        let tools = calculator_tools();
+        let mut messages = serde_json::json!([
+            { "role": "system", "content": "existing policy" },
+            { "role": "user", "content": "2+2" }
+        ]);
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("required")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect("required");
+        assert_eq!(policy, ToolChoicePolicy::Required);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.starts_with("existing policy"));
+        assert!(system.contains("You must call a tool."));
+    }
+
+    #[test]
+    fn tool_choice_specific_filters_tools_and_names_requirement() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([{ "role": "user", "content": "echo hi" }]);
+        let choice = serde_json::json!({
+            "type": "function",
+            "function": { "name": "echo" }
+        });
+        let (policy, forwarded) =
+            project_tool_choice(Some(&choice), Some(&tools), &mut messages).expect("specific");
+        assert_eq!(policy, ToolChoicePolicy::Function("echo".into()));
+        let forwarded = forwarded.expect("filtered tools");
+        let arr = forwarded.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(tool_schema_name(&arr[0]), Some("echo"));
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("You must call the `echo` tool."));
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn tool_choice_rejects_malformed_unknown_and_missing_tool() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([]);
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!("maybe")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("unknown string");
+        assert!(err.to_string().contains("unsupported tool_choice"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({"type": "tool", "function": {"name": "echo"}})),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("bad type");
+        assert!(err.to_string().contains("function"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({"type": "function", "function": {}})),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("missing name");
+        assert!(err.to_string().contains("function.name"));
+
+        let err = project_tool_choice(Some(&serde_json::json!("required")), None, &mut messages)
+            .expect_err("required without tools");
+        assert!(err.to_string().contains("non-empty tools"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({
+                "type": "function",
+                "function": { "name": "missing_tool" }
+            })),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("absent function");
+        assert!(err.to_string().contains("missing_tool"));
+    }
+
+    #[test]
+    fn tool_choice_required_postcondition_fails_without_calls() {
+        let body = tool_body(calculator_tools());
+        let mut calls = Vec::new();
+        let mut done = serde_json::json!({ "finish_reason": "stop" });
+        let err = finalize_tool_calls_for_choice(
+            &ToolChoicePolicy::Required,
+            &mut calls,
+            &mut done,
+            &body,
+        )
+        .expect_err("no-call");
+        assert!(err.to_string().contains("required"));
+    }
+
+    #[test]
+    fn tool_choice_required_allows_parallel_calls() {
+        let body = tool_body(echo_and_translate_tools());
+        let mut calls = vec![
+            sample_tc("echo", serde_json::json!({"text": "a"})),
+            sample_tc("translate_text", serde_json::json!({"text": "b"})),
+        ];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::Required, &mut calls, &mut done, &body)
+            .expect("parallel ok");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(done["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn tool_choice_specific_postcondition_filters_and_fails_closed() {
+        let body = tool_body(echo_and_translate_tools());
+        let policy = ToolChoicePolicy::Function("echo".into());
+
+        // Wrong-only producer output fails closed.
+        let mut wrong = vec![sample_tc(
+            "translate_text",
+            serde_json::json!({"text": "nope"}),
+        )];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        let err = finalize_tool_calls_for_choice(&policy, &mut wrong, &mut done, &body)
+            .expect_err("wrong tool");
+        assert!(err.to_string().contains("echo"));
+
+        // Mixed calls keep only the named tool.
+        let mut mixed = vec![
+            sample_tc("translate_text", serde_json::json!({"text": "x"})),
+            sample_tc("echo", serde_json::json!({"text": "y"})),
+        ];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut mixed, &mut done, &body).expect("filter");
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].name, "echo");
+    }
+
+    #[test]
+    fn tool_choice_streaming_final_policy_parity() {
+        // Preview (commit_ready) and final share finalize_tool_calls_for_choice.
+        let body = tool_body(echo_and_translate_tools());
+        let raw = vec![
+            sample_tc("translate_text", serde_json::json!({"text": "x"})),
+            sample_tc("echo", serde_json::json!({"text": "y"})),
+        ];
+        let policy = ToolChoicePolicy::Function("echo".into());
+
+        let mut preview_calls = raw.clone();
+        let mut preview_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut preview_calls, &mut preview_done, &body)
+            .expect("preview");
+
+        let mut final_calls = raw;
+        let mut final_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut final_calls, &mut final_done, &body)
+            .expect("final");
+
+        assert_eq!(preview_calls.len(), final_calls.len());
+        assert_eq!(preview_calls[0].name, final_calls[0].name);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+        assert_eq!(preview_done, final_done);
+        assert_eq!(preview_calls.len(), 1);
+        assert_eq!(preview_calls[0].name, "echo");
+
+        // none parity: both strip calls and coerce finish_reason.
+        let mut p_calls = vec![sample_tc("echo", serde_json::json!({"text": "z"}))];
+        let mut f_calls = p_calls.clone();
+        let mut p_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        let mut f_done = p_done.clone();
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::None, &mut p_calls, &mut p_done, &body)
+            .unwrap();
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::None, &mut f_calls, &mut f_done, &body)
+            .unwrap();
+        assert!(p_calls.is_empty());
+        assert!(f_calls.is_empty());
+        assert_eq!(p_done, f_done);
+        assert_eq!(p_done["finish_reason"], "stop");
+    }
+    fn contract_resolved_with_system(system: &str) -> hipfire_config::ResolvedConfig {
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("prompt.system", system).unwrap();
+        // generation.max_tokens must resolve for the helper's unwrap_or path.
+        layer.set_cli("generation.max_tokens", "512").unwrap();
+        // request_string ignores GlobalUser for prompt.system unless a registry
+        // layer shadows it — match neighbouring tests and use RegistryModel.
+        resolve([NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: "qwen:test".into(),
+                revision: "v1".into(),
+            },
+            layer,
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn project_request_contract_rejects_malformed_sampling_and_roles() {
+        let resolved = contract_resolved_with_system("");
+        let user = serde_json::json!({ "role": "user", "content": "hi" });
+        let cases: &[(&str, serde_json::Value, &str)] = &[
+            (
+                "temperature type",
+                serde_json::json!({ "temperature": [] }),
+                "temperature must be a finite number",
+            ),
+            (
+                "temperature range",
+                serde_json::json!({ "temperature": 100.0 }),
+                "temperature must be within",
+            ),
+            (
+                "top_p range",
+                serde_json::json!({ "top_p": -5.0 }),
+                "top_p must be within",
+            ),
+            (
+                "top_p type",
+                serde_json::json!({ "top_p": "0.9" }),
+                "top_p must be a finite number",
+            ),
+            (
+                "repeat_window",
+                serde_json::json!({ "repeat_window": -1 }),
+                "repeat_window must be an integer between 0 and 2048",
+            ),
+        ];
+        for (label, extra, expected) in cases {
+            let mut body = serde_json::json!({
+                "max_tokens": 16,
+                "messages": [user],
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            let err = project_request_contract(&body, &resolved, false, true)
+                .expect_err(&format!("{label} must be refused"));
+            assert!(err.to_string().contains(expected), "{label}: {err}");
+        }
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "messages": [{ "role": "wizard", "content": "hi" }],
+        });
+        let err = project_request_contract(&body, &resolved, false, true)
+            .expect_err("unknown role must be refused");
+        assert!(err.to_string().contains("unknown message role"), "{err}");
+
+        // In-range values still pass.
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "repeat_window": 64,
+            "messages": [user],
+        });
+        project_request_contract(&body, &resolved, false, true).expect("valid sampling accepted");
+    }
+
+    #[test]
+    fn project_request_contract_rejects_max_tokens_bounds() {
+        let resolved = contract_resolved_with_system("");
+        for bad in [0u64, 393_217] {
+            let body = serde_json::json!({
+                "max_tokens": bad,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let err = project_request_contract(&body, &resolved, false, false)
+                .expect_err("out of range max_tokens");
+            assert!(
+                err.to_string()
+                    .contains("max_tokens must be between 1 and 393216"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+        for ok in [1u64, 393_216] {
+            let body = serde_json::json!({
+                "max_tokens": ok,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let contract = project_request_contract(&body, &resolved, false, false)
+                .unwrap_or_else(|e| panic!("expected ok for {ok}: {e}"));
+            assert_eq!(contract.max_tokens, ok);
+        }
+    }
+
+    /// A PRESENT-but-malformed max_tokens must be a typed 400, never a
+    /// silent fallback to the config default (the gateway used to
+    /// `.and_then(as_u64).unwrap_or(default)`, quietly re-typing -5 / 1.5 /
+    /// "100" into the default budget).
+    #[test]
+    fn project_request_contract_rejects_malformed_max_tokens() {
+        let resolved = contract_resolved_with_system("");
+        for bad in [
+            serde_json::json!(-5),
+            serde_json::json!(1.5),
+            serde_json::json!("100"),
+        ] {
+            let body = serde_json::json!({
+                "max_tokens": bad,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let err = project_request_contract(&body, &resolved, false, true)
+                .expect_err("malformed max_tokens must be rejected");
+            assert!(
+                err.to_string().contains("max_tokens must be an integer"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    /// Unsupported OpenAI request fields must be refused here — the daemon
+    /// has typed refusals for them, but this gateway builds the generate
+    /// message from scratch and would strip the fields first (silent
+    /// semantic downgrade: `n: 2` returning one completion).
+    #[test]
+    fn project_request_contract_refuses_unsupported_fields() {
+        let resolved = contract_resolved_with_system("");
+        let cases = [
+            serde_json::json!({"n": 2}),
+            serde_json::json!({"best_of": 2}),
+            serde_json::json!({"logit_bias": {"5": 10}}),
+            serde_json::json!({"echo": true}),
+            serde_json::json!({"suffix": "tail"}),
+        ];
+        for extra in cases {
+            let mut body = serde_json::json!({
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let (k, v) = extra.as_object().unwrap().iter().next().unwrap();
+            body[k] = v.clone();
+            let err = project_request_contract(&body, &resolved, false, true)
+                .expect_err("unsupported field must be refused");
+            assert!(
+                err.to_string()
+                    .contains("not supported on this serve route"),
+                "unexpected error for {k}: {err}"
+            );
+        }
+        // n=1 is the only legal arity and must pass.
+        let body = serde_json::json!({
+            "max_tokens": 16, "n": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert!(project_request_contract(&body, &resolved, false, true).is_ok());
+    }
+
+    /// `n != 1` is refused as a typed 400 on BOTH routes (standard and
+    /// multi-slot); `n: 1` and an absent/null `n` pass on both.
+    #[test]
+    fn project_request_contract_refuses_n_on_every_route() {
+        let resolved = contract_resolved_with_system("");
+        for multi_slot in [false, true] {
+            for bad in [
+                serde_json::json!(2),
+                serde_json::json!(0),
+                serde_json::json!("1"),
+            ] {
+                let body = serde_json::json!({
+                    "max_tokens": 16, "n": bad,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                });
+                let err = project_request_contract(&body, &resolved, false, multi_slot)
+                    .expect_err("n != 1 must be refused");
+                assert!(
+                    err.downcast_ref::<super::super::InvalidRequest>().is_some(),
+                    "multi_slot={multi_slot} n={bad}: not a typed invalid request: {err}"
+                );
+            }
+            for ok in [serde_json::json!(1), serde_json::Value::Null] {
+                let body = serde_json::json!({
+                    "max_tokens": 16, "n": ok,
+                    "messages": [{ "role": "user", "content": "hi" }]
+                });
+                assert!(project_request_contract(&body, &resolved, false, multi_slot).is_ok());
+            }
+        }
+    }
+
+    /// `response_format: {"type": "text"}` is OpenAI's DEFAULT format —
+    /// accept it as unconstrained instead of erroring.
+    #[test]
+    fn response_format_text_is_accepted_as_unconstrained() {
+        let value = serde_json::json!({"type": "text"});
+        let got = validate_response_format(Some(&value)).unwrap();
+        assert!(got.is_none(), "text must be accepted as unconstrained");
+    }
+
+    #[test]
+    fn project_request_contract_injects_default_system() {
+        let resolved = contract_resolved_with_system("injected default system");
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let contract = project_request_contract(&body, &resolved, false, false).expect("project");
+        let msgs = contract.messages.as_array().expect("messages array");
+        assert_eq!(msgs[0]["role"], "system");
+        assert_eq!(msgs[0]["content"], "injected default system");
+        assert_eq!(msgs[1]["role"], "user");
+    }
+
+    #[test]
+    fn project_request_contract_none_withholds_tools() {
+        let resolved = contract_resolved_with_system("");
+        let tools = echo_and_translate_tools();
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "tool_choice": "none",
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let contract = project_request_contract(&body, &resolved, false, false).expect("project");
+        assert_eq!(contract.tool_choice_policy, ToolChoicePolicy::None);
+        assert!(contract.forwarded_tools.is_none());
+    }
+
+    #[test]
+    fn project_request_contract_required_and_specific_forward_tools() {
+        let resolved = contract_resolved_with_system("");
+        let tools = echo_and_translate_tools();
+
+        let body_required = serde_json::json!({
+            "max_tokens": 16,
+            "tool_choice": "required",
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let contract =
+            project_request_contract(&body_required, &resolved, false, false).expect("required");
+        assert_eq!(contract.tool_choice_policy, ToolChoicePolicy::Required);
+        assert_eq!(contract.forwarded_tools.as_ref(), Some(&tools));
+
+        let body_specific = serde_json::json!({
+            "max_tokens": 16,
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "echo" }
+            },
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        let contract =
+            project_request_contract(&body_specific, &resolved, false, false).expect("specific");
+        assert_eq!(
+            contract.tool_choice_policy,
+            ToolChoicePolicy::Function("echo".into())
+        );
+        let forwarded = contract.forwarded_tools.expect("filtered tools");
+        let arr = forwarded.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(tool_schema_name(&arr[0]), Some("echo"));
+    }
+
+    #[test]
+    fn tool_choice_instruction_does_not_change_conversation_identity() {
+        let resolved = contract_resolved_with_system("");
+        let tools = echo_and_translate_tools();
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "echo" }
+            },
+            "tools": tools,
+            "messages": [
+                { "role": "system", "content": "stable system" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let contract = project_request_contract(&body, &resolved, false, true).expect("specific");
+        assert_eq!(
+            contract.conversation_messages.as_ref().unwrap()[0]["content"],
+            "stable system"
+        );
+        assert_eq!(
+            contract.messages[0]["content"],
+            "stable system\n\nYou must call the `echo` tool."
+        );
+    }
+
+    /// Every gateway-side client mistake is answered 400 by type, whatever
+    /// its wording; a model-output failure stays a 500.
+    #[test]
+    fn gateway_client_faults_map_to_http_400() {
+        use crate::serve::http::request_error_status;
+        use saddle_core::caps::ReasoningContract;
+        let resolved = hipfire_config::resolve(Vec::<hipfire_config::NamedLayer>::new()).unwrap();
+        let status = |result: Result<()>| {
+            let error = result.expect_err("client fault must be refused");
+            (request_error_status(&error), error.to_string())
+        };
+        let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
+        let reasoning = |body: serde_json::Value| -> Result<()> {
+            apply_http_reasoning_request(
+                &body,
+                &resolved,
+                &mut serde_json::json!({}),
+                ReasoningContract::QwenJinja,
+                true,
+                &[],
+            )
+            .map(drop)
+        };
+        let contract = |body: serde_json::Value| -> Result<()> {
+            project_request_contract(&body, &resolved, false, true).map(drop)
+        };
+        let cases: Vec<(&str, Result<()>)> = vec![
+            (
+                "experimental multi-slot does not support this request",
+                require_multi_slot_support(&serde_json::json!({"stop": ["\n"]})),
+            ),
+            (
+                "top_logprobs requires logprobs to be true",
+                validate_logprobs_request(&serde_json::json!({"top_logprobs": 2})),
+            ),
+            (
+                "logprobs must be a boolean",
+                validate_logprobs_request(&serde_json::json!({"logprobs": "yes"})),
+            ),
+            (
+                "unsupported tool_choice value: x",
+                parse_tool_choice_policy(Some(&serde_json::json!("x")), Some(&tools)).map(drop),
+            ),
+            (
+                "is not present in tools",
+                parse_tool_choice_policy(
+                    Some(&serde_json::json!({"type": "function", "function": {"name": "g"}})),
+                    Some(&tools),
+                )
+                .map(drop),
+            ),
+            (
+                "remote image_url values are unsupported",
+                request_image_base64(Some(&serde_json::json!([
+                    {"role": "user", "content": [image("https://x/y.png")]}
+                ])))
+                .map(drop),
+            ),
+            (
+                "at most one image_url",
+                request_image_base64(Some(&serde_json::json!([
+                    {"role": "user", "content": [
+                        image("data:image/png;base64,AA"),
+                        image("data:image/png;base64,AA")
+                    ]}
+                ])))
+                .map(drop),
+            ),
+            (
+                "max_tokens must be between",
+                contract(serde_json::json!({"max_tokens": 0})),
+            ),
+            (
+                "n != 1",
+                contract(serde_json::json!({"max_tokens": 8, "n": 2})),
+            ),
+            (
+                "temperature must be within",
+                contract(serde_json::json!({"max_tokens": 8, "temperature": 3.0})),
+            ),
+            (
+                "unknown message role",
+                contract(serde_json::json!({"max_tokens": 8, "messages": [{"role": "x"}]})),
+            ),
+            (
+                "response_format type 'json_object' is not supported",
+                contract(serde_json::json!({
+                    "max_tokens": 8, "response_format": {"type": "json_object"}
+                })),
+            ),
+            (
+                "unsupported JSON Schema keyword 'pattern'",
+                contract(serde_json::json!({"max_tokens": 8, "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {"schema": {"type": "string", "pattern": "a"}}
+                }})),
+            ),
+            (
+                "enable_thinking must be a boolean",
+                reasoning(serde_json::json!({"enable_thinking": "true"})),
+            ),
+            (
+                "thinking_budget must be a string preset",
+                reasoning(serde_json::json!({"thinking_budget": 3})),
+            ),
+            (
+                "max_think_tokens must be between",
+                reasoning(serde_json::json!({"max_think_tokens": -1})),
+            ),
+        ];
+        for (needle, result) in cases {
+            let (code, message) = status(result);
+            assert!(message.contains(needle), "{message:?} lacks {needle:?}");
+            assert_eq!(code, 400, "{message}");
+        }
+        // The model, not the client, failed to honor tool_choice.
+        let (code, _) = status(finalize_tool_calls_for_choice(
+            &ToolChoicePolicy::Required,
+            &mut Vec::new(),
+            &mut serde_json::json!({}),
+            &serde_json::json!({}),
+        ));
+        assert_eq!(code, 500);
+    }
+
+    /// Experimental multi-slot accepts sampling that the daemon slot engine
+    /// implements (temperature/top_p/top_k) and rejects every other listed
+    /// capability before the generate is sent. Penalty knobs
+    /// (repeat/frequency/presence, min_p) are forwarded and honoured by the
+    /// slot sampler's penalize-then-argmax prepass — penalized requests
+    /// decode AR with MTP off.
+    #[test]
+    fn multi_slot_request_supported_accepts_sampling_rejects_unsupported() {
+        let ok = |v: serde_json::Value| multi_slot_request_supported(&v).is_ok();
+        let err_contains = |v: serde_json::Value, needle: &str| {
+            let err = multi_slot_request_supported(&v).unwrap_err();
+            assert!(err.contains(needle), "err={err:?} needle={needle}");
+        };
+
+        assert!(ok(serde_json::json!({ "max_tokens": 16 })));
+        assert!(ok(serde_json::json!({
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 40
+        })));
+        assert!(ok(serde_json::json!({ "max_think_tokens": 0 })));
+        assert!(ok(serde_json::json!({ "max_think_tokens": 1 })));
+        assert!(ok(serde_json::json!({ "thinking_budget": "off" })));
+        assert!(ok(serde_json::json!({ "stop": serde_json::Value::Null })));
+        assert!(ok(serde_json::json!({ "presence_penalty": 0.0 })));
+        assert!(ok(serde_json::json!({ "frequency_penalty": 0.0 })));
+        assert!(ok(serde_json::json!({ "repeat_penalty": 1.0 })));
+        assert!(ok(serde_json::json!({ "min_p": 0.0 })));
+        assert!(ok(serde_json::json!({ "tools": [] })));
+        assert!(ok(serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "x"}}],
+            "messages": [{"role":"tool","tool_call_id":"call_x","content":"ok"}]
+        })));
+
+        // Images are supported in multi-slot when the model has a vision
+        // encoder. The daemon slot backend gates on is_vl() and returns a
+        // validation error if the model lacks one; the CLI gate no longer
+        // rejects them upfront.
+        assert!(ok(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
+                ]
+            }]
+        })));
+        // Images + tools together are still refused — the VL prompt path
+        // cannot render a tool contract.
+        err_contains(
+            serde_json::json!({
+                "image_base64": "aa",
+                "tools": [{"type": "function", "function": {"name": "x"}}]
+            }),
+            "images and tools",
+        );
+        err_contains(serde_json::json!({ "stop": ["\n\n"] }), "stop");
+        err_contains(serde_json::json!({ "stop": "END" }), "stop");
+        err_contains(serde_json::json!({ "logprobs": true }), "logprobs");
+        err_contains(serde_json::json!({ "top_logprobs": 5 }), "logprobs");
+        // Non-neutral penalties are supported end-to-end on the slot engine
+        // (in-kernel repeat/presence/frequency over a per-slot recent-token
+        // window), so they are forwarded — no error here.
+        assert!(ok(serde_json::json!({ "presence_penalty": 0.5 })));
+        assert!(ok(serde_json::json!({ "frequency_penalty": 0.1 })));
+        assert!(ok(serde_json::json!({ "repeat_penalty": 1.05 })));
+        assert!(ok(serde_json::json!({ "min_p": 0.05 })));
+        err_contains(serde_json::json!({ "min_p": 1.5 }), "min_p");
+        // Finite caps are ACCEPTED and ENFORCED (the grammar cursor
+        // force-closes the span at the budget), so `max_think_tokens >= 2`
+        // and the nested `reasoning.max_tokens` alias are inputs, not
+        // refusals. `0` = uncapped and `1` = no-thinking sentinel.
+        assert!(ok(serde_json::json!({ "max_think_tokens": 2 })));
+        assert!(ok(
+            serde_json::json!({ "reasoning": { "max_tokens": 2048 } })
+        ));
+        err_contains(serde_json::json!({ "thinking_budget": "high" }), "budget");
+    }
+
+    /// `response_format` validation: accepts valid json_schema, rejects
+    /// malformed/unsupported types and unsupported JSON Schema keywords
+    /// (spec §7.1 G1, A15).
+    #[test]
+    fn response_format_validation_accepts_and_rejects() {
+        // Absent / null → None (no constraint).
+        assert!(validate_response_format(None).unwrap().is_none());
+        assert!(validate_response_format(Some(&serde_json::Value::Null))
+            .unwrap()
+            .is_none());
+
+        // json_object → REJECTED (typed error). This serve route has no
+        // json_object enforcement; silently dropping the requested
+        // constraint and returning success would be the "silent semantic
+        // downgrade" the spec forbids (§7.1/X2). It used to pass through as
+        // None — an unconstrained 200.
+        assert!(
+            validate_response_format(Some(&serde_json::json!({"type": "json_object"}))).is_err()
+        );
+
+        // Valid json_schema with a simple object schema.
+        let rf = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "test",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "age": {"type": "integer"}
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            }
+        })))
+        .unwrap()
+        .expect("valid json_schema should produce ResponseFormat");
+        assert_eq!(rf.name.as_deref(), Some("test"));
+        assert_eq!(
+            rf.schema.get("type").and_then(|v| v.as_str()),
+            Some("object")
+        );
+
+        // Valid array schema with enum.
+        let rf = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["a", "b", "c"]},
+                    "minItems": 1,
+                    "maxItems": 10
+                }
+            }
+        })))
+        .unwrap()
+        .expect("valid array schema");
+        assert!(rf.name.is_none());
+
+        // Accepted: `text` is OpenAI's DEFAULT response format — plain
+        // unconstrained output, same as omitting the field.
+        let rf = validate_response_format(Some(&serde_json::json!({
+            "type": "text"
+        })))
+        .unwrap();
+        assert!(rf.is_none(), "text is the platform default: no constraint");
+
+        // Rejected: genuinely unknown type.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "yaml"
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+
+        // Rejected: missing json_schema wrapper.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema"
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("json_schema is required"));
+
+        // Rejected: missing schema object.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {}
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("schema is required"));
+
+        // Rejected: $ref (external reference).
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"$ref": "#/definitions/foo"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("$ref"));
+
+        // Rejected: pattern (regex assertion).
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"type": "string", "pattern": "^[a-z]+$"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("pattern"));
+
+        // Rejected: allOf combinator.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"allOf": [{"type": "string"}]}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("allOf"));
+
+        // Rejected: contradictory minItems > maxItems.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 5,
+                    "maxItems": 3
+                }
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("contradictory"));
+
+        // Rejected: unsupported type value.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"type": "custom"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("custom"));
+    }
+
+    /// `response_format` is forwarded into the generate payload and passes
+    /// the multi-slot gate (the daemon handles typed refusal).
+    #[test]
+    fn response_format_passes_multi_slot_gate() {
+        // A generate payload with response_format should pass
+        // multi_slot_request_supported — the daemon handles the typed
+        // refusal when the grammar compiler is unavailable.
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {"type": "object", "properties": {"x": {"type": "string"}}}
+                }
+            }
+        });
+        assert!(multi_slot_request_supported(&body).is_ok());
+    }
+}

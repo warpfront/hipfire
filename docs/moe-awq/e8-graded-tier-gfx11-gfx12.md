@@ -1,7 +1,7 @@
 # mfp4-E8 as a graded MoE tier — gfx11 + gfx12 findings
 
 Branch `feat/moe-awq-experts` (local). Qwen3.6-35B-A3B (`qwen3_5_moe`, arch_id 5/6).
-Validated on **gfx1201** (hiptrx, RDNA4) and **gfx1100** (k9lin, RDNA3, RX 7900 XTX).
+Validated on **gfx1201** (4×R9700 host, RDNA4) and **gfx1100** (RDNA3 workstation, RX 7900 XTX).
 
 ## What this is
 
@@ -187,7 +187,7 @@ HIPFIRE_E8_GFX12=1 [HIPFIRE_MOE_MQ6_ADMIT=1 on gfx11 if pre-widen] \
   --scoring-mode {per-token|prefill}
 ```
 Perf (daemon): `bench_prefill.py <model> 4096 512,1024,2048 64` with
-`DAEMON_BIN=…/examples/daemon HIPFIRE_E8_GFX12=1`. (No `bun` on hiptrx → use the
+`DAEMON_BIN=…/examples/daemon HIPFIRE_E8_GFX12=1`. (No `bun` on the gfx1201 host → use the
 Python driver, not the production `scripts/serve_harness.py` route.) Pitfall: `pkill -f examples/daemon`
 self-kills any shell whose cmdline contains `DAEMON_BIN=…examples/daemon`.
 

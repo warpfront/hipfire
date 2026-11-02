@@ -5,8 +5,253 @@ use crate::context::DispatchCtx;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Select the fused gate/up kernel key for a packed weight container.
+pub fn fused_gate_up_key_for(dtype: DType) -> KernelKey {
+    match dtype {
+        DType::Q8_0 => KernelKey::FusedGateUpQ8_0,
+        // qt=15/qt=8 share the 200 B/group 6-bit container. The MoE shared
+        // expert prefill (AWQ A3B layers 0/1/38/39) reaches this with MQ6G256;
+        // the HFQ4 default below read it at the 136 B stride and the whole
+        // residual stream turned to noise ("!!!!" on every prompt).
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedGateUpHfq6G256,
+        DType::MQ4G256V2 => KernelKey::FusedGateUpMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedGateUpMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedGateUpMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
+        DType::MQ3G256 => KernelKey::FusedGateUpHfq3G256,
+        DType::MQ3G256Lloyd => KernelKey::FusedGateUpMq3G256Lloyd,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_gate_up_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::FusedGateUpHfq4G256,
+    }
+}
+
+// ── Kernel-key selection by weight CONTAINER, never hardcoded ──────────────
+//
+// qt=6 (HFQ4G256) and qt=13 (MQ4G256) share one container: 136 B groups holding
+// `[0..4) f32 scale, [4..8) f32 zero` over all 256 weights, then 128 B of nibbles.
+// MQ4 is that container plus an offline FWHT, so it has always borrowed HFQ4's
+// kernel keys and that is correct — only the activations differ.
+//
+// qt=44 (MQ4G256V2) is a DIFFERENT container. Same 136 B stride, same nibble
+// payload at the same offset, but the 8 header bytes become
+// `[0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1`, with s0/z0
+// governing weights 0..127 and s1/z1 governing 128..255.
+//
+// Hand a v1 key a qt=44 weight and the kernel bit_casts an fp16 pair to f32,
+// yielding ~1e-14: every weight in the tensor collapses to numerically zero. It
+// cannot fail — every bit pattern is a valid finite f32, the nibbles are read
+// correctly, and stride/alignment/K%256 are identical — so it runs at full speed
+// and returns noise. That cost two full KLD measurement cycles (WT2 12.137559
+// against a 0.043776 baseline, bit-identical across both runs) before it was
+// found. Select on the container; never hardcode.
+
+pub fn fused_qkvza_key_for(dt: DType) -> KernelKey {
+    match dt {
+        DType::Q8_0 => KernelKey::FusedQkvzaQ8_0,
+        DType::MQ4G256V2 => KernelKey::FusedQkvzaMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedQkvzaMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedQkvzaMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedQkvzaMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedQkvzaMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedQkvzaMq2G256V2,
+        // qt=15/qt=8 are the 200 B/group 6-bit container: an HFQ4 key would
+        // read them at the 136 B HFQ4 stride and return noise at full speed.
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvzaHfq6G256,
+        DType::MQ3G256 => KernelKey::FusedQkvzaHfq3G256,
+        DType::MQ3G256Lloyd => KernelKey::FusedQkvzaMq3G256Lloyd,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_qkvza_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::FusedQkvzaHfq4G256,
+    }
+}
+
+pub fn fused_qkv_key_for(dt: DType) -> KernelKey {
+    match dt {
+        DType::Q8_0 => KernelKey::FusedQkvQ8_0,
+        DType::MQ4G256V2 => KernelKey::FusedQkvMq4G256V2,
+        DType::MQ4CG256 => KernelKey::FusedQkvMq4CG256,
+        DType::MQ6G256V2 => KernelKey::FusedQkvMq6G256V2,
+        DType::MQ5G256V2 => KernelKey::FusedQkvMq5G256V2,
+        DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
+        DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
+        DType::MQ6G256 | DType::HFQ6G256 => KernelKey::FusedQkvHfq6G256,
+        DType::MQ3G256 => KernelKey::FusedQkvHfq3G256,
+        DType::MQ3G256Lloyd => KernelKey::FusedQkvMq3G256Lloyd,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_qkv_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
+        _ => KernelKey::FusedQkvHfq4G256,
+    }
+}
+
+fn is_fused_hfq4_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::FusedQkvHfq4G256
+            | KernelKey::FusedQkvzaHfq4G256
+            | KernelKey::FusedGateUpHfq4G256
+    )
+}
+
+fn is_fused_mq4v2_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::FusedQkvMq4G256V2
+            | KernelKey::FusedQkvzaMq4G256V2
+            | KernelKey::FusedGateUpMq4G256V2
+            | KernelKey::FusedQkvMq4G256V2VerifyExact
+            | KernelKey::FusedQkvzaMq4G256V2VerifyExact
+            | KernelKey::FusedGateUpMq4G256V2VerifyExact
+    )
+}
+
+fn is_fused_mq4cg256_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::FusedQkvMq4CG256
+            | KernelKey::FusedQkvzaMq4CG256
+            | KernelKey::FusedGateUpMq4CG256
+    )
+}
+
+fn is_fused_v2_key(key: KernelKey) -> bool {
+    matches!(
+        key,
+        KernelKey::FusedQkvMq4G256V2
+            | KernelKey::FusedQkvMq5G256V2
+            | KernelKey::FusedQkvMq6G256V2
+            | KernelKey::FusedQkvMq3G256V2
+            | KernelKey::FusedQkvMq2G256V2
+            | KernelKey::FusedQkvMq4CG256
+            | KernelKey::FusedQkvzaMq4G256V2
+            | KernelKey::FusedQkvzaMq5G256V2
+            | KernelKey::FusedQkvzaMq6G256V2
+            | KernelKey::FusedQkvzaMq3G256V2
+            | KernelKey::FusedQkvzaMq2G256V2
+            | KernelKey::FusedQkvzaMq4CG256
+            | KernelKey::FusedGateUpMq4G256V2
+            | KernelKey::FusedGateUpMq5G256V2
+            | KernelKey::FusedGateUpMq6G256V2
+            | KernelKey::FusedGateUpMq3G256V2
+            | KernelKey::FusedGateUpMq2G256V2
+            | KernelKey::FusedGateUpMq4CG256
+            | KernelKey::FusedQkvMq4G256V2VerifyExact
+            | KernelKey::FusedQkvzaMq4G256V2VerifyExact
+            | KernelKey::FusedGateUpMq4G256V2VerifyExact
+    )
+}
+
+fn is_v2_dtype(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::MQ4G256V2
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+            | DType::MQ4CG256
+    )
+}
+
+fn guard_fused_qkv_dtype_key(weights: &[&GpuTensor], key: KernelKey) -> Result<(), DispatchError> {
+    let is_v1 = is_fused_hfq4_key(key);
+    let is_v2 = is_fused_v2_key(key);
+    let is_mq4c = is_fused_mq4cg256_key(key);
+    let is_mq4v2 = is_fused_mq4v2_key(key);
+    // qt=52 (Lloyd-V2): this family has no LUT ABI (fused kernels here decode
+    // the uniform grid only). Decode never routes through the family for these
+    // keys — `launch_fused` handles Fused*Mq4G256V2Lloyd first (steps.rs
+    // FusedQkv/Qkvza/GateUp Lloyd arms). Any Lloyd weight arriving here is a
+    // missing re-arm at the callsite: refuse, never silent-uniform.
+    for (idx, w) in weights.iter().enumerate() {
+        if w.dtype == DType::MQ4G256V2Lloyd {
+            return Err(DispatchError::Hip(format!(
+                "fused_qkv family: qt=52 (MQ4G256V2Lloyd) weight[{idx}] (dtype {:?}) routed to fused kernel key {key:?}: \
+                 no fused LUT kernel exists — decode must use per-projection LUT GEMVs \
+                 (gemv_mq4g256v2_lloyd / residual_lloyd) and prefill the FP8-LUT launchers (*_fp8_lloyd).",
+                w.dtype
+            )));
+        }
+    }
+    for (idx, w) in weights.iter().enumerate() {
+        let w_is_v2 = is_v2_dtype(w.dtype);
+        let w_is_mq4v2 = w.dtype == DType::MQ4G256V2;
+        if w_is_v2 && is_v1 {
+            return Err(DispatchError::Hip(format!(
+                "qt V2 weight[{}] (dtype {:?}) routed to v1 kernel key {:?}:                  v2 stores fp16 scale/zero per 128 weights (s0/z0 for 0..127, s1/z1 for 128..255)                  where v1 stores f32 scale/zero per 256, so the v1 kernel decodes every weight                  to ~1e-14. This is a missing v2 routing arm at the callsite, not a valid configuration.",
+                idx, w.dtype, key
+            )));
+        }
+        if (w.dtype == DType::HFQ4G256 || w.dtype == DType::MQ4G256) && is_v2 {
+            return Err(DispatchError::Hip(format!(
+                "v1 weight[{}] (dtype {:?}) routed to v2 kernel key {:?}:                  v2 expects fp16 s0/z0/s1/z1 per 128 weights while v1 stores f32 scale/zero per 256.                  Routing a v1 payload through a v2 kernel is equally wrong and silent.",
+                idx, w.dtype, key
+            )));
+        }
+        if w_is_v2 && is_v2 {
+            let ok = match w.dtype {
+                DType::MQ4G256V2 => matches!(
+                    key,
+                    KernelKey::FusedQkvMq4G256V2
+                        | KernelKey::FusedQkvzaMq4G256V2
+                        | KernelKey::FusedGateUpMq4G256V2
+                        | KernelKey::FusedQkvMq4G256V2VerifyExact
+                        | KernelKey::FusedQkvzaMq4G256V2VerifyExact
+                        | KernelKey::FusedGateUpMq4G256V2VerifyExact
+                ),
+                DType::MQ6G256V2 => matches!(
+                    key,
+                    KernelKey::FusedQkvMq6G256V2
+                        | KernelKey::FusedQkvzaMq6G256V2
+                        | KernelKey::FusedGateUpMq6G256V2
+                ),
+                DType::MQ5G256V2 => matches!(
+                    key,
+                    KernelKey::FusedQkvMq5G256V2
+                        | KernelKey::FusedQkvzaMq5G256V2
+                        | KernelKey::FusedGateUpMq5G256V2
+                ),
+                DType::MQ3G256V2 => matches!(
+                    key,
+                    KernelKey::FusedQkvMq3G256V2
+                        | KernelKey::FusedQkvzaMq3G256V2
+                        | KernelKey::FusedGateUpMq3G256V2
+                ),
+                DType::MQ2G256V2 => matches!(
+                    key,
+                    KernelKey::FusedQkvMq2G256V2
+                        | KernelKey::FusedQkvzaMq2G256V2
+                        | KernelKey::FusedGateUpMq2G256V2
+                ),
+                DType::MQ4CG256 => is_mq4c,
+                _ => false,
+            };
+            if !ok {
+                return Err(DispatchError::Hip(format!(
+                    "V2 weight[{}] (dtype {:?}) routed to incompatible V2 kernel key {:?}: cross-V2 group bytes differ (MQ6=200, MQ5=168, MQ4=136, MQ3=104, MQ2=72, MQ4C=136 packed) — mis-route decodes every group wrong.",
+                    idx, w.dtype, key
+                )));
+            }
+        }
+        if (w.dtype == DType::HFQ4G256 || w.dtype == DType::MQ4G256 || w_is_mq4v2) && is_mq4c {
+            return Err(DispatchError::Hip(format!(
+                "non-mq4c weight[{}] (dtype {:?}) routed to mq4c kernel key {:?}:                  mq4c expects 136 B groups (packed fp16 scale/zero dword + 4 B pad + 128 B                  nibbles); v1/v2 payloads are also 136 B/group but with different headers, so                  equal stride is not interchangeable and would decode every group wrong.",
+                idx, w.dtype, key
+            )));
+        }
+    }
+    Ok(())
+}
 pub struct FusedQkvParams<'a> {
     pub kind: KernelKey,
     pub weights: &'a [&'a GpuTensor],
@@ -42,6 +287,37 @@ pub struct FusedQkvBiasParams<'a> {
     pub m: [usize; 3],
     pub k: usize,
     pub bias: [&'a GpuTensor; 3],
+}
+
+/// Operands of the opt-in exact-gfx1201 RMSNorm/FWHT + `block_i4_128` producer
+/// that feeds a prepared uniform-MQ4V2 QKV (`FusedQkvMq4G256V2`) or QKVZA
+/// (`FusedQkvzaMq4G256V2`) projection
+/// (`HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`). The F32 `x_rot` store is always
+/// written so every downstream reader (calibration tap, small tails) sees the
+/// same bytes as the unprepared route.
+pub struct FusedQkvIu4RmsnormParams<'a> {
+    pub kind: KernelKey,
+    pub x: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    pub awq: Option<&'a GpuTensor>,
+    pub x_rot: &'a GpuTensor,
+    pub k: usize,
+    pub eps: f32,
+    pub batch_size: usize,
+}
+
+/// Operands of a prepared-IU4 fused QKV / QKVZA consumer. `x_rot` is the F32
+/// rotated activation the producer also emitted: the family's calibration taps
+/// read it exactly as the unprepared arm reads its input.
+pub struct FusedQkvIu4PreparedParams<'a> {
+    pub kind: KernelKey,
+    pub weights: &'a [&'a GpuTensor],
+    pub x_rot: &'a GpuTensor,
+    pub prepared: &'a rdna_compute::Int4MmqPrepared,
+    pub outputs: &'a [&'a GpuTensor],
+    pub m: &'a [usize],
+    pub k: usize,
+    pub batch_size: usize,
 }
 
 pub struct FusedQkvFamily {
@@ -90,6 +366,107 @@ impl FusedQkvFamily {
         self.resolve(params.kind, ctx, None)?;
         dispatch_fused_qkv_with_qwen2_bias(gpu, params)
     }
+
+    /// Opt-in exact IU4 RMSNorm producer for a prepared QKV / QKVZA consumer.
+    /// Resolves `params.kind` through the registry like [`Self::run`], reserves
+    /// the IU4 sidecar and seals it into a prepared handle.
+    pub fn emit_rmsnorm_iu4_exact(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        params: &FusedQkvIu4RmsnormParams,
+    ) -> Result<rdna_compute::Int4MmqPrepared, DispatchError> {
+        self.resolve(params.kind, ctx, None)?;
+        require_iu4_prepared_kind(params.kind)?;
+        let reservation = hip!(gpu.reserve_int4_mmq(params.k, params.batch_size))?;
+        hip!(gpu.fused_rmsnorm_rotate_mq_i4_gfx12_exact_batched(
+            params.x,
+            params.norm_weight,
+            params.awq,
+            Some(params.x_rot),
+            reservation,
+            params.k,
+            params.eps,
+            params.batch_size,
+        ))
+    }
+
+    /// Prepared-IU4 twin of [`Self::run`] for uniform MQ4V2 QKV / QKVZA with
+    /// `Some(n)` batch size. The prepared consumers neither tap nor note the
+    /// F16 receipt, so this performs both once (one tap per constituent weight
+    /// in projection order on the F32 `x_rot`, then the receipt) before the
+    /// prepared GEMMs, matching the unprepared arm.
+    pub fn run_iu4_prepared(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        params: &FusedQkvIu4PreparedParams,
+    ) -> Result<(), DispatchError> {
+        self.resolve(params.kind, ctx, None)?;
+        require_iu4_prepared_kind(params.kind)?;
+        guard_fused_qkv_dtype_key(params.weights, params.kind)?;
+        let (x, k, n) = (params.x_rot, params.k, params.batch_size);
+        match params.kind {
+            KernelKey::FusedQkvMq4G256V2 => {
+                let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                    .map_err(|_| err_wrong_arity(params.kind, 3))?;
+                let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                    .map_err(|_| err_wrong_arity(params.kind, 3))?;
+                let [mq, mk, mv] = <[usize; 3]>::try_from(params.m)
+                    .map_err(|_| err_wrong_arity(params.kind, 3))?;
+                gpu.maybe_capture_activation(wq, x, n, k);
+                gpu.maybe_capture_activation(wk, x, n, k);
+                gpu.maybe_capture_activation(wv, x, n, k);
+                gpu.iu4_verify_note_f16();
+                hip!(gpu.gemm_qkv_mq4g256v2_wmma_iu4_prepared(
+                    wq,
+                    wk,
+                    wv,
+                    params.prepared,
+                    q,
+                    kout,
+                    v,
+                    mq,
+                    mk,
+                    mv,
+                    k,
+                    n,
+                ))
+            }
+            KernelKey::FusedQkvzaMq4G256V2 => {
+                let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights)
+                    .map_err(|_| err_wrong_arity(params.kind, 4))?;
+                let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                    .map_err(|_| err_wrong_arity(params.kind, 4))?;
+                let [mqkv, mz, mbeta, malpha] = <[usize; 4]>::try_from(params.m)
+                    .map_err(|_| err_wrong_arity(params.kind, 4))?;
+                gpu.maybe_capture_activation(wqkv, x, n, k);
+                gpu.maybe_capture_activation(wz, x, n, k);
+                gpu.maybe_capture_activation(w_beta, x, n, k);
+                gpu.maybe_capture_activation(w_alpha, x, n, k);
+                gpu.iu4_verify_note_f16();
+                hip!(gpu.gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
+                    wqkv,
+                    wz,
+                    w_beta,
+                    w_alpha,
+                    x,
+                    params.prepared,
+                    qkv,
+                    z,
+                    beta,
+                    alpha,
+                    mqkv,
+                    mz,
+                    mbeta,
+                    malpha,
+                    k,
+                    n,
+                ))
+            }
+            other => Err(err_wrong_arity(other, 0)),
+        }
+    }
 }
 
 impl KernelFamily for FusedQkvFamily {
@@ -98,13 +475,21 @@ impl KernelFamily for FusedQkvFamily {
     }
 }
 
-macro_rules! hip {
-    ($e:expr) => {
-        $e.map_err(|e| DispatchError::Hip(e.to_string()))
-    };
+/// The prepared-IU4 entry points exist only for the uniform MQ4V2 QKV and
+/// QKVZA keys; any other key is a caller error.
+fn require_iu4_prepared_kind(kind: KernelKey) -> Result<(), DispatchError> {
+    match kind {
+        KernelKey::FusedQkvMq4G256V2 | KernelKey::FusedQkvzaMq4G256V2 => Ok(()),
+        other => Err(DispatchError::Hip(format!(
+            "fused_qkv prepared IU4: key {other:?} has no prepared IU4 consumer \
+             (only FusedQkvMq4G256V2 / FusedQkvzaMq4G256V2)"
+        ))),
+    }
 }
 
 fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), DispatchError> {
+    // Guard: never route V2 bytes through a v1 kernel or vice-versa.
+    guard_fused_qkv_dtype_key(params.weights, params.kind)?;
     let x = params.x;
     let k = params.k;
     match params.kind {
@@ -126,9 +511,151 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] =
                 <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkv_hfq4g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
                 None => hip!(gpu.fused_qkv_hfq4g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
+        }
+        KernelKey::FusedQkvMq4G256V2 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => {
+                    hip!(gpu.gemm_qkv_hfq4g256_mq4v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
+                None => {
+                    hip!(gpu.fused_qkv_hfq4g256_mq4v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
+                }
+            }
+        }
+        // Explicit exact verify QKV (1..=128 rows, singleton F16-WMMA chain).
+        // Batched-only: never falls back to a product kernel.
+        KernelKey::FusedQkvMq4G256V2VerifyExact => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let n = params
+                .batch_size
+                .ok_or(DispatchError::MissingImpl { key: params.kind })?;
+            // Calibration taps: one per constituent weight, shared input x.
+            gpu.maybe_capture_activation(wq, x, n, k);
+            gpu.maybe_capture_activation(wk, x, n, k);
+            gpu.maybe_capture_activation(wv, x, n, k);
+            hip!(gpu.gemm_qkv_mq4g256v2_verify_exact(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+        }
+        KernelKey::FusedQkvMq6G256V2 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => {
+                    hip!(gpu.gemm_qkv_mq6g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
+                None => hip!(gpu.fused_qkv_mq6g256v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
+        }
+        KernelKey::FusedQkvMq5G256V2 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => {
+                    hip!(gpu.gemm_qkv_mq5g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
+                None => hip!(gpu.fused_qkv_mq5g256v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
+        }
+        KernelKey::FusedQkvMq3G256V2 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) if super::gemm::mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, n) => {
+                    hip!(gpu.gemm_qkv_mq3v25_iu8(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
+                Some(n) if super::gemm::mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, n, mq) => {
+                    hip!(gpu.gemm_qkv_mq3v25_iu4(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
+                Some(n) => {
+                    hip!(gpu.gemm_qkv_mq3g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
+                None => hip!(gpu.fused_qkv_mq3g256v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
+        }
+        KernelKey::FusedQkvMq2G256V2 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => {
+                    hip!(gpu.gemm_qkv_mq2g256v2_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
+                }
+                None => hip!(gpu.fused_qkv_mq2g256v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
+            }
+        }
+        KernelKey::FusedQkvMq4CG256 => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkv_mq4cg256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
+                None => hip!(gpu.fused_qkv_mq4cg256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k)),
             }
         }
         KernelKey::FusedQkvMq3G256Lloyd => {
@@ -138,6 +665,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] =
                 <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+
             match params.batch_size {
                 // Prefill mq3-lloyd is WMMA-only (`gemm_qkv_mq3g256_lloyd_wmma`);
                 // arch_required=HasWmma gates the entry.
@@ -155,6 +688,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] =
                 <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => {
                     hip!(gpu
@@ -170,6 +709,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] =
                 <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkv_hfq6g256(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n)),
                 None if gpu.arch_caps.gemv_dp4a_enabled() => {
@@ -185,6 +730,11 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] =
                 <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x (decode, n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+
             hip!(gpu.fused_qkv_q4k(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
         }
         // ── Q8_0 fused QKV ──
@@ -199,6 +749,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 3))?;
             let [mq, mk, mv] =
                 <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wq, x, __cap_n, k);
+            gpu.maybe_capture_activation(wk, x, __cap_n, k);
+            gpu.maybe_capture_activation(wv, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => {
                     hip!(gpu.gemm_qkv_q8_0_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
@@ -224,6 +780,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 arch: "",
                 quant: "hfq3g256 (prefill-only)",
             })?;
+            gpu.maybe_capture_activation(wq, x, n, k);
+            gpu.maybe_capture_activation(wk, x, n, k);
+            gpu.maybe_capture_activation(wv, x, n, k);
+
             if gpu.arch_caps.has_wmma() {
                 hip!(gpu.gemm_qkv_hfq3g256_wmma(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
             } else {
@@ -248,6 +808,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 arch: "",
                 quant: "hfp4g32 (prefill-only)",
             })?;
+            gpu.maybe_capture_activation(wq, x, n, k);
+            gpu.maybe_capture_activation(wk, x, n, k);
+            gpu.maybe_capture_activation(wv, x, n, k);
+
             hip!(gpu.gemm_qkv_hfp4g32(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
         }
 
@@ -264,12 +828,182 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] =
                 <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_beta, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkvza_hfq4g256(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
                     n
                 )),
                 None => hip!(gpu.fused_qkvza_hfq4g256(
+                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k
+                )),
+            }
+        }
+        KernelKey::FusedQkvzaMq4G256V2 => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_beta, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_hfq4g256_mq4v2(
+                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
+                    n
+                )),
+                None => hip!(gpu.fused_qkvza_hfq4g256_mq4v2(
+                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k
+                )),
+            }
+        }
+        // Explicit exact verify QKVZA (1..=128 rows, singleton F16-WMMA chain).
+        // Batched-only: never falls back to a product kernel.
+        KernelKey::FusedQkvzaMq4G256V2VerifyExact => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let n = params
+                .batch_size
+                .ok_or(DispatchError::MissingImpl { key: params.kind })?;
+            // Calibration taps: one per constituent weight, shared input x.
+            gpu.maybe_capture_activation(wqkv, x, n, k);
+            gpu.maybe_capture_activation(wz, x, n, k);
+            gpu.maybe_capture_activation(w_beta, x, n, k);
+            gpu.maybe_capture_activation(w_alpha, x, n, k);
+            hip!(gpu.gemm_qkvza_mq4g256v2_verify_exact(
+                wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n
+            ))
+        }
+        KernelKey::FusedQkvzaMq5G256V2 => {
+            let [wqkv, wz, wb, wa] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mb, ma] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(wb, x, __cap_n, k);
+            gpu.maybe_capture_activation(wa, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_mq5g256v2_wmma(
+                    wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
+                )),
+                None => hip!(gpu.fused_qkvza_mq5g256v2(
+                    wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k
+                )),
+            }
+        }
+        KernelKey::FusedQkvzaMq6G256V2 => {
+            let [wqkv, wz, wb, wa] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mb, ma] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(wb, x, __cap_n, k);
+            gpu.maybe_capture_activation(wa, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_mq6g256v2_wmma(
+                    wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
+                )),
+                None => hip!(gpu.fused_qkvza_mq6g256v2(
+                    wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k
+                )),
+            }
+        }
+        KernelKey::FusedQkvzaMq3G256V2 => {
+            let [wqkv, wz, wb, wa] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mb, ma] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(wb, x, __cap_n, k);
+            gpu.maybe_capture_activation(wa, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) if super::gemm::mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, n) => {
+                    hip!(gpu.gemm_qkvza_mq3v25_iu8(
+                        wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
+                    ))
+                }
+                Some(n) if super::gemm::mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, n, mqkv) => {
+                    hip!(gpu.gemm_qkvza_mq3v25_iu4(
+                        wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
+                    ))
+                }
+                Some(n) => hip!(gpu.gemm_qkvza_mq3g256v2_wmma(
+                    wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
+                )),
+                None => hip!(gpu.fused_qkvza_mq3g256v2(
+                    wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k
+                )),
+            }
+        }
+        KernelKey::FusedQkvzaMq2G256V2 => {
+            let [wqkv, wz, wb, wa] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mb, ma] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(wb, x, __cap_n, k);
+            gpu.maybe_capture_activation(wa, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_mq2g256v2_wmma(
+                    wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k, n
+                )),
+                None => hip!(gpu.fused_qkvza_mq2g256v2(
+                    wqkv, wz, wb, wa, x, qkv, z, beta, alpha, mqkv, mz, mb, ma, k
+                )),
+            }
+        }
+        KernelKey::FusedQkvzaMq4CG256 => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_beta, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_qkvza_mq4cg256(
+                    wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
+                    n
+                )),
+                None => hip!(gpu.fused_qkvza_mq4cg256(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k
                 )),
             }
@@ -281,6 +1015,13 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] =
                 <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_beta, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkvza_mq3g256_lloyd_wmma(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
@@ -298,6 +1039,13 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] =
                 <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_beta, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkvza_mq4g256_lloyd_wmma(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
@@ -315,6 +1063,13 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] =
                 <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_beta, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
+
             match params.batch_size {
                 // Batched prefill: cross-arch ladder (wmma_gfx12/wmma/dp4a/dot2/fp16/scalar).
                 Some(n) => hip!(gpu.gemm_qkvza_hfq6g256(
@@ -344,6 +1099,13 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 4))?;
             let [mqkv, mz, mbeta, malpha] =
                 <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wqkv, x, __cap_n, k);
+            gpu.maybe_capture_activation(wz, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_beta, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_alpha, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_qkvza_q8_0_wmma(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
@@ -370,6 +1132,11 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 arch: "",
                 quant: "hfq3g256 (prefill-only)",
             })?;
+            gpu.maybe_capture_activation(wqkv, x, n, k);
+            gpu.maybe_capture_activation(wz, x, n, k);
+            gpu.maybe_capture_activation(w_beta, x, n, k);
+            gpu.maybe_capture_activation(w_alpha, x, n, k);
+
             if gpu.arch_caps.has_wmma() {
                 hip!(gpu.gemm_qkvza_hfq3g256_wmma(
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k,
@@ -399,6 +1166,11 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 arch: "",
                 quant: "hfp4g32 (prefill-only)",
             })?;
+            gpu.maybe_capture_activation(wqkv, x, n, k);
+            gpu.maybe_capture_activation(wz, x, n, k);
+            gpu.maybe_capture_activation(w_beta, x, n, k);
+            gpu.maybe_capture_activation(w_alpha, x, n, k);
+
             hip!(gpu.gemm_qkvza_hfp4g32(
                 wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n
             ))
@@ -422,6 +1194,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     quant: "mfp4g32e8 (decode-only)",
                 });
             }
+            // Calibration taps: one per constituent weight, shared input x (decode, n=1).
+            gpu.maybe_capture_activation(wqkv, x, 1, k);
+            gpu.maybe_capture_activation(wz, x, 1, k);
+            gpu.maybe_capture_activation(w_beta, x, 1, k);
+            gpu.maybe_capture_activation(w_alpha, x, 1, k);
+
             hip!(gpu.fused_qkvza_mfp4g32_e8(
                 wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k
             ))
@@ -443,9 +1221,143 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 2))?;
             let [mg, mu] =
                 <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(w_gate, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_up, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_gate_up_hfq4g256(w_gate, w_up, x, gate, up, mg, mu, k, n)),
                 None => hip!(gpu.fused_gate_up_hfq4g256(w_gate, w_up, x, gate, up, mg, mu, k)),
+            }
+        }
+        KernelKey::FusedGateUpMq4G256V2 => {
+            let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(w_gate, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_up, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => {
+                    hip!(gpu.gemm_gate_up_hfq4g256_mq4v2(w_gate, w_up, x, gate, up, mg, mu, k, n))
+                }
+                None => {
+                    hip!(gpu.fused_gate_up_hfq4g256_mq4v2(w_gate, w_up, x, gate, up, mg, mu, k))
+                }
+            }
+        }
+        // Explicit exact verify gate+up (1..=128 rows, singleton F16-WMMA chain).
+        // Batched-only: never falls back to a product kernel.
+        KernelKey::FusedGateUpMq4G256V2VerifyExact => {
+            let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let n = params
+                .batch_size
+                .ok_or(DispatchError::MissingImpl { key: params.kind })?;
+            // Calibration taps: one per constituent weight, shared input x.
+            gpu.maybe_capture_activation(w_gate, x, n, k);
+            gpu.maybe_capture_activation(w_up, x, n, k);
+            hip!(gpu.gemm_gate_up_mq4g256v2_verify_exact(w_gate, w_up, x, gate, up, mg, mu, k, n))
+        }
+        KernelKey::FusedGateUpMq5G256V2 => {
+            let [wg, wu] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [g, u] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wg, x, __cap_n, k);
+            gpu.maybe_capture_activation(wu, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => {
+                    hip!(gpu.gemm_gate_up_mq5g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
+                }
+                None => hip!(gpu.fused_gate_up_mq5g256v2(wg, wu, x, g, u, mg, mu, k)),
+            }
+        }
+        KernelKey::FusedGateUpMq6G256V2 => {
+            let [wg, wu] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [g, u] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wg, x, __cap_n, k);
+            gpu.maybe_capture_activation(wu, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => {
+                    hip!(gpu.gemm_gate_up_mq6g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
+                }
+                None => hip!(gpu.fused_gate_up_mq6g256v2(wg, wu, x, g, u, mg, mu, k)),
+            }
+        }
+        KernelKey::FusedGateUpMq3G256V2 => {
+            let [wg, wu] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [g, u] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wg, x, __cap_n, k);
+            gpu.maybe_capture_activation(wu, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) if super::gemm::mq3v25_a8_route(&gpu.flags, gpu.mq3v2_symmetric, n) => {
+                    hip!(gpu.gemm_gate_up_mq3v25_iu8(wg, wu, x, g, u, mg, mu, k, n))
+                }
+                Some(n) if super::gemm::mq3v25_route(&gpu.flags, gpu.mq3v2_symmetric, n, mg) => {
+                    hip!(gpu.gemm_gate_up_mq3v25_iu4(wg, wu, x, g, u, mg, mu, k, n))
+                }
+                Some(n) => {
+                    hip!(gpu.gemm_gate_up_mq3g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
+                }
+                None => hip!(gpu.fused_gate_up_mq3g256v2(wg, wu, x, g, u, mg, mu, k)),
+            }
+        }
+        KernelKey::FusedGateUpMq2G256V2 => {
+            let [wg, wu] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [g, u] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(wg, x, __cap_n, k);
+            gpu.maybe_capture_activation(wu, x, __cap_n, k);
+            match params.batch_size {
+                Some(n) => {
+                    hip!(gpu.gemm_gate_up_mq2g256v2_wmma(wg, wu, x, g, u, mg, mu, k, n))
+                }
+                None => hip!(gpu.fused_gate_up_mq2g256v2(wg, wu, x, g, u, mg, mu, k)),
+            }
+        }
+        KernelKey::FusedGateUpMq4CG256 => {
+            let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(w_gate, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_up, x, __cap_n, k);
+
+            match params.batch_size {
+                Some(n) => hip!(gpu.gemm_gate_up_mq4cg256(w_gate, w_up, x, gate, up, mg, mu, k, n)),
+                None => hip!(gpu.fused_gate_up_mq4cg256(w_gate, w_up, x, gate, up, mg, mu, k)),
             }
         }
         // MFP4G32E8 fused gate+up — DECODE-ONLY (gfx1151 launch-fusion). Same
@@ -465,6 +1377,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     quant: "mfp4g32e8 (decode-only)",
                 });
             }
+            // Calibration taps: one per constituent weight, shared input x (decode, n=1).
+            gpu.maybe_capture_activation(w_gate, x, 1, k);
+            gpu.maybe_capture_activation(w_up, x, 1, k);
+
             hip!(gpu.fused_gate_up_mfp4g32_e8(w_gate, w_up, x, gate, up, mg, mu, k))
         }
         KernelKey::FusedGateUpMq3G256Lloyd => {
@@ -474,6 +1390,11 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 2))?;
             let [mg, mu] =
                 <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(w_gate, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_up, x, __cap_n, k);
+
             match params.batch_size {
                 // Prefill mq3-lloyd is WMMA-only (`gemm_gate_up_mq3g256_lloyd_wmma`,
                 // routed for_arch over RDNA3/RDNA4); arch_required=HasWmma gates entry.
@@ -491,6 +1412,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 2))?;
             let [mg, mu] =
                 <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x (decode, n=1).
+            gpu.maybe_capture_activation(w_gate, x, 1, k);
+            gpu.maybe_capture_activation(w_up, x, 1, k);
+
             hip!(gpu.fused_gate_up_mq4g256_lloyd(w_gate, w_up, x, gate, up, mg, mu, k))
         }
         KernelKey::FusedGateUpHfq6G256 => {
@@ -500,6 +1425,11 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 2))?;
             let [mg, mu] =
                 <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(w_gate, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_up, x, __cap_n, k);
+
             match params.batch_size {
                 Some(n) => hip!(gpu.gemm_gate_up_hfq6g256(w_gate, w_up, x, gate, up, mg, mu, k, n)),
                 None if gpu.arch_caps.gemv_dp4a_enabled() => {
@@ -515,6 +1445,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 2))?;
             let [mg, mu] =
                 <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x (decode, n=1).
+            gpu.maybe_capture_activation(w_gate, x, 1, k);
+            gpu.maybe_capture_activation(w_up, x, 1, k);
+
             hip!(gpu.fused_gate_up_q4k(w_gate, w_up, x, gate, up, mg, mu, k))
         }
         KernelKey::FusedGateUpQ8_0 => {
@@ -524,6 +1458,11 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 .map_err(|_| err_wrong_arity(params.kind, 2))?;
             let [mg, mu] =
                 <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            // Calibration taps: one per constituent weight, shared input x.
+            let __cap_n = params.batch_size.unwrap_or(1);
+            gpu.maybe_capture_activation(w_gate, x, __cap_n, k);
+            gpu.maybe_capture_activation(w_up, x, __cap_n, k);
+
             match params.batch_size {
                 // Prefill Q8 gate+up routes ONLY the WMMA arch case here
                 // (`gemm_gate_up_q8_0_wmma`); the non-WMMA arch case stays as two
@@ -552,6 +1491,9 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 arch: "",
                 quant: "hfq3g256 (prefill-only)",
             })?;
+            gpu.maybe_capture_activation(w_gate, x, n, k);
+            gpu.maybe_capture_activation(w_up, x, n, k);
+
             if gpu.arch_caps.has_wmma() {
                 hip!(gpu.gemm_gate_up_hfq3g256_wmma(w_gate, w_up, x, gate, up, mg, mu, k, n))
             } else {
@@ -574,6 +1516,9 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 arch: "",
                 quant: "hfp4g32 (prefill-only)",
             })?;
+            gpu.maybe_capture_activation(w_gate, x, n, k);
+            gpu.maybe_capture_activation(w_up, x, n, k);
+
             hip!(gpu.gemm_gate_up_hfp4g32(w_gate, w_up, x, gate, up, mg, mu, k, n))
         }
 
@@ -600,6 +1545,10 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 mg,
                 k
             );
+            // Calibration taps: one per constituent weight, shared input x (decode, n=1).
+            gpu.maybe_capture_activation(w_gate, x, 1, k);
+            gpu.maybe_capture_activation(w_up, x, 1, k);
+
             hip!(gpu.fused_gate_up_paro4g128t(w_gate, w_up, x, gate, up, &rs[0], mg, k))
         }
         // QKVZA: 4 explicit rotation scratch buffers.
@@ -634,6 +1583,12 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 "FusedQkvzaParo4G128T requires k%128==0, got {}",
                 k
             );
+            // Calibration taps: one per constituent weight, shared input x (decode, n=1).
+            gpu.maybe_capture_activation(wqkv, x, 1, k);
+            gpu.maybe_capture_activation(wz, x, 1, k);
+            gpu.maybe_capture_activation(w_beta, x, 1, k);
+            gpu.maybe_capture_activation(w_alpha, x, 1, k);
+
             hip!(gpu.fused_qkvza_paro4g128t(
                 wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, &rs[0], &rs[1], &rs[2], &rs[3],
                 mqkv, mz, mbeta, malpha, k
@@ -663,6 +1618,11 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                 "FusedQkvParo4G128T requires k%128==0, got {}",
                 k
             );
+            // Calibration taps: one per constituent weight, shared input x (decode, n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+
             hip!(gpu.fused_qkvza_paro4g128t(
                 wq, wk, wv, wq, // a3 = wq (aliased)
                 x, q, kout, v, q, // y3 = q (aliased)
@@ -684,6 +1644,11 @@ fn dispatch_fused_qkv_with_qwen2_bias(
     gpu: &mut Gpu,
     params: &FusedQkvBiasParams,
 ) -> Result<(), DispatchError> {
+    // Guard: same v1/v2 cross-check as the non-bias path, but with the 3 bias weights.
+    guard_fused_qkv_dtype_key(
+        &[params.weights[0], params.weights[1], params.weights[2]],
+        params.kind,
+    )?;
     let [wq, wk, wv] = params.weights;
     let [q, kout, v] = params.outputs;
     let [mq, mk, mv] = params.m;
@@ -692,102 +1657,192 @@ fn dispatch_fused_qkv_with_qwen2_bias(
     let x = params.x;
 
     match params.kind {
-        KernelKey::FusedQkvHfq4G256 => hip!(gpu.fused_qkv_hfq4g256_with_bias(
-            wq,
-            wk,
-            wv,
-            x,
-            q,
-            kout,
-            v,
-            mq,
-            mk,
-            mv,
-            k,
-            bq.buf.as_ptr(),
-            bk.buf.as_ptr(),
-            bv.buf.as_ptr()
-        )),
-        KernelKey::FusedQkvMq3G256Lloyd => hip!(gpu.fused_qkv_mq3g256_lloyd_with_bias(
-            wq,
-            wk,
-            wv,
-            x,
-            q,
-            kout,
-            v,
-            mq,
-            mk,
-            mv,
-            k,
-            bq.buf.as_ptr(),
-            bk.buf.as_ptr(),
-            bv.buf.as_ptr()
-        )),
-        KernelKey::FusedQkvMq4G256Lloyd => hip!(gpu.fused_qkv_mq4g256_lloyd_with_bias(
-            wq,
-            wk,
-            wv,
-            x,
-            q,
-            kout,
-            v,
-            mq,
-            mk,
-            mv,
-            k,
-            bq.buf.as_ptr(),
-            bk.buf.as_ptr(),
-            bv.buf.as_ptr()
-        )),
-        KernelKey::FusedQkvHfq6G256 => hip!(gpu.fused_qkv_hfq6g256_with_bias(
-            wq,
-            wk,
-            wv,
-            x,
-            q,
-            kout,
-            v,
-            mq,
-            mk,
-            mv,
-            k,
-            bq.buf.as_ptr(),
-            bk.buf.as_ptr(),
-            bv.buf.as_ptr()
-        )),
-        KernelKey::FusedQkvQ4K => hip!(gpu.fused_qkv_q4k_with_bias(
-            wq,
-            wk,
-            wv,
-            x,
-            q,
-            kout,
-            v,
-            mq,
-            mk,
-            mv,
-            k,
-            bq.buf.as_ptr(),
-            bk.buf.as_ptr(),
-            bv.buf.as_ptr()
-        )),
-        KernelKey::FusedQkvQ8_0 => hip!(gpu.fused_qkv_q8_0_with_bias(
-            wq,
-            wk,
-            wv,
-            x,
-            q,
-            kout,
-            v,
-            mq,
-            mk,
-            mv,
-            k,
-            bq.buf.as_ptr(),
-            bk.buf.as_ptr(),
-            bv.buf.as_ptr()
-        )),
+        KernelKey::FusedQkvHfq4G256 => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_hfq4g256_with_bias(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        }
+        KernelKey::FusedQkvMq4G256V2 => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_hfq4g256_with_bias_mq4v2(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        }
+        KernelKey::FusedQkvMq5G256V2 => {
+            return Err(DispatchError::Hip(
+                "FusedQkvMq5G256V2 bias not implemented".to_string(),
+            ))
+        }
+        KernelKey::FusedQkvMq6G256V2 => {
+            return Err(DispatchError::Hip(
+                "FusedQkvMq6G256V2 bias not implemented".to_string(),
+            ))
+        }
+        KernelKey::FusedQkvMq4CG256 => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_mq4cg256_with_bias(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        }
+        KernelKey::FusedQkvMq3G256Lloyd => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_mq3g256_lloyd_with_bias(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        }
+        KernelKey::FusedQkvMq4G256Lloyd => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_mq4g256_lloyd_with_bias(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        }
+        KernelKey::FusedQkvHfq6G256 => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_hfq6g256_with_bias(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        }
+        KernelKey::FusedQkvQ4K => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_q4k_with_bias(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        }
+        KernelKey::FusedQkvQ8_0 => {
+            // Calibration taps: one per constituent weight, shared input x (qwen2 bias, decode n=1).
+            gpu.maybe_capture_activation(wq, x, 1, k);
+            gpu.maybe_capture_activation(wk, x, 1, k);
+            gpu.maybe_capture_activation(wv, x, 1, k);
+            hip!(gpu.fused_qkv_q8_0_with_bias(
+                wq,
+                wk,
+                wv,
+                x,
+                q,
+                kout,
+                v,
+                mq,
+                mk,
+                mv,
+                k,
+                bq.buf.as_ptr(),
+                bk.buf.as_ptr(),
+                bv.buf.as_ptr()
+            ))
+        }
         _ => Err(DispatchError::UnsupportedVariant {
             family: "fused_qkv",
             variant: "qwen2_bias",
@@ -823,5 +1878,35 @@ fn err_wrong_arity(kind: KernelKey, expected: usize) -> DispatchError {
         // Not a fused-projection key (should be unreachable from this family) —
         // fall back to the bare missing-impl report rather than mislabel it.
         None => DispatchError::MissingImpl { key: kind },
+    }
+}
+
+#[cfg(test)]
+mod dispatch_tests {
+    use super::is_fused_v2_key;
+    use crate::types::KernelKey;
+
+    #[test]
+    fn v2_fused_keys_never_hfq4() {
+        let cases: &[(KernelKey, &str)] = &[
+            (KernelKey::FusedQkvMq6G256V2, "qkv6"),
+            (KernelKey::FusedQkvMq5G256V2, "qkv5"),
+            (KernelKey::FusedQkvMq3G256V2, "qkv3"),
+            (KernelKey::FusedQkvMq2G256V2, "qkv2"),
+            (KernelKey::FusedQkvzaMq6G256V2, "qkvza6"),
+            (KernelKey::FusedQkvzaMq5G256V2, "qkvza5"),
+            (KernelKey::FusedQkvzaMq3G256V2, "qkvza3"),
+            (KernelKey::FusedQkvzaMq2G256V2, "qkvza2"),
+            (KernelKey::FusedGateUpMq6G256V2, "gate6"),
+            (KernelKey::FusedGateUpMq5G256V2, "gate5"),
+            (KernelKey::FusedGateUpMq3G256V2, "gate3"),
+            (KernelKey::FusedGateUpMq2G256V2, "gate2"),
+        ];
+        for (key, _) in cases {
+            assert!(is_fused_v2_key(*key), "V2 key not recognized {:?}", key);
+            assert_ne!(*key, KernelKey::FusedQkvHfq4G256);
+            assert_ne!(*key, KernelKey::FusedQkvzaHfq4G256);
+            assert_ne!(*key, KernelKey::FusedGateUpHfq4G256);
+        }
     }
 }

@@ -4,9 +4,44 @@
 
 //! Graph-capture lifecycle for AR forward, DFlash verify, and DeltaNet replay.
 
-use hip_bridge::{Graph, GraphExec, HipResult, HipRuntime, Stream};
+use hip_bridge::{Graph, GraphExec, HipError, HipResult, HipRuntime, Stream};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+
+/// Set once any hipGraph is instantiated in this process.
+///
+/// A captured graph's nodes embed the device pointers that were live at
+/// capture time. Releasing one of those buffers later makes every subsequent
+/// replay read freed memory, which surfaces as
+/// `HipError(700): illegal memory access` at the next synchronisation point —
+/// typically somewhere unrelated, because the fault is reported late.
+///
+/// `scratch::grow_scratch_buffer` consults this before releasing a replaced
+/// scratch buffer: architectures that never capture (Muse Glimmer has no
+/// hipGraph decode path by design) free immediately, while architectures
+/// that do capture (qwen35's verify / replay / AR-forward graphs) invalidate
+/// first. Freeing under a live graph was measured to break qwen35 outright
+/// — every turn of a 4-turn DFlash session returned empty with
+/// `spec_step: HipError(700) ... reset_recurrent` — so every `Gpu` scratch
+/// caller checks `scratch::scratch_will_grow` before delegating and drops
+/// all captured execution state via `Gpu::invalidate_for_scratch_growth`
+/// (the model-swap teardown `invalidate_for_layout_growth`: AR graph,
+/// verify / replay graphs, retained Redline route). Graphs re-capture
+/// lazily on the next replay; each growth event costs at most one
+/// re-capture. An earlier revision retained the old buffers with
+/// `std::mem::forget` instead — that leak is fixed; no path retains.
+static ANY_GRAPH_CAPTURED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// True once any hipGraph has been instantiated in this process.
+pub(crate) fn any_graph_captured() -> bool {
+    ANY_GRAPH_CAPTURED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Latch the graph-captured flag. Called from every graph instantiation site.
+pub(crate) fn mark_graph_captured() {
+    ANY_GRAPH_CAPTURED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 // Thread-local cache of the last device id bound on this thread.
 // Shared with `Gpu::bind_thread` / `Gpu::bind_thread_or_warn` in dispatch.rs.
@@ -63,12 +98,25 @@ pub struct PerBGraphCache {
     /// DFlash verify lm_head + argmax tail. Callers check this before
     /// deciding whether to enqueue lm_head outside the graph.
     pub lmhead_argmax: HashSet<usize>,
+    /// Subset of cache entries captured with the gfx1201 native-fp8 split-KV
+    /// verifier route (see `Gpu::fp8_fa2_split_verify_admitted`). The route
+    /// depends on the live context, which a replay cannot change, so a
+    /// caller compares this class with the window's own before each replay
+    /// and re-captures on a mismatch.
+    pub fp8_split: HashSet<usize>,
 }
 
 /// Graph-capture state split across AR forward, DFlash verify, and DeltaNet replay.
 pub struct GraphState {
     // AR forward (single-slot)
     pub capture_mode: bool,
+    /// The model owns host-mapped weights the CPU multiplies
+    /// (`memory.offload_exec=cpu` over a spilled prefix). A CPU step is a host
+    /// sync point — a D2H/H2D around the multiplication — so it can neither be
+    /// recorded into a hipGraph nor replayed out of one; capture is refused
+    /// centrally here. Set once per load from the resolved placement, cleared on
+    /// unload; false for every non-offload model (the zero-diff default).
+    pub host_cpu_weights: bool,
     pub capture_blobs: Vec<Vec<u8>>,
     pub graph_exec: Option<GraphExec>,
     pub captured_graph: Option<Graph>,
@@ -81,12 +129,25 @@ pub struct GraphState {
     pub ar_forward_blobs: Vec<Vec<u8>>,
     pub ar_forward_kernel_dirty: bool,
     pub ar_forward_replay_enabled: bool,
+    /// Caller-defined identity of the buffers baked into `graph_exec` (the
+    /// qwen35 `forward_scratch` binding of weights, KV cache, DeltaNet state
+    /// and scratch). Zero means unbound: every AR capture resets it, and only
+    /// the capturing caller sets it. A replay must see the binding it was
+    /// captured with; the graph ignores the buffers a later call passes.
+    pub ar_forward_binding: u64,
     /// One-shot AR-graph eligibility, CONSUMED (reset to **true**) on read in
     /// `forward_scratch`. Plain sequential single-token decode is eligible by
     /// default; the spec-decode / MTP / verify callers set it FALSE right before
     /// their `forward_scratch` call so the plain-AR graph can't capture/replay
     /// in their non-sequential context.
     pub ar_graph_eligible: bool,
+
+    /// Per-segment AR graphs for dense TP decode. Each entry owns its kernarg
+    /// blobs (drained from shared `capture_blobs` at `end_graph_capture_segment`)
+    /// so segment lifetime is independent of later captures that clear the
+    /// shared blob vec. Destroyed in `drop_graph_segments` / `drop_captured_graph`
+    /// / `graph_destroy`.
+    pub ar_segments: Vec<(Graph, GraphExec, Vec<Vec<u8>>)>,
 
     // Verify (DFlash, per-B)
     pub verify: PerBGraphCache,
@@ -107,10 +168,43 @@ impl GraphState {
         device_id: i32,
         stream: &Stream,
     ) -> HipResult<()> {
+        if self.host_cpu_weights {
+            return Err(HipError::new(
+                0,
+                "hipGraph capture refused: the model owns CPU-executed (host) weights",
+            ));
+        }
         bind_thread(hip, device_id)?;
         self.capture_blobs.clear();
         self.capture_mode = true;
         hip.stream_begin_capture(stream, 0) // 0 = hipStreamCaptureModeGlobal
+    }
+
+    /// Begin a graph capture that may contain system-scope coordination with
+    /// independently captured peer-device streams. ROCm rejects that shape in
+    /// Global mode; Relaxed mode keeps each rank graph independent while the
+    /// captured signal kernels provide the explicit ordering contract.
+    pub fn begin_graph_capture_relaxed(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        if self.host_cpu_weights {
+            return Err(HipError::new(
+                0,
+                "hipGraph capture refused: the model owns CPU-executed (host) weights",
+            ));
+        }
+        bind_thread(hip, device_id)?;
+        self.capture_blobs.clear();
+        self.capture_mode = true;
+        if let Err(e) = hip.stream_begin_capture(stream, 2) {
+            // 2 = hipStreamCaptureModeRelaxed
+            self.capture_mode = false;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// End capture, instantiate the graph for replay.
@@ -124,8 +218,10 @@ impl GraphState {
         self.capture_mode = false;
         let graph = hip.stream_end_capture(stream)?;
         let exec = hip.graph_instantiate(&graph)?;
+        mark_graph_captured();
         self.captured_graph = Some(graph);
         self.graph_exec = Some(exec);
+        self.ar_forward_binding = 0;
         // Take OWNERSHIP of this graph's kernarg blobs out of the shared
         // `capture_blobs` (mirrors `end_verify_graph_capture`). The heap
         // allocations move with the Vec, so the graph nodes' kernarg pointers
@@ -133,6 +229,86 @@ impl GraphState {
         // `capture_blobs` can no longer dangle them.
         self.ar_forward_blobs = std::mem::take(&mut self.capture_blobs);
         Ok(())
+    }
+
+    /// End a per-segment capture (typically after `begin_graph_capture_relaxed`),
+    /// instantiate, and push ownership of the graph + kernarg blobs.
+    pub fn end_graph_capture_segment(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        // Always exit capture mode — even when bind/end/instantiate fails —
+        // so a partial segment attempt cannot leave dispatch in blob mode.
+        self.capture_mode = false;
+        if let Err(e) = bind_thread(hip, device_id) {
+            self.capture_blobs.clear();
+            return Err(e);
+        }
+        let graph = match hip.stream_end_capture(stream) {
+            Ok(g) => g,
+            Err(e) => {
+                self.capture_blobs.clear();
+                return Err(e);
+            }
+        };
+        let exec = match hip.graph_instantiate(&graph) {
+            Ok(exec) => exec,
+            Err(e) => {
+                let _ = hip.graph_destroy(graph);
+                self.capture_blobs.clear();
+                return Err(e);
+            }
+        };
+        mark_graph_captured();
+        // Only move blobs into the segment after instantiate succeeds.
+        let blobs = std::mem::take(&mut self.capture_blobs);
+        self.ar_segments.push((graph, exec, blobs));
+        Ok(())
+    }
+
+    /// How many captured AR segment graphs are retained.
+    pub fn graph_segment_count(&self) -> usize {
+        self.ar_segments.len()
+    }
+
+    /// Abort an in-flight capture without instantiating or retaining a graph.
+    /// Used when the capture body fails: leaves capture_mode off, drops partial
+    /// blobs, ends the stream capture, and destroys the returned Graph.
+    pub fn abort_graph_capture(&mut self, hip: &HipRuntime, device_id: i32, stream: &Stream) {
+        self.capture_mode = false;
+        self.capture_blobs.clear();
+        bind_thread_or_warn(hip, device_id);
+        if let Ok(graph) = hip.stream_end_capture(stream) {
+            let _ = hip.graph_destroy(graph);
+        }
+    }
+
+    /// Replay a previously captured AR segment by index.
+    pub fn graph_segment_launch(
+        &self,
+        hip: &HipRuntime,
+        device_id: i32,
+        stream: &Stream,
+        segment: usize,
+    ) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        let entry = self
+            .ar_segments
+            .get(segment)
+            .ok_or_else(|| HipError::new(0, &format!("no captured AR graph segment {segment}")))?;
+        hip.graph_launch(&entry.1, stream)
+    }
+
+    /// Destroy every per-segment AR graph and clear shared capture blobs.
+    pub fn drop_graph_segments(&mut self, hip: &HipRuntime, device_id: i32) {
+        bind_thread_or_warn(hip, device_id);
+        for (graph, exec, _blobs) in self.ar_segments.drain(..) {
+            let _ = hip.graph_exec_destroy(exec);
+            let _ = hip.graph_destroy(graph);
+        }
+        self.capture_blobs.clear();
     }
 
     /// Replay the captured graph.
@@ -171,6 +347,7 @@ impl GraphState {
         }
         self.capture_blobs.clear();
         self.ar_forward_blobs.clear();
+        self.drop_graph_segments(hip, device_id);
     }
 
     /// Caller signals a kernel-module change (model load, dtype switch, etc).
@@ -195,6 +372,7 @@ impl GraphState {
         self.ar_forward_blobs.clear();
         self.ar_forward_kernel_dirty = true;
         self.ar_forward_replay_enabled = false;
+        self.drop_graph_segments(hip, device_id);
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────
@@ -263,6 +441,7 @@ impl GraphState {
         self.capture_mode = false;
         let graph = hip.stream_end_capture(stream)?;
         let exec = hip.graph_instantiate(&graph)?;
+        mark_graph_captured();
         let blobs = std::mem::take(&mut self.capture_blobs);
         self.verify.cache.insert(b, (graph, exec, blobs));
         Ok(())
@@ -300,6 +479,33 @@ impl GraphState {
         self.verify.lmhead_argmax.insert(b);
     }
 
+    /// Was the captured verify graph for `b` recorded with the native-fp8
+    /// split-KV verifier route?
+    pub fn verify_graph_has_fp8_split(&self, b: usize) -> bool {
+        self.verify.fp8_split.contains(&b)
+    }
+
+    /// Mark the captured verify graph for `b` as recorded with the
+    /// native-fp8 split-KV verifier route.
+    pub fn verify_mark_graph_fp8_split(&mut self, b: usize) {
+        self.verify.fp8_split.insert(b);
+    }
+
+    /// Destroy the captured verify graph for `b` (and its warmup, so the
+    /// next window at `b` warms up and captures again), leaving every other
+    /// batch size. The caller must have synchronized the stream the graph
+    /// was launched on.
+    pub fn verify_graph_destroy(&mut self, hip: &HipRuntime, device_id: i32, b: usize) {
+        bind_thread_or_warn(hip, device_id);
+        if let Some((graph, exec, _blobs)) = self.verify.cache.remove(&b) {
+            let _ = hip.graph_exec_destroy(exec);
+            let _ = hip.graph_destroy(graph);
+        }
+        self.verify.warmed_up.remove(&b);
+        self.verify.lmhead_argmax.remove(&b);
+        self.verify.fp8_split.remove(&b);
+    }
+
     /// Destroy all cached verify graphs and their blobs.
     pub fn verify_graph_destroy_all(&mut self, hip: &HipRuntime, device_id: i32) {
         bind_thread_or_warn(hip, device_id);
@@ -309,6 +515,7 @@ impl GraphState {
         }
         self.verify.warmed_up.clear();
         self.verify.lmhead_argmax.clear();
+        self.verify.fp8_split.clear();
         self.verify.capturing = None;
     }
 
@@ -369,6 +576,7 @@ impl GraphState {
         self.capture_mode = false;
         let graph = hip.stream_end_capture(stream)?;
         let exec = hip.graph_instantiate(&graph)?;
+        mark_graph_captured();
         let blobs = std::mem::take(&mut self.capture_blobs);
         self.replay.cache.insert(n_steps, (graph, exec, blobs));
         Ok(())
@@ -405,5 +613,118 @@ impl GraphState {
         }
         self.replay.warmed_up.clear();
         self.replay.capturing = None;
+    }
+
+    /// Whether any hipGraph, graph exec, per-segment graph, verify/replay cache
+    /// entry, or in-progress capture exists. Every one of them bakes device
+    /// addresses into node parameters or kernarg blobs.
+    fn holds_captured_graph_state(&self) -> bool {
+        self.capture_mode
+            || self.graph_exec.is_some()
+            || self.captured_graph.is_some()
+            || !self.ar_segments.is_empty()
+            || !self.verify.cache.is_empty()
+            || self.verify.capturing.is_some()
+            || !self.replay.cache.is_empty()
+            || self.replay.capturing.is_some()
+    }
+
+    /// Relocation guard for VMM resource moves (`Gpu::relocate_qsa_resources`).
+    ///
+    /// Rewriting the pointer parameters of captured hipGraph kernel nodes is
+    /// not implemented. Qwen4 routes are PM4/HIP only and never capture a
+    /// hipGraph, so the supported state is "no graph state at all": `Ok(())`
+    /// when `moves` is empty or no graph, exec, segment, verify/replay cache
+    /// entry or capture exists. Any captured graph with a non-empty `moves`
+    /// fails closed instead of replaying stale addresses.
+    pub fn relocate_resources(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        moves: &[crate::dispatch::VmmResourceMove],
+    ) -> HipResult<()> {
+        let _ = (hip, device_id);
+        self.check_relocation_supported(moves)
+    }
+
+    fn check_relocation_supported(
+        &self,
+        moves: &[crate::dispatch::VmmResourceMove],
+    ) -> HipResult<()> {
+        if moves.is_empty() || !self.holds_captured_graph_state() {
+            return Ok(());
+        }
+        Err(HipError::new(
+            0,
+            "hipGraph node relocation is not implemented; Qwen4 never captures graphs",
+        ))
+    }
+
+    #[cfg(test)]
+    fn empty_for_test() -> Self {
+        let cache = || PerBGraphCache {
+            cache: HashMap::new(),
+            warmed_up: HashSet::new(),
+            capturing: None,
+            lmhead_argmax: HashSet::new(),
+            fp8_split: HashSet::new(),
+        };
+        Self {
+            capture_mode: false,
+            host_cpu_weights: false,
+            capture_blobs: Vec::new(),
+            graph_exec: None,
+            captured_graph: None,
+            ar_forward_blobs: Vec::new(),
+            ar_forward_kernel_dirty: true,
+            ar_forward_replay_enabled: false,
+            ar_forward_binding: 0,
+            ar_graph_eligible: true,
+            ar_segments: Vec::new(),
+            verify: cache(),
+            replay: cache(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::VmmResourceMove;
+
+    fn one_move() -> VmmResourceMove {
+        VmmResourceMove {
+            old_base: 0x7f00_0000_0000,
+            new_base: 0x7f00_0100_0000,
+            reserved_bytes: 0x20_0000,
+            mapped_bytes: 0x20_0000,
+            owner_generation: 1,
+        }
+    }
+
+    #[test]
+    fn relocation_without_graph_state_is_ok() {
+        let state = GraphState::empty_for_test();
+        assert!(!state.holds_captured_graph_state());
+        state.check_relocation_supported(&[]).expect("empty moves");
+        state
+            .check_relocation_supported(&[one_move()])
+            .expect("no graph state to relocate");
+    }
+
+    #[test]
+    fn relocation_with_graph_state_fails_closed() {
+        let mut state = GraphState::empty_for_test();
+        state.verify.capturing = Some(4);
+        assert!(state.holds_captured_graph_state());
+        state.check_relocation_supported(&[]).expect("empty moves");
+        let error = state
+            .check_relocation_supported(&[one_move()])
+            .expect_err("captured graph state must refuse relocation");
+        assert!(
+            error.message.contains("not implemented"),
+            "{}",
+            error.message
+        );
     }
 }

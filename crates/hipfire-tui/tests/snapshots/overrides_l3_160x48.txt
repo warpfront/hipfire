@@ -1,0 +1,48 @@
+                                                 hipfire · control panel    serve: offline    model: qwen3.8:27b
+
+ Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ GPU: gfx1151 (install.json)    Editing: choose a model (m)
+ ┌ Models ──────────────────────────────────────────┐┌ qwen3.8:27b — own values ──────────────────────────────────────────────────────────────────────────────┐
+ │Pick a model to see or change its own values.     ││Values that differ from "All models"                                                                    │
+ │                                                  ││                                                                                                        │
+ │  Model                    Own values  State      ││  Setting                  This model        All models        From                  Applies            │
+ │  All models               —           default    ││> Context length           ● 131072          32768             this model            next model load    │
+ │> qwen3.8:27b              2           loaded     ││  Thinking effort          ● high            low               this model            next message       │
+ │  gemma4:12b               1           on disk    ││                                                                                                        │
+ │  qwen3.5:9b               0           on disk    ││Everything else follows "All models". Press Enter to edit all of this model's settings (Settings opens  │
+ │  qwen3.6:35b-a3b          1           on disk    ││with Editing: qwen3.8:27b).                                                                             │
+ │  qwen3.8:flash-next       0           on disk    ││                                                                                                        │
+ │                                                  ││Only all-models (one value per serve process)                                                           │
+ │Own values live in ~/.hipfire/models.toml and win ││  Prompt processing, Flash-Next experts, Flash-Next word table, GPU devices, graph capture and other    │
+ │over "All models" for that model only.            ││  kernel switches. hipfire refuses them in models.toml (memory and kernel routes are chosen once when   │
+ │                                                  ││  serve starts).                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││CLI: hipfire config qwen3.8:27b list   ·   hipfire config qwen3.8:27b set memory.max_seq 131072         │
+ │                                                  ││     hipfire config qwen3.8:27b reset memory.max_seq                                                    │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ │                                                  ││                                                                                                        │
+ └──────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+↑↓ model · ←→ value · Enter edit this model in Settings · Del remove selected value · D remove all values for this model · Esc back    loaded hipfire state
+

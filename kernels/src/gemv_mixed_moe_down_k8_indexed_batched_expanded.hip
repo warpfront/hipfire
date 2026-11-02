@@ -7,7 +7,7 @@
 
 // Merged per-expert MIXED-PRECISION MoE down GEMV (expanded write).
 //
-// Each routed expert in a layer has one of four precision tiers.
+// Each routed expert in a layer has a dtype tag (0..18).
 // The grid is block-per-(row, krank, token), so all 32 threads in a block
 // share ONE expert_id → ONE dtype tag → the per-block branch is
 // block-uniform → NO warp divergence.
@@ -22,6 +22,30 @@
 //                                             + 96 B of 3-bit packed quants)
 //   dtype_tags[expert_id] == 4 → mfp4-E8    (16 B row hdr + (K/32)*17 B;
 //                                             136 B/256-group, E8 lattice VQ)
+//   dtype_tags[expert_id] == 5 → mfp3-E8   (16 B row hdr + (K/32)*13 B;
+//                                             104 B/256-group, 3-bit E8 VQ)
+//   dtype_tags[expert_id] == 6 → mfp2-E8   (16 B row hdr + (K/32)* 9 B;
+//                                              72 B/256-group, 2-bit E8 VQ)
+//
+// Mixed in-memory tags 7..18 (process-local loader metadata, not HFQ wire ABI).
+// Down-side decode (pair = gate/down; only the down half is consumed here):
+//   7  MQ4V2/MQ4V2  → MQ4V2 down
+//   8  MQ6V2/MQ6V2  → MQ6V2 down
+//   9  MQ4V2/MQ6V1  → MQ6V1 down  (same body as tag 0)
+//   10 MQ4V2/MQ2L   → MQ2L down   (same body as tag 1)
+//   11 MQ4V2/MQ4V1  → MQ4V1 down  (same body as tag 2)
+//   12 MQ4V1/MQ4V2  → MQ4V2 down
+//   13 MQ4V2/MQ3L   → MQ3L down   (same body as tag 3)
+//   14 MQ4V2/MFP4E8 → mfp4-E8     (same body as tag 4)
+//   15 MQ4V2/MFP3E8 → mfp3-E8     (same body as tag 5)
+//   16 MQ4V2/MFP2E8 → mfp2-E8     (same body as tag 6)
+//   17 MQ4V2/MQ6V2  → MQ6V2 down
+//   18 MQ4V1/MQ6V2  → MQ6V2 down
+//
+// MQ4V2 (qt44) / MQ6V2 (qt47) are dual-half headers: [f16 s0,f16 z0,f16 s1,f16 z1]
+// at bytes 0..8. Lane 0..15 uses pair 0; lane 16..31 uses pair 1. Payload packing
+// matches V1 (MQ4 nibbles / MQ6 6-bit). V1 f32 scale/zero and V2 dual-f16 headers
+// MUST NOT collapse — wrong dispatch yields fluent corruption.
 //
 // All branches accumulate into a SINGLE `acc` and share one wave32 reduce
 // + one expanded write — byte-identical to the reference expanded kernels.
@@ -29,7 +53,7 @@
 //
 // Shapes:
 //   expert_ptrs    : [n_exp]
-//   dtype_tags     : [n_exp]                 u8, 0=MQ6 / 1=MQ2-Lloyd / 2=MQ4 / 3=MQ3-Lloyd
+//   dtype_tags     : [n_exp]                 u8, see tag table above
 //   topk_indices   : [N × K_TOP]
 //   rot_batch      : [N × K_TOP × K]
 //   expert_outputs : [N × K_TOP × M]         non-atomic, one writer per cell
@@ -42,11 +66,6 @@
 // `e8_row_partial` returns the PER-THREAD partial (NO wave reduce) so this
 // kernel's shared wave32 reduce folds it, like the MQ tag branches. E8 row
 // layout: 16 B header (fp16 row scale) + (K/32)*17 B blocks; 256-group = 136 B.
-//
-//   dtype_tags[expert_id] == 5 → mfp3-E8   (16 B row hdr + (K/32)*13 B;
-//                                             104 B/256-group, 3-bit E8 VQ)
-//   dtype_tags[expert_id] == 6 → mfp2-E8   (16 B row hdr + (K/32)* 9 B;
-//                                              72 B/256-group, 2-bit E8 VQ)
 //
 // QUANT_STEP constants MUST match crates/hipfire-quantize/src/e8.rs.
 #define QUANT_STEP_MFP3 1.8f
@@ -370,7 +389,7 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
     const int*   __restrict__ topk_indices,              // [N × K_TOP]
     const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
     float*       __restrict__ expert_outputs,            // [N × K_TOP × M]
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -380,6 +399,11 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
 
     const int routing_base = bid * K_TOP;
     const int expert_id = topk_indices[routing_base + krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0)
+            expert_outputs[((long long)bid * K_TOP + krank) * (long long)M + row] = 0.0f;
+        return;
+    }
     const unsigned char tag = dtype_tags[expert_id]; // block-uniform
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
@@ -390,11 +414,12 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
 
     float acc = 0.0f;
 
-    // cb_lds: 32 B shared, used only by tag==3 (MQ3-Lloyd); harmless to other branches.
+    // cb_lds: 32 B shared, used by tag==3/13 (MQ3-Lloyd); harmless to other branches.
     __shared__ float cb_lds[8];
 
-    if (tag == 0) {
-        // ---- MQ6 branch (200 B/group affine dequant) ----
+    if (tag == 0 || tag == 9) {
+        // ---- MQ6 / MQ6V1 branch (200 B/group affine dequant) ----
+        // tag 9 = MQ4V2/MQ6V1 → down is MQ6V1
         const int row_bytes = groups_per_row * 200;
         const char* row_ptr = A + (long long)row * row_bytes;
         for (int g = 0; g < groups_per_row; g++) {
@@ -431,8 +456,9 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
                  + (scale * (float)q6 + zero) * x[base_idx + 6]
                  + (scale * (float)q7 + zero) * x[base_idx + 7];
         }
-    } else if (tag == 1) {
+    } else if (tag == 1 || tag == 10) {
         // ---- MQ2-Lloyd branch (72 B/group 2-bit codebook) ----
+        // tag 10 = MQ4V2/MQ2L → down is MQ2L
         const int row_bytes = groups_per_row * 72;
         const char* row_ptr = A + (long long)row * row_bytes;
         const int boff = tid * 2;
@@ -459,8 +485,9 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
                 +  cb[(b1 >> 4) & 3] * x[base + 6]
                 +  cb[b1 >> 6]       * x[base + 7];
         }
-    } else if (tag == 2) {
-        // ---- MQ4 branch (136 B/group: [0..4) f32 scale, [4..8) f32 zero, [8..136) 128 B 4-bit) ----
+    } else if (tag == 2 || tag == 11) {
+        // ---- MQ4 / MQ4V1 branch (136 B/group: [0..4) f32 scale, [4..8) f32 zero, [8..136) 128 B 4-bit) ----
+        // tag 11 = MQ4V2/MQ4V1 → down is MQ4V1
         const int row_bytes = groups_per_row * 136;
         const char* row_ptr = A + (long long)row * row_bytes;
         const int boff = tid * 4;
@@ -479,8 +506,9 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
                  + (sc * (float)((pk >> 24) & 0xFu) + zp) * x[base + 6]
                  + (sc * (float)((pk >> 28) & 0xFu) + zp) * x[base + 7];
         }
-    } else if (tag == 3) {
+    } else if (tag == 3 || tag == 13) {
         // ---- MQ3-Lloyd branch (112 B/group: [0..16) 8xfp16 codebook, [16..112) 96 B 3-bit) ----
+        // tag 13 = MQ4V2/MQ3L → down is MQ3L
         const int row_bytes = groups_per_row * 112;
         const char* row_ptr = A + (long long)row * row_bytes;
         const int boff = tid * 3;
@@ -503,16 +531,91 @@ extern "C" __global__ void gemv_mixed_moe_down_k8_indexed_batched_expanded(
                  + cb_lds[(pk >> 21) & 7u] * x[base + 7];
             __syncthreads();   // protect cb_lds before next group reload
         }
-    } else if (tag == 4) {
+    } else if (tag == 4 || tag == 14) {
         // ---- mfp4-E8 branch (16 B row hdr + (K/32)*17 B; 136 B / 256-group) ----
+        // tag 14 = MQ4V2/MFP4E8 → down is mfp4-E8
         // block-uniform → no syncthreads/LDS; per-thread partial, shared reduce folds.
         acc = e8_row_partial(A, x, row, K, tid);
-    } else if (tag == 5) {
+    } else if (tag == 5 || tag == 15) {
         // ---- mfp3-E8 branch (16 B row hdr + (K/32)*13 B; 104 B / 256-group) ----
+        // tag 15 = MQ4V2/MFP3E8 → down is mfp3-E8
         acc = mfp3e8_row_partial(A, x, row, K, tid);
-    } else if (tag == 6) {
+    } else if (tag == 6 || tag == 16) {
         // ---- mfp2-E8 branch (16 B row hdr + (K/32)* 9 B;  72 B / 256-group) ----
+        // tag 16 = MQ4V2/MFP2E8 → down is mfp2-E8
         acc = mfp2e8_row_partial(A, x, row, K, tid);
+    } else if (tag == 7 || tag == 12) {
+        // ---- MQ4V2 branch (qt44; 136 B/group dual-fp16 headers + 128 B nibbles) ----
+        // Sister decode of gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded /
+        // fused_gate_up_mq4g256v2: [0..4)=s0|z0 (lane 0..15), [4..8)=s1|z1
+        // (lane 16..31), payload at +8 identical to MQ4V1 nibbles.
+        // tag 7 = MQ4V2/MQ4V2, tag 12 = MQ4V1/MQ4V2 → down is MQ4V2.
+        // V1 f32 pair and V2 dual-f16 pair MUST NOT collapse.
+        const int row_bytes = groups_per_row * 136;
+        const char* row_ptr = A + (long long)row * row_bytes;
+        const int boff = tid * 4;
+        const int hoff = (tid < 16) ? 0 : 4;
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* gptr = row_ptr + g * 136;
+            unsigned int h = *(const unsigned int*)(gptr + hoff);
+            float sc = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));
+            float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16)));
+            unsigned int pk = *(const unsigned int*)(gptr + 8 + boff);
+            const int base = g * 256 + tid * 8;
+            acc += (sc * (float)( pk        & 0xFu) + zp) * x[base]
+                 + (sc * (float)((pk >>  4) & 0xFu) + zp) * x[base + 1]
+                 + (sc * (float)((pk >>  8) & 0xFu) + zp) * x[base + 2]
+                 + (sc * (float)((pk >> 12) & 0xFu) + zp) * x[base + 3]
+                 + (sc * (float)((pk >> 16) & 0xFu) + zp) * x[base + 4]
+                 + (sc * (float)((pk >> 20) & 0xFu) + zp) * x[base + 5]
+                 + (sc * (float)((pk >> 24) & 0xFu) + zp) * x[base + 6]
+                 + (sc * (float)((pk >> 28) & 0xFu) + zp) * x[base + 7];
+        }
+    } else if (tag == 8 || tag == 17 || tag == 18) {
+        // ---- MQ6V2 branch (qt47; 200 B/group dual-fp16 headers + 192 B 6-bit) ----
+        // Sister decode of fused_gate_up_mq6g256v2 / HFQ6 V1 packing with V2
+        // dual-half header: [0..4)=s0|z0 (lane 0..15), [4..8)=s1|z1 (lane 16..31),
+        // payload at +8 identical to MQ6V1 6-bit packing.
+        // tag 8 = MQ6V2/MQ6V2, tag 17 = MQ4V2/MQ6V2, tag 18 = MQ4V1/MQ6V2.
+        // V1 f32 pair and V2 dual-f16 pair MUST NOT collapse.
+        const int row_bytes = groups_per_row * 200;
+        const char* row_ptr = A + (long long)row * row_bytes;
+        const int byte_off = tid * 6;
+        const int hoff = (tid < 16) ? 0 : 4;
+        for (int g = 0; g < groups_per_row; g++) {
+            const char* gptr = row_ptr + g * 200;
+            unsigned int h = *(const unsigned int*)(gptr + hoff);
+            float scale = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));
+            float zero  = __half2float(__ushort_as_half((unsigned short)(h >> 16)));
+            const unsigned char* data = (const unsigned char*)(gptr + 8);
+
+            int base_idx = g * 256 + tid * 8;
+
+            unsigned char b0 = data[byte_off];
+            unsigned char b1 = data[byte_off + 1];
+            unsigned char b2 = data[byte_off + 2];
+            unsigned char b3 = data[byte_off + 3];
+            unsigned char b4 = data[byte_off + 4];
+            unsigned char b5 = data[byte_off + 5];
+
+            int q0 = b0 & 63;
+            int q1 = (b0 >> 6) | ((b1 & 0xF) << 2);
+            int q2 = (b1 >> 4) | ((b2 & 3) << 4);
+            int q3 = b2 >> 2;
+            int q4 = b3 & 63;
+            int q5 = (b3 >> 6) | ((b4 & 0xF) << 2);
+            int q6 = (b4 >> 4) | ((b5 & 3) << 4);
+            int q7 = b5 >> 2;
+
+            acc += (scale * (float)q0 + zero) * x[base_idx]
+                 + (scale * (float)q1 + zero) * x[base_idx + 1]
+                 + (scale * (float)q2 + zero) * x[base_idx + 2]
+                 + (scale * (float)q3 + zero) * x[base_idx + 3]
+                 + (scale * (float)q4 + zero) * x[base_idx + 4]
+                 + (scale * (float)q5 + zero) * x[base_idx + 5]
+                 + (scale * (float)q6 + zero) * x[base_idx + 6]
+                 + (scale * (float)q7 + zero) * x[base_idx + 7];
+        }
     }
 
     for (int offset = 16; offset > 0; offset >>= 1)

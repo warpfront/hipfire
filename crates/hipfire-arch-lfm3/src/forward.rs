@@ -31,7 +31,7 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, Step};
-use hipfire_runtime::llama::weight_gemv;
+use hipfire_runtime::llama::{weight_gemv, KvCacheExt};
 use rdna_compute::Gpu;
 
 /// Decode one token; returns the full logits vector.
@@ -345,6 +345,7 @@ fn attn_mixer(
         // (it is a plain per-head broadcast, not the Qwen fused gate+MQ-rotation
         // that `output_gate` triggers). Leave None here.
         output_gate: None,
+        output_awq_scale: None,
         output: &state.fa_attn_out,
     };
     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])

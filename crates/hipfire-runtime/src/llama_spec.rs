@@ -9,9 +9,9 @@
 //! through `impl SpecTarget for LlamaBundle` (in `hipfire-arch-llama`).
 
 use crate::llama::{
-    argmax, forward_prefill_batch_capture, forward_prefill_batch_tree, forward_scratch_compute,
-    forward_scratch_embed, is_batchable_la, weight_gemv, ForwardScratch, HiddenCaptureSink,
-    KvCache, LlamaConfig, LlamaWeights, PrefillBatchScratch,
+    argmax, forward_prefill_batch_capture, forward_prefill_batch_tree, forward_scratch_embed,
+    is_batchable_la, weight_gemv, ForwardScratch, HiddenCaptureSink, KvCache, LlamaConfig,
+    LlamaWeights, PrefillBatchScratch,
 };
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -375,13 +375,15 @@ fn verify_block_logits_or_argmax(
 
     let eligible = batched_verify_eligible(gpu, weights, kv_cache, n, pbs);
 
-    // DFlash hidden capture only flows through the batched path; the per-token
-    // fallback below does not run the capturing per-layer loop.
-    // When the block is too small for the batched path (n < MIN_BATCH), silently
-    // skip the capture by clearing the capture sink — the caller checks whether
-    // hidden_out is non-empty, so an empty result is the correct "not captured"
-    // signal and does not break correctness.
-    let capture = if !eligible { None } else { capture };
+    // DFlash hidden capture: the batched path captures every row; the per-token
+    // fallback (n < MIN_BATCH, or ineligible dtypes/KV) captures through
+    // `forward_scratch_compute_capture`, the same per-token capture prefill
+    // uses, so a 1..3-row block still returns `n × extract × dim` hidden rows.
+    // (Previously the fallback captured nothing and the generic DFlash commit
+    // sliced an empty buffer: a daemon panic whenever the remaining budget made
+    // the block 1-3 rows.) The GPU-resident sink variant is only ever passed
+    // for eligible blocks; the per-token capture is host-only.
+    let mut capture = capture;
 
     if eligible {
         // Single batched forward (n <= pbs.max_batch ⇒ one chunk) populates
@@ -419,54 +421,65 @@ fn verify_block_logits_or_argmax(
         } else {
             None
         };
-        for i in 0..n {
-            let off_bytes = i * dim * 4;
-            gpu.hip
-                .memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, off_bytes, dim * 4)?;
-            gpu.rmsnorm_f32(
-                &scratch.x,
-                &weights.output_norm,
-                &scratch.tmp,
-                config.norm_eps,
-            )?;
-            weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
-            if let Some(sc) = sample.as_mut() {
-                // temp>0: fused GPU sample (softmax+nucleus+draw) → 4-byte D2H.
-                let tok = sample_one(gpu, &scratch.logits, vocab, sc)?;
-                out.push(tok);
-                // LAZY: acceptance is a prefix — once a position's sample differs
-                // from its drafted token (`block[i+1]`), every later position is
-                // rejected, so skip their (expensive) head+sample entirely. `tok`
-                // is the committed correction; pad the tail so the pick vector is
-                // full length (accept_greedy_prefix only reads up to this mismatch).
-                if lazy && i + 1 < n && block[i + 1] != tok {
-                    while out.len() < n {
-                        out.push(u32::MAX);
-                    }
-                    break;
+        if argmax_one.is_some() && lm_head_rows_eligible(gpu, &weights.output) {
+            out = lm_head_argmax_rows(gpu, weights, config, &pbs.x_batch, n, scratch)?;
+            // LAZY: the per-row loop below stops at the first mismatch and pads.
+            if lazy {
+                if let Some(i) = (0..n.saturating_sub(1)).find(|&i| block[i + 1] != out[i]) {
+                    out[i + 1..].fill(u32::MAX);
                 }
-            } else if let Some(ref ab) = argmax_one {
-                // GPU argmax → 4-byte D2H (avoids 607 KB download per position).
-                gpu.argmax_f32_batched(&scratch.logits, ab, vocab, 1)?;
-                let mut raw = 0i32;
-                let bytes =
-                    unsafe { std::slice::from_raw_parts_mut(&mut raw as *mut i32 as *mut u8, 4) };
-                gpu.hip.memcpy_dtoh(bytes, &ab.buf)?;
-                let tok = raw as u32;
-                out.push(tok);
-                // LAZY prefix stop (greedy): same reasoning as the sample branch —
-                // skip lm_head for positions after the first mismatch. Output is
-                // byte-identical (accept reads only up to the mismatch).
-                if lazy && i + 1 < n && block[i + 1] != tok {
-                    while out.len() < n {
-                        out.push(u32::MAX);
+            }
+        } else {
+            for i in 0..n {
+                let off_bytes = i * dim * 4;
+                gpu.hip
+                    .memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, off_bytes, dim * 4)?;
+                gpu.rmsnorm_f32(
+                    &scratch.x,
+                    &weights.output_norm,
+                    &scratch.tmp,
+                    config.norm_eps,
+                )?;
+                weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
+                if let Some(sc) = sample.as_mut() {
+                    // temp>0: fused GPU sample (softmax+nucleus+draw) → 4-byte D2H.
+                    let tok = sample_one(gpu, &scratch.logits, vocab, sc)?;
+                    out.push(tok);
+                    // LAZY: acceptance is a prefix — once a position's sample differs
+                    // from its drafted token (`block[i+1]`), every later position is
+                    // rejected, so skip their (expensive) head+sample entirely. `tok`
+                    // is the committed correction; pad the tail so the pick vector is
+                    // full length (accept_greedy_prefix only reads up to this mismatch).
+                    if lazy && i + 1 < n && block[i + 1] != tok {
+                        while out.len() < n {
+                            out.push(u32::MAX);
+                        }
+                        break;
                     }
-                    break;
+                } else if let Some(ref ab) = argmax_one {
+                    // GPU argmax → 4-byte D2H (avoids 607 KB download per position).
+                    gpu.argmax_f32_batched(&scratch.logits, ab, vocab, 1)?;
+                    let mut raw = 0i32;
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts_mut(&mut raw as *mut i32 as *mut u8, 4)
+                    };
+                    gpu.hip.memcpy_dtoh(bytes, &ab.buf)?;
+                    let tok = raw as u32;
+                    out.push(tok);
+                    // LAZY prefix stop (greedy): same reasoning as the sample branch —
+                    // skip lm_head for positions after the first mismatch. Output is
+                    // byte-identical (accept reads only up to the mismatch).
+                    if lazy && i + 1 < n && block[i + 1] != tok {
+                        while out.len() < n {
+                            out.push(u32::MAX);
+                        }
+                        break;
+                    }
+                } else {
+                    let row = gpu.download_f32(&scratch.logits)?;
+                    out.push(argmax(&row));
+                    logits_out.extend_from_slice(&row);
                 }
-            } else {
-                let row = gpu.download_f32(&scratch.logits)?;
-                out.push(argmax(&row));
-                logits_out.extend_from_slice(&row);
             }
         }
         if let Some(ab) = argmax_one {
@@ -475,7 +488,16 @@ fn verify_block_logits_or_argmax(
     } else {
         for (i, &tok) in block.iter().enumerate() {
             forward_scratch_embed(gpu, weights, config, tok, start_pos + i, scratch)?;
-            forward_scratch_compute(gpu, weights, config, start_pos + i, kv_cache, scratch)?;
+            let host_sink = capture.as_deref_mut().filter(|c| c.hidden_gpu.is_none());
+            crate::llama::forward_scratch_compute_capture(
+                gpu,
+                weights,
+                config,
+                start_pos + i,
+                kv_cache,
+                scratch,
+                host_sink,
+            )?;
             if let Some(sc) = sample.as_mut() {
                 let pick = sample_one(gpu, &scratch.logits, vocab, sc)?;
                 out.push(pick);
@@ -499,6 +521,61 @@ fn verify_block_logits_or_argmax(
         argmax: out,
         logits: logits_out,
     })
+}
+
+/// Whether [`lm_head_argmax_rows`] reproduces the per-row `weight_gemv` lm_head
+/// bit for bit: MQ4G256 on gfx1151, where that GEMV is `gemv_hfq4g256_multirow_r2`
+/// (rows default 2, not the 248320x2048 lm_head specials).
+fn lm_head_rows_eligible(gpu: &Gpu, w: &crate::llama::WeightTensor) -> bool {
+    gpu.arch_caps.is_gfx1151()
+        && gpu.arch_caps.gemv_rows_default() == 2
+        && w.gpu_dtype == DType::MQ4G256
+        && !(w.m == 248_320 && w.k == 2_048)
+}
+
+/// Greedy picks for `n` hidden rows: per row the exact pre-GEMV steps of the
+/// per-row loop (rmsnorm, FWHT rotation) into an `[n, dim]` panel, then one
+/// `gemv_hfq4g256_r2_rows` (r2 arithmetic per row, vocab matrix streamed once per
+/// 8 rows instead of per row) and one batched argmax.
+fn lm_head_argmax_rows(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    hidden_rows: &GpuTensor,
+    n: usize,
+    scratch: &ForwardScratch,
+) -> HipResult<Vec<u32>> {
+    let (dim, vocab) = (config.dim, config.vocab_size);
+    let panel = gpu.alloc_tensor(&[n * dim], DType::F32)?;
+    let logits = gpu.alloc_tensor(&[n * vocab], DType::F32)?;
+    let picks = gpu.alloc_tensor(&[n], DType::F32)?;
+    gpu.ensure_mq_signs()?;
+    for i in 0..n {
+        gpu.hip
+            .memcpy_dtod_at(&scratch.x.buf, 0, &hidden_rows.buf, i * dim * 4, dim * 4)?;
+        gpu.rmsnorm_f32(
+            &scratch.x,
+            &weights.output_norm,
+            &scratch.tmp,
+            config.norm_eps,
+        )?;
+        crate::llama::rotate_x_mq_for(
+            gpu,
+            &weights.output,
+            &scratch.tmp,
+            &panel.sub_offset(i * dim, dim),
+            dim,
+        )?;
+    }
+    gpu.gemv_hfq4g256_r2_rows(&weights.output.buf, &panel, &logits, vocab, dim, n)?;
+    gpu.argmax_f32_batched(&logits, &picks, vocab, n)?;
+    let mut raw = vec![0i32; n];
+    let bytes = unsafe { std::slice::from_raw_parts_mut(raw.as_mut_ptr() as *mut u8, n * 4) };
+    gpu.hip.memcpy_dtoh(bytes, &picks.buf)?;
+    for t in [panel, logits, picks] {
+        let _ = gpu.free_tensor(t);
+    }
+    Ok(raw.into_iter().map(|t| t as u32).collect())
 }
 
 /// One fused GPU sample from `logits` (`[vocab]` F32) via `sample_top_p_pf` — the

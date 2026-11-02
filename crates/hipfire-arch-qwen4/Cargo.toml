@@ -1,0 +1,150 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-qwen4"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen4/ Qwen3.8-Flash-Next text configuration, PLE hashing, admission, and manifest foundations"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
+smallvec = { version = "1.15.2", features = ["const_generics"] }
+sha2.workspace = true
+tracing = "0.1"
+peacemaker-npu = { path = "../peacemaker-npu" }
+rayon.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+railgun = { path = "../railgun", features = ["npu"] }
+
+[dev-dependencies]
+half.workspace = true
+memmap2.workspace = true
+# `mtp_head_reference_pin_hw` decodes the artifact head tensors the HIP head reads (qt44 / qt53 experts).
+hipfire-cpu = { path = "../hipfire-cpu" }
+saddle-quant = { path = "../saddle-quant" }
+# `greedy_mtp_identity_hw` loads through the product loader (`load_qwen4_rank`) so the
+# split-base PLE sidecar, trunk overlay and expert hot set are the serve load's own.
+# hipfire-loader depends on this crate as a normal edge; dev-dep cycles are legal
+# (same pattern as hipfire-runtime's dev-dependency on hipfire-loader).
+hipfire-loader = { path = "../hipfire-loader" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["test-utils"] }
+
+[features]
+# Explicit developer build opt-in; never part of the default serving build.
+qwen4-dev-profiles = []
+reference-parity = ["rdna-compute/lab", "hipfire-dispatch/test-utils"]
+# Tools-only S1 validation surface: the lab feature enables the S1
+lab = ["hipfire-dispatch/test-utils"]
+kernel-timing = ["lab", "rdna-compute/kernel-timing"]
+[[example]]
+name = "qwen4_parity"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_qsa_ctx"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_qsa_arena_check"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_mtp_fill"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_wide_verify"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_rowtile_capture"
+required-features = ["reference-parity"]
+
+[[example]]
+name = "qwen4_legacy_mq4_rowtile_oracle"
+required-features = ["lab", "reference-parity"]
+
+[[example]]
+name = "qwen4_kld"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_greedy_ids"
+required-features = ["lab"]
+
+# S1 combined-lever quality probe (OFF + PLACE_IU4; baseline / s1a / s1b / beta-f32 / s1-f32 phases).
+[[example]]
+name = "qwen4_slowlink_quality"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_g2_replay_gate"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_lane_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_q8_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_prefill_g0"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_sampled_plumbing_oracle"
+required-features = ["lab"]
+
+# R8 / K-E1 real-layer E8P G1 + Gp driver. Raw PM module launches only; helper modules live in examples/e8p_gp/.
+[[example]]
+name = "qwen4_e8p_gp"
+path = "examples/qwen4_e8p_gp.rs"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_cpu_split_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_placement_receipt"
+required-features = ["lab"]
+
+# GDN in-projection group byte probe: grouped MQ6 x4 / MQ4 rows_x4 routes vs the singletons (GPU; optional real layer).
+[[example]]
+name = "qwen4_gdn_in_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_cost_prompts"
+required-features = ["lab"]
+
+[[test]]
+name = "mtp_takeover_fill_hw"
+required-features = ["reference-parity"]
+
+[[test]]
+name = "mtp_head_d2_hw"
+required-features = ["reference-parity"]
+
+# S1 slow-link layer-major prefill gate (frozen CLI; see docs/VALIDATION.md).
+[[example]]
+name = "qwen4_slowlink_gate"
+required-features = ["lab", "reference-parity"]
+
+[[test]]
+name = "slowlink_prefill_hw"
+required-features = ["lab", "reference-parity"]

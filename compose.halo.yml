@@ -1,0 +1,28 @@
+# Strix Halo (XDNA2 NPU) additions for compose.yml. Opt-in.
+#
+# Adds the NPU device node and the memlock limit the NPU trunk needs to pin its
+# buffers (hipfire doctor --npu checks for >= 1318060032 bytes).
+#
+# Enable with either:
+#   COMPOSE_FILE=compose.yml:compose.halo.yml     (in .env)
+#   docker compose -f compose.yml -f compose.halo.yml up -d
+#
+# Rootless podman: the invoking user's memlock hard limit must already be at
+# least this value (ulimit -Hl), since a container cannot raise it above the user's.
+
+services:
+  hipfire-init:
+    devices:
+      - /dev/accel
+    ulimits:
+      memlock:
+        soft: 1318060032
+        hard: 1318060032
+
+  hipfire:
+    devices:
+      - /dev/accel
+    ulimits:
+      memlock:
+        soft: 1318060032
+        hard: 1318060032

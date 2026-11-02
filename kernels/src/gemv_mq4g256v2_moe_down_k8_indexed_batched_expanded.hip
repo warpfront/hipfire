@@ -1,0 +1,286 @@
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>  // __ushort_as_half / __half2float for the qt44 f16 header
+
+#ifndef HIPFIRE_MOE_DOWN_LAST_COMBINE
+#define HIPFIRE_MOE_DOWN_LAST_COMBINE 0
+#endif
+
+#ifndef HIPFIRE_MOE_DOWN_KERNEL
+#define HIPFIRE_MOE_DOWN_KERNEL gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded
+#endif
+
+// MQ4G256V2 (qt=44) sister of
+// `gemv_hfq4g256_moe_down_k8_indexed_batched_expanded`.
+//
+// Transcribed from that kernel; the tiling, x hoisting, pairwise fold,
+// wavefront reduction and output layout are identical. The ONLY difference is
+// the group header decode: qt44 carries TWO fp16 scale/zero pairs per
+// 256-weight group (one per 128-weight half) where qt13 carries one f32 pair
+// for all 256. Same 136 B stride, same nibble packing.
+//
+// The affine grid is LANE-CONSTANT here (see `hoff` below), so qt44's header
+// read is one 4-byte load against qt13's two.
+//
+// Atomic-free variant of the residual_scaled sister.
+//
+// Same per-(token, krank) GEMV compute. Instead of `atomicAdd(scale * acc)`
+// into a shared `x_residual[N × M]` row (K_TOP-way contention per output
+// cell, observed ~387 GiB/s on R9700/gfx1201 vs the sister gate_up at
+// 954 GiB/s with the same MQ4 layout but no atomic), this kernel writes
+// each (token, krank) result to its own row in an expanded buffer
+// `expert_outputs[N × K_TOP × M]`. A separate `moe_down_combine_k8_batched`
+// kernel folds K_TOP outputs back into the residual stream with topk_weights
+// applied — see kernels/src/moe_down_combine_k8_batched.hip.
+//
+// Shapes (vs the residual_scaled variant):
+//   expert_ptrs    : [n_exp]                — unchanged
+//   topk_indices   : [N × K_TOP]            — unchanged
+//   rot_batch      : [N × K_TOP × K]        — unchanged
+//   expert_outputs : [N × K_TOP × M]        — replaces x_residual; non-atomic
+// Note: `topk_weights` is NOT consumed here; the combine kernel applies the
+// scale during reduction over K_TOP. Dropping the weights load also saves
+// a small amount of bandwidth.
+//
+// Grid: (M, K_TOP, N). Block = 32 threads. No atomic ops — each output
+// address is written by exactly one workgroup, so the writes are pure
+// stores.
+//
+// VARIANT R17c1 down_g2_hoist_x16:
+// BOD: L2-resident/mixed occ~43% mem_busy~44% (post g2_branchless_fulltile WIN).
+// Current body: per-group LOAD_X8 then 4 DOGs → x-load serializes with weight
+// DOG for each of the 2 groups. residual/multirow R13/R15 WIN was hoisting
+// full x for the group-quad BEFORE dual-row DOG so weight MAC dual-issues
+// against resident x under L2-resident weights. Apply that here: float4×4
+// hoist of both groups' 16 x lanes first, then all 8 DOGs (4 rows × 2
+// groups) with x resident. Value-preserving: same sc/zp/pk, same FMA order
+// per DOG, same pairwise slot fold + shfl reduce + masked store.
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
+    const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
+    const int*   __restrict__ topk_indices,              // [N × K_TOP]
+    const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
+    float*       __restrict__ expert_outputs,            // [N × K_TOP × M]
+#if HIPFIRE_MOE_DOWN_LAST_COMBINE
+    const float* __restrict__ topk_weights,               // [N × K_TOP]
+    float*       __restrict__ x_residual,                 // [N × M], in-place
+#endif
+    int M, int K, int K_TOP, int n_experts
+) {
+    const int row0 = blockIdx.x * 4;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int row2 = row0 + 2;
+    const int row3 = row0 + 3;
+    const bool have_row1 = row1 < M;
+    const bool have_row2 = row2 < M;
+    const bool have_row3 = row3 < M;
+    const int krank = blockIdx.y;
+    const int bid = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const int routing_base = bid * K_TOP;
+    const int expert_id = topk_indices[routing_base + krank];
+    const bool expert_valid = (unsigned)expert_id < (unsigned)n_experts;
+    if (!expert_valid) {
+        if (tid == 0) {
+            const long long out_inv = ((long long)bid * K_TOP + krank) * (long long)M;
+            expert_outputs[out_inv + row0] = 0.0f;
+            if (have_row1) expert_outputs[out_inv + row1] = 0.0f;
+            if (have_row2) expert_outputs[out_inv + row2] = 0.0f;
+            if (have_row3) expert_outputs[out_inv + row3] = 0.0f;
+        }
+    } else {
+    const char* __restrict__ A =
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    const float* __restrict__ x =
+        rot_batch + ((long long)bid * K_TOP + krank) * K;
+    // Arbitrary K%256==0: groups_per_row = K/256 (K=512 → 2). Row stride is groups*136.
+    const int groups_per_row = K / 256;
+    const long long row_stride = (long long)groups_per_row * 136;
+    const char* row_ptr0 = A + (long long)row0 * row_stride;
+    const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
+    const char* row_ptr2 = A + (long long)(have_row2 ? row2 : row0) * row_stride;
+    const char* row_ptr3 = A + (long long)(have_row3 ? row3 : row0) * row_stride;
+    const int boff = tid * 4;
+    // Lane-constant affine-grid header offset: tid 0..15 -> weights 0..127
+    // (grid 0, header at gp+0); tid 16..31 -> weights 128..255 (grid 1, gp+4).
+    const int hoff = (tid < 16) ? 0 : 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto row_rsrc0 = HIPFIRE_WEIGHT_RSRC(row_ptr0);
+    const auto row_rsrc1 = HIPFIRE_WEIGHT_RSRC(row_ptr1);
+    const auto row_rsrc2 = HIPFIRE_WEIGHT_RSRC(row_ptr2);
+    const auto row_rsrc3 = HIPFIRE_WEIGHT_RSRC(row_ptr3);
+#endif
+
+    // gfx12: initiate the four first-demand group-0 cacheline fetches while
+    // the existing x float4 hoist provides independent VMEM work.  Group 1
+    // is adjacent and already covered by the group-0 compute window.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr0, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr1, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr2, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr3, 0);
+#endif
+
+    // Accumulators — general K%256==0, K=512 fast path identical.
+    float acc = 0.0f, bcc = 0.0f, ccc = 0.0f, dcc = 0.0f;
+
+    #if HIPFIRE_GFX1151_MOE_DOWN_HYBRID_BUFFER
+    // gfx1151 hybrid cache lowering: scale/zero-point are wave-uniform, so
+    // preserve their scalar/global path. Only the lane-divergent packed nibbles
+    // use temporal buffer VMEM. This avoids turning uniform headers into 64
+    // redundant vector loads while retaining the lean packed-weight address.
+    #define HIPFIRE_MOE_DOWN_LOAD_HDR(rsrc, gp, weight_offset) (*(const unsigned int*)((gp) + hoff))
+    #else
+    #define HIPFIRE_MOE_DOWN_LOAD_HDR(rsrc, gp, weight_offset) \
+        HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + hoff, (weight_offset) + hoff)
+    #endif
+
+    #define DOG_X8(gp, rsrc, weight_offset, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
+        unsigned int h = HIPFIRE_MOE_DOWN_LOAD_HDR(rsrc, gp, weight_offset); \
+        float sc = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu))); \
+        float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16))); \
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
+        /* Pinned contraction orientation (must match shipped fused D4 */ \
+        /* ninepath: round d1*x1 first, then FMA(d0,x0,that), then d2..d7), */ \
+        /* NOT the compiler's default of rounding d0*x0 then FMA(d1,x1,..). */ \
+        /* Dequant d_i = fma(sc,q_i,zp) is fused in both. Group sum is formed */ \
+        /* separately and added to the accumulator (a) += sum, never seeded. */ \
+        const float d0 = __fmaf_rn(sc, (float)((pk) & 0xFu), zp); \
+        const float d1 = __fmaf_rn(sc, (float)(((pk) >> 4) & 0xFu), zp); \
+        const float d2 = __fmaf_rn(sc, (float)(((pk) >> 8) & 0xFu), zp); \
+        const float d3 = __fmaf_rn(sc, (float)(((pk) >> 12) & 0xFu), zp); \
+        const float d4 = __fmaf_rn(sc, (float)(((pk) >> 16) & 0xFu), zp); \
+        const float d5 = __fmaf_rn(sc, (float)(((pk) >> 20) & 0xFu), zp); \
+        const float d6 = __fmaf_rn(sc, (float)(((pk) >> 24) & 0xFu), zp); \
+        const float d7 = __fmaf_rn(sc, (float)(((pk) >> 28) & 0xFu), zp); \
+        float sum = __fmul_rn(d1, (x1)); \
+        sum = __fmaf_rn(d0, (x0), sum); \
+        sum = __fmaf_rn(d2, (x2), sum); \
+        sum = __fmaf_rn(d3, (x3), sum); \
+        sum = __fmaf_rn(d4, (x4), sum); \
+        sum = __fmaf_rn(d5, (x5), sum); \
+        sum = __fmaf_rn(d6, (x6), sum); \
+        sum = __fmaf_rn(d7, (x7), sum); \
+        (a) += sum; \
+    } while (0)
+
+    if (groups_per_row == 2) {
+        // K=512 fast/unrolled — bitwise identical to the original 2-group body.
+        // Preserve pairwise slots and hoisted x for identical scheduling/output.
+        float acc0 = 0.0f, acc1 = 0.0f;
+        float bcc0 = 0.0f, bcc1 = 0.0f;
+        float ccc0 = 0.0f, ccc1 = 0.0f;
+        float dcc0 = 0.0f, dcc1 = 0.0f;
+        const int base0 = tid * 8;
+        const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
+        const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
+        const float4 xv1a = *reinterpret_cast<const float4*>(x + base0 + 256);
+        const float4 xv1b = *reinterpret_cast<const float4*>(x + base0 + 260);
+        DOG_X8(row_ptr0 + 0 * 136, row_rsrc0, 0 * 136, acc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(row_ptr1 + 0 * 136, row_rsrc1, 0 * 136, bcc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(row_ptr2 + 0 * 136, row_rsrc2, 0 * 136, ccc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(row_ptr3 + 0 * 136, row_rsrc3, 0 * 136, dcc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(row_ptr0 + 1 * 136, row_rsrc0, 1 * 136, acc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(row_ptr1 + 1 * 136, row_rsrc1, 1 * 136, bcc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(row_ptr2 + 1 * 136, row_rsrc2, 1 * 136, ccc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(row_ptr3 + 1 * 136, row_rsrc3, 1 * 136, dcc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        acc = acc0 + acc1;
+        bcc = bcc0 + bcc1;
+        ccc = ccc0 + ccc1;
+        dcc = dcc0 + dcc1;
+    } else {
+        // General K%256==0: sequential group loop, one accumulator per row.
+        for (int g = 0; g < groups_per_row; ++g) {
+            const char* gp0 = row_ptr0 + (long long)g * 136;
+            const char* gp1 = row_ptr1 + (long long)g * 136;
+            const char* gp2 = row_ptr2 + (long long)g * 136;
+            const char* gp3 = row_ptr3 + (long long)g * 136;
+            const long long w_off = (long long)g * 136;
+            const int x_off = g * 256 + tid * 8;
+            const float4 xv_a = *reinterpret_cast<const float4*>(x + x_off);
+            const float4 xv_b = *reinterpret_cast<const float4*>(x + x_off + 4);
+            DOG_X8(gp0, row_rsrc0, w_off, acc,
+                   xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+            DOG_X8(gp1, row_rsrc1, w_off, bcc,
+                   xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+            DOG_X8(gp2, row_rsrc2, w_off, ccc,
+                   xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+            DOG_X8(gp3, row_rsrc3, w_off, dcc,
+                   xv_a.x, xv_a.y, xv_a.z, xv_a.w, xv_b.x, xv_b.y, xv_b.z, xv_b.w);
+        }
+    }
+    #undef DOG_X8
+    #undef HIPFIRE_MOE_DOWN_LOAD_HDR
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        bcc += __shfl_down(bcc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        ccc += __shfl_down(ccc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        dcc += __shfl_down(dcc, offset);
+
+    if (tid == 0) {
+        // Direct store to per-(token, krank) row — no atomic contention.
+        // Layout: expert_outputs[bid][krank][row].
+        const long long out_base =
+            ((long long)bid * K_TOP + krank) * (long long)M;
+        expert_outputs[out_base + row0] = acc;
+        if (have_row1) expert_outputs[out_base + row1] = bcc;
+        if (have_row2) expert_outputs[out_base + row2] = ccc;
+        if (have_row3) expert_outputs[out_base + row3] = dcc;
+    }
+
+    }  // expert_valid
+
+#if HIPFIRE_MOE_DOWN_LAST_COMBINE
+    // Preserve one independently schedulable expert wave per workgroup. Each
+    // row tile publishes its four expanded outputs, then increments a reusable
+    // counter in the scratch tail. Only the last expert wave performs the
+    // fixed k=0..7 weighted fold, replacing the separate combine dispatch.
+    // The scratch tail is [N × ceil(M/4)] u32 immediately after the expanded
+    // [N × K_TOP × M] payload and is zeroed once at scratch allocation.
+    int prior = -1;
+    const int row_tiles = (M + 3) / 4;
+    int* counters = reinterpret_cast<int*>(
+        expert_outputs + (long long)gridDim.z * K_TOP * M);
+    const int counter_index = bid * row_tiles + blockIdx.x;
+    if (tid == 0) {
+        // Publish this block's output stores before advertising arrival.
+        __threadfence();
+        prior = atomicAdd(counters + counter_index, 1);
+    }
+    prior = __shfl(prior, 0);
+    if (prior == K_TOP - 1) {
+        if (tid < 4) {
+            const int row = row0 + tid;
+            if (row < M) {
+                const long long token_base = (long long)bid * K_TOP * M;
+                const int weights_base = bid * K_TOP;
+                float combined = 0.0f;
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    if (k < K_TOP) {
+                        combined += topk_weights[weights_base + k]
+                                  * expert_outputs[token_base + (long long)k * M + row];
+                    }
+                }
+                x_residual[(long long)bid * M + row] += combined;
+            }
+        }
+        __syncwarp();
+        if (tid == 0)
+            atomicExch(counters + counter_index, 0);
+    }
+#endif
+}

@@ -1,0 +1,24 @@
+         hipfire · control panel    serve: offline    model: qwen3.8:27b
+
+ Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
+
+────────────────────────────────────────────────────────────────────────────────
+ Tuning: Balanced  p    GPU: gfx1201    Editing: all models  m
+ Search: kv█                                             31 matches · Esc clear
+ ┌ Search results — name, key, env var or description ────────────────────────┐
+ │  Setting                   Using now         From               Group      │
+ │> KV cache precision        fp8 (auto)        default · gfx1201  Memory     │
+ │  KV fit-to-memory          off               default            Memory     │
+ │  KV cache layout           vmm               default            Memory     │
+ │  KV key format             (follows KV)      default            Memory     │
+ │  KV value format           (follows KV)      default            Memory     │
+ │  memory.unsafe_wsl_vmm_kv  off               default            Memory     │
+ └────────────────────────────────────────────────────────── rows 1–6 of 31 ↓ ┘
+ ┌ KV cache precision ────────────────────────────────────────────────────────┐
+ │Format of the conversation memory (KV cache). Smaller fits longer chats.    │
+ │Smaller formats save memory; exact formats keep more detail.                │
+ │Auto: fp8 on exact gfx1201, one GPU, Qwen. Applies: next model load.        │
+ │memory.kv_cache · HIPFIRE_KV_MODE · ←/→ preview, Enter saves                │
+ └────────────────────────────────────────────────────────────────────────────┘
+type to filter · ↑↓ move · Enter results · Esc clear search
+

@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The Q8_0 `fa_prefill` module (gfx1201 GQA-fused FA2 prefill attention, H = 16, Hkv = 2, D = 256),
+// composed in `.rip` from the `fa::*` natives of `fa_prefill::blocks`: the preconvert export
+// `attention_fa2_q_preconvert_pm_gfx1201` and the causal direct export
+// `attention_q8_0_fa2_gqa_pm_gfx1201`.
+//
+// `fa_prefill::emit` / `emit_preconvert` (kernels/fa_prefill.rs) are written over exactly the blocks
+// this script calls, so for each variant the script re-emits the production kernel's bytes (`s_text`
+// and proof). A test in peacemaker-rip (`fa_prefill_twin_matches_the_rust_emit`) requires it. Edit the
+// composition here and re-run: no rebuild. The native-fp8 export has its own twin, `fa_prefill_fp8.rip`.
+//
+// The shipped generators are untyped-`Builder` kernels, so this script is too: it builds with
+// `Builder::new` (no `Workgroup`) and every LDS slot (`b.lds_slot`), barrier (`b.barrier_with_scope`),
+// branch label (`fa::label`) and the tile loop (`b.loop_`) is a statement here that you can move; the
+// builder's slot machine, wait ledger, hazard guards and loop fixpoint refuse a wrong one (a barrier
+// over a slot that was never stored, a loop whose back edge differs from its entry). The natives are
+// instruction emitters: prologue, tile set-up, the K/V fill, QK, each softmax/PV subtile, the epilogue.
+//
+// Variants: `direct` and `preconvert`. gfx1201 only, exactly H16 / KV2 / D256 (the Rust gate).
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &["direct", "preconvert"];
+
+fn fa_spec() -> FaSpec {
+    FaSpec { heads: 16, kv_heads: 2, head_dim: 256, kv: FaKv::Q8_0 }
+}
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let g = FaGen::new(spec.arch, fa_spec())?;
+    match spec.variant.as_str() {
+        "direct" => direct(&g),
+        "preconvert" => preconvert(&g),
+        v => Err(format!("variant `{v}`: expected direct or preconvert")),
+    }
+}
+
+fn preconvert(g: &FaGen) -> Result<Emitted, String> {
+    let mut b = Builder::new(g.preconvert_kernel_spec(), g.preconvert_plan()?);
+    b.enable_delay_alu();
+    fa::preconvert(&mut b, g)?;
+    b.finish()
+}
+
+fn direct(g: &FaGen) -> Result<Emitted, String> {
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    b.enable_delay_alu();
+    // Two LDS planes (ids 0, 1): K bytes [0, 32768), V bytes [32768, 65536).
+    declare_lds(&mut b, g)?;
+    fa::prologue(&mut b, g)?;
+    b.loop_(fa::LOOP, |b| tile(b, g))?;
+    fa::epilogue(&mut b, g)?;
+    b.finish()
+}
+
+fn declare_lds(b: &mut Builder, g: &FaGen) -> Result<(), String> {
+    let slots = g.lds_slots();
+    for i in 0..slots.len() {
+        let (name, base, bytes) = slots[i];
+        let id = b.lds_slot(name, base, bytes)?;
+        if id != i {
+            return Err(format!("LDS slot {name} got id {id}"));
+        }
+    }
+    Ok(())
+}
+
+// One KT64 tile: fill K and V (the helper wave skips the stores but not the rendezvous), publish both
+// planes, QK and the four softmax/PV subtiles on the four compute waves, retire both planes, advance.
+fn tile(b: &mut Builder, g: &FaGen) -> Result<(), String> {
+    fa::tile_setup(b, g)?;
+    fa::fill(b, g)?;
+    fa::label(b, fa::FILL_DONE)?;
+    b.barrier_with_scope([ready(0), ready(1)], "lds_only")?;
+    fa::label(b, fa::QK)?;
+    fa::skip_if_helper(b, fa::TURN)?;
+    fa::qk(b, g)?;
+    for sub in 0..4 {
+        fa::softmax_sub(b, g, sub)?;
+    }
+    fa::label(b, fa::TURN)?;
+    b.barrier_with_scope([retire(0), retire(1)], "lds_only")?;
+    fa::next_tile(b)
+}

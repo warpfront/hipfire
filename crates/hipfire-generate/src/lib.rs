@@ -1,0 +1,87 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! # hipfire-generate
+//!
+//! Per-architecture generation bodies, lifted out of the daemon binary.
+//!
+//! ## Why this crate exists
+//!
+//! `daemon.rs` carried 17 `generate_*` functions — roughly 25k lines — that
+//! each reach into an architecture crate directly. That is the last thing
+//! keeping the daemon's arch-crate reference count above zero.
+//!
+//! They could not simply move down. `hipfire-loader` has the 11 arch
+//! dependencies but sits *below* `hipfire-engine`; `hipfire-engine` sits above
+//! the loader but is deliberately arch-free (0 arch deps). The bodies need
+//! both sides, so they need a layer above both:
+//!
+//! ```text
+//! saddle-core -> hipfire-runtime -> hipfire-loader -> hipfire-engine
+//!                -> hipfire-generate -> hipfire-daemon
+//! ```
+//!
+//! ## Module ownership during the re-layering
+//!
+//! Grouped by architecture family so each module has exactly one owning agent
+//! and the three can be filled concurrently without collision. This file and
+//! `Cargo.toml` are scaffold-owned and belong to no agent.
+
+/// Helpers shared by more than one family — the tail that made the first
+/// three-way split fail. Single owner; families depend on it and never on
+/// each other.
+pub mod common;
+
+/// Jev-compatible "decide": typed classification questions answered by
+/// next-token logit readout, orchestrated over the `Carrier` decide hooks.
+pub mod decide;
+
+/// The generic autoregressive generate path — the fallback every model
+/// without a specialised route takes, and the last daemon code that
+/// manipulates architecture types directly.
+pub mod ar;
+
+/// Qwen3.5/3.6 family: the multi-token path, native MTP, speculative and
+/// DFlash routes, and expert-parallel. The largest group —
+/// `generate_multi` alone is ~5,300 lines.
+pub mod qwen;
+
+/// DeepSeek-V4 plus the smaller dense and MoE architectures: LFM2.5,
+/// MiniMax-M2, Cohere2-MoE, Gemma4, Muse Glimmer, Qwen2, LLaMA.
+pub mod dense;
+
+/// Raon-1-mini (arch 19): prompt render, sampling defaults and the
+/// `generate_ar_with_forward` wiring for `GenerationRoute::RaonAr`.
+pub mod raon;
+
+/// Image generation: the `img_generate` wire body (FLUX.1/FLUX.2),
+/// including reference-image decode and the GPU/CPU denoise split.
+pub mod img;
+
+/// Embeddings: the `embed` wire body (arch 17, qwen3.5 multi-vector
+/// encoder) — assemble, encode, skiplist mask, L2 normalize.
+pub mod embed;
+/// Vision and OCR: Qwen3.5-VL and dots.ocr, including the text-only
+/// dots.ocr path.
+pub mod vision;
+
+/// LFM3 (arch_id 24) generation bodies (text / VL / audio / omni).
+pub mod lfm3;
+
+/// Redline capture/replay fixtures lifted out of the daemon.
+pub mod redline;
+
+/// Synthetic `bench_prefill` / `bench_decode` forwards for every multi-device
+/// topology `serve` admits (PP, dense TP, EP), through serve's own entrypoints.
+pub mod bench_topology;
+
+/// Continuous-batch drivers and their admission predicates.
+pub mod batch;
+
+/// Flash-Next exact autoregressive request lanes.
+pub mod fn_batch;
+
+/// VMM batch route: per-request singleton semantics on batch lanes —
+/// conversation continuity (prefix pool) and think control.
+pub mod vmm_conv;

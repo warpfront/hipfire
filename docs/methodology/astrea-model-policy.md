@@ -46,7 +46,8 @@ Intended Astrea scope when implemented and owned:
   emit mixed-format recipes under a size budget.
 - MoE ingress: separate router, expert, and shared dense tensors before
   optimizing a MoE model family.
-- KV policy: compare current `asym3` against `q8`, TriAttention/CASK,
+- KV policy: compare the `q8` default (native `fp8` on gfx1201) against the
+  `fwht3` headroom mode, TriAttention/CASK,
   TurboQuant-like, and RotorQuant-like candidates using an explicit policy
   artifact.
 - Package planning: describe a future single-file HFQ package containing

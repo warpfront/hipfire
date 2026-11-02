@@ -1,0 +1,58 @@
+{
+  "scope": "standalone gfx1201 production-symbol twin with isolated HIP-event measurements; not serving-route promotion",
+  "module": "fused_qkvza_hfq4g256_mq4v2",
+  "symbol": "fused_qkvza_mq4g256v2",
+  "arch": "gfx1201",
+  "source_commit": "dbe0f62a3644b0c199825d3079f57d79b728fa43",
+  "builder_commit": "d58bff4b856c26e7b618db469377defa60f18fec",
+  "incumbent_recipe_sha256": "24946fc118db455e19f96b0e02fd67bb6bfaf46ed4a917e23352bef6153e1ba5",
+  "hashes": {
+    "s_text": "e8a580a6e3c5680f5e14898716dde3172a7715506991ec1d79b248363454b34b",
+    "proof": "901fc1b46eb3d58e03ab0f88cd5b7593fbbef12d138e64e38389842376a63478",
+    "shape": "b35a4773a2732745a94a26701f0a4396c00e24b83ae1c7143a8d67619d8e0257",
+    "radiowave": "515afab9d53679c0322178f2e6cc85546fed626431690698fb97230d8b1dd39e",
+    "co": "31ac049859d799558b6f9e44176f94a68c6bfbcd3145ac23bf127b7ab4f36f38",
+    "hxaco": "ded83395c4dc4fe78750d1669d029f725b9b69b53216ac8d25c9de5b9e79ac7d",
+    "m7": "a3b84fca8c51c87283dd86a756a2990fdfa060b24b005c4a522bca2d577f869b"
+  },
+  "abi": {"kernarg_bytes": 92, "kernarg_align": 8, "wavefront": 32, "block": [32,1,1], "fixed_lds": 0, "dynamic_lds": 0, "private_segment": 0},
+  "m7": {"lift": "byte-exact", "obligations": {}, "ambiguous_delays": 0, "instructions": 403, "vgpr_high_water": 76, "sgpr_high_water": 30, "clauses": 2, "delays": 12},
+  "schedule": {"quad_first_batch_loads": 16, "quad_loadcnt_waits": [14,12,11,10,9,6,2,1,0], "quad_checked_vopd_pairs": 14, "quad_delay_hints": 12, "arithmetic": "unchanged element-1 RN seed, FMAC elements 0 then 2..7, separate stream add, frozen stream fold and crosslane tree"},
+  "oracle": {
+    "owner": "PmQkvza",
+    "reviewed_by": "PmOracle",
+    "reports": [
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/fused_qkvza_hfq4g256_mq4v2/full-occ0-31ac049859d79955/report.json",
+      "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/fused_qkvza_hfq4g256_mq4v2/full-occ47-31ac049859d79955/report.json"
+    ],
+    "mismatch_bytes": 0,
+    "all_nine_buffers_and_guards": true,
+    "edge_shapes_per_capture": 99,
+    "edge_group_counts": [1,2,3,4,5,6,7,8,9,19,20]
+  },
+  "emission": {"single_fresh_process_real_seconds": 0.01, "includes_native_link_and_m7": true, "gpus_hidden": true, "evidence": "GNU time -p; real 0.01, user 0.01, sys 0.00", "performance_claim": false},
+  "kernel_timing": {
+    "method": "HIP events; 5 warm launches and 15 measured launches per arm, 3 fresh Python processes; median of process medians",
+    "gpu": "GPU-6109a4cb5f833235",
+    "lock": "card-D via lockrun.sh, LOCKRUN_MAX_SECS=900",
+    "capture": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-inputs/fused_qkvza_mq4g256v2/occ0",
+    "dimensions": [10240,6144,48,48,5120],
+    "hipcc_sha256": "8b4ad8d1ae1f45ebbde2979fa2fe9c2cf88703a4045d1c42fea177660094ec47",
+    "hipcc_process_medians_us": [60.88100001215935,61.0009990632534,60.96100062131882],
+    "pm_process_medians_us": [62.081001698970795,62.12100014090538,62.04099953174591],
+    "hipcc_median_us": 60.96100062131882,
+    "pm_median_us": 62.081001698970795,
+    "pm_over_hipcc": 1.0183724195180008,
+    "within_three_percent": true,
+    "post_mismatches_all_processes": 0,
+    "evidence": [
+      "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.timing.process1.json",
+      "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.timing.process2.json",
+      "/home/kaden/ClaudeCode/warpfront/wt-pmdt-plan/kernels/pm-decode/gfx1201/fused_qkvza_hfq4g256_mq4v2.timing.process3.json"
+    ],
+    "serving_route_or_speedup_claim": false
+  },
+  "hipcc_inventory_median_seconds": 0.3641493969989824,
+  "removed_hip_modules": 0,
+  "removal_note": "One complete selected export is authored; routing and pack removal remain Main-owned integration gates."
+}

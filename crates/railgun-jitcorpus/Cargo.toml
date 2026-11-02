@@ -1,0 +1,21 @@
+[package]
+name = "railgun-jitcorpus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Offline railgun JIT receipt corpus (design §2.5, milestone MJ): compiles every runtime-JIT module of the admitted default programs with the runtime's own recipe, certifies each object with railgun-cert, and checks coverage"
+publish = false
+
+# Offline only (links peacemaker through railgun-cert); the runtime reads the
+# corpus through `railgun-corpus`.
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+railgun-cert = { path = "../railgun-cert" }
+railgun-corpus = { path = "../railgun-corpus" }
+rdna-compute = { path = "../rdna-compute", features = ["deltanet"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+[[bin]]
+name = "railgun-jit-corpus"
+path = "src/main.rs"

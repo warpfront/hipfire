@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# lifecycle: deprecated since 0.4.0, removal 0.5.0 — PFlash is unsupported research; prefix caching supersedes it
+echo "warning: pflash-niah-bench.sh is deprecated and will be removed in 0.5.0; PFlash is not supported" >&2
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Kaden Schutt
@@ -88,7 +90,7 @@ if [ -z "$FIXTURE" ] || [ ! -f "$FIXTURE" ]; then
 fi
 if [ ! -x "$EXE" ]; then
     echo "ERR: bench binary missing -- build with:" >&2
-    echo "  cargo build --release --features deltanet -p hipfire-runtime --example pflash_niah_bench" >&2
+    echo "  cargo build --release --features deltanet -p hipfire-pflash --example pflash_niah_bench" >&2
     exit 2
 fi
 

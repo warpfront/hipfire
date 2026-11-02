@@ -12,6 +12,9 @@
 // LDS: (head_dim + 32) * 4 bytes.
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
+#ifdef HIPFIRE_KV_SLOT_PAGED
+#include "kv_slot_desc_paged.h"
+#endif
 
 extern "C" __global__ void kv_cache_write_asym_k_fwht4_batched(
     unsigned char* __restrict__ k_dst,
@@ -21,13 +24,33 @@ extern "C" __global__ void kv_cache_write_asym_k_fwht4_batched(
     const float* __restrict__ signs2,
     int n_kv_heads,
     int head_dim,
+#ifdef HIPFIRE_KV_SLOT_PAGED
+    int batch_size,
+    // Multi-slot addressing: when non-null, `row_slot[bid]` selects the
+    // KvSlotDesc whose `legacy_k_base`/block table translates this row's
+    // destination position. Nulls = legacy single-arena mode, byte-identical
+    // to the pre-port kernel.
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot           // [batch_size] or nullptr = legacy
+#else
     int batch_size
+#endif
 ) {
     const int h = blockIdx.x;
     const int bid = blockIdx.y;
     if (h >= n_kv_heads || bid >= batch_size) return;
     const int tid = threadIdx.x;
     const int pos = positions[bid];
+#ifdef HIPFIRE_KV_SLOT_PAGED
+
+    // One code path for both modes: in legacy mode we synthesise a zero-base
+    // descriptor, so the address arithmetic below is unchanged and the
+    // output is bitwise identical to the pre-port kernel.
+    const int slot = (row_slot != nullptr) ? row_slot[bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(0, 0);
+#endif
 
     const int kv_dim = n_kv_heads * head_dim;
     const int bytes_per_head = 4 + head_dim / 2;
@@ -48,7 +71,10 @@ extern "C" __global__ void kv_cache_write_asym_k_fwht4_batched(
     __syncthreads();
     for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
     float orig_norm = sqrtf(scratch[0]);
-    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+    // FWHT coords of a unit 256-dim head have variance 1/256; the 128-family thresholds
+    // assume 1/128, so scale by sqrt(2). cnorm absorbs it (format unchanged).
+    const float q_scale = head_dim == 256 ? 1.41421356f : 1.0f;
+    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm * q_scale : 0.0f;
     for (int d = tid; d < head_dim; d += 32) x[d] *= inv_norm;
     __syncthreads();
 
@@ -72,7 +98,12 @@ extern "C" __global__ void kv_cache_write_asym_k_fwht4_batched(
     float recon_norm = sqrtf(scratch[0]);
     float cnorm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
 
+#ifdef HIPFIRE_KV_SLOT_PAGED
+    unsigned char* out =
+        k_dst + kv_offset_for_k(desc, pos, bytes_per_pos) + h * bytes_per_head;
+#else
     unsigned char* out = k_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+#endif
     if (tid == 0) *(float*)out = cnorm;
     for (int half = 0; half < n_halves; half++) {
         int base = half * 4;

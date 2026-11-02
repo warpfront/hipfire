@@ -5,7 +5,7 @@
 //! Machine install / repair wizard (`hipfire setup`).
 //!
 //! Bash only bootstraps the CLI binary; this module owns ROCm/GPU resolution,
-//! runtime builds, atomic binary install, cold-kernel seeding, and install.json.
+//! runtime builds, atomic binary install, exact-registry kernel packaging, and install.json.
 
 use anyhow::{bail, Context, Result};
 use serde_json::json;
@@ -97,7 +97,6 @@ fn selection_from_prompt_read(read: PromptRead, count: usize) -> Result<Option<u
     }
 }
 
-/// Install or repair this machine's hipfire runtime.
 pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Result<()> {
     install_setup_interrupt_handler();
 
@@ -117,10 +116,136 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     let commit = crate::git_output(&source, &["rev-parse", "HEAD"])
         .context("failed to resolve full git HEAD for source checkout")?;
 
+    // Honour explicit --hipcc and --strict-rocm for this run without mutating
+    // process-global env in tests — the pure helpers below take them as params.
+    // For the live installer we also export them so child cargo/hipcc processes
+    // see the same selection.
+    let hipcc_override = args.hipcc.as_deref();
+    let strict = args.strict_rocm || hipfire_config::rocm::is_strict_rocm();
+    if let Some(hipcc) = hipcc_override {
+        if !hipcc.is_file() {
+            bail!(
+                "--hipcc {} does not exist or is not executable; set --hipcc to an executable hipcc/amdclang++ (also HIPFIRE_HIPCC)",
+                hipcc.display()
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(hipcc) {
+                if meta.permissions().mode() & 0o111 == 0 {
+                    bail!("--hipcc {} is not executable", hipcc.display());
+                }
+            }
+        }
+    }
+    // Export for child processes (single-threaded installer, safe).
+    if let Some(hipcc) = hipcc_override {
+        // SAFETY: installer is single-threaded at this point; tests use pure
+        // helpers and do not call setup_command.
+        unsafe { std::env::set_var("HIPFIRE_HIPCC", hipcc) };
+    }
+    if strict {
+        unsafe { std::env::set_var("HIPFIRE_ROCM_STRICT", "1") };
+    }
+
+    // A tag (or a tag-named --ref) selects that release's prebuilt kernel
+    // pack; --compile-kernels keeps local compilation.
+    let pack_tag = kernel_pack_tag(&args);
+
     // --- 4a. Resolve ROCm root (no mutation) ---
-    let rocm_root = resolve_rocm_root(args.rocm_root.as_deref(), args.yes)?;
-    ensure_rocm_complete(&rocm_root)?;
+    // A kernel pack needs only the HIP runtime. Without a device compiler the
+    // install proceeds on a runtime-only root and fails later only if the
+    // pack turns out to be unusable.
+    let (rocm_root, has_compiler) =
+        match resolve_rocm_root_with(args.rocm_root.as_deref(), hipcc_override, strict, args.yes) {
+            Ok(root) => (root, true),
+            Err(error) => match pack_tag.and_then(|_| runtime_only_root(args.rocm_root.as_deref()))
+            {
+                Some(root) => {
+                    // The runtime-only fallback fires when root resolution
+                    // failed (e.g. multiple ambiguous roots without
+                    // --rocm-root). A resolution failure is not evidence that
+                    // no device compiler exists: an explicit --hipcc override
+                    // or a cross-root toolchain against this root still
+                    // counts, so re-derive has_compiler from the same
+                    // resolver the success path trusts instead of forcing
+                    // pack-only mode.
+                    let has_compiler = root_supports_compiler(&root, hipcc_override, strict);
+                    if has_compiler {
+                        eprintln!(
+                            "ROCm roots were ambiguous; continuing on runtime root {} with the \
+                             device compiler resolved separately",
+                            root.display()
+                        );
+                    }
+                    (root, has_compiler)
+                }
+                None => return Err(error),
+            },
+        };
+    if has_compiler {
+        ensure_rocm_complete(&rocm_root)?;
+    }
     ensure_not_interrupted()?;
+
+    // Print resolved provenance before any heavy work so a failing install
+    // report always contains it. Uses the same toolchain resolver as
+    // hipfire-rocm-resolve so output stays consistent.
+    if !has_compiler {
+        let version = hipfire_config::rocm::version_for_root(&rocm_root)
+            .unwrap_or_else(|| "unknown".to_string());
+        let runtime = hipfire_config::rocm::runtime_library(&rocm_root)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "not found".to_string());
+        eprintln!(
+            "ROCm root:       {} (version {version})",
+            rocm_root.display()
+        );
+        eprintln!("HIPCC:           none (kernels must come from the release kernel pack)");
+        eprintln!("HIP runtime:     {runtime}");
+    } else {
+        let toolchain = hipfire_config::rocm::resolve_toolchain_for_explicit(
+            Some(&rocm_root),
+            hipcc_override,
+            strict,
+        )
+        .or_else(|_| hipfire_config::rocm::resolve_toolchain());
+        if let Ok(tc) = toolchain {
+            let version = hipfire_config::rocm::version_for_root(&tc.root)
+                .or_else(hipfire_config::rocm::version)
+                .unwrap_or_else(|| "unknown".to_string());
+            let compiler = tc
+                .compiler
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found".to_string());
+            let source = tc
+                .compiler_source
+                .as_ref()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let comp_root = tc
+                .compiler_root
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let runtime = hipfire_config::rocm::runtime_library(&tc.root)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "not found".to_string());
+            eprintln!("ROCm root:       {} (version {version})", tc.root.display());
+            eprintln!("HIPCC:           {compiler} (source: {source}, root: {comp_root})");
+            eprintln!("HIP runtime:     {runtime}");
+            for line in hipfire_config::rocm::toolchain_warnings(&tc) {
+                eprintln!("{line}");
+            }
+        } else {
+            // Fallback: at least show the selected root when toolchain
+            // resolution failed (e.g. strict cross-root). The error itself will
+            // already have been printed via ensure_* failures.
+            eprintln!("ROCm root:       {}", rocm_root.display());
+        }
+    }
 
     // --- 4b. Resolve GPU arch (no mutation) ---
     let gpu_arch = resolve_gpu_arch(args.gpu_arch.as_deref(), &rocm_root, args.yes)?;
@@ -143,6 +268,13 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
             gpu_arch.as_deref().unwrap_or("unknown")
         );
         println!("Profile:         {profile}");
+        println!(
+            "Kernels:         {}",
+            pack_tag.map_or_else(
+                || "compile locally".to_owned(),
+                |tag| format!("release pack {tag} (compile locally if unusable)")
+            )
+        );
         println!("Install prefix:  {}", bin_dir.display());
         eprint!("Continue? [Y/n] ");
         io::stderr().flush()?;
@@ -158,16 +290,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     run_cargo_required(
         &source,
         &rocm_root,
-        &[
-            "build",
-            "--release",
-            "--features",
-            "deltanet",
-            "--example",
-            "daemon",
-            "-p",
-            "hipfire-runtime",
-        ],
+        &["build", "--release", "-p", "hipfire-daemon"],
         "required runtime (daemon) build",
     )?;
     ensure_not_interrupted()?;
@@ -212,7 +335,7 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         };
 
     install_one(
-        &release.join("examples").join("daemon"),
+        &release.join("daemon"),
         &bin_dir.join("daemon"),
         &mut replacements,
     )?;
@@ -238,40 +361,91 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         err
     })?;
 
-    if let Some(arch) = gpu_arch.as_deref() {
-        let cold = bin_dir.join("kernels").join("compiled").join(arch);
-        if let Err(err) = fs::create_dir_all(&cold) {
-            rollback_replacements(&replacements);
-            return Err(err)
-                .with_context(|| format!("failed to create cold kernel dir {}", cold.display()));
+    let pack = match (pack_tag, gpu_arch.as_deref()) {
+        (Some(tag), Some(arch))
+            if rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(&arch) =>
+        {
+            let base = args
+                .kernel_pack_url
+                .clone()
+                .unwrap_or_else(|| crate::kernel_pack::default_base_url(tag));
+            let rocm_version = hipfire_config::rocm::version_for_root(&rocm_root)
+                .or_else(hipfire_config::rocm::version);
+            let dest = bin_dir.join("kernels").join("compiled").join(arch);
+            match crate::kernel_pack::install(&crate::kernel_pack::PackRequest {
+                tag,
+                arch,
+                commit: &commit,
+                dest: &dest,
+                base: &base,
+                rocm_version: rocm_version.as_deref(),
+            }) {
+                Ok(manifest) => {
+                    eprintln!(
+                        "Installed kernel pack {tag} for {arch}: {} modules from `{}`, SHA-256 and every index verified against this checkout",
+                        manifest.modules, manifest.toolchain_id
+                    );
+                    Some(manifest)
+                }
+                Err(reason) => {
+                    eprintln!("Kernel pack {tag} not used: {reason}");
+                    None
+                }
+            }
         }
-    }
-    ensure_not_interrupted().map_err(|err| {
-        rollback_replacements(&replacements);
-        err
-    })?;
-
-    let mut precompile = Command::new(bin_dir.join("daemon"));
-    precompile.arg("--precompile");
-    apply_rocm_env(&mut precompile, &rocm_root);
-    match run_capturing(precompile) {
-        Ok(out) if out.status.success() && !interrupted() => {}
-        Ok(out) if interrupted() => {
-            let _ = out;
-            rollback_replacements(&replacements);
-            bail!("setup interrupted");
-        }
-        Ok(out) => {
-            print_command_output(&out);
-            rollback_replacements(&replacements);
-            bail!(
-                "required kernel precompile failed; previous binaries remain in place ({})",
-                out.status
+        (Some(tag), None) => {
+            eprintln!(
+                "Kernel pack {tag} not used: GPU architecture not detected (pass --gpu-arch ARCH)"
             );
+            None
         }
-        Err(err) => {
-            rollback_replacements(&replacements);
-            return Err(err).context("failed to start installed daemon --precompile");
+        _ => None,
+    };
+    if pack.is_some() {
+        // Installed and verified above; nothing to compile.
+    } else if let Some(arch) = gpu_arch
+        .as_deref()
+        .filter(|arch| !rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(arch))
+    {
+        eprintln!(
+            "No indexed kernel registry for {arch}; hipcc remains required for JIT on this GPU."
+        );
+    } else if !has_compiler {
+        rollback_replacements(&replacements);
+        bail!(
+            "no usable kernel pack and no device compiler to build kernels locally; install ROCm's hipcc, \
+             or pass --rocm-root PATH / --hipcc PATH (HIPFIRE_HIPCC)"
+        );
+    } else {
+        if pack_tag.is_some() {
+            eprintln!("Compiling kernels locally with hipcc");
+        }
+        // The daemon packages the exact registry through KernelCompiler::pack_to,
+        // the same indexed publisher used by hipfire-kernel-pack. Failure is
+        // required: never leave an unindexed compiler-free installation behind.
+        let mut precompile = Command::new(bin_dir.join("daemon"));
+        precompile.arg("--precompile");
+        apply_rocm_env(&mut precompile, &rocm_root);
+        match run_capturing(precompile) {
+            Ok(out) if out.status.success() && !interrupted() => {}
+            Ok(out) if interrupted() => {
+                let _ = out;
+                rollback_replacements(&replacements);
+                bail!("setup interrupted");
+            }
+            Ok(out) => {
+                print_command_output(&out);
+                rollback_replacements(&replacements);
+                bail!(
+                    "required indexed kernel packaging failed; previous binaries remain in place ({})",
+                    out.status
+                );
+            }
+            Err(err) => {
+                rollback_replacements(&replacements);
+                return Err(err)
+                    .context("failed to start installed daemon indexed kernel packaging");
+            }
         }
     }
 
@@ -318,7 +492,14 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         "ref": meta_ref,
         "rocm_root": rocm_root.to_string_lossy(),
         "gpu_arch": gpu_arch,
+        "hipcc": hipcc_override.map(|p| p.to_string_lossy().into_owned()),
+        "strict_rocm": strict,
         "profile": profile,
+        "kernel_pack": pack.as_ref().map(|manifest| json!({
+            "tag": manifest.tag,
+            "toolchain_id": manifest.toolchain_id,
+            "rocm_range": [manifest.rocm_min, manifest.rocm_max_exclusive],
+        })),
         "installed_at": installed_at,
     });
     if let Err(err) = write_install_json(&paths.root, &record) {
@@ -340,23 +521,55 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
 }
 
 fn resolve_rocm_root(explicit: Option<&Path>, yes: bool) -> Result<PathBuf> {
+    // Env-based wrapper for call sites that do not have explicit hipcc/strict.
+    // The live installer passes them explicitly via resolve_rocm_root_with to
+    // avoid global mutation in tests (see rocm.rs:723-746 pattern).
+    let hipcc = hipfire_config::rocm::configured_compiler().map(|(_, path)| path);
+    let strict = hipfire_config::rocm::is_strict_rocm();
+    resolve_rocm_root_with(explicit, hipcc.as_deref(), strict, yes)
+}
+
+/// Pure form of [`resolve_rocm_root`] with injected hipcc/strict (no env reads).
+///
+/// `hipcc` is the `HIPFIRE_HIPCC` / `--hipcc` override if set, `strict`
+/// mirrors `HIPFIRE_ROCM_STRICT=1` / `--strict-rocm`.
+fn resolve_rocm_root_with(
+    explicit: Option<&Path>,
+    hipcc: Option<&Path>,
+    strict: bool,
+    yes: bool,
+) -> Result<PathBuf> {
     if let Some(path) = explicit {
-        // Preserve exact invalid-root wording with the path as given (before canonicalize).
-        if !root_has_device_compiler(path) {
-            bail!(
-                "ROCm root {} has no usable device compiler; pass --rocm-root PATH",
-                path.display()
-            );
+        // Prefer the toolchain resolver so a libs-only explicit root with a
+        // cross-root compiler is accepted when not strict. Preserve the exact
+        // invalid-root wording with the path as given (before canonicalize).
+        let toolchain =
+            hipfire_config::rocm::resolve_toolchain_for_explicit(Some(path), hipcc, strict);
+        if toolchain.is_ok() {
+            return Ok(canonicalize_or_keep(path));
         }
-        // Valid explicit roots return a canonical absolute path when possible.
-        return Ok(canonicalize_or_keep(path));
+        // No usable compiler even with cross-root/override — hard-fail and
+        // point at both --rocm-root and --hipcc as remedies.
+        let tried = hipfire_config::rocm::resolve_toolchain_for_explicit(Some(path), hipcc, strict)
+            .err()
+            .unwrap_or_else(|| "no device compiler".to_string());
+        bail!(
+            "ROCm root {} has no usable device compiler; pass --rocm-root PATH or --hipcc PATH (HIPFIRE_HIPCC)\n{tried}",
+            path.display()
+        );
     }
 
-    let mut candidates = usable_rocm_roots(hipfire_config::rocm::roots());
+    // Gather candidates that are usable either as coherent SDKs or as
+    // headers+runtime-only roots with an external compiler when not strict.
+    let candidates = collapse_packaging_ambiguity(usable_rocm_roots_with(
+        hipfire_config::rocm::roots(),
+        hipcc,
+        strict,
+    ));
 
     let selected = match candidates.len() {
-        0 => bail!("no ROCm installation found; install ROCm or pass --rocm-root PATH"),
-        1 => candidates.remove(0),
+        0 => bail!("no ROCm installation found; install ROCm or pass --rocm-root PATH or --hipcc PATH (HIPFIRE_HIPCC)"),
+        1 => candidates.into_iter().next().unwrap(),
         _ => {
             if io::stdin().is_terminal() && !yes {
                 println!("Multiple ROCm installations found:");
@@ -378,7 +591,7 @@ fn resolve_rocm_root(explicit: Option<&Path>, yes: bool) -> Result<PathBuf> {
                     println!("  {}. {}{note}", i + 1, root.display());
                 }
                 let idx = read_numbered_selection(candidates.len(), "ROCm root")?;
-                candidates.remove(idx)
+                candidates.into_iter().nth(idx).unwrap()
             } else {
                 let list = candidates
                     .iter()
@@ -394,6 +607,46 @@ fn resolve_rocm_root(explicit: Option<&Path>, yes: bool) -> Result<PathBuf> {
     Ok(selected)
 }
 
+/// Reduce a multi-root candidate list over the two packaging shapes that are
+/// not real ambiguity and should not force `--rocm-root`:
+///
+///  - an umbrella root alongside its own versioned subdirectories (the
+///    amdrocm debs install `/opt/rocm` plus `/opt/rocm/core-10.0`, each a
+///    distinct directory with its own hipcc);
+///  - exactly one complete root next to compiler-only stubs (e.g. `/usr`
+///    with `bin/hipcc` but no runtime or headers).
+///
+/// Descendants of another candidate drop in favour of the umbrella; if one
+/// complete root remains it wins with a note. Genuinely distinct complete
+/// roots stay ambiguous (prompt interactively, bail otherwise) exactly as
+/// before.
+fn collapse_packaging_ambiguity(mut candidates: Vec<PathBuf>) -> Vec<PathBuf> {
+    if candidates.len() > 1 {
+        // Drop roots that live underneath another candidate (umbrella wins).
+        let snapshot = candidates.clone();
+        candidates.retain(|root| {
+            !snapshot
+                .iter()
+                .any(|other| other != root && root.starts_with(other))
+        });
+    }
+    if candidates.len() > 1 {
+        let complete: Vec<PathBuf> = candidates
+            .iter()
+            .filter(|root| hipfire_config::rocm::missing_components(root).is_empty())
+            .cloned()
+            .collect();
+        if complete.len() == 1 {
+            eprintln!(
+                "Multiple ROCm roots found; selecting the only complete one: {}",
+                complete[0].display()
+            );
+            candidates = complete;
+        }
+    }
+    candidates
+}
+
 /// Prefer a canonical absolute path; keep `path` if canonicalize fails.
 fn canonicalize_or_keep(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
@@ -405,9 +658,37 @@ fn canonicalize_or_keep(path: &Path) -> PathBuf {
 /// (e.g. `/opt/rocm/core`, `core-7`, `core-7.14` → one root). Canonicalization
 /// failure keeps the original path rather than discarding a usable candidate.
 fn usable_rocm_roots(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let hipcc = hipfire_config::rocm::configured_compiler().map(|(_, path)| path);
+    let strict = hipfire_config::rocm::is_strict_rocm();
+    usable_rocm_roots_with(roots, hipcc.as_deref(), strict)
+}
+
+/// Pure form of [`usable_rocm_roots`] with injected hipcc/strict.
+fn usable_rocm_roots_with(
+    roots: impl IntoIterator<Item = PathBuf>,
+    hipcc: Option<&Path>,
+    strict: bool,
+) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     for root in roots {
-        if !root_has_device_compiler(&root) {
+        // A root is usable if it is coherent, or if it is headers+runtime-only
+        // and a cross-root compiler can be supplied (when not strict).
+        let usable = if root_has_device_compiler(&root) {
+            true
+        } else if !strict && hipfire_config::rocm::is_headers_runtime_only_root(&root) {
+            // Cross-root compiler available via explicit hipcc or via PATH/other roots.
+            if hipcc.is_some_and(|p| p.is_file()) {
+                true
+            } else {
+                // Check PATH / other roots via the toolchain helper — if a
+                // toolchain can be resolved for this root alone, it is usable.
+                hipfire_config::rocm::resolve_toolchain_for_explicit(Some(&root), hipcc, strict)
+                    .is_ok()
+            }
+        } else {
+            false
+        };
+        if !usable {
             continue;
         }
         let key = canonicalize_or_keep(&root);
@@ -468,7 +749,7 @@ fn ensure_rocm_complete(root: &Path) -> Result<()> {
     for line in hipfire_config::rocm::install_guidance() {
         msg.push_str(&format!("  {line}\n"));
     }
-    msg.push_str("\nTo use a different ROCm install instead: --rocm-root PATH");
+    msg.push_str("\nTo use a different ROCm install instead: --rocm-root PATH or --hipcc PATH (HIPFIRE_HIPCC)");
     bail!(msg)
 }
 
@@ -476,6 +757,15 @@ fn root_has_device_compiler(root: &Path) -> bool {
     hipfire_config::rocm::DEVICE_COMPILERS
         .iter()
         .any(|name| root.join("bin").join(name).is_file())
+}
+
+/// Whether `root` can supply, or pair with, a device compiler: its own
+/// `bin/hipcc`, an explicit `--hipcc`/`HIPFIRE_HIPCC` override, or a
+/// cross-root toolchain resolution (non-strict).
+fn root_supports_compiler(root: &Path, hipcc: Option<&Path>, strict: bool) -> bool {
+    root_has_device_compiler(root)
+        || hipcc.is_some_and(|p| p.is_file())
+        || hipfire_config::rocm::resolve_toolchain_for_explicit(Some(root), hipcc, strict).is_ok()
 }
 
 fn resolve_gpu_arch(explicit: Option<&str>, rocm_root: &Path, yes: bool) -> Result<Option<String>> {
@@ -548,6 +838,41 @@ fn metadata_ref(args: &crate::SetupArgs) -> String {
         .or(args.commit.as_ref())
         .cloned()
         .unwrap_or_else(|| "local".to_owned())
+}
+
+/// Release whose kernel pack to install: `--tag`, or a `--ref` that names a
+/// tag (a branch or commit simply has no pack and falls back). `None` with
+/// `--compile-kernels`.
+fn kernel_pack_tag(args: &crate::SetupArgs) -> Option<&str> {
+    if args.compile_kernels {
+        return None;
+    }
+    args.tag.as_deref().or(args.reference.as_deref())
+}
+
+/// A ROCm root with the HIP runtime but no device compiler, enough to run a
+/// prebuilt kernel pack. An explicit root is taken as given; otherwise the
+/// candidates must share one runtime library.
+fn runtime_only_root(explicit: Option<&Path>) -> Option<PathBuf> {
+    if let Some(root) = explicit {
+        return hipfire_config::rocm::runtime_library(root)
+            .is_some()
+            .then(|| canonicalize_or_keep(root));
+    }
+    let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+    for root in hipfire_config::rocm::roots() {
+        let Some(library) = hipfire_config::rocm::runtime_library(&root) else {
+            continue;
+        };
+        let library = canonicalize_or_keep(&library);
+        if !found.iter().any(|(_, seen)| *seen == library) {
+            found.push((canonicalize_or_keep(&root), library));
+        }
+    }
+    match found.len() {
+        1 => found.pop().map(|(root, _)| root),
+        _ => None,
+    }
 }
 
 fn read_numbered_selection(count: usize, label: &str) -> Result<usize> {
@@ -741,7 +1066,19 @@ fn run_cargo_required(source: &Path, rocm_root: &Path, args: &[&str], label: &st
     cmd.args(args).current_dir(source);
     pin_cargo_to_source_target(&mut cmd, source);
     apply_rocm_env(&mut cmd, rocm_root);
-    let out = run_capturing(cmd).with_context(|| format!("failed to start {label}"))?;
+    let out = match run_capturing(cmd) {
+        Ok(out) => out,
+        // The bare os error 2 from exec is "No such file or directory",
+        // which names neither cargo nor the fix; scripts/install.sh checks
+        // this up front but direct `hipfire setup` reached from other
+        // entry points does not.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => bail!(
+            "cargo not found on PATH; {label} needs it. Install Rust from \
+             https://rustup.rs and re-run, and make sure ~/.cargo/bin is on PATH \
+             for non-login shells."
+        ),
+        Err(err) => return Err(err).with_context(|| format!("failed to start {label}")),
+    };
     if interrupted() {
         bail!("setup interrupted");
     }
@@ -996,11 +1333,11 @@ fn path_on_path(bin: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        backup_path_for, cleanup_backups, continue_decision, ensure_rocm_complete,
-        install_binary_with_backup, metadata_ref_from_parts, parse_gpu_arches,
-        pin_cargo_to_source_target, prompt_line_from_read, restore_config_toml,
-        rollback_replacements, selection_from_prompt_read, snapshot_config_toml, usable_rocm_roots,
-        BinaryReplacement, ContinueDecision, PromptRead,
+        backup_path_for, cleanup_backups, collapse_packaging_ambiguity, continue_decision,
+        ensure_rocm_complete, install_binary_with_backup, metadata_ref_from_parts,
+        parse_gpu_arches, pin_cargo_to_source_target, prompt_line_from_read, restore_config_toml,
+        rollback_replacements, root_supports_compiler, selection_from_prompt_read,
+        snapshot_config_toml, usable_rocm_roots, BinaryReplacement, ContinueDecision, PromptRead,
     };
     use std::{
         env, fs,
@@ -1108,6 +1445,113 @@ mod tests {
         assert_eq!(got, vec![expected]);
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Lay out a fake ROCm root: `compiler` writes `bin/hipcc`, `complete`
+    /// additionally writes `lib/libamdhip64.so` and `include/hip/hip_runtime.h`
+    /// (the exact probes of `missing_components` and `root_has_device_compiler`).
+    fn fake_rocm_root(base: &Path, name: &str, compiler: bool, complete: bool) -> PathBuf {
+        let root = base.join(name);
+        if compiler || complete {
+            fs::create_dir_all(root.join("bin")).unwrap();
+            fs::write(root.join("bin/hipcc"), b"#!/bin/sh\n").unwrap();
+        }
+        if complete {
+            fs::create_dir_all(root.join("lib")).unwrap();
+            fs::write(root.join("lib/libamdhip64.so"), b"").unwrap();
+            fs::create_dir_all(root.join("include/hip")).unwrap();
+            fs::write(root.join("include/hip/hip_runtime.h"), b"").unwrap();
+        } else {
+            fs::create_dir_all(&root).unwrap();
+        }
+        root
+    }
+
+    fn test_base(tag: &str) -> PathBuf {
+        let base = env::temp_dir().join(format!(
+            "hipfire-setup-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        base
+    }
+
+    /// amdrocm debs install `/opt/rocm` as a real umbrella alongside versioned
+    /// children like `/opt/rocm/core-10.0`, each with its own hipcc. Discovery
+    /// lists both (they are distinct directories, not aliases), setup then
+    /// bails for `--rocm-root` in non-interactive contexts. The umbrella must
+    /// absorb its descendants instead (#967).
+    #[test]
+    fn umbrella_root_absorbs_versioned_siblings() {
+        let base = test_base("umbrella");
+        let umbrella = fake_rocm_root(&base, "rocm", true, true);
+        let child = fake_rocm_root(&base, "rocm/core-10.0", true, true);
+        let stub = fake_rocm_root(&base, "usr", true, false);
+
+        let collapsed = collapse_packaging_ambiguity(vec![umbrella.clone(), child, stub.clone()]);
+        assert_eq!(collapsed, vec![umbrella]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// A compiler-only root (hipcc with no runtime or headers, e.g. `/usr`
+    /// after a partial ROCm install) must not keep the candidate list
+    /// ambiguous when exactly one complete root exists (#967).
+    #[test]
+    fn sole_complete_root_wins_over_compiler_only_stub() {
+        let base = test_base("sole-complete");
+        let complete = fake_rocm_root(&base, "rocm", true, true);
+        let stub = fake_rocm_root(&base, "usr", true, false);
+
+        let collapsed = collapse_packaging_ambiguity(vec![stub, complete.clone()]);
+        assert_eq!(collapsed, vec![complete]);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// Two genuinely distinct complete roots stay ambiguous; the reduction
+    /// must not silently pick a winner.
+    #[test]
+    fn distinct_complete_roots_stay_ambiguous() {
+        let base = test_base("two-complete");
+        let a = fake_rocm_root(&base, "rocm-a", true, true);
+        let b = fake_rocm_root(&base, "rocm-b", true, true);
+
+        let collapsed = collapse_packaging_ambiguity(vec![a.clone(), b.clone()]);
+        assert_eq!(collapsed.len(), 2);
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    /// An explicit `--hipcc` override must count as "has a device compiler"
+    /// even when root resolution fell back to a runtime-only root: on the
+    /// reporting host `install.sh --hipcc` still ended in "no device compiler"
+    /// because the fallback hardcoded `has_compiler = false` (#967).
+    #[test]
+    fn root_supports_compiler_honors_explicit_hipcc() {
+        let base = test_base("hipcc-override");
+        let runtime_only = fake_rocm_root(&base, "rocm", false, false);
+        let toolchain_dir = base.join("toolchain");
+        fs::create_dir_all(&toolchain_dir).unwrap();
+        let hipcc = toolchain_dir.join("hipcc");
+        fs::write(&hipcc, b"#!/bin/sh\n").unwrap();
+
+        assert!(
+            root_supports_compiler(&runtime_only, Some(&hipcc), false),
+            "explicit hipcc override must count"
+        );
+        assert!(
+            !root_supports_compiler(&runtime_only, None, true),
+            "no compiler anywhere and strict must stay false"
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

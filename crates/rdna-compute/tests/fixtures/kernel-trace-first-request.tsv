@@ -1,0 +1,78 @@
+# FirstRequestJit discovery: modules compiled/loaded lazily AFTER `ready` by the
+# first requests of fresh-kernel-cache, product-default holds (daemon 567fc823296c
+# unless noted). Each row is a hole the installer inventory must carry; columns:
+# arch, module, symbols requested after ready. Evidence: first-request-jit-evidence/
+# discovery-cells/<cell>.json + .warnings.txt.
+# Batch 1, cell R4, hold frj-disc-r4-v2-01, R9700 (gfx1201), qwen3.6:35b-a3b
+# (qwen3.6-35b-a3b.mq4p, default A3B), 7 diverse requests.
+gfx1201	fused_qkv_q8_0	fused_qkv_q8_0
+gfx1201	fused_qkvza_q8_0	fused_qkvza_q8_0
+gfx1201	gemm_gate_up_hfq4g256_wmma_gfx12_bt4	gemm_gate_up_hfq4g256_wmma_gfx12_bt4
+gfx1201	gemm_gate_up_hfq4g256_wmma_gfx12_bt8	gemm_gate_up_hfq4g256_wmma_gfx12_bt8
+gfx1201	gemm_gate_up_hfq4g256_wmma_gfx12_bt12	gemm_gate_up_hfq4g256_wmma_gfx12_bt12
+gfx1201	gemm_mixed_moe_grouped_wmma_gfx12	gemm_mixed_moe_grouped_wmma_gfx12
+gfx1201	gemm_q8_0_residual_wmma_gfx12	gemm_q8_0_residual_wmma_gfx12
+gfx1201	gemm_qkv_q8_0_wmma_gfx12	gemm_qkv_q8_0_wmma_gfx12
+gfx1201	gemm_qkvza_q8_0_wmma_gfx12	gemm_qkvza_q8_0_wmma_gfx12
+gfx1201	gemv_hfq4g256_residual_scaled	gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched,gemv_hfq4g256_residual_sigmoid_scaled_gpu
+gfx1201	gemv_mixed_moe_down_k8_indexed_batched_expanded	gemv_mixed_moe_down_k8_indexed_batched_expanded
+gfx1201	gemv_mixed_moe_gate_up_indexed_batched	gemv_mixed_moe_gate_up_k8_indexed_batched
+gfx1201	attention_flash_q8_0_tile_batched	attention_flash_q8_0_tile_batched
+# Cells R5 (hold frj-disc-r5-v2-01, qwen3.6:35b-a3b-mq3p) and R8 (frj-disc-r8-v2-01,
+# qwen3.5:35b-a3b mq4): the R4 module set, no new module. Cell R7 (hold
+# frj-disc-r7-v2-01, qwen3.6:35b-a3b-mq4r), gfx1201 additions:
+gfx1201	gemm_hfq4g256_moe_grouped_wmma_gfx12	gemm_hfq4g256_moe_grouped_wmma_gfx12
+gfx1201	gemm_hfq4g256_residual_wmma_gfx12_bt8	gemm_hfq4g256_residual_wmma_gfx12_bt8
+gfx1201	gemm_hfq4g256_residual_wmma_gfx12_bt12	gemm_hfq4g256_residual_wmma_gfx12_bt12
+gfx1201	gemm_qkvza_hfq4g256_wmma_gfx12_bt8	gemm_qkvza_hfq4g256_wmma_gfx12_bt8
+gfx1201	gemm_qkvza_hfq4g256_wmma_gfx12_bt12	gemm_qkvza_hfq4g256_wmma_gfx12_bt12
+gfx1201	gemv_hfq4g256_moe_gate_up_indexed	gemv_hfq4g256_moe_gate_up_k8_indexed
+gfx1201	gemv_hfq4g256_moe_ninepath_d4	gemv_hfq4g256_moe_ninepath_d4
+# Cell R6 (hold frj-disc-r6-v2-01, qwen3.6:35b-a3b-mq2, partial: request 6 timed out), gfx1201:
+gfx1201	gemv_mq2g256_lloyd_moe_gate_up_indexed	gemv_mq2g256_lloyd_moe_gate_up_k8_indexed
+gfx1201	gemv_mq2g256_lloyd_moe_down_indexed	gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed
+# Cell R11 (hold frj-disc-r11-v2-01, qwen3.8:27b mq4 + default DFlash draft), gfx1201:
+gfx1201	fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2	fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2
+gfx1201	fused_silu_mul_mq_rotate_awq_i4_gfx12	fused_silu_mul_mq_rotate_awq_i4_gfx12
+gfx1201	gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16	gated_norm_mq_rotate_awq_i4_gfx12_v2_xbf16
+gfx1201	sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12	sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12
+# Cell R13 (hold frj-disc-r13-v2-01, qwen3.6:27b mq4 AR), gfx1201 (its bt4/bt8/bt12 rows repeat R4/R7's):
+gfx1201	gated_norm_mq_rotate_k6144_gfx1201	gated_norm_mq_rotate_k6144_gfx1201
+gfx1201	qwen35_fa_prep_fp8q_batched_gfx1201	qwen35_fa_prep_fp8q_batched_gfx1201
+gfx1201	gemm_hfq4g256_residual_wmma_gfx12_bt4	gemm_hfq4g256_residual_wmma_gfx12_bt4
+gfx1201	gemm_qkvza_hfq4g256_wmma_gfx12_bt4	gemm_qkvza_hfq4g256_wmma_gfx12_bt4
+# Cell R14 (hold frj-disc-r14-v2-01, qwen3.6:27b-mq3, rc=4: request 1 daemon error
+# 'unsupported gemv.swiglu_residual'; modules recorded after exit), gfx1201 (fp8q prep repeats R13's):
+gfx1201	gemm_gate_up_hfq3g256_wmma_gfx12	gemm_gate_up_hfq3g256_wmma_gfx12
+gfx1201	gemm_hfq3g256_residual_wmma_gfx12	gemm_hfq3g256_residual_wmma_gfx12
+gfx1201	gemm_qkv_hfq3g256_wmma_gfx12	gemm_qkv_hfq3g256_wmma_gfx12
+gfx1201	gemm_qkvza_hfq3g256_wmma_gfx12	gemm_qkvza_hfq3g256_wmma_gfx12
+gfx1201	gemv_hfq3g256	gemv_hfq3g256
+gfx1201	gemv_hfq3g256_residual	gemv_hfq3g256_residual
+# Cell R15 (hold frj-disc-r15-v2-01, qwen3.8:27b-mq3 DFlash), gfx1201 (fp8q prep repeats R13's):
+gfx1201	gemm_qkvza_mq3g256v2_wmma_gfx12_mq5v2	gemm_qkvza_mq3g256v2_wmma_gfx12
+gfx1201	gemm_qkvza_mq3g256v2_wmma_gfx12_bt4_mq5v2	gemm_qkvza_mq3g256v2_wmma_gfx12_bt4
+gfx1201	gemm_qkvza_mq3g256v2_wmma_gfx12_bt8_mq5v2	gemm_qkvza_mq3g256v2_wmma_gfx12_bt8
+gfx1201	gemm_qkvza_mq3g256v2_wmma_gfx12_bt12_mq5v2	gemm_qkvza_mq3g256v2_wmma_gfx12_bt12
+gfx1201	gemm_gate_up_mq3g256v2_wmma_gfx12_mq5v2	gemm_gate_up_mq3g256v2_wmma_gfx12
+gfx1201	gemm_gate_up_mq3g256v2_wmma_gfx12_bt4_mq5v2	gemm_gate_up_mq3g256v2_wmma_gfx12_bt4
+gfx1201	gemm_gate_up_mq3g256v2_wmma_gfx12_bt8_mq5v2	gemm_gate_up_mq3g256v2_wmma_gfx12_bt8
+gfx1201	gemm_gate_up_mq3g256v2_wmma_gfx12_bt12_mq5v2	gemm_gate_up_mq3g256v2_wmma_gfx12_bt12
+gfx1201	gemm_mq3g256v2_residual_wmma_gfx12_mq5v2	gemm_mq3g256v2_residual_wmma_gfx12
+gfx1201	gemm_mq3g256v2_residual_wmma_gfx12_bt4_mq5v2	gemm_mq3g256v2_residual_wmma_gfx12_bt4
+gfx1201	gemm_mq3g256v2_residual_wmma_gfx12_bt8_mq5v2	gemm_mq3g256v2_residual_wmma_gfx12_bt8
+gfx1201	gemm_mq3g256v2_residual_wmma_gfx12_bt12_mq5v2	gemm_mq3g256v2_residual_wmma_gfx12_bt12
+gfx1201	gemm_qkv_hfq4g256_wmma_gfx12_mq3v2	gemm_qkv_mq3g256v2_wmma_gfx12
+gfx1201	gemv_hfq4g256_multirow_default_mq3v2	gemv_mq3g256v2_multirow_r2
+gfx1201	gemv_hfq4g256_residual_mq3g256v2	gemv_mq3g256v2_residual
+gfx1201	gemv_mq3g256v2_mq3v2	gemv_mq3g256v2
+# Cell R16 (hold frj-disc-r16-v2-01, qwen3.8:27b-mq3-pro DFlash), gfx1201 (R15 set plus):
+gfx1201	gemv_hfq4g256_residual_mq6v2	gemv_mq6g256v2_residual
+# Cell H2 (hold frj-disc-h2-serve-v2-02, Halo gfx1151 serve, native MTP), after-req7:
+gfx1151	gemm_mq4g256v2_residual_wmma_gfx1151_bt	gemm_mq4g256v2_residual_wmma_gfx11_bt4
+# Cell H1-pilot, hold frj-t-halo-mq4-fix2-01, Strix Halo (gfx1151),
+# qwen3.8-flash-next-base.mq4-xts (MQ4 Flash-Next, 3 requests): QSA gathered F16 WMMA arena.
+gfx1151	indexed_attention_gathered_wmma	indexed_attention_kv_f16vb_q8
+# Hold frj-t-r9700-mq2-fix-01, R9700 (gfx1201), qwen3.8-flash-next-base.mq2-xts
+# (daemon 7f3ce867cc0d): Qwen4 BF16 storage-boundary round trip.
+gfx1201	bf16_round_trip	bf16_round_trip_f32

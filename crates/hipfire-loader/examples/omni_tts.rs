@@ -20,7 +20,7 @@
 use hipfire_arch_lfm3_omni::{
     codec_decode, load_codec_weights, omni_generate_audio, write_wav, CodecConfig, DepthRng,
 };
-use hipfire_loader::{load_model, ModelState};
+use hipfire_loader::load_model;
 use hipfire_runtime::loader_api::{CaskConfig, SpecLoadCfg};
 use hipfire_runtime::safetensors_source::SafetensorsSource;
 use rdna_compute::Gpu;
@@ -64,7 +64,7 @@ fn main() {
         &mut gpu,
     )
     .expect("load_model");
-    let depth_cfg = model.lfm3_depth_config.as_ref().expect("depth config").clone();
+    let depth_cfg = model.lfm3_depth_config().expect("depth config").clone();
 
     // ── Build the prompt: ChatML user turn + assistant prefix + <|audio_start|> ──
     let tok = model.tokenizer.as_ref().expect("tokenizer");
@@ -89,10 +89,12 @@ fn main() {
     );
     let (frames, n_emitted, hit_eos) = {
         let bundle = match model.state.as_mut() {
-            Some(ModelState::Lfm3(b)) => b,
-            _ => panic!("not lfm3"),
+            Some(s) => (s.as_mut() as &mut dyn std::any::Any)
+                .downcast_mut::<hipfire_loader::Lfm3Bundle>()
+                .expect("not lfm3"),
+            None => panic!("not lfm3"),
         };
-        let depth_weights = model.lfm3_depth_weights.as_ref().expect("depth weights");
+        let depth_weights = bundle.depth_weights.as_ref().expect("depth weights");
         let mut rng = DepthRng::new(42);
         omni_generate_audio(
             &bundle.config,

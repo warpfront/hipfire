@@ -27,6 +27,20 @@ use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Single-pass argmax over a logit row.
+// NOTE: deliberately NOT `hipfire_runtime::llama::argmax`, and deliberately
+// duplicated with the other arch crate that carries this function.
+//
+// The runtime's copy adds an `is_finite()` guard (its "O2b-2 finite guard")
+// because it doubles as the degenerate fallback for `sample_top_p` /
+// `sample_full_dist`, where a `+Inf` logit must not beat the real finite max.
+//
+// This copy is on the speculative-decode path and must agree bit-for-bit with
+// the GPU kernel it is checked against — `kernels/src/argmax.hip:13` is a bare
+// `if (data[i] > lmax)`, which *does* select `+Inf`. Adding the finite guard
+// here would make draft and target disagree on `+Inf` logits and produce
+// spurious spec-decode rejections.
+//
+// Both behaviours are correct for their own caller. Do not unify them.
 fn argmax(logits: &[f32]) -> u32 {
     logits
         .iter()
@@ -271,9 +285,10 @@ impl SpecTarget for ModelSlot {
         .map_err(|e| e.to_string())?;
         let vocab = self.config.vocab_size;
         let b = block.len();
-        // top_p of 0.0 means "disabled" upstream → 1.0 (no nucleus). top_k is
-        // folded into the GPU kernel's tau alongside top_p. min_p is routed to AR
-        // by the dispatch, so it is never set on this path.
+        // top_p of 0.0 means "disabled" upstream → 1.0 (no nucleus). `top_k` is
+        // the AR candidate cap; the kernel's tau/Z encode AR's law (top_k pool,
+        // then the nucleus over its mass). min_p is routed to AR by the
+        // dispatch, so it is never set on this path.
         let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
         let logits_batch = s.verify_scratch.logits.sub_offset(0, b * vocab);
         let probs_gpu = gpu

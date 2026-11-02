@@ -1,0 +1,316 @@
+// QSA selector scores, BF16-pooled (gfx1151): standalone RIP, evaluated without rustc.
+// The twin of `qsa_score.rip.rs` `emit_bf16`: `indexed_attention_select_scores_rows16_bf16_pm_gfx1151`
+// (variant `score-bf16`) and, with the row tile parameterized 16 -> 32 (first row `32 * wg_y`,
+// row clamp 32, nothing else), `indexed_attention_select_scores_rows32_bf16_pm_gfx1151`
+// (variant `score-bf16-rows32`).
+// Every lane loads its whole pooled key row (128 BF16, 256 bytes) once as 16
+// `buffer_load_b128` into the upper 64 key VGPRs; after `vmcnt(0)` an ascending
+// in-place unpack (low half `v_lshlrev_b32 16`, high half `v_and_b32 0xffff0000`)
+// widens them exactly to 128 F32 keys. The workgroup-uniform
+// query streams through SGPRs, eight dims per stage, four index heads per dim.
+// Each (row, head) dot is the in-order fused multiply-add chain from +0.0, then
+// hipcc's IEEE division by sqrtf(128), max(0, x) and the in-order head sum.
+// The store goes through a per-row raw descriptor whose num_records is the
+// row's visible block range, so no lane masks or branches are needed.
+// Instructions carry explicit defs/uses; waits and branches go through
+// peacemaker-author's sealed runtime driver, then object-level certification.
+
+/// The `check` channel: variant names and target arches (front-door discovery).
+pub const VARIANTS: &[&str] = &["score-bf16", "score-bf16-rows32"];
+pub const ARCHES: &[&str] = &["gfx1151"];
+
+/// `sqrtf(128.0f)` correctly rounded.
+const SQRT_INDEX_DIM: u32 = 0x4135_04f3;
+/// Query rows per workgroup: the only geometry that differs between the R16
+/// and R32 symbols.
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum Tile { R16, R32 }
+impl Tile {
+    fn rows(self) -> i32 { match self { Self::R16 => 16, Self::R32 => 32 } }
+    /// `log2(rows)`: the shift from `wg_y` to the tile's first row.
+    fn shift(self) -> u32 { match self { Self::R16 => 4, Self::R32 => 5 } }
+    /// Assembler labels are module-global: the R16 labels are the incumbent's,
+    /// the R32 kernels (same module) carry their own.
+    fn end_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_end", Self::R32 => ".Lqsc32_end" } }
+    fn rows_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_rows", Self::R32 => ".Lqsc32_rows" } }
+    fn done_label(self) -> &'static str { match self { Self::R16 => ".Lqsc_rows_done", Self::R32 => ".Lqsc32_rows_done" } }
+}
+/// Index heads and dims per head (the host contract).
+const HEADS: usize = 4;
+const DIM: usize = 128;
+/// Dims per query stage (`s_load_b256`) and stages per row.
+const CHUNK: usize = 8;
+const STAGES: usize = DIM / CHUNK;
+/// Blocks per workgroup tile.
+const TILE_BLOCKS: u32 = 256;
+
+// SGPRs.
+const KARG: u8 = 0; const WGX: u8 = 2; const WGY: u8 = 3;
+const SRD_S: u8 = 4; // scores descriptor 4:7
+const A0: u8 = 8; // query 8:9, pooled 10:11, scores 12:13, rows 14, query_row_stride 15
+const QUERY: u8 = 8; const POOLED: u8 = 10; const SCORES: u8 = 12; const ROWS_ARG: u8 = 14; const QSTRIDE: u8 = 15;
+const A1: u8 = 16; // block_count 16, index_dim 17 (unused), compress 18, position_start 19
+const BLOCK_COUNT: u8 = 16; const COMPRESS: u8 = 18; const POSITION: u8 = 19;
+const SRD_K: u8 = 20; // pooled key descriptor 20:23
+const QCUR: u8 = 24; // query row cursor 24:25
+const SCSTRIDE: u8 = 26; const ROW0: u8 = 27; const NROWS: u8 = 28; const ROW: u8 = 29; const QUOT: u8 = 30; const REM: u8 = 31;
+const RING: u8 = 32; // 2 stages x 4 heads x 8 SGPRs, 32:95
+const T0: u8 = 96; const T1: u8 = 97; const T2: u8 = 98; const T3: u8 = 99; const MASK: u8 = 100; const BLK0: u8 = 101; const WAVE: u8 = 102;
+
+// VGPRs.
+const TID: u8 = 0; const SOFF: u8 = 1; const DIV: u8 = 2; const KOFF: u8 = 3;
+const ACC: u8 = 4; // dot[h], h = 0..4
+const KEYS: u8 = 8; // key[d] = v(8 + d)
+const DT: u8 = 136; // division temporaries: ns, ds, rc, e, q per interleaved pair half
+
+pub fn symbol(arch: Arch) -> String { format!("indexed_attention_select_scores_rows16_bf16_pm_{}", arch.name()) }
+pub fn symbol_rows32(arch: Arch) -> String { format!("indexed_attention_select_scores_rows32_bf16_pm_{}", arch.name()) }
+
+fn kernargs() -> KernargLayout {
+    KernargLayout::new(52).pointer("query", 0).pointer("pooled", 8).pointer("scores", 16)
+        .hidden("rows", 24, 4, "by_value").hidden("query_row_stride", 28, 4, "by_value")
+        .hidden("block_count", 32, 4, "by_value").hidden("index_dim", 36, 4, "by_value")
+        .hidden("compress", 40, 4, "by_value").hidden("position_start", 44, 4, "by_value")
+        .hidden("score_stride", 48, 4, "by_value")
+}
+
+fn plan() -> Result<RegPlan, String> {
+    let mut p = RegPlan::new(256, 104)?;
+    p.s::<2>("kernarg_ptr", KARG, Live::Whole)?;
+    p.s::<1>("wg_x_in", WGX, Live::Whole)?;
+    p.s::<1>("wg_y_in", WGY, Live::Whole)?;
+    p.s::<4>("srd_scores", SRD_S, Live::Whole)?;
+    p.s::<8>("kernargs_0x00", A0, Live::Whole)?;
+    p.s::<4>("kernargs_0x20", A1, Live::Whole)?;
+    p.s::<4>("srd_keys", SRD_K, Live::Whole)?;
+    p.s::<2>("query_cursor", QCUR, Live::Whole)?;
+    for (name, r) in [("score_stride", SCSTRIDE), ("row0", ROW0), ("nrows", NROWS), ("row", ROW), ("visible_quot", QUOT), ("visible_rem", REM),
+        ("t0", T0), ("t1", T1), ("t2", T2), ("t3", T3), ("div_mask", MASK), ("blk0", BLK0), ("wave", WAVE)] {
+        p.s::<1>(name, r, Live::Whole)?;
+    }
+    for i in 0..8u8 { p.s::<8>("query_ring", RING + 8 * i, Live::Whole)?; }
+    for (name, r) in [("tid", TID), ("score_off", SOFF), ("sqrt_dim", DIV), ("key_off", KOFF)] { p.v::<1>(name, r, Live::Whole)?; }
+    p.v::<4>("dot", ACC, Live::Whole)?;
+    for i in 0..16u8 { p.v::<8>("key", KEYS + 8 * i, Live::Whole)?; }
+    p.v::<8>("div_t0", DT, Live::Whole)?;
+    p.v::<2>("div_t1", DT + 8, Live::Whole)?;
+    let top = p.next_free_vgpr();
+    if top % 8 != 0 { p.v::<1>("granule_pad", (top.div_ceil(8) * 8 - 1) as u8, Live::Whole)?; }
+    Ok(p)
+}
+
+pub fn emit(arch: Arch, variant: &str) -> Result<Emitted, String> {
+    if arch != Arch::Gfx1151 { return Err("qsa_score: built for gfx1151 only".into()) }
+    let (tile, sym) = match variant {
+        "score-bf16" => (Tile::R16, symbol(arch)),
+        "score-bf16-rows32" => (Tile::R32, symbol_rows32(arch)),
+        _ => return Err(format!("qsa_score: unknown variant `{variant}` (score-bf16|score-bf16-rows32)")),
+    };
+    let spec = KernelSpec {
+        kernel_id: "qsa_select".into(), variant: variant.into(), arch, symbol: sym,
+        kernargs: kernargs(), user_sgpr_count: 2, system_sgpr_workgroup_id_y: true,
+        workgroup_size: 256, group_segment_fixed_size: 0, wave32: true, cu_mode: false,
+    };
+    let mut b = Builder::new(spec, plan()?);
+    let mut wg = Workgroup::new(&mut b, arch)?;
+    author(&mut wg, tile)?;
+    b.finish()
+}
+
+fn scmp(w: &mut Wg, text: String, uses: &[u8]) -> Result<Cond, String> {
+    w.scmp(Instruction::new(text, vec![], uses.iter().map(|&n| s(n)).collect()))
+}
+
+fn author(wg: &mut Wg, tile: Tile) -> Result<(), String> {
+    let end = wg.exit(tile.end_label())?;
+    let b = wg.isa();
+    smem(b, A0, 8, KARG, 0)?;
+    smem(b, A1, 4, KARG, 0x20)?;
+    smem(b, SCSTRIDE, 1, KARG, 0x30)?;
+    // Lane constants: key row byte offset, score byte offset, the divisor and this wave's index.
+    op(b, format!("v_lshlrev_b32_e32 v{KOFF}, 8, v{TID}"), &[v(KOFF)], &[v(TID)])?;
+    op(b, format!("v_lshlrev_b32_e32 v{SOFF}, 2, v{TID}"), &[v(SOFF)], &[v(TID)])?;
+    op(b, format!("v_mov_b32_e32 v{DIV}, {}", lit(SQRT_INDEX_DIM)), &[v(DIV)], &[])?;
+    op(b, format!("v_lshrrev_b32_e32 v{ACC}, 5, v{TID}"), &[v(ACC)], &[v(TID)])?;
+    op(b, format!("v_readfirstlane_b32 s{WAVE}, v{ACC}"), &[s(WAVE)], &[v(ACC)])?;
+    sop(b, format!("s_lshl_b32 s{BLK0}, s{WGX}, 8"), &[BLK0], &[WGX])?;
+    sop(b, format!("s_lshl_b32 s{T0}, s{WAVE}, 5"), &[T0], &[WAVE])?;
+    sop(b, format!("s_add_i32 s{T0}, s{T0}, s{BLK0}"), &[T0], &[T0, BLK0])?;
+    sop(b, format!("s_lshl_b32 s{ROW0}, s{WGY}, {}", tile.shift()), &[ROW0], &[WGY])?;
+    // A wave entirely past block_count, or a row tile past the rows, returns.
+    let live = scmp(wg, format!("s_cmp_lt_i32 s{T0}, s{BLOCK_COUNT}"), &[T0, BLOCK_COUNT])?;
+    wg.wave_exit_unless(live, &end)?;
+    let b = wg.isa();
+    sop(b, format!("s_sub_i32 s{NROWS}, s{ROWS_ARG}, s{ROW0}"), &[NROWS], &[ROWS_ARG, ROW0])?;
+    sop(b, format!("s_min_i32 s{NROWS}, s{NROWS}, {}", tile.rows()), &[NROWS], &[NROWS])?;
+    let some = scmp(wg, format!("s_cmp_gt_i32 s{NROWS}, 0"), &[NROWS])?;
+    wg.wave_exit_unless(some, &end)?;
+    let b = wg.isa();
+    // Pooled key descriptor: this workgroup's first block, at most 256 blocks of records.
+    sop(b, format!("s_lshl_b32 s{T1}, s{WGX}, 16"), &[T1], &[WGX])?;
+    sop(b, format!("s_add_u32 s{SRD_K}, s{POOLED}, s{T1}"), &[SRD_K], &[POOLED, T1])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, 0", SRD_K + 1, POOLED + 1), &[SRD_K + 1], &[POOLED + 1])?;
+    sop(b, format!("s_sub_i32 s{T1}, s{BLOCK_COUNT}, s{BLK0}"), &[T1], &[BLOCK_COUNT, BLK0])?;
+    sop(b, format!("s_min_i32 s{T1}, s{T1}, {}", lit(TILE_BLOCKS)), &[T1], &[T1])?;
+    sop(b, format!("s_lshl_b32 s{}, s{T1}, 8", SRD_K + 2), &[SRD_K + 2], &[T1])?;
+    sop(b, format!("s_mov_b32 s{}, {}", SRD_K + 3, lit(SRD_WORD3)), &[SRD_K + 3], &[])?;
+    // Every lane's whole packed key row (256 bytes), in one clause, into the upper key half.
+    b.clause(|b| {
+        for i in 0..(DIM * 2 / 16) as u8 { bload(b, 4, KEYS + 64 + 4 * i, KOFF, SRD_K, 16 * u32::from(i))?; }
+        Ok(())
+    })?;
+    // Query row cursor and the scores descriptor, based at row0 and this tile's first block.
+    sop(b, format!("s_lshl_b32 s{QSTRIDE}, s{QSTRIDE}, 2"), &[QSTRIDE], &[QSTRIDE])?;
+    sop(b, format!("s_mul_i32 s{T1}, s{ROW0}, s{QSTRIDE}"), &[T1], &[ROW0, QSTRIDE])?;
+    sop(b, format!("s_add_u32 s{QCUR}, s{QUERY}, s{T1}"), &[QCUR], &[QUERY, T1])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, 0", QCUR + 1, QUERY + 1), &[QCUR + 1], &[QUERY + 1])?;
+    sop(b, format!("s_lshl_b32 s{SCSTRIDE}, s{SCSTRIDE}, 2"), &[SCSTRIDE], &[SCSTRIDE])?;
+    sop(b, format!("s_mul_i32 s{T1}, s{ROW0}, s{SCSTRIDE}"), &[T1], &[ROW0, SCSTRIDE])?;
+    sop(b, format!("s_lshl_b32 s{T2}, s{BLK0}, 2"), &[T2], &[BLK0])?;
+    sop(b, format!("s_add_i32 s{T1}, s{T1}, s{T2}"), &[T1], &[T1, T2])?;
+    sop(b, format!("s_add_u32 s{SRD_S}, s{SCORES}, s{T1}"), &[SRD_S], &[SCORES, T1])?;
+    sop(b, format!("s_addc_u32 s{}, s{}, 0", SRD_S + 1, SCORES + 1), &[SRD_S + 1], &[SCORES + 1])?;
+    sop(b, format!("s_mov_b32 s{}, {}", SRD_S + 3, lit(SRD_WORD3)), &[SRD_S + 3], &[])?;
+    // The first stage of row 0 (the loop keeps one stage fetched ahead).
+    issue_stage(b, 0)?;
+    // Visible blocks of row 0: (position_start + row0 + 1) / compress and its remainder.
+    sop(b, format!("s_add_i32 s{T0}, s{POSITION}, s{ROW0}"), &[T0], &[POSITION, ROW0])?;
+    sop(b, format!("s_add_i32 s{T0}, s{T0}, 1"), &[T0], &[T0])?;
+    udiv(b, QUOT, T0, COMPRESS, [ACC, ACC + 1, ACC + 2], [T1, T2, T3])?;
+    sop(b, format!("s_mul_i32 s{T1}, s{QUOT}, s{COMPRESS}"), &[T1], &[QUOT, COMPRESS])?;
+    sop(b, format!("s_sub_i32 s{REM}, s{T0}, s{T1}"), &[REM], &[T0, T1])?;
+    set_visible(b)?;
+    sop(b, format!("s_mov_b32 s{ROW}, 0"), &[ROW], &[])?;
+    b.wait(Counter::Vm, 0)?;
+    // Ascending unpack cannot overwrite a future packed source. The last
+    // high destination aliases its source; emit low before high.
+    for i in 0..64u8 {
+        let packed = KEYS + 64 + i;
+        let lo = KEYS + 2 * i;
+        let hi = lo + 1;
+        op(b, format!("v_lshlrev_b32_e32 v{lo}, 16, v{packed}"), &[v(lo)], &[v(packed)])?;
+        op(b, format!("v_and_b32_e32 v{hi}, 0xffff0000, v{packed}"), &[v(hi)], &[v(packed)])?;
+    }
+    wg.loop_until(tile.rows_label(), tile.done_label(), |w, exit| {
+        row(w.isa())?;
+        let b = w.isa();
+        // Visible blocks of the next row: remainder + 1, carrying into the quotient.
+        sop(b, format!("s_add_i32 s{REM}, s{REM}, 1"), &[REM], &[REM])?;
+        sop(b, format!("s_cmp_ge_u32 s{REM}, s{COMPRESS}"), &[], &[REM, COMPRESS])?;
+        sop(b, format!("s_cselect_b32 s{T0}, s{COMPRESS}, 0"), &[T0], &[COMPRESS])?;
+        sop(b, format!("s_cselect_b32 s{T1}, 1, 0"), &[T1], &[])?;
+        sop(b, format!("s_sub_i32 s{REM}, s{REM}, s{T0}"), &[REM], &[REM, T0])?;
+        sop(b, format!("s_add_i32 s{QUOT}, s{QUOT}, s{T1}"), &[QUOT], &[QUOT, T1])?;
+        // The query cursor moves to the next row; the last row's lookahead stays on it.
+        sop(b, format!("s_add_i32 s{ROW}, s{ROW}, 1"), &[ROW], &[ROW])?;
+        sop(b, format!("s_cmp_lt_u32 s{ROW}, s{NROWS}"), &[], &[ROW, NROWS])?;
+        sop(b, format!("s_cselect_b32 s{T0}, s{QSTRIDE}, 0"), &[T0], &[QSTRIDE])?;
+        add64(b, QCUR, QCUR, T0)?;
+        issue_stage(b, 0)?;
+        // The store must have read its descriptor and data before they change.
+        b.wait(Counter::Vs, 0)?;
+        add64(b, SRD_S, SRD_S, SCSTRIDE)?;
+        set_visible(b)?;
+        let done = scmp(w, format!("s_cmp_ge_u32 s{ROW}, s{NROWS}"), &[ROW, NROWS])?;
+        w.break_if(done, exit)
+    })?;
+    wg.isa().wait(Counter::Lgkm, 0)?;
+    wg.end(end)
+}
+
+/// Fetch stage `stage` of the current query row into its ring half: head `h`'s
+/// dims `8 * stage .. 8 * stage + 8` into eight SGPRs.
+fn issue_stage(b: &mut Builder, stage: usize) -> Result<(), String> {
+    for h in 0..HEADS { smem(b, q_buf(stage, h), 8, QCUR, (h * DIM * 4 + stage * CHUNK * 4) as u32)?; }
+    Ok(())
+}
+
+/// First SGPR of head `h` of stage `stage`'s ring half.
+fn q_buf(stage: usize, h: usize) -> u8 { RING + 32 * (stage % 2) as u8 + 8 * h as u8 }
+
+/// `num_records` of the scores descriptor for the row whose visible block
+/// count is `visible_quot`: `4 * max(0, min(block_count, visible) - blk0)`.
+fn set_visible(b: &mut Builder) -> Result<(), String> {
+    sop(b, format!("s_min_i32 s{T0}, s{BLOCK_COUNT}, s{QUOT}"), &[T0], &[BLOCK_COUNT, QUOT])?;
+    sop(b, format!("s_sub_i32 s{T0}, s{T0}, s{BLK0}"), &[T0], &[T0, BLK0])?;
+    sop(b, format!("s_max_i32 s{T0}, s{T0}, 0"), &[T0], &[T0])?;
+    sop(b, format!("s_lshl_b32 s{}, s{T0}, 2", SRD_S + 2), &[SRD_S + 2], &[T0])
+}
+
+/// One query row: 16 stages of eight dims, four chains per dim, then the epilogue and the store.
+fn row(b: &mut Builder) -> Result<(), String> {
+    for st in 0..STAGES {
+        // Retire this stage's fetch (issued during the previous stage), then fetch the next into the other half.
+        b.wait(Counter::Lgkm, 0)?;
+        if st + 1 < STAGES { issue_stage(b, st + 1)?; }
+        for dd in 0..CHUNK {
+            let d = st * CHUNK + dd;
+            let key = KEYS + d as u8;
+            for h in 0..HEADS {
+                let (acc, q) = (ACC + h as u8, q_buf(st, h) + dd as u8);
+                if d == 0 { op(b, format!("v_fma_f32 v{acc}, s{q}, v{key}, 0"), &[v(acc)], &[s(q), v(key)])?; }
+                else { op(b, format!("v_fmac_f32_e32 v{acc}, s{q}, v{key}"), &[v(acc)], &[v(acc), s(q), v(key)])?; }
+            }
+        }
+    }
+    b.enable_delay_alu();
+    divide_pair(b, ACC, ACC + 1, [DT, DT + 1, DT + 2, DT + 3, DT + 4], [DT + 5, DT + 6, DT + 7, DT + 8, DT + 9])?;
+    divide_pair(b, ACC + 2, ACC + 3, [DT, DT + 1, DT + 2, DT + 3, DT + 4], [DT + 5, DT + 6, DT + 7, DT + 8, DT + 9])?;
+    for h in 0..HEADS as u8 { op(b, format!("v_max_f32_e32 v{}, 0, v{}", ACC + h, ACC + h), &[v(ACC + h)], &[v(ACC + h)])?; }
+    op(b, format!("v_add_f32_e32 v{ACC}, 0, v{ACC}"), &[v(ACC)], &[v(ACC)])?;
+    for h in 1..HEADS as u8 { op(b, format!("v_add_f32_e32 v{ACC}, v{}, v{ACC}", ACC + h), &[v(ACC)], &[v(ACC + h), v(ACC)])?; }
+    mem(b, format!("buffer_store_b32 v{ACC}, v{SOFF}, s[{SRD_S}:{}], 0 offen", SRD_S + 3), &[], &[v(ACC), v(SOFF), sr(SRD_S, 4)], MemoryClass::VmemStore)
+}
+
+/// IEEE `n / sqrtf(128)` in place over two accumulators, the two hipcc
+/// `v_div_scale` / `v_div_fmas` / `v_div_fixup` sequences interleaved. `ta`
+/// and `tb` are `[ns, ds, rc, e, q]`; the first uses VCC for its scale flag
+/// and the second `s{MASK}`, moved to VCC for its `v_div_fmas` as hipcc does.
+fn divide_pair(b: &mut Builder, na: u8, nb: u8, ta: [u8; 5], tb: [u8; 5]) -> Result<(), String> {
+    let (n, t) = ([na, nb], [ta, tb]);
+    for i in 0..2 {
+        let [_, ds, ..] = t[i];
+        op(b, format!("v_div_scale_f32 v{ds}, null, v{DIV}, v{DIV}, v{}", n[i]), &[v(ds)], &[v(DIV), v(n[i])])?;
+    }
+    op(b, format!("v_div_scale_f32 v{}, vcc_lo, v{na}, v{DIV}, v{na}", ta[0]), &[v(ta[0])], &[v(na), v(DIV)])?;
+    op(b, format!("v_div_scale_f32 v{}, s{MASK}, v{nb}, v{DIV}, v{nb}", tb[0]), &[v(tb[0]), s(MASK)], &[v(nb), v(DIV)])?;
+    for i in 0..2 { let [_, ds, rc, ..] = t[i]; op(b, format!("v_rcp_f32_e32 v{rc}, v{ds}"), &[v(rc)], &[v(ds)])?; }
+    for i in 0..2 { let [_, ds, rc, e, _] = t[i]; op(b, format!("v_fma_f32 v{e}, -v{ds}, v{rc}, 1.0"), &[v(e)], &[v(ds), v(rc)])?; }
+    for i in 0..2 { let [_, _, rc, e, _] = t[i]; op(b, format!("v_fmac_f32_e32 v{rc}, v{e}, v{rc}"), &[v(rc)], &[v(rc), v(e)])?; }
+    for i in 0..2 { let [ns, _, rc, _, q] = t[i]; op(b, format!("v_mul_f32_e32 v{q}, v{ns}, v{rc}"), &[v(q)], &[v(ns), v(rc)])?; }
+    for i in 0..2 { let [ns, ds, _, e, q] = t[i]; op(b, format!("v_fma_f32 v{e}, -v{ds}, v{q}, v{ns}"), &[v(e)], &[v(ds), v(q), v(ns)])?; }
+    for i in 0..2 { let [_, _, rc, e, q] = t[i]; op(b, format!("v_fmac_f32_e32 v{q}, v{e}, v{rc}"), &[v(q)], &[v(q), v(e), v(rc)])?; }
+    for i in 0..2 { let [ns, ds, _, e, q] = t[i]; op(b, format!("v_fma_f32 v{e}, -v{ds}, v{q}, v{ns}"), &[v(e)], &[v(ds), v(q), v(ns)])?; }
+    let [_, _, rc, e, q] = ta;
+    op(b, format!("v_div_fmas_f32 v{e}, v{e}, v{rc}, v{q}"), &[v(e)], &[v(e), v(rc), v(q)])?;
+    sop(b, format!("s_mov_b32 vcc_lo, s{MASK}"), &[], &[MASK])?;
+    let [_, _, rc, e, q] = tb;
+    op(b, format!("v_div_fmas_f32 v{e}, v{e}, v{rc}, v{q}"), &[v(e)], &[v(e), v(rc), v(q)])?;
+    for i in 0..2 { let [_, _, _, e, _] = t[i]; op(b, format!("v_div_fixup_f32 v{}, v{e}, v{DIV}, v{}", n[i], n[i]), &[v(n[i])], &[v(e), v(DIV), v(n[i])])?; }
+    Ok(())
+}
+
+/// Exact `q = n / d` over unsigned 32-bit SGPRs (`d != 0`): the LLVM
+/// reciprocal estimate on lane-uniform VGPRs, then two remainder corrections.
+fn udiv(b: &mut Builder, q: u8, n: u8, d: u8, vt: [u8; 3], t: [u8; 3]) -> Result<(), String> {
+    let [f, r, h] = vt;
+    let [neg, rem, alt] = t;
+    op(b, format!("v_cvt_f32_u32_e32 v{f}, s{d}"), &[v(f)], &[s(d)])?;
+    op(b, format!("v_rcp_iflag_f32_e32 v{f}, v{f}"), &[v(f)], &[v(f)])?;
+    op(b, format!("v_mul_f32_e32 v{f}, 0x4f7ffffe, v{f}"), &[v(f)], &[v(f)])?;
+    op(b, format!("v_cvt_u32_f32_e32 v{r}, v{f}"), &[v(r)], &[v(f)])?;
+    sop(b, format!("s_sub_i32 s{neg}, 0, s{d}"), &[neg], &[d])?;
+    op(b, format!("v_mul_lo_u32 v{h}, s{neg}, v{r}"), &[v(h)], &[s(neg), v(r)])?;
+    op(b, format!("v_mul_hi_u32 v{h}, v{r}, v{h}"), &[v(h)], &[v(r), v(h)])?;
+    op(b, format!("v_add_nc_u32_e32 v{r}, v{r}, v{h}"), &[v(r)], &[v(r), v(h)])?;
+    op(b, format!("v_mul_hi_u32 v{h}, s{n}, v{r}"), &[v(h)], &[s(n), v(r)])?;
+    op(b, format!("v_readfirstlane_b32 s{q}, v{h}"), &[s(q)], &[v(h)])?;
+    for _ in 0..2 {
+        sop(b, format!("s_mul_i32 s{rem}, s{q}, s{d}"), &[rem], &[q, d])?;
+        sop(b, format!("s_sub_i32 s{rem}, s{n}, s{rem}"), &[rem], &[n, rem])?;
+        sop(b, format!("s_add_i32 s{alt}, s{q}, 1"), &[alt], &[q])?;
+        sop(b, format!("s_cmp_ge_u32 s{rem}, s{d}"), &[], &[rem, d])?;
+        sop(b, format!("s_cselect_b32 s{q}, s{alt}, s{q}"), &[q], &[alt, q])?;
+    }
+    Ok(())
+}

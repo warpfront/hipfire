@@ -1,0 +1,28 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/husrcf/.hipfire/models/qwen3.6-27b.mq4
+  registry tag  : qwen3.6:27b
+  kv_mode       : q8 [explicit(--kv)]   kv_backend: automatic [automatic]   mtp_mode: off   mode: battery
+  max_seq       : 4096 [explicit(--max-seq)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : off   <-- OVERRIDES dflash/mtp
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: benchmarks/prompts/adaptive_kv_long_prefill.txt
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [explicit(--max-think-tokens)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 1024 [explicit(--max-tokens)]  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+  [kv_backend effective: vmm (log-marker)]
+### RUN qwen3.6-27b.mq4|off|battery  kv=q8 sampling={'temperature': 0.0} seed=None ###
+  [prose]t1  finish=stop   ctx=936    cached=0      gen=942  (think 0/ans 674w) prefill=18688.5ms/50.1tok/s decode=27.8tok/s tau=None | '**Technical Review: Halyard Distributed Cache v3**\n\n**1. Architecture Summary**\nHalyard im'
+[qwen3.6-27b.mq4|off|battery DONE] turns=1 runaway=0 empty=0 attractor=0 retrieval_miss=0 avg_prefill=50.1tok/s avg_decode=27.8tok/s
+  prompt_md5=7ef3f606d2826a08e161bbeb4848b11e request_md5=0f634eb0150a6a50bdc375c418eaa595 step=
+  daemon_binary_md5=6752dce38181d60b5fae72d43ab074d9 path=/home/husrcf/Code/ProtBind/hipfireTMP/hipfire-packed-mq4-beta/target/release/daemon

@@ -1,0 +1,44 @@
+{
+    "gpu_data": [
+        {
+            "gpu": 0,
+            "asic": {
+                "market_name": "AMD Radeon AI PRO R9700",
+                "vendor_id": "0x1002",
+                "vendor_name": "Advanced Micro Devices Inc. [AMD/ATI]",
+                "subvendor_id": "0x1849",
+                "device_id": "0x7551",
+                "subsystem_id": "0x5413",
+                "rev_id": "0xc0",
+                "chip_rev_id": "0x01",
+                "external_rev_id": "0x51",
+                "asic_serial": "0x0000000000000000",
+                "oam_id": "N/A",
+                "physical_acc_id": "N/A",
+                "num_compute_units": 64,
+                "target_graphics_version": "gfx1201",
+                "flags": 16
+            }
+        },
+        {
+            "gpu": 1,
+            "asic": {
+                "market_name": "AMD Radeon AI PRO R9700",
+                "vendor_id": "0x1002",
+                "vendor_name": "Advanced Micro Devices Inc. [AMD/ATI]",
+                "subvendor_id": "0x1849",
+                "device_id": "0x7551",
+                "subsystem_id": "0x5413",
+                "rev_id": "0xc0",
+                "chip_rev_id": "0x01",
+                "external_rev_id": "0x51",
+                "asic_serial": "0x0000000000000001",
+                "oam_id": "N/A",
+                "physical_acc_id": "N/A",
+                "num_compute_units": 64,
+                "target_graphics_version": "gfx1201",
+                "flags": 16
+            }
+        }
+    ]
+}

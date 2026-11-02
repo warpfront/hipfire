@@ -1244,14 +1244,28 @@ pub(crate) fn linear_f16_no_bias(
 /// tokens after the vision pass. Until that wiring lands (Phase 3),
 /// the function panics on inputs whose `patches.numel()` is not
 /// consistent with a single image's `[grid_h * grid_w, 588]` shape.
-pub fn vision_forward(
+///
+/// # Cooperative abort
+///
+/// `should_abort` is polled once before any persistent GPU allocation and
+/// again at every completed transformer-block boundary, where no block-local
+/// temporaries are live. `Ok(None)` signals cooperative abort — the function
+/// has released every function-owned GPU tensor live at the poll (`x` and the
+/// RoPE `cos_table`/`sin_table`, plus any other persistent tensor live at that
+/// boundary) and never runs the merger; `Ok(Some(t))` is the successful
+/// merged-token tensor.
+pub fn vision_forward<F>(
     gpu: &mut Gpu,
     weights: &DotsVisionWeights,
     cfg: &DotsVisionConfig,
     patches: &GpuTensor,
     grid_h: usize,
     grid_w: usize,
-) -> HipResult<GpuTensor> {
+    mut should_abort: F,
+) -> HipResult<Option<GpuTensor>>
+where
+    F: FnMut() -> bool,
+{
     let h = cfg.embed_dim;
     let n_heads = cfg.num_attention_heads;
     let head_dim = cfg.head_dim;
@@ -1338,6 +1352,9 @@ pub fn vision_forward(
         }
         Ok(())
     };
+    if should_abort() {
+        return Ok(None);
+    }
 
     // ── Build + upload 2-D RoPE tables (CPU build per plan §2.6) ─────
     //
@@ -1756,6 +1773,12 @@ pub fn vision_forward(
         if matches!(li, 0 | 1 | 2 | 4 | 8 | 12 | 16 | 21 | 41) {
             dump_stage(gpu, &x, &format!("block_{li:02}"), &[n_patches, h])?;
         }
+        if should_abort() {
+            gpu.free_tensor(x)?;
+            gpu.free_tensor(cos_table)?;
+            gpu.free_tensor(sin_table)?;
+            return Ok(None);
+        }
     }
 
     // Drop RoPE tables now that all blocks are done.
@@ -1834,7 +1857,7 @@ pub fn vision_forward(
         t0.elapsed().as_secs_f32(),
     );
     dump_stage(gpu, &m2, "merger", &[n_merged, cfg.out_hidden_size])?;
-    Ok(m2)
+    Ok(Some(m2))
 }
 
 /// Minimal NumPy `.npy` writer for F32 row-major tensors. Used by the
@@ -2050,27 +2073,13 @@ mod tests {
         assert_eq!(got.last(), expected.last(), "trailing cue diverged");
 
         // The prompt-text interior is tokenized by the shared GPT-2 BPE
-        // path, which has a known `\s+(?!\S)` lookahead gap (see
-        // tokenizer.rs:22 — the `regex` crate can't express the
-        // negative lookahead, so whitespace runs before a non-space split
-        // one token differently than HF). That is NOT a framing bug: the
-        // decoded *text* is identical, only BPE boundaries on indentation
-        // runs differ. Assert text-equality (the strong invariant) and
-        // report any boundary diffs for visibility.
+        // path. Its pretokenizer honors the tokenizer.json `Split` regex and
+        // emulates the `\s+(?!\S)` lookahead exactly (tokenizer.rs), so the
+        // interior — including indentation runs — must match the HF capture
+        // token-for-token.
         assert_eq!(
-            tok.decode(&got),
-            tok.decode(&expected),
-            "decoded prompt text diverged — this IS a real bug (not just a BPE-boundary diff)"
+            got, expected,
+            "prompt token ids diverged from HF capture (BPE pretokenizer / whitespace lookahead)"
         );
-
-        let n_diff = (0..got.len()).filter(|&i| got[i] != expected[i]).count();
-        if n_diff > 0 {
-            eprintln!(
-                "NOTE: {n_diff}/{} tokens differ on BPE whitespace boundaries \
-                 (decoded text identical) — tokenizer.rs `\\s+` lookahead gap, \
-                 tracked separately; verify benign via the daemon OCR grade.",
-                got.len()
-            );
-        }
     }
 }

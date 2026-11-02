@@ -1,0 +1,209 @@
+# Committed thresholds for scripts/leanup-ratchets.sh.
+#
+# Format:  <metric> <op> <value>
+#   ==  must equal exactly
+#   <=  ceiling; may only decrease
+#
+# A metric with no line here is informational and never fails the run.
+#
+# Lowering a ceiling after an improvement is expected and encouraged. RAISING
+# one requires a sentence in the commit message saying what was traded for it --
+# otherwise the ratchet stops meaning anything, which is precisely the failure
+# this file exists to end. Before 2026-08-16 the script emitted 22 metrics and
+# contained exactly one `exit 1`, guarding `cd`.
+
+# --- decoupling invariants: a nonzero value is a regression, not a trend ---
+daemon_arch_id              == 0
+daemon_arch_refs            == 0
+daemon_modelstate           == 0
+loader_modelstate_code      == 0
+grammar_copies              == 0
+substrate_clean_arch_refs   == 0
+required_features_daemon    == 0
+
+# --- ceilings ---
+# Reconciled to the measured f2ea5136 master baseline on 2026-08-28. This
+# branch adds no semantic debt; rustfmt makes one existing Qwen35 call visible.
+# hipfire-daemon/src/main.rs. Was 43,696 as hipfire-runtime/examples/daemon.rs
+# on master; the saddle layering moved it into a crate. Raised 4155 -> 4176 on
+# 2026-09-02 for the G2 source-aware admission block (see commit message).
+# Raised 4176 -> 4204 on 2026-09-06: the 7b16762b0 reconciliation merged the
+# G2 block (28 net lines once the DS4 tp>1 refusal moved before admission)
+# with the sticky GPU-fault latch (370592d17) and DFlash sidecar plumbing
+# (351c326e0). See commit message.
+# One additional call argument passes max_seq to pre-teardown source admission.
+# RATCHET-RAISE 4816 -> 4840: traded 24 lines of daemon main.rs for fail-closed
+# max_seq floor admission. A `load` carrying max_seq=0 previously panicked the
+# KV physical_cap assertion and killed the daemon process with the resident
+# model still serving; the guard refuses it before any teardown or allocation.
+# The load arm was sitting exactly at the old ceiling, so no correctness fix
+# there fits under it. Paid down when the arm's branch duplication is factored.
+# RATCHET-RAISE 5355 -> 5362: the gfx1201 retained-decode PM4 pacing scope
+# (0466dbd01, HIPFIRE_GFX1201_PM4_PACING) added 14 lines after #778 measured 5348.
+# RATCHET-RAISE 5362 -> 5377: the 0.4.0 deprecation pass (chore/deprecate-050,
+# 355eeb987) added the daemon load warnings for deprecated KV names and PFlash
+# plus their lifecycle markers (+23 lines, 5358 -> 5381 on land); fold/flash-next
+# took 4 back. The warnings go with the surfaces they announce in 0.5.0.
+# RATCHET-RAISE 5377 -> 5392: 0.4.1 landed the engine-owned session cache
+# (231935f6a3, #825/#826), the Qwen4 unload-first lifecycle fix (a31e438c73) and
+# the Qwen4 think-budget/EOS serve fixes (163d26d5b0, 325f31cc1a); e4d816e6b2
+# already removed formatter churn. v0.4.1 shipped at 5392 with CI red on this
+# ratchet; recorded here in 0.4.1.1 rather than masking the gate.
+# RATCHET-RAISE 5392 -> 5393: the MoE host-offload branch threads the slot's
+# `mtp_mode` into the Qwen35 slot forward, preserving explicit native MTP's
+# forced advances on the CPU-splice route. The implicit MoE auto-fit/default
+# change was removed, so the parsed-MoE replay-default plumbing and its ten
+# daemon lines were also removed. Only the required slot argument remains.
+# RATCHET-RAISE 5392 -> 5440: the `embed` wire verb (arch 17, the qwen3.5
+# multi-vector embedding encoder) adds a dispatch arm + its non-embed refusal
+# to the daemon's message loop. The body lives in hipfire-generate::embed (the
+# img_generate precedent), so the daemon only names arch_id 17 and the verb —
+# the 42 lines are the arm itself plus the refusal. Paid down when the message
+# loop's per-verb refusal boilerplate is factored out.
+# RATCHET-RAISE 5440 -> 5460: the `embed` verb's sibling guard — `generate` on
+# the arch-17 embedding encoder must refuse BEFORE any generation state is
+# entered. It was not refused, and the `has_deltanet`-implies-Qwen35Bundle
+# branch in hipfire-generate then downcast the wrong bundle and PANICKED the
+# daemon (killing every in-flight request). Both verb guards now classify
+# through `hipfire_loader::wire_verb`, so the daemon still carries no arch_id
+# literal (`daemon_arch_id` stays 0). Paid down when the message loop's
+# per-verb refusal boilerplate is factored out, as noted at the 5392 raise.
+# RATCHET-RAISE 5460 -> 5495: the arch-17 embedding arms in the daemon message
+# loop (#855, beta-base replay) — the generate refusal that is keyed after the
+# attempt id and admission token are bound (its attempt-0 twin hung requests),
+# the embed arm's thread-creation bound, the multi-slot engine spawn and its
+# carrier-delegated slot preflight, and the request-named-model reload policy.
+# Same paydown as the 5392 raise: factor the per-verb refusal boilerplate out.
+# RATCHET-RAISE 5393 -> 5496 (#855, arch 17, the qwen3.5 multi-vector
+# embedding encoder pplx-embed-v2), on top of #858's 5392 -> 5393 above:
+# +103 lines in daemon main.rs, in two hunks.
+#   +77  the `embed` verb arm: the multi-slot worker spawn with its
+#        thread-creation bound checked before spawning, the no-model and
+#        not-an-embedding-checkpoint refusals, and the call into
+#        hipfire-generate::embed, which owns the body (the img_generate
+#        precedent, so main.rs names no arch-crate type);
+#   +26  the `generate` arm's refusal of an embedding checkpoint, keyed after
+#        the attempt id and admission token are bound (an attempt-0 refusal
+#        hangs the caller; without any refusal the generic body downcasts the
+#        wrong bundle and panics the daemon).
+# Both guards classify through `hipfire_loader::wire_verb`, so `daemon_arch_id`
+# stays 0. Paid down when the message loop's per-verb refusal boilerplate is
+# factored out.
+daemon_lines                <= 5850
+
+# Examples compile on every `cargo build --all-targets`. Archived research
+# probes are gated behind `--features lab`; this is the count still ungated.
+# 28 of these are invoked by scripts or CI gates and are meant to stay.
+# RATCHET-RAISE 61 -> 63: `rdna-compute/verify_attn_oracle` (VerifyAttn byte oracle, gfx1201/gfx1100)
+# and `hipfire-arch-qwen35/mq4_prefill_state_oracle` (#794 cross-process state oracle), test-only
+# correctness oracles that their gates and docs invoke without `--features lab`.
+# RATCHET-RAISE 63 -> 64: v0.4.1 shipped at 64 (CI red on this ratchet); the
+# 0.4.1 cycle added QSA/PM oracles in rdna-compute/examples that their gates
+# invoke. Pay down by gating archived probes behind `lab` in 0.4.2.
+# route-043 sub-4 oracles; Kaden-approved raise 2026-10-15
+# RATCHET-RAISE 67 -> 68: `rdna-compute/gdn_wy_repeat_check`, the synthetic GPU oracle for the Qwen GDN WY
+# T-inverse fix (repeated-token NaN); its gate runs it without `--features lab`.
+ungated_examples            <= 68
+
+# --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
+# An arch crate must not depend on anything above the arch band. The band is
+# computed each run, so downward edges to hipfire-dispatch / saddle-core / 
+# hipfire-runtime stay legal and an edge to hipfire-loader / engine / generate /
+# daemon / cli fails the build.
+arch_depends_upward         == 0
+layer_unlisted_crates       == 0
+
+# Arch-key dispatch expressed as a string. A CEILING, not zero: hipfire-generate
+# is the architecture composition root by design, and the daemon keeps a narrow
+# arch_key() == "deepseek4" check because that arch's captured decode graph must
+# be invalidated across reset while gemma4's stays valid. The current fourteen
+# matches have reasons; a fifteenth needs one too.
+arch_key_dispatch           <= 14
+
+# --- quant-type register parity (scripts/check-quant-registry.py) ------------
+# Asserted against docs/quant-formats/qt-register.txt, the committed allocation
+# of qt numbers. All four are invariants rather than ceilings: a table check has
+# no legitimate slack, which is the point of preferring it to a count.
+#
+# The first draft of this gate WAS three counts, including `qt_unregistered <= 10`.
+# That ceiling could not distinguish a deliberate non-passthrough format (qt 22 is
+# an index tensor; 28/29 load via paro.rs; 31-37 via arch loaders) from a genuine
+# omission like cf061b7ed, where qt=40's encoder, GEMV and is_mq arms all landed
+# and the model would not load. Nor could any count see substitution -- delete one
+# justified entry, add an unjustified one, cardinality unchanged, gate green. That
+# is the shape of f00fa8058. Declaring each number's disposition in a table makes
+# both cases mechanical.
+
+# A declared variant missing from the register, or a register row naming no
+# variant. Same UNLISTED/STALE pair check-layering.py applies to crates.
+qt_unlisted                 == 0
+qt_stale                    == 0
+
+# A QuantType the writer can emit but its own parser rejects. qt 38/39 were in
+# exactly this state until this gate was added.
+qt_unparseable              == 0
+
+# A row whose declared disposition contradicts RAW_CODECS -- `passthrough`
+# without a table row, or a non-passthrough disposition with one -- or a name
+# that disagrees with the enum.
+qt_disposition_mismatch     == 0
+
+# --- dispatch-bypass debt ledger (scripts/check-dispatch-bypass.py) ----------
+# Rows live in docs/governance/debt-dispatch-bypass.txt. This is holster's
+# ledger: existing debt is permitted and recorded, new debt fails, and paying
+# down is a one-line edit. The first three are invariants; the last is the
+# objective's progress number and descends as crates migrate.
+
+# A crate with bypass calls and no row, or a row whose crate is gone.
+bypass_unlisted             == 0
+bypass_stale                == 0
+
+# A crate that reached for Gpu::gemv_*/gemm_*/fused_* more than its row allows.
+bypass_regressions          == 0
+
+# Debt paid in the tree but not banked in the table. Asserting this at 0 stops a
+# stale allowance becoming headroom the debt can quietly regrow into.
+bypass_slack                == 0
+
+# Total across all arch crates. Redundant given the rows, kept so the descent is
+# visible in this file's diff. Lower it when you bank a migration.
+# RATCHET-RAISE 304 -> 305: the "+1 pending from the SCS port PR series" already
+# recorded on the hipfire-arch-qwen35 ledger row, now carried by the SCS fold.
+# Banked 305 -> 296 with fold/flash-next: #755's sealed MoE prefill moved into
+# dispatch (qwen35 -5, cohere2moe -6), plus hipfire-arch-qwen4's 2 recorded rows.
+# RATCHET-RAISE 296 -> 300: the +4 gfx1151 A4-fusion arms recorded on the
+# hipfire-arch-qwen35 ledger row (HIPFIRE_V2B_A4_EPI, default on gfx1151 since v0.4.1).
+# RATCHET-RAISE 300 -> 307: the +7 row-exact gfx1151 batched native-MTP prompt
+# fill calls (a5b0cc14f) recorded on the hipfire-arch-qwen4 ledger row; follow-up:
+# migrate row-exact kernels into a dispatch-registry row family (0.4.2).
+# RATCHET-RAISE 306 -> 357: measurement correction, not new debt. The checker's
+# regex required `gpu.` adjacent to the method name and missed rustfmt-wrapped
+# `gpu\n    .gemm_*` chains; 51 existing call sites across six arch crates
+# became visible (deepseek4 +20, muse-glimmer +11, minimax +7, diffusion +7,
+# qwen35 +5, gemma4 +1). No arch reached for the Gpu handle newly; the holster
+# objective's descent starts from 357.
+# RATCHET-RAISE 357 -> 364: hipfire-arch-qwen35-embed (new, #855) records its
+# 7 existing-style debt sites: the trunk's f16 WMMA GEMM projections and the
+# encoder attention's eager decomposition (Q*K^T and P*V WMMA GEMMs), the same
+# registry-key debt the other arch crates carry. Migration target: the shared
+# encoder-attention op and project_weights family (staged follow-up).
+# RATCHET-RAISE 364 -> 366 (#855 maintainer hardening): measured arch 17
+# hipfire-arch-qwen35-embed 7 -> 9, registry refs 0; all other crate counts
+# unchanged. The two additional gfx1201 split1 pitched WMMA Q*K^T and P*V
+# entry points avoid head gathers and carry the same encoder-attention
+# registry-key debt; the existing gfx11 route is unchanged.
+bypass_total                <= 366
+
+# --- multi-card front doors: arch-id match forms (check-topology-arch-arms.sh) ---
+# Multi-GPU routing is declared by the carrier (Carrier::topology_caps); the
+# loader's bench classification, the topology caps module and the generate EP
+# dispatch name no arch id. The admission/lib ceilings are the arms that remain
+# for NON-topology policy (VMM KV, spill, vision, KV-mode families, route
+# tables), measured after the TopoG0 slice; they only go down.
+topology_arch_arms_admission     <= 27
+topology_arch_arms_lib           <= 16
+topology_arch_arms_bench_loader  == 0
+topology_arch_arms_caps          == 0
+topology_arch_arms_generate_qwen == 0
+topology_arch_arms_generate_bench == 0
+topology_arch_arms_total         <= 43

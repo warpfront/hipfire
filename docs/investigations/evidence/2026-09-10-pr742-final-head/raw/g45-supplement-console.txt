@@ -1,0 +1,1 @@
+{"cases": ["ordinary_stop", "max_tokens_length", "assistant_prefix_open_think", "next_turn_reuse"], "controlled_abort": {"abort_sent_at_gen_start": true, "aborted_done_pair": true, "no_token_before_abort": true}, "summary": "/home/bjoern/hipfire/.claude/worktrees/g4-next-integration/docs/investigations/evidence/2026-09-10-pr742-final-head/raw/g45-and-prefill-summary.json"}

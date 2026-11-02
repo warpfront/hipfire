@@ -1,0 +1,1563 @@
+# hipfire-dispatch — map
+
+> **Status:** `production` (vocabulary owned by [`docs/GLOSSARY.md`](../../docs/GLOSSARY.md)).
+> **Layer:** Kernel select — beside `rdna-compute`; family tables + pipelines so callers avoid matching on `DType` by hand; see the layering table in [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
+
+## Purpose
+
+Unified kernel dispatch abstraction: one entry point per kernel family. Owns `families/` (model×arch×quant routing), `tables/`, `pipeline/` (MoE/attn pipelines), `ops/`, `types`/`traits`, and `context`/`resource` scaffolding. The `//!` docs in [`src/lib.rs`](src/lib.rs) state the principle — resolve quant format, arch caps, and feature flags at init time, then dispatch without per-call `DType` matching.
+
+## Gotchas
+
+- Fast paths first; baseline last; drop redundant arch clauses when a newer predicate subsumes them (see coverage in `hipfire-dispatch-tests`).
+- Functional tests live in sibling `hipfire-dispatch-tests`, not here — this crate's own `tests` are placement/coverage helpers.
+- `Step::Moe` retains the sealed ownership boundary; `pipeline/moe_program.rs` lowers it to executable computation stages without changing fused-kernel boundaries. Collective scheduling stays in runtime, not this crate.
+- `cpu_split.rs` is the D2 eager CPU-cold/GPU-hot routed-expert transaction (`CpuSplitExecutor`, one per Flash-Next layer, `<=4` rows via `CPU_SPLIT_MAX_ROWS`, top-10). A fixed hotset ownership plan (`placement`, `1` = cold/CPU) partitions the ORIGINAL route without rewriting ids or weights: `prepare` downloads the rotated F32 activation, the original I32 ids and F32 weights (10,320 B/row at dim 2560), retires old pinned reads and uploads a separate masked-ids tensor (`masked_indices`, 40 B/row, cold slots `-1`) before the routed GPU kernels run; invalid ids belong to neither arm. `join` runs the cold slots through `cpu_exec::moe_cpu_host_slot_outputs` (scoped pool, no CPU job outlives it) and queues each cold slot's raw F32 output (10,240 B/slot) into the GPU expanded buffer on the same stream after the masked zero stores, so the original canonical BF16 combine runs once for both arms; `join` must not wait on the stream. Decode transfer is `10,360 + 10,240 × cold_slots` B/layer (`transfer_bytes`). The gate refuses graph/specialized capture, retained replay, AQL/PM4 and shadow routes; EP/PP/slab/AWQ/non-uniform layouts and other arches are refused by the attaching arch. A failed transaction is poisoned, never retried. Release with `free_gpu` while the device is bound. This is distinct from the `cpu_exec.rs` D1 whole-layer splice, which a hotset load never uses.
+- A3B PM attention in [`src/families/attention.rs`](src/families/attention.rs) passes `Option<FaPrefillKvCodec>` to `Gpu::fa_prefill_pm_admitted`: `AttnQ8_0KvBatchedMasked` uses `Some(Q8_0)` only for 8-bit V; `AttnFp8E4m3KvBatchedMasked` uses `Some(Fp8E4M3)` only for 8-bit V. Unsupported codecs are `None`, not Q8. Admitted full-causal H16/KV2/D256 calls select `attention_q8_0_fa_prefill_pm_gfx1201` or `attention_fp8_e4m3_fa_prefill_pm_gfx1201` before the incumbent ladder; tree/window/block layouts and every refusal retain that ladder. The native-FP8 arm additionally requires F32 Q/output, no gate/AWQ epilogue and no verify-tile attend.
+- PM defaults are codec-specific, not a new flag or a global flash default: `HIPFIRE_FA_PREFILL_PM` retains Q8's exact-gfx1201 qualification, while the two existing `FP8_KV_QUALIFIED` rows separately qualify native-FP8 H16/KV2/D256 PM attention and Qprep. Explicit `0`/`1` overrides qualified defaults without removing shape, codec, eager/capture/recording or other admission gates. F5 in [`hipfire-arch-qwen35/src/qwen35/prefill.rs`](../hipfire-arch-qwen35/src/qwen35/prefill.rs) also requires `HIPFIRE_FA_PREFILL_PM_QPREP` for that codec, exact paired writer/attend keys and codec-correct K/V writes before `Gpu::fa_prefill_pm_direct_codec`. PM `0` refuses F5; Q8 and H24/KV4 fallbacks remain. KV storage and FA2 are independent; the qualified F16-Q/FP8-KV path is not FP8-Q packet qualification.
+- Accepted F1 lives in [`src/pipeline/moe_program.rs`](src/pipeline/moe_program.rs): `expert_iu4_combine_v2_admits` selects the grouped BF16-input v2 combine only after IU4 admission, with `HIPFIRE_MOE_COMBINE_V2`, the device bundle and supported plan geometry; refusals keep v1. F2's resident NT8 gate/up selection remains in [`rdna-compute/src/gemm.rs`](../rdna-compute/src/gemm.rs) under `HIPFIRE_MOE_IU4_WIDE_TILES`, actual slot/shape and placement gates; resident down stays NT4 and the existing host-mapped NT8 behavior is unchanged.
+- F3 in [`src/families/fused_qkv.rs`](src/families/fused_qkv.rs) exposes `FusedQkvFamily::emit_rmsnorm_iu4_exact` / `FusedQkvIu4RmsnormParams` and `run_iu4_prepared` / `FusedQkvIu4PreparedParams`. Only `FusedQkvMq4G256V2` and `FusedQkvzaMq4G256V2` accept these prepared calls; the sidecar is the runtime eight-candidate (`cand_mode = 8`) representation on non-`_v2` gfx12 exports. `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` retains the existing eager/dtype/inventory gates. Shared producers/consumers in [`src/pipeline/mod.rs`](src/pipeline/mod.rs) and [`src/pipeline/moe_program.rs`](src/pipeline/moe_program.rs) preserve zero+ADD/SET ordering, calibration taps and same-activation router/shared prepared-token reuse (`HIPFIRE_MOE_SHARED_PREPARED_IU4`), not a different quantizer.
+- Shared F3 token threading stays explicit: `prefill_shared_activation_stage(gpu, p)` returns an optional prepared token; `prefill_shared_gate_up_stage(ctx, gpu, p, prepared)` and `prefill_shared_down_stage(ctx, gpu, p, prepared)` each take `Option<&Int4MmqPrepared>` as their fourth argument. Do not drop the token, requantize a prepared activation or treat the activation stage as returning `()`. F2's symbol census uses `Gpu::qwen4_moe_sym_gemm_symbols(host_mapped, total_slots, n_experts)` with real slots and all three arguments.
+- F4 in [`src/pipeline/sealed_moe.rs`](src/pipeline/sealed_moe.rs) nests `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` beneath the admitted `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` branch: `Gpu::moe_router_topk_multirow_admitted` requires top-8, 256 experts, wave32 and positive even rows before `moe_router_softmax_topk_k8_multirow_prefill`. A parent kill or refusal keeps the incumbent router. F1–F4 gates do not read the KV codec; their accepted prerequisites are not new FP8 qualification or measurement.
+- Late-H switches are qualified exact-gfx1201 defaults (unset on there, `0` kills): `HIPFIRE_MOE_ROTATE_I4_PM` selects the PM down-A4 producer beneath the symmetric IU4 route; `HIPFIRE_PREFILL_IU4_C8_PM` selects the exact PM rotate/RMSNorm C8 twins beneath resolved F3. `HIPFIRE_GDN_CHUNK_PREP_PM` selects the PM prep twin only inside the architecture's admitted generalized 16/32 MoE GDN scan, with views/modules resolved before projection or conv-ring mutation; dense 16/48 retains its incumbent/fixup prep. Their leaf sources are [`rdna-compute/src/moe_rotate_i4_pm.rs`](../rdna-compute/src/moe_rotate_i4_pm.rs), [`iu4_c8_pm.rs`](../rdna-compute/src/iu4_c8_pm.rs) and [`gdn_chunk_prep_pm.rs`](../rdna-compute/src/gdn_chunk_prep_pm.rs).
+- `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` is the fourth late-H route: `prefill_shared_down_sigmoid_epi_admitted` in [`src/pipeline/mod.rs`](src/pipeline/mod.rs), with the grouped path in [`src/pipeline/qt44_qt53_prefill.rs`](src/pipeline/qt44_qt53_prefill.rs), admits an MQ4G256V2 shared-down HIP V3 sigmoid-gated residual epilogue, not PM. It preserves the incumbent zeroed-temporary + ADD arithmetic, upstream AWQ and checked prepared-token consumption; capture/recording and collectors needing the shared intermediate refuse it.
+
+## Family step programs
+
+Conventions for the `Step` program a model family declares. Decided in HIPF-86 and checked against beta after the #666 cutovers (#877, #884, #881, #886, #883, #889) and #929. Worked examples: [`docs/design/gemma4-declarative-program.md`](../../docs/design/gemma4-declarative-program.md) and [`docs/design/glimmer-declarative-program.md`](../../docs/design/glimmer-declarative-program.md). The dense MLP op is in [`docs/design/gated-mlp-op.md`](../../docs/design/gated-mlp-op.md).
+
+1. **Sandwich-norm decoders** run one `Step::SandwichAttention` per layer and one MLP step per layer (`pipeline::sandwich`). The MLP step is `Step::GatedMlp` with `MlpLadder::SandwichWide` and a `MlpOutput::PostNorm` epilogue for Gemma 4 dense layers, or `Step::SandwichMlp` for Glimmer. Family differences become op fields or route variants inside `sandwich`, for example `SandwichRoute`, `KvRoute`, `AttnGate`, `RopeKind::NoPe` and `post_eps`, not a new step.
+2. **Rows live in the op, with one explicit route.** An op that serves both decode and batched rows carries `rows` plus exactly one explicit route; `rows` never selects kernels (a one-row prefill chunk keeps its batched arithmetic).
+   - The shared discriminator is `pipeline::RowsRoute { Decode, Prefill, Verify }`.
+   - An op whose routes need route-only operands uses a per-op `XRoute::{Decode { .. }, Batched { .. }}` enum (the DS4 `mla` ops, e.g. `KvJointRoute`, `QLoraProjectRoute`).
+   - `validate_for_gpu` rejects `Decode` with `rows != 1`, and a batched route without `positions` or without its operands.
+   - No `*Rows` twin steps, no per-family rows sub-enum, and no decode-only composite next to a rows decomposition of the same sublayer: decode and prefill of a layer expose the same `OpKind` set.
+   - Rows projection of sandwich models is `sandwich::gemm_rows` (one definition; `Ladder::Wide` or a `RowsRoute`).
+3. **RoPE** is described by `sandwich::Rope { kind, theta }`, and `Step::Rope` carries it as `rope` (#884).
+4. **MoE routing** goes through sealed MoE (`Step::Moe`). The biased sigmoid selection (`MoeSelectionBias`, `src/families/moe.rs`) is defined once.
+5. **Existing families come first.** DFlash draft attention uses `AttentionFamily::run_full_attention` (or `run_full_attention_on` to pin a tile). Fused SiLU·up + FWHT uses `RotationFamily` with `RotationVariant::WithSwiGLU`. Device copies are recorded launches (`copy_f32_buffer`), never `hip.memcpy_dtod`.
+6. **Standard pre-norm decoders** (LFM2, MiniMax) keep the llama-style primitive steps (`RmsnormAutomatic`, `Gemv`, `QkNorm`, `Rope`, `Attend`, `GemvResidual`). A dense gated FFN is `Step::GatedMlp` (#929).
+7. **Row norms are row norms.** A hidden-width RMSNorm over `rows` rows uses `Step::RmsnormAutomatic` with `rows` (`OpKind::RmsnormAutomatic`, `SplitRule::RowComplete`), never `Step::QkNorm`, which is `HeadLocal`.
+8. **Every new `Step` variant gets an appended `OpKind` ID** in `src/pipeline/step_graph.rs`, and `op_kind_ids_frozen` is extended. IDs are never renumbered or reused: `18` (`DenseFfn`) and `20` (the first `SandwichMlp`) were retired when those ops folded into `GatedMlp = 28`, and the later `Step::SandwichMlp` took the appended ID `31`, not `20`. A hand-route ID that already exists (e.g. `OpKind::SiluMul = 1001`) is reused for its op rather than given a second ID.
+9. **Every op validates.** Each `Step` operand has `validate_for_gpu` (geometry, route/rows consistency, cache bounds, scratch sizes), and `validate_steps` (`src/pipeline/steps.rs`) calls it.
+
+## Crate map
+
+<!-- crate-map:generated:begin -->
+
+_Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside the markers._
+
+### Modules and exported symbols
+
+- [`src/context.rs`](src/context.rs)
+  - `cpu_wide_verify`
+  - `device_id`
+  - `DispatchCtx`
+  - `DispatchWorkload`
+  - `for_test`
+  - `for_test_device`
+  - `new`
+  - `with_batch_size`
+  - `with_cpu_wide_verify`
+  - `with_verify_tile_attend`
+  - `with_workload`
+- [`src/coverage_tests.rs`](src/coverage_tests.rs)
+- [`src/cpu_exec.rs`](src/cpu_exec.rs)
+  - `bf16_bits_rne`
+  - `cpu_exec_counters`
+  - `cpu_exec_enabled`
+  - `cpu_exec_redline_conflict`
+  - `CPU_EXECUTED_DTYPES`
+  - `cpu_kernel_for`
+  - `cpu_offload_active`
+  - `cpu_quant_for`
+  - `cpu_transfer_capacity_bytes`
+  - `CpuMoeExpert`
+  - `dense_cpu_quant_for`
+  - `host_mapped_cpu_capable`
+  - `log_capture_disabled_once`
+  - `moe_canonical_combine_reference`
+  - `moe_cpu_experts`
+  - `moe_cpu_experts_enabled`
+  - `moe_cpu_grouped_rows_bf16`
+  - `moe_cpu_host_slot_outputs`
+  - `moe_cpu_host_slot_scratch_capacity_rows`
+  - `moe_cpu_oracle_report`
+  - `moe_layer_trace`
+  - `moe_step_trace`
+  - `moe_trace_enabled`
+  - `moe_window_trace`
+  - `MoeLayerTiming`
+  - `MoeStepTime`
+  - `MoeWindowTiming`
+  - `new`
+  - `passback_enabled`
+  - `reject_cpu_exec_under_redline`
+  - `reserve`
+  - `reserve_cpu_transfer_values`
+  - `reserve_moe_cpu_host_slot_scratch`
+  - `run_host_mapped_gemv`
+  - `run_host_mapped_gemv_residual`
+  - `SpCpuExpert`
+  - `SpCpuScratch`
+  - `SpCpuStats`
+  - `splice_pool_threads`
+  - `splice_read_bandwidth`
+  - `split_counters`
+  - `validate_moe_cpu_host_slot_outputs`
+- [`src/cpu_split.rs`](src/cpu_split.rs)
+  - `abort_armed`
+  - `as_str`
+  - `capacity_rows`
+  - `combine_enqueued`
+  - `combine_outputs`
+  - `configure`
+  - `CPU_SPLIT_MAX_ROWS`
+  - `cpu_split_storage_extents`
+  - `CPU_SPLIT_STORAGE_MAX_ROWS`
+  - `CpuShadow`
+  - `CpuSplitExecutor`
+  - `cpwait_active`
+  - `cpwait_arm`
+  - `cpwait_counters`
+  - `D2ReturnMode`
+  - `dim`
+  - `enable_cpwait_join`
+  - `enable_event_ready`
+  - `enable_mapped_return`
+  - `fn`
+  - `free_gpu`
+  - `join`
+  - `join_mode`
+  - `join_refusal`
+  - `JoinDecision`
+  - `mapped_capacity_bytes`
+  - `mapped_return_bytes`
+  - `masked_indices`
+  - `max_rows`
+  - `mi`
+  - `new`
+  - `parity_after_combine`
+  - `parity_before_combine`
+  - `parity_reference`
+  - `placement`
+  - `prepare`
+  - `ready_counters`
+  - `ready_mode`
+  - `return_mode`
+  - `return_refusal`
+  - `ReturnDecision`
+  - `select_join_mode`
+  - `select_return_mode`
+  - `SPLIT_PARITY_MAX_RECORDS`
+  - `SplitEndpoint`
+  - `SplitParityConfig`
+  - `SplitParityMode`
+  - `SplitParityRecord`
+  - `SplitTiming`
+  - `SplitTransport`
+  - `storage_bytes`
+  - `take_parity_records`
+  - `top_k`
+  - `transfer_bytes`
+  - `transfer_bytes_for`
+  - `transport_counters`
+  - `wants_parity`
+  - `wants_reference`
+- [`src/cpwait.rs`](src/cpwait.rs)
+  - `abort`
+  - `aborts`
+  - `arm`
+  - `ArmId`
+  - `begin_call`
+  - `Clock`
+  - `CPWAIT_WATCHDOG_TIMEOUT`
+  - `Disarm`
+  - `disarm`
+  - `expire`
+  - `fail`
+  - `fires`
+  - `fn`
+  - `GateError`
+  - `GatePort`
+  - `GateState`
+  - `global_watchdog`
+  - `is_armed`
+  - `is_poisoned`
+  - `JoinGate`
+  - `JoinTarget`
+  - `manual`
+  - `new`
+  - `poison`
+  - `polls`
+  - `READY_SPIN_BUDGET`
+  - `release`
+  - `spawn`
+  - `spin_until_ready`
+  - `SpinOutcome`
+  - `state`
+  - `SystemClock`
+  - `Watchdog`
+  - `WatchdogTarget`
+- [`src/families/attention.rs`](src/families/attention.rs)
+  - `AttentionFamily`
+  - `AttnParams`
+  - `FullAttnParams`
+  - `gfx1100_split_verify_admitted`
+  - `gfx1100_split_verify_min_ctx`
+  - `Gfx1100SplitVerifyModel`
+  - `Gfx1100SplitVerifyRoute`
+  - `new`
+  - `positions`
+  - `registry`
+  - `resolve`
+  - `run_attend_only`
+  - `run_attention`
+  - `run_full_attention`
+  - `run_full_attention_on`
+- [`src/families/fused_qkv.rs`](src/families/fused_qkv.rs)
+  - `emit_rmsnorm_iu4_exact`
+  - `fused_gate_up_key_for`
+  - `fused_qkv_key_for`
+  - `fused_qkvza_key_for`
+  - `FusedQkvBiasParams`
+  - `FusedQkvFamily`
+  - `FusedQkvIu4PreparedParams`
+  - `FusedQkvIu4RmsnormParams`
+  - `FusedQkvParams`
+  - `new`
+  - `registry`
+  - `resolve`
+  - `run`
+  - `run_iu4_prepared`
+  - `run_with_qwen2_bias`
+- [`src/families/gemm.rs`](src/families/gemm.rs)
+  - `GemmFamily`
+  - `GemmParams`
+  - `new`
+  - `registry`
+  - `residual_gemm_key_for`
+  - `resolve`
+  - `run`
+  - `run_key`
+  - `run_mtp_fill_mq4`
+  - `run_q8_projection_fresh`
+- [`src/families/gemv.rs`](src/families/gemv.rs)
+  - `buf`
+  - `check_rotation_tag`
+  - `GemvFamily`
+  - `GemvParams`
+  - `GivensRef`
+  - `into_buf`
+  - `new`
+  - `registry`
+  - `resolve`
+  - `rotate`
+  - `RotatedActivation`
+  - `RotateInputs`
+  - `RotationTag`
+  - `RotInput`
+  - `run`
+  - `run_auto`
+  - `run_input`
+  - `run_rows_exact`
+  - `select_rotation_variant`
+  - `tag`
+  - `WeightRef`
+- [`src/families/kv_tier.rs`](src/families/kv_tier.rs)
+  - `classify`
+  - `derive`
+  - `F32AttnPolicy`
+  - `is_compactable`
+  - `is_q8`
+  - `k_bytes_per_pos`
+  - `KTier`
+  - `KvTierInputs`
+  - `KvTierPlan`
+  - `storage_ok_for_pflash`
+  - `UnsupportedTreeTier`
+- [`src/families/mod.rs`](src/families/mod.rs)
+  - `attention`
+  - `fused_qkv`
+  - `gemm`
+  - `gemv`
+  - `kv_tier`
+  - `moe`
+  - `moe_buckets`
+  - `moe_expert_iu4`
+  - `rotation`
+- [`src/families/moe.rs`](src/families/moe.rs)
+  - `any_host`
+  - `check_generic_route`
+  - `codebook_batched_admit_enabled`
+  - `codebook_batched_admit_enabled_from_env`
+  - `codecs`
+  - `cpu_d1_prewarmed_scratch_rows`
+  - `cpu_split_executor`
+  - `cpu_split_executor_wide`
+  - `CpuWideVerifyScope`
+  - `crate`
+  - `deterministic_down`
+  - `down_entries`
+  - `down_writes_expanded`
+  - `EXPERT_TIER_DEVICE`
+  - `EXPERT_TIER_HOST`
+  - `ExpertTierIdentity`
+  - `fn`
+  - `gate_up_entries`
+  - `gated_moe_prefill_admissible`
+  - `gated_moe_prefill_admissible_for_dtypes`
+  - `generation`
+  - `grouped_moe_m_total_bound`
+  - `GroupedMoeGeometry`
+  - `has_fp8_b128_projection`
+  - `has_mq6_projection`
+  - `host_projections`
+  - `is_fp8_grouped`
+  - `is_qt44_qt53_grouped`
+  - `is_sealed_grouped`
+  - `is_slab`
+  - `keepalive`
+  - `logical_digest`
+  - `MIXED_SUPPORTED_TIERS`
+  - `MOE_BIASED_SIGMOID_MAX_K`
+  - `moe_down_writes_expanded`
+  - `MOE_GROUPED_BLOCK_M`
+  - `MOE_GROUPED_MAX_TOP_K`
+  - `moe_grouped_top_k_supported`
+  - `moe_prefill_topk_shape_supported`
+  - `moe_softmax_k8_router_top_k_supported`
+  - `MoeBiasAwareMq2Backend`
+  - `MoeBiasAwarePrefillParams`
+  - `MoeDtypes`
+  - `MoeEpMode`
+  - `MoeFamily`
+  - `MoeMq2Lloyd`
+  - `MoeNormalization`
+  - `MoeParams`
+  - `MoePointerEntries`
+  - `MoePrefillDtypes`
+  - `MoePrefillParams`
+  - `MoePrefillPrelude`
+  - `MoePrefillResolution`
+  - `MoePrefillRouting`
+  - `MoeQ8RouterPolicy`
+  - `MoeRecipe`
+  - `MoeResolution`
+  - `MoeRouteCapability`
+  - `MoeRouteFormats`
+  - `MoeRouteGeometry`
+  - `MoeRoutePolicy`
+  - `MoeRowGather`
+  - `MoeScores`
+  - `MoeSelectedParams`
+  - `MoeSelectionBias`
+  - `MoeSharedDecode`
+  - `MoeSharedDtypes`
+  - `MoeSharedPrefill`
+  - `MoeSharedWeights`
+  - `MoeStageTables`
+  - `MoeTileExchange`
+  - `MoeTileExchangeParams`
+  - `mq6_batched_admit_enabled_from_env`
+  - `NARROW_VERIFY_MAX_ROWS`
+  - `new`
+  - `paro_batched_admit_enabled_from_env`
+  - `placement`
+  - `qt53_routed_down_fallback`
+  - `rdna_compute`
+  - `registry`
+  - `resolve`
+  - `resolve_arch`
+  - `resolve_with_batch_ctx`
+  - `routed_codebook_grouped_supported`
+  - `routed_codebook_pair_batched_supported`
+  - `routed_host_mapped`
+  - `routed_host_mapped_projections`
+  - `routed_indexable`
+  - `routed_uniform_mqv2_grouped_supported`
+  - `RoutedExpertWeights`
+  - `router_scores_precomputed`
+  - `run_bias_aware_prefill`
+  - `run_selected`
+  - `sealed_fp8`
+  - `sigmoid_routed_prefill_supported`
+  - `slab_bucket_of_pair`
+  - `slab_codec_of_pair`
+  - `slab_codec_pair`
+  - `slab_down_dtype`
+  - `slab_gate_up_dtype`
+  - `slab_launch_cold_codec`
+  - `softmax_shared_gate_prerotated`
+  - `softmax_shared_gate_uniform_mq4`
+  - `uniform`
+  - `validate`
+  - `with_topk_indices`
+- [`src/families/moe_buckets.rs`](src/families/moe_buckets.rs)
+  - `bucket_topk_by_tier`
+  - `TierBucket`
+- [`src/families/moe_expert_iu4.rs`](src/families/moe_expert_iu4.rs)
+  - `ALL`
+  - `expert_iu4_admission`
+  - `EXPERT_IU4_MIN_ROWS`
+  - `ExpertIu4Inputs`
+  - `ExpertIu4Reject`
+  - `ExpertIu4Spec`
+  - `ExpertNumerics`
+  - `fn`
+  - `validate`
+- [`src/families/rotation.rs`](src/families/rotation.rs)
+  - `new`
+  - `RotationFamily`
+  - `RotationParams`
+  - `run`
+- [`src/lib.rs`](src/lib.rs)
+  - `context`
+  - `cpu_exec`
+  - `cpu_split`
+  - `cpwait`
+  - `families`
+  - `offload_split`
+  - `ops`
+  - `pipeline`
+  - `resource`
+  - `sp_plan`
+  - `tables`
+  - `traits`
+  - `types`
+- [`src/macros.rs`](src/macros.rs)
+- [`src/model_ext/deepseek4.rs`](src/model_ext/deepseek4.rs)
+  - `CompressorParams`
+  - `Deepseek4ModelExt`
+  - `JointKvParams`
+  - `QLoraParams`
+  - `weight_needs_fwht`
+- [`src/model_ext/mod.rs`](src/model_ext/mod.rs)
+  - `crate`
+  - `deepseek4`
+  - `DeltaNetOps`
+  - `MlaOps`
+  - `qwen35`
+- [`src/model_ext/qwen35.rs`](src/model_ext/qwen35.rs)
+  - `ConvStateParams`
+  - `DeltaNetBatchParams`
+  - `DeltaNetStepParams`
+  - `DeltaNetTreeParams`
+  - `Qwen35ModelExt`
+  - `StateQuant`
+- [`src/offload_split.rs`](src/offload_split.rs)
+  - `CpuProbePool`
+  - `enabled`
+  - `from_process`
+  - `MIN_SPLIT_BYTES`
+  - `passback_capable_format`
+  - `PassbackOptions`
+  - `probe_synthetic`
+  - `probe_synthetic_on`
+  - `probe_weight`
+  - `row_bytes_for`
+  - `run`
+  - `run_with`
+  - `scheduler_snapshot`
+  - `seed`
+  - `ShapeSnapshot`
+  - `SplitCalibration`
+- [`src/ops/delta_net.rs`](src/ops/delta_net.rs)
+  - `contiguous`
+  - `ConvStateParams`
+  - `DecayAxis`
+  - `DeltaNetBatchParams`
+  - `DeltaNetOps`
+  - `DeltaNetStepParams`
+  - `DeltaNetTreeParams`
+  - `execute_gated_delta`
+  - `GatedDeltaOp`
+  - `GatedDeltaStrides`
+  - `sigmoid_alpha_gate_batched`
+  - `StateQuant`
+- [`src/ops/mla.rs`](src/ops/mla.rs)
+  - `CompressorParams`
+  - `JointKvParams`
+  - `MlaOps`
+  - `QLoraParams`
+  - `weight_needs_fwht`
+- [`src/ops/mod.rs`](src/ops/mod.rs)
+  - `delta_net`
+  - `mla`
+  - `pm_xbatch`
+  - `verify_twins`
+- [`src/ops/pm_xbatch.rs`](src/ops/pm_xbatch.rs)
+  - `multirow_r2`
+  - `plain`
+  - `residual`
+- [`src/ops/verify_twins.rs`](src/ops/verify_twins.rs)
+  - `attention_fp8_segs`
+  - `rdna_compute`
+  - `stage_attention_fp8_segs`
+- [`src/pipeline/batched.rs`](src/pipeline/batched.rs)
+  - `active_mask`
+  - `BatchEpilogue`
+  - `BatchScratch`
+  - `BatchSemantics`
+  - `DenseBatchMath`
+  - `DflashFusionCtx`
+  - `fn`
+  - `fused_rmsnorm_rotate_mq_batched_for`
+  - `fused_rmsnorm_rotate_mq_f16_batched_for`
+  - `fused_silu_mul_rotate_mq_batched_for`
+  - `fused_silu_mul_rotate_mq_f16_batched_for`
+  - `is_independent`
+  - `mq_f16_projection_fast_route`
+  - `MropeRows`
+  - `plain_gemm_key_for`
+  - `q8_prefill_wmma_enabled`
+  - `reject_typed_only_format`
+  - `rotate_x_mq_batched_for`
+  - `run_fused_gate_up_key`
+  - `run_fused_qkv_key`
+  - `run_fused_qkvza_key`
+  - `run_plain_gemm_key`
+  - `run_residual_gemm_key`
+  - `s4_residual_fast`
+  - `TreeVerifyCtx`
+  - `try_iu4_rotate_prepared_no_epilogue`
+  - `valid_lane_mask`
+  - `verify_dense_math`
+  - `WIDENED_COMMIT_ROWS`
+- [`src/pipeline/batched_attention.rs`](src/pipeline/batched_attention.rs)
+  - `alloc`
+  - `attend`
+  - `AttentionLayerView`
+  - `batch_chunk_fa_attend`
+  - `batch_chunk_fa_attend_ragged_fp8q`
+  - `batch_chunk_fa_pm_qprep_direct`
+  - `batch_chunk_fa_pm_qprep_prep`
+  - `batch_chunk_full_attn_attn`
+  - `batch_chunk_full_attn_input_projection`
+  - `batch_chunk_full_attn_output_projection`
+  - `batch_chunk_full_attn_prepare`
+  - `batched_gemm_single_weight`
+  - `BatchedAttentionTap`
+  - `dflash_fa_batch_fusion_admitted`
+  - `execute_fa_attend_step`
+  - `FA_PAIR_BATCH`
+  - `FA_PAIR_ROWS`
+  - `fa_pertoken_min_ctx`
+  - `fa_pm_kv_codec`
+  - `fa_pm_qprep_admitted`
+  - `fa_prep_unfused_qk_norm`
+  - `fa_prep_unfused_rope`
+  - `FaPairHalf`
+  - `FaPairStage`
+  - `FlashScratch`
+  - `free_gpu`
+  - `gfx1100_split_verify_admitted`
+  - `gfx1100_split_verify_min_ctx`
+  - `gfx12_fa_prep_admitted`
+  - `gfx12_fa_prep_fp8q_admitted`
+  - `KvView`
+  - `q8_multirow_attn_admitted`
+  - `tier_inputs`
+  - `uses_vmm_backend`
+- [`src/pipeline/batched_deltanet.rs`](src/pipeline/batched_deltanet.rs)
+  - `batch_chunk_delta_net_attn`
+  - `batch_chunk_delta_net_input_projection`
+  - `batch_chunk_delta_net_output_projection`
+  - `batch_chunk_delta_net_pre_gdn`
+  - `DeltaNetLayerView`
+  - `DeltaNetStateView`
+  - `ef_residual`
+  - `GDN_CHUNK_HEAD_DIM`
+  - `gdn_chunk_head_geometry_supported`
+  - `GDN_CHUNK_KEY_HEADS`
+  - `GDN_CHUNK_MAX_VALUE_HEADS`
+  - `gdn_chunk_scan_layer`
+  - `gdn_chunk_scan_prepare_views`
+  - `gdn_qk_norm_interleave`
+  - `gdn_sigmoid_alpha_gate`
+  - `GdnChunkPrepModule`
+  - `GdnChunkScanViews`
+  - `GdnTapeView`
+  - `gfx12_gdn_quant_fused_admitted`
+  - `push_gdn_tape_copies`
+  - `try_gfx11_gdn_quant_fused_prepared_no_epilogue`
+  - `try_gfx12_gdn_quant_fused_prepared`
+- [`src/pipeline/batched_moe.rs`](src/pipeline/batched_moe.rs)
+  - `attention_moe_finish_batched`
+  - `attention_moe_prep_batched`
+  - `AttentionMoeLayerView`
+  - `DeltaNetMoeLayerView`
+  - `execute_attention_moe_layer_batched`
+  - `execute_deltanet_moe_layer_batched`
+- [`src/pipeline/draft_head.rs`](src/pipeline/draft_head.rs)
+  - `allocation_sizes`
+  - `device_bytes`
+  - `draft`
+  - `draft_enqueue`
+  - `draft_finish`
+  - `draft_finish_request`
+  - `draft_rows_enqueue`
+  - `DraftHead`
+  - `DraftHeadLayout`
+  - `DraftHeadPolicy`
+  - `DraftHeadRequestState`
+  - `free_gpu`
+  - `logits`
+  - `margin`
+  - `new`
+  - `observe`
+  - `observe_request`
+  - `parse`
+  - `request_state`
+  - `rescored_candidates`
+  - `reset_request_state`
+  - `set_request_state`
+- [`src/pipeline/gated_mlp.rs`](src/pipeline/gated_mlp.rs)
+  - `Activation`
+  - `down`
+  - `execute_gated_mlp`
+  - `execute_product_rows`
+  - `GatedMlpOp`
+  - `GatedMlpScratch`
+  - `MlpLadder`
+  - `MlpOutput`
+  - `MlpStorage`
+  - `ProductRows`
+  - `project`
+  - `RmsNorm`
+  - `tp_shardable`
+  - `validate_for_gpu`
+  - `write_partial`
+- [`src/pipeline/hybrid.rs`](src/pipeline/hybrid.rs)
+  - `attend`
+  - `AttentionKv`
+  - `AttentionRow`
+  - `AttentionTap`
+  - `conv_qknorm`
+  - `conv_scalar_prep`
+  - `DeltaNetMixerOp`
+  - `execute_deltanet_mixer`
+  - `execute_gated_attention`
+  - `fused_attention_epilogue`
+  - `fused_attention_prep`
+  - `gated_norm`
+  - `gated_norm_mq_rotate`
+  - `GatedAttentionOp`
+  - `gdn_compact_qk_div`
+  - `GdnState`
+  - `gfx1151_radiowave`
+  - `gfx1201_state_fusions`
+  - `HybridDims`
+  - `is_dense_27b_shape`
+  - `kv_attention`
+  - `MixerOutput`
+  - `MropeRope`
+  - `normed_projection`
+  - `output`
+  - `prepare`
+  - `project`
+  - `qkvza_scalar_prep`
+  - `recur`
+- [`src/pipeline/latent_attention.rs`](src/pipeline/latent_attention.rs)
+  - `AbsorbOperands`
+  - `AttentionRoute`
+  - `default_scale`
+  - `execute_latent_attention`
+  - `expanded_width`
+  - `ExpandedMirror`
+  - `KvExpansion`
+  - `LatentAttentionOp`
+  - `LatentCache`
+  - `LatentGeometry`
+  - `MlaRowsRoute`
+  - `qk_dim`
+  - `row_width`
+  - `RowRange`
+  - `rows_route`
+- [`src/pipeline/layer_ops.rs`](src/pipeline/layer_ops.rs)
+  - `BroadcastAddOp`
+  - `ClearOp`
+  - `CoreWindow`
+  - `EmbeddingOp`
+  - `execute_argmax`
+  - `execute_broadcast_add`
+  - `execute_clear`
+  - `execute_embedding`
+  - `execute_final_hyper`
+  - `execute_gated_delta_net`
+  - `execute_gated_delta_net_arena`
+  - `execute_gated_delta_net_core_lanes`
+  - `execute_gated_delta_net_core_rows`
+  - `execute_gated_delta_net_hc`
+  - `execute_gated_delta_net_uncovered`
+  - `execute_gated_short_conv`
+  - `execute_grouped_depthwise`
+  - `execute_grouped_depthwise_rows`
+  - `execute_hyper_norm`
+  - `execute_hyper_read`
+  - `execute_hyper_read_paired`
+  - `execute_hyper_read_prenormed`
+  - `execute_hyper_write`
+  - `execute_hyper_write_pregated`
+  - `execute_hyper_write_read_fold`
+  - `execute_hyper_write_then_read`
+  - `execute_indexed_attention`
+  - `execute_indexed_attention_arena`
+  - `execute_indexed_attention_core_lanes`
+  - `execute_indexed_attention_core_rows`
+  - `execute_indexed_attention_hc`
+  - `execute_indexed_attention_uncovered`
+  - `execute_lane_attention`
+  - `execute_lm_head`
+  - `execute_project`
+  - `GATED_SHORT_CONV_MAX_KERNEL`
+  - `GatedDeltaNetOp`
+  - `GatedShortConvOp`
+  - `gdn_qkv_projection_bf16`
+  - `GdnRowCapture`
+  - `GdnTrunkArenas`
+  - `GroupedDepthwiseOp`
+  - `hc_row_fold_next_gfx1201_ok`
+  - `hyper_gate_quarters`
+  - `hyper_read_pairs_write`
+  - `hyper_read_prenorm_applies`
+  - `hyper_write_read_fold_applies`
+  - `HyperNormOp`
+  - `HyperReadOp`
+  - `HyperWriteAr`
+  - `HyperWriteOp`
+  - `IndexedAttentionMode`
+  - `IndexedAttentionOp`
+  - `IndexedAttentionState`
+  - `LaneAttentionOp`
+  - `MixerPhase`
+  - `next_lengths`
+  - `next_lengths_after`
+  - `project_weight`
+  - `project_weights`
+  - `ProjectLadder`
+  - `ProjectOp`
+  - `qsa_projection_hook_installed`
+  - `QsaProjectionHook`
+  - `QsaTrunkArenas`
+  - `reset_qsa_projection_slot`
+  - `set_qsa_projection_hook`
+  - `validate_for_gpu`
+  - `validate_lm_head`
+- [`src/pipeline/mla/attention.rs`](src/pipeline/mla/attention.rs)
+  - `CompressedCache`
+  - `DirectTopk`
+  - `execute_identity_gather`
+  - `execute_o_lora`
+  - `execute_sparse_attention`
+  - `execute_sparse_index`
+  - `execute_swa_attention`
+  - `execute_swa_ring_write`
+  - `IdentityGatherOp`
+  - `IdentityGatherRoute`
+  - `IndexTopK`
+  - `LatentAttentionBackend`
+  - `OloraA`
+  - `OLoraOp`
+  - `OLoraRoute`
+  - `SparseAttentionOp`
+  - `SparseAttentionRoute`
+  - `SparseIndexOp`
+  - `SparseIndexRoute`
+  - `SwaAttentionOp`
+  - `SwaAttentionRoute`
+  - `SwaRingWriteOp`
+  - `SwaRingWriteRoute`
+  - `TopkGather`
+  - `validate_for_gpu`
+- [`src/pipeline/mla/compressor.rs`](src/pipeline/mla/compressor.rs)
+  - `CompressorCommit`
+  - `CompressorDebug`
+  - `CompressorInput`
+  - `CompressorProjection`
+  - `CompressorProjectOp`
+  - `CompressorProjectRoute`
+  - `CompressorRope`
+  - `execute_compressor_project`
+  - `execute_kv_compress`
+  - `KvCompressOp`
+  - `KvCompressRoute`
+  - `validate_for_gpu`
+- [`src/pipeline/mla/expert_ffn.rs`](src/pipeline/mla/expert_ffn.rs)
+  - `execute_expert_ffn`
+  - `execute_ffn_norm`
+  - `execute_hash_routed_experts`
+  - `execute_moe_route`
+  - `execute_routed_experts`
+  - `execute_shared_expert`
+  - `ExpertFfnOp`
+  - `ExpertFfnRoute`
+  - `ExpertFfnRouter`
+  - `ExpertFfnSchedule`
+  - `HashRoutedExpertsOp`
+  - `HashSelection`
+  - `HashToken`
+  - `RoutedExpertsOp`
+  - `validate_for_gpu`
+- [`src/pipeline/mla/hc.rs`](src/pipeline/mla/hc.rs)
+  - `execute_hc_head`
+  - `execute_hc_post`
+  - `execute_hc_pre`
+  - `HcHeadOp`
+  - `HcHeadRoute`
+  - `HcMixBranch`
+  - `HcPostOp`
+  - `HcPostRoute`
+  - `HcPreOp`
+  - `HcPreRoute`
+  - `validate_for_gpu`
+- [`src/pipeline/mla/mod.rs`](src/pipeline/mla/mod.rs)
+  - `attention`
+  - `compressor`
+  - `expert_ffn`
+  - `hc`
+  - `project`
+  - `query_kv`
+  - `rows`
+- [`src/pipeline/mla/project.rs`](src/pipeline/mla/project.rs)
+  - `E8SoaKernel`
+  - `execute_prepared_projection`
+  - `PreparedProjectionOp`
+  - `PreparedProjectionRoute`
+  - `project_prepared`
+  - `project_prepared_rows`
+  - `RowsProjection`
+  - `validate_for_gpu`
+- [`src/pipeline/mla/query_kv.rs`](src/pipeline/mla/query_kv.rs)
+  - `ApplyTailRopeOp`
+  - `ApplyTailRopeRoute`
+  - `execute_apply_tail_rope`
+  - `execute_kv_joint`
+  - `execute_packed_projections`
+  - `execute_q_lora_prepare`
+  - `execute_q_lora_project`
+  - `KvJointOp`
+  - `KvJointRoute`
+  - `PackedProjection`
+  - `PackedProjectionsOp`
+  - `PackedProjectionsRoute`
+  - `QLoraPrepareOp`
+  - `QLoraPrepareRoute`
+  - `QLoraProjectOp`
+  - `QLoraProjectRoute`
+  - `validate_for_gpu`
+- [`src/pipeline/mla/rows.rs`](src/pipeline/mla/rows.rs)
+  - `AttentionInputPackB3`
+  - `BlockStageOp`
+  - `EmbedStreamsOp`
+  - `execute_block_stage`
+  - `execute_embed_streams`
+  - `execute_ring_kv`
+  - `execute_stream_mean_capture`
+  - `execute_swa_stage`
+  - `RingKvOp`
+  - `StreamMeanCaptureOp`
+  - `SwaStageOp`
+- [`src/pipeline/mod.rs`](src/pipeline/mod.rs)
+  - `batched`
+  - `batched_attention`
+  - `batched_deltanet`
+  - `batched_moe`
+  - `can_satisfy`
+  - `check_moe_decode_batch_size`
+  - `check_moe_decode_supported`
+  - `dispatch_fused`
+  - `draft_head`
+  - `dump_hidden_localize`
+  - `execute_pipeline`
+  - `gated_mlp`
+  - `hybrid`
+  - `latent_attention`
+  - `layer_ops`
+  - `LinearParams`
+  - `mla`
+  - `moe_capture`
+  - `moe_dump`
+  - `moe_program`
+  - `mq8_attn`
+  - `new`
+  - `Pipeline`
+  - `PipelineParams`
+  - `projection_split`
+  - `q8_prefill`
+  - `routed_down_rotation`
+  - `RoutedDownRotation`
+  - `router_observer`
+  - `RowsRoute`
+  - `run_moe_decode_selected`
+  - `run_moe_prefill_bias_aware`
+  - `run_uniform_moe_down_expanded`
+  - `run_uniform_moe_gate_up`
+  - `sandwich`
+  - `sealed_moe`
+  - `slab_moe_decode`
+  - `slab_route`
+  - `slowlink_prefill`
+  - `sp_layer`
+  - `step_graph`
+  - `steps`
+  - `stream_mix`
+  - `superop`
+- [`src/pipeline/moe_capture.rs`](src/pipeline/moe_capture.rs)
+  - `ACT_CAP_BYTES`
+  - `act_capture`
+  - `act_capture_enabled`
+  - `ACT_CAPTURE_ENV`
+  - `act_capture_unavailable`
+  - `ACT_MAGIC`
+  - `enabled`
+  - `encode_act_record`
+  - `encode_route_record`
+  - `route_dump`
+  - `route_dump_enabled`
+  - `ROUTE_DUMP_ENV`
+  - `set_site`
+  - `SITE_DOWN`
+  - `SITE_GATE_UP`
+- [`src/pipeline/moe_dump.rs`](src/pipeline/moe_dump.rs)
+  - `enabled`
+  - `final_residual`
+  - `final_residual_deferred`
+  - `fold_begin`
+  - `fold_end`
+  - `FoldInfo`
+  - `FoldPending`
+  - `set_context`
+  - `shared_begin`
+  - `shared_end`
+  - `SharedPending`
+- [`src/pipeline/moe_program.rs`](src/pipeline/moe_program.rs)
+  - `CastPolicy`
+  - `down_producer_fused_admits`
+  - `execute_gated_ffn`
+  - `execute_grouped_moe`
+  - `for_protocol`
+  - `for_rows`
+  - `free`
+  - `GatedFfnOp`
+  - `gfx1100_grouped_down_producer_enabled`
+  - `grouped_down_producer_fused_admits`
+  - `GROUPED_MOE_INDEXED_MAX_ROWS`
+  - `GROUPED_MOE_IU4_MIN_ROWS`
+  - `grouped_moe_iu4_shape_admits`
+  - `grouped_moe_site_tiers`
+  - `GroupedMoeGroupedScratch`
+  - `GroupedMoeIndexedScratch`
+  - `GroupedMoeOp`
+  - `GroupedMoePolicy`
+  - `GroupedMoeProtocol`
+  - `GroupedMoeRouted`
+  - `GroupedMoeRouter`
+  - `GroupedMoeScratch`
+  - `GroupedMoeScratchPlan`
+  - `GroupedMoeShared`
+  - `GroupedMoeSharedScratch`
+  - `GroupedMoeSiteTiers`
+  - `is_empty`
+  - `len`
+  - `MAX_ENTRIES`
+  - `max_with`
+  - `MoeStage`
+  - `new`
+  - `rdna_compute`
+  - `resolve`
+  - `SealedMoeOp`
+  - `SharedExpertPolicy`
+  - `SingleExpertTableCache`
+  - `validate`
+  - `with_tier`
+- [`src/pipeline/mq8_attn.rs`](src/pipeline/mq8_attn.rs)
+  - `mq8_acts_current`
+  - `mq8_gemv_fused`
+  - `mq8_gemv_rows`
+  - `mq8_prefill_gemm`
+  - `mq8_quantize`
+- [`src/pipeline/norm_fold.rs`](src/pipeline/norm_fold.rs)
+- [`src/pipeline/projection_split.rs`](src/pipeline/projection_split.rs)
+  - `ProjectionSplit`
+  - `split_scope`
+  - `SplitBand`
+  - `SplitScope`
+- [`src/pipeline/q8_prefill.rs`](src/pipeline/q8_prefill.rs)
+  - `fn`
+  - `grouped_sym_tier_admits`
+  - `parse`
+  - `prefill_quant_admitted`
+  - `PREFILL_QUANT_MIN_ROWS`
+  - `PrefillActTier`
+  - `PreparedA8`
+  - `q8_0_f16_x_shareable`
+  - `q8_0_prefill_gemm`
+  - `q8_0_prefill_gemm_f16x`
+  - `q8_0_prefill_gemm_prepared`
+  - `q8_0_prefill_prepare`
+  - `q8_0_prefill_runs`
+  - `q8_0_weight_admits`
+  - `Q8PrefillRun`
+- [`src/pipeline/qt44_qt53_prefill.rs`](src/pipeline/qt44_qt53_prefill.rs)
+- [`src/pipeline/router_observer.rs`](src/pipeline/router_observer.rs)
+  - `clear`
+  - `RouterRouteObservation`
+  - `RouterScoresAfterRoute`
+  - `take`
+- [`src/pipeline/sandwich.rs`](src/pipeline/sandwich.rs)
+  - `Activation`
+  - `AttnGate`
+  - `DraftContext`
+  - `execute_parallel_moe_mlp`
+  - `execute_per_layer_input`
+  - `execute_sandwich_attention`
+  - `execute_sandwich_attention_partial`
+  - `execute_sandwich_epilogue`
+  - `execute_sandwich_mlp`
+  - `execute_sandwich_mlp_partial`
+  - `execute_scale`
+  - `execute_softcap`
+  - `gemm_rows`
+  - `grouped_rows`
+  - `KvProjection`
+  - `KvRoute`
+  - `Ladder`
+  - `m_total`
+  - `ParallelMoeMlpOp`
+  - `PerLayerInputOp`
+  - `Rope`
+  - `RopeKind`
+  - `RoutedBatch`
+  - `RoutedExperts`
+  - `RoutedScratch`
+  - `SandwichAttentionOp`
+  - `SandwichKv`
+  - `SandwichMlpOp`
+  - `SandwichRoute`
+  - `SandwichStream`
+  - `ScaleOp`
+  - `SoftcapOp`
+  - `StepsRoute`
+  - `supports`
+  - `supports_batched_projection`
+  - `validate_for_gpu`
+  - `windowed_q8_partials_elems`
+  - `windowed_q8_rows_flash`
+  - `windowed_q8_rows_origin`
+  - `WINDOWED_Q8_TILED_MIN_SEQ`
+  - `WindowedQ8RowsFlash`
+  - `WindowedQ8Tiled`
+- [`src/pipeline/sealed_moe.rs`](src/pipeline/sealed_moe.rs)
+  - `activation`
+  - `ActivationIdentity`
+  - `ActivationInput`
+  - `alias`
+  - `alignment`
+  - `arm_fault_after_expert_mutation`
+  - `assignment`
+  - `basis`
+  - `bind_live`
+  - `bind_live_compact`
+  - `BoundMoeExperts`
+  - `byte_len`
+  - `byte_offset`
+  - `checked_grouped_m_total_bound`
+  - `checked_tp_local_shapes`
+  - `collective_rows`
+  - `CompactLiveWeight`
+  - `contract_id`
+  - `ContractAssignment`
+  - `ContractAxis`
+  - `ContractCollectiveHint`
+  - `ContractCollectiveRow`
+  - `ContractParallelism`
+  - `contribution`
+  - `decode_params`
+  - `down`
+  - `dtype`
+  - `encoded_bytes`
+  - `ep_route_producer_proof`
+  - `execute_ep_slot_combine`
+  - `execution`
+  - `execution_contract`
+  - `expert`
+  - `expert_weights_match_metadata`
+  - `ExpertBindingCache`
+  - `ExpertExecutionContract`
+  - `ExpertMetadata`
+  - `ExpertResource`
+  - `ExpertResources`
+  - `experts`
+  - `ExpertTable`
+  - `fingerprint`
+  - `from_cache`
+  - `fused`
+  - `gate`
+  - `gate_up`
+  - `global_id`
+  - `group`
+  - `input`
+  - `into_absent`
+  - `invocation`
+  - `is_absent`
+  - `is_fused`
+  - `is_live_bound`
+  - `is_owner_routed_ep`
+  - `is_root_routed_ep`
+  - `layer`
+  - `local_expert_ids`
+  - `local_rank`
+  - `local_slot`
+  - `local_slots`
+  - `mapping_fingerprint`
+  - `mesh_epoch`
+  - `MoeContribution`
+  - `MoePrefillRouteProducerProof`
+  - `MoeProtocol`
+  - `MoeRouteProducerProof`
+  - `MoeRouterInput`
+  - `MoeSharedContribution`
+  - `n_experts`
+  - `new`
+  - `owner`
+  - `owner_rank`
+  - `owner_ranks`
+  - `parallelism`
+  - `physical_device`
+  - `physical_devices`
+  - `prefill_params`
+  - `PrefillRouteMode`
+  - `preflight_decode`
+  - `preflight_prefill`
+  - `prepare_binding`
+  - `protocol`
+  - `rank_count`
+  - `records`
+  - `ResourceAlias`
+  - `resources`
+  - `retained_body_action`
+  - `retained_route_identities`
+  - `RetainedBodyAction`
+  - `RetainedRouteInputs`
+  - `ROOT_ROUTED_EP_EXECUTION`
+  - `rotation`
+  - `router_input`
+  - `row_stride`
+  - `seal_decode`
+  - `seal_ep_routed_contrib`
+  - `seal_prefill`
+  - `seal_prefill_ep`
+  - `SealedMoeCall`
+  - `separate`
+  - `shape`
+  - `shared_contribution`
+  - `sidecars`
+  - `SLAB_RESOURCE_FORMAT`
+  - `source_fingerprint`
+  - `source_name`
+  - `specialized_sealed_moe_retained_admission`
+  - `SpecializedRouteAdmission`
+  - `take_fault_after_expert_mutation`
+  - `tier_identity`
+  - `tier_keepalive`
+  - `up`
+  - `with_alias`
+  - `with_execution_contract`
+  - `with_sidecars`
+- [`src/pipeline/slab_moe_decode.rs`](src/pipeline/slab_moe_decode.rs)
+  - `Bucket`
+  - `bucket_experts`
+  - `bucket_offsets`
+  - `bucket_slots`
+  - `BucketKey`
+  - `BucketLaunch`
+  - `build`
+  - `canonical`
+  - `check_plan_extents`
+  - `Codec`
+  - `DecodeRequest`
+  - `DescriptorArrays`
+  - `DevView`
+  - `DOWN_K`
+  - `DOWN_M`
+  - `expert_count`
+  - `expert_id_words`
+  - `expert_offset_words`
+  - `expert_slots`
+  - `fixed_union_bytes`
+  - `fixed_union_words`
+  - `FixedUnion`
+  - `fn`
+  - `from_qt`
+  - `from_qt_pair`
+  - `from_routes`
+  - `from_tensor`
+  - `GATE_UP_K`
+  - `GATE_UP_M`
+  - `GATE_UP_OUT_ROWS`
+  - `get`
+  - `ids`
+  - `is_empty`
+  - `iter`
+  - `KERNARG_BYTES`
+  - `Kind`
+  - `LaneUnionPlan`
+  - `launch`
+  - `LaunchPlan`
+  - `len`
+  - `load`
+  - `MAX_BUCKETS`
+  - `MAX_EXPERTS`
+  - `MAX_LANES`
+  - `model`
+  - `MoeGemvKernargs`
+  - `offsets`
+  - `ORDER`
+  - `PLAN_BUCKETS`
+  - `plan_launches`
+  - `PLAN_MAX_SLOTS`
+  - `PLAN_THREADS`
+  - `Profile`
+  - `SlabMoeDecodeModule`
+  - `SlabMoeError`
+  - `slot_count`
+  - `slot_words`
+  - `slots`
+  - `SYMBOLS`
+  - `to_bytes`
+  - `TOP_K`
+  - `u32_le_bytes`
+  - `UnionLayout`
+  - `validate`
+  - `WORKGROUP`
+- [`src/pipeline/slab_route.rs`](src/pipeline/slab_route.rs)
+  - `CODEC_TAG_ALLOC_BYTES`
+  - `CODEC_U8_BYTES`
+  - `K1_MAX_ROWS`
+- [`src/pipeline/slowlink_prefill.rs`](src/pipeline/slowlink_prefill.rs)
+  - `a4_sidecar_bytes`
+  - `accumulator_bytes`
+  - `add_decode_tile`
+  - `add_tail_tile`
+  - `AGGREGATE_MIN_TILE_ROWS`
+  - `AGGREGATE_PANEL_ROWS`
+  - `alloc`
+  - `arm_signature`
+  - `BarrierCost`
+  - `BindingSource`
+  - `bytes`
+  - `canonical_combine_exact`
+  - `charged_bytes`
+  - `cohort_counts_bytes`
+  - `combined`
+  - `compatible_with`
+  - `DECODE_TAIL_ANCHOR_ROWS`
+  - `decode_tail_cohort`
+  - `DEFAULT_SUITE`
+  - `device_total`
+  - `diag_scope`
+  - `DiagBytes`
+  - `DiagCase`
+  - `DiagDevice`
+  - `DiagGeometry`
+  - `diagnostic_bytes`
+  - `dims`
+  - `execute_panel`
+  - `execute_panel_rows`
+  - `ExpertPanelBinding`
+  - `experts_with_rows`
+  - `extra_after_admitted`
+  - `filled_rows`
+  - `finish_combine`
+  - `finish_route_plan`
+  - `finish_route_plan_with`
+  - `finish_shared`
+  - `from_counts`
+  - `from_name`
+  - `from_region`
+  - `from_run`
+  - `GATE_PRIMITIVES`
+  - `group_scatter_bytes`
+  - `grouped_rows_bound`
+  - `has_sp`
+  - `is_aggregate_layout`
+  - `is_complete`
+  - `is_decode`
+  - `is_k2`
+  - `k1_bytes`
+  - `k1_tail_cohort`
+  - `K_TOP`
+  - `label`
+  - `LayerRoutePlan`
+  - `layout`
+  - `max_with`
+  - `n_exp`
+  - `name`
+  - `new`
+  - `NoScope`
+  - `OrderedCombineCursor`
+  - `panel`
+  - `PanelCodec`
+  - `PanelLimits`
+  - `PanelRange`
+  - `panels_done`
+  - `PanelScratch`
+  - `position`
+  - `prepare_routes`
+  - `PreparedChunkCall`
+  - `PrimitiveCheck`
+  - `PrimitiveReport`
+  - `PromptRouteDims`
+  - `PromptRouteLayout`
+  - `PromptRouteStorage`
+  - `quantizes_window`
+  - `release`
+  - `reset_for_layer`
+  - `resident`
+  - `route`
+  - `route_map_bytes`
+  - `route_rows`
+  - `RoutedPanelView`
+  - `row0`
+  - `rows`
+  - `S1`
+  - `schedule`
+  - `scratch_allocation_sizes`
+  - `scratch_bytes`
+  - `ScratchSlots`
+  - `selftest`
+  - `set_sp`
+  - `shared_hidden_bytes`
+  - `shared_scalar_bytes`
+  - `sorted`
+  - `sp`
+  - `sp_finish_combine`
+  - `sp_inverse`
+  - `sp_inverse_bytes`
+  - `sp_rows`
+  - `sp_rows_bytes`
+  - `sp_tile_class`
+  - `start`
+  - `suite_diagnostic_bytes`
+  - `SuiteBytes`
+  - `tail_ids_bytes`
+  - `tile_kind`
+  - `TileClass`
+  - `TileKind`
+  - `TileScopeHook`
+  - `to_json`
+  - `topk_ids_bytes`
+  - `topk_weights_bytes`
+  - `total`
+  - `total_bytes`
+  - `validate`
+  - `view`
+  - `window_arm`
+  - `window_arms_compatible`
+  - `window_route`
+  - `WindowArm`
+  - `WindowRoute`
+  - `with_sp_rows`
+  - `within_expert_panel_canary`
+  - `x_f16_bytes`
+  - `x_f16_rows`
+  - `x_norm_bytes`
+  - `zero_row_panel`
+- [`src/pipeline/sp_layer.rs`](src/pipeline/sp_layer.rs)
+  - `exact_counts`
+  - `gpu_rows`
+  - `plan_sp_layer`
+  - `S1_XTX`
+  - `SpLayerPlan`
+  - `SpLimits`
+  - `touched_binding_ranges`
+  - `touched_experts`
+  - `touched_groups`
+  - `validate`
+- [`src/pipeline/step_graph.rs`](src/pipeline/step_graph.rs)
+  - `add_op`
+  - `add_resource`
+  - `Alias`
+  - `new`
+  - `op_kind_of`
+  - `OpDecl`
+  - `OpId`
+  - `OpKind`
+  - `ops`
+  - `ResourceClass`
+  - `ResourceDecl`
+  - `ResourceId`
+  - `resources`
+  - `SplitRule`
+  - `StateClass`
+  - `StepGraph`
+  - `StepGraphError`
+- [`src/pipeline/steps.rs`](src/pipeline/steps.rs)
+  - `execute_steps`
+  - `execute_validated_steps`
+  - `execute_validated_steps_window`
+  - `execute_validated_steps_with_moe_hooks`
+  - `FusedPattern`
+  - `GemvInput`
+  - `HcFusionCursor`
+  - `match_prefix`
+  - `MoeStepHooks`
+  - `Step`
+  - `validate_steps`
+- [`src/pipeline/stream_mix.rs`](src/pipeline/stream_mix.rs)
+  - `execute_stream_mix`
+  - `helmert_selector_rows`
+  - `MHC_FUSED_MIN_ROWS`
+  - `preload_stream_mix`
+  - `rdna_compute`
+  - `StreamChart`
+  - `StreamControls`
+  - `StreamMixOp`
+  - `StreamMixStage`
+  - `StreamNorm`
+  - `validate`
+- [`src/pipeline/superop.rs`](src/pipeline/superop.rs)
+  - `contract_id`
+  - `dispatch_super_op`
+  - `EpMoeCombineMode`
+  - `EpMoeRouteView`
+  - `EscapeKind`
+  - `execution_contract`
+  - `ForwardBindings`
+  - `LayerProgram`
+  - `lower_layer`
+  - `LoweredForward`
+  - `new`
+  - `OpBinding`
+  - `OpFlavor`
+  - `run_layer_program`
+  - `ScratchSlot`
+  - `SuperOp`
+  - `SuperOpKind`
+  - `WeightSlot`
+- [`src/resource/mod.rs`](src/resource/mod.rs)
+  - `for_test`
+  - `new`
+  - `ResourceManager`
+- [`src/sp_plan.rs`](src/sp_plan.rs)
+  - `e1_expert_us`
+  - `e1_for_rows`
+  - `E1_REF_WORKERS`
+  - `EXPERT_BYTES`
+  - `HOOK_CPU_SLOT_CAP`
+  - `HOOK_LINK_BPS`
+  - `HOOK_STREAM_MS_PER_EXPERT`
+  - `LINK_BPS`
+  - `NUM_EXPERTS`
+  - `plan_layer_split`
+  - `plan_threshold`
+  - `ROUTE_BYTES`
+  - `ROUTE_TOPK`
+  - `ROW_BYTES`
+  - `sp_hook_xtx`
+  - `SP_MAX_ROWS`
+  - `SplitCost`
+  - `SplitPlan`
+- [`src/tables/attention_table.rs`](src/tables/attention_table.rs)
+  - `populate`
+- [`src/tables/fused_qkv_table.rs`](src/tables/fused_qkv_table.rs)
+  - `populate`
+- [`src/tables/gemm_table.rs`](src/tables/gemm_table.rs)
+  - `populate`
+- [`src/tables/gemv_table.rs`](src/tables/gemv_table.rs)
+  - `populate`
+- [`src/tables/mod.rs`](src/tables/mod.rs)
+  - `all_keys`
+  - `attention_table`
+  - `eval`
+  - `eval_arch`
+  - `fused_qkv_table`
+  - `gemm_table`
+  - `gemv_table`
+  - `KernelRegistry`
+  - `moe_table`
+  - `new`
+  - `register`
+  - `resolve`
+  - `rotation_table`
+  - `validate`
+  - `variants_for`
+- [`src/tables/moe_table.rs`](src/tables/moe_table.rs)
+  - `populate`
+- [`src/tables/rotation_table.rs`](src/tables/rotation_table.rs)
+  - `populate`
+- [`src/tests.rs`](src/tests.rs)
+- [`src/traits.rs`](src/traits.rs)
+  - `KernelFamily`
+- [`src/types.rs`](src/types.rs)
+  - `ArchPredicate`
+  - `DispatchError`
+  - `dtype_arch_predicate`
+  - `dtype_needs_rotation`
+  - `dtype_post_rotation_variant`
+  - `dtype_rotation_plan`
+  - `for_gemv`
+  - `for_gemv_prerotated`
+  - `for_gemv_residual`
+  - `for_gemv_swiglu_residual`
+  - `fused_qkv_variant_for_key`
+  - `FusedQkvVariant`
+  - `gemv_steps`
+  - `GemvVariant`
+  - `KernelKey`
+  - `KernelVariant`
+  - `MoeVariant`
+  - `PipelineOp`
+  - `RotationPlan`
+  - `RotationVariant`
+  - `ShapeInfo`
+  - `ShapePredicate`
+  - `TileImpl`
+
+### Dependencies (from `Cargo.toml`)
+
+#### path
+
+- `hip-bridge`
+- `hipfire-config`
+- `hipfire-cpu`
+- `rdna-compute`
+
+#### external
+
+- `smallvec`
+
+#### dev
+
+- `rayon`
+
+#### build
+
+—
+
+### Reverse dependencies
+
+Workspace crates with a path dependency on this crate:
+
+- `hipfire-arch-cohere2moe`
+- `hipfire-arch-deepseek4`
+- `hipfire-arch-gemma4`
+- `hipfire-arch-lfm2moe`
+- `hipfire-arch-llama`
+- `hipfire-arch-maple`
+- `hipfire-arch-minimax`
+- `hipfire-arch-muse-glimmer`
+- `hipfire-arch-qwen2`
+- `hipfire-arch-qwen35`
+- `hipfire-arch-qwen4`
+- `hipfire-arch-raon`
+- `hipfire-cli`
+- `hipfire-dispatch-tests`
+- `hipfire-generate`
+- `hipfire-loader`
+- `hipfire-pflash`
+- `hipfire-runtime`
+- `saddle-lab`
+
+<!-- crate-map:generated:end -->

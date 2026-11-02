@@ -34,7 +34,8 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
     const int*                __restrict__ sorted_slot_index,
     const _Float16*           __restrict__ X_src,
     float*                    __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total,
+    int n_experts
 ) {
     const int block_m   = blockIdx.x * M_TILE;
     const int tile_y    = blockIdx.y;
@@ -43,7 +44,7 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_mmqload(
     if (block_m >= M || slot_start >= m_total) return;
 
     const int expert_id = expert_tile_ids[tile_y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
 
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
 

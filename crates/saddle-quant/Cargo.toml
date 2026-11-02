@@ -1,0 +1,35 @@
+[package]
+name = "saddle-quant"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Quantization-quality toolkit: artifact formats, calibration corpora,
+# activation statistics, KLD reference construction/scoring, and reduction.
+#
+# Deliberately GPU-free and dependency-light so CI, Python bindings, and any
+# tool can link it without hipfire-runtime or a ROCm toolchain. Format,
+# calibration, stats, and host-side eval math are unconditional public API —
+# there is no optional feature gate and no runtime dependency.
+
+[features]
+default = []
+
+[dependencies]
+memmap2.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
+# Chat-template rendering for calibration corpora. Matching the workspace
+# pin in hipfire-runtime so a template renders identically in both.
+minijinja = { workspace = true, features = ["loop_controls", "json", "preserve_order"] }
+minijinja-contrib = { workspace = true, features = ["pycompat"] }
+
+# CLI only. The library never parses arguments.
+clap = { workspace = true, features = ["derive"] }
+
+
+[dev-dependencies]
+tempfile = "3"

@@ -51,21 +51,50 @@
 //!   (source of truth for MTP wiring, Hyper-Connections head reduction,
 //!   and the raw SWA + compressed-KV KV-cache layout).
 
+/// Producer capability: the DeepSeek V4 in-trunk native MTP layer
+/// (`mtp_speculator::Deepseek4MtpDrafter`, `spec_decode`) has no measured
+/// autoregressive floor (audited: no floor/retire pricing anywhere in the
+/// crate), so `speculation.mtp = auto` keeps plain AR and the MTP layer is not
+/// loaded; explicit `on` / `--spec mtp` arms it. The DSpark sidecar is a
+/// separate selector (`speculation.dspark`) and is unaffected.
+pub const MTP_MEASURED_AR_FLOOR: bool = false;
+
 pub mod arch;
+pub mod arch_model;
+mod backend;
+pub mod carrier;
+pub mod config_cache;
 pub mod deepseek4;
 pub mod dsml;
 pub mod dspark_speculator;
+pub mod ep;
 pub mod forward;
-pub mod grammar;
+pub mod mtp;
+pub use saddle_core::grammar::dsml as grammar;
+pub mod heterogeneous;
+
 pub mod mtp_speculator;
+mod program;
+mod routed_seal;
+mod rows_program;
 pub mod sampling;
 pub mod spec_decode;
 pub mod spec_emit;
 pub mod spec_impl;
 
-pub use arch::DeepseekV4;
+pub use arch::{DeepseekV4, DeepseekV4HeterogeneousFault, DeepseekV4HeterogeneousProjection};
+pub use carrier::{
+    load_bundle as load_deepseek4_bundle,
+    load_heterogeneous_model as load_deepseek4_heterogeneous_model, Deepseek4LoadParts,
+};
 pub use deepseek4::{
-    config_from_safetensors, DeepseekV4Config, DeepseekV4State, DeepseekV4Weights,
-    IndexerLayerState, MainAttentionLayerState,
+    config_from_safetensors, CompressorCachePlacement, CompressorCacheShard, DeepseekV4Config,
+    DeepseekV4DenseWeights, DeepseekV4HeterogeneousWeights, DeepseekV4OwnershipAudit,
+    DeepseekV4RoutedWeights, DeepseekV4State, DeepseekV4Weights, IndexerLayerState,
+    MainAttentionLayerState,
+};
+pub use heterogeneous::{
+    DeepseekV4HeterogeneousLoadPlan, DeepseekV4HeterogeneousLoadReport,
+    DeepseekV4HeterogeneousModel, DeepseekV4VerifiedArtifact,
 };
 pub use spec_impl::Deepseek4Bundle;

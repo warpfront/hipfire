@@ -51,7 +51,10 @@ extern "C" __global__ void kv_cache_write_asym_k_fwht2(
     __syncthreads();
     for (int s = 16; s > 0; s >>= 1) { if (tid < s) scratch[tid] += scratch[tid + s]; __syncthreads(); }
     float orig_norm = sqrtf(scratch[0]);
-    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+    // FWHT coords of a unit 256-dim head have variance 1/256; the 128-family thresholds
+    // assume 1/128, so scale by sqrt(2). cnorm absorbs it (format unchanged).
+    const float q_scale = head_dim == 256 ? 1.41421356f : 1.0f;
+    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm * q_scale : 0.0f;
 
     for (int d = tid; d < head_dim; d += nthreads) x[d] *= inv_norm;
     __syncthreads();

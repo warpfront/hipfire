@@ -1,0 +1,9 @@
+[package]
+name = "peacemaker-npu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "AIE2P (XDNA2 NPU) builder: core instruction encoder/scheduler, CDO/PDI writer, DPU transaction writer, kernels, and a pure-CPU AIE2P simulator (`sim`). Used by hipfire-arch-qwen4 for the Flash-Next NPU trunk prefill route on Strix Halo."
+publish = false
+
+[dependencies]

@@ -1,15 +1,36 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hipfire-arch-qwen35-embed",
+    "crates/hipfire-arch-embeddinggemma2",
+    "crates/peacemaker-ir",
+    "crates/peacemaker-lift",
+    "crates/peacemaker-author",
+    "crates/railgun",
+    "crates/railgun-cert",
+    "crates/railgun-corpus",
+    "crates/hipfire-kernel-abi",
+    "crates/pm-census",
+    "crates/railgun-jitcorpus",
+    "crates/peacemaker-isa",
+    "crates/peacemaker-rip",
     "crates/hip-bridge",
+    "crates/va-bridge",
     "crates/hsa-bridge",
     "crates/rdna-compute",
+    "crates/saddle-core",
+    "crates/hipfire-generate",
     "crates/radiowave",
     "crates/hipfire-runtime",
     "crates/hipfire-arch-qwen35",
+    "crates/hipfire-arch-qwen4",
+    "crates/hipfire-pflash",
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
     "crates/hipfire-arch-deepseek4",
+    "crates/hipfire-ds4-parent",
+    "crates/hipfire-arch-gemma4",
+    "crates/hipfire-arch-muse-glimmer",
     "crates/hipfire-arch-toy",
     "crates/hipfire-arch-qwen2",
     "crates/hipfire-arch-lfm2moe",
@@ -17,10 +38,15 @@ members = [
     "crates/hipfire-arch-lfm3-vl",
     "crates/hipfire-arch-lfm3-audio",
     "crates/hipfire-arch-lfm3-omni",
+    "crates/hipfire-arch-raon",
+    "crates/hipfire-arch-lfm2-vl",
     "crates/hipfire-arch-minimax",
     "crates/hipfire-arch-cohere2moe",
+    "crates/hipfire-arch-maple",
     "crates/hipfire-arch-dots-ocr",
+    "crates/hipfire-arch-diffusion",
     "crates/hipfire-quantize",
+    "crates/saddle-quant",
     "crates/hipfire-detect",
     "crates/hipfire-atlas",
     "crates/redline",
@@ -28,24 +54,121 @@ members = [
     "crates/redline-dispatch",
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
+    "crates/hipfire-cpu",
     "crates/hipfire-tui",
     "crates/hipfire-reap",
     "crates/hipfire-loader",
+    "crates/hipfire-engine",
     "crates/hipfire-config",
     "crates/hipfire-registry",
     "crates/hipfire-cli",
     "crates/hipfire-client",
+    "crates/hipfire-daemon",
+    "crates/saddle-lab",
+    "crates/hipfire-xdna",
+    "crates/peacemaker-npu",
+    "crates/peacemaker-cdna",
+    "crates/npu-tools",
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.5"
 edition = "2021"
 # Outbound license for the work as a whole. Individual files whose authors
 # have not elected Apache-2.0 keep an MIT SPDX header; see LICENSE and NOTICE.
 license = "Apache-2.0"
 
 [workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = "4.6"
+fancy-regex = "0.14"
 half = "2.7"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libc = "0.2"
+libjpeg-turbo-rs = "0.8"
 libloading = "0.9"
+libm = "0.2"
+memmap2 = "0.9"
+minijinja = "2"
+minijinja-contrib = "2"
 proptest = { version = "1.11", default-features = false, features = ["std"] }
+rayon = "1"
+regex = "1"
 safetensors = "0.8"
+serde = "1"
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+
+# The PeaceMaker CPU emulator and the exhaustive row-tile oracles in
+# peacemaker-isa's tests run hours unoptimized. Optimize these crates in dev
+# and test builds; debug assertions and overflow checks stay on.
+[profile.dev.package.peacemaker-isa]
+opt-level = 3
+
+[profile.dev.package.peacemaker-ir]
+opt-level = 3
+
+[profile.dev.package.peacemaker-cdna]
+opt-level = 3
+
+[profile.dev.package.peacemaker-author]
+opt-level = 3
+
+[profile.dev.package.peacemaker-lift]
+opt-level = 3
+
+# CI test/build profile (`cargo test --profile ci`, see .github/workflows/ci.yml).
+#
+# The GPU-free CI job runs exhaustive CPU oracle/emulator tests (the rowtile
+# and MoE-splice oracles, the sampler-distribution and PSD-projection checks,
+# the launcher-ABI source scan) that took hours at opt-level 0 on a 4-core
+# runner. Optimize exactly the crates those tests live in, plus every external
+# dependency (cached by rust-cache, so it costs nothing per run); everything
+# else stays at opt-level 0 to keep the compile cheap. Debug assertions and
+# overflow checks stay ON: they are part of what the tests check. Debuginfo is
+# off (panic locations and symbol names are unaffected).
+[profile.ci]
+inherits = "dev"
+opt-level = 0
+debug = false
+debug-assertions = true
+overflow-checks = true
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 3
+
+[profile.ci.package.peacemaker-isa]
+opt-level = 3
+
+[profile.ci.package.peacemaker-ir]
+opt-level = 3
+
+[profile.ci.package.peacemaker-cdna]
+opt-level = 3
+
+[profile.ci.package.peacemaker-author]
+opt-level = 3
+
+[profile.ci.package.peacemaker-lift]
+opt-level = 3
+
+[profile.ci.package.peacemaker-npu]
+opt-level = 3
+
+[profile.ci.package.hipfire-cpu]
+opt-level = 3
+
+[profile.ci.package.hipfire-dispatch]
+opt-level = 3
+
+[profile.ci.package.hipfire-quantize]
+opt-level = 3
+
+[profile.ci.package.hipfire-runtime]
+opt-level = 3
+
+[profile.ci.package.rdna-compute]
+opt-level = 3

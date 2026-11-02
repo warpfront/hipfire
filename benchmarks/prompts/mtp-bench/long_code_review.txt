@@ -1,0 +1,37 @@
+You are reviewing a backend service that has been suffering intermittent latency spikes in production. Below is the relevant code and a description of the system. After reading carefully, produce a structured review with three sections: (1) likely root causes ranked by probability, (2) concrete code or configuration changes you would make first, (3) what telemetry you would add to confirm the diagnosis.
+
+System description: a Python FastAPI service in front of a Postgres 15 database, deployed as four replicas behind an nginx load balancer. Each request reads a user record, fetches their last 50 events from a partitioned events table, computes an aggregate score, writes the score back to the user row, and returns a JSON response. Average payload is 4 KB. p50 latency is 35 ms; p99 spikes to 1.8 seconds approximately every 90 seconds in a regular pattern. The spikes correlate with elevated Postgres CPU but not with elevated Postgres connection count. The application pool is sized at 20 connections per replica. PgBouncer is in front of Postgres in transaction pooling mode with a pool size of 50.
+
+Code excerpt — the hot endpoint:
+```python
+@app.post('/score/{user_id}')
+async def score(user_id: int, payload: ScoreRequest):
+    async with db.transaction() as tx:
+        user = await tx.fetchrow(
+            'SELECT id, tier, last_score FROM users WHERE id = $1 FOR UPDATE',
+            user_id,
+        )
+        if user is None:
+            raise HTTPException(404)
+        events = await tx.fetch(
+            'SELECT type, weight, ts FROM events '
+            'WHERE user_id = $1 ORDER BY ts DESC LIMIT 50',
+            user_id,
+        )
+        new_score = compute_score(user['tier'], events, payload.signals)
+        await tx.execute(
+            'UPDATE users SET last_score = $1, updated_at = now() WHERE id = $2',
+            new_score, user_id,
+        )
+        await tx.execute(
+            'INSERT INTO score_history (user_id, score, ts) VALUES ($1, $2, now())',
+            user_id, new_score,
+        )
+    await cache.set(f'score:{user_id}', new_score, ex=300)
+    metrics.histogram('score.latency_ms').observe((time.time() - start) * 1000)
+    return {'user_id': user_id, 'score': new_score}
+```
+
+Schema notes: `users` is ~50M rows, `events` is partitioned by month with ~2B rows total and a btree index on `(user_id, ts DESC)`. `score_history` is unpartitioned, ~800M rows, with a single index on `user_id`. Postgres autovacuum is at default settings. There is a nightly batch job that rebuilds materialized views starting at 02:00 UTC; spikes occur throughout the day, not just during the batch window. Connection pooling metrics show PgBouncer waiting connections occasionally hit 8-12 during spikes but never saturate. CPU on the FastAPI replicas stays below 30% even during spikes. Network round-trip time between the application and Postgres is consistently 0.4 ms.
+
+Begin your review now.

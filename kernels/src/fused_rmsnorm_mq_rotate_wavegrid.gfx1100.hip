@@ -3,6 +3,9 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#ifndef HF_DEVICE_WAIT_DEADLINE_H
+#include "device_wait_deadline.h"
+#endif
 
 // gfx1100 K=2048 experiment: preserve the exact arithmetic assignment of the
 // baseline 256-thread block while allowing its eight wave32s to occupy eight
@@ -12,6 +15,11 @@
 //
 // Scratch layout (64 bytes, zero-initialized and restored after every launch):
 //   f32 partials[8], f32 rms, u32 arrivals, u32 ready, u32 done, padding.
+//
+// The ready wait is bounded (device_wait_deadline.h). If the eight workgroups
+// are not co-resident, a waiter records the timeout in `wait_block` and
+// finishes with a stale RMS, which the host discards when it fails the step.
+// The waiter still counts `done`, so the last completion restores the scratch.
 
 __launch_bounds__(32, 16)
 extern "C" __global__ void fused_rmsnorm_mq_rotate_wavegrid(
@@ -22,7 +30,8 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_wavegrid(
     float* __restrict__ x_rot,
     float* __restrict__ scratch,
     int K,
-    float eps
+    float eps,
+    hf_device_wait_block* __restrict__ wait_block
 ) {
     if (K != 2048 || blockDim.x != 32 || gridDim.x != 8) return;
 
@@ -84,9 +93,10 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_wavegrid(
     }
 
     if (lane_id == 0) {
-        while (atomicAdd(ready, 0u) == 0u) {
-            __builtin_amdgcn_s_sleep(1);
-        }
+        hf_bounded_wait(
+            [&] { return atomicAdd(ready, 0u) != 0u; },
+            wait_block, HF_WAIT_SITE_RMSNORM_WAVEGRID_READY,
+            static_cast<unsigned int>(warp_id));
         __threadfence();
     }
     const float rms = __shfl(lane_id == 0 ? *rms_slot : 0.0f, 0);

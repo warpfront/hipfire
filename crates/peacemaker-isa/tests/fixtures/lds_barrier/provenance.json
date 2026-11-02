@@ -1,0 +1,22 @@
+{
+  "purpose": "audit::lds_barrier_scan fixtures (finding lds_store_unwaited_at_barrier). Tests never invoke hipcc.",
+  "toolchain": "HIP 7.15.26333, AMD clang 23.0.0git (ROCm llvm-project 8f497e0992fb7513f7f78a6f6b6f1056c375e961)",
+  "recipe": "git show <rev>:kernels/src/attention_verify_wmma.gfx1151.hip > x.hip; hipcc --genco --offload-arch=gfx1151 -O3 --no-offload-compress x.hip -o x.hsaco; clang-offload-bundler --type=o --unbundle --targets=hipv4-amdgcn-amd-amdhsa--gfx1151 --input=x.hsaco --output=x.co",
+  "files": [
+    {
+      "file": "verify_attn_gfx1151.pre-1ba84942a.co",
+      "rev": "1ba84942a~1",
+      "sha256": "5299ff4d6dc96d186fd432185ec0647601cc0edeb08821951bb567cc33d9fb8d",
+      "bytes": 38920,
+      "expect": "exactly one site: attention_verify_wmma_qk_gfx1151 s_barrier at 0x40f4, the loop-head barrier of .LBB0_36 in the hipcc -S output (the VerifyAttn co-residency race fixed by 1ba84942a)"
+    },
+    {
+      "file": "verify_attn_gfx1151.1ba84942a.co",
+      "rev": "1ba84942a",
+      "sha256": "e597d4d30b7e65c75e7fa3eed177563336587818396ec2236c1e6018f3eeaa54",
+      "bytes": 38920,
+      "expect": "clean: every VW_LDS_BARRIER issues s_waitcnt lgkmcnt(0)"
+    }
+  ],
+  "gfx1201_clean": "crates/peacemaker-lift/tests/fixtures/kt48/hipcc.co (KT48 FA2 prefill, 17 DS stores, 8 split barriers; see its provenance.json)"
+}

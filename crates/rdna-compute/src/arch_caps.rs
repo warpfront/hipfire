@@ -58,6 +58,8 @@ pub struct ArchCaps {
     has_wmma: bool,
     has_wmma_w32: bool,
     has_wmma_w32_gfx12: bool,
+    has_iu4_wmma: bool,
+    has_gfx11_plus_simt: bool,
     has_dot2_f32_f16: bool,
     has_mmq: bool,
     is_gcn5_wave64: bool,
@@ -76,6 +78,25 @@ pub struct ArchCaps {
 
     // ── Reference to FeatureFlags for env-var overrides ───────────
     flags: std::sync::Arc<FeatureFlags>,
+}
+
+// Process-wide GPU arch, recorded at `Gpu::init[_with_device]` so config-time
+// policy that runs without a `Gpu` handle in hand (the `kv_slots` memory
+// preflight) can still classify the deployment as unified-memory APU vs
+// discrete GPU. First init wins: a mixed APU + dGPU process is not a
+// supported topology, and re-inits (device swaps in harnesses) must not
+// silently change which class the OOM guard applies to.
+static PROCESS_GPU_ARCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Record the arch this process initialized its primary GPU with. First call
+/// wins; later calls are no-ops.
+pub fn note_process_gpu_arch(arch: &str) {
+    let _ = PROCESS_GPU_ARCH.set(arch.to_string());
+}
+
+/// The arch recorded at GPU init, if any GPU has been initialized.
+pub fn process_gpu_arch() -> Option<&'static str> {
+    PROCESS_GPU_ARCH.get().map(|s| s.as_str())
 }
 
 impl ArchCaps {
@@ -124,6 +145,8 @@ impl ArchCaps {
         let has_wmma = is_rdna3 || is_rdna4;
         let has_wmma_w32 = is_rdna3;
         let has_wmma_w32_gfx12 = is_rdna4;
+        let has_iu4_wmma = has_wmma_w32 || has_wmma_w32_gfx12;
+        let has_gfx11_plus_simt = is_rdna3 || is_rdna4;
         let has_dot2_f32_f16 = is_rdna1p1 || is_rdna2 || is_rdna3 || is_rdna4;
         let has_mmq = is_gfx906 || is_rdna3;
         let is_gcn5_wave64 = is_gfx906 || (is_gfx908 && flags.gcn5_wave64_hybrid.unwrap_or(false));
@@ -185,6 +208,8 @@ impl ArchCaps {
             has_wmma,
             has_wmma_w32,
             has_wmma_w32_gfx12,
+            has_iu4_wmma,
+            has_gfx11_plus_simt,
             has_dot2_f32_f16,
             has_mmq,
             is_gcn5_wave64,
@@ -330,6 +355,17 @@ impl ArchCaps {
     pub fn is_rdna3p5(&self) -> bool {
         self.is_rdna3p5
     }
+    /// Discrete RDNA3 (gfx1100 / gfx1101 / gfx1102) — 96-CU class dGPU at
+    /// ~960 GB/s. Distinct from the RDNA3.5 APU for tuning purposes.
+    pub fn is_rdna3_discrete(&self) -> bool {
+        self.is_rdna3_dgpu
+    }
+    /// RDNA3.5 APU (gfx1150 / gfx1151 / gfx1152) — unified-memory APU with
+    /// far fewer CUs. Shares `has_wmma_w32` with discrete RDNA3 but needs
+    /// independent tuning (prefetch, LDS pressure, compile-time head_dim).
+    pub fn is_rdna35_apu(&self) -> bool {
+        self.is_rdna3p5
+    }
     /// MQ4-Lloyd `_mb4` batch-fanout kernel admission. The MQ4-Lloyd mb4
     /// `*_mb4_for_arch` source selectors in `kernels.rs` ship a real kernel
     /// only for gfx1100/1101/1102 (RDNA3 dGPU) and gfx1151 (the Strix-Halo K4
@@ -350,6 +386,66 @@ impl ArchCaps {
     pub fn supports_mq3_lloyd_mb4(&self) -> bool {
         self.is_rdna3 && !self.is_gfx1152 && !self.is_gfx1103
     }
+    /// DeepSeek V4 F16 compressor-cache admission. The route is carried by two
+    /// kernel sources — `deepseek4_compressor_cache_f16.hip` and
+    /// `compressor_commit_staged_f16.hip`. Neither is arch-suffixed: the only
+    /// generation-specific construct is the indexer score kernel's WMMA, whose
+    /// fragment layout and D row mapping are selected in-source (gfx12 takes
+    /// 8-wide fragments with D row `8*k_half + j`, gfx11 takes 16-wide with
+    /// `2*j + k_half`).
+    ///
+    /// This predicate MUST stay in lock-step with those two `#if` arms. gfx11
+    /// uses `has_wmma_w32` and the standard wave32 F16 WMMA intrinsic; gfx12
+    /// uses `has_wmma_w32_gfx12` and its distinct intrinsic and fragment layout.
+    /// CAPABILITY gate (can this chip run the kernels), not a capacity or
+    /// bandwidth policy — whether F16 storage is *worth* selecting is decided
+    /// by the loader, not here.
+    pub fn supports_ds4_f16_compressor_cache(&self) -> bool {
+        self.has_wmma_w32 || self.has_wmma_w32_gfx12
+    }
+    /// Wave32 integer-4 WMMA hardware: gfx11 (RDNA3 / 3.5) `v_wmma_i32_16x16x16_iu4`
+    /// (K16) and gfx12 (RDNA4) `v_wmma_i32_16x16x32_iu4` (K32). Hardware only: it says
+    /// nothing about which kernels, images or producers exist for a codec; those come from
+    /// the kernel inventory and its admission (`crate::gemm::moe_sym_iu4_kernel`).
+    pub fn has_iu4_wmma(&self) -> bool {
+        self.has_iu4_wmma
+    }
+    /// DFlash S2 hidden-ring commit/scatter launch fusion: pure F32 copies with
+    /// no WMMA, arithmetic, or arch builtins, measured byte-identical on exact
+    /// gfx1100 and exact gfx1201 and admitted on exact gfx1151 as a pure
+    /// byte-copy. Its only callers are `dflash_hidden_commit5_applicable` and
+    /// `dflash_hidden_scatter5_try`; arithmetic fusions use
+    /// [`Self::supports_dflash_f16_residual_fusions`], which stays exact
+    /// gfx1100/gfx1201. Other arches keep the per-row copy loops.
+    pub fn supports_dflash_hidden_scatter_fusion(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1151 || self.is_gfx1201
+    }
+    /// DFlash S4 exact-F16 residual producers feeding the direct-F16 residual
+    /// WMMA consumer (gfx11 tiers on gfx1100, the gfx12 base/ldsstage kernels
+    /// on gfx1201). Exact gfx1100 and exact gfx1201 only.
+    pub fn supports_dflash_f16_residual_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash exact-F16 projection producer/consumer admission.
+    ///
+    /// The producer is wave32 portable. The consumers select distinct gfx11
+    /// and gfx12 WMMA sources, so keep this on the hardware validated by the
+    /// projection parity harness.
+    pub fn supports_dflash_f16_projection_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash GDN pre/tape fusion admission.
+    pub fn supports_dflash_gdn_pre_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash batched FA preparation and paired Q8 K/V-write admission.
+    ///
+    /// Both kernels use portable wave32 reductions and no generation-specific
+    /// WMMA intrinsics. Keep admission limited to architectures covered by the
+    /// end-to-end parity harness.
+    pub fn supports_dflash_fa_batch_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -366,6 +462,23 @@ impl ArchCaps {
     }
     pub fn has_wmma_w32_gfx12(&self) -> bool {
         self.has_wmma_w32_gfx12
+    }
+    /// gfx11-generation wave32 SIMT ISA, shared by gfx12: DPP16 row shifts,
+    /// `permlanex16`, and the gfx11+ buffer-resource descriptor (word3
+    /// `0x31004000`).  Kernels that need only these (no WMMA) compile from one
+    /// source for both generations behind `__GFX11__ || __GFX12__`.
+    pub fn has_gfx11_plus_simt(&self) -> bool {
+        self.has_gfx11_plus_simt
+    }
+    /// Qwen4 named QSA score/select/attention routes and the persistent
+    /// batched GDN recurrence: every `has_gfx11_plus_simt` arch plus gfx942.
+    /// These kernels are wave-agnostic LDS/reduction bodies; gfx942 (wave64,
+    /// no gfx11 SIMT ISA, no WMMA) runs them. This is NOT a gfx11 ISA
+    /// capability: the exact `mov_dpp8` selector, WMMA/chunked GDN, and every
+    /// other `has_gfx11_plus_simt` caller stay RDNA-only. gfx940/gfx941 are
+    /// not admitted.
+    pub fn has_qwen4_parallel_qsa_gdn(&self) -> bool {
+        self.has_gfx11_plus_simt || self.is_gfx942
     }
     pub fn has_dot2_f32_f16(&self) -> bool {
         self.has_dot2_f32_f16
@@ -485,6 +598,9 @@ mod tests {
         assert!(!caps.is_rdna3_dgpu());
         assert!(caps.is_rdna3p5());
         assert!(caps.is_gfx1151());
+        assert!(caps.has_wmma_w32());
+        assert!(!caps.has_wmma_w32_gfx12());
+        assert!(caps.supports_ds4_f16_compressor_cache());
     }
 
     #[test]
@@ -522,6 +638,61 @@ mod tests {
         assert!(caps.has_wmma());
         assert!(!caps.has_wmma_w32());
         assert!(!caps.is_rdna3());
+        assert!(caps.supports_ds4_f16_compressor_cache());
+    }
+
+    #[test]
+    fn dflash_s2_s4_fusions_split_exact_arch_admission() {
+        for arch in ["gfx1100", "gfx1201"] {
+            let caps = make_caps(arch);
+            assert!(caps.supports_dflash_hidden_scatter_fusion(), "{arch}");
+            assert!(caps.supports_dflash_f16_residual_fusions(), "{arch}");
+        }
+        // gfx1151: pure-copy S2 hidden scatter only; f16 residual stays refused.
+        let caps = make_caps("gfx1151");
+        assert!(caps.supports_dflash_hidden_scatter_fusion());
+        assert!(!caps.supports_dflash_f16_residual_fusions());
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1152", "gfx1200", "gfx942",
+        ] {
+            let caps = make_caps(arch);
+            assert!(!caps.supports_dflash_hidden_scatter_fusion(), "{arch}");
+            assert!(!caps.supports_dflash_f16_residual_fusions(), "{arch}");
+        }
+    }
+
+    #[test]
+    fn dflash_launch_fusions_cover_validated_fleet_only() {
+        // S2 hidden scatter has its own split admission (gfx1151 pure copy),
+        // pinned by `dflash_s2_s4_fusions_split_exact_arch_admission`.
+        let gates: [(&str, fn(&ArchCaps) -> bool); 4] = [
+            (
+                "f16 projection",
+                ArchCaps::supports_dflash_f16_projection_fusions,
+            ),
+            (
+                "f16 residual",
+                ArchCaps::supports_dflash_f16_residual_fusions,
+            ),
+            ("gdn pre", ArchCaps::supports_dflash_gdn_pre_fusions),
+            ("fa batch", ArchCaps::supports_dflash_fa_batch_fusions),
+        ];
+
+        for (arch, expected) in [
+            ("gfx1030", false),
+            ("gfx1100", true),
+            ("gfx1101", false),
+            ("gfx1150", false),
+            ("gfx1151", false),
+            ("gfx1200", false),
+            ("gfx1201", true),
+            ("gfx942", false),
+        ] {
+            let caps = make_caps(arch);
+            for (name, gate) in gates {
+                assert_eq!(gate(&caps), expected, "{name}: {arch}");
+            }
+        }
     }
 
     #[test]
@@ -660,6 +831,68 @@ mod tests {
                 !make_caps(arch).supports_mq3_lloyd_mb4(),
                 "mq3-lloyd mb4 must NOT admit {arch}"
             );
+        }
+    }
+
+    #[test]
+    fn gfx11_plus_simt_covers_rdna3_and_rdna4_only() {
+        for arch in &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201",
+        ] {
+            assert!(make_caps(arch).has_gfx11_plus_simt(), "{arch}");
+        }
+        for arch in &["gfx1010", "gfx1030", "gfx906", "gfx908", "gfx942"] {
+            assert!(!make_caps(arch).has_gfx11_plus_simt(), "{arch}");
+        }
+    }
+
+    #[test]
+    fn qwen4_parallel_qsa_gdn_adds_gfx942_to_gfx11_plus_simt_only() {
+        for arch in &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201", "gfx942",
+        ] {
+            assert!(make_caps(arch).has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+        for arch in &["gfx1010", "gfx1030", "gfx906", "gfx908", "gfx940", "gfx941"] {
+            assert!(!make_caps(arch).has_qwen4_parallel_qsa_gdn(), "{arch}");
+        }
+        // gfx942 gains only the parallel capability: the gfx11+ SIMT ISA
+        // (which the exact `mov_dpp8` selector and every other
+        // `has_gfx11_plus_simt` caller need) and WMMA stay RDNA-only.
+        let gfx942 = make_caps("gfx942");
+        assert!(!gfx942.has_gfx11_plus_simt());
+        assert!(!gfx942.has_wmma_w32());
+        assert!(!gfx942.has_wmma());
+        for arch in &["gfx1151", "gfx1201"] {
+            let caps = make_caps(arch);
+            assert!(
+                caps.has_gfx11_plus_simt() && caps.has_qwen4_parallel_qsa_gdn(),
+                "{arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn iu4_wmma_is_the_gfx11_and_gfx12_wave32_hardware_capability() {
+        for arch in &[
+            "gfx1100", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1200",
+            "gfx1201",
+        ] {
+            let caps = make_caps(arch);
+            assert!(caps.has_iu4_wmma(), "{arch}");
+            assert_eq!(
+                caps.has_iu4_wmma(),
+                caps.has_wmma_w32() || caps.has_wmma_w32_gfx12(),
+                "{arch}"
+            );
+        }
+        for arch in &[
+            "gfx906", "gfx908", "gfx1010", "gfx1011", "gfx1012", "gfx1030", "gfx1031", "gfx1032",
+            "gfx940", "gfx941", "gfx942", "",
+        ] {
+            assert!(!make_caps(arch).has_iu4_wmma(), "{arch:?}");
         }
     }
 

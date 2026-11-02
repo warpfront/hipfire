@@ -46,7 +46,9 @@
 // 132B@256), so even an in-place ascending pass would be safe, but we do not
 // rely on it.
 //
-// Grid: [n_kv_heads, n_positions]. Block: [32]. LDS: (head_dim + 32) * 4 bytes
+// Grid: [n_kv_heads * n_positions, 1, 1] (y folded into x: HIP grid.y caps at
+// 65535, full context reaches 262144). blockIdx.x = pos * n_kv_heads + h.
+// Block: [32]. LDS: (head_dim + 32) * 4 bytes
 // (only the +32 scratch tail is used; sized to match the K-write template).
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
@@ -56,9 +58,10 @@ extern "C" __global__ void kv_transcode_k_fwht4_to_fwht2(
     const unsigned char* __restrict__ src,  // fwht4 layout (132 B/head/pos @256)
     int n_kv_heads, int head_dim, int n_positions
 ) {
-    const int h = blockIdx.x;
-    if (h >= n_kv_heads) return;
-    const int pos = blockIdx.y;
+    if (n_kv_heads <= 0) return;
+    const unsigned int fold = blockIdx.x;
+    const int h = (int)(fold % (unsigned int)n_kv_heads);
+    const int pos = (int)(fold / (unsigned int)n_kv_heads);
     if (pos >= n_positions) return;
     const int tid = threadIdx.x;
 
@@ -107,7 +110,9 @@ extern "C" __global__ void kv_transcode_k_fwht4_to_fwht2(
 
     // Re-quantize the UNIT-normalized reconstruction at 2-bit (matches the
     // write kernels, which normalize before quantizing).
-    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm : 0.0f;
+    // Same sqrt(2) threshold scale at hd 256 as kv_cache_write_asym_k_fwht2.
+    const float q_scale = head_dim == 256 ? 1.41421356f : 1.0f;
+    float inv_norm = (orig_norm > 1e-10f) ? 1.0f / orig_norm * q_scale : 0.0f;
     int didx[8];
     float local_rsq = 0.0f;
     for (int i = 0; i < n_halves * 4; i++) {

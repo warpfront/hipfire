@@ -1,5 +1,21 @@
 # Spec-Decode Durability — qwen dense, gfx11 (2026-06-23)
 
+| Field | Value |
+|---|---|
+| Page state | **historical** — retained 2026-06-23 measurement record (see [`INDEX.md`](INDEX.md)); not a current baseline, default, floor, acceptance route, or procedure |
+| Current capability | [`speculation-support-inventory.md`](speculation-support-inventory.md) (source wins) |
+| Validation routes | [`VALIDATION.md`](VALIDATION.md) only |
+
+> **Historical record, 2026-06-23.** Every number, floor and recommendation below belongs to the
+> fixture, binary and wiring of that date and is reproduction context only. Wiring described here
+> has since changed: the `HIPFIRE_QWEN_MTP` / `generate_qwen35_mtp` serve path is gone (qwen35 MTP is
+> now attached by default through `speculation.mtp = auto` when a head is present), and
+> `speculation.dflash` defaults to `off` except for the registry's paired Qwen3.8-27B tiers. The
+> "durability floors" below were campaign targets, not product admission criteria; `admissions.yml`
+> carries no speculation row. Retired `scripts/coherence-gate-*.sh` batteries are historical
+> reproduction only. DFlash itself is not deprecated; only the legacy contiguous knobs
+> (`HIPFIRE_DFLASH_WINDOW=0`, `HIPFIRE_DFLASH_CTX_CAP`) are deprecated since 0.4.0, removal 0.5.0.
+
 Measured on gfx1100 (RX 7900-class), dense Qwen3.6-27B (`qwen3.6-27b.mq4`), q8 KV,
 greedy (temp=0), 3-run median. **AR decode baseline ≈ 43 tok/s** (genre-independent).
 
@@ -83,8 +99,8 @@ drafter is slightly weaker on instruct; 3.6 passes at 1.72×).
 **All genres clear, losslessly, at one fixed config.** `p_min=0.4` (deeper adaptive chain) is the
 prose-optimal early-exit threshold and doesn't hurt structured genres; `p_min` is not a correctness
 knob (greedy MTP is distribution-preserving at any threshold). MTP perf is proven via
-`mtp_only_demo`; it is **not yet daemon-wired** (only ds4 MTP is) — deployment is the remaining
-implement step (§6).
+`mtp_only_demo`; at the time of this measurement it was **not yet daemon-wired** (only ds4 MTP was) —
+deployment was the remaining implement step (§6, since completed and later superseded).
 
 ## 2.5 Sampled (temp>0) serving — DFlash + GPU-softmax fast path
 
@@ -139,7 +155,7 @@ same KV: the difference is entirely the drafter's prose competence.
 | **CACTUS bumped acceptance (lossy)** | τ>1.5 but visibly corrupts prose (garbled tokens, repeats) at the δ that clears τ; also D2H-capped ~45 tok/s | rejected (quality) |
 | **Verify-cost cuts (compressed lm_head, drop topk sync)** | ~+15% ceiling; the 27B forward is the floor, can't reach 56 losslessly | insufficient for prose |
 | **MTP (native head)** | clears all genres incl. prose, lossless | **the answer for prose** |
-| **DFlash prose drafter retrain** | the only lossless DFlash-prose lever; infra broken 3 ways (trainer won't compile, `load_target_init` unbuilt, mi300 torn down), correct d=5120 arch never run, multi-week, 30–40% odds | **deferred** (dedicated effort) |
+| **DFlash prose drafter retrain** | the only lossless DFlash-prose lever; infra broken 3 ways (trainer won't compile, `load_target_init` unbuilt, the MI300-class training host torn down), correct d=5120 arch never run, multi-week, 30–40% odds | **deferred** (dedicated effort) |
 
 ## 5. State of spec-decode for qwen in hipfire (report)
 
@@ -178,7 +194,7 @@ all-genre-durable config.)
 
 ## 6. Open items / recommendations
 
-1. **Deploy MTP — DONE** (commit `fd717e5d`). Wired into the daemon: `LoadedModel.qwen35_mtp_head`
+1. **Deploy MTP — DONE at the time** (commit `fd717e5d`; historical wiring, superseded as noted in the banner). Wired into the daemon: `LoadedModel.qwen35_mtp_head`
    (bundled `.mq4-mtp` trailer or `<trunk>.mtp` sidecar), `generate_qwen35_mtp`, gated
    `HIPFIRE_QWEN_MTP=1` + greedy + arch 5/6 + single-GPU (default path unchanged), generation-local
    `MtpSpecState` freed at every exit (state-bleed guard), defaults K=3/p_min=0.4. **Validated

@@ -1,0 +1,17 @@
+{
+  "scenario": "open-story",
+  "A_decode_median": 30.4,
+  "B_decode_median": 30.5,
+  "speedup": 1.0032894736842106,
+  "A_range": [
+    30.4,
+    30.5
+  ],
+  "B_range": [
+    30.5,
+    30.5
+  ],
+  "text_parity": true,
+  "tau_parity": true,
+  "cycles_parity": true
+}

@@ -335,5 +335,5 @@ quant-boundary step) on gfx1100 AND gfx1201; preset + advanced coherence
 end-to-end (downshifts fire at predicted positions; fluent through every
 transition incl. the attractor-prone K steps). Default OFF (opt-in).
 
-**Deferred (see `NEXT-STEPS.md`):** DFlash hook, default-on decision, multi-GPU,
+**Deferred (see [`docs/plans/historical/2026-05-31-adaptive-kv-next-steps.md`](historical/2026-05-31-adaptive-kv-next-steps.md)):** DFlash hook, default-on decision, multi-GPU,
 pattern-tuning KLD sweep, `Aggressive` differentiation, recency-tiered precision.

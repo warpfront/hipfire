@@ -1,0 +1,188 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The `iu4_gemm` generator, composed from its typed phase blocks in `.rip`.
+//
+// `iu4_gemm::emit(spec)` (kernels/iu4_gemm/mod.rs) is written over exactly the
+// blocks this script calls (`iu4_gemm::blocks`), so for every valid Spec the
+// script re-emits the production kernel's bytes. A test in peacemaker-rip
+// (`iu4_gemm_twin_matches_the_rust_emit`) requires `s_text` identity for every
+// valid Spec on gfx1201. Edit the composition here (the K-loop trip structure,
+// which blocks run, where a fetch or a descriptor step sits, a hand-written
+// epilogue) and re-run: no rebuild.
+//
+// Variant grammar: the shipped variant name, `Spec::variant_name()`:
+//
+//     FOLD-TILE-CACC[-slab]-EPI[-s24x64|-s24x32]
+//
+//     FOLD  k128 | k256s | k256p              (fold granularity; only k128 builds)
+//     TILE  128x128x8 | 256x128x16            (rows x tokens x waves)
+//     CACC  cacc1 | cacc2                     (int32 accumulator sets; only cacc1 builds)
+//     slab  optional: the slab activation layout (default: token layout)
+//     EPI   set | add | addsigmoid | silu | silu-bf16 | qkvzagdn
+//     MMA   optional: s24x64 | s24x32 = the 2:4-sparse SWMMAC K-loop (set/add on the
+//           128x128x8 token-layout tile only; default: the dense WMMA K-loop)
+//
+// e.g. `k128-128x128x8-cacc1-set`, `k128-128x128x8-cacc1-slab-silu-bf16`,
+// `k128-256x128x16-cacc1-add`. A combination without a generator is refused by
+// `Iu4Gen::new` with the Rust `Spec::validate` message. `VARIANTS` lists every
+// valid one. gfx1201 only.
+//
+// Blocks work on the typed workgroup scope through `Driver::typed`: `lds` is
+// the array of the four LDS rings (A, W, DS, SZ), declared Free, Published/Free
+// at a block boundary. A block takes it and returns it.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &[
+    "k128-128x128x8-cacc1-set",
+    "k128-128x128x8-cacc1-slab-set",
+    "k128-128x128x8-cacc1-add",
+    "k128-128x128x8-cacc1-slab-add",
+    "k128-128x128x8-cacc1-addsigmoid",
+    "k128-128x128x8-cacc1-silu",
+    "k128-128x128x8-cacc1-slab-silu",
+    "k128-128x128x8-cacc1-silu-bf16",
+    "k128-128x128x8-cacc1-slab-silu-bf16",
+    "k128-128x128x8-cacc1-qkvzagdn",
+    "k128-128x128x8-cacc1-slab-qkvzagdn",
+    "k128-256x128x16-cacc1-set",
+    "k128-256x128x16-cacc1-add",
+    "k128-256x128x16-cacc1-silu",
+    "k128-128x128x8-cacc1-set-s24x64",
+    "k128-128x128x8-cacc1-set-s24x32",
+    "k128-128x128x8-cacc1-add-s24x64",
+    "k128-128x128x8-cacc1-add-s24x32",
+];
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let g = Iu4Gen::new(iu4_spec(&spec.variant, spec.arch)?)?;
+    let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+    let mut wg = Workgroup::new(&mut b, spec.arch)?;
+    author(&mut wg, &g)?;
+    b.finish()
+}
+
+// The variant name as the `Iu4Spec` it names.
+fn iu4_spec(variant: &str, arch: Arch) -> Result<Iu4Spec, String> {
+    let mut parts: Vec<&str> = variant.split('-').collect();
+    // An optional trailing `-s24x64` / `-s24x32`: the 2:4-sparse SWMMAC K-loop.
+    let mut mma = Mma::Dense;
+    let last = parts[parts.len() - 1];
+    if last == "s24x64" {
+        mma = Mma::S24X64;
+        parts.pop();
+    } else if last == "s24x32" {
+        mma = Mma::S24X32;
+        parts.pop();
+    }
+    if parts.len() < 4 {
+        return Err(format!("variant `{variant}`: expected FOLD-TILE-CACC[-slab]-EPI[-s24x64|-s24x32]"));
+    }
+    let fold = match parts[0] {
+        "k128" => Fold::K128,
+        "k256s" => Fold::K256Shared,
+        "k256p" => Fold::K256Pow2,
+        f => return Err(format!("variant `{variant}`: unknown fold `{f}` (k128, k256s, k256p)")),
+    };
+    let tile = match parts[1] {
+        "128x128x8" => Tile::T128x128x8,
+        "256x128x16" => Tile::T256x128x16,
+        t => return Err(format!("variant `{variant}`: unknown tile `{t}` (128x128x8, 256x128x16)")),
+    };
+    let cacc = match parts[2] {
+        "cacc1" => Cacc::One,
+        "cacc2" => Cacc::Two,
+        c => return Err(format!("variant `{variant}`: unknown accumulator count `{c}` (cacc1, cacc2)")),
+    };
+    let slab = parts[3] == "slab";
+    let act = if slab { ALayout::Slab } else { ALayout::Token };
+    let first = if slab { 4 } else { 3 };
+    if first >= parts.len() {
+        return Err(format!("variant `{variant}`: missing the epilogue"));
+    }
+    let name = parts.iter().skip(first).cloned().collect::<Vec<_>>().join("-");
+    let epi = match name.as_str() {
+        "set" => Epi::Set,
+        "add" => Epi::Add,
+        "addsigmoid" => Epi::AddSigmoid,
+        "silu" => Epi::GateUpSilu,
+        "silu-bf16" => Epi::GateUpSiluBf16,
+        "qkvzagdn" => Epi::QkvzaGdn,
+        e => return Err(format!("variant `{variant}`: unknown epilogue `{e}` (set, add, addsigmoid, silu, silu-bf16, qkvzagdn)")),
+    };
+    Ok(Iu4Spec { fold: fold, tile: tile, cacc: cacc, epi: epi, act: act, arch: arch, mma: mma })
+}
+
+// The Workgroup scope lives here, not in emit(): emit() mentions `b` again at
+// finish(), which would end the scope under any later `wg` use.
+fn author<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen) -> Result<(), String> {
+    let lds = iu4::declare_lds(wg, g)?;
+    let end = wg.exit(iu4::END)?;
+    // Every symbol runs its K-loop at wave priority 1 and drops to 0 for its
+    // epilogue (the fused projection keeps its stores at 1 and drops at the QKV
+    // tiles' GDN epilogue), so co-resident K-loops win issue arbitration over a
+    // finishing tile. Scheduling only.
+    op(wg.isa(), "s_setprio 1", vec![], vec![])?;
+    let lds = iu4::prologue(wg, g, end, lds)?;
+    let lds = kloop(wg, g, lds)?;
+    iu4::epilogue(wg, g, end)?;
+    // Only the fused projection reuses the LDS after the K loop: its QKV tiles
+    // continue at the GDN label the epilogue's exit branch skips to.
+    if g.spec().epi == Epi::QkvzaGdn {
+        iu4::gdn_epilogue(wg, g, lds)?;
+    }
+    wg.end(end)
+}
+
+// The rolled K-loop. One trip is a whole 256-K group (two 128-K blocks, plane
+// parity 0 then 1), so every LDS address is an immediate and the trip ends in
+// the state it started in; `loop_carried` checks that. The last group is
+// peeled: its second block fetches and publishes nothing.
+fn kloop<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, lds: Lds) -> Result<Lds, String> {
+    wg.label(iu4::K_BEGIN)?;
+    // K == 256: no full trip; go straight to the peeled group.
+    let no_trip = iu4::trips_cmp(wg, g, "s_cmp_eq_u32")?;
+    let lds = wg.wg_skip_if(no_trip, iu4::tail_label(0), lds, |wg, lds| {
+        let lds = wg.loop_carried(iu4::K_LOOP, lds, |wg, lds| {
+            let lds = mma_block(wg, g, "m0", 0, true, iu4::label("m1"), true, lds)?;
+            // The even-block descriptor was last read by block 0's slab-1 fetch;
+            // block 1 moves it to block 2g+2 before its own next-block fetch
+            // reads it (a step inside the block, after its slab-1 fetch).
+            let lds = mma_block_stepping(wg, g, "m1", 1, true, iu4::K_LOOP_END, true, 0, lds)?;
+            // Trip end: the odd-block descriptor and the group offset move on
+            // after every read of them in this trip.
+            iu4::trip_end(wg, g)?;
+            let more = iu4::trips_cmp(wg, g, "s_cmp_lg_u32")?;
+            Ok((lds, more))
+        })?;
+        wg.label(iu4::K_LOOP_END)?;
+        Ok(lds)
+    })?;
+    // The skip target is the peeled group's first block label, which this
+    // block's `entry_label = false` leaves for the `wg_skip_if` above to place.
+    let lds = mma_block(wg, g, "t0", 0, true, iu4::label("t1"), false, lds)?;
+    mma_block(wg, g, "t1", 1, false, iu4::EPI, true, lds)
+}
+
+// The block of the spec's matrix instruction: the dense WMMA block, or the
+// 2:4-sparse SWMMAC block (the weights must be packed by
+// `iu4_gemm::sparse24::pack_block`; same arguments, same ring transitions).
+fn mma_block<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
+        end_label: &str, entry_label: bool, lds: Lds) -> Result<Lds, String> {
+    if g.spec().mma == Mma::Dense {
+        iu4::block(wg, g, tag, h, fetch_next, end_label, entry_label, lds)
+    } else {
+        iu4::sparse_block(wg, g, tag, h, fetch_next, end_label, entry_label, lds)
+    }
+}
+
+fn mma_block_stepping<T: Target>(wg: &mut Wg<T>, g: &Iu4Gen, tag: &str, h: usize, fetch_next: bool,
+        end_label: &str, entry_label: bool, step: usize, lds: Lds) -> Result<Lds, String> {
+    if g.spec().mma == Mma::Dense {
+        iu4::block_stepping(wg, g, tag, h, fetch_next, end_label, entry_label, step, lds)
+    } else {
+        iu4::sparse_block_stepping(wg, g, tag, h, fetch_next, end_label, entry_label, step, lds)
+    }
+}

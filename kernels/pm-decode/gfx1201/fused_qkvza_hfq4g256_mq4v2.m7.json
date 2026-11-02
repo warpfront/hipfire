@@ -1,0 +1,18 @@
+{
+  "fused_qkvza_mq4g256v2": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 2,
+    "delays": 12,
+    "instructions": 403,
+    "lds_accesses": 5,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 5,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 30,
+    "table": "gfx1201",
+    "vgpr_high_water": 76,
+    "wait_facts": 31
+  }
+}

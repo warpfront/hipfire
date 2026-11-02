@@ -1,0 +1,20 @@
+# Prometheus scrape config for the compose `monitoring` profile.
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: hipfire
+    metrics_path: /metrics
+    # When the serve runs with an API key (HIPFIRE_SERVE_ARGS=--api-key-file ...),
+    # /metrics needs the key too. Mount the key file into the prometheus service
+    # and uncomment:
+    # authorization:
+    #   type: Bearer
+    #   credentials_file: /etc/prometheus/hipfire-api-key
+    static_configs:
+      - targets: ["hipfire:11435"]
+
+  # GPU memory/busy and host memory, read from sysfs/procfs by node-exporter.
+  - job_name: node
+    static_configs:
+      - targets: ["node-exporter:9100"]

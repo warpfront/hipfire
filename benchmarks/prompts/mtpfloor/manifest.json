@@ -1,0 +1,98 @@
+{
+  "sizing": "Heuristic UTF-8 bytes / 4, NOT tokenizer counts; includes rendered chat framing. All tool contexts preserve complete capture 00031.",
+  "format": "Qwen official reference Jinja, thinking disabled, add_generation_prompt true; tool argument JSON strings parsed as objects for template parameter rendering. Rendered txt requires HIPFIRE_JINJA_CHAT=0. Request JSON can instead use normal messages/tools rendering.",
+  "generator": "generate.py",
+  "jinja2_version": "3.1.6",
+  "prompts": [
+    {
+      "filename": "code-1k.txt",
+      "md5": "56af301f8253fbaed03cab53b4b83e8f",
+      "bytes": 4097,
+      "characters": 4097,
+      "approximate_tokens_bytes_div_4": 1024.25,
+      "requested_approximate_tokens": 1024,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "code-1k.request.json"
+    },
+    {
+      "filename": "code-32k.txt",
+      "md5": "e0ee01ca88b7f5f2bfa0f2181c50bd53",
+      "bytes": 131073,
+      "characters": 131073,
+      "approximate_tokens_bytes_div_4": 32768.25,
+      "requested_approximate_tokens": 32768,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "code-32k.request.json"
+    },
+    {
+      "filename": "code-128k.txt",
+      "md5": "4d3973562be03ade44bc0df672f83ec5",
+      "bytes": 524289,
+      "characters": 524289,
+      "approximate_tokens_bytes_div_4": 131072.25,
+      "requested_approximate_tokens": 131072,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "code-128k.request.json"
+    },
+    {
+      "filename": "prose-1k.txt",
+      "md5": "788139d5a1ca519319119f10454c6b8d",
+      "bytes": 4097,
+      "characters": 4097,
+      "approximate_tokens_bytes_div_4": 1024.25,
+      "requested_approximate_tokens": 1024,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "prose-1k.request.json"
+    },
+    {
+      "filename": "prose-32k.txt",
+      "md5": "997d62014ebdbf98798c66b349790e30",
+      "bytes": 131073,
+      "characters": 131073,
+      "approximate_tokens_bytes_div_4": 32768.25,
+      "requested_approximate_tokens": 32768,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "prose-32k.request.json"
+    },
+    {
+      "filename": "prose-128k.txt",
+      "md5": "e3323c6480a244317640edb042eb4397",
+      "bytes": 524289,
+      "characters": 524289,
+      "approximate_tokens_bytes_div_4": 131072.25,
+      "requested_approximate_tokens": 131072,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "prose-128k.request.json"
+    },
+    {
+      "filename": "tool-1k.txt",
+      "md5": "1d20bcbc04f0176c24bccb90f977c609",
+      "bytes": 4096,
+      "characters": 4096,
+      "approximate_tokens_bytes_div_4": 1024.0,
+      "requested_approximate_tokens": 1024,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "tool-1k.request.json"
+    },
+    {
+      "filename": "tool-32k.txt",
+      "md5": "7e8c285ae76bb3622bd3900da19e983a",
+      "bytes": 131072,
+      "characters": 131072,
+      "approximate_tokens_bytes_div_4": 32768.0,
+      "requested_approximate_tokens": 32768,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "tool-32k.request.json"
+    },
+    {
+      "filename": "tool-128k.txt",
+      "md5": "76fc8102aa13e9fa000cbbba1ee0de65",
+      "bytes": 524288,
+      "characters": 524288,
+      "approximate_tokens_bytes_div_4": 131072.0,
+      "requested_approximate_tokens": 131072,
+      "immutable_capture_floor_exceeds_target": false,
+      "request_filename": "tool-128k.request.json"
+    }
+  ]
+}

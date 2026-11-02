@@ -1,0 +1,128 @@
+{
+  "schema": "consumer24.gfx1100.b4-reviewed-twin-j658.provenance.v1",
+  "run": "j658 reviewed-twin full 8-check G1 hold",
+  "result": "all eight GPU G1 checks PASS (g1a, g1b, g1c; exceptional GateUp0; wrongsel detected)",
+  "source": {
+    "actual_source_git": "90d429ce9017f1c3f18b17d1bc10080aa7c45ccd",
+    "cpu_checkout": "/home/kaden/qcal/release-0.4.3/consumer24-k2-gfx1100",
+    "gpu_checkout": "/home/kaden/qcal/release-0.4.3/consumer24-k2-twin-90d429ce9",
+    "note": "Both checkouts were clean at the single commit above (closure receipt source.cpu/source.gpu). The three tracked helpers below are byte-identical at 90d429ce9, in the cpu checkout, and in this tree."
+  },
+  "reviewed_adapter": {
+    "original_commits": [
+      "77af6abf82c0e8c12433d2d9f3f04a708f11ba17",
+      "c1473d37899e85a067a00a10edcc0afa9e73a360"
+    ],
+    "original_commit_subjects": [
+      "Model reviewed gfx1100 MulUp NaN semantics in a local adapter",
+      "Classify NaN model deltas by the original rounded gate"
+    ],
+    "local_cherry_picks": [
+      "678b72d70d56af741ccd6514e54f85060d8392f5",
+      "70a6e73d20281bc8be818259027bdd1005b3cf8c"
+    ],
+    "local_branch": "consumer24/k2-oracle"
+  },
+  "config": {
+    "path_in_tree": "tools/b4-reviewed-twin-90d429ce9.config.json",
+    "sha256": "254366f499f31fab3bdf6d155ab3be09d5868e0b551df65684dc164478695aa0",
+    "canonical_path": "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b4-reviewed-twin-90d429ce9/config.json",
+    "schema": "consumer24.gfx1100.hook-closure-config.v1",
+    "hipx_copy_sha256": "254366f499f31fab3bdf6d155ab3be09d5868e0b551df65684dc164478695aa0",
+    "path_binding": "The config was produced by preflight.py invoking the coordinator's own --write-config and is byte-for-byte what the hold consumed (closure receipt config_sha256 equals this sha). Every path inside is a verbatim, run-specific absolute path bound to the original hosts and checkouts: cpu_repo/cpu_chain_helper -> hiptrx checkout /home/kaden/qcal/release-0.4.3/consumer24-k2-gfx1100, gpu_repo -> /home/kaden/qcal/release-0.4.3/consumer24-k2-twin-90d429ce9, GPU run/oracle/tables/chain dirs/g1_commands -> /home/kaden/pm-wave/consumer24/..., CPU work dir/fixture/samples -> /home/kaden/qcal/release-0.4.3/consumer24/... . Paths were NOT rewritten and no wrapper was added; replaying requires those paths to exist (or an explicit new config via the coordinator's --write-config)."
+  },
+  "closure_receipt": {
+    "canonical_path": "consumer24/rcpt/b4-reviewed-twin-90d429ce9/hipx-copy/closure.receipt.json",
+    "absolute_path": "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b4-reviewed-twin-90d429ce9/hipx-copy/closure.receipt.json",
+    "sha256": "61d00e112d5ba2aaf8af9ce5784e4266d727e919724502e236fe1f35363bbdcf",
+    "vendored": false,
+    "lease": {"FABRIC_JOB": "955552:13218166:xtx", "FABRIC_CARDS": "xtx", "cu_mask_env": "none set"}
+  },
+  "files": [
+    {
+      "path_in_tree": "tools/qwen4_moe_gfx1100_hook_closure.py",
+      "sha256": "aac80c87690e071c96e625b6c59204f406a31b2da3779882729c678e700f080a",
+      "original_path": "crates/peacemaker-isa/tools/qwen4_moe_gfx1100_hook_closure.py",
+      "executed_path": "/home/kaden/qcal/release-0.4.3/consumer24-k2-twin-90d429ce9/crates/peacemaker-isa/tools/qwen4_moe_gfx1100_hook_closure.py",
+      "git_tracked_at": "90d429ce9",
+      "role": "one-hold coordinator: ran on hipx inside the caller-held fabric lease; census frontier loop, chain re-prepare, 8 G1 runs",
+      "executed_inside_hold": true,
+      "executable": true
+    },
+    {
+      "path_in_tree": "tools/qwen4_moe_gfx1100_chain_a4.py",
+      "sha256": "4b8e2181170c00ab9ae6208f4476eea22f1db4211047a9362e5adb0f963e6541",
+      "original_path": "crates/peacemaker-isa/tools/qwen4_moe_gfx1100_chain_a4.py",
+      "executed_path": "/home/kaden/qcal/release-0.4.3/consumer24-k2-gfx1100/crates/peacemaker-isa/tools/qwen4_moe_gfx1100_chain_a4.py",
+      "git_tracked_at": "90d429ce9",
+      "role": "CPU-only A4 chain helper (config cpu_chain_helper); run on hiptrx over ssh by the coordinator during the hold (not on the GPU)",
+      "executed_inside_hold": true,
+      "executable": true
+    },
+    {
+      "path_in_tree": "tools/mq_i4_a4_oracle.py",
+      "sha256": "f34707b5e2f28b364faa14813ae792d4c0cb1e261ebbf7fe9c242fde9899b31f",
+      "original_path": "crates/peacemaker-isa/tools/mq_i4_a4_oracle.py",
+      "executed_path": "/home/kaden/qcal/release-0.4.3/consumer24-k2-gfx1100/crates/peacemaker-isa/tools/mq_i4_a4_oracle.py",
+      "git_tracked_at": "90d429ce9",
+      "role": "sibling R128 rotation source loaded by chain_a4.py on hiptrx (closure receipt cpu_rotation_source); hash-pinned by the coordinator",
+      "executed_inside_hold": true,
+      "executable": true
+    },
+    {
+      "path_in_tree": "tools/b4-reviewed-twin.preflight.py",
+      "sha256": "f508f01d7a47752cfb29d7d018e4297658ff9cc27bf6de0f690fa96bbee08247",
+      "original_path": "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b4-reviewed-twin.preflight.py",
+      "git_tracked_at": null,
+      "role": "CPU-only staging + preflight on hiptrx before the hold (no lease, no GPU process); wrote the config via the coordinator's --write-config and ran CPU census/chain-prepare scratch passes",
+      "executed_inside_hold": false,
+      "executable": true,
+      "location_binding": "reads rcpt/b4.g1c.commands.sh and writes <rcpt>/b4-reviewed-twin-<commit9>/ under /home/kaden/qcal/release-0.4.3/consumer24/rcpt"
+    },
+    {
+      "path_in_tree": "tools/b4-reviewed-twin.aggregate.py",
+      "sha256": "1d65392b1f2e952e77551be8883059145f21f1c690969b54779ecf913831b020",
+      "original_path": "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b4-reviewed-twin.aggregate.py",
+      "git_tracked_at": null,
+      "role": "CPU-only post-run aggregation of the raw hipx artifacts into b4.g1a/b/c.json (usage: aggregate.py <stage_dir> <out_dir>)",
+      "executed_inside_hold": false,
+      "executable": true
+    },
+    {
+      "path_in_tree": "tools/b4.g1c.commands.sh",
+      "sha256": "48b9ae8d09b1bfc292410bbeb85da03b335c0cec9dddfddd11676622ad21546e",
+      "original_path": "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b4.g1c.commands.sh",
+      "git_tracked_at": null,
+      "role": "input data for the preflight: the 5 raw G1c argv templates (j587 binary name oracle_ad6e94a1a, run paths .../consumer24/b4/...); the closure's coordinator rewrites binary/tables/chain/--out for the 8 final G1 commands. Not executed as a script in the hold",
+      "executed_inside_hold": false,
+      "executable": false
+    },
+    {
+      "path_in_tree": "tools/b4-reviewed-twin-90d429ce9.config.json",
+      "sha256": "254366f499f31fab3bdf6d155ab3be09d5868e0b551df65684dc164478695aa0",
+      "original_path": "/home/kaden/qcal/release-0.4.3/consumer24/rcpt/b4-reviewed-twin-90d429ce9/config.json",
+      "git_tracked_at": null,
+      "role": "exact j658 coordinator config (the bytes the hold consumed); see config.path_binding",
+      "executed_inside_hold": false,
+      "consumed_inside_hold": true,
+      "executable": false
+    }
+  ],
+  "census": {
+    "script": null,
+    "tracked_rust_oracle": "qwen4_moe_sym_gfx1100_g1_oracle --collect-hook-keys OUT.json",
+    "source_module": "crates/hipfire-runtime/examples/qwen4_moe_sym_gfx1100_g1/census.rs",
+    "source_module_sha256": "92e1f682c53b64bc9f15a6988fca38ae835ddc2e9b8308dba1a0d19ed084f1e5",
+    "source_module_sha256_note": "Identical blob content at 90d429ce9, 77af6abf8, 678b72d70 and 70a6e73d2 (and in the current tree).",
+    "cli_entry": "crates/hipfire-runtime/examples/qwen4_moe_sym_gfx1100_g1_oracle.rs (--collect-hook-keys)",
+    "oracle_binary_sha256": "e5a083eb320dd997bf1401630ff1fa2eb93b7cff29bbd8d2ee327e080f5bf88c",
+    "note": "No standalone census script exists or was run; the coordinator invoked the Rust oracle's --collect-hook-keys on hiptrx (CPU only, ROCR_VISIBLE_DEVICES=-1 HIP_VISIBLE_DEVICES=-1 CUDA_VISIBLE_DEVICES= nice -n 19)."
+  },
+  "outer_staging": "Outer arm and staging were inline ssh/cat/tar commands; there is no additional script to vendor.",
+  "external_infrastructure_not_vendored": [
+    {"name": "fabric-run.sh", "sha256": "6ec4e2b0d3af4590249fa71adf8b119def16968bbfa103bea16e5708586532a2"},
+    {"name": "fabric.py", "sha256": "e3ee38b4a8d53ac475a22770afe106153d76d844f6abbb64a842f44a9949753a"},
+    {"name": "pilot_solve.py", "sha256": "53965f2328e32d86c7b87460a02573a065424e220383891da210441dc9f6c0df", "note": "external pin (config pilot_solve_sha256) required by chain_a4.py; used by the CPU chain prep"}
+  ],
+  "adjacency": "tools/qwen4_moe_gfx1100_chain_a4.py loads tools/mq_i4_a4_oracle.py from its own directory (ROTATION = dirname(__file__)/mq_i4_a4_oracle.py); both are kept adjacent in root tools/."
+}

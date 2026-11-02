@@ -1,0 +1,50 @@
+{
+  "npu_arena_copy_bf16_bf16_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 5,
+    "instructions": 36,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 20,
+    "table": "gfx1151",
+    "vgpr_high_water": 5,
+    "wait_facts": 3
+  },
+  "npu_arena_copy_bf16_f32_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 5,
+    "instructions": 37,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 20,
+    "table": "gfx1151",
+    "vgpr_high_water": 5,
+    "wait_facts": 3
+  },
+  "npu_arena_copy_f32_f32_pm": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 5,
+    "instructions": 36,
+    "lds_accesses": 0,
+    "lds_max_known_end": 0,
+    "lds_unknown_addresses": 0,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 20,
+    "table": "gfx1151",
+    "vgpr_high_water": 5,
+    "wait_facts": 3
+  }
+}

@@ -1,0 +1,3334 @@
+{
+  "arch": "gfx1201",
+  "baseline": {
+    "code_bytes": 588,
+    "code_sha256": "f250033c63276356702b284f0f64f7ad4342096034b1676003134f1ab6262f63",
+    "explicit_args": [
+      {
+        "class": "pointer",
+        "offset": 0,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 8,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 16,
+        "size": 8
+      },
+      {
+        "class": "value",
+        "offset": 24,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 28,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 32,
+        "size": 4
+      }
+    ],
+    "hipcc_argv": [
+      "/opt/rocm/core/bin/hipcc",
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "--rocm-path=/opt/rocm/core",
+      "--hip-path=/opt/rocm/core",
+      "-I/opt/rocm/core/include",
+      "-fmacro-prefix-map=/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/baseline/=",
+      "-o",
+      "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/baseline/gemm_f32_batched.hsaco",
+      "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/baseline/gemm_f32_batched.hip"
+    ],
+    "kernarg_bytes": 36,
+    "kernels_in_object": 1,
+    "lds_bytes": 0,
+    "max_flat_workgroup_size": 32,
+    "object_bytes": 8920,
+    "object_path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/baseline/gemm_f32_batched.hsaco",
+    "object_sha256": "21452069b60777c96554ab9eec8e2340c1f388d6bf4df6ee490fb9ab21cce3ae",
+    "occupancy_basis": "vgpr (gfx11 wave32: 1536 VGPR/SIMD, granule 8, 16 slots)",
+    "occupancy_waves_per_simd": 16,
+    "scratch_bytes": 0,
+    "sgpr_spill": 0,
+    "sgprs": 20,
+    "source_path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/baseline/gemm_f32_batched.hip",
+    "spill": 0,
+    "symbol": "gemm_f32_batched",
+    "vgpr_spill": 0,
+    "vgprs": 9,
+    "vgprs_allocated": 16,
+    "wavefront_size": 32
+  },
+  "baseline_co": {
+    "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/baseline.co",
+    "sha256": "21452069b60777c96554ab9eec8e2340c1f388d6bf4df6ee490fb9ab21cce3ae",
+    "sidecar": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/baseline.co.json"
+  },
+  "candidate": {
+    "code_bytes": 14924,
+    "code_sha256": "2f8e669def9681fbc9d2fd0fb0541a6fb1d23f5dbd10e28a8f6b5d979b496838",
+    "explicit_args": [
+      {
+        "class": "pointer",
+        "offset": 0,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 8,
+        "size": 8
+      },
+      {
+        "class": "pointer",
+        "offset": 16,
+        "size": 8
+      },
+      {
+        "class": "value",
+        "offset": 24,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 28,
+        "size": 4
+      },
+      {
+        "class": "value",
+        "offset": 32,
+        "size": 4
+      }
+    ],
+    "hipcc_argv": [
+      "/opt/rocm/core/bin/hipcc",
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "--rocm-path=/opt/rocm/core",
+      "--hip-path=/opt/rocm/core",
+      "-I/opt/rocm/core/include",
+      "-fmacro-prefix-map=/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/candidate/=",
+      "-o",
+      "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/candidate/gemm_f32_tiled_rows.hsaco",
+      "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/candidate/gemm_f32_tiled_rows.hip"
+    ],
+    "kernarg_bytes": 296,
+    "kernels_in_object": 2,
+    "lds_bytes": 16384,
+    "max_flat_workgroup_size": 256,
+    "object_bytes": 30528,
+    "object_path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/candidate/gemm_f32_tiled_rows.hsaco",
+    "object_sha256": "04b5dce9db6159f28dd6b772a5f7c345aaf1b067e4da3c1e5a1424ffff07a349",
+    "occupancy_basis": "vgpr (gfx11 wave32: 1536 VGPR/SIMD, granule 8, 16 slots)",
+    "occupancy_waves_per_simd": 12,
+    "scratch_bytes": 0,
+    "sgpr_spill": 0,
+    "sgprs": 44,
+    "source_path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/candidate/gemm_f32_tiled_rows.hip",
+    "spill": 0,
+    "symbol": "gemm_f32_tiled_rows",
+    "vgpr_spill": 0,
+    "vgprs": 120,
+    "vgprs_allocated": 120,
+    "wavefront_size": 32
+  },
+  "candidate_co": {
+    "path": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/candidate.co",
+    "sha256": "04b5dce9db6159f28dd6b772a5f7c345aaf1b067e4da3c1e5a1424ffff07a349",
+    "sidecar": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128/candidate.co.json"
+  },
+  "candidate_geometry_arg": "",
+  "candidate_header": {},
+  "clipped_classes": [],
+  "contract": {
+    "admit": {
+      "kill_env": "HIPFIRE_F32_TILED_ROWS",
+      "max_rows": null,
+      "min_rows": 512,
+      "predicate": "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::F32_TILED_ROWS_MIN_N"
+    },
+    "arch": "gfx1201",
+    "digest": "018828df59cdfe37051a3de4cbbfd328063d544f5e9ec2c2649c599de71ff28b",
+    "explicit_bytes": 36,
+    "hidden_words": 13,
+    "id": "generic_gemm.f32_tiled_rows.mpw16",
+    "module": "gemm_f32_tiled_rows",
+    "numeric": "generic_gemm.f32.lane_strided_fma.shfl_tree32",
+    "segment_bytes": 296,
+    "symbol": "gemm_f32_tiled_rows",
+    "version": 1,
+    "work_op_class": "gemm"
+  },
+  "contract_vs": {
+    "admit": {
+      "kill_env": null,
+      "max_rows": null,
+      "min_rows": 1,
+      "predicate": "crates/hipfire-dispatch/src/pipeline/stream_mix.rs::F32_TILED_ROWS_MIN_N"
+    },
+    "arch": "gfx1201",
+    "digest": "8a5ea50f39b3c0a0aec0694693e294a6f559dc9e1179f2ddd90fe12b0ff02e08",
+    "explicit_bytes": 36,
+    "hidden_words": 0,
+    "id": "generic_gemm.f32_batched.wave_per_output",
+    "module": "gemm_f32_batched",
+    "numeric": "generic_gemm.f32.lane_strided_fma.shfl_tree32",
+    "segment_bytes": 36,
+    "symbol": "gemm_f32_batched",
+    "version": 1,
+    "work_op_class": "gemm"
+  },
+  "device": {
+    "arch": "gfx1201",
+    "device_id": 0,
+    "fabric_job": "1218829:140891721:A",
+    "uuid": "GPU-9eb7aeda51c88ffd"
+  },
+  "error": null,
+  "identical_code": false,
+  "identical_to_baseline": true,
+  "llc_bytes": 67108864,
+  "module": "gemm_f32_batched",
+  "node": "contract:gemm_f32_tiled_rows",
+  "offline": false,
+  "out_dir": "/home/kaden/qcal/release-0.4.3/pmrip/ev/s2/m128/tiled_vs_batched_m128",
+  "regime": "pool",
+  "rowclasses": [
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 1321472,
+      "footprint_bytes": 1321472,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          1,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          1,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          1,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          1,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 512
+      },
+      "identity_mode": "full",
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio_median": 9.806263367743295,
+      "regime": "hot",
+      "rows": 1,
+      "same_geometry": false,
+      "shape": "M128-K2560-N1",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 10240,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 512,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 1
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3345Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "S: 15Mhz * | 1: 500Mhz  | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000244140625,
+        "ratio_max": 9.837012296139239,
+        "ratio_median": 9.806263367743295,
+        "ratio_min": 9.774829775957723,
+        "rounds": [
+          {
+            "base_us": 18.67049979045987,
+            "cand_us": 183.6327500641346,
+            "ratio": 9.835449084119647,
+            "round": 0
+          },
+          {
+            "base_us": 17.5799997523427,
+            "cand_us": 172.25224897265434,
+            "ratio": 9.798194050014143,
+            "round": 1
+          },
+          {
+            "base_us": 17.550249584019184,
+            "cand_us": 172.56249859929085,
+            "ratio": 9.83248117202971,
+            "round": 2
+          },
+          {
+            "base_us": 17.559999600052834,
+            "cand_us": 171.86225205659866,
+            "ratio": 9.787144417479462,
+            "round": 3
+          },
+          {
+            "base_us": 17.580249812453985,
+            "cand_us": 172.63225093483925,
+            "ratio": 9.819669957849246,
+            "round": 4
+          },
+          {
+            "base_us": 17.5799997523427,
+            "cand_us": 172.24249988794327,
+            "ratio": 9.797639494562013,
+            "round": 5
+          },
+          {
+            "base_us": 17.59024988859892,
+            "cand_us": 172.60275036096573,
+            "ratio": 9.812410366770163,
+            "round": 6
+          },
+          {
+            "base_us": 17.610250040888786,
+            "cand_us": 173.23224619030952,
+            "ratio": 9.837012296139239,
+            "round": 7
+          },
+          {
+            "base_us": 17.620000056922436,
+            "cand_us": 172.2325012087822,
+            "ratio": 9.774829775957723,
+            "round": 8
+          },
+          {
+            "base_us": 17.640000209212303,
+            "cand_us": 172.87199944257736,
+            "ratio": 9.799999852171021,
+            "round": 9
+          },
+          {
+            "base_us": 17.620500177145004,
+            "cand_us": 173.22249710559845,
+            "ratio": 9.830736662644792,
+            "round": 10
+          },
+          {
+            "base_us": 17.610250040888786,
+            "cand_us": 172.5824996829033,
+            "ratio": 9.800116368716425,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 12,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 75.08363677048486,
+          "baseline_tflops": 0.037236363838132745,
+          "baseline_us": {
+            "max": 23.560000583529472,
+            "mean": 17.695547444746087,
+            "median": 17.59999990463257,
+            "min": 17.400000244379044,
+            "p90": 17.72099919617176
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 7.6340655143213265,
+          "candidate_tflops": 0.0037859759234139087,
+          "candidate_us": {
+            "max": 205.5629938840866,
+            "mean": 173.4982246160507,
+            "median": 173.1019988656044,
+            "min": 165.76199233531952,
+            "p90": 178.44200134277344
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1321472.0,
+        "flops": 655360.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 1332224,
+      "footprint_bytes": 1332224,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          2,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          2,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          1,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          1,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 1024
+      },
+      "identity_mode": "full",
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio_median": 9.898013738501742,
+      "regime": "hot",
+      "rows": 2,
+      "same_geometry": false,
+      "shape": "M128-K2560-N2",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 20480,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 1024,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 2
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3341Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3357Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000244140625,
+        "ratio_max": 9.93628501542549,
+        "ratio_median": 9.898013738501742,
+        "ratio_min": 9.823717278449708,
+        "rounds": [
+          {
+            "base_us": 17.67025049775839,
+            "cand_us": 174.382496625185,
+            "ratio": 9.86870540671208,
+            "round": 0
+          },
+          {
+            "base_us": 17.720000818371773,
+            "cand_us": 175.20249634981155,
+            "ratio": 9.887273603744127,
+            "round": 1
+          },
+          {
+            "base_us": 17.700000666081905,
+            "cand_us": 175.87225139141083,
+            "ratio": 9.93628501542549,
+            "round": 2
+          },
+          {
+            "base_us": 17.710749991238117,
+            "cand_us": 174.4229979813099,
+            "ratio": 9.848425282249517,
+            "round": 3
+          },
+          {
+            "base_us": 17.690750770270824,
+            "cand_us": 175.13249814510345,
+            "ratio": 9.899664543316744,
+            "round": 4
+          },
+          {
+            "base_us": 17.680500634014606,
+            "cand_us": 175.16224831342697,
+            "ratio": 9.907086452995642,
+            "round": 5
+          },
+          {
+            "base_us": 17.660250421613455,
+            "cand_us": 174.90224912762642,
+            "ratio": 9.903724180126728,
+            "round": 6
+          },
+          {
+            "base_us": 17.680000513792038,
+            "cand_us": 175.52275210618973,
+            "ratio": 9.92775718356262,
+            "round": 7
+          },
+          {
+            "base_us": 17.680000513792038,
+            "cand_us": 174.41299930214882,
+            "ratio": 9.864988361628752,
+            "round": 8
+          },
+          {
+            "base_us": 17.660250421613455,
+            "cand_us": 174.772247672081,
+            "ratio": 9.896362933686738,
+            "round": 9
+          },
+          {
+            "base_us": 17.66050048172474,
+            "cand_us": 175.23249611258507,
+            "ratio": 9.922283702770336,
+            "round": 10
+          },
+          {
+            "base_us": 17.700249794870615,
+            "cand_us": 173.88224974274635,
+            "ratio": 9.823717278449708,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 12,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 75.35203400931702,
+          "baseline_tflops": 0.07413574445190298,
+          "baseline_us": {
+            "max": 27.160000056028366,
+            "mean": 17.718760101124765,
+            "median": 17.680000513792038,
+            "min": 17.480000853538513,
+            "p90": 17.799999564886093
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 7.629165513969702,
+          "candidate_tflops": 0.0075060198753891,
+          "candidate_us": {
+            "max": 181.32300674915314,
+            "mean": 174.8746079454819,
+            "median": 174.62250590324402,
+            "min": 168.28200221061707,
+            "p90": 180.4029941558838
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1332224.0,
+        "flops": 1310720.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 1353728,
+      "footprint_bytes": 1353728,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          4,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          4,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          1,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          1,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 2048
+      },
+      "identity_mode": "full",
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio_median": 10.044689307678873,
+      "regime": "hot",
+      "rows": 4,
+      "same_geometry": false,
+      "shape": "M128-K2560-N4",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 40960,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 2048,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 4
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3368Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3355Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000244140625,
+        "ratio_max": 10.093152902770727,
+        "ratio_median": 10.044689307678873,
+        "ratio_min": 9.988263018129816,
+        "rounds": [
+          {
+            "base_us": 17.66050048172474,
+            "cand_us": 177.74274945259094,
+            "ratio": 10.064423125297095,
+            "round": 0
+          },
+          {
+            "base_us": 17.720000818371773,
+            "cand_us": 177.9327541589737,
+            "ratio": 10.041351351095665,
+            "round": 1
+          },
+          {
+            "base_us": 17.680500634014606,
+            "cand_us": 178.4519962966442,
+            "ratio": 10.093152902770727,
+            "round": 2
+          },
+          {
+            "base_us": 17.680500634014606,
+            "cand_us": 177.0227514207363,
+            "ratio": 10.012315549491362,
+            "round": 3
+          },
+          {
+            "base_us": 17.700000666081905,
+            "cand_us": 177.7927502989769,
+            "ratio": 10.044787774481668,
+            "round": 4
+          },
+          {
+            "base_us": 17.66050048172474,
+            "cand_us": 177.64199897646904,
+            "ratio": 10.058718276998704,
+            "round": 5
+          },
+          {
+            "base_us": 17.640000209212303,
+            "cand_us": 177.00224742293358,
+            "ratio": 10.034140891364391,
+            "round": 6
+          },
+          {
+            "base_us": 17.640000209212303,
+            "cand_us": 177.6524968445301,
+            "ratio": 10.071003103035848,
+            "round": 7
+          },
+          {
+            "base_us": 17.64050032943487,
+            "cand_us": 177.03275009989738,
+            "ratio": 10.035585544277405,
+            "round": 8
+          },
+          {
+            "base_us": 17.66050048172474,
+            "cand_us": 177.39250138401985,
+            "ratio": 10.044590840876076,
+            "round": 9
+          },
+          {
+            "base_us": 17.66000036150217,
+            "cand_us": 177.90275067090988,
+            "ratio": 10.073768234950215,
+            "round": 10
+          },
+          {
+            "base_us": 17.680000513792038,
+            "cand_us": 176.59249529242516,
+            "ratio": 9.988263018129816,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 12,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 76.56832356673105,
+          "baseline_tflops": 0.14827148890380595,
+          "baseline_us": {
+            "max": 17.96099916100502,
+            "mean": 17.674286744246917,
+            "median": 17.680000513792038,
+            "min": 17.480000853538513,
+            "p90": 17.760999500751495
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 7.622213315656291,
+          "candidate_tflops": 0.014760110505355601,
+          "candidate_us": {
+            "max": 184.36199426651,
+            "mean": 177.43886951357103,
+            "median": 177.60300636291504,
+            "min": 170.68199813365936,
+            "p90": 183.0430030822754
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1353728.0,
+        "flops": 2621440.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 1396736,
+      "footprint_bytes": 1396736,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          8,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          8,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          2,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          2,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 4096
+      },
+      "identity_mode": "full",
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio_median": 9.853532725809494,
+      "regime": "hot",
+      "rows": 8,
+      "same_geometry": false,
+      "shape": "M128-K2560-N8",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 81920,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 4096,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 8
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3379Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3376Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000244140625,
+        "ratio_max": 9.873879000397347,
+        "ratio_median": 9.853532725809494,
+        "ratio_min": 9.840386970797086,
+        "rounds": [
+          {
+            "base_us": 17.779999412596226,
+            "cand_us": 175.49224942922592,
+            "ratio": 9.87020558082238,
+            "round": 0
+          },
+          {
+            "base_us": 17.799999564886093,
+            "cand_us": 175.55250227451324,
+            "ratio": 9.862500368866534,
+            "round": 1
+          },
+          {
+            "base_us": 17.799999564886093,
+            "cand_us": 175.44200271368027,
+            "ratio": 9.856292528218551,
+            "round": 2
+          },
+          {
+            "base_us": 17.780499532818794,
+            "cand_us": 175.56250095367432,
+            "ratio": 9.873879000397347,
+            "round": 3
+          },
+          {
+            "base_us": 17.800249624997377,
+            "cand_us": 175.4324994981289,
+            "ratio": 9.855620184773377,
+            "round": 4
+          },
+          {
+            "base_us": 17.80049968510866,
+            "cand_us": 175.54299905896187,
+            "ratio": 9.86168939997879,
+            "round": 5
+          },
+          {
+            "base_us": 17.81024970114231,
+            "cand_us": 175.44250190258026,
+            "ratio": 9.850648073245585,
+            "round": 6
+          },
+          {
+            "base_us": 17.839999869465828,
+            "cand_us": 175.55250227451324,
+            "ratio": 9.840386970797086,
+            "round": 7
+          },
+          {
+            "base_us": 17.83024985343218,
+            "cand_us": 175.4624992609024,
+            "ratio": 9.840720163948085,
+            "round": 8
+          },
+          {
+            "base_us": 17.83024985343218,
+            "cand_us": 175.62249675393105,
+            "ratio": 9.849693537531957,
+            "round": 9
+          },
+          {
+            "base_us": 17.82049983739853,
+            "cand_us": 175.45249685645103,
+            "ratio": 9.845542967781533,
+            "round": 10
+          },
+          {
+            "base_us": 17.81999971717596,
+            "cand_us": 175.55275186896324,
+            "ratio": 9.85144526684561,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 12,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 78.4683165248683,
+          "baseline_tflops": 0.29454382742472557,
+          "baseline_us": {
+            "max": 18.12100037932396,
+            "mean": 17.813825779594467,
+            "median": 17.799999564886093,
+            "min": 17.59999990463257,
+            "p90": 17.920000478625298
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 7.959380532944649,
+          "candidate_tflops": 0.029876853613399267,
+          "candidate_us": {
+            "max": 181.6830039024353,
+            "mean": 175.6150204936663,
+            "median": 175.48300325870514,
+            "min": 170.0029969215393,
+            "p90": 179.92199957370758
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1396736.0,
+        "flops": 5242880.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 1482752,
+      "footprint_bytes": 1482752,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          16,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          16,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          4,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          4,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 8192
+      },
+      "identity_mode": "full",
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio_median": 9.052626329282745,
+      "regime": "hot",
+      "rows": 16,
+      "same_geometry": false,
+      "shape": "M128-K2560-N16",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 163840,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 8192,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 16
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3376Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3381Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000244140625,
+        "ratio_max": 9.120940769757281,
+        "ratio_median": 9.052626329282745,
+        "ratio_min": 9.000516187398334,
+        "rounds": [
+          {
+            "base_us": 19.100250210613012,
+            "cand_us": 174.2122508585453,
+            "ratio": 9.120940769757281,
+            "round": 0
+          },
+          {
+            "base_us": 19.27049970254302,
+            "cand_us": 174.51250180602074,
+            "ratio": 9.055940660583456,
+            "round": 1
+          },
+          {
+            "base_us": 19.22075031325221,
+            "cand_us": 174.26275089383125,
+            "ratio": 9.0663864861551,
+            "round": 2
+          },
+          {
+            "base_us": 19.28024971857667,
+            "cand_us": 174.47299510240555,
+            "ratio": 9.049311997982032,
+            "round": 3
+          },
+          {
+            "base_us": 19.270249642431736,
+            "cand_us": 174.27249625325203,
+            "ratio": 9.043603455427803,
+            "round": 4
+          },
+          {
+            "base_us": 19.240749534219503,
+            "cand_us": 174.51249808073044,
+            "ratio": 9.069942819553964,
+            "round": 5
+          },
+          {
+            "base_us": 19.260249566286802,
+            "cand_us": 174.47249591350555,
+            "ratio": 9.058683030717459,
+            "round": 6
+          },
+          {
+            "base_us": 19.370250403881073,
+            "cand_us": 174.34225231409073,
+            "ratio": 9.000516187398334,
+            "round": 7
+          },
+          {
+            "base_us": 19.32050008326769,
+            "cand_us": 174.29250106215477,
+            "ratio": 9.021117482000319,
+            "round": 8
+          },
+          {
+            "base_us": 19.270249642431736,
+            "cand_us": 174.61275309324265,
+            "ratio": 9.061260561397068,
+            "round": 9
+          },
+          {
+            "base_us": 19.300249870866537,
+            "cand_us": 174.30200055241585,
+            "ratio": 9.031074816058332,
+            "round": 10
+          },
+          {
+            "base_us": 19.299999810755253,
+            "cand_us": 174.34274777770042,
+            "ratio": 9.033303082238632,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 12,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 76.9062254287416,
+          "baseline_tflops": 0.5438672295513217,
+          "baseline_us": {
+            "max": 40.35999998450279,
+            "mean": 19.310766624597218,
+            "median": 19.279999658465385,
+            "min": 18.44000071287155,
+            "p90": 19.520999863743782
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 8.496050810228631,
+          "candidate_tflops": 0.06008256926570524,
+          "candidate_us": {
+            "max": 181.04299902915955,
+            "mean": 174.49386461327475,
+            "median": 174.5224967598915,
+            "min": 169.32299733161926,
+            "p90": 178.88200283050537
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1482752.0,
+        "flops": 10485760.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 1654784,
+      "footprint_bytes": 1654784,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          32,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          32,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          8,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          8,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 16384
+      },
+      "identity_mode": "full",
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio_median": 5.701844449412503,
+      "regime": "hot",
+      "rows": 32,
+      "same_geometry": false,
+      "shape": "M128-K2560-N32",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 327680,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 16384,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 32
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3370Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3382Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000244140625,
+        "ratio_max": 5.77426622698382,
+        "ratio_median": 5.701844449412503,
+        "ratio_min": 5.674330952623007,
+        "rounds": [
+          {
+            "base_us": 30.15024960041046,
+            "cand_us": 173.19224774837494,
+            "ratio": 5.744305604223493,
+            "round": 0
+          },
+          {
+            "base_us": 30.310750007629395,
+            "cand_us": 173.19249734282494,
+            "ratio": 5.713896795665939,
+            "round": 1
+          },
+          {
+            "base_us": 30.370500404387712,
+            "cand_us": 173.1324978172779,
+            "ratio": 5.700679788347016,
+            "round": 2
+          },
+          {
+            "base_us": 30.360750388354063,
+            "cand_us": 173.19249734282494,
+            "ratio": 5.704486718129965,
+            "round": 3
+          },
+          {
+            "base_us": 30.420499853789806,
+            "cand_us": 173.17300289869308,
+            "ratio": 5.692641597968978,
+            "round": 4
+          },
+          {
+            "base_us": 30.400500167161226,
+            "cand_us": 172.50249907374382,
+            "ratio": 5.674330952623007,
+            "round": 5
+          },
+          {
+            "base_us": 30.400500632822514,
+            "cand_us": 173.16249758005142,
+            "ratio": 5.696040985361045,
+            "round": 6
+          },
+          {
+            "base_us": 30.450250022113323,
+            "cand_us": 173.16224426031113,
+            "ratio": 5.686726517337582,
+            "round": 7
+          },
+          {
+            "base_us": 30.36050032824278,
+            "cand_us": 173.09299856424332,
+            "ratio": 5.701256457991372,
+            "round": 8
+          },
+          {
+            "base_us": 29.97999917715788,
+            "cand_us": 173.11249673366547,
+            "ratio": 5.77426622698382,
+            "round": 9
+          },
+          {
+            "base_us": 30.16025060787797,
+            "cand_us": 173.14224690198898,
+            "ratio": 5.740742978334656,
+            "round": 10
+          },
+          {
+            "base_us": 30.380500480532646,
+            "cand_us": 173.2427515089512,
+            "ratio": 5.702432440833634,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 12,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 54.57550846434384,
+          "baseline_tflops": 0.6916500082609912,
+          "baseline_us": {
+            "max": 56.92100152373314,
+            "mean": 30.359381625118395,
+            "median": 30.321000143885612,
+            "min": 29.48099933564663,
+            "p90": 30.64100071787834
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 9.55627687006735,
+          "candidate_tflops": 0.12110925142263572,
+          "candidate_us": {
+            "max": 178.40300500392914,
+            "mean": 173.0471909046174,
+            "median": 173.16199839115143,
+            "min": 169.68299448490143,
+            "p90": 176.64200067520142
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1654784.0,
+        "flops": 20971520.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 1998848,
+      "footprint_bytes": 1998848,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          64,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          64,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          16,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          16,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 32768
+      },
+      "identity_mode": "full",
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio_median": 3.380791134959297,
+      "regime": "hot",
+      "rows": 64,
+      "same_geometry": false,
+      "shape": "M128-K2560-N64",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 655360,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 32768,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 64
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3363Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3373Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000244140625,
+        "ratio_max": 3.4022278254439,
+        "ratio_median": 3.380791134959297,
+        "ratio_min": 3.364932695082195,
+        "rounds": [
+          {
+            "base_us": 50.54100044071674,
+            "cand_us": 171.9519980251789,
+            "ratio": 3.4022278254439,
+            "round": 0
+          },
+          {
+            "base_us": 50.830500200390816,
+            "cand_us": 171.97249829769135,
+            "ratio": 3.3832541017640647,
+            "round": 1
+          },
+          {
+            "base_us": 50.900498405098915,
+            "cand_us": 171.96249589323997,
+            "ratio": 3.378404952435864,
+            "round": 2
+          },
+          {
+            "base_us": 50.920248962938786,
+            "cand_us": 172.01250046491623,
+            "ratio": 3.3780765799105157,
+            "round": 3
+          },
+          {
+            "base_us": 50.800999626517296,
+            "cand_us": 171.75250127911568,
+            "ratio": 3.3808882215275085,
+            "round": 4
+          },
+          {
+            "base_us": 50.86074955761433,
+            "cand_us": 172.0230020582676,
+            "ratio": 3.382234897332813,
+            "round": 5
+          },
+          {
+            "base_us": 50.88075064122677,
+            "cand_us": 172.01225087046623,
+            "ratio": 3.3806940483910854,
+            "round": 6
+          },
+          {
+            "base_us": 50.90099945664406,
+            "cand_us": 171.94250226020813,
+            "ratio": 3.377978902097268,
+            "round": 7
+          },
+          {
+            "base_us": 50.86074955761433,
+            "cand_us": 171.14299908280373,
+            "ratio": 3.364932695082195,
+            "round": 8
+          },
+          {
+            "base_us": 50.77099986374378,
+            "cand_us": 171.75249755382538,
+            "ratio": 3.3828858603290186,
+            "round": 9
+          },
+          {
+            "base_us": 50.89024920016527,
+            "cand_us": 172.08199948072433,
+            "ratio": 3.3814336181353477,
+            "round": 10
+          },
+          {
+            "base_us": 50.84099993109703,
+            "cand_us": 171.72300070524216,
+            "ratio": 3.377647979740212,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 12,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 39.315670476760225,
+          "baseline_tflops": 0.8249845608238211,
+          "baseline_us": {
+            "max": 73.4810009598732,
+            "mean": 50.88557475556951,
+            "median": 50.84099993109703,
+            "min": 49.92099851369858,
+            "p90": 51.121000200510025
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 11.668527567042783,
+          "candidate_tflops": 0.24484779157073386,
+          "candidate_us": {
+            "max": 174.76199567317963,
+            "mean": 171.8783854693176,
+            "median": 171.30250483751297,
+            "min": 169.88199949264526,
+            "p90": 173.92300069332123
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 1998848.0,
+        "flops": 41943040.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 2686976,
+      "footprint_bytes": 2686976,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          128,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          128,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          32,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          32,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 65536
+      },
+      "identity_mode": "full",
+      "p_faster": 1.0,
+      "p_slower": 0.000244140625,
+      "ratio_median": 1.8557308358150686,
+      "regime": "hot",
+      "rows": 128,
+      "same_geometry": false,
+      "shape": "M128-K2560-N128",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 65536,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 128
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3340Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3355Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 1.0,
+        "p_slower": 0.000244140625,
+        "ratio_max": 1.8593276053831158,
+        "ratio_median": 1.8557308358150686,
+        "ratio_min": 1.8532901385618916,
+        "rounds": [
+          {
+            "base_us": 91.84099733829498,
+            "cand_us": 170.76250165700912,
+            "ratio": 1.8593276053831158,
+            "round": 0
+          },
+          {
+            "base_us": 91.98150038719177,
+            "cand_us": 170.88250070810318,
+            "ratio": 1.857792055889297,
+            "round": 1
+          },
+          {
+            "base_us": 92.16149896383286,
+            "cand_us": 170.80199718475342,
+            "ratio": 1.8532901385618916,
+            "round": 2
+          },
+          {
+            "base_us": 92.05099754035473,
+            "cand_us": 170.83300277590752,
+            "ratio": 1.855851727201708,
+            "round": 3
+          },
+          {
+            "base_us": 92.01125055551529,
+            "cand_us": 170.75275257229805,
+            "ratio": 1.8557812391569857,
+            "round": 4
+          },
+          {
+            "base_us": 91.96124784648418,
+            "cand_us": 170.72200030088425,
+            "ratio": 1.8564558909191793,
+            "round": 5
+          },
+          {
+            "base_us": 92.02150255441666,
+            "cand_us": 170.76250165700912,
+            "ratio": 1.8556804324731515,
+            "round": 6
+          },
+          {
+            "base_us": 92.06100180745125,
+            "cand_us": 170.78199982643127,
+            "ratio": 1.8550960392938989,
+            "round": 7
+          },
+          {
+            "base_us": 91.991251334548,
+            "cand_us": 170.8424985408783,
+            "ratio": 1.8571602849445872,
+            "round": 8
+          },
+          {
+            "base_us": 92.1312514692545,
+            "cand_us": 170.8424985408783,
+            "ratio": 1.8543381948728968,
+            "round": 9
+          },
+          {
+            "base_us": 92.0414999127388,
+            "cand_us": 170.74250429868698,
+            "ratio": 1.855059994247831,
+            "round": 10
+          },
+          {
+            "base_us": 92.04124845564365,
+            "cand_us": 170.74250429868698,
+            "ratio": 1.8550650622798852,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 0,
+        "rounds_slower": 12,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 29.19325060428279,
+          "baseline_tflops": 0.9113990432556578,
+          "baseline_us": {
+            "max": 93.00100058317184,
+            "mean": 92.02313064908016,
+            "median": 92.0410007238388,
+            "min": 91.16099774837494,
+            "p90": 92.36100316047668
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 15.735118185376926,
+          "candidate_tflops": 0.49124271408006015,
+          "candidate_us": {
+            "max": 172.76300489902496,
+            "mean": 170.84655546893686,
+            "median": 170.76300084590912,
+            "min": 170.52200436592102,
+            "p90": 171.04299366474152
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 2686976.0,
+        "flops": 83886080.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": false
+      },
+      "bytes_per_call": 4063232,
+      "footprint_bytes": 4063232,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          256,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          256,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          64,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          64,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 131072
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio_median": 0.9807494058106325,
+      "regime": "hot",
+      "rows": 256,
+      "same_geometry": false,
+      "shape": "M128-K2560-N256",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 2621440,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 131072,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 256
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3288Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3356Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000244140625,
+        "p_slower": 1.0,
+        "ratio_max": 0.9853103773724455,
+        "ratio_median": 0.9807494058106325,
+        "ratio_min": 0.9780931217268152,
+        "rounds": [
+          {
+            "base_us": 174.27299916744232,
+            "cand_us": 171.7129945755005,
+            "ratio": 0.9853103773724455,
+            "round": 0
+          },
+          {
+            "base_us": 174.9427504837513,
+            "cand_us": 171.62249982357025,
+            "ratio": 0.9810209302700461,
+            "round": 1
+          },
+          {
+            "base_us": 175.28225108981133,
+            "cand_us": 171.62249982357025,
+            "ratio": 0.9791208109007803,
+            "round": 2
+          },
+          {
+            "base_us": 175.38275197148323,
+            "cand_us": 171.72299697995186,
+            "ratio": 0.9791327542167519,
+            "round": 3
+          },
+          {
+            "base_us": 174.88249763846397,
+            "cand_us": 171.51200026273727,
+            "ratio": 0.9807270743428278,
+            "round": 4
+          },
+          {
+            "base_us": 174.82300102710724,
+            "cand_us": 171.89299687743187,
+            "ratio": 0.9832401678700101,
+            "round": 5
+          },
+          {
+            "base_us": 175.26274919509888,
+            "cand_us": 171.89275100827217,
+            "ratio": 0.9807717372784374,
+            "round": 6
+          },
+          {
+            "base_us": 175.73275044560432,
+            "cand_us": 171.8829944729805,
+            "ratio": 0.9780931217268152,
+            "round": 7
+          },
+          {
+            "base_us": 175.55249482393265,
+            "cand_us": 172.3024994134903,
+            "ratio": 0.9814870451502163,
+            "round": 8
+          },
+          {
+            "base_us": 175.28199777007103,
+            "cand_us": 172.27275297045708,
+            "ratio": 0.9828319802495554,
+            "round": 9
+          },
+          {
+            "base_us": 175.66249892115593,
+            "cand_us": 172.20250144600868,
+            "ratio": 0.9803031523723215,
+            "round": 10
+          },
+          {
+            "base_us": 175.8822500705719,
+            "cand_us": 172.36249893903732,
+            "ratio": 0.9799880253401222,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 12,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 23.24463490169179,
+          "baseline_tflops": 0.9597784733601772,
+          "baseline_us": {
+            "max": 204.32299375534058,
+            "mean": 175.31759288162007,
+            "median": 174.8030036687851,
+            "min": 171.68299853801727,
+            "p90": 178.20300161838531
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 23.628523880907178,
+          "candidate_tflops": 0.975629373147135,
+          "candidate_us": {
+            "max": 178.8029968738556,
+            "mean": 172.5063653662804,
+            "median": 171.96300625801086,
+            "min": 171.24199867248535,
+            "p90": 174.92200434207916
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 4063232.0,
+        "flops": 167772160.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 6815744,
+      "footprint_bytes": 6815744,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          512,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          512,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          128,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          128,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 262144
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio_median": 0.5327245115179537,
+      "regime": "hot",
+      "rows": 512,
+      "same_geometry": false,
+      "shape": "M128-K2560-N512",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 5242880,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 262144,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 512
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3237Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3333Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000244140625,
+        "p_slower": 1.0,
+        "ratio_max": 0.5366310317281183,
+        "ratio_median": 0.5327245115179537,
+        "ratio_min": 0.527720427057896,
+        "rounds": [
+          {
+            "base_us": 333.5047513246536,
+            "cand_us": 177.5529980659485,
+            "ratio": 0.5323852129863892,
+            "round": 0
+          },
+          {
+            "base_us": 334.78474617004395,
+            "cand_us": 176.67274922132492,
+            "ratio": 0.527720427057896,
+            "round": 1
+          },
+          {
+            "base_us": 332.9145014286041,
+            "cand_us": 176.5725016593933,
+            "ratio": 0.5303839301132413,
+            "round": 2
+          },
+          {
+            "base_us": 333.3844989538193,
+            "cand_us": 176.91300064325333,
+            "ratio": 0.530657547661685,
+            "round": 3
+          },
+          {
+            "base_us": 333.4349989891052,
+            "cand_us": 177.24249884486198,
+            "ratio": 0.5315653707085898,
+            "round": 4
+          },
+          {
+            "base_us": 333.31499993801117,
+            "cand_us": 177.05275118350983,
+            "ratio": 0.5311874689601054,
+            "round": 5
+          },
+          {
+            "base_us": 332.9849988222122,
+            "cand_us": 177.50225216150284,
+            "ratio": 0.5330638100495184,
+            "round": 6
+          },
+          {
+            "base_us": 333.25474709272385,
+            "cand_us": 177.71224677562714,
+            "ratio": 0.5332624616032281,
+            "round": 7
+          },
+          {
+            "base_us": 333.2349956035614,
+            "cand_us": 177.82225087285042,
+            "ratio": 0.5336241787894319,
+            "round": 8
+          },
+          {
+            "base_us": 332.37501233816147,
+            "cand_us": 178.36274579167366,
+            "ratio": 0.5366310317281183,
+            "round": 9
+          },
+          {
+            "base_us": 333.22425186634064,
+            "cand_us": 178.30274999141693,
+            "ratio": 0.5350833530055784,
+            "round": 10
+          },
+          {
+            "base_us": 333.2647532224655,
+            "cand_us": 178.312998265028,
+            "ratio": 0.5350490759699332,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 12,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 20.452651389113804,
+          "baseline_tflops": 1.0068997606948333,
+          "baseline_us": {
+            "max": 343.60501170158386,
+            "mean": 333.61764932672213,
+            "median": 333.24500918388367,
+            "min": 328.7239968776703,
+            "p90": 337.7639949321747
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 38.402453370780265,
+          "candidate_tflops": 1.8905823197922593,
+          "candidate_us": {
+            "max": 251.24400854110718,
+            "mean": 177.87203771372592,
+            "median": 177.4819940328598,
+            "min": 175.28299987316132,
+            "p90": 179.52199280261993
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 6815744.0,
+        "flops": 335544320.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 12320768,
+      "footprint_bytes": 12320768,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          1024,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          1024,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          256,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          256,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 524288
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio_median": 0.4861239274491973,
+      "regime": "hot",
+      "rows": 1024,
+      "same_geometry": false,
+      "shape": "M128-K2560-N1024",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 10485760,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 524288,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 1024
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3144Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3090Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000244140625,
+        "p_slower": 1.0,
+        "ratio_max": 0.4892253926567889,
+        "ratio_median": 0.4861239274491973,
+        "ratio_min": 0.4809054558317573,
+        "rounds": [
+          {
+            "base_us": 667.729988694191,
+            "cand_us": 321.11499458551407,
+            "ratio": 0.4809054558317573,
+            "round": 0
+          },
+          {
+            "base_us": 669.0297573804855,
+            "cand_us": 322.2445026040077,
+            "ratio": 0.4816594464582885,
+            "round": 1
+          },
+          {
+            "base_us": 667.1697348356247,
+            "cand_us": 323.17450642585754,
+            "ratio": 0.48439623314969515,
+            "round": 2
+          },
+          {
+            "base_us": 668.1195050477982,
+            "cand_us": 323.7547501921654,
+            "ratio": 0.48457610913335564,
+            "round": 3
+          },
+          {
+            "base_us": 669.4595217704773,
+            "cand_us": 324.66425746679306,
+            "ratio": 0.484964731860373,
+            "round": 4
+          },
+          {
+            "base_us": 670.2800095081329,
+            "cand_us": 325.6950005888939,
+            "ratio": 0.4859088678892519,
+            "round": 5
+          },
+          {
+            "base_us": 671.6194897890091,
+            "cand_us": 326.6347423195839,
+            "ratio": 0.48633898700914263,
+            "round": 6
+          },
+          {
+            "base_us": 672.6497560739517,
+            "cand_us": 327.8747424483299,
+            "ratio": 0.48743754009818313,
+            "round": 7
+          },
+          {
+            "base_us": 673.3395010232925,
+            "cand_us": 328.8250043988228,
+            "ratio": 0.4883494936790406,
+            "round": 8
+          },
+          {
+            "base_us": 673.8599985837936,
+            "cand_us": 329.4849991798401,
+            "ratio": 0.4889517108483908,
+            "round": 9
+          },
+          {
+            "base_us": 673.4600067138672,
+            "cand_us": 329.28499579429626,
+            "ratio": 0.48894513781306026,
+            "round": 10
+          },
+          {
+            "base_us": 672.8897392749786,
+            "cand_us": 329.1947469115257,
+            "ratio": 0.4892253926567889,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 12,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 18.32547647648891,
+          "baseline_tflops": 0.9981536123364173,
+          "baseline_us": {
+            "max": 684.9700212478638,
+            "mean": 670.82388078173,
+            "median": 672.3300218582153,
+            "min": 654.770016670227,
+            "p90": 678.5299777984619
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 37.73768111076347,
+          "candidate_tflops": 2.055499226458606,
+          "candidate_us": {
+            "max": 336.48499846458435,
+            "mean": 326.24836790064927,
+            "median": 326.4845013618469,
+            "min": 318.44499707221985,
+            "p90": 330.44499158859253
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 12320768.0,
+        "flops": 671088640.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 23330816,
+      "footprint_bytes": 23330816,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          2048,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          2048,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          512,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          512,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 1048576
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio_median": 0.3935612195402841,
+      "regime": "hot",
+      "rows": 2048,
+      "same_geometry": false,
+      "shape": "M128-K2560-N2048",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 20971520,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 1048576,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 2048
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3128Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 2264Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000244140625,
+        "p_slower": 1.0,
+        "ratio_max": 0.39455433018464026,
+        "ratio_median": 0.3935612195402841,
+        "ratio_min": 0.3842377769762093,
+        "rounds": [
+          {
+            "base_us": 1342.8592383861542,
+            "cand_us": 515.9772485494614,
+            "ratio": 0.3842377769762093,
+            "round": 0
+          },
+          {
+            "base_us": 1323.4990239143372,
+            "cand_us": 520.3577280044556,
+            "ratio": 0.3931681992975429,
+            "round": 1
+          },
+          {
+            "base_us": 1322.009265422821,
+            "cand_us": 520.3177481889725,
+            "ratio": 0.39358101474618495,
+            "round": 2
+          },
+          {
+            "base_us": 1321.0490047931671,
+            "cand_us": 519.8875069618225,
+            "ratio": 0.39354142433438327,
+            "round": 3
+          },
+          {
+            "base_us": 1320.6492364406586,
+            "cand_us": 520.2879905700684,
+            "ratio": 0.39396379917828905,
+            "round": 4
+          },
+          {
+            "base_us": 1320.7989931106567,
+            "cand_us": 520.3475058078766,
+            "ratio": 0.39396419025304463,
+            "round": 5
+          },
+          {
+            "base_us": 1322.8289783000946,
+            "cand_us": 520.2372372150421,
+            "ratio": 0.39327626303104923,
+            "round": 6
+          },
+          {
+            "base_us": 1321.8995034694672,
+            "cand_us": 519.8377370834351,
+            "ratio": 0.3932505729210618,
+            "round": 7
+          },
+          {
+            "base_us": 1321.0392594337463,
+            "cand_us": 520.2177613973618,
+            "ratio": 0.3937943234331652,
+            "round": 8
+          },
+          {
+            "base_us": 1321.8392729759216,
+            "cand_us": 519.6077525615692,
+            "ratio": 0.3930945033822083,
+            "round": 9
+          },
+          {
+            "base_us": 1321.4092552661896,
+            "cand_us": 521.3677436113358,
+            "ratio": 0.39455433018464026,
+            "round": 10
+          },
+          {
+            "base_us": 1322.8590190410614,
+            "cand_us": 521.1174935102463,
+            "ratio": 0.3939327517213464,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 12,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 17.64599244249515,
+          "baseline_tflops": 1.015140239388485,
+          "baseline_us": {
+            "max": 1479.6220064163208,
+            "mean": 1323.0973165233934,
+            "median": 1322.159469127655,
+            "min": 1296.218991279602,
+            "p90": 1334.4589471817017
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 44.847333840009746,
+          "candidate_tflops": 2.5799814523690996,
+          "candidate_us": {
+            "max": 808.5319995880127,
+            "mean": 520.7699354489648,
+            "median": 520.2274918556213,
+            "min": 512.0469927787781,
+            "p90": 523.1670141220093
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 23330816.0,
+        "flops": 1342177280.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 45350912,
+      "footprint_bytes": 45350912,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          4096,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          4096,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          1024,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          1024,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 2097152
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio_median": 0.39337055960997835,
+      "regime": "hot",
+      "rows": 4096,
+      "same_geometry": false,
+      "shape": "M128-K2560-N4096",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 41943040,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 2097152,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 4096
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3077Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 2042Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000244140625,
+        "p_slower": 1.0,
+        "ratio_max": 0.3938040559882255,
+        "ratio_median": 0.39337055960997835,
+        "ratio_min": 0.3888072232511453,
+        "rounds": [
+          {
+            "base_us": 2681.9589734077454,
+            "cand_us": 1042.7650213241577,
+            "ratio": 0.3888072232511453,
+            "round": 0
+          },
+          {
+            "base_us": 2660.3782773017883,
+            "cand_us": 1046.7249751091003,
+            "ratio": 0.3934496774536555,
+            "round": 1
+          },
+          {
+            "base_us": 2663.5084748268127,
+            "cand_us": 1047.995239496231,
+            "ratio": 0.39346420309940033,
+            "round": 2
+          },
+          {
+            "base_us": 2662.0882749557495,
+            "cand_us": 1047.6952493190765,
+            "ratio": 0.39356142287824464,
+            "round": 3
+          },
+          {
+            "base_us": 2662.098705768585,
+            "cand_us": 1048.3452677726746,
+            "ratio": 0.3938040559882255,
+            "round": 4
+          },
+          {
+            "base_us": 2661.5185141563416,
+            "cand_us": 1047.5552380084991,
+            "ratio": 0.393593068181439,
+            "round": 5
+          },
+          {
+            "base_us": 2663.428544998169,
+            "cand_us": 1047.3752319812775,
+            "ratio": 0.39324322552156077,
+            "round": 6
+          },
+          {
+            "base_us": 2662.6582741737366,
+            "cand_us": 1047.2752749919891,
+            "ratio": 0.39331944513870243,
+            "round": 7
+          },
+          {
+            "base_us": 2666.7985320091248,
+            "cand_us": 1048.0349957942963,
+            "ratio": 0.39299369008003876,
+            "round": 8
+          },
+          {
+            "base_us": 2662.4487042427063,
+            "cand_us": 1047.4650263786316,
+            "ratio": 0.3934216740812542,
+            "round": 9
+          },
+          {
+            "base_us": 2662.888467311859,
+            "cand_us": 1046.5952455997467,
+            "ratio": 0.39303007183634203,
+            "round": 10
+          },
+          {
+            "base_us": 2672.448456287384,
+            "cand_us": 1047.124981880188,
+            "ratio": 0.391822330349029,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 12,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 17.092279740893183,
+          "baseline_tflops": 1.0117048817730996,
+          "baseline_us": {
+            "max": 2962.4030590057373,
+            "mean": 2659.5117761691363,
+            "median": 2653.298020362854,
+            "min": 2571.7968940734863,
+            "p90": 2701.678991317749
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 43.3078614787946,
+          "candidate_tflops": 2.563424864409576,
+          "candidate_us": {
+            "max": 1291.1789417266846,
+            "mean": 1048.36461553971,
+            "median": 1047.1750497817993,
+            "min": 1031.695008277893,
+            "p90": 1052.1750450134277
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 45350912.0,
+        "flops": 2684354560.0
+      }
+    },
+    {
+      "admitted": {
+        "baseline": true,
+        "candidate": true
+      },
+      "bytes_per_call": 177471488,
+      "footprint_bytes": 177471488,
+      "geometry_base": {
+        "block": [
+          32,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          4096,
+          16384,
+          1
+        ],
+        "grid_workgroups": [
+          128,
+          16384,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "geometry_cand": {
+        "block": [
+          256,
+          1,
+          1
+        ],
+        "grid_work_items": [
+          256,
+          4096,
+          1
+        ],
+        "grid_workgroups": [
+          1,
+          4096,
+          1
+        ],
+        "lds_dynamic_bytes": 0
+      },
+      "identical_to_baseline": true,
+      "identity": {
+        "baseline_repeatable": true,
+        "candidate_repeatable": true,
+        "differing_bytes": null,
+        "dispatch_changed_output": true,
+        "first_diff_byte": null,
+        "output_bytes": 8388608
+      },
+      "identity_mode": "full",
+      "p_faster": 0.000244140625,
+      "p_slower": 1.0,
+      "ratio_median": 0.26362844253372925,
+      "regime": "pool",
+      "rows": 16384,
+      "same_geometry": false,
+      "shape": "M128-K2560-N16384",
+      "shape_dims": {
+        "arch": "gfx1201",
+        "extent": "small emu shape over the full grid only (no production-extent cases for a contract node)",
+        "operands": [
+          {
+            "access": "read_only",
+            "bytes": 1310720,
+            "format": "f32.flat",
+            "name": "A",
+            "recipe": "F32"
+          },
+          {
+            "access": "read_only",
+            "bytes": 167772160,
+            "format": "f32.flat",
+            "name": "B",
+            "recipe": "F32"
+          },
+          {
+            "access": "write_only",
+            "bytes": 8388608,
+            "format": "f32.n_x_m",
+            "name": "Y",
+            "recipe": "Poison"
+          }
+        ],
+        "params": {
+          "K": 2560,
+          "M": 128,
+          "N": 16384
+        },
+        "timing_pool": {
+          "bytes_per_set": 169082880,
+          "dispatch_i_uses_set": "i % sets",
+          "sets": 3,
+          "total_bytes": 507248640
+        }
+      },
+      "timing": {
+        "clock_note": {
+          "after": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 3172Mhz * | 2: 2350Mhz"
+          },
+          "before": {
+            "bus_id": "0000:03:00.0",
+            "perf_level": "auto",
+            "sclk_dpm": "0: 500Mhz  | 1: 1615Mhz * | 2: 2350Mhz"
+          },
+          "clocks_pinned": false,
+          "method": "ABBA-paired rounds cancel slow drift; sclk dpm table sampled before/after"
+        },
+        "p_faster": 0.000244140625,
+        "p_slower": 1.0,
+        "ratio_max": 0.2638452873320975,
+        "ratio_median": 0.26362844253372925,
+        "ratio_min": 0.26305330345877026,
+        "rounds": [
+          {
+            "base_us": 15202.44026184082,
+            "cand_us": 4000.5882382392883,
+            "ratio": 0.2631543468900215,
+            "round": 0
+          },
+          {
+            "base_us": 15201.69997215271,
+            "cand_us": 4000.0776648521423,
+            "ratio": 0.2631335753356335,
+            "round": 1
+          },
+          {
+            "base_us": 15195.300102233887,
+            "cand_us": 4009.20832157135,
+            "ratio": 0.2638452873320975,
+            "round": 2
+          },
+          {
+            "base_us": 15209.00011062622,
+            "cand_us": 4000.7777214050293,
+            "ratio": 0.26305330345877026,
+            "round": 3
+          },
+          {
+            "base_us": 15210.890531539917,
+            "cand_us": 4009.857952594757,
+            "ratio": 0.26361756691893096,
+            "round": 4
+          },
+          {
+            "base_us": 15211.080312728882,
+            "cand_us": 4011.618494987488,
+            "ratio": 0.26373001867793044,
+            "round": 5
+          },
+          {
+            "base_us": 15217.640399932861,
+            "cand_us": 4013.328433036804,
+            "ratio": 0.26372869430233814,
+            "round": 6
+          },
+          {
+            "base_us": 15223.379850387573,
+            "cand_us": 4014.1979455947876,
+            "ratio": 0.26368638141106293,
+            "round": 7
+          },
+          {
+            "base_us": 15219.250440597534,
+            "cand_us": 4013.9782428741455,
+            "ratio": 0.2637434910832934,
+            "round": 8
+          },
+          {
+            "base_us": 15222.180604934692,
+            "cand_us": 4013.088345527649,
+            "ratio": 0.2636342617185014,
+            "round": 9
+          },
+          {
+            "base_us": 15216.099977493286,
+            "cand_us": 4011.308193206787,
+            "ratio": 0.2636226233489571,
+            "round": 10
+          },
+          {
+            "base_us": 15220.870733261108,
+            "cand_us": 4012.1980905532837,
+            "ratio": 0.2635984603552086,
+            "round": 11
+          }
+        ],
+        "rounds_faster": 12,
+        "rounds_slower": 0,
+        "rounds_tied": 0,
+        "timing": {
+          "baseline_gbps": 11.66614684045916,
+          "baseline_tflops": 0.7058277320313252,
+          "baseline_us": {
+            "max": 16355.436325073242,
+            "mean": 15123.12811930974,
+            "median": 15212.519645690918,
+            "min": 13876.002311706543,
+            "p90": 15255.181312561035
+          },
+          "calls_per_arm": 1200,
+          "candidate_gbps": 44.259231587000855,
+          "candidate_tflops": 2.6777815743036264,
+          "candidate_us": {
+            "max": 7650.5608558654785,
+            "mean": 4017.7998614311214,
+            "median": 4009.8185539245605,
+            "min": 3966.1779403686523,
+            "p90": 4028.977870941162
+          },
+          "flush": false,
+          "n": 50,
+          "rounds": 12,
+          "unit": "us per launch: hipEvent pair on the default stream around one dispatch; device idle at the start (output reset + sync outside the interval), so launch latency is inside the interval for both arms"
+        }
+      },
+      "work": {
+        "bytes": 177471488.0,
+        "flops": 10737418240.0
+      }
+    }
+  ],
+  "rowclasses_requested": [
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    512,
+    1024,
+    2048,
+    4096,
+    16384
+  ],
+  "rows_param": "N",
+  "same_geometry": false,
+  "schema": 1,
+  "selection": "generic_gemm.f32_batched.wave_per_output",
+  "shape": "M=128,K=2560,vs=contract:gemm_f32_batched,pool=1",
+  "symbol": "gemm_f32_batched",
+  "tool": "hip_loop",
+  "vs": {
+    "baseline": {
+      "contract": "generic_gemm.f32_batched.wave_per_output",
+      "module": "gemm_f32_batched",
+      "symbol": "gemm_f32_batched"
+    },
+    "candidate": {
+      "contract": "generic_gemm.f32_tiled_rows.mpw16",
+      "module": "gemm_f32_tiled_rows",
+      "symbol": "gemm_f32_tiled_rows"
+    }
+  }
+}

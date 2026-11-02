@@ -59,8 +59,8 @@ use crate::dflash::{draft_forward, DflashConfig, DflashScratch, DflashWeights};
 use crate::hfq::HfqFile;
 use crate::llama;
 use crate::spec::{
-    accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecScratch, SpecStep,
-    SpecTarget, Speculator,
+    accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecScratch,
+    SpecStep, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -120,7 +120,7 @@ impl TreeMode {
 /// Target-generic chain-mode DFlash speculator.
 ///
 /// Owns the loaded draft weights/scratch/config, the cumulative target-hidden
-/// host buffer (`[committed_rows × num_extract × hidden]` f32, row-major,
+/// host buffer (`[committed_rows × feature_width]` f32, row-major,
 /// extract-layers ascending), and the arch-specific verify scratch the target
 /// minted via [`SpecTarget::new_spec_scratch`]. The target itself is borrowed
 /// per call — never owned — exactly like the qwen35 `DflashSpeculator`.
@@ -146,15 +146,21 @@ pub struct GenericDflashSpeculator {
     rng_state: u64,
     /// Per-request temperature from [`Speculator::set_sampling`]. Used only for
     /// the post-prefill first-token draw (`step` receives `temp` as an argument).
-    /// Default 0 → historical greedy argmax. top_p/top_k/cactus are accepted by
-    /// `set_sampling` for API parity with qwen35 but the shipped chain path is
-    /// temperature-only via [`naive_sample_chain`] (same as later verify/bonus).
+    /// Default 0 → historical greedy argmax.
     sample_temp: f32,
+    /// Per-request nucleus/top-k truncation from [`Speculator::set_sampling`].
+    /// Defaults `1.0` / `0` (disabled) so a speculator whose `set_sampling` is
+    /// never called behaves exactly as today — byte-identical draws via the
+    /// `top_k == 0 && top_p >= 0.999` fast path in [`crate::ddtree::naive_sample_chain`].
+    sample_top_p: f32,
+    sample_top_k: usize,
 }
 
 impl GenericDflashSpeculator {
-    fn num_extract(&self) -> usize {
-        self.config.num_extract()
+    /// Hidden rows (`h` wide) per feature row: `num_extract × streams`, so
+    /// `feature_rows() * hidden == config.feature_width()`.
+    fn feature_rows(&self) -> usize {
+        self.config.num_extract() * self.config.target_streams_per_layer
     }
 
     /// True one-token window: verify only `[seed]`, emit exactly one target
@@ -172,7 +178,7 @@ impl GenericDflashSpeculator {
         seed: u32,
         temp: f32,
     ) -> Result<SpecStep, String> {
-        let ne = self.num_extract();
+        let ne = self.feature_rows();
         let h = self.config.hidden;
         let vocab = self.config.vocab_size;
         let block = [seed];
@@ -204,8 +210,15 @@ impl GenericDflashSpeculator {
             )?;
             debug_assert_eq!(logits.len(), vocab);
             // Empty drafts → single bonus draw at row 0 (distribution-exact).
-            let (accepted, bonus) =
-                naive_sample_chain(&logits, &[], vocab, temp, &mut self.rng_state);
+            let (accepted, bonus) = naive_sample_chain(
+                &logits,
+                &[],
+                vocab,
+                temp,
+                self.sample_top_p,
+                self.sample_top_k,
+                &mut self.rng_state,
+            );
             debug_assert_eq!(
                 accepted, 0,
                 "empty-draft naive_sample_chain accepts nothing"
@@ -276,7 +289,7 @@ impl GenericDflashSpeculator {
         temp: f32,
         max_emit: usize,
     ) -> Result<SpecStep, String> {
-        let ne = self.num_extract();
+        let ne = self.feature_rows();
         let h = self.config.hidden;
         let depth = b - 1; // drafted positions = block_size - 1
 
@@ -470,6 +483,10 @@ impl GenericDflashSpeculator {
         // seed dropped), next_seed = bonus. emit.len() == accepted + 1 drives the
         // daemon's position += emit.len(). Pre-commit budget guarantees
         // emit.len() <= max_emit; cap_emit is defensive only.
+        if let Some(t) = self.scratch.online.as_mut() {
+            let committed: Vec<u32> = drafts[..accepted].iter().copied().chain([bonus]).collect();
+            t.observe(position, &committed, accepted);
+        }
         let emit = drafts[..accepted]
             .iter()
             .copied()
@@ -563,6 +580,9 @@ impl Speculator for GenericDflashSpeculator {
             (prompt_tokens, 0)
         };
 
+        if let Some(t) = self.scratch.online.as_mut() {
+            t.seed_prompt(prompt_tokens);
+        }
         if !cache_hit {
             // Cold start: drop both the cumulative host shadow and the draft's
             // upload/projection tracking so the first step re-uploads from row 0.
@@ -615,6 +635,8 @@ impl Speculator for GenericDflashSpeculator {
                         &[],
                         vocab,
                         self.sample_temp,
+                        self.sample_top_p,
+                        self.sample_top_k,
                         &mut self.rng_state,
                     );
                     debug_assert_eq!(
@@ -655,7 +677,7 @@ impl Speculator for GenericDflashSpeculator {
         let b = cfg_b.min(max_emit).max(2);
         assert!(b >= 2, "dflash block size must be >= 2");
         let h = self.config.hidden;
-        let ne = self.num_extract();
+        let ne = self.feature_rows();
 
         // ── 1. Build the masked block: [seed, MASK, …, MASK] ────────────────
         let mut block: Vec<u32> = vec![self.config.mask_token_id; b];
@@ -721,10 +743,24 @@ impl Speculator for GenericDflashSpeculator {
         let draft_logits = target.lm_head_logits(gpu, &draft_hidden, batch)?;
         debug_assert_eq!(draft_logits.len(), batch * self.config.vocab_size);
         let vocab = self.config.vocab_size;
-        let mut drafts: Vec<u32> = Vec::with_capacity(batch);
-        for i in 0..batch {
-            drafts.push(llama::argmax(&draft_logits[i * vocab..(i + 1) * vocab]));
-        }
+        let drafts: Vec<u32> = match self.scratch.online.as_mut().filter(|_| !self.tree.enabled) {
+            // Developer online draft tuner: re-rank the host top-K. Drafts stay
+            // deterministic, which both the greedy accept and the temp>0 naive
+            // sampling verify (exact for any deterministic draft) require.
+            Some(t) => {
+                let (ids, vals) = crate::dflash_online::top_k_rows(&draft_logits, vocab, batch);
+                let picks = t.propose(position, seed, &ids, &vals, batch);
+                if t.mode == crate::dflash_online::Mode::Sweep {
+                    // Always rejected: every cycle commits exactly one target token.
+                    vec![vocab as u32 - 1; batch]
+                } else {
+                    picks
+                }
+            }
+            None => (0..batch)
+                .map(|i| llama::argmax(&draft_logits[i * vocab..(i + 1) * vocab]))
+                .collect(),
+        };
         for (i, &d) in drafts.iter().enumerate() {
             block[i + 1] = d;
         }
@@ -780,8 +816,15 @@ impl Speculator for GenericDflashSpeculator {
             // token per row, accepts the matching draft prefix, and returns the
             // bonus at the divergence position. All emitted tokens are genuine
             // target draws → distribution-exact.
-            let (accepted, bonus) =
-                naive_sample_chain(&logits_per_pos, &drafts, vocab, temp, &mut self.rng_state);
+            let (accepted, bonus) = naive_sample_chain(
+                &logits_per_pos,
+                &drafts,
+                vocab,
+                temp,
+                self.sample_top_p,
+                self.sample_top_k,
+                &mut self.rng_state,
+            );
             // Pre-commit budget: emit = accepted + 1 ≤ max_emit. With b ≤ max_emit
             // this is defensive; if it binds, keep the walk's own boundary draw
             // (drafts[max_accept] — matched, since accepted > max_accept), never argmax.
@@ -888,7 +931,7 @@ impl Speculator for GenericDflashSpeculator {
                     .into(),
             );
         }
-        let ne = self.num_extract();
+        let ne = self.feature_rows();
         let h = self.config.hidden;
         let expected_len = self.target_hidden_host.len() + tokens.len() * ne * h;
         // Host is authoritative at `start_pos` rows going in (same invariant as step).
@@ -926,6 +969,22 @@ impl Speculator for GenericDflashSpeculator {
                 Ok(true)
             }
         }
+    }
+
+    fn supports_ar_step(&self) -> bool {
+        true
+    }
+
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        _emitted: &[u32],
+    ) -> Result<u32, String> {
+        self.step_one_token(gpu, target, position, seed, 0.0)
+            .map(|step| step.next_seed)
     }
 
     fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
@@ -969,14 +1028,27 @@ impl Speculator for GenericDflashSpeculator {
         false
     }
 
-    fn set_sampling(&mut self, temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {
-        // Store temp for the post-prefill first-token draw. Re-seed RNG to the
-        // same fixed value qwen35 uses per request so sampled runs are
-        // deterministic given seed; greedy does not consume it. top_p/top_k are
-        // accepted for Speculator API parity — chain verify remains temperature-
-        // only via `naive_sample_chain` (identical to later step/bonus draws).
-        self.sample_temp = temp;
-        self.rng_state = 0x13579BDF;
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
+        // Store temp + truncation policy for the post-prefill first-token draw and
+        // every subsequent chain verify / bonus draw. The chain verify now applies
+        // the same temp -> top-k -> nucleus truncation as the AR sampler
+        // (`sample_host_nucleus`), via `naive_sample_chain`'s `top_p`/`top_k`
+        // arguments. Previously `top_p`/`top_k` were discarded here, so a caller
+        // requesting top_p/top_k with generic DFlash on was silently sampling the
+        // UNTRUNCATED softmax while believing truncation was applied.
+        // Blast radius: generic-DFlash targets loaded via LlamaCarrier (arch ids
+        // 0/1). Qwen35's own `DflashSpeculator` (`hipfire-arch-qwen35`) stores and
+        // plumbs all three correctly and is not affected.
+        // Re-seed RNG to the same fixed value qwen35 uses per request so sampled
+        // runs are deterministic given seed; greedy does not consume it.
+        // New SpecRequestConfig fields (min_p / rng_seed / ngram) are ignored.
+        self.sample_temp = cfg.temp;
+        self.sample_top_p = cfg.top_p;
+        self.sample_top_k = cfg.top_k_cut();
+        self.rng_state = crate::spec::request_rng_state(cfg.rng_seed);
+        if let Some(t) = self.scratch.online.as_mut() {
+            t.reset();
+        }
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
@@ -1014,22 +1086,47 @@ pub fn build_generic_dflash_speculator(
     let draft_hfq = HfqFile::open(Path::new(draft_hfq_path)).map_err(|e| format!("{e}"))?;
     let config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
+    let target_streams = target.dflash_streams_per_layer();
+    if target_streams != config.target_streams_per_layer {
+        return Err(format!(
+            "draft '{draft_hfq_path}' expects target_streams_per_layer {} but the target \
+             captures {target_streams} stream(s) per extract layer",
+            config.target_streams_per_layer
+        ));
+    }
     let weights = DflashWeights::load(gpu, &draft_hfq, &config).map_err(|e| format!("{e}"))?;
     let block_size = config.block_size;
     // L3: F16 drafts (dflash_convert) → has_mq=false → DflashScratch::new.
     // new_with_mq only for an MQ-quantized draft.
-    let scratch = if weights.has_mq {
+    // Transactional: `weights` and `scratch` own GPU memory with no `Drop`,
+    // so each fallible step below frees what is already owned before
+    // returning Err (same class as the `or_free!` chain in
+    // `hipfire-arch-qwen35`'s `load_dflash_state`).
+    let scratch = match if weights.has_mq {
         DflashScratch::new_with_mq(gpu, &config, block_size, ctx_capacity, true)
-            .map_err(|e| format!("{e}"))?
+            .map_err(|e| format!("{e}"))
     } else {
-        DflashScratch::new(gpu, &config, block_size, ctx_capacity).map_err(|e| format!("{e}"))?
+        DflashScratch::new(gpu, &config, block_size, ctx_capacity).map_err(|e| format!("{e}"))
+    } {
+        Ok(s) => s,
+        Err(e) => {
+            weights.free_gpu(gpu);
+            return Err(e);
+        }
     };
     let _ = draft_hfq;
 
     // Tell the target which residual-hidden layers to capture (the drafter's
     // target_layer_ids), and mint the per-target verify scratch.
     target.set_dflash_extract_layers(config.target_layer_ids.clone());
-    let verify_scratch = target.new_spec_scratch(gpu, block_size)?;
+    let verify_scratch = match target.new_spec_scratch(gpu, block_size) {
+        Ok(v) => v,
+        Err(e) => {
+            weights.free_gpu(gpu);
+            scratch.free_gpu(gpu);
+            return Err(e);
+        }
+    };
 
     Ok(Box::new(GenericDflashSpeculator {
         weights,
@@ -1042,8 +1139,12 @@ pub fn build_generic_dflash_speculator(
         tree: TreeMode::from_flags(&gpu.flags),
         // Fixed deterministic seed (matches the qwen35 dflash_spec default).
         rng_state: 0x13579BDF,
-        // Greedy until a request calls `set_sampling`.
+        // Greedy until a request calls `set_sampling`. Truncation defaults
+        // disabled (top_p=1.0, top_k=0) so behaviour is byte-identical until
+        // the caller opts in — matches the `1.0, 0` callers pass in tests.
         sample_temp: 0.0,
+        sample_top_p: 1.0,
+        sample_top_k: 0,
     }))
 }
 
@@ -1251,7 +1352,7 @@ mod tests {
 
         let mut rng = 0xDEAD_BEEF_u64;
         let (accepted, bonus) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, &mut rng);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng);
         assert_eq!(accepted, 0, "empty-draft chain accepts nothing");
         assert_eq!(
             bonus, last_argmax,
@@ -1266,7 +1367,7 @@ mod tests {
         assert_eq!(crate::llama::argmax(&tied), 1);
         let mut rng_tie = 1u64;
         let (_, tbonus) =
-            crate::ddtree::naive_sample_chain(&tied, &[], tied.len(), 0.0, &mut rng_tie);
+            crate::ddtree::naive_sample_chain(&tied, &[], tied.len(), 0.0, 1.0, 0, &mut rng_tie);
         assert_eq!(tbonus, 1);
         assert_eq!(rng_tie, 1);
 
@@ -1295,7 +1396,7 @@ mod tests {
 
         let mut rng_a = seed;
         let (acc_a, tok_a) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_a);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_a);
         assert_eq!(acc_a, 0, "first-token empty-draft never accepts drafts");
         assert!(
             (tok_a as usize) < vocab,
@@ -1307,7 +1408,7 @@ mod tests {
         // Same seed → identical draw and identical post-state (deterministic).
         let mut rng_b = seed;
         let (acc_b, tok_b) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_b);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_b);
         assert_eq!(acc_b, 0);
         assert_eq!(tok_b, tok_a);
         assert_eq!(rng_b, rng_a);
@@ -1316,14 +1417,15 @@ mod tests {
         // Later step_one_token / chain verify continue from this rng_state.
         let mut rng_c = rng_a;
         let (_acc_c, _tok_c) =
-            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, &mut rng_c);
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, temp, 1.0, 0, &mut rng_c);
         assert_ne!(rng_c, rng_a, "second draw continues the RNG stream");
 
         // temp≈0 branch remains last_argmax / llama::argmax (byte-identical).
         let last_argmax = crate::llama::argmax(&logits);
         assert_eq!(last_argmax, 1);
         let mut rng_g = seed;
-        let (_, gbonus) = crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, &mut rng_g);
+        let (_, gbonus) =
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng_g);
         assert_eq!(gbonus, last_argmax);
         assert_eq!(rng_g, seed, "greedy first token must not advance rng");
     }

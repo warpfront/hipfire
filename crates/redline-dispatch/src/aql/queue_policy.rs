@@ -34,20 +34,30 @@ impl QueuePolicy {
         }
     }
 
-    pub fn resolve(self, architecture: &str, independent_width: usize) -> usize {
+    pub fn resolve(self, device_name: &str, independent_width: usize) -> usize {
         let available = independent_width.max(1);
         let requested = self
             .explicit_lanes()
-            .unwrap_or_else(|| automatic_lane_limit(architecture));
+            .unwrap_or_else(|| automatic_lane_limit(device_name));
         requested.min(available)
     }
 }
 
-fn automatic_lane_limit(architecture: &str) -> usize {
-    let architecture = architecture.to_ascii_lowercase();
-    if architecture.starts_with("gfx12") {
+/// Default lane count for `QueuePolicy::Auto`: the measured per-device table
+/// in `crate::lanes` where the device is known, otherwise the pre-existing
+/// family fallback (gfx12 family 2, gfx11 family 4, everything else 1).
+///
+/// Explicit `One`/`Two`/`Four` policies (including the `HIPFIRE_REPLAY_PM4_QUEUES`
+/// env override that selects them) bypass this function entirely, so operator
+/// overrides keep precedence over the measured default.
+fn automatic_lane_limit(device_name: &str) -> usize {
+    let normalized = device_name.to_ascii_lowercase();
+    if let Some(measured) = crate::lanes::measured_lanes(&normalized) {
+        return measured;
+    }
+    if normalized.starts_with("gfx12") {
         2
-    } else if architecture.starts_with("gfx11") {
+    } else if normalized.starts_with("gfx11") {
         4
     } else {
         1
@@ -92,7 +102,10 @@ mod tests {
         assert_eq!(QueuePolicy::Auto.resolve("gfx1100", 16), 4);
         assert_eq!(QueuePolicy::Auto.resolve("gfx1151", 16), 4);
         assert_eq!(QueuePolicy::Auto.resolve("gfx1201", 16), 2);
-        assert_eq!(QueuePolicy::Auto.resolve("gfx1030", 16), 1);
+        // gfx1030 comes from the measured no-op sweep in crate::lanes (4
+        // lanes at 0.0952 us/dispatch vs 1 lane at 0.2009); the family
+        // fallback below only covers devices with no measured entry.
+        assert_eq!(QueuePolicy::Auto.resolve("gfx1030", 16), 4);
         assert_eq!(QueuePolicy::Auto.resolve("gfx9999", 16), 1);
     }
 

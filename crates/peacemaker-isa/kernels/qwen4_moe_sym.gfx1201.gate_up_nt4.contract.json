@@ -1,0 +1,35 @@
+{
+  "symbol": "qwen4_moe_gate_up_silu_iu4_sym_pm_gfx1201_nt4",
+  "counts": {
+    "buffer_load_b32": 26,
+    "buffer_load_b64": 80,
+    "buffer_store_b128": 4,
+    "ds_load_b128": 8,
+    "ds_store_b128": 8,
+    "ds_swizzle_b32": 32,
+    "s_barrier_signal": 2,
+    "s_barrier_wait": 2,
+    "s_endpgm": 1,
+    "v_dual_fmac_f32": 64,
+    "v_dual_mul_f32": 128,
+    "v_wmma_i32_16x16x32_iu4": 64,
+    "vopd_packets": 192
+  },
+  "forbidden": [
+    "scratch_*",
+    "flat_*",
+    "global_*",
+    "ds_read*",
+    "ds_write*",
+    "v_readlane*",
+    "v_writelane*",
+    "s_waitcnt*"
+  ],
+  "vgpr_max": 160,
+  "sgpr_max": 104,
+  "require_wave32": true,
+  "require_zero_spills": true,
+  "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 0,
+  "group_segment_fixed_bytes": 8192
+}

@@ -40,7 +40,7 @@ static_assert(sizeof(block_q8_1_mmq) == 144, "bad block_q8_1_mmq size");
 #if !HIPFIRE_GFX10_MQ2L_MMQ
 extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
     const unsigned long long*, const int*, const int*,
-    const void*, float*, int, int, int, int, int
+    const void*, float*, int, int, int, int, int, int
 ) {}
 #else
 __device__ __forceinline__ int mq2l_lut4(unsigned int pk, int shift, unsigned int cbp) {
@@ -58,7 +58,8 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
     const int*                 __restrict__ sorted_slot_index,
     const block_q8_1_mmq*      __restrict__ X_q8_src,
     float*                     __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total, int x_src_rows
+    int M, int K, int x_row_div, int m_total, int x_src_rows,
+    int n_experts
 ) {
     const int tid = threadIdx.x;
     const int row_start = blockIdx.x * 16;
@@ -67,7 +68,7 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
     if (row_start >= M || slot_start >= m_total) return;
     // Host expert_tile_ids remains one entry per 16-slot routing tile.
     const int expert_id = expert_tile_ids[tile_y];
-    if (expert_id < 0) return;
+    if (expert_id < 0 || expert_id >= n_experts) return;
     const char* __restrict__ A = reinterpret_cast<const char*>(expert_weight_ptrs[expert_id]);
     const int row_local = tid & 15;
     const int slot_half = tid >> 4; // 0 → slots 0..7, 1 → slots 8..15
@@ -83,6 +84,7 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1030(
             const int flat = sorted_slot_index[slot_idx];
             if (flat >= 0) {
                 my_x_row = (x_row_div > 1) ? (flat / x_row_div) : flat;
+                if (my_x_row >= x_src_rows) my_x_row = -1;  // malformed slot: treat as padding
             }
         }
     }

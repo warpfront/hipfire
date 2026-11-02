@@ -1,0 +1,337 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+// The gfx1201 MQ4 entries of `qwen4_moe_sym`: `gate_up` (SwiGLU) and `down`, at NT1, NT4 and NT8,
+// plus the grouped-position down entries, composed in `.rip` from the `moent::*` / `moe1::*`
+// natives of `qwen4_moe_sym::{blocks, nt1_blocks}`.
+//
+// `qwen4_moe_sym::emit(spec)` (and `emit_down_gp(spec)` for the grouped-position entries) are the
+// oracle: for every valid entry this script re-emits their bytes (`s_text` and proof). A test in
+// peacemaker-rip (`qwen4_moe_sym_twin_matches_the_rust_emit`) requires it. Edit anything below and
+// re-run: no rebuild.
+//
+// What is script-level here, for every entry: the exits (a tile past the end, a sentinel expert, a
+// non-leader tile), the run walk's loop, the per-tile liveness branches of an epoch's fold and WHERE
+// EACH WAIT SITS (`moent::wait_tile` is a statement; a fold that reads a tile whose loads have not
+// landed waits there and nowhere else), the order of loads and folds inside a K-loop trip and
+// across the tail, the descriptor steps, the trip counter, the odd/even tail, the per-tile output
+// exits, and, for NT4 / NT8 `gate_up`, the LDS hand-off: the gate waves' `ds_store`s
+// (`moent::publish_insns`), the up waves' `ds_load`s (`moent::gate_load_insns`) and the `handoff`
+// that joins them. The natives are the instruction runs between those statements; every one is the
+// same Rust function the generator calls, so the twin cannot drift from it. Tile geometry (`nt`,
+// the register map, the fold math, the prefetch schedule of the Rust generator) is a spec axis of
+// the generator and needs a rebuild.
+//
+// Variant grammar (the pm_loop `--epi` names):
+//
+//     gate_up         NT1 SwiGLU (2 waves, no LDS)
+//     gate_up_nt4     NT4 SwiGLU (4 waves, gate/up hand-off through LDS)
+//     gate_up_nt8     NT8 SwiGLU
+//     down            NT1 down (4 waves)
+//     down_nt4        NT4 down
+//     down_nt8        NT8 down
+//     down_gp_nt4     grouped-position down NT4 (reads the down A4 plane at `g * m_total + row`)
+//     down_gp_nt8     grouped-position down NT8
+//
+// gfx1201 only.
+
+const ARCHES: &[&str] = &["gfx1201"];
+
+const VARIANTS: &[&str] = &[
+    "gate_up",
+    "gate_up_nt4",
+    "gate_up_nt8",
+    "down",
+    "down_nt4",
+    "down_nt8",
+    "down_gp_nt4",
+    "down_gp_nt8",
+];
+
+region Gate;
+
+fn emit(spec: Spec) -> Result<Emitted, String> {
+    let (kind, nt, gp) = entry(&spec.variant)?;
+    if nt == 1 {
+        let g = MoeNt1Gen::new(kind, spec.arch)?;
+        let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+        b.enable_delay_alu();
+        let mut wg = Workgroup::new(&mut b, spec.arch)?;
+        author1(&mut wg, &g)?;
+        b.finish()
+    } else {
+        let g = MoeNtGen::new(kind, nt, gp, spec.arch)?;
+        let mut b = Builder::new(g.kernel_spec(), g.plan()?);
+        b.enable_delay_alu();
+        let mut wg = Workgroup::new(&mut b, spec.arch)?;
+        author(&mut wg, &g)?;
+        b.finish()
+    }
+}
+
+// The variant name as `(kind, nt, gp)`.
+fn entry(variant: &str) -> Result<(&str, u8, bool), String> {
+    match variant {
+        "gate_up" => Ok(("gate_up", 1, false)),
+        "gate_up_nt4" => Ok(("gate_up", 4, false)),
+        "gate_up_nt8" => Ok(("gate_up", 8, false)),
+        "down" => Ok(("down", 1, false)),
+        "down_nt4" => Ok(("down", 4, false)),
+        "down_nt8" => Ok(("down", 8, false)),
+        "down_gp_nt4" => Ok(("down", 4, true)),
+        "down_gp_nt8" => Ok(("down", 8, true)),
+        v => Err(format!(
+            "variant `{v}`: expected gate_up|down[_ntN] or down_gp_ntN (nt4, nt8)"
+        )),
+    }
+}
+
+// =============================================================================================
+// NT4 / NT8.
+
+// The Workgroup scope lives here, not in emit(): emit() mentions `b` again at finish(), which
+// would end the scope under any later `wg` use.
+fn author<T: Target>(wg: &mut Wg<T>, g: &MoeNtGen) -> Result<(), String> {
+    // `gate_up`: the gate waves publish the rounded gate rows here, the up waves read them.
+    let gate = if g.gate_up() {
+        Some(wg.lds::<Gate>("swiglu_gate", 0, g.lds_bytes())?)
+    } else {
+        None
+    };
+    let end = wg.exit(g.exit_label())?;
+    prologue(wg, g, end)?;
+    kloop(wg, g)?;
+    epilogue(wg, g, end, gate)
+}
+
+// Kernel arguments, ids, the exits, the run walk (this tile's position in its expert's run: only
+// the run's `nt`-aligned leader folds), the live-tile count, descriptors and the first epoch's
+// loads.
+fn prologue<T: Target>(wg: &mut Wg<T>, g: &MoeNtGen, end: Exit) -> Result<(), String> {
+    moent::pro_front(wg, g)?;
+    // A tile at or past m_total, or a sentinel / corrupt expert id, returns before any store.
+    let outside = wg.scmp_wg_uniform(moent::outside_insn(g))?;
+    wg.exit_if(outside, end)?;
+    moent::pro_expert(wg, g)?;
+    let sentinel = wg.scmp_wg_uniform(moent::sentinel_insn(g))?;
+    wg.exit_if(sentinel, end)?;
+    moent::pro_run(wg, g)?;
+    // Wave-uniform: every lane mask is a compare over the same loads.
+    wg.loop_until(g.label("run_walk"), g.label("run_found"), |w, brk| {
+        moent::walk_head(w, g)?;
+        let hit = w.scmp(moent::walk_hit_insn(g))?;
+        w.break_if(hit, brk)?;
+        moent::walk_step(w, g)
+    })?;
+    moent::pro_leader(wg, g)?;
+    // Not a leader: another CTA folds this tile.
+    let follower = wg.scmp_wg_uniform(moent::follower_insn(g))?;
+    wg.exit_if(follower, end)?;
+    moent::pro_cnt(wg, g)?;
+    for j in 0..g.nt() {
+        moent::pro_slot_load(wg, g, j)?;
+    }
+    moent::pro_desc(wg, g)?;
+    // Per tile: the activation row offset (dead tiles gather slot -1), then its epoch-0 loads.
+    for j in 0..g.nt() {
+        moent::pro_tile(wg, g, j)?;
+        moent::load_x(wg, g, j, 0)?;
+    }
+    moent::pro_init(wg, g)
+}
+
+// The K loop. One trip is two epochs (K128 each): weights of epoch 1 are issued before the fold of
+// epoch 0, weights of epoch 0 before the fold of epoch 1, and each fold re-issues its tiles'
+// activations of the NEXT epoch through the other descriptor (`reload`). K/128 epochs: (K/128 - 1)/2
+// full trips, then the tail: one pair (always for gate_up; even K/128 for down) or one epoch (odd
+// K/128 for down).
+fn kloop<T: Target>(wg: &mut Wg<T>, g: &MoeNtGen) -> Result<(), String> {
+    wg.label(g.label("k_begin"))?;
+    let no_trip = wg.scmp_wg_uniform(moent::trips_zero_insn())?;
+    wg.wg_skip_if(no_trip, g.label("k_loop_end"), (), |wg, st| {
+        wg.loop_carried(g.label("k_loop"), (), |wg, st| {
+            if g.gate_up() && g.nt() == 8 {
+                wg.barrier(())?;
+            }
+            moent::load_w(wg, g, 1)?;
+            compute(wg, g, 0, "l0", Some(1))?;
+            moent::advance(wg)?;
+            if g.gate_up() && g.nt() == 8 {
+                wg.barrier(())?;
+            }
+            moent::load_w(wg, g, 0)?;
+            compute(wg, g, 1, "l1", Some(0))?;
+            moent::trips_dec(wg)?;
+            let more = wg.scmp_wg_uniform(moent::trips_more_insn())?;
+            Ok(more)
+        })?;
+        Ok(())
+    })?;
+    if g.gate_up() {
+        tail_pair(wg, g)
+    } else {
+        let odd = wg.scmp(moent::odd_insn())?;
+        wg.if_else(
+            odd,
+            g.label("tail_odd"),
+            g.label("epilogue"),
+            |w| tail_pair(w, g),
+            |w| compute(w, g, 0, "t2", None),
+        )
+    }
+}
+
+// The two epochs left after the trips: epoch 1's weights, then the folds of epochs 0 and 1.
+fn tail_pair<T: Target>(wg: &mut Wg<T>, g: &MoeNtGen) -> Result<(), String> {
+    moent::load_w(wg, g, 1)?;
+    compute(wg, g, 0, "t0", Some(1))?;
+    compute(wg, g, 1, "t1", None)
+}
+
+// Fold epoch `p` into every live tile's sums. Tile 0 is always live. Tile j > 0 waits for its own
+// loads (the ONLY waits of the fold; WMMA operands of tile 0 are tracked by the builder) and runs
+// under a wave-uniform liveness branch (`cnt > j`). With `reload`, each tile's NEXT-epoch
+// activations are issued through that epoch's descriptor right after its (maybe skipped) fold.
+fn compute<T: Target>(
+    wg: &mut Wg<T>,
+    g: &MoeNtGen,
+    p: usize,
+    site: &str,
+    reload: Option<usize>,
+) -> Result<(), String> {
+    moent::compute_head(wg, g, p)?;
+    for j in 0..g.nt() {
+        if j > 0 {
+            moent::wait_tile(wg, g, j)?;
+            let live = wg.scmp(moent::tile_live_insn(g, j)?)?;
+            wg.skip_unless(live, g.label(&format!("{}_dead{}", site, j)), (), |w, st| {
+                moent::fold_tile(w, g, p, j)
+            })?;
+        } else {
+            moent::fold_tile(wg, g, p, j)?;
+        }
+        if let Some(r) = reload {
+            moent::load_x(wg, g, j, r)?;
+        }
+    }
+    Ok(())
+}
+
+// `down`: the tile stores. `gate_up`: every wave's BF16 round trip, then the hand-off: the gate
+// waves publish the rounded gate rows and leave; the up waves (the readers) meet them at their own
+// barrier, read the publication and store the SwiGLU of each tile (to the kernel exit).
+fn epilogue<T: Target>(
+    wg: &mut Wg<T>,
+    g: &MoeNtGen,
+    end: Exit,
+    gate: Option<Region>,
+) -> Result<(), String> {
+    moent::epilogue_label(wg, g)?;
+    match gate {
+        None => {
+            store_tiles(wg, g, end, None)?;
+            wg.end(end)
+        }
+        Some(r) => {
+            moent::bf16_roundtrip(wg, g)?;
+            let up = wg.scmp(moent::up_insn())?;
+            wg.handoff(
+                up,
+                g.label("up"),
+                end,
+                r,
+                |w, r| {
+                    let _ = w.begin_write(r);
+                    for j in 0..g.nt() {
+                        for insn in moent::publish_insns(g, j)? {
+                            w.ds_store(r, insn)?;
+                        }
+                    }
+                    Ok(())
+                },
+                |w, r, end| store_tiles(w, g, end, Some(r)),
+            )
+        }
+    }
+}
+
+// Stores of every live tile: tile 0 always, tile j while j < cnt (the rest leave); the output
+// descriptor moves one tile (16 rows) on per tile. With a gate region each tile first reads its
+// gate rows back and takes the SwiGLU.
+fn store_tiles<T: Target>(
+    w: &mut Wg<T>,
+    g: &MoeNtGen,
+    end: Exit,
+    gate: Option<Region>,
+) -> Result<(), String> {
+    moent::y_descriptor(w, g)?;
+    for j in 0..g.nt() {
+        if j > 0 {
+            let live = w.scmp(moent::tile_live_insn(g, j)?)?;
+            w.wave_exit_unless(live, end)?;
+            moent::y_step(w)?;
+        }
+        if let Some(r) = gate {
+            for insn in moent::gate_load_insns(g, j)? {
+                w.ds_load(r, insn)?;
+            }
+            moent::silu_tile(w, g, j)?;
+        }
+        moent::store_rows(w, g, j, gate.is_some())?;
+    }
+    Ok(())
+}
+
+// =============================================================================================
+// NT1.
+
+fn author1<T: Target>(wg: &mut Wg<T>, g: &MoeNt1Gen) -> Result<(), String> {
+    let end = wg.exit(g.exit_label())?;
+    moe1::pro_front(wg, g)?;
+    // A tile at or past m_total, or a sentinel / corrupt expert id, returns before any store.
+    let outside = wg.scmp_wg_uniform(moe1::outside_insn())?;
+    wg.exit_if(outside, end)?;
+    moe1::pro_expert(wg)?;
+    let sentinel = wg.scmp_wg_uniform(moe1::sentinel_insn())?;
+    wg.exit_if(sentinel, end)?;
+    moe1::pro_setup(wg, g)?;
+    moe1::pro_init(wg, g)?;
+    // Two-epoch trips (skipped at zero trips): set 1's loads before the fold of set 0, set 0's
+    // before the fold of set 1.
+    wg.label(g.label("k_begin"))?;
+    let no_trip = wg.scmp_wg_uniform(moe1::trips_zero_insn())?;
+    wg.wg_skip_if(no_trip, g.label("k_loop_end"), (), |wg, st| {
+        wg.loop_carried(g.label("k_loop"), (), |wg, st| {
+            moe1::load_set(wg, g, 1)?;
+            moe1::compute(wg, g, 0)?;
+            moe1::advance(wg, g)?;
+            moe1::load_set(wg, g, 0)?;
+            moe1::compute(wg, g, 1)?;
+            moe1::trips_dec(wg)?;
+            let more = wg.scmp_wg_uniform(moe1::trips_more_insn())?;
+            Ok(more)
+        })?;
+        Ok(())
+    })?;
+    // K % 256 == 0 (gate_up): an even epoch count, two epochs left. K % 128 == 0 (down): one epoch
+    // left when K/128 is odd, else two.
+    if g.gate_up() {
+        moe1::tail_pair(wg, g)?;
+    } else {
+        let odd = wg.scmp(moe1::odd_insn())?;
+        wg.if_else(
+            odd,
+            g.label("tail_odd"),
+            g.label("epilogue"),
+            |w| moe1::tail_pair(w, g),
+            |w| moe1::compute(w, g, 0),
+        )?;
+    }
+    moe1::epilogue_label(wg, g)?;
+    if g.gate_up() {
+        moe1::swiglu(wg, g)?;
+    }
+    moe1::store(wg, g)?;
+    wg.end(end)
+}

@@ -15,11 +15,12 @@
 // layers = 36-48 launches per forward, each costing ~9 µs of dispatch
 // latency on gfx1100 → ~300 µs shaved off forward time.
 //
-// Grid: [n_heads, batch, 1]. Each block handles one head's Q then one
-// head's K for a single batch row. Q gets normalized AND scaled. For
-// decode grid.y=1 and blockIdx.y=0 (byte-identical to pre-batching);
-// for prefill grid.y=N and q/k are laid out as [N × (n_heads*head_dim)]
-// row-major.
+// Grid: [n_heads * batch, 1, 1] (rows folded into grid.x: row = blockIdx.x /
+// n_heads, head = blockIdx.x % n_heads; not bound by the 65535 grid.y limit).
+// Each block handles one head's Q then one head's K for a single batch row.
+// Q gets normalized AND scaled. For decode the grid is [n_heads,1,1] (row 0,
+// byte-identical to pre-batching); for prefill q/k are laid out as
+// [N × (n_heads*head_dim)] row-major.
 //
 // Uses wave-reduction over head_dim, same pattern as the single l2_norm
 // kernel. head_dim must fit "reasonable" sizes (≤ 4096, easily).
@@ -32,11 +33,11 @@ extern "C" __global__ void fused_qk_l2_norm_scale_f32(
     float q_scale,   // e.g. 1.0f / sqrtf((float)head_dim)
     float eps
 ) {
-    const int h = blockIdx.x;
-    if (h >= n_heads) return;
+    const unsigned row = blockIdx.x / (unsigned)n_heads;
+    const int h = blockIdx.x - row * (unsigned)n_heads;
     const int tid = threadIdx.x;
 
-    const long long batch_off = (long long)blockIdx.y * n_heads * head_dim;
+    const long long batch_off = (long long)row * n_heads * head_dim;
     float* q_head = q + batch_off + h * head_dim;
     float* k_head = k + batch_off + h * head_dim;
 

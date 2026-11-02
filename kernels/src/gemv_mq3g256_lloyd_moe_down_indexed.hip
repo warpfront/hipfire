@@ -29,7 +29,7 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexe
     const float* __restrict__ topk_weights,              // [k_top]
     const float* __restrict__ rot_batch,                 // [k_top × K] FWHT-rotated
     float*       __restrict__ x_residual,                // [M]
-    int M, int K
+    int M, int K, int n_experts
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -37,6 +37,7 @@ extern "C" __global__ void gemv_mq3g256_lloyd_moe_down_residual_scaled_k8_indexe
     const int tid = threadIdx.x;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) return;
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
     const float* __restrict__ x = rot_batch + (long long)krank * K;

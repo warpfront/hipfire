@@ -37,24 +37,24 @@
 #
 # Report destination: $HIPFIRE_PARITY_OUT or /tmp/forward-lowered-parity-<ts>.md
 #
+# Qwen3.5 has no hand path any more (its decode is one typed step program),
+# so it has no rows here.
+#
 # Usage:
-#   ./scripts/forward-lowered-parity.sh          # qwen35 dense + Paro rows
-#   ./scripts/forward-lowered-parity.sh --full   # add A3B MoE rows (large)
+#   ./scripts/forward-lowered-parity.sh
 
 set -u
 cd "$(dirname "$0")/.."
 
-FULL=0
 while [ $# -gt 0 ]; do
     case "$1" in
-        --full) FULL=1 ;;
-        -h|--help) sed -n '3,40p' "$0"; exit 0 ;;
+        -h|--help) sed -n '3,44p' "$0"; exit 0 ;;
         *) echo "unknown arg: $1" >&2; exit 2 ;;
     esac
     shift
 done
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_PARITY_OUT:-/tmp/forward-lowered-parity-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -66,7 +66,7 @@ MAX_TOK="${HIPFIRE_PARITY_MAX_TOK:-256}"
 # (or rm the binary) if you changed forward/dispatch code since the last build.
 if [ ! -x "$EXE" ]; then
     echo "forward-lowered-parity: building daemon (--features deltanet)..." >&2
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "forward-lowered-parity: build failed" >&2
         exit 2
     fi
@@ -82,21 +82,14 @@ fi
 
 # ── Model matrix ───────────────────────────────────────────────────────────
 # Format: "model_file|id|prompt"
-# Seeded with qwen35 rows (the arch whose dispatch shape is the open question):
-#   - 9b.mq4   : dense MQ4 workhorse — exercises DeltaNet + FullAttn variants
-#                + FWHT rotation on the lowered Proj/GateUp bindings.
-#   - 9b.q8f16 : Q8_0 path (different GemvResidual / rotation arms).
-#   - a3b-paro : Givens (ParoQ4G128) QKVZA + MoE — the highest-risk lowered
-#                path (per-weight Givens + Recurrent + Moe super-ops).
 # A short instruction that yields a long greedy continuation maximizes the
 # number of DECODE steps under test (the toggle only gates decode-side
 # `forward_scratch_layers`; prefill is shared and identical across A/B).
 # The model list is a single array so the other FORWARD_LOWERED arches
-# (qwen2 / lfm2moe / deepseek4 / minimax — same shared toggle) drop in later.
+# (deepseek4 — same shared toggle) drop in later.
 DENSE_PROMPT="Write a short Python function called fib that returns the nth Fibonacci number, then explain how it works in two sentences."
-SHEEP_PROMPT="A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number."
 
-ROWS=(
+rows=(
     # llama-family dense (arch_id 0/1) — N5 Phase A: validates the new llama
     # forward_scratch_layers_lowered (execute_steps projections) vs the legacy
     # hand path. MQ4 → expected byte-identical (the F1 rmsnorm fix only changes
@@ -106,16 +99,7 @@ ROWS=(
     # path now routes through the shared dense_forward (was the SuperOp
     # interpreter). Byte-identical by construction (same kernel sequences).
     "qwen25-0.5b-instruct.mq4|qwen25-0.5b-mq4|$DENSE_PROMPT"
-    "qwen3.5-9b.mq4|qwen35-9b-mq4|$DENSE_PROMPT"
-    "qwen3.5-9b.q8f16|qwen35-9b-q8|$DENSE_PROMPT"
-    "qwen3.6-35b-a3b-paro.hfq|qwen36-a3b-paro|$SHEEP_PROMPT"
 )
-FULL_EXTRA=(
-    "qwen3.5-35b-a3b.mq4|qwen35-a3b-mq4|$SHEEP_PROMPT"
-    "qwen3.6-35b-a3b.mq4|qwen36-a3b-mq4|$SHEEP_PROMPT"
-)
-rows=("${ROWS[@]}")
-[ "$FULL" -eq 1 ] && rows+=("${FULL_EXTRA[@]}")
 
 # ── Report header ──────────────────────────────────────────────────────────
 {
@@ -124,7 +108,7 @@ rows=("${ROWS[@]}")
     echo "- commit:  $(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
     echo "- branch:  $(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo unknown)"
     echo "- date:    $(date -Iseconds)"
-    echo "- max_tok: $MAX_TOK   mode: $( [ "$FULL" -eq 1 ] && echo full || echo short )"
+    echo "- max_tok: $MAX_TOK"
     echo
     echo "Each row runs the daemon twice (HIPFIRE_FORWARD_LOWERED=0 vs default),"
     echo "greedy temp=0, and compares the committed token-id streams. A mismatch"

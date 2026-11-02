@@ -5,7 +5,7 @@
 //! LFM3-VL (vision-language) architecture for hipfire — Phase 2 of the LFM3
 //! port (`docs/plans/2026-10-31-lfm3-port.md`).
 //!
-//! Wraps the LFM3 text decoder (`hipfire-arch-lfm3`, arch_id 13) with the
+//! Wraps the LFM3 text decoder (`hipfire-arch-lfm3`, arch_id 24) with the
 //! LFM3-VL vision tower + multi-modal projector. The vision tower is a hybrid
 //! stack of 14 `Lfm3VlVisionLayer`s — gated depthwise 2D conv layers and
 //! bidirectional GQA attention layers with axial 2D RoPE — exactly the HF

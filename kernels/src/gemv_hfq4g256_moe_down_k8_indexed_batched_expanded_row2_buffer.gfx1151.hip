@@ -26,7 +26,7 @@ HIPFIRE_MOE_DOWN_ROW2_KERNEL(
     const int* __restrict__ topk_indices,
     const float* __restrict__ rot_batch,
     float* __restrict__ expert_outputs,
-    int M, int K, int K_TOP
+    int M, int K, int K_TOP, int n_experts
 ) {
     const int row0 = blockIdx.x * 2;
     if (row0 >= M) return;
@@ -41,6 +41,14 @@ HIPFIRE_MOE_DOWN_ROW2_KERNEL(
         reinterpret_cast<const char*>(topk_indices));
     const unsigned int expert_id = HIPFIRE_WEIGHT_LOAD_U32(
         indices_rsrc, (unsigned int)routing_index * 4u);
+    if (expert_id >= (unsigned int)n_experts) {
+        if (tid == 0) {
+            const long long out_inv = (long long)routing_index * M;
+            expert_outputs[out_inv + row0] = 0.0f;
+            if (have_row1) expert_outputs[out_inv + row1] = 0.0f;
+        }
+        return;
+    }
     const auto pointers_rsrc = HIPFIRE_WEIGHT_RSRC(
         reinterpret_cast<const char*>(expert_ptrs));
     const unsigned int expert_lo = HIPFIRE_WEIGHT_LOAD_U32(

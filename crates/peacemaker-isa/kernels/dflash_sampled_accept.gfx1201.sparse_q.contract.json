@@ -1,0 +1,11 @@
+{
+  "symbol": "dflash_sampled_accept_sparse_q_f32_pm_gfx1201",
+  "counts": {"buffer_load_b32": 120, "buffer_store_b128": 1, "s_load_b256": 1, "s_load_b128": 1,
+    "ds_load_b128": 320, "ds_load_2addr_b32": 6, "ds_store_b32": 265,
+    "s_barrier_signal": 4, "s_barrier_wait": 4, "v_div_fixup_f32": 2, "s_endpgm": 1},
+  "forbidden": ["scratch_*", "flat_*", "global_*", "buffer_atomic_*", "ds_add_*", "ds_sub_*", "ds_rsub_*", "ds_inc_*", "ds_dec_*", "ds_min_*", "ds_max_*", "ds_and_*", "ds_or_*", "ds_xor_*", "ds_mskor_*", "ds_cmpst*", "ds_cmpstore*", "ds_wrxchg*", "ds_append", "ds_consume", "ds_gws_*", "ds_bpermute*", "ds_permute*", "v_writelane*", "s_setpc*", "s_swappc*"],
+  "vgpr_max": 112, "sgpr_max": 104,
+  "require_wave32": true, "require_zero_spills": true, "require_zero_private": true,
+  "launch_dynamic_lds_bytes": 0,
+  "group_segment_fixed_bytes": 6208
+}

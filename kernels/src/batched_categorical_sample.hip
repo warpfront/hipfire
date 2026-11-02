@@ -12,7 +12,8 @@
 //                           Comes from softmax_temp_topp_batched_f32.
 //   z[batch]              — kept mass per row (1.0 when tau_cut==0).
 //   vocab                 — vocabulary size.
-//   seed                  — u32 base seed; each block uses (seed ^ blockIdx.x | 1).
+//   seeds[batch]          — u32 LCG state per row, from the host
+//                           `rdna_compute::sampling::spec_draft_row_seed`.
 //
 // Outputs (two separate buffers):
 //   out_tokens[batch]     — sampled token id per row (i32).
@@ -26,7 +27,12 @@
 // RNG: LCG matching ddtree_swor_walk convention:
 //   s = s * 1664525 + 1013904223  (Numerical Recipes)
 //   u = (s >> 8) / 2^24
-// Seeded per block as (seed ^ blockIdx.x) | 1 to avoid cross-row correlation.
+// Each row starts from its own `seeds[row]`. The host derives it by hashing
+// (request stream, window position, row), so rows of one block, the same
+// row across windows, and co-scheduled lanes all draw independent uniforms.
+// (The former in-kernel `(seed ^ row) | 1` gave rows 2k and 2k+1 the same
+// state and adjacent rows lattice-spaced first draws, coupling the draft
+// tokens of one DFlash block.)
 //
 // The CDF walk uses the effective probability:
 //   p_eff[i] = (tau_cut > 0 && probs[i] < tau_cut) ? 0 : probs[i] / z
@@ -47,7 +53,7 @@ extern "C" __global__ void batched_categorical_sample_f32(
     const float* __restrict__ tau_cut,    // [batch] f32
     const float* __restrict__ z,          // [batch] f32
     int   vocab,
-    unsigned int seed,
+    const unsigned int* __restrict__ seeds, // [batch] u32
     int*  __restrict__ out_tokens,        // [batch] i32
     float* __restrict__ out_probs         // [batch] f32
 ) {
@@ -60,7 +66,7 @@ extern "C" __global__ void batched_categorical_sample_f32(
     const float  inv_z = 1.0f / fmaxf(z[row], 1e-30f);
     // When tau == 0.0 truncation is disabled; inv_z == 1.0.
 
-    // LCG RNG per block, seeded to avoid same-seed correlation across rows.
+    // LCG RNG per block, seeded from the row's host-derived seed.
     __shared__ unsigned int s_rng;
     __shared__ float        s_red[BCAT_NTH];  // for block sum reduction
     __shared__ float        s_total_mass;
@@ -68,7 +74,7 @@ extern "C" __global__ void batched_categorical_sample_f32(
     __shared__ float        s_pick_prob;
 
     if (tid == 0) {
-        s_rng  = (seed ^ (unsigned int)row) | 1u;
+        s_rng  = seeds[row];
         s_pick = vocab - 1;  // fallback: last token
         s_pick_prob = 0.0f;
     }

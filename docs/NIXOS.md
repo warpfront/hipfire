@@ -6,7 +6,7 @@ packages and the NixOS module under `nix/`.
 | Output | Path / attribute | Role |
 |---|---|---|
 | Package | `packages.hipfire` (default) | Native `hipfire` CLI + wrapped `hipfire-daemon` |
-| Kernels | `packages.hipfire-kernels` | Optional precompile via `scripts/compile-kernels.sh` |
+| Kernels | `packages.hipfire-kernels` | Indexed exact-source registry packages for gfx1201/gfx1100/gfx1151/gfx906/gfx942; also bundled with `packages.hipfire` |
 | Dev shell | `devShells.default` | Rust and hipcc/ROCm tools when `rocmSupport` |
 | Module | `nixosModules.default` | `services.hipfire` systemd unit(s) |
 | Overlay | `overlays.default` | Pins `rocmPackages` from this flake’s nixpkgs + hipfire packages |
@@ -15,8 +15,8 @@ packages and the NixOS module under `nix/`.
 |---|---|
 | Flake nixpkgs input | `github:NixOS/nixpkgs/nixos-unstable` |
 | Module default port | `11435` |
-| System model dir option default | `/var/lib/hipfire/models` (see [modelDir limitation](#modeldir-and-effective-paths)) |
-| Kernel package default targets | `[]` (JIT only unless overridden) |
+| System model dir option default | `/var/lib/hipfire/models` (exported as `HIPFIRE_MODELS_DIR`; see [modelDir](#modeldir-and-effective-paths)) |
+| Kernel package default targets | `gfx1201`, `gfx1100`, `gfx1151`, `gfx906`, `gfx942` |
 
 Truth state: **shipped / ref-pinned** for the flake/module surface described
 here. Pin a release tag or commit for production hosts; building
@@ -54,7 +54,7 @@ Tools only — not a checkout. From a local tree:
 
 ```bash
 nix develop
-cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release -p hipfire-daemon
 ```
 
 ### Build CLI + daemon
@@ -72,13 +72,17 @@ hipfire.url = "github:warpfront/hipfire/<tag-or-commit>";
 
 ### Precompiled kernels package
 
-```bash
-nix build github:warpfront/hipfire#hipfire-kernels
-```
-
-Default `gpuTargets = []` produces an empty/near-empty kernels tree; the
-daemon JIT-compiles on first use. Override targets in the NixOS module or
-your own package override — an empty default avoids baking the wrong arch.
+`nix build github:warpfront/hipfire` bundles indexed kernel objects beside
+`hipfire-daemon-unwrapped`. The separate
+`nix build github:warpfront/hipfire#hipfire-kernels` output contains the same
+exact-source registry objects and `.index.json` files. Override `gpuTargets`
+with the architecture of your GPU to avoid building the entire five-arch set;
+the NixOS module uses `services.hipfire.gpuTargets`. Targets outside the
+five-arch registry (for example `gfx1200` or `gfx1030`) package no kernels,
+print an evaluation warning naming them, and are compiled by hipcc JIT on first
+use, as is any unregistered runtime route.
+Packaging fails if a required registry entry cannot compile; partial unindexed
+packages are not installed.
 
 ## NixOS module
 
@@ -123,7 +127,7 @@ services.hipfire = {
   enable = true;
   gpuTargets = [ "gfx1100" ]; # required non-empty
   openFirewall = false;  # does NOT change listen address — only skips opening the port when the host firewall is enabled
-  # openFirewall = true opens cfg.port with NO auth/TLS on the listener — see SERVE.md
+  # openFirewall = true opens cfg.port to the network; the listener has no TLS and auth is optional (serve.api_key_file) — see SERVE.md
 
   defaultModel = "qwen3.5:9b";
   # Module writes these into config.toml as stored globals. run/serve sampling
@@ -135,7 +139,7 @@ services.hipfire = {
   maxSeq = 32768;
   repeatPenalty = 1.05;
   kvCache = "auto";
-  dflashMode = "off";
+  dflashMode = "off";    # explicit global kill switch; omit to keep the registry per-model default
   idleTimeout = 300;
 
   # Writes native ~/.hipfire/models.toml per-model overrides.
@@ -188,9 +192,14 @@ services.hipfire = {
   enable = true;
   userService = true;
   gpuTargets = [ "gfx1201" ];
-  # Must be user-writable. Default /var/lib/hipfire/models is not; setup's
-  # mkdir -p fails for an unprivileged user unit.
-  modelDir = "/home/yourname/.hipfire/models";  # match effective CLI path
+  # Must be an absolute path writable by the user running the unit. The default
+  # /var/lib/hipfire/models belongs to the system service, so setup's
+  # `mkdir -p` fails for an unprivileged user unit. Create the directory once
+  # and hand it to that user, for example:
+  #   sudo install -d -o <login-user> -g <login-group> /srv/hipfire/models
+  # Do not write `~` or `$HOME` here: the value is passed verbatim to
+  # `mkdir -p` and to HIPFIRE_MODELS_DIR, and neither expands it.
+  modelDir = "/srv/hipfire/models";
   defaultModel = "";                             # module starts --no-prewarm
 };
 
@@ -207,8 +216,9 @@ systemctl --user status hipfire.service
 
 User mode skips the dedicated `hipfire` system user and the oneshot
 precompile unit; setup still copies config and symlinks daemon/kernels under
-`$HOME/.hipfire`. Models for tag discovery must live under
-`$HOME/.hipfire/models` (see [modelDir limitation](#modeldir-and-effective-paths)).
+`$HOME/.hipfire`. Models for tag discovery live in the configured `modelDir`
+(`HIPFIRE_MODELS_DIR`), not under `$HOME/.hipfire/models`
+(see [modelDir and effective paths](#modeldir-and-effective-paths)).
 
 ### Pinning source from the module
 
@@ -248,8 +258,7 @@ When `userService = false` (default):
 
 | Unit | Role |
 |---|---|
-| `hipfire-setup.service` | Oneshot: native `config.toml` + `models.toml`, `bin/daemon` symlink, kernels symlink under `/var/lib/hipfire/.hipfire` |
-| `hipfire-precompile.service` | Oneshot: `hipfire-daemon --precompile` (failure is warned; JIT still works) |
+| `hipfire-setup.service` | Oneshot: native config and daemon symlink; the daemon resolves verified kernels from its immutable Nix package |
 | `hipfire.service` | `ExecStart = hipfire serve`, restart on failure |
 
 Environment always includes `HIPFIRE_MODELS_DIR=<modelDir>`; the native CLI
@@ -257,13 +266,13 @@ and TUI honor it for discovery and model lifecycle. With `rocmSupport`,
 `LD_LIBRARY_PATH` is set for nixpkgs ROCm. System mode also sets
 `HOME=/var/lib/hipfire` and `HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels`.
 
-**Security:** `hipfire serve` has **no authentication and no TLS**
-([SERVE.md](SERVE.md)). Default listen remains **`0.0.0.0`** unless you set
-`extraSettings.host = "127.0.0.1"` (or equivalent). `openFirewall = false` does
+**Security:** `hipfire serve` has **no TLS**, and bearer authentication is
+optional (`serve.api_key_file`; [SERVE.md](SERVE.md)). The default listen address is **`127.0.0.1`**; set
+`extraSettings.host = "0.0.0.0"` to listen on all interfaces. `openFirewall = false` does
 **not** change the listen address — it only avoids opening `cfg.port` when the
 **host firewall is enabled**. Keep the firewall closed unless the host is on a
-trusted network or an authenticated TLS reverse proxy terminates in front of
-the port. Prefer probing on loopback (`127.0.0.1`).
+trusted network or a TLS reverse proxy terminates in front of the port; a key
+is recommended on any non-loopback listen address. Prefer probing on loopback (`127.0.0.1`).
 
 Device policy allows `/dev/kfd`, DRM char devices, and `/dev/accel/accel0`.
 
@@ -281,8 +290,8 @@ Set only arches you need. Common labels (not an admission list):
 | gfx1030 | RX 6800 XT class |
 | gfx1100 | RX 7900 XTX class |
 | gfx1151 | Strix Halo |
-| gfx1200 | Radeon AI PRO R9700 class |
-| gfx1201 | RX 9070 / 9070 XT class |
+| gfx1200 | RX 9060 / 9060 XT class |
+| gfx1201 | RX 9070 / 9070 XT, Radeon AI PRO R9700 class |
 
 ```nix
 services.hipfire.gpuTargets = [ "gfx1100" "gfx1030" ];
@@ -295,15 +304,15 @@ From `nix/module.nix` (defaults are module defaults, not every CLI default):
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `enable` | bool | `false` | Enable the service |
-| `openFirewall` | bool | `false` | Open `port` when the host firewall is enabled; does **not** change listen address (default still `0.0.0.0`) |
+| `openFirewall` | bool | `false` | Open `port` when the host firewall is enabled; does **not** change listen address (default `127.0.0.1`) |
 | `package` | package | `pkgs.hipfire` | Package to run |
 | `src` | path or null | `null` | Override source **path** (not a package/derivation) |
 | `github.owner` | str |  `"warpfront"`    | fetch owner |
 | `github.repo` | str | `"hipfire"` | fetch repo |
 | `github.rev` | str or null | `null` | branch/tag/commit |
 | `github.hash` | str | `""` | SRI hash for fetch |
-| `kernelsPackage` | package | `pkgs.hipfire-kernels` | Precompiled kernels |
-| `gpuTargets` | list of str | `[]` (**required non-empty when enabled**) | Kernel compile arches |
+| `kernelsPackage` | package | `pkgs.hipfire-kernels` | Exact-source indexed kernels bundled alongside the daemon |
+| `gpuTargets` | list of str | `[]` (**required non-empty when enabled**) | Kernel package architectures |
 | `rocmSupport` | bool | `true` | Use nixpkgs ROCm + graphics ICD |
 | `port` | port | `11435` | Serve port |
 | `defaultModel` | str | `""` | Empty omits `serve.default_model` and makes the module start `hipfire serve --no-prewarm`; a non-empty value is pre-warmed |
@@ -313,7 +322,7 @@ From `nix/module.nix` (defaults are module defaults, not every CLI default):
 | `maxSeq` | int | `32768` | KV capacity |
 | `repeatPenalty` | float | `1.05` | Stored global; same send caveat as temperature |
 | `kvCache` | str | `"auto"` | KV mode string |
-| `dflashMode` | enum | `"off"` | `on` / `off` / `auto` |
+| `dflashMode` | enum | `"auto"` (unset) | `on` / `off` / `auto`. Leaving it unset writes no `speculation.dflash` to `config.toml`, so the registry's per-model policy applies: `auto` only for Qwen3.8-27B tiers whose registry entry declares a paired DFlash draft ([CONFIG.md](CONFIG.md#qwen38-27b-paired-dflash-default)); every other model keeps the schema default `off`. Setting it explicitly, including `"auto"`, writes a global `speculation.dflash` that outranks the registry layer (`"auto"` then applies the same `auto` to every model); `"off"` is the kill switch that disables DFlash for all models |
 | `idleTimeout` | int | `300` | Idle unload seconds (`0` = never) |
 | `extraSettings` | attrs | `{}` | Extra config.toml keys (e.g. `"serve.host" = "127.0.0.1"`; legacy `host` is translated) |
 | `perModelSettings` | attrs of attrs | `{}` | Writes native `models.toml` per-model overrides |
@@ -332,7 +341,13 @@ nixos-25.11’s ROCm 6.4.3 `libamdhip64` can segfault on **gfx1151** during
 weight upload — prefer the overlay on Strix Halo hosts.
 
 `LD_LIBRARY_PATH` is injected on the daemon/CLI wrappers and the systemd
-unit when `rocmSupport = true`.
+unit when `rocmSupport = true`. The wrappers, the kernel package build and the
+dev shell also set `HIPFIRE_ROCM_PATH` to the prefix built by
+`nix/rocm-root.nix`, which joins `clr`, `rocm-runtime` and `rocm-device-libs`:
+hipfire requires the HIP headers, `libamdhip64`, `libhsa-runtime64`, `hipcc`
+and the device bitcode under a single root, and nixpkgs splits them across
+those packages. The wrappers only set a default, so an exported
+`HIPFIRE_ROCM_PATH` wins.
 
 ### Bring your own ROCm
 
@@ -340,12 +355,15 @@ unit when `rocmSupport = true`.
 services.hipfire = {
   rocmSupport = false;
   environment = {
+    HIPFIRE_ROCM_PATH = "/opt/rocm";
     LD_LIBRARY_PATH = "/opt/rocm/lib";
   };
 };
 ```
 
-You must still satisfy GPU device access and any ICD requirements yourself.
+hipfire loads the HIP runtime and compiler from the one root named by
+`HIPFIRE_ROCM_PATH`; `LD_LIBRARY_PATH` alone does not select it. You must still
+satisfy GPU device access and any ICD requirements yourself.
 
 ## Configuration precedence
 
@@ -364,14 +382,16 @@ Interactive shells outside systemd only see variables you export yourself
 Enabling the module starts `hipfire serve`; it does **not** by itself certify
 model quality or GPU numerical correctness.
 
-On a machine with models in the **effective** CLI path
-(`/var/lib/hipfire/.hipfire/models` for the system service, or
-`~/.hipfire/models` for user mode — not necessarily `modelDir`):
+On a machine with models in the configured `services.hipfire.modelDir`
+(`/var/lib/hipfire/models` by default; the service exports it as
+`HIPFIRE_MODELS_DIR`):
 
 ```bash
 curl -s http://127.0.0.1:11435/health
-# GPU serve semantics (manual); pass an absolute model file:
-python3 scripts/serve_harness.py --model /var/lib/hipfire/.hipfire/models/<file> --tag qwen3.5:9b
+# GPU serve semantics (manual); pass an absolute model file. --no-spawn attaches
+# to the running service instead of starting a second server on the same GPU:
+python3 scripts/serve_harness.py --no-spawn --port 11435 \
+  --model /var/lib/hipfire/models/<file> --tag qwen3.5:9b
 ```
 
 Route selection: [VALIDATION.md](VALIDATION.md). No-GPU CI does not replace
@@ -404,11 +424,12 @@ hardware.amdgpu.initrd.enable = true;
 
 Ensure `hardware.graphics.enable = true` when using bundled ROCm.
 
-### Kernel pre-compilation fails
+### Indexed kernel package build fails
 
-`hipfire-precompile` warns and continues; first request JIT-compiles. Check
-`hipcc --version` against the target arch. gfx1151 expects ROCm 7.2+ class
-tooling (aligned with the container base and flake overlay intent).
+`hipfire-kernels` now fails its build when an admitted registry entry cannot
+compile; there is no partial package or boot-time `hipfire-precompile` service.
+Check the selected `gpuTargets`, ROCm hipcc and device libraries, then rebuild.
+gfx1151 expects ROCm 7.2+ class tooling (aligned with the container base).
 
 ## Related
 

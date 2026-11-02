@@ -1,0 +1,496 @@
+{
+  "amdgpu_metadata": "---\namdhsa.kernels:\n  - .args:\n      - .actual_access: read_only\n        .address_space: global\n        .name: topk\n        .offset: 0\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: read_only\n        .address_space: global\n        .name: codec\n        .offset: 8\n        .size: 8\n        .value_kind: global_buffer\n      - .actual_access: write_only\n        .address_space: global\n        .name: out\n        .offset: 16\n        .size: 8\n        .value_kind: global_buffer\n      - \n        .name: rows\n        .offset: 24\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: uniform_bucket\n        .offset: 28\n        .size: 4\n        .value_kind: by_value\n      - \n        .name: n_experts\n        .offset: 32\n        .size: 4\n        .value_kind: by_value\n    .group_segment_fixed_size: 1280\n    .kernarg_segment_align: 8\n    .kernarg_segment_size: 40\n    .max_flat_workgroup_size: 128\n    .name: qwen4_slab_union_plan_t8_pm_gfx1201\n    .private_segment_fixed_size: 0\n    .sgpr_count: 27\n    .sgpr_spill_count: 0\n    .symbol: qwen4_slab_union_plan_t8_pm_gfx1201.kd\n    .uniform_work_group_size: 1\n    .uses_dynamic_stack: false\n    .vgpr_count: 24\n    .vgpr_spill_count: 0\n    .wavefront_size: 32\n    .workgroup_processor_mode: 1\namdhsa.target: amdgcn-amd-amdhsa--gfx1201\namdhsa.version: [1, 2]\n...\n.end_amdgpu_metadata\n.text\n\t.p2alignl 7, 3214868480\n\t.fill 96, 4, 3214868480\n",
+  "arch": "gfx1201",
+  "builder_proof": {
+    "arch": "gfx1201",
+    "barriers": [
+      {
+        "pc_index": 56,
+        "transitions": [
+          "Ready(0)",
+          "Ready(1)"
+        ]
+      },
+      {
+        "pc_index": 92,
+        "transitions": [
+          "Ready(2)",
+          "Ready(3)"
+        ]
+      }
+    ],
+    "builder_crate_version": "0.4.1",
+    "builder_git_sha": "unknown",
+    "clauses": [],
+    "forbidden_mnemonics_checked": [
+      "s_waitcnt (gfx12)",
+      "scratch_*"
+    ],
+    "hazards": [
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 68,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 75,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 79,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_va_sdst(0)",
+        "pc_index": 83,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 101,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 110,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 118,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 127,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 129,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 135,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 157,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 169,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 201,
+        "rule": "gfx12 SGPR read-after-write"
+      },
+      {
+        "insn": "s_wait_alu depctr_sa_sdst(0)",
+        "pc_index": 213,
+        "rule": "gfx12 SGPR read-after-write"
+      }
+    ],
+    "kernel_id": "qwen4_slab_union_plan",
+    "lds_slots": [
+      {
+        "base": 0,
+        "len": 320,
+        "name": "ids",
+        "state": "Reading"
+      },
+      {
+        "base": 320,
+        "len": 320,
+        "name": "buckets",
+        "state": "Reading"
+      },
+      {
+        "base": 640,
+        "len": 320,
+        "name": "heads",
+        "state": "Reading"
+      },
+      {
+        "base": 960,
+        "len": 320,
+        "name": "totals",
+        "state": "Reading"
+      }
+    ],
+    "loop_fixpoints": [
+      {
+        "head": ".Lunion_matches",
+        "iterations": 2
+      },
+      {
+        "head": ".Lunion_heads",
+        "iterations": 2
+      }
+    ],
+    "next_free_sgpr": 27,
+    "next_free_vgpr": 24,
+    "reg_plan": [
+      {
+        "base": 0,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "kernarg"
+      },
+      {
+        "base": 2,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "workgroup_x"
+      },
+      {
+        "base": 8,
+        "kind": "s",
+        "len": 8,
+        "live": "Whole",
+        "name": "args_0"
+      },
+      {
+        "base": 16,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "n_experts"
+      },
+      {
+        "base": 17,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "tile"
+      },
+      {
+        "base": 18,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "absolute_base"
+      },
+      {
+        "base": 19,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "limit"
+      },
+      {
+        "base": 20,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "temporary"
+      },
+      {
+        "base": 21,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "scan_index"
+      },
+      {
+        "base": 26,
+        "kind": "s",
+        "len": 1,
+        "live": "Whole",
+        "name": "saved_exec"
+      },
+      {
+        "base": 22,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "mask"
+      },
+      {
+        "base": 24,
+        "kind": "s",
+        "len": 2,
+        "live": "Whole",
+        "name": "mask2"
+      },
+      {
+        "base": 0,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "slot_state"
+      },
+      {
+        "base": 8,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "slot_state"
+      },
+      {
+        "base": 16,
+        "kind": "v",
+        "len": 8,
+        "live": "Whole",
+        "name": "slot_state"
+      }
+    ],
+    "s_text_sha256": "7cad29ef3ccde077761d06308fe359cd38b3dd312c12156b1ce3d1ee9605fea4",
+    "variant": "t8",
+    "vopd_pairs": 0,
+    "waits": [
+      {
+        "count": 0,
+        "counter": "Km",
+        "insn": "s_wait_kmcnt 0x0",
+        "pc_index": 3,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Load",
+        "insn": "s_wait_loadcnt 0x0",
+        "pc_index": 34,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Load",
+        "insn": "s_wait_loadcnt 0x0",
+        "pc_index": 40,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 54,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 64,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 90,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Ds",
+        "insn": "s_wait_dscnt 0x0",
+        "pc_index": 106,
+        "reason": "Barrier"
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 145,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 148,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 159,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 162,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 171,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 177,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 184,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 189,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 192,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 203,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 206,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 215,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 221,
+        "reason": {
+          "War": {
+            "reg": "v4"
+          }
+        }
+      },
+      {
+        "count": 0,
+        "counter": "Store",
+        "insn": "s_wait_storecnt 0x0",
+        "pc_index": 225,
+        "reason": "Barrier"
+      }
+    ]
+  },
+  "group_segment_fixed_bytes": 1280,
+  "isa_shape": {
+    "barriers": 2,
+    "ds": 8,
+    "instructions": 228,
+    "next_free_sgpr": 27,
+    "next_free_vgpr": 24,
+    "valu_slots": 86,
+    "vmem": 16,
+    "vopd_pairs": 0,
+    "waits": 35,
+    "wmma": 0
+  },
+  "kernarg_segment_bytes": 40,
+  "launch": {
+    "block": [
+      128,
+      1,
+      1
+    ],
+    "grid": [
+      "ceil(rows/8)",
+      "1",
+      "1"
+    ],
+    "row_domain": {
+      "argument": "rows",
+      "descriptor_stride_bytes": 1928,
+      "descriptor_words": 482,
+      "expert_order": "first occurrence",
+      "max": 64,
+      "min": 1,
+      "slot_capacity": 80,
+      "slot_ids": "absolute"
+    }
+  },
+  "launch_dynamic_lds_bytes": 0,
+  "module": "qwen4_slab_union_plan_t8_pm_gfx1201",
+  "require_wave32": true,
+  "require_zero_private": true,
+  "require_zero_spills": true,
+  "sgpr_max": 27,
+  "symbol": "qwen4_slab_union_plan_t8_pm_gfx1201",
+  "vgpr_max": 24
+}

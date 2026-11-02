@@ -1,0 +1,1 @@
+In 2024, the team trained a model on 1,536 GPUs for 12 days. 모델은 한국어와 영어를 모두 이해하며, 추론 속도는 초당 약 38.5개의 토큰입니다. If you ask it what 17 + 25 is, the answer is

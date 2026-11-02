@@ -1,0 +1,55 @@
+[package]
+name = "hipfire-arch-embeddinggemma2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "EmbeddingGemma 2 single-vector embedding architecture (bidirectional Gemma-4-family encoder, PLE, sliding/full hybrid, 768-d Matryoshka head) for hipfire"
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-config = { path = "../hipfire-config" }
+rdna-compute = { path = "../rdna-compute" }
+# The audio tower JITs three elementwise kernels of its own (clip clamp, GLU,
+# causal depthwise conv) through `Gpu::ensure_kernel_public` +
+# `launch_kernel_blob`, exactly the way `hipfire-arch-qwen35-vl`'s image
+# preprocess does.
+hip-bridge = { path = "../hip-bridge" }
+half = "2"
+serde_json = "1"
+# Image preprocessing for the Gemma-4 vision leg (`crate::image`):
+# aspect-preserving BICUBIC resize + patchify. Decode itself is
+# `hipfire_runtime::imagedec` (PNG through this crate's `png` feature,
+# JPEG through libjpeg-turbo-rs), the same pair `hipfire-arch-qwen35-vl`
+# uses.
+image.workspace = true
+
+[features]
+default = []
+# GPU-only examples (parity / inspection), off the default build like the
+# qwen35-embed `lab` gate.
+lab = []
+
+# GPU smoke: the vision tower forward end to end on synthetic weights.
+[[example]]
+name = "vision_smoke"
+required-features = ["lab"]
+
+# Differential instrument: dumps the processor output and the projected rows
+# for a PNG so they can be diffed against the transformers reference
+# (scripts/check_embeddinggemma2_vision_parity.py).
+[[example]]
+name = "vision_parity"
+required-features = ["lab"]
+
+# GPU smoke: the audio tower forward (mel frontend → subsample → 12-layer
+# shape → projector) on synthetic weights.
+[[example]]
+name = "audio_smoke"
+required-features = ["lab"]
+
+# Audio parity instrument: the log-mel and the `[M, text_hidden]` rows for one
+# WAV straight from the checkpoint, with `--layers N` to truncate the tower for
+# a layer-by-layer bisect against HF.
+[[example]]
+name = "audio_lab"
+required-features = ["lab"]

@@ -1,0 +1,24 @@
+         hipfire · control panel    serve: offline    model: qwen3.8:27b
+
+ Home  |  Dashboard  |  Chat  |  Models  |  Settings  |  System  |  Logs
+
+────────────────────────────────────────────────────────────────────────────────
+ ┌ Per-model overrides ───────────────────────────────────────────────────────┐
+ │Settings that apply to one model only (~/.hipfire/models.toml).             │
+ │                                                                            │
+ │  Model                  Setting               Value  (all models)          │
+ │> qwen3.8:27b            Context length        131072 (32768)               │
+ │  qwen3.8:27b            Thinking effort       high   (low)                 │
+ │  gemma4:12b             Speculation           off    (auto)                │
+ │  qwen3.6:35b-a3b        KV cache precision    q8     (auto)                │
+ │                                                                            │
+ │4 overrides on 3 models. Models without a row follow "all models".          │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ │                                                                            │
+ └────────────────────────────────────────────────────────────────────────────┘
+↑↓ move · Enter open in Settings · Del remove · Esc back    loaded hipfire state
+

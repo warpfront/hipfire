@@ -1,0 +1,4555 @@
+<|im_start|>system
+You are a careful assistant. Follow the requested long continuation length.<|im_end|>
+<|im_start|>user
+# archival module 000000; context only, not the implementation requested below
+def archive_000000(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000001; context only, not the implementation requested below
+def archive_000001(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000002; context only, not the implementation requested below
+def archive_000002(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000003; context only, not the implementation requested below
+def archive_000003(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000004; context only, not the implementation requested below
+def archive_000004(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000005; context only, not the implementation requested below
+def archive_000005(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000006; context only, not the implementation requested below
+def archive_000006(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000007; context only, not the implementation requested below
+def archive_000007(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000008; context only, not the implementation requested below
+def archive_000008(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000009; context only, not the implementation requested below
+def archive_000009(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000010; context only, not the implementation requested below
+def archive_000010(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000011; context only, not the implementation requested below
+def archive_000011(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000012; context only, not the implementation requested below
+def archive_000012(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000013; context only, not the implementation requested below
+def archive_000013(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000014; context only, not the implementation requested below
+def archive_000014(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000015; context only, not the implementation requested below
+def archive_000015(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000016; context only, not the implementation requested below
+def archive_000016(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000017; context only, not the implementation requested below
+def archive_000017(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000018; context only, not the implementation requested below
+def archive_000018(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000019; context only, not the implementation requested below
+def archive_000019(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000020; context only, not the implementation requested below
+def archive_000020(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000021; context only, not the implementation requested below
+def archive_000021(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000022; context only, not the implementation requested below
+def archive_000022(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000023; context only, not the implementation requested below
+def archive_000023(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000024; context only, not the implementation requested below
+def archive_000024(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000025; context only, not the implementation requested below
+def archive_000025(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000026; context only, not the implementation requested below
+def archive_000026(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000027; context only, not the implementation requested below
+def archive_000027(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000028; context only, not the implementation requested below
+def archive_000028(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000029; context only, not the implementation requested below
+def archive_000029(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000030; context only, not the implementation requested below
+def archive_000030(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000031; context only, not the implementation requested below
+def archive_000031(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000032; context only, not the implementation requested below
+def archive_000032(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000033; context only, not the implementation requested below
+def archive_000033(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000034; context only, not the implementation requested below
+def archive_000034(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000035; context only, not the implementation requested below
+def archive_000035(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000036; context only, not the implementation requested below
+def archive_000036(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000037; context only, not the implementation requested below
+def archive_000037(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000038; context only, not the implementation requested below
+def archive_000038(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000039; context only, not the implementation requested below
+def archive_000039(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000040; context only, not the implementation requested below
+def archive_000040(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000041; context only, not the implementation requested below
+def archive_000041(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000042; context only, not the implementation requested below
+def archive_000042(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000043; context only, not the implementation requested below
+def archive_000043(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000044; context only, not the implementation requested below
+def archive_000044(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000045; context only, not the implementation requested below
+def archive_000045(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000046; context only, not the implementation requested below
+def archive_000046(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000047; context only, not the implementation requested below
+def archive_000047(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000048; context only, not the implementation requested below
+def archive_000048(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000049; context only, not the implementation requested below
+def archive_000049(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000050; context only, not the implementation requested below
+def archive_000050(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000051; context only, not the implementation requested below
+def archive_000051(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000052; context only, not the implementation requested below
+def archive_000052(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000053; context only, not the implementation requested below
+def archive_000053(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000054; context only, not the implementation requested below
+def archive_000054(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000055; context only, not the implementation requested below
+def archive_000055(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000056; context only, not the implementation requested below
+def archive_000056(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000057; context only, not the implementation requested below
+def archive_000057(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000058; context only, not the implementation requested below
+def archive_000058(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000059; context only, not the implementation requested below
+def archive_000059(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000060; context only, not the implementation requested below
+def archive_000060(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000061; context only, not the implementation requested below
+def archive_000061(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000062; context only, not the implementation requested below
+def archive_000062(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000063; context only, not the implementation requested below
+def archive_000063(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000064; context only, not the implementation requested below
+def archive_000064(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000065; context only, not the implementation requested below
+def archive_000065(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000066; context only, not the implementation requested below
+def archive_000066(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000067; context only, not the implementation requested below
+def archive_000067(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000068; context only, not the implementation requested below
+def archive_000068(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000069; context only, not the implementation requested below
+def archive_000069(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000070; context only, not the implementation requested below
+def archive_000070(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000071; context only, not the implementation requested below
+def archive_000071(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000072; context only, not the implementation requested below
+def archive_000072(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000073; context only, not the implementation requested below
+def archive_000073(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000074; context only, not the implementation requested below
+def archive_000074(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000075; context only, not the implementation requested below
+def archive_000075(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000076; context only, not the implementation requested below
+def archive_000076(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000077; context only, not the implementation requested below
+def archive_000077(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000078; context only, not the implementation requested below
+def archive_000078(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000079; context only, not the implementation requested below
+def archive_000079(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000080; context only, not the implementation requested below
+def archive_000080(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000081; context only, not the implementation requested below
+def archive_000081(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000082; context only, not the implementation requested below
+def archive_000082(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000083; context only, not the implementation requested below
+def archive_000083(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000084; context only, not the implementation requested below
+def archive_000084(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000085; context only, not the implementation requested below
+def archive_000085(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000086; context only, not the implementation requested below
+def archive_000086(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000087; context only, not the implementation requested below
+def archive_000087(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000088; context only, not the implementation requested below
+def archive_000088(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000089; context only, not the implementation requested below
+def archive_000089(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000090; context only, not the implementation requested below
+def archive_000090(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000091; context only, not the implementation requested below
+def archive_000091(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000092; context only, not the implementation requested below
+def archive_000092(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000093; context only, not the implementation requested below
+def archive_000093(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000094; context only, not the implementation requested below
+def archive_000094(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000095; context only, not the implementation requested below
+def archive_000095(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000096; context only, not the implementation requested below
+def archive_000096(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000097; context only, not the implementation requested below
+def archive_000097(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000098; context only, not the implementation requested below
+def archive_000098(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000099; context only, not the implementation requested below
+def archive_000099(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000100; context only, not the implementation requested below
+def archive_000100(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000101; context only, not the implementation requested below
+def archive_000101(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000102; context only, not the implementation requested below
+def archive_000102(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000103; context only, not the implementation requested below
+def archive_000103(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000104; context only, not the implementation requested below
+def archive_000104(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000105; context only, not the implementation requested below
+def archive_000105(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000106; context only, not the implementation requested below
+def archive_000106(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000107; context only, not the implementation requested below
+def archive_000107(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000108; context only, not the implementation requested below
+def archive_000108(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000109; context only, not the implementation requested below
+def archive_000109(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000110; context only, not the implementation requested below
+def archive_000110(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000111; context only, not the implementation requested below
+def archive_000111(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000112; context only, not the implementation requested below
+def archive_000112(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000113; context only, not the implementation requested below
+def archive_000113(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000114; context only, not the implementation requested below
+def archive_000114(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000115; context only, not the implementation requested below
+def archive_000115(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000116; context only, not the implementation requested below
+def archive_000116(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000117; context only, not the implementation requested below
+def archive_000117(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000118; context only, not the implementation requested below
+def archive_000118(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000119; context only, not the implementation requested below
+def archive_000119(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000120; context only, not the implementation requested below
+def archive_000120(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000121; context only, not the implementation requested below
+def archive_000121(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000122; context only, not the implementation requested below
+def archive_000122(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000123; context only, not the implementation requested below
+def archive_000123(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000124; context only, not the implementation requested below
+def archive_000124(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000125; context only, not the implementation requested below
+def archive_000125(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000126; context only, not the implementation requested below
+def archive_000126(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000127; context only, not the implementation requested below
+def archive_000127(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000128; context only, not the implementation requested below
+def archive_000128(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000129; context only, not the implementation requested below
+def archive_000129(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000130; context only, not the implementation requested below
+def archive_000130(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000131; context only, not the implementation requested below
+def archive_000131(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000132; context only, not the implementation requested below
+def archive_000132(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000133; context only, not the implementation requested below
+def archive_000133(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000134; context only, not the implementation requested below
+def archive_000134(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000135; context only, not the implementation requested below
+def archive_000135(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000136; context only, not the implementation requested below
+def archive_000136(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000137; context only, not the implementation requested below
+def archive_000137(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000138; context only, not the implementation requested below
+def archive_000138(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000139; context only, not the implementation requested below
+def archive_000139(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000140; context only, not the implementation requested below
+def archive_000140(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000141; context only, not the implementation requested below
+def archive_000141(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000142; context only, not the implementation requested below
+def archive_000142(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000143; context only, not the implementation requested below
+def archive_000143(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000144; context only, not the implementation requested below
+def archive_000144(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000145; context only, not the implementation requested below
+def archive_000145(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000146; context only, not the implementation requested below
+def archive_000146(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000147; context only, not the implementation requested below
+def archive_000147(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000148; context only, not the implementation requested below
+def archive_000148(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000149; context only, not the implementation requested below
+def archive_000149(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000150; context only, not the implementation requested below
+def archive_000150(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000151; context only, not the implementation requested below
+def archive_000151(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000152; context only, not the implementation requested below
+def archive_000152(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000153; context only, not the implementation requested below
+def archive_000153(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000154; context only, not the implementation requested below
+def archive_000154(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000155; context only, not the implementation requested below
+def archive_000155(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000156; context only, not the implementation requested below
+def archive_000156(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000157; context only, not the implementation requested below
+def archive_000157(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000158; context only, not the implementation requested below
+def archive_000158(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000159; context only, not the implementation requested below
+def archive_000159(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000160; context only, not the implementation requested below
+def archive_000160(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000161; context only, not the implementation requested below
+def archive_000161(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000162; context only, not the implementation requested below
+def archive_000162(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000163; context only, not the implementation requested below
+def archive_000163(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000164; context only, not the implementation requested below
+def archive_000164(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000165; context only, not the implementation requested below
+def archive_000165(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000166; context only, not the implementation requested below
+def archive_000166(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000167; context only, not the implementation requested below
+def archive_000167(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000168; context only, not the implementation requested below
+def archive_000168(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000169; context only, not the implementation requested below
+def archive_000169(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000170; context only, not the implementation requested below
+def archive_000170(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000171; context only, not the implementation requested below
+def archive_000171(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000172; context only, not the implementation requested below
+def archive_000172(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000173; context only, not the implementation requested below
+def archive_000173(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000174; context only, not the implementation requested below
+def archive_000174(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000175; context only, not the implementation requested below
+def archive_000175(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000176; context only, not the implementation requested below
+def archive_000176(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000177; context only, not the implementation requested below
+def archive_000177(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000178; context only, not the implementation requested below
+def archive_000178(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000179; context only, not the implementation requested below
+def archive_000179(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000180; context only, not the implementation requested below
+def archive_000180(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000181; context only, not the implementation requested below
+def archive_000181(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000182; context only, not the implementation requested below
+def archive_000182(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000183; context only, not the implementation requested below
+def archive_000183(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000184; context only, not the implementation requested below
+def archive_000184(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000185; context only, not the implementation requested below
+def archive_000185(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000186; context only, not the implementation requested below
+def archive_000186(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000187; context only, not the implementation requested below
+def archive_000187(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000188; context only, not the implementation requested below
+def archive_000188(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000189; context only, not the implementation requested below
+def archive_000189(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000190; context only, not the implementation requested below
+def archive_000190(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000191; context only, not the implementation requested below
+def archive_000191(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000192; context only, not the implementation requested below
+def archive_000192(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000193; context only, not the implementation requested below
+def archive_000193(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000194; context only, not the implementation requested below
+def archive_000194(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000195; context only, not the implementation requested below
+def archive_000195(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000196; context only, not the implementation requested below
+def archive_000196(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000197; context only, not the implementation requested below
+def archive_000197(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000198; context only, not the implementation requested below
+def archive_000198(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000199; context only, not the implementation requested below
+def archive_000199(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000200; context only, not the implementation requested below
+def archive_000200(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000201; context only, not the implementation requested below
+def archive_000201(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000202; context only, not the implementation requested below
+def archive_000202(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000203; context only, not the implementation requested below
+def archive_000203(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000204; context only, not the implementation requested below
+def archive_000204(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000205; context only, not the implementation requested below
+def archive_000205(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000206; context only, not the implementation requested below
+def archive_000206(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000207; context only, not the implementation requested below
+def archive_000207(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000208; context only, not the implementation requested below
+def archive_000208(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000209; context only, not the implementation requested below
+def archive_000209(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000210; context only, not the implementation requested below
+def archive_000210(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000211; context only, not the implementation requested below
+def archive_000211(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000212; context only, not the implementation requested below
+def archive_000212(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000213; context only, not the implementation requested below
+def archive_000213(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000214; context only, not the implementation requested below
+def archive_000214(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000215; context only, not the implementation requested below
+def archive_000215(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000216; context only, not the implementation requested below
+def archive_000216(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000217; context only, not the implementation requested below
+def archive_000217(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000218; context only, not the implementation requested below
+def archive_000218(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000219; context only, not the implementation requested below
+def archive_000219(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000220; context only, not the implementation requested below
+def archive_000220(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000221; context only, not the implementation requested below
+def archive_000221(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000222; context only, not the implementation requested below
+def archive_000222(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000223; context only, not the implementation requested below
+def archive_000223(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000224; context only, not the implementation requested below
+def archive_000224(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000225; context only, not the implementation requested below
+def archive_000225(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000226; context only, not the implementation requested below
+def archive_000226(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000227; context only, not the implementation requested below
+def archive_000227(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000228; context only, not the implementation requested below
+def archive_000228(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000229; context only, not the implementation requested below
+def archive_000229(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000230; context only, not the implementation requested below
+def archive_000230(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000231; context only, not the implementation requested below
+def archive_000231(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000232; context only, not the implementation requested below
+def archive_000232(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000233; context only, not the implementation requested below
+def archive_000233(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000234; context only, not the implementation requested below
+def archive_000234(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000235; context only, not the implementation requested below
+def archive_000235(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000236; context only, not the implementation requested below
+def archive_000236(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000237; context only, not the implementation requested below
+def archive_000237(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000238; context only, not the implementation requested below
+def archive_000238(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000239; context only, not the implementation requested below
+def archive_000239(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000240; context only, not the implementation requested below
+def archive_000240(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000241; context only, not the implementation requested below
+def archive_000241(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000242; context only, not the implementation requested below
+def archive_000242(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000243; context only, not the implementation requested below
+def archive_000243(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000244; context only, not the implementation requested below
+def archive_000244(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000245; context only, not the implementation requested below
+def archive_000245(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000246; context only, not the implementation requested below
+def archive_000246(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000247; context only, not the implementation requested below
+def archive_000247(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000248; context only, not the implementation requested below
+def archive_000248(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000249; context only, not the implementation requested below
+def archive_000249(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000250; context only, not the implementation requested below
+def archive_000250(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000251; context only, not the implementation requested below
+def archive_000251(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000252; context only, not the implementation requested below
+def archive_000252(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000253; context only, not the implementation requested below
+def archive_000253(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000254; context only, not the implementation requested below
+def archive_000254(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000255; context only, not the implementation requested below
+def archive_000255(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000256; context only, not the implementation requested below
+def archive_000256(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000257; context only, not the implementation requested below
+def archive_000257(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000258; context only, not the implementation requested below
+def archive_000258(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000259; context only, not the implementation requested below
+def archive_000259(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000260; context only, not the implementation requested below
+def archive_000260(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000261; context only, not the implementation requested below
+def archive_000261(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000262; context only, not the implementation requested below
+def archive_000262(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000263; context only, not the implementation requested below
+def archive_000263(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000264; context only, not the implementation requested below
+def archive_000264(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000265; context only, not the implementation requested below
+def archive_000265(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000266; context only, not the implementation requested below
+def archive_000266(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000267; context only, not the implementation requested below
+def archive_000267(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000268; context only, not the implementation requested below
+def archive_000268(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000269; context only, not the implementation requested below
+def archive_000269(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000270; context only, not the implementation requested below
+def archive_000270(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000271; context only, not the implementation requested below
+def archive_000271(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000272; context only, not the implementation requested below
+def archive_000272(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000273; context only, not the implementation requested below
+def archive_000273(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000274; context only, not the implementation requested below
+def archive_000274(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000275; context only, not the implementation requested below
+def archive_000275(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000276; context only, not the implementation requested below
+def archive_000276(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000277; context only, not the implementation requested below
+def archive_000277(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000278; context only, not the implementation requested below
+def archive_000278(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000279; context only, not the implementation requested below
+def archive_000279(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000280; context only, not the implementation requested below
+def archive_000280(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000281; context only, not the implementation requested below
+def archive_000281(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000282; context only, not the implementation requested below
+def archive_000282(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000283; context only, not the implementation requested below
+def archive_000283(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000284; context only, not the implementation requested below
+def archive_000284(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000285; context only, not the implementation requested below
+def archive_000285(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000286; context only, not the implementation requested below
+def archive_000286(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000287; context only, not the implementation requested below
+def archive_000287(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000288; context only, not the implementation requested below
+def archive_000288(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000289; context only, not the implementation requested below
+def archive_000289(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000290; context only, not the implementation requested below
+def archive_000290(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000291; context only, not the implementation requested below
+def archive_000291(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000292; context only, not the implementation requested below
+def archive_000292(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000293; context only, not the implementation requested below
+def archive_000293(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000294; context only, not the implementation requested below
+def archive_000294(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000295; context only, not the implementation requested below
+def archive_000295(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000296; context only, not the implementation requested below
+def archive_000296(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000297; context only, not the implementation requested below
+def archive_000297(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000298; context only, not the implementation requested below
+def archive_000298(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000299; context only, not the implementation requested below
+def archive_000299(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000300; context only, not the implementation requested below
+def archive_000300(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000301; context only, not the implementation requested below
+def archive_000301(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000302; context only, not the implementation requested below
+def archive_000302(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000303; context only, not the implementation requested below
+def archive_000303(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000304; context only, not the implementation requested below
+def archive_000304(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000305; context only, not the implementation requested below
+def archive_000305(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000306; context only, not the implementation requested below
+def archive_000306(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000307; context only, not the implementation requested below
+def archive_000307(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000308; context only, not the implementation requested below
+def archive_000308(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000309; context only, not the implementation requested below
+def archive_000309(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000310; context only, not the implementation requested below
+def archive_000310(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000311; context only, not the implementation requested below
+def archive_000311(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000312; context only, not the implementation requested below
+def archive_000312(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000313; context only, not the implementation requested below
+def archive_000313(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000314; context only, not the implementation requested below
+def archive_000314(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000315; context only, not the implementation requested below
+def archive_000315(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000316; context only, not the implementation requested below
+def archive_000316(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000317; context only, not the implementation requested below
+def archive_000317(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000318; context only, not the implementation requested below
+def archive_000318(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000319; context only, not the implementation requested below
+def archive_000319(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000320; context only, not the implementation requested below
+def archive_000320(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000321; context only, not the implementation requested below
+def archive_000321(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000322; context only, not the implementation requested below
+def archive_000322(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000323; context only, not the implementation requested below
+def archive_000323(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000324; context only, not the implementation requested below
+def archive_000324(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000325; context only, not the implementation requested below
+def archive_000325(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000326; context only, not the implementation requested below
+def archive_000326(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000327; context only, not the implementation requested below
+def archive_000327(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000328; context only, not the implementation requested below
+def archive_000328(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000329; context only, not the implementation requested below
+def archive_000329(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000330; context only, not the implementation requested below
+def archive_000330(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000331; context only, not the implementation requested below
+def archive_000331(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000332; context only, not the implementation requested below
+def archive_000332(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000333; context only, not the implementation requested below
+def archive_000333(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000334; context only, not the implementation requested below
+def archive_000334(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000335; context only, not the implementation requested below
+def archive_000335(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000336; context only, not the implementation requested below
+def archive_000336(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000337; context only, not the implementation requested below
+def archive_000337(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000338; context only, not the implementation requested below
+def archive_000338(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000339; context only, not the implementation requested below
+def archive_000339(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000340; context only, not the implementation requested below
+def archive_000340(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000341; context only, not the implementation requested below
+def archive_000341(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000342; context only, not the implementation requested below
+def archive_000342(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000343; context only, not the implementation requested below
+def archive_000343(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000344; context only, not the implementation requested below
+def archive_000344(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000345; context only, not the implementation requested below
+def archive_000345(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000346; context only, not the implementation requested below
+def archive_000346(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000347; context only, not the implementation requested below
+def archive_000347(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000348; context only, not the implementation requested below
+def archive_000348(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000349; context only, not the implementation requested below
+def archive_000349(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000350; context only, not the implementation requested below
+def archive_000350(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000351; context only, not the implementation requested below
+def archive_000351(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000352; context only, not the implementation requested below
+def archive_000352(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000353; context only, not the implementation requested below
+def archive_000353(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000354; context only, not the implementation requested below
+def archive_000354(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000355; context only, not the implementation requested below
+def archive_000355(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000356; context only, not the implementation requested below
+def archive_000356(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000357; context only, not the implementation requested below
+def archive_000357(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000358; context only, not the implementation requested below
+def archive_000358(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000359; context only, not the implementation requested below
+def archive_000359(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000360; context only, not the implementation requested below
+def archive_000360(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000361; context only, not the implementation requested below
+def archive_000361(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000362; context only, not the implementation requested below
+def archive_000362(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000363; context only, not the implementation requested below
+def archive_000363(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000364; context only, not the implementation requested below
+def archive_000364(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000365; context only, not the implementation requested below
+def archive_000365(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000366; context only, not the implementation requested below
+def archive_000366(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000367; context only, not the implementation requested below
+def archive_000367(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000368; context only, not the implementation requested below
+def archive_000368(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000369; context only, not the implementation requested below
+def archive_000369(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000370; context only, not the implementation requested below
+def archive_000370(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000371; context only, not the implementation requested below
+def archive_000371(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000372; context only, not the implementation requested below
+def archive_000372(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000373; context only, not the implementation requested below
+def archive_000373(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000374; context only, not the implementation requested below
+def archive_000374(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000375; context only, not the implementation requested below
+def archive_000375(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000376; context only, not the implementation requested below
+def archive_000376(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000377; context only, not the implementation requested below
+def archive_000377(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000378; context only, not the implementation requested below
+def archive_000378(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000379; context only, not the implementation requested below
+def archive_000379(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000380; context only, not the implementation requested below
+def archive_000380(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000381; context only, not the implementation requested below
+def archive_000381(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000382; context only, not the implementation requested below
+def archive_000382(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000383; context only, not the implementation requested below
+def archive_000383(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000384; context only, not the implementation requested below
+def archive_000384(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000385; context only, not the implementation requested below
+def archive_000385(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000386; context only, not the implementation requested below
+def archive_000386(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000387; context only, not the implementation requested below
+def archive_000387(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000388; context only, not the implementation requested below
+def archive_000388(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000389; context only, not the implementation requested below
+def archive_000389(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000390; context only, not the implementation requested below
+def archive_000390(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000391; context only, not the implementation requested below
+def archive_000391(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000392; context only, not the implementation requested below
+def archive_000392(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000393; context only, not the implementation requested below
+def archive_000393(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000394; context only, not the implementation requested below
+def archive_000394(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000395; context only, not the implementation requested below
+def archive_000395(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000396; context only, not the implementation requested below
+def archive_000396(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000397; context only, not the implementation requested below
+def archive_000397(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000398; context only, not the implementation requested below
+def archive_000398(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000399; context only, not the implementation requested below
+def archive_000399(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000400; context only, not the implementation requested below
+def archive_000400(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000401; context only, not the implementation requested below
+def archive_000401(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000402; context only, not the implementation requested below
+def archive_000402(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000403; context only, not the implementation requested below
+def archive_000403(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000404; context only, not the implementation requested below
+def archive_000404(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000405; context only, not the implementation requested below
+def archive_000405(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000406; context only, not the implementation requested below
+def archive_000406(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000407; context only, not the implementation requested below
+def archive_000407(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000408; context only, not the implementation requested below
+def archive_000408(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000409; context only, not the implementation requested below
+def archive_000409(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000410; context only, not the implementation requested below
+def archive_000410(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000411; context only, not the implementation requested below
+def archive_000411(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000412; context only, not the implementation requested below
+def archive_000412(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000413; context only, not the implementation requested below
+def archive_000413(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000414; context only, not the implementation requested below
+def archive_000414(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000415; context only, not the implementation requested below
+def archive_000415(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000416; context only, not the implementation requested below
+def archive_000416(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000417; context only, not the implementation requested below
+def archive_000417(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000418; context only, not the implementation requested below
+def archive_000418(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000419; context only, not the implementation requested below
+def archive_000419(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000420; context only, not the implementation requested below
+def archive_000420(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000421; context only, not the implementation requested below
+def archive_000421(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000422; context only, not the implementation requested below
+def archive_000422(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000423; context only, not the implementation requested below
+def archive_000423(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000424; context only, not the implementation requested below
+def archive_000424(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000425; context only, not the implementation requested below
+def archive_000425(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000426; context only, not the implementation requested below
+def archive_000426(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000427; context only, not the implementation requested below
+def archive_000427(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000428; context only, not the implementation requested below
+def archive_000428(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000429; context only, not the implementation requested below
+def archive_000429(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000430; context only, not the implementation requested below
+def archive_000430(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000431; context only, not the implementation requested below
+def archive_000431(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000432; context only, not the implementation requested below
+def archive_000432(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000433; context only, not the implementation requested below
+def archive_000433(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000434; context only, not the implementation requested below
+def archive_000434(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000435; context only, not the implementation requested below
+def archive_000435(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000436; context only, not the implementation requested below
+def archive_000436(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000437; context only, not the implementation requested below
+def archive_000437(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000438; context only, not the implementation requested below
+def archive_000438(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000439; context only, not the implementation requested below
+def archive_000439(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000440; context only, not the implementation requested below
+def archive_000440(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000441; context only, not the implementation requested below
+def archive_000441(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000442; context only, not the implementation requested below
+def archive_000442(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000443; context only, not the implementation requested below
+def archive_000443(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000444; context only, not the implementation requested below
+def archive_000444(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000445; context only, not the implementation requested below
+def archive_000445(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000446; context only, not the implementation requested below
+def archive_000446(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000447; context only, not the implementation requested below
+def archive_000447(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000448; context only, not the implementation requested below
+def archive_000448(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000449; context only, not the implementation requested below
+def archive_000449(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000450; context only, not the implementation requested below
+def archive_000450(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000451; context only, not the implementation requested below
+def archive_000451(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000452; context only, not the implementation requested below
+def archive_000452(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000453; context only, not the implementation requested below
+def archive_000453(values):
+    total = 0
+    for position, value in enumerate(values):
+        if position % 3 == 0:
+            total += value * 2
+        else:
+            total -= value
+    return total
+
+# archival module 000454; context only, not the implementation requested below
+def archive_000454(values):
+    total = 0
+    for position, value in enumerate(values):
+        
+
+Write a complete Python implementation of an in-memory transactional key-value store with nested transactions, rollback, commit, snapshots, and deterministic iteration. Include full runnable unittest coverage and explanatory docstrings. Output at least 150 lines of complete code, not a summary or outline. Continue the implementation and tests for at least 2048 output tokens; do not finish early or emit a closing summary.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

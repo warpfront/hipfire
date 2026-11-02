@@ -1,0 +1,453 @@
+{
+  "_comment": "Post-land GPU smoke plan (runner: scripts/post_land_smoke.py; orchestrator: scripts/post-land-smoke.sh). Model paths come from the SMOKE_* environment variables named in each load (set per host in the orchestrator model-env files); model_bytes pins the artifact size. Artifact exceptions, all approved: the PP2 loads use the mq2-xts export because the mq4 split base (70.9 GB) cannot fit resident-expert PP2 on two 32 GB cards; the A3B load uses the canonical mq4r because the registry default mq4p is not present on the lane host; PLE is pinned to q4 on every Flash-Next load (the gfx1201 default is q8), so these cells are smoke pins, not claims about the full shipped defaults. KV mode, recurrent-state quantization and MTP depth are omitted so the shipped defaults apply. stderr_fail_patterns is empty on purpose: kernel faults are caught by the hold watcher, and route proofs are positive stderr_require/loaded_expect checks per load (there is no global 'no closed route plan' rejection: PP2, EP2 and A3B legitimately print it). xtx-d2 is disabled and path-filtered (see docs/post-land-smoke.md). Load names carry a -load suffix because the runner rejects a load and a cell sharing a name; pins and invariants use the cell names (fn1-ar, ep2-mtp, ...).",
+  "version": 1,
+  "prompt": "Explain why the sky is blue in three short sentences.",
+  "max_tokens": 32,
+  "stderr_fail_patterns": [],
+  "loads": [
+    {
+      "name": "fn1-ar-load",
+      "note": "PLE q4 explicit (gfx1201 default is q8); smoke pin, not a full-default claim",
+      "model": "${SMOKE_FN_MQ4_SPLIT}",
+      "model_bytes": 70888270360,
+      "load_params": {
+        "max_seq": 2048,
+        "mtp_mode": "off"
+      },
+      "env": {
+        "HIPFIRE_TOPOLOGY_PP": "1",
+        "HIPFIRE_TOPOLOGY_EP": "1",
+        "HIPFIRE_PLE_FORMAT": "q4",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0"
+      },
+      "deadline_s": 280,
+      "stderr_require": [
+        "kernels: Ar route plan \\(\\d+ modules\\)",
+        "kernels: Ar route ready, open \\(never sealed\\): \\d+/\\d+ predicted .* compiled before ready .*; 0 unplanned kernel requests during load",
+        "drafter=off"
+      ],
+      "loaded_expect": {
+        "arch": "qwen4",
+        "pp": 1,
+        "mtp_mode_effective": "off",
+        "max_seq": 2048
+      },
+      "cells": [
+        {
+          "name": "fn1-ar",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    },
+    {
+      "name": "fn1-mtp-load",
+      "note": "PLE q4 explicit (gfx1201 default is q8); smoke pin, not a full-default claim",
+      "model": "${SMOKE_FN_MQ4_SPLIT}",
+      "model_bytes": 70888270360,
+      "load_params": {
+        "max_seq": 2048,
+        "mtp_mode": "on"
+      },
+      "env": {
+        "HIPFIRE_TOPOLOGY_PP": "1",
+        "HIPFIRE_TOPOLOGY_EP": "1",
+        "HIPFIRE_PLE_FORMAT": "q4",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0"
+      },
+      "deadline_s": 280,
+      "stderr_require": [
+        "kernels: NativeMtp route plan \\(\\d+ modules\\)",
+        "kernels: NativeMtp route ready, open \\(never sealed\\): \\d+/\\d+ predicted .* compiled before ready .*; 0 unplanned kernel requests during load",
+        "qwen4 native MTP speculator enabled",
+        "drafter=mtp"
+      ],
+      "loaded_expect": {
+        "arch": "qwen4",
+        "pp": 1,
+        "mtp_mode_effective": "on",
+        "max_seq": 2048
+      },
+      "cells": [
+        {
+          "name": "fn1-mtp",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    },
+    {
+      "name": "ep2-ar-load",
+      "note": "PLE q4 explicit (gfx1201 default is q8); smoke pin, not a full-default claim.",
+      "model": "${SMOKE_FN_MQ4_SPLIT}",
+      "model_bytes": 70888270360,
+      "load_params": {
+        "max_seq": 2048,
+        "mtp_mode": "off"
+      },
+      "env": {
+        "HIPFIRE_TOPOLOGY_PP": "1",
+        "HIPFIRE_TOPOLOGY_EP": "2",
+        "HIPFIRE_PLE_FORMAT": "q4",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0"
+      },
+      "deadline_s": 270,
+      "stderr_require": [
+        "qwen4 EP plan: 2 ranks",
+        "native MTP off"
+      ],
+      "loaded_expect": {
+        "arch": "qwen4",
+        "pp": 1,
+        "ep": 2,
+        "mtp_mode_effective": "off",
+        "max_seq": 2048
+      },
+      "cells": [
+        {
+          "name": "ep2-ar",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    },
+    {
+      "name": "ep2-mtp-load",
+      "note": "PLE q4 explicit (gfx1201 default is q8); smoke pin, not a full-default claim.",
+      "model": "${SMOKE_FN_MQ4_SPLIT}",
+      "model_bytes": 70888270360,
+      "load_params": {
+        "max_seq": 2048,
+        "mtp_mode": "on"
+      },
+      "env": {
+        "HIPFIRE_TOPOLOGY_PP": "1",
+        "HIPFIRE_TOPOLOGY_EP": "2",
+        "HIPFIRE_PLE_FORMAT": "q4",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0"
+      },
+      "deadline_s": 300,
+      "stderr_require": [
+        "qwen4 EP plan: 2 ranks",
+        "qwen4 native MTP speculator enabled",
+        "drafter=mtp"
+      ],
+      "loaded_expect": {
+        "arch": "qwen4",
+        "pp": 1,
+        "ep": 2,
+        "mtp_mode_effective": "on",
+        "max_seq": 2048
+      },
+      "cells": [
+        {
+          "name": "ep2-mtp",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pp2-ar-load",
+      "note": "PLE q4 explicit (gfx1201 default is q8); smoke pin, not a full-default claim. Parent selects available mq2-xts because default mq4 cannot fit resident PP2; cross-quant PP2==fn1 is not contractual.",
+      "model": "${SMOKE_FN_MQ2}",
+      "model_bytes": 47038936600,
+      "load_params": {
+        "max_seq": 2048,
+        "mtp_mode": "off"
+      },
+      "env": {
+        "HIPFIRE_TOPOLOGY_PP": "2",
+        "HIPFIRE_TOPOLOGY_EP": "1",
+        "HIPFIRE_PLE_FORMAT": "q4",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0"
+      },
+      "deadline_s": 180,
+      "stderr_require": [
+        "qwen4 PP plan: 2 bands"
+      ],
+      "loaded_expect": {
+        "arch": "qwen4",
+        "pp": 2,
+        "mtp_mode_effective": "off",
+        "max_seq": 2048
+      },
+      "cells": [
+        {
+          "name": "pp2-ar",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    },
+    {
+      "name": "pp2-mtp-load",
+      "note": "PLE q4 explicit (gfx1201 default is q8); smoke pin, not a full-default claim. Parent selects available mq2-xts because default mq4 cannot fit resident PP2; cross-quant PP2==fn1 is not contractual.",
+      "model": "${SMOKE_FN_MQ2}",
+      "model_bytes": 47038936600,
+      "load_params": {
+        "max_seq": 2048,
+        "mtp_mode": "on"
+      },
+      "env": {
+        "HIPFIRE_TOPOLOGY_PP": "2",
+        "HIPFIRE_TOPOLOGY_EP": "1",
+        "HIPFIRE_PLE_FORMAT": "q4",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0"
+      },
+      "deadline_s": 180,
+      "stderr_require": [
+        "qwen4 PP plan: 2 bands",
+        "qwen4 native MTP speculator enabled",
+        "drafter=mtp"
+      ],
+      "loaded_expect": {
+        "arch": "qwen4",
+        "pp": 2,
+        "mtp_mode_effective": "on",
+        "max_seq": 2048
+      },
+      "cells": [
+        {
+          "name": "pp2-mtp",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    },
+    {
+      "name": "a3b-ar-load",
+      "note": "Registry default mq4p 8eb3be69 is not on this host; parent selects canonical mq4r to cover the A3B/Qwen3.5-MoE arch path. SHA256 4685c140c46b1a6f31a0fd9053bf09d5faf1d2529d715b84794249b66cde0428.",
+      "model": "${SMOKE_A3B}",
+      "model_bytes": 18700048128,
+      "load_params": {
+        "max_seq": 2048,
+        "mtp_mode": "off"
+      },
+      "env": {
+        "HIPFIRE_TOPOLOGY_PP": "1",
+        "HIPFIRE_TOPOLOGY_EP": "1",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0"
+      },
+      "deadline_s": 90,
+      "stderr_require": [
+        "drafter=off"
+      ],
+      "loaded_expect": {
+        "arch": "qwen3_5_moe",
+        "pp": 1,
+        "mtp_mode_effective": "off",
+        "max_seq": 2048
+      },
+      "cells": [
+        {
+          "name": "a3b-ar",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    },
+    {
+      "name": "xtx-ar-load",
+      "note": "every land; D2 forced OFF (Main ruling 2026-10-18: XTX bus drops under D2 unexplained). D2 is the shipped mq4 XTX default, so this cell does NOT cover it; see xtx-d2.",
+      "model": "${SMOKE_FN_MQ4_SPLIT}",
+      "model_bytes": 70888270360,
+      "load_params": {
+        "max_seq": 4096,
+        "mtp_mode": "off",
+        "dflash_mode": "off",
+        "ngram_draft": false
+      },
+      "env": {
+        "HIPFIRE_QWEN4_D2_DEFAULT": "0",
+        "HIPFIRE_PLE_FORMAT": "q4",
+        "HIPFIRE_PLE_PREWARM_BYTES": "0",
+        "HIPFIRE_PLE_LOAD_FILL_BYTES": "0",
+        "HIPFIRE_PLE_HOT_STORE_BYTES": "0",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0",
+        "HIPFIRE_TOPOLOGY_PP": "1",
+        "HIPFIRE_TOPOLOGY_EP": "1"
+      },
+      "deadline_s": 540,
+      "stderr_require": [
+        "qwen4 D2 default \\(\\d+ host split layers\\): off \\(developer\\.qwen4_d2_default=false\\)"
+      ],
+      "loaded_expect": {
+        "arch": "qwen4",
+        "mtp_mode_effective": "off"
+      },
+      "cells": [
+        {
+          "name": "xtx-ar",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    },
+    {
+      "name": "xtx-d2-load",
+      "note": "runs only when the land touches the D2/decode-split paths (Main ruling); D2 is the shipped mq4 XTX default",
+      "enabled": false,
+      "run_if_paths": [
+        "^crates/hipfire-dispatch/src/cpu_split",
+        "^crates/hipfire-cpu/",
+        "^crates/hipfire-arch-qwen4/src/d2_default\\.rs$",
+        "^crates/hipfire-arch-qwen4/src/gpu_forward/cpu_splice\\.rs$"
+      ],
+      "run_if_diff": [
+        {
+          "path": "^crates/hipfire-arch-qwen4/src/gpu_forward\\.rs$",
+          "hunk": "(?i)\\bd2\\b|d2_|cpu_split|routed_view"
+        },
+        {
+          "path": "^crates/hipfire-loader/src/carriers\\.rs$",
+          "hunk": "(?i)\\bd2\\b|cpu split"
+        },
+        {
+          "path": "^crates/hip-bridge/src/",
+          "hunk": "(?i)mapped|cpwait|cp_wait|host_register|hostregister|hostmalloc"
+        }
+      ],
+      "model": "${SMOKE_FN_MQ4_SPLIT}",
+      "model_bytes": 70888270360,
+      "load_params": {
+        "max_seq": 4096,
+        "mtp_mode": "off",
+        "dflash_mode": "off",
+        "ngram_draft": false
+      },
+      "env": {
+        "HIPFIRE_QWEN4_D2_DEFAULT": "1",
+        "HIPFIRE_PLE_FORMAT": "q4",
+        "HIPFIRE_PLE_PREWARM_BYTES": "0",
+        "HIPFIRE_PLE_LOAD_FILL_BYTES": "0",
+        "HIPFIRE_PLE_HOT_STORE_BYTES": "0",
+        "HIPFIRE_SESSION_CACHE_BYTES": "0",
+        "HIPFIRE_TOPOLOGY_PP": "1",
+        "HIPFIRE_TOPOLOGY_EP": "1"
+      },
+      "deadline_s": 540,
+      "stderr_require": [
+        "qwen4 D2 default \\(\\d+ host split layers\\): FORCED ON",
+        "CPU split \\(D2\\) armed on [1-9]\\d* layers"
+      ],
+      "loaded_expect": {
+        "arch": "qwen4",
+        "mtp_mode_effective": "off"
+      },
+      "cells": [
+        {
+          "name": "xtx-d2",
+          "generate": {
+            "thinking_enabled": false,
+            "assistant_prefix": "closed_think"
+          }
+        }
+      ]
+    }
+  ],
+  "invariants": [
+    [
+      "fn1-ar",
+      "fn1-mtp"
+    ],
+    [
+      "fn1-ar",
+      "ep2-ar"
+    ],
+    [
+      "fn1-mtp",
+      "ep2-mtp"
+    ],
+    [
+      "ep2-ar",
+      "ep2-mtp"
+    ],
+    [
+      "pp2-ar",
+      "pp2-mtp"
+    ]
+  ],
+  "lanes": [
+    {
+      "name": "hiptrx-fn1",
+      "host": "hiptrx",
+      "cards": "A",
+      "mem_gb": 30.3,
+      "hostmem_gb": 54,
+      "hostmem_lock": true,
+      "max_secs": 600,
+      "loads": [
+        "fn1-ar-load",
+        "fn1-mtp-load"
+      ]
+    },
+    {
+      "name": "hiptrx-ep2",
+      "host": "hiptrx",
+      "cards": "A,E",
+      "mem_gb": 30.3,
+      "hostmem_gb": 54,
+      "hostmem_lock": true,
+      "max_secs": 600,
+      "loads": [
+        "ep2-ar-load",
+        "ep2-mtp-load"
+      ]
+    },
+    {
+      "name": "hiptrx-pp-a3b",
+      "host": "hiptrx",
+      "cards": "B,C",
+      "mem_gb": 28,
+      "hostmem_gb": 4,
+      "hostmem_lock": true,
+      "max_secs": 600,
+      "loads": [
+        "pp2-ar-load",
+        "pp2-mtp-load",
+        "a3b-ar-load"
+      ]
+    },
+    {
+      "name": "hipx-xtx",
+      "host": "hipx",
+      "cards": "xtx",
+      "mem_gb": 22.4,
+      "hostmem_gb": 64,
+      "hostmem_lock": true,
+      "max_secs": 600,
+      "loads": [
+        "xtx-ar-load"
+      ]
+    },
+    {
+      "name": "hipx-xtx-d2",
+      "host": "hipx",
+      "cards": "xtx",
+      "mem_gb": 22.4,
+      "hostmem_gb": 64,
+      "hostmem_lock": true,
+      "max_secs": 600,
+      "loads": [
+        "xtx-d2-load"
+      ]
+    }
+  ]
+}

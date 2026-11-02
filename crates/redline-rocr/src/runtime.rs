@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use hipfire_config::devices::{RDNA_CU_MASK_BAN, cu_mask_refused_on};
+use hipfire_config::emu_budget;
+
 use super::abi;
 use super::packet::{AQL_PACKET_BYTES, KernelMetadata, LaunchGeometry, PacketImage};
 
@@ -68,6 +71,7 @@ struct RuntimeInner {
 
 impl Runtime {
     pub fn initialize(symbols: Arc<abi::Symbols>) -> Result<Self, RuntimeError> {
+        hipfire_config::devices::cu_mask_env_guard().map_err(RuntimeError::CuMaskEnvRefused)?;
         // SAFETY: `Symbols::load` established the function ABI and keeps the
         // dynamic library mapped.
         let status = unsafe { (symbols.init)() };
@@ -139,6 +143,55 @@ impl Runtime {
             ));
         }
         Ok(frequency)
+    }
+
+    /// Enable or disable public ROCr asynchronous-copy profiling globally.
+    ///
+    /// ROCr stores the most recent copy's system-clock timestamps on its
+    /// completion signal. Optional symbol resolution keeps ordinary replay
+    /// usable on runtimes which do not expose this profiling extension.
+    pub fn set_async_copy_profiling(&self, enable: bool) -> Result<(), RuntimeError> {
+        let function = self.inner.symbols.profiling_async_copy_enable.ok_or(
+            RuntimeError::ProfilingUnavailable("hsa_amd_profiling_async_copy_enable"),
+        )?;
+        // SAFETY: `Symbols::load` established the optional function ABI.
+        let status = unsafe { function(enable) };
+        check_status(
+            &self.inner.symbols,
+            "hsa_amd_profiling_async_copy_enable",
+            status,
+        )
+    }
+
+    /// Retrieve the system-clock interval recorded for one completed async
+    /// copy. Profiling must have been enabled before submitting that copy.
+    pub fn async_copy_time(
+        &self,
+        signal: &CompletionSignal,
+    ) -> Result<abi::ProfilingAsyncCopyTime, RuntimeError> {
+        if !Arc::ptr_eq(&self.inner, &signal.runtime) {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "profiling signal belongs to another HSA runtime",
+            ));
+        }
+        let function = self.inner.symbols.profiling_get_async_copy_time.ok_or(
+            RuntimeError::ProfilingUnavailable("hsa_amd_profiling_get_async_copy_time"),
+        )?;
+        let mut time = abi::ProfilingAsyncCopyTime { start: 0, end: 0 };
+        // SAFETY: the owned completion signal remains live and has completed;
+        // `time` is valid output for the public ROCr call.
+        let status = unsafe { function(signal.raw(), &mut time) };
+        check_status(
+            &self.inner.symbols,
+            "hsa_amd_profiling_get_async_copy_time",
+            status,
+        )?;
+        if time.end < time.start {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "HSA async-copy profiling timestamp runs backward",
+            ));
+        }
+        Ok(time)
     }
 
     fn agents(&self) -> Result<Vec<AgentInfo>, RuntimeError> {
@@ -530,12 +583,174 @@ impl GpuDevice {
         Ok(frequency)
     }
 
+    /// Number of compute units on this GPU agent
+    /// (`HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT`).
+    ///
+    /// Ported from upstream redline-rocr runtime.rs. Diagnostic use: CU
+    /// partition sizing for `create_with_cu_mask` flows.
+    pub fn compute_unit_count(&self) -> Result<u32, RuntimeError> {
+        let mut count = 0_u32;
+        query_agent(
+            &self.runtime.symbols,
+            self.gpu_agent(),
+            abi::AMD_AGENT_INFO_COMPUTE_UNIT_COUNT,
+            (&mut count as *mut u32).cast(),
+        )?;
+        Ok(count)
+    }
+
+    /// CUs fully enabled for cooperative dispatch
+    /// (`HSA_AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT`).
+    pub fn cooperative_compute_unit_count(&self) -> Result<u32, RuntimeError> {
+        let mut count = 0_u32;
+        query_agent(
+            &self.runtime.symbols,
+            self.gpu_agent(),
+            abi::AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT,
+            (&mut count as *mut u32).cast(),
+        )?;
+        Ok(count)
+    }
+
     fn gpu_agent(&self) -> abi::Agent {
         self.gpu.handle
     }
 
     pub fn raw_gpu_agent(&self) -> abi::Agent {
         self.gpu.handle
+    }
+
+    /// Return the available SDMA-engine bit mask for copies from `source` to
+    /// this destination agent.
+    pub fn copy_engine_mask(&self, source: &GpuDevice) -> Result<u32, RuntimeError> {
+        self.require_same_runtime(source)?;
+        let mut mask = 0_u32;
+        // SAFETY: both agents belong to this live runtime and `mask` is valid
+        // output for the public ROCr ABI.
+        let status = unsafe {
+            (self.runtime.symbols.memory_copy_engine_status)(
+                self.gpu_agent(),
+                source.gpu_agent(),
+                &mut mask,
+            )
+        };
+        check_status(
+            &self.runtime.symbols,
+            "hsa_amd_memory_copy_engine_status",
+            status,
+        )?;
+        Ok(mask)
+    }
+
+    /// Return ROCr's preferred SDMA-engine mask for copies from `source`.
+    pub fn preferred_copy_engine_mask(&self, source: &GpuDevice) -> Result<u32, RuntimeError> {
+        self.require_same_runtime(source)?;
+        let mut mask = 0_u32;
+        // SAFETY: both agents belong to this live runtime and `mask` is valid
+        // output for the public ROCr ABI.
+        let status = unsafe {
+            (self.runtime.symbols.memory_get_preferred_copy_engine)(
+                self.gpu_agent(),
+                source.gpu_agent(),
+                &mut mask,
+            )
+        };
+        check_status(
+            &self.runtime.symbols,
+            "hsa_amd_memory_get_preferred_copy_engine",
+            status,
+        )?;
+        Ok(mask)
+    }
+
+    /// Submit one public-ROCr asynchronous peer copy.
+    ///
+    /// `engine` is one single-bit engine ID returned by [`Self::copy_engine_mask`].
+    /// `None` leaves engine selection to ROCr. Dependencies and completion are
+    /// persistent HSA signals; the caller must not reset or destroy them while
+    /// the copy is in flight.
+    ///
+    /// # Safety
+    ///
+    /// `dst` and `src` must each name at least `size` accessible bytes owned by
+    /// their corresponding agents, and must remain live until completion.
+    pub unsafe fn memory_async_copy(
+        &self,
+        dst: *mut c_void,
+        source: &GpuDevice,
+        src: *const c_void,
+        size: usize,
+        dependencies: &[&CompletionSignal],
+        completion: &CompletionSignal,
+        engine: Option<u32>,
+    ) -> Result<(), RuntimeError> {
+        self.require_same_runtime(source)?;
+        if !Arc::ptr_eq(&self.runtime, &completion.runtime)
+            || dependencies
+                .iter()
+                .any(|signal| !Arc::ptr_eq(&self.runtime, &signal.runtime))
+        {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "async-copy signal belongs to another HSA runtime",
+            ));
+        }
+        if dst.is_null() || src.is_null() || size == 0 {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "async-copy pointers must be non-null and size must be nonzero",
+            ));
+        }
+        let dep_signals = dependencies
+            .iter()
+            .map(|signal| signal.raw())
+            .collect::<Vec<_>>();
+        let dep_count = u32::try_from(dep_signals.len()).map_err(|_| {
+            RuntimeError::InvalidRuntimeObject("async-copy dependency count exceeds u32")
+        })?;
+        let dep_pointer = if dep_signals.is_empty() {
+            ptr::null()
+        } else {
+            dep_signals.as_ptr()
+        };
+        // SAFETY: upheld by this method's contract; all handles are owned by
+        // this runtime and the dependency array lives through the synchronous
+        // submission call.
+        let status = unsafe {
+            match engine {
+                Some(engine) => (self.runtime.symbols.memory_async_copy_on_engine)(
+                    dst,
+                    self.gpu_agent(),
+                    src,
+                    source.gpu_agent(),
+                    size,
+                    dep_count,
+                    dep_pointer,
+                    completion.raw(),
+                    engine,
+                    true,
+                ),
+                None => (self.runtime.symbols.memory_async_copy)(
+                    dst,
+                    self.gpu_agent(),
+                    src,
+                    source.gpu_agent(),
+                    size,
+                    dep_count,
+                    dep_pointer,
+                    completion.raw(),
+                ),
+            }
+        };
+        check_status(&self.runtime.symbols, "hsa_amd_memory_async_copy", status)
+    }
+
+    fn require_same_runtime(&self, other: &GpuDevice) -> Result<(), RuntimeError> {
+        if Arc::ptr_eq(&self.runtime, &other.runtime) {
+            Ok(())
+        } else {
+            Err(RuntimeError::InvalidRuntimeObject(
+                "GPU agents belong to different HSA runtimes",
+            ))
+        }
     }
 
     pub fn validate_geometry(&self, geometry: LaunchGeometry) -> Result<(), RuntimeError> {
@@ -640,6 +855,14 @@ impl CompletionSignal {
     pub fn is_complete(&self) -> bool {
         // SAFETY: the owned signal remains valid for this load.
         unsafe { (self.runtime.symbols.signal_load_scacquire)(self.raw) < 1 }
+    }
+
+    /// System-scope acquire load of the current signal value. Async-copy
+    /// callers use this to distinguish success (`0`) from a negative ROCr
+    /// asynchronous error indication.
+    pub fn value_scacquire(&self) -> i64 {
+        // SAFETY: the owned signal remains valid for this load.
+        unsafe { (self.runtime.symbols.signal_load_scacquire)(self.raw) }
     }
 
     /// Wait for completion using the default finite host-side bound.
@@ -882,6 +1105,18 @@ pub struct AqlQueue {
     raw: NonNull<abi::Queue>,
     fault: Option<Box<QueueFaultState>>,
     active: bool,
+    /// True when the last `hsa_amd_queue_cu_set_mask` returned
+    /// `HSA_STATUS_CU_MASK_REDUCED` (requested bits ANDed with process-wide
+    /// `HSA_CU_MASK`). False after a plain success or when no mask was set.
+    cu_mask_was_reduced: bool,
+    /// Effective CU affinity after the last successful set-mask, one bool per
+    /// device CU. Cached because ROCr 1.21 `AqlQueue::SetCUMasking` returns
+    /// from the KFD path without updating its internal `cu_mask_`, so
+    /// `hsa_amd_queue_cu_get_mask` keeps reporting the init-time all-CU mask.
+    effective_cu_mask: Option<Vec<bool>>,
+    /// Owning device's ISA name, kept so mask entry points without a
+    /// `GpuDevice` parameter can refuse RDNA (see [`RDNA_CU_MASK_BAN`]).
+    device_name: String,
 }
 
 impl fmt::Debug for AqlQueue {
@@ -889,6 +1124,7 @@ impl fmt::Debug for AqlQueue {
         f.debug_struct("AqlQueue")
             .field("id", &self.id())
             .field("size", &self.size())
+            .field("cu_mask_was_reduced", &self.cu_mask_was_reduced)
             .finish()
     }
 }
@@ -937,6 +1173,9 @@ impl AqlQueue {
             raw,
             fault: Some(fault),
             active: true,
+            cu_mask_was_reduced: false,
+            effective_cu_mask: None,
+            device_name: device.name().to_owned(),
         };
         let descriptor = queue.descriptor();
         if descriptor.base_address.is_null()
@@ -949,6 +1188,166 @@ impl AqlQueue {
             ));
         }
         Ok(queue)
+    }
+
+    /// Create a queue and apply a CU affinity mask before first use.
+    ///
+    /// Ported from upstream redline-rocr runtime.rs (`AqlQueue::create_with_cu_mask`).
+    /// `cu_mask[i] == true` enables compute unit `i`. The mask must not be
+    /// longer than `GpuDevice::compute_unit_count`; it is packed into the
+    /// `uint32_t` bit-vector expected by `hsa_amd_queue_cu_set_mask` (bit
+    /// count rounded up to a multiple of 32). An empty mask enables every CU
+    /// (`num_cu_mask_count == 0`).
+    ///
+    /// `HSA_STATUS_CU_MASK_REDUCED` handling matches upstream: ROCr combines
+    /// the requested mask with any process-wide `HSA_CU_MASK` via bitwise AND.
+    /// When that intersection drops requested CUs the queue is still kept and
+    /// `cu_mask_was_reduced` reports the reduction; only an effective mask
+    /// with no CUs enabled is an error (`CuMaskEmptyAfterReduce`).
+    ///
+    /// Diagnostic-only entry point: hipfire wires no default partition. The
+    /// disjoint-mask slowdown upstream measured (0.57x/0.43x) is why this
+    /// stays opt-in.
+    ///
+    /// Refused on RDNA (gfx10/gfx11/gfx12): returns
+    /// `RuntimeError::CuMaskRefusedOnRdna` before any HSA call, so no queue is
+    /// created. See [`RDNA_CU_MASK_BAN`].
+    pub fn create_with_cu_mask(
+        device: &GpuDevice,
+        requested_size: u32,
+        cu_mask: &[bool],
+    ) -> Result<Self, RuntimeError> {
+        refuse_rdna_cu_mask(device.name())?;
+        let cu_count = device.compute_unit_count()?;
+        if cu_mask.len() > cu_count as usize {
+            return Err(RuntimeError::CuMaskWiderThanDevice {
+                mask_bits: cu_mask.len(),
+                compute_unit_count: cu_count,
+            });
+        }
+        let mut queue = Self::create(device, requested_size)?;
+        queue.set_cu_mask(device, cu_mask)?;
+        Ok(queue)
+    }
+
+    /// Apply a per-CU bool affinity mask to this queue.
+    ///
+    /// See `create_with_cu_mask` for `HSA_STATUS_CU_MASK_REDUCED` semantics
+    /// (effective-mask read-back and empty-mask rejection).
+    fn set_cu_mask(&mut self, device: &GpuDevice, cu_mask: &[bool]) -> Result<(), RuntimeError> {
+        refuse_rdna_cu_mask(device.name())?;
+        let cu_count = device.compute_unit_count()? as usize;
+        let (num_bits, words) = pack_cu_mask_words(cu_mask);
+        let cu_mask_ptr = if num_bits == 0 {
+            ptr::null()
+        } else {
+            words.as_ptr()
+        };
+        // SAFETY: the queue is live and owned; `cu_mask_ptr` is either null
+        // (enable-all) or points at `words`, which outlives the call.
+        let status = unsafe {
+            (self.runtime().symbols.queue_cu_set_mask)(self.raw.as_ptr(), num_bits, cu_mask_ptr)
+        };
+        self.apply_cu_mask_set_status(device, status, cu_mask, cu_count)
+    }
+
+    /// Interpret `hsa_amd_queue_cu_set_mask` status, including REDUCED read-back.
+    ///
+    /// On plain success the requested mask is the effective affinity (any
+    /// process-wide `HSA_CU_MASK` clip would have returned REDUCED). On REDUCED
+    /// the HSA get-mask is consulted; when ROCr returns the un-updated all-CU
+    /// init vector (the KFD early-return path upstream documented) the
+    /// requested bits are kept so callers never observe a silent full-device
+    /// mask after a successful partitioned set. When this runtime predates the
+    /// get-mask symbol the requested bits are likewise kept.
+    fn apply_cu_mask_set_status(
+        &mut self,
+        device: &GpuDevice,
+        status: abi::Status,
+        requested: &[bool],
+        cu_count: usize,
+    ) -> Result<(), RuntimeError> {
+        if status == abi::STATUS_SUCCESS {
+            self.cu_mask_was_reduced = false;
+            self.effective_cu_mask = Some(normalize_cu_mask(requested, cu_count));
+            return Ok(());
+        }
+        if status == STATUS_CU_MASK_REDUCED {
+            let requested_norm = normalize_cu_mask(requested, cu_count);
+            let from_hsa = self
+                .cu_mask_from_hsa(device)
+                .unwrap_or_else(|_| requested_norm.clone());
+            let effective =
+                if cu_mask_is_all_enabled(&from_hsa) && !cu_mask_is_all_enabled(&requested_norm) {
+                    requested_norm
+                } else {
+                    from_hsa
+                };
+            if effective.iter().all(|enabled| !*enabled) {
+                return Err(RuntimeError::CuMaskEmptyAfterReduce);
+            }
+            self.cu_mask_was_reduced = true;
+            self.effective_cu_mask = Some(effective);
+            return Ok(());
+        }
+        Err(RuntimeError::Hsa {
+            operation: "hsa_amd_queue_cu_set_mask",
+            status,
+            message: status_message(&self.runtime().symbols, status),
+        })
+    }
+
+    /// Whether the last CU mask application was reduced by process-wide
+    /// `HSA_CU_MASK` (`HSA_STATUS_CU_MASK_REDUCED`).
+    ///
+    /// When true, call `cu_mask` for the effective affinity; the
+    /// requested mask was not applied verbatim.
+    #[must_use]
+    pub fn cu_mask_was_reduced(&self) -> bool {
+        self.cu_mask_was_reduced
+    }
+
+    /// Read the queue's current CU affinity mask (one bool per compute unit).
+    ///
+    /// Prefers the post-set effective cache when present (see
+    /// `effective_cu_mask`). Otherwise queries `hsa_amd_queue_cu_get_mask`
+    /// when the loaded runtime exports it; on older runtimes without the
+    /// symbol a fresh queue reports the creation-state all-enabled mask.
+    pub fn cu_mask(&self, device: &GpuDevice) -> Result<Vec<bool>, RuntimeError> {
+        if let Some(mask) = self.effective_cu_mask.as_ref() {
+            let cu_count = device.compute_unit_count()? as usize;
+            return Ok(normalize_cu_mask(mask, cu_count));
+        }
+        self.cu_mask_from_hsa(device)
+    }
+
+    fn cu_mask_from_hsa(&self, device: &GpuDevice) -> Result<Vec<bool>, RuntimeError> {
+        let runtime = self
+            .runtime
+            .as_ref()
+            .ok_or(RuntimeError::InvalidRuntimeObject(
+                "queue runtime is not retained",
+            ))?;
+        if !Arc::ptr_eq(runtime, &device.runtime) {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "CU mask query device belongs to another HSA runtime",
+            ));
+        }
+        let cu_count = device.compute_unit_count()?;
+        let num_bits = cu_mask_bit_capacity(cu_count as usize);
+        if num_bits == 0 {
+            return Ok(Vec::new());
+        }
+        let word_count = (num_bits / 32) as usize;
+        let Some(get_mask) = runtime.symbols.queue_cu_get_mask else {
+            return Ok(vec![true; cu_count as usize]);
+        };
+        let mut words = vec![0_u32; word_count];
+        // SAFETY: the queue descriptor is owned and live; `words` is a valid
+        // output buffer sized to a non-zero multiple of 32 bits.
+        let status = unsafe { get_mask(self.raw.as_ptr(), num_bits, words.as_mut_ptr()) };
+        check_status(&runtime.symbols, "hsa_amd_queue_cu_get_mask", status)?;
+        Ok(unpack_cu_mask_words(&words, cu_count as usize))
     }
 
     pub fn id(&self) -> u64 {
@@ -974,7 +1373,8 @@ impl AqlQueue {
         )
     }
 
-    fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
+    fn set_cu_mask_words(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
+        refuse_rdna_cu_mask(&self.device_name)?;
         if mask_bits == 0 || !mask_bits.is_multiple_of(32) {
             return Err(RuntimeError::InvalidCuMask(
                 "mask bit count must be a non-zero multiple of 32",
@@ -1011,6 +1411,33 @@ impl AqlQueue {
             write_index,
             depth: write_index.wrapping_sub(read_index),
         }
+    }
+    fn timeout_diagnostic(&self) -> String {
+        let sample = self.depth_sample();
+        let doorbell = unsafe {
+            (self.runtime().symbols.signal_load_scacquire)(self.descriptor().doorbell_signal)
+        };
+        let last_packet_id = sample.write_index.wrapping_sub(1);
+        let slot_index = last_packet_id & u64::from(self.descriptor().size - 1);
+        let slot = unsafe {
+            self.descriptor()
+                .base_address
+                .cast::<u8>()
+                .add(slot_index as usize * AQL_PACKET_BYTES)
+        };
+        let header_word = unsafe { &*slot.cast::<AtomicU32>() }.load(Ordering::Acquire);
+        format!(
+            "queue_id={} active={} read_index={} write_index={} depth={} \
+             doorbell={} last_packet_id={} slot={} header_word=0x{header_word:08x}",
+            sample.queue_id,
+            self.active,
+            sample.read_index,
+            sample.write_index,
+            sample.depth,
+            doorbell,
+            last_packet_id,
+            slot_index,
+        )
     }
 
     /// Reserve, fill, and release-publish one contiguous recorded batch without
@@ -1236,6 +1663,68 @@ impl QueueSet {
         })
     }
 
+    /// Create one queue per CU mask, applying each mask before first use.
+    ///
+    /// Ported from upstream redline-rocr runtime.rs (`QueueSet::create_with_cu_masks`).
+    /// Empty `cu_masks` is rejected (`ZeroQueues`). Each mask is forwarded to
+    /// `AqlQueue::create_with_cu_mask`; an empty per-lane mask enables every CU.
+    /// Diagnostic-only: hipfire wires no default partition.
+    ///
+    /// Refused on RDNA (gfx10/gfx11/gfx12) with
+    /// `RuntimeError::CuMaskRefusedOnRdna` before any queue is created; see
+    /// [`RDNA_CU_MASK_BAN`].
+    pub fn create_with_cu_masks(
+        device: &GpuDevice,
+        queue_size: u32,
+        cu_masks: &[Vec<bool>],
+    ) -> Result<Self, RuntimeError> {
+        refuse_rdna_cu_mask(device.name())?;
+        if cu_masks.is_empty() {
+            return Err(RuntimeError::ZeroQueues);
+        }
+        let mut queues = Vec::with_capacity(cu_masks.len());
+        for mask in cu_masks {
+            queues.push(AqlQueue::create_with_cu_mask(device, queue_size, mask)?);
+        }
+        let mut ids = queues.iter().map(AqlQueue::id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RuntimeError::DuplicateQueueId);
+        }
+        Ok(Self {
+            prepared_doorbells: vec![None; queues.len()],
+            queues,
+        })
+    }
+
+    /// Create one queue for each explicitly supplied GPU agent.
+    ///
+    /// This is the mixed-agent counterpart to [`Self::create`]. All devices
+    /// must belong to one initialized ROCr runtime; queue order follows device
+    /// order so packet batches remain lane-stable across replays.
+    pub fn create_for_devices(
+        devices: &[GpuDevice],
+        queue_size: u32,
+    ) -> Result<Self, RuntimeError> {
+        let Some(first) = devices.first() else {
+            return Err(RuntimeError::ZeroQueues);
+        };
+        let mut queues = Vec::with_capacity(devices.len());
+        for device in devices {
+            first.require_same_runtime(device)?;
+            queues.push(AqlQueue::create(device, queue_size)?);
+        }
+        let mut ids = queues.iter().map(AqlQueue::id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RuntimeError::DuplicateQueueId);
+        }
+        Ok(Self {
+            prepared_doorbells: vec![None; queues.len()],
+            queues,
+        })
+    }
+
     pub fn len(&self) -> usize {
         self.queues.len()
     }
@@ -1255,15 +1744,38 @@ impl QueueSet {
         Ok(())
     }
 
+    /// Apply a raw HSA CU mask to every queue.
+    ///
+    /// Refused on RDNA (gfx10/gfx11/gfx12) with
+    /// `RuntimeError::CuMaskRefusedOnRdna` before any HSA call; see
+    /// [`RDNA_CU_MASK_BAN`].
     pub fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
         for queue in &self.queues {
-            queue.set_cu_mask(mask_bits, mask)?;
+            queue.set_cu_mask_words(mask_bits, mask)?;
         }
         Ok(())
     }
 
     pub fn size(&self, lane: usize) -> Option<u32> {
         self.queues.get(lane).map(AqlQueue::size)
+    }
+
+    /// Read lane `lane`'s effective CU affinity via `AqlQueue::cu_mask`.
+    ///
+    /// Returns `None` when `lane` is out of range.
+    pub fn cu_mask(
+        &self,
+        lane: usize,
+        device: &GpuDevice,
+    ) -> Option<Result<Vec<bool>, RuntimeError>> {
+        self.queues.get(lane).map(|queue| queue.cu_mask(device))
+    }
+
+    /// Whether lane `lane`'s last CU mask application was reduced by process-wide
+    /// `HSA_CU_MASK`. Returns `None` when `lane` is out of range.
+    #[must_use]
+    pub fn cu_mask_was_reduced(&self, lane: usize) -> Option<bool> {
+        self.queues.get(lane).map(AqlQueue::cu_mask_was_reduced)
     }
 
     /// Prepare every queue without ringing any queue. This avoids a CPU packet
@@ -1315,6 +1827,17 @@ impl QueueSet {
                 return Ok(());
             }
             if started.elapsed() >= timeout {
+                let queue_state = self
+                    .queues
+                    .iter()
+                    .map(AqlQueue::timeout_diagnostic)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                eprintln!(
+                    "HIPFIRE_REDLINE_QUEUE_TIMEOUT signal=0x{:x} signal_value={} {queue_state}",
+                    signal.raw().0,
+                    signal.value_scacquire(),
+                );
                 return Err(RuntimeError::SignalTimeout {
                     signal: signal.raw().0,
                     timeout,
@@ -1427,9 +1950,13 @@ struct KernargPoolInner {
     cpu: Option<abi::Agent>,
     granule: usize,
     alignment: usize,
-    /// True for GPU-agent (VRAM) pools: buffer writes must go through
-    /// `hsa_amd_memory_copy`, not host pointer stores.
+    /// True for GPU-agent (VRAM) pools. Host stores reach them through the
+    /// BAR (large BAR / UMA only) and must be published with
+    /// [`KernargBuffer::publish_host_writes`] before the GPU reads them.
     device_local: bool,
+    /// The CPU agent must be granted access per allocation
+    /// (`HSA_AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT`).
+    grant_host_access: bool,
 }
 
 impl KernargPool {
@@ -1552,24 +2079,24 @@ impl KernargPool {
                     granule,
                     alignment,
                     device_local: false,
+                    grant_host_access: false,
                 }),
             });
         }
         Err(RuntimeError::NoKernargPool)
     }
 
-    /// Discover a GPU-agent (VRAM) pool for the retained indirect buffer.
+    /// Discover a GPU-agent (VRAM) pool for retained PM4 data.
     ///
-    /// The default [`KernargPool::discover`] pool is CPU-agent global — the
-    /// command processor re-fetches the retained PM4 IB over the host
-    /// interface on EVERY replay. A device-local pool lets the CP fetch the
-    /// tape from VRAM instead. Requires a GPU-agent GLOBAL pool with runtime
-    /// allocation allowed; coarse-grained preferred (true VRAM), fine-grained
-    /// accepted (UMA, e.g. Strix Halo). Buffers from this pool are written via
-    /// `hsa_amd_memory_copy` — host pointer stores are invalid on dGPU VRAM.
+    /// The default [`KernargPool::discover`] pool is CPU-agent global, so the
+    /// GPU reaches it over the host interface on EVERY replay. Requires a
+    /// GPU-agent GLOBAL pool with runtime allocation allowed; coarse-grained
+    /// preferred (true VRAM), fine-grained accepted (UMA, e.g. Strix Halo).
+    /// Host stores into these buffers go through the BAR and are valid only
+    /// when the CPU agent may access the pool; retained kernargs therefore use
+    /// [`Self::discover_host_writable_device_local`], which checks that.
     ///
-    /// Only the IB belongs here: timestamps/semaphores read by the host stay
-    /// on the CPU-agent pool.
+    /// Timestamps/semaphores read by the host stay on the CPU-agent pool.
     pub fn discover_device_local(device: &GpuDevice) -> Result<Self, RuntimeError> {
         unsafe extern "C" fn collect(pool: abi::MemoryPool, data: *mut c_void) -> abi::Status {
             // SAFETY: context is a live vector for synchronous iteration.
@@ -1657,6 +2184,7 @@ impl KernargPool {
                         granule,
                         alignment,
                         device_local: true,
+                        grant_host_access: false,
                     }),
                 });
             }
@@ -1671,17 +2199,76 @@ impl KernargPool {
         if let Some((pool, granule, alignment)) = fine_grained_fallback {
             return Ok(Self {
                 inner: Arc::new(KernargPoolInner {
-                        runtime: device.runtime.clone(),
-                        pool,
-                        gpu: device.gpu_agent(),
-                        cpu: device.cpu.as_ref().map(|c| c.handle),
-                        granule,
-                        alignment,
-                        device_local: true,
+                    runtime: device.runtime.clone(),
+                    pool,
+                    gpu: device.gpu_agent(),
+                    cpu: device.cpu.as_ref().map(|c| c.handle),
+                    granule,
+                    alignment,
+                    device_local: true,
+                    grant_host_access: false,
                 }),
             });
         }
         Err(RuntimeError::NoKernargPool)
+    }
+
+    /// Discover a GPU-agent pool for retained kernarg segments that the host
+    /// patches in place between replays.
+    ///
+    /// Same pool choice as [`Self::discover_device_local`], additionally
+    /// requiring that the CPU agent may access it (large-BAR dGPU or UMA), so
+    /// the per-replay position/frame patches stay plain host stores. Fails
+    /// with [`RuntimeError::DeviceLocalPoolNotHostWritable`] on small-BAR
+    /// systems; callers fall back to [`Self::discover`].
+    pub fn discover_host_writable_device_local(device: &GpuDevice) -> Result<Self, RuntimeError> {
+        let cpu = device.cpu.as_ref().ok_or(RuntimeError::NoCpuAgent)?;
+        let query = device.runtime.symbols.agent_memory_pool_get_info.ok_or(
+            RuntimeError::DeviceLocalPoolNotHostWritable(
+                "hsa_amd_agent_memory_pool_get_info is unavailable",
+            ),
+        )?;
+        let mut pool = Self::discover_device_local(device)?;
+        let mut access = abi::AMD_MEMORY_POOL_ACCESS_NEVER_ALLOWED;
+        // SAFETY: both handles are live and the output is the documented
+        // 32-bit `hsa_amd_memory_pool_access_t`.
+        let status = unsafe {
+            query(
+                cpu.handle,
+                pool.inner.pool,
+                abi::AMD_AGENT_MEMORY_POOL_INFO_ACCESS,
+                (&mut access as *mut u32).cast(),
+            )
+        };
+        check_status(
+            &device.runtime.symbols,
+            "hsa_amd_agent_memory_pool_get_info",
+            status,
+        )?;
+        let grant_host_access = match access {
+            abi::AMD_MEMORY_POOL_ACCESS_ALLOWED_BY_DEFAULT => false,
+            abi::AMD_MEMORY_POOL_ACCESS_DISALLOWED_BY_DEFAULT => true,
+            _ => {
+                return Err(RuntimeError::DeviceLocalPoolNotHostWritable(
+                    "the CPU agent can never access the device-local pool (small BAR)",
+                ));
+            }
+        };
+        if hipfire_config::developer_var_os("HIPFIRE_REDLINE_POOL_DEBUG")
+            .is_some_and(|v| v != "0" && !v.is_empty())
+        {
+            eprintln!(
+                "[redline] retained-kernarg pool: handle=0x{:x} owner=GPU-agent cpu_access={access} \
+                 grant_host_access={grant_host_access} granule={} alignment={}",
+                pool.inner.pool.0, pool.inner.granule, pool.inner.alignment,
+            );
+        }
+        Arc::get_mut(&mut pool.inner)
+            .ok_or(RuntimeError::InvalidRuntimeObject(
+                "freshly discovered kernarg pool is shared",
+            ))?
+            .grant_host_access = grant_host_access;
+        Ok(pool)
     }
 
     pub fn allocate_for(&self, metadata: KernelMetadata) -> Result<KernargBuffer, RuntimeError> {
@@ -1692,6 +2279,19 @@ impl KernargPool {
             required_alignment,
             abi::AMD_MEMORY_POOL_STANDARD_FLAG,
         )
+    }
+
+    /// Allocate retained zeroed host-resident fine-grained standard memory.
+    ///
+    /// Same pool and zeroing path as [`Self::allocate_for`], with an explicit
+    /// length/alignment for non-kernarg GPU-visible host words (e.g. PM4
+    /// dependency-fence counters).
+    pub fn allocate_fine_grained_bytes(
+        &self,
+        length: usize,
+        alignment: usize,
+    ) -> Result<KernargBuffer, RuntimeError> {
+        self.allocate_bytes(length, alignment, abi::AMD_MEMORY_POOL_STANDARD_FLAG)
     }
 
     /// Allocate CPU-writable, GPU-accessible command memory. The executable
@@ -1727,52 +2327,70 @@ impl KernargPool {
                 pointer: None,
                 length: 0,
                 allocation_size: 0,
+                budget_token: None,
             });
         }
         let allocation_size = length
             .checked_add(self.inner.granule - 1)
             .map(|value| value / self.inner.granule * self.inner.granule)
             .ok_or(RuntimeError::KernargSizeOverflow(length))?;
-        let mut pointer = ptr::null_mut();
-        // SAFETY: selected pool allows runtime allocations and output is valid.
-        let status = unsafe {
-            (self.inner.runtime.symbols.memory_pool_allocate)(
-                self.inner.pool,
-                allocation_size,
-                flags,
-                &mut pointer,
-            )
-        };
-        check_status(
-            &self.inner.runtime.symbols,
-            "hsa_amd_memory_pool_allocate",
-            status,
+        // Emu capacity gate: reserve the rounded size before the raw pool
+        // allocation; no-op (one `active()` check) when emu is off.
+        let (reservation, pointer) = reserve_then_allocate(
+            || reserve_kernarg_budget(self.inner.device_local, allocation_size),
+            || {
+                let mut pointer = ptr::null_mut();
+                // SAFETY: selected pool allows runtime allocations and output is valid.
+                let status = unsafe {
+                    (self.inner.runtime.symbols.memory_pool_allocate)(
+                        self.inner.pool,
+                        allocation_size,
+                        flags,
+                        &mut pointer,
+                    )
+                };
+                check_status(
+                    &self.inner.runtime.symbols,
+                    "hsa_amd_memory_pool_allocate",
+                    status,
+                )?;
+                match NonNull::new(pointer.cast::<u8>()) {
+                    Some(pointer) => Ok(pointer),
+                    None => Err(RuntimeError::InvalidRuntimeObject(
+                        "memory-pool allocation returned null",
+                    )),
+                }
+            },
         )?;
-        let pointer = match NonNull::new(pointer.cast::<u8>()) {
-            Some(pointer) => pointer,
-            None => {
-                return Err(RuntimeError::InvalidRuntimeObject(
-                    "memory-pool allocation returned null",
-                ));
-            }
-        };
         if pointer.as_ptr() as usize % required_alignment != 0
             || pointer.as_ptr() as usize % self.inner.alignment != 0
         {
             // SAFETY: pointer came from the matching allocation function.
-            let _ =
+            let free_status =
                 unsafe { (self.inner.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+            settle_reservation_after_cleanup(
+                reservation,
+                free_status == abi::STATUS_SUCCESS,
+                emu_budget::Reservation::commit,
+            );
             return Err(RuntimeError::KernargAlignmentNotMet {
                 required: required_alignment.max(self.inner.alignment),
                 address: pointer.as_ptr() as usize,
             });
         }
-        // SAFETY: the allocation came from this pool and the GPU agent is a
-        // valid access target; flags are reserved and therefore null.
+        // A host-writable device-local pool whose CPU access is disallowed by
+        // default also grants the CPU agent, so host kernarg stores are
+        // within the HSA access contract.
+        let (agents, agent_count) = match (self.inner.grant_host_access, self.inner.cpu) {
+            (true, Some(cpu)) => ([self.inner.gpu, cpu], 2),
+            _ => ([self.inner.gpu, self.inner.gpu], 1),
+        };
+        // SAFETY: the allocation came from this pool and every listed agent is
+        // a valid access target; flags are reserved and therefore null.
         let status = unsafe {
             (self.inner.runtime.symbols.agents_allow_access)(
-                1,
-                &self.inner.gpu,
+                agent_count,
+                agents.as_ptr(),
                 ptr::null(),
                 pointer.as_ptr().cast(),
             )
@@ -1783,8 +2401,13 @@ impl KernargPool {
             status,
         ) {
             // SAFETY: pointer came from the matching allocation function.
-            let _ =
+            let free_status =
                 unsafe { (self.inner.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+            settle_reservation_after_cleanup(
+                reservation,
+                free_status == abi::STATUS_SUCCESS,
+                emu_budget::Reservation::commit,
+            );
             return Err(error);
         }
         // Zero the entire allocation before callers populate the ABI payload,
@@ -1800,7 +2423,224 @@ impl KernargPool {
             pointer: Some(pointer),
             length,
             allocation_size,
+            budget_token: reservation.map(emu_budget::Reservation::commit),
         })
+    }
+}
+
+/// Emu capacity class charged for a kernarg-pool allocation: device-local
+/// (VRAM) pools charge the device, CPU/system pools charge pinned GTT host.
+fn kernarg_budget_class(device_local: bool) -> emu_budget::AllocationClass {
+    if device_local {
+        emu_budget::AllocationClass::Device
+    } else {
+        emu_budget::AllocationClass::HostPinnedGtt
+    }
+}
+
+/// Reserve the rounded `allocation_size` against the emu ledger. `Ok(None)`
+/// (no ledger work at all) when no emu budget is installed.
+fn reserve_kernarg_budget(
+    device_local: bool,
+    allocation_size: usize,
+) -> Result<Option<emu_budget::Reservation>, RuntimeError> {
+    let Some(id) = emu_budget::active() else {
+        return Ok(None);
+    };
+    let (class, class_name) = if device_local {
+        (kernarg_budget_class(true), "device-local")
+    } else {
+        (kernarg_budget_class(false), "host-pinned GTT")
+    };
+    emu_budget::reserve(id, class, allocation_size as u64)
+        .map(Some)
+        .map_err(|error| {
+            RuntimeError::EmuBudgetRefused(format!(
+                "emulated SKU capacity refused {allocation_size}-byte {class_name} kernarg pool \
+                 allocation: {error}"
+            ))
+        })
+}
+
+/// Reserve first, then run the raw allocation. A refused reservation never
+/// reaches `raw`; a failed `raw` drops (rolls back) the reservation.
+fn reserve_then_allocate<R, P, E>(
+    reserve: impl FnOnce() -> Result<Option<R>, E>,
+    raw: impl FnOnce() -> Result<P, E>,
+) -> Result<(Option<R>, P), E> {
+    let reservation = reserve()?;
+    let allocation = raw()?;
+    Ok((reservation, allocation))
+}
+
+/// Settle a reservation whose raw allocation succeeded but was then freed on
+/// an error path. A successful free rolls the reservation back; a failed free
+/// commits it and leaves the charge outstanding (the token is not releasing).
+fn settle_reservation_after_cleanup<R, T>(
+    reservation: Option<R>,
+    raw_freed: bool,
+    commit: impl FnOnce(R) -> T,
+) {
+    if let Some(reservation) = reservation {
+        if raw_freed {
+            drop(reservation);
+        } else {
+            let _retained = commit(reservation);
+        }
+    }
+}
+
+/// Release a committed charge only after the physical free succeeded.
+fn release_after_free<T>(token: Option<T>, raw_freed: bool, release: impl FnOnce(T)) {
+    if let Some(token) = token {
+        if raw_freed {
+            release(token);
+        }
+    }
+}
+
+#[cfg(test)]
+mod emu_kernarg_budget_tests {
+    use std::cell::{Cell, RefCell};
+
+    use super::*;
+
+    /// Reservation stand-in recording rollback (drop) vs commit.
+    struct FakeReservation<'a> {
+        log: &'a RefCell<Vec<&'static str>>,
+        committed: bool,
+    }
+
+    impl<'a> FakeReservation<'a> {
+        fn new(log: &'a RefCell<Vec<&'static str>>) -> Self {
+            Self {
+                log,
+                committed: false,
+            }
+        }
+
+        fn commit(mut self) -> &'static str {
+            self.committed = true;
+            self.log.borrow_mut().push("commit");
+            "token"
+        }
+    }
+
+    impl Drop for FakeReservation<'_> {
+        fn drop(&mut self) {
+            if !self.committed {
+                self.log.borrow_mut().push("rollback");
+            }
+        }
+    }
+
+    #[test]
+    fn class_follows_pool_locality() {
+        assert!(matches!(
+            kernarg_budget_class(true),
+            emu_budget::AllocationClass::Device
+        ));
+        assert!(matches!(
+            kernarg_budget_class(false),
+            emu_budget::AllocationClass::HostPinnedGtt
+        ));
+    }
+
+    #[test]
+    fn disabled_state_reserves_nothing() {
+        // No emu budget is installed by these CPU tests.
+        assert!(emu_budget::active().is_none());
+        assert!(matches!(reserve_kernarg_budget(true, 4096), Ok(None)));
+        assert!(matches!(reserve_kernarg_budget(false, 4096), Ok(None)));
+    }
+
+    #[test]
+    fn refusal_never_reaches_raw_allocation() {
+        let raw_calls = Cell::new(0);
+        let result: Result<(Option<()>, u32), &'static str> = reserve_then_allocate(
+            || Err("refused"),
+            || {
+                raw_calls.set(raw_calls.get() + 1);
+                Ok(7)
+            },
+        );
+        assert_eq!(result.err(), Some("refused"));
+        assert_eq!(raw_calls.get(), 0);
+    }
+
+    #[test]
+    fn raw_failure_rolls_back_reservation() {
+        let log = RefCell::new(Vec::new());
+        let result: Result<(Option<FakeReservation<'_>>, u32), &'static str> =
+            reserve_then_allocate(
+                || Ok(Some(FakeReservation::new(&log))),
+                || Err("raw failed"),
+            );
+        assert_eq!(result.err(), Some("raw failed"));
+        assert_eq!(*log.borrow(), ["rollback"]);
+    }
+
+    #[test]
+    fn raw_success_keeps_reservation_pending_for_commit() {
+        let log = RefCell::new(Vec::new());
+        let (reservation, value) = reserve_then_allocate::<_, _, &'static str>(
+            || Ok(Some(FakeReservation::new(&log))),
+            || Ok(11u32),
+        )
+        .unwrap();
+        assert_eq!(value, 11);
+        assert!(log.borrow().is_empty());
+        assert_eq!(reservation.map(FakeReservation::commit), Some("token"));
+        assert_eq!(*log.borrow(), ["commit"]);
+    }
+
+    #[test]
+    fn disabled_path_passes_through_without_reservation() {
+        let (reservation, value) =
+            reserve_then_allocate::<FakeReservation<'_>, _, &'static str>(|| Ok(None), || Ok(5u32))
+                .unwrap();
+        assert!(reservation.is_none());
+        assert_eq!(value, 5);
+    }
+
+    #[test]
+    fn cleanup_after_successful_free_rolls_back() {
+        let log = RefCell::new(Vec::new());
+        settle_reservation_after_cleanup(
+            Some(FakeReservation::new(&log)),
+            true,
+            FakeReservation::commit,
+        );
+        assert_eq!(*log.borrow(), ["rollback"]);
+    }
+
+    #[test]
+    fn cleanup_after_failed_free_retains_charge() {
+        let log = RefCell::new(Vec::new());
+        settle_reservation_after_cleanup(
+            Some(FakeReservation::new(&log)),
+            false,
+            FakeReservation::commit,
+        );
+        // Committed, never rolled back, never released.
+        assert_eq!(*log.borrow(), ["commit"]);
+    }
+
+    #[test]
+    fn cleanup_without_reservation_is_a_no_op() {
+        settle_reservation_after_cleanup::<FakeReservation<'_>, _>(None, true, |_| ());
+        settle_reservation_after_cleanup::<FakeReservation<'_>, _>(None, false, |_| ());
+    }
+
+    #[test]
+    fn release_only_after_successful_free() {
+        let released = Cell::new(0);
+        release_after_free(Some("token"), true, |_| released.set(released.get() + 1));
+        assert_eq!(released.get(), 1);
+        release_after_free(Some("token"), false, |_| released.set(released.get() + 1));
+        assert_eq!(released.get(), 1, "failed free must retain the charge");
+        release_after_free(None::<&str>, true, |_| released.set(released.get() + 1));
+        assert_eq!(released.get(), 1, "no token means nothing to release");
     }
 }
 
@@ -1826,6 +2666,8 @@ pub struct KernargBuffer {
     pointer: Option<NonNull<u8>>,
     length: usize,
     allocation_size: usize,
+    /// Emu capacity-ledger charge for this backing (`None` when emu is off).
+    budget_token: Option<emu_budget::AllocationToken>,
 }
 
 impl fmt::Debug for KernargBuffer {
@@ -1844,6 +2686,38 @@ impl KernargBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.length == 0
+    }
+
+    /// Bytes the pool actually allocated (the length rounded up to the pool
+    /// granule): the extent of the VA range this buffer owns.
+    pub fn allocation_size(&self) -> usize {
+        self.allocation_size
+    }
+
+    /// True when the buffer lives in a GPU-agent (VRAM) pool.
+    pub fn is_device_local(&self) -> bool {
+        self.device_local
+    }
+
+    /// Publish host stores to a device-local segment before the next doorbell.
+    ///
+    /// Stores through the BAR are write-combined and posted. A full fence
+    /// drains the CPU write-combining buffers, and reading one byte back
+    /// through the BAR cannot complete before every earlier posted write to
+    /// the device has landed (ROCclr's readback rule for device kernargs). One
+    /// call therefore covers every device-local buffer written before it.
+    /// Host-pool buffers need nothing and return immediately.
+    pub fn publish_host_writes(&self) {
+        if !self.device_local {
+            return;
+        }
+        let Some(pointer) = self.pointer else {
+            return;
+        };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        // SAFETY: a non-null pointer owns `length >= 1` readable bytes.
+        let _ = unsafe { ptr::read_volatile(pointer.as_ptr().add(self.length - 1)) };
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
     }
 
     pub fn as_mut_bytes(&mut self) -> &mut [u8] {
@@ -1885,8 +2759,15 @@ impl Drop for KernargBuffer {
             // The owning graph guarantees all dispatches have completed.
             // SAFETY: pointer was allocated from this runtime memory pool and
             // is uniquely owned here.
-            let _ =
+            let status =
                 unsafe { (self.pool.runtime.symbols.memory_pool_free)(pointer.as_ptr().cast()) };
+            // The emu charge is released only after the physical backing was
+            // freed; a failed free retains the charge (token dropped unreleased).
+            release_after_free(
+                self.budget_token.take(),
+                status == abi::STATUS_SUCCESS,
+                emu_budget::release,
+            );
         }
     }
 }
@@ -1901,23 +2782,107 @@ struct ExecutableInner {
     agent: abi::Agent,
     executable: abi::Executable,
     reader: abi::CodeObjectReader,
-    // `hsa_code_object_reader_create_from_memory` does not copy this storage.
-    _code_object: Arc<[u8]>,
+    // `hsa_code_object_reader_create_from_memory` does not copy this storage;
+    // the backing (owned or static) lives as long as the reader/executable.
+    _code_object: CodeObjectBytes,
+}
+
+#[derive(Clone)]
+enum CodeObjectBacking {
+    Static(&'static [u8]),
+    Owned(Arc<[u8]>),
+}
+
+/// Immutable code-object image: an owned `Arc` or a `'static` embedded image,
+/// plus a validated byte range. Cloning and `subimage` never copy bytes, so a
+/// bundle's ELF entry is a view sharing the original backing.
+#[derive(Clone)]
+pub struct CodeObjectBytes {
+    backing: CodeObjectBacking,
+    start: usize,
+    end: usize,
+}
+
+impl CodeObjectBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        let whole: &[u8] = match &self.backing {
+            CodeObjectBacking::Static(bytes) => bytes,
+            CodeObjectBacking::Owned(bytes) => bytes,
+        };
+        &whole[self.start..self.end]
+    }
+
+    /// A view of `range` relative to this view's bytes, sharing the backing.
+    pub fn subimage(&self, range: std::ops::Range<usize>) -> Result<Self, RuntimeError> {
+        let len = self.end - self.start;
+        if range.start > range.end || range.end > len {
+            return Err(RuntimeError::CodeObjectRangeOutOfBounds {
+                start: range.start,
+                end: range.end,
+                len,
+            });
+        }
+        Ok(Self {
+            backing: self.backing.clone(),
+            start: self.start + range.start,
+            end: self.start + range.end,
+        })
+    }
+}
+
+impl From<Arc<[u8]>> for CodeObjectBytes {
+    fn from(bytes: Arc<[u8]>) -> Self {
+        let end = bytes.len();
+        Self {
+            backing: CodeObjectBacking::Owned(bytes),
+            start: 0,
+            end,
+        }
+    }
+}
+
+impl From<&'static [u8]> for CodeObjectBytes {
+    fn from(bytes: &'static [u8]) -> Self {
+        Self {
+            backing: CodeObjectBacking::Static(bytes),
+            start: 0,
+            end: bytes.len(),
+        }
+    }
+}
+
+impl AsRef<[u8]> for CodeObjectBytes {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl fmt::Debug for CodeObjectBytes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = match self.backing {
+            CodeObjectBacking::Static(_) => "static",
+            CodeObjectBacking::Owned(_) => "owned",
+        };
+        write!(f, "CodeObjectBytes({kind}, {}..{})", self.start, self.end)
+    }
 }
 
 impl Executable {
-    pub fn load(device: &GpuDevice, code_object: Arc<[u8]>) -> Result<Self, RuntimeError> {
-        let code_object = unwrap_clang_offload_bundle(code_object)?;
-        if code_object.is_empty() {
+    pub fn load(
+        device: &GpuDevice,
+        image: impl Into<CodeObjectBytes>,
+    ) -> Result<Self, RuntimeError> {
+        let code_object = unwrap_clang_offload_bundle(image.into())?;
+        if code_object.as_bytes().is_empty() {
             return Err(RuntimeError::EmptyCodeObject);
         }
         let symbols = &device.runtime.symbols;
         let mut reader = abi::CodeObjectReader(0);
-        // SAFETY: Arc bytes remain alive in ExecutableInner through reader use.
+        // SAFETY: the backing remains alive in ExecutableInner through reader use.
         let status = unsafe {
             (symbols.code_object_reader_create_from_memory)(
-                code_object.as_ptr().cast(),
-                code_object.len(),
+                code_object.as_bytes().as_ptr().cast(),
+                code_object.as_bytes().len(),
                 &mut reader,
             )
         };
@@ -2050,7 +3015,7 @@ impl Executable {
             (&mut metadata.dynamic_callstack as *mut bool).cast(),
         )?;
         let pm4 = parse_kernel_pm4_metadata(
-            &self.inner._code_object,
+            self.inner._code_object.as_bytes(),
             symbol_name,
             metadata.kernel_object,
         );
@@ -2064,30 +3029,38 @@ impl Executable {
 }
 
 const CLANG_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"__CLANG_OFFLOAD_BUNDLE__";
+const COMPRESSED_OFFLOAD_BUNDLE_MAGIC: &[u8] = b"CCOB";
 
 /// HIP accepts a clang offload bundle at `hipModuleLoad`, while the public HSA
 /// code-object reader accepts only the embedded AMDGPU ELF. Unwrap exactly one
 /// AMDGPU entry in-process so HIP and AQL consume byte-identical device code.
-fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeError> {
-    if !code.starts_with(CLANG_OFFLOAD_BUNDLE_MAGIC) {
+fn unwrap_clang_offload_bundle(code: CodeObjectBytes) -> Result<CodeObjectBytes, RuntimeError> {
+    let bytes = code.as_bytes();
+    if bytes.starts_with(COMPRESSED_OFFLOAD_BUNDLE_MAGIC) {
+        return Err(RuntimeError::InvalidOffloadBundle(
+            "compressed bundle (CCOB); rebuild the kernel cache so hipcc runs with \
+             --no-offload-compress, or unbundle it with clang-offload-bundler",
+        ));
+    }
+    if !bytes.starts_with(CLANG_OFFLOAD_BUNDLE_MAGIC) {
         return Ok(code);
     }
     let mut cursor = CLANG_OFFLOAD_BUNDLE_MAGIC.len();
-    let bundle_count = read_bundle_u64(&code, &mut cursor)?;
+    let bundle_count = read_bundle_u64(bytes, &mut cursor)?;
     let mut amdgpu = None;
     for _ in 0..bundle_count {
-        let offset = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+        let offset = usize::try_from(read_bundle_u64(bytes, &mut cursor)?)
             .map_err(|_| RuntimeError::InvalidOffloadBundle("entry offset overflows usize"))?;
-        let size = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+        let size = usize::try_from(read_bundle_u64(bytes, &mut cursor)?)
             .map_err(|_| RuntimeError::InvalidOffloadBundle("entry size overflows usize"))?;
-        let id_len = usize::try_from(read_bundle_u64(&code, &mut cursor)?)
+        let id_len = usize::try_from(read_bundle_u64(bytes, &mut cursor)?)
             .map_err(|_| RuntimeError::InvalidOffloadBundle("entry ID length overflows usize"))?;
         let id_end = cursor
             .checked_add(id_len)
             .ok_or(RuntimeError::InvalidOffloadBundle(
                 "entry ID range overflows",
             ))?;
-        let id = code
+        let id = bytes
             .get(cursor..id_end)
             .ok_or(RuntimeError::InvalidOffloadBundle("truncated entry ID"))?;
         cursor = id_end;
@@ -2096,7 +3069,7 @@ fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeErro
             .ok_or(RuntimeError::InvalidOffloadBundle(
                 "entry payload range overflows",
             ))?;
-        if end > code.len() {
+        if end > bytes.len() {
             return Err(RuntimeError::InvalidOffloadBundle(
                 "entry payload exceeds bundle",
             ));
@@ -2115,7 +3088,8 @@ fn unwrap_clang_offload_bundle(code: Arc<[u8]>) -> Result<Arc<[u8]>, RuntimeErro
     let (start, end) = amdgpu.ok_or(RuntimeError::InvalidOffloadBundle(
         "bundle contains no AMDGPU code object",
     ))?;
-    Ok(Arc::from(&code[start..end]))
+    // A view into the caller's backing: the bundle's ELF is never copied.
+    code.subimage(start..end)
 }
 
 fn read_bundle_u64(code: &[u8], cursor: &mut usize) -> Result<u64, RuntimeError> {
@@ -2306,6 +3280,72 @@ fn read_elf_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
+/// `HSA_STATUS_CU_MASK_REDUCED` — set-mask applied the request ANDed with
+/// process-wide `HSA_CU_MASK`; some requested CUs may be disabled. Handled by
+/// `AqlQueue::apply_cu_mask_set_status` (not treated as unconditional success).
+const STATUS_CU_MASK_REDUCED: abi::Status = 44;
+
+/// Bit capacity for HSA CU mask APIs: 0, or a positive multiple of 32.
+fn cu_mask_bit_capacity(bit_len: usize) -> u32 {
+    if bit_len == 0 {
+        0
+    } else {
+        (bit_len.div_ceil(32) * 32) as u32
+    }
+}
+
+/// Pack a per-CU bool mask into the `uint32_t` bit-vector HSA expects.
+///
+/// Returns `(num_cu_mask_count, words)` where `num_cu_mask_count` is the bit
+/// width (0 or a multiple of 32). Empty input means "enable all CUs".
+fn pack_cu_mask_words(cu_mask: &[bool]) -> (u32, Vec<u32>) {
+    let num_bits = cu_mask_bit_capacity(cu_mask.len());
+    if num_bits == 0 {
+        return (0, Vec::new());
+    }
+    let mut words = vec![0_u32; (num_bits / 32) as usize];
+    for (index, enabled) in cu_mask.iter().enumerate() {
+        if *enabled {
+            words[index / 32] |= 1_u32 << (index % 32);
+        }
+    }
+    (num_bits, words)
+}
+
+fn unpack_cu_mask_words(words: &[u32], bit_len: usize) -> Vec<bool> {
+    (0..bit_len)
+        .map(|index| {
+            let word = words.get(index / 32).copied().unwrap_or(0);
+            word & (1_u32 << (index % 32)) != 0
+        })
+        .collect()
+}
+
+/// Normalize a CU bool mask to exactly `cu_count` bits (pad false / truncate).
+fn normalize_cu_mask(cu_mask: &[bool], cu_count: usize) -> Vec<bool> {
+    let mut out = vec![false; cu_count];
+    let n = cu_mask.len().min(cu_count);
+    out[..n].copy_from_slice(&cu_mask[..n]);
+    // Empty request means "all CUs" per hsa_amd_queue_cu_set_mask.
+    if cu_mask.is_empty() {
+        out.fill(true);
+    }
+    out
+}
+
+fn cu_mask_is_all_enabled(mask: &[bool]) -> bool {
+    !mask.is_empty() && mask.iter().all(|&bit| bit)
+}
+
+fn refuse_rdna_cu_mask(device_name: &str) -> Result<(), RuntimeError> {
+    if cu_mask_refused_on(device_name) {
+        return Err(RuntimeError::CuMaskRefusedOnRdna {
+            device: device_name.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn check_status(
     symbols: &abi::Symbols,
     operation: &'static str,
@@ -2381,8 +3421,27 @@ pub enum RuntimeError {
     ZeroQueues,
     DuplicateQueueId,
     InvalidCuMask(&'static str),
+    CuMaskWiderThanDevice {
+        mask_bits: usize,
+        compute_unit_count: u32,
+    },
+    /// Effective CU mask after `HSA_STATUS_CU_MASK_REDUCED` enables no CUs.
+    CuMaskEmptyAfterReduce,
+    /// A CU-mask entry point was called on an RDNA device; see [`RDNA_CU_MASK_BAN`].
+    CuMaskRefusedOnRdna {
+        device: String,
+    },
+    /// `HSA_CU_MASK` / `ROC_GLOBAL_CU_MASK` is set while an RDNA device may be
+    /// visible; refused at runtime initialization (`hipfire_config::devices::cu_mask_env_guard`).
+    CuMaskEnvRefused(String),
+    /// The emu capacity ledger (`HIPFIRE_EMU`) refused an allocation before the
+    /// raw ROCr pool allocation was attempted; this is the out-of-memory
+    /// analogue for an emulated smaller SKU.
+    EmuBudgetRefused(String),
+    ProfilingUnavailable(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
+    DeviceLocalPoolNotHostWritable(&'static str),
     InvalidKernargAlignment(usize),
     KernargAlignmentNotMet {
         required: usize,
@@ -2404,6 +3463,11 @@ pub enum RuntimeError {
         maximum: u64,
     },
     EmptyCodeObject,
+    CodeObjectRangeOutOfBounds {
+        start: usize,
+        end: usize,
+        len: usize,
+    },
     InvalidOffloadBundle(&'static str),
     SymbolContainsNul,
     SymbolIsNotKernel(String),
@@ -2474,11 +3538,33 @@ impl fmt::Display for RuntimeError {
             Self::ZeroQueues => write!(f, "at least one HSA queue is required"),
             Self::DuplicateQueueId => write!(f, "ROCr returned duplicate IDs for distinct queues"),
             Self::InvalidCuMask(message) => write!(f, "invalid HSA CU mask: {message}"),
+            Self::CuMaskWiderThanDevice {
+                mask_bits,
+                compute_unit_count,
+            } => write!(
+                f,
+                "CU mask has {mask_bits} bits but device reports only {compute_unit_count} compute units"
+            ),
+            Self::CuMaskEmptyAfterReduce => write!(
+                f,
+                "CU mask was reduced by process-wide HSA_CU_MASK to an empty affinity (no compute units enabled)"
+            ),
+            Self::CuMaskRefusedOnRdna { device } => {
+                write!(f, "CU mask refused on {device}: {RDNA_CU_MASK_BAN}")
+            }
+            Self::CuMaskEnvRefused(message) => f.write_str(message),
+            Self::EmuBudgetRefused(message) => f.write_str(message),
+            Self::ProfilingUnavailable(symbol) => {
+                write!(f, "ROCr profiling capability is unavailable: {symbol}")
+            }
             Self::InvalidRuntimeObject(message) => write!(f, "invalid ROCr object: {message}"),
             Self::NoKernargPool => write!(
                 f,
                 "no allocatable fine-grained host pool with KERNARG_INIT was found"
             ),
+            Self::DeviceLocalPoolNotHostWritable(reason) => {
+                write!(f, "device-local pool is not host-writable: {reason}")
+            }
             Self::InvalidKernargAlignment(alignment) => {
                 write!(f, "kernel reported invalid kernarg alignment {alignment}")
             }
@@ -2510,6 +3596,10 @@ impl fmt::Display for RuntimeError {
                 "grid axis/total {axis} is {requested}, agent maximum is {maximum}"
             ),
             Self::EmptyCodeObject => write!(f, "HSACO code object is empty"),
+            Self::CodeObjectRangeOutOfBounds { start, end, len } => write!(
+                f,
+                "code-object view {start}..{end} is outside its {len}-byte image"
+            ),
             Self::InvalidOffloadBundle(reason) => {
                 write!(f, "invalid clang offload bundle: {reason}")
             }
@@ -2529,6 +3619,101 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn pack_cu_mask_words_empty_means_all_cus() {
+        let (bits, words) = pack_cu_mask_words(&[]);
+        assert_eq!(bits, 0);
+        assert!(words.is_empty());
+    }
+
+    #[test]
+    fn pack_cu_mask_words_rounds_up_to_multiple_of_32() {
+        let mask = vec![true, false, true];
+        let (bits, words) = pack_cu_mask_words(&mask);
+        assert_eq!(bits, 32);
+        assert_eq!(words, vec![0b101]);
+        assert_eq!(unpack_cu_mask_words(&words, mask.len()), mask);
+    }
+
+    #[test]
+    fn pack_cu_mask_words_spans_multiple_words() {
+        let mut mask = vec![false; 40];
+        mask[0] = true;
+        mask[31] = true;
+        mask[32] = true;
+        mask[39] = true;
+        let (bits, words) = pack_cu_mask_words(&mask);
+        assert_eq!(bits, 64);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0], 1 | (1 << 31));
+        assert_eq!(words[1], 1 | (1 << 7));
+        assert_eq!(unpack_cu_mask_words(&words, mask.len()), mask);
+    }
+
+    #[test]
+    fn normalize_cu_mask_pads_and_truncates_to_device_width() {
+        assert_eq!(normalize_cu_mask(&[true], 3), vec![true, false, false]);
+        assert_eq!(
+            normalize_cu_mask(&[true, false, true, true], 2),
+            vec![true, false]
+        );
+        // Empty request means all CUs per hsa_amd_queue_cu_set_mask.
+        assert_eq!(normalize_cu_mask(&[], 2), vec![true, true]);
+    }
+
+    #[test]
+    fn cu_mask_wider_than_device_display_names_counts() {
+        let err = RuntimeError::CuMaskWiderThanDevice {
+            mask_bits: 128,
+            compute_unit_count: 64,
+        };
+        let text = err.to_string();
+        assert!(text.contains("128"), "{text}");
+        assert!(text.contains("64"), "{text}");
+    }
+
+    #[test]
+    fn cu_mask_empty_after_reduce_display_names_cause() {
+        let text = RuntimeError::CuMaskEmptyAfterReduce.to_string();
+        assert!(text.contains("HSA_CU_MASK"), "{text}");
+        assert!(text.contains("empty"), "{text}");
+    }
+
+    #[test]
+    fn status_cu_mask_reduced_is_hsa_value_44() {
+        assert_eq!(STATUS_CU_MASK_REDUCED, 44);
+    }
+
+    #[test]
+    fn refuse_rdna_cu_mask_rejects_rdna_and_allows_cdna() {
+        for name in ["gfx1201", "gfx1151"] {
+            match refuse_rdna_cu_mask(name) {
+                Err(RuntimeError::CuMaskRefusedOnRdna { device }) => assert_eq!(device, name),
+                other => panic!("{name}: expected CuMaskRefusedOnRdna, got {other:?}"),
+            }
+        }
+        assert!(refuse_rdna_cu_mask("gfx942").is_ok());
+    }
+
+    #[test]
+    fn cu_mask_refused_display_names_device_and_incident() {
+        let text = RuntimeError::CuMaskRefusedOnRdna {
+            device: "gfx1201".to_owned(),
+        }
+        .to_string();
+        assert!(text.contains("gfx1201"), "{text}");
+        assert!(text.contains("2026-10-14"), "{text}");
+        assert!(text.contains("MES"), "{text}");
+        assert!(text.contains(RDNA_CU_MASK_BAN), "{text}");
+    }
+
+    #[test]
+    fn cu_mask_env_refused_display_is_the_guard_message() {
+        let text =
+            RuntimeError::CuMaskEnvRefused("HSA_CU_MASK set but refused".to_owned()).to_string();
+        assert_eq!(text, "HSA_CU_MASK set but refused");
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
@@ -2538,6 +3723,128 @@ mod tests {
             loaded_descriptor in any::<u64>(),
         ) {
             let _ = parse_kernel_pm4_metadata(&elf, "kernel.kd", loaded_descriptor);
+        }
+    }
+
+    #[test]
+    fn compressed_offload_bundle_is_named_not_passed_to_rocr() {
+        // CCOB v3 header prefix as clang emits it, followed by a zstd frame magic.
+        let mut blob = b"CCOB".to_vec();
+        blob.extend_from_slice(&[3, 0, 1, 0]);
+        blob.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]);
+        let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(blob.as_slice()).into())
+            .expect_err("a compressed bundle must not reach the HSA code-object reader");
+        assert!(
+            err.to_string().contains("CCOB"),
+            "error must name the container: {err}"
+        );
+    }
+
+    #[test]
+    fn plain_code_object_passes_through_unwrapped() {
+        let elf: Vec<u8> = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        let out = unwrap_clang_offload_bundle(Arc::<[u8]>::from(elf.as_slice()).into()).unwrap();
+        assert_eq!(out.as_bytes(), &elf[..]);
+    }
+
+    /// Uncompressed clang offload bundle with the given `(triple, payload)` entries.
+    fn offload_bundle(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let header: usize = CLANG_OFFLOAD_BUNDLE_MAGIC.len()
+            + 8
+            + entries.iter().map(|(id, _)| 24 + id.len()).sum::<usize>();
+        let mut out = CLANG_OFFLOAD_BUNDLE_MAGIC.to_vec();
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        let mut offset = header;
+        for (id, payload) in entries {
+            out.extend_from_slice(&(offset as u64).to_le_bytes());
+            out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+            out.extend_from_slice(&(id.len() as u64).to_le_bytes());
+            out.extend_from_slice(id.as_bytes());
+            offset += payload.len();
+        }
+        for (_, payload) in entries {
+            out.extend_from_slice(payload);
+        }
+        out
+    }
+
+    const ELF: &[u8] = &[0x7f, b'E', b'L', b'F', 2, 1, 1, 0, 9, 9];
+
+    #[test]
+    fn bundle_unwrap_is_a_view_of_owned_backing_not_a_copy() {
+        let bundle: Arc<[u8]> = Arc::from(
+            offload_bundle(&[
+                ("host-x86_64-unknown-linux-gnu-", b""),
+                ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+            ])
+            .as_slice(),
+        );
+        let base = bundle.as_ptr() as usize;
+        let out = unwrap_clang_offload_bundle(bundle.clone().into()).unwrap();
+        assert_eq!(out.as_bytes(), ELF);
+        let view = out.as_bytes().as_ptr() as usize;
+        assert!(
+            view >= base && view + ELF.len() <= base + bundle.len(),
+            "view must alias the bundle"
+        );
+        assert_eq!(
+            Arc::strong_count(&bundle),
+            2,
+            "the view retains the backing"
+        );
+        // Lifetime: dropping every other owner keeps the view's bytes valid.
+        drop(bundle);
+        assert_eq!(out.as_bytes(), ELF);
+    }
+
+    #[test]
+    fn static_and_owned_images_unwrap_identically() {
+        static BUNDLE: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+            offload_bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)])
+        });
+        let bundle: &'static [u8] = BUNDLE.as_slice();
+        let from_static = unwrap_clang_offload_bundle(bundle.into()).unwrap();
+        let from_owned = unwrap_clang_offload_bundle(Arc::<[u8]>::from(bundle).into()).unwrap();
+        assert_eq!(from_static.as_bytes(), from_owned.as_bytes());
+        assert_eq!(
+            from_static.as_bytes().as_ptr(),
+            bundle[bundle.len() - ELF.len()..].as_ptr()
+        );
+    }
+
+    #[test]
+    fn multi_device_and_truncated_bundles_fail_closed() {
+        let two = offload_bundle(&[
+            ("hipv4-amdgcn-amd-amdhsa--gfx1100", ELF),
+            ("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF),
+        ]);
+        let err =
+            unwrap_clang_offload_bundle(Arc::<[u8]>::from(two.as_slice()).into()).unwrap_err();
+        assert!(err.to_string().contains("multiple AMDGPU"), "{err}");
+        let one = offload_bundle(&[("hipv4-amdgcn-amd-amdhsa--gfx1201", ELF)]);
+        let truncated = &one[..one.len() - 1];
+        let err = unwrap_clang_offload_bundle(Arc::<[u8]>::from(truncated).into()).unwrap_err();
+        assert!(err.to_string().contains("exceeds bundle"), "{err}");
+        let none = offload_bundle(&[("host-x86_64-unknown-linux-gnu-", ELF)]);
+        let err =
+            unwrap_clang_offload_bundle(Arc::<[u8]>::from(none.as_slice()).into()).unwrap_err();
+        assert!(err.to_string().contains("no AMDGPU"), "{err}");
+    }
+
+    #[test]
+    #[allow(clippy::reversed_empty_ranges)] // 4..3 is the reversed-range rejection case under test
+    fn subimage_bounds_are_relative_and_checked() {
+        let image = CodeObjectBytes::from(ELF);
+        let inner = image.subimage(2..8).unwrap();
+        assert_eq!(inner.as_bytes(), &ELF[2..8]);
+        assert_eq!(inner.subimage(1..3).unwrap().as_bytes(), &ELF[3..5]);
+        assert_eq!(inner.subimage(6..6).unwrap().as_bytes(), &[] as &[u8]);
+        for bad in [0..7, 7..7, 4..3] {
+            let err = inner.subimage(bad.clone()).unwrap_err();
+            assert!(
+                matches!(err, RuntimeError::CodeObjectRangeOutOfBounds { len: 6, .. }),
+                "{bad:?}: {err}"
+            );
         }
     }
 
@@ -2719,8 +4026,8 @@ mod device_local_pool_tests {
             eprintln!("probe skipped (set HIPFIRE_REDLINE_PROBE_VMEMAP=1)");
             return;
         }
-        let runtime = Runtime::initialize(crate::load_symbols().expect("symbols"))
-            .expect("runtime init");
+        let runtime =
+            Runtime::initialize(crate::load_symbols().expect("symbols")).expect("runtime init");
         let device = runtime
             .select_gpu(GpuSelector::Ordinal(0))
             .expect("gpu select");
@@ -2739,7 +4046,10 @@ mod device_local_pool_tests {
         let pattern: Vec<u8> = (0..4096).map(|i| (i % 251) as u8).collect();
         buf.as_mut_bytes().copy_from_slice(&pattern);
         let readback: Vec<u8> = buf.as_mut_bytes().to_vec();
-        assert_eq!(pattern, readback, "host memcpy round-trip mismatch on device-local pool");
+        assert_eq!(
+            pattern, readback,
+            "host memcpy round-trip mismatch on device-local pool"
+        );
         eprintln!("device-local pool host memcpy probe: OK");
     }
 }

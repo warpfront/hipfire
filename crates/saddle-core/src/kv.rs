@@ -1,0 +1,6573 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! KV cache, extracted from hipfire-runtime/src/llama.rs.
+//! This module is the canonical home for `KvCache` and its supporting
+//! types. `hipfire-runtime::llama` re-exports these for backward
+//! compatibility; new code should import from `saddle_core::kv`.
+
+use hip_bridge::HipResult;
+use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// The resolved, validated KV-cache mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KvMode {
+    Q8,
+    /// Flat 2-byte BF16 K/V. NOT part of the quantized ladder: no rotation, no
+    /// per-block scale, and no VMM / adaptive / compaction support. Only a
+    /// site whose `accepted` list names it can ever resolve to it — today that
+    /// is maple alone, so every other site's behaviour is unchanged.
+    Bf16,
+    /// Flat 2-byte IEEE fp16 K/V — the same layout as BF16 with the true
+    /// half format (better small-magnitude precision, narrower exponent
+    /// range). Slots-engine tier only today: descriptor-aware write/attend
+    /// kernels exist for it there. Same constraints as BF16: no rotation,
+    /// no scales, no adaptive/compaction.
+    F16,
+    Asym2,
+    Asym3,
+    Asym4,
+    Fwht2,
+    Fwht3,
+    Fwht4,
+    /// Native E4M3FN K/V, independently scaled per (layer, token, KV head)
+    /// with one f16 scale per 256-element head stored inline in the token
+    /// row (`[Hkv x D codes][Hkv f16 scales]`, 1032 bytes/row/side at
+    /// Hkv=4/D=256). K/V pair is indivisible: fp8 on both sides.
+    /// Legacy-backend, single-GPU, Qwen dense H24/Hkv4/D256 only;
+    /// no VMM / adaptive / compaction support. Slots support is
+    /// gfx1201-gated: descriptor-aware fp8 write/attend kernels exist for
+    /// the slot engine (head_dim 256 only), and every non-gfx1201 entry
+    /// point fails closed with a named error before any allocation.
+    Fp8,
+}
+
+/// KV storage backend selection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KvBackend {
+    Legacy,
+    #[default]
+    Vmm,
+}
+
+impl KvBackend {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::Vmm => "vmm",
+        }
+    }
+}
+
+impl std::fmt::Display for KvBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseKvBackendError {
+    value: String,
+}
+
+pub const KV_BACKEND_NAMES: &[&str] = &["legacy", "vmm"];
+
+pub const DEFAULT_KV_CHUNK_TOKENS: usize = 64;
+pub const DEFAULT_VMM_PHYSICAL_CHUNK_BYTES: usize = 2 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvMapGrowth {
+    pub offset_bytes: usize,
+    pub size_bytes: usize,
+    pub token_capacity: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KvChunkPlan {
+    bytes_per_token: usize,
+    max_tokens: usize,
+    target_chunk_tokens: usize,
+    granularity: usize,
+    reserve_bytes: usize,
+    growth_bytes: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KvChunkPlanError {
+    Zero(&'static str),
+    Overflow,
+    RequiredTokens { required: usize, max: usize },
+    InvalidMappedBytes { mapped: usize, reserve: usize },
+}
+
+impl std::fmt::Display for KvChunkPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero(field) => write!(f, "{field} must be greater than zero"),
+            Self::Overflow => f.write_str("KV chunk byte calculation overflowed"),
+            Self::RequiredTokens { required, max } => {
+                write!(f, "required token count {required} exceeds maximum {max}")
+            }
+            Self::InvalidMappedBytes { mapped, reserve } => write!(
+                f,
+                "current mapped byte count {mapped} is not page-aligned or exceeds reserve {reserve}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for KvChunkPlanError {}
+
+impl KvChunkPlan {
+    pub fn new(
+        bytes_per_token: usize,
+        max_tokens: usize,
+        target_chunk_tokens: usize,
+        granularity: usize,
+        minimum_growth_bytes: usize,
+    ) -> Result<Self, KvChunkPlanError> {
+        for (name, value) in [
+            ("bytes_per_token", bytes_per_token),
+            ("max_tokens", max_tokens),
+            ("target_chunk_tokens", target_chunk_tokens),
+            ("granularity", granularity),
+            ("minimum_growth_bytes", minimum_growth_bytes),
+        ] {
+            if value == 0 {
+                return Err(KvChunkPlanError::Zero(name));
+            }
+        }
+
+        let logical_bytes = bytes_per_token
+            .checked_mul(max_tokens)
+            .ok_or(KvChunkPlanError::Overflow)?;
+        let target_bytes = bytes_per_token
+            .checked_mul(target_chunk_tokens)
+            .ok_or(KvChunkPlanError::Overflow)?;
+        let reserve_bytes = checked_round_up(logical_bytes, granularity)?;
+        let growth_bytes = checked_round_up(target_bytes.max(minimum_growth_bytes), granularity)?;
+
+        Ok(Self {
+            bytes_per_token,
+            max_tokens,
+            target_chunk_tokens,
+            granularity,
+            reserve_bytes,
+            growth_bytes,
+        })
+    }
+
+    pub const fn reserve_bytes(self) -> usize {
+        self.reserve_bytes
+    }
+
+    pub const fn growth_bytes(self) -> usize {
+        self.growth_bytes
+    }
+
+    pub const fn bytes_per_token(self) -> usize {
+        self.bytes_per_token
+    }
+
+    pub const fn target_chunk_tokens(self) -> usize {
+        self.target_chunk_tokens
+    }
+
+    pub const fn granularity(self) -> usize {
+        self.granularity
+    }
+
+    pub fn mapped_bytes_for_tokens(
+        self,
+        required_tokens: usize,
+    ) -> Result<usize, KvChunkPlanError> {
+        if required_tokens > self.max_tokens {
+            return Err(KvChunkPlanError::RequiredTokens {
+                required: required_tokens,
+                max: self.max_tokens,
+            });
+        }
+        if required_tokens == 0 {
+            return Ok(0);
+        }
+
+        let required_bytes = self
+            .bytes_per_token
+            .checked_mul(required_tokens)
+            .ok_or(KvChunkPlanError::Overflow)?;
+        Ok(checked_round_up(required_bytes, self.growth_bytes)?.min(self.reserve_bytes))
+    }
+
+    pub fn token_capacity(self, mapped_bytes: usize) -> usize {
+        (mapped_bytes / self.bytes_per_token).min(self.max_tokens)
+    }
+
+    pub fn growth(
+        self,
+        mapped_bytes: usize,
+        required_tokens: usize,
+    ) -> Result<Option<KvMapGrowth>, KvChunkPlanError> {
+        if mapped_bytes > self.reserve_bytes || !mapped_bytes.is_multiple_of(self.granularity) {
+            return Err(KvChunkPlanError::InvalidMappedBytes {
+                mapped: mapped_bytes,
+                reserve: self.reserve_bytes,
+            });
+        }
+        let target = self.mapped_bytes_for_tokens(required_tokens)?;
+        if target <= mapped_bytes {
+            return Ok(None);
+        }
+        Ok(Some(KvMapGrowth {
+            offset_bytes: mapped_bytes,
+            size_bytes: target - mapped_bytes,
+            token_capacity: self.token_capacity(target),
+        }))
+    }
+}
+
+fn checked_round_up(value: usize, alignment: usize) -> Result<usize, KvChunkPlanError> {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        Ok(value)
+    } else {
+        value
+            .checked_add(alignment - remainder)
+            .ok_or(KvChunkPlanError::Overflow)
+    }
+}
+
+impl std::fmt::Display for ParseKvBackendError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.value == "contiguous" {
+            return f.write_str(
+                "KV backend 'contiguous' was renamed to 'legacy'; use --kv-backend legacy or memory.kv_backend = \"legacy\"",
+            );
+        }
+        write!(
+            f,
+            "unknown KV backend {:?}; expected one of: {}",
+            self.value,
+            KV_BACKEND_NAMES.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for ParseKvBackendError {}
+
+impl std::str::FromStr for KvBackend {
+    type Err = ParseKvBackendError;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        match raw {
+            "legacy" => Ok(Self::Legacy),
+            "vmm" => Ok(Self::Vmm),
+            other => Err(ParseKvBackendError {
+                value: other.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VMode {
+    Q8,
+    Lloyd2,
+    Lloyd3,
+    Lloyd4,
+}
+
+impl VMode {
+    /// Kernarg value: the per-element bit count (8 for Q8). Drives both kernel
+    /// dispatch branches and byte-layout arithmetic.
+    pub fn bits(self) -> i32 {
+        match self {
+            VMode::Q8 => 8,
+            VMode::Lloyd2 => 2,
+            VMode::Lloyd3 => 3,
+            VMode::Lloyd4 => 4,
+        }
+    }
+}
+
+/// Two capacity axes live here:
+///   * `max_seq`       — advertised absolute-position range (used for RoPE phase,
+///                       attention masks, and anything that reasons about the
+///                       user-visible context window).
+///   * `physical_cap`  — actual buffer size along the token axis (drives
+///                       allocation + kernel strides). When eviction is active,
+///                       `physical_cap << max_seq` so the buffer stays bounded
+///                       even as the absolute position grows past it.
+///
+/// Back-compat: constructors that do not take `physical_cap` set it equal to
+/// `max_seq`, preserving existing behaviour.
+pub struct KvCache {
+    pub k_gpu: Vec<GpuTensor>,    // [n_layers] key values (FP32 or int8)
+    pub v_gpu: Vec<GpuTensor>,    // [n_layers] value values (FP32 or int8)
+    pub k_scales: Vec<GpuTensor>, // [n_layers] key scales (for INT8 mode)
+    pub v_scales: Vec<GpuTensor>, // [n_layers] value scales (for INT8 mode)
+    pub kv_dim: usize,
+    pub max_seq: usize,
+    /// Physical capacity of each per-layer k/v buffer in *tokens*.
+    /// Equals `max_seq` unless the buffer was sized for eviction-bounded use.
+    pub physical_cap: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub quantized: bool,
+    pub quant_q8: bool,
+    pub quant_int8: bool,    // true = INT8 with separate scales
+    pub quant_hfq4: bool,    // true = HFQ4 co-located blocks (72 bytes/head)
+    pub quant_asym4: bool,   // true = K at 4-bit rotated, V at Q8_0 — RotorQuant planar4 asymmetric
+    pub quant_asym3: bool, // true = K at givens3 (rotated 3-bit Lloyd-Max), V at Q8_0 — best-quality rotated K per RotorQuant
+    pub quant_asym2: bool, // true = K at givens2 (rotated 2-bit), V at Q8_0 (normal space)
+    pub boundary_layers: u8, // number of boundary layers at each end (default 2)
+    // KV rotation parameter buffers. Field names are historical — in the
+    // Givens-rotated asym{2,3,4} modes (`quant_fwht == false`) these hold the
+    // per-block cos/sin tables. In the signed-FWHT-rotated fwht{2,3,4} modes
+    // (`quant_fwht == true`) the SAME slots hold signs1/signs2 ±1 vectors.
+    // Both are [n_blocks × f32] in shape, so the storage is fungible; the
+    // dispatcher reads `quant_fwht` to know which kernel signature to use.
+    pub givens_cos: Option<GpuTensor>,
+    pub givens_sin: Option<GpuTensor>,
+    /// True when the rotation primitive is signed-FWHT (matches Fwht{2,3,4}
+    /// KvMode values). False when Givens (matches Asym{2,3,4}).
+    pub quant_fwht: bool,
+    /// True when K and V are stored as flat 2-byte BF16 (no scales, no
+    /// blocks) instead of a quantized block layout. Mutually exclusive with
+    /// every `quant_*` tier flag above; `quantized` is also set so the legacy
+    /// llama/qwen35 `!quantized` branches never mistake it for plain F32.
+    pub quant_bf16: bool,
+    /// True when K and V are stored as native E4M3FN with one f16 scale per
+    /// (token, KV head) stored inline in the token row (`[Hkv x D codes]
+    /// [Hkv f16 scales]`). Mutually exclusive with every other `quant_*`
+    /// tier flag; `quantized` is also set so legacy `!quantized` branches
+    /// never mistake it for plain F32.
+    pub quant_fp8: bool,
+    /// V-cache quantization mode (independent of the K mode). Defaults to Q8.
+    pub v_mode: VMode,
+    /// Per-layer flag: true = this layer uses Q8 (boundary layer)
+    pub layer_is_boundary: Vec<bool>,
+    /// TriAttention compaction bookkeeping. After each eviction we leave the
+    /// retained keys in physical slots `0..budget` with their baked-in RoPE
+    /// phases intact, but the forward pass still counts absolute positions
+    /// for new writes. `compact_offset = absolute_seq_len - physical_seq_len`
+    /// — added to `pos` before RoPE so the new query/key get the correct
+    /// absolute phase, and the cache write still lands at `pos` (physical).
+    /// Zero when no compaction has happened.
+    pub compact_offset: usize,
+}
+
+/// Per-tier arena plan for a flat multi-slot KV pool (the `SlotEngine`
+/// addressing scheme): byte strides for one position of K and of V, plus the
+/// rotation-table geometry the tier's write/attend kernels need.
+///
+/// This is the multi-slot sibling of [`KvCache::vmm_k_bytes_per_head`] — the
+/// same packed layouts, addressed per position instead of per VMM head. The
+/// two stride facts that matter to a slot pool live here:
+///
+/// * K and V strides DIFFER on every rotated-K tier (asym{2,3,4} /
+///   fwht{2,3,4} store K packed + a 4-byte norm/sign header per head, V at
+///   Q8_0), so a pool must track them separately and the 32-byte
+///   `KvSlotDesc` carries separate `legacy_k_base`/`legacy_v_base`.
+/// * The rotation tables are MODEL-global (shared by every slot and layer):
+///   Givens angles for asym tiers, ±1 sign vectors for fwht tiers, nothing
+///   for q8/bf16. Seeds match the `new_gpu_*_filtered` constructors exactly
+///   (42 for the primary table, 1042 for the secondary FWHT signs) so a slot
+///   pool writes bit-identical cache bytes to the sequential path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotKvTierPlan {
+    pub k_bytes_per_pos: usize,
+    pub v_bytes_per_pos: usize,
+    /// Givens cos/sin table length (asym tiers): `head_dim / 2`.
+    pub givens_len: Option<usize>,
+    /// FWHT sign-vector length (fwht tiers): 128 (Q8-V sign width).
+    pub fwht_len: Option<usize>,
+}
+
+impl SlotKvTierPlan {
+    /// Resolve the plan for `mode` (static Q8 V on the rotated tiers, fp8 V
+    /// on the fp8 tier — the multi-slot ladder). Geometry gates mirror the
+    /// contiguous `new_gpu_*_filtered` constructors: asym3/fwht3 need
+    /// head_dim 256, the other rotated tiers need 128 or 256, every packed
+    /// tier needs head_dim divisible by 32, and fp8 needs the kernels' fixed
+    /// 256 (32 lanes × 8 dims per head).
+    pub fn resolve(mode: KvMode, n_kv_heads: usize, head_dim: usize) -> HipResult<Self> {
+        if n_kv_heads == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slot KV plan requires n_kv_heads > 0",
+            ));
+        }
+        let quant_gate = |name: &str, ok_hd: bool| -> HipResult<()> {
+            if !head_dim.is_multiple_of(32) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{name} slot KV requires head_dim divisible by 32 (got {head_dim})"),
+                ));
+            }
+            if !ok_hd {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "{name} slot KV requires head_dim {} (got {head_dim})",
+                        if matches!(mode, KvMode::Asym3 | KvMode::Fwht3) {
+                            "256"
+                        } else {
+                            "128 or 256"
+                        }
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        let k_bph = match mode {
+            KvMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("q8 slot KV requires head_dim divisible by 32 (got {head_dim})"),
+                    ));
+                }
+                (head_dim / 32) * 34
+            }
+            // Bf16 and F16 are flat 2 bytes/element with no per-head blocks
+            // and no rotation table. Whether a given engine ACCEPTS the tier
+            // is its policy's call (see kv_mode.rs); this helper just
+            // describes the layout.
+            KvMode::Bf16 | KvMode::F16 => {
+                let kv_dim = n_kv_heads
+                    .checked_mul(head_dim)
+                    .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV kv_dim overflowed"))?;
+                kv_dim * 2
+            }
+            KvMode::Asym2 | KvMode::Fwht2 => {
+                quant_gate("asym2", head_dim == 128 || head_dim == 256)?;
+                4 + head_dim / 4
+            }
+            KvMode::Asym3 | KvMode::Fwht3 => {
+                quant_gate("asym3", head_dim == 256)?;
+                4 + (head_dim * 3) / 8
+            }
+            KvMode::Asym4 | KvMode::Fwht4 => {
+                quant_gate("asym4", head_dim == 128 || head_dim == 256)?;
+                4 + head_dim / 2
+            }
+            // Native fp8-E4M3: one byte per element plus one f16 scale per KV
+            // head, stored inline at the end of each token row
+            // (`[Hkv*D codes][Hkv f16 scales]` — `n_kv_heads*(head_dim+2)`
+            // bytes/pos/side, matching `fp8_e4m3_row_bytes`). Both arenas are
+            // fp8 (K and V strides EQUAL — the tile kernel decodes V with the
+            // same per-pos stride as K), so the pool's descriptors carry one
+            // slab base per side and both write launches resolve the shared
+            // K base. The fp8 writer/reader kernels' fixed geometry reads
+            // exactly 32 lanes × 8 dims per head, so head_dim must be 256 —
+            // the only shape the sequential fp8 path admits too. Admission is
+            // gfx1201-only (OCP E4M3FN cvt); the policy/engine gates enforce
+            // the arch before this geometry is ever allocated.
+            KvMode::Fp8 => {
+                if head_dim != 256 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("fp8 slot KV requires head_dim 256 (got {head_dim})"),
+                    ));
+                }
+                head_dim + 2
+            }
+        };
+        let k_bytes_per_pos = match mode {
+            // Flat 2-byte tiers: the stride is already per-position (kv_dim
+            // flat elements, no per-head blocks) — never scaled by n_kv_heads.
+            KvMode::Bf16 | KvMode::F16 => k_bph,
+            _ => n_kv_heads
+                .checked_mul(k_bph)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV K stride overflowed"))?,
+        };
+        let v_bytes_per_pos = match mode {
+            // Flat tiers store V exactly like K. fp8 is not flat, but its K
+            // and V rows share the same `[Hkv*D codes][Hkv f16 scales]`
+            // layout (the fp8 tile decodes V with K's per-pos stride), so V
+            // takes K's stride too — NOT the static Q8_0 V the rotated
+            // tiers use.
+            KvMode::Bf16 | KvMode::F16 | KvMode::Fp8 => k_bytes_per_pos,
+            _ => {
+                // Static multi-slot ladder stores V at Q8_0 — the same
+                // per-head layout the asym/fwht constructors allocate.
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "Q8_0 V slot KV requires head_dim divisible by 32 (got {head_dim})"
+                        ),
+                    ));
+                }
+                n_kv_heads * (head_dim / 32) * 34
+            }
+        };
+        Ok(Self {
+            k_bytes_per_pos,
+            v_bytes_per_pos,
+            givens_len: matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
+                .then_some(head_dim / 2),
+            // fwht3's K-rotation kernel is `fwht_shfl_forward_256` — it reads
+            // signs[0..255] (d0 = tid*8 → lane 31 touches index 255). The
+            // sequential path already allocates 256 for Fwht3 (kv.rs:776);
+            // the slot path must match or the sign table is 512 B short →
+            // OOB read + a wrong rotation → silently corrupted KV.
+            // fwht2/fwht4 use the 128-wide `fwht_shfl_forward_128`.
+            fwht_len: match mode {
+                KvMode::Fwht3 => Some(256),
+                KvMode::Fwht2 | KvMode::Fwht4 => Some(128),
+                _ => None,
+            },
+        })
+    }
+
+    /// True when the K and V per-position strides differ (the rotated-K
+    /// tiers). Drives whether a pool's descriptors carry distinct
+    /// `legacy_k_base`/`legacy_v_base` and whether the V-side write must
+    /// resolve the V base instead of the shared K base.
+    pub fn kv_strides_differ(&self) -> bool {
+        self.k_bytes_per_pos != self.v_bytes_per_pos
+    }
+}
+
+/// Layer addressing for [`KvCache::from_mode`]: a per-layer "is this a
+/// full-attention layer" mask (→ `_filtered` family) OR a flat layer count
+/// (→ plain / flat-`_capped` family).
+pub enum KvLayers {
+    /// `is_kv_layer` mask — sites 1, 2, 6.
+    Mask(Vec<bool>),
+    /// `n_layers` — sites 3, 4, 5.
+    Flat(usize),
+}
+
+/// Geometry + cap inputs shared by every `new_gpu_*` constructor.
+pub struct KvDims {
+    pub layers: KvLayers,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    /// For minimax (site 5a) this MUST be the CLAMPED value (12288), not the
+    /// raw `ctx.max_seq`, or the allocation size changes.
+    pub max_seq: usize,
+    /// `Some(cap)` → request a `_capped` form. HONORED ONLY for modes that have
+    /// one (q8/asym3/fwht2/fwht3 on Mask sites; q8/asym3/asym4 on Flat sites);
+    /// silently DROPPED for asym2/asym4/fwht4 on Mask sites — faithful to today.
+    pub physical_cap: Option<usize>,
+}
+
+/// Single- vs multi-GPU dispatch for [`KvCache::from_mode`].
+
+/// Single source of truth for VMM K/V byte layout.
+///
+/// - `k_bytes_per_token` / `v_bytes_per_token` are **current** encoding strides
+///   (drive mapped-token capacity, growth, and live source-prefix sizing).
+/// - `k_reserve_*` describe the virtual VA arena size (static: reserve == current;
+///   adaptive may reserve at floor while current encoding is FWHT4/Q8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmmKvLayout {
+    mode: KvMode,
+    v_mode: VMode,
+    n_kv_heads: usize,
+    head_dim: usize,
+    physical_cap: usize,
+    kv_dim: usize,
+    k_bytes_per_head: usize,
+    v_bytes_per_head: usize,
+    k_bytes_per_token: usize,
+    v_bytes_per_token: usize,
+    /// Virtual reserve bytes at the reserve tier (may differ from current).
+    k_reserve_bytes: usize,
+    v_reserve_bytes: usize,
+    k_reserve_elems: usize,
+    v_reserve_elems: usize,
+    /// Sign/angle table width. 0 = none (Q8). 128 = Givens or FWHT-128.
+    /// 256 = FWHT-256 (fwht3, or any FWHT+lloyd-V).
+    rotation_table_len: usize,
+    uses_fwht_signs: bool,
+}
+
+impl VmmKvLayout {
+    /// Checked live K source-prefix bytes for `n_positions` at the **current**
+    /// K stride. Independent of virtual reserve size — used by adaptive
+    /// transcode scratch sizing and map-before-read guards.
+    fn prefix_k_bytes(self, n_positions: usize) -> HipResult<usize> {
+        KvCache::checked_vmm_product("K source prefix", &[n_positions, self.k_bytes_per_token])
+    }
+
+    /// Checked live V source-prefix bytes for `n_positions` at the **current**
+    /// V stride. Independent of virtual reserve size.
+    fn prefix_v_bytes(self, n_positions: usize) -> HipResult<usize> {
+        KvCache::checked_vmm_product("V source prefix", &[n_positions, self.v_bytes_per_token])
+    }
+}
+
+impl KvCache {
+    fn checked_vmm_product(label: &str, factors: &[usize]) -> HipResult<usize> {
+        factors
+            .iter()
+            .try_fold(1usize, |product, &factor| product.checked_mul(factor))
+            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("VMM KV {label} size overflowed")))
+    }
+
+    fn bytes_to_f32_elems(label: &str, bytes: usize) -> HipResult<usize> {
+        bytes.checked_add(3).map(|value| value / 4).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("VMM KV {label} element count overflowed"))
+        })
+    }
+
+    /// Packed K bytes-per-head for Q8 / asym{2,3,4} / fwht{2,3,4}.
+    /// Asym and FWHT share storage at the same bit width; only rotation tables differ.
+    fn vmm_k_bytes_per_head(mode: KvMode, head_dim: usize) -> HipResult<usize> {
+        match mode {
+            KvMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM q8 requires a non-zero head_dim divisible by 32 (got head_dim={head_dim})"
+                        ),
+                    ));
+                }
+                Self::checked_vmm_product("q8 K head stride", &[head_dim / 32, 34])
+            }
+            // BF16/F16 are flat unscaled: 2 bytes/element (per-token row =
+            // n_kv_heads*D*2). F16 has no VMM constructor today — computing
+            // the stride here is harmless; the constructors gate it.
+            KvMode::Bf16 | KvMode::F16 => head_dim
+                .checked_mul(2)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM bf16 K head stride overflowed")),
+            // FP8 token-local rows: D codes + one inline f16 scale per head.
+            // Same 1032-byte rows at Hkv4/D256 as the contiguous constructor.
+            KvMode::Fp8 => head_dim
+                .checked_add(2)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM fp8 K head stride overflowed")),
+            KvMode::Asym2 | KvMode::Fwht2 => head_dim
+                .checked_div(4)
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 2-bit K head stride overflowed")),
+            KvMode::Asym3 | KvMode::Fwht3 => head_dim
+                .checked_mul(3)
+                .and_then(|n| n.checked_div(8))
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 3-bit K head stride overflowed")),
+            KvMode::Asym4 | KvMode::Fwht4 => head_dim
+                .checked_div(2)
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 4-bit K head stride overflowed")),
+        }
+    }
+
+    /// Packed V bytes-per-head for Q8 / Lloyd{2,3,4}.
+    fn vmm_v_bytes_per_head(v_mode: VMode, head_dim: usize) -> HipResult<usize> {
+        match v_mode {
+            VMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM Q8-V requires a non-zero head_dim divisible by 32 (got head_dim={head_dim})"
+                        ),
+                    ));
+                }
+                Self::checked_vmm_product("q8 V head stride", &[head_dim / 32, 34])
+            }
+            VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4 => {
+                let bits = v_mode.bits() as usize;
+                head_dim
+                    .checked_mul(bits)
+                    .and_then(|n| n.checked_div(8))
+                    .and_then(|n| n.checked_add(4))
+                    .ok_or_else(|| {
+                        hip_bridge::HipError::new(
+                            0,
+                            &format!("VMM lloyd{bits} V head stride overflowed"),
+                        )
+                    })
+            }
+        }
+    }
+
+    /// Geometry gates shared by every static VMM mode (and legal Lloyd-V pairs).
+    fn validate_vmm_static_geometry(
+        mode: KvMode,
+        v_mode: VMode,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        if n_kv_heads == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM {mode:?} requires n_kv_heads>0 (got 0)"),
+            ));
+        }
+        match mode {
+            KvMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM q8 requires n_kv_heads>0 and a non-zero head_dim divisible by 32 (got n_kv_heads={n_kv_heads}, head_dim={head_dim})"
+                        ),
+                    ));
+                }
+                if !matches!(v_mode, VMode::Q8) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM q8 only supports VMode::Q8 (lloyd-V requires an FWHT K mode)",
+                    ));
+                }
+            }
+            // BF16 flat rows: any non-zero head_dim (no block structure).
+            // K/V pair is indivisible; v_mode carries the ignored Q8 default.
+            KvMode::Bf16 => {
+                if head_dim == 0 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM bf16 requires head_dim>0 (got 0)",
+                    ));
+                }
+                if !matches!(v_mode, VMode::Q8) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM bf16 only supports VMode::Q8 (K/V pair is indivisible)",
+                    ));
+                }
+            }
+            // F16 flat rows exist only on the slots engine (contiguous,
+            // descriptor-addressed). There is no VMM constructor — fail
+            // closed rather than compute a layout nothing can allocate.
+            KvMode::F16 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "VMM does not support f16 KV (slots/contiguous only)",
+                ));
+            }
+            // FP8 token-local rows: exact admitted geometry (D256); v_mode
+            // carries the ignored Q8 default, V is fp8 like K.
+            KvMode::Fp8 => {
+                if head_dim != 256 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("VMM fp8 requires head_dim=256 (got {head_dim})"),
+                    ));
+                }
+                if !matches!(v_mode, VMode::Q8) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM fp8 only supports VMode::Q8 (K/V pair is indivisible)",
+                    ));
+                }
+            }
+            KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
+                let ok_hd = match mode {
+                    KvMode::Asym3 => head_dim == 256,
+                    _ => head_dim == 128 || head_dim == 256,
+                };
+                if !ok_hd {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM {mode:?} requires head_dim={} (got {head_dim})",
+                            if matches!(mode, KvMode::Asym3) {
+                                "256"
+                            } else {
+                                "128 or 256"
+                            }
+                        ),
+                    ));
+                }
+                if !matches!(v_mode, VMode::Q8) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM {mode:?} only supports VMode::Q8 (lloyd-V requires an FWHT K mode)"
+                        ),
+                    ));
+                }
+            }
+            KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4 => match v_mode {
+                VMode::Q8 => {
+                    let ok_hd = match mode {
+                        KvMode::Fwht3 => head_dim == 256,
+                        _ => head_dim == 128 || head_dim == 256,
+                    };
+                    if !ok_hd {
+                        return Err(hip_bridge::HipError::new(
+                            0,
+                            &format!(
+                                "VMM {mode:?} requires head_dim={} (got {head_dim})",
+                                if matches!(mode, KvMode::Fwht3) {
+                                    "256"
+                                } else {
+                                    "128 or 256"
+                                }
+                            ),
+                        ));
+                    }
+                }
+                VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4 => {
+                    if head_dim != 256 {
+                        return Err(hip_bridge::HipError::new(
+                            0,
+                            &format!(
+                                "VMM lloyd-V requires head_dim=256 with FWHT K (got mode={mode:?}, head_dim={head_dim})"
+                            ),
+                        ));
+                    }
+                }
+            },
+        }
+        Ok(())
+    }
+
+    /// Build a static VMM layout (reserve tier == current tier).
+    fn vmm_static_layout(
+        mode: KvMode,
+        v_mode: VMode,
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<VmmKvLayout> {
+        Self::validate_vmm_static_geometry(mode, v_mode, n_kv_heads, head_dim)?;
+        if physical_cap == 0 {
+            return Err(hip_bridge::HipError::new(0, "VMM physical_cap must be > 0"));
+        }
+        let kv_dim = Self::checked_vmm_product("logical", &[n_kv_heads, head_dim])?;
+        let k_bytes_per_head = Self::vmm_k_bytes_per_head(mode, head_dim)?;
+        // FP8/BF16 are K/V-indivisible: V shares K's exact row layout and
+        // v_mode carries the ignored Q8 default (never read on these paths).
+        let v_bytes_per_head = match mode {
+            KvMode::Fp8 | KvMode::Bf16 => k_bytes_per_head,
+            _ => Self::vmm_v_bytes_per_head(v_mode, head_dim)?,
+        };
+        let k_bytes_per_token =
+            Self::checked_vmm_product("K token stride", &[n_kv_heads, k_bytes_per_head])?;
+        let v_bytes_per_token =
+            Self::checked_vmm_product("V token stride", &[n_kv_heads, v_bytes_per_head])?;
+        let k_reserve_bytes =
+            Self::checked_vmm_product("K reserve", &[physical_cap, k_bytes_per_token])?;
+        let v_reserve_bytes =
+            Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?;
+        let rotation_table_len = match mode {
+            KvMode::Q8 => 0,
+            // Unrotated, like Q8. None of these tiers uses a rotation table,
+            // so 0 is the honest answer for all of them.
+            KvMode::Bf16 | KvMode::F16 => 0,
+            KvMode::Fp8 => 0,
+            KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => head_dim / 2,
+            KvMode::Fwht3 => 256,
+            KvMode::Fwht2 | KvMode::Fwht4 => {
+                // Q8-V uses 128-wide signs; lloyd-V needs 256-wide up front so
+                // constructors never replace owners after publish.
+                if matches!(v_mode, VMode::Q8) {
+                    128
+                } else {
+                    256
+                }
+            }
+        };
+        let uses_fwht_signs = matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4);
+        Ok(VmmKvLayout {
+            mode,
+            v_mode,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            kv_dim,
+            k_bytes_per_head,
+            v_bytes_per_head,
+            k_bytes_per_token,
+            v_bytes_per_token,
+            k_reserve_bytes,
+            v_reserve_bytes,
+            k_reserve_elems: Self::bytes_to_f32_elems("K reserve", k_reserve_bytes)?,
+            v_reserve_elems: Self::bytes_to_f32_elems("V reserve", v_reserve_bytes)?,
+            rotation_table_len,
+            uses_fwht_signs,
+        })
+    }
+
+    /// Floor-reserved layout: current encoding strides may differ from reserve.
+    /// Adaptive uses this with start FWHT4/Q8 and floor reserve bph/v_mode.
+    fn vmm_layout_with_reserve(
+        mode: KvMode,
+        v_mode: VMode,
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+        reserve_k_bytes_per_head: usize,
+        reserve_v_mode: VMode,
+    ) -> HipResult<VmmKvLayout> {
+        Self::validate_vmm_static_geometry(mode, v_mode, n_kv_heads, head_dim)?;
+        if physical_cap == 0 {
+            return Err(hip_bridge::HipError::new(0, "VMM physical_cap must be > 0"));
+        }
+        if reserve_k_bytes_per_head == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "VMM reserve K bytes-per-head must be > 0",
+            ));
+        }
+        let kv_dim = Self::checked_vmm_product("logical", &[n_kv_heads, head_dim])?;
+        let k_bytes_per_head = Self::vmm_k_bytes_per_head(mode, head_dim)?;
+        let v_bytes_per_head = Self::vmm_v_bytes_per_head(v_mode, head_dim)?;
+        let reserve_v_bph = Self::vmm_v_bytes_per_head(reserve_v_mode, head_dim)?;
+        let k_bytes_per_token =
+            Self::checked_vmm_product("K token stride", &[n_kv_heads, k_bytes_per_head])?;
+        let v_bytes_per_token =
+            Self::checked_vmm_product("V token stride", &[n_kv_heads, v_bytes_per_head])?;
+        let k_reserve_token =
+            Self::checked_vmm_product("K reserve token", &[n_kv_heads, reserve_k_bytes_per_head])?;
+        let v_reserve_token =
+            Self::checked_vmm_product("V reserve token", &[n_kv_heads, reserve_v_bph])?;
+        let k_reserve_bytes =
+            Self::checked_vmm_product("K reserve", &[physical_cap, k_reserve_token])?;
+        let v_reserve_bytes =
+            Self::checked_vmm_product("V reserve", &[physical_cap, v_reserve_token])?;
+        // Adaptive / lloyd paths need 256-wide signs (q8→lloyd, optional fwht4→fwht3).
+        let rotation_table_len = if matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+            || !matches!(reserve_v_mode, VMode::Q8)
+            || !matches!(v_mode, VMode::Q8)
+        {
+            256
+        } else if matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4) {
+            head_dim / 2
+        } else {
+            0
+        };
+        let uses_fwht_signs = matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+            || !matches!(reserve_v_mode, VMode::Q8);
+        Ok(VmmKvLayout {
+            mode,
+            v_mode,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            kv_dim,
+            k_bytes_per_head,
+            v_bytes_per_head,
+            k_bytes_per_token,
+            v_bytes_per_token,
+            k_reserve_bytes,
+            v_reserve_bytes,
+            k_reserve_elems: Self::bytes_to_f32_elems("K reserve", k_reserve_bytes)?,
+            v_reserve_elems: Self::bytes_to_f32_elems("V reserve", v_reserve_bytes)?,
+            rotation_table_len,
+            uses_fwht_signs,
+        })
+    }
+
+    /// Back-compat wrappers used by older call sites / tests.
+    fn q8_vmm_layout(
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<(usize, usize, usize)> {
+        let layout =
+            Self::vmm_static_layout(KvMode::Q8, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
+        Ok((
+            layout.kv_dim,
+            layout.k_reserve_elems,
+            layout.k_bytes_per_token,
+        ))
+    }
+
+    fn asym3_vmm_layout(
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<(usize, usize, usize, usize, usize)> {
+        let layout =
+            Self::vmm_static_layout(KvMode::Asym3, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
+        Ok((
+            layout.kv_dim,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            layout.k_bytes_per_head,
+            layout.v_bytes_per_head,
+        ))
+    }
+
+    /// FWHT3 reuses the Asym3 packed-K / Q8-V byte layout; only the rotation
+    /// tables and `quant_fwht` flag differ from Asym3 VMM.
+    fn fwht3_vmm_layout(
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<(usize, usize, usize, usize, usize)> {
+        let layout =
+            Self::vmm_static_layout(KvMode::Fwht3, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
+        Ok((
+            layout.kv_dim,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            layout.k_bytes_per_head,
+            layout.v_bytes_per_head,
+        ))
+    }
+
+    /// Flag bundle applied by the unified static VMM constructor.
+    /// Returns (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht).
+    /// Pure classification of a `KvMode` into its five VMM layout flags.
+    /// Public so callers one layer up can build a cache in a known layout
+    /// without duplicating the mapping.
+    pub fn vmm_mode_flags(mode: KvMode) -> (bool, bool, bool, bool, bool) {
+        match mode {
+            KvMode::Q8 => (true, false, false, false, false),
+            KvMode::Asym2 => (false, false, false, true, false),
+            KvMode::Asym3 => (false, false, true, false, false),
+            KvMode::Asym4 => (false, true, false, false, false),
+            KvMode::Fwht2 => (false, false, false, true, true),
+            KvMode::Fwht3 => (false, false, true, false, true),
+            KvMode::Fwht4 => (false, true, false, false, true),
+            // Bf16 is NOT representable in this 5-flag bundle — all-false
+            // here would decode as KTier::F32 and hand a bf16 buffer to the
+            // F32 kernels. Bf16 VMM caches are built by the dedicated
+            // `new_gpu_bf16_vmm_capped_filtered`, never this bundle.
+            // Panic loudly rather than return a lie.
+            KvMode::Bf16 => panic!(
+                "vmm_mode_flags: bf16 has no 5-flag VMM bundle representation — \
+                 use new_gpu_bf16_vmm_capped_filtered"
+            ),
+            // F16 likewise: slots-only tier with no VMM bundle. Panic loudly
+            // rather than return a lie.
+            KvMode::F16 => panic!(
+                "vmm_mode_flags: f16 has no 5-flag VMM bundle representation — \
+                 it is a slots/contiguous-only tier"
+            ),
+            // FP8 likewise: the dedicated `new_gpu_fp8_vmm_capped_filtered`
+            // sets its flags directly. Panic loudly rather than return a lie.
+            KvMode::Fp8 => panic!(
+                "vmm_mode_flags: fp8 has no 5-flag VMM bundle representation — \
+                 use new_gpu_fp8_vmm_capped_filtered"
+            ),
+        }
+    }
+
+    /// Validate a backend request without touching GPU memory.
+    pub fn validate_mode_with_backend(
+        mode: KvMode,
+        backend: KvBackend,
+        single_gpu: bool,
+        dims: &KvDims,
+    ) -> HipResult<()> {
+        if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{} KV cache requires head_dim=256; head_dim={} is unsupported",
+                    if mode == KvMode::Asym4 {
+                        "asym4"
+                    } else {
+                        "asym3"
+                    },
+                    dims.head_dim
+                ),
+            ));
+        }
+        // FP8 is exact-geometry (D256); the VMM arm below re-validates it
+        // through the layout table, but legacy requests fail here too.
+        if mode == KvMode::Fp8 && dims.head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "fp8 KV cache requires head_dim=256; head_dim={} is unsupported",
+                    dims.head_dim
+                ),
+            ));
+        }
+        if backend != KvBackend::Vmm {
+            return Ok(());
+        }
+        if !single_gpu {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "KV backend 'vmm' currently supports single-GPU qwen3.5 only",
+            ));
+        }
+        let KvLayers::Mask(is_kv_layer) = &dims.layers else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "KV backend 'vmm' requires qwen3.5's filtered FullAttention layer mask",
+            ));
+        };
+        if !is_kv_layer.iter().any(|is_kv| *is_kv) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "KV backend 'vmm' requires at least one FullAttention layer",
+            ));
+        }
+        let physical_cap = dims.physical_cap.ok_or_else(|| {
+            hip_bridge::HipError::new(0, "KV backend 'vmm' requires a physical token capacity")
+        })?;
+        if physical_cap == 0 || physical_cap > dims.max_seq {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM physical_cap must be in 1..=max_seq (got {physical_cap}, max_seq={})",
+                    dims.max_seq
+                ),
+            ));
+        }
+        match mode {
+            KvMode::Q8
+            | KvMode::Asym2
+            | KvMode::Asym3
+            | KvMode::Asym4
+            | KvMode::Fwht2
+            | KvMode::Fwht3
+            | KvMode::Fwht4
+            | KvMode::Fp8
+            | KvMode::Bf16 => {
+                // Default static V is Q8; Lloyd-V is validated when a constructor
+                // is invoked with an explicit v_mode.
+                Self::vmm_static_layout(
+                    mode,
+                    VMode::Q8,
+                    dims.n_kv_heads,
+                    dims.head_dim,
+                    physical_cap,
+                )?;
+            }
+            other => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "KV backend 'vmm' supports kv_mode=q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|fp8|bf16 only (got {other:?})"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-owning view of one lane inside a parent contiguous Q8 cache.
+    ///
+    /// `self` must have been allocated with total physical capacity
+    /// `lanes * lane_capacity`. The returned cache presents ordinary
+    /// single-sequence Q8 addressing, so existing prefill kernels can seed one
+    /// lane without copying weights or allocating a second cache. The view must
+    /// never be passed to [`KvCache::free_gpu`].
+    ///
+    /// Rejects asym / FWHT / INT8 / HFQ4 / VMM layouts rather than fabricating
+    /// support: continuous-batch only targets exact contiguous Q8 HIP.
+    pub fn q8_lane_view(&self, lane: usize, lane_capacity: usize) -> HipResult<Self> {
+        if !self.quant_q8
+            || self.quant_int8
+            || self.quant_hfq4
+            || self.quant_asym4
+            || self.quant_asym3
+            || self.quant_asym2
+            || self.quant_fwht
+            || self.v_mode != VMode::Q8
+            || lane_capacity == 0
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "q8_lane_view requires a contiguous Q8 cache and non-zero lane capacity",
+            ));
+        }
+        if self.head_dim == 0 || !self.head_dim.is_multiple_of(32) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "q8_lane_view requires head_dim divisible by 32 (got {})",
+                    self.head_dim
+                ),
+            ));
+        }
+        // Fail closed on VMM-backed parent storage: lane views only slice
+        // contiguous hipMalloc buffers via borrowed DeviceBuffer pointers.
+        for t in self.k_gpu.iter().chain(self.v_gpu.iter()) {
+            if t.buf.is_vmm_owner() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "q8_lane_view does not support VMM-backed KV caches",
+                ));
+            }
+        }
+        let lane_end = lane
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(lane_capacity))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view capacity overflow"))?;
+        if lane_end > self.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "q8_lane_view lane exceeds backing cache capacity",
+            ));
+        }
+        let blocks_per_pos = self
+            .n_kv_heads
+            .checked_mul(self.head_dim / 32)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view blocks_per_pos overflow"))?;
+        let bytes_per_pos = blocks_per_pos
+            .checked_mul(34)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view bytes_per_pos overflow"))?;
+        let byte_offset = lane
+            .checked_mul(lane_capacity)
+            .and_then(|n| n.checked_mul(bytes_per_pos))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view byte_offset overflow"))?;
+        let lane_bytes = lane_capacity
+            .checked_mul(bytes_per_pos)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "q8_lane_view lane_bytes overflow"))?;
+        let lane_elems = Self::bytes_to_f32_elems("q8_lane_view lane", lane_bytes)?;
+        let view = |t: &GpuTensor| -> HipResult<GpuTensor> {
+            if t.numel() <= 1 {
+                // Filtered placeholder layer — keep a non-owning alias.
+                return Ok(t.shallow_clone());
+            }
+            let parent_bytes = t.buf.size();
+            let end = byte_offset.checked_add(lane_bytes).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "q8_lane_view parent byte range overflow")
+            })?;
+            if end > parent_bytes {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "q8_lane_view lane byte range exceeds parent buffer",
+                ));
+            }
+            Ok(GpuTensor {
+                buf: t.buf.byte_view(byte_offset, lane_bytes),
+                shape: vec![lane_elems],
+                dtype: DType::F32,
+            })
+        };
+        let k_gpu = self.k_gpu.iter().map(view).collect::<HipResult<Vec<_>>>()?;
+        let v_gpu = self.v_gpu.iter().map(view).collect::<HipResult<Vec<_>>>()?;
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: Vec::new(),
+            v_scales: Vec::new(),
+            kv_dim: self.kv_dim,
+            max_seq: lane_capacity,
+            physical_cap: lane_capacity,
+            n_kv_heads: self.n_kv_heads,
+            head_dim: self.head_dim,
+            quantized: true,
+            quant_q8: true,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            boundary_layers: self.boundary_layers,
+            givens_cos: None,
+            givens_sin: None,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            v_mode: VMode::Q8,
+            layer_is_boundary: self.layer_is_boundary.clone(),
+            compact_offset: 0,
+        })
+    }
+
+    /// Check if a given KV layer ordinal is a boundary layer (first N + last N).
+    pub fn is_boundary(&self, kv_ordinal: usize) -> bool {
+        kv_ordinal < self.layer_is_boundary.len() && self.layer_is_boundary[kv_ordinal]
+    }
+
+    /// Zero every per-layer K/V (and scale) buffer on the GPU. Defense-in-depth
+    /// for arch `reset()`: positional KV is normally overwritten by the next
+    /// prefill (so the stale tail is never attended), but this guarantees no
+    /// prior-conversation bytes can survive a reset even under a future
+    /// window/LCP edge that reads an un-rewritten slot. Sub-millisecond memset
+    /// of the cache buffers; callers MUST also clear their token mirror so a
+    /// zeroed slot can never be stale-LCP-reused.
+    pub fn clear_gpu(&mut self, gpu: &mut Gpu) -> HipResult<()> {
+        for t in self
+            .k_gpu
+            .iter()
+            .chain(self.v_gpu.iter())
+            .chain(self.k_scales.iter())
+            .chain(self.v_scales.iter())
+        {
+            // A VMM owner's buffer already spans exactly its mapped bytes
+            // (`VmmArena::owner_buffer` caps the logical extent there). The
+            // arena's mapped prefix itself grows in granularity-rounded
+            // chunks and can end past the tensor, so it is not the length.
+            gpu.hip.memset(&t.buf, 0, t.buf.size())?;
+        }
+        Ok(())
+    }
+
+    /// The single dispatcher over the `new_gpu_*` constructor family. Each
+    /// non-error arm corresponds 1:1 to a line that exists in a load-site ladder
+    /// today (the byte-identical contract). Unreachable `(mode × layers × cap ×
+    /// target)` cells return `Err` rather than panic, so a future policy mis-wire
+    /// surfaces as a clean load failure.
+    pub fn from_mode(mode: KvMode, gpu: &mut Gpu, dims: &KvDims) -> HipResult<Self> {
+        Self::from_mode_with_backend(mode, KvBackend::Legacy, gpu, dims)
+    }
+
+    pub fn from_mode_with_backend(
+        mode: KvMode,
+        backend: KvBackend,
+        gpu: &mut Gpu,
+        dims: &KvDims,
+    ) -> HipResult<Self> {
+        Self::validate_mode_with_backend(mode, backend, true, dims)?;
+        match backend {
+            KvBackend::Legacy => Self::from_mode_single(mode, gpu, dims),
+            KvBackend::Vmm => Self::from_mode_single_vmm(mode, gpu, dims),
+        }
+    }
+
+    fn from_mode_single_vmm(mode: KvMode, gpu: &mut Gpu, dims: &KvDims) -> HipResult<Self> {
+        let KvLayers::Mask(is_kv_layer) = &dims.layers else {
+            unreachable!("VMM layer shape validated before dispatch")
+        };
+        let physical_cap = dims
+            .physical_cap
+            .expect("VMM physical capacity validated before dispatch");
+        // Static path defaults V to Q8. Carrier may call
+        // `new_gpu_vmm_capped_filtered` directly with Lloyd-V for FWHT-K.
+        match mode {
+            KvMode::Fp8 => Self::new_gpu_fp8_vmm_capped_filtered(
+                gpu,
+                is_kv_layer,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.max_seq,
+                physical_cap,
+            ),
+            KvMode::Q8
+            | KvMode::Asym2
+            | KvMode::Asym3
+            | KvMode::Asym4
+            | KvMode::Fwht2
+            | KvMode::Fwht3
+            | KvMode::Fwht4 => Self::new_gpu_vmm_capped_filtered(
+                gpu,
+                is_kv_layer,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.max_seq,
+                physical_cap,
+                mode,
+                VMode::Q8,
+            ),
+            KvMode::Bf16 => Self::new_gpu_bf16_vmm_capped_filtered(
+                gpu,
+                is_kv_layer,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.max_seq,
+                physical_cap,
+            ),
+            other => unreachable!("VMM mode {other:?} validated before dispatch"),
+        }
+    }
+
+    fn from_mode_single(mode: KvMode, gpu: &mut Gpu, dims: &KvDims) -> HipResult<Self> {
+        use KvLayers::*;
+        let nh = dims.n_kv_heads;
+        let hd = dims.head_dim;
+        let ms = dims.max_seq;
+        match (mode, &dims.layers, dims.physical_cap) {
+            // Mask + Some(cap): _capped_filtered (q8/asym3/fwht2/fwht3/fp8/bf16).
+            (KvMode::Q8, Mask(m), Some(cap)) => {
+                Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Asym3, Mask(m), Some(cap)) => {
+                Self::new_gpu_asym3_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Fwht2, Mask(m), Some(cap)) => {
+                Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Fwht3, Mask(m), Some(cap)) => {
+                Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            // FP8 is Mask-only (hybrid FA layers carry KV): capped + plain
+            // filtered pair. Flat and VMM fall through to the error below.
+            (KvMode::Fp8, Mask(m), Some(cap)) => {
+                Self::new_gpu_fp8_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            // Mask + cap-but-no-capped-variant: cap DROPPED, use _filtered (faithful).
+            (KvMode::Asym2, Mask(m), _) => Self::new_gpu_asym2_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Asym4, Mask(m), _) => Self::new_gpu_asym4_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht4, Mask(m), _) => Self::new_gpu_fwht4_filtered(gpu, m, nh, hd, ms),
+            // Mask + None for the capped-capable modes: plain _filtered.
+            (KvMode::Q8, Mask(m), None) => Self::new_gpu_q8_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Asym3, Mask(m), None) => Self::new_gpu_asym3_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht2, Mask(m), None) => Self::new_gpu_fwht2_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fwht3, Mask(m), None) => Self::new_gpu_fwht3_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Fp8, Mask(m), None) => Self::new_gpu_fp8_filtered(gpu, m, nh, hd, ms),
+            // Flat + Some(cap): _capped (only q8/asym3/asym4).
+            (KvMode::Q8, Flat(n), Some(cap)) => Self::new_gpu_q8_capped(gpu, *n, nh, hd, ms, cap),
+            (KvMode::Asym3, Flat(n), Some(cap)) => {
+                Self::new_gpu_asym3_capped(gpu, *n, nh, hd, ms, cap)
+            }
+            (KvMode::Asym4, Flat(n), Some(cap)) => {
+                Self::new_gpu_asym4_capped(gpu, *n, nh, hd, ms, cap)
+            }
+            // Flat + None: plain (only q8/asym3/asym4).
+            (KvMode::Q8, Flat(n), None) => Self::new_gpu_q8(gpu, *n, nh, hd, ms),
+            (KvMode::Asym3, Flat(n), None) => Self::new_gpu_asym3(gpu, *n, nh, hd, ms),
+            (KvMode::Asym4, Flat(n), None) => Self::new_gpu_asym4(gpu, *n, nh, hd, ms),
+            // Bf16 also serves hybrid stacks via the _filtered pair (Qwen
+            // eval quality control); Flat keeps the legacy plain constructors.
+            (KvMode::Bf16, Mask(m), Some(cap)) => {
+                Self::new_gpu_bf16_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Bf16, Mask(m), None) => Self::new_gpu_bf16_filtered(gpu, m, nh, hd, ms),
+            (KvMode::Bf16, Flat(n), Some(cap)) => {
+                Self::new_gpu_bf16_capped(gpu, *n, nh, hd, ms, cap)
+            }
+            (KvMode::Bf16, Flat(n), None) => Self::new_gpu_bf16(gpu, *n, nh, hd, ms),
+            // No constructor exists for this combination.
+            (m, l, c) => Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KvCache::from_mode_single: no constructor for (mode={m:?}, layers={}, cap={c:?}); \
+                     unreachable under current policies — a policy/accepted-set mis-wire, not a user error",
+                    match l {
+                        Mask(_) => "Mask",
+                        Flat(_) => "Flat",
+                    },
+                ),
+            )),
+        }
+    }
+}
+
+impl KvCache {
+    pub fn new_gpu(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let cache_size = max_seq_len * kv_dim;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_size], DType::F32)?);
+        }
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap: max_seq_len,
+            n_kv_heads,
+            head_dim,
+            quantized: false,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
+    pub fn new_gpu_q4(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        // Per position per head: 8 bytes (scale+zero) + head_dim/2 bytes (nibbles)
+        let bytes_per_head = 8 + head_dim / 2;
+        let bytes_per_pos = n_kv_heads * bytes_per_head;
+        let cache_bytes = max_seq_len * bytes_per_pos;
+        // Allocate as raw bytes (use F32 dtype but size in bytes)
+        let cache_elems = (cache_bytes + 3) / 4; // round up to F32 elements
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap: max_seq_len,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create Q8_0 quantized KV cache (GGML Q8_0 format). 3.76x smaller than FP32.
+    /// Block: [f16 scale (2B)][int8 × 32 (32B)] = 34 bytes per 32 elements.
+    /// head_dim=128 → 4 blocks × 34 = 136 bytes per head.
+    pub fn new_gpu_q8(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_q8_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Same as [`new_gpu_q8`] with an explicit physical_cap. Eviction-aware.
+    pub fn new_gpu_q8_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_q8_capped_with_alloc(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            Gpu::zeros,
+        )
+    }
+
+    /// [`new_gpu_q8_capped`] with an injectable K/V allocator: the production
+    /// door passes [`Gpu::zeros`]; rollback tests fail the Nth call to prove a
+    /// mid-loop failure frees every already-owned buffer before the original
+    /// error propagates.
+    fn new_gpu_q8_capped_with_alloc(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mut alloc_zero: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let blocks_per_head = head_dim / 32;
+        let total_blocks = n_kv_heads * blocks_per_head;
+        let cache_bytes = physical_cap * total_blocks * 34;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        // Same cleanup-closure shape as `alloc_k_v_filtered`: on any mid-loop
+        // failure free every tensor already pushed so a partial build never
+        // leaks device memory (GpuTensor has no freeing Drop). The K push
+        // precedes its V, so a V failure leaves the current K unmatched but
+        // still owned in `k_gpu` — the drain below covers it.
+        let result = (|| -> HipResult<()> {
+            for _ in 0..n_layers {
+                k_gpu.push(alloc_zero(gpu, &[cache_elems], DType::F32)?);
+                v_gpu.push(alloc_zero(gpu, &[cache_elems], DType::F32)?);
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
+        }
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: true,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create a flat BF16 KV cache. 2 bytes per element — 1.88x the Q8_0
+    /// layout (34 B per 32 elements). Values are **rounded F32→BF16** (same 8
+    /// exponent bits, truncated mantissa); that is not lossless, but it is the
+    /// near-reference tier Maple compares Q8 against and **the default Maple
+    /// KV mode** today.
+    ///
+    /// Layout is deliberately the simplest thing that can work: element
+    /// `(t, kv_h, d)` lives at `t * kv_dim + kv_h * head_dim + d`, one bf16
+    /// each. No blocks, no scales, no padding. That is what lets the tile
+    /// kernel drop the entire Q8 block-index computation.
+    ///
+    /// Sized by `physical_cap` like `new_gpu_q8_capped`, so eviction-bounded
+    /// callers get the buffer they asked for.
+
+    pub fn new_gpu_bf16(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_bf16_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Same as [`KvCache::new_gpu_bf16`] with an explicit physical_cap.
+    pub fn new_gpu_bf16_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        // 2 bytes per element, rounded up to whole F32 elements because the
+        // allocator is typed F32 everywhere else in this file. kv_dim is even
+        // for every real model so the round-up is a no-op, but the ceil keeps
+        // a hypothetical odd kv_dim from under-allocating.
+        let cache_bytes = physical_cap * kv_dim * 2;
+        let cache_elems = cache_bytes.div_ceil(4);
+        // All layers carry KV (no hybrid mask). Route through
+        // `alloc_k_v_filtered` so a mid-loop `zeros` failure frees every
+        // already-pushed owner — GpuTensor has no freeing Drop.
+        let is_kv_layer = vec![true; n_layers];
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, &is_kv_layer)?;
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            // `quantized` is TRUE even though bf16 is not a quantized tier:
+            // the legacy llama/qwen35 paths branch on `!quantized` to mean
+            // "plain F32 layout", and a bf16 buffer read as F32 is garbage.
+            // Setting this keeps those paths out of their F32 arm. Only Maple
+            // can allocate this cache today.
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: true,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            // V is bf16 too. `VMode::Q8` is the struct's default and is never
+            // read on this path — the tier decode reaches `KTier::Bf16` before
+            // any v_mode branch.
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Flat bf16 KV cache that skips allocation for layers flagged as
+    /// non-KV (Qwen hybrid): same unscaled `Hkv*D*2`-byte rows as
+    /// [`Self::new_gpu_bf16`], 1-element placeholders elsewhere.
+    pub fn new_gpu_bf16_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_bf16_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped variant of [`Self::new_gpu_bf16_filtered`]: buffers sized by
+    /// `physical_cap`, `max_seq_len` retained for RoPE/masks.
+    pub fn new_gpu_bf16_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "bf16 KV kv_dim overflowed"))?;
+        let row_bytes = Self::bf16_row_bytes(n_kv_heads, head_dim)?;
+        let cache_bytes = row_bytes
+            .checked_mul(physical_cap)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "bf16 KV cache byte size overflowed"))?;
+        let cache_elems = cache_bytes.div_ceil(4);
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: bf16 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
+            is_kv_layer.len()
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: true,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            // V is bf16 too; `VMode::Q8` is never read on this path.
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Helper: allocate K/V Vecs, skipping layers where is_kv_layer[i] is false
+    /// by inserting a 1-element placeholder. Saves VRAM for hybrid arches
+    /// (Qwen 3.5 DeltaNet + FullAttention) where 75% of layers don't carry
+    /// KV in this cache — their state lives in [`crate::qwen35::DeltaNetState`].
+    /// Per-layer index is preserved so downstream code can index by absolute
+    /// layer_idx unchanged.
+    fn alloc_k_v_filtered(
+        gpu: &mut Gpu,
+        k_elems: usize,
+        v_elems: usize,
+        is_kv_layer: &[bool],
+    ) -> HipResult<(Vec<GpuTensor>, Vec<GpuTensor>)> {
+        let n = is_kv_layer.len();
+        let mut k_gpu = Vec::with_capacity(n);
+        let mut v_gpu = Vec::with_capacity(n);
+        // Legacy path mirrors alloc_k_v_vmm_filtered: on any mid-loop
+        // failure free every tensor already pushed so a partial build never
+        // leaks device memory (GpuTensor has no freeing Drop).
+        let result = (|| -> HipResult<()> {
+            for &is_kv in is_kv_layer {
+                if is_kv {
+                    k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+                    v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+                } else {
+                    k_gpu.push(gpu.zeros(&[1], DType::F32)?);
+                    v_gpu.push(gpu.zeros(&[1], DType::F32)?);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
+        }
+        Ok((k_gpu, v_gpu))
+    }
+
+    /// Reserve dense virtual K/V tensors while mapping physical pages only as
+    /// the request grows. Placeholder tensors preserve absolute layer indices.
+    fn alloc_k_v_vmm_filtered(
+        gpu: &mut Gpu,
+        k_elems: usize,
+        v_elems: usize,
+        is_kv_layer: &[bool],
+    ) -> HipResult<(Vec<GpuTensor>, Vec<GpuTensor>)> {
+        let mut k_gpu = Vec::with_capacity(is_kv_layer.len());
+        let mut v_gpu = Vec::with_capacity(is_kv_layer.len());
+        let device_id = gpu.device_id;
+        let result = (|| -> HipResult<()> {
+            for &is_kv in is_kv_layer {
+                if is_kv {
+                    // SAFETY: Qwen3.5 mapped-prefix guards run before every
+                    // write, attention dispatch, and graph capture/replay.
+                    k_gpu.push(unsafe {
+                        gpu.alloc_vmm_tensor(&[k_elems], DType::F32, 0, &[device_id])?
+                    });
+                    v_gpu.push(unsafe {
+                        gpu.alloc_vmm_tensor(&[v_elems], DType::F32, 0, &[device_id])?
+                    });
+                } else {
+                    k_gpu.push(gpu.zeros(&[1], DType::F32)?);
+                    v_gpu.push(gpu.zeros(&[1], DType::F32)?);
+                }
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
+        }
+        Ok((k_gpu, v_gpu))
+    }
+
+    /// Resolve the current K `KvMode` from live cache flags.
+    /// Read-only: the mode this cache is currently laid out for.
+    pub fn current_kv_mode(&self) -> HipResult<KvMode> {
+        if self.quant_fp8 {
+            return Ok(KvMode::Fp8);
+        }
+        if self.quant_q8 {
+            return Ok(KvMode::Q8);
+        }
+        if self.quant_bf16 {
+            return Ok(KvMode::Bf16);
+        }
+        if self.quant_asym4 {
+            return Ok(if self.quant_fwht {
+                KvMode::Fwht4
+            } else {
+                KvMode::Asym4
+            });
+        }
+        if self.quant_asym3 {
+            return Ok(if self.quant_fwht {
+                KvMode::Fwht3
+            } else {
+                KvMode::Asym3
+            });
+        }
+        if self.quant_asym2 {
+            return Ok(if self.quant_fwht {
+                KvMode::Fwht2
+            } else {
+                KvMode::Asym2
+            });
+        }
+        Err(hip_bridge::HipError::new(
+            0,
+            "VMM KV cache encoding flags are not a recognized static mode",
+        ))
+    }
+
+    /// Current K/V bytes-per-token from live flags / V mode.
+    /// Independent K and V strides — capacity is always min-of-two.
+    fn vmm_bytes_per_token(&self) -> HipResult<(usize, usize)> {
+        if self.n_kv_heads == 0 {
+            return Err(hip_bridge::HipError::new(0, "VMM KV requires n_kv_heads>0"));
+        }
+        // Indivisible tiers short-circuit the flag decode: both sides share
+        // one token-local row (fp8: codes + inline f16 scales; bf16: flat).
+        if self.quant_fp8 {
+            let row = Self::fp8_row_bytes(self.n_kv_heads, self.head_dim)?;
+            return Ok((row, row));
+        }
+        if self.quant_bf16 {
+            let row = Self::bf16_row_bytes(self.n_kv_heads, self.head_dim)?;
+            return Ok((row, row));
+        }
+        let mode = self.current_kv_mode()?;
+        // Geometry for the live encoding; lloyd-V only legal on FWHT-K.
+        Self::validate_vmm_static_geometry(mode, self.v_mode, self.n_kv_heads, self.head_dim)?;
+        let k_bph = Self::vmm_k_bytes_per_head(mode, self.head_dim)?;
+        let v_bph = Self::vmm_v_bytes_per_head(self.v_mode, self.head_dim)?;
+        let k = Self::checked_vmm_product("K token stride", &[self.n_kv_heads, k_bph])?;
+        let v = Self::checked_vmm_product("V token stride", &[self.n_kv_heads, v_bph])?;
+        Ok((k, v))
+    }
+
+    pub fn uses_vmm_backend(&self) -> bool {
+        self.k_gpu
+            .iter()
+            .chain(self.v_gpu.iter())
+            .find(|tensor| tensor.numel() > 1)
+            .is_some_and(|tensor| tensor.buf.is_vmm_owner())
+    }
+
+    fn fast_mapped_token_capacity(&self) -> HipResult<Option<usize>> {
+        if !self.uses_vmm_backend() {
+            return Ok(None);
+        }
+        let (k_bytes_per_token, v_bytes_per_token) = self.vmm_bytes_per_token()?;
+        let capacity = [
+            ("K", self.k_gpu.as_slice(), k_bytes_per_token),
+            ("V", self.v_gpu.as_slice(), v_bytes_per_token),
+        ]
+        .into_iter()
+        .try_fold(self.physical_cap, |capacity, (label, tensors, stride)| {
+            let tensor = tensors
+                .iter()
+                .rev()
+                .find(|tensor| tensor.numel() > 1)
+                .ok_or_else(|| {
+                    hip_bridge::HipError::new(
+                        0,
+                        &format!("VMM KV cache has no real {label} tensor"),
+                    )
+                })?;
+            if !tensor.buf.is_vmm_owner() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("VMM KV cache has a non-VMM real {label} tensor"),
+                ));
+            }
+            Ok(capacity.min(tensor.buf.size() / stride))
+        })?;
+        Ok(Some(capacity))
+    }
+
+    pub fn mapped_token_capacity(&self) -> HipResult<Option<usize>> {
+        if !self.uses_vmm_backend() {
+            return Ok(None);
+        }
+        let (k_bytes_per_token, v_bytes_per_token) = self.vmm_bytes_per_token()?;
+        let mut capacity = self.physical_cap;
+        for (label, tensors, bytes_per_token) in [
+            ("K", self.k_gpu.as_slice(), k_bytes_per_token),
+            ("V", self.v_gpu.as_slice(), v_bytes_per_token),
+        ] {
+            for tensor in tensors {
+                if tensor.buf.is_vmm_owner() {
+                    capacity = capacity.min(tensor.buf.size() / bytes_per_token);
+                } else if tensor.numel() > 1 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!(
+                            "VMM KV cache mixes a non-VMM real {label} tensor with VMM tensors"
+                        ),
+                    ));
+                }
+            }
+        }
+        Ok(Some(capacity))
+    }
+
+    pub fn require_mapped_capacity(&self, required_tokens: usize) -> HipResult<()> {
+        let Some(mapped_tokens) = self.mapped_token_capacity()? else {
+            return Ok(());
+        };
+        if required_tokens > self.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KV write requires {required_tokens} tokens but physical_cap is {}",
+                    self.physical_cap
+                ),
+            ));
+        }
+        if required_tokens > mapped_tokens {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM KV mapped prefix holds {mapped_tokens} tokens but the operation requires {required_tokens}"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Grow VMM tensors for one side (K or V).
+    ///
+    /// `bytes_per_token` is the **current** encoding stride. `physical_cap` is
+    /// the constructor token horizon. Per-tensor max tokens is
+    /// `min(physical_cap, reserve_bytes / current_stride)` so adaptive
+    /// floor-reserved arenas never plan growth past the stable VA.
+    fn grow_vmm_tensors(
+        gpu: &mut Gpu,
+        tensors: &mut [GpuTensor],
+        bytes_per_token: usize,
+        physical_cap: usize,
+        required_tokens: usize,
+    ) -> HipResult<usize> {
+        if bytes_per_token == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "VMM growth requires a non-zero current byte stride",
+            ));
+        }
+        let mut grown = 0usize;
+        let device_id = gpu.device_id;
+        let minimum_growth_bytes = DEFAULT_VMM_PHYSICAL_CHUNK_BYTES;
+        for tensor in tensors {
+            if !tensor.buf.is_vmm_owner() {
+                if tensor.numel() > 1 {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM KV cache contains a non-VMM real tensor",
+                    ));
+                }
+                continue;
+            }
+            let mapped = gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
+            })?;
+            let granularity = gpu.vmm_granularity(tensor).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "VMM KV tensor has no allocation granularity")
+            })?;
+            // Full reserved VA size (shape × dtype), independent of mapped prefix.
+            let reserve_bytes = tensor.byte_size();
+            let side_cap = (reserve_bytes / bytes_per_token).min(physical_cap);
+            if side_cap == 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "VMM KV reserve is smaller than one token at the current stride",
+                ));
+            }
+            if required_tokens > side_cap {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "VMM KV current-stride capacity is {side_cap} tokens but the operation requires {required_tokens}"
+                    ),
+                ));
+            }
+            let plan = KvChunkPlan::new(
+                bytes_per_token,
+                side_cap,
+                DEFAULT_KV_CHUNK_TOKENS,
+                granularity,
+                minimum_growth_bytes,
+            )
+            .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?;
+            if let Some(growth) = plan
+                .growth(mapped, required_tokens)
+                .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?
+            {
+                if gpu.graphs.capture_mode {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM KV growth requested during graph capture",
+                    ));
+                }
+                // Map before any subsequent write; owners stay at the same VA.
+                gpu.grow_vmm_tensor(tensor, growth.size_bytes, &[device_id])?;
+                grown += 1;
+            }
+        }
+        Ok(grown)
+    }
+
+    /// Same fast no-growth gate used by `ensure_mapped_capacity`. Optional
+    /// caches need not scan every KV layer on each decode token.
+    pub fn needs_mapped_growth(&self, required_tokens: usize) -> HipResult<bool> {
+        Ok(self
+            .fast_mapped_token_capacity()?
+            .is_some_and(|capacity| required_tokens > capacity))
+    }
+
+    /// Physical bytes the next `ensure_mapped_capacity` would map. Used by
+    /// optional caches to yield memory to KV before mapping, with the same
+    /// per-tensor chunk plan and current encoding strides as actual growth.
+    pub fn planned_mapped_growth_bytes(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+    ) -> HipResult<usize> {
+        self.planned_mapped_bytes(gpu, required_tokens, false)
+    }
+
+    /// Physical bytes an owner shaped like this one maps to hold
+    /// `required_tokens` from an empty mapping: the admission cost of a new
+    /// request owner under the same chunk plan and encoding strides.
+    pub fn planned_mapped_bytes_from_empty(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+    ) -> HipResult<usize> {
+        self.planned_mapped_bytes(gpu, required_tokens, true)
+    }
+
+    fn planned_mapped_bytes(
+        &self,
+        gpu: &Gpu,
+        required_tokens: usize,
+        from_empty: bool,
+    ) -> HipResult<usize> {
+        if !self.uses_vmm_backend() {
+            return Ok(0);
+        }
+        let (k_stride, v_stride) = self.vmm_bytes_per_token()?;
+        let mut bytes = 0usize;
+        for (tensors, stride) in [(&self.k_gpu, k_stride), (&self.v_gpu, v_stride)] {
+            for tensor in tensors {
+                if !tensor.buf.is_vmm_owner() {
+                    if tensor.numel() > 1 {
+                        return Err(hip_bridge::HipError::new(
+                            0,
+                            "VMM KV contains a non-VMM tensor",
+                        ));
+                    }
+                    continue;
+                }
+                let mapped = if from_empty {
+                    0
+                } else {
+                    gpu.vmm_mapped_bytes(tensor).ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "VMM KV tensor is not registered with its GPU")
+                    })?
+                };
+                let granularity = gpu.vmm_granularity(tensor).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "VMM KV tensor has no allocation granularity")
+                })?;
+                let side_cap = (tensor.byte_size() / stride).min(self.physical_cap);
+                let plan = KvChunkPlan::new(
+                    stride,
+                    side_cap,
+                    DEFAULT_KV_CHUNK_TOKENS,
+                    granularity,
+                    DEFAULT_VMM_PHYSICAL_CHUNK_BYTES,
+                )
+                .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?;
+                if let Some(growth) = plan
+                    .growth(mapped, required_tokens)
+                    .map_err(|err| hip_bridge::HipError::new(0, &err.to_string()))?
+                {
+                    bytes = bytes.checked_add(growth.size_bytes).ok_or_else(|| {
+                        hip_bridge::HipError::new(0, "VMM KV planned growth overflows usize")
+                    })?;
+                }
+            }
+        }
+        Ok(bytes)
+    }
+
+    /// Ensure both K and V mapped prefixes cover `required_tokens` at the
+    /// **current** strides. Growth is independent per side and completes before
+    /// the caller may write. Never replaces VMM owners.
+    pub fn ensure_mapped_capacity(
+        &mut self,
+        gpu: &mut Gpu,
+        required_tokens: usize,
+    ) -> HipResult<()> {
+        let Some(fast_capacity) = self.fast_mapped_token_capacity()? else {
+            return Ok(());
+        };
+        if required_tokens > self.physical_cap {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "KV write requires {required_tokens} tokens but physical_cap is {}",
+                    self.physical_cap
+                ),
+            ));
+        }
+        if required_tokens <= fast_capacity {
+            return Ok(());
+        }
+        let (k_bytes_per_token, v_bytes_per_token) = self.vmm_bytes_per_token()?;
+        // Growth is monotonic: if a later map fails, the next call keeps the
+        // completed prefixes and fills the lagging tensors before the final guard.
+        // K and V are grown independently at their current strides.
+        Self::grow_vmm_tensors(
+            gpu,
+            &mut self.k_gpu,
+            k_bytes_per_token,
+            self.physical_cap,
+            required_tokens,
+        )?;
+        Self::grow_vmm_tensors(
+            gpu,
+            &mut self.v_gpu,
+            v_bytes_per_token,
+            self.physical_cap,
+            required_tokens,
+        )?;
+        self.require_mapped_capacity(required_tokens)?;
+        let mapped = self.mapped_token_capacity()?.unwrap_or(0);
+        eprintln!(
+            "KV cache: mapped_prefix={fast_capacity}->{mapped} / physical_cap={} / max_seq={}",
+            self.physical_cap, self.max_seq,
+        );
+        Ok(())
+    }
+
+    /// Context bound a per-request VMM owner can address: positions
+    /// `[0, logical_bound)`. Never silently below the request's admitted
+    /// context — admission compares against this and refuses.
+    pub fn vmm_logical_bound(&self) -> usize {
+        self.max_seq.min(self.physical_cap)
+    }
+
+    /// `_vmm` kernel format of this per-request owner. Only Q8 (K+V Q8_0)
+    /// and native fp8 have a validated VMM descriptor implementation;
+    /// everything else is refused, never routed through a legacy arena.
+    pub fn vmm_kv_format(&self) -> HipResult<rdna_compute::attention::VmmKvFormat> {
+        use rdna_compute::attention::VmmKvFormat;
+        if !self.uses_vmm_backend() {
+            return Err(hip_bridge::HipError::new(0, "KV cache is not a VMM owner"));
+        }
+        if self.compact_offset != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "VMM request owner was compacted; absolute VA addressing requires compact_offset == 0",
+            ));
+        }
+        match self.current_kv_mode()? {
+            KvMode::Fp8 => Ok(VmmKvFormat::Fp8E4M3),
+            KvMode::Q8 if self.v_mode == VMode::Q8 => Ok(VmmKvFormat::Q8),
+            other => Err(hip_bridge::HipError::new(
+                0,
+                &format!("KV mode {other:?} has no validated per-request VMM descriptor"),
+            )),
+        }
+    }
+
+    /// Physical bytes this owner must map to hold `positions` tokens, after
+    /// refusing anything past [`Self::vmm_logical_bound`]. Pure planning —
+    /// the admission check for one request against a shared budget.
+    pub fn vmm_admission_bytes(&self, gpu: &Gpu, positions: usize) -> HipResult<usize> {
+        self.vmm_kv_format()?;
+        let bound = self.vmm_logical_bound();
+        if positions > bound {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM admission refused: {positions} positions exceed logical bound {bound}"
+                ),
+            ));
+        }
+        self.planned_mapped_growth_bytes(gpu, positions)
+    }
+
+    /// Provision (map) this request's prefix to cover `positions` tokens,
+    /// outside graph capture, refusing — without mapping anything — if the
+    /// growth exceeds `budget_bytes` (caller's remaining shared physical
+    /// budget) or the logical bound. Growth is monotonic and keeps every
+    /// owner at its VA. Returns the mapped bytes consumed by this call.
+    pub fn provision_vmm_positions(
+        &mut self,
+        gpu: &mut Gpu,
+        positions: usize,
+        budget_bytes: usize,
+    ) -> HipResult<usize> {
+        let need = self.vmm_admission_bytes(gpu, positions)?;
+        if need > budget_bytes {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM admission refused: mapping {positions} positions needs {need} B, budget {budget_bytes} B"
+                ),
+            ));
+        }
+        if need > 0 {
+            self.ensure_mapped_capacity(gpu, positions)?;
+        }
+        Ok(need)
+    }
+
+    /// Request-wide owner generation: the registration generation of this
+    /// owner's first real K tensor. Generations are monotonic per GPU and
+    /// never reused, so it identifies this owner instance across abort and
+    /// slot reuse; every layer descriptor carries the same value.
+    pub fn vmm_owner_generation(&self, gpu: &Gpu) -> HipResult<u64> {
+        let k = self
+            .k_gpu
+            .iter()
+            .find(|t| t.buf.is_vmm_owner())
+            .ok_or_else(|| hip_bridge::HipError::new(0, "KV cache has no VMM K owner"))?;
+        gpu.vmm_owner_generation(k).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU")
+        })
+    }
+
+    /// Per-layer VMM descriptors for this request (index = model layer;
+    /// non-KV layers are [`VmmKvSlotDesc::MASKED`]). Addresses are the
+    /// owners' stable VAs; `mapped_positions` is the actual mapped prefix
+    /// over K and V, `owner_generation` the request-wide
+    /// [`Self::vmm_owner_generation`]. A view borrows: it never transfers or clones ownership,
+    /// and is invalid after [`Self::release_vmm_after`].
+    pub fn vmm_slot_descs(
+        &self,
+        gpu: &Gpu,
+    ) -> HipResult<Vec<rdna_compute::kv_slots::VmmKvSlotDesc>> {
+        use rdna_compute::kv_slots::VmmKvSlotDesc;
+        self.vmm_kv_format()?;
+        let mapped = self.mapped_token_capacity()?.unwrap_or(0);
+        let to_u32 = |v: usize, what: &str| {
+            u32::try_from(v)
+                .map_err(|_| hip_bridge::HipError::new(0, &format!("VMM {what} {v} exceeds u32")))
+        };
+        let mapped_positions = to_u32(mapped.min(self.vmm_logical_bound()), "mapped prefix")?;
+        let logical_bound = to_u32(self.vmm_logical_bound(), "logical bound")?;
+        let owner_generation = self.vmm_owner_generation(gpu)?;
+        self.k_gpu
+            .iter()
+            .zip(&self.v_gpu)
+            .map(|(k, v)| {
+                if !k.buf.is_vmm_owner() {
+                    return Ok(VmmKvSlotDesc::MASKED);
+                }
+                if !v.buf.is_vmm_owner() {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM K owner paired with non-VMM V",
+                    ));
+                }
+                gpu.vmm_owner_generation(k).ok_or_else(|| {
+                    hip_bridge::HipError::new(0, "VMM K owner is not registered with this GPU")
+                })?;
+                Ok(VmmKvSlotDesc {
+                    k_base: k.buf.as_ptr() as u64,
+                    v_base: v.buf.as_ptr() as u64,
+                    mapped_positions,
+                    logical_bound,
+                    owner_generation,
+                })
+            })
+            .collect()
+    }
+
+    /// Release the request owner once its last reader has completed:
+    /// synchronizes `completion` (the event recorded after the final step
+    /// that read or wrote this KV, including graph replays) before unmapping.
+    /// Never call with readers still in flight and no event.
+    pub fn release_vmm_after(
+        self,
+        gpu: &mut Gpu,
+        completion: Option<&hip_bridge::Event>,
+    ) -> HipResult<()> {
+        if let Some(event) = completion {
+            gpu.hip.event_synchronize(event)?;
+        }
+        self.free_gpu(gpu)
+    }
+
+    /// Bytes of V-cache per token-position (all heads) for a given V mode.
+    /// Q8 = n_kv_heads * (head_dim/32) * 34. Lloyd = n_kv_heads * (4 + head_dim*bits/8).
+    fn v_bytes_per_pos(n_kv_heads: usize, head_dim: usize, v_mode: VMode) -> usize {
+        match v_mode {
+            VMode::Q8 => n_kv_heads * (head_dim / 32) * 34,
+            VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4 => {
+                n_kv_heads * (4 + (head_dim * v_mode.bits() as usize) / 8)
+            }
+        }
+    }
+
+    /// V-mode bit-count to pass as a kernarg.
+    pub fn v_mode_bits(&self) -> i32 {
+        self.v_mode.bits()
+    }
+
+    /// Mode-derived `KvTierInputs` with per-call fields zero-filled. Each
+    /// attention dispatch site sets `pos`/`flash_mode`/`capture_mode`/
+    /// `batch_size`/`is_tree`/`is_boundary` after this returns (via functional
+    /// update). Single source of truth for the cache-stable tier flags,
+    /// replacing the four hand-copied literals.
+    /// The "quantized but no known format and no separate scales" residual —
+    /// the llama legacy Q4 KV path. Shared by `tier_inputs()` and `k_tier()`
+    /// so the two derivations can never silently diverge.
+    pub fn quant_q4_residual(&self) -> bool {
+        // The llama-legacy "plain Q4" KV tier is the residual: quantized but
+        // none of the named tiers. MUST also exclude asym{2,3,4} — those set
+        // `quantized:true` with empty `k_scales`, so without this guard an asym
+        // cache reports BOTH its asym flag AND quant_q4, tripping classify()'s
+        // "at most one tier flag" debug_assert (debug-build panic on the qwen35
+        // asym3 default) and breaking the byte-identical-to-legacy-literal
+        // invariant (the legacy qwen35 literals hardcoded quant_q4 = false).
+        // Release classify() output is unchanged either way (asym is matched
+        // before q4), so this is a true no-op for kernel selection.
+        // BF16 is a distinct flat tier (maple): it is `quantized:true` with
+        // empty `k_scales` and no other quant flag, so without `!quant_bf16`
+        // it would ALSO report quant_q4, giving two true tier flags and
+        // tripping the same debug_assert on every Maple BF16 dispatch.
+        self.quantized
+            && !self.quant_hfq4
+            && !self.quant_q8
+            && !self.quant_int8
+            && !self.quant_asym4
+            && !self.quant_asym3
+            && !self.quant_asym2
+            && !self.quant_bf16
+            && !self.quant_fp8
+            && self.k_scales.is_empty()
+    }
+
+    /// HFQ8 flat-layout KV: quantized with a separate per-block scale table,
+    /// and none of the other named tiers. Mirrors the hand ladder's hfq8 branch
+    /// condition (`llama.rs` `llama_kv_write_attend` `quantized && !k_scales.is_empty()
+    /// && !int8 && !q8`), extended with the exclusions that keep exactly one tier
+    /// flag set (asym caches set `quantized` with EMPTY `k_scales`; hfq4 is matched
+    /// earlier) so classify()'s "at most one tier flag" debug_assert holds.
+    pub fn is_hfq8_kv(&self) -> bool {
+        self.quantized
+            && !self.k_scales.is_empty()
+            && !self.quant_int8
+            && !self.quant_q8
+            && !self.quant_hfq4
+            && !self.quant_asym4
+            && !self.quant_asym3
+            && !self.quant_asym2
+            && !self.quant_fp8
+    }
+
+    /// The sealed decode of this cache's storage tier. The sanctioned way to
+    /// branch on KV quant mode — replaces hand-rolled `if kv.quant_q8 { … }` ladders.
+
+    fn resize_real_tensors_zeroed(
+        gpu: &mut Gpu,
+        tensors: &mut [GpuTensor],
+        elems: usize,
+    ) -> HipResult<()> {
+        let real: Vec<usize> = tensors
+            .iter()
+            .enumerate()
+            .filter_map(|(i, t)| (t.numel() > 1).then_some(i))
+            .collect();
+        for &i in &real {
+            let placeholder = gpu.zeros(&[1], DType::F32)?;
+            let old = std::mem::replace(&mut tensors[i], placeholder);
+            let _ = gpu.free_tensor(old);
+        }
+        gpu.drain_pool();
+        for &i in &real {
+            let new_tensor = gpu.zeros(&[elems], DType::F32)?;
+            let placeholder = std::mem::replace(&mut tensors[i], new_tensor);
+            let _ = gpu.free_tensor(placeholder);
+        }
+        gpu.drain_pool();
+        Ok(())
+    }
+
+    /// Reallocate the V buffers for a new V mode (used by eval/bench to set an
+    /// independent V quant after construction). Re-sizes only real KV layers
+    /// (placeholder 1-element buffers for non-KV layers are left as-is).
+    /// K buffers and rotation tables are untouched except when enabling lloyd-V
+    /// on fwht2/4-K caches (128-element signs → reallocated to 256; the 128-wide
+    /// K rotation reads only indices 0..127 so the LCG prefix is byte-identical).
+    /// Note: single-GPU only; multi-GPU V-mode wiring is deferred (plan Task 9).
+    pub fn set_v_mode_realloc(&mut self, gpu: &mut Gpu, v_mode: VMode) -> HipResult<()> {
+        // Indivisible tiers have no V-mode axis: V shares K's encoding.
+        if self.quant_fp8 || self.quant_bf16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "set_v_mode_realloc refuses fp8/bf16 caches (K/V pair is indivisible)",
+            ));
+        }
+        assert!(
+            ((self.quant_asym2 || self.quant_asym3 || self.quant_asym4) && self.quant_fwht)
+                || matches!(v_mode, VMode::Q8),
+            "lloyd-V is 256-wide and requires an FWHT K mode (quant_asym{{2,3,4}} && quant_fwht); got a different K mode — would corrupt the V cache"
+        );
+        if !matches!(v_mode, VMode::Q8) {
+            assert!(self.head_dim == 256, "lloyd-V requires head_dim == 256");
+        }
+        // For fwht2/4-K caches the sign tables are 128-element (the K rotation
+        // is 128-wide). Lloyd-V is 256-wide and needs 256-element tables.
+        // gen_fwht_signs is a pure LCG: gen_fwht_signs(seed,256)[0..128] ==
+        // gen_fwht_signs(seed,128), so the K path remains byte-identical after
+        // realloc. Skip when signs are already 256 (fwht3) or when givens_cos
+        // is None (multi-GPU cache — sign realloc deferred to Task 9).
+        if !matches!(v_mode, VMode::Q8) {
+            let need_realloc = self.givens_cos.as_ref().map_or(false, |t| t.numel() < 256);
+            if need_realloc {
+                let n = 256usize;
+                let s1v = Self::gen_fwht_signs(42, n);
+                let s2v = Self::gen_fwht_signs(1042, n);
+                let s1b: Vec<u8> = s1v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                let s2b: Vec<u8> = s2v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                let s1 = gpu.alloc_tensor(&[n], DType::F32)?;
+                let s2 = gpu.alloc_tensor(&[n], DType::F32)?;
+                gpu.hip.memcpy_htod(&s1.buf, &s1b)?;
+                gpu.hip.memcpy_htod(&s2.buf, &s2b)?;
+                if let Some(old) = self.givens_cos.take() {
+                    let _ = gpu.free_tensor(old);
+                }
+                if let Some(old) = self.givens_sin.take() {
+                    let _ = gpu.free_tensor(old);
+                }
+                self.givens_cos = Some(s1);
+                self.givens_sin = Some(s2);
+            }
+        }
+        let v_bpp = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_mode);
+        let v_elems = (self.physical_cap * v_bpp + 3) / 4;
+        Self::resize_real_tensors_zeroed(gpu, &mut self.v_gpu, v_elems)?;
+        self.v_mode = v_mode;
+        Ok(())
+    }
+
+    /// Adaptive-KV load setup: size the V buffer at the V FLOOR (so the fixed
+    /// buffer holds `physical_cap` tokens at the floor; FEWER at higher tiers)
+    /// and ensure 256-wide FWHT signs (so the q8→lloyd4 transcode is safe).
+    /// `v_mode` STAYS Q8 — the fast, highest-precision start tier the controller
+    /// runs until the first threshold. K is untouched (the caller loads K at the
+    /// fwht4 footprint). Mirrors the sign-upgrade block of `set_v_mode_realloc`
+    /// but reallocs each real V layer to the FLOOR size, not the current mode's
+    /// size. Because the floor record (e.g. lloyd2 = 68 B/head) is smaller than
+    /// the q8 record (272 B/head), the q8 phase physically holds only
+    /// ~physical_cap*68/272 ≈ 0.25*physical_cap positions — exactly why the
+    /// controller transcodes before that cap. Single-GPU only (matches
+    /// set_v_mode_realloc).
+    /// `k_floor_bph` is the K bytes-per-head at the K FLOOR tier (e.g. fwht2 =
+    /// 68 @hd=256, fwht4 = 132 @hd=256). When it is SMALLER than the current K
+    /// mode's footprint (i.e. the floor is below fwht4), the K buffers are
+    /// reallocated to `physical_cap * n_kv_heads * k_floor_bph` so we actually
+    /// save K VRAM. K data is still WRITTEN at the fwht4 stride (132 @256) until
+    /// `transcode_k_step` runs, so the floor-sized K buffer physically holds
+    /// ~physical_cap * k_floor_bph / 132 positions at fwht4 — the controller
+    /// transcodes K→fwht2 before that cap. Pass the current K footprint (132 for
+    /// a fwht4 cache) to leave K unresized (V-only presets).
+    pub fn set_adaptive_floor_alloc(
+        &mut self,
+        gpu: &mut Gpu,
+        v_floor: VMode,
+        k_floor_bph: usize,
+    ) -> HipResult<()> {
+        // Indivisible tiers never enter the adaptive ladder.
+        if self.quant_fp8 || self.quant_bf16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "set_adaptive_floor_alloc refuses fp8/bf16 caches (no adaptive transcoders)",
+            ));
+        }
+        // VMM owners are never replaced after publication. Adaptive VMM must be
+        // constructed via `new_gpu_vmm_adaptive_filtered` with floor reserve.
+        if self.uses_vmm_backend() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "set_adaptive_floor_alloc refuses VMM owners; construct adaptive VMM with floor reserve up front",
+            ));
+        }
+        // Mirror the set_v_mode_realloc guard: lloyd-V is 256-wide and requires
+        // an FWHT K mode + head_dim == 256.
+        assert!(
+            (self.quant_asym2 || self.quant_asym3 || self.quant_asym4) && self.quant_fwht,
+            "adaptive-KV requires an FWHT K mode (quant_asym{{2,3,4}} && quant_fwht)"
+        );
+        assert!(self.head_dim == 256, "adaptive-KV requires head_dim == 256");
+        assert!(
+            !matches!(v_floor, VMode::Q8),
+            "adaptive-KV V floor must be a lloyd tier (got Q8); nothing to size down to"
+        );
+        // Upgrade the FWHT signs to 256-wide (copy of the need_realloc block from
+        // set_v_mode_realloc): fwht2/4-K caches allocate only 128-element sign
+        // tables; the q8→lloyd4 transcode runs fwht_shfl_forward_256 (reads
+        // signs[0..255]). gen_fwht_signs is a pure LCG, so the first 128 entries
+        // are byte-identical and the 128-wide K reads are unaffected.
+        let need_realloc = self.givens_cos.as_ref().map_or(false, |t| t.numel() < 256);
+        if need_realloc {
+            let n = 256usize;
+            let s1v = Self::gen_fwht_signs(42, n);
+            let s2v = Self::gen_fwht_signs(1042, n);
+            let s1b: Vec<u8> = s1v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let s2b: Vec<u8> = s2v.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let s1 = gpu.alloc_tensor(&[n], DType::F32)?;
+            let s2 = gpu.alloc_tensor(&[n], DType::F32)?;
+            gpu.hip.memcpy_htod(&s1.buf, &s1b)?;
+            gpu.hip.memcpy_htod(&s2.buf, &s2b)?;
+            if let Some(old) = self.givens_cos.take() {
+                let _ = gpu.free_tensor(old);
+            }
+            if let Some(old) = self.givens_sin.take() {
+                let _ = gpu.free_tensor(old);
+            }
+            self.givens_cos = Some(s1);
+            self.givens_sin = Some(s2);
+        }
+        // Size V at the FLOOR tier (not the current v_mode). The q8 start phase
+        // simply fits fewer positions in this smaller buffer.
+        let v_bpp_floor = Self::v_bytes_per_pos(self.n_kv_heads, self.head_dim, v_floor);
+        let v_elems = (self.physical_cap * v_bpp_floor + 3) / 4;
+        Self::resize_real_tensors_zeroed(gpu, &mut self.v_gpu, v_elems)?;
+        // v_mode STAYS at its current value (Q8 fast start tier); only the buffer
+        // size changed.
+
+        // Size K at the K FLOOR (fwht2=68 or fwht3=100 @256) when the floor is
+        // below the current fwht4 footprint (132 @256). K data is still WRITTEN
+        // at the fwht4 stride until the K transcode fires (fwht4→fwht2 remap, or
+        // fwht4→fwht3 re-rotation for k_floor=fwht3), exactly mirroring the V
+        // side. The 256-wide sign upgrade above ALSO satisfies the fwht4→fwht3
+        // re-rotation's sign-width requirement (inverse-128 + forward-256). The
+        // K-mode booleans STAY at fwht4 (start tier).
+        let k_bph_cur = 4 + self.head_dim / 2; // fwht4 footprint @ this head_dim
+        if k_floor_bph < k_bph_cur {
+            let k_bpp_floor = self.n_kv_heads * k_floor_bph;
+            let k_elems = (self.physical_cap * k_bpp_floor + 3) / 4;
+            Self::resize_real_tensors_zeroed(gpu, &mut self.k_gpu, k_elems)?;
+        }
+        Ok(())
+    }
+
+    /// Restore cache mode flags to the adaptive start tier (K=fwht4, V=q8)
+    /// without touching buffer owners. Used by atomic controller+cache reset.
+    pub fn restore_adaptive_start_flags(&mut self) {
+        self.quant_q8 = false;
+        self.quant_int8 = false;
+        self.quant_hfq4 = false;
+        self.quant_asym4 = true;
+        self.quant_asym3 = false;
+        self.quant_asym2 = false;
+        self.quant_fwht = true;
+        self.quant_fp8 = false;
+        self.v_mode = VMode::Q8;
+        self.quantized = true;
+    }
+
+    /// Adaptive-KV: re-quantize the EXISTING V cache (all written positions of
+    /// every real KV layer) from the current `v_mode` to a lower `target` tier,
+    /// in place. No realloc — the V buffers are floor-sized (allocated at the V
+    /// floor) and the lloyd record is smaller than the q8/higher-lloyd record, so
+    /// the in-place ascending transcode is byte-safe (dst stride < src stride;
+    /// see the per-kernel headers).
+    ///
+    /// Supported transitions: Q8→Lloyd4 (FWHT), Lloyd4→Lloyd3, Lloyd4→Lloyd2,
+    /// Lloyd3→Lloyd2 (rotated-space remap, no FWHT). `n_positions` is the number
+    /// of token positions currently written (seq_pos+1, or physical_cap if
+    /// compacted). Reuses self.givens_cos/givens_sin (256-wide FWHT signs) for
+    /// the q8→lloyd4 FWHT.
+    pub fn transcode_v_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: VMode,
+        n_positions: usize,
+    ) -> HipResult<()> {
+        // Indivisible tiers never enter the adaptive ladder.
+        if self.quant_fp8 || self.quant_bf16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "transcode_v_step refuses fp8/bf16 caches (no adaptive transcoders)",
+            ));
+        }
+        // Mirror set_v_mode_realloc's guard: lloyd-V is 256-wide and needs an
+        // FWHT K mode + head_dim==256.
+        assert!(
+            (self.quant_asym2 || self.quant_asym3 || self.quant_asym4) && self.quant_fwht,
+            "lloyd-V transcode requires an FWHT K mode (quant_asym{{2,3,4}} && quant_fwht)"
+        );
+        assert!(
+            self.head_dim == 256,
+            "lloyd-V transcode requires head_dim == 256"
+        );
+        assert!(
+            !matches!(target, VMode::Q8),
+            "transcode_v_step only downshifts (target != Q8)"
+        );
+
+        if n_positions == 0 {
+            self.v_mode = target;
+            gpu.invalidate_for_kv_mode_switch();
+            return Ok(());
+        }
+
+        let n_kv_heads = self.n_kv_heads;
+        let head_dim = self.head_dim;
+
+        // Determine the kernel for the (current → target) transition.
+        #[derive(Clone, Copy)]
+        enum Op {
+            Q8ToL4,
+            Down(i32, i32),
+        }
+        let op = match (self.v_mode, target) {
+            (VMode::Q8, VMode::Lloyd4) => Op::Q8ToL4,
+            (VMode::Lloyd4, VMode::Lloyd3) => Op::Down(4, 3),
+            (VMode::Lloyd4, VMode::Lloyd2) => Op::Down(4, 2),
+            (VMode::Lloyd3, VMode::Lloyd2) => Op::Down(3, 2),
+            (cur, tgt) => panic!("unsupported V transcode {cur:?} -> {tgt:?}"),
+        };
+
+        // q8→lloyd4 needs the 256-wide FWHT signs (already reallocated to 256 by
+        // set_v_mode_realloc when lloyd-V was enabled at load). Take non-owning
+        // views so we don't borrow `self` across the v_gpu iteration below.
+        let (signs1, signs2) = match op {
+            Op::Q8ToL4 => {
+                let s1 = self
+                    .givens_cos
+                    .as_ref()
+                    .expect("q8→lloyd4 transcode needs 256-wide FWHT signs");
+                let s2 = self
+                    .givens_sin
+                    .as_ref()
+                    .expect("q8→lloyd4 transcode needs 256-wide FWHT signs");
+                // The q8→lloyd4 kernel runs fwht_shfl_forward_256 → reads
+                // signs[0..255]. fwht2/fwht4 K caches allocate only 128-element
+                // sign tables; adaptive's load path MUST upgrade them to 256
+                // (LCG prefix keeps the K-side 128-wide reads byte-identical)
+                // before the first transcode. Fail loud rather than OOB-read
+                // phantom signs and silently corrupt every position's cnorm.
+                assert!(
+                    s1.numel() >= 256 && s2.numel() >= 256,
+                    "q8→lloyd4 transcode requires 256-wide FWHT signs (got {}); \
+                     upgrade fwht2/4 signs to 256 at adaptive load before transcode_v_step",
+                    s1.numel()
+                );
+                (
+                    Some(s1.sub_offset(0, s1.numel())),
+                    Some(s2.sub_offset(0, s2.numel())),
+                )
+            }
+            Op::Down(_, _) => (None, None),
+        };
+
+        // Map the live prefix at the CURRENT V stride before any read/write.
+        // Floor-reserved VMM VA may be larger than the mapped prefix — never
+        // size or copy from the full virtual reserve.
+        self.ensure_mapped_capacity(gpu, n_positions)?;
+        let (cur_k_bpt, cur_v_bpt) = if self.uses_vmm_backend() {
+            self.vmm_bytes_per_token()?
+        } else {
+            // Legacy: full buffer is mapped; keep prior full-layer scratch size.
+            (0, 0)
+        };
+        let prefix_v_bytes = if self.uses_vmm_backend() {
+            Self::checked_vmm_product("V source prefix", &[n_positions, cur_v_bpt])?
+        } else {
+            0
+        };
+        let prefix_v_elems = if self.uses_vmm_backend() {
+            Self::bytes_to_f32_elems("V source prefix", prefix_v_bytes)?
+        } else {
+            0
+        };
+
+        // 1-layer scratch: VMM uses live source-prefix elems only; contiguous
+        // keeps full-layer elems (prior behavior). Copy layer→scratch then
+        // transcode scratch→layer (non-aliasing).
+        let src_elems = if self.uses_vmm_backend() {
+            if prefix_v_elems > 0 {
+                Some(prefix_v_elems)
+            } else {
+                None
+            }
+        } else {
+            self.v_gpu
+                .iter()
+                .map(|t| t.numel())
+                .filter(|&n| n > 1)
+                .max()
+        };
+        let scratch = match src_elems {
+            Some(n) => Some(gpu.zeros(&[n], DType::F32)?),
+            None => None,
+        };
+        let _ = cur_k_bpt; // K stride unused on V step
+
+        // Free the scratch on EVERY exit path (GpuTensor has no Drop): capture
+        // the first error, break, free, then propagate — a HIP failure mid-pass
+        // must not leak the per-layer scratch (multi-MB at long context).
+        let mut pending: HipResult<()> = Ok(());
+        for t in self.v_gpu.iter() {
+            // Skip 1-element placeholder buffers for non-KV layers.
+            if t.numel() <= 1 {
+                continue;
+            }
+            let scratch = scratch.as_ref().unwrap();
+            // Copy the live source prefix into scratch (device-to-device), then
+            // read from scratch and write the compacted record back into the layer.
+            let nbytes = if self.uses_vmm_backend() {
+                prefix_v_bytes
+            } else {
+                t.byte_size()
+            };
+            pending = gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes);
+            if pending.is_err() {
+                break;
+            }
+            pending = match op {
+                Op::Q8ToL4 => gpu.transcode_v_q8_to_lloyd4(
+                    t,
+                    scratch,
+                    signs1.as_ref().unwrap(),
+                    signs2.as_ref().unwrap(),
+                    n_kv_heads,
+                    head_dim,
+                    n_positions,
+                ),
+                Op::Down(sb, db) => gpu.transcode_v_lloyd_down(
+                    t,
+                    scratch,
+                    n_kv_heads,
+                    head_dim,
+                    n_positions,
+                    sb,
+                    db,
+                ),
+            };
+            if pending.is_err() {
+                break;
+            }
+        }
+
+        if let Some(s) = scratch {
+            let _ = gpu.free_tensor(s);
+        }
+        pending?;
+        self.v_mode = target;
+        gpu.invalidate_for_kv_mode_switch();
+        Ok(())
+    }
+
+    /// Adaptive-KV: re-quantize the EXISTING K cache to a lower tier
+    /// (`target_bits` ∈ {2,3}). Two supported transitions, both from the fwht4
+    /// start tier:
+    ///   * fwht4 → fwht2 (`target_bits==2`): SAME-WIDTH 128-LUT remap (the
+    ///     balanced/aggressive presets' only K step). Reconstructs from the
+    ///     fwht4 record and re-quantizes each rotated dim at 2-bit (128-family);
+    ///     no FWHT.
+    ///   * fwht4 → fwht3 (`target_bits==3`): RE-ROTATION (128-wide → 256-wide).
+    ///     Reconstructs normal-space K (dequant + inverse-128), re-rotates
+    ///     256-wide, quantizes to TURBO_C3_256. Engaged only by the advanced
+    ///     selector with k_floor=fwht3. fwht3→fwht2 never occurs (K starts at
+    ///     fwht4 and balanced_steps adds at most one K step), so it is not
+    ///     implemented; any other request errors clearly.
+    ///
+    /// Per real KV layer: copy the K layer into a 1-layer scratch (d2d), then
+    /// transcode scratch→layer (separate buffers, never aliased). cnorm is
+    /// recomputed per (head, pos). Then flips the K-mode booleans (clears
+    /// quant_asym4; sets quant_asym2 OR quant_asym3; quant_fwht stays true) so
+    /// the next forward dispatches the right attention kernel, and invalidates
+    /// captured graphs.
+    ///
+    /// Sign tables: fwht4→fwht2 are both 128-wide and share the SAME signs
+    /// (gen_fwht_signs(42/1042); the first 128 entries of a 256-wide table equal
+    /// the 128-wide table). fwht4→fwht3 RE-ROTATION needs 256-wide signs (the
+    /// inverse-128 reads [0..127], forward-256 reads [0..255]) — adaptive's load
+    /// path (set_adaptive_floor_alloc with k_floor=fwht3) upgrades them to 256.
+    ///
+    /// `n_positions` is the number of token positions currently written. The K
+    /// buffer is floor-sized at adaptive load (fwht2=68 or fwht3=100 B/head), so
+    /// the fwht4 phase physically holds only ~physical_cap*floor_bph/132
+    /// positions — the controller transcodes K before that cap.
+    pub fn transcode_k_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target_bits: u32,
+        n_positions: usize,
+    ) -> HipResult<()> {
+        // Determine the current K mode. Adaptive starts at fwht4
+        // (quant_asym4 && quant_fwht). Supported steps: fwht4->fwht2 (remap),
+        // fwht4->fwht3 (re-rotation).
+        let src_is_fwht4 = self.quant_asym4 && self.quant_fwht;
+        let cur_label = if !self.quant_fwht {
+            "non-fwht"
+        } else if self.quant_asym4 {
+            "fwht4"
+        } else if self.quant_asym3 {
+            "fwht3"
+        } else if self.quant_asym2 {
+            "fwht2"
+        } else {
+            "unknown"
+        };
+        if !(src_is_fwht4 && (target_bits == 2 || target_bits == 3)) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "K transcode {cur_label}->fwht{target_bits} not implemented \
+                     (only fwht4->fwht2 same-width remap and fwht4->fwht3 re-rotation are supported)"
+                ),
+            ));
+        }
+        assert!(
+            self.head_dim % 128 == 0,
+            "fwht K transcode requires head_dim multiple of 128"
+        );
+        // fwht4->fwht3 re-rotation is hard-wired to the 128↔256 width crossing.
+        if target_bits == 3 {
+            assert!(
+                self.head_dim == 256,
+                "fwht4->fwht3 re-rotation requires head_dim == 256"
+            );
+        }
+
+        if n_positions == 0 {
+            self.quant_asym4 = false;
+            if target_bits == 3 {
+                self.quant_asym3 = true;
+            } else {
+                self.quant_asym2 = true;
+            }
+            // quant_fwht stays true.
+            gpu.invalidate_for_kv_mode_switch();
+            return Ok(());
+        }
+
+        let n_kv_heads = self.n_kv_heads;
+        let head_dim = self.head_dim;
+
+        // For the re-rotation (fwht4->fwht3) the kernel runs fwht_shfl_inverse
+        // (128-wide, reads signs[0..127]) then fwht_shfl_forward_256 (reads
+        // signs[0..255]). The cache signs MUST be 256-wide — adaptive's load
+        // (set_adaptive_floor_alloc with k_floor=fwht3) upgrades them. Fail loud
+        // rather than OOB-read phantom signs and silently corrupt every record.
+        if target_bits == 3 {
+            let n1 = self.givens_cos.as_ref().map_or(0, |t| t.numel());
+            let n2 = self.givens_sin.as_ref().map_or(0, |t| t.numel());
+            assert!(
+                n1 >= 256 && n2 >= 256,
+                "fwht4->fwht3 transcode requires 256-wide FWHT signs (got {n1}); \
+                 set_adaptive_floor_alloc(k_floor=fwht3) must upgrade signs to 256 first"
+            );
+        }
+        // Take non-owning views of the 256-wide signs for the re-rotation so we
+        // don't borrow `self` across the k_gpu iteration below.
+        let signs = if target_bits == 3 {
+            let s1 = self.givens_cos.as_ref().unwrap();
+            let s2 = self.givens_sin.as_ref().unwrap();
+            Some((s1.sub_offset(0, s1.numel()), s2.sub_offset(0, s2.numel())))
+        } else {
+            None
+        };
+
+        // Map the live prefix at the CURRENT K stride before any read/write.
+        // Floor-reserved VMM VA may be larger than the mapped prefix — never
+        // size or copy from the full virtual reserve.
+        self.ensure_mapped_capacity(gpu, n_positions)?;
+        let (cur_k_bpt, _cur_v_bpt) = if self.uses_vmm_backend() {
+            self.vmm_bytes_per_token()?
+        } else {
+            (0, 0)
+        };
+        let prefix_k_bytes = if self.uses_vmm_backend() {
+            Self::checked_vmm_product("K source prefix", &[n_positions, cur_k_bpt])?
+        } else {
+            0
+        };
+        let prefix_k_elems = if self.uses_vmm_backend() {
+            Self::bytes_to_f32_elems("K source prefix", prefix_k_bytes)?
+        } else {
+            0
+        };
+
+        // 1-layer scratch: VMM uses live source-prefix elems only; contiguous
+        // keeps full-layer elems (prior behavior).
+        let src_elems = if self.uses_vmm_backend() {
+            if prefix_k_elems > 0 {
+                Some(prefix_k_elems)
+            } else {
+                None
+            }
+        } else {
+            self.k_gpu
+                .iter()
+                .map(|t| t.numel())
+                .filter(|&n| n > 1)
+                .max()
+        };
+        let scratch = match src_elems {
+            Some(n) => Some(gpu.zeros(&[n], DType::F32)?),
+            None => None,
+        };
+
+        // Free the scratch on EVERY exit path (GpuTensor has no Drop): capture
+        // the first error, break, free, then propagate.
+        let mut pending: HipResult<()> = Ok(());
+        for t in self.k_gpu.iter() {
+            // Skip 1-element placeholder buffers for non-KV layers.
+            if t.numel() <= 1 {
+                continue;
+            }
+            let scratch = scratch.as_ref().unwrap();
+            let nbytes = if self.uses_vmm_backend() {
+                prefix_k_bytes
+            } else {
+                t.byte_size()
+            };
+            pending = gpu.hip.memcpy_dtod(&scratch.buf, &t.buf, nbytes);
+            if pending.is_err() {
+                break;
+            }
+            pending = if target_bits == 3 {
+                let (s1, s2) = signs.as_ref().unwrap();
+                gpu.transcode_k_fwht4_to_fwht3(
+                    t,
+                    scratch,
+                    s1,
+                    s2,
+                    n_kv_heads,
+                    head_dim,
+                    n_positions,
+                )
+            } else {
+                gpu.transcode_k_fwht4_to_fwht2(t, scratch, n_kv_heads, head_dim, n_positions)
+            };
+            if pending.is_err() {
+                break;
+            }
+        }
+
+        if let Some(s) = scratch {
+            let _ = gpu.free_tensor(s);
+        }
+        pending?;
+
+        // Flip the K-mode booleans so the next forward dispatches the target
+        // attention kernel. quant_fwht stays true (still FWHT-rotated K).
+        self.quant_asym4 = false;
+        if target_bits == 3 {
+            self.quant_asym3 = true;
+        } else {
+            self.quant_asym2 = true;
+        }
+        gpu.invalidate_for_kv_mode_switch();
+        Ok(())
+    }
+
+    /// Adaptive VMM constructor: reserve at K/V floors, start encoding FWHT4/Q8.
+    /// One stable K and one stable V owner per real layer for the load lifetime.
+    /// Built on `vmm_layout_with_reserve`; never replaces owners after publish.
+    pub fn new_gpu_vmm_adaptive_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        k_floor_bph: usize,
+        v_floor: VMode,
+    ) -> HipResult<Self> {
+        if max_seq == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "adaptive VMM requires max_seq > 0",
+            ));
+        }
+        if !is_kv_layer.iter().any(|is_kv| *is_kv) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "adaptive VMM requires at least one KV-carrying layer",
+            ));
+        }
+        if matches!(v_floor, VMode::Q8) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "adaptive VMM V floor must be a lloyd tier (got Q8)",
+            ));
+        }
+        if head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("adaptive VMM requires head_dim=256 (got {head_dim})"),
+            ));
+        }
+        let layout = Self::vmm_layout_with_reserve(
+            KvMode::Fwht4,
+            VMode::Q8,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            k_floor_bph,
+            v_floor,
+        )?;
+        let (mut k_gpu, mut v_gpu) = Self::alloc_k_v_vmm_filtered(
+            gpu,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            is_kv_layer,
+        )?;
+
+        // Adaptive always needs 256-wide FWHT signs (q8→lloyd and optional fwht4→fwht3).
+        let n = layout.rotation_table_len.max(256);
+        let s1_vals = Self::gen_fwht_signs(42, n);
+        let s2_vals = Self::gen_fwht_signs(1042, n);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
+            let s1 = gpu.alloc_tensor(&[n], DType::F32)?;
+            let s2 = match gpu.alloc_tensor(&[n], DType::F32) {
+                Ok(s2) => s2,
+                Err(err) => {
+                    let _ = gpu.free_tensor(s1);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = gpu.hip.memcpy_htod(&s1.buf, &s1_bytes) {
+                let _ = gpu.free_tensor(s1);
+                let _ = gpu.free_tensor(s2);
+                return Err(err);
+            }
+            if let Err(err) = gpu.hip.memcpy_htod(&s2.buf, &s2_bytes) {
+                let _ = gpu.free_tensor(s1);
+                let _ = gpu.free_tensor(s2);
+                return Err(err);
+            }
+            Ok((s1, s2))
+        })();
+        let (s1, s2) = match tables {
+            Ok(pair) => pair,
+            Err(err) => {
+                for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                    let _ = gpu.free_tensor(tensor);
+                }
+                return Err(err);
+            }
+        };
+
+        let mut cache = Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: layout.kv_dim,
+            max_seq,
+            physical_cap: layout.physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: true, // FWHT4 start
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: true,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(s1),
+            givens_sin: Some(s2),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8, // start tier
+        };
+        if let Err(err) = cache.ensure_mapped_capacity(gpu, 1) {
+            let _ = cache.free_gpu(gpu);
+            return Err(err);
+        }
+        let n_kv = is_kv_layer.iter().filter(|is_kv| **is_kv).count();
+        let mapped = match cache.mapped_token_capacity() {
+            Ok(capacity) => capacity.unwrap_or(0),
+            Err(err) => {
+                let _ = cache.free_gpu(gpu);
+                return Err(err);
+            }
+        };
+        eprintln!(
+            "KV cache: adaptive vmm ({n_kv}/{} layers; start FWHT4/Q8; K floor {}B/head V floor {:?}; reserve_k={}B reserve_v={}B; mapped_prefix={mapped} / max_seq={max_seq})",
+            is_kv_layer.len(),
+            k_floor_bph,
+            v_floor,
+            layout.k_reserve_bytes,
+            layout.v_reserve_bytes,
+        );
+        Ok(cache)
+    }
+
+    /// Q8_0 KV cache that skips allocation for layers flagged as non-KV.
+    /// Each `is_kv_layer[i] == false` slot gets a 1-element placeholder
+    /// (~4 bytes) instead of the full `cache_elems × 4` allocation.
+    ///
+    /// For Qwen 3.5 hybrid (48 DeltaNet + 16 FullAttention layers), saves
+    /// 48 × cache_elems × 4 bytes per cache — at ctx=64K this is multi-GB.
+    pub fn new_gpu_q8_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_q8_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped variant of [`new_gpu_q8_filtered`].
+    pub fn new_gpu_q8_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let blocks_per_head = head_dim / 32;
+        let total_blocks = n_kv_heads * blocks_per_head;
+        let cache_bytes = physical_cap * total_blocks * 34;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: q8 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
+            is_kv_layer.len()
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: true,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+    /// E4M3FN KV codec constants (plan §2.1; OCP E4M3FN as implemented by
+    /// gfx1201's `cvt_pk_fp8_f32`, not gfx942 FNUZ).
+    /// Maximum finite magnitude of the encoding; per-head scales satisfy
+    /// `amax / scale <= 448` so every code is finite.
+    pub const FP8_E4M3_MAX_F32: f32 = 448.0;
+    /// Minimum per-head scale floor (2^-24): `amax / 448` below this pins
+    /// to this value. All-zero rows use scale 1.0 with zero codes.
+    pub const FP8_KV_MIN_SCALE_F32: f32 = 5.9604645e-8;
+
+    /// Checked bytes-per-token-row per side for the native fp8 layout:
+    /// `[Hkv x D codes, head-major][Hkv little-endian f16 scales]`.
+    /// Exactly 1032 at Hkv=4/D=256. Pure math, no GPU.
+    pub fn fp8_row_bytes(n_kv_heads: usize, head_dim: usize) -> HipResult<usize> {
+        if n_kv_heads == 0 || head_dim == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "fp8 KV requires n_kv_heads>0 and head_dim>0 (got n_kv_heads={n_kv_heads}, head_dim={head_dim})"
+                ),
+            ));
+        }
+        let codes = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV codes bytes overflowed"))?;
+        let scales = n_kv_heads
+            .checked_mul(2)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV scales bytes overflowed"))?;
+        codes
+            .checked_add(scales)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV row bytes overflowed"))
+    }
+
+    /// This cache's fp8 bytes-per-token-row per side. Rejects non-fp8
+    /// caches rather than derive a stride for foreign bytes (the redline
+    /// guard-span oracle uses this instead of q8's `n_kv*(D/32)*34`).
+    pub fn fp8_bytes_per_token(&self) -> HipResult<usize> {
+        if !self.quant_fp8 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fp8_bytes_per_token requires a native fp8 KV cache",
+            ));
+        }
+        Self::fp8_row_bytes(self.n_kv_heads, self.head_dim)
+    }
+
+    /// Checked bytes-per-token-row per side for flat unscaled bf16:
+    /// `Hkv * D` bf16 elements (2 bytes each), head-major, no scales.
+    /// Same rows as the contiguous bf16 constructor. Pure math, no GPU.
+    pub fn bf16_row_bytes(n_kv_heads: usize, head_dim: usize) -> HipResult<usize> {
+        if n_kv_heads == 0 || head_dim == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "bf16 KV requires n_kv_heads>0 and head_dim>0 (got n_kv_heads={n_kv_heads}, head_dim={head_dim})"
+                ),
+            ));
+        }
+        n_kv_heads
+            .checked_mul(head_dim)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "bf16 KV row bytes overflowed"))
+    }
+
+    /// This cache's bf16 bytes-per-token-row per side. Rejects non-bf16
+    /// caches rather than derive a stride for foreign bytes.
+    pub fn bf16_bytes_per_token(&self) -> HipResult<usize> {
+        if !self.quant_bf16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "bf16_bytes_per_token requires a flat bf16 KV cache",
+            ));
+        }
+        Self::bf16_row_bytes(self.n_kv_heads, self.head_dim)
+    }
+
+    /// Native fp8 KV cache that skips allocation for layers flagged as
+    /// non-KV. Each `is_kv_layer[i] == false` slot gets a 1-element
+    /// placeholder instead of the full row-bytes allocation, mirroring
+    /// [`Self::new_gpu_q8_filtered`].
+    pub fn new_gpu_fp8_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fp8_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped variant of [`Self::new_gpu_fp8_filtered`]: buffers are sized
+    /// by `physical_cap` while `max_seq_len` is retained for RoPE/masks.
+    /// Exact admitted geometry (D256, contiguous, single-GPU Qwen dense)
+    /// is validated here; topology/architecture admission lives one layer
+    /// up. K/V pair is indivisible: fp8 on both sides, neutral V only.
+    pub fn new_gpu_fp8_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        if head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("fp8 KV cache requires head_dim=256 (got head_dim={head_dim})"),
+            ));
+        }
+        let kv_dim = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV kv_dim overflowed"))?;
+        let row_bytes = Self::fp8_row_bytes(n_kv_heads, head_dim)?;
+        let cache_bytes = row_bytes
+            .checked_mul(physical_cap)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV cache byte size overflowed"))?;
+        // Allocator is typed F32; rows are 8-byte aligned by construction
+        // (Hkv*(D+2) is even for every real geometry) so the ceil is exact.
+        let cache_elems = cache_bytes.div_ceil(4);
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fp8-e4m3 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
+            is_kv_layer.len()
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: true,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Unified static VMM constructor for every legal (K mode × V mode) pair.
+    ///
+    /// Reserves stable K/V VAs from [`vmm_static_layout`], maps an initial
+    /// prefix, and never replaces owners afterward. Lloyd-V is accepted only
+    /// with FWHT-K and head_dim=256 (validated by the layout table).
+    pub fn new_gpu_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mode: KvMode,
+        v_mode: VMode,
+    ) -> HipResult<Self> {
+        if physical_cap == 0 || physical_cap > max_seq_len {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM {mode:?} physical_cap must be in 1..=max_seq_len (got physical_cap={physical_cap}, max_seq_len={max_seq_len})"
+                ),
+            ));
+        }
+        if !is_kv_layer.iter().any(|is_kv| *is_kv) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM {mode:?} requires at least one KV-carrying layer"),
+            ));
+        }
+        let layout = Self::vmm_static_layout(mode, v_mode, n_kv_heads, head_dim, physical_cap)?;
+        let (mut k_gpu, mut v_gpu) = Self::alloc_k_v_vmm_filtered(
+            gpu,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            is_kv_layer,
+        )?;
+
+        // Optional rotation tables (Givens angles or FWHT signs). Built before
+        // the cache is published so a table failure can roll back arenas.
+        let rotation = if layout.rotation_table_len == 0 {
+            None
+        } else {
+            let n = layout.rotation_table_len;
+            let (a_vals, b_vals) = if layout.uses_fwht_signs {
+                (Self::gen_fwht_signs(42, n), Self::gen_fwht_signs(1042, n))
+            } else {
+                Self::gen_givens_angles(42, n)
+            };
+            let a_bytes: Vec<u8> = a_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let b_bytes: Vec<u8> = b_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
+                let a = gpu.alloc_tensor(&[n], DType::F32)?;
+                let b = match gpu.alloc_tensor(&[n], DType::F32) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        let _ = gpu.free_tensor(a);
+                        return Err(err);
+                    }
+                };
+                if let Err(err) = gpu.hip.memcpy_htod(&a.buf, &a_bytes) {
+                    let _ = gpu.free_tensor(a);
+                    let _ = gpu.free_tensor(b);
+                    return Err(err);
+                }
+                if let Err(err) = gpu.hip.memcpy_htod(&b.buf, &b_bytes) {
+                    let _ = gpu.free_tensor(a);
+                    let _ = gpu.free_tensor(b);
+                    return Err(err);
+                }
+                Ok((a, b))
+            })();
+            match tables {
+                Ok(pair) => Some(pair),
+                Err(err) => {
+                    for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(err);
+                }
+            }
+        };
+
+        let (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht) =
+            Self::vmm_mode_flags(mode);
+        let (givens_cos, givens_sin) = match rotation {
+            Some((a, b)) => (Some(a), Some(b)),
+            None => (None, None),
+        };
+
+        let mut cache = Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: layout.kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4,
+            quant_asym3,
+            quant_asym2,
+            quant_fwht,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos,
+            givens_sin,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode,
+        };
+        // Map initial prefix before any write; roll back on failure.
+        if let Err(err) = cache.ensure_mapped_capacity(gpu, 1) {
+            let _ = cache.free_gpu(gpu);
+            return Err(err);
+        }
+        let n_kv = is_kv_layer.iter().filter(|is_kv| **is_kv).count();
+        let mapped = match cache.mapped_token_capacity() {
+            Ok(capacity) => capacity.unwrap_or(0),
+            Err(err) => {
+                let _ = cache.free_gpu(gpu);
+                return Err(err);
+            }
+        };
+        let v_label = match v_mode {
+            VMode::Q8 => "Q8".to_string(),
+            VMode::Lloyd2 => "lloyd2".to_string(),
+            VMode::Lloyd3 => "lloyd3".to_string(),
+            VMode::Lloyd4 => "lloyd4".to_string(),
+        };
+        eprintln!(
+            "KV cache: {mode:?} vmm ({n_kv}/{} layers carry KV; K {}B/head + V {v_label} {}B/head; mapped_prefix={mapped} / physical_cap={physical_cap} / max_seq={max_seq_len})",
+            is_kv_layer.len(),
+            layout.k_bytes_per_head,
+            layout.v_bytes_per_head,
+        );
+        Ok(cache)
+    }
+
+    /// VMM-backed Q8 cache for Qwen3.5 hybrid stacks.
+    /// Thin wrapper over [`Self::new_gpu_vmm_capped_filtered`].
+    pub fn new_gpu_q8_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Q8,
+            VMode::Q8,
+        )
+    }
+
+    /// Shared VMM build for the K/V-indivisible tiers (fp8 token-local
+    /// rows, flat bf16 rows): reserve stable K/V VAs from
+    /// [`vmm_static_layout`], map an initial prefix, never replace owners
+    /// afterward. No rotation tables; tier flags are set directly since
+    /// these modes have no 5-flag bundle representation. Reserve and mapped
+    /// sizes round up to the device allocation granularity (growth in
+    /// ≥2 MiB steps); rows stay unpadded and equal-sized, so token
+    /// capacity is `floor(mapped_bytes / row_bytes)` and tree-gather row
+    /// copies keep working.
+    fn new_gpu_indivisible_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mode: KvMode,
+    ) -> HipResult<Self> {
+        debug_assert!(matches!(mode, KvMode::Fp8 | KvMode::Bf16));
+        if physical_cap == 0 || physical_cap > max_seq_len {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "VMM {mode:?} physical_cap must be in 1..=max_seq_len (got physical_cap={physical_cap}, max_seq_len={max_seq_len})"
+                ),
+            ));
+        }
+        if !is_kv_layer.iter().any(|is_kv| *is_kv) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("VMM {mode:?} requires at least one KV-carrying layer"),
+            ));
+        }
+        // Static V is the ignored Q8 default on both tiers (K/V indivisible).
+        let layout = Self::vmm_static_layout(mode, VMode::Q8, n_kv_heads, head_dim, physical_cap)?;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_vmm_filtered(
+            gpu,
+            layout.k_reserve_elems,
+            layout.v_reserve_elems,
+            is_kv_layer,
+        )?;
+        let (quant_fp8, quant_bf16) = match mode {
+            KvMode::Fp8 => (true, false),
+            KvMode::Bf16 => (false, true),
+            _ => unreachable!("indivisible VMM modes are fp8|bf16 (validated before dispatch)"),
+        };
+        let mut cache = Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: layout.kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16,
+            quant_fp8,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        };
+        // Map initial prefix before any write; roll back on failure.
+        if let Err(err) = cache.ensure_mapped_capacity(gpu, 1) {
+            let _ = cache.free_gpu(gpu);
+            return Err(err);
+        }
+        let n_kv = is_kv_layer.iter().filter(|is_kv| **is_kv).count();
+        let mapped = match cache.mapped_token_capacity() {
+            Ok(capacity) => capacity.unwrap_or(0),
+            Err(err) => {
+                let _ = cache.free_gpu(gpu);
+                return Err(err);
+            }
+        };
+        eprintln!(
+            "KV cache: {mode:?} vmm ({n_kv}/{} layers carry KV; K/V {}B/row; mapped_prefix={mapped} / physical_cap={physical_cap} / max_seq={max_seq_len})",
+            is_kv_layer.len(),
+            layout.k_bytes_per_token,
+        );
+        Ok(cache)
+    }
+
+    /// VMM-backed native fp8 cache for Qwen3.5 hybrid stacks: token-local
+    /// `[codes][f16 scales]` rows, same 1032-byte rows at Hkv4/D256 as the
+    /// contiguous constructor. Routed internally by `from_mode_with_backend`.
+    pub fn new_gpu_fp8_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_indivisible_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Fp8,
+        )
+    }
+
+    /// VMM-backed flat bf16 cache for Qwen3.5 hybrid stacks: same unscaled
+    /// rows as the contiguous bf16 constructor. Routed internally by
+    /// `from_mode_with_backend`.
+    pub fn new_gpu_bf16_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_indivisible_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Bf16,
+        )
+    }
+
+    /// Create INT8 co-located KV cache: [f32 scale][pad 4B][int8 × head_dim] = 136 bytes per head.
+    pub fn new_gpu_int8c(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let bph = 8 + head_dim; // 136 for head_dim=128 (8-byte header + data)
+        let bpp = n_kv_heads * bph;
+        let cache_bytes = max_seq_len * bpp;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap: max_seq_len,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: true,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create HFQ4 KV cache: co-located blocks. 72 bytes per head (scale+zero+nibbles).
+    pub fn new_gpu_hfq4kv(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let bytes_per_block = 8 + head_dim / 2; // 72 for head_dim=128
+        let bytes_per_pos = n_kv_heads * bytes_per_block;
+        let cache_bytes = max_seq_len * bytes_per_pos;
+        let cache_elems = (cache_bytes + 3) / 4;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        }
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap: max_seq_len,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: true,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create HFQ8 KV cache: FP32 scale+zero per head, contiguous uint8 data.
+    pub fn new_gpu_hfq8(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        let val_elems = (max_seq_len * kv_dim + 3) / 4; // uint8 data, rounded to f32
+        let scale_elems = max_seq_len * n_kv_heads * 2; // scale + zero per head per pos
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        let mut k_scales = Vec::with_capacity(n_layers);
+        let mut v_scales = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+            v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+        }
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales,
+            v_scales,
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap: max_seq_len,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create INT8 KV cache with separate scale arrays. Clean contiguous layout.
+    pub fn new_gpu_int8(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        let kv_dim = n_kv_heads * head_dim;
+        // Values: max_seq × kv_dim bytes (int8). Round up to f32 elements for alloc.
+        let val_elems = (max_seq_len * kv_dim + 3) / 4;
+        // Scales: max_seq × n_kv_heads floats
+        let scale_elems = max_seq_len * n_kv_heads;
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        let mut k_scales = Vec::with_capacity(n_layers);
+        let mut v_scales = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[val_elems], DType::F32)?);
+            k_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+            v_scales.push(gpu.zeros(&[scale_elems], DType::F32)?);
+        }
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales,
+            v_scales,
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap: max_seq_len,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: true,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Generate deterministic Givens rotation angles from a seed.
+    /// Returns (cos_theta, sin_theta) each of length n_blocks.
+    pub fn gen_givens_angles(seed: u32, n_blocks: usize) -> (Vec<f32>, Vec<f32>) {
+        let mut state = seed;
+        let mut cos_vals = Vec::with_capacity(n_blocks);
+        let mut sin_vals = Vec::with_capacity(n_blocks);
+        for _ in 0..n_blocks {
+            state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+            let angle = (state as f64 / 0x7fffffff as f64) * std::f64::consts::TAU;
+            cos_vals.push(angle.cos() as f32);
+            sin_vals.push(angle.sin() as f32);
+        }
+        (cos_vals, sin_vals)
+    }
+
+    /// Create asym4 KV cache: K at 4-bit rotated (Givens + Lloyd-Max), V at Q8_0.
+    /// head_dim=256 → K=132 B/head, V=272 B/head → 404 B/head total (5.1× vs fp32).
+    /// Back-compat wrapper: `physical_cap == max_seq_len`.
+    pub fn new_gpu_asym4(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym4_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Filtered variant of [`new_gpu_asym4`]: skips KV alloc for non-KV layers.
+    pub fn new_gpu_asym4_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "asym4 requires head_dim=128 or 256"
+        );
+        assert!(head_dim % 32 == 0);
+        let physical_cap = max_seq_len;
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        let n_blocks = head_dim / 2;
+        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
+        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
+        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: asym4 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: true,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(ct),
+            givens_sin: Some(st),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Filtered variant of [`new_gpu_fwht4`]: skips KV alloc for non-KV layers.
+    /// Mirrors `new_gpu_asym4_filtered` byte-for-byte except the rotation
+    /// parameter buffers hold signs1/signs2 (FWHT) instead of cos/sin (Givens)
+    /// and `quant_fwht` is set true. K-cache byte layout is identical to
+    /// asym4 so scoring kernels are shared.
+    pub fn new_gpu_fwht4_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "fwht4 requires head_dim=128 or 256"
+        );
+        assert!(head_dim % 32 == 0);
+        let physical_cap = max_seq_len;
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        // fwht_shfl_forward operates on 128 elements regardless of head_dim;
+        // signs are shared across the hd=256 two-half rotation. Seeds (42,
+        // 1042) match the MQ4 weight-FWHT convention.
+        let n_signs = 128;
+        let s1_vals = Self::gen_fwht_signs(42, n_signs);
+        let s2_vals = Self::gen_fwht_signs(1042, n_signs);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fwht4 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: true,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: true,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(s1),
+            givens_sin: Some(s2),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Same as [`new_gpu_asym4`] with an explicit physical_cap. Eviction-aware.
+    pub fn new_gpu_asym4_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "asym4 requires head_dim=128 or 256"
+        );
+        assert!(head_dim % 32 == 0);
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+        }
+        let n_blocks = head_dim / 2;
+        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
+        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
+        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let v_bph = v_bpp / n_kv_heads;
+        eprintln!(
+            "KV cache: asym4 backend=legacy (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            k_bph + v_bph,
+            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: true,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(ct),
+            givens_sin: Some(st),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create fwht4 KV cache: K at 4-bit signed-FWHT-rotated (Lloyd-Max
+    /// post-FWHT N(0, 1/128)), V at Q8_0 in normal space. Byte-identical
+    /// storage to asym4 — only the rotation primitive differs.
+    /// Back-compat wrapper: `physical_cap == max_seq_len`.
+    pub fn new_gpu_fwht4(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fwht4_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Same as [`new_gpu_fwht4`] with an explicit physical_cap. Eviction-aware.
+    pub fn new_gpu_fwht4_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "fwht4 requires head_dim=128 or 256"
+        );
+        assert!(head_dim % 32 == 0);
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 2;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+        }
+        // fwht_shfl_forward operates on 128 elements regardless of head_dim
+        // (hd=256 is processed as 2 halves with the same signs reused).
+        // Seeds (42, 1042) match the established MQ4 weight-FWHT convention
+        // (see crates/hipfire-quantize/src/bin/dflash_convert.rs:600 and
+        // crates/hipfire-arch-qwen35/src/qwen35.rs:872 — same PRNG family).
+        let n_signs = 128;
+        let s1_vals = Self::gen_fwht_signs(42, n_signs);
+        let s2_vals = Self::gen_fwht_signs(1042, n_signs);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let v_bph = v_bpp / n_kv_heads;
+        eprintln!(
+            "KV cache: fwht4 backend=legacy (K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            k_bph + v_bph,
+            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: true,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: true,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(s1),
+            givens_sin: Some(s2),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create asym3 KV cache: K at 3-bit rotated (Lloyd-Max N(0, 1/256)), V at Q8_0.
+    /// head_dim=256 → K=100 B/head, V=272 B/head → 372 B/head (5.5× vs fp32).
+    /// Back-compat wrapper: allocates physical_cap == max_seq_len slots per layer.
+    pub fn new_gpu_asym3(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym3_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Gemma4 variant of `new_gpu_asym3` (global 512). Delegates to the
+    /// gemma4-capped door so the shared 256-only guard stays unchanged.
+    pub fn new_gpu_asym3_gemma4(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym3_capped_gemma4(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Filtered variant of [`new_gpu_asym3`]: skips KV allocation for layers
+    /// flagged as non-KV (LinearAttention/DeltaNet in hybrid arches). See
+    /// [`alloc_k_v_filtered`].
+    pub fn new_gpu_asym3_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym3_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped + filtered asym3 — saves multi-GB at long ctx for Qwen 3.5 hybrid.
+    pub fn new_gpu_asym3_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 256,
+            "asym3 currently requires head_dim=256 (Qwen 3.5)"
+        );
+        assert!(head_dim % 32 == 0);
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + (head_dim * 3) / 8;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        let n_blocks = head_dim / 2;
+        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
+        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
+        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: asym3 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: true,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(ct),
+            givens_sin: Some(st),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// VMM-backed Asym3-K/Q8-V cache for Qwen3.5 hybrid stacks.
+    /// Thin wrapper over [`Self::new_gpu_vmm_capped_filtered`].
+    pub fn new_gpu_asym3_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Asym3,
+            VMode::Q8,
+        )
+    }
+
+    /// VMM-backed FWHT3-K/Q8-V cache for Qwen3.5 hybrid stacks.
+    /// Thin wrapper over [`Self::new_gpu_vmm_capped_filtered`].
+    pub fn new_gpu_fwht3_vmm_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_vmm_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            KvMode::Fwht3,
+            VMode::Q8,
+        )
+    }
+
+    /// Filtered variant of fwht3 — signed-FWHT-256 K-rotation, 3-bit centroid,
+    /// V at Q8_0. Same byte layout as asym3_filtered; rotation primitive swapped
+    /// to fwht_shfl_forward_256 which expects 256-element signs1/signs2.
+    pub fn new_gpu_fwht3_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fwht3_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped + filtered fwht3 — layer-filtered (skips non-KV layers) with an
+    /// explicit `physical_cap` for TriAttention/CASK eviction. Default path has
+    /// `physical_cap == max_seq_len` (no eviction). Byte layout identical to
+    /// `asym3_capped_filtered`; rotation primitive is signed-FWHT-256.
+    pub fn new_gpu_fwht3_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 256,
+            "fwht3 currently requires head_dim=256 (Qwen 3.5)"
+        );
+        Self::new_gpu_fwht3_capped_filtered_inner(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+        )
+    }
+
+    /// Gemma 4 door for the global-attention KV, whose `global_head_dim` is
+    /// 512. Deliberately a SEPARATE entry point: the shared constructor above
+    /// keeps its exact 256-only guard for Qwen 3.5/3.6 and every other
+    /// architecture. Gemma gets its own door rather than a bound widened on
+    /// everyone's behalf — a relaxed shared guard silently admits misconfigured
+    /// geometry for architectures that were previously protected from it.
+    pub fn new_gpu_fwht3_capped_filtered_gemma4(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 256 || head_dim == 512,
+            "fwht3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
+        );
+        Self::new_gpu_fwht3_capped_filtered_inner(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+        )
+    }
+
+    fn new_gpu_fwht3_capped_filtered_inner(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(head_dim % 32 == 0);
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + (head_dim * 3) / 8;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        // fwht_shfl_forward_256 reads signs[tid*8..tid*8+7], so 256 floats each.
+        let n_signs = 256;
+        let s1_vals = Self::gen_fwht_signs(42, n_signs);
+        let s2_vals = Self::gen_fwht_signs(1042, n_signs);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fwht3 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: true,
+            quant_asym2: false,
+            quant_fwht: true,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(s1),
+            givens_sin: Some(s2),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Same as [`new_gpu_asym3`] but with an explicit physical capacity. When
+    /// `physical_cap < max_seq_len`, the cache is sized for `physical_cap`
+    /// tokens along the time axis; the caller is responsible for triggering
+    /// TriAttention/CASK eviction before the physical position overruns
+    /// `physical_cap`. `max_seq_len` is retained for RoPE/mask purposes.
+    pub fn new_gpu_asym3_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 256,
+            "asym3 currently requires head_dim=256 (Qwen 3.5)"
+        );
+        Self::new_gpu_asym3_capped_inner(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+        )
+    }
+
+    /// Gemma 4 door for the global-attention KV, whose `global_head_dim` is
+    /// 512. Separate entry point so the shared constructor above keeps its
+    /// exact 256-only guard for Qwen 3.5/3.6 and every other architecture.
+    pub fn new_gpu_asym3_capped_gemma4(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 256 || head_dim == 512,
+            "asym3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
+        );
+        Self::new_gpu_asym3_capped_inner(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+        )
+    }
+
+    fn new_gpu_asym3_capped_inner(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym3_capped_inner_with_alloc(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            Gpu::zeros,
+            Gpu::alloc_tensor,
+            |gpu: &mut Gpu, tensor: &GpuTensor, bytes: &[u8]| {
+                gpu.hip.memcpy_htod(&tensor.buf, bytes)
+            },
+        )
+    }
+
+    /// [`new_gpu_asym3_capped_inner`] with injectable allocation/copy seams:
+    /// the production door passes [`Gpu::zeros`], [`Gpu::alloc_tensor`], and
+    /// a host-to-device copy; rollback tests fail the Nth seam call to prove
+    /// a mid-build failure frees every already-owned buffer — the current
+    /// unmatched K, all prior K/V layers, and any owned givens table — before
+    /// the original error propagates.
+    fn new_gpu_asym3_capped_inner_with_alloc(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mut alloc_zero: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+        mut alloc: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+        mut copy_htod: impl FnMut(&mut Gpu, &GpuTensor, &[u8]) -> HipResult<()>,
+    ) -> HipResult<Self> {
+        assert!(head_dim % 32 == 0);
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + (head_dim * 3) / 8;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        // Same cleanup-closure shape as `alloc_k_v_filtered`: on any mid-loop
+        // failure free every tensor already pushed (GpuTensor has no freeing
+        // Drop). The K push precedes its V, so a V failure leaves the current
+        // K unmatched but still owned in `k_gpu` — the drain below covers it.
+        let kv_result = (|| -> HipResult<()> {
+            for _ in 0..n_layers {
+                k_gpu.push(alloc_zero(gpu, &[k_elems], DType::F32)?);
+                v_gpu.push(alloc_zero(gpu, &[v_elems], DType::F32)?);
+            }
+            Ok(())
+        })();
+        if let Err(err) = kv_result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
+        }
+        let n_blocks = head_dim / 2;
+        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
+        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        // Givens tables follow the filtered-VMM rotation-table pattern: a
+        // partial pair never escapes — a second-alloc or copy failure frees
+        // the already-owned table — and a table failure rolls back every K/V
+        // owner above so the caller can retry on the same `gpu`.
+        let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
+            let ct = alloc(gpu, &[n_blocks], DType::F32)?;
+            let st = match alloc(gpu, &[n_blocks], DType::F32) {
+                Ok(st) => st,
+                Err(err) => {
+                    let _ = gpu.free_tensor(ct);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = copy_htod(gpu, &ct, &cb) {
+                let _ = gpu.free_tensor(ct);
+                let _ = gpu.free_tensor(st);
+                return Err(err);
+            }
+            if let Err(err) = copy_htod(gpu, &st, &sb) {
+                let _ = gpu.free_tensor(ct);
+                let _ = gpu.free_tensor(st);
+                return Err(err);
+            }
+            Ok((ct, st))
+        })();
+        let (ct, st) = match tables {
+            Ok(pair) => pair,
+            Err(err) => {
+                for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                    let _ = gpu.free_tensor(tensor);
+                }
+                return Err(err);
+            }
+        };
+        let v_bph = v_bpp / n_kv_heads;
+        eprintln!(
+            "KV cache: asym3 backend=legacy (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            k_bph + v_bph,
+            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: true,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(ct),
+            givens_sin: Some(st),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create asym2 KV cache: K at 2-bit rotated, V at Q8_0.
+    /// head_dim=256 → K=68 B/head, V=272 B/head → 340 B/head (6.0× vs fp32).
+    /// Back-compat wrapper: `physical_cap == max_seq_len`.
+    pub fn new_gpu_asym2(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym2_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Filtered variant of [`new_gpu_asym2`]: skips KV alloc for non-KV layers.
+    pub fn new_gpu_asym2_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "asym2 requires head_dim=128 or 256"
+        );
+        assert!(head_dim % 32 == 0);
+        let physical_cap = max_seq_len;
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 4;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        let n_blocks = head_dim / 2;
+        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
+        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
+        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: asym2 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: true,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(ct),
+            givens_sin: Some(st),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Filtered variant of fwht2 — signed-FWHT-128 K-rotation, 2-bit centroid,
+    /// V at Q8_0. Same 2-pass-over-128 structure as fwht4, signs are 128 floats.
+    pub fn new_gpu_fwht2_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_fwht2_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped + filtered fwht2 — layer-filtered with explicit `physical_cap`
+    /// for TriAttention/CASK eviction. Byte layout identical to
+    /// `asym2_capped`; rotation primitive is signed-FWHT-128.
+    pub fn new_gpu_fwht2_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "fwht2 requires head_dim=128 or 256"
+        );
+        assert!(head_dim % 32 == 0);
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 4;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, k_elems, v_elems, is_kv_layer)?;
+        let n_signs = 128;
+        let s1_vals = Self::gen_fwht_signs(42, n_signs);
+        let s2_vals = Self::gen_fwht_signs(1042, n_signs);
+        let s1_bytes: Vec<u8> = s1_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s2_bytes: Vec<u8> = s2_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let s1 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        let s2 = gpu.alloc_tensor(&[n_signs], DType::F32)?;
+        gpu.hip.memcpy_htod(&s1.buf, &s1_bytes)?;
+        gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
+        let v_bph = v_bpp / n_kv_heads;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: fwht2 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            is_kv_layer.len(),
+            k_bph + v_bph,
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: true,
+            quant_fwht: true,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(s1),
+            givens_sin: Some(s2),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Same as [`new_gpu_asym2`] with an explicit physical_cap. Eviction-aware.
+    pub fn new_gpu_asym2_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            head_dim == 128 || head_dim == 256,
+            "asym2 requires head_dim=128 or 256"
+        );
+        assert!(head_dim % 32 == 0);
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let k_bph = 4 + head_dim / 4;
+        let k_elems = (physical_cap * n_kv_heads * k_bph + 3) / 4;
+        let v_blocks_per_head = head_dim / 32;
+        let v_bpp = n_kv_heads * v_blocks_per_head * 34;
+        let v_elems = (physical_cap * v_bpp + 3) / 4;
+
+        let mut k_gpu = Vec::with_capacity(n_layers);
+        let mut v_gpu = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
+            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+        }
+        let n_blocks = head_dim / 2;
+        let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
+        let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
+        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
+        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        let v_bph = v_bpp / n_kv_heads;
+        eprintln!(
+            "KV cache: asym2 backend=legacy (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            k_bph + v_bph,
+            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: true,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_fp8: false,
+            boundary_layers: 0,
+            givens_cos: Some(ct),
+            givens_sin: Some(st),
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Generate deterministic ±1 sign array for FWHT.
+    pub fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1103515245).wrapping_add(12345) & 0x7fffffff;
+                if (state >> 16) & 1 == 1 {
+                    1.0f32
+                } else {
+                    -1.0f32
+                }
+            })
+            .collect()
+    }
+
+    /// Free all GPU tensors in this cache. Call before drop to return VRAM.
+    /// After calling, follow with gpu.drain_pool() to actually release memory.
+    ///
+    /// Legacy frees keep prior log-and-continue behavior. VMM teardown
+    /// failures are aggregated and returned so unload cannot claim success
+    /// while arenas remain registered (retry via `Gpu::ensure_vmm_cleaned`).
+    pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
+        let mut first_err: Option<hip_bridge::HipError> = None;
+        let mut note = |r: HipResult<()>| {
+            if let Err(err) = r {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        };
+        for t in self.k_gpu {
+            note(gpu.free_tensor(t));
+        }
+        for t in self.v_gpu {
+            note(gpu.free_tensor(t));
+        }
+        for t in self.k_scales {
+            note(gpu.free_tensor(t));
+        }
+        for t in self.v_scales {
+            note(gpu.free_tensor(t));
+        }
+        if let Some(t) = self.givens_cos {
+            note(gpu.free_tensor(t));
+        }
+        if let Some(t) = self.givens_sin {
+            note(gpu.free_tensor(t));
+        }
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
+    }
+
+    /// Store K, V at position `pos` in layer cache (CPU → GPU copy into cache slot).
+    pub fn store_kv_pub(
+        &mut self,
+        gpu: &Gpu,
+        layer: usize,
+        pos: usize,
+        k: &[f32],
+        v: &[f32],
+    ) -> HipResult<()> {
+        self.store_kv(gpu, layer, pos, k, v)
+    }
+
+    fn store_kv(
+        &mut self,
+        gpu: &Gpu,
+        layer: usize,
+        pos: usize,
+        k_data: &[f32],
+        v_data: &[f32],
+    ) -> HipResult<()> {
+        // The f32 row addressing below only fits plain-F32 buffers; fp8
+        // token-local rows must go through the native device writer.
+        if self.quant_fp8 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "store_kv refuses fp8 caches (use the native fp8 device writer)",
+            ));
+        }
+        let byte_offset = pos * self.kv_dim * 4; // float = 4 bytes
+        let k_bytes =
+            unsafe { std::slice::from_raw_parts(k_data.as_ptr() as *const u8, k_data.len() * 4) };
+        let v_bytes =
+            unsafe { std::slice::from_raw_parts(v_data.as_ptr() as *const u8, v_data.len() * 4) };
+        gpu.hip
+            .memcpy_htod_offset(&self.k_gpu[layer].buf, byte_offset, k_bytes)?;
+        gpu.hip
+            .memcpy_htod_offset(&self.v_gpu[layer].buf, byte_offset, v_bytes)?;
+        Ok(())
+    }
+
+    // ── Multi-GPU constructors (Stage 5 of issue #58) ───────────────────
+    //
+    // Each `_multi` variant places the per-layer K/V slot on
+    // `gpus.devices[gpus.device_for_layer(i)]`. asym{2,3,4} variants
+    // additionally replicate the rotation tables to every device by
+    // populating `gpus.givens_cos_per_dev` / `gpus.givens_sin_per_dev`.
+    //
+    // The KvCache.givens_cos / .givens_sin fields stay `None` in multi mode
+    // — Stage 6 forward dispatch reads from the per-device replicas in
+    // `Gpus` instead.
+}
+
+/// KV VMM-layout and adaptive-reset contract tests.
+///
+/// These ten tests were dropped when `KvCache` moved out of
+/// `hipfire-runtime::llama` (wave 1, C1) and were never restored. Recovered
+/// verbatim from `8510ca5f2`. They live inside this module rather than in
+/// `tests/` because they exercise private layout internals — moving them out
+/// would have meant widening `KvCache`'s public API to keep its own tests.
+#[cfg(test)]
+mod vmm_layout_tests {
+    use super::*;
+    use rdna_compute::Gpu;
+
+    fn expected_k_bph(mode: KvMode, head_dim: usize) -> usize {
+        match mode {
+            KvMode::Q8 => (head_dim / 32) * 34,
+            KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
+            KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
+            KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
+            KvMode::Fp8 => head_dim + 2,
+            KvMode::Bf16 | KvMode::F16 => head_dim * 2,
+        }
+    }
+
+    fn expected_v_bph(v_mode: VMode, head_dim: usize) -> usize {
+        match v_mode {
+            VMode::Q8 => (head_dim / 32) * 34,
+            VMode::Lloyd2 => 4 + head_dim / 4,
+            VMode::Lloyd3 => 4 + (head_dim * 3) / 8,
+            VMode::Lloyd4 => 4 + head_dim / 2,
+        }
+    }
+
+    fn flag_standin(mode: KvMode, v_mode: VMode, n_kv_heads: usize, head_dim: usize) -> KvCache {
+        // Indivisible tiers bypass the 5-flag VMM bundle (it panics for them
+        // by design); set their flags directly like their constructors do.
+        let (q8, a4, a3, a2, fwht, bf16, fp8) = match mode {
+            KvMode::Fp8 => (false, false, false, false, false, false, true),
+            KvMode::Bf16 => (false, false, false, false, false, true, false),
+            _ => {
+                let (q8, a4, a3, a2, fwht) = KvCache::vmm_mode_flags(mode);
+                (q8, a4, a3, a2, fwht, false, false)
+            }
+        };
+        KvCache {
+            k_gpu: vec![],
+            v_gpu: vec![],
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: n_kv_heads * head_dim,
+            max_seq: 128,
+            physical_cap: 128,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: q8,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: a4,
+            quant_asym3: a3,
+            quant_asym2: a2,
+            quant_fwht: fwht,
+            quant_bf16: bf16,
+            quant_fp8: fp8,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode,
+        }
+    }
+
+    fn vmm_mask_dims(
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        physical_cap: usize,
+    ) -> KvDims {
+        KvDims {
+            layers: KvLayers::Mask(vec![true, false, true]),
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            physical_cap: Some(physical_cap),
+        }
+    }
+
+    #[test]
+    fn fwht3_vmm_layout_matches_asym3_byte_geometry() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 128;
+        let asym = KvCache::asym3_vmm_layout(n_kv_heads, head_dim, physical_cap).unwrap();
+        let fwht = KvCache::fwht3_vmm_layout(n_kv_heads, head_dim, physical_cap).unwrap();
+        assert_eq!(fwht, asym, "fwht3 VMM must reuse asym3 K/V byte layout");
+        // Explicit stride math: K 100 B/head, V Q8 272 B/head at head_dim=256.
+        assert_eq!(fwht.3, 4 + (head_dim * 3) / 8);
+        assert_eq!(fwht.4, (head_dim / 32) * 34);
+        let k_bytes = physical_cap * n_kv_heads * fwht.3;
+        let v_bytes = physical_cap * n_kv_heads * fwht.4;
+        assert_eq!(fwht.1, (k_bytes + 3) / 4);
+        assert_eq!(fwht.2, (v_bytes + 3) / 4);
+        assert_eq!(fwht.0, n_kv_heads * head_dim);
+    }
+
+    #[test]
+    fn independent_k_v_capacity_math_from_reserve_and_current() {
+        // Simulate lopsided adaptive start: K floor 68, V floor 68, current K132/V272.
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 1000;
+        let layout = KvCache::vmm_layout_with_reserve(
+            KvMode::Fwht4,
+            VMode::Q8,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            expected_k_bph(KvMode::Fwht2, head_dim),
+            VMode::Lloyd2,
+        )
+        .unwrap();
+        let k_tokens = layout.k_reserve_bytes / layout.k_bytes_per_token;
+        let v_tokens = layout.v_reserve_bytes / layout.v_bytes_per_token;
+        // Must NOT sum K+V bytes into a shared pool.
+        let naive_shared = (layout.k_reserve_bytes + layout.v_reserve_bytes)
+            / (layout.k_bytes_per_token + layout.v_bytes_per_token);
+        assert_ne!(
+            k_tokens.min(v_tokens),
+            naive_shared,
+            "min-of-two must differ from shared-pool sum"
+        );
+        assert_eq!(k_tokens.min(v_tokens), v_tokens);
+    }
+
+    #[test]
+    fn validate_mode_admits_all_seven_static_vmm_modes() {
+        let dims = vmm_mask_dims(4, 256, 4096, 1024);
+        for mode in [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ] {
+            KvCache::validate_mode_with_backend(mode, KvBackend::Vmm, true, &dims)
+                .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
+            // Legacy admission remains open (no VMM-only gate).
+            KvCache::validate_mode_with_backend(mode, KvBackend::Legacy, true, &dims)
+                .unwrap_or_else(|e| panic!("legacy mode={mode:?}: {e}"));
+        }
+    }
+
+    #[test]
+    fn validate_mode_rejects_multi_gpu_and_flat_vmm() {
+        let mask = vmm_mask_dims(4, 256, 4096, 1024);
+        let err = KvCache::validate_mode_with_backend(KvMode::Fwht3, KvBackend::Vmm, false, &mask)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("single-GPU"), "{err}");
+
+        let flat = KvDims {
+            layers: KvLayers::Flat(8),
+            n_kv_heads: 4,
+            head_dim: 256,
+            max_seq: 4096,
+            physical_cap: Some(1024),
+        };
+        let err = KvCache::validate_mode_with_backend(KvMode::Fwht3, KvBackend::Vmm, true, &flat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("filtered"), "{err}");
+    }
+
+    #[test]
+    fn vmm_bytes_per_token_matches_layout_for_all_static_modes() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        for mode in [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ] {
+            let cache = flag_standin(mode, VMode::Q8, n_kv_heads, head_dim);
+            let (k, v) = cache.vmm_bytes_per_token().unwrap();
+            assert_eq!(k, n_kv_heads * expected_k_bph(mode, head_dim), "{mode:?}");
+            assert_eq!(
+                v,
+                n_kv_heads * expected_v_bph(VMode::Q8, head_dim),
+                "{mode:?}"
+            );
+        }
+        // FWHT-K + Lloyd-V current strides.
+        for v_mode in [VMode::Lloyd2, VMode::Lloyd3, VMode::Lloyd4] {
+            let cache = flag_standin(KvMode::Fwht4, v_mode, n_kv_heads, head_dim);
+            let (k, v) = cache.vmm_bytes_per_token().unwrap();
+            assert_eq!(
+                k,
+                n_kv_heads * expected_k_bph(KvMode::Fwht4, head_dim),
+                "{v_mode:?}"
+            );
+            assert_eq!(
+                v,
+                n_kv_heads * expected_v_bph(v_mode, head_dim),
+                "{v_mode:?}"
+            );
+        }
+        // Asym-K + Lloyd-V must fail (illegal pair).
+        let bad = flag_standin(KvMode::Asym3, VMode::Lloyd3, n_kv_heads, head_dim);
+        assert!(bad.vmm_bytes_per_token().is_err());
+    }
+
+    #[test]
+    fn vmm_layout_rejects_illegal_pairs() {
+        // Asym-K + Lloyd-V is illegal.
+        for mode in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4, KvMode::Q8] {
+            let err = KvCache::vmm_static_layout(mode, VMode::Lloyd4, 4, 256, 64)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("lloyd-V") || err.contains("VMode::Q8"),
+                "mode={mode:?} err={err}"
+            );
+        }
+        // FWHT3 / Asym3 require head_dim=256.
+        for mode in [KvMode::Fwht3, KvMode::Asym3] {
+            let err = KvCache::vmm_static_layout(mode, VMode::Q8, 4, 128, 64)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("head_dim"), "mode={mode:?} err={err}");
+        }
+        // n_kv_heads == 0.
+        let err = KvCache::vmm_static_layout(KvMode::Fwht3, VMode::Q8, 0, 256, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("n_kv_heads>0"), "{err}");
+        // Lloyd-V with FWHT-K but head_dim != 256.
+        let err = KvCache::vmm_static_layout(KvMode::Fwht4, VMode::Lloyd2, 4, 128, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("head_dim=256"), "{err}");
+    }
+
+    #[test]
+    fn vmm_layout_with_reserve_separates_current_and_floor() {
+        // Adaptive-style: current FWHT4/Q8, reserve at fwht2/lloyd2 floors.
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 1000;
+        let k_floor_bph = expected_k_bph(KvMode::Fwht2, head_dim); // 68
+        let layout = KvCache::vmm_layout_with_reserve(
+            KvMode::Fwht4,
+            VMode::Q8,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            k_floor_bph,
+            VMode::Lloyd2,
+        )
+        .unwrap();
+        // Current strides are start encoding.
+        assert_eq!(
+            layout.k_bytes_per_token,
+            n_kv_heads * expected_k_bph(KvMode::Fwht4, head_dim)
+        );
+        assert_eq!(
+            layout.v_bytes_per_token,
+            n_kv_heads * expected_v_bph(VMode::Q8, head_dim)
+        );
+        // Reserve is floor-sized.
+        assert_eq!(
+            layout.k_reserve_bytes,
+            physical_cap * n_kv_heads * k_floor_bph
+        );
+        assert_eq!(
+            layout.v_reserve_bytes,
+            physical_cap * n_kv_heads * expected_v_bph(VMode::Lloyd2, head_dim)
+        );
+        // Token capacity at start is min of reserve/current (V binds: 68/272).
+        let k_cap = layout.k_reserve_bytes / layout.k_bytes_per_token;
+        let v_cap = layout.v_reserve_bytes / layout.v_bytes_per_token;
+        assert_eq!(
+            k_cap,
+            physical_cap * k_floor_bph / expected_k_bph(KvMode::Fwht4, head_dim)
+        );
+        assert_eq!(
+            v_cap,
+            physical_cap * expected_v_bph(VMode::Lloyd2, head_dim)
+                / expected_v_bph(VMode::Q8, head_dim)
+        );
+        assert!(v_cap < k_cap, "V should bind at FWHT4/Q8 start");
+        // Source-prefix bytes remain current-stride × n_pos (not floor).
+        assert_eq!(
+            layout.prefix_k_bytes(10).unwrap(),
+            10 * layout.k_bytes_per_token
+        );
+        assert_eq!(
+            layout.prefix_v_bytes(10).unwrap(),
+            10 * layout.v_bytes_per_token
+        );
+        assert_eq!(layout.rotation_table_len, 256);
+    }
+
+    #[test]
+    fn vmm_static_layout_covers_all_seven_k_modes_with_q8_v() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 128;
+        let modes = [
+            KvMode::Q8,
+            KvMode::Asym2,
+            KvMode::Asym3,
+            KvMode::Asym4,
+            KvMode::Fwht2,
+            KvMode::Fwht3,
+            KvMode::Fwht4,
+        ];
+        for mode in modes {
+            let layout =
+                KvCache::vmm_static_layout(mode, VMode::Q8, n_kv_heads, head_dim, physical_cap)
+                    .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
+            let k_bph = expected_k_bph(mode, head_dim);
+            let v_bph = expected_v_bph(VMode::Q8, head_dim);
+            assert_eq!(layout.k_bytes_per_head, k_bph, "mode={mode:?}");
+            assert_eq!(layout.v_bytes_per_head, v_bph, "mode={mode:?}");
+            assert_eq!(
+                layout.k_bytes_per_token,
+                n_kv_heads * k_bph,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_bytes_per_token,
+                n_kv_heads * v_bph,
+                "mode={mode:?}"
+            );
+            // Static: reserve == current.
+            assert_eq!(
+                layout.k_reserve_bytes,
+                physical_cap * layout.k_bytes_per_token,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_reserve_bytes,
+                physical_cap * layout.v_bytes_per_token,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.k_reserve_elems,
+                (layout.k_reserve_bytes + 3) / 4,
+                "mode={mode:?}"
+            );
+            assert_eq!(
+                layout.v_reserve_elems,
+                (layout.v_reserve_bytes + 3) / 4,
+                "mode={mode:?}"
+            );
+            assert_eq!(layout.kv_dim, n_kv_heads * head_dim);
+            // Independent K vs V capacity at equal physical_cap is just physical_cap.
+            let k_cap = layout.k_reserve_bytes / layout.k_bytes_per_token;
+            let v_cap = layout.v_reserve_bytes / layout.v_bytes_per_token;
+            assert_eq!(k_cap.min(v_cap), physical_cap, "mode={mode:?}");
+        }
+    }
+
+    #[test]
+    fn vmm_static_layout_covers_fwht_k_with_lloyd_v() {
+        let n_kv_heads = 4;
+        let head_dim = 256;
+        let physical_cap = 64;
+        let k_modes = [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4];
+        let v_modes = [VMode::Lloyd2, VMode::Lloyd3, VMode::Lloyd4];
+        for mode in k_modes {
+            for v_mode in v_modes {
+                let layout =
+                    KvCache::vmm_static_layout(mode, v_mode, n_kv_heads, head_dim, physical_cap)
+                        .unwrap_or_else(|e| panic!("{mode:?}/{v_mode:?}: {e}"));
+                assert_eq!(layout.k_bytes_per_head, expected_k_bph(mode, head_dim));
+                assert_eq!(layout.v_bytes_per_head, expected_v_bph(v_mode, head_dim));
+                // Lloyd-V forces 256-wide signs even for fwht2/4.
+                assert_eq!(layout.rotation_table_len, 256, "{mode:?}/{v_mode:?}");
+                assert!(layout.uses_fwht_signs, "{mode:?}/{v_mode:?}");
+                // Prefix helpers use current stride, not reserve.
+                let n_pos = 17;
+                assert_eq!(
+                    layout.prefix_k_bytes(n_pos).unwrap(),
+                    n_pos * layout.k_bytes_per_token
+                );
+                assert_eq!(
+                    layout.prefix_v_bytes(n_pos).unwrap(),
+                    n_pos * layout.v_bytes_per_token
+                );
+            }
+        }
+    }
+}
+
+/// BF16 tier projection / plan regression (debug-build).
+///
+/// Maple's BF16 cache sets `quantized=true` with empty `k_scales` and
+/// `quant_bf16=true` — the exact shape that the legacy Q4 residual
+/// `quantized && !tier && k_scales.is_empty()` would also match.
+/// Without the `!quant_bf16` exclusion the cache reports TWO true tier flags
+/// (`bf16` + `q4`), which trips `hipfire-dispatch::families::kv_tier::classify`'s
+/// `debug_assert!(count <= 1)` on every Maple BF16 attention dispatch.
+/// These tests mirror that assertion without taking a dispatch dependency, so
+/// a future regression is caught here even in GPU-free CI.
+#[cfg(test)]
+mod bf16_tier_projection_tests {
+    use super::*;
+
+    fn stub(
+        quantized: bool,
+        quant_q8: bool,
+        quant_hfq4: bool,
+        quant_int8: bool,
+        quant_asym4: bool,
+        quant_asym3: bool,
+        quant_asym2: bool,
+        quant_fwht: bool,
+        quant_bf16: bool,
+        quant_fp8: bool,
+        k_scales_empty: bool,
+    ) -> KvCache {
+        KvCache {
+            k_gpu: Vec::new(),
+            v_gpu: Vec::new(),
+            k_scales: if k_scales_empty {
+                Vec::new()
+            } else {
+                // non-empty sentinel: one dummy 1-element tensor avoids needing Gpu
+                vec![GpuTensor {
+                    buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), 0) },
+                    shape: vec![1],
+                    dtype: DType::F32,
+                }]
+            },
+            v_scales: Vec::new(),
+            kv_dim: 0,
+            max_seq: 0,
+            physical_cap: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            quantized,
+            quant_q8,
+            quant_int8,
+            quant_hfq4,
+            quant_asym4,
+            quant_asym3,
+            quant_asym2,
+            quant_fwht,
+            quant_bf16,
+            quant_fp8,
+            v_mode: VMode::Q8,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: Vec::new(),
+            compact_offset: 0,
+        }
+    }
+
+    /// Mirrors `hipfire_dispatch::families::kv_tier::classify`'s at-most-one check,
+    /// using the two derived predicates exactly as `KvCacheExt::{k_tier,tier_inputs}`
+    /// do: `quant_q4 = quant_q4_residual()`, `quant_hfq8 = is_hfq8_kv()`.
+    fn tier_count(cache: &KvCache) -> usize {
+        let flags = [
+            cache.quant_asym4,
+            cache.quant_asym3,
+            cache.quant_asym2,
+            cache.quant_q8,
+            cache.quant_hfq4,
+            cache.quant_q4_residual(),
+            cache.quant_int8,
+            cache.is_hfq8_kv(),
+            cache.quant_bf16,
+            cache.quant_fp8,
+        ];
+        flags.iter().filter(|&&b| b).count()
+    }
+
+    #[test]
+    fn bf16_projection_is_exclusive_q4_false_bf16_true() {
+        // Maple BF16: quantized true, empty scales, bf16 true, no other tier.
+        let bf16 = stub(
+            true, false, false, false, false, false, false, false, true, false, true,
+        );
+        assert!(
+            !bf16.quant_q4_residual(),
+            "BF16 must NOT report legacy Q4 residual"
+        );
+        assert!(bf16.quant_bf16, "BF16 flag must be true");
+        assert!(!bf16.is_hfq8_kv(), "BF16 must not report HFQ8");
+        assert_eq!(
+            tier_count(&bf16),
+            1,
+            "BF16 must classify as exactly one tier (bf16)"
+        );
+        // The dispatch crate's `classify` debug_assert would trip if count > 1.
+        // Mirror that guard so GPU-free CI catches the same regression.
+        debug_assert!(
+            tier_count(&bf16) <= 1,
+            "at most one KV storage tier flag should be set (BF16)"
+        );
+    }
+
+    #[test]
+    fn q4_residual_still_reports_q4_only() {
+        // LLaMA legacy Q4: quantized true, empty scales, no named tier, no bf16.
+        let q4 = stub(
+            true, false, false, false, false, false, false, false, false, false, true,
+        );
+        assert!(q4.quant_q4_residual(), "legacy Q4 must report q4 residual");
+        assert!(!q4.quant_bf16);
+        assert!(!q4.is_hfq8_kv());
+        assert_eq!(
+            tier_count(&q4),
+            1,
+            "Q4 must classify as exactly one tier (q4)"
+        );
+        debug_assert!(tier_count(&q4) <= 1, "at most one tier (Q4)");
+    }
+
+    #[test]
+    fn q8_projection_is_exclusive_q4_false() {
+        // Q8: quantized true, q8 true, empty scales, no bf16. Must not also be Q4.
+        let q8 = stub(
+            true, true, false, false, false, false, false, false, false, false, true,
+        );
+        assert!(
+            !q8.quant_q4_residual(),
+            "Q8 must NOT report legacy Q4 residual"
+        );
+        assert!(!q8.quant_bf16);
+        assert!(!q8.is_hfq8_kv());
+        assert!(q8.quant_q8);
+        assert_eq!(
+            tier_count(&q8),
+            1,
+            "Q8 must classify as exactly one tier (q8)"
+        );
+        debug_assert!(tier_count(&q8) <= 1, "at most one tier (Q8)");
+    }
+
+    #[test]
+    fn asym_and_hfq_variants_remain_exclusive() {
+        // Asym3 (qwen35 default) was the original motivator for the asym exclusion;
+        // ensure the new bf16 exclusion didn't reintroduce overlap.
+        let asym3 = stub(
+            true, false, false, false, false, true, false, false, false, false, true,
+        );
+        assert!(
+            !asym3.quant_q4_residual(),
+            "asym3 must NOT report Q4 residual"
+        );
+        assert_eq!(tier_count(&asym3), 1);
+
+        // HFQ8 has non-empty k_scales and is its own tier.
+        let hfq8 = stub(
+            true, false, false, false, false, false, false, false, false, false, false,
+        );
+        assert!(hfq8.is_hfq8_kv(), "hfq8 with scales must report hfq8");
+        assert!(
+            !hfq8.quant_q4_residual(),
+            "hfq8 must NOT report Q4 (scales non-empty)"
+        );
+        assert_eq!(tier_count(&hfq8), 1);
+
+        // F32: quantized false => no tier at all (KTier::F32).
+        let f32_cache = stub(
+            false, false, false, false, false, false, false, false, false, false, true,
+        );
+        assert!(!f32_cache.quant_q4_residual());
+        assert!(!f32_cache.is_hfq8_kv());
+        assert_eq!(tier_count(&f32_cache), 0, "F32 must classify as zero tiers");
+    }
+}
+
+/// Partial-construction rollback for the two flat Gemma doors.
+///
+/// No mock-GPU seam exists in this crate (`Gpu` needs real HIP), so these
+/// tests follow the workspace's `*_with_alloc` convention (qwen35 batch
+/// scratch, dflash weights): the private `..._with_alloc` helpers take over
+/// each allocation/copy seam, the test fails the Nth seam call, and a
+/// successful retry on the same `gpu` must reuse the rolled-back pool blocks
+/// — any retained (leaked) owner would force fresh `hipMalloc`s and move
+/// `pool_stats().0`. GPU-gated like the qwen35/dflash rollback tests.
+#[cfg(test)]
+mod kv_capped_rollback_tests {
+    use super::*;
+    use hip_bridge::HipError;
+    use std::cell::Cell;
+
+    const ROLLBACK_LAYERS: usize = 4;
+    const ROLLBACK_HEADS: usize = 2;
+    const ROLLBACK_SEQ: usize = 16;
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises Q8 partial-construction rollback and retry"]
+    fn q8_capped_partial_alloc_failure_frees_owners_and_retries() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        // Warm the pool so the retry legs below reuse pooled blocks.
+        let warm = KvCache::new_gpu_q8_capped(
+            &mut gpu,
+            ROLLBACK_LAYERS,
+            ROLLBACK_HEADS,
+            128,
+            ROLLBACK_SEQ,
+            ROLLBACK_SEQ,
+        )
+        .expect("warm q8 cache");
+        warm.free_gpu(&mut gpu).expect("release warm q8 cache");
+        let fresh = gpu.pool_stats().0;
+
+        // Fail at every K/V seam call. Odd calls fail a K (all prior layers
+        // owned); even calls fail a V, leaving the current K unmatched but
+        // already pushed — the drain must cover it too.
+        for fail_at in 1..=ROLLBACK_LAYERS * 2 {
+            let calls = Cell::new(0usize);
+            let err = KvCache::new_gpu_q8_capped_with_alloc(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                128,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+                |gpu, shape, dtype| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == fail_at {
+                        Err(HipError::new(2, "injected q8 K/V allocation failure"))
+                    } else {
+                        gpu.zeros(shape, dtype)
+                    }
+                },
+            )
+            .err()
+            .expect(&format!(
+                "q8 allocation fault at call {fail_at} did not trigger"
+            ));
+            assert!(
+                err.to_string()
+                    .contains("injected q8 K/V allocation failure"),
+                "q8 fault at call {fail_at} surfaced the wrong error: {err}"
+            );
+            // Successful retry on the same gpu must reuse the rolled-back pool
+            // blocks: a leak would force fresh hipMallocs and move `total_new`.
+            let retry = KvCache::new_gpu_q8_capped(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                128,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+            )
+            .expect("immediate retry after q8 allocation failure");
+            retry.free_gpu(&mut gpu).expect("release retried q8 cache");
+            assert_eq!(
+                gpu.pool_stats().0,
+                fresh,
+                "failed q8 construction at call {fail_at} leaked owners instead of rolling them back",
+            );
+        }
+        gpu.drain_pool();
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises asym3 partial-construction rollback and retry"]
+    fn asym3_capped_partial_failure_frees_layers_givens_and_retries() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        // Warm the pool so the retry legs below reuse pooled blocks.
+        let warm = KvCache::new_gpu_asym3_capped_gemma4(
+            &mut gpu,
+            ROLLBACK_LAYERS,
+            ROLLBACK_HEADS,
+            256,
+            ROLLBACK_SEQ,
+            ROLLBACK_SEQ,
+        )
+        .expect("warm asym3 cache");
+        warm.free_gpu(&mut gpu).expect("release warm asym3 cache");
+        let fresh = gpu.pool_stats().0;
+
+        // Seam order per attempt: 2 K/V calls per layer, then cos alloc, sin
+        // alloc, cos copy, sin copy. Failing at each index covers partial
+        // layers (incl. the unmatched-K case), each partial-givens shape, and
+        // both copy failures.
+        let total_seams = ROLLBACK_LAYERS * 2 + 4;
+        for fail_at in 1..=total_seams {
+            let calls = Cell::new(0usize);
+            let fault = |calls: &Cell<usize>, label: &str| -> HipResult<()> {
+                calls.set(calls.get() + 1);
+                if calls.get() == fail_at {
+                    Err(HipError::new(2, &format!("injected asym3 {label} failure")))
+                } else {
+                    Ok(())
+                }
+            };
+            let err = KvCache::new_gpu_asym3_capped_inner_with_alloc(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                256,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+                |gpu, shape, dtype| {
+                    fault(&calls, "K/V allocation")?;
+                    gpu.zeros(shape, dtype)
+                },
+                |gpu, shape, dtype| {
+                    fault(&calls, "givens allocation")?;
+                    gpu.alloc_tensor(shape, dtype)
+                },
+                |gpu, tensor, bytes| {
+                    fault(&calls, "givens copy")?;
+                    gpu.hip.memcpy_htod(&tensor.buf, bytes)
+                },
+            )
+            .err()
+            .expect(&format!("asym3 fault at seam {fail_at} did not trigger"));
+            assert!(
+                err.to_string().contains("injected asym3"),
+                "asym3 fault at seam {fail_at} surfaced the wrong error: {err}"
+            );
+            // Successful retry through the Gemma door on the same gpu must
+            // reuse the rolled-back pool blocks.
+            let retry = KvCache::new_gpu_asym3_capped_gemma4(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                256,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+            )
+            .expect("immediate retry after asym3 failure");
+            retry
+                .free_gpu(&mut gpu)
+                .expect("release retried asym3 cache");
+            assert_eq!(
+                gpu.pool_stats().0,
+                fresh,
+                "failed asym3 construction at seam {fail_at} leaked owners instead of rolling them back",
+            );
+        }
+        gpu.drain_pool();
+    }
+}
+/// Native fp8 + flat bf16 format contract tests (GPU-free).
+///
+/// Pins the frozen §2.1 layout (1032-byte fp8 rows, 2048-byte bf16 rows at
+/// Hkv4/D256), the VMM admission matrix, tier exclusivity, and the exact
+/// CPU model of the writer's scale/code rule that O's screen assumes:
+/// smallest f16 `s >= amax/448` (floor 2^-24, zero row → 1.0), codes
+/// `E4M3_RNE(x / f32(s))` with a next-up bump when `448*f32(s) < amax`,
+/// decode `f16(f32(s) * e4m3(code))`. OCP E4M3FN numbers: bias 7, max 448,
+/// min normal 2^-6, min subnormal 2^-9, RNE, finite saturation, NaN 0x7F.
+#[cfg(test)]
+mod fp8_bf16_format_tests {
+    use super::*;
+
+    // ── layout sizing ────────────────────────────────────────────────
+
+    #[test]
+    fn canonical_rows_match_frozen_strides() {
+        assert_eq!(KvCache::fp8_row_bytes(4, 256).unwrap(), 1032);
+        assert_eq!(KvCache::bf16_row_bytes(4, 256).unwrap(), 2048);
+        // Head-major codes then packed f16 scales / flat bf16, no padding.
+        assert_eq!(KvCache::fp8_row_bytes(1, 256).unwrap(), 258);
+        assert_eq!(KvCache::bf16_row_bytes(8, 128).unwrap(), 2048);
+    }
+
+    #[test]
+    fn row_helpers_reject_degenerate_and_overflow() {
+        for bad in [
+            KvCache::fp8_row_bytes(0, 256),
+            KvCache::fp8_row_bytes(4, 0),
+            KvCache::bf16_row_bytes(0, 256),
+            KvCache::bf16_row_bytes(4, 0),
+            KvCache::fp8_row_bytes(usize::MAX, 256),
+            KvCache::bf16_row_bytes(usize::MAX, 256),
+        ] {
+            assert!(bad.is_err());
+        }
+    }
+
+    // ── admission matrix (GPU-free validation) ───────────────────────
+
+    fn mask_dims(head_dim: usize, cap: Option<usize>) -> KvDims {
+        KvDims {
+            layers: KvLayers::Mask(vec![true, false, true]),
+            n_kv_heads: 4,
+            head_dim,
+            max_seq: 1024,
+            physical_cap: cap,
+        }
+    }
+
+    #[test]
+    fn validate_admits_fp8_bf16_legacy_and_vmm() {
+        // Legacy: fp8 exact geometry, bf16 any non-zero geometry.
+        KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Legacy,
+            true,
+            &mask_dims(256, None),
+        )
+        .unwrap();
+        KvCache::validate_mode_with_backend(
+            KvMode::Bf16,
+            KvBackend::Legacy,
+            true,
+            &mask_dims(128, None),
+        )
+        .unwrap();
+        let err = KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Legacy,
+            true,
+            &mask_dims(128, None),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("head_dim=256"), "{err}");
+        // VMM: mask + cap required, single-GPU only, exact geometry.
+        KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap();
+        KvCache::validate_mode_with_backend(
+            KvMode::Bf16,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap();
+        let err = KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(128, Some(512)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("head_dim=256"), "{err}");
+        let err = KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            false,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("single-GPU"), "{err}");
+        let flat = KvDims {
+            layers: KvLayers::Flat(64),
+            n_kv_heads: 4,
+            head_dim: 256,
+            max_seq: 1024,
+            physical_cap: Some(512),
+        };
+        let err = KvCache::validate_mode_with_backend(KvMode::Fp8, KvBackend::Vmm, true, &flat)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("filtered"), "{err}");
+    }
+
+    #[test]
+    fn vmm_layout_strides_match_row_helpers() {
+        let fp8 = KvCache::vmm_static_layout(KvMode::Fp8, VMode::Q8, 4, 256, 64).unwrap();
+        assert_eq!(fp8.k_bytes_per_token, 1032);
+        assert_eq!(fp8.v_bytes_per_token, 1032);
+        assert_eq!(fp8.k_reserve_bytes, 64 * 1032);
+        assert_eq!(fp8.rotation_table_len, 0);
+        let bf16 = KvCache::vmm_static_layout(KvMode::Bf16, VMode::Q8, 4, 256, 64).unwrap();
+        assert_eq!(bf16.k_bytes_per_token, 2048);
+        assert_eq!(bf16.v_bytes_per_token, 2048);
+        assert_eq!(bf16.rotation_table_len, 0);
+        // K/V indivisible: lloyd-V never pairs with fp8/bf16 K.
+        assert!(KvCache::vmm_static_layout(KvMode::Fp8, VMode::Lloyd4, 4, 256, 64).is_err());
+        assert!(KvCache::vmm_static_layout(KvMode::Bf16, VMode::Lloyd2, 4, 256, 64).is_err());
+        assert!(KvCache::vmm_static_layout(KvMode::Bf16, VMode::Q8, 4, 0, 64).is_err());
+    }
+
+    // ── live-flag decode ─────────────────────────────────────────────
+
+    fn indivisible_standin(fp8: bool, bf16: bool) -> KvCache {
+        KvCache {
+            k_gpu: vec![],
+            v_gpu: vec![],
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: 4 * 256,
+            max_seq: 128,
+            physical_cap: 128,
+            n_kv_heads: 4,
+            head_dim: 256,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: bf16,
+            quant_fp8: fp8,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        }
+    }
+
+    #[test]
+    fn live_strides_and_modes_resolve() {
+        let fp8 = indivisible_standin(true, false);
+        assert_eq!(fp8.current_kv_mode().unwrap(), KvMode::Fp8);
+        assert_eq!(fp8.vmm_bytes_per_token().unwrap(), (1032, 1032));
+        assert_eq!(fp8.fp8_bytes_per_token().unwrap(), 1032);
+        assert!(fp8.bf16_bytes_per_token().is_err());
+        let bf16 = indivisible_standin(false, true);
+        assert_eq!(bf16.current_kv_mode().unwrap(), KvMode::Bf16);
+        assert_eq!(bf16.vmm_bytes_per_token().unwrap(), (2048, 2048));
+        assert_eq!(bf16.bf16_bytes_per_token().unwrap(), 2048);
+        assert!(bf16.fp8_bytes_per_token().is_err());
+    }
+
+    #[test]
+    fn indivisible_tiers_stay_out_of_residual_ladders() {
+        for cache in [
+            indivisible_standin(true, false),
+            indivisible_standin(false, true),
+        ] {
+            assert!(!cache.quant_q4_residual());
+            assert!(!cache.is_hfq8_kv());
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "no 5-flag VMM bundle representation")]
+    fn vmm_mode_flags_rejects_fp8() {
+        let _ = KvCache::vmm_mode_flags(KvMode::Fp8);
+    }
+
+    #[test]
+    #[should_panic(expected = "no 5-flag VMM bundle representation")]
+    fn vmm_mode_flags_rejects_bf16() {
+        let _ = KvCache::vmm_mode_flags(KvMode::Bf16);
+    }
+
+    // ── CPU model of the §2.1 writer rule ────────────────────────────
+    //
+    // OCP E4M3FN as frozen: bias 7, max finite 448, min normal 2^-6, min
+    // subnormal 2^-9, RNE, finite saturation, NaN 0x7F/0xFF, no infinities.
+
+    /// RNE f32 → f16 bit pattern; overflows saturate to max finite (the
+    /// writer's domain is finite and the oracle rejects the rest).
+    fn f32_to_f16_rne_bits(x: f32) -> u16 {
+        let b = x.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let e = ((b >> 23) & 0xff) as i32;
+        let m = b & 0x7f_ffff;
+        if e == 0xff {
+            return sign | 0x7bff;
+        }
+        if e == 0 {
+            return sign;
+        }
+        let unbiased = e - 127;
+        if unbiased > 15 {
+            return sign | 0x7bff;
+        }
+        if unbiased >= -14 {
+            let mut m16 = m >> 13;
+            let rest = m & 0x1fff;
+            if rest > 0x1000 || (rest == 0x1000 && (m16 & 1) == 1) {
+                m16 += 1;
+                if m16 == 0x400 {
+                    let e16 = unbiased + 16;
+                    if e16 >= 31 {
+                        return sign | 0x7bff;
+                    }
+                    return sign | ((e16 as u16) << 10);
+                }
+            }
+            return sign | (((unbiased + 15) as u16) << 10) | (m16 as u16);
+        }
+        if unbiased < -25 {
+            return sign;
+        }
+        // Subnormal: value = M * 2^(unbiased-23), unit 2^-24.
+        let full = m | 0x80_0000;
+        let shift = (-unbiased - 1) as u32;
+        let mut m16 = full >> shift;
+        let rest = full & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        if rest > half || (rest == half && (m16 & 1) == 1) {
+            m16 += 1;
+        }
+        if m16 >= 0x400 {
+            return sign | (1 << 10);
+        }
+        sign | (m16 as u16)
+    }
+
+    fn f16_to_f32(bits: u16) -> f32 {
+        let s = ((bits >> 15) & 1) as u32;
+        let e = ((bits >> 10) & 0x1f) as i32;
+        let m = (bits & 0x3ff) as u32;
+        let fbits = if e == 0 {
+            // Subnormal: m * 2^-24.
+            if m == 0 {
+                s << 31
+            } else {
+                // Normalize into f32 range exactly.
+                let mut mm = m;
+                let mut ee: i32 = -14;
+                while mm & 0x400 == 0 {
+                    mm <<= 1;
+                    ee -= 1;
+                }
+                mm &= 0x3ff;
+                (s << 31) | (((ee + 127) as u32) << 23) | (mm << 13)
+            }
+        } else if e == 0x1f {
+            (s << 31) | (0xff << 23) | (m << 13)
+        } else {
+            (s << 31) | (((e - 15 + 127) as u32) << 23) | (m << 13)
+        };
+        f32::from_bits(fbits)
+    }
+
+    /// RNE f32 → E4M3FN byte (bias 7, saturating, NaN → sign-preserving
+    /// 0x7F/0xFF, infinities saturate; E=15/m=7 is never emitted for
+    /// finite inputs — those saturate to 448).
+    fn e4m3_encode_rne(x: f32) -> u8 {
+        let b = x.to_bits();
+        let sign = if b & 0x8000_0000 != 0 { 0x80 } else { 0 };
+        let e = ((b >> 23) & 0xff) as i32;
+        let m = b & 0x7f_ffff;
+        if e == 0xff {
+            if m == 0 {
+                return sign | 0x7e;
+            }
+            return sign | 0x7f;
+        }
+        if e == 0 {
+            return sign;
+        }
+        let unbiased = e - 127;
+        if unbiased > 8 {
+            return sign | 0x7e;
+        }
+        if unbiased >= -6 {
+            let field = unbiased + 7;
+            let mut m3 = m >> 20;
+            let rest = m & 0xf_ffff;
+            if rest > 0x8_0000 || (rest == 0x8_0000 && (m3 & 1) == 1) {
+                m3 += 1;
+            }
+            let (mut ef, mut mm) = (field, m3);
+            if mm == 8 {
+                mm = 0;
+                ef += 1;
+            }
+            if ef > 15 || (ef == 15 && mm == 7) {
+                return sign | 0x7e;
+            }
+            return sign | ((ef as u8) << 3) | (mm as u8);
+        }
+        if unbiased < -10 {
+            return sign;
+        }
+        // Subnormal: value = M * 2^(unbiased-23), unit 2^-9.
+        let full = m | 0x80_0000;
+        let shift = (14 - unbiased) as u32;
+        let mut m3 = full >> shift;
+        let rest = full & ((1u32 << shift) - 1);
+        let half = 1u32 << (shift - 1);
+        if rest > half || (rest == half && (m3 & 1) == 1) {
+            m3 += 1;
+        }
+        if m3 >= 8 {
+            return sign | 0x08;
+        }
+        sign | (m3 as u8)
+    }
+
+    fn e4m3_decode(code: u8) -> f32 {
+        let s = (code & 0x80) != 0;
+        let e = ((code >> 3) & 0x0f) as i32;
+        let m = (code & 7) as f32;
+        let v = if e == 0 {
+            m * 2f32.powi(-9)
+        } else if e == 15 {
+            if m as u8 == 7 {
+                f32::NAN
+            } else {
+                2f32.powi(8) * (1.0 + m / 8.0)
+            }
+        } else {
+            2f32.powi(e - 7) * (1.0 + m / 8.0)
+        };
+        if s {
+            -v
+        } else {
+            v
+        }
+    }
+
+    /// Frozen scale rule: smallest positive f16 `s >= amax/448`, floor
+    /// 2^-24, zero row → 1.0, next-up bump when `448*f32(s) < amax`.
+    fn fp8_pick_scale_bits(amax: f32) -> u16 {
+        if !(amax > 0.0) {
+            return 0x3c00;
+        }
+        let mut s = f32_to_f16_rne_bits(amax / KvCache::FP8_E4M3_MAX_F32);
+        if s < 0x0001 {
+            s = 0x0001;
+        }
+        if KvCache::FP8_E4M3_MAX_F32 * f16_to_f32(s) < amax {
+            s = if s >= 0x7bff { 0x7bff } else { s + 1 };
+        }
+        s
+    }
+
+    #[test]
+    fn e4m3_codec_known_vectors() {
+        assert_eq!(e4m3_encode_rne(0.0), 0x00);
+        assert_eq!(e4m3_encode_rne(-0.0), 0x80);
+        assert_eq!(e4m3_encode_rne(1.0), 0x38);
+        assert_eq!(e4m3_encode_rne(-1.0), 0xb8);
+        assert_eq!(e4m3_encode_rne(0.5), 0x30);
+        assert_eq!(e4m3_encode_rne(448.0), 0x7e);
+        assert_eq!(e4m3_encode_rne(-448.0), 0xfe);
+        // Finite saturation (hardware cvt saturates; never NaN/Inf).
+        assert_eq!(e4m3_encode_rne(500.0), 0x7e);
+        assert_eq!(e4m3_encode_rne(-500.0), 0xfe);
+        assert_eq!(e4m3_encode_rne(f32::INFINITY), 0x7e);
+        assert_eq!(e4m3_encode_rne(f32::NAN), 0x7f);
+        // Subnormal floor and exact decode points.
+        assert_eq!(e4m3_encode_rne(2f32.powi(-9)), 0x01);
+        assert_eq!(e4m3_decode(0x38), 1.0);
+        assert_eq!(e4m3_decode(0xb8), -1.0);
+        assert_eq!(e4m3_decode(0x01), 2f32.powi(-9));
+        assert_eq!(e4m3_decode(0x7e), 448.0);
+        assert!(e4m3_decode(0x7f).is_nan());
+        // RNE tie: halfway between 1.0 (0x38) and 1.125 (0x39) is 1.0625;
+        // even mantissa (0) wins → 0x38.
+        assert_eq!(e4m3_encode_rne(1.0625), 0x38);
+    }
+
+    #[test]
+    fn f16_rne_known_vectors() {
+        assert_eq!(f32_to_f16_rne_bits(1.0), 0x3c00);
+        assert_eq!(f32_to_f16_rne_bits(0.5), 0x3800);
+        assert_eq!(f32_to_f16_rne_bits(65504.0), 0x7bff);
+        assert_eq!(f32_to_f16_rne_bits(100000.0), 0x7bff);
+        assert_eq!(f32_to_f16_rne_bits(2f32.powi(-24)), 0x0001);
+        assert_eq!(f32_to_f16_rne_bits(0.0), 0x0000);
+        // Tie 1+2^-11 → even (0x3c00), not up.
+        assert_eq!(f32_to_f16_rne_bits(1.0 + 2f32.powi(-11)), 0x3c00);
+        // Just above the tie → up.
+        assert_eq!(f32_to_f16_rne_bits(1.0 + 2f32.powi(-10)), 0x3c01);
+        // Round-trip through the exact decoder.
+        for bits in [0x0000u16, 0x0001, 0x03ff, 0x0400, 0x3c00, 0x7bff] {
+            assert_eq!(f32_to_f16_rne_bits(f16_to_f32(bits)), bits);
+        }
+    }
+
+    #[test]
+    fn scale_selection_zero_floor_and_bump() {
+        // All-zero row → canonical s=1, zero codes by construction.
+        assert_eq!(fp8_pick_scale_bits(0.0), 0x3c00);
+        // amax/448 rounds to zero in f16 → pin to the 2^-24 floor.
+        assert_eq!(fp8_pick_scale_bits(1e-5), 0x0001);
+        // Exact unity.
+        assert_eq!(fp8_pick_scale_bits(448.0), 0x3c00);
+        // Upward-half case: f16(448.01/448) rounds DOWN to 1.0, but
+        // 448*1.0 < 448.01, so the stored scale bumps one ulp.
+        let bumped = fp8_pick_scale_bits(448.01);
+        assert_eq!(bumped, 0x3c01);
+        assert!(KvCache::FP8_E4M3_MAX_F32 * f16_to_f32(bumped) >= 448.01);
+        // Bumped scale is still the SMALLEST f16 covering amax.
+        assert!(KvCache::FP8_E4M3_MAX_F32 * f16_to_f32(bumped - 1) < 448.01);
+    }
+
+    fn xorshift(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn writer_rule_round_trip_stays_within_one_ulp() {
+        // Deterministic rows across five magnitude decades. Error is
+        // measured in the scaled domain (|decode(code) - x/s|), isolating
+        // the codec from the scale choice: normals get ≤6.5% relative,
+        // subnormals get an absolute 2^-10 floor.
+        let mut state = 0x243f_6a88u32;
+        for _row in 0..32 {
+            let mut xs = [0f32; 256];
+            let mut amax = 0f32;
+            // Keep every row's amax inside the finite domain.
+            let exp = (xorshift(&mut state) % 17) as i32 - 10;
+            for x in xs.iter_mut() {
+                let mant = 1.0 + (xorshift(&mut state) % 1000) as f32 / 1000.0;
+                let sign = if xorshift(&mut state) & 1 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                *x = sign * mant * 2f32.powi(exp);
+                amax = amax.max(x.abs());
+            }
+            let s_bits = fp8_pick_scale_bits(amax);
+            let s = f16_to_f32(s_bits);
+            assert!(s > 0.0 && s.is_finite());
+            assert!(KvCache::FP8_E4M3_MAX_F32 * s >= amax);
+            let mut worst = 0f32;
+            for x in xs {
+                let code = e4m3_encode_rne(x / s);
+                let v = e4m3_decode(code);
+                let target = x / s;
+                let bound = (target.abs() * 0.065).max(2f32.powi(-10));
+                let err = (v - target).abs();
+                assert!(
+                    err <= bound,
+                    "x={x} s={s} code={code:#x} err={err} bound={bound}"
+                );
+                worst = worst.max(err);
+                // Fill-side decode point: f16(f32(s) * code) stays finite.
+                let fill = f32_to_f16_rne_bits(s * v);
+                assert_ne!(fill, 0x7c00, "fill decode overflowed to Inf");
+            }
+            let _ = worst;
+        }
+        // Zero row: canonical scale, every code zero, decode exact.
+        let s_bits = fp8_pick_scale_bits(0.0);
+        assert_eq!(s_bits, 0x3c00);
+        assert_eq!(e4m3_encode_rne(0.0 / f16_to_f32(s_bits)), 0x00);
+    }
+}
+
+/// Slot-pool tier-plan truth table: strides must equal the constructor
+/// formulas (`expected_k_bph` above) and the Q8_0 V stride, the rotation
+/// metadata must match the tier family, and the geometry gates must refuse
+/// what the constructors refuse.
+#[cfg(test)]
+mod slot_kv_plan_tests {
+    use super::*;
+
+    #[test]
+    fn strides_match_constructor_formulas() {
+        let n_kv_heads = 8usize;
+        for (mode, hd, k_bph) in [
+            (KvMode::Q8, 256usize, 8 * 34usize),
+            (KvMode::Asym2, 128, 4 + 128 / 4),
+            (KvMode::Asym2, 256, 4 + 256 / 4),
+            (KvMode::Asym3, 256, 4 + (256 * 3) / 8),
+            (KvMode::Asym4, 128, 4 + 128 / 2),
+            (KvMode::Asym4, 256, 4 + 256 / 2),
+            (KvMode::Fwht2, 256, 4 + 256 / 4),
+            (KvMode::Fwht3, 256, 4 + (256 * 3) / 8),
+            (KvMode::Fwht4, 256, 4 + 256 / 2),
+        ] {
+            let p = SlotKvTierPlan::resolve(mode, n_kv_heads, hd)
+                .unwrap_or_else(|e| panic!("{mode:?} hd={hd}: {e}"));
+            assert_eq!(p.k_bytes_per_pos, n_kv_heads * k_bph, "{mode:?} hd={hd}");
+            assert_eq!(
+                p.v_bytes_per_pos,
+                n_kv_heads * (hd / 32) * 34,
+                "{mode:?} hd={hd} V must be Q8_0 stride"
+            );
+            assert_eq!(
+                p.kv_strides_differ(),
+                !matches!(mode, KvMode::Q8),
+                "{mode:?}: only q8 shares the K/V stride"
+            );
+        }
+    }
+
+    #[test]
+    fn q8_shares_strides_and_has_no_tables() {
+        let p = SlotKvTierPlan::resolve(KvMode::Q8, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, p.v_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+    }
+
+    #[test]
+    fn bf16_is_flat_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::Bf16, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+    }
+
+    #[test]
+    fn f16_is_flat_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::F16, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+        // And the VMM gate refuses it — the tier is slots/contiguous only.
+        let err = KvCache::vmm_static_layout(KvMode::F16, VMode::Q8, 4, 256, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("f16"), "{err}");
+    }
+
+    /// fp8 stores BOTH arenas in the `[Hkv*D codes][Hkv f16 scales]` row
+    /// layout (the fp8 tile decodes V with K's per-pos stride), so K and V
+    /// strides are EQUAL and no rotation table exists. Hkv=4/D=256 →
+    /// 4*258 = 1032 B/pos/side, the same number `fp8_e4m3_row_bytes`
+    /// computes on the kernel side.
+    #[test]
+    fn fp8_is_scale_inline_strided_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::Fp8, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 258);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+        // The stride scales with Hkv at the fixed D256 the kernels pin.
+        let p8 = SlotKvTierPlan::resolve(KvMode::Fp8, 8, 256).unwrap();
+        assert_eq!(p8.k_bytes_per_pos, 8 * 258);
+        assert_eq!(p8.v_bytes_per_pos, p8.k_bytes_per_pos);
+    }
+
+    /// The fp8 write/read kernels read exactly 32 lanes × 8 dims per head,
+    /// so head_dim must be 256 — anything else is refused with a named
+    /// error instead of describing a layout no kernel can serve.
+    #[test]
+    fn fp8_head_dim_gate_is_256_only() {
+        for hd in [64usize, 128, 512] {
+            let err = SlotKvTierPlan::resolve(KvMode::Fp8, 4, hd)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("fp8"), "hd={hd}: {err}");
+            assert!(err.contains("256"), "hd={hd}: {err}");
+        }
+        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 4, 256).is_ok());
+    }
+
+    #[test]
+    fn rotation_tables_match_tier_family() {
+        for m in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4] {
+            let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
+            assert_eq!(p.givens_len, Some(128), "{m:?}: head_dim/2 givens angles");
+            assert!(p.fwht_len.is_none(), "{m:?} must not carry fwht signs");
+        }
+        for m in [KvMode::Fwht2, KvMode::Fwht4] {
+            let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
+            assert_eq!(p.fwht_len, Some(128), "{m:?}: 128-wide sign vectors");
+            assert!(p.givens_len.is_none(), "{m:?} must not carry givens angles");
+        }
+        // fwht3's K-rotation kernel reads signs[0..255] — 256-wide, not 128.
+        let p = SlotKvTierPlan::resolve(KvMode::Fwht3, 2, 256).unwrap();
+        assert_eq!(p.fwht_len, Some(256), "Fwht3: 256-wide sign vectors");
+        assert!(p.givens_len.is_none(), "Fwht3 must not carry givens angles");
+    }
+
+    #[test]
+    fn geometry_gates_refuse_what_constructors_refuse() {
+        // asym3/fwht3 are 256-only (Qwen 3.5 geometry).
+        for m in [KvMode::Asym3, KvMode::Fwht3] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 128).is_err(), "{m:?} @128");
+        }
+        // asym2/asym4 accept 128 or 256, nothing else in between.
+        for m in [KvMode::Asym2, KvMode::Asym4] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 256).is_ok(), "{m:?} @256");
+            assert!(SlotKvTierPlan::resolve(m, 2, 64).is_err(), "{m:?} @64");
+        }
+        // Packed tiers need head_dim % 32.
+        for m in [KvMode::Q8, KvMode::Asym3, KvMode::Fwht4] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 100).is_err(), "{m:?} @100");
+        }
+        // fp8 is pinned to the kernels' fixed 32x8/head geometry: 256 only
+        // (see fp8_head_dim_gate_is_256_only for the named-error shape).
+        assert!(SlotKvTierPlan::resolve(KvMode::Fp8, 2, 128).is_err());
+        // Zero heads refused.
+        assert!(SlotKvTierPlan::resolve(KvMode::Q8, 0, 256).is_err());
+    }
+}

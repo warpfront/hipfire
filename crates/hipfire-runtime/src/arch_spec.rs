@@ -24,6 +24,7 @@
 use hip_bridge::{DeviceBuffer, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::pipeline::sandwich::{Rope, RopeKind};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::RotationPlan;
 use rdna_compute::{Gpu, GpuTensor};
@@ -118,11 +119,28 @@ pub trait DenseArch {
     > {
         Ok(None)
     }
+    /// Called once layer `l` is complete, while `scratch().x` holds its
+    /// post-FFN residual. Default no-op; llama uses it for DFlash hidden capture.
+    fn after_layer(&self, _gpu: &mut Gpu, _l: usize) -> HipResult<()> {
+        Ok(())
+    }
 }
 
 #[inline]
 fn herr(e: impl std::fmt::Display) -> hip_bridge::HipError {
     hip_bridge::HipError::new(0, &e.to_string())
+}
+
+/// Norm-step rotation and projection input for a group of projections that
+/// share one normed activation. A Givens (Paro) weight carries its own rotation
+/// sidecar, so no single rotated activation serves the group: the norm stays
+/// plain and every GEMV rotates its raw input (`GemvInput::Raw`).
+fn shared_input(rot: RotationPlan, x_rot: &GpuTensor) -> (RotationPlan, GemvInput<'_>) {
+    if rot == RotationPlan::Givens {
+        (RotationPlan::None, GemvInput::Raw(x_rot))
+    } else {
+        (rot, GemvInput::Prerotated(x_rot))
+    }
 }
 
 /// Shared dense-transformer decode forward for one token. Runs the per-layer op
@@ -134,6 +152,8 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
 
     for l in 0..arch.n_layers() {
         let layer = arch.layer(l);
+        let (qkv_rot, qkv_in) = shared_input(layer.qkv_rot, s.x_rot);
+        let (ffn_rot, ffn_in) = shared_input(layer.ffn_rot, s.x_rot);
 
         // The attention block as one contiguous step list: QKV (fuses to
         // FusedQkv*), bias, qk-norm, RoPE — then, on the `Some` path, the
@@ -150,21 +170,22 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
                 awq_scale: layer.qkv_awq,
                 k: layer.qkv_k,
                 eps: k.norm_eps,
-                rotation: layer.qkv_rot,
+                rotation: qkv_rot,
+                rows: 1,
             },
             Step::Gemv {
                 w: &layer.wq,
-                input: GemvInput::Prerotated(s.x_rot),
+                input: qkv_in,
                 out: s.q,
             },
             Step::Gemv {
                 w: &layer.wk,
-                input: GemvInput::Prerotated(s.x_rot),
+                input: qkv_in,
                 out: s.k,
             },
             Step::Gemv {
                 w: &layer.wv,
-                input: GemvInput::Prerotated(s.x_rot),
+                input: qkv_in,
                 out: s.v,
             },
         ];
@@ -215,10 +236,14 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
             q: s.q,
             k: s.k,
             pos_buf: s.pos_buf,
+            positions: None,
             n_heads: k.n_heads,
             n_kv_heads: k.n_kv_heads,
             head_dim: k.head_dim,
-            theta: k.rope_theta,
+            rope: Rope {
+                kind: RopeKind::RotateHalf,
+                theta: k.rope_theta,
+            },
         });
 
         let o_proj = Step::GemvResidual {
@@ -257,16 +282,17 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
                     awq_scale: layer.ffn_awq,
                     k: layer.ffn_k,
                     eps: k.norm_eps,
-                    rotation: layer.ffn_rot,
+                    rotation: ffn_rot,
+                    rows: 1,
                 },
                 Step::Gemv {
                     w: &layer.w_gate,
-                    input: GemvInput::Prerotated(s.x_rot),
+                    input: ffn_in,
                     out: s.gate,
                 },
                 Step::Gemv {
                     w: &layer.w_up,
-                    input: GemvInput::Prerotated(s.x_rot),
+                    input: ffn_in,
                     out: s.up,
                 },
             ],
@@ -286,6 +312,7 @@ pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -
             }],
         )
         .map_err(herr)?;
+        arch.after_layer(gpu, l)?;
     }
 
     Ok(())

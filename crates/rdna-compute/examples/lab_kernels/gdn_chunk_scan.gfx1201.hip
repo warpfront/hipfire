@@ -1,0 +1,478 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+
+// LAB-ONLY shape-parameterised copy of the production gdn_chunk_scan.gfx1201.hip.
+// Shape macros (override with -D at runtime compile; defaults reproduce the
+// production 16/48/ratio3/XDIM10240/UNITS80 build exactly):
+//   GDN_LAB_HK    key heads                    (default 16)
+//   GDN_LAB_HV    value heads                  (default 48)
+//   GDN_LAB_RATIO value heads per key head     (default HV/HK)
+//   GDN_LAB_UNITS 128-wide conv/QKV units      (default 2*HK+HV)
+//   GDN_LAB_XDIM  conv channel row width       (default UNITS*128)
+// A3B: -DGDN_LAB_HK=16 -DGDN_LAB_HV=32 -DGDN_LAB_RATIO=2 -DGDN_LAB_XDIM=8192 -DGDN_LAB_UNITS=64
+#ifndef GDN_LAB_HK
+#define GDN_LAB_HK 16
+#endif
+#ifndef GDN_LAB_HV
+#define GDN_LAB_HV 48
+#endif
+#ifndef GDN_LAB_RATIO
+#define GDN_LAB_RATIO ((GDN_LAB_HV) / (GDN_LAB_HK))
+#endif
+#ifndef GDN_LAB_UNITS
+#define GDN_LAB_UNITS (2 * (GDN_LAB_HK) + (GDN_LAB_HV))
+#endif
+#ifndef GDN_LAB_XDIM
+#define GDN_LAB_XDIM ((GDN_LAB_UNITS) * 128)
+#endif
+#if ((GDN_LAB_HK) * (GDN_LAB_RATIO) != (GDN_LAB_HV))
+#error "GDN_LAB_HV must equal GDN_LAB_HK * GDN_LAB_RATIO"
+#endif
+#if ((GDN_LAB_UNITS) != 2 * (GDN_LAB_HK) + (GDN_LAB_HV))
+#error "GDN_LAB_UNITS must equal 2*HK+HV"
+#endif
+#if ((GDN_LAB_XDIM) != (GDN_LAB_UNITS) * 128)
+#error "GDN_LAB_XDIM must equal UNITS*128"
+#endif
+#define GS_HK (GDN_LAB_HK)
+#define GS_HV (GDN_LAB_HV)
+#define GS_RATIO (GDN_LAB_RATIO)
+#define GS_HKU ((unsigned)(GDN_LAB_HK))
+#define GS_HVU ((unsigned)(GDN_LAB_HV))
+#define GS_C 64
+#define GS_D 128
+#define GS_BV 64
+#define GS_KP 132
+#define GS_AP 68
+#ifdef GDN_SCAN_MULTISEG
+// Multi-segment launch (`gdn_chunk_scan_bf16_mseg`, HIPFIRE_GDN_SCAN_MSEG):
+// T is the layer's whole row count, walked in commit segments of GS_SEG rows.
+#define GS_SEG 512
+#endif
+
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define GDN_CHUNK_GFX12 1
+typedef _Float16 gs_bfrag __attribute__((ext_vector_type(8)));
+#else
+#define GDN_CHUNK_GFX12 0
+typedef _Float16 gs_bfrag __attribute__((ext_vector_type(16)));
+#endif
+typedef float gs_f8 __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ float gs_bf(unsigned short x){return __half2float(__ushort_as_half(x));}
+__device__ __forceinline__ unsigned short gs_b16(float x){return __half_as_ushort(__float2half_rn(x));}
+// Scan output format (host-selected module variants; the default build is
+// unchanged). GDN_SCAN_OUT_EMU=1/2 is the diagnostic emulation: every `out`
+// value is rounded to bf16/f16 RNE and still stored as f32.
+// GDN_SCAN_OUT_BF16 stores the EMU=1 values' bf16 bits as a 16-bit plane
+// (same [T][HV][128] element layout, half the bytes).
+#ifndef GDN_SCAN_OUT_EMU
+#define GDN_SCAN_OUT_EMU 0
+#endif
+#if GDN_SCAN_OUT_EMU && defined(GDN_SCAN_OUT_BF16)
+#error "GDN_SCAN_OUT_EMU and GDN_SCAN_OUT_BF16 are exclusive"
+#endif
+#ifndef GDN_CHUNK_SCAN_KERNEL
+#define GDN_CHUNK_SCAN_KERNEL gdn_chunk_scan
+#endif
+__device__ __forceinline__ unsigned short gs_bf16_rne(float x){unsigned u=__float_as_uint(x);
+ if((u&0x7fffffffu)>0x7f800000u)return (unsigned short)((u>>16)|0x40u);
+ return (unsigned short)((u+0x7fffu+((u>>16)&1u))>>16);}
+__device__ __forceinline__ float gs_out_emu(float x){
+#if GDN_SCAN_OUT_EMU==1
+ return __uint_as_float((unsigned)gs_bf16_rne(x)<<16);
+#elif GDN_SCAN_OUT_EMU==2
+ return __half2float(__float2half_rn(x));
+#else
+ return x;
+#endif
+}
+#ifdef GDN_SCAN_OUT_BF16
+typedef unsigned short gs_out_t;
+#else
+typedef float gs_out_t;
+#endif
+__device__ __forceinline__ gs_f8 gs_z8(){return (gs_f8){0,0,0,0,0,0,0,0};}
+__device__ __forceinline__ gs_f8 gs_mma(gs_bfrag a,gs_bfrag b,gs_f8 c){
+#if GDN_CHUNK_GFX12
+ return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a,b,c);
+#else
+ return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b,c);
+#endif
+}
+__device__ __forceinline__ int gs_acc_row(int lane,int elem){
+#if GDN_CHUNK_GFX12
+ return 8*(lane>>4)+elem;
+#else
+ return 2*elem+(lane>>4);
+#endif
+}
+__device__ __forceinline__ gs_bfrag gs_frag(const unsigned short*p,int pitch,int row0,int k0,int lane){union{unsigned short h[sizeof(gs_bfrag)/sizeof(unsigned short)];gs_bfrag v;}u;int r=row0+(lane&15);
+#if GDN_CHUNK_GFX12
+ int k=k0+4*(lane>>4);
+#pragma unroll
+ for(int e=0;e<4;++e){u.h[e]=p[r*pitch+k+e];u.h[e+4]=p[r*pitch+k+8+e];}
+#else
+#pragma unroll
+ for(int e=0;e<16;++e)u.h[e]=p[r*pitch+k0+e];
+#endif
+ return u.v;}
+__device__ __forceinline__ gs_bfrag gs_frag_t(const unsigned short*p,int pitch,int row0,int k0,int lane){union{unsigned short h[sizeof(gs_bfrag)/sizeof(unsigned short)];gs_bfrag v;}u;int r=row0+(lane&15);
+#if GDN_CHUNK_GFX12
+ int k=k0+4*(lane>>4);
+#pragma unroll
+ for(int e=0;e<4;++e){u.h[e]=p[(k+e)*pitch+r];u.h[e+4]=p[(k+8+e)*pitch+r];}
+#else
+#pragma unroll
+ for(int e=0;e<16;++e)u.h[e]=p[(k0+e)*pitch+r];
+#endif
+ return u.v;}
+__device__ __forceinline__ gs_bfrag gs_frag_g(const unsigned short*p,unsigned stride,int row0,int last,int k0,int lane){union{unsigned short h[sizeof(gs_bfrag)/sizeof(unsigned short)];gs_bfrag v;}u;int r=row0+(lane&15);if(r>last)r=last;
+#if GDN_CHUNK_GFX12
+ int k=k0+4*(lane>>4);
+#pragma unroll
+ for(int e=0;e<4;++e){u.h[e]=p[(unsigned)r*stride+k+e];u.h[e+4]=p[(unsigned)r*stride+k+8+e];}
+#else
+#pragma unroll
+ for(int e=0;e<16;++e)u.h[e]=p[(unsigned)r*stride+k0+e];
+#endif
+ return u.v;}
+// Exact gfx1201 runs a latency-hiding copy of the chunk loop (GS_G12_PIPE).
+// It keeps every LDS byte, WMMA operand, accumulation order and rounding of
+// the original loop, which every other target still compiles.
+#if defined(__gfx1201__)
+#define GS_G12_PIPE 1
+#else
+#define GS_G12_PIPE 0
+#endif
+// LDS-only workgroup barrier: the "local" fences keep in-flight global
+// prefetches in flight. Each wave waits for its own LDS ops before it signals:
+// s_wait_dscnt 0 on gfx12 (clang has no builtin for it, so the intrinsic is
+// bound by name; the legacy s_waitcnt is deprecated there), lgkmcnt(0) with
+// vmcnt/expcnt left open (s_waitcnt 0xFC07) on gfx11. The fence's own wait is
+// a soft wait that SIInsertWaitcnts may erase as redundant without seeing
+// loop-carried stores (llvm/llvm-project#220357), after which a read past the
+// barrier could overtake another wave's queued store (the gfx1151 VerifyAttn
+// race). The explicit wait cannot be erased.
+#if GDN_CHUNK_GFX12
+extern "C" __device__ void gs_wait_dscnt(unsigned short) __asm("llvm.amdgcn.s.wait.dscnt");
+#define GS_WAIT_LDS() gs_wait_dscnt(0)
+#else
+#define GS_WAIT_LDS() __builtin_amdgcn_s_waitcnt(0xFC07)
+#endif
+#define GS_BAR() do{__builtin_amdgcn_fence(__ATOMIC_RELEASE,"workgroup","local");GS_WAIT_LDS();__builtin_amdgcn_s_barrier();__builtin_amdgcn_fence(__ATOMIC_ACQUIRE,"workgroup","local");}while(0)
+
+struct __attribute__((aligned(16))) GsLds{
+ unsigned short score[GS_C][GS_AP];
+ unsigned short state[2][GS_BV][GS_KP];
+ unsigned short d[2][GS_BV][GS_AP];
+ float ctrl[4][GS_C];
+};
+
+#ifdef GDN_CHUNK_SCAN_F32_EDGE
+extern "C" __launch_bounds__(512,1)
+__global__ void gdn_chunk_scan_f32_edge(
+ const unsigned short* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,
+ const unsigned short* __restrict__ A,const float* __restrict__ G,const float* __restrict__ beta,
+ const float* __restrict__ h0,float* __restrict__ ht,float* __restrict__ out,int row0,int T){
+#else
+extern "C" __launch_bounds__(512,1)
+__global__ void GDN_CHUNK_SCAN_KERNEL(
+ const unsigned short* __restrict__ q,const unsigned short* __restrict__ k,const unsigned short* __restrict__ v,
+ const unsigned short* __restrict__ A,const float* __restrict__ G,const float* __restrict__ beta,
+ signed char* __restrict__ sq,float* __restrict__ sc,_Float16* __restrict__ ef,gs_out_t* __restrict__ out,int row0,int T){
+#endif
+#ifdef GDN_SCAN_MULTISEG
+ if(T<=0)return;
+#else
+ if(T<=0||T>512)return;
+#endif
+ const int head=(int)blockIdx.y;
+ if((int)blockIdx.x!=0||head>=GS_HV)return;
+ const int tid=(int)threadIdx.x,lane=tid&31,lo=lane&15,hi=lane>>4;
+#if GS_G12_PIPE
+ const int wave=__builtin_amdgcn_readfirstlane(tid>>5);
+#else
+ const int wave=tid>>5;
+#endif
+ const int half=wave>>3,swave=wave&7,vbase=half*GS_BV,keyhead=head/GS_RATIO;
+ const int kt0=(swave>>1)*2,vt0=(swave&1)*2;
+ __shared__ GsLds shared;
+ GsLds& sm=shared;
+
+ // Sixteen waves own the two BV=64 value tiles concurrently.  QK and the
+ // decay score are produced by the first eight waves, while half-private
+ // state and delta storage reuse the LDS formerly occupied by K and W.
+ gs_f8 St[4];
+#pragma unroll
+ for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){const int t=ki*2+vi;const int vv=vbase+(vt0+vi)*16+lo;
+#pragma unroll
+  for(int e=0;e<8;++e){const int key=(kt0+ki)*16+gs_acc_row(lane,e);
+#ifdef GDN_CHUNK_SCAN_F32_EDGE
+   St[t][e]=h0[((unsigned long long)head*GS_D+vv)*GS_D+key];
+#else
+   const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+key;
+   St[t][e]=(float)sq[off]*sc[head*GS_D+vv]+(float)ef[off];
+#endif
+  }}
+ auto stage_state=[&](){
+#pragma unroll
+  for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){int t=ki*2+vi;int vv=(vt0+vi)*16+lo;
+   for(int e=0;e<8;++e)sm.state[half][vv][(kt0+ki)*16+gs_acc_row(lane,e)]=gs_b16(St[t][e]);}
+ };
+#ifdef GDN_SCAN_MULTISEG
+ // One launch walks the layer's GS_SEG-row commit segments in order. Inside
+ // the loop row0/T/A name the segment exactly as the per-segment launch's
+ // arguments did (A offset to the segment's first row, as the host's
+ // batched-KKT view). Between segments the state takes the per-segment
+ // launch's q8/scale/EF round trip in registers (below); only the last
+ // segment stores it.
+ const int gs_T_all=T;const unsigned short* const gs_A_all=A;
+ for(int gs_seg0=0;gs_seg0<gs_T_all;gs_seg0+=GS_SEG){
+ const int row0=gs_seg0,T=gs_T_all-gs_seg0<GS_SEG?gs_T_all-gs_seg0:GS_SEG;
+ const unsigned short* const A=gs_A_all+(unsigned long long)gs_seg0*GS_HV*GS_C;
+#endif
+ const int nch=(T+GS_C-1)/GS_C;
+#if GS_G12_PIPE
+ // Scheduling-only differences from the #else loop:
+ //  * V and K tiles are staged with one 16-byte load per 8 halves, and all
+ //    global addresses are a uniform base plus a 32-bit lane offset;
+ //  * each of the 16 waves owns one K Q^T score tile (K rows pn, Q rows mt),
+ //    accumulated over kk=0..7 as before; tiles above the causal diagonal are
+ //    written as the same +0 without the unobserved product;
+ //  * the next kk's Q/K fragments and this chunk's A fragments are in flight
+ //    before the WMMAs that precede their use.
+ typedef const unsigned char* gs_gp;
+ const int mt=swave>>1,ntb=(swave&1)*2,pn=ntb+half,hx=swave*32+lane;
+ const bool doP=pn<=mt;
+ auto frag=[&](gs_gp b,unsigned rowbytes,int r0,int ls,int k0)->gs_bfrag{int r=r0+lo;if(r>ls)r=ls;
+  const unsigned off=(unsigned)r*rowbytes+(unsigned)(k0+4*hi)*2u;union{uint2 w[2];gs_bfrag v;}u;
+  u.w[0]=*reinterpret_cast<const uint2*>(b+off);u.w[1]=*reinterpret_cast<const uint2*>(b+off+16u);return u.v;};
+ for(int chunk=0;chunk<nch;++chunk){
+  const int local0=chunk*GS_C,parent0=row0+local0;int rows=T-local0;if(rows>GS_C)rows=GS_C;const int last=rows-1;
+  const float gl=G[(unsigned long long)(parent0+last)*GS_HV+head];
+  const gs_gp kb=reinterpret_cast<gs_gp>(k+((unsigned long long)parent0*GS_HK+keyhead)*GS_D);
+  const gs_gp qb=reinterpret_cast<gs_gp>(q+((unsigned long long)parent0*GS_HK+keyhead)*GS_D);
+  if(tid<GS_C){if(tid<rows){const unsigned long long go=(unsigned long long)(parent0+tid)*GS_HV+head;const float g=G[go];sm.ctrl[0][tid]=expf(g);sm.ctrl[1][tid]=expf(gl-g);sm.ctrl[2][tid]=g;sm.ctrl[3][tid]=beta[go];}else{sm.ctrl[0][tid]=0;sm.ctrl[1][tid]=0;sm.ctrl[2][tid]=0;sm.ctrl[3][tid]=0;}}
+  stage_state();
+  {const gs_gp vb=reinterpret_cast<gs_gp>(v+((unsigned long long)parent0*GS_HV+head)*GS_D+vbase);uint4 vw[2];
+#pragma unroll
+   for(int it=0;it<2;++it){const int idx=hx+it*256,r=idx>>3,rr=r<rows?r:last;vw[it]=*reinterpret_cast<const uint4*>(vb+(unsigned)rr*(GS_HVU*GS_D*2u)+(unsigned)(idx&7)*16u);}
+#pragma unroll
+   for(int it=0;it<2;++it){const int idx=hx+it*256,r=idx>>3,c=(idx&7)*8;const unsigned u[4]={vw[it].x,vw[it].y,vw[it].z,vw[it].w};
+#pragma unroll
+    for(int e=0;e<4;++e){sm.d[half][c+2*e][r]=(unsigned short)(u[e]&0xffffu);sm.d[half][c+2*e+1][r]=(unsigned short)(u[e]>>16);}}}
+  GS_BAR();
+
+  gs_f8 O[2]={gs_z8(),gs_z8()},U[2]={gs_z8(),gs_z8()},Pt=gs_z8();
+  gs_bfrag km=frag(kb,GS_HKU*GS_D*2u,mt*16,last,0),qq=frag(qb,GS_HKU*GS_D*2u,mt*16,last,0),kn=km;
+  if(doP)kn=frag(kb,GS_HKU*GS_D*2u,pn*16,last,0);
+#pragma unroll
+  for(int kk=0;kk<8;++kk){gs_bfrag km1=km,qq1=qq,kn1=kn;
+   if(kk<7){km1=frag(kb,GS_HKU*GS_D*2u,mt*16,last,(kk+1)*16);qq1=frag(qb,GS_HKU*GS_D*2u,mt*16,last,(kk+1)*16);if(doP)kn1=frag(kb,GS_HKU*GS_D*2u,pn*16,last,(kk+1)*16);}
+   __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+   for(int j=0;j<2;++j){gs_bfrag st=gs_frag(&sm.state[half][0][0],GS_KP,(ntb+j)*16,kk*16,lane);U[j]=gs_mma(km,st,U[j]);O[j]=gs_mma(st,qq,O[j]);}
+   if(doP)Pt=gs_mma(kn,qq,Pt);
+   km=km1;qq=qq1;kn=kn1;}
+  const float oge=sm.ctrl[0][mt*16+lo];
+#pragma unroll
+  for(int j=0;j<2;++j)for(int e=0;e<8;++e)O[j][e]*=oge;
+  {const int i=mt*16+lo;
+#pragma unroll
+   for(int e=0;e<8;++e){const int j0e=pn*16+gs_acc_row(lane,e);sm.score[i][j0e]=gs_b16((j0e<=i&&i<rows)?expf(sm.ctrl[2][i]-sm.ctrl[2][j0e])*Pt[e]:0.0f);}}
+  GS_BAR();
+
+  const gs_gp ab=reinterpret_cast<gs_gp>(A+(unsigned long long)local0*GS_HV*GS_C+(unsigned long long)head*GS_C);
+  gs_bfrag aa[4];
+#pragma unroll
+  for(int kk=0;kk<4;++kk)aa[kk]=frag(ab,GS_HVU*GS_C*2u,mt*16,last,kk*16);
+  __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+  for(int j=0;j<2;++j)
+#pragma unroll
+   for(int e=0;e<8;++e){int tok=mt*16+gs_acc_row(lane,e);int vv=(ntb+j)*16+lo;float z=sm.ctrl[3][tok]*(gs_bf(sm.d[half][vv][tok])-sm.ctrl[0][tok]*U[j][e]);sm.state[half][vv][tok]=gs_b16(z);}
+  GS_BAR();
+
+  gs_f8 Dacc[2]={gs_z8(),gs_z8()};
+#pragma unroll
+  for(int kk=0;kk<4;++kk){
+#pragma unroll
+   for(int j=0;j<2;++j)Dacc[j]=gs_mma(aa[kk],gs_frag(&sm.state[half][0][0],GS_KP,(ntb+j)*16,kk*16,lane),Dacc[j]);}
+#pragma unroll
+  for(int j=0;j<2;++j)for(int e=0;e<8;++e){int tok=mt*16+gs_acc_row(lane,e);sm.d[half][(ntb+j)*16+lo][tok]=gs_b16(Dacc[j][e]);}
+  GS_BAR();
+
+  uint4 kw[2];
+#pragma unroll
+  for(int it=0;it<2;++it){const int idx=tid+it*512,r=idx>>4,rr=r<rows?r:last;kw[it]=*reinterpret_cast<const uint4*>(kb+(unsigned)rr*(GS_HKU*GS_D*2u)+(unsigned)(idx&15)*16u);}
+#pragma unroll
+  for(int kk=0;kk<4;++kk){gs_bfrag score=gs_frag(&sm.score[0][0],GS_AP,mt*16,kk*16,lane);
+#pragma unroll
+   for(int j=0;j<2;++j)O[j]=gs_mma(gs_frag(&sm.d[half][0][0],GS_AP,(ntb+j)*16,kk*16,lane),score,O[j]);}
+  const int tok=mt*16+lo;
+  if(tok<rows){unsigned char*ob=reinterpret_cast<unsigned char*>(out+((unsigned long long)parent0*GS_HV+head)*GS_D+vbase);
+#pragma unroll
+   for(int j=0;j<2;++j){
+#ifdef GDN_SCAN_OUT_BF16
+    const unsigned off=(unsigned)tok*(GS_HVU*GS_D*2u)+(unsigned)((ntb+j)*16+8*hi)*2u;unsigned w[4];
+#pragma unroll
+    for(int e=0;e<4;++e)w[e]=(unsigned)gs_bf16_rne(O[j][2*e])|((unsigned)gs_bf16_rne(O[j][2*e+1])<<16);
+    *reinterpret_cast<uint4*>(ob+off)=make_uint4(w[0],w[1],w[2],w[3]);}}
+#else
+    const unsigned off=(unsigned)tok*(GS_HVU*GS_D*4u)+(unsigned)((ntb+j)*16+8*hi)*4u;
+    *reinterpret_cast<float4*>(ob+off)=make_float4(gs_out_emu(O[j][0]),gs_out_emu(O[j][1]),gs_out_emu(O[j][2]),gs_out_emu(O[j][3]));
+    *reinterpret_cast<float4*>(ob+off+16u)=make_float4(gs_out_emu(O[j][4]),gs_out_emu(O[j][5]),gs_out_emu(O[j][6]),gs_out_emu(O[j][7]));}}
+#endif
+  // The z tile in state[] has been dead since the previous barrier.
+#pragma unroll
+  for(int it=0;it<2;++it){const int idx=tid+it*512,r=idx>>4,c=(idx&15)*8;uint2*dst=reinterpret_cast<uint2*>(&sm.state[0][r][c]);dst[0]=make_uint2(kw[it].x,kw[it].y);dst[1]=make_uint2(kw[it].z,kw[it].w);}
+  GS_BAR();
+#pragma unroll
+  for(int j=0;j<2;++j)for(int e=0;e<8;++e){int t=mt*16+gs_acc_row(lane,e),vv=(ntb+j)*16+lo;sm.d[half][vv][t]=gs_b16(sm.ctrl[1][t]*gs_bf(sm.d[half][vv][t]));}
+  GS_BAR();
+
+  const float ec=expf(gl);
+#pragma unroll
+  for(int t=0;t<4;++t)for(int e=0;e<8;++e)St[t][e]*=ec;
+#pragma unroll
+  for(int kk=0;kk<4;++kk){gs_bfrag dv[2]={gs_frag(&sm.d[half][0][0],GS_AP,(vt0+0)*16,kk*16,lane),gs_frag(&sm.d[half][0][0],GS_AP,(vt0+1)*16,kk*16,lane)};
+#pragma unroll
+   for(int ki=0;ki<2;++ki){gs_bfrag kt=gs_frag_t(&sm.state[0][0][0],GS_KP,(kt0+ki)*16,kk*16,lane);
+#pragma unroll
+    for(int vi=0;vi<2;++vi)St[ki*2+vi]=gs_mma(kt,dv[vi],St[ki*2+vi]);}}
+  GS_BAR();
+ }
+#else
+ for(int chunk=0;chunk<nch;++chunk){
+  const int local0=chunk*GS_C,parent0=row0+local0;int rows=T-local0;if(rows>GS_C)rows=GS_C;const int last=rows-1;
+  const float gl=G[(unsigned long long)(parent0+last)*GS_HV+head];
+  const unsigned short*kbase=k+((unsigned long long)parent0*GS_HK+keyhead)*GS_D;
+  const unsigned short*qbase=q+((unsigned long long)parent0*GS_HK+keyhead)*GS_D;
+  if(tid<GS_C){if(tid<rows){const unsigned long long go=(unsigned long long)(parent0+tid)*GS_HV+head;const float g=G[go];sm.ctrl[0][tid]=expf(g);sm.ctrl[1][tid]=expf(gl-g);sm.ctrl[2][tid]=g;sm.ctrl[3][tid]=beta[go];}else{sm.ctrl[0][tid]=0;sm.ctrl[1][tid]=0;sm.ctrl[2][tid]=0;sm.ctrl[3][tid]=0;}}
+  stage_state();
+  for(int x=swave*32+lane;x<GS_C*GS_BV;x+=256){int r=x/GS_BV,c=x-r*GS_BV,rr=r<rows?r:last;sm.d[half][c][r]=v[((unsigned long long)(parent0+rr)*GS_HV+head)*GS_D+vbase+c];}
+  GS_BAR();
+
+  const int mt=swave>>1,ntb=(swave&1)*2;
+  gs_f8 O[2]={gs_z8(),gs_z8()},U[2]={gs_z8(),gs_z8()},P[2]={gs_z8(),gs_z8()};
+#pragma unroll
+  for(int kk=0;kk<8;++kk){gs_bfrag km=gs_frag_g(kbase,GS_HK*GS_D,mt*16,last,kk*16,lane);gs_bfrag qq=gs_frag_g(qbase,GS_HK*GS_D,mt*16,last,kk*16,lane);
+   for(int j=0;j<2;++j){gs_bfrag st=gs_frag(&sm.state[half][0][0],GS_KP,(ntb+j)*16,kk*16,lane);U[j]=gs_mma(km,st,U[j]);O[j]=gs_mma(st,qq,O[j]);if(half==0){gs_bfrag kn=gs_frag_g(kbase,GS_HK*GS_D,(ntb+j)*16,last,kk*16,lane);P[j]=gs_mma(kn,qq,P[j]);}}}
+  const float oge=sm.ctrl[0][mt*16+lo];
+#pragma unroll
+  for(int j=0;j<2;++j)for(int e=0;e<8;++e)O[j][e]*=oge;
+  if(half==0){
+#pragma unroll
+   for(int j=0;j<2;++j){const int i=mt*16+lo;
+#pragma unroll
+    for(int e=0;e<8;++e){const int j0e=(ntb+j)*16+gs_acc_row(lane,e);sm.score[i][j0e]=gs_b16((j0e<=i&&i<rows)?expf(sm.ctrl[2][i]-sm.ctrl[2][j0e])*P[j][e]:0.0f);}}
+  }
+  GS_BAR();
+#pragma unroll
+  for(int j=0;j<2;++j)
+#pragma unroll
+   for(int e=0;e<8;++e){int tok=mt*16+gs_acc_row(lane,e);int vv=(ntb+j)*16+lo;float z=sm.ctrl[3][tok]*(gs_bf(sm.d[half][vv][tok])-sm.ctrl[0][tok]*U[j][e]);sm.state[half][vv][tok]=gs_b16(z);}
+  GS_BAR();
+
+  const unsigned short*abase=A+(unsigned long long)local0*GS_HV*GS_C+(unsigned long long)head*GS_C;
+  gs_f8 Dacc[2]={gs_z8(),gs_z8()};
+#pragma unroll
+  for(int kk=0;kk<4;++kk){gs_bfrag aa=gs_frag_g(abase,GS_HV*GS_C,mt*16,last,kk*16,lane);
+#pragma unroll
+   for(int j=0;j<2;++j)Dacc[j]=gs_mma(aa,gs_frag(&sm.state[half][0][0],GS_KP,(ntb+j)*16,kk*16,lane),Dacc[j]);}
+#pragma unroll
+  for(int j=0;j<2;++j)for(int e=0;e<8;++e){int tok=mt*16+gs_acc_row(lane,e);sm.d[half][(ntb+j)*16+lo][tok]=gs_b16(Dacc[j][e]);}
+  GS_BAR();
+
+#pragma unroll
+  for(int kk=0;kk<4;++kk){gs_bfrag score=gs_frag(&sm.score[0][0],GS_AP,mt*16,kk*16,lane);
+#pragma unroll
+   for(int j=0;j<2;++j)O[j]=gs_mma(gs_frag(&sm.d[half][0][0],GS_AP,(ntb+j)*16,kk*16,lane),score,O[j]);}
+  const int tok=mt*16+lo;
+  if(tok<rows){
+#pragma unroll
+#ifdef GDN_SCAN_OUT_BF16
+   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int vv=vbase+(ntb+j)*16+gs_acc_row(lane,e);out[((unsigned long long)(parent0+tok)*GS_HV+head)*GS_D+vv]=gs_bf16_rne(O[j][e]);}}
+#else
+   for(int j=0;j<2;++j)for(int e=0;e<8;++e){int vv=vbase+(ntb+j)*16+gs_acc_row(lane,e);out[((unsigned long long)(parent0+tok)*GS_HV+head)*GS_D+vv]=gs_out_emu(O[j][e]);}}
+#endif
+  GS_BAR();
+#pragma unroll
+  for(int j=0;j<2;++j)for(int e=0;e<8;++e){int t=mt*16+gs_acc_row(lane,e),vv=(ntb+j)*16+lo;sm.d[half][vv][t]=gs_b16(sm.ctrl[1][t]*gs_bf(sm.d[half][vv][t]));}
+  for(int x=tid;x<GS_C*GS_D;x+=512){int r=x/GS_D,c=x-r*GS_D,rr=r<rows?r:last;sm.state[0][r][c]=kbase[(unsigned)rr*GS_HK*GS_D+c];}
+  GS_BAR();
+
+  const float ec=expf(gl);
+#pragma unroll
+  for(int t=0;t<4;++t)for(int e=0;e<8;++e)St[t][e]*=ec;
+#pragma unroll
+  for(int kk=0;kk<4;++kk){gs_bfrag dv[2]={gs_frag(&sm.d[half][0][0],GS_AP,(vt0+0)*16,kk*16,lane),gs_frag(&sm.d[half][0][0],GS_AP,(vt0+1)*16,kk*16,lane)};
+#pragma unroll
+   for(int ki=0;ki<2;++ki){gs_bfrag kt=gs_frag_t(&sm.state[0][0][0],GS_KP,(kt0+ki)*16,kk*16,lane);
+#pragma unroll
+    for(int vi=0;vi<2;++vi)St[ki*2+vi]=gs_mma(kt,dv[vi],St[ki*2+vi]);}}
+  GS_BAR();
+ }
+
+#endif
+#ifdef GDN_SCAN_MULTISEG
+ if(gs_seg0+GS_SEG<gs_T_all){
+  // The end-of-launch requant below, then the next launch's state load
+  // (float)sq*sc+(float)ef, without the global round trip (contraction is
+  // off in this module, so the products and sums round as there).
+  float vmax[2]={0,0};
+#pragma unroll
+  for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;
+#pragma unroll
+   for(int ki=0;ki<2;++ki){int t=ki*2+vi;
+#pragma unroll
+    for(int e=0;e<8;++e)vmax[vi]=fmaxf(vmax[vi],fabsf(St[t][e]));}
+   vmax[vi]=fmaxf(vmax[vi],__shfl_xor(vmax[vi],16));if(hi==0)reinterpret_cast<float*>(&sm.state[half][0][0])[(swave>>1)*GS_BV+vv-vbase]=vmax[vi];}
+  GS_BAR();
+#pragma unroll
+  for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;float mx=0;
+#pragma unroll
+   for(int g=0;g<4;++g)mx=fmaxf(mx,reinterpret_cast<float*>(&sm.state[half][0][0])[g*GS_BV+vv-vbase]);float inv=mx>0?127.0f/mx:0.0f,scale=mx>0?mx/127.0f:1.0f;
+#pragma unroll
+   for(int ki=0;ki<2;++ki){int t=ki*2+vi;
+#pragma unroll
+    for(int e=0;e<8;++e){float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);const float qs=qf*scale;St[t][e]=qs+(float)(_Float16)(St[t][e]-qs);}}}
+  // The next segment's stage_state overwrites the reduction tile.
+  GS_BAR();
+ }
+ }
+#endif
+
+#ifdef GDN_CHUNK_SCAN_F32_EDGE
+#pragma unroll
+ for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){int t=ki*2+vi,vv=vbase+(vt0+vi)*16+lo;
+#pragma unroll
+  for(int e=0;e<8;++e)ht[((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e)]=St[t][e];}
+#else
+ // The old EF was folded into St before the scan so it participates in every
+ // output and decay.  The dead state staging tile now holds the two independent
+ // full-row reductions without increasing the shipped LDS allocation.
+ float vmax[2]={0,0};
+#pragma unroll
+ for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;
+#pragma unroll
+  for(int ki=0;ki<2;++ki){int t=ki*2+vi;
+#pragma unroll
+   for(int e=0;e<8;++e)vmax[vi]=fmaxf(vmax[vi],fabsf(St[t][e]));}
+  vmax[vi]=fmaxf(vmax[vi],__shfl_xor(vmax[vi],16));if(hi==0)reinterpret_cast<float*>(&sm.state[half][0][0])[(swave>>1)*GS_BV+vv-vbase]=vmax[vi];}
+ GS_BAR();
+#pragma unroll
+ for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;float mx=0;
+#pragma unroll
+  for(int g=0;g<4;++g)mx=fmaxf(mx,reinterpret_cast<float*>(&sm.state[half][0][0])[g*GS_BV+vv-vbase]);float inv=mx>0?127.0f/mx:0.0f,scale=mx>0?mx/127.0f:1.0f;if(swave<2&&hi==0)sc[head*GS_D+vv]=scale;
+#pragma unroll
+  for(int ki=0;ki<2;++ki){int t=ki*2+vi;
+#pragma unroll
+   for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);float qf=fminf(fmaxf(rintf(St[t][e]*inv),-128.0f),127.0f);sq[off]=(signed char)qf;ef[off]=(_Float16)(St[t][e]-qf*scale);}}}
+#endif
+}

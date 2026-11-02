@@ -1,5 +1,7 @@
 # LFM2.5 gfx1201 batched-prefill architecture — FROZEN CONTRACT
 
+> **Historical-design notice (2026-10):** this document is a historical proposal. `HIPFIRE_LFM2_PREFILL_BATCH`, `HIPFIRE_LFM2_PREFILL_MAX_BATCH` and `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` named below have **no readers in crate sources** and no current runtime effect; the batched-prefill/decode-fusion routes described here are not selectable. The text is kept unchanged as design evidence.
+
 **Status:** ✅ FROZEN by conductor (Main) 2026-07-18. Reviewer `PrimitiveLeech` FINAL VERDICT = APPROVE/freezable after 3 adversarial cycles (BLOCK → BLOCK → APPROVE) resolving 7 blockers + 3 residuals (grouped-MoE 16-alignment, flash-partials footprint, capacity cap) + the per-cohort manifest correction (dense vocab 65536 / θ 1e6 / 350M hidden 1024; only 8B is 2048/128000/5e6). Oversight `WhisperingPike` PASS; baseline Amdahl (`local://lfm-baseline-amdahl.md`) sets lane priority (dense-GEMM > attention > conv). Frozen contracts: `forward_prefill_batch`/`forward_prefill_chunk` API (§2), additive lazy `Lfm2MoeState` scratch (§4), chunking/state-transition contract (§3), per-cohort admissions (§8). Phase 0 head-elision is committed (`62dedc41a`) + hardened parity oracle (`0198fe6c0`). Implementation MAY now proceed per the §10 vertical-slice order (350m.q8 first); §13 items are implementation/promotion gates, not design blockers.
 
 **Checkout witnessed:** `lfm-redline` at `62dedc41aa5d335f0518e70cb9e748da332b6138`.
@@ -551,7 +553,7 @@ Phase 1 creates the helper modules below so Phase 2 has disjoint ownership. Publ
 | Attention | `crates/hipfire-arch-lfm2moe/src/prefill_attention.rs` | QKV, Q/K norm, RoPE, KV writes, hd64 causal flash, out residual | no `forward.rs`, state struct, conv source, dense/MoE helper edits |
 | Dense projection/FFN | `crates/hipfire-arch-lfm2moe/src/prefill_dense.rs` | Q8 and MQ4/FWHT dense call sites, gate/up BT choice, residual down | no attention, MoE, state sizing, or chunk loop edits |
 | MoE Path 2 | `crates/hipfire-arch-lfm2moe/src/prefill_moe.rs` | LFM sigmoid+bias routing adapter and existing grouped-WMMA Path-2 invocation | no decode `_k8`, no dense/attention/state ownership, no m2/i8 |
-| State/scratch/chunking | `crates/hipfire-arch-lfm2moe/src/lfm2moe.rs`, `crates/hipfire-arch-lfm2moe/src/forward.rs` | allocation, env capacity, chunk loop, cross-chunk state, final head | no stage helper or HIP kernel edits |
+| State, scratch, and chunking | `crates/hipfire-arch-lfm2moe/src/lfm2moe.rs`, `crates/hipfire-arch-lfm2moe/src/forward.rs` | allocation, env capacity, chunk loop, cross-chunk state, final head | no stage helper or HIP kernel edits |
 
 `crates/hipfire-arch-lfm2moe/src/kernels.rs`, `src/lib.rs`, and daemon selection are frozen after Phase 1 and are conductor-owned integration files, not lane files. Lane branches do not edit them. Shared parity and benchmark harnesses are conductor-run and are not lane-owned. Integration is by reviewed cherry-pick, never rsync.
 

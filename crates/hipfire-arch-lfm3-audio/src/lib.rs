@@ -5,7 +5,7 @@
 //! LFM3-Audio (audio-input / ASR) architecture for hipfire — Phase 3 of the
 //! LFM3 port (`docs/plans/2026-10-31-lfm3-port.md`).
 //!
-//! Wraps the LFM3 text decoder (`hipfire-arch-lfm3`, arch_id 13) with the
+//! Wraps the LFM3 text decoder (`hipfire-arch-lfm3`, arch_id 24) with the
 //! LFM3-Audio speech encoder + audio projector. The speech encoder is a
 //! conv2d mel downsampler followed by a 17-layer LFM2 backbone (hidden 768,
 //! conv K=3, 8Q/4KV heads, sliding-window 32 causal attention), exactly the
@@ -21,7 +21,7 @@
 //! The mel front-end + conv2d downsampler run on CPU (the mel is small and
 //! must byte-match the HF `Lfm3AudioFeatureExtractor`); the 17-layer encoder
 //! backbone + projector run on GPU, reusing the LFM3 conv/attn/RoPE/GQA
-//! primitives. arch_id stays 13 (audio detected by `encoder.downsample.*` /
+//! primitives. arch_id stays 24 (audio detected by `encoder.downsample.*` /
 //! `encoder.lfm.*` tensor presence, the qwen35-vl / lfm3-vl precedent).
 //!
 //! Forward dispatch is static (not trait-routed), matching the project

@@ -1,0 +1,108 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/home/avery/.hipfire/models/ornith-1.5-35b-a3b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5_moe",
+    "dim": 2048,
+    "layers": 40,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 200000,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": null,
+    "card_cap": null,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 4786,
+    "vram_total_mb": 16304,
+    "model_loaded": true,
+    "model_arch": "qwen3_5_moe",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 16152,
+  "max_tokens": 512,
+  "runs": 1,
+  "batch": 1,
+  "prompt_tokens": 64,
+  "prompt_md5": "c7c9abe92445046ec66eb41cc7c204c3",
+  "prompt_chars": 258,
+  "warnings": [
+    "prompt is 64 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 35.6,
+    "mean": 35.6,
+    "min": 35.6,
+    "max": 35.6,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 123.2,
+    "mean": 123.2,
+    "min": 123.2,
+    "max": 123.2,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 25.6,
+    "mean": 25.6,
+    "min": 25.6,
+    "max": 25.6,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 519.6,
+    "mean": 519.6,
+    "min": 519.6,
+    "max": 519.6,
+    "stdev": 0.0
+  },
+  "samples": {
+    "decode": [
+      35.6
+    ],
+    "prefill": [
+      123.2
+    ],
+    "wall": [
+      25.6
+    ],
+    "ttft_ms": [
+      519.6
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}

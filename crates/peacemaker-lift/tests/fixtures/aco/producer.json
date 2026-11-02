@@ -1,0 +1,79 @@
+{
+  "schema": "pm-aco-producer-spec-v1",
+  "description": "P0 producer inputs (PM-ACO-PARITY.md section 6): real SPIR-V compiler inputs for the wave32 copy/scale gate and the MQ4 residual GEMV, compiled by the pinned RADV/ACO via tools/aco-export. Outputs (shader.spv/bin/abi/rawspec/dump/artifact) are generated, never hand-authored, and are NOT checked in.",
+  "mesa_pin": "tools/aco-export/mesa/pin.json",
+  "glslang": { "target_env": "vulkan1.3", "stage": "comp", "entry": "main" },
+  "kernels": {
+    "copy_scale_f32": {
+      "source": "src/copy_scale_f32.comp",
+      "symbol": "copy_scale_f32",
+      "arch": "gfx1201",
+      "wave": 32,
+      "local_size": [32, 1, 1],
+      "subgroup": { "required": 32, "require_full": true },
+      "push": {
+        "size": 24,
+        "fields": [
+          { "name": "src", "offset": 0, "size": 8, "kind": "u64_ptr", "hip_arg": "src", "access": "read_only" },
+          { "name": "dst", "offset": 8, "size": 8, "kind": "u64_ptr", "hip_arg": "dst", "access": "write_only" },
+          { "name": "n", "offset": 16, "size": 4, "kind": "u32", "hip_arg": "n", "access": null },
+          { "name": "scale", "offset": 20, "size": 4, "kind": "f32", "hip_arg": "scale", "access": null }
+        ]
+      },
+      "bindings": [
+        { "name": "src", "access": "read", "extent": "n*4 bytes" },
+        { "name": "dst", "access": "write", "extent": "n*4 bytes" }
+      ]
+    },
+    "gemv_mq4g256v2_residual": {
+      "source": "src/gemv_mq4g256v2_residual.comp",
+      "symbol": "gemv_mq4g256v2_residual",
+      "arch": "gfx1201",
+      "wave": 32,
+      "local_size": [32, 1, 1],
+      "subgroup": { "required": 32, "require_full": true },
+      "incumbent": {
+        "hip_source": "kernels/src/gemv_mq4g256v2_residual.hip",
+        "builder_twin": "crates/peacemaker-isa/src/kernels/pm_decode/gemv_hfq4g256_residual_mq4v2.rs",
+        "kernarg_abi": "A@0 x@8 y@16 (8-byte global pointers), M i32 @24, K i32 @28; grid = M workgroups of 32; row0 = blockIdx.x*2"
+      },
+      "push": {
+        "size": 32,
+        "fields": [
+          { "name": "A", "offset": 0, "size": 8, "kind": "u64_ptr", "hip_arg": "A", "access": "read_only" },
+          { "name": "x", "offset": 8, "size": 8, "kind": "u64_ptr", "hip_arg": "x", "access": "read_only" },
+          { "name": "y", "offset": 16, "size": 8, "kind": "u64_ptr", "hip_arg": "y", "access": "read_write" },
+          { "name": "M", "offset": 24, "size": 4, "kind": "i32", "hip_arg": "M", "access": null, "reference_value": "M" },
+          { "name": "K", "offset": 28, "size": 4, "kind": "i32", "hip_arg": "K", "access": null, "reference_value": "K" }
+        ]
+      },
+      "bindings": [
+        { "name": "A", "access": "read", "extent": "M*(K/256)*136 bytes (HFQ4-G256 rows; reads rows < M only)" },
+        { "name": "x", "access": "read", "extent": "K*4 bytes" },
+        { "name": "y", "access": "read_write", "extent": "M*4 bytes (y[row0], y[row0+1] read-modify-write)" }
+      ],
+      "hip": {
+        "symbol": "gemv_mq4g256v2_residual",
+        "kernarg_size": 32,
+        "args": [
+          { "name": "A", "offset": 0, "size": 8, "kind": "global_pointer", "access": "read_only", "extent": "M*K/256*136" },
+          { "name": "x", "offset": 8, "size": 8, "kind": "global_pointer", "access": "read_only", "extent": "K*4" },
+          { "name": "y", "offset": 16, "size": 8, "kind": "global_pointer", "access": "read_write", "extent": "M*4" },
+          { "name": "M", "offset": 24, "size": 4, "kind": "by_value" },
+          { "name": "K", "offset": 28, "size": 4, "kind": "by_value" }
+        ],
+        "scalars": [
+          { "arg": "M", "value": "M" },
+          { "arg": "K", "value": "K" }
+        ]
+      },
+      "reference": {
+        "pointer_buffers": [
+          { "push": "A", "buffer": "arg0" },
+          { "push": "x", "buffer": "arg8" },
+          { "push": "y", "buffer": "arg16" }
+        ]
+      }
+    }
+  }
+}

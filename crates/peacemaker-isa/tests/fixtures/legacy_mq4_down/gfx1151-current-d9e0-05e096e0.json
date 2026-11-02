@@ -1,0 +1,47 @@
+{
+  "identity": "current-source-gfx1151-singleton-down-with-k640-r4-twin",
+  "artifact_status": "BUILD_READY",
+  "numerical_status": "NOT_RUN",
+  "evidence_class": "BUILD_EVIDENCE_NOT_NUMERICAL_PASS",
+  "source_path": "kernels/src/gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded.hip",
+  "source_sha256": "e50f30807a2f88c6ab20b57d9c27493f88f1809e0226be9209b0427881965745",
+  "source_note": "beta PR #909 (e9e6acde0d) appended the K=640 four-row twin after the singleton body; b5078c5fbf added the k_top ABI argument to both. PR #941 adds alternate-entry and constant-K preprocessor controls. Rebuilding the default translation unit from source e50f3080 with the recorded JIT flags reproduced the complete existing raw ELF 05e096e0 byte-for-byte; neither kernel nor the fixture was replaced.",
+  "raw_file": "gfx1151-current-d9e0-05e096e0.elf",
+  "raw_bytes": 12504,
+  "raw_sha256": "05e096e066a9c503e3d762584bb3a21a50d95f45785f22a31764b5500947be8b",
+  "container_sha256": "0cf3a3b856f01c2adfc86ebc60e11e1d2b23e71d37c16b0fa4fc32a293e5501b",
+  "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1151",
+  "elf_flags": "EF_AMDGPU_MACH_AMDGCN_GFX1151 (0x4A)",
+  "kernels": [
+    {
+      "name": "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
+      "role": "one-row AR singleton: recorded/captured decode, and eager decode with HIPFIRE_QWEN4_MOE_DOWN_R4=0",
+      "grid": "[M, k_top, N]",
+      "symbol_size": 2476,
+      "vgpr_count": 52,
+      "sgpr_count": 30
+    },
+    {
+      "name": "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
+      "role": "four-row K=640 AR singleton selected by rdna-compute moe.rs on exact gfx1151 when K == 640, HIPFIRE_QWEN4_MOE_DOWN_R4 (default on) and not recording / not capturing",
+      "grid": "[ceil(M/4), k_top, N]",
+      "symbol_size": 3904,
+      "vgpr_count": 92,
+      "sgpr_count": 22
+    }
+  ],
+  "kernarg_segment_size": 52,
+  "kernarg_segment_align": 8,
+  "argument_offsets": [0, 8, 16, 24, 32, 36, 40, 44, 48],
+  "argument_sizes": [8, 8, 8, 8, 4, 4, 4, 4, 4],
+  "wavefront_size": 32,
+  "max_flat_workgroup_size": 32,
+  "compiler": "/opt/rocm/core-10.1/bin/hipcc",
+  "hip_version": "7.16.26385-0000000",
+  "clang_version": "24.0.0git d6f6cb691863e9258034ab48c1dfce21689d5606",
+  "jit_flags": ["--genco", "--offload-arch=gfx1151", "-O3", "--no-offload-compress", "-fuse-cuid=none", "-mcode-object-version=6", "--rocm-path=/opt/rocm/core-10.1", "--hip-path=/opt/rocm/core-10.1", "-I/opt/rocm/core-10.1/include", "-DIU4_A4_CANDIDATES=2"],
+  "unbundle": "clang-offload-bundler --unbundle --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx1151",
+  "pipeline_validation": "the identical recipe on the a8f8 source reproduced the previous fixture byte for byte (container be5b98d4..., raw 0d86c0a7...)",
+  "build_evidence": "/home/kaden/qcal/release-0.4.3/row-exact-wide/runs/fn-wide-beta-down-fixture-20261022-001/",
+  "scope": "Source-matched reference input for the legacy_mq4_rowtiles current-source gfx1151 consumers (scalar singleton and K=640 r4 twin). Not a historical fixture replacement, golden repin, GPU pass, M7 pass or model claim."
+}

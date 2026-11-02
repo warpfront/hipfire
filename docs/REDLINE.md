@@ -8,9 +8,10 @@ behavior. Dated reports are evidence for the fixtures they name only.
 | Field | Value |
 |---|---|
 | Page state | **shipped / ref-pinned** (see [`INDEX.md`](INDEX.md)) |
-| Inventory date | 2026-07-22 |
-| Audited source ref | `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
-| Comparison base | `origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
+| Original route inventory date | 2026-07-22 (historical provenance) |
+| Original inventory source ref | `202282de8759dfa6963ea5184ad2bf2b9259cef6` (historical provenance) |
+| Original comparison base | `origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6` (historical provenance) |
+| Documentation audit | 2026-10-13, `origin/beta` @ `c7a732ad5`: source and documentation review only. No hardware certification was rerun and the route inventory was not remeasured. |
 | Validation routes | [`VALIDATION.md`](VALIDATION.md) |
 | Thin skill hook (non-normative) | [`.agents/skills/redline-retained-replay/SKILL.md`](../.agents/skills/redline-retained-replay/SKILL.md) |
 
@@ -111,6 +112,17 @@ public ROCr/HSA queue → release-ordered doorbell → signal → completion
 Redline retains the real model forward. It does not inherently replace or fuse
 kernels. A kernel change is a separate optimization that must be re-certified.
 
+railgun is a different system. It authors and validates typed dispatch
+programs (kernel nodes with typed arguments and resource effects, hazard edges,
+a per-arch lowering plan) and checks them against the Redline tape through the
+G0 recording-invariance gate, the G4 probe and the G7 shadow diff (see §5).
+Redline is the retained-replay transport that actually submits the tape. By
+default railgun submits nothing and the route stays plain retained PM4; the
+opt-in `HIPFIRE_RAILGUN_BACKEND=railgun` executes railgun's lowering over
+Redline's kernarg buffers only for the gfx12 single-IB tape and fails the
+prepare closed on refusal. railgun is not a full replacement for Redline, and a
+railgun result is not Redline route proof.
+
 ### Three-crate ownership
 
 | Crate | Owns | Does not own |
@@ -136,17 +148,33 @@ transport crate.
 | Experimental `crates/redline` | Direct DRM outside HIP/ROCr serving | Direct-KMD experimentation | Current serving transport |
 | Launch fusion | Fewer/different kernels under any host path | Changed device graph | Redline, route selection, or wall-time win |
 | Stable partial recorder fingerprint | Repeatable recorded subsequence | Discovery progress | Complete tape or installed route |
+| railgun program (`crates/railgun`, `crates/railgun-cert`) | Typed program authored, checked and lowered; shadow-diffed against the Redline tape | Program/effect/hazard facts for the tape it matches (G0/G4/G7 diagnostics) | Redline route proof, certification, admission, or that railgun replaces the retained transport |
 
 ## 3. Runtime lifecycle and the model boundary
 
 ### Model load and automatic default
 
 After a successful model load, the daemon may request Auto via
-`ReplayController::configure_model_default` when the MQ4R runtime-default
-predicate matches. **Current automatic runtime selection is only**
-`mq4r_redline_default` for single-GPU `.mq4r` on the exact GPU-arch allowlist.
-Existing LFM `.mq4` registry evidence is not auto-selected because it is not
-`.mq4r` (not because LFM is categorically model-family exempt).
+`ReplayController::configure_model_default` when `retained_redline_default`
+matches. **Current automatic runtime selection is only** the MQ4R predicate
+`mq4r_redline_default` (single-GPU `.mq4r` on the exact GPU-arch allowlist),
+the gfx1201 A3B `.mq4rs` (`qwen3_5_moe`, no drafter, pp=tp=1; extension-selected, deprecated since 0.4.0, removal 0.5.0) plus Qwen3.5 dense and Qwen4 (Flash-Next) plain-AR predicates below, and
+the gfx1151 DeepSeek4 `.mq2r` AR predicate. Existing LFM `.mq4` registry evidence is not
+auto-selected because it is not `.mq4r` (not because LFM is categorically
+model-family exempt).
+
+Exclusions applied by `retained_redline_default` before any predicate matches
+(`crates/hipfire-runtime/src/config.rs`): expert-parallel loads (`ep` > 1)
+are never admitted, because a single-device retained tape cannot record the
+cross-device row gather; Muse Glimmer (arch 14) is withheld from the MQ4R
+predicate until its PM4 lowering lands; Gemma 4 (arch 13, every variant) is
+never admitted automatically, because its retained tape is unvalidated (the
+gfx1201 E4B PM4 shadow is not exact) and Redline runs for it only when
+selected explicitly; and a Qwen3.5 process configured for
+CPU-executed partial offload gets no retained default, because the spilled
+layers' GEMVs run on the host between GPU launches. The selection of MQ4R and
+DeepSeek4 `.mq2r` routes by file extension is marked in source as deprecated
+since 0.4.0, removal in 0.5.0 (0.5.0 selects by HFQ metadata).
 
 #### MQ4R runtime default
 
@@ -174,6 +202,85 @@ config wizard, choosing an explicit backend there, or setting
 `HIPFIRE_REPLAY_BACKEND=hip`. That opt-out does **not** relax certification or
 admission requirements for any later promotion claim.
 
+#### gfx1201 Qwen3.5 dense plain-AR runtime default
+
+`retained_redline_default` — source: `crates/hipfire-runtime/src/config.rs`.
+
+```text
+exact GPU arch is gfx1201
+AND model_arch is qwen3_5 (dense, arch_id 5), any weight format
+AND pipeline parallelism == 1
+AND tensor parallelism == 1
+AND no drafter is installed
+```
+
+Plain-AR decode then runs as one retained PM4-IB submission per token (the
+first eligible forward records as ordinary HIP, then the tape is prepared).
+On H2 (27B, native fp8 KV) the 0.4.1 qualification run recorded a tape of 899
+launches (tape size moves with decode fusions, so treat it as a dated
+identity, not a current constant). The retained route was byte-identical to
+the HIP AR graph for logits, final hidden, DeltaNet state and KV at ctx 512 /
+8,192 / 32,768 over 256 greedy tokens and a 200-replay stress. The raw
+reports from that run are not checked in. No per-token time saving is stated
+here: any such figure is fixture-bound and needs its own matched measurement
+(§8).
+
+It ships together with the prefill gate in
+`crates/hipfire-arch-qwen35/src/qwen35/prefill.rs`: the chunked GDN prefill
+scan is withheld only while a forward is being **recorded**
+(`is_recording()`), not for the whole life of a Redline-enabled process, so a
+Redline process prefills exactly like the HIP-graph default. Batched prefill
+(`forward_prefill_batch`'s batched path and `forward_prefill_batch_multi`)
+also clears the plain-AR eligibility the previous decode forward left set
+(`ReplayController::enter_batched_forward`). Otherwise, once the prepared tape
+is `Ready`, `retained_body_active()` and the PM4/AQL routing predicates would
+read true for the whole prefill. The MoE prefill gates (symmetric IU4 experts,
+combine zinit, sealed retained admission) therefore evaluate exactly as on a
+fresh load; the next plain-AR `forward_scratch` re-arms eligibility.
+
+Opt-out: `replay.backend = "hip"` (or `HIPFIRE_REPLAY_BACKEND=hip`, or the
+wizard's built-in `hip` profile) restores the HIP AR graph for the process. A
+failed tape preparation or PM4 replay falls back closed to the HIP graph.
+Known limits: every new gfx1201 decode kernel must be covered by Radiowave
+certification or by the name-keyed tables in
+`crates/rdna-compute/src/replay.rs` (resource effects, kernarg sizes, acquire
+and header policies); an uncovered kernel loses its typed resource binding and
+can fail preparation, which silently gives the gain back to the HIP graph; in
+the 0.4.1 qualification run 80 of H2's 898 boundary waits were elided by the
+`resource` wait policy, proven empirically for that tape; and
+`ROC_GLOBAL_CU_MASK` does not constrain the
+Redline PM4 queue.
+
+#### gfx1201 Qwen4 (Flash-Next) plain-AR runtime default
+
+The same predicate admits `model_arch` `qwen4` on exact gfx1201, any weight
+format, with PP=1, TP=1 and no drafter. A native MTP head counts as a drafter,
+so a default Flash-Next load (MTP `auto`, attached on gfx1201) keeps its MTP
+path, and only an MTP-off load (`--spec off` / `speculation.mtp = "off"`)
+replays. The load logs `[redline] enabling fail-closed retained default on
+gfx1201 (model_arch=qwen4, drafter=off, transport=pm4)`. The tape is 973
+launches (28 kernels) and runs unpaced; the Qwen3.5 `PostDispatchNop` pacing
+does not apply. The Qwen4 PM4 replay goes through `Gpu::replay_pm4_routed`, which
+is the plain PM4 replay unless `HIPFIRE_RAILGUN_CHECK` is set.
+
+Evidence (historical 0.4.1 qualification run on an R9700, canonical
+`qwen3.8-flash-next-gptq3.mq4`, `auto` placement; the raw artifacts are not
+checked in): `scripts/redline_daemon_harness.py --qwen4 --pm4 --skip-prefill
+--shadow-iterations 5` passed, with the capture stable and HIP, PM4 and blob
+bit-exact at positions 129–133 over the recorded state surfaces. Greedy text
+equalled the HIP graph and the previous binary on 8/8 prompts and on the serve
+battery, and a serve durability stress (8 lengths up to 8,193 tokens, solo and
+2/4-way queued) gave byte-equal responses on PM4 and HIP. railgun refused this
+program in that run (`route=unmatched`), so its lowering was not a candidate.
+`HIPFIRE_RAILGUN_CHECK=always` byte-compared the PM4 lowering with its HIP
+twin across the decode steps of that run; the Qwen4 loader registers its
+weights as `Weights` so they are digested rather than snapshotted. Reproduce
+with the commands above to regenerate evidence. This guide states no Qwen4
+decode speedup; any PM4-versus-HIP delta needs its own matched measurement (§8).
+
+Opt-out and fail-closed behavior are as for Qwen3.5 above. gfx1151 Flash-Next
+`.mq4` and every other arch stay on the HIP graph unless the file is `.mq4r`.
+
 #### LFM registry evidence (not a runtime default)
 
 Registry owner: [`admissions.yml`](admissions.yml) row
@@ -198,12 +305,13 @@ hash `04305cf1254244f6`.
 
 An explicit `HIPFIRE_REPLAY_BACKEND` selection, config wizard / profile
 backend selection (including the built-in `hip` opt-out), or enabled
-`HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses the MQ4R runtime default.
+`HIPFIRE_REPLAY_MANUAL_CAPTURE` bypasses every automatic runtime default.
 `HIPFIRE_REPLAY_TRANSPORT` does **not**: it changes only the
-transport. Therefore an eligible automatic-default `.mq4r` model still
+transport. Therefore an eligible automatic-default model still
 requests `Auto` when only the transport is explicit (using that transport);
-with transport unset, it uses `Pm4Ib`. When `mq4r_redline_default` is false
-and no backend/manual selection applies, the backend remains ordinary HIP.
+with transport unset, it uses `Pm4Ib`. When `retained_redline_default` is
+false and no backend/manual selection applies, the backend remains ordinary
+HIP.
 
 Explicit opt-in can exercise broader implementation capability (including LFM
 retained routes when the implementation supports them). Opt-in availability is
@@ -321,6 +429,15 @@ A retained route is valid only when all of the following hold.
 - Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded
   blob, grid, block, and shared memory are one identity contract. A stable
   kernel-name hash alone is insufficient.
+- Retained PM4 kernarg segments live in a host-writable GPU-agent (VRAM) pool
+  by default: kernels whose prologue chains dependent kernarg `s_load`s
+  otherwise pay host-memory latency on every round. The per-replay binding
+  patches stay plain host stores through the BAR, and one fence plus a one-byte
+  readback publishes them before the doorbell. Small-BAR systems (CPU access
+  never allowed) and a gfx1151 non-system entry acquire keep the CPU-agent
+  fine-grained pool; `HIPFIRE_PM4_KERNARG_POOL=host` forces it. The daemon log
+  records the choice as `[redline] retained PM4 kernargs: pool=…`. The indirect
+  buffer, timestamps and completion words stay in the host pool.
 
 ### Geometry and dynamic bindings
 
@@ -388,7 +505,7 @@ python3 scripts/redline_daemon_harness.py \
 
 python3 -m tools.redline bench \
   --model "$MODEL" \
-  --daemon target/release/examples/daemon \
+  --daemon target/release/daemon \
   --context 128 --iterations 100 --warmups 3 --runs 10 \
   --transport pm4 --max-seq 2048 \
   --work-dir .redline-work/product \
@@ -414,9 +531,148 @@ Section 7 ledger. The diagnostic commands above still do **not** emit that full
 ledger; use the product bench (or the Golden wrapper around it) for certification
 evidence.
 
+### Recording-invariance diagnostic (railgun G0)
+
+A tape records the kernels chosen while `is_recording()` is true; an ordinary
+forward runs the eager branch of every recording-dependent predicate. The
+inventory of those predicates is `railgun-cert recording-inventory
+markdown|json` (`crates/railgun-cert/src/recording.rs`); its source scan fails
+`cargo test -p railgun-cert` when a new `is_recording()`/`capture_mode`-style
+check has no inventory row. The G0 gate runs one forward both ways in the same
+process and compares the launch sequences:
+
+- `bench_decode` with `"g0": "observe" | "record"` (`iterations == 1`):
+  `observe` brackets the token with `ReplayController::begin_g0_observation`
+  (every funnel launch is copied, `is_recording()` stays false), `record`
+  with a manual capture. The response's `g0` object carries the sequence
+  (kernel, grid, block, shared memory, exact kernarg bytes) and the HIP
+  launch/copy counter deltas, so a launch that bypasses the funnels is
+  visible in either arm. DeepSeek4 supports the same field.
+- `railgun_g0_dflash_cycle` with `g0` and `context_tokens`: one served DFlash
+  acceptance window (`Speculator::step`: draft + verify + commit) after a
+  synthetic prefill. Requires `HIPFIRE_VERIFY_GRAPH=0` and refuses
+  `HIPFIRE_DFLASH_VERIFY_PM4=1`.
+
+```bash
+cargo run --release -p railgun-cert -- recording-inventory json > .redline-work/g0/inventory.json
+HIPFIRE_REPLAY_BACKEND=shadow HIPFIRE_REPLAY_MANUAL_CAPTURE=1 \
+python3 scripts/redline_daemon_harness.py --model "$MODEL" --max-seq 16384 \
+  --g0 --g0-program h2_gfx1201 --inventory .redline-work/g0/inventory.json \
+  --out .redline-work/g0/decode.json
+```
+
+Add `--dflash-cycle --draft "$DRAFT"` for the DFlash cycle. A difference passes
+only when every kernel involved is attributed to a `byte_exact` inventory
+decision of the matching effect; G0 is diagnostic evidence, and G2 arm 3
+remains the byte-exactness proof. Both `bench_decode` arms prime from GDN
+requant frame 0, so the `gated_delta_net_*` frame word is the same forward's.
+
+HIP launches outside the recorder funnels (HIP launch counter minus funnel
+launches) fail the arm unless they equal the program's declared pre-program
+launches (`--g0-program`; inventory `pre_program_launches`): host-input
+launches that run before the program in every lowering. The only one declared
+is the Qwen3.5 token embedding (`embedding_q8`, `Gpu::embedding_lookup_q8`,
+one per forward) for `h2_gfx1201`. Without `--g0-program` none are allowed.
+
+### railgun shadow diff (M1, G7 diagnostic)
+
+`HIPFIRE_RAILGUN_SHADOW=<corpus dir>` (a `railgun-jit-corpus` build,
+`<out>/v2/<host key>`) makes every recorded launch also feed railgun
+(`crates/rdna-compute/src/replay/railgun_shadow.rs`): the SHA-256 of the object
+the launch ran is looked up in the corpus, the receipt's A1/A3/A4 facts type
+its arguments, A1 pointer arguments are bound to their live allocations, and
+launch sites declare their dynamic words (`Gpu::launch_maybe_blob_declared`;
+the GDN requant frame). When the gfx12 single-IB tape is prepared, railgun
+authors its program (`crates/railgun/src/kernel.rs`), derives edges and
+boundaries from its gfx12 cache table (`plan.rs`; the writer-side system
+acquire is the derived `WarPreWriter` rule, not a name table), lowers it
+through the same command builder, kernarg pool and loaded kernels, and diffs
+it against the prepared tape (`shadow.rs`): IB dwords with kernarg addresses
+canonicalised, kernarg images, pointer bindings, word and grid patch lists,
+per-boundary wait and acquire rung, and the post-dispatch NOP pacing. Every
+difference is classified `benign_relocation`, `pacing_mismatch`,
+`railgun_stronger` or `railgun_weaker`; G7 fails on any weaker one because no
+G4 receipt exists, and on any pacing mismatch. Nothing railgun builds is
+submitted and the route is unchanged.
+
+Pacing is a per-arch lowering parameter (`railgun::plan::ArchLowering`), not a
+kernel property: on exact gfx1201 railgun's lowering emits the same 64-body-dword
+`NOP` after every `DISPATCH_DIRECT` as the Redline tape (`PostDispatchNop(64)`),
+and an explicit `HIPFIRE_GFX1201_PM4_PACING` (`off`, `nop:N`) applies to both
+planners. Other arches lower unpaced.
+
+- `HIPFIRE_RAILGUN_SHADOW_OUT=<dir>`: one JSON report per prepare
+  (`railgun-shadow-<pid>-<n>.json`); the `[railgun] shadow G7 …` stderr line
+  summarises it.
+- `HIPFIRE_RAILGUN_INVENTORY=<file>`: `railgun-cert recording-inventory json`
+  output; the matched route's recording-dependent decisions go into the
+  report's certificate.
+- Artifact hashes match the corpus only when the runtime loads the corpus
+  pack (install `pack/<arch>` as `kernels/compiled/<arch>`); locally
+  JIT-compiled objects are loud `receipt_missing` nodes lowered `HipDirect`.
+  On exact gfx1201 the five embedded PeaceMaker decode twins
+  (`kernel.pm_decode`, default on) load instead of their hipcc objects; the
+  corpus records their images too (`origin: pm_native`, `native/<arch>/`,
+  keyed by image digest), so they need no install step.
+  Redline reads Radiowave argument effects from `*.radiowave.json` sidecars
+  beside each object; without them it falls back to its name tables and keeps
+  boundaries (16 K→V `kv_cache_write_fp8_e4m3` waits on the 27B) that railgun's
+  facts drop, which G7 reports as `railgun_weaker`. The corpus pack ships one
+  sidecar per hipcc object (`KernelCompiler::certify_radiowave`, the
+  inspection the JIT attaches to its own cache entries), and railgun-cert
+  cross-checks each receipt against it.
+
+The corpus is bound to the tree and the toolchain: every registry source,
+recipe flag, cache ABI, twin image or `hipcc --version` change leaves nodes
+without a record, and railgun then refuses the tape. Rebuild it on the host
+that runs railgun, at the commit that built the daemon (CPU only):
+
+```bash
+cargo build --release -p railgun-jitcorpus
+HIP_VISIBLE_DEVICES=-1 target/release/railgun-jit-corpus build --out "$CORPUS" --arch gfx1201
+target/release/railgun-jit-corpus check --corpus "$CORPUS/v2/<host key>" --arch gfx1201   # exit 0 = every node covered
+cp -a "$CORPUS/v2/<host key>/pack/gfx1201" "$HOME/.hipfire/bin/kernels/compiled/gfx1201"
+```
+
+`build` prints the corpus directory. `check` names every node without a
+record and why: a changed key, or a railgun-cert rejection such as an
+instruction the PeaceMaker gfx12 ISA table (`crates/peacemaker-ir/isa/gfx12.tbl`)
+does not decode yet, which a new compiler can emit.
+
+### railgun G4 probe, backend and check mode (M2)
+
+- **G4 silicon probe** (`crates/railgun/examples/g4_probe.rs` + `.hip`, feature
+  `g4-probe`): per cache-visibility row (`raw_vmem`, `raw_smem`, `war`, `waw`,
+  `war_pre_writer`, `pre_writer_after_barrier`), adversarial producer→consumer
+  kernels inside one retained PM4 IB, swept over the barrier rungs from none to
+  the system acquire, ≥2²⁰ trials per rung split over four footprints (≤L0,
+  ≤L1, ≤L2, >L2) and two write layouts, placement recorded from `HW_ID1`. Any
+  stale observation disqualifies a rung; `receipt.<arch>.<row>.json` and
+  `cache-table.<arch>.json` name the weakest rung never observed stale.
+- `HIPFIRE_RAILGUN_CACHE_TABLE=<cache-table.<arch>.json>` attaches those
+  receipts to the cache-table rows whose own rung the probe ran clean.
+- `HIPFIRE_RAILGUN_BACKEND=railgun` makes the gfx12 single-IB tape execute
+  railgun's lowering (over Redline's kernarg buffers, admitted only when every
+  railgun kernarg image equals them); a refusal fails the prepare closed.
+- `HIPFIRE_RAILGUN_CHECK=off|sample(N)|always` runs the prepared PM4 lowering
+  and its HIP twin (the same nodes through `hipModuleLaunchKernel`, same
+  kernarg bytes) from the same snapshot and byte-compares every live `State`
+  allocation of the allocator registry (`hip_bridge::registry`), poisoning the
+  route on any difference. The snapshot and the restore are each fenced with
+  `hipDeviceSynchronize`: `hipMemcpy` device→device returns before the copy
+  lands, and the PM4 queue is outside HIP's stream order (unfenced, the PM4
+  run raced the pre-image copies). `always` digests the immutable `Weights`
+  allocations before and after the first checked step of each prepared
+  program, not per step. `HIPFIRE_RAILGUN_DIGEST=1` writes per-step state
+  digests for the cross-process third arm; `HIPFIRE_RAILGUN_CHECK_OUT` is the
+  JSON-lines log. Negative controls (`HIPFIRE_RAILGUN_NEGATIVE_CONTROL`):
+  `flip_byte` XORs one byte of one surface into the PM4 arm's result (the
+  step must come back unequal on exactly that byte); `drop_boundaries` lowers
+  the tape without its mid-segment boundaries.
+
 ### Steady-state dispatch profiler (attribution-only diagnostic)
 
-`scripts/redline_dispatch_profile.py` is a **named manual diagnostic** for
+`python3 -m tools.redline.dispatch_profile` is a **named manual diagnostic** for
 steady-state, exactly-once retained-PM4 per-dispatch span attribution on an
 instrumented GFX12 tape. It is **not** route proof, **not** Section 7
 certification or registry admission, and **not** absolute or pure kernel timing.
@@ -487,6 +743,14 @@ metric looks attractive.
 | 6. Production serve | User-facing generation with exact model/settings has healthy decoded output, finish state, repetition/attractor behavior, and model-specific framing | Emitted tokens without semantic/framing health, runaway, empty response, or route ambiguity |
 | 7. Stationary matched performance | Certified baseline and retained route use identical binary, model, prompt/token stream, settings, process policy, and clocks; tok/s and ms/token reported | Cross-harness, cross-binary, cross-prompt, nonstationary, silent-fallback, or microkernel-only comparison |
 | 8. Long-context and lifecycle | Dynamic position, geometry, KV growth, recurrent/convolution state, request reset, failure behavior, and model swap pass throughout the supported range | Context drift, state leak, stale pointer, wrong reset, or same-forward fallback claim |
+
+Automatic captures enforce the launch half of gate 2 at prepare: when the
+window issued more kernel launches on the capturing thread than the tape holds
+(a launcher that calls `hip.launch_kernel` directly instead of the
+`Gpu::launch_maybe_blob*` funnel), prepare refuses with `unrecorded launch` and
+the route falls back to HIP (sticky), because every replay would skip that
+kernel. A per-token input staged before the window opens (the embedding row) is
+outside the window, not an unrecorded launch.
 
 Harness success without route proof is insufficient. A ratio from two nominal
 arms that both executed ordinary HIP is invalid evidence. A stable manual-capture
@@ -640,10 +904,15 @@ with their dates and fixtures. None of these cases is a universal admission.
 
 ### 11.2 Qwen3.6 35B-A3B MQ4R across gfx1100, gfx1151, and gfx1201
 
-Current automatic predicate `mq4r_redline_default` is model-family agnostic
+The MQ4R automatic predicate `mq4r_redline_default` is model-family agnostic
 and narrower than full implementation capability: exact GPU arch `gfx1100`,
 `gfx1151`, or `gfx1201`; single GPU (`pp=tp=1`); case-insensitive `.mq4r`.
-No `arch_id` gate. `gfx1200` and every other arch remain explicit opt-in.
+No `arch_id` gate, apart from the exclusions listed in §3 (expert-parallel
+loads, Muse Glimmer, Gemma 4, and Qwen3.5 under CPU-executed partial offload).
+`gfx1200` and every other arch remain explicit opt-in.
+Separately, Qwen3.5 dense (`arch_id=5`) and Qwen4 (`arch_id=16`, Flash-Next)
+plain-AR decode (any weight format, no drafter) on exact gfx1201 defaults to
+retained PM4 (§3).
 Explicit backend selection (including the config wizard / profile backend)
 can request broader implemented paths or disable the automatic default.
 Explicit transport changes only the transport. Runtime default ≠ Section 7
@@ -683,17 +952,18 @@ Repository-visible rejection record (performance-checkpoint tree not extended).
 | Intent | Port Qwen3.6 35B-A3B MQ2G256Lloyd prefill and retained-PM4 decode to RX 6950 XT gfx1030 for a product wall-time win |
 | Baseline route | Ordinary HIP decode |
 | Candidate route | Product `auto` with `transport=pm4`, plus Radiowave off/on overlay |
-| Source identity | Host `hipx`; branch `feat/mq2g256-gfx1030-prefill-redline`; prefill commit `0f3444f8cecf9976ced483237a8fc26028f3b94d`; measured candidate `e017f83ceb9d41d4be0d6665161615c9ae74d89b`; daemon SHA-256 `47585859295f44a5cc2aab090e7fc43ef342d2932e1d7d402a4d569cbf53acaf` |
-| Model and device | `/home/kaden/bench/models/qwen3.6-35b-a3b.mq2`, SHA-256 `48b3f84614c46eb8b5ffb494f7a75c15216664afcbb47c3e78dd80c4ce7eb0a3`; RX 6950 XT gfx1030; `ROCR_VISIBLE_DEVICES=2`; Q8 KV; automatic clocks; dated 2026-07-18 |
+| Source identity | Measurement workstation (gfx1030 class); branch `feat/mq2g256-gfx1030-prefill-redline`; prefill commit `0f3444f8cecf9976ced483237a8fc26028f3b94d`; measured candidate `e017f83ceb9d41d4be0d6665161615c9ae74d89b`; daemon SHA-256 `47585859295f44a5cc2aab090e7fc43ef342d2932e1d7d402a4d569cbf53acaf` |
+| Model and device | `qwen3.6-35b-a3b.mq2` (local file), SHA-256 `48b3f84614c46eb8b5ffb494f7a75c15216664afcbb47c3e78dd80c4ce7eb0a3`; RX 6950 XT gfx1030; single visible device; Q8 KV; automatic clocks; dated 2026-07-18 |
 | Exact PM4 evidence | Radiowave-off/on exact reports: 942 launches, 24 kernels, sequence hash `becff4a4f1849d1e`, one PM4-IB packet, queue id 2, 21,783 command dwords; bit-exact parity passed |
 | Matched product result | Same e017 binary/model: Radiowave-off HIP median 101.431 vs `auto` 83.711 tok/s (`0.82529×`); Radiowave-on similar ~17.5% slower; overlay did not recover |
 | Route-proof limitation | Product JSON records requested `transport=pm4` but omits controller `Ready`, fallback reason, observed multi-position replay |
 | Disposition | **Rejected** as retained-route/Radiowave product promotion |
 | Reusable lesson | Stable sequence + bit-exact shadow cannot replace positive product-arm route proof plus matched wall time |
 
-Raw remote evidence (not checked in):
-`ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-ab-20260718/` and
-`ssh://hipx/home/kaden/redline-results/gfx1030-radiowave-precontract-ab-20260718/`.
+Raw artifacts for the two gfx1030 Radiowave A/B campaigns (2026-07-18; the
+pre-contract and post-contract runs) were produced on the measurement
+workstation and are not checked in. This table is the repository-visible
+record; it is not reproducible from the repository alone.
 
 ### 11.4 Rejected LFM Stage A
 
@@ -701,6 +971,8 @@ Repository-visible rejection record. **Not Redline** — serial-HIP fusion only.
 Exact scope: **LFM2.5-350M dense MQ4** on **gfx1201**, candidate path with
 explicit `HIPFIRE_LFM2_DECODE_FUSION=1`, ordinary serial HIP only (no AQL/PM4/
 HipGraph product route). **Rejected / not shipped.**
+
+> **Historical/inert flags:** `HIPFIRE_LFM2_DECODE_FUSION` and `HIPFIRE_LFM2_GFX1201_DECODE_FUSION` (here and in the reproduce commands below) have no readers in current crate sources and no effect today. They are recorded as the campaign's historical candidate-route labels; measurement evidence is unchanged.
 
 **2026-07-19 Stage-A disposition:** LFM was not admitted to a retained route
 in that campaign — no Redline admission predicate then covered `arch_id==11`.
@@ -724,22 +996,19 @@ retained-PM4 sealed registry evidence/admission record documented in §11.5 and
 | Disposition | **Rejected** as standalone Stage A promotion. Classified as serial-HIP activation-preparation fusion, **not** Redline. Not shipped. |
 | Reusable lesson | Fewer launches are neither retained replay nor a wall-time win. **As of the 2026-07-19 Stage A campaign, LFM was never admitted to a Redline route** — "not Redline" is upstream of the then-absent PM4/shadow work. Preserve that rejection. The later exact gfx1201 retained-PM4 row in §11.5 / [`admissions.yml`](admissions.yml) is a separate sealed registry evidence/admission record without automatic runtime wiring and does not imply generic LFM Redline, automatic product default, or promotion beyond that sealed fixture. |
 
-**Local evidence pointers (session/workstation-local — not checked into this
-repo):**
+**Evidence availability (workstation-local; raw artifacts are not checked in):**
+the phase command ledgers (preflight, serve gate, ABBA, recorder, direct
+capture, rocprof), their raw output directories, and the narrative measurement
+report for the 2026-07-19 Stage-A campaign were produced on a workstation and
+are not part of this repository. Recorded toolchain identity for that
+campaign: gfx1201; daemon HIP 7.2; `hipcc` `7.2.26015-fc0010cf6a`; ROCm clang
+`roc-7.2.0 26014`.
 
-| Kind | Location |
-|---|---|
-| Source ledger / narrative report | `local://lfm-stage-a-measurement-report.md` |
-| Raw artifact root | `/home/kaden/ClaudeCode/autorocm/lfm-stage-a-measurement-20260719/` |
-| Phase command ledgers | `run_preflight.sh`, `run_serve_gate.sh`, `run_abba.sh`, `run_recorder.sh`, `run_direct_capture.sh`, `run_rocprof.sh` under that root |
-| Phase raw dirs | `preflight/`, `serve/`, `abba/`, `recorder/`, `rocprof/` under that root |
-| GPU / ROCm identity | live `rocminfo` gfx1201 UUID `GPU-6125bfcd5e216e52`; daemon HIP 7.2; `hipcc` `7.2.26015-fc0010cf6a`; ROCm clang `roc-7.2.0 26014` (see `preflight/rocminfo.stdout`, `preflight/hipcc-version.stdout`) |
-
-**Locality warning:** those raw artifacts and the `local://` ledger are
-session/workstation-local evidence for the named 2026-07-19 campaign. They are
-**not** portable repository fixtures. Absence of the local tree on another
-machine does not reopen the rejection; it only means the raw dumps are not
-recoverable there. Do not treat missing local paths as missing rejection.
+**Locality warning:** those raw artifacts are workstation-local evidence for
+the named 2026-07-19 campaign and are **not** portable repository fixtures.
+Their absence on another machine does not reopen the rejection; it only means
+the raw dumps are not recoverable there. Do not treat missing raw artifacts as
+a missing rejection.
 
 ### 11.5 LFM2.5-350M dense MQ4 on gfx1201: positive retained-PM4 evidence
 
@@ -752,7 +1021,7 @@ explicit opt-in and must still prove route support.
 
 | Field | Evidence |
 |---|---|
-| Date and fixture | 2026-07-20; `/home/kaden/.hipfire/models/lfm2.5-350m.mq4`, 229,474,032 bytes, MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`, base HFQ with no REAP overlay; gfx1201; Q8 KV; `max_seq=physical_cap=2048`; context position 127; plain AR; `pp=tp=1`; graph off |
+| Date and fixture | 2026-07-20; `lfm2.5-350m.mq4` fixture file, 229,474,032 bytes, MD5 `cb5284b8ad5c6f9e4ca859c0aff0bcd0`, base HFQ with no REAP overlay; gfx1201; Q8 KV; `max_seq=physical_cap=2048`; context position 127; plain AR; `pp=tp=1`; graph off |
 | Exact admission | On Linux, the trusted loader first rejects REAP overlays, then copies exactly 229,474,032 bytes from the already-open HFQ into an anonymous memfd while computing the content MD5 over that same stream. It applies and verifies write/grow/shrink/final seals, reparses the HFQ from the sealed fd, and rebinds later mmap, pread, and path-based reads to that immutable snapshot before minting the opaque exact-identity token. Short reads fail; non-Linux targets mint no retained provenance. The token is then combined with the frozen LFM structure. Retained replay additionally requires gfx1201, active decode fusion, lowered forward, sequential `position == n_tokens`, non-HIP replay request, plain AR, `pp=tp=1`, Q8 KV with the exact 2048-token state surface, and graph off. Any identity, overlay, route, or geometry miss selects ordinary decode. MD5 is fixture identity here, not a cryptographic authorization boundary. |
 | Tape identity | 161 retained dispatches, 15 unique kernels, ordered sequence hash `04305cf1254244f6`; one PM4-IB packet on queue 2; 3,916 command dwords |
 | Shadow equivalence | Artifact `.redline-work/lfm-pm4-wide-sealed-final.json` reports `backend=pm4_ib`: 161 dispatches across 15 kernel identities collapsed into one 3,916-dword IB on queue 2. The ordered dispatch sequence hash was `04305cf1254244f6`; logits, KV, recurrent state, scratch state, and cursor state were bit-exact across 4 compared decode steps. PM4-IB host time was 7,296.400 µs versus 14,283.526 µs for fresh HIP. |
@@ -762,11 +1031,18 @@ explicit opt-in and must still prove route support.
 | Serve health | The production server returned `Paris Berlin Rome`, `finish_reason=stop`, 3 generated tokens, with no empty-output, runaway, or repeated-attractor failure (`.redline-work/lfm-serve-health-sealed-final.json`); the matching runtime transcript is `.redline-work/lfm-serve-health-sealed-final.log`. |
 | Disposition | Positive, self-contained retained-PM4 product-route evidence for the exact fixture. Gate 5 is cleared for this dated run. Full Section 7 certification remains blocked at Gate 7 until the matched automatic-clock arms satisfy the canonical stationarity contract. |
 
-Reproduce the exact shadow and submission proof from a release daemon:
+Artifact names under `.redline-work/` in this table are outputs of that
+2026-07-20 run; they are not checked in. The numbers above are a dated
+record, not reproducible from the repository alone; rerun the commands below
+to regenerate fresh evidence.
+
+Reproduce the exact shadow and submission proof from a release daemon (set
+`MODEL` to the `lfm2.5-350m.mq4` fixture file whose MD5 is listed above):
 
 ```bash
 cargo build -p hipfire-runtime --release --example daemon --features deltanet
 
+# HISTORICAL/INERT: HIPFIRE_LFM2_GFX1201_DECODE_FUSION and HIPFIRE_REPLAY_LOWERED_FORWARD have no reader in current sources; the exports below are retained as recorded and have no effect on the route.
 HIPFIRE_LFM2_GFX1201_DECODE_FUSION=1 \
 HIPFIRE_REPLAY_LOWERED_FORWARD=1 \
 HIPFIRE_REPLAY_MANUAL_CAPTURE=1 \
@@ -777,8 +1053,8 @@ HIPFIRE_REPLAY_PM4_QUEUES=1 \
 HIPFIRE_REPLAY_PM4_STATEFUL=stateful \
 HIPFIRE_REPLAY_PM4_GCR_TRIM=1 \
 python3 scripts/redline_daemon_harness.py \
-  --model ~/.hipfire/models/lfm2.5-350m.mq4 \
-  --daemon target/release/examples/daemon \
+  --model "$MODEL" \
+  --daemon target/release/daemon \
   --kv-mode q8 --skip-prefill --decode-context 127 \
   --capture-repeats 2 --measure-repeats 5 \
   --decode-iterations 4 --shadow-iterations 4 --pm4 \
@@ -794,6 +1070,7 @@ and performance evidence.
 Run the product arm separately; do not stitch its result to the shadow report:
 
 ```bash
+# HISTORICAL/INERT: HIPFIRE_LFM2_GFX1201_DECODE_FUSION and HIPFIRE_REPLAY_LOWERED_FORWARD have no reader in current sources; the exports below are retained as recorded and have no effect on the route.
 HIPFIRE_LFM2_GFX1201_DECODE_FUSION=1 \
 HIPFIRE_REPLAY_LOWERED_FORWARD=1 \
 HIPFIRE_REPLAY_PM4_WAIT_POLICY=resource \
@@ -802,8 +1079,8 @@ HIPFIRE_REPLAY_PM4_QUEUES=1 \
 HIPFIRE_REPLAY_PM4_STATEFUL=stateful \
 HIPFIRE_REPLAY_PM4_GCR_TRIM=1 \
 python3 -m tools.redline bench \
-  --model ~/.hipfire/models/lfm2.5-350m.mq4 \
-  --daemon target/release/examples/daemon \
+  --model "$MODEL" \
+  --daemon target/release/daemon \
   --context 127 --transport pm4 --kv-mode q8 \
   --dpm-warmup-secs 10 \
   --out .redline-work/lfm-product-pm4-stationary.json
@@ -874,17 +1151,18 @@ Prefer paths and symbols over line numbers.
 
 | Concern | Stable source path and symbols |
 |---|---|
-| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `mq4r_redline_default` only (`.mq4r` + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic, no `arch_id` gate). Existing LFM `.mq4` sealed evidence has no automatic selector. |
-| Model-load application and diagnostic handlers | `crates/hipfire-runtime/examples/daemon.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
+| Automatic product predicates | `crates/hipfire-runtime/src/config.rs` — `retained_redline_default`: `mq4r_redline_default` (`.mq4r` + exact `gfx1100`/`gfx1151`/`gfx1201` + `pp=tp=1`; model-family agnostic except the Muse Glimmer and Gemma 4 withholds), Qwen3.5 dense (`qwen3_5`) and Qwen4 (`qwen4`) on exact gfx1201 with `pp=tp=1` and no drafter, and DeepSeek4 `.mq2r` on gfx1151 AR. Expert-parallel loads (`ep` > 1) and Qwen3.5 under CPU-executed partial offload are never admitted. Existing LFM `.mq4` sealed evidence has no automatic selector. |
+| Model-load application and diagnostic handlers | `crates/hipfire-daemon/src/main.rs` — load-time `configure_model_default`; `redline_capture`; `redline_shadow_aql`; `redline_shadow_pm4` |
 | Qwen model boundary and route | `crates/hipfire-arch-qwen35/src/qwen35.rs` — `forward_scratch`; `prepare_scratch_inputs`; `set_forward_eligible`; `should_route_aql`; `should_route_pm4`; `finish_capture`; `prepare_*` |
 | LFM decode path and registry evidence | `crates/hipfire-arch-lfm2moe/src/forward.rs` — `decode_step`; `decode_step_with_graph`; lowered path under `HIPFIRE_FORWARD_LOWERED`. Sealed LFM retained-PM4 evidence/admission: [`admissions.yml`](admissions.yml) row `lfm25-350m-mq4-gfx1201-retained-pm4-plain-ar` (no current runtime selector). |
-| LFM generate / spec path | `crates/hipfire-runtime/examples/daemon.rs` — `generate_lfm2moe`; `crates/hipfire-arch-lfm2moe/src/spec_impl.rs` — `Lfm2MoeBundle` / `SpecTarget` |
+| LFM generate / spec path | `crates/hipfire-daemon/src/main.rs` — `generate_lfm2moe`; `crates/hipfire-arch-lfm2moe/src/spec_impl.rs` — `Lfm2MoeBundle` / `SpecTarget` |
 | Controller, tape, lifecycle, routing | `crates/rdna-compute/src/replay.rs` — `ReplayController`; `ReplayState`; `RecordedHipLaunch`; `ReplayGridBinding`; `configure_model_default`; `reset_for_model`; `begin_auto_capture_if_armed`; `finish_capture`; `prepare_linear_aql_prefix`; `prepare_pm4_prefix`; `replay_linear_aql`; `replay_pm4`; `observe_shadow`; `install_prepared_plan`; `should_route_aql`; `should_route_pm4`; `poison` |
 | Central HIP recording and artifact aliases | `crates/rdna-compute/src/dispatch.rs` — `Gpu::replay`; typed HIP launch recording |
 | DAG, identity, ABI, visibility | `crates/redline-dispatch/src/lib.rs` — `Recorder`; `CompiledPlan`; `KernelArtifactIdentity`; `KernargAbi`; `derive_aql_visibility` |
 | Retained AQL and PM4 graph objects | `crates/redline-dispatch/src/aql/replay.rs` — `SingleQueueBatchGraph`; `SingleQueuePm4Ib`; `PhasedMultiQueuePm4Ib` |
 | Public ROCr/HSA ownership | `crates/redline-rocr/src/lib.rs` |
 | PM4-IB vendor packet | `crates/redline-rocr/src/packet.rs` — `PacketImage::pm4_indirect_buffer` |
+| railgun program model | `crates/railgun/src/lib.rs` (program/prepare), `kernel.rs`, `plan.rs`, `shadow.rs`; `crates/railgun-cert/src/recording.rs` (recording inventory); `crates/rdna-compute/src/replay/railgun_shadow.rs`, `crates/rdna-compute/src/railgun_check.rs` |
 | Architecture PM4 builders | `crates/redline-rocr/src/pm4.rs`; `crates/redline-rocr/src/pm4_gfx10.rs` |
 | Manual capture/shadow diagnostic | `scripts/redline_daemon_harness.py` |
 | Product stationary comparison | `python3 -m tools.redline bench` |

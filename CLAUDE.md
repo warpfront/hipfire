@@ -14,12 +14,19 @@ path, no Vulkan/cross-vendor layer. It runs natively across RDNA generations
 
 ## Architecture
 
-The crate stack layers bottom-up. User-facing entry is the native Rust CLI
-(`crates/hipfire-cli`), backed by shared typed config, registry, and HTTP/JSONL
-client crates. It posts to — or spawns — the inference daemon
-(`crates/hipfire-runtime/examples/daemon.rs`, a JSON-lines stdio server).
-Kernels are HIP source under `kernels/src/`, compiled at runtime via `hipcc`
-and cached as `.hsaco` per GPU arch.
+Full crate map, layering invariants, and request lifecycle live in
+`docs/ARCHITECTURE.md` — this section is the short working summary.
+
+The crate stack layers bottom-up with a strict one-way edge
+`saddle-core -> hipfire-runtime -> hipfire-loader -> hipfire-engine ->
+hipfire-generate -> hipfire-daemon` (`docs/ARCHITECTURE.md` § Layering).
+User-facing entry is the native Rust CLI (`crates/hipfire-cli`),
+backed by shared typed config, registry, and HTTP/JSONL client crates.
+It posts to — or spawns — the inference daemon
+(`crates/hipfire-daemon/src/main.rs`, ~3,879 lines, `[[bin]] name = "daemon"`,
+JSON-lines stdio/HTTP server). Kernels are HIP source under `kernels/src/` —
+see `docs/ARCHITECTURE.md` § Kernel build for precompiled `.hsaco` vs JIT
+cache selection.
 
 - **hip-bridge / hsa-bridge** — safe Rust FFI to the AMD HIP / HSA runtimes via
   `dlopen` (no link-time ROCm dependency).
@@ -27,8 +34,22 @@ and cached as `.hsaco` per GPU arch.
   predicates.
 - **hipfire-dispatch** — unified per-kernel-family dispatch; picks the kernel by
   quant format × arch capability × feature flags resolved at init.
-- **hipfire-runtime** — inference orchestrator: KV cache, sampler, token loop,
-  HFQ loader, tokenizer, and the daemon. Top of the compute DAG.
+- **saddle-core** — the substrate: grammar, KV, caps, sampling policy (depends
+  only on `rdna-compute`, `hip-bridge`, `serde`).
+- **hipfire-runtime** — arch-agnostic infra + `Architecture` trait; HFQ/safetensors,
+  tokenizer, sampler, framing, spec primitives. LLaMA dense forward still lives
+  here (`hipfire-arch-llama` is a facade; see `docs/ARCHITECTURE.md`).
+- **hipfire-loader** — composition root: `Carrier` registry, single
+  `load_model` dispatch, `LoadedModel`, continuous-batch staging. Depends on all
+  arch crates; arch crates MUST NOT depend on it.
+- **hipfire-engine** — arch-free serve engine: scheduler, terminal, emit, prompt.
+  Declares no `hipfire-arch-*` dependency.
+- **hipfire-generate** — generation bodies (`ar`, `qwen`, `dense`, `vision`,
+  `batch`, Redline fixtures) that need both arch types and engine machinery;
+  sits `hipfire-loader -> hipfire-engine -> hipfire-generate -> hipfire-daemon`.
+- **hipfire-daemon** — the product binary. `[[bin]] name = "daemon"` in
+  `crates/hipfire-daemon`; message dispatch and process lifetime only
+  (`docs/ARCHITECTURE.md` § Serve / generate path).
 - **hipfire-quantize** — CPU-side encoder (safetensors/GGUF → `.hfq`/`.mq4`/…);
   builds without a GPU.
 - **hipfire-detect** — GPU-independent observability: attractor / special-token /
@@ -37,30 +58,43 @@ and cached as `.hsaco` per GPU arch.
   TOML configuration, model catalog, dynamic registry, daemon/HTTP client, and
   the native operator/service surface.
 - **hipfire-arch-\*** — one crate per model family's forward pass, keyed by
-  `arch_id` (see `docs/architecture-ids.md`): llama (0/1), qwen35 (5 dense / 6
-  MoE-A3B, also hosts DFlash spec-decode), qwen2 (7), dots-ocr (8), deepseek4 (9,
-  multi-GPU EP), minimax (10), lfm2moe (11), cohere2moe (12). `toy` (0xFF) is the
-  new-port template; the daemon refuses to dispatch it.
-- Support crates: hipfire-loader, hipfire-atlas (perf corpus), hipfire-reap (MoE
+  `arch_id` (see `docs/architecture-ids.md` and `docs/ARCHITECTURE.md` §
+  Architecture crates): llama (0/1), qwen35 (5/6), qwen2 (7), dots-ocr (8),
+  deepseek4 (9, EP), minimax (10, EP), lfm2moe (11), cohere2moe (12), gemma4
+  (13, 22), muse-glimmer (14), maple (15), qwen4 (16), qwen35-embed (17 —
+  the multi-vector embedding encoder, served via the non-chat `embed`
+  verb only). `toy` (0xFF) is the new-port template; the
+  daemon refuses to dispatch it.
+- Support crates: hipfire-atlas (perf corpus), hipfire-reap (MoE
   expert pruning), hipfire-tui (chat/settings TUI), redline (experimental
-  direct-KMD compute, not wired into serving).
-
+  direct-KMD compute, not wired into serving) — plus `hipfire-ds4-parent`
+  (provisional) and `hipfire-pflash` (deprecated, removal in 0.5.0, see below).
 
 ### PFlash status
 
-PFlash is retained legacy research, not mainline or production functionality.
-Prefix caching supersedes it for supported serving workloads. Its remaining
-code and artifacts exist only for historical reference and reproduction; do
-not treat PFlash as a production element, recommendation, acceptance route, or
-basis for a current performance claim.
+PFlash is deprecated since 0.4.0 and will be removed in 0.5.0. Prefix caching
+supersedes it for supported serving workloads. It still loads, but enabling it
+prints a deprecation warning and it is not supported; do not treat PFlash as a
+production element, recommendation, acceptance route, or basis for a current
+performance claim.
+
+### CASK status
+
+CASK / TriAttention KV eviction (FlashCASK, `memory.cask.*`, `hipfire
+sidecar-gen`, `dflash_spec_demo --cask-*`) is deprecated since 0.4.0 and will
+be removed in 0.5.0. It still loads, but using it prints a deprecation
+warning and it is not supported; do not treat it as a production element,
+recommendation, acceptance route, or basis for a current performance claim.
 
 ## Building, testing & gates
 
 ```
 # Workspace build — no GPU/ROCm needed (HIP is dlopen'd at runtime); CI-required:
 cargo build --release --workspace --all-targets --locked
-# The inference daemon:
-cargo build --release --example daemon --features deltanet -p hipfire-runtime
+# Product binaries — no --features required (required-features is 0):
+cargo build --release
+# → target/release/hipfire  (from crates/hipfire-cli, [[bin]] name = "hipfire")
+# → target/release/daemon   (from crates/hipfire-daemon/src/main.rs, [[bin]] name = "daemon")
 # No-GPU local check (cargo check + Rust tests + pytest):
 ./scripts/no-gpu-ci.sh
 # Wire the pre-commit hook once per clone (sets core.hooksPath=.githooks):
@@ -73,7 +107,9 @@ workflow refreshes `registry/v1.json`. There is no GPU CI runner yet — the
 **GPU-bound correctness/perf gates run locally** (the pre-commit hook fires the
 relevant ones when staged files match the kernel/serve/spec/pp hotspot globs).
 The gate suite is documented in the sections below; `scripts/gates.sh` is the
-unified wrapper. Conventions: don't `--no-verify`; don't bare `cargo fmt` (use
+unified wrapper. Conventions: run `scripts/pre-commit-ci.sh [origin/<base>]`
+(the fast GPU-free CI checks, no tests) before every commit; don't
+`--no-verify`; don't bare `cargo fmt` (use
 `scripts/fmt-changed.sh <master|beta>` — the base ref is mandatory, since a
 branch cut from `beta` formatted against `master` reformats the whole
 divergence); don't hand-edit `registry/v1.json` (it's generated by
@@ -81,11 +117,18 @@ divergence); don't hand-edit `registry/v1.json` (it's generated by
 
 ### The `cargo fmt` block (enforced, not advisory)
 
-The repo carries historical rustfmt debt, so CI only checks CHANGED files. A
-bare `cargo fmt` rewrites the whole workspace, buries the real change under a
-200+ file diff, and makes review impossible. That rule used to be prose in this
-file — prose an agent or a teammate can skip — so it is now enforced in three
-independent layers:
+`beta` has been rustfmt-clean since the one-time 0.4.3 sweep (commit
+`style: rustfmt the whole workspace (one-time 0.4.3 sweep)`), and
+`scripts/pre-commit-ci.sh` (the land gate) now checks the whole workspace with
+`cargo-fmt --all -- --check`, so a packet cannot land new format debt. Branches
+cut before the sweep, and `master` until the release merge, still carry the old
+debt: there a bare `cargo fmt` rewrites 1000+ files and buries the real change.
+Replay such a branch with `scripts/fmt-sweep-rebase.sh <sweep-sha>` instead of
+resolving format conflicts by hand: it writes each commit as the sweep applied
+to that commit's tree onto a new branch `fmt-swept/<branch>` (your branch is
+never touched). That branch sits on the sweep commit only — rebase it onto
+current `beta` as usual and rerun your acceptance before calling it ready. The
+block stays enforced in three independent layers:
 
 1. **`.cargo/config.toml`** shadows the `fmt` subcommand, so `cargo fmt` exits
    101 with a self-documenting error. Covers humans, IDEs, and non-Claude
@@ -136,7 +179,7 @@ failed so the search space narrows.
 
 Phases 0–4 (ROCm-unlock recon → approach bake-off → E2E validation → first
 forward pass) bootstrapped the engine and are complete. For that archaeology see
-`git log` and the `findings/` / `approaches/` history; day-to-day work now lives
+`git log` and the archived `docs/investigations/dispatch/` / `approaches/` history; day-to-day work now lives
 in `crates/` and the gate suite below — there is no setup phase to re-run.
 
 ## Perf benchmarking (kernel perf changes)
@@ -210,7 +253,7 @@ verify the caller actually sets a stream (fix pattern: create
 `gpu.active_stream` at the top of the caller — see da2753e for
 `spec_step_dflash`).
 
-## Skills (`docs/skills/`)
+## Skills (`.agents/skills/`)
 
 Reusable how-tos kept out of CLAUDE.md to avoid bloat. Each skill is a
 self-contained reference; reach for it by name when the situation
@@ -230,8 +273,9 @@ matches. Index of currently-available skills:
   `hipfire serve`. **Reach for this when:** serve "Failed to start
   (port in use)", a stale daemon holds VRAM, a pre-warm JSON-parse /
   os-error-2 crash left a zombie `daemon.pid` singleton, or you need a
-  guaranteed-fresh daemon. Kills the native serve + spawned daemon, fuser-frees
-  the port, reaps pid/lock files. `scripts/serve-restart.sh [port]`.
+  guaranteed-fresh daemon. Runs `hipfire stop --force`, which stops only this
+  install's serve and daemons (never other worktrees' or agents'), then waits
+  for the port. `scripts/serve-restart.sh [port]`.
 
 - **`agent-memory`** — git-tracked cross-session project memory as in-repo markdown
   notes (`.agent-memory/notes/*.md`, YAML frontmatter) with **lexical (ripgrep)
@@ -241,7 +285,7 @@ matches. Index of currently-available skills:
   gotcha). Recall before answering (`scripts/mem.sh recall <terms>`), remember after
   learning (`scripts/mem.sh remember <slug> "<title>" tags`). Project findings go
   here (shared, diffable, travel with the code); personal/fleet notes stay in global
-  memory. See `docs/skills/agent-memory.md`.
+  memory. See `.agent-memory/` and `scripts/mem.sh`.
 
 When adding a new skill, give it a one-line index entry here so future
 sessions find it without grepping.
@@ -348,10 +392,23 @@ re-learned per session.
   engine.** A wrong-recipe model (e.g. dense-AWQ on an MoE) lobotomizes output
   and burns engine-debugging cycles. Coherence gates must include a bare factual
   prompt — strong/code prompts mask a lobotomy.
-- **Byte-parity validation is meaningless under stochastic state — pin FP32 +
-  `HIPFIRE_DETERMINISTIC=1`.** Q8 DeltaNet-state stochastic rounding makes an
-  exact TP/seam path look non-bit-exact ("ULP cascade") and mis-attributes the
-  bug. Use FP32 DeltaNet state for any byte-parity claim.
+- **Byte-parity validation requires deterministic recurrent state.** Production
+  Q8 DeltaNet state has default-on error feedback (`q8_ef`,
+  `HIPFIRE_DN_STATE_EF=1`) and is deterministic; leave the production default
+  enabled when validating the shipping route. If explicitly testing legacy
+  stochastic Q8 (`HIPFIRE_DN_STATE_EF=0`), byte parity is meaningless: re-enable
+  EF or pin FP32 plus `HIPFIRE_DETERMINISTIC=1`.
+- **NaN defeats a `max`-based relative-error check.** `if rel > worst { worst = rel }`
+  scores NaN↔NaN as 0, so an all-NaN comparison reads as "bit-exact agreement".
+  Compare with an explicit `is_nan()` (or fail on any non-finite element).
+- **An unwritten scratch tensor reads as zeros, not as a reference.** `|gpu-down| 0`
+  from a buffer the arm never writes carries no information; confirm a buffer is
+  written before measuring against it.
+- **A parity check that compares an implementation against itself proves nothing.**
+  When two copies of a decoder are consolidated, any cross-check that runs the
+  merged path on both sides is a tautology. Keep the independent oracle — a stored
+  expectation table generated pre-merge, or a GPU-vs-CPU kernel check — as the
+  guard, and say in the test doc which side is the reference.
 
 ## GPU Lock Protocol (Multi-Agent)
 
@@ -410,47 +467,26 @@ who doesn't have the file.
 
 @~/.claude/hipfire-fleet.md
 
-<!-- gitnexus:start -->
-# GitNexus — Code Intelligence
+# Code intelligence — CodeGraph
 
-This project is indexed by GitNexus as **hipfire** (31703 symbols, 108481 relationships, 275 execution flows). Use the GitNexus MCP tools to understand code, assess impact, and navigate safely.
+GitNexus is **removed from this project**. Do not run it, do not restore its
+block into this file, and do not follow any `gitnexus://` resource, MCP tool,
+or `.claude/skills/gitnexus/**` skill file: none of them are provisioned here.
+Tooling that re-injects a GitNexus marker block into CLAUDE.md or AGENTS.md is
+re-adding a dependency this project already dropped; delete it rather than
+merging it.
 
-> Index stale? Run `node .gitnexus/run.cjs analyze` from the project root — it auto-selects an available runner. No `.gitnexus/run.cjs` yet? `npx gitnexus analyze` (npm 11 crash → `npm i -g gitnexus`; #1939).
+The code-intelligence tool for hipfire is **CodeGraph** — a per-project SQLite
+graph of symbols, edges, and call paths, queried through the
+`codegraph_explore` MCP tool or the equivalent `codegraph` CLI. See
+[AGENTS.md](AGENTS.md) § "Code intelligence — CodeGraph" for the full usage
+contract; the short version:
 
-## Always Do
-
-- **MUST run impact analysis before editing any symbol.** Before modifying a function, class, or method, run `impact({target: "symbolName", direction: "upstream"})` and report the blast radius (direct callers, affected processes, risk level) to the user.
-- **MUST run `detect_changes()` before committing** to verify your changes only affect expected symbols and execution flows. For regression review, compare against the default branch: `detect_changes({scope: "compare", base_ref: "main"})`.
-- **MUST warn the user** if impact analysis returns HIGH or CRITICAL risk before proceeding with edits.
-- When exploring unfamiliar code, use `query({search_query: "concept"})` to find execution flows instead of grepping. It returns process-grouped results ranked by relevance.
-- When you need full context on a specific symbol — callers, callees, which execution flows it participates in — use `context({name: "symbolName"})`.
-- For security review, `explain({target: "fileOrSymbol"})` lists taint findings (source→sink flows; needs `analyze --pdg`).
-
-## Never Do
-
-- NEVER edit a function, class, or method without first running `impact` on it.
-- NEVER ignore HIGH or CRITICAL risk warnings from impact analysis.
-- NEVER rename symbols with find-and-replace — use `rename` which understands the call graph.
-- NEVER commit changes without running `detect_changes()` to check affected scope.
-
-## Resources
-
-| Resource | Use for |
-|----------|---------|
-| `gitnexus://repo/hipfire/context` | Codebase overview, check index freshness |
-| `gitnexus://repo/hipfire/clusters` | All functional areas |
-| `gitnexus://repo/hipfire/processes` | All execution flows |
-| `gitnexus://repo/hipfire/process/{name}` | Step-by-step execution trace |
-
-## CLI
-
-| Task | Read this skill file |
-|------|---------------------|
-| Understand architecture / "How does X work?" | `.claude/skills/gitnexus/gitnexus-exploring/SKILL.md` |
-| Blast radius / "What breaks if I change X?" | `.claude/skills/gitnexus/gitnexus-impact-analysis/SKILL.md` |
-| Trace bugs / "Why is X failing?" | `.claude/skills/gitnexus/gitnexus-debugging/SKILL.md` |
-| Rename / extract / split / refactor | `.claude/skills/gitnexus/gitnexus-refactoring/SKILL.md` |
-| Tools, resources, schema reference | `.claude/skills/gitnexus/gitnexus-guide/SKILL.md` |
-| Index, status, clean, wiki CLI commands | `.claude/skills/gitnexus/gitnexus-cli/SKILL.md` |
-
-<!-- gitnexus:end -->
+- `codegraph_explore` FIRST, before a grep/read loop or an edit. Source it
+  returns is already read — do not re-open those files.
+- Point it at a checkout that actually has a `.codegraph/` index; fresh
+  worktrees start without one (`codegraph init .`). The index is machine-local
+  and gitignored.
+- `lsp references` — not CodeGraph — is the authority on "did I get every
+  callsite". CodeGraph shows call paths; the language server shows the set.
+- NEVER rename across files with find-and-replace; use `lsp rename`.

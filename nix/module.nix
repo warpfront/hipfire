@@ -1,4 +1,4 @@
-{ config, lib, pkgs, ... }:
+{ config, options, lib, pkgs, ... }:
 
 let
   cfg = config.services.hipfire;
@@ -30,8 +30,16 @@ let
     "memory.max_seq" = cfg.maxSeq;
     "generation.repeat_penalty" = cfg.repeatPenalty;
     "memory.kv_cache" = cfg.kvCache;
-    "speculation.dflash" = cfg.dflashMode;
     "serve.idle_timeout_seconds" = cfg.idleTimeout;
+  }
+  # An untouched dflashMode (only the option default, mkOptionDefault priority;
+  # `isDefined` is true for that default, so compare the priority) writes no
+  # speculation.dflash, so the registry's per-model policy applies (auto only
+  # for Qwen3.8-27B tiers with a declared paired draft; every other model keeps
+  # the schema default off). Any explicit definition, including "auto", is
+  # written as a global that outranks the registry layer.
+  // lib.optionalAttrs (options.services.hipfire.dflashMode.highestPrio < (lib.mkOptionDefault null).priority) {
+    "speculation.dflash" = cfg.dflashMode;
   }
   // lib.optionalAttrs (cfg.defaultModel != "") {
     "serve.default_model" = cfg.defaultModel;
@@ -59,15 +67,21 @@ let
       }
     else null;
 
-  hipfirePkg =
-    if effectiveSrc != null then
-      cfg.package.override { src = effectiveSrc; cargoLockFile = "${effectiveSrc}/Cargo.lock"; }
-    else
-      cfg.package;
   hipfireKernelsPkg =
     if cfg.kernelsPackage == pkgs.hipfire-kernels
-    then cfg.kernelsPackage.override { gpuTargets = cfg.gpuTargets; }
+    then cfg.kernelsPackage.override ({
+      gpuTargets = cfg.gpuTargets;
+    } // lib.optionalAttrs (effectiveSrc != null) {
+      src = effectiveSrc;
+      cargoLockFile = "${effectiveSrc}/Cargo.lock";
+    })
     else cfg.kernelsPackage;
+  hipfirePkg = cfg.package.override ({
+    kernels = hipfireKernelsPkg;
+  } // lib.optionalAttrs (effectiveSrc != null) {
+    src = effectiveSrc;
+    cargoLockFile = "${effectiveSrc}/Cargo.lock";
+  });
 
   envList =
     (lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment)
@@ -79,10 +93,6 @@ let
         pkgs.rocmPackages.rocm-comgr
         pkgs.rocmPackages.rocprofiler-register
       ]}"
-      # JIT hipcc needs HIP_PATH (clr) and rocm-device-libs bitcode dir.
-      # Without these the daemon panics on first kernel compile.
-      "HIP_PATH=${pkgs.rocmPackages.clr}"
-      "HIPFIRE_HIPCC_EXTRA_FLAGS=--rocm-device-lib-path=${pkgs.rocmPackages.rocm-device-libs}/amdgcn/bitcode"
     ];
 in
 {
@@ -236,8 +246,16 @@ in
 
     dflashMode = lib.mkOption {
       type = lib.types.enum [ "on" "off" "auto" ];
-      default = "off";
-      description = "DFlash speculative decode: on / off / auto.";
+      default = "auto";
+      description = ''
+        DFlash speculative decode: on / off / auto. Leaving this option unset
+        writes no `speculation.dflash` key, so the registry's per-model policy
+        applies: `auto` only for Qwen3.8-27B tiers whose registry entry declares
+        a paired DFlash draft, `off` (the schema default) for every other model.
+        Setting it explicitly, to `"auto"` as well, writes a global
+        `speculation.dflash` that outranks the registry layer; `"off"` is the
+        kill switch that disables DFlash for every model.
+      '';
     };
 
     idleTimeout = lib.mkOption {
@@ -377,7 +395,7 @@ in
       systemd.services.hipfire-setup = {
         description = "hipfire config setup";
         wantedBy = [ "multi-user.target" ];
-        before = [ "hipfire-precompile.service" "hipfire.service" ];
+        before = [ "hipfire.service" ];
         serviceConfig = {
           Type = "oneshot";
           RemainAfterExit = true;
@@ -391,38 +409,14 @@ in
           cp -f ${modelsToml} /var/lib/hipfire/.hipfire/models.toml
           rm -f /var/lib/hipfire/.hipfire/config.json /var/lib/hipfire/.hipfire/per_model_config.json
           ln -sf ${hipfirePkg}/bin/hipfire-daemon /var/lib/hipfire/.hipfire/bin/daemon
-          ln -sfn ${hipfireKernelsPkg}/kernels /var/lib/hipfire/.hipfire/bin/kernels
+          # Packaged indexes and objects live beside hipfire-daemon-unwrapped.
         '';
       };
 
-      systemd.services.hipfire-precompile = {
-        description = "hipfire GPU kernel pre-compilation";
-        wantedBy = [ "multi-user.target" ];
-        after = [ "hipfire-setup.service" ];
-        before = [ "hipfire.service" ];
-        serviceConfig = {
-          Type = "oneshot";
-          RemainAfterExit = true;
-          User = cfg.user;
-          Group = cfg.group;
-          StateDirectory = "hipfire";
-          CacheDirectory = "hipfire";
-          WorkingDirectory = "/var/lib/hipfire";
-          Environment = envList ++ [
-            "HIPFIRE_KERNEL_CACHE=/var/cache/hipfire/kernels"
-          ];
-        };
-        script = ''
-          export HOME=/var/lib/hipfire
-          if ! ${hipfirePkg}/bin/hipfire-daemon --precompile; then
-            echo "WARNING: kernel pre-compilation failed (exit $?). Daemon will JIT-compile on first request." >&2
-          fi
-        '';
-      };
 
       systemd.services.hipfire = {
         description = "hipfire inference daemon";
-        after = [ "network.target" "hipfire-precompile.service" ];
+        after = [ "network.target" "hipfire-setup.service" ];
         wantedBy = [ "multi-user.target" ];
         path = lib.optionals cfg.rocmSupport [ pkgs.rocmPackages.clr ];
         serviceConfig = {

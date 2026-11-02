@@ -41,6 +41,7 @@ pub mod gemv;
 
 pub mod moe;
 pub mod moe_buckets;
+pub mod moe_expert_iu4;
 
 pub mod rotation;
 

@@ -1,0 +1,4339 @@
+{
+  "record": {
+    "arch": "gfx1151",
+    "artifact_sha256": "bc34ee389bd990386bdfc93d94b66752affcd3fbd33bec212a6b4edcaa51a963",
+    "module": "qwen4_lane_rows_pm",
+    "origin": "pm_native",
+    "symbols": [
+      "gemv_mq6g256v2_xbatch_pm",
+      "gemv_mq6g256v2_x4_xbatch_pm",
+      "gemv_q8_0_k8_xbatch_pm",
+      "gemv_q8_0_k320_xbatch_pm",
+      "gemv_mq6g256v2_rows_t8_pm_gfx1151",
+      "gemv_mq6g256v2_rows_x4_t8_pm_gfx1151",
+      "gemv_q8_0_k8_rows_t8_pm_gfx1151",
+      "gemv_q8_0_k320_rows_t8_pm_gfx1151",
+      "gemv_q8_0_k2560_rows_t8_pm_gfx1151",
+      "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1151",
+      "gemv_q8_0_wide_rows_t8_pm_gfx1151"
+    ],
+    "source_sha256": "",
+    "extra_flags": "",
+    "flags": [],
+    "scheduler_profile": "",
+    "packaging_key": "",
+    "jit_cache_key": "",
+    "argv": [],
+    "object": "native/gfx1151/qwen4_lane_rows_pm.hxaco",
+    "receipt": "receipts/gfx1151/bc34ee389bd990386bdfc93d94b66752affcd3fbd33bec212a6b4edcaa51a963.receipt.json",
+    "receipt_sha256": "525add472630d0fc63d701710a8383c4174956ffaae2670e97f9693234589a52",
+    "kernels": [
+      {
+        "symbol": "gemv_mq6g256v2_xbatch_pm",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_mq6g256v2_x4_xbatch_pm",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_q8_0_k8_xbatch_pm",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_q8_0_k320_xbatch_pm",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_mq6g256v2_rows_t8_pm_gfx1151",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_mq6g256v2_rows_x4_t8_pm_gfx1151",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_q8_0_k8_rows_t8_pm_gfx1151",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_q8_0_k320_rows_t8_pm_gfx1151",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_q8_0_k2560_rows_t8_pm_gfx1151",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1151",
+        "status": "proven",
+        "differential": "pass"
+      },
+      {
+        "symbol": "gemv_q8_0_wide_rows_t8_pm_gfx1151",
+        "status": "proven",
+        "differential": "pass"
+      }
+    ]
+  },
+  "receipt": {
+    "schema": "peacemaker-receipt",
+    "schema_version": 9,
+    "object_sha256": "bc34ee389bd990386bdfc93d94b66752affcd3fbd33bec212a6b4edcaa51a963",
+    "device_elf_sha256": "b0a702507aa5420261ac90742e3665403e47636c24e034918507997bb14c53dc",
+    "arch": "gfx1151",
+    "strict": false,
+    "tier": "D",
+    "lifter": {
+      "name": "peacemaker-lift",
+      "crate_version": "0.4.5",
+      "git_sha": "cbb287f056a7c0cf912221422b55941b32ec9e04"
+    },
+    "certifier": {
+      "name": "railgun-cert",
+      "crate_version": "0.4.5",
+      "git_sha": "cbb287f056a7c0cf912221422b55941b32ec9e04"
+    },
+    "round_trip_proof_sha256": "f79e477edeb94f34f5c5842dc130926e93ba86b30f282661480c27e86c38745e",
+    "kernels": [
+      {
+        "symbol": "gemv_mq6g256v2_xbatch_pm",
+        "text_range": [
+          17920,
+          123004
+        ],
+        "text_sha256": "5e917bd2f034dce6e81991edf3684552e224d57355c0a3771cdad9d75e2d9220",
+        "kd_sha256": "03e313c090a5ad3557a0f061357f7cf396b81c6d6d5759312b00c2f53bcba7e6",
+        "metadata_sha256": "68ec539f88e9682bf3cbedab78bb0f452041bb7a766174fa67059c981ccabf2d"
+      },
+      {
+        "symbol": "gemv_mq6g256v2_x4_xbatch_pm",
+        "text_range": [
+          141056,
+          123164
+        ],
+        "text_sha256": "0f45bf8944aad27e9f8fa01b861fecd196e0e47c4a0b52c9058c611f4a6bb8a1",
+        "kd_sha256": "0e482a06130bfd82fd22e0258827e28a86efb082a8aa01b4c29b2317986f5209",
+        "metadata_sha256": "70e6c64e425db6030810f353a79e55d1c5c30fe9e27ae670c441c8d325293dc7"
+      },
+      {
+        "symbol": "gemv_q8_0_k8_xbatch_pm",
+        "text_range": [
+          264448,
+          43860
+        ],
+        "text_sha256": "a1064b678349c6b5cb809dc917a8e076292baf5f7fda2f8c9203adb2b312e0f8",
+        "kd_sha256": "5397bdf40abe05cc6b409a3abcea136738b11c069f822be5db502aa3a5342685",
+        "metadata_sha256": "faeb5b1115475284350a4c8b00f447709490b3c7563eab9a64fbdf6a986284a0"
+      },
+      {
+        "symbol": "gemv_q8_0_k320_xbatch_pm",
+        "text_range": [
+          308480,
+          81636
+        ],
+        "text_sha256": "c2dc0dc781413be9813df79b65b920a983952a58b2efbc1d6892231eaa7b89b4",
+        "kd_sha256": "20b292ad5cb8c596daf1175d5f29f1d8ae4946f4dff7d0971cb73bde5d3d2ccc",
+        "metadata_sha256": "380aefac96ace7dcb48d2718e2d0ceba209b7fa8223cbb6eaa50a35fe3edfc31"
+      },
+      {
+        "symbol": "gemv_mq6g256v2_rows_t8_pm_gfx1151",
+        "text_range": [
+          390144,
+          9576
+        ],
+        "text_sha256": "5665047396261c089ad016a6ce1cc6776e85cbd3d608c4cae39b6a445c1f2c14",
+        "kd_sha256": "b439d872da245da9936e76a81a9297a9504c01cc696977321284b9211d94ec48",
+        "metadata_sha256": "626e54cdb1a26878d456adec838cac5828bd46aac09246150657b9c17c18b83a"
+      },
+      {
+        "symbol": "gemv_mq6g256v2_rows_x4_t8_pm_gfx1151",
+        "text_range": [
+          399872,
+          9664
+        ],
+        "text_sha256": "8791874ea36ff0b04122213a5d59a4e1ac8771f63cd26c7a53bc8560f063f650",
+        "kd_sha256": "bad0b597343bc4e3ba6f605aa9a4f3b668f60d1e2dac1f345299dacd1cb4e6a4",
+        "metadata_sha256": "50cec52b2da649b1fccfa972c6e81474759b56473c07b5d0f4c2d82cca961c3b"
+      },
+      {
+        "symbol": "gemv_q8_0_k8_rows_t8_pm_gfx1151",
+        "text_range": [
+          409600,
+          13916
+        ],
+        "text_sha256": "2ca71bbc1ae7ed6308d3c81dd67621ef688dcb7bfac5f1db569dc92132dc9d69",
+        "kd_sha256": "dc80520bec2b8b5618c70dc5d4fec142657c3f0926e63bd4e6de8460dd3ccf38",
+        "metadata_sha256": "f1e92d450ead7828d20e365b1757e041f2e0532f2effe575b8b4e2a43dc328e5"
+      },
+      {
+        "symbol": "gemv_q8_0_k320_rows_t8_pm_gfx1151",
+        "text_range": [
+          423680,
+          10012
+        ],
+        "text_sha256": "3a46a8d230083a4b292e8171bbfbf04a8edabd6c8f0fbe8c2eeb4ba40e8e1c2a",
+        "kd_sha256": "8b7bd7719e2f292031f8916fe3ab087608942192b9696357b9752e9cd38b439f",
+        "metadata_sha256": "8992c030112d4fcac2281ee73f048fdb7a593cb65c855cf808d6c0a19c84143f"
+      },
+      {
+        "symbol": "gemv_q8_0_k2560_rows_t8_pm_gfx1151",
+        "text_range": [
+          433920,
+          10012
+        ],
+        "text_sha256": "440d7beec43374239f76ff85cc64616570e490148c97f605da50ecacad58d7e1",
+        "kd_sha256": "a8cb8bdab15aa3c8e0566bdac7f95acf732c03e39047a8a821d8d52130724079",
+        "metadata_sha256": "8bdd1ec125d2c572830b8ec1f95514af4b5e52002e7fe7a12f5c6915118178e3"
+      },
+      {
+        "symbol": "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1151",
+        "text_range": [
+          444160,
+          10064
+        ],
+        "text_sha256": "f77fa7985c81d1e41e382dae5786e35fe665710f4cae7bc4ca25abf96313623e",
+        "kd_sha256": "e1050617daab79709ad30fd994258e1f717617674852f1da3aafe84bf06cc563",
+        "metadata_sha256": "501b900d6f9e35877b24d8266d1c960e4332d55e07e8e4da4a937417d8cd6a38"
+      },
+      {
+        "symbol": "gemv_q8_0_wide_rows_t8_pm_gfx1151",
+        "text_range": [
+          454400,
+          14152
+        ],
+        "text_sha256": "e3dc852d9100a313243f7d28cf83c530255575b2d25e2dafc1f05aba10884ef8",
+        "kd_sha256": "35eca2d498e1f7fa72550c5be7e4eab6533fc7698b516d40ff5739ab0535cba2",
+        "metadata_sha256": "4fb709eaf6709101b199fe9b079581932bfa247d37a2cabe9acf9508e7cb4839"
+      }
+    ],
+    "checks": [
+      {
+        "id": "roundtrip",
+        "status": "pass",
+        "detail": "11 kernels re-encode byte-identically; module re-emits identically"
+      },
+      {
+        "id": "railgun-a1",
+        "status": "proven",
+        "detail": "11/11 kernels Proven, 0 Conditional (witness required)"
+      },
+      {
+        "id": "g8-metadata-differential",
+        "status": "pass",
+        "detail": "source object-metadata"
+      }
+    ],
+    "obligations": [
+      "AddressArithmetic",
+      "InBoundsNoAlias"
+    ],
+    "railgun": {
+      "section_version": 3,
+      "analysis": "peacemaker_ir::passes::kernargs (A1/A3/A4)",
+      "assumptions": [
+        "AddressArithmetic: a pointer is never rebuilt by multiplication, shifting or bit-field extraction of a value loaded from memory",
+        "AllocationWide: every recognised pointer effect covers its whole allocation (A2 bounds are M0b)",
+        "SealedTable: a value loaded from a sealed table is only used as a whole 64-bit pointer base of reads that stay inside the pointee allocation the entry names (halves are never recombined across entries, an entry is never added to another pointer, and a read whose base may be an entry or an argument pointer reads whichever it names; a table whose certificate records `null_guarded` may hold null entries, every other table holds none; the loader keeps the table and every pointee immutable)"
+      ],
+      "kernels": [
+        {
+          "symbol": "gemv_mq6g256v2_xbatch_pm",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 36,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 672,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 504,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "y",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 144,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 4,
+              "index": 3,
+              "name": "M",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 28,
+              "size": 4,
+              "index": 4,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 4,
+              "index": 5,
+              "name": "B",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "y",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_mq6g256v2_x4_xbatch_pm",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 96,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A0",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 672,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "A1",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 672,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "A2",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 672,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 8,
+              "index": 3,
+              "name": "A3",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 672,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 8,
+              "index": 4,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 504,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 40,
+              "size": 8,
+              "index": 5,
+              "name": "y0",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 144,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 48,
+              "size": 8,
+              "index": 6,
+              "name": "y1",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 144,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 56,
+              "size": 8,
+              "index": 7,
+              "name": "y2",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 144,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 64,
+              "size": 8,
+              "index": 8,
+              "name": "y3",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 144,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 72,
+              "size": 4,
+              "index": 9,
+              "name": "M0",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 76,
+              "size": 4,
+              "index": 10,
+              "name": "M1",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 80,
+              "size": 4,
+              "index": 11,
+              "name": "M2",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 84,
+              "size": 4,
+              "index": 12,
+              "name": "M3",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 88,
+              "size": 4,
+              "index": 13,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 92,
+              "size": 4,
+              "index": 14,
+              "name": "B",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 36,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 40,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 44,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 48,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 52,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 56,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 60,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 64,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 68,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 72,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 76,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 80,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 84,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 88,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 92,
+              "loaded": true,
+              "sinks": [
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A0",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "A1",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "A2",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 24,
+                "name": "A3",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 32,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 40,
+                "name": "y0",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 48,
+                "name": "y1",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 56,
+                "name": "y2",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 64,
+                "name": "y3",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_q8_0_k8_xbatch_pm",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 44,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 768,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 432,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "y",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 4,
+              "index": 3,
+              "name": "M",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 28,
+              "size": 4,
+              "index": 4,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 4,
+              "index": 5,
+              "name": "B",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "guard"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 36,
+              "size": 4,
+              "index": 6,
+              "name": "scale",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "guard",
+                "stored"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 40,
+              "size": 4,
+              "index": 7,
+              "name": "hc_act",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "guard"
+              ]
+            },
+            {
+              "offset": 36,
+              "loaded": true,
+              "sinks": [
+                "guard",
+                "stored"
+              ]
+            },
+            {
+              "offset": 40,
+              "loaded": true,
+              "sinks": [
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "y",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_q8_0_k320_xbatch_pm",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 32,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 192,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 360,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "y",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 288,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 4,
+              "index": 3,
+              "name": "M",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 28,
+              "size": 4,
+              "index": 4,
+              "name": "B",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "y",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_mq6g256v2_rows_t8_pm_gfx1151",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 36,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 12,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "y",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 4,
+              "index": 3,
+              "name": "M",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 28,
+              "size": 4,
+              "index": 4,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 4,
+              "index": 5,
+              "name": "R",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "y",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_mq6g256v2_rows_x4_t8_pm_gfx1151",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 96,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A0",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 12,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "A1",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 12,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "A2",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 12,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 8,
+              "index": 3,
+              "name": "A3",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "buffer"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 12,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 8,
+              "index": 4,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 40,
+              "size": 8,
+              "index": 5,
+              "name": "y0",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 48,
+              "size": 8,
+              "index": 6,
+              "name": "y1",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 56,
+              "size": 8,
+              "index": 7,
+              "name": "y2",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 64,
+              "size": 8,
+              "index": 8,
+              "name": "y3",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 72,
+              "size": 4,
+              "index": 9,
+              "name": "M0",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 76,
+              "size": 4,
+              "index": 10,
+              "name": "M1",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 80,
+              "size": 4,
+              "index": 11,
+              "name": "M2",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 84,
+              "size": 4,
+              "index": 12,
+              "name": "M3",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 88,
+              "size": 4,
+              "index": 13,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 92,
+              "size": 4,
+              "index": 14,
+              "name": "R",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 36,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 40,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 44,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 48,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 52,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 56,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 60,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 64,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 68,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 72,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 76,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 80,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 84,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 88,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 92,
+              "loaded": true,
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A0",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "A1",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "A2",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 24,
+                "name": "A3",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 32,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 40,
+                "name": "y0",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 48,
+                "name": "y1",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 56,
+                "name": "y2",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 64,
+                "name": "y3",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_q8_0_k8_rows_t8_pm_gfx1151",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 44,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 72,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 144,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "y",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 1,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 4,
+              "index": 3,
+              "name": "M",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 28,
+              "size": 4,
+              "index": 4,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 4,
+              "index": 5,
+              "name": "R",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 36,
+              "size": 4,
+              "index": 6,
+              "name": "scale",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "guard",
+                "stored"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 40,
+              "size": 4,
+              "index": 7,
+              "name": "hc_act",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ]
+            },
+            {
+              "offset": 36,
+              "loaded": true,
+              "sinks": [
+                "guard",
+                "stored"
+              ]
+            },
+            {
+              "offset": 40,
+              "loaded": true,
+              "sinks": [
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "y",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_q8_0_k320_rows_t8_pm_gfx1151",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 36,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 72,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 36,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "y",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 4,
+              "index": 3,
+              "name": "M",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 28,
+              "size": 4,
+              "index": 4,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 4,
+              "index": 5,
+              "name": "R",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "y",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_q8_0_k2560_rows_t8_pm_gfx1151",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 36,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 72,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 36,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "y",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 4,
+              "index": 3,
+              "name": "M",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 28,
+              "size": 4,
+              "index": 4,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 4,
+              "index": 5,
+              "name": "R",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "y",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_q8_0_k2560_rows_x2_t8_pm_gfx1151",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 56,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A0",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 72,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "A1",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 72,
+              "shared": true,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 36,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 8,
+              "index": 3,
+              "name": "y0",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 8,
+              "index": 4,
+              "name": "y1",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 8,
+              "shared": true,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 40,
+              "size": 4,
+              "index": 5,
+              "name": "M0",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 44,
+              "size": 4,
+              "index": 6,
+              "name": "M1",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 48,
+              "size": 4,
+              "index": 7,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 52,
+              "size": 4,
+              "index": 8,
+              "name": "R",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 36,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 40,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 44,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 48,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 52,
+              "loaded": true,
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A0",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "A1",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 24,
+                "name": "y0",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 32,
+                "name": "y1",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        },
+        {
+          "symbol": "gemv_q8_0_wide_rows_t8_pm_gfx1151",
+          "status": "proven",
+          "unresolved": [],
+          "kernarg_size": 36,
+          "read_cache": "vmem_only",
+          "dynamic_kernarg_reads": false,
+          "taint_overflow": false,
+          "side": {
+            "kernarg_segment": 0,
+            "module_global": 0,
+            "abi_packet": 0,
+            "local_flat": 0,
+            "scratch": 0
+          },
+          "implicit": {
+            "hidden_loaded": [],
+            "hidden_grid": [],
+            "hidden_grid_live": [],
+            "loads_block_count": false,
+            "loads_group_size": false
+          },
+          "args": [
+            {
+              "offset": 0,
+              "size": 8,
+              "index": 0,
+              "name": "A",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 96,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 8,
+              "size": 8,
+              "index": 1,
+              "name": "x",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "read",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_load"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 48,
+              "shared": false,
+              "read_cache": "vmem_only",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 16,
+              "size": 8,
+              "index": 2,
+              "name": "y",
+              "value_kind": "global_buffer",
+              "role": "pointer",
+              "mode": "write",
+              "bound": "allocation_wide",
+              "classes": [
+                "vmem_store"
+              ],
+              "paths": [
+                "global"
+              ],
+              "cache_bits": [
+                "th=0 scope=0 glc=0 slc=0 dlc=0 nv=0"
+              ],
+              "accesses": 16,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_base"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 24,
+              "size": 4,
+              "index": 3,
+              "name": "M",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 28,
+              "size": 4,
+              "index": 4,
+              "name": "K",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ],
+              "loaded": true
+            },
+            {
+              "offset": 32,
+              "size": 4,
+              "index": 5,
+              "name": "R",
+              "value_kind": "by_value",
+              "role": "integer",
+              "mode": null,
+              "bound": null,
+              "classes": [],
+              "paths": [],
+              "cache_bits": [],
+              "accesses": 0,
+              "shared": false,
+              "read_cache": "not_read",
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ],
+              "loaded": true
+            }
+          ],
+          "dwords": [
+            {
+              "offset": 0,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 4,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 8,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 12,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 16,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 20,
+              "loaded": true,
+              "sinks": [
+                "address_base"
+              ]
+            },
+            {
+              "offset": 24,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 28,
+              "loaded": true,
+              "sinks": [
+                "address_offset",
+                "loop_bound",
+                "guard",
+                "grid_term"
+              ]
+            },
+            {
+              "offset": 32,
+              "loaded": true,
+              "sinks": [
+                "loop_bound",
+                "guard"
+              ]
+            }
+          ],
+          "differential": {
+            "source": "object-metadata",
+            "status": "pass",
+            "args": [
+              {
+                "offset": 0,
+                "name": "A",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 8,
+                "name": "x",
+                "a1": "read",
+                "metadata": "read_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              },
+              {
+                "offset": 16,
+                "name": "y",
+                "a1": "write",
+                "metadata": "write_only",
+                "explicit": true,
+                "status": "pass",
+                "reason": ""
+              }
+            ],
+            "radiowave_mutable_read_cache": null,
+            "guards": [],
+            "guarded": false
+          },
+          "pm_obligations": {},
+          "pm_analyze_error": null,
+          "unguarded_unresolved": [],
+          "guards": [],
+          "indexed_effects": [],
+          "required_witnesses": [],
+          "case_digest": ""
+        }
+      ]
+    }
+  }
+}

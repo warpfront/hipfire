@@ -6,16 +6,18 @@ license.workspace = true
 description = "Top-of-DAG model loader / carrier registry for hipfire"
 
 [features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
 default = [
     "arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2",
-    "arch-deepseek4", "arch-dots-ocr",
+    "arch-deepseek4",
 ]
 arch-qwen35 = ["dep:hipfire-arch-qwen35"]
 arch-qwen35-vl = ["dep:hipfire-arch-qwen35-vl"]
 arch-llama = ["dep:hipfire-arch-llama"]
 arch-qwen2 = ["dep:hipfire-arch-qwen2"]
 arch-deepseek4 = ["dep:hipfire-arch-deepseek4"]
-arch-dots-ocr = ["dep:hipfire-arch-dots-ocr"]
+qwen4-dev-profiles = ["hipfire-arch-qwen4/qwen4-dev-profiles"]
 # Test-only: compile the HIPFIRE_EP_FAIL_RANK partial-load fault injector. OFF by
 # default so production builds can never synthetically fail an EP load.
 ep-fault-inject = []
@@ -24,20 +26,72 @@ ep-fault-inject = []
 rdna-compute = { path = "../rdna-compute" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 hip-bridge = { path = "../hip-bridge" }
+saddle-core = { path = "../saddle-core" }
 # Optional arch crate deps — feature-gated.
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", optional = true }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl", optional = true }
 hipfire-arch-llama = { path = "../hipfire-arch-llama", optional = true }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2", optional = true }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4", optional = true }
-hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr", optional = true }
 # Non-optional arch deps — LoadedModel struct references these types.
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-lfm3 = { path = "../hipfire-arch-lfm3" }
 hipfire-arch-lfm3-vl = { path = "../hipfire-arch-lfm3-vl" }
 hipfire-arch-lfm3-audio = { path = "../hipfire-arch-lfm3-audio" }
 hipfire-arch-lfm3-omni = { path = "../hipfire-arch-lfm3-omni" }
+hipfire-arch-raon = { path = "../hipfire-arch-raon" }
+# Public accessor types (Lfm2MoeBundle.vision_* fields are lfm2-vl types).
+hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-qwen35-embed = { path = "../hipfire-arch-qwen35-embed" }
+hipfire-arch-embeddinggemma2 = { path = "../hipfire-arch-embeddinggemma2" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
-serde_json = "1"
+hipfire-arch-maple = { path = "../hipfire-arch-maple" }
+hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
+hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-arch-diffusion = { path = "../hipfire-arch-diffusion" }
+serde_json.workspace = true
+
+# fn_ep_oracle (lab example) only: the MoE dump context hook, SHA-256 and the
+# Qwen4 lab head-state digest (`lab_resident_head_items`).
+[dev-dependencies]
+hipfire-arch-qwen4 = { path = "../hipfire-arch-qwen4", features = ["lab"] }
+sha2.workspace = true
+tempfile = "3"
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# One-question GPU experiments -- "is GPU argmax faster than downloading logits
+# at vocab 129,280 on gfx1201" -- written at roughly eleven a month since
+# 2026-03. They are the working method for kernel decisions and worth keeping:
+# a HIP kernel cannot be measured by a unit test.
+#
+# Gated because an answer obtained in April should not be type-checked on every
+# build in August. Ungated, they all compile under `cargo build --all-targets`,
+# so every refactor drags every probe with it -- several build breaks during the
+# ModelState removal were in probes nobody had run since the day they were
+# written.
+#
+# Run on demand:  cargo build -p <crate> --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "dspark_qwen3_1window"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_ep_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "fn_mesh_lane_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_slab_d2_capture"
+required-features = ["lab"]

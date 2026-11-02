@@ -62,3 +62,5 @@ kernels/compiled/
 
 # The existing narrow gfx12-precompile helper is out of scope
 docker/
+!docker/hipfire-entrypoint.sh
+!docker/hipfire-halo-tune.sh

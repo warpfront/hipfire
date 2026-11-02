@@ -1,9 +1,10 @@
 # Structural guard: make `cargo fmt` fail loudly instead of reformatting the
 # whole workspace.
 #
-# WHY: the repo carries historical rustfmt debt, so CI only checks CHANGED
-# files (scripts/ci-rustfmt-changed.sh). A bare `cargo fmt` rewrites every file
-# in the workspace, burying the real change under a 200+ file diff. This alias
+# WHY: master (until the 0.4.3 release merge) and branches cut before the 0.4.3
+# sweep carry historical rustfmt debt; there a bare `cargo fmt` rewrites 1000+
+# files, burying the real change. (beta is clean since the sweep, and its land
+# gate runs `cargo-fmt --all -- --check` directly.) This alias
 # shadows the external `cargo-fmt` subcommand so the mistake is impossible
 # rather than merely discouraged — it covers humans, IDEs, and non-Claude
 # agents, none of which read CLAUDE.md.
@@ -21,3 +22,14 @@
 # this file — scripts/check-fmt-bomb.sh (pre-commit) still backstops the case.
 [alias]
 fmt = ["use-scripts-fmt-changed-sh-instead-of-cargo-fmt"]
+
+# Windows gives the main thread a 1 MB stack unless the linker says otherwise,
+# which is not enough for the CLI's startup path (hipfire --version
+# stack-overflows). Reserve 32 MB. No effect on other targets. `/STACK:` is a
+# link.exe/lld-link flag; the mingw (gnu) toolchain links through gcc/ld and
+# takes `--stack` instead.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "link-args=/STACK:33554432"]
+
+[target.'cfg(all(windows, target_env = "gnu"))']
+rustflags = ["-C", "link-args=-Wl,--stack,33554432"]

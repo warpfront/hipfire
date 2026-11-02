@@ -16,9 +16,10 @@ name: CI
 # Required vs advisory: `build` and `test` are the load-bearing
 # "is it broken" gates and are intended to be required status checks on
 # master. `fmt` and `clippy` start advisory (not required) because this
-# repo predates CI and carries lint/format debt. rustfmt is enforced on
-# changed Rust files only until the historical workspace-wide churn is paid
-# down; promote the full gate after that cleanup pass.
+# repo predates CI and carries lint/format debt. beta is rustfmt-clean since
+# the 0.4.3 sweep: `fmt` checks the whole workspace plus the changed files
+# (which covers tools/ outside it); master carries the old debt until the
+# release merge, so the job stays advisory until then.
 
 on:
   pull_request:
@@ -28,8 +29,8 @@ on:
     # Gating direct pushes catches the dead-gate / missing-arm / broken-test
     # class (e.g. the 3 stale prerotated tests, gfx12 dead-gate) at push time
     # via the GPU-free `cargo test --lib --workspace` dispatch coverage gate,
-    # not just on PRs.
-    branches: [master, 'integration/**']
+    # not just on PRs. beta = pre-release line, also pushed to directly.
+    branches: [master, beta, 'integration/**']
 
 # Supersede in-flight runs when a PR gets new pushes.
 concurrency:
@@ -46,34 +47,338 @@ env:
   # red the build on legacy code. Add it after a warning-cleanup pass.
 
 jobs:
+  # `build` and `test` below are the required status checks (see the header).
+  # The work runs in the matrix jobs `build-shards` / `test-shards` so a run
+  # takes the longest shard, not the sum of all of them; `build` and `test`
+  # keep the original check names and only report whether every shard passed.
+  # Test shards compile and run under the `ci` profile (Cargo.toml): optimised
+  # where the exhaustive CPU oracles/emulators live, debug assertions and
+  # overflow checks on everywhere. rust-cache is keyed per shard (the default
+  # key does not include matrix values, so shards would otherwise collide).
+  build-shards:
+    name: build shard (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: release
+            # The release profile is what ships: every library and binary (not
+            # the test/example targets, which `all-targets` covers), then the
+            # daemon alone (its feature set differs from the workspace-unified
+            # one) and the dark NPU stack.
+            run: |
+              cargo build --release --locked --workspace --lib --bins
+              cargo build --release --locked -p hipfire-daemon
+              cargo build --release --locked -p railgun --features npu && cargo build --release --locked -p npu-tools --features lab
+          - name: all-targets
+            # Every target of every crate (lib, bins, examples, tests, benches),
+            # including the GPU-only ones CI does not run, must keep compiling.
+            # `check`, not `build`: linking every example and test binary
+            # unoptimised writes ~15-19 GB, more than a hosted runner has to
+            # spare. Everything that ships is built and linked by `release`
+            # above and everything CI runs is built and linked by the test
+            # shards; only the never-run examples/benches/GPU tests are
+            # type-checked rather than linked.
+            run: cargo check --locked --workspace --all-targets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: build-${{ matrix.name }}
+      - name: Build (${{ matrix.name }})
+        run: ${{ matrix.run }}
+
   build:
     name: build (workspace, no GPU)
+    needs: build-shards
+    if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
+      - name: Every build shard passed
+        run: |
+          echo "build-shards: ${{ needs.build-shards.result }}"
+          test "${{ needs.build-shards.result }}" = success
+
+  test-shards:
+    name: test shard (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    env:
+      # Belt and braces on a GPU-less runner: no test may see a device.
+      ROCR_VISIBLE_DEVICES: "-1"
+      HIP_VISIBLE_DEVICES: "-1"
+      HIPFIRE_TEST_REQUIRE_ROCM: "0"
+      # GPU-free integration/bin tests: `--lib` skips crates/*/tests/*.rs and
+      # bin-only unit tests. These crates' integration tests are GPU-free (GPU
+      # ones are #[ignore]). The `int-*` shards split them by the first letter
+      # of the test target name with cargo `--test` globs; the globs partition
+      # every name (the last one is a negation), so a new test target lands in
+      # a shard without touching this file. Keep the package list identical in
+      # every shard: cargo unifies features over the selected packages, so a
+      # different list would build the same tests with different features.
+      INTEG_PKGS: >-
+        -p hipfire-engine -p hipfire-generate -p peacemaker-isa -p peacemaker-lift
+        -p redline-dispatch -p hipfire-arch-qwen35-vl -p hipfire-detect
+        -p hipfire-daemon -p saddle-quant -p hipfire-tui
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: lib-peacemaker-isa
+            # peacemaker-isa's unit tests, with the `toolchain` feature that
+            # rdna-compute turns on in the workspace-wide build (181 tests; the
+            # `int-*` shards build it without, 107). Run alone, because they
+            # are the longest lib binary.
+            run: cargo test --profile ci --locked --lib -p peacemaker-isa -p rdna-compute
+          - name: lib-rest
+            # --lib only: unit tests inside library targets are GPU-free
+            # (detector logic, sampler, framing, quant math). Integration
+            # tests / examples that dispatch kernels need the self-hosted
+            # GPU runner and are intentionally excluded here. peacemaker-isa is
+            # the only package excluded; rdna-compute stays selected so the
+            # feature set of every other crate is the workspace-wide one.
+            run: cargo test --profile ci --locked --lib --workspace --exclude peacemaker-isa
+          - name: serve
+            # hipfire-cli is bin-only, so `--lib --workspace` skips it. Its tests
+            # drive the OpenAI HTTP gateway against the scripted fake daemon
+            # (crates/hipfire-cli/src/serve/fake_daemon.py, stdlib python3) and
+            # need no GPU. hipfire-client is a lib crate and runs above.
+            run: |
+              cargo test --profile ci --locked -p hipfire-cli
+              cargo test --profile ci --locked -p npu-tools --bin npu-trunk-transport
+              cargo test --profile ci --locked -p hipfire-generate --features serve-fault-inject --test serve_fault_inject_tests
+          - name: rdna-compute-abi
+            # dflash_accept_emu compares the builder device-accept kernel with
+            # the rdna-compute host twin on the CPU interpreter;
+            # all_launcher_abi is the MoE launcher ABI gate.
+            run: |
+              cargo test --profile ci --locked -p rdna-compute --test dflash_accept_emu
+              cargo test --profile ci --locked -p rdna-compute --test all_launcher_abi
+          - name: int-e
+            run: cargo test --profile ci --locked $INTEG_PKGS --test '[e]*'
+          - name: int-l
+            run: cargo test --profile ci --locked $INTEG_PKGS --test '[l]*'
+          - name: int-m
+            run: cargo test --profile ci --locked $INTEG_PKGS --test '[m]*'
+          - name: int-q
+            run: cargo test --profile ci --locked $INTEG_PKGS --test '[q]*'
+          - name: int-rest
+            # Everything else, plus the unit tests of the lib and bin targets.
+            run: cargo test --profile ci --locked $INTEG_PKGS --lib --bins --test '[!elmq]*'
+    steps:
+      - name: Private hipfire lock dir
+        run: echo "HIPFIRE_LOCK_DIR=$RUNNER_TEMP/hipfire-locks" >> "$GITHUB_ENV" && mkdir -p "$RUNNER_TEMP/hipfire-locks"
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Build workspace (lib + bins + examples + tests)
-        run: cargo build --release --workspace --all-targets --locked
-      - name: Build daemon example (real shipped binary, arch features on)
-        run: >
-          cargo build --release --locked
-          -p hipfire-runtime --example daemon
-          --features arch-qwen35,arch-qwen35-vl,arch-llama,arch-qwen2,arch-deepseek4,arch-dots-ocr
+        with:
+          key: test-${{ matrix.name }}
+      - name: Test (${{ matrix.name }})
+        run: ${{ matrix.run }}
 
   test:
-    name: unit tests (lib, no GPU)
+    name: unit + integration tests (no GPU)
+    needs: test-shards
+    if: ${{ always() }}
     runs-on: ubuntu-latest
+    steps:
+      - name: Every test shard passed
+        run: |
+          echo "test-shards: ${{ needs.test-shards.result }}"
+          test "${{ needs.test-shards.result }}" = success
+
+  windows:
+    name: Windows MSVC (no GPU)
+    runs-on: windows-latest
+    # Required: build, package smoke and PE-import checks must pass.
+    # Compile/smoke coverage is not Windows GPU/runtime certification.
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: "12"
+      ROCR_VISIBLE_DEVICES: "-1"
+      HIP_VISIBLE_DEVICES: "-1"
+      HIPFIRE_TEST_REQUIRE_ROCM: "0"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          # llvm-readobj for scripts/check-pe-imports.ps1.
+          components: llvm-tools
       - uses: Swatinem/rust-cache@v2
-      - name: Run workspace lib unit tests
-        # --lib only: unit tests inside library targets are GPU-free
-        # (detector logic, sampler, framing, quant math). Integration
-        # tests / examples that dispatch kernels need the self-hosted
-        # GPU runner and are intentionally excluded here.
-        run: cargo test --lib --workspace --locked
+      - name: PowerShell scripts parse; install.ps1 params bind
+        # Regression guard for #979: a BOM-damaged or unparsable script, or an
+        # install.ps1 whose param() block no longer binds, only fails on a
+        # user's machine. Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI,
+        # so one leading BOM is legal; a doubled BOM is not.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $failed = New-Object System.Collections.Generic.List[string]
+          foreach ($script in Get-ChildItem -LiteralPath scripts -Filter '*.ps1' -File) {
+            $bytes = [System.IO.File]::ReadAllBytes($script.FullName)
+            $boms = @()
+            for ($i = 0; $i + 2 -lt $bytes.Length; $i++) {
+              if ($bytes[$i] -eq 0xEF -and $bytes[$i + 1] -eq 0xBB -and $bytes[$i + 2] -eq 0xBF) { $boms += $i }
+            }
+            if ($boms.Count -gt 1 -or ($boms.Count -eq 1 -and $boms[0] -ne 0)) {
+              $failed.Add("$($script.Name): BOM bytes at offsets $($boms -join ', ') (at most one, at offset 0)")
+            }
+            $tokens = $null
+            $errors = $null
+            $null = [System.Management.Automation.Language.Parser]::ParseFile($script.FullName, [ref]$tokens, [ref]$errors)
+            foreach ($e in $errors) { $failed.Add("$($script.Name):$($e.Extent.StartLineNumber): $($e.Message)") }
+            Write-Output ("{0}: {1} bytes, BOM={2}, parse errors={3}" -f $script.Name, $bytes.Length, ($boms.Count -eq 1), @($errors).Count)
+          }
+          $keys = (Get-Command (Join-Path $PWD 'scripts/install.ps1')).Parameters.Keys
+          foreach ($name in 'Ref', 'Branch', 'Tag', 'Commit', 'CompileKernels', 'KernelPackUrl') {
+            if ($keys -notcontains $name) { $failed.Add("install.ps1: parameter -$name does not bind") }
+          }
+          if ($failed.Count -gt 0) {
+            $failed | ForEach-Object { Write-Error $_ -ErrorAction Continue }
+            throw "$($failed.Count) PowerShell script problem(s)"
+          }
+      - name: PE import checker self-test
+        run: ./scripts/check-pe-imports.ps1 -SelfTest
+      - name: Build native CLI and daemon (MSVC)
+        # Same cargo invocations and feature set as scripts/install.ps1's source
+        # build (`cargo build --release -p hipfire-daemon`, then `-p hipfire-cli`;
+        # no extra features). CI adds only --locked, which pins dependency
+        # versions and does not change the compiled code paths.
+        run: cargo build --release --locked -p hipfire-cli -p hipfire-daemon
+      - name: Test control-plane libraries (no GPU)
+        run: cargo test --locked --lib -p hipfire-config -p hipfire-registry -p hipfire-client
+      - name: Test unsupported-platform loaded-code registration (no GPU)
+        run: cargo test --locked --lib -p rdna-compute loaded_code_check::tests::non_linux_hsa_registration_is_unavailable_and_unregisters -- --exact
+      - name: Smoke version and JSON diagnostics without HIP
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:HIPFIRE_HOME = Join-Path $env:RUNNER_TEMP 'hipfire-smoke'
+          New-Item -ItemType Directory -Force -Path $env:HIPFIRE_HOME | Out-Null
+          & ./target/release/hipfire.exe --version
+          if ($LASTEXITCODE -ne 0) { throw 'hipfire --version failed' }
+          # Missing HIP is reported by diag; it must not fail the CLI or
+          # contaminate stdout. Do not assert GPU values on a hosted runner.
+          $diag = & ./target/release/hipfire.exe diag --json
+          if ($LASTEXITCODE -ne 0) { throw 'hipfire diag --json failed' }
+          $json = $diag -join "`n"
+          if ([string]::IsNullOrWhiteSpace($json)) { throw 'Empty diagnostic output' }
+          $null = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+          Write-Output $json
+      - name: Package unsigned developer artifact
+        run: ./scripts/package-windows.ps1
+      - name: Package smoke (restricted PATH)
+        # Runs the binaries from the extracted ZIP, not target/release, with a
+        # PATH of only the Windows system directories, so a missing runtime DLL
+        # or an accidental dependence on a dev tool on PATH fails here.
+        # find_daemon() probes HIPFIRE_DAEMON_BIN, then $HIPFIRE_HOME/bin, then
+        # the build-tree target/ directory baked in at compile time -- never the
+        # directory the CLI sits in. On this runner the build tree exists, so
+        # without HIPFIRE_DAEMON_BIN diag would silently report target/release's
+        # daemon instead of the packaged one. The env var pins it; the assertion
+        # below then proves diag reports the packaged daemon.exe.
+        # No GPU or HIP is expected on a hosted runner: only exit codes, version
+        # output and diag's JSON shape are asserted, never GPU values.
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $zip = @(Get-ChildItem -LiteralPath dist -Filter 'hipfire-*-x86_64-pc-windows-msvc.zip' -File)
+          if ($zip.Count -ne 1) { throw "Expected exactly one package ZIP in dist, found $($zip.Count)" }
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          if (Test-Path -LiteralPath $pkg) { Remove-Item -LiteralPath $pkg -Recurse -Force }
+          Expand-Archive -LiteralPath $zip[0].FullName -DestinationPath $pkg
+          $daemon = Join-Path $pkg 'daemon.exe'
+          $cli = Join-Path $pkg 'hipfire.exe'
+          foreach ($f in $daemon, $cli) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "Missing from package: $f" }
+          }
+          $hipHome = Join-Path $env:RUNNER_TEMP 'hipfire-pkg-home'
+          if (Test-Path -LiteralPath $hipHome) { Remove-Item -LiteralPath $hipHome -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $hipHome | Out-Null
+          $env:HIPFIRE_HOME = $hipHome
+          $env:HIPFIRE_DAEMON_BIN = $daemon
+          $env:PATH = 'C:\Windows\System32;C:\Windows'
+          $daemonVersion = & $daemon --version
+          if ($LASTEXITCODE -ne 0) { throw "daemon.exe --version failed (exit $LASTEXITCODE)" }
+          Write-Output "daemon: $daemonVersion"
+          $cliVersion = & $cli --version
+          if ($LASTEXITCODE -ne 0) { throw "hipfire.exe --version failed (exit $LASTEXITCODE)" }
+          Write-Output "hipfire: $cliVersion"
+          $diag = & $cli diag --json
+          if ($LASTEXITCODE -ne 0) { throw "hipfire.exe diag --json failed (exit $LASTEXITCODE)" }
+          $json = $diag -join "`n"
+          if ([string]::IsNullOrWhiteSpace($json)) { throw 'Empty diagnostic output' }
+          $report = ConvertFrom-Json -InputObject $json -ErrorAction Stop
+          Write-Output $json
+          if (-not $report.daemon -or ([System.IO.Path]::GetFullPath($report.daemon) -ne [System.IO.Path]::GetFullPath($daemon))) {
+            throw "diag reports daemon '$($report.daemon)', expected the packaged '$daemon'"
+          }
+      - name: PE imports (packaged binaries)
+        # Lists every DLL the shipped binaries import and fails on any outside
+        # the allowlist in scripts/check-pe-imports.ps1. HIP is loaded at run
+        # time, so no AMD DLL is expected in the list.
+        run: |
+          $pkg = Join-Path $env:RUNNER_TEMP 'pkg'
+          ./scripts/check-pe-imports.ps1 -Path (Join-Path $pkg 'daemon.exe'), (Join-Path $pkg 'hipfire.exe')
+          if ($LASTEXITCODE -ne 0) { throw "PE import check failed (exit $LASTEXITCODE)" }
+      # upload-artifact@v4 is already used in hw-gate.yml and allowed here.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hipfire-windows-msvc
+          path: |
+            dist/hipfire-*-x86_64-pc-windows-msvc.zip
+            dist/hipfire-*-x86_64-pc-windows-msvc.zip.sha256
+          if-no-files-found: error
+
+  gates:
+    name: gates (ratchets, layering, registers)
+    runs-on: ubuntu-latest
+    # GPU-free structural gates. Until now every one of these was a script a
+    # human had to remember to run: nothing in CI invoked leanup-ratchets.sh,
+    # check-layering.py, check-arch-dispatch.py, check-crate-maps.py or the
+    # table registers, and the only references to them outside scripts/ were
+    # comments in Cargo.toml. Phase 3A's mandate is "every gate either fails on
+    # regression or is deleted"; a gate nothing runs fails on nothing.
+    #
+    # Not advisory. These assert committed expectations that are green on the
+    # branch that introduces them, so a red here is a real regression, not lint
+    # debt. scripts/gates.sh is the separate GPU/model harness and needs
+    # hardware -- it is deliberately not called from CI.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # ratchet-diff resolves the merge base to read the base revision's
+          # thresholds; a shallow clone has no merge base to find.
+          fetch-depth: 0
+      - name: Ratchets, layering, arch dispatch, qt register, bypass ledger
+        run: bash scripts/leanup-ratchets.sh
+      - name: Crate maps match the tree
+        run: python3 scripts/check-crate-maps.py --check
+      - name: Scratch growers invalidate captured graphs first
+        run: python3 scripts/check-scratch-growth.py
+      - name: Released CHANGELOG sections match their tags
+        run: python3 scripts/check-changelog.py
+      - name: Row-predicate selector constants carry a covering receipt
+        run: python3 scripts/check-selector-receipts.py
+      - name: MTP parity fixture bytes are pinned and the acceptance ratchet self-tests
+        run: |
+          python3 scripts/check-mtp-parity-ratchet.py --self-test
+          python3 scripts/check-mtp-parity-ratchet.py fixture
+      - name: No committed expectation was loosened
+        # PR-only: on a push there is no proposed base to compare against.
+        if: github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          labels_json=$(gh pr view "${{ github.event.pull_request.number }}" --json labels)
+          if echo "$labels_json" | jq -e '.labels[] | select(.name=="ratchet-raise")' >/dev/null; then
+            export RATCHET_RAISE_LABEL_PRESENT=1
+          else
+            export RATCHET_RAISE_LABEL_PRESENT=0
+          fi
+          export RATCHET_RAISE_REQUIRE_LABEL=1
+          bash scripts/ratchet-diff.sh "origin/${{ github.base_ref }}"
 
   supply-chain:
     name: cargo-deny (${{ matrix.checks }})
@@ -96,9 +401,10 @@ jobs:
   fmt:
     name: rustfmt (advisory)
     runs-on: ubuntu-latest
-    # Truly advisory: on pushes, ci-rustfmt-changed diffs vs master and surfaces
-    # the whole dispatch-effort format backlog (Kevin's in-flight files included),
-    # so keep the step visible without making the job's status check red.
+    # Advisory: on master the old format debt remains until the 0.4.3 release
+    # merge (beta is clean since the sweep), so keep the steps visible without
+    # making the job's status check red. cargo-fmt is called directly because
+    # .cargo/config.toml shadows `cargo fmt`.
     steps:
       - uses: actions/checkout@v4
         with:
@@ -106,6 +412,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
+      - run: cargo-fmt --all -- --check
+        continue-on-error: true
       - run: bash scripts/ci-rustfmt-changed.sh
         continue-on-error: true
 

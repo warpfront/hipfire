@@ -1,0 +1,31 @@
+[package]
+name = "saddle-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "saddle — target-agnostic model composition: grammar, KV, capabilities, sampling."
+
+# LAYERING CONTRACT — do not widen without amending
+# docs/governance/2026-08-15-hipfire-leanup-map.md § 5b.
+#
+# saddle-core sits BELOW hipfire-runtime. It may depend only on the compute and
+# HAL layers. It must NEVER depend on hipfire-runtime, hipfire-dispatch, or any
+# hipfire-arch-* crate — those depend on it. A cycle here defeats the whole
+# point of the layer.
+[dependencies]
+rdna-compute = { path = "../rdna-compute" }
+hip-bridge = { path = "../hip-bridge" }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# Archived research probes; gated so default builds do not compile them.
+# Run on demand:  cargo build -p saddle-core --examples --features lab
+[features]
+lab = []
+
+[[example]]
+name = "cb_vmm_addressing_g1"
+required-features = ["lab"]
+
+[[example]]
+name = "cb_a3b_fa_lanes_gate"
+required-features = ["lab"]

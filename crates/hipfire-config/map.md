@@ -1,0 +1,687 @@
+# hipfire-config — map
+
+> **Status:** `production` (vocabulary owned by [`docs/GLOSSARY.md`](../../docs/GLOSSARY.md)).
+> **Layer:** Operator — typed TOML config + migration and deterministic layer resolution, side-DAG; see the layering table in [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
+
+## Purpose
+
+Typed configuration schema and deterministic layer resolution for the operator plane. Owns the public vocabulary, legacy-key compatibility, `~/.hipfire/config.toml` + env + CLI layer merge, validation, field-level provenance, and `rocm` sub-tables. Deliberately independent of GPU/model crates so runtime crates consume resolved values instead of parsing hot-path config. See the `//!` docs in [`src/lib.rs`](src/lib.rs).
+
+## Gotchas
+
+- Resolution is deterministic layer-order (global → catalog → env → CLI profile) — out-of-order merges will mis-report provenance.
+- DS4-specific knobs must never alter Qwen or the process-wide mixed-arch policy; respect the per-field scoping in `lib.rs`.
+- `mtp_mode_admits` / `mtp_effective_mode[_name]` / `mtp_no_floor_decline_line` are the one pure producer-capability gate for `speculation.mtp = auto`: `auto` arms only a producer whose crate declares `MTP_MEASURED_AR_FLOOR = true` (Qwen4); `on` always arms, `off` never. The host-spill policy (`mtp_host_spill_policy`) only narrows an already admitted mode. Keep the gate arch-blind: no tag or card names.
+- The registered `prefill.chunk_rows` value (`512`) is a schema fallback that the process config does not export; per-arch and per-model defaults (Qwen35 dense 8192, resident Qwen35 MoE memory-aware 4096) live in the arch crates.
+- A3B prefill's 15 carried keys are registered in [`src/lib.rs`](src/lib.rs) in `TYPED_BOOL_DEVELOPER_KEYS`; [`src/intent.rs`](src/intent.rs) classifies their operator intent. They accept `true`/`false`/`1`/`0` (invalid values are rejected when the layer is built). An unset `developer_typed_bool` lookup is `None`, not a schema default; consumers resolve it through [`rdna-compute/src/prefill_route_capabilities.rs`](../rdna-compute/src/prefill_route_capabilities.rs), then apply their existing inventory/shape/state gates. Existing typed keys, including `developer.qwen4_slowlink_prefill`, are unchanged.
+
+  | Typed developer key | Environment flag | Consumer route / prerequisite |
+  | --- | --- | --- |
+  | `developer.gdn_qk_indexed` | `HIPFIRE_GDN_QK_INDEXED` | `GdnQkIndexed`; raw-Q/K indexed sequential Q8 GDN launch |
+  | `developer.gdn_moe_pre_fused` | `HIPFIRE_GDN_MOE_PRE_FUSED` | `GdnMoePreFused`; fused MoE GDN preamble |
+  | `developer.gdn_moe_chunk_scan` | `HIPFIRE_GDN_MOE_CHUNK_SCAN` | `GdnMoeChunkScan`; generalized MoE scan with common and per-layer admission |
+  | `developer.moe_router_fused_prefill` | `HIPFIRE_MOE_ROUTER_FUSED_PREFILL` | `MoeRouterFusedPrefill`; sealed fused router |
+  | `developer.moe_shared_prepared_iu4` | `HIPFIRE_MOE_SHARED_PREPARED_IU4` | `MoeSharedPreparedIu4`; same-activation router/shared token reuse |
+  | `developer.fa_prefill_pm` | `HIPFIRE_FA_PREFILL_PM` | `FaPrefillPm`; PM attention, resolved per KV codec |
+  | `developer.moe_router_topk_multirow` | `HIPFIRE_MOE_ROUTER_TOPK_MULTIROW` | `MoeRouterTopkMultirow` (F4); nested beneath the admitted fused router |
+  | `developer.moe_combine_v2` | `HIPFIRE_MOE_COMBINE_V2` | `MoeCombineV2` (F1); admitted IU4 expert combine |
+  | `developer.moe_iu4_wide_tiles` | `HIPFIRE_MOE_IU4_WIDE_TILES` | `MoeIu4WideTiles` (F2); resident NT8 gate/up, resident down remains NT4 |
+  | `developer.prefill_iu4_producer_fused` | `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED` | `PrefillIu4ProducerFused` (F3); exact eight-candidate IU4 producer |
+  | `developer.fa_prefill_pm_qprep` | `HIPFIRE_FA_PREFILL_PM_QPREP` | `FaPrefillPmQprep` (F5); nested beneath PM attention for the same codec |
+  | `developer.moe_rotate_i4_pm` | `HIPFIRE_MOE_ROTATE_I4_PM` | `MoeRotateI4Pm`; PM down-A4 producer beneath the symmetric IU4 route |
+  | `developer.prefill_iu4_c8_pm` | `HIPFIRE_PREFILL_IU4_C8_PM` | `PrefillIu4C8Pm`; PM C8 producers beneath resolved F3 |
+  | `developer.gdn_chunk_prep_pm` | `HIPFIRE_GDN_CHUNK_PREP_PM` | `GdnChunkPrepPm`; PM prep nested beneath admitted 16/32 MoE chunk scan |
+  | `developer.moe_shared_down_sigmoid_epi` | `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` | `MoeSharedDownSigmoidEpi`; shared-down HIP V3 epilogue |
+
+- All fifteen routes have one accepted exact-gfx1201 `QUALIFIED` row; explicit `0` kills and `1` opts in only where admission permits. PM attention and F5 resolve via `Gpu::fa_prefill_pm_flag` / `fa_prefill_pm_qprep_flag` for the actual codec: Q8 keeps its qualification and the existing two `FP8_KV_QUALIFIED` rows enable H16/KV2/D256 native-FP8 PM attention and Qprep on exact gfx1201. These rows qualify F16 Q with FP8 KV, not FP8-quantized Q. A parent PM `0` always refuses F5. The four late-H routes keep their nesting beneath their parent routes. These keys do not select KV storage; KV selection and FA2 selection remain independent and stackable, with all existing admission guards retained.
+
+## Crate map
+
+<!-- crate-map:generated:begin -->
+
+_Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside the markers._
+
+### Modules and exported symbols
+
+- [`src/bin/hipfire-rocm-resolve.rs`](src/bin/hipfire-rocm-resolve.rs)
+- [`src/calibration.rs`](src/calibration.rs)
+  - `Calibration`
+  - `clear`
+  - `CpuReadRate`
+  - `detect_gpus`
+  - `detect_gpus_at`
+  - `detect_host`
+  - `detect_host_at`
+  - `DetectedGpu`
+  - `device_staleness`
+  - `DeviceCalibration`
+  - `DeviceIdentity`
+  - `engine_rate`
+  - `EngineRate`
+  - `host_staleness`
+  - `HostFacts`
+  - `lists_unmeasured`
+  - `live`
+  - `live_at`
+  - `load`
+  - `Lookup`
+  - `lookup`
+  - `lookup_in`
+  - `normalize_bdf`
+  - `pcie_link_at`
+  - `PcieLink`
+  - `PROBE_VERSION`
+  - `RAM_TOLERANCE_BYTES`
+  - `SECTION`
+  - `Stale`
+  - `store`
+  - `UnmeasuredDevice`
+  - `utc_rfc3339`
+- [`src/devices.rs`](src/devices.rs)
+  - `active_devices`
+  - `ActiveDevices`
+  - `apply_device_visibility`
+  - `apply_entry_point_device_visibility`
+  - `at`
+  - `Claim`
+  - `ClaimFn`
+  - `cu_mask_env_decision`
+  - `cu_mask_env_guard`
+  - `cu_mask_refused_on`
+  - `detect`
+  - `detect_at`
+  - `device_table`
+  - `DeviceRoot`
+  - `devices_from_hip`
+  - `DeviceSelection`
+  - `DeviceVisibility`
+  - `enumerate_gpus`
+  - `from_kfd`
+  - `GpuDevice`
+  - `HIP_VISIBLE_DEVICES`
+  - `HSA_CU_MASK`
+  - `HSA_OVERRIDE_GFX_VERSION`
+  - `identify_observed`
+  - `identity_source`
+  - `IdentitySource`
+  - `is_wsl_dxg`
+  - `kfd_gpu_gfx_target_versions`
+  - `kfd_topology`
+  - `KFD_TOPOLOGY_NODES`
+  - `lock_file_name`
+  - `lock_identity`
+  - `ObservedDevice`
+  - `override_arch`
+  - `parse`
+  - `PciBdf`
+  - `QWEN4_VMM_GFX1100`
+  - `qwen4_vmm_gfx1100_enabled`
+  - `RDNA_CU_MASK_BAN`
+  - `redline_platform_refusal`
+  - `redline_refusal`
+  - `resolve_device_selectors`
+  - `ROC_GLOBAL_CU_MASK`
+  - `rocr_selector`
+  - `ROCR_VISIBLE_DEVICES`
+  - `startup_devices`
+  - `synchronized_device_visibility`
+  - `system`
+  - `UncertifiedPlatform`
+  - `UNSAFE_WSL_REDLINE`
+  - `UNSAFE_WSL_VMM_KV`
+  - `uuid`
+  - `verify`
+  - `verify_visible`
+  - `visibility`
+  - `vmm_kv_platform_refusal`
+  - `vmm_kv_refusal`
+- [`src/effective.rs`](src/effective.rs)
+  - `A8Prefill`
+  - `active_choice`
+  - `Applies`
+  - `ArchCtx`
+  - `Choice`
+  - `detect`
+  - `Effective`
+  - `effective`
+  - `from_scope`
+  - `install_gpu_arch`
+  - `kind`
+  - `label`
+  - `marked`
+  - `Origin`
+  - `origin_of`
+  - `quality_choices`
+  - `quality_choices_for`
+- [`src/emu.rs`](src/emu.rs)
+  - `check_host`
+  - `EmuError`
+  - `EmuOptions`
+  - `EmuProfile`
+  - `Fidelity`
+  - `from_process_config`
+  - `HostFacts`
+  - `MemoryKind`
+  - `profile`
+  - `PROFILES`
+  - `shared_host_bytes`
+  - `UmaScenario`
+  - `validate`
+  - `wgp_to_physical_cus`
+- [`src/emu_budget.rs`](src/emu_budget.rs)
+  - `active`
+  - `AllocationClass`
+  - `AllocationToken`
+  - `budget_id`
+  - `BudgetDimension`
+  - `BudgetError`
+  - `BudgetId`
+  - `BudgetLimits`
+  - `BudgetSnapshot`
+  - `BudgetUsage`
+  - `bytes`
+  - `charge_vector`
+  - `check_additional`
+  - `class`
+  - `commit`
+  - `install`
+  - `is_out_of_memory`
+  - `release`
+  - `Reservation`
+  - `reserve`
+  - `snapshot`
+- [`src/emu_model.rs`](src/emu_model.rs)
+  - `BucketDiagnostic`
+  - `DeratingEstimate`
+  - `DeratingInput`
+  - `EmuLimitsRecord`
+  - `estimate`
+  - `EstimateQuality`
+  - `KernelObservation`
+  - `known`
+  - `mismatches`
+  - `ModelError`
+  - `RatesSource`
+  - `Reading`
+  - `ResourceRates`
+  - `RouteConfig`
+  - `RunIdentity`
+  - `SCHEMA_VERSION`
+  - `spec_ratio_rates`
+  - `Telemetry`
+  - `unknown`
+  - `validate`
+- [`src/env_audit.rs`](src/env_audit.rs)
+  - `audit_env`
+  - `audit_process_env`
+  - `classify`
+  - `EnvEntry`
+  - `EnvStatus`
+  - `inventory`
+  - `is_secret_name`
+  - `label`
+- [`src/evidence.rs`](src/evidence.rs)
+  - `A8_TO_IU4`
+  - `closer_pct`
+  - `evidence_for`
+  - `EvidenceRow`
+  - `Extra`
+  - `FLASH_NEXT_EXPERTS`
+  - `FLASH_NEXT_PLE`
+  - `FLASH_NEXT_PLE_DISK`
+  - `format_closer`
+  - `format_slower`
+  - `PROMPT_PROCESSING`
+  - `rows`
+  - `SHORTER_THINKING`
+  - `slower_x`
+  - `two_sig`
+- [`src/host_memory.rs`](src/host_memory.rs)
+  - `amd_adapters`
+  - `AMD_VENDOR_ID`
+  - `dxgi_adapter_budgets`
+  - `DXGI_BUDGET_SOURCE`
+  - `DxgiAdapterBudget`
+  - `DxgiError`
+  - `host_memory`
+  - `HostMemory`
+  - `matches_luid`
+  - `SegmentBudget`
+  - `SOURCE_GLOBAL_MEMORY_STATUS_EX`
+  - `SOURCE_PROC_MEMINFO`
+- [`src/http_auth.rs`](src/http_auth.rs)
+  - `BearerTokenProblem`
+  - `hf_authorization`
+  - `hf_authorization_from`
+  - `HF_TOKEN_ENV_VARS`
+  - `validate_bearer_token`
+- [`src/intent.rs`](src/intent.rs)
+  - `ALL`
+  - `curated`
+  - `curated_present`
+  - `field_matches`
+  - `header`
+  - `Intent`
+  - `intent_of`
+  - `key_matches`
+  - `title`
+- [`src/lib.rs`](src/lib.rs)
+  - `active_or_local_process_config`
+  - `active_process_config`
+  - `apply_config_profile`
+  - `as_str`
+  - `calibration`
+  - `canonical_config_key`
+  - `CatalogFormat`
+  - `CONFIG_PROFILE_NAMES`
+  - `CONFIG_SCHEMA_VERSION`
+  - `ConfigCandidate`
+  - `ConfigCategory`
+  - `ConfigError`
+  - `ConfigField`
+  - `ConfigFormat`
+  - `ConfigLayer`
+  - `ConfigLayerDiff`
+  - `ConfigPaths`
+  - `ConfigProfileEntry`
+  - `ConfigProfileKind`
+  - `ConfigScope`
+  - `ConfigSource`
+  - `ConfigValue`
+  - `create_config_profile`
+  - `custom_config_profile_path`
+  - `D2Join`
+  - `D2Ready`
+  - `D2Return`
+  - `D2Transport`
+  - `Deepseek4CompressorCache`
+  - `Deepseek4ComputePlacement`
+  - `default_d2_transport`
+  - `DefaultValue`
+  - `detect_config_profile`
+  - `developer_bool`
+  - `developer_env_for_key`
+  - `developer_key_for_env`
+  - `developer_typed_bool`
+  - `developer_var`
+  - `developer_var_os`
+  - `devices`
+  - `DeviceSelector`
+  - `dflash_lookup_enabled`
+  - `dflash_lookup_tail_enabled`
+  - `diff_config_layers`
+  - `discover`
+  - `DISCRETE_MEMORY_ARCHS`
+  - `effective`
+  - `effective_offload_budgets`
+  - `effective_pp`
+  - `emu`
+  - `emu_budget`
+  - `emu_model`
+  - `env_audit`
+  - `ep`
+  - `EP_ENV`
+  - `EP_EXPERT_HOTSET_DEFAULT_ON`
+  - `ep_expert_hotset_sidecar_path`
+  - `EP_EXPERT_HOTSET_SIDECAR_SUFFIX`
+  - `ep_killed`
+  - `EP_MAX_DEGREE`
+  - `ep_with_kill_switch`
+  - `evidence`
+  - `expert_hotset_sidecar_path`
+  - `EXPERT_HOTSET_SIDECAR_SUFFIX`
+  - `field`
+  - `FIELDS`
+  - `fields`
+  - `from_name`
+  - `from_resolved`
+  - `from_tri_state`
+  - `get`
+  - `gpu_layer_budget`
+  - `hipfire_home`
+  - `host_memory`
+  - `http_auth`
+  - `install_process_config`
+  - `intent`
+  - `is_deprecated_key`
+  - `is_developer_key`
+  - `is_discrete_memory_arch`
+  - `is_empty`
+  - `is_supported`
+  - `is_typed_bool_developer_key`
+  - `is_unified_memory_arch`
+  - `kind`
+  - `legacy_devices_env_set`
+  - `legacy_value`
+  - `legacy_values`
+  - `len`
+  - `list_config_profiles`
+  - `load_catalog`
+  - `load_catalog_toml`
+  - `load_config_profile`
+  - `load_env_layer`
+  - `load_global`
+  - `load_legacy_json_layer`
+  - `load_local_process_config`
+  - `load_summary`
+  - `load_toml_layer`
+  - `load_toml_layer_with_warnings`
+  - `load_weight_digest_path`
+  - `LoadedCatalog`
+  - `LoadedConfig`
+  - `LocalModelConfig`
+  - `MAX_CONTINUOUS_BATCH_SIZE`
+  - `memory`
+  - `model`
+  - `model_id`
+  - `model_override_allowed`
+  - `ModelCatalog`
+  - `moe_expert_budget`
+  - `mtp_cache_policy`
+  - `mtp_effective_mode`
+  - `mtp_effective_mode_name`
+  - `mtp_host_spill_decline_line`
+  - `mtp_host_spill_policy`
+  - `mtp_host_spill_reason`
+  - `MTP_K_DEFAULT`
+  - `mtp_k_default`
+  - `mtp_mode_admits`
+  - `mtp_ngram_copy_enabled_for_arch`
+  - `mtp_ngram_enabled`
+  - `mtp_ngram_enabled_for_arch`
+  - `mtp_no_floor_decline_line`
+  - `mtp_own_prefill`
+  - `mtp_sampled_enabled`
+  - `MtpCachePolicy`
+  - `MtpHostSpillPolicy`
+  - `MtpMode`
+  - `name`
+  - `NamedLayer`
+  - `NGRAM_MOD_COPY_TRIPLE`
+  - `ngram_mod_copy_triple`
+  - `ngram_mod_triple`
+  - `ngram_mod_triple_for_arch`
+  - `npu_trunk_calibration_path`
+  - `offload_exec`
+  - `offload_exec_explicit`
+  - `OFFLOAD_EXECS`
+  - `offload_passback_share`
+  - `OffloadBudget`
+  - `OffloadExec`
+  - `oom_guard_effective`
+  - `oom_guard_mode`
+  - `OomGuardMode`
+  - `parse`
+  - `parse_cli`
+  - `parse_d2_join`
+  - `parse_d2_join_explicit`
+  - `parse_d2_ready`
+  - `parse_d2_return`
+  - `parse_d2_return_explicit`
+  - `parse_ep`
+  - `parse_gpu_layer_budget`
+  - `parse_offload_exec`
+  - `parse_offload_exec_explicit`
+  - `parse_passback_share`
+  - `parse_ple_format`
+  - `parse_ple_hot_store_bytes`
+  - `parse_ple_prewarm_bytes`
+  - `parse_pp`
+  - `parse_qwen4_direct_load`
+  - `parse_tri_state`
+  - `parse_tri_state_alias`
+  - `parse_typed_bool`
+  - `PassbackShare`
+  - `ple_format`
+  - `PLE_FORMATS`
+  - `ple_hot_debug`
+  - `ple_hot_pack_file`
+  - `ple_hot_rank_file`
+  - `ple_hot_store_bytes`
+  - `ple_load_fill_bytes`
+  - `ple_prewarm_bytes`
+  - `ple_sidecar_path`
+  - `PleFormat`
+  - `PleFormatRequest`
+  - `PleHotStoreBudget`
+  - `pp`
+  - `PP_ENV`
+  - `PP_MAX_DEGREE`
+  - `process_value`
+  - `ProcessConfig`
+  - `qwen4_d2_default`
+  - `qwen4_d2_ready`
+  - `qwen4_d2_transport`
+  - `qwen4_direct_load`
+  - `qwen4_ep`
+  - `QWEN4_EP_KILL_SWITCH_ENV`
+  - `QWEN4_FEW_ROW_ROUTE_ROWS`
+  - `qwen4_mtp_head_d2`
+  - `QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1151`
+  - `QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201`
+  - `qwen4_row_exact_verify_rows_table`
+  - `qwen4_sp`
+  - `qwen4_sp_touched`
+  - `QWEN4_VERIFY_MAX_ROWS`
+  - `REASONING_EFFORTS`
+  - `remove`
+  - `remove_model_override`
+  - `RemoveModelOverride`
+  - `resolve`
+  - `resolve_d2_transport`
+  - `resolve_ep`
+  - `resolve_load_pp`
+  - `resolve_load_pp_with`
+  - `resolve_pp`
+  - `ResolvedConfig`
+  - `ResolvedValue`
+  - `Result`
+  - `retired_config_key`
+  - `RETIRED_CONFIG_KEYS`
+  - `RetiredConfigKey`
+  - `rocm`
+  - `secret`
+  - `session_cache_bytes`
+  - `session_cache_dir`
+  - `session_cache_disk_bytes`
+  - `set`
+  - `set_cli`
+  - `set_model_override`
+  - `SetModelOverride`
+  - `sidecar_suffix`
+  - `SPECULATION_MODES`
+  - `spill_requested`
+  - `spill_support`
+  - `SpillRefusal`
+  - `SpillSupport`
+  - `stray_passback_share_configured`
+  - `to_toml_string`
+  - `topology`
+  - `trunk_overlay_sidecar_path`
+  - `TRUNK_OVERLAY_SIDECAR_SUFFIX`
+  - `try_discover`
+  - `tuning`
+  - `under`
+  - `UNIFIED_MEMORY_ARCHS`
+  - `unknown_key`
+  - `validate`
+  - `validate_config_profile_name`
+  - `ValueRule`
+  - `vision_mode_default`
+  - `write_catalog_toml`
+  - `write_global_toml`
+- [`src/load_summary.rs`](src/load_summary.rs)
+  - `begin`
+  - `Facet`
+  - `LoadNotes`
+  - `note`
+  - `take`
+- [`src/rocm.rs`](src/rocm.rs)
+  - `ambiguous_roots`
+  - `compiler_env_root`
+  - `CompilerSource`
+  - `configured_compiler`
+  - `configured_compiler_error`
+  - `configured_compiler_error_from`
+  - `configured_compiler_from`
+  - `configured_root`
+  - `cross_root_warning`
+  - `cross_root_warning_with_versions`
+  - `device_compiler`
+  - `DEVICE_COMPILERS`
+  - `has_configured_compiler`
+  - `has_configured_root`
+  - `HIP_RUNTIME_DIRS`
+  - `HIP_RUNTIME_LIBRARIES`
+  - `install_guidance`
+  - `is_complete_root`
+  - `is_headers_runtime_only_root`
+  - `is_strict_rocm`
+  - `library_candidates`
+  - `missing_components`
+  - `MissingComponent`
+  - `resolution_failure`
+  - `resolve_toolchain`
+  - `resolve_toolchain_for_explicit`
+  - `resolve_toolchain_pure`
+  - `ResolvedToolchain`
+  - `ROCM_INSTALL_DOCS`
+  - `root`
+  - `roots`
+  - `runtime_library`
+  - `strict_from`
+  - `strict_from_str`
+  - `tool`
+  - `tool_from_selected_root`
+  - `toolchain_warnings`
+  - `version`
+  - `version_for_root`
+- [`src/secret.rs`](src/secret.rs)
+  - `as_str`
+  - `BearerToken`
+  - `load`
+  - `matches`
+  - `MIN_BEARER_TOKEN_BYTES`
+  - `new`
+- [`src/tuning.rs`](src/tuning.rs)
+  - `ALL`
+  - `Applied`
+  - `apply`
+  - `ApplyOutcome`
+  - `attribute`
+  - `commit`
+  - `Conflict`
+  - `conflicts_json`
+  - `current_value`
+  - `DEFAULT_FLASH_NEXT_TAG`
+  - `default_ticked`
+  - `deserialize`
+  - `diff_json`
+  - `display_value`
+  - `evidence_lines`
+  - `evidence_summary`
+  - `find_conflicts`
+  - `from_toml`
+  - `id`
+  - `is_empty`
+  - `keys`
+  - `label`
+  - `line`
+  - `LINE_IDS`
+  - `lines_json`
+  - `load`
+  - `NotChanged`
+  - `one_liner`
+  - `parse`
+  - `plan`
+  - `PlanEnv`
+  - `PlanLine`
+  - `Preset`
+  - `preset`
+  - `preview`
+  - `Prior`
+  - `Requirement`
+  - `second_line`
+  - `serialize`
+  - `status`
+  - `takes_effect`
+  - `title`
+  - `to_toml_string`
+  - `TUNING_SCHEMA_VERSION`
+  - `TuningPlan`
+  - `TuningPreview`
+  - `TuningState`
+  - `TuningStatus`
+  - `Undo`
+  - `undo`
+  - `UndoOutcome`
+  - `writes_for`
+
+### Dependencies (from `Cargo.toml`)
+
+#### path
+
+—
+
+#### external
+
+- `serde`
+- `serde_json`
+- `subtle`
+- `thiserror`
+- `toml`
+- `windows`
+
+#### dev
+
+—
+
+#### build
+
+—
+
+### Reverse dependencies
+
+Workspace crates with a path dependency on this crate:
+
+- `hip-bridge`
+- `hipfire-arch-cohere2moe`
+- `hipfire-arch-deepseek4`
+- `hipfire-arch-diffusion`
+- `hipfire-arch-dots-ocr`
+- `hipfire-arch-embeddinggemma2`
+- `hipfire-arch-gemma4`
+- `hipfire-arch-lfm2moe`
+- `hipfire-arch-maple`
+- `hipfire-arch-minimax`
+- `hipfire-arch-muse-glimmer`
+- `hipfire-arch-qwen2`
+- `hipfire-arch-qwen35`
+- `hipfire-arch-qwen35-embed`
+- `hipfire-arch-qwen35-vl`
+- `hipfire-arch-qwen4`
+- `hipfire-arch-raon`
+- `hipfire-cli`
+- `hipfire-client`
+- `hipfire-daemon`
+- `hipfire-dispatch`
+- `hipfire-ds4-parent`
+- `hipfire-engine`
+- `hipfire-generate`
+- `hipfire-loader`
+- `hipfire-pflash`
+- `hipfire-quantize`
+- `hipfire-reap`
+- `hipfire-registry`
+- `hipfire-runtime`
+- `hipfire-tui`
+- `hsa-bridge`
+- `railgun`
+- `railgun-jitcorpus`
+- `rdna-compute`
+- `redline-dispatch`
+- `redline-rocr`
+- `saddle-lab`
+- `va-bridge`
+
+<!-- crate-map:generated:end -->

@@ -31,6 +31,8 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::HFQ3G128,
         DType::HFQ2G256,
         DType::HFQ2G128,
+        DType::TQ2G128,
+        DType::BQ1G128,
         DType::HFQ6G256,
         DType::MQ4G256,
         DType::MQ4G128,
@@ -40,6 +42,9 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::MQ6G256,
         DType::MQ8G256,
         DType::MQ2G256Lloyd,
+        // Unrotated sibling: Plain only. Deliberately absent from
+        // register_prerotated below — it consumes x in the natural basis.
+        DType::MQ2G256LloydU,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
         DType::MFP4G32,
@@ -47,8 +52,10 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::MFP4G32P,
         DType::MFP4G32E8,
         DType::MFP4G32E8SOA,
+        DType::MFP4G32E8G128,
         DType::HFP4G32,
         DType::ParoQ4G128,
+        DType::ParoQ4G64,
         DType::Q4F16G64,
         DType::Q4F16G32,
         DType::BF16, // native bf16 reference (KLD oracle); plain gemv, no rotation
@@ -71,6 +78,12 @@ fn register_plain(registry: &mut KernelRegistry) {
 fn register_prerotated(registry: &mut KernelRegistry) {
     let dtypes: &[DType] = &[
         DType::MQ4G256,
+        DType::MQ4G256V2,
+        DType::MQ5G256V2,
+        DType::MQ6G256V2,
+        DType::MQ3G256V2,
+        DType::MQ2G256V2,
+        DType::MQ4CG256,
         DType::MQ3G256,
         DType::MQ2G256,
         DType::MQ5G256,
@@ -84,6 +97,7 @@ fn register_prerotated(registry: &mut KernelRegistry) {
         DType::MFP4G32P,
         DType::MFP4G32E8,
         DType::MFP4G32E8SOA,
+        DType::MFP4G32E8G128,
     ];
     for &dtype in dtypes {
         let Ok(key) = KernelKey::for_gemv_prerotated(dtype) else {
@@ -106,6 +120,12 @@ fn register_residual(registry: &mut KernelRegistry) {
         DType::HFQ3G256,
         DType::HFQ6G256,
         DType::MQ4G256,
+        DType::MQ4G256V2,
+        DType::MQ5G256V2,
+        DType::MQ6G256V2,
+        DType::MQ3G256V2,
+        DType::MQ2G256V2,
+        DType::MQ4CG256,
         DType::MQ3G256,
         DType::MQ5G256,
         DType::MQ6G256,
@@ -144,6 +164,12 @@ fn register_swiglu_residual(registry: &mut KernelRegistry) {
         DType::HFQ3G256,
         DType::HFQ6G256,
         DType::MQ4G256,
+        DType::MQ4G256V2,
+        DType::MQ5G256V2,
+        DType::MQ6G256V2,
+        DType::MQ3G256V2,
+        DType::MQ2G256V2,
+        DType::MQ4CG256,
         DType::MQ3G256,
         DType::MQ5G256,
         DType::MQ6G256,

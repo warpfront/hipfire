@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="362" viewBox="0 0 880 362" role="img" aria-label="hipfire GPU support matrix">
+<title>hipfire GPU support matrix</title>
+<text x="0" y="28" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="18" fill="#f0f6fc" text-anchor="start" font-weight="bold">GPU support matrix</text>
+<text x="302.5" y="62" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#f0f6fc" text-anchor="middle" font-weight="bold">Decode</text>
+<text x="407.5" y="62" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#f0f6fc" text-anchor="middle" font-weight="bold">Prefill WMMA</text>
+<text x="512.5" y="62" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#f0f6fc" text-anchor="middle" font-weight="bold">DFlash</text>
+<text x="617.5" y="62" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#f0f6fc" text-anchor="middle" font-weight="bold">MTP</text>
+<text x="722.5" y="62" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#f0f6fc" text-anchor="middle" font-weight="bold">NPU prefill</text>
+<text x="827.5" y="62" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#f0f6fc" text-anchor="middle" font-weight="bold">Redline</text>
+<line x1="0" y1="74" x2="880" y2="74" stroke="#3d444d"/>
+<text x="0" y="92" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#f0f6fc" text-anchor="start" font-weight="bold">Vega / CDNA</text>
+<text x="0" y="107" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#9198a1" text-anchor="start" font-weight="normal">gfx906, gfx908, gfx940-942</text>
+<rect x="268.5" y="85" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="302.5" y="99" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<text x="407.5" y="100" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<rect x="478.5" y="85" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="512.5" y="99" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<rect x="583.5" y="85" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="617.5" y="99" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<text x="722.5" y="100" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<text x="827.5" y="100" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<line x1="0" y1="114" x2="880" y2="114" stroke="#3d444d"/>
+<text x="0" y="132" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#f0f6fc" text-anchor="start" font-weight="bold">RDNA1</text>
+<text x="0" y="147" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#9198a1" text-anchor="start" font-weight="normal">gfx1010-1013</text>
+<rect x="268.5" y="125" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="302.5" y="139" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<text x="407.5" y="140" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<rect x="478.5" y="125" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="512.5" y="139" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<rect x="583.5" y="125" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="617.5" y="139" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<text x="722.5" y="140" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<rect x="793.5" y="125" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="827.5" y="139" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<line x1="0" y1="154" x2="880" y2="154" stroke="#3d444d"/>
+<text x="0" y="172" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#f0f6fc" text-anchor="start" font-weight="bold">RDNA2</text>
+<text x="0" y="187" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#9198a1" text-anchor="start" font-weight="normal">gfx1030-1032</text>
+<rect x="268.5" y="165" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="302.5" y="179" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<text x="407.5" y="180" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<rect x="478.5" y="165" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="512.5" y="179" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<rect x="583.5" y="165" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="617.5" y="179" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<text x="722.5" y="180" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<rect x="793.5" y="165" width="68" height="20" rx="10" fill="#d29922"/>
+<text x="827.5" y="179" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">generic</text>
+<line x1="0" y1="194" x2="880" y2="194" stroke="#3d444d"/>
+<text x="0" y="212" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#f0f6fc" text-anchor="start" font-weight="bold">RDNA3</text>
+<text x="0" y="227" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#9198a1" text-anchor="start" font-weight="normal">gfx1100-1103</text>
+<rect x="268.5" y="205" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="302.5" y="219" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="373.5" y="205" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="407.5" y="219" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="478.5" y="205" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="512.5" y="219" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="583.5" y="205" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="617.5" y="219" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<text x="722.5" y="220" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<rect x="793.5" y="205" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="827.5" y="219" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<line x1="0" y1="234" x2="880" y2="234" stroke="#3d444d"/>
+<text x="0" y="252" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#f0f6fc" text-anchor="start" font-weight="bold">RDNA3.5</text>
+<text x="0" y="267" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#9198a1" text-anchor="start" font-weight="normal">gfx1150-1152 (Strix Halo gfx1151)</text>
+<rect x="268.5" y="245" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="302.5" y="259" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="373.5" y="245" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="407.5" y="259" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="478.5" y="245" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="512.5" y="259" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="583.5" y="245" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="617.5" y="259" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="688.5" y="245" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="722.5" y="259" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="793.5" y="245" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="827.5" y="259" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<line x1="0" y1="274" x2="880" y2="274" stroke="#3d444d"/>
+<text x="0" y="292" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="13" fill="#f0f6fc" text-anchor="start" font-weight="bold">RDNA4</text>
+<text x="0" y="307" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#9198a1" text-anchor="start" font-weight="normal">gfx1200, gfx1201</text>
+<rect x="268.5" y="285" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="302.5" y="299" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="373.5" y="285" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="407.5" y="299" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="478.5" y="285" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="512.5" y="299" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<rect x="583.5" y="285" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="617.5" y="299" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<text x="722.5" y="300" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="14" fill="#9198a1" text-anchor="middle" font-weight="normal">—</text>
+<rect x="793.5" y="285" width="68" height="20" rx="10" fill="#ff7b72"/>
+<text x="827.5" y="299" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#ffffff" text-anchor="middle" font-weight="bold">tuned</text>
+<line x1="0" y1="314" x2="880" y2="314" stroke="#3d444d"/>
+<text x="0" y="336" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#9198a1" text-anchor="start" font-weight="normal">tuned: arch-specific kernels or default-on route · generic: portable typed-dispatch path</text>
+<text x="0" y="352" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="11" fill="#9198a1" text-anchor="start" font-weight="normal">Capability, not admission or certification. Sources: docs/assets/readme-data.json.</text>
+</svg>

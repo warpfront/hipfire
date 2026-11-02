@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark light">
+<title>hipfire</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%23f28a4a' d='M8.5 14.5A2.5 2.5 0 0 0 11 12c0-1.38-.5-2-1-3-1.07-2.14-.22-4.05 2-6 .5 2.5 2 4.9 4 6.5 2 1.6 3 3.5 3 5.5a7 7 0 1 1-14 0c0-1.15.43-2.29 1-3a2.5 2.5 0 0 0 2.5 2.5z'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<noscript><p class="noscript-note">
+  The hipfire chat UI needs JavaScript — it streams from the local serve API and keeps history in this browser.
+</p></noscript>
+<div id="app">
+
+  <!-- ============ conversations sidebar ============ -->
+  <aside id="sidebar" aria-label="conversations">
+    <div class="side-head">
+      <span class="brand"><span class="mark" data-icon="flame"></span><span class="brand-name">hipfire</span></span>
+      <button id="collapse-sidebar" class="icon-btn" type="button" aria-label="Close sidebar" title="Close sidebar (Ctrl+B)"><span data-icon="sidebar"></span></button>
+    </div>
+
+    <button id="sidebar-new" class="new-chat" type="button" title="New chat (Ctrl+Shift+O)">
+      <span data-icon="edit"></span><span>New chat</span><kbd class="kbd-hint">Ctrl ⇧ O</kbd>
+    </button>
+
+    <label class="search">
+      <span data-icon="search"></span>
+      <input id="conv-search" type="search" placeholder="Search chats" aria-label="Search chats" autocomplete="off">
+      <kbd class="kbd-hint">Ctrl K</kbd>
+    </label>
+
+    <nav id="conv-list" aria-label="chat history"></nav>
+
+    <div class="side-foot">
+      <div class="storage" id="storage" title="Chats are stored in this browser's IndexedDB">
+        <span data-icon="database"></span><span id="storage-text">Local history</span>
+      </div>
+      <div class="side-actions">
+        <button id="import-chats" class="icon-btn" type="button" aria-label="Import chats" title="Import chats (JSON)"><span data-icon="upload"></span></button>
+        <button id="export-all" class="icon-btn" type="button" aria-label="Export all chats" title="Export all chats (JSON)"><span data-icon="download"></span></button>
+        <button id="clear-all" class="icon-btn danger" type="button" aria-label="Delete all chats" title="Delete all chats"><span data-icon="trash"></span></button>
+        <span class="spacer"></span>
+        <div class="seg" id="theme-seg" role="radiogroup" aria-label="Theme">
+          <button type="button" role="radio" data-theme-opt="light" aria-label="Light theme" title="Light"><span data-icon="sun"></span></button>
+          <button type="button" role="radio" data-theme-opt="system" aria-label="System theme" title="System"><span data-icon="monitor"></span></button>
+          <button type="button" role="radio" data-theme-opt="dark" aria-label="Dark theme" title="Dark"><span data-icon="moon"></span></button>
+        </div>
+      </div>
+      <input id="import-file" type="file" accept=".json,application/json" hidden>
+    </div>
+  </aside>
+  <div id="scrim" hidden></div>
+
+  <!-- ============ main column ============ -->
+  <section id="main">
+    <header id="topbar">
+      <button id="open-sidebar" class="icon-btn" type="button" aria-label="Open sidebar" title="Open sidebar (Ctrl+B)"><span data-icon="sidebar"></span></button>
+      <div class="model-pick">
+        <select id="model" aria-label="Model"></select>
+        <span class="chev" data-icon="chevDown"></span>
+      </div>
+      <span id="model-badges" class="badges"></span>
+      <span class="spacer"></span>
+      <div id="status-pill" class="status-pill" title="serve status">
+        <span id="status-dot" class="dot"></span><span id="status">connecting…</span>
+      </div>
+      <button id="export-conv" class="icon-btn" type="button" aria-label="Export chat as Markdown" title="Export chat as Markdown" hidden><span data-icon="file"></span></button>
+      <button id="show-shortcuts" class="icon-btn hide-sm" type="button" aria-label="Keyboard shortcuts" title="Keyboard shortcuts (?)"><span data-icon="keyboard"></span></button>
+      <button id="toggle-settings" class="icon-btn" type="button" aria-label="Settings" aria-controls="settings" title="Settings (Ctrl+.)"><span data-icon="sliders"></span></button>
+    </header>
+
+    <div id="scroller">
+      <div id="empty">
+        <div class="hero-mark"><span data-icon="flame"></span></div>
+        <h1 id="greeting">How can I help?</h1>
+        <p id="empty-sub" class="empty-sub">Running locally on your GPU.</p>
+        <div id="suggestions" class="suggestions"></div>
+      </div>
+      <main id="log" aria-live="polite" aria-label="messages"></main>
+    </div>
+
+    <button id="scroll-bottom" type="button" aria-label="Scroll to bottom" hidden><span data-icon="arrowDown"></span></button>
+
+    <footer id="composer-wrap">
+      <div id="live-stats" hidden>
+        <span id="live-ttft"></span><span id="live-rate"></span>
+      </div>
+      <form id="composer" autocomplete="off">
+        <div id="attachments"></div>
+        <textarea id="input" rows="1" placeholder="Message hipfire…" aria-label="Message"></textarea>
+        <div class="composer-bar">
+          <button id="attach" class="tool-btn" type="button" aria-label="Attach image" title="Attach image (PNG/JPEG)" hidden><span data-icon="clip"></span></button>
+          <input id="file" type="file" accept="image/png,image/jpeg" hidden>
+          <button id="think-pill" class="pill" type="button" hidden title="Reasoning mode — click to cycle">
+            <span data-icon="bulb"></span><span id="think-label">Think: auto</span>
+          </button>
+          <select id="effort" class="pill effort-pill" hidden title="Reasoning effort" aria-label="Reasoning effort"></select>
+          <span class="spacer"></span>
+          <span id="char-count" class="char-count" aria-live="off"></span>
+          <button id="send" class="send-btn" type="submit" aria-label="Send" title="Send (Enter)" disabled><span data-icon="arrowUp"></span></button>
+          <button id="stop-btn" class="send-btn stop" type="button" aria-label="Stop generating" title="Stop (Esc)" hidden><span data-icon="stop"></span></button>
+        </div>
+      </form>
+      <p class="composer-hint"><kbd>Enter</kbd> to send · <kbd>Shift</kbd>+<kbd>Enter</kbd> new line · history stays in this browser</p>
+    </footer>
+
+    <div id="drop-overlay" hidden><div class="drop-card"><span data-icon="image"></span><p>Drop an image to attach</p></div></div>
+  </section>
+
+  <!-- ============ settings drawer ============ -->
+  <aside id="settings" aria-label="Generation settings">
+    <div class="drawer-head">
+      <div>
+        <h2>Settings</h2>
+        <p class="sub">Applies to the next message. Empty fields use the server default.</p>
+      </div>
+      <button id="close-settings" class="icon-btn" type="button" aria-label="Close settings"><span data-icon="x"></span></button>
+    </div>
+
+    <div class="drawer-body">
+      <section class="group">
+        <h3>System prompt</h3>
+        <textarea id="system" rows="4" placeholder="You are a helpful assistant…"></textarea>
+      </section>
+
+      <section class="group">
+        <h3>Sampling</h3>
+        <div class="grid">
+          <label class="fld"><span>Temperature</span><input id="temperature" type="number" min="0" max="2" step="0.05" placeholder="default"></label>
+          <label class="fld"><span>Top-p</span><input id="top_p" type="number" min="0" max="1" step="0.05" placeholder="default"></label>
+          <label class="fld"><span>Min-p</span><input id="min_p" type="number" min="0" max="1" step="0.01" placeholder="default"></label>
+          <label class="fld"><span>Top-k</span><input id="top_k" type="number" min="0" step="1" placeholder="default"></label>
+          <label class="fld"><span>Max tokens</span><input id="max_tokens" type="number" min="1" step="1" placeholder="default"></label>
+          <label class="fld"><span>Seed</span><input id="seed" type="number" step="1" placeholder="random"></label>
+        </div>
+      </section>
+
+      <section class="group">
+        <h3>Penalties</h3>
+        <div class="grid">
+          <label class="fld"><span>Repeat</span><input id="repeat_penalty" type="number" min="0" step="0.01" placeholder="default"></label>
+          <label class="fld"><span>Presence</span><input id="presence_penalty" type="number" step="0.01" placeholder="default"></label>
+          <label class="fld"><span>Frequency</span><input id="frequency_penalty" type="number" step="0.01" placeholder="default"></label>
+        </div>
+        <label class="fld"><span>Stop sequences (comma-separated)</span><input id="stop_seq" type="text" placeholder="e.g. ###, &lt;|end|&gt;"></label>
+      </section>
+
+      <section class="group" id="reasoning-group">
+        <h3>Reasoning</h3>
+        <div class="grid">
+          <label class="fld" id="thinking-wrap"><span>Thinking</span><select id="thinking"></select></label>
+        </div>
+        <p class="hint" id="settings-hint"></p>
+      </section>
+
+      <section class="group" id="tools-wrap">
+        <h3>Tools</h3>
+        <label class="fld"><span>Function schemas (JSON array)</span>
+          <textarea id="tools" rows="5" class="mono" spellcheck="false" placeholder='[{"type":"function","function":{"name":"…","parameters":{…}}}]'></textarea>
+        </label>
+        <label class="fld" id="tool-choice-row" hidden><span>Tool choice</span>
+          <select id="tool_choice">
+            <option value="auto">auto</option>
+            <option value="required">required</option>
+            <option value="none">none</option>
+          </select>
+        </label>
+      </section>
+
+      <section class="group">
+        <h3>Structured output</h3>
+        <label class="fld"><span>Response format (JSON object)</span>
+          <textarea id="response_format" rows="3" class="mono" spellcheck="false" placeholder='{"type":"json_schema","json_schema":{…}}'></textarea>
+        </label>
+      </section>
+    </div>
+
+    <div class="drawer-foot">
+      <button id="reset-settings" class="btn btn-ghost" type="button">Reset to defaults</button>
+      <button id="done-settings" class="btn btn-accent" type="button">Done</button>
+    </div>
+  </aside>
+</div>
+
+<!-- ============ overlays ============ -->
+<div id="menu" class="menu" role="menu" hidden></div>
+<div id="toasts" aria-live="polite"></div>
+
+<dialog id="confirm-dlg" class="dlg">
+  <form method="dialog">
+    <h2 id="confirm-title">Are you sure?</h2>
+    <p id="confirm-body"></p>
+    <div class="dlg-actions">
+      <button value="cancel" class="btn btn-ghost">Cancel</button>
+      <button value="ok" id="confirm-ok" class="btn btn-danger">Delete</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="shortcuts-dlg" class="dlg">
+  <form method="dialog">
+    <h2>Keyboard shortcuts</h2>
+    <dl class="keys" id="shortcut-list"></dl>
+    <div class="dlg-actions"><button value="close" class="btn btn-accent">Close</button></div>
+  </form>
+</dialog>
+
+<dialog id="lightbox" class="lightbox"><img id="lightbox-img" alt=""></dialog>
+
+<script src="/ui/db.js"></script>
+<script src="/ui/render.js"></script>
+<script src="/ui/app.js"></script>
+</body>
+</html>

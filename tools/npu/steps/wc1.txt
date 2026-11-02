@@ -1,0 +1,7 @@
+# WC1: gate_up co-op J=3,1,2 x2 fresh processes, tails sep|wide|fold ABBA in-process (coarse, glue v2)
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --iters 6 --pack wb --reg coarse --glue v2 --tail sep,wide,fold --hid 3072
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --iters 6 --pack wb --reg coarse --glue v2 --tail sep,wide,fold --hid 1024
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --iters 6 --pack wb --reg coarse --glue v2 --tail sep,wide,fold --hid 2048
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --iters 6 --pack wb --reg coarse --glue v2 --tail sep,wide,fold --hid 3072
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --iters 6 --pack wb --reg coarse --glue v2 --tail sep,wide,fold --hid 1024
+--mode coop --proj gate_up --layer 2 --xq $DATA/L2.mlp.a4.bin --iters 6 --pack wb --reg coarse --glue v2 --tail sep,wide,fold --hid 2048

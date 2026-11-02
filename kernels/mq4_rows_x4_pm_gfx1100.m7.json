@@ -1,0 +1,18 @@
+{
+  "gemv_mq4g256v2_rows_x4_t8_pm_gfx1100": {
+    "ambiguous_delays": 0,
+    "barrier_pairs": 0,
+    "clauses": 0,
+    "delays": 4681,
+    "instructions": 12879,
+    "lds_accesses": 360,
+    "lds_max_known_end": null,
+    "lds_unknown_addresses": 360,
+    "lift": "byte-exact",
+    "obligations": {},
+    "sgpr_high_water": 88,
+    "table": "gfx1100",
+    "vgpr_high_water": 121,
+    "wait_facts": 665
+  }
+}

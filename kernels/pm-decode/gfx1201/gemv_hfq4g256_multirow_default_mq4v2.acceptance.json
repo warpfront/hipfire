@@ -1,0 +1,48 @@
+{
+  "module": "gemv_hfq4g256_multirow_default_mq4v2",
+  "symbol": "gemv_mq4g256v2_multirow_r2",
+  "arch": "gfx1201",
+  "scope": "standalone kernel twin; no default routing or whole-product promotion claim",
+  "source_commit": "e95fbb84b3",
+  "artifact_commit": "a81baabed8",
+  "incumbent_source_sha256": "64b1b7eededa4bce636b8799247d7a66e7ef045f32d1674d07180bd56b98c3af",
+  "elf_sha256": "c4732e91f06e38ca9d30053e09e9645b3ff2c6be9faa798bfdbb0074186a22c6",
+  "bundle_sha256": "0a63776ee63fe3321043bec3fd13817fc592c2f62fc0cb28d84111140d992dfe",
+  "m7": {"lift": "byte-exact", "obligations": {}, "ambiguous_delays": 0, "instructions": 1081, "vgpr_high_water": 32, "sgpr_high_water": 24},
+  "custom_certification": "gemv_hfq4g256_multirow_default_mq4v2.radiowave.json",
+  "real_h2_oracle": {
+    "owner": "PmOracle",
+    "report": "/home/kaden/qcal/release-0.4.2/pm-decode-twins/oracle-results/gemv_hfq4g256_multirow_default_mq4v2/full-occ0-c4732e91f06e38ca/report.json",
+    "report_sha256": "000738702a43ed9920509e7ba1e7209401fc9bc8097bf2f12471c0d885c3b965",
+    "capture_launch_index": 754,
+    "capture_position": 513,
+    "grid": [124160, 1, 1],
+    "block": [32, 1, 1],
+    "dynamic_lds": 0,
+    "rows": 248320,
+    "mismatch_bytes": 0,
+    "incumbent_vs_captured_callsite_mismatch_bytes": 0,
+    "compared_buffers_including_guards": [
+      {"argument_offset": 0, "bytes": 675438592, "mismatch_bytes": 0},
+      {"argument_offset": 8, "bytes": 28672, "mismatch_bytes": 0},
+      {"argument_offset": 16, "bytes": 1001472, "mismatch_bytes": 0}
+    ],
+    "edge_shapes": 77,
+    "edge_mismatch_bytes": 0,
+    "edge_group_counts": [1,2,3,4,5,6,7,8,9,19,20],
+    "edge_row_counts": [1,2,3,31,32,33,65]
+  },
+  "native_emission_measurement": {
+    "tool": "/home/kaden/qcal/release-0.4.2/target-pmdt-PmMultirow/release/hipfire-isa",
+    "scope": "emission plus native assembly/bundling and M7, excluding cargo build and custom certification; three fresh processes, warm filesystem, GPUs hidden",
+    "timer": "/usr/bin/time, 0.01-second output precision",
+    "wall_seconds": [0.01,0.01,0.01],
+    "user_seconds": [0.01,0.01,0.01],
+    "system_seconds": [0.0,0.0,0.0],
+    "max_rss_kib": [9060,9004,9176],
+    "speedup_claim": null
+  },
+  "selected_default_module_candidates": 1,
+  "actual_removed_hip_jobs_in_this_slice": 0,
+  "remaining_integration": "routing/pack owner must consume this accepted r2 image; unported r4/r8 and opt-out/other-architecture HIP recipes remain outside this author's ownership"
+}

@@ -1,0 +1,61 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Nick Woolmer
+[package]
+name = "hipfire-arch-maple"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Maple-Preview 20B-A1B architecture (natively-ternary 256-expert MoE on every layer, 3:1 sliding/NoPE-full attention, QK-norm before partial RoPE, clamped SwiGLU, untied lm_head) for hipfire"
+
+[features]
+# Archived research probes; see the note by the [[example]] blocks.
+lab = []
+default = ["deltanet"]
+# Mirrors hipfire-arch-cohere2moe: the shared MoE rotate/silu helpers in
+# hipfire-runtime::llama are deltanet-gated.
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+
+# ---------------------------------------------------------------------------
+# Archived research probes.
+#
+# The one-question GPU experiments that established this port: value-exactness
+# of the qt=51 pack, the KL and perplexity numbers quoted in the PR, and the
+# prefill parity/near-tie analysis. They are the evidence behind the design
+# doc and worth keeping, but an answer obtained in August should not be
+# type-checked on every build in December.
+#
+# Run on demand:  cargo build -p hipfire-arch-maple --examples --features lab
+# The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
+# ---------------------------------------------------------------------------
+[[example]]
+name = "maple_coherence"
+required-features = ["lab"]
+
+[[example]]
+name = "maple_decode_profile"
+required-features = ["lab"]
+
+[[example]]
+name = "maple_kld"
+required-features = ["lab"]
+
+[[example]]
+name = "maple_perplexity"
+required-features = ["lab"]
+
+[[example]]
+name = "maple_prefill_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "maple_verify_pack"
+required-features = ["lab"]

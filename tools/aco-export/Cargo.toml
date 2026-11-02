@@ -1,0 +1,15 @@
+[package]
+name = "aco-export"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+description = "Offline developer exporter: SPIR-V -> real RADV/NIR/ACO -> pm-aco-artifact-v1 (not a shipping crate; no Mesa dependency enters the runtime)"
+
+# Standalone: deliberately NOT a member of the hipfire workspace. Build with
+#   cargo build --release --manifest-path tools/aco-export/Cargo.toml
+[workspace]
+
+[dependencies]
+sha2 = "0.10"
+serde_json = "1"

@@ -185,16 +185,18 @@ fn gpu_categorical_sample_one(
     let d_z = gpu.upload_f32(&[z], &[1]).unwrap();
     let d_out_tok = gpu.zeros(&[1], rdna_compute::DType::F32).unwrap(); // i32 as raw bytes
     let d_out_prob = gpu.zeros(&[1], rdna_compute::DType::F32).unwrap();
+    let row_seed = rdna_compute::sampling::spec_draft_row_seed(seed as u64, 0, 0);
+    let d_seed = gpu.upload_raw(&row_seed.to_ne_bytes(), &[4]).unwrap();
 
     gpu.batched_categorical_sample_f32(
         &d_probs,
         &d_tau,
         &d_z,
+        &d_seed,
         &d_out_tok,
         &d_out_prob,
         VOCAB,
         1,
-        seed,
     )
     .unwrap();
 
@@ -206,6 +208,7 @@ fn gpu_categorical_sample_one(
     gpu.free_tensor(d_z).unwrap();
     gpu.free_tensor(d_out_tok).unwrap();
     gpu.free_tensor(d_out_prob).unwrap();
+    gpu.free_tensor(d_seed).unwrap();
 
     let tok = f32::to_bits(tok_raw[0]) as u32;
     (tok, prob_raw[0])

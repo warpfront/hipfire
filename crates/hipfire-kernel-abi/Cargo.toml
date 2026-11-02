@@ -1,0 +1,17 @@
+[package]
+name = "hipfire-kernel-abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "KernelAbiV1: one typed kernarg/descriptor/extent/numeric contract per kernel family, shared by the PM generator checks, the rdna-compute launchers, pm_loop and railgun nodes"
+publish = false
+
+# The runtime depends on this crate: it must never reach peacemaker (checked by
+# peacemaker-ir's `runtime_dependency_graph_does_not_include_peacemaker`).
+# Generator / object-metadata evidence is gathered by dev-only tests in the
+# crates that already depend on peacemaker (rdna-compute tests).
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true

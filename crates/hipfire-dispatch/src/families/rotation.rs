@@ -23,6 +23,8 @@ pub struct RotationParams<'a> {
     pub givens_theta: Option<&'a GpuTensor>,
     pub givens_scales: Option<&'a GpuTensor>,
     pub givens_krot: Option<usize>,
+    /// Givens block width = `DType::paro_group_size` of the consuming weight.
+    pub givens_group_size: Option<usize>,
 }
 
 /// Rotation kernel family — selects and runs FWHT rotation kernels.
@@ -34,7 +36,9 @@ impl RotationFamily {
     pub fn new() -> Self {
         let mut registry = KernelRegistry::new();
         super::super::tables::rotation_table::populate(&mut registry);
-        registry.validate().expect("rotation kernel table has empty entries");
+        registry
+            .validate()
+            .expect("rotation kernel table has empty entries");
         Self { registry }
     }
 
@@ -53,72 +57,75 @@ impl RotationFamily {
 
         match params.variant {
             RotationVariant::Givens => {
-                let pairs = params.givens_pairs.ok_or_else(|| {
-                    HipError::new(0, "givens_pairs required for Givens rotation")
-                })?;
-                let theta = params.givens_theta.ok_or_else(|| {
-                    HipError::new(0, "givens_theta required for Givens rotation")
-                })?;
+                let pairs = params
+                    .givens_pairs
+                    .ok_or_else(|| HipError::new(0, "givens_pairs required for Givens rotation"))?;
+                let theta = params
+                    .givens_theta
+                    .ok_or_else(|| HipError::new(0, "givens_theta required for Givens rotation"))?;
                 let scales = params.givens_scales.ok_or_else(|| {
                     HipError::new(0, "givens_scales required for Givens rotation")
                 })?;
-                let krot = params.givens_krot.ok_or_else(|| {
-                    HipError::new(0, "givens_krot required for Givens rotation")
+                let krot = params
+                    .givens_krot
+                    .ok_or_else(|| HipError::new(0, "givens_krot required for Givens rotation"))?;
+                let group = params.givens_group_size.ok_or_else(|| {
+                    HipError::new(0, "givens_group_size required for Givens rotation")
                 })?;
                 // givens_rotate_to does copy_d2d + rotate in one kernel
                 gpu.givens_rotate_to(
-                    params.x, params.x_rot,
-                    pairs, theta, scales,
+                    params.x,
+                    params.x_rot,
+                    pairs,
+                    theta,
+                    scales,
                     1, /* seq_len */
                     params.k,
                     krot,
+                    group,
                 )
             }
             RotationVariant::PlainG128 => {
-                self.registry.resolve(KernelKey::RotateMqG128, ctx, None)
+                self.registry
+                    .resolve(KernelKey::RotateMqG128, ctx, None)
                     .map_err(he)?;
                 // rotate_x_mq_128 internally calls ensure_mq_signs_128()
                 gpu.rotate_x_mq_128(params.x, params.x_rot, params.k)
             }
             RotationVariant::Plain => match (has_awq, batched) {
                 (false, false) => {
-                    self.registry.resolve(KernelKey::RotateMq, ctx, None)
+                    self.registry
+                        .resolve(KernelKey::RotateMq, ctx, None)
                         .map_err(he)?;
                     gpu.rotate_x_mq(params.x, params.x_rot, params.k)
                 }
                 (true, false) => {
-                    self.registry.resolve(KernelKey::RotateMqAwq, ctx, None)
+                    self.registry
+                        .resolve(KernelKey::RotateMqAwq, ctx, None)
                         .map_err(he)?;
-                    gpu.rotate_x_mq_awq(
-                        params.x,
-                        params.awq_scale.unwrap(),
-                        params.x_rot,
-                        params.k,
-                    )
+                    gpu.rotate_x_mq_awq(params.x, params.awq_scale.unwrap(), params.x_rot, params.k)
                 }
                 (false, true) => {
-                    self.registry.resolve(KernelKey::RotateMqBatched, ctx, None)
+                    self.registry
+                        .resolve(KernelKey::RotateMqBatched, ctx, None)
                         .map_err(he)?;
                     gpu.rotate_x_mq(params.x, params.x_rot, params.k)
                 }
                 (true, true) => {
-                    self.registry.resolve(KernelKey::RotateMqAwqBatched, ctx, None)
+                    self.registry
+                        .resolve(KernelKey::RotateMqAwqBatched, ctx, None)
                         .map_err(he)?;
-                    gpu.rotate_x_mq_awq(
-                        params.x,
-                        params.awq_scale.unwrap(),
-                        params.x_rot,
-                        params.k,
-                    )
+                    gpu.rotate_x_mq_awq(params.x, params.awq_scale.unwrap(), params.x_rot, params.k)
                 }
             },
             RotationVariant::WithRmsnorm => {
-                let w_norm = params.w_norm.ok_or_else(|| {
-                    HipError::new(0, "w_norm required for WithRmsnorm rotation")
-                })?;
+                let w_norm = params
+                    .w_norm
+                    .ok_or_else(|| HipError::new(0, "w_norm required for WithRmsnorm rotation"))?;
                 match (has_awq, batched) {
                     (false, false) => {
-                        self.registry.resolve(KernelKey::RmsnormRotateMq, ctx, None)
+                        self.registry
+                            .resolve(KernelKey::RmsnormRotateMq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_rmsnorm_rotate_mq(
                             params.x,
@@ -129,7 +136,8 @@ impl RotationFamily {
                         )
                     }
                     (true, false) => {
-                        self.registry.resolve(KernelKey::RmsnormRotateMqAwq, ctx, None)
+                        self.registry
+                            .resolve(KernelKey::RmsnormRotateMqAwq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_rmsnorm_rotate_mq_awq(
                             params.x,
@@ -141,7 +149,8 @@ impl RotationFamily {
                         )
                     }
                     (false, true) => {
-                        self.registry.resolve(KernelKey::RmsnormRotateMqBatched, ctx, None)
+                        self.registry
+                            .resolve(KernelKey::RmsnormRotateMqBatched, ctx, None)
                             .map_err(he)?;
                         gpu.fused_rmsnorm_rotate_mq_batched(
                             params.x,
@@ -168,30 +177,53 @@ impl RotationFamily {
                     }
                 }
             }
+            // The batched launchers run the same kernel over `batch_size` rows.
             RotationVariant::WithSwiGLU => {
-                let x_up = params.x_up.ok_or_else(|| {
-                    HipError::new(0, "x_up required for WithSwiGLU rotation")
-                })?;
-                match has_awq {
-                    false => {
-                        self.registry.resolve(KernelKey::SiluMulRotateMq, ctx, None)
+                let x_up = params
+                    .x_up
+                    .ok_or_else(|| HipError::new(0, "x_up required for WithSwiGLU rotation"))?;
+                match (params.awq_scale, batched) {
+                    (None, false) => {
+                        self.registry
+                            .resolve(KernelKey::SiluMulRotateMq, ctx, None)
                             .map_err(he)?;
-                        gpu.fused_silu_mul_rotate_mq(
-                            params.x,
-                            x_up,
-                            params.x_rot,
-                            params.k,
-                        )
+                        gpu.fused_silu_mul_rotate_mq(params.x, x_up, params.x_rot, params.k)
                     }
-                    true => {
-                        self.registry.resolve(KernelKey::SiluMulRotateMqAwq, ctx, None)
+                    (Some(awq), false) => {
+                        self.registry
+                            .resolve(KernelKey::SiluMulRotateMqAwq, ctx, None)
                             .map_err(he)?;
                         gpu.fused_silu_mul_rotate_mq_awq(
                             params.x,
                             x_up,
-                            params.awq_scale.unwrap(),
+                            awq,
                             params.x_rot,
                             params.k,
+                        )
+                    }
+                    (None, true) => {
+                        self.registry
+                            .resolve(KernelKey::SiluMulRotateMq, ctx, None)
+                            .map_err(he)?;
+                        gpu.fused_silu_mul_rotate_mq_batched(
+                            params.x,
+                            x_up,
+                            params.x_rot,
+                            params.k,
+                            params.batch_size,
+                        )
+                    }
+                    (Some(awq), true) => {
+                        self.registry
+                            .resolve(KernelKey::SiluMulRotateMqAwq, ctx, None)
+                            .map_err(he)?;
+                        gpu.fused_silu_mul_rotate_mq_awq_batched(
+                            params.x,
+                            x_up,
+                            awq,
+                            params.x_rot,
+                            params.k,
+                            params.batch_size,
                         )
                     }
                 }

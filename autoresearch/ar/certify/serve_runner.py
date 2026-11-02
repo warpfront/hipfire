@@ -114,9 +114,10 @@ def _run_rocprof(runner, daemon):
         subprocess.run(cmd, shell=True, capture_output=True, text=True,
                        env=dict(os.environ, HIP_VISIBLE_DEVICES=str(runner.dev)))
 
-    # Free the GPU first (a lingering serve-daemon holding HVD blocks rocprof's HIP init). Kill by
-    # EXACT comm (-x) so we never hit the gate's own python process.
-    run(f"pkill -9 -x daemon 2>/dev/null; pkill -9 -x {os.path.basename(daemon)[:15]} 2>/dev/null; sleep 2")
+    # Free the GPU first (a lingering serve-daemon holding HVD blocks rocprof's HIP init). Kill only
+    # this runner's own serve process group: every daemon has comm `daemon`, so a name kill would
+    # also take down other agents' and other worktrees' daemons on a shared host.
+    _sh()._kill_serve()
     run(f"{daemon} < {reqf} >/dev/null 2>&1")                       # warm (JIT) at auto
     run(f"echo profile_standard | sudo -n tee {pl} >/dev/null")     # PIN the clock
     run(f"rm -rf {outdir}; mkdir -p {outdir}")

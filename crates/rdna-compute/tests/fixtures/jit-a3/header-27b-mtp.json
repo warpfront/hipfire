@@ -1,0 +1,300 @@
+{
+  "model": "/home/kaden/qcal/release-0.4.0/fp8-tp-ep-geo/models/qwen3.8-27b.mtp",
+  "file_size": 225716224,
+  "arch_id": 21,
+  "header_sha256": "acee0178b1f8e36d561ef0ad48386a6b2d503f412804455ddb0e148aa28552c9",
+  "header_bytes": 4096,
+  "metadata": {
+    "arch": "qwen35_mtp_head",
+    "arch_id": 21,
+    "source_model": "qwen3.8-27b",
+    "n_embd": 5120,
+    "n_layer": 64,
+    "nextn_predict_layers": 1,
+    "n_head": 24,
+    "n_head_kv": 4,
+    "n_embd_head": 256,
+    "n_ff": 17408,
+    "ffn_kind": "dense",
+    "num_experts": 0,
+    "num_experts_per_tok": 0,
+    "moe_intermediate_size": 0,
+    "shared_expert_intermediate_size": 0,
+    "norm_topk_prob": true,
+    "vocab_size": 248320,
+    "rope_theta": 10000000.0,
+    "rope_sections": [
+      11,
+      11,
+      10
+    ],
+    "rms_norm_eps": 1e-06,
+    "shared_embed_with_trunk": true,
+    "shared_lm_head_with_trunk": true,
+    "shared_output_norm_with_trunk": false,
+    "tie_word_embeddings": false,
+    "weight_quant": "MQ4G256",
+    "has_compressed_lm_head_draft": false,
+    "compressed_vocab_size": 0,
+    "config_text_config": {
+      "attention_bias": false,
+      "attention_dropout": 0.0,
+      "attn_output_gate": true,
+      "bos_token_id": 248044,
+      "dtype": "bfloat16",
+      "eos_token_id": 248044,
+      "full_attention_interval": 4,
+      "head_dim": 256,
+      "hidden_act": "silu",
+      "hidden_size": 5120,
+      "initializer_range": 0.02,
+      "intermediate_size": 17408,
+      "layer_types": [
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention",
+        "linear_attention",
+        "linear_attention",
+        "linear_attention",
+        "full_attention"
+      ],
+      "linear_conv_kernel_dim": 4,
+      "linear_key_head_dim": 128,
+      "linear_num_key_heads": 16,
+      "linear_num_value_heads": 48,
+      "linear_value_head_dim": 128,
+      "mamba_ssm_dtype": "float32",
+      "max_position_embeddings": 262144,
+      "model_type": "qwen3_5_text",
+      "mtp_num_hidden_layers": 1,
+      "mtp_use_dedicated_embeddings": false,
+      "num_attention_heads": 24,
+      "num_hidden_layers": 64,
+      "num_key_value_heads": 4,
+      "output_gate_type": "swish",
+      "pad_token_id": null,
+      "partial_rotary_factor": 0.25,
+      "rms_norm_eps": 1e-06,
+      "rope_parameters": {
+        "mrope_interleaved": true,
+        "mrope_section": [
+          11,
+          11,
+          10
+        ],
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 10000000,
+        "rope_type": "default"
+      },
+      "tie_word_embeddings": false,
+      "use_cache": true,
+      "vocab_size": 248320
+    }
+  },
+  "quant_census": {
+    "2": 7,
+    "13": 8
+  },
+  "tensors": [
+    {
+      "name": "shared_head_norm",
+      "quant_tag": 2,
+      "shape": [
+        5120
+      ],
+      "group_size": 0,
+      "data_size": 20480
+    },
+    {
+      "name": "enorm",
+      "quant_tag": 2,
+      "shape": [
+        5120
+      ],
+      "group_size": 0,
+      "data_size": 20480
+    },
+    {
+      "name": "hnorm",
+      "quant_tag": 2,
+      "shape": [
+        5120
+      ],
+      "group_size": 0,
+      "data_size": 20480
+    },
+    {
+      "name": "attn_norm",
+      "quant_tag": 2,
+      "shape": [
+        5120
+      ],
+      "group_size": 0,
+      "data_size": 20480
+    },
+    {
+      "name": "attn_post_norm",
+      "quant_tag": 2,
+      "shape": [
+        5120
+      ],
+      "group_size": 0,
+      "data_size": 20480
+    },
+    {
+      "name": "attn_q_norm",
+      "quant_tag": 2,
+      "shape": [
+        256
+      ],
+      "group_size": 0,
+      "data_size": 1024
+    },
+    {
+      "name": "attn_k_norm",
+      "quant_tag": 2,
+      "shape": [
+        256
+      ],
+      "group_size": 0,
+      "data_size": 1024
+    },
+    {
+      "name": "eh_proj",
+      "quant_tag": 13,
+      "shape": [
+        5120,
+        10240
+      ],
+      "group_size": 256,
+      "data_size": 27852800
+    },
+    {
+      "name": "wq",
+      "quant_tag": 13,
+      "shape": [
+        12288,
+        5120
+      ],
+      "group_size": 256,
+      "data_size": 33423360
+    },
+    {
+      "name": "wk",
+      "quant_tag": 13,
+      "shape": [
+        1024,
+        5120
+      ],
+      "group_size": 256,
+      "data_size": 2785280
+    },
+    {
+      "name": "wv",
+      "quant_tag": 13,
+      "shape": [
+        1024,
+        5120
+      ],
+      "group_size": 256,
+      "data_size": 2785280
+    },
+    {
+      "name": "wo",
+      "quant_tag": 13,
+      "shape": [
+        5120,
+        6144
+      ],
+      "group_size": 256,
+      "data_size": 16711680
+    },
+    {
+      "name": "ffn_gate",
+      "quant_tag": 13,
+      "shape": [
+        17408,
+        5120
+      ],
+      "group_size": 256,
+      "data_size": 47349760
+    },
+    {
+      "name": "ffn_up",
+      "quant_tag": 13,
+      "shape": [
+        17408,
+        5120
+      ],
+      "group_size": 256,
+      "data_size": 47349760
+    },
+    {
+      "name": "ffn_down",
+      "quant_tag": 13,
+      "shape": [
+        5120,
+        17408
+      ],
+      "group_size": 256,
+      "data_size": 47349760
+    }
+  ]
+}

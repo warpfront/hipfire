@@ -1,0 +1,958 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+
+use std::fs::File;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use crate::pipeline_gguf::GgufFormat;
+use crate::reap_overlay;
+
+// ─── HFQ File Format ────────────────────────────────────────────────────────
+
+pub(crate) const HFQ_MAGIC: &[u8; 4] = b"HFQM";
+pub(crate) const HFQ_VERSION: u32 = 1;
+
+impl QuantType {
+    /// Reconstruct a `QuantType` from its serialized HFQ byte.
+    ///
+    /// Needed to copy tensors through an HFQ->HFQ rewrite byte-for-byte
+    /// (`build_deepseek4_dspark_e8soa_sidecar`) without knowing each tensor's
+    /// tier statically. Generated from the `#[repr(u8)]` discriminants; keep in
+    /// sync when adding a variant.
+    pub(crate) fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Q4F16G64),
+            1 => Some(Self::F16),
+            2 => Some(Self::F32),
+            3 => Some(Self::Q8F16),
+            4 => Some(Self::Q4K),
+            5 => Some(Self::Q8HFQ),
+            6 => Some(Self::HFQ4G256),
+            7 => Some(Self::HFQ4G128),
+            8 => Some(Self::HFQ6G256),
+            9 => Some(Self::HFQ2G256),
+            10 => Some(Self::HFQ2G128),
+            11 => Some(Self::HFQ3G256),
+            12 => Some(Self::HFQ3G128),
+            13 => Some(Self::MQ4G256),
+            14 => Some(Self::MQ8G256),
+            15 => Some(Self::MQ6G256),
+            16 => Some(Self::BF16),
+            17 => Some(Self::MQ3G256),
+            18 => Some(Self::MQ2G256),
+            19 => Some(Self::MQ2G256Lloyd),
+            20 => Some(Self::MQ3G256Lloyd),
+            21 => Some(Self::HFP4G32),
+            24 => Some(Self::MFP4G32),
+            22 => Some(Self::TidI32),
+            28 => Some(Self::PARO4G128),
+            29 => Some(Self::PARO4G128T),
+            30 => Some(Self::MQ4G256Lloyd),
+            31 => Some(Self::MQ5G256),
+            32 => Some(Self::MFP4G32Lloyd),
+            33 => Some(Self::MFP4G32P),
+            34 => Some(Self::MFP4G32E8),
+            35 => Some(Self::MFP4G32E8SOA),
+            36 => Some(Self::MFP3G32E8),
+            37 => Some(Self::MFP2G32E8),
+            42 => Some(Self::MFP4G32E8G128),
+            38 => Some(Self::MQ2G256GL),
+            39 => Some(Self::MQ3G256GL),
+            40 => Some(Self::TQ2G128),
+            41 => Some(Self::BQ1G128),
+            44 => Some(Self::MQ4G256V2),
+            45 => Some(Self::MQ4CG256),
+            47 => Some(Self::MQ6G256V2),
+            48 => Some(Self::MQ5G256V2),
+            49 => Some(Self::MQ3G256V2),
+            50 => Some(Self::MQ2G256V2),
+            51 => Some(Self::MQ2G256LloydU),
+            52 => Some(Self::MQ4G256V2L),
+            53 => Some(Self::MQ4G128V2),
+            55 => Some(Self::FP8E4M3B128),
+            56 => Some(Self::FP8E4M3PT),
+            131 => Some(Self::MQ3I4G128R256),
+            132 => Some(Self::MQ3I4G128R128),
+            133 => Some(Self::MQ2I4G128R256),
+            134 => Some(Self::MQ2I4G128R128),
+            _ => None,
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuantType {
+    Q4F16G64 = 0,
+    F16 = 1,
+    F32 = 2,
+    Q8F16 = 3,
+    Q4K = 4,
+    Q8HFQ = 5,
+    HFQ4G256 = 6,
+    HFQ4G128 = 7,
+    HFQ6G256 = 8,
+    HFQ2G256 = 9,
+    HFQ2G128 = 10,
+    HFQ3G256 = 11,
+    HFQ3G128 = 12,
+    MQ4G256 = 13,      // MagnumQuant: FWHT-rotated HFQ4-G256
+    MQ8G256 = 14,      // MagnumQuant: FWHT-rotated symmetric INT8, dp4a target
+    MQ6G256 = 15,      // MagnumQuant: FWHT-rotated HFQ6-G256 (6-bit, 200 B/group)
+    BF16 = 16,         // Original BF16 weights (zero precision loss for vision)
+    MQ3G256 = 17,      // MagnumQuant: FWHT-rotated HFQ3-G256 (3-bit, 104 B/group)
+    MQ2G256 = 18,      // MagnumQuant: FWHT-rotated HFQ2-G256 (2-bit, 72 B/group)
+    MQ2G256Lloyd = 19, // MagnumQuant 2-bit + per-block Lloyd-Max 4-entry fp16 codebook (72 B/group)
+    MQ3G256Lloyd = 20, // MagnumQuant 3-bit + per-block Lloyd-Max 8-entry fp16 codebook (112 B/group)
+    // HFP4 family — RDNA-optimal FP4 (E2M1 elements + UE8M0 block scale + FP16 row scale).
+    // See docs/quant-formats/hfp4.md for byte layout, dequant, rotation modes.
+    // Per-row header is 16 B; per-block payload is (1 + g/2) bytes (UE8M0 + nibbles).
+    HFP4G32 = 21, // E2M1 + UE8M0 g32 + FP16 row scale — canonical (FP8-WMMA-K aligned)
+    // MFP4G32 = HFP4G32 + offline FWHT rotation (256-element FWHT applied to weights at quant time;
+    // runtime applies the same FWHT to x via mq_rotate_x). format_flags bit 0 + bits 2-3 = 0b0101
+    // signals "rotation present, offline FWHT" for future interop/detection.
+    MFP4G32 = 24, // v1.5 — HFP4G32 + offline FWHT (drop-in MQ4 replacement)
+    /// I64→U32 downcast of DeepSeek V4 hash-routing `tid2eid` lookup tables.
+    /// Shape `[vocab, num_experts_per_tok]`. Stored as raw u32 LE; the
+    /// loader reads `bytes.chunks_exact(4)`. ID 22 was reserved for the
+    /// HFP4G16 NV-aligned ablation (never built) — we re-use the slot
+    /// for tid2eid storage to stay byte-compatible with antirezQ8.hfq.
+    TidI32 = 22,
+    // Reserved IDs — DO NOT REUSE for unrelated formats. Documented in docs/quant-formats/hfp4.md.
+    // HFP4G16     = 22, // v1.5 — NV-aligned FP16-WMMA-K alignment ablation (re-used by TidI32)
+    // HFP4G64     = 23, // v1.5 — RDNA1/2 sweet-spot ablation
+    // HFP4G32MX   = 25, // v2  — strict OCP MXFP4 interop alias (no row scale, UE8M0 only)
+    // HFP4G16NV   = 26, // v2  — strict NVFP4 interop alias (E4M3 scale + FP32 tensor)
+    // HFP8E4M3G32 = 27, // v2  — HFP8 E4M3 family
+    PARO4G128 = 28,  // ParoQuant native AWQ W4 + pairwise activation rotation metadata
+    PARO4G128T = 29, // ParoQuant engine-tiled qweight [M/8, K] for coalesced GEMV reads
+    // MFP4G32R    = 29, // v3  — HFP4G32 + online block-diag-128 rotation (AMD recipe)
+    MQ4G256Lloyd = 30, // MagnumQuant 4-bit + per-block Lloyd-Max 16-entry fp16 codebook (160 B/group)
+    // Renumbered from 21 → 30 in mq4-lloyd merge to avoid HFP4G32=21 collision.
+    // Models quantized pre-renumber MUST be re-quantized.
+    MQ5G256 = 31,      // MagnumQuant: FWHT-rotated 5-bit (168 B/group, 5.25 bpw).
+    MFP4G32Lloyd = 32, // mfp4 (E2M1+UE8M0 g32+FP16 row scale+offline FWHT) with the fixed
+    // E2M1 grid replaced by ONE per-tensor 16-entry fp16 Lloyd codebook
+    // prepended (32 B) before row 0. Rows byte-identical to MFP4G32 (qt 24).
+    // 8B affine header (f32 scale + f32 min) + 160B payload
+    // (5 bits × 256, cross-byte: 8 codes per 5 bytes). NOTE: 16=BF16.
+    MFP4G32P = 33, // mfp4+P: mfp4 (E2M1+FP16 row scale+offline FWHT) with the per-32-block
+    // UE8M0 scale promoted to E4M3 (FP8, non-power-of-2). Byte layout
+    // BYTE-IDENTICAL to MFP4G32 (qt 24): 16-B hdr + n_blocks×17 B, NO prefix.
+    // Only the per-block scale byte's meaning differs (E4M3 vs UE8M0).
+    MFP4G32E8 = 34, // mfp4-E8: mfp4+P container (E4M3 block scale, NO prefix, same row_bytes)
+    // with the 32 E2M1 nibbles replaced by 4x32-bit E8-lattice codewords
+    // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, FWHT rotation.
+    // MQ*-GL ("global Lloyd"): N-bit codes against ONE tensor-global codebook
+    // plus a per-block fp16 scale, in structure-of-arrays layout:
+    //     [0 .. M*gpr*P)                  packed N-bit indices, P B/group
+    //     [M*gpr*P .. +M*gpr*2)           fp16 per-block scales
+    // vs the per-block Lloyd formats (qt 19/20), which interleave a fitted
+    // 2^N-entry fp16 codebook into every group.
+    //
+    // Rationale (measured 2026-08-04, docs/investigations/2026-08-04-a3b-lowbit-quality.md):
+    // post-FWHT blocks are Gaussian by CLT, so the optimal LEVEL SHAPE is the
+    // same in every block — a per-block fit re-derives it ~4000x per tensor and
+    // differs only by scale. Fitting a global codebook on 28.3M real a3b expert
+    // weights reproduces the textbook Lloyd-Max Gaussian levels to 3 decimals.
+    // Cost on real weights: +2.35% NRMSE / +1.16% end-to-end KLD, for -0.1875 bpw
+    // (MQ2) — and the group base becomes naturally aligned (64 B vs 72 B stride).
+    MQ2G256GL = 38, // 2-bit + global codebook: 64 B idx/group + 2 B scale = 2.0625 bpw
+    MQ3G256GL = 39, // 3-bit + global codebook: 96 B idx/group + 2 B scale = 3.0625 bpw
+    MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
+    // [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
+    MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
+    // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
+    MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
+    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    MFP4G32E8G128 = 42, // mfp4-E8 with a 128-wide FWHT rotation group. Wire layout
+    // BYTE-FOR-BYTE MFP4G32E8 (16-B hdr + (K/32) x 17 B blocks: 1 B E4M3 scale +
+    // 4 x u32 E8 codewords, QUANT_STEP 0.88). The rotation width is not in the
+    // bytes, so the row stride is identical to qt=34; only the segmentation the
+    // encoder rotated (128 elements, sign seeds 43/1043) and the matching
+    // activation basis differ. Exists because qt=34's 256-wide segmentation
+    // cannot tile qwen4's expert down_proj reduction K = 640 = 5 x 128.
+    TQ2G128 = 40, // TQ2G128: PrismML Q2_0-compatible scale-only ternary, g128, 34 B/blk
+    // (2.125 bpw). [FP16 d][32B 2-bit codes], code=(w/d)+1 clamped 0..2,
+    // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
+    // See findings/prismml-q2_0-layout.md.
+    BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
+    // (exactly 1.125 bpw = 18 B * 8 / 128 weights). [FP16 d][16B sign bits], bit set for +d.
+    /// MQ4-G256 v2 (qt=44): FWHT-rotated 4-bit, per-128 asymmetric. 136 B/group,
+    /// byte-identical to qt=13 (MQ4G256) except the 8 header bytes. Payload is
+    /// unchanged: 128 B of 4-bit nibbles at offset 8, lane `t` reading the u32 at
+    /// `8 + 4*t`, covering weights `8t..8t+7`.
+    ///
+    /// Header layout (little-endian, low 16 bits = scale, high 16 bits = zero):
+    ///   [0..2) fp16 scale for half 0 (weights 0-127)
+    ///   [2..4) fp16 zero  for half 0
+    ///   [4..6) fp16 scale for half 1 (weights 128-255)
+    ///   [6..8) fp16 zero  for half 1
+    ///   [8..136) 128 B nibbles, packed exactly as qt=13 (low nibble = even index)
+    MQ4G256V2 = 44,
+    /// MQ4CG256 (qt=45): FWHT-rotated 4-bit, single affine grid per 256, fp16 header, 136 B/group (pad layout).
+    /// Per-group, 136 B stride: `[0..4)` fp16 header, `[4..8)` zero padding, `[8..136)` 128 B nibbles.
+    /// Header is ONE packed dword, low 16 bits fp16 scale, high 16 bits fp16 zero, governing
+    /// all 256 weights (`w = q * f32(scale) + f32(zero)` with scale/zero round-tripped through fp16).
+    MQ4CG256 = 45,
+    /// MQ6G256V2 (qt=47): FWHT-rotated 6-bit, per-128 asymmetric fp16 header. 200 B/group (6b 4/3B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..200) 192 B packed 6-bit.
+    /// Half 0 covers q[0..128), half 1 q[128..256); reconstruction q*f32(s[h])+f32(z[h]).
+    MQ6G256V2 = 47,
+    /// MQ5G256V2 (qt=48): FWHT-rotated 5-bit, per-128 asymmetric fp16 header. 168 B/group (5b 8/5B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..168) 160 B packed 5-bit.
+    MQ5G256V2 = 48,
+    /// MQ3G256V2 (qt=49): FWHT-rotated 3-bit, per-128 asymmetric fp16 header. 104 B/group (3b 8/3B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..104) 96 B packed 3-bit.
+    MQ3G256V2 = 49,
+    /// MQ2G256V2 (qt=50): FWHT-rotated 2-bit, per-128 asymmetric fp16 header. 72 B/group (2b 4/B payload).
+    /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..72) 64 B packed 2-bit.
+    /// Half 0 covers q[0..128), half 1 q[128..256); degenerate half uses scale=0, zero=f16(lo), q=0.
+    MQ2G256V2 = 50,
+    /// MQ2G256LloydU (qt=51): **UNROTATED** sibling of MQ2G256Lloyd (qt=19).
+    ///
+    /// Byte layout is IDENTICAL — 72 B per 256-weight group: `[0..8)` four fp16
+    /// codebook entries sorted ascending, `[8..72)` 64 B of 2-bit indices, 4 per
+    /// byte LSB-first — so every existing MQ2-Lloyd kernel binds unchanged.
+    ///
+    /// The ONLY difference is that no FWHT is applied at pack time, so the
+    /// runtime MUST NOT rotate x for these weights (`needs_x_rot_local ==
+    /// false`). Feeding a rotated x to unrotated weights is silent garbage
+    /// output, so the MoE resolver gates this explicitly and deliberately
+    /// omits this dtype from the rotation chain.
+    ///
+    /// Purpose: carry natively-ternary checkpoints (Maple-Preview) losslessly.
+    /// Those weights are already `{-s, 0, +s}` per row, so a 3-entry codebook
+    /// reproduces them exactly; FWHT would destroy that structure and force an
+    /// approximation. Three slots are used, slot 3 duplicates slot 2 and is
+    /// never indexed. 2.25 bpw. `K % 256 == 0`.
+    MQ2G256LloydU = 51,
+    /// MQ4G256V2L (qt=52): MQ4v2 wire layout (136 B/group, per-128 fp16 sc/zp) with
+    /// codes indexing a per-tensor 16-level Lloyd-Max codebook `L` in [0,15] units.
+    /// Dequant: `w = sc · L[q] + zp`. Codebook shipped as F32 sidecar
+    /// `<stem>.lloyd_levels.weight` shape `[16]` (not embedded in the weight blob).
+    MQ4G256V2L = 52,
+    /// MQ4-G128 v2 (qt=53): FWHT-rotated 4-bit, per-128 asymmetric affine.
+    /// Each logical row is independently tiled as `ceil(K/128)` groups; every
+    /// group is 68 B: `[0..2)` fp16 scale, `[2..4)` fp16 zero, `[4..68)`
+    /// 64 B low-nibble-even packed payload. The final partial group is zero
+    /// padded before FWHT. Loaded and decoded on GPU (`gemv_mq4g128v2*`
+    /// kernels); it is the Flash-Next routed-expert down_proj role
+    /// (`ROUTED_DOWN_DTYPE` in hipfire-arch-qwen4). Exactly 4.25 bpw
+    /// (68 B * 8 / 128 weights). It must never be interpreted as qt=44 or
+    /// the legacy MQ4G128.
+    MQ4G128V2 = 53,
+    /// FP8 E4M3B128 (qt=55): OCP e4m3fn codes verbatim from the checkpoint with
+    /// 128x128 bf16 `s_inv` block scales, expert-blocked payload. Passthrough;
+    /// layout and decode in `docs/quant-formats/fp8-e4m3.md` and
+    /// `rdna_compute::fp8_e4m3`. Never FWHT-rotated.
+    FP8E4M3B128 = 55,
+    /// FP8 E4M3PT (qt=56): OCP e4m3fn codes with one per-tensor bf16 scale in a
+    /// 16-byte header, then `rows*K` code bytes. Arch-loaded (Qwen4 PLE row store).
+    FP8E4M3PT = 56,
+    /// MQ3-I4 gate/up (qt=131, DESIGN F1/F2): W3 grid ±{1,3,5,7} (3-bit planar
+    /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042). Tensor bytes are
+    /// `[codes plane M*K*3/8][scales plane M*K/128 f16]`. Typed-qwen4 expert
+    /// slab only (`qwen4.expert_slabs` v1); no GPU kernel yet. See
+    /// `hipfire_runtime::mq_i4`.
+    MQ3I4G128R256 = 131,
+    /// MQ3-I4 down (qt=132, DESIGN F1/F2): W3 codec, R128 FWHT (seeds 43/1043).
+    MQ3I4G128R128 = 132,
+    /// MQ2-I4 gate/up (qt=133, DESIGN F1/F2): W2 grid ±{1,3} (2-bit planar
+    /// codes) + per-128 f16 scales, R256 FWHT (seeds 42/1042).
+    MQ2I4G128R256 = 133,
+    /// MQ2-I4 down (qt=134, DESIGN F1/F2): W2 codec, R128 FWHT (seeds 43/1043).
+    MQ2I4G128R128 = 134,
+}
+
+/// Per-tensor precision level assigned by the K-map pre-pass.
+/// Determines whether a tensor gets the base format, a 6-bit promotion,
+/// Q8, or F16. See docs/superpowers/specs/2026-05-08-mixed-quant-kmap-design.md.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum QuantLevel {
+    /// Store as F16 (norms, biases, 1D tensors).
+    F16,
+    /// Store as Q8_F16 (embeddings, lm_head, MoE routers).
+    Q8,
+    /// Promote to 6-bit variant of the base format (edge layers, MoE expert FFN).
+    Promote6,
+    /// Override the default for a specific tensor class (today: lm_head)
+    /// to a CLI-specified format. Currently unused on this branch (no emission
+    /// site); kept so origin/master's lm_head-format override match arms
+    /// compile after the merge. Re-wire to `--lm-head-format` when the
+    /// configurable-kmap-pair refactor lands here.
+    #[allow(dead_code)]
+    Override(GgufFormat),
+    /// Use the base format as-is.
+    Base,
+}
+
+/// Whether K-map `Promote6` under the MQ4 V2 family (`mq4`/`mq4v2`, V2 Lloyd)
+/// may emit MQ6G256V2 (qt47) for this `arch_id`. Only loader families whose
+/// runtime accepts qt47 on every promoted role are listed: Llama (0, 1),
+/// Qwen3.5 dense/MoE (5, 6) and Qwen2 (7, 8). Every other arch (MiniMax 10,
+/// LFM2-MoE 11, Cohere2-MoE 12, Gemma4 13/22, Glimmer 14/23, and any arch not
+/// yet audited) keeps its unchanged legacy encoder routes: ordinary MQ4 V2
+/// and nonexpert V2 Lloyd promotions use MQ6G256 (qt15), while V2 Lloyd
+/// stacked experts remain unpromoted MQ4G256 (qt13).
+pub(crate) fn mq6v2_promote_supported(arch_id: u32) -> bool {
+    matches!(arch_id, 0 | 1 | 5 | 6 | 7 | 8)
+}
+
+/// Extract layer index from a tensor name.
+/// Handles both safetensors (`layers.{N}.`) and GGUF (`blk.{N}.`) patterns.
+/// Uses unanchored search to handle any prefix (model.layers, model.language_model.layers, etc.).
+pub(crate) fn parse_layer_idx(name: &str) -> Option<usize> {
+    // Vision towers contain `vision_tower.layers.N` — don't treat that as a
+    // text layer index (would pick up edge-layer Promote6 for vision). Return
+    // None early for vision prefixes additively (no behaviour change for text).
+    if name.starts_with("model.vision_tower.")
+        || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_adapter.")
+        || name.starts_with("model.vision_projection.")
+        || name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+    {
+        return None;
+    }
+    // Try safetensors pattern: "layers.{N}."
+    if let Some(pos) = name.find("layers.") {
+        let after = &name[pos + 7..]; // skip "layers."
+        if let Some(dot) = after.find('.') {
+            if let Ok(idx) = after[..dot].parse::<usize>() {
+                return Some(idx);
+            }
+        }
+    }
+    // Try GGUF pattern: "blk.{N}."
+    if let Some(pos) = name.find("blk.") {
+        let after = &name[pos + 4..]; // skip "blk."
+        if let Some(dot) = after.find('.') {
+            if let Ok(idx) = after[..dot].parse::<usize>() {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+/// Stride for alternating-mode promotion: edge layers always promoted,
+/// plus every Nth middle layer. 3 was chosen empirically — promotes ~40%
+/// of middle layers, matching llama.cpp Q4_K_M's budget-allocation pattern.
+/// On MoE 3.6-35B-A3B: stride=3 gives PPL 8K=19.96 at 21.8 GB vs full
+/// K-map PPL 8K=20.07 at 27.7 GB.
+pub(crate) const ALTERNATING_STRIDE: usize = 3;
+
+/// llama.cpp-style alternating promotion: edge layers always promoted,
+/// middle layers promoted every `stride` layers.
+pub(crate) fn is_positional_promote(idx: usize, n_layers: usize, stride: usize) -> bool {
+    if n_layers == 0 || stride == 0 {
+        return false;
+    }
+    if idx < 2 || idx >= n_layers.saturating_sub(2) {
+        return true;
+    }
+    (idx - 2) % stride == 0
+}
+
+#[cfg(test)]
+/// Resolve the quantization level for a tensor based on its name, the model's
+/// layer count, whether the model is MoE, and the K-map mode.
+///
+/// `kmap_mode`: 0 = full (all candidates promoted), 1 = alternating
+/// (experts + ffn_down every 3rd middle layer, edge layers always),
+/// 2 = typed (ffn_down + attn_v everywhere).
+///
+/// Note: In the safetensors path, norms/biases are filtered by `should_quantize()`
+/// before this function is called. Rules 1-2 exist for the GGUF path and completeness.
+pub(crate) fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
+    kmap_resolve_mode(name, n_layers, is_moe, 0)
+}
+
+pub(crate) fn kmap_resolve_mode(
+    name: &str,
+    n_layers: usize,
+    is_moe: bool,
+    kmap_mode: u8,
+) -> QuantLevel {
+    // Vision tensors (809 on Glimmer) stay F16 and must not be mis-classified
+    // as text. This also prevents `vision_tower.layers.N` from being parsed
+    // as a text layer index for edge-layer Promote6. Additive: text tensors
+    // never match these prefixes, so no existing arch changes.
+    if name.starts_with("model.vision_tower.")
+        || name.starts_with("vision_tower.")
+        || name.starts_with("model.vision_adapter.")
+        || name.starts_with("model.vision_projection.")
+        || name.starts_with("model.visual.")
+        || name.starts_with("visual.")
+    {
+        return QuantLevel::F16;
+    }
+    // Rule 1: norms, biases, 1D (GGUF path mainly)
+    if name.contains("norm") || name.contains("bias") {
+        return QuantLevel::F16;
+    }
+
+    // Rule 2: embeddings, lm_head, output projection
+    if name.contains("embed_tokens")
+        || name.contains("token_embd")
+        || name.contains("lm_head")
+        || name.ends_with("output.weight")
+    {
+        return QuantLevel::Q8;
+    }
+
+    // Rule 3: MoE routers
+    if is_moe
+        && (name.ends_with("mlp.gate.weight")
+            || name.contains("shared_expert_gate")
+            || name.ends_with("router.proj.weight"))
+    {
+        return QuantLevel::Q8;
+    }
+
+    // Rule 4: MoE expert FFN weights
+    if is_moe && name.contains("mlp.experts.") {
+        if kmap_mode == 1 {
+            // Alternating: promote expert groups only in positional layers
+            if let Some(idx) = parse_layer_idx(name) {
+                if is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
+                    return QuantLevel::Promote6;
+                }
+                return QuantLevel::Base;
+            }
+        }
+        return QuantLevel::Promote6;
+    }
+
+    // Mode 2 (typed): promote ffn_down and attn_v in all layers.
+    // UNCHANGED semantics — every model that already ships with `--kmap-mode
+    // typed` must keep producing byte-identical output. Gemma 4's variant of
+    // this rule lives in mode 3 below rather than mutating this one.
+    if kmap_mode == 2 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    return QuantLevel::Promote6;
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 3 (typed-gemma4): mode 2, except edge layers promote FFN + v_proj
+    // only and leave attn q/k/o at Base — dense attn promotion regresses PPL
+    // +3.1% on 27B (see ppl_kmap_20260508.md).
+    //
+    // This is a SEPARATE mode rather than a tweak to mode 2 so that no model
+    // already quantized with `--kmap-mode typed` changes bytes. Selected
+    // automatically for gemma4 (arch_id 13); reachable explicitly as
+    // `--kmap-mode typed-gemma4`.
+    if kmap_mode == 3 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        let is_v = name.contains("v_proj") || name.contains("attn_v");
+        if is_down || is_v {
+            return QuantLevel::Promote6;
+        }
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    let is_attn_qko = name.contains("q_proj")
+                        || name.contains("attn_q")
+                        || name.contains("k_proj")
+                        || name.contains("attn_k")
+                        || name.contains("o_proj")
+                        || name.contains("attn_o");
+                    if !is_attn_qko {
+                        return QuantLevel::Promote6;
+                    }
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Mode 1 (alternating): ffn_down in edge + every 3rd middle layer.
+    // Edge-layer rule mirrors mode 0 below: attn+FFN for MoE (full promotion
+    // gives -19.8% PPL on 3.6-35B-A3B), FFN only for dense (attn promotion
+    // regresses PPL +3.1% on 27B). Bench: asym4 KV, ctx=8192, wikitext-2-test.
+    // See ppl_kmap_20260508.md.
+    if kmap_mode == 1 {
+        let is_down = name.contains("down_proj") || name.contains("ffn_down");
+        if n_layers > 0 {
+            if let Some(idx) = parse_layer_idx(name) {
+                if is_down && is_positional_promote(idx, n_layers, ALTERNATING_STRIDE) {
+                    return QuantLevel::Promote6;
+                }
+                // Edge layers: attn+FFN for MoE, FFN only for dense.
+                if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                    if is_moe {
+                        return QuantLevel::Promote6;
+                    }
+                    let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                    if is_ffn {
+                        return QuantLevel::Promote6;
+                    }
+                }
+            }
+        }
+        return QuantLevel::Base;
+    }
+
+    // Rule 5 (full mode 0): edge layers (first 2 + last 2).
+    // Dense models: FFN only — attn promotion regresses PPL (+3.1% on 27B).
+    // MoE models: attn+FFN — full promotion gives -19.8% PPL on 3.6-35B-A3B.
+    // Bench: asym4 KV, ctx=8192, wikitext-2-test. See ppl_kmap_20260508.md.
+    if n_layers > 0 {
+        if let Some(idx) = parse_layer_idx(name) {
+            if idx < 2 || idx >= n_layers.saturating_sub(2) {
+                if is_moe {
+                    // MoE: promote all tensors in edge layers (attn + FFN)
+                    return QuantLevel::Promote6;
+                }
+                // Dense: promote FFN only — attn stays at Base
+                let is_ffn = name.contains("mlp.") || name.contains("ffn");
+                if is_ffn {
+                    return QuantLevel::Promote6;
+                }
+            }
+        }
+    }
+
+    // Rule 6: everything else
+    QuantLevel::Base
+}
+
+#[derive(Debug)]
+pub(crate) struct HfqTensor {
+    pub(crate) name: String,
+    pub(crate) quant_type: QuantType,
+    pub(crate) shape: Vec<u32>,
+    pub(crate) group_size: u32,
+    pub(crate) data: Vec<u8>,
+    /// When data is spilled to disk, this holds the byte count.
+    /// `data` is empty and the bytes live in the spill file.
+    pub(crate) spilled_len: u64,
+}
+
+/// Streaming tensor spill file. When the quantizer accumulates more than
+/// `SPILL_THRESHOLD` bytes of tensor data in memory, it flushes completed
+/// tensors to this file. At write_hfq time, spilled data is copied from
+/// the spill file instead of from memory, keeping peak RSS bounded.
+pub(crate) struct TensorSpill {
+    file: std::io::BufWriter<File>,
+    path: PathBuf,
+    offset: u64,
+}
+
+impl TensorSpill {
+    pub(crate) fn new(dir: &Path) -> std::io::Result<Self> {
+        // PID-unique so concurrent quantize runs in the same output dir don't
+        // share a spill path (a sibling run's Drop would otherwise delete this
+        // run's spill file → write_hfq NotFound panic).
+        let path = dir.join(format!(".hipfire_quant_spill.{}.tmp", std::process::id()));
+        let file = std::io::BufWriter::with_capacity(4 * 1024 * 1024, File::create(&path)?);
+        Ok(Self {
+            file,
+            path,
+            offset: 0,
+        })
+    }
+
+    /// Write tensor data to the spill file. Returns the byte count written.
+    pub(crate) fn spill(&mut self, data: &[u8]) -> std::io::Result<u64> {
+        use std::io::Write;
+        self.file.write_all(data)?;
+        self.offset += data.len() as u64;
+        Ok(data.len() as u64)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn flush(&mut self) -> std::io::Result<()> {
+        use std::io::Write;
+        self.file.flush()
+    }
+
+    pub(crate) fn cleanup(self) {
+        // Explicit cleanup — Drop impl handles the actual removal.
+        drop(self);
+    }
+}
+
+impl Drop for TensorSpill {
+    fn drop(&mut self) {
+        // Ensure the temp file is removed even on panic.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Spill tensors whose data is in memory to the spill file, freeing RAM.
+/// Called after each layer's expert batch to keep peak RSS bounded.
+///
+/// An `Err` means tensor bytes may already be lost (moved into a buffer that
+/// failed to reach disk), so the run cannot produce a correct artifact; the
+/// caller must abort (see [`spill_or_exit`]).
+pub(crate) fn maybe_spill(
+    tensors: &mut [HfqTensor],
+    spill: &mut TensorSpill,
+    threshold: usize,
+) -> std::io::Result<()> {
+    let in_mem: usize = tensors
+        .iter()
+        .filter(|t| t.spilled_len == 0)
+        .map(|t| t.data.len())
+        .sum();
+    if in_mem < threshold {
+        return Ok(());
+    }
+    for t in tensors.iter_mut() {
+        if t.spilled_len == 0 && !t.data.is_empty() {
+            t.spilled_len = spill.spill(&t.data)?;
+            t.data = Vec::new(); // free the memory
+        }
+    }
+    spill.flush()
+}
+
+/// [`maybe_spill`] for the quantize loop: a spill failure aborts the run with
+/// exit 2 (removing the spill file) instead of writing a truncated model.
+pub(crate) fn spill_or_exit(tensors: &mut [HfqTensor], spill: &mut TensorSpill, threshold: usize) {
+    if let Err(e) = maybe_spill(tensors, spill, threshold) {
+        eprintln!(
+            "error: tensor spill to {} failed: {e}; no output written",
+            spill.path.display()
+        );
+        let _ = std::fs::remove_file(&spill.path);
+        std::process::exit(2);
+    }
+}
+
+/// The arch-correct config field naming the routed-expert count, as the arch's
+/// loader config parser reads it from the HFQ metadata `config` object:
+///   * deepseek4 → `n_routed_experts`
+///   * qwen3.5-moe / lfm2moe → `num_experts`
+///   * minimax → `num_local_experts`
+pub(crate) fn reap_expert_count_field(arch: reap_overlay::ReapArch) -> &'static str {
+    match arch {
+        reap_overlay::ReapArch::Deepseek4 => "n_routed_experts",
+        reap_overlay::ReapArch::Qwen35 => "num_experts",
+        reap_overlay::ReapArch::Lfm2Moe => "num_experts",
+        reap_overlay::ReapArch::Minimax => "num_local_experts",
+    }
+}
+
+/// Patch the HFQ metadata envelope's `config` so the routed-expert count reads
+/// `kept` (the pruned/compact count) for `arch`. The arch loaders parse the
+/// inner `config` object (qwen3.5 additionally descends into `config.text_config`
+/// when present), so patch the field WHEREVER it currently exists under `config`:
+/// at `config[field]` and, if present, at `config.text_config[field]`. Erroring
+/// (rather than silently no-op'ing) when the field is absent prevents shipping a
+/// baked model whose metadata still claims the original expert count.
+pub(crate) fn patch_expert_count_metadata(
+    metadata_json: &str,
+    arch: reap_overlay::ReapArch,
+    kept: usize,
+) -> Result<String, String> {
+    let field = reap_expert_count_field(arch);
+    let mut v: serde_json::Value =
+        serde_json::from_str(metadata_json).map_err(|e| format!("metadata not valid JSON: {e}"))?;
+    let config = v
+        .get_mut("config")
+        .ok_or_else(|| "metadata missing `config` object".to_string())?;
+    let mut patched = false;
+    if config.get(field).is_some() {
+        config[field] = serde_json::json!(kept);
+        patched = true;
+    }
+    if let Some(tc) = config.get_mut("text_config") {
+        if tc.get(field).is_some() {
+            tc[field] = serde_json::json!(kept);
+            patched = true;
+        }
+    }
+    if !patched {
+        return Err(format!(
+            "expert-count field '{field}' not found under config (or config.text_config) for {arch:?}"
+        ));
+    }
+    serde_json::to_string(&v).map_err(|e| format!("re-serialize metadata: {e}"))
+}
+
+/// Write an HFQ container atomically: the bytes go to `<path>.tmp.<pid>` in
+/// the same directory, are fsynced, then renamed over `path`. On any error the
+/// temp file is removed and an existing `path` is left untouched.
+pub(crate) fn write_hfq(
+    path: &Path,
+    arch: u32,
+    metadata_json: &str,
+    tensors: &[HfqTensor],
+    spill: Option<&mut TensorSpill>,
+) -> std::io::Result<()> {
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let result = File::create(&tmp).and_then(|mut f| {
+        write_hfq_to(&mut f, arch, metadata_json, tensors, spill)?;
+        f.flush()?;
+        f.sync_all()
+    });
+    match result.and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+fn write_hfq_to(
+    f: &mut File,
+    arch: u32,
+    metadata_json: &str,
+    tensors: &[HfqTensor],
+    spill: Option<&mut TensorSpill>,
+) -> std::io::Result<()> {
+    let metadata_bytes = metadata_json.as_bytes();
+
+    // Calculate offsets
+    let header_size = 32u64;
+    let metadata_offset = header_size;
+    let metadata_size = metadata_bytes.len() as u64;
+
+    // Tensor index follows metadata
+    let index_offset = metadata_offset + metadata_size;
+    let mut index_bytes = Vec::new();
+    // Write tensor count
+    index_bytes.extend_from_slice(&(tensors.len() as u32).to_le_bytes());
+    for t in tensors {
+        // name length + name
+        let name_bytes = t.name.as_bytes();
+        index_bytes.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        index_bytes.extend_from_slice(name_bytes);
+        // quant type
+        index_bytes.push(t.quant_type as u8);
+        // n_dims + shape
+        index_bytes.push(t.shape.len() as u8);
+        for &d in &t.shape {
+            index_bytes.extend_from_slice(&d.to_le_bytes());
+        }
+        // group size
+        index_bytes.extend_from_slice(&t.group_size.to_le_bytes());
+        // data size (offset computed at read time from cumulative sizes)
+        let data_len = if t.spilled_len > 0 {
+            t.spilled_len
+        } else {
+            t.data.len() as u64
+        };
+        index_bytes.extend_from_slice(&data_len.to_le_bytes());
+    }
+
+    // Data starts after index, aligned to 4096
+    let data_start_unaligned = index_offset + index_bytes.len() as u64;
+    let data_offset = (data_start_unaligned + 4095) & !4095;
+
+    // Write header (32 bytes)
+    f.write_all(HFQ_MAGIC)?;
+    f.write_all(&HFQ_VERSION.to_le_bytes())?;
+    f.write_all(&arch.to_le_bytes())?;
+    f.write_all(&(tensors.len() as u32).to_le_bytes())?;
+    f.write_all(&metadata_offset.to_le_bytes())?;
+    f.write_all(&data_offset.to_le_bytes())?;
+
+    // Write metadata
+    f.write_all(metadata_bytes)?;
+
+    // Write tensor index
+    f.write_all(&index_bytes)?;
+
+    // Pad to data alignment
+    let pad_size = (data_offset - data_start_unaligned) as usize;
+    f.write_all(&vec![0u8; pad_size])?;
+
+    // Write tensor data — from spill file or from memory
+    if let Some(spill) = spill {
+        spill.flush()?;
+        let mut spill_reader = std::io::BufReader::new(File::open(&spill.path)?);
+        let mut buf = vec![0u8; 4 * 1024 * 1024]; // 4 MB copy buffer
+        for t in tensors {
+            if t.spilled_len > 0 {
+                // Copy from spill file
+                let mut remaining = t.spilled_len as usize;
+                while remaining > 0 {
+                    let chunk = remaining.min(buf.len());
+                    use std::io::Read;
+                    spill_reader.read_exact(&mut buf[..chunk])?;
+                    f.write_all(&buf[..chunk])?;
+                    remaining -= chunk;
+                }
+            } else {
+                f.write_all(&t.data)?;
+            }
+        }
+    } else {
+        for t in tensors {
+            f.write_all(&t.data)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// One tensor index record for [`write_hfq_streamed`]; the payload is produced
+/// by the caller's emitter in index order.
+#[derive(Debug, Clone)]
+pub(crate) struct HfqIndexEntry {
+    pub(crate) name: String,
+    pub(crate) quant_type: u8,
+    pub(crate) shape: Vec<u32>,
+    pub(crate) group_size: u32,
+    pub(crate) data_len: u64,
+}
+
+/// Write an HFQ container whose tensor payloads are streamed by `emit`
+/// (called once per entry, in index order, and required to write exactly
+/// `entries[i].data_len` bytes). Same container layout and atomic
+/// tmp + fsync + rename discipline as [`write_hfq`]; no payload is held in RAM.
+pub(crate) fn write_hfq_streamed(
+    path: &Path,
+    arch: u32,
+    metadata_json: &str,
+    entries: &[HfqIndexEntry],
+    mut emit: impl FnMut(usize, &mut File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::io::Seek;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(format!(".tmp.{}", std::process::id()));
+    let tmp = path.with_file_name(tmp_name);
+    let result = File::create(&tmp).and_then(|mut f| {
+        let metadata_bytes = metadata_json.as_bytes();
+        let metadata_offset = 32u64;
+        let index_offset = metadata_offset + metadata_bytes.len() as u64;
+        let mut index_bytes = Vec::new();
+        index_bytes.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for e in entries {
+            let name_bytes = e.name.as_bytes();
+            index_bytes.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            index_bytes.extend_from_slice(name_bytes);
+            index_bytes.push(e.quant_type);
+            index_bytes.push(e.shape.len() as u8);
+            for &d in &e.shape {
+                index_bytes.extend_from_slice(&d.to_le_bytes());
+            }
+            index_bytes.extend_from_slice(&e.group_size.to_le_bytes());
+            index_bytes.extend_from_slice(&e.data_len.to_le_bytes());
+        }
+        let data_start_unaligned = index_offset + index_bytes.len() as u64;
+        let data_offset = (data_start_unaligned + 4095) & !4095;
+
+        f.write_all(HFQ_MAGIC)?;
+        f.write_all(&HFQ_VERSION.to_le_bytes())?;
+        f.write_all(&arch.to_le_bytes())?;
+        f.write_all(&(entries.len() as u32).to_le_bytes())?;
+        f.write_all(&metadata_offset.to_le_bytes())?;
+        f.write_all(&data_offset.to_le_bytes())?;
+        f.write_all(metadata_bytes)?;
+        f.write_all(&index_bytes)?;
+        f.write_all(&vec![0u8; (data_offset - data_start_unaligned) as usize])?;
+
+        let mut expect = data_offset;
+        for (i, e) in entries.iter().enumerate() {
+            emit(i, &mut f)?;
+            expect += e.data_len;
+            let pos = f.stream_position()?;
+            if pos != expect {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "tensor `{}`: emitter wrote {} bytes, index says {}",
+                        e.name,
+                        pos + e.data_len - expect,
+                        e.data_len
+                    ),
+                ));
+            }
+        }
+        f.flush()?;
+        f.sync_all()
+    });
+    match result.and_then(|()| std::fs::rename(&tmp, path)) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod maple_dtype_tests {
+    use super::*;
+
+    #[test]
+    fn mq2g256_lloyd_u_is_qt51_and_round_trips() {
+        assert_eq!(QuantType::MQ2G256LloydU as u8, 51);
+        assert_eq!(QuantType::from_u8(51), Some(QuantType::MQ2G256LloydU));
+    }
+
+    #[test]
+    fn mq2g256_lloyd_u_does_not_collide_with_an_existing_id() {
+        // 51 must be genuinely free: every other id must map elsewhere.
+        for v in 0u8..=50 {
+            if let Some(qt) = QuantType::from_u8(v) {
+                assert_ne!(
+                    qt,
+                    QuantType::MQ2G256LloydU,
+                    "id {v} already resolves to MQ2G256LloydU"
+                );
+            }
+        }
+    }
+
+    const MQ_I4: [(u8, QuantType); 4] = [
+        (131, QuantType::MQ3I4G128R256),
+        (132, QuantType::MQ3I4G128R128),
+        (133, QuantType::MQ2I4G128R256),
+        (134, QuantType::MQ2I4G128R128),
+    ];
+
+    #[test]
+    fn mq_i4_qtypes_131_to_134_round_trip() {
+        for (id, qt) in MQ_I4 {
+            assert_eq!(qt as u8, id);
+            assert_eq!(QuantType::from_u8(id), Some(qt));
+        }
+        // Neighbours are unassigned: 130 is the compact-Hessian record id
+        // (not a QuantType) and 135 is unallocated.
+        assert_eq!(QuantType::from_u8(130), None);
+        assert_eq!(QuantType::from_u8(135), None);
+    }
+
+    #[test]
+    fn mq_i4_qtypes_do_not_collide_with_any_existing_id() {
+        for v in 0u8..=255 {
+            if let Some(qt) = QuantType::from_u8(v) {
+                assert_eq!(qt as u8, v, "from_u8({v}) returned a mismatched variant");
+                if let Some((id, _)) = MQ_I4.iter().find(|(_, mq)| *mq == qt) {
+                    assert_eq!(*id, v, "{qt:?} resolves from id {v}");
+                }
+            }
+        }
+        for (id, qt) in MQ_I4 {
+            let hits = (0u8..=255)
+                .filter(|v| QuantType::from_u8(*v) == Some(qt))
+                .count();
+            assert_eq!(hits, 1, "{qt:?} (id {id}) must resolve from exactly one id");
+        }
+    }
+}

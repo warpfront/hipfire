@@ -55,7 +55,7 @@ extern "C" __global__ void HIPFIRE_MOE_PROJECTION_KERNEL(
     const float* __restrict__ x,
     HIPFIRE_MOE_PROJECTION_OUTPUT_ARGS
     int M,
-    int K
+    int K, int n_experts
 ) {
     // Host dispatch admits this kernel only for K=2048. Keep K in the ABI so
     // capture/replay validation can retain the same shape contract as the
@@ -76,6 +76,10 @@ extern "C" __global__ void HIPFIRE_MOE_PROJECTION_KERNEL(
     if (row >= mi) return;
 
     const int expert_id = topk_indices[krank];
+    if ((unsigned)expert_id >= (unsigned)n_experts) {
+        if (tid == 0) out[krank * mi + row] = 0.0f;
+        return;
+    }
     const char* __restrict__ A =
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 

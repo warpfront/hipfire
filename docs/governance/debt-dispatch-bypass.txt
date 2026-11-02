@@ -1,0 +1,58 @@
+# Debt table — arch crates that reach kernels without the dispatch registry.
+#
+# OBJECTIVE (holster): drive `bypass` to zero, or to a justified core, by
+# migrating each arch crate onto `hipfire_dispatch::KernelRegistry`. Track the
+# programme in its issue; this file is the ledger it draws down.
+#
+# This is a DEBT TABLE, not a purity check. Every row below is known, owned, and
+# allowed to exist. What is not allowed is growth: `scripts/check-dispatch-bypass.py`
+# fails when any crate's count rises above its recorded number, or when a crate
+# appears that is not listed here at all. Paying debt down means editing this file
+# to a smaller number, which is a one-line diff a reviewer can see.
+#
+# Why per-crate and not per-callsite. A table keyed on file:line churns on every
+# unrelated edit and would be abandoned within a week. The crate is the stable
+# identity and it is also the migration unit -- you convert a crate, not a line.
+#
+# Why a table rather than a single ceiling. `dispatch_registry_bypass <= 222`
+# cannot see one crate improving while another regresses, and it cannot see a
+# crate being added. Per-crate rows make both mechanical, and they make the
+# migration order legible: `debt` crates convert cleanly, `partial` crates have
+# to reconcile two routing systems and cost more.
+#
+# status
+#   ok        no bypass calls; fully on the registry
+#   debt      bypass only, zero registry use -- cheapest to convert, no dual system
+#   partial   BOTH bypass and registry in the same crate. The worst state: a new
+#             quant format must be wired into two routing systems that do not know
+#             about each other. qwen35 at 118/189 is the expensive one and should
+#             be migrated LAST, after the pattern is settled on the debt crates.
+#
+# Measured 2026-08-18 on arch/saddle. Baseline total: 222.
+#
+# Format:  <crate>  <status>  <bypass>  <registry>  [note]
+
+#
+# 2026-10-13 — TABLE CORRECTED, no debt was added. `check-dispatch-bypass.py`'s
+# regex required `gpu.` immediately adjacent to the method name, so it only saw
+# calls short enough for rustfmt to keep on one line; a wrapped
+# `gpu\n    .gemm_*` chain (every match arm returning one) was invisible. The
+# regex is now whitespace-tolerant and the rows below are re-measured. The
+# total rises 306 -> 357 because 51 previously-uncounted call sites became
+# visible, not because any arch reached for the Gpu handle newly. Per-crate
+# corrections: hipfire-arch-deepseek4 19->39, hipfire-arch-diffusion 10->17, hipfire-arch-gemma4 17->18, hipfire-arch-minimax 12->19, hipfire-arch-muse-glimmer 12->23, hipfire-arch-qwen35 183->188.
+
+hipfire-arch-embeddinggemma2 debt         5     0   arch 18 (EmbeddingGemma 2 single-vector embedding encoder); the trunk projection's f16 WMMA GEMMs (f32/mb8/LDS-tiled/LDS-tiled-ld variants) and the eager attention's two f16 GEMMs — the same registry-key debt the other arch crates carry
+hipfire-arch-qwen35-embed  debt        9     0   arch 17; the trunk's f16 WMMA GEMMs and the encoder attention's fused ops — the same registry-key debt the other arch crates carry; +2 = gfx1201 split1 pitched WMMA Q*K^T and P*V entry points, without head gathers
+hipfire-arch-qwen35        partial    86   191   migrate last; MTP routed MoE now dispatch-layer owned; +10 = DFlash fp16-X GEMM entries (S3/S4 launch fusion); -20 = MQ v2 lm_head match deduped in speculative.rs; +7 = MQ4-Lloyd (qt=52) FP8-LUT prefill arms (gemm_*_fp8_lloyd) pending registry keys with LUT plumbing (gfx11 MMQ-LUT PR); +15 = MQ4-Lloyd gfx11 MMQ-LUT prefill arms (gemm_*_mmq_lloyd), same registry-key debt as the FP8-LUT arms; +40 = speculation-decode additions recorded by the SCS hygiene pass (was carried unrecorded on the beta integration base); +1 from the SCS port PR series (landed with the SCS fold); +2 landed on beta since this ledger was frozen (recorded on rebase, not new debt); -5 = sealed MoE prefill moved into dispatch (PR #755 via #774); +4 = gfx1151 A4-fusion gate/up + down-sidecar arms (gemm_gate_up_silu_a4_*, gemm_*_iu4_down_prepared) beside the Iu4H direct calls they mirror, same registry-key debt; MTP MQ4 fill and shared-wv projection now dispatch-layer owned; -1 = #732: the DFlash Q8 lm_head chunk loop in speculative.rs went into the GemmQ8_0Batched dispatch key, deleting its `gpu.gemm_q8_0_batched` comment line (the checker counts comment text); no kernel call site was removed; -5 = Qwen3.5 decode layer bodies moved into hipfire_dispatch::pipeline::hybrid (HIPF-117); -85 = Qwen3.5 batched dense FFN, full-attention and DeltaNet prefill/verify bodies moved into hipfire_dispatch::pipeline::batched{,_attention,_deltanet} (HIPF-118); -4 = Qwen3.5 MoE-layer batched DeltaNet and attention mixers (incl. PARO arms) moved into hipfire_dispatch::pipeline::batched_moe (HIPF-119); -3 = Qwen3.5 decode hand arms (DFlash hidden capture, VL mrope, CPU-spilled models) deleted, those cases run the hybrid step program (HIPF-120); -8 = the batched prefill's per-token FA fallback hand body (run_fa_layer_body) deleted, it runs the decode step program (HIPF-128); +4 = A3B exact VMM batch route lane-batched launches in exact.rs (DeltaNet/FA row twins, `moe_decode_lanes_mq4rs`, head lanes), each a lane-batched twin of a singleton kernel without a registry key
+hipfire-arch-gemma4        partial     1     4
+hipfire-arch-minimax       debt       15     0
+hipfire-arch-llama         debt       10     0
+hipfire-arch-dots-ocr      partial     7     4
+hipfire-arch-qwen4         debt        9     0   F32 lm_head GEMM in program.rs (2); +7 = gfx1151 batched native-MTP prompt fill (a5b0cc14f, mtp_gpu.rs append_rows): each call is a row-exact MTP fill op that must match the single-row decode reduction order bit for bit, so it cannot take project_weight's F16 WMMA route (>= 512 rows) — fc_embedding gemm_bf16_xf32_multirow (twin of gemv_bf16_xf32); fc_hidden gemm_bf16_xf32_multirow over 4 branch rows per token (twin of gemv_bf16_xf32_x4_rows); HC input_mix_down gemv_bf16_xf32_k4_rows_tiled (twin of the K4 quarter-fold gemv with its 1/branches epilogue); HC input_mix_up gemm_bf16_xf32_multirow (twin of gemv_bf16_xf32); QSA indexer_qk gemv_q8_0_k2560_staged_rows_tiled, QSA k gemv_q8_0_k2560_staged_rows_tiled, QSA v gemv_q8_0_k2560_staged_rows_tiled (twins of the single-row Q8_0 staged gemv). Follow-up: migrate row-exact kernels into a dispatch-registry row family (0.4.2)
+hipfire-arch-diffusion     debt       17     0   arch 40/45 image-diffusion trunk; direct f16 WMMA LDS GEMM + VAE/text-encoder kernel calls
+hipfire-arch-maple         debt        4     0   arch 15; no registry use to reconcile
+hipfire-arch-qwen2         debt        2     0
+hipfire-arch-raon          debt        1     0   Raon-1-mini-preview arch; 1 direct rdna-compute launcher call (bypass debt owned by the Raon bring-up; the Q8_0 prefill projection now goes through hipfire-dispatch q8_0_prefill_gemm)
+hipfire-arch-lfm2-vl       debt        2     0   arch 11; tower/projector GEMMs (gemm_f16_wmma_mb8, gemm_f16)
+hipfire-arch-qwen35-vl     debt        5     0   arch 5 vision tower linears; +3 = LDS-tiled WMMA GEMM (gfx1201 split1 packed + pitched for the padded fc2, gfx11 lds_auto_ld), the same entry points qwen35-embed uses

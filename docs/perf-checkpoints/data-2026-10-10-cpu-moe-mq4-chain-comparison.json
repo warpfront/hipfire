@@ -1,0 +1,598 @@
+{
+ "primary_criterion": "traced absolute compute per splice line (GU/DN/middle/combine medians + per-line compute-total median gu+middle+dn+combine, calls>=16 gate); splice TOTAL incl copies + tok/s context only; no CPU-vs-bus rebench; no per-label attribution",
+ "trace_filter": "eligible lines calls>=16; trace prints 2-decimal ms so sums carry ~10us/field quantization",
+ "fixture": {
+  "model_md5": "f9b5b13eb24ecbe4b39f3a3f4a297645",
+  "prompt_md5": "253c7ac50857fe6d0e10fb0d2c5e35c0",
+  "cpu": "7800X3D default16 RAYON unset",
+  "gpu": "RX9070XT gfx1201",
+  "env": "offload=cpu budget24 graph0 hip-replay gpu0 q8/vmm seq4096 max256 DPM10s",
+  "coverage": "16/16 CPU-covered all runs"
+ },
+ "binaries_daemon": {
+  "fourchain": "27105a4e0f7fb12226f38648d2ea431e",
+  "singlechain": "34fad9e1adaa0e6c204228363e4ea483",
+  "twochain": "4e8d31ac1d101fb5042d16f6389d42df"
+ },
+ "x86_rs_md5_twochain": "ea44b0c171c5798252f76ac0fd68d03a",
+ "codegen": {
+  "fourchain": "4 FMA chains + 3x vaddps; outer scalar row-acc spill ~4 ld/st per group",
+  "twochain": "2 FMA chains + 1x vaddps; max live ymm10, row acc xmm0, zero spills in cached row fn"
+ },
+ "correctness_cited": "CPU 37 + splice 4 passed; GPU oracle worst Mq4 normalized 4.797e-7 (twochain) / 4.317e-7 (fourchain), TOL 1e-4",
+ "runs": [
+  {
+   "stamp": "042743",
+   "arm": "fourchain",
+   "control": {
+    "tokens": 166,
+    "tok_s": 51.0,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 160,
+    "tok_s": 50.6,
+    "finish": "stop",
+    "clen": 569,
+    "md5": "130d41724e0fcc29d014a12906ab1105",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.22,
+     "min": 0.2,
+     "max": 0.26,
+     "n": 21
+    },
+    "dn": {
+     "med": 0.12,
+     "min": 0.1,
+     "max": 0.13,
+     "n": 21
+    },
+    "middle": {
+     "med": 0.03,
+     "min": 0.02,
+     "max": 0.03,
+     "n": 21
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 21
+    },
+    "compute": {
+     "med": 0.38,
+     "min": 0.34,
+     "max": 0.42,
+     "n": 21
+    },
+    "total": {
+     "med": 0.61,
+     "min": 0.56,
+     "max": 0.64,
+     "n": 21
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-042743.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-042743.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-042743.trace.log"
+   }
+  },
+  {
+   "stamp": "042915",
+   "arm": "fourchain",
+   "control": {
+    "tokens": 166,
+    "tok_s": 50.9,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 50.6,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.23,
+     "min": 0.2,
+     "max": 0.26,
+     "n": 22
+    },
+    "dn": {
+     "med": 0.12,
+     "min": 0.11,
+     "max": 0.13,
+     "n": 22
+    },
+    "middle": {
+     "med": 0.03,
+     "min": 0.02,
+     "max": 0.03,
+     "n": 22
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 22
+    },
+    "compute": {
+     "med": 0.39,
+     "min": 0.35,
+     "max": 0.42,
+     "n": 22
+    },
+    "total": {
+     "med": 0.62,
+     "min": 0.57,
+     "max": 0.67,
+     "n": 22
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-042915.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-042915.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-042915.trace.log"
+   }
+  },
+  {
+   "stamp": "043043",
+   "arm": "fourchain",
+   "control": {
+    "tokens": 166,
+    "tok_s": 52.1,
+    "finish": "stop",
+    "clen": 594,
+    "md5": "71305ea4f716de61d73efdac4ad7e87f",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 160,
+    "tok_s": 49.3,
+    "finish": "stop",
+    "clen": 569,
+    "md5": "130d41724e0fcc29d014a12906ab1105",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.26,
+     "min": 0.22,
+     "max": 0.3,
+     "n": 21
+    },
+    "dn": {
+     "med": 0.13,
+     "min": 0.12,
+     "max": 0.14,
+     "n": 21
+    },
+    "middle": {
+     "med": 0.02,
+     "min": 0.02,
+     "max": 0.03,
+     "n": 21
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 21
+    },
+    "compute": {
+     "med": 0.42,
+     "min": 0.37,
+     "max": 0.47,
+     "n": 21
+    },
+    "total": {
+     "med": 0.65,
+     "min": 0.6,
+     "max": 0.7,
+     "n": 21
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-043043.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-043043.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-043043.trace.log"
+   }
+  },
+  {
+   "stamp": "043407",
+   "arm": "singlechain",
+   "control": {
+    "tokens": 166,
+    "tok_s": 51.2,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 51.0,
+    "finish": "stop",
+    "clen": 601,
+    "md5": "6dddd3d2f960c53b50800ef4e4dc2b43",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n            \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.23,
+     "min": 0.2,
+     "max": 0.27,
+     "n": 22
+    },
+    "dn": {
+     "med": 0.12,
+     "min": 0.1,
+     "max": 0.13,
+     "n": 22
+    },
+    "middle": {
+     "med": 0.03,
+     "min": 0.02,
+     "max": 0.03,
+     "n": 22
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 22
+    },
+    "compute": {
+     "med": 0.39,
+     "min": 0.34,
+     "max": 0.43,
+     "n": 22
+    },
+    "total": {
+     "med": 0.615,
+     "min": 0.57,
+     "max": 0.65,
+     "n": 22
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-043407.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-043407.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-043407.trace.log"
+   }
+  },
+  {
+   "stamp": "043537",
+   "arm": "singlechain",
+   "control": {
+    "tokens": 166,
+    "tok_s": 51.2,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 156,
+    "tok_s": 51.5,
+    "finish": "stop",
+    "clen": 550,
+    "md5": "e8b8bea2ee3497096a2ab0b9c0ece198",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left = merge_sort(arr[:mid])\n    right = merge_sort(arr[mid:])\n    \n    return merge(left, right)\n\ndef merge(left, right):\n    result = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            result.append(left[i])\n            i += 1\n        else:\n            result.append(right[j])\n            j += 1\n    \n    result.extend(left[i:])\n    result.extend(right[j:])\n    \n    return result\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.255,
+     "min": 0.19,
+     "max": 0.33,
+     "n": 20
+    },
+    "dn": {
+     "med": 0.135,
+     "min": 0.1,
+     "max": 0.17,
+     "n": 20
+    },
+    "middle": {
+     "med": 0.02,
+     "min": 0.02,
+     "max": 0.03,
+     "n": 20
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 20
+    },
+    "compute": {
+     "med": 0.42,
+     "min": 0.32,
+     "max": 0.53,
+     "n": 20
+    },
+    "total": {
+     "med": 0.655,
+     "min": 0.56,
+     "max": 0.79,
+     "n": 20
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-043537.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-043537.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-043537.trace.log"
+   }
+  },
+  {
+   "stamp": "043701",
+   "arm": "singlechain",
+   "control": {
+    "tokens": 166,
+    "tok_s": 51.9,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 51.4,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.235,
+     "min": 0.19,
+     "max": 0.28,
+     "n": 22
+    },
+    "dn": {
+     "med": 0.12,
+     "min": 0.1,
+     "max": 0.15,
+     "n": 22
+    },
+    "middle": {
+     "med": 0.03,
+     "min": 0.02,
+     "max": 0.03,
+     "n": 22
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 22
+    },
+    "compute": {
+     "med": 0.395,
+     "min": 0.32,
+     "max": 0.46,
+     "n": 22
+    },
+    "total": {
+     "med": 0.62,
+     "min": 0.55,
+     "max": 0.66,
+     "n": 22
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-043701.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-043701.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-043701.trace.log"
+   }
+  },
+  {
+   "stamp": "044026",
+   "arm": "twochain",
+   "control": {
+    "tokens": 166,
+    "tok_s": 51.1,
+    "finish": "stop",
+    "clen": 605,
+    "md5": "d5d83eb486eea415b696d098fce87c7d",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_array = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_array.append(left[i])\n            i += 1\n        else:\n            sorted_array.append(right[j])\n            j += 1\n    \n    sorted_array.extend(left[i:])\n    sorted_array.extend(right[j:])\n    \n    return sorted_array\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 50.4,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.24,
+     "min": 0.2,
+     "max": 0.29,
+     "n": 22
+    },
+    "dn": {
+     "med": 0.13,
+     "min": 0.11,
+     "max": 0.17,
+     "n": 22
+    },
+    "middle": {
+     "med": 0.03,
+     "min": 0.02,
+     "max": 0.03,
+     "n": 22
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 22
+    },
+    "compute": {
+     "med": 0.415,
+     "min": 0.35,
+     "max": 0.47,
+     "n": 22
+    },
+    "total": {
+     "med": 0.65,
+     "min": 0.57,
+     "max": 0.69,
+     "n": 22
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-044026.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-044026.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-044026.trace.log"
+   }
+  },
+  {
+   "stamp": "044158",
+   "arm": "twochain",
+   "control": {
+    "tokens": 166,
+    "tok_s": 50.0,
+    "finish": "stop",
+    "clen": 593,
+    "md5": "dff503e84f0d6046bb7c6749ea43afb8",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 51.2,
+    "finish": "stop",
+    "clen": 594,
+    "md5": "71305ea4f716de61d73efdac4ad7e87f",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] <= right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n    \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.24,
+     "min": 0.19,
+     "max": 0.3,
+     "n": 22
+    },
+    "dn": {
+     "med": 0.12,
+     "min": 0.1,
+     "max": 0.13,
+     "n": 22
+    },
+    "middle": {
+     "med": 0.03,
+     "min": 0.02,
+     "max": 0.03,
+     "n": 22
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 22
+    },
+    "compute": {
+     "med": 0.4,
+     "min": 0.32,
+     "max": 0.46,
+     "n": 22
+    },
+    "total": {
+     "med": 0.625,
+     "min": 0.56,
+     "max": 0.7,
+     "n": 22
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-044158.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-044158.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-044158.trace.log"
+   }
+  },
+  {
+   "stamp": "044325",
+   "arm": "twochain",
+   "control": {
+    "tokens": 160,
+    "tok_s": 49.7,
+    "finish": "stop",
+    "clen": 569,
+    "md5": "130d41724e0fcc29d014a12906ab1105",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    merged = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            merged.append(left[i])\n            i += 1\n        else:\n            merged.append(right[j])\n            j += 1\n    \n    merged.extend(left[i:])\n    merged.extend(right[j:])\n    \n    return merged\n```"
+   },
+   "trace": {
+    "tokens": 166,
+    "tok_s": 50.7,
+    "finish": "stop",
+    "clen": 601,
+    "md5": "6dddd3d2f960c53b50800ef4e4dc2b43",
+    "content": "```python\ndef merge_sort(arr):\n    if len(arr) <= 1:\n        return arr\n    \n    mid = len(arr) // 2\n    left_half = merge_sort(arr[:mid])\n    right_half = merge_sort(arr[mid:])\n    \n    return merge(left_half, right_half)\n\ndef merge(left, right):\n    sorted_arr = []\n    i = j = 0\n    \n    while i < len(left) and j < len(right):\n        if left[i] < right[j]:\n            sorted_arr.append(left[i])\n            i += 1\n        else:\n            sorted_arr.append(right[j])\n            j += 1\n            \n    sorted_arr.extend(left[i:])\n    sorted_arr.extend(right[j:])\n    \n    return sorted_arr\n```"
+   },
+   "compute_primary": {
+    "gu": {
+     "med": 0.225,
+     "min": 0.2,
+     "max": 0.28,
+     "n": 22
+    },
+    "dn": {
+     "med": 0.12,
+     "min": 0.11,
+     "max": 0.14,
+     "n": 22
+    },
+    "middle": {
+     "med": 0.03,
+     "min": 0.03,
+     "max": 0.03,
+     "n": 22
+    },
+    "combine": {
+     "med": 0.01,
+     "min": 0.01,
+     "max": 0.01,
+     "n": 22
+    },
+    "compute": {
+     "med": 0.39,
+     "min": 0.35,
+     "max": 0.45,
+     "n": 22
+    },
+    "total": {
+     "med": 0.62,
+     "min": 0.57,
+     "max": 0.67,
+     "n": 22
+    }
+   },
+   "artifacts": {
+    "json": ".codeinsight+research/cpu-exec-debug-20261010-044325.json",
+    "control": ".codeinsight+research/cpu-exec-debug-20261010-044325.control.json",
+    "trace": ".codeinsight+research/cpu-exec-debug-20261010-044325.trace.log"
+   }
+  }
+ ],
+ "binaries_cli": {
+  "fourchain": "852e62e276c6677cb1e7e12c28e48f27",
+  "singlechain": "852e62e276c6677cb1e7e12c28e48f27",
+  "twochain": "852e62e276c6677cb1e7e12c28e48f27",
+  "note": "CLI identical across all 9 MQ4 runs (CPU kernel lives in daemon only, per objdump); extracted from per-run stderr logs, no rerun"
+ }
+}

@@ -44,6 +44,12 @@ enum QuiescenceTransition {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Quiescence {
+    Proven,
+    Unknown,
+}
+
 fn apply_quiescence_transition(
     in_flight: &mut bool,
     usable: &mut bool,
@@ -79,6 +85,7 @@ pub struct SingleQueuePm4Ib {
     timestamp_frequency_hz: Option<u64>,
     dispatch_workgroup_offsets: Vec<usize>,
     usable: bool,
+    in_flight: bool,
 }
 
 impl SingleQueuePm4Ib {
@@ -281,6 +288,66 @@ impl SingleQueuePm4Ib {
         )
     }
 
+    /// [`Self::create_profiled_gfx11`] with the indirect buffer allocated from
+    /// a separate (device-local) pool; timestamps and completion stay on `pool`.
+    pub fn create_profiled_legacy_with_ib_pool(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        ib_pool: &KernargPool,
+        commands: &Gfx10Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        if commands.is_empty() {
+            return Err(ReplayError::EmptyGraph);
+        }
+        let mut timestamps = pool.allocate_executable_bytes(16)?;
+        timestamps.as_mut_bytes().fill(0);
+        let start = timestamps.address() as usize as u64;
+        let timed = commands.with_gpu_timestamps(start, start + 8);
+        let frequency_hz = device.gpu_timestamp_frequency_hz()?;
+        Self::create_encoded(
+            device,
+            pool,
+            Some(ib_pool),
+            &timed.as_bytes(),
+            timed.len_dwords(),
+            Some(timestamps),
+            Some(frequency_hz),
+        )
+    }
+
+    /// GFX10/GFX11 attribution tape: a stamp after every dispatch and after
+    /// every compute-idle packet (see
+    /// [`Gfx10Pm4CommandBuffer::with_boundary_timestamps`]). Spans alternate
+    /// kernel issue-to-idle and boundary idle-to-next-issue.
+    pub fn create_boundary_profiled_legacy(
+        device: &GpuDevice,
+        pool: &KernargPool,
+        commands: &Gfx10Pm4CommandBuffer,
+    ) -> Result<Self, ReplayError> {
+        if commands.is_empty() {
+            return Err(ReplayError::EmptyGraph);
+        }
+        let slots = commands
+            .boundary_timestamp_slot_count()
+            .map_err(|dword| ReplayError::MalformedPm4IndirectBuffer { dword })?;
+        let mut timestamps = pool.allocate_executable_bytes(slots * 8)?;
+        timestamps.as_mut_bytes().fill(0);
+        let base = timestamps.address() as usize as u64;
+        let timed = commands
+            .with_boundary_timestamps(base)
+            .map_err(|dword| ReplayError::MalformedPm4IndirectBuffer { dword })?;
+        let frequency_hz = device.gpu_timestamp_frequency_hz()?;
+        Self::create_encoded(
+            device,
+            pool,
+            None,
+            &timed.as_bytes(),
+            timed.len_dwords(),
+            Some(timestamps),
+            Some(frequency_hz),
+        )
+    }
+
     fn create_encoded(
         device: &GpuDevice,
         pool: &KernargPool,
@@ -319,6 +386,7 @@ impl SingleQueuePm4Ib {
             timestamp_frequency_hz,
             dispatch_workgroup_offsets,
             usable: true,
+            in_flight: false,
         })
     }
 
@@ -330,7 +398,8 @@ impl SingleQueuePm4Ib {
     }
 
     /// Restrict the retained replay queue to an ABI-valid WGP-paired CU mask.
-    /// This must be called before the first submission.
+    /// This must be called before the first submission. Refused on RDNA
+    /// (`RuntimeError::CuMaskRefusedOnRdna`): CU masks hung the R9700 MES on 2026-10-14.
     pub fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), ReplayError> {
         self.queues.set_cu_mask(mask_bits, mask).map_err(Into::into)
     }
@@ -381,6 +450,42 @@ impl SingleQueuePm4Ib {
         Ok(())
     }
 
+    /// Decode the retained indirect buffer as the CP will read it: every
+    /// `DISPATCH_DIRECT`'s raw dimensions and the `COMPUTE_NUM_THREAD`
+    /// workgroup size in force at it. Quiescent use only (a self-check of what
+    /// [`Self::patch_dispatch_dimensions`] and the builder left in the IB).
+    pub fn decode_dispatches(&mut self) -> Result<Vec<DecodedDispatch>, ReplayError> {
+        decode_pm4_dispatches(self.indirect.as_mut_bytes())
+    }
+
+    pub fn in_flight(&self) -> bool {
+        self.in_flight
+    }
+
+    pub fn quiesce(&mut self) -> Result<(), ReplayError> {
+        if !self.in_flight {
+            return Ok(());
+        }
+        match self.queues.inactivate_all() {
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Cancelled,
+                );
+                Ok(())
+            }
+            Err(error) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Failed,
+                );
+                Err(error.into())
+            }
+        }
+    }
+
     /// Submit and synchronously prove completion with a finite timeout.
     ///
     /// # Safety
@@ -390,26 +495,49 @@ impl SingleQueuePm4Ib {
     /// error they must remain live through this object's destruction.
     pub unsafe fn replay_and_wait(&mut self) -> Result<(), ReplayError> {
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.replay_and_wait_inner() }
+        unsafe { self.replay_and_wait_checked() }.map_err(|(error, _)| error)
+    }
+
+    /// Checked variant that reports quiescence.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::replay_and_wait`].
+    pub unsafe fn replay_and_wait_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked() }
     }
 
     /// Replay once and return the GPU-clock span bracketed inside the retained
     /// indirect buffer, excluding host queue publication and signal polling.
     pub unsafe fn replay_and_wait_profiled(&mut self) -> Result<GpuMultiQueueTiming, ReplayError> {
-        let frequency_hz = self
-            .timestamp_frequency_hz
-            .ok_or(ReplayError::ProfilingUnavailable)?;
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.replay_and_wait_inner()? };
-        let bytes = self
-            .timestamps
-            .as_mut()
-            .ok_or(ReplayError::ProfilingUnavailable)?
-            .as_mut_bytes();
+        unsafe { self.replay_and_wait_profiled_checked() }.map_err(|(error, _)| error)
+    }
+
+    /// Checked variant of [`Self::replay_and_wait_profiled`].
+    pub unsafe fn replay_and_wait_profiled_checked(
+        &mut self,
+    ) -> Result<GpuMultiQueueTiming, (ReplayError, Quiescence)> {
+        let frequency_hz = match self.timestamp_frequency_hz {
+            Some(frequency_hz) => frequency_hz,
+            None => {
+                return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven));
+            }
+        };
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked()? };
+        let bytes = match self.timestamps.as_mut() {
+            Some(timestamps) => timestamps.as_mut_bytes(),
+            None => return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven)),
+        };
         let start = u64::from_le_bytes(bytes[..8].try_into().unwrap());
         let end = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
         if start == 0 || end < start {
-            return Err(ReplayError::InvalidGpuTimestamp { start, end });
+            return Err((
+                ReplayError::InvalidGpuTimestamp { start, end },
+                Quiescence::Proven,
+            ));
         }
         Ok(GpuMultiQueueTiming {
             first_start: start,
@@ -432,22 +560,29 @@ impl SingleQueuePm4Ib {
     /// the two bracketing timestamps yields a single span, which is what
     /// [`replay_and_wait_profiled`] already reports.
     pub unsafe fn replay_and_wait_dispatch_spans(&mut self) -> Result<Vec<u64>, ReplayError> {
-        let frequency_hz = self
-            .timestamp_frequency_hz
-            .ok_or(ReplayError::ProfilingUnavailable)?;
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.replay_and_wait_inner()? };
-        let bytes = self
-            .timestamps
-            .as_mut()
-            .ok_or(ReplayError::ProfilingUnavailable)?
-            .as_mut_bytes();
+        unsafe { self.replay_and_wait_dispatch_spans_checked() }.map_err(|(error, _)| error)
+    }
+
+    pub unsafe fn replay_and_wait_dispatch_spans_checked(
+        &mut self,
+    ) -> Result<Vec<u64>, (ReplayError, Quiescence)> {
+        let frequency_hz = match self.timestamp_frequency_hz {
+            Some(frequency_hz) => frequency_hz,
+            None => return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven)),
+        };
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked()? };
+        let bytes = match self.timestamps.as_mut() {
+            Some(timestamps) => timestamps.as_mut_bytes(),
+            None => return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven)),
+        };
         let ticks: Vec<u64> = bytes
             .chunks_exact(8)
             .map(|word| u64::from_le_bytes(word.try_into().unwrap()))
             .collect();
         if ticks.len() < 2 {
-            return Err(ReplayError::ProfilingUnavailable);
+            return Err((ReplayError::ProfilingUnavailable, Quiescence::Proven));
         }
         let mut spans = Vec::with_capacity(ticks.len() - 1);
         for pair in ticks.windows(2) {
@@ -455,7 +590,10 @@ impl SingleQueuePm4Ib {
             // A zero or non-monotonic pair means the write did not land; report
             // it rather than silently producing a plausible-looking number.
             if start == 0 || end < start {
-                return Err(ReplayError::InvalidGpuTimestamp { start, end });
+                return Err((
+                    ReplayError::InvalidGpuTimestamp { start, end },
+                    Quiescence::Proven,
+                ));
             }
             spans.push((end - start).saturating_mul(1_000_000_000) / frequency_hz);
         }
@@ -469,8 +607,16 @@ impl SingleQueuePm4Ib {
         &mut self,
     ) -> Result<(GpuMultiQueueTiming, Vec<u64>), ReplayError> {
         // SAFETY: forwarded from this method's caller.
-        unsafe { self.replay_and_wait_inner()? };
+        unsafe { self.replay_and_wait_dispatch_profiled_checked() }.map_err(|(error, _)| error)
+    }
+
+    pub unsafe fn replay_and_wait_dispatch_profiled_checked(
+        &mut self,
+    ) -> Result<(GpuMultiQueueTiming, Vec<u64>), (ReplayError, Quiescence)> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked()? };
         self.read_dispatch_profile()
+            .map_err(|error| (error, Quiescence::Proven))
     }
 
     /// Decode the timestamps written by the most recent instrumented replay.
@@ -510,40 +656,175 @@ impl SingleQueuePm4Ib {
         ))
     }
 
-    unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
-        if !self.usable {
-            return Err(ReplayError::GraphInactive);
+    fn reset_timestamp_progress(&mut self) {
+        if let Some(timestamps) = self.timestamps.as_mut() {
+            timestamps.as_mut_bytes().fill(0);
         }
+    }
+
+    fn timestamp_progress(&mut self) -> Option<(u64, u64)> {
+        let bytes = self.timestamps.as_mut()?.as_mut_bytes();
+        if bytes.len() < 16 {
+            return None;
+        }
+        let start = u64::from_le_bytes(bytes[..8].try_into().ok()?);
+        let end = u64::from_le_bytes(bytes[bytes.len() - 8..].try_into().ok()?);
+        Some((start, end))
+    }
+
+    unsafe fn replay_and_wait_inner(&mut self) -> Result<(), ReplayError> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe { self.replay_and_wait_inner_checked() }.map_err(|(error, _)| error)
+    }
+
+    unsafe fn replay_and_wait_inner_checked(&mut self) -> Result<(), (ReplayError, Quiescence)> {
+        if !self.usable {
+            return Err((ReplayError::GraphInactive, Quiescence::Proven));
+        }
+        if self.in_flight {
+            return Err((ReplayError::AlreadyInFlight, Quiescence::Proven));
+        }
+        self.reset_timestamp_progress();
         self.completion.reset();
         if let Err(error) = self
             .queues
             .prepare_batches(std::slice::from_ref(&self.batch))
         {
-            self.usable = false;
-            return Err(error.into());
+            apply_quiescence_transition(
+                &mut self.in_flight,
+                &mut self.usable,
+                QuiescenceTransition::Cancelled,
+            );
+            return Err((error.into(), Quiescence::Proven));
         }
+        // Mark in-flight before doorbell publication.
+        self.in_flight = true;
         if let Err(error) = self.queues.ring_prepared() {
-            self.usable = false;
-            return Err(error.into());
+            apply_quiescence_transition(
+                &mut self.in_flight,
+                &mut self.usable,
+                QuiescenceTransition::Cancelled,
+            );
+            return Err((error.into(), Quiescence::Proven));
         }
         match self
             .queues
             .wait_signal(&self.completion, DEFAULT_WAIT_TIMEOUT)
         {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                apply_quiescence_transition(
+                    &mut self.in_flight,
+                    &mut self.usable,
+                    QuiescenceTransition::Completed,
+                );
+                Ok(())
+            }
             Err(operation) => {
-                self.usable = false;
+                if let Some((start_tick, end_tick)) = self.timestamp_progress() {
+                    eprintln!(
+                        "HIPFIRE_REDLINE_PM4_PROGRESS start_tick={start_tick} end_tick={end_tick}"
+                    );
+                }
                 match self.queues.inactivate_all() {
-                    Ok(()) => Err(operation.into()),
-                    Err(teardown) => Err(RuntimeError::OperationAndTeardown {
-                        operation: Box::new(operation),
-                        teardown: Box::new(teardown),
+                    Ok(()) => {
+                        apply_quiescence_transition(
+                            &mut self.in_flight,
+                            &mut self.usable,
+                            QuiescenceTransition::Cancelled,
+                        );
+                        Err((operation.into(), Quiescence::Proven))
                     }
-                    .into()),
+                    Err(teardown) => {
+                        apply_quiescence_transition(
+                            &mut self.in_flight,
+                            &mut self.usable,
+                            QuiescenceTransition::Failed,
+                        );
+                        Err((
+                            RuntimeError::OperationAndTeardown {
+                                operation: Box::new(operation),
+                                teardown: Box::new(teardown),
+                            }
+                            .into(),
+                            Quiescence::Unknown,
+                        ))
+                    }
                 }
             }
         }
     }
+}
+
+/// One decoded `DISPATCH_DIRECT` of a retained IB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodedDispatch {
+    /// The packet's three raw dimension dwords (GFX12: total work-items).
+    pub dimensions: [u32; 3],
+    /// `COMPUTE_NUM_THREAD_{X,Y,Z}` as last set before it (`None` when the
+    /// stream never set them).
+    pub workgroup: Option<[u32; 3]>,
+}
+
+/// `COMPUTE_NUM_THREAD_X` in the `SET_SH_REG` register space the builder uses
+/// (`redline-rocr` `pm4.rs`); `Y` and `Z` follow.
+const PM4_COMPUTE_NUM_THREAD_X: u32 = 0x207;
+const PM4_SET_SH_REG: u32 = 0x76;
+const PM4_DISPATCH_DIRECT: u32 = 0x15;
+
+fn decode_pm4_dispatches(bytes: &[u8]) -> Result<Vec<DecodedDispatch>, ReplayError> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(ReplayError::MalformedPm4IndirectBuffer {
+            dword: bytes.len() / 4,
+        });
+    }
+    let dwords = bytes
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    let mut out = Vec::new();
+    let mut threads: [Option<u32>; 3] = [None; 3];
+    let mut cursor = 0_usize;
+    while cursor < dwords.len() {
+        let header = dwords[cursor];
+        if header >> 30 != 3 {
+            return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+        }
+        let body_dwords = ((header >> 16) & 0x3fff) as usize + 1;
+        let next = cursor
+            .checked_add(1 + body_dwords)
+            .ok_or(ReplayError::MalformedPm4IndirectBuffer { dword: cursor })?;
+        if next > dwords.len() {
+            return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+        }
+        let body = &dwords[cursor + 1..next];
+        match (header >> 8) & 0xff {
+            PM4_SET_SH_REG => {
+                let first = body[0];
+                for (i, value) in body[1..].iter().enumerate() {
+                    let register = first + i as u32;
+                    if (PM4_COMPUTE_NUM_THREAD_X..PM4_COMPUTE_NUM_THREAD_X + 3).contains(&register)
+                    {
+                        threads[(register - PM4_COMPUTE_NUM_THREAD_X) as usize] = Some(*value);
+                    }
+                }
+            }
+            PM4_DISPATCH_DIRECT => {
+                if body_dwords != 4 {
+                    return Err(ReplayError::MalformedPm4IndirectBuffer { dword: cursor });
+                }
+                out.push(DecodedDispatch {
+                    dimensions: [body[0], body[1], body[2]],
+                    workgroup: match threads {
+                        [Some(x), Some(y), Some(z)] => Some([x, y, z]),
+                        _ => None,
+                    },
+                });
+            }
+            _ => {}
+        }
+        cursor = next;
+    }
+    Ok(out)
 }
 
 fn pm4_dispatch_workgroup_offsets(bytes: &[u8]) -> Result<Vec<usize>, ReplayError> {
@@ -584,7 +865,7 @@ fn pm4_dispatch_workgroup_offsets(bytes: &[u8]) -> Result<Vec<usize>, ReplayErro
 
 impl Drop for SingleQueuePm4Ib {
     fn drop(&mut self) {
-        if !self.usable {
+        if self.in_flight || !self.usable {
             let _ = self.queues.inactivate_all();
         }
     }
@@ -920,6 +1201,10 @@ impl PhasedMultiQueuePm4Ib {
 
     pub fn phase_count(&self) -> usize {
         self.logical_phase_count
+    }
+
+    pub fn packet_count(&self) -> usize {
+        self.batches.iter().map(|batch| batch.len()).sum()
     }
 
     pub fn indirect_addresses(&self) -> impl ExactSizeIterator<Item = usize> + '_ {
@@ -3290,6 +3575,116 @@ mod tests {
     }
 
     #[test]
+    fn gfx11_builder_streams_decode_and_patch_in_workgroup_counts() {
+        use redline_rocr::{Gfx10KernelImage, Gfx10Pm4CommandBuffer};
+        let image = Gfx10KernelImage {
+            code_entry: 0x1_0000_0000,
+            compute_pgm_rsrc1: 0x60af_0000,
+            compute_pgm_rsrc2: 0x84,
+            compute_pgm_rsrc3: 0,
+            group_segment_size: 0,
+            private_segment_size: 0,
+            dynamic_callstack: false,
+            wave32: true,
+            kernel_code_properties: 1 << 10,
+        };
+        let mut commands = Gfx10Pm4CommandBuffer::new_stateful();
+        for (grid, block) in [([5, 2, 1], [256, 1, 1]), ([96, 1, 1], [128, 1, 1])] {
+            commands
+                .dispatch_image(
+                    &image,
+                    crate::aql::LaunchGeometry::from_hip_workgroups(grid, block).unwrap(),
+                    0,
+                    &[0x1000, 0],
+                )
+                .unwrap();
+            commands.wait_compute_idle();
+        }
+        let mut bytes = commands
+            .dwords()
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>();
+        // gfx10/gfx11 `DISPATCH_DIRECT` carries workgroup COUNTS, and the
+        // workgroup size in force comes from COMPUTE_NUM_THREAD.
+        let decoded = decode_pm4_dispatches(&bytes).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].dimensions, [5, 2, 1]);
+        assert_eq!(decoded[0].workgroup, Some([256, 1, 1]));
+        assert_eq!(decoded[1].dimensions, [96, 1, 1]);
+        assert_eq!(decoded[1].workgroup, Some([128, 1, 1]));
+        // The patch offsets address exactly those three dimension dwords.
+        let offsets = pm4_dispatch_workgroup_offsets(&bytes).unwrap();
+        assert_eq!(offsets.len(), 2);
+        for (&offset, want) in offsets.iter().zip([[5u32, 2, 1], [96, 1, 1]]) {
+            let got: Vec<u32> = bytes[offset..offset + 12]
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+                .collect();
+            assert_eq!(got, want);
+        }
+        // Patching the first dispatch's workgroup counts changes only it.
+        for (axis, value) in [9u32, 3, 1].into_iter().enumerate() {
+            bytes[offsets[0] + axis * 4..offsets[0] + axis * 4 + 4]
+                .copy_from_slice(&value.to_le_bytes());
+        }
+        let decoded = decode_pm4_dispatches(&bytes).unwrap();
+        assert_eq!(decoded[0].dimensions, [9, 3, 1]);
+        assert_eq!(decoded[1].dimensions, [96, 1, 1]);
+        assert_eq!(decoded[0].workgroup, Some([256, 1, 1]));
+    }
+
+    #[test]
+    fn decoded_dispatches_carry_the_workgroup_size_in_force() {
+        // SET NUM_THREAD (64,2,1); dispatch; SET only X (a cached/elided
+        // register run keeps Y,Z); dispatch.
+        let words = [
+            0xc003_7602_u32,
+            0x207,
+            64,
+            2,
+            1,
+            0xc003_1502,
+            8,
+            4,
+            1,
+            0x800d,
+            0xc001_7602,
+            0x207,
+            128,
+            0xc003_1502,
+            16,
+            4,
+            1,
+            0x800d,
+        ];
+        let bytes = words
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            decode_pm4_dispatches(&bytes).unwrap(),
+            vec![
+                DecodedDispatch {
+                    dimensions: [8, 4, 1],
+                    workgroup: Some([64, 2, 1])
+                },
+                DecodedDispatch {
+                    dimensions: [16, 4, 1],
+                    workgroup: Some([128, 2, 1])
+                },
+            ]
+        );
+        // A dispatch before any NUM_THREAD write has no workgroup.
+        let early = [0xc003_1502_u32, 8, 4, 1, 0x800d]
+            .iter()
+            .flat_map(|w| w.to_le_bytes())
+            .collect::<Vec<_>>();
+        assert_eq!(decode_pm4_dispatches(&early).unwrap()[0].workgroup, None);
+        assert!(decode_pm4_dispatches(&early[..6]).is_err());
+    }
+
+    #[test]
     fn gpu_batch_span_uses_first_and_last_kernel_timestamps() {
         let timing = GpuBatchTiming {
             first_start: 100,
@@ -3374,6 +3769,68 @@ mod tests {
         in_flight = true;
         apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
         assert!(!in_flight);
+        assert!(!usable);
+    }
+
+    #[test]
+    fn quiescence_enum_maps_transitions() {
+        fn quiescence_for(transition: QuiescenceTransition) -> Quiescence {
+            let mut in_flight = true;
+            let mut usable = true;
+            apply_quiescence_transition(&mut in_flight, &mut usable, transition);
+            if in_flight {
+                Quiescence::Unknown
+            } else {
+                Quiescence::Proven
+            }
+        }
+        assert_eq!(
+            quiescence_for(QuiescenceTransition::Completed),
+            Quiescence::Proven
+        );
+        assert_eq!(
+            quiescence_for(QuiescenceTransition::Cancelled),
+            Quiescence::Proven
+        );
+        assert_eq!(
+            quiescence_for(QuiescenceTransition::Failed),
+            Quiescence::Unknown
+        );
+    }
+
+    #[test]
+    fn quiescence_proven_allows_free_and_unknown_retains_in_flight() {
+        // Proven => safe to free; Unknown => must retain and Drop retry.
+        let mut in_flight = false;
+        let mut usable = true;
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
+        assert_eq!(in_flight, false);
+        // Failed keeps in_flight true
+        in_flight = true;
+        usable = true;
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Failed);
+        assert_eq!(in_flight, true);
+        assert_eq!(usable, false);
+    }
+
+    #[test]
+    fn unknown_quiescence_blocks_subsequent_replay_until_quiesce() {
+        // After Failed (Unknown), controller must remain in-flight+unusable
+        // so any subsequent replay is refused until quiesce proves Proven.
+        let mut in_flight = true;
+        let mut usable = false; // state after Failed
+        // Simulate Failed transition already applied
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Failed);
+        assert!(in_flight);
+        assert!(!usable);
+        // Subsequent replay attempt should be refused: usable false => Proven refusal
+        // (no new doorbell), and in_flight true prevents reuse.
+        let would_allow_replay = usable && !in_flight;
+        assert!(!would_allow_replay);
+        // Quiesce success => Cancelled transition clears in_flight
+        apply_quiescence_transition(&mut in_flight, &mut usable, QuiescenceTransition::Cancelled);
+        assert!(!in_flight);
+        // Still unusable (needs re-prepare), but quiescence now Proven so safe to free/reprepare
         assert!(!usable);
     }
 }

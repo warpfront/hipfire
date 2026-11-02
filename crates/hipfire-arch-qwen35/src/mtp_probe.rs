@@ -281,13 +281,10 @@ pub fn mtp_probe_step(
 
     match w_out.gpu_dtype {
         DType::Q8_0 => {
-            // gemm_q8_0_batched has a hard MAX_BATCH=64 (speculative.rs
-            // Q8_LM_MAX); probe's n <= MTP_PROBE_MAX_BATCH = 3 always
-            // satisfies this. If MTP_PROBE_MAX_BATCH grows past 64, copy the
-            // chunking loop from verify_dflash_block_inner. Do NOT route
+            // Scalar F32 Q8 GEMM chunked at its 64-row cap. Do NOT route
             // through gemm_qkv_q8_0_wmma — would break greedy-parity with
             // GEMV.
-            gpu.gemm_q8_0_batched(
+            gpu.gemm_q8_0_batched_f32_chunked(
                 &w_out.buf,
                 &final_hidden_view,
                 &logits_batch,
@@ -445,6 +442,10 @@ fn embed_lookup_to_scratch(
         // kept defensively in case it lands later — verify call convention then.
         EmbeddingFormat::Q4K => gpu.embedding_lookup_q4k(&weights.token_embd, out, token, dim),
         EmbeddingFormat::F32 => gpu.embedding_lookup(&weights.token_embd, out, token, dim),
+        EmbeddingFormat::Ggml(_) => Err(hip_bridge::HipError::new(
+            0,
+            "GGUF-native embedding tables are served by the dense qwen35 decode/prefill route only",
+        )),
     }
 }
 

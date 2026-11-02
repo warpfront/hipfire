@@ -35,7 +35,8 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
     const int*                __restrict__ sorted_slot_index,  // [m_total]
     const _Float16*           __restrict__ X_src,              // [n_rows × K]
     float*                    __restrict__ Y_grouped,          // [m_total × M]
-    int M, int K, int x_row_div, int m_total
+    int M, int K, int x_row_div, int m_total,
+    int n_experts
 ) {
     const int block_m = blockIdx.x * M_TILE;
     const int n_tiles = (m_total + 15) / 16;
@@ -43,8 +44,12 @@ extern "C" __global__ void gemm_mq2g256_lloyd_moe_grouped_wmma_4w_k2_n32(
     const int tile1   = tile0 + 1;
     if (block_m >= M || tile0 >= n_tiles) return;
 
-    const int e0 = expert_tile_ids[tile0];
-    const int e1 = (tile1 < n_tiles) ? expert_tile_ids[tile1] : -1;
+    // Out-of-range expert ids (non-finite router rows) are treated as the -1 sentinel
+    // before any expert_weight_ptrs index.
+    const int raw0 = expert_tile_ids[tile0];
+    const int raw1 = (tile1 < n_tiles) ? expert_tile_ids[tile1] : -1;
+    const int e0 = (raw0 >= 0 && raw0 < n_experts) ? raw0 : -1;
+    const int e1 = (raw1 >= 0 && raw1 < n_experts) ? raw1 : -1;
     if (e0 < 0 && e1 < 0) return;
     const bool same = (e0 >= 0) && (e0 == e1);
 

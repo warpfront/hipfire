@@ -18,7 +18,7 @@
 //!
 //! Status: the trait, the unified [`SpecStep`] result, and the borrowed-target /
 //! erased-grammar interfaces are live. The daemon's DFlash decode loop drives a
-//! `&mut dyn Speculator` (`examples/daemon.rs::generate_dflash`), with the
+//! `&mut dyn Speculator` (`hipfire-daemon/src/main.rs::generate_dflash`), with the
 //! loader's `DflashSpeculator` as the sole impl. Still future work: a generic
 //! `build_speculator` registry (dispatch on arch/draft kind) and additional
 //! drafters (n-gram, MTP, EAGLE) — the AR one-token path still runs through
@@ -112,6 +112,18 @@ impl SpecStep {
     }
 }
 
+/// Tokens that must be re-forwarded after restoring a speculative window's
+/// pre-verify snapshot. The final consumed token remains pending and is
+/// committed by the caller's ordinary terminal flush.
+pub fn terminal_prefix_replay(window_seed: u32, consumed: &[u32]) -> SmallVec<[u32; 8]> {
+    let mut replay = SmallVec::with_capacity(consumed.len());
+    if !consumed.is_empty() {
+        replay.push(window_seed);
+        replay.extend_from_slice(&consumed[..consumed.len() - 1]);
+    }
+    replay
+}
+
 /// Outcome of the shared greedy accept-prefix rule ([`accept_greedy_prefix`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GreedyAccept {
@@ -199,6 +211,16 @@ pub trait SpecTarget {
     /// so production rollback can attest `rolled_back:false`.
     fn reset_recurrent(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 
+    /// Discard live decode state after a terminal stop inside a speculative
+    /// window that [`Speculator::repair_terminal_prefix`] could not repair.
+    /// The caller drops its host history and never extends this state; the
+    /// next request prefills anew. Default: [`Self::reset_recurrent`]. A
+    /// target whose prompt cache is a durable checkpoint that live decode
+    /// rows never overwrite may rewind to it instead, so it survives the stop.
+    fn reset_after_unrepaired_terminal(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset_recurrent(gpu)
+    }
+
     /// Whether this target's architecture reset-core is complete enough for
     /// serve-hardening retry. Default `false` (explicitly ineligible). Retry
     /// candidates override to `true` only when recurrent/EF/KV/cache/graph/
@@ -206,6 +228,14 @@ pub trait SpecTarget {
     fn retry_reset_eligible(&self) -> bool {
         false
     }
+
+    /// One-shot advisory for the next session begin (the following
+    /// [`Speculator::prefill`]): this request will write state rows at most
+    /// up to absolute position `through`, including speculative rows. A target
+    /// that parks side state may use it to bound that parking before prefill.
+    /// It is not validation and never rejects a request; the limit applies to
+    /// the next begin only. Default: no-op.
+    fn session_request_write_limit(&mut self, _through: usize) {}
 
     // ── Arch-generic speculation primitives ─────────────────────────────────
     //
@@ -233,8 +263,8 @@ pub trait SpecTarget {
     /// from the current state (cache-hit suffix, or the partial-accept replay).
     ///
     /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
-    /// the target appends, per processed position, the concat of residual hidden
-    /// at `layers` (`layers.len() × dim` f32/row) to the provided `Vec`. Ignored
+    /// the target appends, per processed position, the capture of the residual hidden
+    /// at `layers` (`layers.len() × dflash_streams_per_layer() × dim` f32/row) to the provided `Vec`. Ignored
     /// (no-op) when `None` or when `dflash_extract_layers()` returns `None`.
     fn spec_advance(
         &mut self,
@@ -258,8 +288,8 @@ pub trait SpecTarget {
     /// snapshot nothing.
     ///
     /// `hidden_out`: when `Some` and `dflash_extract_layers()` is `Some(layers)`,
-    /// the target appends, per processed position, the concat of residual hidden
-    /// at `layers` (`layers.len() × dim` f32/row). Ignored when `None` or when
+    /// the target appends, per processed position, the capture of the residual hidden
+    /// at `layers` (`layers.len() × dflash_streams_per_layer() × dim` f32/row). Ignored when `None` or when
     /// `dflash_extract_layers()` returns `None`.
     fn verify_block(
         &mut self,
@@ -324,6 +354,21 @@ pub trait SpecTarget {
     /// The target's usable context capacity (decode-loop overflow guard).
     fn ctx_capacity(&self) -> usize;
 
+    /// Once per request, after the speculator's prefill and before the first
+    /// decode window: map the target's context-growing state ahead for a
+    /// decode from `position` that may emit `remaining_new_tokens` more
+    /// tokens, with windows writing up to `max_draft_rows` rows past the
+    /// seed. Best effort (implementations log and swallow failure); default
+    /// no-op, as [`crate::arch_model::ArchModel::map_ahead_for_decode`].
+    fn map_ahead_for_decode(
+        &mut self,
+        _gpu: &mut Gpu,
+        _position: usize,
+        _remaining_new_tokens: usize,
+        _max_draft_rows: usize,
+    ) {
+    }
+
     /// The target's KV cache, for the daemon's FlashCASK eviction — but ONLY for
     /// arches that store KV in the shared [`crate::llama::KvCache`] (qwen35
     /// `ModelSlot`, llama `LlamaBundle`). Arches with their own KV representation
@@ -348,12 +393,24 @@ pub trait SpecTarget {
 
     /// The layer indices whose residual hidden states the drafter wants captured,
     /// in order. When `Some(layers)`, the target should, on each processed
-    /// position, append `layers.len() × dim` f32 values to the `hidden_out` sink
+    /// position, append `layers.len() × dflash_streams_per_layer() × dim` f32 values to the `hidden_out` sink
     /// passed to [`spec_advance`](Self::spec_advance) / [`verify_block`](Self::verify_block).
     ///
     /// `None` (default) means this target cannot feed a hidden-conditioned drafter.
     fn dflash_extract_layers(&self) -> Option<&[usize]> {
         None
+    }
+
+    /// Hidden rows the target captures per extract layer per position (default
+    /// 1: one `dim`-wide residual row per layer; a target whose residual has
+    /// several streams either averages them down to 1 or exposes all of them).
+    /// A feature row is `layers.len() × dflash_streams_per_layer() × dim` F32,
+    /// layer-major in [`set_dflash_extract_layers`](Self::set_dflash_extract_layers)
+    /// order, then stream-major, then hidden. A hidden-conditioned drafter
+    /// refuses a target whose value differs from its own
+    /// `target_streams_per_layer`.
+    fn dflash_streams_per_layer(&self) -> usize {
+        1
     }
 
     /// Apply the target's lm_head to `n` rows of residual hidden states
@@ -367,6 +424,18 @@ pub trait SpecTarget {
         _n: usize,
     ) -> Result<Vec<f32>, String> {
         Err("target does not expose lm_head over hidden".into())
+    }
+
+    /// [`lm_head_logits`](Self::lm_head_logits) left on the device: a
+    /// non-owning `[n, vocab]` F32 view of the target's logit scratch, valid
+    /// until the target's next forward or head call. Returns `Err` by default.
+    fn lm_head_logits_device(
+        &mut self,
+        _gpu: &mut Gpu,
+        _hidden_rows: &GpuTensor,
+        _n: usize,
+    ) -> Result<GpuTensor, String> {
+        Err("target does not expose a device lm_head over hidden".into())
     }
 
     /// Like [`verify_block`](Self::verify_block), but returns the FULL per-position
@@ -392,10 +461,63 @@ pub trait SpecTarget {
         Err("target does not expose verify_block_logits".into())
     }
 
+    /// One committed target row: feed `token` at `position` (a drafter's
+    /// one-row step, whose row is always kept), capture its feature row into
+    /// `hidden_out` as [`verify_block`](Self::verify_block) does, and return
+    /// its argmax, or its full logits when `want_logits`. Leaves the target at
+    /// `position + 1` with no verify outstanding. Since nothing is rolled back,
+    /// a target may skip the snapshot a verify takes; on `Err` the target
+    /// state is then undefined and the caller resets it (as it does on any
+    /// failed spec step). Default: a one-row verify plus
+    /// [`commit_prefix`](Self::commit_prefix).
+    fn commit_row(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        want_logits: bool,
+    ) -> Result<RowPick, String> {
+        let block = [token];
+        let pick = if want_logits {
+            RowPick::Logits(self.verify_block_logits(gpu, &block, position, scratch, hidden_out)?)
+        } else {
+            let picks = self.verify_block(gpu, &block, position, scratch, hidden_out)?;
+            RowPick::Argmax(*picks.first().ok_or("verify returned no pick")?)
+        };
+        self.commit_prefix(gpu, &block, 0, position, scratch)?;
+        Ok(pick)
+    }
+
+    /// [`commit_row`](Self::commit_row) with `want_logits`, into caller-owned
+    /// storage: `logits` is replaced by the row's full logits, reusing its
+    /// allocation, and the feature row is appended to `hidden_out`, which a
+    /// drafter may point straight at its own feature log. A target that can
+    /// enqueue both readbacks and wait once overrides it. Default: the
+    /// allocating [`commit_row`](Self::commit_row).
+    fn commit_row_logits(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        position: usize,
+        scratch: &mut dyn SpecScratch,
+        hidden_out: Option<&mut Vec<f32>>,
+        logits: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        match self.commit_row(gpu, token, position, scratch, hidden_out, true)? {
+            RowPick::Logits(row) => {
+                *logits = row;
+                Ok(())
+            }
+            RowPick::Argmax(_) => Err("commit_row returned an argmax for a logits request".into()),
+        }
+    }
+
     /// Like [`verify_block`](Self::verify_block), but captures the per-position
     /// extract-layer residual hidden into the caller-owned GPU buffer
     /// `hidden_gpu` (position-major `[n_pos × dflash_extract_layers().len() ×
-    /// dim]` F32) instead of a host `Vec` — keeping the DSpark accepted-prefix-
+    /// dflash_streams_per_layer() × dim]` F32) instead of a host `Vec` — keeping the DSpark accepted-prefix-
     /// hidden reuse entirely on-device (no D2H+H2D per window; ~free on UMA, a
     /// real saving on a discrete-VRAM GPU).
     ///
@@ -404,7 +526,7 @@ pub trait SpecTarget {
     /// whose batched capture path can't run for this block (e.g. llama with
     /// `block.len() < 4`) returns `false` and leaves `hidden_gpu` untouched, and
     /// the caller re-bootstraps the next window. `hidden_gpu` must be
-    /// `≥ block.len() × dflash_extract_layers().len() × dim` F32.
+    /// `≥ block.len() × dflash_extract_layers().len() × dflash_streams_per_layer() × dim` F32.
     ///
     /// Same snapshot/advance contract as [`verify_block`](Self::verify_block).
     /// Returns `Err` by default (target has no GPU-resident hidden capture).
@@ -493,6 +615,55 @@ pub trait SpecTarget {
     /// stays `None`).
     fn set_dflash_extract_layers(&mut self, _layers: Vec<usize>) {}
 
+    /// The drafter reads only the last `rows` rows of the `hidden_out` sink
+    /// of [`spec_advance`](Self::spec_advance): the target may drop leading
+    /// rows of the sink while it appends, keeping at least `rows` (the drafter
+    /// re-derives its base from the end position). Default: keep every row.
+    fn set_dflash_feature_window(&mut self, _rows: usize) {}
+
+    /// The measured spec → AR break-even line of a DFlash2 drafter on this
+    /// target and device (`draft_quantized`: the draft carries MQ weights),
+    /// in AR decode steps per spec cycle ([`crate::spec_retire::BreakEven`]).
+    /// `Some` also arms the drafter's AR step, so a request whose drafts do
+    /// not pay continues as plain AR. Default `None`: no measured line, the
+    /// drafter never retires.
+    fn dflash_retire_break_even(
+        &self,
+        _gpu: &Gpu,
+        _draft_quantized: bool,
+    ) -> Option<crate::spec_retire::BreakEven> {
+        None
+    }
+
+    /// Roll back a verify whose window will not reach
+    /// [`commit_prefix`](Self::commit_prefix) (the drafter failed after the
+    /// verify ran): restore whatever the verify snapshotted into `scratch`.
+    /// A no-op when no verify is outstanding. Default: nothing to restore.
+    fn abandon_verify(
+        &mut self,
+        _gpu: &mut Gpu,
+        _scratch: &mut dyn SpecScratch,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Roll the target back to the start `position` of the window the last
+    /// [`commit_prefix`](Self::commit_prefix) committed and re-run `replay`,
+    /// a prefix of that window's committed tokens (a terminal stop inside
+    /// the window, [`Speculator::repair_terminal_prefix`]). Valid only
+    /// before the next verify, advance or reset. `Ok(false)`: no window is
+    /// retained or it does not match; the target is unchanged. Default:
+    /// nothing retained.
+    fn repair_committed_prefix(
+        &mut self,
+        _gpu: &mut Gpu,
+        _scratch: &mut dyn SpecScratch,
+        _position: usize,
+        _replay: &[u32],
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Capture the target's residual hidden states at `layers` for a freshly-
     /// committed `seed` token at absolute `position`, returning the concatenated
     /// `[layers.len() * hidden]` F32 vector (the DSpark `main_hidden`).
@@ -566,6 +737,18 @@ pub trait SpecScratch {
     /// `DeviceBuffer` have no `Drop` in this codebase — a bare `drop` of the box
     /// would orphan device memory. Called from the speculator's `free`.
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// Forget per-window state that names target state a reset discarded
+    /// (an outstanding verify ticket). Default: nothing to forget.
+    fn clear(&mut self) {}
+}
+
+/// Outcome of [`SpecTarget::commit_row`]: the row's argmax, or its full
+/// `vocab` logits.
+#[derive(Debug, Clone)]
+pub enum RowPick {
+    Argmax(u32),
+    Logits(Vec<f32>),
 }
 
 /// Outcome of [`SpecTarget::spec_advance`].
@@ -606,16 +789,27 @@ pub trait SpecGrammar {
 }
 
 /// Outcome of [`Speculator::prefill`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PrefillOutcome {
     /// Prompt prefilled; `first_token` is the target's next-token draw at the
     /// last prompt position (the seed for the first decode window). At temp≈0
     /// this is the historical argmax; at temp>0 a sampling-capable speculator
-    /// MUST draw from the target distribution configured via [`Speculator::set_sampling`].
+    /// MUST draw from the target distribution configured via [`Speculator::configure_request`].
     Ready { first_token: u32 },
     /// Client cancelled mid-prefill. The caller resets conversation state and
     /// emits the aborted/done events; the slot guard restores the target bundle.
     Aborted,
+}
+
+impl PrefillOutcome {
+    /// The seed of a prefill whose caller never aborts (oracles, tests);
+    /// an abort there is an error.
+    pub fn into_first_token(self) -> Result<u32, String> {
+        match self {
+            PrefillOutcome::Ready { first_token } => Ok(first_token),
+            PrefillOutcome::Aborted => Err("prefill aborted".into()),
+        }
+    }
 }
 
 /// Eviction-retain descriptor for [`Speculator::on_evict`] — lets the drafter
@@ -672,8 +866,20 @@ pub trait Speculator {
     /// daemon may route temp>0 requests through it for the spec speedup). Default
     /// `false` — greedy-only drafters (n-gram, chain DFlash, MTP) keep temp>0 on
     /// the AR sampler. The qwen35 DFlash ddtree path overrides this to `true`
-    /// (its SWOR verify samples the target distribution exactly).
+    /// (its SWOR verify samples the target distribution exactly). DFlash2
+    /// selector-chain also returns `true` here, but route selection must consult
+    /// [`Self::supports_chain_nucleus_verify`] to allow user-explicit top_p/top_k
+    /// (SWOR is temperature-only; selector-chain nucleus is not).
     fn supports_temp_verify(&self) -> bool {
+        false
+    }
+
+    /// Whether chain-mode verify faithfully applies user-explicit top_p/top_k
+    /// nucleus sampling (DFlash2 candidate-selector rejection sampling).
+    /// Distinct from [`Self::supports_temp_verify`]: that flag is also true for
+    /// DDTree SWOR, which honors temperature only and must refuse non-temperature
+    /// controls at the route gate. Default `false`.
+    fn supports_chain_nucleus_verify(&self) -> bool {
         false
     }
 
@@ -751,6 +957,85 @@ pub trait Speculator {
         Ok(false)
     }
 
+    /// Whether [`Self::ar_step`] is implemented. The spec-retire policy
+    /// ([`crate::spec_retire`]) only arms for speculators that can continue a
+    /// request as plain AR.
+    fn supports_ar_step(&self) -> bool {
+        false
+    }
+
+    /// One target-only token for a request the spec-retire policy retired:
+    /// feed `seed` at absolute `position` through the target, keep
+    /// drafter-local per-position state in sync (a later request that hits
+    /// this prompt cache drafts from those rows), and return the next token:
+    /// the target's argmax, or for a sampled request on a speculator with
+    /// [`Self::supports_sampled_ar_step`] a draw from the request's sampling
+    /// law. No draft runs. `emitted` is the committed generation so far with
+    /// the pending `seed` last, as [`Self::step`] receives it: the penalty
+    /// history of a speculator that [`Self::supports_penalties`].
+    fn ar_step(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        emitted: &[u32],
+    ) -> Result<u32, String> {
+        let _ = (gpu, target, position, seed, emitted);
+        Err(format!("{}: speculator has no AR step", self.name()))
+    }
+
+    /// Whether this speculator reproduces AR under non-neutral
+    /// repeat/presence/frequency penalties: every verify row (and the AR
+    /// step) is penalized against `suffix_W(history || emitted || earlier
+    /// drafts)` with AR's own arithmetic, `history` being the prompt unless
+    /// [`SpecRequestConfig::penalty_generated_only`]. Route selection admits
+    /// a penalized request to a speculator only when this is `true`.
+    /// Default `false`: the speculator refuses or ignores penalties.
+    fn supports_penalties(&self) -> bool {
+        false
+    }
+
+    /// Whether [`Self::ar_step`] samples a temperature > 0 request with the
+    /// request's own law (so the spec-retire policy may retire a sampled
+    /// request). Default: greedy AR steps only.
+    fn supports_sampled_ar_step(&self) -> bool {
+        false
+    }
+
+    /// The drafter's measured spec → AR break-even line for this target
+    /// ([`crate::spec_retire::BreakEven`]; `HIPFIRE_SPEC_RETIRE` overrides it).
+    /// `None`: the shared [`crate::spec_retire::DEFAULT_BREAK_EVEN`].
+    fn retire_break_even(&self) -> Option<crate::spec_retire::BreakEven> {
+        None
+    }
+
+    /// Repair a terminal that consumed only a strict prefix of the most recent
+    /// speculative window. Implementations with a retained pre-window snapshot
+    /// restore it and replay only the state-committable prefix, leaving the last
+    /// consumed token pending for the caller's normal terminal flush.
+    ///
+    /// Returns `true` when the resident target and drafter caches are repaired.
+    /// The default is unsupported; callers retain the conservative reset path.
+    ///
+    /// Call it right after observing the window, before any further `step`,
+    /// forced advance, prefill, reset or [`Self::configure_request`] on this
+    /// speculator: an implementation that retains pre-window state (Qwen4
+    /// native MTP) releases it at the next such call. `false` also means "no
+    /// retained window" (see [`SpecRequestConfig::stop_sequences`]), not only
+    /// "unsupported".
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        let _ = (gpu, target, window_start, window_seed, consumed);
+        Ok(false)
+    }
+
     /// Rewind drafter-LOCAL state for a fresh conversation. The target's KV /
     /// recurrent state is the daemon's concern (it owns the bundle); this clears
     /// only the drafter's own scratch + checkpoint ring.
@@ -758,6 +1043,13 @@ pub trait Speculator {
     /// Returns `Err` when any HIP free/memset that must succeed for a clean
     /// drafter fails so production rollback can attest `rolled_back:false`.
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
+
+    /// Rewind drafter-local GPU state for an intra-request strict-prefix
+    /// realignment. Request-local policy and telemetry must survive. Stateless
+    /// and non-MTP speculators use the ordinary full reset by default.
+    fn reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.reset(gpu)
+    }
 
     /// Live post-reset evidence for serve-fault-inject snapshots.
     ///
@@ -808,10 +1100,26 @@ pub trait Speculator {
         Vec::new()
     }
 
+    /// Whether the drafter can continue a target restored or continued live
+    /// at `start` of `prompt` (a prompt-cache hit). Default `true`. The Qwen4
+    /// session planner prefills cold when it cannot.
+    fn can_resume_at(&self, _prompt: &[u32], _start: usize) -> bool {
+        true
+    }
+
     /// Release all GPU buffers the drafter owns. Called from `unload_model`,
     /// so a drafter that forgets to free is a missing-trait-method compile
     /// error rather than a silent VRAM leak.
     fn free(self: Box<Self>, gpu: &mut Gpu);
+
+    /// [`Self::free`] for a mesh unload: a dense-TP drafter owns per-rank
+    /// buffers the daemon's single `Gpu` cannot reach.
+    fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            self.free(dev);
+        }
+    }
 
     /// Whether this drafter requires greedy verification (temperature 0).
     /// A greedy-only drafter (n-gram chain, the MTP-via-`Speculator` wrapper)
@@ -825,25 +1133,224 @@ pub trait Speculator {
     }
 
     /// Configure per-request sampling for the next acceptance window(s). Called
-    /// by the daemon's spec wrapper (`generate_dflash`) once before the step
-    /// loop, threading the request's resolved temp/top_p/top_k/cactus down to
-    /// the drafter. Default no-op: a greedy-only drafter ignores it and keeps
-    /// decoding at argmax. A sampling-capable drafter (DFlash) stores these and
-    /// applies the IDENTICAL (top_k,top_p) nucleus truncation to draft + target
-    /// inside `step` (lossless == AR-at-(top_k,top_p)). `temp <= 0` ⇒ greedy.
-    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
+    /// by the daemon's spec wrapper once before the step loop, threading the
+    /// request's resolved [`SpecRequestConfig`] down to the drafter. Default
+    /// no-op: a greedy-only drafter ignores it and keeps decoding at argmax. A
+    /// sampling-capable drafter stores the config and applies the IDENTICAL
+    /// (top_k, top_p, min_p, …) truncation to draft + target inside `step`
+    /// (lossless == AR at the same nucleus). `temp <= 0` ⇒ greedy.
+    fn configure_request(&mut self, _cfg: SpecRequestConfig) {}
+
+    /// Per-request MTP+ngram counters for the wire done event. Default empty
+    /// (all zeros / false) for non-MTP drafters.
+    fn request_stats(&self) -> MtpRequestStats {
+        MtpRequestStats::default()
+    }
+    /// Prove no retained speculative IB is in flight before model free.
+    /// Default no-op. Drafters that own a retained-PM4 route override this and
+    /// return `Err` when quiescence is unknown — the unload path must then
+    /// refuse to free any pointer the route may still name.
+    fn quiesce(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Route-proof JSON for a retained-PM4 verify path, when present.
+    /// Default `None` for drafters without a retained route.
+    fn verify_pm4_report(&self) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// The concrete drafter, for an arch-owned hand-off of its live state
+    /// (continuous-batching promotion of a running request). Default `None`.
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        None
+    }
+
+    /// The raw target logit row (full vocabulary, before penalties and
+    /// truncation) that produced token `index` of the most recent emission:
+    /// index 0 is the prefill's first token right after [`Self::prefill`],
+    /// otherwise `index` indexes the last [`Self::step`]'s `emit`. Rows are
+    /// kept only for a request configured with
+    /// [`SpecRequestConfig::logprobs`]. Default `None`.
+    fn token_logits(&self, _index: usize) -> Option<&[f32]> {
+        None
+    }
 }
 
 // ─── Multi-token-prediction (MTP) drafter core ──────────────────────────────
 //
 // Every MTP drafter (qwen35 MTP head, deepseek4 MTP layer) shares one shape: a
 // prompt prefill that primes the arch's MTP history + recurrent/KV state and
-// returns a greedy seed, then a per-window draft+verify+accept step returning
-// the committed tail (accepted prefix + bonus, seed excluded). The arches differ
-// only in the fused kernels they run — that difference is [`MtpDrafter`], and
-// [`MtpSpeculator`] adapts any `MtpDrafter` to the generic [`Speculator`]
-// interface (prefill→`PrefillOutcome`, window→`SpecStep`) ONCE, so a new MTP arch
+// returns the first-token seed (argmax when greedy; sampled when configured),
+// then a per-window draft+verify+accept step returning the committed tail
+// (accepted prefix + bonus, seed excluded). The arches differ only in the fused
+// kernels they run — that difference is [`MtpDrafter`], and [`MtpSpeculator`]
+// adapts any `MtpDrafter` to the generic [`Speculator`] interface
+// (prefill→`PrefillOutcome`, window→`SpecStep`) ONCE, so a new MTP arch
 // implements only `MtpDrafter` (+ `SpecTarget`), never a whole `Speculator`.
+
+/// Per-request sampling / draft-control contract for speculative decode.
+///
+/// Built once by the daemon (or harness) and installed via
+/// [`Speculator::configure_request`] before the acceptance-window loop. Generic
+/// MTP configures its drafter from this exactly once per request — never
+/// re-stashes positional sampling args on every step.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpecRequestConfig {
+    /// Sampling temperature. `temp <= 0` ⇒ greedy (argmax) verify/draft.
+    pub temp: f32,
+    /// Nucleus (top-p) mass. `1.0` disables nucleus truncation.
+    pub top_p: f32,
+    /// Request top-k as sent; `None` = absent. The host AR sampler
+    /// distinguishes absent (20 candidates) from `Some(0)` (its 64-wide
+    /// pool); verifiers that reproduce it take [`Self::ar_candidate_cap`],
+    /// the remaining chain verifiers [`Self::top_k_cut`].
+    pub top_k: Option<u32>,
+    /// Min-p truncation floor. `0.0` disables.
+    pub min_p: f32,
+    /// CACTUS acceptance-boost δ. `0.0` = lossless rejection sampling.
+    pub cactus_delta: f32,
+    /// Fixed RNG seed for the request's sampling stream.
+    pub rng_seed: u64,
+    /// When true, allow n-gram draft modifiers that touch the proposal stream.
+    pub allow_ngram_modifier: bool,
+    /// Recency-weighted repeat penalty (`llama::apply_repeat_penalty`).
+    /// `1.0` = off.
+    pub repeat_penalty: f32,
+    /// Trailing tokens of the request history the three penalties see.
+    /// `0` disables all of them.
+    pub repeat_window: usize,
+    /// OpenAI presence penalty over the window. `0.0` = off.
+    pub presence_penalty: f32,
+    /// OpenAI frequency penalty over the window. `0.0` = off.
+    pub frequency_penalty: f32,
+    /// The request can end inside a speculative window on a stop sequence,
+    /// which no draft-side signal predicts. A speculator whose cheapest
+    /// windows commit rows one at a time (Qwen4's interleaved MTP routes)
+    /// keeps pre-window state only when this is set, so
+    /// [`Speculator::repair_terminal_prefix`] can still repair such a stop;
+    /// windows that already snapshot for their own rollback retain it
+    /// regardless. A caller sets it from `!stop.is_empty()`; the default is
+    /// `false`, which keeps those windows snapshot-free.
+    pub stop_sequences: bool,
+    /// The request asked for logprobs: a speculator that implements
+    /// [`Speculator::token_logits`] keeps the target logit row behind each
+    /// emitted token. Default `false`, which keeps no rows.
+    pub logprobs: bool,
+    /// The three penalties see the generated tokens only, not the rendered
+    /// prompt (Raon's AR producer: `penalty_generated_only`). Default `false`:
+    /// every other producer penalizes `prompt ‖ generated`. Read by the
+    /// speculators that own a [`crate::spec_sampling::PenaltyHistory`]; they
+    /// seed it with an empty prompt when set.
+    pub penalty_generated_only: bool,
+}
+
+impl Default for SpecRequestConfig {
+    /// Conservative greedy defaults: open nucleus, no top-k/min-p/CACTUS, fixed
+    /// Qwen request seed `0x13579BDF`, n-gram modifier off.
+    fn default() -> Self {
+        Self {
+            temp: 0.0,
+            top_p: 1.0,
+            top_k: None,
+            min_p: 0.0,
+            cactus_delta: 0.0,
+            rng_seed: 0x1357_9BDF,
+            allow_ngram_modifier: false,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            stop_sequences: false,
+            logprobs: false,
+            penalty_generated_only: false,
+        }
+    }
+}
+
+impl SpecRequestConfig {
+    /// Top-k truncation for verifiers where `0` disables it: absent and
+    /// `Some(0)` both disable.
+    pub fn top_k_cut(&self) -> usize {
+        self.top_k.map_or(0, |k| k as usize)
+    }
+
+    /// The AR sampler's candidate cap for this request
+    /// ([`crate::llama::ar_candidate_cap`]): absent → 20, `Some(0)` → 64,
+    /// `Some(k)` → `min(k, 64)`. Never 0, so a verifier taking it as its
+    /// top-k always truncates to AR's pool.
+    pub fn ar_candidate_cap(&self) -> usize {
+        crate::llama::ar_candidate_cap(self.top_k)
+    }
+
+    /// Whether the request's penalties move the target distribution: the
+    /// exact predicate `sampler::sample_cpu` (and the GPU sampler) applies.
+    /// A penalty-capable verifier reproduces AR only if every verify row
+    /// is penalized against `suffix_W(prompt || emitted || earlier drafts)`
+    /// — the full rendered prompt included, not the generated ids alone —
+    /// unless [`Self::penalty_generated_only`] drops the prompt.
+    pub fn penalties_active(&self) -> bool {
+        self.repeat_window > 0
+            && (self.repeat_penalty != 1.0
+                || self.presence_penalty > 0.0
+                || self.frequency_penalty > 0.0)
+    }
+
+    /// The window a penalty history must keep: `repeat_window` when
+    /// [`Self::penalties_active`], else `0` (no history work at all).
+    pub fn penalty_window(&self) -> usize {
+        if self.penalties_active() {
+            self.repeat_window
+        } else {
+            0
+        }
+    }
+}
+
+/// Map a request's wire seed onto the speculator RNG state. `0` maps to the
+/// historical `0x13579BDF` sentinel because xorshift state 0 is stuck; every
+/// other seed passes through verbatim so an explicit seed reproduces its draw
+/// sequence exactly. Shared by every `Speculator::configure_request` impl that
+/// owns an xorshift stream (generic DFlash, DSpark, n-gram).
+pub fn request_rng_state(rng_seed: u64) -> u64 {
+    if rng_seed == 0 {
+        0x1357_9BDF
+    } else {
+        rng_seed
+    }
+}
+
+/// Typed MTP and ngram-mod counters surfaced on the wire done event.
+///
+/// Populated by the Qwen MTP drafter. Ngram-mod counters remain zero unless
+/// `HIPFIRE_MTP_NGRAM` composition is armed for the request. Accept-rate is
+/// `accepted/drafts` rounded to three decimals when drafts > 0.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct MtpRequestStats {
+    /// True when n-gram-mod composition was armed for this request.
+    pub mtp_ngram: bool,
+    /// Windows that used external n-gram candidates (takeover path).
+    pub ngram_mod_windows: usize,
+    /// Sum of n-gram draft lengths offered across those windows.
+    pub ngram_mod_drafts: usize,
+    /// Sum of n-gram drafts accepted across those windows.
+    pub ngram_mod_accepted: usize,
+    /// `ngram_mod_accepted / ngram_mod_drafts` (0 when no drafts), 3-dp.
+    pub ngram_mod_accept_rate: f64,
+    /// Native MTP windows (every n-gram miss, or plain MTP).
+    pub mtp_windows: usize,
+    /// Of `mtp_windows`, the target-only tokens the native Qwen4 AR floor
+    /// timed before any retirement: the request's calibration token and the
+    /// AR probes of a would-be retirement. They draft nothing.
+    pub floor_ar_windows: usize,
+    /// Target-only (`k=0`) windows after sticky native Qwen4 floor retirement.
+    /// Qwen35 MTP does not retire after an n-gram accept because the takeover
+    /// fills the head KV.
+    pub ar_windows: usize,
+    /// Sticky native Qwen4 retirement to target-only decoding for this request.
+    /// Qwen35 MTP does not retire because takeovers fill the head KV.
+    pub mtp_retired: bool,
+}
 
 /// One acceptance window's committed tokens: the accepted draft prefix plus the
 /// verifier's bonus, EXCLUDING the seed. Identical in meaning to qwen35's
@@ -866,26 +1373,34 @@ pub struct MtpWindow {
 /// (prefill outcome, window→step lowering, position/seed advance) lives once in
 /// [`MtpSpeculator`].
 pub trait MtpDrafter {
-    /// Prefill `fill_tokens` from absolute `start_pos`: advance the target's
-    /// KV/recurrent state AND the MTP head's position-aligned cache, returning
-    /// the greedy seed (argmax at the last prefilled position). `cache_hit=false`
-    /// ⇒ cold start (reset recurrent + MTP cache first); `true` ⇒ warm suffix
-    /// extension (preserve prior state).
+    /// Prefill from absolute `start_pos`: advance the target's KV/recurrent
+    /// state AND the MTP head's position-aligned cache, returning the first-token
+    /// seed (argmax when greedy; drawn from the configured target distribution
+    /// when sampling-capable). `prompt_tokens` is the full rendered prompt;
+    /// `fill_tokens` is the slice actually advanced this call (warm suffix on
+    /// cache hit, full prompt on miss). `cache_hit=false` ⇒ cold start (reset
+    /// recurrent + MTP cache first); `true` ⇒ warm suffix extension (preserve
+    /// prior state). A client abort polled through `abort` is
+    /// `Ok(PrefillOutcome::Aborted)`, never `Err`: errors are real failures.
     fn mtp_prefill(
         &mut self,
         gpu: &mut Gpu,
         target: &mut dyn SpecTarget,
+        prompt_tokens: &[u32],
         fill_tokens: &[u32],
         start_pos: usize,
         cache_hit: bool,
-    ) -> Result<u32, String>;
+        abort: &dyn Fn() -> bool,
+    ) -> Result<PrefillOutcome, String>;
 
     /// One acceptance window: seed at absolute `position`; draft up to `k`,
-    /// verify, greedily accept the longest matching prefix + bonus. `k` is the
-    /// per-call draft budget from [`MtpSpeculator::step`] (already clamped by
-    /// remaining `max_emit`); implementations MUST honor it and MUST NOT draft
-    /// or commit more than `k` candidates (emit ≤ k+1 including bonus). `k == 0`
-    /// means verify `[seed]` only and emit the single bonus token.
+    /// verify, accept the longest matching prefix + bonus under the installed
+    /// [`SpecRequestConfig`]. `emitted` is the prior committed token stream
+    /// (repeat-penalty / n-gram context). `k` is the per-call draft budget from
+    /// [`MtpSpeculator::step`] (already clamped by remaining `max_emit` and
+    /// [`Self::proposal_capacity`]); implementations MUST honor it and MUST NOT
+    /// draft or commit more than `k` candidates (emit ≤ k+1 including bonus).
+    /// `k == 0` means verify `[seed]` only and emit the single bonus token.
     /// `grammar` is the IN-STEP grammar (deepseek4 masks draft+verify logits
     /// with it; qwen35 ignores it and relies on post-hoc grammar in the
     /// emission layer).
@@ -896,6 +1411,7 @@ pub trait MtpDrafter {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
+        emitted: &[u32],
         k: usize,
         eos: u32,
         grammar: Option<&mut dyn SpecGrammar>,
@@ -916,16 +1432,68 @@ pub trait MtpDrafter {
         Ok(false)
     }
 
+    /// Repair a terminal that retained only a strict prefix of the most recent
+    /// MTP window. Implementations with a valid pre-window snapshot restore it
+    /// and replay only the committable prefix.
+    fn mtp_repair_terminal_prefix(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+        _window_start: usize,
+        _window_seed: u32,
+        _consumed: &[u32],
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    /// Positions of MTP recurrent-state checkpoints available for a divergent
+    /// rendered-history resume.
+    fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Restore the MTP target's recurrent state to an advertised checkpoint
+    /// and discard checkpoints from the now-stale future.
+    fn mtp_rewind_to(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        Ok(position)
+    }
+
     /// Reset drafter-local state for a fresh conversation (MTP cache + any
     /// captured graphs). The target's KV/recurrent reset is the daemon's job.
     /// Returns `Err` when any HIP step required for a clean drafter fails.
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 
+    /// Reset only position-dependent MTP state during an intra-request prefix
+    /// realignment. Request-local modifier retirement and counters survive.
+    fn mtp_reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.mtp_reset(gpu)
+    }
+
     /// Release all GPU buffers the drafter owns.
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
 
+    /// [`Self::mtp_free`] for a mesh unload.
+    fn mtp_free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            self.mtp_free(dev);
+        }
+    }
+
     /// Draft window size (K).
     fn k(&self) -> usize;
+
+    /// Maximum proposal length this drafter may offer this request. Defaults to
+    /// [`Self::k`]; a sampling-capable drafter may tighten it from the installed
+    /// [`SpecRequestConfig`] without changing the structural head width.
+    fn proposal_capacity(&self) -> usize {
+        self.k()
+    }
 
     /// Target context capacity (for the loop overflow guard).
     fn ctx_capacity(&self) -> usize;
@@ -940,16 +1508,26 @@ pub trait MtpDrafter {
         "mtp"
     }
 
-    /// Stash the request sampling params for the next `mtp_step`. The
-    /// [`MtpSpeculator`] forwards `set_sampling` + the per-step `temp` here so a
-    /// temp>0-capable drafter (DSpark) can drive a sampled verify. Default no-op
-    /// (greedy-only drafters ignore it). `top_p==0` means "disabled" (→ 1.0).
-    fn set_sampling(&mut self, _temp: f32, _top_p: f32, _top_k: usize, _cactus_delta: f32) {}
+    /// Install the per-request sampling contract. [`MtpSpeculator`] forwards
+    /// [`Speculator::configure_request`] here exactly once per request so a
+    /// temp>0-capable drafter (DSpark) can drive a sampled verify. Default
+    /// no-op (greedy-only drafters ignore it).
+    fn configure_request(&mut self, _cfg: SpecRequestConfig) {}
 
     /// Whether this drafter's verify is distribution-correct at temp>0 (so the
     /// daemon may route temp>0 requests through it). Default `false`.
     fn supports_temp_verify(&self) -> bool {
         false
+    }
+
+    /// Per-request MTP+ngram counters. Default empty; Qwen MTP overrides.
+    fn request_stats(&self) -> MtpRequestStats {
+        MtpRequestStats::default()
+    }
+
+    /// [`Speculator::token_logits`] of this drafter. Default `None`.
+    fn token_logits(&self, _index: usize) -> Option<&[f32]> {
+        None
     }
 }
 
@@ -958,24 +1536,17 @@ pub trait MtpDrafter {
 /// `MtpDrafter` (+ `SpecTarget`) impl in the arch crate.
 pub struct MtpSpeculator<A: MtpDrafter> {
     arch: A,
-    /// Request sampling (top_p/top_k from `set_sampling`, temp from `step`).
-    /// Forwarded to the drafter via `arch.set_sampling` before each `mtp_step`
-    /// so a temp>0-capable drafter (DSpark) can sample its verify. `top_p==0`
-    /// means disabled; greedy drafters ignore all three.
-    top_p: f32,
-    top_k: usize,
-    /// CACTUS acceptance-boost δ (0 = lossless). Forwarded to the drafter with
-    /// top_p/top_k; only a CACTUS-capable sampled verify (deepseek4 DSpark) uses it.
-    cactus: f32,
+    /// Full per-request sampling contract installed via
+    /// [`Speculator::configure_request`] and forwarded to the drafter exactly
+    /// once. Steps consume only this stored config (no per-step reconfigure).
+    request: SpecRequestConfig,
 }
 
 impl<A: MtpDrafter> MtpSpeculator<A> {
     pub fn new(arch: A) -> Self {
         Self {
             arch,
-            top_p: 1.0,
-            top_k: 0,
-            cactus: 0.0,
+            request: SpecRequestConfig::default(),
         }
     }
 }
@@ -1006,7 +1577,7 @@ fn mtp_draft_k(arch_k: usize, max_emit: usize) -> usize {
     max_emit.saturating_sub(1).min(arch_k)
 }
 
-impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
+impl<A: MtpDrafter + 'static> Speculator for MtpSpeculator<A> {
     fn name(&self) -> &'static str {
         self.arch.name()
     }
@@ -1020,19 +1591,26 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         prefill_start: usize,
         cache_hit: bool,
         _resume_from: Option<usize>,
-        _abort: &dyn Fn() -> bool,
+        abort: &dyn Fn() -> bool,
     ) -> Result<PrefillOutcome, String> {
         // Cache hit ⇒ warm suffix prefill from `prefill_start`; miss ⇒ full
         // prefill from 0 (the drafter resets recurrent + MTP cache on miss).
+        // Forward both the full prompt and the actual fill slice so drafters
+        // that need prompt-global context (n-gram, repeat stats) stay aligned.
         let (fill_tokens, start_pos): (&[u32], usize) = if cache_hit {
             (prefill_tokens, prefill_start)
         } else {
             (prompt_tokens, 0)
         };
-        let first_token = self
-            .arch
-            .mtp_prefill(gpu, target, fill_tokens, start_pos, cache_hit)?;
-        Ok(PrefillOutcome::Ready { first_token })
+        self.arch.mtp_prefill(
+            gpu,
+            target,
+            prompt_tokens,
+            fill_tokens,
+            start_pos,
+            cache_hit,
+            abort,
+        )
     }
 
     fn step(
@@ -1041,28 +1619,25 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         target: &mut dyn SpecTarget,
         position: usize,
         seed: u32,
-        _emitted: &[u32],
+        emitted: &[u32],
         grammar: Option<&mut dyn SpecGrammar>,
-        temp: f32,
+        _temp: f32,
         max_emit: usize,
     ) -> Result<SpecStep, String> {
         // Remaining budget caps how many tokens this window may emit
         // (accepted drafts + bonus). Reject 0 before any trunk/head/KV mutation.
-        // k drafts ⇒ emit ≤ k+1; clamp k so drafts + bonus ≤ max_emit.
+        // k drafts ⇒ emit ≤ k+1; clamp k by proposal_capacity and max_emit.
         // max_emit == 1 → k = 0 → verify [seed] only, commit the single bonus.
+        // Sampling comes only from the stored SpecRequestConfig (configured once
+        // per request) — never re-forwarded here.
         if max_emit == 0 {
             return Err("MtpSpeculator: max_emit=0 (no remaining output budget)".into());
         }
-        let k = mtp_draft_k(self.arch.k(), max_emit);
+        let k = mtp_draft_k(self.arch.proposal_capacity(), max_emit);
         let eos = target.eos_token();
-        // Forward the per-step temp + the request top_p/top_k (stashed by
-        // `set_sampling`) to the drafter. Greedy-only drafters ignore it; a
-        // temp>0-capable one (DSpark) uses it to sample its verify.
-        self.arch
-            .set_sampling(temp, self.top_p, self.top_k, self.cactus);
         let window = self
             .arch
-            .mtp_step(gpu, target, position, seed, k, eos, grammar)?;
+            .mtp_step(gpu, target, position, seed, emitted, k, eos, grammar)?;
         // Pre-commit budget is authoritative; cap_emit is defensive only.
         let step = lower_mtp_window(window)?;
         debug_assert!(
@@ -1086,14 +1661,44 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
             .mtp_forced_advance(gpu, target, tokens, start_pos, abort)
     }
 
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        self.arch
+            .mtp_repair_terminal_prefix(gpu, target, window_start, window_seed, consumed)
+    }
+
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.arch.mtp_reset(gpu)
     }
 
-    fn block_size(&self) -> usize {
-        self.arch.k()
+    fn reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.arch.mtp_reset_for_realign(gpu)
     }
 
+    fn checkpoint_positions(&self) -> Vec<usize> {
+        self.arch.mtp_checkpoint_positions()
+    }
+
+    fn rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        self.arch.mtp_rewind_to(gpu, target, position)
+    }
+
+    fn block_size(&self) -> usize {
+        // Context admission must track the live proposal ceiling (ngram n_max
+        // when armed), not the structural MTP head width alone.
+        self.arch.proposal_capacity()
+    }
     fn ctx_capacity(&self) -> usize {
         self.arch.ctx_capacity()
     }
@@ -1101,6 +1706,14 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         // Move the drafter out of the box and hand it its own boxed-self free.
         Box::new(self.arch).mtp_free(gpu);
+    }
+
+    fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        Box::new(self.arch).mtp_free_multi(gpus);
+    }
+
+    fn drafter_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(&mut self.arch)
     }
 
     fn requires_greedy(&self) -> bool {
@@ -1111,12 +1724,17 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
         self.arch.supports_temp_verify()
     }
 
-    fn set_sampling(&mut self, _temp: f32, top_p: f32, top_k: usize, cactus_delta: f32) {
-        // Stash top_p/top_k/cactus; temp arrives per-step via `step`. Forwarded to
-        // the drafter inside `step` (before `mtp_step`).
-        self.top_p = top_p;
-        self.top_k = top_k;
-        self.cactus = cactus_delta;
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
+        self.request = cfg;
+        self.arch.configure_request(cfg);
+    }
+
+    fn request_stats(&self) -> MtpRequestStats {
+        self.arch.request_stats()
+    }
+
+    fn token_logits(&self, index: usize) -> Option<&[f32]> {
+        self.arch.token_logits(index)
     }
 }
 
@@ -1140,10 +1758,8 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
 pub enum ClientEvent {
     /// Visible answer text (post-filter, post-think-strip). → `{"type":"token"}`.
     Token(String),
-    /// Reasoning/think-block text surfaced separately (DSML reasoning channel).
-    /// → `{"type":"reasoning"}`. Unused by the qwen35 emitter (it strips think
-    /// only when configured and never emits a separate reasoning channel), but
-    /// part of the shared vocabulary the deepseek4 emitter will populate.
+    /// Reasoning/think-block text surfaced separately by model emitters.
+    /// → `{"type":"reasoning"}`.
     Reasoning(String),
     /// Parsed tool calls for this turn. → `{"type":"tool_calls"}`.
     ToolCalls(Vec<crate::prompt_frame::ToolCall>),
@@ -1210,8 +1826,10 @@ pub struct FinishSummary {
     /// Final events to render (e.g. trailing visible Token + held ToolCalls).
     pub events: Vec<ClientEvent>,
     /// The emitter's finish reason (`stop`, `tool_calls`, `malformed_protocol`,
-    /// or `open_think`); the caller may override with `length` on a pure
-    /// token-cap exit.
+    /// `truncated_tool_call` — output ended inside a tool call — or
+    /// `open_think`); the caller may override with `length` on a pure
+    /// token-cap exit, which also wins over `truncated_tool_call` and
+    /// `open_think`.
     pub finish_reason: &'static str,
     /// Number of tool calls parsed this turn (for the `done` envelope).
     /// Zero when malformed or when calls must stay suppressed.
@@ -1224,7 +1842,11 @@ pub struct FinishSummary {
     /// filter stop_at spanning split byte fragments). Carried into terminal
     /// lowering so wrappers do not recompute solely from the last token id.
     pub decoded_eot: bool,
-    /// Unclosed thinking region at finish — nonretryable unsafe terminal.
+    /// Unclosed thinking region at finish (`finish_reason == "open_think"`):
+    /// a reasoning-only `stop` with no tool calls. Qwen may cache a completed
+    /// whole-body turn; truncation and fail-closed exits stay unstored. A
+    /// length terminal is classified by the wrapper (the AR route stores a
+    /// call-less length body verbatim; see `qwen_ar_finish_route`).
     pub open_think: bool,
 }
 
@@ -1247,10 +1869,14 @@ pub struct SpecEmitCtx<'a> {
     pub eos: u32,
     /// Secondary terminator (e.g. `<|im_end|>`), if the arch uses one.
     pub im_end: Option<u32>,
-    /// Raw tool definitions from the request (OpenAI-shape JSON). Each carrier
-    /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
-    /// tool-call grammar.
+    /// Raw tool definitions from the request (OpenAI-shape JSON). `Some` enables
+    /// the tool-call *parser* (XML or JSON) even when constrained grammar is off.
+    /// `None` ⇒ tool-looking text is ordinary assistant content.
     pub tools: Option<&'a [serde_json::Value]>,
+    /// Constrained tool-call grammar. Independent of [`Self::tools`]: Qwen3.5/3.8
+    /// XML-native cards keep this false (default `qwen35_grammar_on`) so the
+    /// matcher does not force Hermes-JSON, but still parse `<tool_call>` XML.
+    pub enable_grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).
@@ -1339,6 +1965,15 @@ pub trait SpecEmit {
     /// enters the force path, so every other emitter is byte-identical no-op.
     fn take_forced(&mut self) -> Vec<u32> {
         Vec::new()
+    }
+
+    /// The most tokens the next speculative window may commit so that no
+    /// emitter intervention (think-budget force-close or think-cap stop) lands
+    /// strictly inside it: any intervention may only fall on the window's last
+    /// token, so the loop never has to repair already-committed state.
+    /// `None` = no limit (the default).
+    fn window_cap(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -1547,6 +2182,51 @@ mod tests {
         assert_eq!(step.emit.len(), step.accepted + 1);
         assert_eq!(*step.emit.last().unwrap(), step.next_seed);
     }
+    // ── request_rng_state ─────────────────────────────────────────────────
+
+    #[test]
+    fn request_rng_state_zero_maps_to_sentinel_otherwise_passthrough() {
+        assert_eq!(request_rng_state(0), 0x1357_9BDF);
+        // The sentinel itself is idempotent (explicit seed == sentinel works).
+        assert_eq!(request_rng_state(0x1357_9BDF), 0x1357_9BDF);
+        // Explicit seeds reproduce verbatim — this is what makes HTTP
+        // seed=N byte-reproducible through the sampled spec routes.
+        assert_eq!(request_rng_state(42), 42);
+        assert_eq!(request_rng_state(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn request_rng_state_distinct_seeds_distinct_states() {
+        let states: std::collections::HashSet<u64> = (1u64..=64).map(request_rng_state).collect();
+        assert_eq!(
+            states.len(),
+            64,
+            "mapping must be injective on the nonzero domain"
+        );
+    }
+
+    #[test]
+    fn request_rng_state_seeded_stream_advances_and_replays() {
+        // Route-level RNG-advance contract: a speculator configured with an
+        // explicit seed draws from that exact state and advances it every
+        // draw; the same seed replays the same sequence (xorshift32).
+        let mut rng_a = request_rng_state(1234) as u32;
+        let mut rng_b = request_rng_state(1234) as u32;
+        let mut rng_c = request_rng_state(1235) as u32;
+        let xs = |s: &mut u32| {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *s = x;
+            x
+        };
+        let seq_a: Vec<u32> = (0..16).map(|_| xs(&mut rng_a)).collect();
+        let seq_b: Vec<u32> = (0..16).map(|_| xs(&mut rng_b)).collect();
+        let seq_c: Vec<u32> = (0..16).map(|_| xs(&mut rng_c)).collect();
+        assert_eq!(seq_a, seq_b, "same seed ⇒ same draw sequence");
+        assert_ne!(seq_a, seq_c, "different seed ⇒ different stream");
+    }
 
     // ── accept_greedy_prefix ────────────────────────────────────────────────
 
@@ -1640,6 +2320,65 @@ mod tests {
         .is_err());
     }
 
+    #[test]
+    fn mtp_adapter_exposes_drafter_checkpoint_positions() {
+        struct CheckpointDrafter;
+
+        impl MtpDrafter for CheckpointDrafter {
+            fn mtp_prefill(
+                &mut self,
+                _gpu: &mut Gpu,
+                _target: &mut dyn SpecTarget,
+                _prompt_tokens: &[u32],
+                _fill_tokens: &[u32],
+                _start_pos: usize,
+                _cache_hit: bool,
+                _abort: &dyn Fn() -> bool,
+            ) -> Result<PrefillOutcome, String> {
+                unreachable!()
+            }
+
+            fn mtp_step(
+                &mut self,
+                _gpu: &mut Gpu,
+                _target: &mut dyn SpecTarget,
+                _position: usize,
+                _seed: u32,
+                _emitted: &[u32],
+                _k: usize,
+                _eos: u32,
+                _grammar: Option<&mut dyn SpecGrammar>,
+            ) -> Result<MtpWindow, String> {
+                unreachable!()
+            }
+
+            fn mtp_reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn mtp_free(self: Box<Self>, _gpu: &mut Gpu) {}
+
+            fn k(&self) -> usize {
+                4
+            }
+
+            fn ctx_capacity(&self) -> usize {
+                32_768
+            }
+
+            fn requires_greedy(&self) -> bool {
+                true
+            }
+
+            fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+                vec![2_048, 4_096]
+            }
+        }
+
+        let spec = MtpSpeculator::new(CheckpointDrafter);
+        assert_eq!(spec.checkpoint_positions(), vec![2_048, 4_096]);
+    }
+
     // ── SpecEmit seam types ─────────────────────────────────────────────────
 
     #[test]
@@ -1729,5 +2468,30 @@ mod tests {
             ClientEvent::Committed { id: 42, idx: 7 }
         ));
         assert!(matches!(&o.events[1], ClientEvent::Token(t) if t == "hi"));
+    }
+}
+
+#[cfg(test)]
+mod prefill_outcome_tests {
+    use super::PrefillOutcome;
+
+    #[test]
+    fn into_first_token_returns_the_seed() {
+        let ready = PrefillOutcome::Ready { first_token: 7 };
+        assert_eq!(ready.into_first_token(), Ok(7));
+    }
+
+    #[test]
+    fn into_first_token_turns_an_abort_into_an_error_for_never_abort_callers() {
+        assert!(PrefillOutcome::Aborted.into_first_token().is_err());
+    }
+
+    #[test]
+    fn an_abort_is_distinct_from_a_ready_prefill() {
+        assert_ne!(
+            PrefillOutcome::Aborted,
+            PrefillOutcome::Ready { first_token: 0 }
+        );
+        assert_eq!(PrefillOutcome::Aborted, PrefillOutcome::Aborted);
     }
 }

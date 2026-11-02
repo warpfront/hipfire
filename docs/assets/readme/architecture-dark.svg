@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="470" viewBox="0 0 880 470" role="img" aria-label="hipfire architecture: model file, loader, PeaceMaker, Redline and railgun, serve">
+<title>hipfire architecture: model file, loader, PeaceMaker, Redline and railgun, serve</title>
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0 L10,5 L0,10 z" fill="#9198a1"/></marker>
+</defs>
+<g font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" fill="none" stroke-width="1.5">
+  <!-- top lane: request path -->
+  <rect x="10" y="20" width="150" height="60" rx="8" stroke="#9198a1"/>
+  <text x="85" y="46" font-size="14" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">Model file</text>
+  <text x="85" y="64" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">HFQM / MQ + sidecars</text>
+  <rect x="200" y="20" width="150" height="60" rx="8" stroke="#9198a1"/>
+  <text x="275" y="46" font-size="14" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">Loader</text>
+  <text x="275" y="64" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">arch carriers, admission</text>
+  <rect x="390" y="20" width="150" height="60" rx="8" stroke="#9198a1"/>
+  <text x="465" y="46" font-size="14" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">Runtime</text>
+  <text x="465" y="64" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">graph, typed dispatch</text>
+  <rect x="720" y="20" width="150" height="60" rx="8" stroke="#9198a1"/>
+  <text x="795" y="46" font-size="14" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">Serve</text>
+  <text x="795" y="64" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">OpenAI-compatible API</text>
+  <path d="M160,50 H196" stroke="#9198a1" marker-end="url(#a)"/>
+  <path d="M350,50 H386" stroke="#9198a1" marker-end="url(#a)"/>
+
+  <!-- PeaceMaker -->
+  <rect x="10" y="120" width="440" height="330" rx="10" stroke="#ff7b72" stroke-width="2"/>
+  <text x="26" y="146" font-size="16" font-weight="bold" fill="#ff7b72" stroke="none">PeaceMaker · compiles and certifies kernels</text>
+  <rect x="30" y="165" width="125" height="48" rx="6" stroke="#9198a1"/>
+  <text x="92" y="186" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">author / rip</text>
+  <text x="92" y="202" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">PM kernel source</text>
+  <rect x="30" y="225" width="125" height="48" rx="6" stroke="#9198a1"/>
+  <text x="92" y="246" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">lift</text>
+  <text x="92" y="262" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">code obj → typed</text>
+  <rect x="30" y="285" width="125" height="48" rx="6" stroke="#9198a1"/>
+  <text x="92" y="306" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">ir</text>
+  <text x="92" y="322" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">typed machine code</text>
+  <rect x="195" y="225" width="110" height="48" rx="6" stroke="#ff7b72"/>
+  <text x="250" y="246" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">isa</text>
+  <text x="250" y="262" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">build, emit, M7</text>
+  <rect x="330" y="225" width="105" height="48" rx="6" stroke="#ff7b72"/>
+  <text x="382" y="246" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">kernels</text>
+  <text x="382" y="262" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">.hxaco, contract</text>
+  <path d="M155,189 L192,240" stroke="#9198a1" marker-end="url(#a)"/>
+  <path d="M155,249 H192" stroke="#9198a1" marker-end="url(#a)"/>
+  <path d="M155,309 L192,258" stroke="#9198a1" marker-end="url(#a)"/>
+  <path d="M305,249 H327" stroke="#9198a1" marker-end="url(#a)"/>
+  <rect x="195" y="300" width="240" height="40" rx="6" stroke="#656c76" stroke-dasharray="5 4"/>
+  <text x="315" y="325" font-size="12" fill="#9198a1" stroke="none" text-anchor="middle">hipcc twin: test oracle only</text>
+  <path d="M382,300 V276" stroke="#656c76" stroke-dasharray="4 3" marker-end="url(#a)"/>
+  <rect x="30" y="375" width="405" height="55" rx="6" stroke="#9198a1"/>
+  <text x="232" y="398" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">npu: XDNA2 / AIE2P builder + CPU simulator</text>
+  <text x="232" y="416" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">programs for the Strix Halo NPU prefill route</text>
+
+  <!-- Redline / railgun -->
+  <rect x="490" y="120" width="380" height="330" rx="10" stroke="#4493f8" stroke-width="2"/>
+  <text x="506" y="146" font-size="16" font-weight="bold" fill="#4493f8" stroke="none">Redline / railgun · replays them</text>
+  <rect x="510" y="170" width="340" height="48" rx="6" stroke="#9198a1"/>
+  <text x="680" y="191" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">record</text>
+  <text x="680" y="207" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">actual kernel graph, resource dependencies</text>
+  <rect x="510" y="240" width="340" height="48" rx="6" stroke="#9198a1"/>
+  <text x="680" y="261" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">certify</text>
+  <text x="680" y="277" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">shadow validation, railgun-cert inventory</text>
+  <rect x="510" y="310" width="340" height="48" rx="6" stroke="#9198a1"/>
+  <text x="680" y="331" font-size="13" font-weight="bold" fill="#f0f6fc" stroke="none" text-anchor="middle">replay</text>
+  <text x="680" y="347" font-size="11" fill="#9198a1" stroke="none" text-anchor="middle">retained AQL / PM4 via public ROCr queues</text>
+  <path d="M680,218 V237" stroke="#9198a1" marker-end="url(#a)"/>
+  <path d="M680,288 V307" stroke="#9198a1" marker-end="url(#a)"/>
+  <text x="680" y="390" font-size="12" fill="#9198a1" stroke="none" text-anchor="middle">anything unvalidated falls back to</text>
+  <text x="680" y="408" font-size="12" fill="#9198a1" stroke="none" text-anchor="middle">ordinary HIP dispatch (fail closed)</text>
+
+  <!-- cross links -->
+  <path d="M435,249 H445 V112 H430 V84" stroke="#9198a1" marker-end="url(#a)"/>
+  <path d="M540,50 H716" stroke="#9198a1" marker-end="url(#a)"/>
+  <path d="M520,80 V100 H680 V166" stroke="#9198a1" marker-end="url(#a)"/>
+  <path d="M850,334 H860 V84" stroke="#9198a1" marker-end="url(#a)"/>
+</g>
+</svg>

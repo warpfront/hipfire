@@ -35,6 +35,15 @@ impl AllocationPolicy {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BindingRevision(pub u64);
 
+impl BindingRevision {
+    /// Next revision after a reallocation or survived layout growth. Wraps
+    /// only at `u64::MAX`, which no tape reaches; wrapping preserves the
+    /// "revision changed" signal the re-encode cache keys on.
+    pub const fn next(self) -> Self {
+        Self(self.0.wrapping_add(1))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct ResourceBinding {
     base: NonNull<c_void>,

@@ -1,0 +1,126 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "qwen3.5:35b-a3b",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5_moe",
+    "dim": 2048,
+    "layers": 40,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 32768,
+    "max_seq_bound": "legacy",
+    "max_seq_reason": "max_seq auto-capacity unsupported for MoE; using prior default",
+    "model_ctx": null,
+    "card_cap": null,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.2",
+    "vram_free_mb": 9188,
+    "vram_total_mb": 16304,
+    "model_loaded": true,
+    "model_arch": "qwen3_5_moe",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 16180,
+  "max_tokens": 64,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 59,
+  "prompt_md5": "5835c71e471849b4a72e1dc8e39695e7",
+  "prompt_chars": 215,
+  "warnings": [
+    "prompt is 59 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 42.0,
+    "mean": 41.940000000000005,
+    "min": 41.3,
+    "max": 42.4,
+    "stdev": 0.3773592452822654
+  },
+  "prefill_tok_s": {
+    "median": 89.2,
+    "mean": 89.05999999999999,
+    "min": 87.8,
+    "max": 90.7,
+    "stdev": 1.040384544291199
+  },
+  "wall_tok_s": {
+    "median": 29.3,
+    "mean": 29.24,
+    "min": 29.0,
+    "max": 29.3,
+    "stdev": 0.12000000000000027
+  },
+  "ttft_ms": {
+    "median": 661.1,
+    "mean": 662.48,
+    "min": 650.6,
+    "max": 671.9,
+    "stdev": 7.604577568806814
+  },
+  "samples": {
+    "decode": [
+      42.0,
+      41.8,
+      42.2,
+      42.4,
+      41.3
+    ],
+    "prefill": [
+      89.2,
+      90.7,
+      88.1,
+      87.8,
+      89.5
+    ],
+    "wall": [
+      29.3,
+      29.3,
+      29.3,
+      29.3,
+      29.0
+    ],
+    "ttft_ms": [
+      661.1,
+      650.6,
+      669.4,
+      671.9,
+      659.4
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}

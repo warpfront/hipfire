@@ -46,7 +46,7 @@ tail -n 80 ~/.hipfire/serve.log
 |---|---|---|
 | **Safe automatic** | Read-only triage/diag; `hipfire ps`; `curl` `/health`; one-shot env on a **confirmed local** daemon path (`HIPFIRE_LOCAL=1` / no resident serve — see bisection); `HIPFIRE_HIPCC_EXTRA_FLAGS`; `tail` logs | Always allowed while diagnosing |
 | **Safe controlled recovery** | Plain `hipfire stop` **only when** it targets the tracked serve pid that passes CLI ownership validation; wait on cold JIT while tailing `serve.log` | Prefer these before any force-reap path |
-| **Destructive / manual — need explicit user approval** | `hipfire restart -d` (stop leg force-reaps name-matched daemons and `fuser -k` on the port — can kill an unvalidated port owner); `hipfire stop --force` / `--all`; `scripts/serve-restart.sh` (kills by pattern + `fuser -k`); bare `pkill`/`kill -9`; deleting `serve.pid`/`daemon.pid` outside CLI validation; wiping kernel cache; `hipfire config set …`; `hipfire update`; package installs; reboot; any privileged command | Only after **port/process-owner inspection** (`hipfire ps`, pidfile, port listener, `/health`) and explicit user approval |
+| **Destructive / manual — need explicit user approval** | `hipfire restart -d` (stop leg force-reaps name-matched daemons and `fuser -k` on the port — can kill an unvalidated port owner); `hipfire stop --force` / `--all`; `scripts/serve-restart.sh` (`hipfire stop --force`, optionally relaunches on 0.0.0.0); bare `pkill`/`kill -9`; deleting `serve.pid`/`daemon.pid` outside CLI validation; wiping kernel cache; `hipfire config set …`; `hipfire update`; package installs; reboot; any privileged command | Only after **port/process-owner inspection** (`hipfire ps`, pidfile, port listener, `/health`) and explicit user approval |
 
 Never blind-kill or delete:
 
@@ -74,7 +74,7 @@ Never blind-kill or delete:
 | Config / env owners | [`docs/CONFIG.md`](../../../docs/CONFIG.md), [`docs/env-vars.md`](../../../docs/env-vars.md) |
 | Claim → validation route | [`docs/VALIDATION.md`](../../../docs/VALIDATION.md) |
 
-Default bind: `0.0.0.0:11435`. Pid/log: `~/.hipfire/serve.pid`,
+Default bind: `127.0.0.1:11435`. Pid/log: `~/.hipfire/serve.pid`,
 `~/.hipfire/serve.log`. Install root: `~/.hipfire/` (`bin/daemon`, `models/`,
 `config.toml`).
 

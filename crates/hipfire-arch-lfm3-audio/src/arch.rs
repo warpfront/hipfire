@@ -18,7 +18,7 @@ impl Architecture for Lfm3Audio {
     type Config = AudioConfig;
 
     fn arch_id() -> u32 {
-        13
+        24
     }
     fn name() -> &'static str {
         "lfm3-audio"

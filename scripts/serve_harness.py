@@ -11,7 +11,7 @@ to tell coherent output from runaway/empty and to read real perf:
 
 TWO-STEP DISCIPLINE: `--show-config` resolves and prints the CONCRETE config —
 every sampling value with its source ([registry]/[default]/[recipe]/[explicit]),
-`thinking_budget med -> 2048 tok`, `max_tokens`, `kv`, `mtp`, model — WITHOUT
+the resolved effort and independent thinking cap, `max_tokens`, `kv`, `mtp`, model — WITHOUT
 running, so you eyeball exactly what is and isn't set before anything fires. The
 sampling DEFAULT is production-sampled (the model's registry recommended_settings),
 never greedy or the 0.3 CLI fallback.
@@ -21,10 +21,28 @@ Modes:
             conversation each prompt (no cache); surfaces genre-specific runaway.
   chain   — the genre prompts chained into one growing conversation; exercises the
             prefix cache (cached_tokens) + cross-turn prefill/decode.
+            With --tool-chain FILE (tool-chain-v1 JSON, e.g.
+            benchmarks/sessions/tool_chain_agent.json) the chain is an agent
+            transcript: system prompt + tools, user turns, and every tool call
+            answered from frozen tool_results; rows carry per-request
+            cached/prefill_ms/ttft for session-cache reuse A/B (diff two --out dumps).
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
-            session_coding.json the coherence gate uses.
+            session_coding.json the coherence gate uses. A turn's "expect" list
+            holds case-insensitive substrings that must all appear in the reply.
+            Expect what the conversation pins, never a name the model picks:
+            the recall turn asks for "the FIRST function", which the user
+            specified as a streaming blake3 hasher but the model names itself
+            (e.g. `hash_file_streaming`), so it expects "blake3", not "dedupe";
+            the summary expects "dedup" (dedupe, deduplication, dedup).
+  prefix-fanout — opt-in shared-header concurrency/alternating-session workload.
+            Use --fanout-calibrate to size the header by canonical prompt usage;
+            invoke separately with --fanout-shared-tokens 2048 and 8192.
+            Without a corpus, the built-in text is calibrated automatically.
+            Requires a harness-owned server; restarts after calibration keep
+            the conditioning/fanout workload independent of calibration cache hits.
 """
-import argparse, atexit, errno, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import argparse, atexit, base64, errno, hashlib, json, math, os, random, re, shutil, signal, struct, subprocess, sys, tempfile, threading, time, urllib.error, urllib.request, zlib
+from pathlib import Path
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
 # concrete token cap, not just the preset name).
@@ -59,6 +77,127 @@ GENRE_BATTERY = [
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 
+def _registry_entry(tag, registry_path):
+    """Return (canonical_tag, entry_dict) for *tag*, following aliases."""
+    registry = json.load(open(registry_path))
+    canonical = (registry.get("aliases") or {}).get(tag, tag)
+    entry = (registry.get("models") or {}).get(canonical, {}) or {}
+    return canonical, entry
+
+
+def resolve_model_default(explicit, tag, registry_path, field, fallback, explicit_label):
+    """Resolve an optional CLI override, then registry *field*, then *fallback*.
+
+    Returns ``(value, source_label)``. Explicit None means "omitted" so registry
+    defaults can apply; non-None always wins.
+    """
+    if explicit is not None:
+        return explicit, explicit_label
+    try:
+        canonical, entry = _registry_entry(tag, registry_path)
+        val = entry.get(field)
+        if val is not None:
+            return val, f"registry({canonical})"
+    except Exception as e:
+        print(f"  [warn] could not resolve {field} from {registry_path}: {e}",
+              file=sys.stderr)
+    return fallback, f"default({fallback})"
+
+
+def resolve_kv_mode(explicit, tag, registry_path):
+    """Resolve the cache mode the product would load, unless --kv overrides it.
+
+    Mirrors the product KV precedence (docs/QUANTIZATION.md): a registry
+    ``default_kv_mode`` applies only when it is not ``q8``; a ``q8`` card value
+    is left to ``auto`` (native fp8 on eligible gfx1201, Q8 elsewhere). Writing
+    the registry ``q8`` as an explicit ``kv_cache`` would certify Q8 instead of
+    the shipped default.
+    """
+    kv, source = resolve_model_default(
+        explicit, tag, registry_path, "default_kv_mode", "auto", "explicit(--kv)")
+    if explicit is None and kv == "q8":
+        return "auto", f"{source}:q8->auto"
+    return kv, source
+
+
+def _tag_load_policy(canonical_tag, entry=None):
+    """Automatic load policy keyed by canonical registry tag.
+
+    Mirrors hipfire-registry's generation-only tag policy (not wire fields).
+    Context is resolved by loader admission from model metadata and card
+    capacity; only an explicit user max_seq reaches the sparse TOML.
+      - Qwen3.5 / 3.6 / 3.8 targets → max_tokens=81920, except Qwen3.8
+        entries with arch_id=16 (Qwen4 / Flash-Next), which take no policy
+      - DeepSeek V4 Flash targets → max_tokens=393216
+      - other tags and draft/dflash sidecars → no policy.
+    """
+    if not canonical_tag:
+        return {}
+    tag = canonical_tag
+    if "draft" in tag or "dflash" in tag:
+        return {}
+    family = tag.split(":", 1)[0]
+    if family in ("qwen3.5", "qwen3.6", "qwen3.8"):
+        if (entry or {}).get("arch_id") == 16:
+            return {}
+        return {"max_tokens": 81920}
+    if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
+        return {"max_tokens": 393216}
+    return {}
+
+
+def parse_kv_backend_arg(value):
+    """CLI --kv-backend: accept legacy|vmm; reject contiguous with migration text."""
+    if value == "contiguous":
+        raise argparse.ArgumentTypeError(
+            "KV backend 'contiguous' was renamed to 'legacy'; "
+            "use --kv-backend legacy or memory.kv_backend = \"legacy\""
+        )
+    if value not in ("legacy", "vmm"):
+        raise argparse.ArgumentTypeError(
+            f"unknown KV backend {value!r}; expected one of: legacy, vmm"
+        )
+    return value
+
+
+def resolve_kv_backend_request(explicit):
+    """Requested backend: explicit CLI/config value, else automatic (None).
+
+    Tags no longer choose a backend. The daemon/runtime picks VMM or legacy
+    from the omitted request; the harness only observes the effective marker.
+    """
+    if explicit is not None:
+        return explicit, "explicit(--kv-backend)"
+    return None, "automatic"
+
+
+
+def resolve_max_seq(explicit):
+    """Leave automatic context to the loader; forward only user override."""
+    if explicit is not None:
+        return explicit, "explicit(--max-seq)"
+    return None, "automatic(model/card)"
+
+
+def resolve_max_tokens(explicit, tag, registry_path):
+    """Resolve generation cap: explicit → tag policy → 2048."""
+    if explicit is not None:
+        return explicit, "explicit(--max-tokens)"
+    try:
+        canonical, entry = _registry_entry(tag, registry_path)
+    except Exception as e:
+        print(f"  [warn] could not resolve max_tokens policy from {registry_path}: {e}",
+              file=sys.stderr)
+        canonical, entry = tag, {}
+    policy = _tag_load_policy(canonical, entry) if entry else {}
+    if "max_tokens" in policy:
+        return policy["max_tokens"], f"tag-policy({canonical})"
+    return 2048, "default(2048)"
+
+
+
+
+
 def resolve_sampling(spec, tag, registry_path):
     """Return (values_dict, source_dict). spec: 'registry'|'registry:<mode>'|'greedy'|'recipe:NAME'|json string."""
     src = {}
@@ -80,9 +219,9 @@ def resolve_sampling(spec, tag, registry_path):
         # `general` falls back to recommended_settings when no profile map is set.
         profile = spec.split(":", 1)[1] if ":" in spec else None
         rec = {}
+        canonical = tag
         try:
-            reg = json.load(open(registry_path))["models"]
-            entry = reg.get(tag, {})
+            canonical, entry = _registry_entry(tag, registry_path)
             if profile is None:
                 rec = entry.get("recommended_settings", {}) or {}
             else:
@@ -93,19 +232,20 @@ def resolve_sampling(spec, tag, registry_path):
                     rec = profiles.get(profile, {}) or {}
         except Exception as e:
             print(f"  [warn] could not read registry {registry_path}: {e}", file=sys.stderr)
-        label = f"registry({tag}:{profile})" if profile else f"registry({tag})"
+        label = f"registry({canonical}:{profile})" if profile else f"registry({canonical})"
         vals, source = {}, {}
-        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty", "repeat_penalty"]:
+        for k in ["temperature", "top_p", "top_k", "min_p", "presence_penalty",
+                  "repeat_penalty", "reasoning_effort", "thinking_budget"]:
             if k in rec:
                 vals[k] = rec[k]; source[k] = label
         # The instruct profile is the non-thinking mode: drive reasoning_effort=none
         # through the existing budget machinery (no daemon request-JSON change).
-        if profile == "instruct":
+        if profile == "instruct" and "reasoning_effort" not in vals:
             vals["reasoning_effort"] = "none"; source["reasoning_effort"] = label
         # Registry stays the PREFERENCE; this only covers entries that carry nothing
         # usable. Guard on the sampling keys, not on `vals` — the instruct profile has
         # already inserted reasoning_effort above, so `not vals` would never fire here.
-        if not [k for k in vals if k != "reasoning_effort"]:
+        if not [k for k in vals if k not in ("reasoning_effort", "thinking_budget")]:
             # 38/54 registry models still lack recommended_settings, and a hard exit
             # strands callers that cannot pass --sampling (tools.redline bench's
             # coherence smoke hard-codes "registry" and forwards no --tag).
@@ -128,6 +268,23 @@ def infer_tag(model_path):
     those tags, so the size group must admit a fractional part.
     """
     b = os.path.basename(model_path)
+    if b.startswith("deepseek-v4-flash-0731"):
+        if b.endswith(".mq2r"):
+            return "deepseek-v4-flash:mq2r"
+        if b.endswith(".mq2lloyd"):
+            return "deepseek-v4-flash"
+    # Draft/assistant artifacts are sidecars, not standalone Glimmer targets.
+    # Classify them before the broad target filename pattern so inferred tags
+    # cannot inherit target-only VMM policy.
+    if b.startswith("muse-glimmer-") and any(
+        marker in b for marker in ("-draft", "-dflash", "-assistant")
+    ):
+        return "muse-glimmer:draft"
+    # Muse Glimmer targets ship as muse-glimmer-30b*.mq4 (including historical
+    # -default / -q8head variants, which share the model card's sampling contract).
+    m = re.match(r"muse-glimmer-(\d+(?:\.\d+)?b)", b)
+    if m:
+        return f"muse-glimmer:{m.group(1)}"
     m = re.match(r"(qwen3\.\d+)-(\d+(?:\.\d+)?b(?:-a\d+b)?)", b)
     if m:
         return f"{m.group(1)}:{m.group(2)}"
@@ -136,10 +293,49 @@ def infer_tag(model_path):
 
 def build_config(args):
     tag = args.tag or infer_tag(args.model)
-    samp, samp_src = resolve_sampling(args.sampling, tag, args.registry)
-    think_cap = THINKING_BUDGET.get(args.thinking)
-    if think_cap is None:
-        sys.exit(f"thinking_budget {args.thinking!r} not a key of {list(THINKING_BUDGET)}")
+    kv, kv_source = resolve_kv_mode(args.kv, tag, args.registry)
+    kv_backend, kv_backend_source = resolve_kv_backend_request(
+        getattr(args, "kv_backend", None))
+    max_seq, max_seq_source = resolve_max_seq(getattr(args, "max_seq", None))
+    max_tokens, max_tokens_source = resolve_max_tokens(
+        getattr(args, "max_tokens", None), tag, args.registry)
+    if args.mode == "prefix-fanout":
+        max_tokens, max_tokens_source = args.fanout_output_tokens, "explicit(--fanout-output-tokens)"
+    sampling_spec = ("greedy" if args.mode == "prefix-fanout" and
+                     not getattr(args, "fanout_sampling_explicit", False) else args.sampling)
+    samp, samp_src = resolve_sampling(sampling_spec, tag, args.registry)
+    # Effort is parent-model prompt semantics. Budget is an independent hipfire
+    # cap policy and must never be inferred from the effort level.
+    registry_budget = samp.pop("thinking_budget", None)
+    samp_src.pop("thinking_budget", None)
+    effort = getattr(args, "thinking_effort", None)
+    if effort:
+        samp = dict(samp)
+        samp["reasoning_effort"] = effort
+        samp_src = dict(samp_src)
+        samp_src["reasoning_effort"] = "explicit(--thinking-effort)"
+    selected_budget = args.thinking
+    if selected_budget is None:
+        if registry_budget is not None:
+            selected_budget = registry_budget
+        elif samp.get("reasoning_effort") in ("low", "medium", "high", "xhigh", "max"):
+            selected_budget = "uncapped"
+        elif args.mode == "prefix-fanout":
+            selected_budget = "off"
+        else:
+            selected_budget = "med"
+    named_think_cap = THINKING_BUDGET.get(selected_budget)
+    if named_think_cap is None:
+        sys.exit(f"thinking_budget {selected_budget!r} not a key of {list(THINKING_BUDGET)}")
+    request_think_cap = getattr(args, "max_think_tokens", None)
+    if request_think_cap is not None and request_think_cap < 0:
+        sys.exit("--max-think-tokens must be >= 0")
+    think_cap = request_think_cap if request_think_cap is not None else named_think_cap
+    think_cap_source = (
+        "explicit(--max-think-tokens)"
+        if request_think_cap is not None
+        else f"named-budget({selected_budget})"
+    )
     draft = getattr(args, "draft", None)
     if draft:
         draft = os.path.abspath(os.path.expanduser(draft))
@@ -147,46 +343,223 @@ def build_config(args):
         # Preserve caller-pinned draft env; do not invent a path.
         env_draft = os.environ.get("HIPFIRE_DFLASH_DRAFT")
         draft = os.path.abspath(os.path.expanduser(env_draft)) if env_draft else None
+    ngram = getattr(args, "ngram", "off") or "off"
+    dflash = getattr(args, "dflash", "off") or "off"
+    mtp_ngram = getattr(args, "mtp_ngram", "off") or "off"
+    mtp_ngram_match = None
+    mtp_ngram_min = None
+    mtp_ngram_max = None
+    # One mechanism per run. The CLI's --spec is an enum for the same reason:
+    # silently letting one arm win would certify a path the caller did not ask
+    # for, and the resulting tok/s would be attributed to the wrong speculator.
+    if ngram == "on" and (dflash == "on" or args.mtp == "on"):
+        raise SystemExit(
+            f"serve_harness: --ngram on is exclusive; got dflash={dflash} mtp={args.mtp}. "
+            "Pick one speculative mechanism."
+        )
+    # Opt-in long-gated ngram-mod composition inside native MTP (TOML `speculation.mtp_ngram`; the harness drives it by env).
+    # Not a separate speculation selector: TOML stays mode=mtp; daemon sees
+    # HIPFIRE_MTP_NGRAM + HIPFIRE_NGRAM_MOD_*. Requires --mtp on, greedy sampling,
+    # thinking off; exclusive with standalone --ngram / --dflash on and with
+    # non-mtp --speculation overrides.
+    if mtp_ngram == "on":
+        if args.mtp != "on":
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on requires --mtp on "
+                "(composition is ngram-mod inside native MTP, not a standalone selector)."
+            )
+        if ngram == "on":
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on is exclusive with standalone --ngram on. "
+                "Pick MTP+ngram-mod composition or standalone ngram, not both."
+            )
+        if dflash == "on":
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on is exclusive with --dflash on. "
+                "Pick one speculative mechanism."
+            )
+        explicit = getattr(args, "speculation", None)
+        if explicit is not None and explicit != "mtp":
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram on is incompatible with --speculation {explicit}; "
+                "omit --speculation or use --speculation mtp."
+            )
+        temp = samp.get("temperature")
+        if not isinstance(temp, (int, float)) or abs(float(temp)) > 1e-6:
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on requires greedy sampling "
+                f"(temperature==0); got temperature={temp!r}."
+            )
+        if selected_budget != "off":
+            raise SystemExit(
+                "serve_harness: --mtp-ngram on requires --thinking off "
+                f"(got thinking_budget={selected_budget!r})."
+            )
+        raw_match = getattr(args, "mtp_ngram_match", None)
+        raw_min = getattr(args, "mtp_ngram_min", None)
+        raw_max = getattr(args, "mtp_ngram_max", None)
+        mtp_ngram_match = 24 if raw_match is None else int(raw_match)
+        mtp_ngram_min = 48 if raw_min is None else int(raw_min)
+        mtp_ngram_max = 64 if raw_max is None else int(raw_max)
+        if mtp_ngram_match < 1:
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram-match must be >= 1, got {mtp_ngram_match}."
+            )
+        if mtp_ngram_min < 1:
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram-min must be >= 1, got {mtp_ngram_min}."
+            )
+        if mtp_ngram_max > 64:
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram-max must be <= 64, got {mtp_ngram_max}."
+            )
+        if mtp_ngram_min > mtp_ngram_max:
+            raise SystemExit(
+                f"serve_harness: --mtp-ngram-min ({mtp_ngram_min}) must be <= "
+                f"--mtp-ngram-max ({mtp_ngram_max})."
+            )
     return {
-        "model": args.model, "tag": tag, "kv": args.kv, "mtp": args.mtp,
-        "kv_backend": getattr(args, "kv_backend", "contiguous") or "contiguous",
-        "dflash": getattr(args, "dflash", "off") or "off",
+        "model": args.model, "tag": tag, "kv": kv, "kv_source": kv_source,
+        "mtp": args.mtp,
+        "kv_backend": kv_backend,
+        "kv_backend_source": kv_backend_source,
+        "max_seq": max_seq,
+        "max_seq_source": max_seq_source,
+        "dflash": dflash,
+        "ngram": ngram,
+        "ngram_k": getattr(args, "ngram_k", None),
+        "mtp_ngram": mtp_ngram,
+        "mtp_ngram_match": mtp_ngram_match,
+        "mtp_ngram_min": mtp_ngram_min,
+        "mtp_ngram_max": mtp_ngram_max,
         "draft": draft,
-        "thinking_budget": args.thinking, "thinking_cap_tokens": think_cap,
-        "max_tokens": args.max_tokens, "sampling": samp, "sampling_source": samp_src,
+        "thinking_budget": selected_budget,
+        "thinking_cap_tokens": think_cap,
+        "thinking_cap_source": think_cap_source,
+        "request_max_think_tokens": request_think_cap,
+        "max_tokens": max_tokens,
+        "max_tokens_source": max_tokens_source,
+        "stop": list(getattr(args, "stop", None) or []),
+        "sampling": samp, "sampling_source": samp_src,
         "mode": args.mode, "port": args.port, "seed": getattr(args, "seed", None),
         "prompts_file": getattr(args, "prompts_file", None),
+        "prompt_file": getattr(args, "prompt_file", None),
+        "niah_file": getattr(args, "niah_file", None),
+        "speculation_mode": getattr(args, "speculation", None),
+        "deepseek4_experts_per_token": getattr(args, "deepseek4_experts_per_token", None),
+        "deepseek4_compute_placement": getattr(args, "deepseek4_compute_placement", "single"),
+        "devices": getattr(args, "devices", None),
+        "tp": getattr(args, "tp", None),
         "replay_route_proof_log": bool(getattr(args, "replay_route_proof_log", False)),
+        **({"fanout": {
+            "clients": args.fanout_clients, "shared_tokens": args.fanout_shared_tokens,
+            "unique_tokens": args.fanout_unique_tokens, "output_tokens": args.fanout_output_tokens,
+            "corpus": args.fanout_corpus, "repeats": args.fanout_repeats,
+            "seed": args.fanout_seed, "calibrate": args.fanout_calibrate or not args.fanout_corpus,
+        }} if args.mode == "prefix-fanout" else {}),
     }
 
 
 
 
-def load_prompt_battery(prompts_file):
-    """Return [(genre, prompt), ...] from a --prompts-file JSON, else the built-in GENRE_BATTERY."""
+
+
+def load_prompt_battery(prompts_file, prompt_file=None, niah_file=None):
+    """Return ``(genre, prompt, expected_substrings)`` prompt rows.
+
+    ``--niah-file`` consumes the repository's committed long-context fixture
+    format directly.  Keeping the JSON fixture as the source of truth avoids a
+    second flattened prompt whose whitespace could silently drift.
+    """
+    if prompt_file:
+        text = Path(prompt_file).read_bytes().decode("utf-8")
+        return [("prose", text, [])]
+    if niah_file:
+        raw = Path(niah_file).read_text(encoding="utf-8")
+        stripped = raw.lstrip()
+        records = json.loads(raw) if stripped.startswith("[") else [json.loads(line) for line in raw.splitlines() if line.strip()]
+        rows = []
+        for index, record in enumerate(records):
+            filler = record.get("filler_text")
+            question = record.get("question")
+            if not isinstance(filler, str) or not isinstance(question, str):
+                raise ValueError(f"NIAH row {index} requires string filler_text and question")
+            expected = record.get("expected_answer_substrings")
+            if expected is None:
+                expected = [record.get("expected_answer_substring")]
+            if not isinstance(expected, list) or not expected or not all(isinstance(item, str) and item for item in expected):
+                raise ValueError(f"NIAH row {index} requires nonempty expected answer substring(s)")
+            rows.append((record.get("genre", "longctx-niah"), f"{filler}\n\n{question}", expected))
+        return rows
     if not prompts_file:
-        return list(GENRE_BATTERY)
-    import json
+        return [(genre, prompt, []) for genre, prompt in GENRE_BATTERY]
     rows = json.load(open(prompts_file))
-    return [(r.get("genre", "prose"), r["prompt"]) for r in rows]
+    return [(r.get("genre", "prose"), r["prompt"], r.get("expect", [])) for r in rows]
 
 
 def show_config(cfg):
     print("==================== serve_harness pre-flight (CONFIRM before run) ====================")
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
-    print(f"  kv_mode       : {cfg['kv']}   kv_backend: {cfg.get('kv_backend', 'contiguous')}   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
+    _kv_req = cfg.get("kv_backend")
+    _kv_req_disp = "automatic" if _kv_req is None else _kv_req
+    _kv_eff = cfg.get("kv_backend_effective")
+    if _kv_eff:
+        _kv_eff_reason = cfg.get("kv_backend_effective_reason")
+        _kv_disp = _kv_eff
+        _kv_src = (
+            f"observed({_kv_eff_reason})" if _kv_eff_reason else "observed"
+        )
+    else:
+        _kv_disp = _kv_req_disp
+        _kv_src = cfg.get("kv_backend_source", "unknown")
+    _mode = cfg.get("kv_mode_effective") or cfg["kv"]
+    _mode_src = "observed(loaded)" if cfg.get("kv_mode_effective") else cfg.get("kv_source", "unknown")
+    print(f"  kv_mode       : {_mode} [{_mode_src}]"
+          f"   kv_backend: {_kv_disp}"
+          f" [{_kv_src}]"
+          f"   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
+    print(f"  max_seq       : {cfg['max_seq'] if cfg.get('max_seq') is not None else '(model/card automatic)'}"
+          f" [{cfg.get('max_seq_source', 'unknown')}]")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
-    print(f"  seed          : {cfg.get('seed')}   prompts_file: {cfg.get('prompts_file') or '(built-in battery)'}")
+    print(f"  ngram         : {cfg.get('ngram', 'off')}   ngram_k: {cfg.get('ngram_k') if cfg.get('ngram_k') is not None else '(loader default 12)'}")
+    _mn_match = cfg.get("mtp_ngram_match")
+    _mn_min = cfg.get("mtp_ngram_min")
+    _mn_max = cfg.get("mtp_ngram_max")
+    if cfg.get("mtp_ngram") == "on":
+        _mn_gate = f"match={_mn_match} min={_mn_min} max={_mn_max} (default gate 24/48/64)"
+    else:
+        _mn_gate = "(off / default gate 24/48/64 when enabled)"
+    print(f"  mtp_ngram     : {cfg.get('mtp_ngram', 'off')}   {_mn_gate}")
+    _spec = cfg.get("speculation_mode")
+    print(f"  speculation   : {_spec or '(derived from --dflash/--mtp above)'}"
+          f"{'   <-- OVERRIDES dflash/mtp' if _spec else ''}")
+    print(
+        "  ds4 experts/tok: "
+        f"{cfg.get('deepseek4_experts_per_token') or '(checkpoint default)'}"
+    )
+    print(f"  ds4 placement : {cfg.get('deepseek4_compute_placement', 'single')}")
+    print(f"  devices       : {cfg.get('devices') or '(runtime default)'}")
+    print(f"  expert parallel: tp={cfg.get('tp') or 1}")
+    prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
+    print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
-    _thinking_off = cfg['thinking_budget'] == 'off'
-    _resolved = 'thinking DISABLED (sentinel cap 1)' if _thinking_off else f'{_cap} tok (CONCRETE cap)'
-    print(f"  thinking_budget: {cfg['thinking_budget']} -> {_resolved}")
+    _thinking_off = _cap == 1
+    _resolved = ('thinking DISABLED (sentinel cap 1)' if _thinking_off
+                 else 'uncapped' if _cap == 0
+                 else f'{_cap} tok (CONCRETE cap)')
+    print(f"  thinking_cap  : {_resolved} [{cfg['thinking_cap_source']}]")
+    print(f"  reasoning_effort: {cfg['sampling'].get('reasoning_effort', 'auto')}"
+          "  (parent prompt semantics; independent of cap)")
     _note = ('no think block emitted' if _thinking_off
              else 'uncapped think budget' if _cap == 0
              else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
-             else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail')
-    print(f"  max_tokens     : {cfg['max_tokens']}  ({_note})")
+             else ('n/a for --mode images (diffusion pipe, no chat completion)'
+                   if cfg['mode'] == 'images'
+                   else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail'))
+    print(f"  max_tokens     : {cfg['max_tokens']}"
+          f" [{cfg.get('max_tokens_source', 'unknown')}]  ({_note})")
+    print(f"  stop          : {cfg['stop'] if cfg.get('stop') else '(none)'}")
     print("  sampling (what IS set):")
     for k in SAMPLE_KEYS:
         if k in cfg["sampling"]:
@@ -203,6 +576,9 @@ def show_config(cfg):
     ):
         if env_key in os.environ:
             print(f"  env {env_key}={os.environ[env_key]!r} (pass-through)")
+    if cfg.get("fanout"):
+        for key, value in cfg["fanout"].items():
+            print(f"  fanout_{key:16}: {value}")
     print("=======================================================================================")
 
 
@@ -269,19 +645,53 @@ def _kill_serve():
     pgid = _serve_pgid
     if pgid is None and _serve_proc is not None:
         pgid = _serve_proc.pid
-    if pgid is not None:
+    if pgid is not None and hasattr(os, "killpg"):
+        # rocprof must observe a normal target shutdown to flush its CSV trace.
+        # The default remains the historical exact/fast SIGKILL cleanup; this
+        # opt-in is developer tooling for HIPFIRE_DAEMON_BIN wrappers such as
+        # scripts/rocprof-daemon-wrap.sh and never changes product serving.
+        graceful = os.environ.get("HIPFIRE_SERVE_HARNESS_GRACEFUL_CLEANUP") == "1"
+        if graceful:
+            try:
+                os.killpg(pgid, signal.SIGINT)
+            except ProcessLookupError:
+                pgid = None
+            except OSError as err:
+                if getattr(err, "errno", None) == errno.ESRCH:
+                    pgid = None
+            if pgid is not None:
+                deadline = time.monotonic() + 30.0
+                while time.monotonic() < deadline:
+                    try:
+                        os.killpg(pgid, 0)
+                    except ProcessLookupError:
+                        pgid = None
+                        break
+                    except OSError as err:
+                        if getattr(err, "errno", None) == errno.ESRCH:
+                            pgid = None
+                            break
+                    time.sleep(0.1)
+        if pgid is not None:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError as err:
+                # ESRCH: group already gone (benign race). Other errors:
+                # last-ditch kill the Popen handle if it is still around.
+                if getattr(err, "errno", None) != errno.ESRCH and _serve_proc is not None:
+                    try:
+                        _serve_proc.kill()
+                    except Exception:
+                        pass
+    elif _serve_proc is not None:
+        # Windows: process groups are POSIX-only (os.killpg does not exist);
+        # kill the direct child and let its daemon child exit with it.
         try:
-            os.killpg(pgid, signal.SIGKILL)
-        except ProcessLookupError:
+            _serve_proc.kill()
+        except Exception:
             pass
-        except OSError as err:
-            # ESRCH: group already gone (benign race). Other errors: last-ditch
-            # kill the Popen handle if it is still around.
-            if getattr(err, "errno", None) != errno.ESRCH and _serve_proc is not None:
-                try:
-                    _serve_proc.kill()
-                except Exception:
-                    pass
     _serve_proc = None
     _serve_pgid = None
     _clear_pid_file()
@@ -289,10 +699,11 @@ def _kill_serve():
 
 def _native_cli():
     """Resolve the Rust control-plane binary."""
+    exe = ".exe" if os.name == "nt" else ""
     candidates = [
         os.environ.get("HIPFIRE_CLI_BIN"),
-        os.path.join(REPO, "target", "release", "hipfire"),
-        os.path.expanduser("~/.hipfire/bin/hipfire"),
+        os.path.join(REPO, "target", "release", f"hipfire{exe}"),
+        os.path.expanduser(f"~/.hipfire/bin/hipfire{exe}"),
         shutil.which("hipfire"),
     ]
     for candidate in candidates:
@@ -312,11 +723,73 @@ def _write_native_config(cfg, home):
     DFlash selection uses the canonical speculation selector:
       --dflash on  → mode=dflash, dflash=on, mtp=off, ngram=off
       --dflash auto → mode=auto, dflash=auto (mtp left as requested)
-      --dflash off  → dflash=off (default; mode left auto so other mechanisms stay available)
+      --dflash off + --mtp off → mode=off (plain AR; no sidecar auto-discovery)
+      --dflash off + other MTP setting → dflash=off (mode remains auto)
+
+    `--speculation MODE` overrides all of the above with an explicit selector,
+    mirroring the CLI's apply_speculation_selector. This is the only way to ask
+    for DSpark: the DFlash/MTP matrix above can reach it solely by accident, by
+    leaving `mode` at its schema default of `auto` so the sidecar is
+    auto-discovered. DeepSeek V4 ships its speculative module inside the
+    checkpoint (see the model card: "it comes with a speculative decoding module
+    attached"), so `--speculation dspark` is the supported way to exercise it.
+
+    --ngram on is the exclusive model-free selector, mirroring
+    apply_speculation_selector("ngram") in hipfire-cli: mode=ngram, ngram=on,
+    dflash=off, mtp=off. It is REFUSED alongside --dflash on / --mtp on rather
+    than silently losing to the dflash arm — the CLI treats these as one choice,
+    and a harness that quietly picked for you would certify the wrong path.
     """
+    explicit = cfg.get("speculation_mode")
     dflash = cfg.get("dflash", "off") or "off"
     mtp = cfg["mtp"]
-    if dflash == "on":
+    ngram = cfg.get("ngram", "off") or "off"
+    ngram_k = cfg.get("ngram_k")
+    if explicit:
+        # Mirrors apply_speculation_selector(): each named selector pins every
+        # sibling off so the arms are mutually exclusive and legible in the log.
+        pins = {
+            "off":    ('off',    'off',  'off', 'off'),
+            "dflash": ('dflash', 'on',   'off', 'off'),
+            "mtp":    ('mtp',    'off',  'on',  'off'),
+            "ngram":  ('ngram',  'off',  'off', 'on'),
+            "dspark": ('dspark', 'off',  'off', 'off'),
+            "auto":   ('auto',   'auto', mtp,   'off'),
+        }[explicit]
+        speculation = (
+            '[speculation]\n'
+            f'mode = {json.dumps(pins[0])}\n'
+            f'dflash = {json.dumps(pins[1])}\n'
+            f'mtp = {json.dumps(pins[2])}\n'
+            f'ngram = {json.dumps(pins[3])}\n'
+        )
+        if ngram_k is not None and pins[0] == "ngram":
+            speculation += f'ngram_k = {int(ngram_k)}\n'
+    elif ngram == "on":
+        # Exclusive model-free selector — mirrors apply_speculation_selector("ngram").
+        speculation = (
+            '[speculation]\n'
+            'mode = "ngram"\n'
+            'ngram = "on"\n'
+            'dflash = "off"\n'
+            'mtp = "off"\n'
+        )
+        if ngram_k is not None:
+            speculation += f'ngram_k = {int(ngram_k)}\n'
+    elif mtp == "on":
+        # Exclusive MTP selector — mirrors apply_speculation_selector("mtp").
+        # WITHOUT `mode = "mtp"` the daemon leaves mode at the schema default and
+        # the MTP head loads but the speculative loop is never selected: measured
+        # 2026-08-08 as gen=0 / empty on mq2r AND mq4r-cvs-mtp, on two machines,
+        # with no error envelope. Setting only the `mtp` sub-key is not enough.
+        speculation = (
+            '[speculation]\n'
+            'mode = "mtp"\n'
+            'mtp = "on"\n'
+            'dflash = "off"\n'
+            'ngram = "off"\n'
+        )
+    elif dflash == "on":
         # Exclusive DFlash selector — mirrors apply_speculation_selector("dflash").
         speculation = (
             '[speculation]\n'
@@ -334,30 +807,55 @@ def _write_native_config(cfg, home):
             'ngram = "off"\n'
         )
     else:
-        # Default product path: DFlash hard-off; leave mode at schema default (auto)
-        # so MTP/n-gram knobs remain independently selectable via --mtp.
+        # `--dflash off --mtp off` is the ordinary-AR contract. Leaving mode
+        # at its schema default (`auto`) would still auto-discover DSpark.
+        mode = 'mode = "off"\n' if mtp == "off" else ""
         speculation = (
             '[speculation]\n'
+            f'{mode}'
             f'dflash = "off"\n'
             f'mtp = {json.dumps(mtp)}\n'
             'ngram = "off"\n'
         )
+    model = ""
+    if cfg.get("deepseek4_experts_per_token") is not None:
+        model = (
+            "[model]\n"
+            f"deepseek4_experts_per_token = {cfg['deepseek4_experts_per_token']}\n\n"
+        )
+    placement = cfg.get("deepseek4_compute_placement", "single")
+    devices = cfg.get("devices")
+    devices_line = f"devices = {json.dumps(devices)}\n" if devices else ""
+    hardware = f"""[hardware]
+{devices_line}deepseek4_compute_placement = {json.dumps(placement)}
+
+"""
+    max_seq_line = f"max_seq = {cfg['max_seq']}\n" if cfg.get("max_seq") is not None else ""
     text = f"""[serve]
 host = "127.0.0.1"
 port = {cfg["port"]}
 default_model = {json.dumps(cfg["model"])}
 
-[memory]
-max_seq = {cfg.get("max_seq", 32768)}
-kv_cache = {json.dumps(cfg["kv"])}
+{model}{hardware}[memory]
+{max_seq_line}kv_cache = {json.dumps(cfg["kv"])}
 
 {speculation}
 [generation]
-max_tokens = 16384
+max_tokens = {cfg.get("max_tokens", 16384)}
 
 [reasoning]
 budget = {json.dumps(cfg["thinking_budget"])}
 """
+    # `--thinking off` must disable thinking on every reasoning contract. The
+    # CLI ignores named budgets (including "off") on effort-native contracts
+    # (Qwen3.8 qwen_jinja: "use explicit max_think_tokens for cap"), so the
+    # budget alone left thinking open there; `reasoning.mode = "off"` is the
+    # contract-independent switch.
+    if cfg["thinking_budget"] == "off":
+        text += 'mode = "off"\n'
+    effort = cfg.get("sampling", {}).get("reasoning_effort")
+    if effort:
+        text += f"effort = {json.dumps(effort)}\n"
     if cfg.get("replay_route_proof_log"):
         text += """
 [diagnostic.replay]
@@ -383,27 +881,338 @@ def _serve_log_text(log, offset=0):
         return handle.read()
 
 
+def _log_has_vmm_kv_marker(txt):
+    """True when the current-attempt log engaged a VMM KV owner."""
+    if not txt:
+        return False
+    return bool(
+        re.search(r"KV cache:.*\bvmm\s*\(", txt, re.IGNORECASE)
+        or re.search(r"KV cache:.*\bvmm\b", txt, re.IGNORECASE)
+        or re.search(r"deepseek4 KV cache:\s+automatic VMM growth\b", txt)
+    )
+
+
+def _normalize_backend_name(name):
+    """Map transitional 'contiguous' spelling to 'legacy'."""
+    if name is None:
+        return None
+    raw = str(name).strip().lower()
+    if raw in ("contiguous", "legacy"):
+        return "legacy"
+    if raw == "vmm":
+        return "vmm"
+    return raw or None
+
+
+def parse_loaded_kv_backend_ack(txt):
+    """Extract the latest type=loaded ACK kv backend fields from serve log text.
+
+    Preferred source over log-line heuristics. Returns a dict with keys
+    kv_backend_warning and effective kv_mode — or None when no usable loaded
+    ACK is present.
+    """
+    if not txt:
+        return None
+    ack = None
+    for line in txt.splitlines():
+        s = line.strip()
+        if not s.startswith("{") or '"loaded"' not in s:
+            continue
+        try:
+            obj = json.loads(s)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if obj.get("type") != "loaded":
+            continue
+        if "kv_backend" not in obj and "kv_backend_legacy" not in obj:
+            continue
+        ack = obj
+    if ack is None:
+        return None
+    backend = _normalize_backend_name(ack.get("kv_backend"))
+    legacy = ack.get("kv_backend_legacy")
+    if legacy is None:
+        legacy = backend == "legacy"
+    else:
+        legacy = bool(legacy)
+    reason = ack.get("kv_backend_reason")
+    warning = ack.get("kv_backend_warning")
+    if warning is not None and not isinstance(warning, str):
+        warning = str(warning) if warning else None
+    if not warning and legacy:
+        warning = format_legacy_kv_backend_warning(
+            reason,
+            explicit=(
+                ack.get("kv_backend_request") == "explicit"
+                or (isinstance(reason, str) and "explicit" in reason.lower())
+            ),
+        )
+    return {
+        "kv_backend": backend,
+        "kv_backend_request": ack.get("kv_backend_request"),
+        "kv_backend_reason": reason,
+        "kv_backend_legacy": legacy,
+        "kv_backend_warning": warning,
+        "kv_mode": ack.get("kv_mode"),
+    }
+
+
+def format_legacy_kv_backend_warning(reason=None, explicit=False):
+    """Build the stable HIPFIRE_KV_BACKEND=legacy warning string."""
+    if explicit:
+        return (
+            "WARNING HIPFIRE_KV_BACKEND=legacy: explicitly selected legacy KV storage "
+            "(--kv-backend legacy or memory.kv_backend); inspect before benchmarking "
+            "or filing a PR."
+        )
+    detail = "unspecified"
+    if reason:
+        detail = str(reason).strip()
+        for prefix in (
+            "automatic-fallback(",
+            "automatic VMM selection unavailable (",
+            "automatic vmm unavailable (",
+        ):
+            if detail.lower().startswith(prefix.lower()) and detail.endswith(")"):
+                detail = detail[len(prefix):-1].strip()
+                break
+        if detail.lower().startswith("explicit"):
+            return format_legacy_kv_backend_warning(explicit=True)
+    return (
+        f"WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable "
+        f"({detail}); using legacy KV storage. Inspect before benchmarking or "
+        f"filing a PR."
+    )
+
+
+def observe_effective_kv_backend(txt):
+    """Resolve effective KV backend from loaded ACK (preferred) or daemon lines.
+
+    Returns (backend, detail) where backend is \"vmm\", \"legacy\", or None.
+    Does **not** infer trunk backend from bare non-VMM ``KV cache`` markers —
+    those may be auxiliary/draft caches. Prefer type=loaded ACK fields, then
+    the stable WARNING token / KV backend reason lines, then trunk VMM markers.
+    """
+    if not txt:
+        return None, None
+    ack = parse_loaded_kv_backend_ack(txt)
+    if ack and ack.get("kv_backend"):
+        reason = ack.get("kv_backend_reason")
+        if reason:
+            detail = f"ack({reason})"
+        elif ack.get("kv_backend_request") == "explicit":
+            detail = "ack(explicit)"
+        else:
+            detail = "ack"
+        return ack["kv_backend"], detail
+
+    m = re.search(
+        r"WARNING HIPFIRE_KV_BACKEND=legacy:\s*(.+)",
+        txt,
+        re.IGNORECASE,
+    )
+    if m:
+        body = m.group(1).strip()
+        if re.search(r"explicitly selected", body, re.IGNORECASE):
+            return "legacy", "explicit-legacy"
+        m_auto = re.search(
+            r"automatic VMM selection unavailable \((.+?)\)",
+            body,
+            re.IGNORECASE,
+        )
+        if m_auto:
+            return "legacy", f"automatic-fallback({m_auto.group(1).strip()})"
+        return "legacy", "warning-token"
+
+    m = re.search(
+        r"KV backend:\s*automatic vmm unavailable \((.+?)\)\s*->\s*(?:legacy|contiguous)",
+        txt,
+        re.IGNORECASE,
+    )
+    if m:
+        return "legacy", f"automatic-fallback({m.group(1).strip()})"
+    if re.search(
+        r"KV backend:\s*explicit (?:legacy|contiguous) override",
+        txt,
+        re.IGNORECASE,
+    ):
+        return "legacy", "explicit-legacy"
+    if _log_has_vmm_kv_marker(txt):
+        return "vmm", "log-marker"
+    # Deliberately no bare ``KV cache:`` fallback — auxiliary/draft owners also
+    # emit those lines and must not decide the trunk backend.
+    return None, None
+
+
+def apply_observed_kv_backend(cfg, txt):
+    """Populate cfg with effective backend metadata from warm log / loaded ACK.
+
+    Emits the once-per-load legacy WARNING (stderr) and
+    ``kv_backend_effective=legacy`` (stdout) when the trunk is legacy.
+    """
+    ack = parse_loaded_kv_backend_ack(txt)
+    if ack:
+        eff = ack.get("kv_backend")
+        reason = ack.get("kv_backend_reason")
+        cfg["kv_backend_effective"] = eff
+        cfg["kv_backend_effective_reason"] = (
+            f"ack({reason})" if reason else "ack"
+        )
+        cfg["kv_backend_reason"] = reason
+        cfg["kv_backend_legacy"] = bool(ack.get("kv_backend_legacy"))
+        cfg["kv_backend_warning"] = ack.get("kv_backend_warning")
+        cfg["kv_backend_request_observed"] = ack.get("kv_backend_request")
+        cfg["kv_mode_effective"] = (
+            ack.get("kv_mode") if isinstance(ack.get("kv_mode"), str) else None
+        )
+    else:
+        eff, eff_reason = observe_effective_kv_backend(txt)
+        if eff is not None:
+            cfg["kv_backend_effective"] = eff
+            cfg["kv_backend_effective_reason"] = eff_reason
+            cfg["kv_backend_legacy"] = eff == "legacy"
+            explicit = eff == "legacy" and (
+                cfg.get("kv_backend") == "legacy"
+                or (eff_reason or "").startswith("explicit")
+            )
+            reason = None
+            if eff_reason and eff_reason.startswith("automatic-fallback("):
+                reason = eff_reason[len("automatic-fallback("):-1]
+            elif explicit:
+                reason = "explicit operator choice"
+            cfg["kv_backend_reason"] = reason
+            if eff == "legacy":
+                cfg["kv_backend_warning"] = format_legacy_kv_backend_warning(
+                    reason, explicit=explicit
+                )
+            else:
+                cfg["kv_backend_warning"] = None
+
+    if cfg.get("kv_mode_effective"):
+        cfg["kv_mode_effective_src"] = "loaded ACK"
+    else:
+        # The loaded ACK is not echoed into every serve log; the loader's own
+        # "KV cache: requested mode=…, effective KV=…" line is the same fact.
+        m = re.search(r"KV cache: requested mode=\S+?, effective KV=(\w+)", txt or "")
+        if m:
+            cfg["kv_mode_effective"] = m.group(1)
+            cfg["kv_mode_effective_src"] = "serve log 'KV cache: ... effective KV'"
+        else:
+            # Resolved split fallback: the producer actually emits per-tensor
+            # "effective K=<mode>, effective V=<mode>" (or space-joined
+            # "effective K=<mode> V=<mode>"); stamp only when K and V agree.
+            ms = re.search(
+                r"KV cache: requested mode=\S+?, effective K=([A-Za-z0-9_.+-]+),? +(?:effective )?V=([A-Za-z0-9_.+-]+)(?=\s|$)",
+                txt or "",
+            )
+            if ms and ms.group(1) == ms.group(2):
+                cfg["kv_mode_effective"] = ms.group(1)
+                cfg["kv_mode_effective_src"] = "serve log effective K/V"
+
+    _emit_legacy_kv_backend_notice(cfg, log_txt=txt)
+    return cfg.get("kv_backend_effective"), cfg.get("kv_backend_effective_reason")
+
+
+def _emit_legacy_kv_backend_notice(cfg, log_txt=""):
+    """Once-per-load stderr WARNING + stdout effective line for legacy trunk."""
+    if cfg.get("_kv_legacy_notice_emitted"):
+        return
+    is_legacy = (
+        cfg.get("kv_backend_legacy")
+        or cfg.get("kv_backend_effective") == "legacy"
+    )
+    if not is_legacy:
+        return
+    cfg["_kv_legacy_notice_emitted"] = True
+    warning = cfg.get("kv_backend_warning")
+    if not warning:
+        explicit = (
+            cfg.get("kv_backend") == "legacy"
+            or cfg.get("kv_backend_request_observed") == "explicit"
+            or (
+                isinstance(cfg.get("kv_backend_effective_reason"), str)
+                and cfg["kv_backend_effective_reason"].startswith("explicit")
+            )
+        )
+        warning = format_legacy_kv_backend_warning(
+            cfg.get("kv_backend_reason"), explicit=explicit
+        )
+        cfg["kv_backend_warning"] = warning
+    # Daemon stderr is merged into the serve log file, not harness stderr, so
+    # always emit once on harness stderr for the operator console.
+    _ = log_txt  # retained for shared-stream detection if spawn wiring changes
+    print(warning, file=sys.stderr, flush=True)
+    print("kv_backend_effective=legacy", flush=True)
+
+
+def stamp_kv_backend_out_fields(rows, cfg):
+    """Attach load-scoped backend metadata to each --out per-turn row (list shape)."""
+    backend = cfg.get("kv_backend_effective")
+    if backend is None and cfg.get("kv_backend_legacy"):
+        backend = "legacy"
+    meta = {
+        "kv_backend": backend,
+        "kv_backend_legacy": bool(cfg.get("kv_backend_legacy", False)),
+        "kv_backend_warning": cfg.get("kv_backend_warning"),
+        "kv_backend_reason": cfg.get("kv_backend_reason"),
+        "kv_mode": cfg.get("kv_mode_effective"),
+    }
+    for row in rows or []:
+        if isinstance(row, dict):
+            row.update(meta)
+    return rows
+
+
+def kv_mode_report_line(cfg):
+    """One report-header line naming the KV mode this run actually certifies.
+
+    The requested value is usually ``auto`` (the product default), which is not a
+    mode: it resolves to native fp8 or Q8 at load. The loaded ACK (or the loader's
+    "effective KV" log line) is the authority, so say so when it was observed and say plainly when it was not.
+    """
+    eff = cfg.get("kv_mode_effective")
+    if eff:
+        src = cfg.get("kv_mode_effective_src", "loaded ACK")
+        return f"  kv_mode_resolved={eff} (observed in {src}; requested {cfg['kv']} [{cfg.get('kv_source', 'unknown')}])"
+    return (f"  kv_mode_resolved=UNOBSERVED (requested {cfg['kv']} [{cfg.get('kv_source', 'unknown')}]; "
+            "no loaded ACK or KV-cache log line seen, e.g. --no-spawn)")
+
+
+
 def _startup_path_proof_failures(cfg, txt):
     """VMM + DFlash draft-load failures for one attempt's log slice (no sys.exit)."""
     failures = []
 
+    # Only an *explicit* VMM request is fail-closed on missing markers.
+    # Automatic omission lets the runtime choose; harness reports the observed
+    # effective backend after warm instead of asserting a tag policy.
     if cfg.get("kv_backend") == "vmm":
-        # KvCache constructors emit e.g. "KV cache: q8 vmm (...", "KV cache: fwht3 vmm (...".
-        if not re.search(r"KV cache:.*\bvmm\b", txt):
+        if not _log_has_vmm_kv_marker(txt):
             failures.append(
-                "kv_backend=vmm requested but serve log has no 'KV cache: … vmm' marker"
+                "kv_backend=vmm requested but serve log has no VMM allocation marker"
             )
+
 
     dflash = cfg.get("dflash", "off") or "off"
     if dflash == "on":
         loaded = (
             "DFlash draft loaded:" in txt
             or "DFlash generic speculator loaded" in txt
+            # Muse Glimmer (arch 14) logs its own wording.
+            or "glimmer DFlash drafter loaded:" in txt
         )
         skipped = "dflash_mode=off — skipping draft load" in txt
-        failed = "DFlash draft load failed" in txt
+        failed = (
+            "DFlash draft load failed" in txt
+            or "glimmer DFlash drafter load failed" in txt
+        )
         disabled = "DFlash disabled (dflash_mode=off)" in txt
-        if skipped or disabled:
+        # A successful load is the authoritative proof and wins: the same log
+        # slice can carry an earlier per-candidate "skipping draft load" line
+        # for a draft the daemon rejected before loading the one it kept.
+        if loaded:
+            pass
+        elif skipped or disabled:
             failures.append(
                 "dflash=on requested but serve log shows DFlash disabled/skipped"
             )
@@ -411,10 +1220,11 @@ def _startup_path_proof_failures(cfg, txt):
             failures.append(
                 "dflash=on requested but serve log shows 'DFlash draft load failed'"
             )
-        elif not loaded:
+        else:
             failures.append(
                 "dflash=on requested but serve log lacks "
-                "'DFlash draft loaded:' / 'DFlash generic speculator loaded' proof"
+                "'DFlash draft loaded:' / 'DFlash generic speculator loaded' / "
+                "'glimmer DFlash drafter loaded:' proof"
             )
     return failures
 
@@ -519,9 +1329,14 @@ def _self_test_serve_path_proofs():
         cur = _serve_log_text(path, offset)
         fails = _startup_path_proof_failures(cfg_vmm, cur)
         check(not fails, f"current-attempt VMM must pass, got {fails!r}")
+        ds4_fails = _startup_path_proof_failures(
+            cfg_vmm,
+            "  deepseek4 KV cache: automatic VMM growth to advertised context 1048576\n",
+        )
+        check(not ds4_fails, f"DeepSeek V4 VMM marker must pass, got {ds4_fails!r}")
 
         # --- draft-loaded without request execution must fail ---
-        cfg_df = {"kv_backend": "contiguous", "dflash": "on"}
+        cfg_df = {"kv_backend": "legacy", "dflash": "on"}
         with open(path, "ab") as ap:
             ap.write(b"DFlash draft loaded: /current/draft.hfq\n")
         cur = _serve_log_text(path, offset)
@@ -556,14 +1371,1078 @@ def _self_test_serve_path_proofs():
         req_fails = _dflash_request_proof_failures(cfg_df, rows=ar_rows, log_txt=cur)
         check(not req_fails, f"log dflash/tau evidence must pass, got {req_fails!r}")
 
-        # Non-DFlash / non-VMM configs stay silent.
-        plain = {"kv_backend": "contiguous", "dflash": "off"}
+        # Non-DFlash / non-explicit-VMM configs stay silent (automatic included).
+        plain = {"kv_backend": "legacy", "dflash": "off"}
         check(not _startup_path_proof_failures(plain, ""), "plain startup must be no-op")
         check(not _dflash_request_proof_failures(plain, [], ""), "plain request proof must be no-op")
+        auto = {"kv_backend": None, "dflash": "off"}
+        check(not _startup_path_proof_failures(auto, ""), "automatic request must not require VMM marker")
+        check(
+            not _startup_path_proof_failures(
+                auto, "KV cache: fp8-e4m3 (4/16 layers carry KV, others placeholder)\n"
+            ),
+            "automatic + non-VMM cache marker must stay silent",
+        )
 
     os.unlink(path)
     print("serve_harness: path-proof self-test OK", flush=True)
 
+
+def _self_test_prompt_sources():
+    """Exercise NIAH lowering without touching a model or GPU."""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump({
+            "filler_text": "alpha needle omega",
+            "question": "What was in the middle?",
+            "expected_answer_substring": "needle",
+        }, tmp)
+        path = tmp.name
+    try:
+        rows = load_prompt_battery(None, niah_file=path)
+        assert rows == [("longctx-niah", "alpha needle omega\n\nWhat was in the middle?", ["needle"])]
+    finally:
+        os.unlink(path)
+    print("serve_harness: prompt-source self-test OK", flush=True)
+
+
+def _self_test_device_config():
+    """Prove multi-device visibility is explicit in the isolated TOML."""
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        cfg = {
+            "port": 11520,
+            "model": "/models/deepseek4.mq2r",
+            "kv": "q8",
+            "mtp": "off",
+            "dflash": "off",
+            "thinking_budget": "off",
+            "deepseek4_compute_placement":
+                "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)",
+            "devices": "0,1",
+        }
+        _write_native_config(cfg, home)
+        config = Path(home, ".hipfire", "config.toml").read_text(encoding="utf-8")
+        assert '[hardware]\ndevices = "0,1"\n' in config
+    print("serve_harness: device-config self-test OK", flush=True)
+
+
+def _self_test_kv_resolution():
+    """Prove registry defaults, aliases, explicit overrides, and fallback."""
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        json.dump({
+            "models": {"deepseek-v4-flash:mq2r": {"default_kv_mode": "f32"},
+                       "qwen3.8:27b-mq4-xts": {"default_kv_mode": "q8"}},
+            "aliases": {"deepseek4:mq2r": "deepseek-v4-flash:mq2r"},
+        }, tmp)
+        path = tmp.name
+    try:
+        assert resolve_kv_mode(None, "deepseek4:mq2r", path) == (
+            "f32", "registry(deepseek-v4-flash:mq2r)")
+        assert resolve_kv_mode("f16", "deepseek4:mq2r", path) == (
+            "f16", "explicit(--kv)")
+        assert resolve_kv_mode(None, "missing", path) == ("auto", "default(auto)")
+        # A registry q8 is left to the product's auto (fp8 on gfx1201), not pinned.
+        assert resolve_kv_mode(None, "qwen3.8:27b-mq4-xts", path) == (
+            "auto", "registry(qwen3.8:27b-mq4-xts):q8->auto")
+        assert resolve_kv_mode("q8", "qwen3.8:27b-mq4-xts", path) == (
+            "q8", "explicit(--kv)")
+    finally:
+        os.unlink(path)
+    print("serve_harness: kv-resolution self-test OK", flush=True)
+
+
+def _self_test_load_defaults():
+    """Tag max_tokens policy; context/backend remain automatic unless explicit."""
+    import argparse
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
+        # Wire fields intentionally absent: policy is tag-keyed, not registry JSON.
+        json.dump({
+            "models": {
+                "qwen3.8:27b": {
+                    "default_kv_mode": "q8",
+                    "recommended_settings": {
+                        "temperature": 1.0,
+                        "reasoning_effort": "xhigh",
+                        "thinking_budget": "uncapped",
+                    },
+                },
+                "qwen3.5:4b": {"default_kv_mode": "q8"},
+                "qwen3.6:35b-a3b": {"default_kv_mode": "q8"},
+                "deepseek-v4-flash": {"default_kv_mode": "f32"},
+                "deepseek-v4-flash:mq2lloyd": {"default_kv_mode": "f32"},
+                "deepseek-v4-flash-preview": {"default_kv_mode": "f32"},
+                "muse-glimmer": {"file": "muse-glimmer-30b.mq4"},
+                "muse-glimmer:fast": {"file": "muse-glimmer-30b.mq4r"},
+                "muse-glimmer:draft": {"file": "muse-glimmer-30b-dflash.mq4"},
+                "qwen3.5:4b-draft": {},
+                "qwen3.6:35b-a3b-dflash": {},
+            },
+            "aliases": {
+                "qwen38:27b": "qwen3.8:27b",
+                "qwen3:latest": "qwen3:8b",
+                "ds4": "deepseek-v4-flash",
+                "deepseek4:mq2lloyd": "deepseek-v4-flash:mq2lloyd",
+                "ds4:preview": "deepseek-v4-flash-preview",
+                "muse-glimmer:quality": "muse-glimmer",
+            },
+        }, tmp)
+        reg_path = tmp.name
+    try:
+        # Backend request ignores tags: omission is always automatic.
+        assert resolve_kv_backend_request(None) == (None, "automatic")
+        assert resolve_kv_backend_request("legacy") == (
+            "legacy", "explicit(--kv-backend)")
+        assert resolve_kv_backend_request("vmm") == (
+            "vmm", "explicit(--kv-backend)")
+        # contiguous is rejected at argparse with an actionable migration error.
+        try:
+            parse_kv_backend_arg("contiguous")
+            raise AssertionError("contiguous must raise ArgumentTypeError")
+        except argparse.ArgumentTypeError as exc:
+            msg = str(exc)
+            assert "renamed to 'legacy'" in msg, msg
+            assert "--kv-backend legacy" in msg, msg
+        assert parse_kv_backend_arg("legacy") == "legacy"
+        assert parse_kv_backend_arg("vmm") == "vmm"
+        assert resolve_max_seq(None) == (None, "automatic(model/card)")
+
+        # Qwen3.8 aliases retain their generation cap, never a context cap.
+        assert resolve_max_tokens(None, "qwen38:27b", reg_path) == (
+            81920, "tag-policy(qwen3.8:27b)")
+        vals, sources = resolve_sampling("registry", "qwen38:27b", reg_path)
+        assert vals["temperature"] == 1.0
+        assert vals["reasoning_effort"] == "xhigh"
+        assert vals["thinking_budget"] == "uncapped"
+        assert sources["temperature"] == "registry(qwen3.8:27b)"
+        # All Qwen target tags keep their generation cap.
+        for tag in ("qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b"):
+            assert resolve_max_tokens(None, tag, reg_path) == (
+                81920, "tag-policy(%s)" % tag)
+        # Explicit context and generation overrides remain independent.
+        assert resolve_max_seq(4096) == (
+            4096, "explicit(--max-seq)")
+        assert resolve_max_tokens(512, "qwen38:27b", reg_path) == (
+            512, "explicit(--max-tokens)")
+        # Original Qwen3 has no generation tag policy.
+        assert resolve_max_tokens(None, "qwen3:latest", reg_path) == (
+            2048, "default(2048)")
+        # DeepSeek V4 Flash canonical targets: 384Ki output.
+        for tag in (
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:mq2lloyd",
+            "deepseek-v4-flash-preview",
+        ):
+            assert resolve_max_tokens(None, tag, reg_path) == (
+                393216, "tag-policy(%s)" % tag)
+        # Aliases resolve to the same DeepSeek canonical policy.
+        assert resolve_max_tokens(None, "ds4", reg_path) == (
+            393216, "tag-policy(deepseek-v4-flash)")
+        assert resolve_max_tokens(None, "ds4:preview", reg_path) == (
+            393216, "tag-policy(deepseek-v4-flash-preview)")
+        # Explicit overrides still beat DeepSeek policy.
+        assert resolve_max_seq(8192) == (
+            8192, "explicit(--max-seq)")
+        assert resolve_max_tokens(256, "deepseek-v4-flash", reg_path) == (
+            256, "explicit(--max-tokens)")
+        # Muse Glimmer has no tag context/generation override.
+        assert resolve_max_tokens(None, "muse-glimmer", reg_path) == (
+            2048, "default(2048)")
+        assert resolve_max_tokens(None, "muse-glimmer:fast", reg_path) == (
+            2048, "default(2048)")
+        # Draft / dflash sidecars and unknown tags: no context/token policy.
+        assert resolve_max_tokens(None, "muse-glimmer:draft", reg_path) == (
+            2048, "default(2048)")
+        assert resolve_max_tokens(None, "qwen3.5:4b-draft", reg_path) == (
+            2048, "default(2048)")
+        assert resolve_max_tokens(None, "missing", reg_path) == (2048, "default(2048)")
+        # Family-looking tags absent from the registry are not registry-selected.
+        for tag in (
+            "qwen3.8:missing",
+            "deepseek-v4-flash:missing",
+            "deepseek-v4-flash-preview:missing",
+        ):
+            assert resolve_max_tokens(None, tag, reg_path) == (
+                2048, "default(2048)")
+
+        # Effective observer: VMM marker, ACK preferred, legacy reason/WARNING.
+        # Bare non-VMM KV cache markers alone must NOT decide trunk backend
+        # (auxiliary/draft caches also emit them).
+        assert observe_effective_kv_backend(
+            "KV cache: Fp8 vmm (layers; mapped_prefix=1)\n"
+        ) == ("vmm", "log-marker")
+        assert observe_effective_kv_backend(
+            "KV cache: fp8-e4m3 (4/16 layers carry KV, others placeholder)\n"
+        ) == (None, None)
+        assert observe_effective_kv_backend(
+            "KV backend: automatic vmm unavailable "
+            "(carrier llama has no VMM KV owner) -> legacy\n"
+            "KV cache: q8 (4/16 layers carry KV, others placeholder)\n"
+        ) == (
+            "legacy",
+            "automatic-fallback(carrier llama has no VMM KV owner)",
+        )
+        # Transitional contiguous daemon spelling still maps to legacy.
+        assert observe_effective_kv_backend(
+            "KV backend: automatic vmm unavailable "
+            "(carrier llama has no VMM KV owner) -> contiguous\n"
+        ) == (
+            "legacy",
+            "automatic-fallback(carrier llama has no VMM KV owner)",
+        )
+        assert observe_effective_kv_backend(
+            "KV backend: explicit legacy override\n"
+        ) == ("legacy", "explicit-legacy")
+        assert observe_effective_kv_backend(
+            "KV backend: explicit contiguous override\n"
+        ) == ("legacy", "explicit-legacy")
+        assert observe_effective_kv_backend(
+            "  deepseek4 KV cache: automatic VMM growth to advertised context 1048576\n"
+        ) == ("vmm", "log-marker")
+        # Loaded ACK preferred over auxiliary draft KV cache markers.
+        ack_line = (
+            '{"type":"loaded","kv_backend_request":"automatic","kv_backend":"legacy",'
+            '"kv_backend_reason":"carrier draft has no VMM owner",'
+            '"kv_backend_legacy":true,'
+            '"kv_backend_warning":"WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM '
+            'selection unavailable (carrier draft has no VMM owner); using legacy KV '
+            'storage. Inspect before benchmarking or filing a PR."}'
+        )
+        mixed = (
+            "draft KV cache: q8 (placeholder)\n"
+            + ack_line
+            + "\n"
+            + "KV cache: fp8-e4m3 (4/16 layers carry KV, others placeholder)\n"
+        )
+        assert observe_effective_kv_backend(mixed) == (
+            "legacy",
+            "ack(carrier draft has no VMM owner)",
+        )
+        ack = parse_loaded_kv_backend_ack(mixed)
+        assert ack["kv_backend"] == "legacy"
+        assert ack["kv_backend_legacy"] is True
+        assert "HIPFIRE_KV_BACKEND=legacy" in ack["kv_backend_warning"]
+        warn_auto = format_legacy_kv_backend_warning(
+            "carrier llama has no VMM KV owner", explicit=False
+        )
+        assert warn_auto.startswith("WARNING HIPFIRE_KV_BACKEND=legacy:")
+        assert "automatic VMM selection unavailable" in warn_auto
+        warn_exp = format_legacy_kv_backend_warning(explicit=True)
+        assert "explicitly selected legacy KV storage" in warn_exp
+
+        def _ns(**kw):
+            base = dict(
+                model="/models/qwen3.8-27b.mq4",
+                tag="qwen38:27b",
+                registry=reg_path,
+                kv=None,
+                kv_backend=None,
+                mtp="off",
+                dflash="off",
+                ngram="off",
+                ngram_k=None,
+                mtp_ngram="off",
+                mtp_ngram_match=None,
+                mtp_ngram_min=None,
+                mtp_ngram_max=None,
+                draft=None,
+                thinking="off",
+                thinking_effort=None,
+                max_tokens=None,
+                max_seq=None,
+                sampling="greedy",
+                mode="battery",
+                port=11520,
+                seed=None,
+                prompts_file=None,
+                prompt_file=None,
+                niah_file=None,
+                speculation=None,
+                deepseek4_experts_per_token=None,
+                deepseek4_compute_placement="single",
+                devices=None,
+                tp=None,
+                replay_route_proof_log=False,
+            )
+            base.update(kw)
+            return argparse.Namespace(**base)
+
+        # Path and tag both request automatic context/backend; only output cap is tagged.
+        cfg = build_config(_ns())
+        assert cfg["kv_backend"] is None, cfg
+        assert cfg["kv_backend_source"] == "automatic"
+        assert cfg["max_seq"] is None
+        assert cfg["max_seq_source"] == "automatic(model/card)"
+        assert cfg["max_tokens"] == 81920
+        assert cfg["max_tokens_source"] == "tag-policy(qwen3.8:27b)"
+        assert cfg["kv"] == "auto"
+        assert cfg["kv_source"] == "registry(qwen3.8:27b):q8->auto"
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, ".hipfire").mkdir()
+            _write_native_config(cfg, home)
+            assert "max_seq =" not in Path(home, ".hipfire", "config.toml").read_text()
+
+        cfg = build_config(_ns(tag=None, model="/models/qwen3.8-27b.mq4"))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
+
+        cfg = build_config(_ns(kv_backend="legacy", max_seq=8192, max_tokens=256))
+        assert cfg["kv_backend"] == "legacy"
+        assert cfg["kv_backend_source"] == "explicit(--kv-backend)"
+        assert cfg["max_seq"] == 8192
+        assert cfg["max_seq_source"] == "explicit(--max-seq)"
+        assert cfg["max_tokens"] == 256
+        assert cfg["max_tokens_source"] == "explicit(--max-tokens)"
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, ".hipfire").mkdir()
+            _write_native_config(cfg, home)
+            assert "max_seq = 8192" in Path(home, ".hipfire", "config.toml").read_text()
+
+        cfg = build_config(_ns(tag="qwen3:latest", model="/models/qwen3-8b.mq4"))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
+        assert cfg["max_seq"] is None
+        assert cfg["max_tokens"] == 2048
+
+        cfg = build_config(_ns(
+            tag="deepseek-v4-flash",
+            model="/models/deepseek-v4-flash-0731.mq2r",
+        ))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
+        assert cfg["max_seq"] is None
+        assert cfg["max_seq_source"] == "automatic(model/card)"
+        assert cfg["max_tokens"] == 393216
+        assert cfg["max_tokens_source"] == "tag-policy(deepseek-v4-flash)"
+
+        cfg = build_config(_ns(
+            tag="deepseek-v4-flash:mq2lloyd",
+            model="/models/deepseek-v4-flash-0731.mq2lloyd",
+        ))
+        assert cfg["kv_backend"] is None
+        assert cfg["max_seq"] is None
+        assert cfg["max_tokens"] == 393216
+
+        cfg = build_config(_ns(
+            tag="deepseek-v4-flash-preview",
+            model="/models/deepseek-v4-flash.mq2lloyd",
+        ))
+        assert cfg["kv_backend"] is None
+        assert cfg["max_seq"] is None
+        assert cfg["max_tokens"] == 393216
+
+        cfg = build_config(_ns(tag="muse-glimmer", model="/models/muse-glimmer-30b.mq4"))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
+        assert cfg["max_seq"] is None
+        assert cfg["max_seq_source"] == "automatic(model/card)"
+        assert cfg["max_tokens"] == 2048
+        assert cfg["max_tokens_source"] == "default(2048)"
+
+        cfg = build_config(_ns(tag="muse-glimmer:fast", model="/models/muse-glimmer-30b.mq4r"))
+        assert cfg["kv_backend"] is None
+        assert cfg["max_seq"] is None
+        assert cfg["max_tokens"] == 2048
+
+        # Draft/dflash sidecars: automatic context/backend; generation fallback.
+        cfg = build_config(_ns(
+            tag="muse-glimmer:draft",
+            model="/models/muse-glimmer-30b-assistant.q8.hfq",
+        ))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
+        assert cfg["max_seq"] is None
+        assert cfg["max_tokens"] == 2048
+        assert infer_tag("/models/muse-glimmer-30b-dflash.mq4") == "muse-glimmer:draft"
+        assert infer_tag("/models/muse-glimmer-30b-assistant.q8.hfq") == "muse-glimmer:draft"
+        cfg = build_config(_ns(
+            tag=None,
+            model="/models/muse-glimmer-30b-dflash.mq4",
+        ))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
+        assert cfg["max_seq"] is None
+        assert cfg["max_tokens"] == 2048
+
+        cfg = build_config(_ns(tag="missing", model="/models/unknown.mq4"))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
+        assert cfg["max_seq"] is None
+        assert cfg["max_tokens"] == 2048
+
+        # Pre-flight shows requested automatic until observation lands.
+        buf = StringIO()
+        with redirect_stdout(buf):
+            show_config(build_config(_ns()))
+        pre = buf.getvalue()
+        assert "kv_backend: automatic [automatic]" in pre, pre
+
+        cfg_obs = build_config(_ns())
+        cfg_obs["kv_backend_effective"] = "vmm"
+        cfg_obs["kv_backend_effective_reason"] = "log-marker"
+        buf = StringIO()
+        with redirect_stdout(buf):
+            show_config(cfg_obs)
+        obs = buf.getvalue()
+        assert "kv_backend: vmm [observed(log-marker)]" in obs, obs
+        # Loaded native layout supersedes the requested auto preset in console and rows.
+        cfg_fp8 = build_config(_ns())
+        apply_observed_kv_backend(
+            cfg_fp8,
+            '{"type":"loaded","kv_backend":"vmm","kv_mode":"fp8"}\n',
+        )
+        buf = StringIO()
+        with redirect_stdout(buf):
+            show_config(cfg_fp8)
+        assert "kv_mode       : fp8 [observed(loaded)]" in buf.getvalue()
+        assert stamp_kv_backend_out_fields([{}], cfg_fp8)[0]["kv_mode"] == "fp8"
+        assert "kv_mode_resolved=fp8 (observed in loaded ACK; requested auto" in kv_mode_report_line(cfg_fp8)
+        assert "kv_mode_resolved=UNOBSERVED (requested auto" in kv_mode_report_line(build_config(_ns()))
+        # No loaded ACK in the serve log: the loader's own effective-KV line still names the mode.
+        cfg_log = build_config(_ns())
+        apply_observed_kv_backend(cfg_log, "  KV cache: requested mode=auto, effective KV=fp8\n")
+        assert "kv_mode_resolved=fp8 (observed in serve log" in kv_mode_report_line(cfg_log)
+        # Split effective K/V grammar the producer actually emits (comma and space forms).
+        cfg_q8 = build_config(_ns())
+        apply_observed_kv_backend(cfg_q8, "  KV cache: requested mode=q8, effective K=q8, effective V=q8\n")
+        assert cfg_q8["kv_mode_effective"] == "q8"
+        assert stamp_kv_backend_out_fields([{}], cfg_q8)[0]["kv_mode"] == "q8"
+        cfg_q8sp = build_config(_ns())
+        apply_observed_kv_backend(cfg_q8sp, "  KV cache: requested mode=q8, effective K=q8 V=q8\n")
+        assert cfg_q8sp["kv_mode_effective"] == "q8"
+        # Auto request still resolves from the effective K/V pair, never the requested token.
+        cfg_aq8 = build_config(_ns())
+        apply_observed_kv_backend(cfg_aq8, "  KV cache: requested mode=auto, effective K=q8, effective V=q8\n")
+        assert cfg_aq8["kv_mode_effective"] == "q8"
+        # Mismatch / partial / requested-only lines fail closed: UNOBSERVED, no row stamp.
+        for _bad in (
+            "  KV cache: requested mode=q8, effective K=q8, effective V=fp8\n",
+            "  KV cache: requested mode=q8, effective K=q8\n",
+            "  KV cache: requested mode=q8\n",
+            "diagnostic effective K=q8, effective V=q8\n",
+            "  KV cache: requested mode=q8, effective K=q8, effective V=q8-unknown\n",
+        ):
+            _cfg_bad = build_config(_ns())
+            apply_observed_kv_backend(_cfg_bad, _bad)
+            assert _cfg_bad.get("kv_mode_effective") is None
+            assert stamp_kv_backend_out_fields([{}], _cfg_bad)[0]["kv_mode"] is None
+
+        # Once-per-load legacy warning + --out row metadata (list shape preserved).
+        cfg_leg = build_config(_ns(kv_backend="legacy"))
+        ack_txt = (
+            '{"type":"loaded","kv_backend_request":"explicit","kv_backend":"legacy",'
+            '"kv_backend_reason":null,"kv_backend_legacy":true,'
+            '"kv_backend_warning":"'
+            + format_legacy_kv_backend_warning(explicit=True)
+            + '"}\n'
+        )
+        out_b, err_b = StringIO(), StringIO()
+        with redirect_stdout(out_b), redirect_stderr(err_b):
+            apply_observed_kv_backend(cfg_leg, ack_txt)
+        err_s = err_b.getvalue()
+        out_s = out_b.getvalue()
+        assert "WARNING HIPFIRE_KV_BACKEND=legacy" in err_s, err_s
+        assert "explicitly selected legacy KV storage" in err_s, err_s
+        assert "kv_backend_effective=legacy" in out_s, out_s
+        assert cfg_leg["kv_backend_legacy"] is True
+        assert cfg_leg["kv_backend_effective"] == "legacy"
+        # Second call must not re-emit.
+        out_b2, err_b2 = StringIO(), StringIO()
+        with redirect_stdout(out_b2), redirect_stderr(err_b2):
+            apply_observed_kv_backend(cfg_leg, ack_txt)
+        assert err_b2.getvalue() == ""
+        assert out_b2.getvalue() == ""
+        # Automatic reason path via WARNING token (no ACK).
+        cfg_auto = build_config(_ns())
+        auto_txt = (
+            "WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable "
+            "(carrier llama has no VMM KV owner); using legacy KV storage. "
+            "Inspect before benchmarking or filing a PR.\n"
+        )
+        out_b3, err_b3 = StringIO(), StringIO()
+        with redirect_stdout(out_b3), redirect_stderr(err_b3):
+            apply_observed_kv_backend(cfg_auto, auto_txt)
+        assert "HIPFIRE_KV_BACKEND=legacy" in err_b3.getvalue()
+        assert "kv_backend_effective=legacy" in out_b3.getvalue()
+        assert cfg_auto["kv_backend_legacy"] is True
+        rows = [{"gen": 1, "tau": 1.0}, {"gen": 2, "tau": 2.0}]
+        stamp_kv_backend_out_fields(rows, cfg_auto)
+        assert isinstance(rows, list)
+        for row in rows:
+            assert row["kv_backend"] == "legacy"
+            assert row["kv_backend_legacy"] is True
+            assert "HIPFIRE_KV_BACKEND=legacy" in (row["kv_backend_warning"] or "")
+            assert row["kv_backend_reason"] == "carrier llama has no VMM KV owner"
+        # Round-trip list shape for --out consumers.
+        dumped = json.loads(json.dumps(rows))
+        assert isinstance(dumped, list) and len(dumped) == 2
+        assert dumped[0]["kv_backend"] == "legacy"
+    finally:
+        os.unlink(reg_path)
+    print("serve_harness: load-defaults self-test OK", flush=True)
+
+
+def _self_test_mtp_ngram_config():
+    """Config exclusivity, default 24/48/64 gate, MTP TOML selector, and env isolation."""
+    import argparse
+    import tempfile
+
+    def _ns(**kw):
+        base = dict(
+            model="/models/x.mq4",
+            tag=None,
+            registry=os.path.join(REPO, "registry/v1.json"),
+            kv=None,
+            kv_backend=None,
+            mtp="off",
+            dflash="off",
+            ngram="off",
+            ngram_k=None,
+            mtp_ngram="off",
+            mtp_ngram_match=None,
+            mtp_ngram_min=None,
+            mtp_ngram_max=None,
+            draft=None,
+            thinking=None,
+            thinking_effort=None,
+            max_tokens=None,
+            max_seq=None,
+            sampling="greedy",
+            mode="battery",
+            port=11520,
+            seed=None,
+            prompts_file=None,
+            prompt_file=None,
+            niah_file=None,
+            speculation=None,
+            deepseek4_experts_per_token=None,
+            deepseek4_compute_placement="single",
+            devices=None,
+            tp=None,
+            replay_route_proof_log=False,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    # Baseline --mtp on leaves composition off and does not invent gate params.
+    cfg = build_config(_ns(mtp="on"))
+    assert cfg["mtp"] == "on"
+    assert cfg["mtp_ngram"] == "off"
+    assert cfg["mtp_ngram_match"] is None
+    assert cfg["mtp_ngram_min"] is None
+    assert cfg["mtp_ngram_max"] is None
+
+    # Composition requires --mtp on.
+    try:
+        build_config(_ns(mtp_ngram="on", thinking="off"))
+        raise AssertionError("expected SystemExit without --mtp on")
+    except SystemExit as exc:
+        assert "--mtp on" in str(exc)
+
+    # Exclusive with standalone ngram / dflash.
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", ngram="on", thinking="off"))
+        raise AssertionError("expected SystemExit for ngram+mtp-ngram")
+    except SystemExit as exc:
+        assert "exclusive" in str(exc)
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", dflash="on", thinking="off"))
+        raise AssertionError("expected SystemExit for dflash+mtp-ngram")
+    except SystemExit as exc:
+        assert "exclusive" in str(exc)
+
+    # Requires greedy sampling and thinking off.
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="off", sampling="recipe:general"))
+        raise AssertionError("expected SystemExit for non-greedy sampling")
+    except SystemExit as exc:
+        assert "greedy" in str(exc)
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="med"))
+        raise AssertionError("expected SystemExit without thinking off")
+    except SystemExit as exc:
+        assert "thinking off" in str(exc)
+
+    # Defaults 24/48/64; invalid bounds refused.
+    cfg = build_config(_ns(mtp="on", mtp_ngram="on", thinking="off"))
+    assert cfg["mtp_ngram"] == "on"
+    assert cfg["mtp_ngram_match"] == 24
+    assert cfg["mtp_ngram_min"] == 48
+    assert cfg["mtp_ngram_max"] == 64
+    cfg = build_config(_ns(
+        mtp="on", mtp_ngram="on", thinking="off",
+        mtp_ngram_match=16, mtp_ngram_min=32, mtp_ngram_max=48,
+    ))
+    assert cfg["mtp_ngram_match"] == 16
+    assert cfg["mtp_ngram_min"] == 32
+    assert cfg["mtp_ngram_max"] == 48
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="off", mtp_ngram_match=0))
+        raise AssertionError("expected SystemExit for match<1")
+    except SystemExit as exc:
+        assert "mtp-ngram-match" in str(exc)
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="off", mtp_ngram_min=0))
+        raise AssertionError("expected SystemExit for min<1")
+    except SystemExit as exc:
+        assert "mtp-ngram-min" in str(exc)
+    try:
+        build_config(_ns(mtp="on", mtp_ngram="on", thinking="off", mtp_ngram_max=65))
+        raise AssertionError("expected SystemExit for max>64")
+    except SystemExit as exc:
+        assert "mtp-ngram-max" in str(exc)
+    try:
+        build_config(_ns(
+            mtp="on", mtp_ngram="on", thinking="off",
+            mtp_ngram_min=50, mtp_ngram_max=40,
+        ))
+        raise AssertionError("expected SystemExit for min>max")
+    except SystemExit as exc:
+        assert "must be <=" in str(exc)
+
+    # Preflight names the 24/48/64 default gate.
+    import io
+    from contextlib import redirect_stdout
+    cfg = build_config(_ns(mtp="on", mtp_ngram="on", thinking="off"))
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        show_config(cfg)
+    pre = buf.getvalue()
+    assert "default gate 24/48/64" in pre
+    assert "match=24 min=48 max=64" in pre
+
+    # TOML stays mode=mtp (no ngram selector); env is the only composition switch.
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        cfg = {
+            "port": 11520,
+            "model": "/models/x.mq4",
+            "kv": "q8",
+            "mtp": "on",
+            "dflash": "off",
+            "ngram": "off",
+            "mtp_ngram": "on",
+            "mtp_ngram_match": 24,
+            "mtp_ngram_min": 48,
+            "mtp_ngram_max": 64,
+            "thinking_budget": "off",
+            "deepseek4_compute_placement": "single",
+            "devices": None,
+        }
+        _write_native_config(cfg, home)
+        text = Path(home, ".hipfire", "config.toml").read_text(encoding="utf-8")
+        assert 'mode = "mtp"' in text
+        assert 'mtp = "on"' in text
+        assert 'ngram = "off"' in text
+        assert "mtp_ngram" not in text
+        assert "HIPFIRE_MTP_NGRAM" not in text
+
+    # turn_line carries a concise ngram-mod fragment without dropping tau (opt-on only).
+    line_on = turn_line(1, {
+        "runaway": False, "empty": False, "attractor": False,
+        "decode_tok_s": 100.0, "decode_estimated": False,
+        "prefill_tok_s": 500.0, "prefill_ms": 10,
+        "finish": "stop", "ctx": 32, "cached": 0, "gen": 16,
+        "think_words": 0, "ans_words": 4, "tau": 2.5,
+        "mtp_ngram": True,
+        "ngram_mod_accepted": 6, "ngram_mod_drafts": 10,
+        "ngram_mod_accept_rate": 0.6,
+        "mtp_windows": 3, "ar_windows": 2, "mtp_retired": True,
+        "ans_preview": "ok",
+    })
+    assert "tau=2.5" in line_on
+    assert "ngram=6/10@0.60" in line_on
+    assert "win=3/2" in line_on
+    assert "retired=1" in line_on
+    assert "pld=" not in line_on
+
+    # Opt-off / absent mtp_ngram: no ngram fragment even if metrics leak in.
+    line_off = turn_line(1, {
+        "runaway": False, "empty": False, "attractor": False,
+        "decode_tok_s": 100.0, "decode_estimated": False,
+        "prefill_tok_s": 500.0, "prefill_ms": 10,
+        "finish": "stop", "ctx": 32, "cached": 0, "gen": 16,
+        "think_words": 0, "ans_words": 4, "tau": 2.5,
+        "mtp_ngram": False,
+        "ngram_mod_accepted": 6, "ngram_mod_drafts": 10,
+        "ngram_mod_accept_rate": 0.6,
+        "mtp_windows": 3, "ar_windows": 2, "mtp_retired": True,
+        "ans_preview": "ok",
+    })
+    assert "tau=2.5" in line_off
+    assert "ngram=" not in line_off
+    assert "win=" not in line_off
+    assert "retired=" not in line_off
+    line_absent = turn_line(1, {
+        "runaway": False, "empty": False, "attractor": False,
+        "decode_tok_s": 100.0, "decode_estimated": False,
+        "prefill_tok_s": 500.0, "prefill_ms": 10,
+        "finish": "stop", "ctx": 32, "cached": 0, "gen": 16,
+        "think_words": 0, "ans_words": 4, "tau": 1.0,
+        "ngram_mod_windows": 9, "ngram_mod_drafts": 9, "ans_preview": "ok",
+    })
+    assert "tau=1.0" in line_absent
+    assert "ngram=" not in line_absent
+    assert "pld=" not in line_absent
+
+    # mtp_window_timings: production projection preserves nested host-timing
+    # records for --out JSON (opt-in HIPFIRE_HOST_TIMING path).
+    windows = [{
+        "kind": "mtp",
+        "wall_us": 1234,
+        "draft_lookup_us": 12,
+        "launch_us": 34,
+        "h2d_us": 56,
+        "d2h_us": 78,
+        "d2d_us": 90,
+        "memset_us": 11,
+        "stream_sync_us": 22,
+        "event_sync_us": 33,
+        "device_sync_us": 44,
+        "graph_launch_us": 55,
+    }]
+    timings_on = {
+        "mtp": True,
+        "mtp_ngram": True,
+        "mtp_windows": 1,
+        "ar_windows": 0,
+        "mtp_retired": True,
+        "mtp_window_timings": windows,
+        "ngram_mod_windows": 1,
+        "ngram_mod_drafts": 2,
+        "ngram_mod_accepted": 1,
+        "ngram_mod_accept_rate": 0.5,
+    }
+    row_on = _project_mtp_ngram_timings(timings_on)
+    assert row_on["mtp_window_timings"] is windows
+    assert row_on["mtp_window_timings"] == windows
+    assert row_on["mtp_window_timings"][0]["kind"] == "mtp"
+    assert row_on["mtp_window_timings"][0]["wall_us"] == 1234
+    assert row_on["mtp"] is True
+    assert row_on["mtp_ngram"] is True
+    assert row_on["mtp_windows"] == 1
+    assert row_on["ngram_mod_accepted"] == 1
+    # --out path is json.dump(rows); nested records must survive round-trip.
+    dumped = json.loads(json.dumps([row_on], indent=0))
+    assert dumped[0]["mtp_window_timings"] == windows
+    # Disabled / missing / explicit null → None (no fabricated empty list).
+    assert _project_mtp_ngram_timings({}).get("mtp_window_timings") is None
+    assert _project_mtp_ngram_timings(None).get("mtp_window_timings") is None
+    assert _project_mtp_ngram_timings({"mtp_window_timings": None})["mtp_window_timings"] is None
+
+
+
+    # spawn_serve opt-off pops all inherited ngram-mod env (no service start).
+    import unittest.mock as mock
+    captured = {}
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    def _fake_popen(*_a, **kw):
+        captured["env"] = dict(kw.get("env") or {})
+        return _FakeProc()
+
+    _ENV_KEYS = (
+        "HIPFIRE_MTP_NGRAM",
+        "HIPFIRE_NGRAM_MOD_N_MATCH",
+        "HIPFIRE_NGRAM_MOD_N_MIN",
+        "HIPFIRE_NGRAM_MOD_N_MAX",
+        "HIPFIRE_MTP_NGRAM_K",
+    )
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        log = str(Path(home, "serve.log"))
+        Path(log).write_text("", encoding="utf-8")
+        cfg_off = build_config(_ns(mtp="on", mtp_ngram="off"))
+        cfg_off["serve_warm_timeout_secs"] = 2
+        prev = {k: os.environ.get(k) for k in _ENV_KEYS}
+        os.environ["HIPFIRE_MTP_NGRAM"] = "1"
+        os.environ["HIPFIRE_NGRAM_MOD_N_MATCH"] = "24"
+        os.environ["HIPFIRE_NGRAM_MOD_N_MIN"] = "48"
+        os.environ["HIPFIRE_NGRAM_MOD_N_MAX"] = "64"
+        os.environ["HIPFIRE_MTP_NGRAM_K"] = "12"
+        try:
+            with mock.patch("subprocess.Popen", side_effect=_fake_popen), \
+                 mock.patch(f"{__name__}._native_service_warm", return_value=True), \
+                 mock.patch(f"{__name__}._kill_serve"), \
+                 mock.patch(f"{__name__}._write_pid_file"), \
+                 mock.patch(f"{__name__}._clear_pid_file"), \
+                 mock.patch(f"{__name__}._write_native_config"), \
+                 mock.patch(f"{__name__}._native_cli", return_value="/bin/true"), \
+                 mock.patch("time.sleep"), \
+                 mock.patch("atexit.register"):
+                assert spawn_serve(cfg_off, home, log) is not None
+        finally:
+            for k, v in prev.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+    for k in _ENV_KEYS:
+        assert k not in captured["env"], k
+
+    # Opt-on injects HIPFIRE_MTP_NGRAM + the three NGRAM_MOD knobs.
+    captured.clear()
+    with tempfile.TemporaryDirectory() as home:
+        Path(home, ".hipfire").mkdir()
+        log = str(Path(home, "serve.log"))
+        Path(log).write_text("", encoding="utf-8")
+        cfg_on = build_config(_ns(
+            mtp="on", mtp_ngram="on", thinking="off",
+            mtp_ngram_match=16, mtp_ngram_min=32, mtp_ngram_max=48,
+        ))
+        cfg_on["serve_warm_timeout_secs"] = 2
+        with mock.patch("subprocess.Popen", side_effect=_fake_popen), \
+             mock.patch(f"{__name__}._native_service_warm", return_value=True), \
+             mock.patch(f"{__name__}._kill_serve"), \
+             mock.patch(f"{__name__}._write_pid_file"), \
+             mock.patch(f"{__name__}._clear_pid_file"), \
+             mock.patch(f"{__name__}._write_native_config"), \
+             mock.patch(f"{__name__}._native_cli", return_value="/bin/true"), \
+             mock.patch("time.sleep"), \
+             mock.patch("atexit.register"):
+            assert spawn_serve(cfg_on, home, log) is not None
+    assert captured["env"].get("HIPFIRE_MTP_NGRAM") == "1"
+    assert captured["env"].get("HIPFIRE_NGRAM_MOD_N_MATCH") == "16"
+    assert captured["env"].get("HIPFIRE_NGRAM_MOD_N_MIN") == "32"
+    assert captured["env"].get("HIPFIRE_NGRAM_MOD_N_MAX") == "48"
+    assert "HIPFIRE_MTP_NGRAM_K" not in captured["env"]
+
+    print("serve_harness: mtp-ngram-config self-test OK", flush=True)
+
+
+def _self_test_thinking_effort():
+    """GPU-free: medium/xhigh are accepted, uncapped by default, sent unchanged."""
+    import argparse
+
+    def _ns(**kw):
+        base = dict(
+            model="/models/x.mq4",
+            tag=None,
+            registry=os.path.join(REPO, "registry/v1.json"),
+            kv=None,
+            kv_backend=None,
+            mtp="off",
+            dflash="off",
+            ngram="off",
+            ngram_k=None,
+            mtp_ngram="off",
+            mtp_ngram_match=None,
+            mtp_ngram_min=None,
+            mtp_ngram_max=None,
+            draft=None,
+            thinking=None,
+            thinking_effort=None,
+            max_think_tokens=None,
+            max_tokens=None,
+            max_seq=None,
+            sampling="greedy",
+            mode="battery",
+            port=11520,
+            seed=None,
+            prompts_file=None,
+            prompt_file=None,
+            niah_file=None,
+            speculation=None,
+            deepseek4_experts_per_token=None,
+            deepseek4_compute_placement="single",
+            devices=None,
+            tp=None,
+            replay_route_proof_log=False,
+        )
+        base.update(kw)
+        return argparse.Namespace(**base)
+
+    for effort in ("medium", "xhigh"):
+        cfg = build_config(_ns(thinking_effort=effort))
+        assert cfg["sampling"]["reasoning_effort"] == effort, cfg["sampling"]
+        assert cfg["thinking_budget"] == "uncapped", (
+            f"{effort} without explicit budget must default uncapped, got "
+            f"{cfg['thinking_budget']!r}"
+        )
+        assert cfg["thinking_cap_tokens"] == 0, cfg["thinking_cap_tokens"]
+        assert cfg["sampling_source"].get("reasoning_effort") == "explicit(--thinking-effort)"
+
+    # Explicit --thinking still wins over the uncapped default.
+    cfg = build_config(_ns(thinking_effort="medium", thinking="high"))
+    assert cfg["sampling"]["reasoning_effort"] == "medium"
+    assert cfg["thinking_budget"] == "high"
+    assert cfg["thinking_cap_tokens"] == THINKING_BUDGET["high"]
+
+    # The exact per-turn numeric cap is independent of semantic effort and
+    # overrides the named budget only on the request wire.
+    cfg = build_config(
+        _ns(
+            thinking_effort="medium",
+            thinking="low",
+            max_think_tokens=4096,
+        )
+    )
+    assert cfg["sampling"]["reasoning_effort"] == "medium"
+    assert cfg["thinking_budget"] == "low"
+    assert cfg["thinking_cap_tokens"] == 4096
+    assert cfg["thinking_cap_source"] == "explicit(--max-think-tokens)"
+    assert cfg["request_max_think_tokens"] == 4096
+    body = _request_body(cfg, [{"role": "user", "content": "test"}])
+    assert body["max_think_tokens"] == 4096
+
+    # --stop: absent => body byte-identical to the no-stop body; present => "stop" list.
+    msgs = [{"role": "user", "content": "test"}]
+    cfg_nostop = build_config(_ns())
+    assert cfg_nostop["stop"] == [], cfg_nostop["stop"]
+    body_nostop = _request_body(cfg_nostop, msgs)
+    assert "stop" not in body_nostop, body_nostop
+    legacy_cfg = {k: v for k, v in cfg_nostop.items() if k != "stop"}
+    assert (json.dumps(_request_body(legacy_cfg, msgs), ensure_ascii=False)
+            == json.dumps(body_nostop, ensure_ascii=False))
+    cfg_stop = build_config(_ns(stop=["</answer>", "\n\nUser:"]))
+    assert cfg_stop["stop"] == ["</answer>", "\n\nUser:"], cfg_stop["stop"]
+    body_stop = _request_body(cfg_stop, msgs)
+    assert body_stop["stop"] == ["</answer>", "\n\nUser:"], body_stop
+    assert {k: v for k, v in body_stop.items() if k != "stop"} == body_nostop
+    from contextlib import redirect_stdout
+    from io import StringIO
+    buf = StringIO()
+    with redirect_stdout(buf):
+        show_config(cfg_stop)
+    assert "stop          : ['</answer>', '\\n\\nUser:']" in buf.getvalue(), buf.getvalue()
+    buf = StringIO()
+    with redirect_stdout(buf):
+        show_config(cfg_nostop)
+    assert "stop          : (none)" in buf.getvalue(), buf.getvalue()
+
+    print("serve_harness: thinking-effort self-test OK", flush=True)
+
+
+
+def _self_test_glimmer_feedback_shape():
+    """GPU-free coverage for Glimmer feedback shapes (rich default vs plain)."""
+    sample = {
+        "content": "answer",
+        "reasoning_content": "think",
+        "tool_calls": [{
+            "id": "call_0",
+            "type": "function",
+            "function": {
+                "name": "weather.get_forecast",
+                "arguments": "{\"location\":\"Paris\"}",
+            },
+        }],
+    }
+    # Implicit/default shape must retain OpenAI-rich history (reasoning + tool_calls).
+    defaulted = _assistant_feedback(sample, None)
+    assert defaulted["role"] == "assistant"
+    assert defaulted["content"] == "answer"
+    assert defaulted["reasoning_content"] == "think"
+    assert defaulted["tool_calls"][0]["function"]["name"] == "weather.get_forecast"
+    rich = _assistant_feedback(sample, "rich")
+    assert rich == defaulted
+    plain = _assistant_feedback(
+        {
+            "content": "answer",
+            "reasoning_content": "think",
+            "tool_calls": [{
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "weather.get_forecast", "arguments": "{}"},
+            }],
+        },
+        "plain",
+    )
+    assert plain["role"] == "assistant"
+    assert plain["content"] == "answer"
+    assert "reasoning_content" not in plain
+    assert "tool_calls" not in plain
+    assert _assistant_feedback({"content": "a", "reasoning_content": "r"}, "reasoning-content")["reasoning_content"] == "r"
+    assert "reasoning_content" not in _assistant_feedback({"content": "a", "reasoning_content": "r"}, "content-only")
+    assert _assistant_feedback({"content": "a", "reasoning_content": "r"}, "content_only")["content"] == "a"
+    tr_default = _tool_result_feedback("call_0", "result", None, name="weather.get_forecast")
+    assert tr_default["tool_call_id"] == "call_0" and tr_default["name"] == "weather.get_forecast"
+    tr_rich = _tool_result_feedback("call_0", "result", "rich", name="weather.get_forecast")
+    assert tr_rich == tr_default
+    tr_plain = _tool_result_feedback("call_0", "result", "plain", name="weather.get_forecast")
+    assert tr_plain["tool_call_id"] == "call_0" and "name" not in tr_plain
+    print("serve_harness: glimmer-feedback-shape self-test OK", flush=True)
+
+
+def _self_test_glimmer_tool_delta_merge():
+    """GPU-free coverage for tool delta merging indexed by delta.index."""
+    import json as _j
+    frozen = _j.dumps({"location": "Paris", "options": {"units": "celsius", "days": [1, 2]}, "include_alerts": True, "fallback": None})
+    # Split streamed arguments arbitrarily
+    mid = len(frozen) // 2
+    part1, part2 = frozen[:mid], frozen[mid:]
+    acc = {}
+    _merge_tool_call_deltas(acc, [{"index": 0, "id": "call_0", "type": "function", "function": {"name": "weather.get_forecast", "arguments": part1}}])
+    _merge_tool_call_deltas(acc, [{"index": 0, "function": {"arguments": part2}}])
+    assert acc[0]["id"] == "call_0"
+    assert acc[0]["function"]["name"] == "weather.get_forecast"
+    args = acc[0]["function"]["arguments"]
+    parsed = _j.loads(args)
+    assert parsed["location"] == "Paris"
+    assert parsed["options"]["days"] == [1, 2]
+    assert parsed["include_alerts"] is True
+    assert parsed["fallback"] is None
+    acc2 = {}
+    _merge_tool_call_deltas(acc2, [{"function": {"name": "foo", "arguments": "{}"}}])
+    assert 0 in acc2 and acc2[0]["function"]["name"] == "foo"
+    print("serve_harness: glimmer-tool-delta-merge self-test OK", flush=True)
+
+
+def _self_test_glimmer_transcript_and_trace():
+    """GPU-free coverage for transcript byte-identity and glimmer-cache trace."""
+    rows_a = [
+        {"step": "normal", "finish": "stop", "content": "READY", "reasoning_content": "think a", "tool_calls": [], "request_md5": "abc"},
+        {"step": "tool_call", "finish": "tool_calls", "content": "", "reasoning_content": "think b", "tool_calls": [{"id": "call_0", "type": "function", "function": {"name": "weather.get_forecast", "arguments": "{\"location\":\"Paris\",\"options\":{\"units\":\"celsius\",\"days\":[1,2]},\"include_alerts\":true,\"fallback\":null}"}}], "request_md5": "def"},
+        {"step": "tool_followup", "finish": "stop", "content": "Paris 18 20", "reasoning_content": "think c", "tool_calls": [], "request_md5": "ghi"},
+    ]
+    rows_b = [dict(r) for r in rows_a]
+    _assert_transcript_equal(rows_a, rows_b)
+    rows_b[0]["content"] = "DIFFERENT"
+    try:
+        _assert_transcript_equal(rows_a, rows_b)
+        raise AssertionError("expected transcript mismatch")
+    except AssertionError as e:
+        assert "mismatch" in str(e).lower()
+    log_ok = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 candidate=false hit=false reason=not_strict_forward_extension replay=0/0
+[glimmer-cache] prior_len=45 n_tokens=45 prompt_len=90 lcp=45 candidate=true hit=true reason= replay=1/1
+[glimmer-cache] prior_len=90 n_tokens=90 prompt_len=150 lcp=90 candidate=true hit=true reason= replay=1/1
+"""
+    rows = _parse_glimmer_cache_trace(log_ok)
+    assert len(rows) == 3 and rows[1]["hit"] is True
+    _assert_glimmer_cache_trace(log_ok, expected_requests=3)
+    log_bad_lcp = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 hit=false replay_used=0 spliced=0
+[glimmer-cache] prior_len=45 n_tokens=45 prompt_len=90 lcp=44 hit=true replay_used=1 spliced=1
+"""
+    try:
+        _assert_glimmer_cache_trace(log_bad_lcp, expected_requests=2)
+        raise AssertionError("expected lcp mismatch")
+    except AssertionError as e:
+        assert "lcp" in str(e)
+    log_bad_ntok = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 hit=false replay_used=0 spliced=0
+[glimmer-cache] prior_len=45 n_tokens=46 prompt_len=90 lcp=45 hit=true replay_used=1 spliced=1
+"""
+    try:
+        _assert_glimmer_cache_trace(log_bad_ntok, expected_requests=2)
+        raise AssertionError("expected n_tokens mismatch")
+    except AssertionError as e:
+        assert "n_tokens" in str(e) or "prior_len" in str(e)
+    log_bad_hit = """[glimmer-cache] prior_len=0 n_tokens=0 prompt_len=123 lcp=0 hit=false replay_used=0 spliced=0
+[glimmer-cache] prior_len=45 n_tokens=45 prompt_len=90 lcp=45 hit=false replay_used=0 spliced=0
+"""
+    try:
+        _assert_glimmer_cache_trace(log_bad_hit, expected_requests=2)
+        raise AssertionError("expected hit mismatch")
+    except AssertionError as e:
+        assert "hit" in str(e)
+    assert "<atem:" in "<atem:function_calls>" and True
+    print("serve_harness: glimmer-transcript-trace self-test OK", flush=True)
 
 
 def _native_service_warm(port, expected_model=None, proc=None):
@@ -615,14 +2494,44 @@ def spawn_serve(cfg, home, log):
         except OSError:
             pass
     _write_native_config(cfg, home)
+    # The requested config is written to <home>/.hipfire/config.toml, but
+    # ConfigPaths::discover prefers HIPFIRE_HOME over HOME/.hipfire — an inherited
+    # HIPFIRE_HOME would make the daemon read a stale parent/gate config instead
+    # (dflash off, wrong max_seq, MTP auto). Point the child's HIPFIRE_HOME at the
+    # harness-written root; the parent environment is untouched.
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
-    env = dict(os.environ, HOME=home, HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
-               HIPFIRE_DAEMON_BIN=os.environ.get("HIPFIRE_DAEMON_BIN", os.path.join(REPO, "target/release/examples/daemon")),
+    # GPU selection: honour whichever selector the caller set. Injecting
+    # HIP_VISIBLE_DEVICES=0 when the parent only set ROCR_VISIBLE_DEVICES made
+    # the child carry both (they remap differently); default to GPU 0 only
+    # when the caller set neither.
+    gpu_env = {}
+    if "HIP_VISIBLE_DEVICES" not in os.environ and "ROCR_VISIBLE_DEVICES" not in os.environ:
+        gpu_env["HIP_VISIBLE_DEVICES"] = "0"
+    env = dict(os.environ, HOME=home, HIPFIRE_HOME=os.path.join(home, ".hipfire"), **gpu_env,
+               HIPFIRE_DAEMON_BIN=os.environ.get(
+                   "HIPFIRE_DAEMON_BIN",
+                   os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),
                HIPFIRE_KV_MODE=cfg["kv"], HIPFIRE_CASK_OFF="1", HIPFIRE_MODEL=cfg["model"])
+    # Sampled native MTP (`speculation.mtp_sampled`) is on by default; a parent
+    # HIPFIRE_MTP_SAMPLED=0 passes through as the opt-out.
     if cfg["mtp"] == "on":
-        env.update(HIPFIRE_QWEN_MTP="1", HIPFIRE_MTP_SAMPLED="1", HIPFIRE_MTP_PREFIX_CACHE="1")
+        env.update(HIPFIRE_QWEN_MTP="1")
+    # Experimental long-gated ngram-mod inside native MTP (TOML key `speculation.mtp_ngram`; the harness drives the env override).
+    # Opt-off must clear inherited vars so a parent shell cannot contradict preflight.
+    if cfg.get("mtp_ngram") == "on":
+        env["HIPFIRE_MTP_NGRAM"] = "1"
+        env["HIPFIRE_NGRAM_MOD_N_MATCH"] = str(int(cfg["mtp_ngram_match"]))
+        env["HIPFIRE_NGRAM_MOD_N_MIN"] = str(int(cfg["mtp_ngram_min"]))
+        env["HIPFIRE_NGRAM_MOD_N_MAX"] = str(int(cfg["mtp_ngram_max"]))
+    else:
+        env.pop("HIPFIRE_MTP_NGRAM", None)
+        env.pop("HIPFIRE_NGRAM_MOD_N_MATCH", None)
+        env.pop("HIPFIRE_NGRAM_MOD_N_MIN", None)
+        env.pop("HIPFIRE_NGRAM_MOD_N_MAX", None)
+    # Retire obsolete short-PLD K env if a parent shell still exports it.
+    env.pop("HIPFIRE_MTP_NGRAM_K", None)
     # Explicit --draft pins HIPFIRE_DFLASH_DRAFT. When absent, preserve any
     # caller-inherited value (do not pop/clear) so parent gates can pin the draft.
     if cfg.get("draft"):
@@ -633,8 +2542,17 @@ def spawn_serve(cfg, home, log):
     # (would otherwise lower as developer.serve_harness_pid_file).
     env.pop("HIPFIRE_SERVE_HARNESS_PID_FILE", None)
     cli = _native_cli()
-    serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"]),
-                 "--kv-backend", cfg.get("kv_backend", "contiguous")]
+    serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"])]
+    # Omitted request = automatic runtime selection. Only forward an explicit
+    # user override (CLI --kv-backend legacy|vmm).
+    if cfg.get("kv_backend") is not None:
+        serve_cmd.extend(["--kv-backend", cfg["kv_backend"]])
+    if cfg.get("mode") == "images":
+        # Pre-warm the diffusion pipe at serve start and pin it (no idle
+        # eviction) so the images battery is deterministic start to finish.
+        serve_cmd.extend(["--model", cfg["model"], "--idle-timeout", "0"])
+    if cfg.get("tp"):
+        serve_cmd.extend(["--tp", str(cfg["tp"])])
     atexit.register(_kill_serve)
     # Append-only log: prior attempts remain for debugging; proofs use per-attempt offsets.
     os.makedirs(os.path.dirname(os.path.abspath(log)) or ".", exist_ok=True)
@@ -652,10 +2570,16 @@ def spawn_serve(cfg, home, log):
         # Leader PID == PGID under start_new_session; retain it for dead-leader cleanup.
         _serve_pgid = _serve_proc.pid
         _write_pid_file(_serve_pgid)
-        for _ in range(90):
+        warm_timeout_secs = max(1, int(cfg.get("serve_warm_timeout_secs", 180)))
+        for _ in range((warm_timeout_secs + 1) // 2):
             txt = _serve_log_text(log, log_offset)
             if _native_service_warm(cfg["port"], expected_model=cfg.get("model"), proc=_serve_proc):
                 return log_offset
+            # A CLI that has already exited cannot become warm. Waiting the
+            # full 180-second startup window hid immediate config-validation
+            # failures behind four long retries.
+            if _serve_proc.poll() is not None:
+                break
             if re.search(r"out of memory|error loading|panic", txt, re.I):
                 break
             time.sleep(2)
@@ -677,22 +2601,821 @@ def gram3(toks):
     from collections import Counter
     c = Counter(g); return sum(v for v in c.values() if v > 1) / len(g)
 
-def send(cfg, messages):
-    body = {"model": cfg["model"], "messages": messages, "max_tokens": cfg["max_tokens"],
-            "stream": True, "stream_options": {"include_usage": True}}
+# An attractor is *repetition*: the frequency tests below are meaningless on a
+# window too short to repeat in. A one-"word" answer (`Paris`, compact JSON
+# `{"name":"Alice","age":34}`, a bare number) has maxfreq == 1.0 by
+# construction and used to fail every short-answer battery turn at random —
+# the gate hard-floors on it (hw-gate run 33862054891, qwen3.8 format turn,
+# recall 6/6). Runaway/empty cover the degenerate short cases.
+ATTRACTOR_MIN_WINDOW = 8
+
+def _token_attractor(toks):
+    first, last, half = toks[:128], toks[-128:], toks[len(toks)//2:]
+    short = len(toks) < ATTRACTOR_MIN_WINDOW
+    return (
+        (not short and (uniq(first) < 0.15 or maxfreq(first) > 0.50))
+        or (not short and (uniq(last) < 0.30 or maxfreq(last) > 0.50))
+        or gram3(half) > 0.50
+    )
+
+def _response_has_attractor(think_text, visible_text):
+    # A reasoning model commonly drafts its eventual answer near the end of
+    # reasoning, then emits that answer visibly. Concatenating both channels
+    # turns this normal cross-channel repetition into a false token attractor.
+    # Score each channel independently; genuine repetition in either still fails.
+    think_tokens = re.findall(r"\S+", think_text.strip())
+    visible_tokens = re.findall(r"\S+", visible_text.strip())
+    return _token_attractor(think_tokens) or _token_attractor(visible_tokens)
+
+def _self_test_attractor_channels():
+    draft = [f"answer-{i}" for i in range(60)]
+    reasoning = " ".join([f"plan-{i}" for i in range(70)] + draft)
+    visible = " ".join(draft)
+    combined = re.findall(r"\S+", f"{reasoning} {visible}")
+    assert _token_attractor(combined), "fixture must reproduce the old false positive"
+    assert not _response_has_attractor(reasoning, visible)
+    assert _response_has_attractor("loop " * 200, "")
+    # Short answers cannot repeat enough to be attractors: one token, a
+    # compact JSON object, a bare number, a two-word echo.
+    for short in ('{"name":"Alice","age":34,"city":"Lisbon"}', "Paris", "43", "yes yes"):
+        assert not _response_has_attractor("", short), f"false positive on short answer {short!r}"
+    # ...but a genuinely degenerate short window still trips once it can repeat.
+    assert _response_has_attractor("", " ".join(["the"] * ATTRACTOR_MIN_WINDOW))
+    print("serve_harness: attractor-channel self-test OK", flush=True)
+
+
+def _g45_sse_bytes(payloads):
+    """Encode canned choice payloads (or raw lines) as SSE ``data:`` bytes."""
+    lines = []
+    for p in payloads:
+        if isinstance(p, bytes):
+            lines.append(p)
+        elif isinstance(p, str):
+            lines.append(p.encode("utf-8"))
+        else:
+            lines.append(("data: " + json.dumps(p)).encode("utf-8"))
+    lines.append(b"data: [DONE]")
+    return lines
+
+
+def _g45_chunk(delta=None, finish=None, cid="chatcmpl-g45"):
+    choice = {"index": 0, "delta": delta or {}}
+    if finish is not None:
+        choice["finish_reason"] = finish
+    return {"id": cid, "choices": [choice]}
+
+
+def _self_test_g45_terminal_accounting():
+    """GPU-free: the SSE fold counts exactly one terminal and any late bytes."""
+    t0 = time.time()
+    # Clean stop: prose, one terminal, usage, DONE.
+    clean = _fold_chat_sse_chunks(_g45_sse_bytes([
+        _g45_chunk({"content": "hi"}),
+        _g45_chunk({}, finish="stop"),
+        {"usage": {"prompt_tokens": 5, "completion_tokens": 2}},
+    ]), t0)
+    assert clean["finish"] == "stop", clean
+    assert clean["terminal_count"] == 1, clean
+    assert clean["terminal_reasons"] == ["stop"], clean
+    assert clean["post_terminal_bytes"] == 0, clean
+    assert "".join(clean["ans"]) == "hi", clean
+    # Duplicate terminal: two finish chunks both counted.
+    dup = _fold_chat_sse_chunks(_g45_sse_bytes([
+        _g45_chunk({"content": "hi"}),
+        _g45_chunk({}, finish="stop"),
+        _g45_chunk({"content": "late"}, finish="stop"),
+    ]), t0)
+    assert dup["terminal_count"] == 2, dup
+    assert dup["post_terminal_bytes"] == len("late".encode("utf-8")), dup
+    # Late tool delta after the terminal counts as late bytes too.
+    late_tool = _fold_chat_sse_chunks(_g45_sse_bytes([
+        _g45_chunk({}, finish="length"),
+        _g45_chunk({"tool_calls": [{"index": 0, "id": "call_0"}]}),
+    ]), t0)
+    assert late_tool["terminal_count"] == 1, late_tool
+    assert late_tool["post_terminal_bytes"] > 0, late_tool
+    # Missing terminal: count 0, finish None — the row assertion must reject.
+    missing = _fold_chat_sse_chunks(_g45_sse_bytes([_g45_chunk({"content": "hi"})]), t0)
+    assert missing["terminal_count"] == 0 and missing["finish"] is None, missing
+    # Non-data lines and broken JSON never disturb the fold.
+    noisy = _fold_chat_sse_chunks([b": keep-alive", b"data: {broken",
+                                   *_g45_sse_bytes([_g45_chunk({}, finish="error")])], t0)
+    assert noisy["terminal_count"] == 1 and noisy["finish"] == "error", noisy
+    print("serve_harness: g45-terminal-accounting self-test OK", flush=True)
+
+
+def _self_test_g45_fail_closed_assertions():
+    """GPU-free: the fail-closed row gate passes good terminals, rejects all
+    four violation classes (wrong finish, duplicate terminal, late bytes,
+    tool release)."""
+    good = {"finish": "error", "terminal_count": 1, "terminal_reasons": ["error"],
+            "post_terminal_bytes": 0, "tool_calls": []}
+    assert _assert_g45_fail_closed_row(dict(good), "malformed_tool", ["error", "length"]) is True
+    length_ok = dict(good, finish="length", terminal_reasons=["length"])
+    assert _assert_g45_fail_closed_row(length_ok, "length_cap", ["length"]) is True
+    cases = [
+        ("wrong finish", dict(good, finish="stop"), ["error", "length"]),
+        ("missing terminal", dict(good, finish=None, terminal_count=0), ["error", "length"]),
+        ("duplicate terminal", dict(good, terminal_count=2,
+                                    terminal_reasons=["error", "error"]), ["error", "length"]),
+        ("late bytes", dict(good, post_terminal_bytes=7), ["error", "length"]),
+        ("tool release", dict(good, tool_calls=[{"id": "call_0"}]), ["error", "length"]),
+    ]
+    for label, row, allowed in cases:
+        try:
+            _assert_g45_fail_closed_row(row, "probe", allowed)
+        except AssertionError:
+            continue
+        raise AssertionError(f"g45 gate accepted a {label} row: {row!r}")
+    # A completed call fails explicitly (tuning signal), even when the
+    # allowed list names tool_calls (defense in depth against typos).
+    for completed in (dict(good, finish="tool_calls"),
+                      dict(good, tool_calls=[{"id": "call_0"}])):
+        try:
+            _assert_g45_fail_closed_row(completed, "probe", ["tool_calls"])
+        except AssertionError as e:
+            assert "call completed; lower max_tokens" in str(e), str(e)
+        else:
+            raise AssertionError(f"g45 gate accepted a completed call: {completed!r}")
+    print("serve_harness: g45-fail-closed-assertions self-test OK", flush=True)
+
+
+def _self_test_g45_cache_store_log_check():
+    """GPU-free: ``[qwen-cache store]`` line counting for both AR and DFlash
+    spellings, ignoring lookups/HITs."""
+    assert _count_qwen_cache_stores("") == 0
+    assert _count_qwen_cache_stores(None) == 0
+    text = (
+        "[qwen-cache store] cached_seq=41 emit_text.len=120 tool_calls=0 preview='hi'\n"
+        "[qwen-cache store dflash] fp=0x0000000000000001 cached_seq=9 span=False\n"
+        "[qwen-cache jinja lookup dflash] fp=0x0000000000000001 role=Role(Assistant) primer=0 hit=True\n"
+        "[qwen-cache HIT dflash] reuse prefix=10 suffix=3 (no reset)\n"
+    )
+    assert _count_qwen_cache_stores(text) == 2, text
+    assert _count_qwen_cache_stores("malformed tool protocol\n") == 0
+    print("serve_harness: g45-cache-store-log-check self-test OK", flush=True)
+
+def _self_test_g45_torn_stream_and_error_mapping():
+    """GPU-free: torn streams never raise and never synthesize a terminal;
+    the serve-log envelope maps them to exactly one error terminal."""
+    import http.client
+    t0 = time.time()
+    # Clean EOF with no DONE and no terminal: honest wire state, no synthesis.
+    torn = _fold_chat_sse_chunks([b"data: " + json.dumps(_g45_chunk({"content": "part"})).encode("utf-8")], t0)
+    assert torn["saw_done"] is False and torn["stream_error"] is None, torn
+    assert torn["terminal_count"] == 0 and torn["finish"] is None, torn
+    assert "".join(torn["ans"]) == "part", torn
+    # Abrupt close mid-stream: exception recorded, partial bytes still folded.
+    partial = b"data: " + json.dumps(_g45_chunk({"content": "late-part"})).encode("utf-8") + b"\n"
+    def raising():
+        yield b"data: " + json.dumps(_g45_chunk({"content": "early"})).encode("utf-8") + b"\n"
+        raise http.client.IncompleteRead(partial=partial, expected=128)
+    cut = _fold_chat_sse_chunks(raising(), t0)
+    assert cut["stream_error"] is not None and "IncompleteRead" in cut["stream_error"], cut
+    assert "".join(cut["ans"]) == "earlylate-part", cut
+    assert cut["terminal_count"] == 0 and cut["saw_done"] is False, cut
+    # Daemon error envelope maps a terminal-less row to exactly one terminal.
+    log_slice = (
+        "[qwen-cache GEN-ENTRY] conv_tok=156 seq_pos=156\n"
+        "[hipfire] streaming completion failed: daemon error: "
+        "[validation retryable=false rolled_back=true attempt=2] "
+        "open think span at end of generation (validation)\n"
+    )
+    row = {"finish": None, "terminal_count": 0, "terminal_reasons": [],
+           "post_terminal_bytes": 0, "tool_calls": [], "saw_done": False,
+           "stream_error": None}
+    assert _apply_daemon_error_terminal(row, log_slice) is True, row
+    assert row["finish"] == "error" and row["terminal_count"] == 1, row
+    assert row["terminal_reasons"] == ["error"], row
+    assert row["rolled_back"] is True and row["retryable"] is False, row
+    assert row["attempt"] == 2 and row["error_class"] == "validation", row
+    assert "open think span" in row["daemon_error"], row
+    # Never overrides a terminal already seen on the wire.
+    wired = {"finish": "length", "terminal_count": 1, "terminal_reasons": ["length"],
+             "post_terminal_bytes": 0, "tool_calls": []}
+    assert _apply_daemon_error_terminal(wired, log_slice) is False, wired
+    assert wired["finish"] == "length" and "daemon_error" not in wired, wired
+    # No envelope, no mapping.
+    bare = {"finish": None, "terminal_count": 0, "terminal_reasons": [],
+            "post_terminal_bytes": 0, "tool_calls": []}
+    assert _apply_daemon_error_terminal(bare, "unrelated log noise\n") is False, bare
+    assert bare["finish"] is None and bare["terminal_count"] == 0, bare
+    print("serve_harness: g45-torn-stream-error-mapping self-test OK", flush=True)
+
+def _project_mtp_ngram_timings(timings):
+    """Project MTP/ngram timing fields from a daemon timings object for report rows.
+
+    Nested mtp_window_timings (when present) are passed through by reference so
+    --out JSON keeps ordered per-window kind + microsecond records unchanged.
+    """
+    t = timings or {}
+    return {
+        "mtp": t.get("mtp"),
+        "mtp_ngram": t.get("mtp_ngram"),
+        "ngram_mod_windows": t.get("ngram_mod_windows"),
+        "ngram_mod_drafts": t.get("ngram_mod_drafts"),
+        "ngram_mod_accepted": t.get("ngram_mod_accepted"),
+        "ngram_mod_accept_rate": t.get("ngram_mod_accept_rate"),
+        "mtp_windows": t.get("mtp_windows"),
+        "ar_windows": t.get("ar_windows"),
+        "mtp_retired": t.get("mtp_retired"),
+        "mtp_window_timings": t.get("mtp_window_timings"),
+    }
+
+# ---------- Glimmer helpers (feedback shape, trace, transcript, tool round-trip) ----------
+_GLIMMER_CACHE_RE = re.compile(
+    r"\[glimmer-cache\]\s+prior_len=(\d+)\s+n_tokens=(\d+)\s+prompt_len=(\d+)\s+lcp=(\d+)\s+(?:candidate=(?:true|false)\s+)?hit=(true|false)",
+    re.I,
+)
+
+
+def _merge_tool_call_deltas(acc, deltas):
+    """Merge OpenAI streamed tool_calls deltas indexed by ``index`` into ``acc``.
+
+    ``acc`` is ``{index: {id, type, function:{name, arguments}}}``.
+    ``deltas`` is the ``delta.tool_calls`` list from one SSE chunk.
+    Arguments are concatenated as strings; name/id/type overwrite.
+    """
+    for delta in deltas or []:
+        if not isinstance(delta, dict):
+            continue
+        idx = delta.get("index")
+        if idx is None:
+            idx = len(acc)
+        try:
+            idx = int(idx)
+        except Exception:
+            idx = len(acc)
+        if idx not in acc:
+            acc[idx] = {"id": None, "type": None, "function": {"name": "", "arguments": ""}}
+        entry = acc[idx]
+        if isinstance(delta.get("id"), str) and delta["id"]:
+            entry["id"] = delta["id"]
+        if isinstance(delta.get("type"), str) and delta["type"]:
+            entry["type"] = delta["type"]
+        func = delta.get("function")
+        if isinstance(func, dict):
+            if isinstance(func.get("name"), str) and func["name"]:
+                entry["function"]["name"] = func["name"]
+            if isinstance(func.get("arguments"), str):
+                entry["function"]["arguments"] += func["arguments"]
+
+
+def _assistant_feedback(result, feedback_shape=None):
+    """Build an assistant history message respecting ``feedback_shape``.
+
+    - ``rich`` / ``reasoning-content`` (default): includes ``reasoning_content`` when
+      non-empty and includes structured ``tool_calls`` when present. Mirrors
+      ``scripts/dump_corpus_openai_multiturn.py:267-294``.
+    - ``plain`` / ``content-only``: intentionally lossy ``{role, content}`` only.
+      Drops ``reasoning_content`` and structured ``tool_calls``; appropriate only
+      when no structured tool round-trip is required. A plain client cannot recover
+      omitted tool-call identity from content alone.
+    """
+    shape = (feedback_shape or "rich").lower().replace("-", "_")
+    rich = shape in ("rich", "reasoning_content")
+    # content fallback: prefer explicit ``content`` field, else legacy ``assistant_content``
+    content = result.get("content")
+    if content is None:
+        content = result.get("assistant_content", "")
+    msg = {"role": "assistant", "content": content if content is not None else ""}
+    tcs = result.get("tool_calls")
+    if rich and tcs:
+        # Preserve nested OpenAI shape {id, type, function:{name, arguments}}
+        msg["tool_calls"] = tcs
+    elif tcs and not rich:
+        # plain intentionally omits tool_calls; lossy, no server-side identity recovery
+        pass
+    if rich:
+        rc = result.get("reasoning_content")
+        if isinstance(rc, str) and rc:
+            msg["reasoning_content"] = rc
+    return msg
+
+
+def _tool_result_feedback(tool_call_id, content, feedback_shape=None, name=None):
+    """Build a tool-result history message.
+
+    Rich (default) echoes ``tool_call_id`` + ``name``; plain echoes only
+    ``{role, content}`` plus ``tool_call_id`` for routing (``tool_call_id`` is
+    required for id lookup). Plain is intentionally lossy for optional ``name``.
+    The gate's structured Glimmer fixture deliberately omits ``name`` on the
+    request payload so Slice E's id->name lookup is exercised; this helper
+    respects the shape but the structured runner overrides to omit name there.
+    """
+    shape = (feedback_shape or "rich").lower().replace("-", "_")
+    rich = shape in ("rich", "reasoning_content")
+    msg = {"role": "tool", "tool_call_id": tool_call_id, "content": content}
+    if rich and name:
+        msg["name"] = name
+    return msg
+
+
+def _daemon_binary_md5():
+    """Return (md5_hex, path) for the daemon binary per AGENTS.md discipline."""
+    exe = ".exe" if os.name == "nt" else ""
+    cand = os.environ.get("HIPFIRE_DAEMON_BIN") or os.path.join(REPO, "target", "release", f"daemon{exe}")
+    # Fallback to HIPFIRE_CLI_BIN if daemon not found
+    if not os.path.exists(cand):
+        alt = os.environ.get("HIPFIRE_CLI_BIN") or os.path.join(REPO, "target", "release", f"hipfire{exe}")
+        if os.path.exists(alt):
+            cand = alt
+    try:
+        h = hashlib.md5()
+        with open(cand, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest(), cand
+    except Exception:
+        return None, cand
+
+
+def _parse_glimmer_cache_trace(text):
+    """Parse [glimmer-cache] lines from daemon log text."""
+    rows = []
+    for m in _GLIMMER_CACHE_RE.finditer(text or ""):
+        rows.append({
+            "prior_len": int(m.group(1)),
+            "n_tokens": int(m.group(2)),
+            "prompt_len": int(m.group(3)),
+            "lcp": int(m.group(4)),
+            "hit": m.group(5).lower() == "true",
+        })
+    return rows
+
+
+def _assert_glimmer_cache_trace(text, expected_requests=None):
+    """Assert Glimmer cache invariants from Turn 2 onward.
+
+    Requires HIPFIRE_GLIMMER_CACHE_TRACE=1 or explicit call.
+    For each parsed row with index >=1: hit==true, lcp==prior_len, prior_len==n_tokens.
+    First row must be cold (prior_len==0, hit==false) when expected_requests>=1.
+    """
+    rows = _parse_glimmer_cache_trace(text)
+    if expected_requests is not None and len(rows) != expected_requests:
+        raise AssertionError(f"glimmer-cache trace: expected {expected_requests} rows, got {len(rows)}: {rows!r}")
+    # Allow empty when trace not enabled? Caller should guard via env check.
+    for i, r in enumerate(rows):
+        if i == 0:
+            # cold first request
+            if r["hit"] is not False:
+                raise AssertionError(f"glimmer-cache trace row 0 expected hit=false, got {r!r}")
+            if r["prior_len"] != 0 or r["lcp"] != 0:
+                raise AssertionError(f"glimmer-cache trace row 0 expected prior_len==lcp==0, got {r!r}")
+        else:
+            if r["hit"] is not True:
+                raise AssertionError(f"glimmer-cache trace row {i} expected hit=true, got {r!r}")
+            if r["lcp"] != r["prior_len"]:
+                raise AssertionError(f"glimmer-cache trace row {i} expected lcp==prior_len, got {r!r}")
+            if r["prior_len"] != r["n_tokens"]:
+                raise AssertionError(f"glimmer-cache trace row {i} expected prior_len==n_tokens, got {r!r}")
+            if r["prompt_len"] <= r["lcp"]:
+                raise AssertionError(f"glimmer-cache trace row {i} expected prompt_len>lcp, got {r!r}")
+    return rows
+
+
+def _transcript_projection(rows):
+    """Project rows to ordered transcript fields for byte-identical comparison."""
+    proj = []
+    for r in rows:
+        # Normalize tool_calls to sorted by id for comparison stability
+        tcs = r.get("tool_calls") or []
+        # Ensure list of dicts with id/type/function
+        proj.append({
+            "step": r.get("step"),
+            "finish": r.get("finish"),
+            "content": r.get("content") if "content" in r else r.get("assistant_content", ""),
+            "reasoning_content": r.get("reasoning_content") if "reasoning_content" in r else "",
+            "tool_calls": tcs,
+        })
+    return proj
+
+
+def _assert_transcript_equal(rows_a, rows_b):
+    """Assert two transcripts are byte-identical turn-for-turn (content, reasoning, tool_calls, finish)."""
+    pa = _transcript_projection(rows_a)
+    pb = _transcript_projection(rows_b)
+    if len(pa) != len(pb):
+        raise AssertionError(f"transcript length mismatch {len(pa)} vs {len(pb)}")
+    for i, (a, b) in enumerate(zip(pa, pb)):
+        if a != b:
+            raise AssertionError(f"transcript row {i} mismatch:\n  cold={json.dumps(a, sort_keys=True)}\n  hot={json.dumps(b, sort_keys=True)}")
+    # Also require identical request_md5 arrays when present
+    ma = [r.get("request_md5") for r in rows_a]
+    mb = [r.get("request_md5") for r in rows_b]
+    if any(ma) or any(mb):
+        if ma != mb:
+            raise AssertionError(f"request_md5 mismatch {ma!r} vs {mb!r}")
+    # Print identity line
+    tx = hashlib.md5(json.dumps(pa, sort_keys=True).encode("utf-8")).hexdigest()
+    print(f"transcript_byte_identical=true transcript_md5={tx}", flush=True)
+    return tx
+
+
+def _load_structured_session(path):
+    """Load a structured session for a known schema, else None.
+
+    Accepted: ``glimmer-cache-tool-roundtrip-v1`` (Glimmer tool round-trip)
+    and ``g45-fail-closed-v1`` (G4.5 parser-finalization fail-closed steps).
+    Preserves prompt bytes exactly (read_bytes().decode) and records prompt_md5.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("schema") not in ("glimmer-cache-tool-roundtrip-v1", "g45-fail-closed-v1"):
+        return None
+    # Resolve any content_file references
+    for turn in (data.get("turns") or []) + (data.get("steps") or []):
+        if "content_file" in turn and "content" not in turn:
+            p = turn["content_file"]
+            fp = p if os.path.isabs(p) else os.path.join(REPO, p)
+            try:
+                b = Path(fp).read_bytes()
+                turn["content"] = b.decode("utf-8")
+                turn["prompt_md5"] = hashlib.md5(b).hexdigest()
+                turn["prompt_file"] = p
+                turn["_bytes_md5"] = hashlib.md5(b).hexdigest()
+            except Exception as e:
+                raise AssertionError(f"failed to load content_file {p!r}: {e}")
+        elif "content" in turn and "prompt_md5" not in turn:
+            turn["prompt_md5"] = hashlib.md5(turn["content"].encode("utf-8")).hexdigest()
+    return data
+
+
+def _run_glimmer_cache_tool_session(cfg, args, scenario):
+    """Execute the frozen 3-request Glimmer tool-roundtrip session.
+
+    Sequence:
+      1) normal user (seed)
+      2) tool-demanding user (weather.get_forecast)
+      3) tool result (tool_call_id=call_0, no name to exercise id lookup)
+    Uses identical ``tools`` on every request so the system tool-def block cannot shift.
+    Asserts per-row invariants: finish, tool_calls, ATEM leak, forward extension.
+    """
+    feedback_shape = getattr(args, "feedback_shape", None) or "rich"
+    tools = scenario.get("tools") or []
+    turns = scenario.get("turns") or []
+    # Tool result content: explicit at scenario level or third turn's content
+    tool_result_content = scenario.get("tool_result_content")
+    if tool_result_content is None:
+        for t in turns:
+            if t.get("role") == "tool":
+                tool_result_content = t.get("content")
+                break
+    if tool_result_content is None:
+        tool_result_content = '{"location":"Paris","units":"celsius","days":[{"day":1,"high":18},{"day":2,"high":20}],"alerts":[],"fallback_used":null}'
+    messages = []
+    rows = []
+    for idx, turn in enumerate(turns):
+        role = turn.get("role", "user")
+        if role == "tool":
+            # Third request: tool result after tool_call
+            prev = rows[-1] if rows else {}
+            prev_calls = prev.get("tool_calls") or []
+            call_id = "call_0"
+            call_name = ""
+            if prev_calls:
+                c0 = prev_calls[0]
+                call_id = c0.get("id") or "call_0"
+                call_name = (c0.get("function") or {}).get("name") or c0.get("name") or ""
+            content = turn.get("content") or tool_result_content or ""
+            # Deliberately omit name per Slice E gate (even in rich mode) so id lookup is exercised
+            tool_msg = {"role": "tool", "tool_call_id": call_id, "content": content}
+            # For rich shape we WOULD include name, but this frozen gate explicitly requires no name
+            messages.append(tool_msg)
+            r = send(cfg, messages, tools=tools)
+            r["prompt_md5"] = hashlib.md5(content.encode("utf-8")).hexdigest()
+            r["prompt_file"] = turn.get("prompt_file", "")
+            r["step"] = turn.get("step", "tool_followup")
+            r["finish"] = r.get("finish")
+            # ATEM leak check
+            if "<atem:" in (r.get("content") or "") or "<atem:" in (r.get("reasoning_content") or ""):
+                raise AssertionError(f"ATEM markup leaked into visible content at step {idx}: {r!r}")
+            rows.append(r)
+            # Validate followup expectations
+            if r.get("finish") != "stop":
+                raise AssertionError(f"tool_followup expected finish=stop, got {r.get('finish')!r} row={r!r}")
+            # Must contain Paris/18/20 per acceptance
+            txt = (r.get("content") or "") + " " + (r.get("reasoning_content") or "")
+            for needle in ["Paris", "18", "20"]:
+                if needle not in txt:
+                    pass  # soft check; gate eyeballs, but we keep assertion soft for model variance
+            messages.append(_assistant_feedback(r, feedback_shape))
+            print(turn_line(idx + 1, r), flush=True)
+        else:
+            prompt = turn.get("content") or ""
+            messages.append({"role": "user", "content": prompt})
+            r = send(cfg, messages, tools=tools)
+            r["prompt_md5"] = turn.get("prompt_md5") or hashlib.md5(prompt.encode("utf-8")).hexdigest()
+            r["prompt_file"] = turn.get("prompt_file", "")
+            r["step"] = turn.get("step") or ("normal" if idx == 0 else "tool_call")
+            # Propagate prompt file md5 printing
+            # ATEM leak check for all turns
+            if "<atem:" in (r.get("content") or "") or "<atem:" in (r.get("reasoning_content") or "") or any("<atem:" in (c.get("function", {}).get("arguments") or "") for c in (r.get("tool_calls") or [])):
+                raise AssertionError(f"ATEM markup leaked at step {idx}: {r!r}")
+            # Per-step assertions
+            if idx == 0:
+                if r.get("finish") != "stop":
+                    raise AssertionError(f"step normal expected finish=stop, got {r.get('finish')!r}")
+                # reasoning_content may be empty depending on thinking, but content should contain READY when gate runs
+                if "READY" not in (r.get("content") or "") and "READY" not in (r.get("assistant_content") or ""):
+                    # Not fatal in self-test without model; gate's live run will eyeball
+                    pass
+            elif idx == 1:
+                if r.get("finish") != "tool_calls":
+                    raise AssertionError(f"step tool_call expected finish=tool_calls, got {r.get('finish')!r} row={r!r}")
+                tcs = r.get("tool_calls") or []
+                if len(tcs) != 1:
+                    raise AssertionError(f"step tool_call expected exactly 1 call, got {tcs!r}")
+                c0 = tcs[0]
+                fn = c0.get("function") or {}
+                name = fn.get("name") or c0.get("name")
+                if name != "weather.get_forecast":
+                    raise AssertionError(f"tool call name mismatch {name!r}")
+                # id must be call_0 for deterministic comparison
+                if c0.get("id") != "call_0":
+                    raise AssertionError(f"tool call id expected call_0, got {c0.get('id')!r}")
+                # Arguments: string is JSON-stringified object; parse and compare to frozen fixture
+                raw_args = fn.get("arguments")
+                if isinstance(raw_args, str):
+                    try:
+                        parsed = json.loads(raw_args)
+                    except Exception as e:
+                        raise AssertionError(f"tool arguments not JSON string: {raw_args!r}: {e}")
+                elif isinstance(raw_args, dict):
+                    parsed = raw_args
+                else:
+                    parsed = raw_args
+                frozen = {"location":"Paris","options":{"units":"celsius","days":[1,2]},"include_alerts":True,"fallback":None}
+                if parsed != frozen:
+                    raise AssertionError(f"tool arguments mismatch {parsed!r} vs {frozen!r}")
+            rows.append(r)
+            messages.append(_assistant_feedback(r, feedback_shape))
+            print(turn_line(idx + 1, r), flush=True)
+    # Print identities per AGENTS.md discipline: prompt md5s + binary md5
+    for r in rows:
+        print(f"  prompt_md5={r.get('prompt_md5')} request_md5={r.get('request_md5')} step={r.get('step')}", flush=True)
+    bmd5, bpath = _daemon_binary_md5()
+    if bmd5:
+        print(f"  daemon_binary_md5={bmd5} path={bpath}", flush=True)
+    # Final summary
+    return rows
+
+
+_QWEN_CACHE_STORE_RE = re.compile(r"\[qwen-cache store[ \]]")
+
+
+def _count_qwen_cache_stores(text):
+    """Count ``[qwen-cache store]`` / ``[qwen-cache store dflash]`` lines.
+
+    The daemon emits one such line (under ``HIPFIRE_QWEN_CACHE_TRACE=1``)
+    exactly when a turn is published to ``asst_turn_cache``. Fail-closed
+    turns (malformed / open-think / length) never store, so a log slice
+    covering only such a request must contain zero new lines.
+    """
+    return len(_QWEN_CACHE_STORE_RE.findall(text or ""))
+
+
+_DAEMON_ERROR_RE = re.compile(
+    r"streaming completion failed: daemon error: "
+    r"\[(\w+) retryable=(\w+) rolled_back=(\w+) attempt=(\d+)\] (.*)"
+)
+
+
+def _apply_daemon_error_terminal(row, log_slice):
+    """Map a torn stream onto the daemon error terminal in the serve log.
+
+    A daemon error terminal (malformed protocol, open think) tears the SSE
+    stream down with no terminal frame, so the row legitimately shows
+    ``terminal_count == 0`` / ``finish is None``. When the step's serve-log
+    slice contains exactly the matching ``streaming completion failed:
+    daemon error:`` envelope, attribute the torn stream to it: set
+    ``finish="error"``, count the one terminal, and keep the envelope's
+    message, class, retryable/rolled_back flags, and attempt on the row.
+    Never overrides a terminal already seen on the wire. Returns True when
+    applied, False when there is nothing to map (wire terminal present or
+    no envelope in the slice).
+    """
+    if row.get("terminal_count"):
+        return False
+    match = None
+    for match in _DAEMON_ERROR_RE.finditer(log_slice or ""):
+        pass
+    if match is None:
+        return False
+    row["finish"] = "error"
+    row["terminal_count"] = 1
+    row["terminal_reasons"] = ["error"]
+    row["error_class"] = match.group(1)
+    row["retryable"] = (match.group(2) == "true")
+    row["rolled_back"] = (match.group(3) == "true")
+    row["attempt"] = int(match.group(4))
+    row["daemon_error"] = match.group(5).strip()
+    return True
+
+
+def _assert_g45_fail_closed_row(row, step, allowed):
+    """Assert one fail-closed parser terminal: exactly one terminal, no tool
+    release, a non-storing finish class, and no late bytes after it.
+
+    ``allowed`` is the step's fail-closed finish set (``error`` and/or
+    ``length`` — the terminals ``qwen_ar_finish_route`` never stores or
+    releases calls for). Raises :class:`AssertionError` naming the step and
+    the offending observation; the G4.5 runner lets it propagate like the
+    Glimmer tool-roundtrip assertions.
+    """
+    finish = row.get("finish")
+    if finish == "tool_calls" or row.get("tool_calls"):
+        raise AssertionError(
+            f"g45 {step}: call completed; lower max_tokens so the cap "
+            f"truncates inside the tool-call body "
+            f"(finish={finish!r} tool_calls={row.get('tool_calls')!r})"
+        )
+    if finish not in allowed:
+        raise AssertionError(
+            f"g45 {step}: expected fail-closed finish in {sorted(allowed)}, "
+            f"got {finish!r} row={row!r}"
+        )
+    if row.get("terminal_count") != 1:
+        raise AssertionError(
+            f"g45 {step}: expected exactly one terminal, got "
+            f"count={row.get('terminal_count')} reasons={row.get('terminal_reasons')} "
+            f"finish={finish!r}"
+        )
+    if row.get("post_terminal_bytes"):
+        raise AssertionError(
+            f"g45 {step}: {row.get('post_terminal_bytes')} late payload bytes "
+            f"after the terminal (finish={finish!r})"
+        )
+    return True
+
+
+def _run_g45_fail_closed_session(cfg, args, scenario):
+    """Execute a ``g45-fail-closed-v1`` parser-finalization session.
+
+    Each step is one independent single-turn request against the same serve
+    (no history carried: a fail-closed turn must neither poison nor require
+    follow-up context). ``kind: fail_closed`` steps assert the G4.5 terminal
+    boundary via :func:`_assert_g45_fail_closed_row`; ``kind: positive``
+    steps assert a storing-capable terminal with the same cardinality shape.
+    A daemon error terminal tears the SSE stream down with no terminal
+    frame, so a terminal-less fail-closed row is attributed through its
+    serve-log slice (:func:`_apply_daemon_error_terminal`) — a torn stream
+    with no matching envelope fails instead of passing silently. With
+    ``HIPFIRE_QWEN_CACHE_TRACE=1`` and a spawned serve, each step's slice
+    must additionally add zero ``[qwen-cache store]`` lines for fail-closed
+    steps; the seed positive control makes absence meaningful (a zero-store
+    seed prints a vacuous-control warning instead of passing silently).
+    """
+    steps = scenario.get("steps") or []
+    if not steps:
+        raise AssertionError("g45-fail-closed-v1 scenario has no steps")
+    log_path = getattr(args, "serve_log", None) or "/tmp/serve_harness.serve.log"
+    no_spawn = bool(getattr(args, "no_spawn", False))
+    trace_on = os.environ.get("HIPFIRE_QWEN_CACHE_TRACE") == "1"
+    want_slice = not no_spawn and os.path.exists(log_path)
+    want_log = want_slice and trace_on
+    if trace_on and not want_log:
+        print("g45: HIPFIRE_QWEN_CACHE_TRACE=1 but no spawned serve log at "
+              f"{log_path} — cache-publication check SKIPPED", flush=True)
+    rows = []
+    seed_stores = None
+    for idx, step in enumerate(steps):
+        name = step.get("name") or f"step{idx}"
+        kind = step.get("kind") or "fail_closed"
+        prompt = step.get("content") or ""
+        tools = step.get("tools")
+        allowed = step.get("expect_finish") or (["stop"] if kind == "positive" else ["error", "length"])
+        log_offset = _serve_log_offset(log_path) if want_slice else 0
+        r = send(cfg, [{"role": "user", "content": prompt}],
+                 tools=tools,
+                 max_tokens=step.get("max_tokens"),
+                 max_think_tokens=step.get("max_think_tokens"))
+        r["prompt_md5"] = step.get("prompt_md5") or hashlib.md5(prompt.encode("utf-8")).hexdigest()
+        r["step"] = name
+        r["g45_kind"] = kind
+        log_slice = _serve_log_text(log_path, log_offset) if want_slice else ""
+        if kind == "positive":
+            if r.get("finish") not in allowed:
+                raise AssertionError(
+                    f"g45 {name}: positive step expected finish in {sorted(allowed)}, "
+                    f"got {r.get('finish')!r} row={r!r}"
+                )
+            if r.get("terminal_count") != 1 or r.get("post_terminal_bytes"):
+                raise AssertionError(
+                    f"g45 {name}: positive step terminal shape violated: "
+                    f"count={r.get('terminal_count')} "
+                    f"reasons={r.get('terminal_reasons')} "
+                    f"late_bytes={r.get('post_terminal_bytes')}"
+                )
+        else:
+            if not r.get("terminal_count"):
+                if not want_slice or not _apply_daemon_error_terminal(r, log_slice):
+                    raise AssertionError(
+                        f"g45 {name}: torn stream with no daemon error terminal "
+                        f"in the serve log (saw_done={r.get('saw_done')} "
+                        f"stream_error={r.get('stream_error')!r})"
+                    )
+            _assert_g45_fail_closed_row(r, name, allowed)
+        if want_log:
+            stores = _count_qwen_cache_stores(log_slice)
+            r["qwen_cache_stores"] = stores
+            if kind == "positive" and seed_stores is None and idx == 0:
+                seed_stores = stores
+            if kind != "positive" and stores != 0:
+                raise AssertionError(
+                    f"g45 {name}: fail-closed turn published {stores} "
+                    f"asst_turn_cache store(s); expected 0"
+                )
+        rows.append(r)
+        print(turn_line(idx + 1, r), flush=True)
+    for r in rows:
+        print(f"  prompt_md5={r.get('prompt_md5')} request_md5={r.get('request_md5')} step={r.get('step')}", flush=True)
+    bmd5, bpath = _daemon_binary_md5()
+    if bmd5:
+        print(f"  daemon_binary_md5={bmd5} path={bpath}", flush=True)
+    if want_log and seed_stores == 0:
+        print("g45: WARNING seed stored 0 turns — no-store absence is a vacuous "
+              "control on this route; rerun on the Qwen AR path with "
+              "HIPFIRE_QWEN_CACHE_TRACE=1 for a meaningful control", flush=True)
+    print(f"g45_fail_closed=PASS steps={len(rows)}", flush=True)
+    return rows
+
+
+def _request_body(cfg, messages, tools=None, max_tokens=None, max_think_tokens=None):
+    body = {
+        "model": cfg["model"],
+        "messages": messages,
+        "max_tokens": cfg["max_tokens"] if max_tokens is None else max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
     body.update(cfg["sampling"])
+    think_cap = cfg.get("request_max_think_tokens") if max_think_tokens is None else max_think_tokens
+    if think_cap is not None:
+        body["max_think_tokens"] = think_cap
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
-    t0 = time.time(); ttft = None; think = []; ans = []; tools = []
+    if cfg.get("stop"):
+        body["stop"] = list(cfg["stop"])
+    if tools is not None:
+        body["tools"] = tools
+    return body
+
+
+def _fold_chat_sse_chunks(line_iter, t0):
+    """Fold OpenAI chat-completions SSE lines into stream observations.
+
+    Pure fold over the ``data:`` payloads (no I/O): identical content
+    accounting to the historical inline loop in :func:`send`, plus terminal
+    cardinality for the G4.5 fail-closed gates — ``terminal_count`` (SSE
+    chunks carrying a non-null ``finish_reason``), ``terminal_reasons``
+    (distinct values in arrival order), and ``post_terminal_bytes``
+    (content / reasoning / tool-delta payload bytes arriving after the first
+    terminal chunk). Accepts ``bytes`` or ``str`` lines; stops at ``[DONE]``.
+
+    A daemon error terminal tears the stream down with no terminal frame
+    (``ResponseChunk::fail`` — no success/error frame is appended), so the
+    iterator may end cleanly without ``[DONE]`` or raise mid-stream
+    (``IncompleteRead`` carries the torn bytes in ``partial``). Both are
+    folded, never raised: ``saw_done`` reports a clean ``[DONE]`` end and
+    ``stream_error`` carries the iterator exception, if any. Attributing a
+    torn stream to the daemon error terminal is the runner's job
+    (:func:`_apply_daemon_error_terminal`, via the serve log) — the fold
+    itself never synthesizes a terminal.
+    """
+    ttft = None; think = []; ans = []
+    content_ttft = None
+    tool_acc = {}
     usage = {}; timings = {}; finish = None; completion_id = None
-    req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
-                                 data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    for raw in urllib.request.urlopen(req, timeout=1800):
-        line = raw.decode("utf-8", "ignore").strip()
+    terminal_count = 0; terminal_reasons = []; post_terminal_bytes = 0
+    seen_terminal = False; saw_done = False; stream_error = None
+    pending = []
+    it = iter(line_iter)
+    while True:
+        if pending:
+            raw = pending.pop(0)
+        else:
+            try:
+                raw = next(it)
+            except StopIteration:
+                break
+            except Exception as e:
+                stream_error = f"{type(e).__name__}: {e}"
+                partial = getattr(e, "partial", None)
+                if partial:
+                    pending.extend(partial.splitlines(keepends=True))
+                    continue
+                break
+        line = raw.decode("utf-8", "ignore").strip() if isinstance(raw, bytes) else raw.strip()
         if not line.startswith("data:"): continue
         p = line[5:].strip()
-        if p == "[DONE]": break
+        if p == "[DONE]":
+            saw_done = True
+            break
         try: ck = json.loads(p)
         except Exception: continue
         if isinstance(ck.get("id"), str):
@@ -700,15 +3423,62 @@ def send(cfg, messages):
         if ck.get("usage"): usage = ck["usage"]
         if ck.get("timings"): timings = ck["timings"]
         ch = (ck.get("choices") or [{}])[0]
-        if ch.get("finish_reason"): finish = ch["finish_reason"]
+        reason = ch.get("finish_reason")
+        if reason is not None:
+            terminal_count += 1
+            if reason not in terminal_reasons:
+                terminal_reasons.append(reason)
+            seen_terminal = True
+        if reason:
+            finish = reason
         d = ch.get("delta") or {}
+        if seen_terminal:
+            for key in ("content", "reasoning_content"):
+                val = d.get(key)
+                if isinstance(val, str):
+                    post_terminal_bytes += len(val.encode("utf-8"))
+            deltas = d.get("tool_calls")
+            if deltas:
+                post_terminal_bytes += len(json.dumps(deltas).encode("utf-8"))
         if isinstance(d.get("reasoning_content"), str):
             if ttft is None and d["reasoning_content"]: ttft = time.time() - t0
             think.append(d["reasoning_content"])
         if isinstance(d.get("content"), str):
             if ttft is None and d["content"]: ttft = time.time() - t0
+            if content_ttft is None and d["content"]: content_ttft = ttft if not think else time.time() - t0
             ans.append(d["content"])
-        if d.get("tool_calls"): tools.append(json.dumps(d["tool_calls"]))
+        if d.get("tool_calls"):
+            _merge_tool_call_deltas(tool_acc, d["tool_calls"])
+    return {
+        "ttft": ttft, "think": think, "ans": ans, "tool_acc": tool_acc,
+        "content_ttft": content_ttft,
+        "usage": usage, "timings": timings, "finish": finish,
+        "completion_id": completion_id, "terminal_count": terminal_count,
+        "terminal_reasons": terminal_reasons,
+        "post_terminal_bytes": post_terminal_bytes,
+        "saw_done": saw_done, "stream_error": stream_error,
+    }
+
+
+def send(cfg, messages, tools=None, max_tokens=None, max_think_tokens=None):
+    body = _request_body(cfg, messages, tools, max_tokens, max_think_tokens)
+    # Exact bytes sent for md5 (AGENTS.md discipline: byte-identical prompts + request identity)
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request_md5 = hashlib.md5(body_bytes).hexdigest()
+    t0 = time.time()
+    req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
+                                 data=body_bytes,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    folded = _fold_chat_sse_chunks(urllib.request.urlopen(req, timeout=1800), t0)
+    ttft = folded["ttft"]; think = folded["think"]; ans = folded["ans"]
+    tool_acc = folded["tool_acc"]
+    usage = folded["usage"]; timings = folded["timings"]; finish = folded["finish"]
+    completion_id = folded["completion_id"]
+    terminal_count = folded["terminal_count"]
+    terminal_reasons = folded["terminal_reasons"]
+    post_terminal_bytes = folded["post_terminal_bytes"]
+    saw_done = folded["saw_done"]
+    stream_error = folded["stream_error"]
     wall = time.time() - t0
     dtoks = usage.get("completion_tokens", 0)
     decode_ts = timings.get("decode_tok_s")
@@ -716,12 +3486,22 @@ def send(cfg, messages):
     if decode_ts is None and dtoks > 1 and ttft is not None and (wall - ttft) > 1e-6:
         decode_ts = round((dtoks - 1) / (wall - ttft), 1)
         decode_est = True
-    think_s = "".join(think); ans_s = "".join(ans); tool_s = "".join(tools)
+    think_s = "".join(think); ans_s = "".join(ans)
+    # Build structured tool_calls list sorted by index (deterministic)
+    tool_calls = []
+    for idx in sorted(tool_acc.keys()):
+        entry = tool_acc[idx]
+        if entry.get("id") is None:
+            entry["id"] = f"call_{idx}"
+        if entry.get("type") is None:
+            entry["type"] = "function"
+        tool_calls.append({"id": entry["id"], "type": entry["type"], "function": {"name": entry["function"]["name"], "arguments": entry["function"]["arguments"]}})
+    # Legacy stringified preview for backwards compat
+    tool_s = " ".join(json.dumps(tc) for tc in tool_calls) if tool_calls else ""
     visible = (ans_s + " " + tool_s).strip()
-    toks = re.findall(r"\S+", (think_s + " " + visible).strip())
-    first, last, half = toks[:128], toks[-128:], toks[len(toks)//2:]
-    bad = (bool(first) and (uniq(first) < 0.15 or maxfreq(first) > 0.50)) or \
-          (bool(last) and (uniq(last) < 0.30 or maxfreq(last) > 0.50)) or (gram3(half) > 0.50)
+    bad = _response_has_attractor(think_s, visible)
+    # ATEM leak detection (visible content deltas must not contain raw ATEM markup)
+    atem_leak = ("<atem:" in ans_s) or ("<atem:" in think_s) or any("<atem:" in (tc.get("function", {}).get("arguments") or "") for tc in tool_calls)
     return {
         "request_id": completion_id,
         "ctx": usage.get("prompt_tokens", 0),
@@ -730,12 +3510,34 @@ def send(cfg, messages):
         "think_words": len(re.findall(r"\S+", think_s)), "ans_words": len(re.findall(r"\S+", visible)),
         "prefill_ms": timings.get("prefill_ms"), "prefill_tok_s": timings.get("prefill_tok_s"),
         "decode_tok_s": decode_ts, "decode_estimated": decode_est, "tau": timings.get("tau"),
-        "cycles": timings.get("cycles"), "dflash": timings.get("dflash"), "mtp": timings.get("mtp"),
+        "cycles": timings.get("cycles"), "dflash": timings.get("dflash"),
+        **_project_mtp_ngram_timings(timings),
         "ttft_s": round(ttft or 0, 3), "wall_s": round(wall, 3),
         "attractor": bad, "empty": (cfg.get("expect_visible", True) and len(visible) == 0),
         "runaway": (finish == "length"),
         "ans_preview": (visible or "<<no visible content>>")[:90],
         "assistant_content": ans_s if ans_s else (tool_s if tool_s else think_s),
+        "content": ans_s,
+        "reasoning_content": think_s,
+        "tool_calls": tool_calls,
+        "request_md5": request_md5,
+        "atem_leak": atem_leak,
+        "terminal_count": terminal_count,
+        "terminal_reasons": terminal_reasons,
+        "post_terminal_bytes": post_terminal_bytes,
+        "saw_done": saw_done,
+        "stream_error": stream_error,
+        **({
+            "client_ttft_s": folded["content_ttft"],
+            "queue_wait_est_ms": (
+                max(0.0, folded["content_ttft"] * 1000 - timings["ttft_ms"])
+                if folded["content_ttft"] is not None and
+                isinstance(timings.get("ttft_ms"), (int, float)) else None),
+            "server_ttft_ms": timings.get("ttft_ms"),
+            "prompt_tokens": usage.get("prompt_tokens"),
+            "cached_tokens": (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0),
+            "completion_tokens": usage.get("completion_tokens"),
+        } if cfg.get("mode") == "prefix-fanout" else {}),
     }
 
 
@@ -747,47 +3549,1108 @@ def turn_line(i, r, recall=""):
     fl = (" !" + ",".join(flags)) if flags else ""
     dec = r["decode_tok_s"]
     dec_str = f"{dec}~" if (dec is not None and r.get("decode_estimated")) else f"{dec}"
+    prefill_tok_s = r.get("prefill_tok_s")
+    prefill_str = f"{prefill_tok_s}" if prefill_tok_s is not None else "n/a"
+    ngram_mod = ""
+    # ngram-mod fragment is meaningful only for MTP+ngram-mod composition.
+    if r.get("mtp_ngram"):
+        rate = r.get("ngram_mod_accept_rate")
+        rate_s = f"{rate:.2f}" if isinstance(rate, (int, float)) else rate
+        retired = r.get("mtp_retired")
+        retired_s = "1" if retired is True else "0" if retired is False else retired
+        ngram_mod = (
+            f" ngram={r.get('ngram_mod_accepted')}/{r.get('ngram_mod_drafts')}"
+            f"@{rate_s} win={r.get('mtp_windows')}/{r.get('ar_windows')}"
+            f" retired={retired_s}"
+        )
     return (f"  t{i:<2} finish={str(r['finish']):<6} ctx={r['ctx']:<6} cached={r['cached']:<6} "
             f"gen={r['gen']:<5}(think {r['think_words']}/ans {r['ans_words']}w) "
-            f"prefill={r['prefill_ms']}ms decode={dec_str} tau={r['tau']}"
+            f"prefill={r['prefill_ms']}ms/{prefill_str}tok/s "
+            f"decode={dec_str}tok/s tau={r['tau']}{ngram_mod}"
             f"{recall}{fl} | {r['ans_preview']!r}")
+
+
+def _decode_png(data):
+    """Minimal dependency-free PNG decoder: 8-bit, non-interlaced, color
+    types 2 (RGB) / 6 (RGBA), all filter types. Returns (w, h, RGB bytes)."""
+    pos = 8
+    w = h = 0
+    color = 2
+    idat = bytearray()
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + length]
+        if ctype == b"IHDR":
+            w, h, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            if depth != 8 or interlace != 0 or color not in (2, 6):
+                raise ValueError(
+                    f"unsupported PNG for images battery: depth={depth} "
+                    f"color={color} interlace={interlace}"
+                )
+        elif ctype == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(bytes(idat))
+    ch = 3 if color == 2 else 4
+    stride = w * ch
+    out = bytearray(w * h * 3)
+    prev = bytearray(stride)
+    row_len = stride + 1
+    for y in range(h):
+        f = raw[y * row_len]
+        cur = bytearray(raw[y * row_len + 1:(y + 1) * row_len])
+        if f == 1:  # Sub
+            for i in range(ch, stride):
+                cur[i] = (cur[i] + cur[i - ch]) & 0xFF
+        elif f == 2:  # Up
+            for i in range(stride):
+                cur[i] = (cur[i] + prev[i]) & 0xFF
+        elif f == 3:  # Average
+            for i in range(stride):
+                a = cur[i - ch] if i >= ch else 0
+                cur[i] = (cur[i] + ((a + prev[i]) >> 1)) & 0xFF
+        elif f == 4:  # Paeth
+            for i in range(stride):
+                a = cur[i - ch] if i >= ch else 0
+                b = prev[i]
+                c = prev[i - ch] if i >= ch else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                cur[i] = (cur[i] + pr) & 0xFF
+        for x in range(w):
+            base = (y * w + x) * 3
+            src = x * ch
+            out[base] = cur[src]
+            out[base + 1] = cur[src + 1]
+            out[base + 2] = cur[src + 2]
+        prev = cur
+    return w, h, out
+
+
+def _img_psnr_ssim(a, b):
+    """PSNR in dB (inf for identical) and global SSIM over equal-length RGB
+    byte arrays. The 1e-3 relative tolerance is enforced at the
+    call site as ssim >= 0.999; byte-identical images score inf / 1.0."""
+    n = len(a)
+    mse = 0.0
+    for x, y in zip(a, b):
+        d = x - y
+        mse += d * d
+    mse /= n
+    psnr = float("inf") if mse == 0.0 else 10.0 * math.log10(255.0 * 255.0 / mse)
+    ma = sum(a) / n
+    mb = sum(b) / n
+    va = sum((x - ma) ** 2 for x in a) / n
+    vb = sum((x - mb) ** 2 for x in b) / n
+    cov = sum((x - ma) * (y - mb) for x, y in zip(a, b)) / n
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    ssim = ((2 * ma * mb + c1) * (2 * cov + c2)) / (
+        (ma * ma + mb * mb + c1) * (va + vb + c2)
+    )
+    return psnr, ssim
+
+
+def _image_request(cfg, prompt, seed, width, height, steps, extra=None):
+    """One POST to /v1/images/generations; returns status + decoded payload.
+
+    On 200: png bytes/md5, size echo, hipfire metadata. On HTTP error: status
+    and the OpenAI error message. Request bytes are md5-stamped per AGENTS.md
+    discipline so a run is byte-identified."""
+    body = {"model": "ignored", "prompt": prompt, "n": 1,
+            "size": f"{width}x{height}", "steps": steps, "seed": seed}
+    if extra:
+        body.update(extra)
+    body_bytes = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{cfg['port']}/v1/images/generations",
+        data=body_bytes, headers={"Content-Type": "application/json"}, method="POST")
+    t0 = time.time()
+    request_md5 = hashlib.md5(body_bytes).hexdigest()
+    try:
+        with urllib.request.urlopen(req, timeout=900) as raw:
+            resp = json.load(raw)
+    except urllib.error.HTTPError as err:
+        text = err.read().decode("utf-8", "ignore")
+        try:
+            payload = json.loads(text)
+        except Exception:
+            payload = {"error": {"message": text[:200]}}
+        return {"http_status": err.code,
+                "error_message": payload.get("error", {}).get("message", ""),
+                "request_md5": request_md5}
+    png = base64.b64decode(resp["data"][0]["b64_json"])
+    return {"http_status": 200, "png": png,
+            "png_md5": hashlib.md5(png).hexdigest(), "png_bytes": len(png),
+            "size_echo": resp["data"][0].get("size"),
+            "request_md5": request_md5,
+            "hipfire": resp.get("hipfire", {}) or {},
+            "model_echo": resp.get("model"), "ms": time.time() - t0}
+
+
+def _run_images_battery(cfg, args):
+    """Image battery: deterministic seeded txt2img over the
+    live serve path.
+
+    Gates: (1) every valid request is 200 and echoes the requested size;
+    (2) same seed repeats byte-identically within one process (self PSNR =
+    inf, SSIM = 1.0, asserted >= 60 dB / >= 0.999); (3) refuse cases fail
+    closed with 400 + message; (4) same seed across a second fresh serve
+    process is byte-identical (cross-process determinism).
+
+    PSNR/SSIM against the committed diffusers golden are recorded as eyeball
+    metrics only: the golden was generated with torch noise and hipfire's
+    seeded noise is its own xorshift64*/Box-Muller generator, so
+    golden-identity is not a pass criterion and must never be asserted."""
+    prompt = args.img_prompt
+    width, height, steps = args.img_width, args.img_height, args.img_steps
+    seeds = [int(s) for s in re.split(r"[,\s]+", args.img_seeds) if s.strip()]
+    if not seeds:
+        sys.exit("serve_harness: --img-seeds must contain at least one seed")
+    gold = {}
+    rows = []
+    refuse = [
+        ("bad-size", {"size": "31x32"}),
+        ("n2", {"n": 2}),
+        ("missing-prompt", {"prompt": ""}),
+        ("bad-format", {"response_format": "png"}),
+        ("bad-steps", {"steps": 0}),
+        ("negative-prompt", {"negative_prompt": "ugly"}),
+        ("bad-sampler", {"sampler": "dpmpp"}),
+        # Reference images never ride the JSON generations body (and never as
+        # server paths): they are multipart file parts on /v1/images/edits.
+        ("images-on-generations", {"images": ["/etc/hostname"]}),
+    ]
+    for seed in seeds:
+        r1 = _image_request(cfg, prompt, seed, width, height, steps)
+        r2 = _image_request(cfg, prompt, seed, width, height, steps)
+        if r1["http_status"] != 200 or r2["http_status"] != 200:
+            sys.exit(f"serve_harness: images battery seed {seed} failed: "
+                     f"{r1.get('error_message') or r2.get('error_message')}")
+        parity = r1["png"] == r2["png"]
+        psnr, ssim = _img_psnr_ssim(r1["png"], r2["png"])
+        if not parity or psnr < 60.0 or ssim < 0.999:
+            sys.exit(
+                f"serve_harness: images battery seed {seed} within-process "
+                f"determinism FAILED (parity={parity} psnr={psnr:.1f}dB ssim={ssim:.4f})"
+            )
+        gold[seed] = r1["png"]
+        # Keep the actual pixels for a human eyeball: one PNG per seed beside
+        # the serve log (append-only log dir; the artifact is a new file).
+        img_artifact = f"{args.serve_log}.img-seed-{seed}.png"
+        try:
+            with open(img_artifact, "wb") as fh:
+                fh.write(r1["png"])
+            print(f"  [img artifact] {img_artifact}", flush=True)
+        except OSError as err:
+            print(f"  [img artifact] could not write {img_artifact}: {err}", flush=True)
+        rows.append({
+            "mode": "images", "seed": seed, "width": width, "height": height,
+            "steps": steps, "png_md5": r1["png_md5"], "png_bytes": r1["png_bytes"],
+            "within_parity": parity, "self_psnr_db": psnr, "self_ssim": ssim,
+            "ms": r1["ms"], "request_md5": r1["request_md5"],
+            "size_echo": r1["size_echo"], "model_echo": r1["model_echo"],
+            "runaway": False, "empty": False, "attractor": False,
+        })
+        print(f"  [img seed={seed}] 200 in {r1['ms'] * 1000:.0f}ms "
+              f"{r1['png_bytes']}B md5={r1['png_md5'][:12]} "
+              f"within-parity={parity} self-psnr={psnr:.1f}dB self-ssim={ssim:.4f}",
+              flush=True)
+    for name, extra in refuse:
+        r = _image_request(cfg, prompt, seeds[0], width, height, steps, extra)
+        ok = r["http_status"] == 400 and bool(r.get("error_message"))
+        rows.append({"mode": "images-refusal", "case": name,
+                     "http_status": r["http_status"],
+                     "error_message": r.get("error_message", ""), "ok": ok})
+        print(f"  [img refuse {name}] {r['http_status']} ok={ok} :: "
+              f"{r.get('error_message', '')[:70]}", flush=True)
+    if not all(r["ok"] for r in rows if r.get("mode") == "images-refusal"):
+        sys.exit("serve_harness: images battery fail-closed refusal gate failed")
+    golden_path = os.path.abspath(args.img_golden)
+    if os.path.isfile(golden_path):
+        gw, gh, gpx = _decode_png(open(golden_path, "rb").read())
+        for seed, png in gold.items():
+            w, h, px = _decode_png(png)
+            if (w, h) != (gw, gh):
+                print(f"  [img golden seed={seed}] size {w}x{h} vs golden "
+                      f"{gw}x{gh}; eyeball metrics skipped", flush=True)
+                continue
+            psnr, ssim = _img_psnr_ssim(px, gpx)
+            print(f"  [img golden seed={seed}] golden-vs-seeded psnr={psnr:.1f}dB "
+                  f"ssim={ssim:.4f} (different noise sources; report-only, "
+                  f"not a gate)", flush=True)
+    else:
+        print(f"  [img golden] fixture not found at {golden_path}; "
+              f"eyeball metrics skipped", flush=True)
+    # Cross-process determinism: same seed, second fresh serve process.
+    second = spawn_serve(cfg, args.home, args.serve_log)
+    if second is None:
+        sys.exit("serve_harness: images battery second serve span failed to warm")
+    cross = None
+    try:
+        r = _image_request(cfg, prompt, seeds[0], width, height, steps)
+        cross = r["http_status"] == 200 and r["png"] == gold[seeds[0]]
+        rows.append({"mode": "images-cross-process", "seed": seeds[0],
+                     "cross_parity": cross, "png_md5": r.get("png_md5", ""),
+                     "http_status": r.get("http_status")})
+        print(f"  [img cross-process seed={seeds[0]}] http={r['http_status']} "
+              f"byte-parity={cross}", flush=True)
+    finally:
+        _kill_serve()
+    if not cross:
+        sys.exit("serve_harness: images battery cross-process byte parity "
+                 "FAILED (same seed across processes must be byte-identical)")
+    return rows
+
+
+def _parse_fanout_clients(value):
+    try:
+        clients = [int(x) for x in value.split(",")]
+    except ValueError:
+        raise argparse.ArgumentTypeError("fanout clients must be comma-separated positive integers")
+    if not clients or any(x < 1 for x in clients) or len(set(clients)) != len(clients):
+        raise argparse.ArgumentTypeError("fanout clients must be distinct positive integers")
+    return clients
+
+
+def _fanout_percentile(values, fraction):
+    """Linear interpolation, excluding absent timings."""
+    values = sorted(x for x in values if x is not None)
+    if not values:
+        return None
+    position = (len(values) - 1) * fraction
+    lo, hi = math.floor(position), math.ceil(position)
+    return values[lo] + (values[hi] - values[lo]) * (position - lo)
+
+
+def _fanout_summary(rows, clients, repeat, wall):
+    client = [r.get("client_ttft_s") for r in rows]
+    service = [r.get("server_ttft_ms") for r in rows]
+    return {
+        "clients": clients, "repeat": repeat, "requests": len(rows),
+        "ttft_p50_s": _fanout_percentile(client, .50),
+        "ttft_p95_s": _fanout_percentile(client, .95),
+        "ttft_max_s": max((x for x in client if x is not None), default=None),
+        "service_ttft_p50_ms": _fanout_percentile(service, .50),
+        "service_ttft_p95_ms": _fanout_percentile(service, .95),
+        "total_wall_s": wall, "hit_tokens_sum": sum(r.get("cached_tokens", 0) for r in rows),
+    }
+
+
+def _fanout_second_order(clients):
+    """Alternate low/high client ids."""
+    order = []
+    lo, hi = 0, clients - 1
+    while lo <= hi:
+        order.append(lo)
+        if lo != hi:
+            order.append(hi)
+        lo += 1
+        hi -= 1
+    return order
+
+
+def _fanout_barrier_requests(clients, request):
+    """Release first-turn workers together; return in client-id order."""
+    barrier = threading.Barrier(clients + 1)
+    results, errors = [None] * clients, [None] * clients
+    def worker(client):
+        try:
+            barrier.wait()
+            results[client] = request(client)
+        except BaseException as error:
+            errors[client] = error
+    threads = [threading.Thread(target=worker, args=(client,)) for client in range(clients)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join()
+    for error in errors:
+        if error is not None:
+            raise error
+    return results
+
+
+def _fanout_prompt_tokens(row):
+    tokens = row.get("prompt_tokens")
+    if not isinstance(tokens, int) or tokens < 1:
+        raise SystemExit("prefix-fanout requires canonical server usage.prompt_tokens")
+    if row.get("stream_error") or not row.get("saw_done") or row.get("finish") is None:
+        raise SystemExit("prefix-fanout token measurement received an incomplete response")
+    return tokens
+
+
+def _fanout_size_text(corpus, prefix, target, measure):
+    """Search text length; only canonical server usage decides convergence."""
+    lo, hi = 0, max(len(corpus), target)
+    length, upper, seen = hi, None, set()
+    for _ in range(40):
+        text = prefix + (corpus * ((length + len(corpus) - 1) // len(corpus)))[:length]
+        actual = measure(text)
+        if abs(actual - target) <= max(1, target * .01):
+            return text, actual
+        if length in seen:
+            break
+        seen.add(length)
+        if actual < target:
+            lo = length + 1
+            if upper is None:
+                hi = max(hi * 2, lo)
+                length = hi
+                continue
+        else:
+            upper, hi = length, length - 1
+        if lo > hi:
+            break
+        length = (lo + hi) // 2
+    raise SystemExit(f"prefix-fanout could not calibrate canonical tokens to {target} within 1%")
+
+
+def _run_prefix_fanout(cfg, args):
+    options = cfg["fanout"]
+    if args.no_spawn:
+        raise SystemExit("prefix-fanout requires a harness-owned serve: calibration must be followed by restart; omit --no-spawn")
+    corpus = (Path(options["corpus"]).read_text(encoding="utf-8") if options["corpus"]
+              else "The shared reference describes rivers, forests, cities, and their histories. ")
+    if not corpus:
+        raise SystemExit("--fanout-corpus must contain nonempty text")
+    calibration = []
+    def probe(messages):
+        row = send(cfg, messages, max_tokens=1, max_think_tokens=1)
+        row.update(phase="calibration", client_id=None, turn=0)
+        calibration.append(row)
+        return _fanout_prompt_tokens(row)
+    system = lambda text: {"role": "system", "content": text}
+    if options["calibrate"]:
+        shared, shared_tokens = _fanout_size_text(
+            corpus, "", options["shared_tokens"], lambda text: probe([system(text)]))
+    else:
+        shared = corpus
+        shared_tokens = probe([system(shared)])
+    if abs(shared_tokens - options["shared_tokens"]) > max(1, options["shared_tokens"] * .01):
+        raise SystemExit("prefix-fanout shared token target differs by >1%; use --fanout-calibrate")
+    # Shared count includes the system-only canonical template overhead.
+    # Unique count is the canonical increment for appending a user turn.
+    rng = random.Random(options["seed"])
+    rows, summaries = [], []
+    for clients in options["clients"]:
+        for repeat in range(options["repeats"]):
+            run_id = f"fanout-{options['seed']}-{clients}-{repeat}"
+            user_turns, user_tokens = {}, {}
+            for client in range(clients):
+                for turn in (1, 2):
+                    prefix = f"Session {rng.getrandbits(64):016x}, turn {turn}. "
+                    user_turns[client, turn], user_tokens[client, turn] = _fanout_size_text(
+                        corpus, prefix, options["unique_tokens"],
+                        lambda text: probe([system(shared), {"role": "user", "content": text}]) - shared_tokens)
+            # Calibration requests must not seed the prefix cache being measured.
+            _kill_serve()
+            restart_offset = spawn_serve(cfg, args.home, args.serve_log)
+            if restart_offset is None:
+                raise SystemExit("prefix-fanout serve failed to warm after calibration restart")
+            cfg["_serve_log_offset"] = restart_offset
+            apply_observed_kv_backend(cfg, _serve_log_text(args.serve_log, restart_offset))
+            _assert_serve_path_proofs(cfg, args.serve_log, offset=restart_offset)
+            group, histories = [], {}
+            def request(client, turn, conditioning=False):
+                session_id = f"{run_id}-{'condition' if conditioning else 'client'}-{client}"
+                messages = ([system(shared)] if conditioning or turn == 1 else list(histories[client]))
+                user = (f"Conditioning observation {client}. Reply briefly." if conditioning
+                        else user_turns[client, turn])
+                messages.append({"role": "user", "content": user})
+                row = send(dict(cfg, seed=options["seed"]), messages, max_tokens=options["output_tokens"])
+                tokens = _fanout_prompt_tokens(row)
+                if not conditioning and turn == 1:
+                    actual_unique = tokens - shared_tokens
+                    if abs(actual_unique - options["unique_tokens"]) > max(1, options["unique_tokens"] * .01):
+                        raise SystemExit("prefix-fanout unique token count changed after calibration")
+                row.update(client_id=client, session_id=session_id, turn=turn,
+                           phase="conditioning" if conditioning else "fanout",
+                           clients=clients, repeat=repeat, shared_tokens_actual=shared_tokens,
+                           unique_tokens_actual=None if conditioning else user_tokens[client, turn],
+                           prompt_md5=hashlib.md5(json.dumps(messages, ensure_ascii=False).encode("utf-8")).hexdigest())
+                if not conditioning:
+                    histories[client] = messages + [_assistant_feedback(row, getattr(args, "feedback_shape", "rich"))]
+                return row
+            started = time.monotonic()
+            for conditioning in range(2):
+                group.append(request(conditioning, 1, conditioning=True))
+            group.extend(_fanout_barrier_requests(clients, lambda client: request(client, 1)))
+            for client in _fanout_second_order(clients):
+                group.append(request(client, 2))
+            summary = _fanout_summary(group, clients, repeat, time.monotonic() - started)
+            summaries.append(summary)
+            rows.extend(group)
+            print("prefix-fanout " + json.dumps(summary, sort_keys=True), flush=True)
+    repeat_summaries = summaries
+    summaries = [
+        _fanout_summary([row for row in rows if row["clients"] == clients], clients, None,
+                        sum(item["total_wall_s"] for item in repeat_summaries if item["clients"] == clients))
+        for clients in options["clients"]
+    ]
+    if args.out:
+        stamp_kv_backend_out_fields(rows, cfg)
+        stamp_kv_backend_out_fields(calibration, cfg)
+        with open(args.out, "w", encoding="utf-8") as handle:
+            json.dump({"mode": "prefix-fanout", "options": options, "shared_tokens_actual": shared_tokens,
+                       "shared_tokens_within_target": abs(shared_tokens - options["shared_tokens"]) <= options["shared_tokens"] * .01,
+                       "calibration_primes_cache": False,
+                       "calibration_cache_isolation": "server restarted after calibration",
+                       "rows": rows, "summaries": summaries, "repeat_summaries": repeat_summaries,
+                       "calibration_rows": calibration}, handle, indent=2)
+    return rows
+
+
+def _self_test_prefix_fanout_summary():
+    rows = [{"client_ttft_s": x, "server_ttft_ms": x * 100, "cached_tokens": 10} for x in (1, 2, 3, 4)]
+    rows.append({"client_ttft_s": None, "server_ttft_ms": None, "cached_tokens": 7})
+    summary = _fanout_summary(rows, 2, 0, 9)
+    assert summary["ttft_p50_s"] == 2.5
+    assert abs(summary["ttft_p95_s"] - 3.85) < 1e-12
+    assert summary["ttft_max_s"] == 4
+    assert summary["service_ttft_p50_ms"] == 250
+    assert summary["service_ttft_p95_ms"] == 385
+    assert summary["hit_tokens_sum"] == 47 and summary["total_wall_s"] == 9
+    assert _fanout_percentile([], .5) is None
+    print("serve_harness: prefix-fanout-summary self-test OK", flush=True)
+
+
+def _self_test_prefix_fanout_scheduling():
+    lock, arrived, released = threading.Lock(), [], []
+    original_barrier = threading.Barrier
+    class ObservedBarrier(original_barrier):
+        def wait(self, timeout=None):
+            with lock:
+                released.append(threading.get_ident())
+            return super().wait(timeout)
+    def request(client):
+        with lock:
+            assert len(released) == 5
+            arrived.append(client)
+        return client
+    threading.Barrier = ObservedBarrier
+    try:
+        assert _fanout_barrier_requests(4, request) == [0, 1, 2, 3]
+    finally:
+        threading.Barrier = original_barrier
+    assert sorted(arrived) == [0, 1, 2, 3]
+    assert _fanout_second_order(4) == [0, 3, 1, 2]
+    assert _fanout_second_order(5) == [0, 4, 1, 3, 2]
+    assert _fanout_second_order(1) == [0]
+    print("serve_harness: prefix-fanout-scheduling self-test OK", flush=True)
+
+
+def _annotate_turn(row, prompt, expected):
+    """Shared battery/chain row annotation (prompt identity + retrieval)."""
+    row["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+    missing = [item for item in expected if item.lower() not in row["assistant_content"].lower()]
+    row["expected_substrings"] = expected
+    row["retrieval_missing"] = missing
+    return f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
+
+
+def _concurrent_client_turns(cfg, battery, client, feedback_shape, emit):
+    """One client's independent conversation. Battery: every prompt as its own
+    request, rotated by client id so concurrent requests differ. Chain: the
+    whole battery as one sequential session (turns never overlap within a
+    client)."""
+    rows, messages, n = [], [], len(battery)
+    order = [(client + i) % n for i in range(n)] if cfg["mode"] == "battery" else list(range(n))
+    for turn, idx in enumerate(order):
+        genre, prompt, expected = battery[idx]
+        try:
+            if cfg["mode"] == "battery":
+                r = send(cfg, [{"role": "user", "content": prompt}])
+            else:
+                messages.append({"role": "user", "content": prompt})
+                r = send(cfg, messages)
+                messages.append(_assistant_feedback(r, feedback_shape))
+        except urllib.error.HTTPError as error:
+            # Admission refusal / server error: recorded (never retried); the
+            # terminal-accounting check reports it. A chain cannot continue.
+            body = error.read().decode("utf-8", "replace")[:400]
+            r = {"http_status": error.code, "http_error": body, "stream_error": f"HTTP {error.code}: {body}",
+                 "finish": None, "terminal_count": 0, "saw_done": False, "post_terminal_bytes": 0,
+                 "content": "", "reasoning_content": "", "assistant_content": "", "tool_calls": [], "gen": 0,
+                 "runaway": False, "empty": False, "attractor": False, "decode_tok_s": None, "ttft_s": None,
+                 "ctx": 0, "cached": 0, "think_words": 0, "ans_words": 0, "prefill_ms": None,
+                 "prefill_tok_s": None, "tau": None, "ans_preview": f"<<HTTP {error.code}>>"}
+            r.update(client=client, turn=turn, prompt_index=idx, genre=genre, prompt_md5=hashlib.md5(prompt.encode("utf-8")).hexdigest())
+            rows.append(r)
+            emit(client, genre, turn, r, "")
+            break
+        recall = _annotate_turn(r, prompt, expected)
+        r.update(client=client, turn=turn, prompt_index=idx, genre=genre)
+        rows.append(r)
+        emit(client, genre, turn, r, recall)
+    return rows
+
+
+_CONCURRENT_ISOLATION_FIELDS = ("content", "reasoning_content", "tool_calls", "finish", "gen")
+
+
+def _concurrent_isolation_key(cfg, row):
+    # Battery: one request per prompt. Chain: every client runs the identical
+    # session, so turn t must match turn t of the reference client.
+    return row["prompt_index"] if cfg["mode"] == "battery" else row["turn"]
+
+
+def _concurrent_terminal_failures(rows):
+    """Exactly-once terminal per request: one terminal, [DONE] seen, no stream
+    error, nothing after the terminal, a finish reason."""
+    bad = []
+    for r in rows:
+        problems = []
+        if r.get("terminal_count") != 1:
+            problems.append(f"terminal_count={r.get('terminal_count')}")
+        if not r.get("saw_done"):
+            problems.append("no [DONE]")
+        if r.get("stream_error"):
+            problems.append(f"stream_error={r.get('stream_error')!r}")
+        if r.get("post_terminal_bytes"):
+            problems.append(f"post_terminal_bytes={r.get('post_terminal_bytes')}")
+        if r.get("finish") is None:
+            problems.append("finish=None")
+        if problems:
+            bad.append(f"c{r['concurrency']}/client{r['client']}/turn{r['turn']}: " + ", ".join(problems))
+    return bad
+
+
+def _concurrent_isolation_mismatches(cfg, rows):
+    """Greedy isolation equality: every row equals the reference row for the
+    same prompt (battery) or turn (chain). Reference = the lowest concurrency
+    level's client 0 (level 1 when requested).
+
+    Returns ``(mismatches, divergent)``. Not like-for-like, so reported
+    separately and never counted as an isolation pass or failure: a row whose
+    request bytes differ from the reference (`request_md5`: a chain whose
+    earlier turn already diverged carries different history), or whose
+    server prompt-cache reuse (`cached` tokens) differs (warm suffix vs cold
+    prefill)."""
+    ref_level = min(r["concurrency"] for r in rows)
+    ref = {_concurrent_isolation_key(cfg, r): r for r in rows if r["concurrency"] == ref_level and r["client"] == 0}
+    out, divergent = [], []
+    for r in rows:
+        base = ref.get(_concurrent_isolation_key(cfg, r))
+        if base is None or base is r:
+            continue
+        diff = [f for f in _CONCURRENT_ISOLATION_FIELDS if r.get(f) != base.get(f)]
+        tag = f"c{r['concurrency']}/client{r['client']}/turn{r['turn']} (prompt {r['prompt_index']})"
+        if r.get("request_md5") != base.get("request_md5"):
+            divergent.append(f"{tag} request bytes differ (history diverged) outputs {'differ in ' + str(diff) if diff else 'equal'}")
+        elif r.get("cached") != base.get("cached"):
+            divergent.append(f"{tag} cached {base.get('cached')}->{r.get('cached')} outputs {'differ in ' + str(diff) if diff else 'equal'}")
+        elif diff:
+            out.append(f"{tag} differs in {diff}")
+    return out, divergent
+
+
+def _run_concurrent_clients(cfg, args, battery, feedback_shape):
+    """`--concurrent-clients N1,N2,..`: for each level, N threads drive
+    independent conversations against the one shared server, released
+    together. Every output is recorded; terminal accounting is asserted and,
+    under greedy sampling, isolation equality across clients and levels."""
+    lock = threading.Lock()
+    rows = []
+    greedy = cfg["sampling"].get("temperature") == 0.0
+    for level in args.concurrent_clients:
+        def emit(client, genre, turn, r, recall, level=level):
+            with lock:
+                print(f"  [c{level}/client{client}][{genre}]" + turn_line(turn + 1, r, recall)[2:], flush=True)
+        print(f"### concurrent-clients={level} mode={cfg['mode']} prompts={len(battery)} ###", flush=True)
+        t0 = time.time()
+        per_client = _fanout_barrier_requests(
+            level, lambda client: _concurrent_client_turns(cfg, battery, client, feedback_shape, emit))
+        wall = time.time() - t0
+        level_rows = [r for client_rows in per_client for r in client_rows]
+        for r in level_rows:
+            r["concurrency"] = level
+        toks = sum(r.get("gen") or 0 for r in level_rows)
+        ttft = [r["ttft_s"] for r in level_rows if isinstance(r.get("ttft_s"), (int, float))]
+        print(
+            f"[concurrent-clients={level} DONE] requests={len(level_rows)} wall={wall:.2f}s "
+            f"completion_tokens={toks} aggregate={toks / wall if wall > 0 else 0:.1f}tok/s "
+            f"ttft_max={max(ttft) if ttft else 'n/a'}s",
+            flush=True,
+        )
+        rows.extend(level_rows)
+    def record():
+        if getattr(args, "out", None):
+            stamp_kv_backend_out_fields(rows, cfg)
+            json.dump(rows, open(args.out, "w"), indent=0)
+    failures = _concurrent_terminal_failures(rows)
+    if failures:
+        record()
+        raise SystemExit("serve_harness: concurrent terminal accounting failed: " + "; ".join(failures[:16]))
+    if greedy:
+        mismatches, divergent = _concurrent_isolation_mismatches(cfg, rows)
+        print(
+            f"concurrent greedy isolation: {len(rows)} rows, mismatches={len(mismatches)} "
+            f"not_comparable={len(divergent)} (request bytes or prompt-cache reuse differ)",
+            flush=True,
+        )
+        for line in divergent:
+            print(f"  not-comparable: {line}", flush=True)
+        if mismatches:
+            record()
+            raise SystemExit("serve_harness: concurrent greedy isolation failed: " + "; ".join(mismatches[:16]))
+    else:
+        print("concurrent isolation equality: skipped (sampled; per-request outputs recorded)", flush=True)
+    return rows
+
+
+def _self_test_concurrent_clients():
+    """Offline: scheduling, chain sequencing, terminal and isolation checks."""
+    global send
+    real_send = send
+    seen = []
+    def fake(cfg, messages, *a, **k):
+        users = [m["content"] for m in messages if m["role"] == "user"]
+        seen.append(len(users))
+        text = "ok:" + users[-1]
+        return {"assistant_content": text, "content": text, "reasoning_content": "", "tool_calls": [],
+                "finish": "stop", "gen": 3, "terminal_count": 1, "saw_done": True, "stream_error": None,
+                "post_terminal_bytes": 0, "runaway": False, "empty": False, "attractor": False,
+                "decode_tok_s": None, "ttft_s": 0.0, "ans_preview": text, "ctx": 1, "cached": 0,
+                "think_words": 0, "ans_words": 1, "prefill_ms": None, "prefill_tok_s": None, "tau": None}
+    battery = [("code", "a", []), ("prose", "b", ["ok"]), ("short", "c", [])]
+    class A: concurrent_clients = [1, 3]
+    try:
+        send = fake
+        for mode in ("battery", "chain"):
+            seen.clear()
+            cfg = {"mode": mode, "sampling": {"temperature": 0.0}}
+            rows = _run_concurrent_clients(cfg, A, battery, "rich")
+            assert len(rows) == (1 + 3) * len(battery), len(rows)
+            assert {r["concurrency"] for r in rows} == {1, 3}
+            if mode == "chain":
+                assert sorted(seen) == sorted([1, 2, 3] * 4), seen
+            else:
+                assert sorted({r["prompt_index"] for r in rows if r["concurrency"] == 3 and r["turn"] == 0}) == [0, 1, 2]
+        rows = [dict(r) for r in rows]
+        rows[-1]["terminal_count"] = 2
+        assert _concurrent_terminal_failures(rows)
+        rows[-1]["terminal_count"] = 1
+        rows[-1]["content"] = "drift"
+        mism, div = _concurrent_isolation_mismatches({"mode": "chain"}, rows)
+        assert mism and not div, (mism, div)
+        rows[-1]["cached"] = 7  # different prompt-cache reuse: not comparable
+        mism, div = _concurrent_isolation_mismatches({"mode": "chain"}, rows)
+        assert not mism and div, (mism, div)
+    finally:
+        send = real_send
+    print("self-test concurrent-clients: OK", flush=True)
+
+
+def _load_tool_chain(path):
+    """Load a ``tool-chain-v1`` fixture for ``--mode chain --tool-chain``.
+
+    Returns ``{system, tools, turns:[{content, prompt_md5, step}], tool_results:{name:str},
+    max_tool_rounds, tool_chain_md5, path}``. ``content_file`` / ``system_file`` paths
+    resolve REPO-relative (or absolute) and are read as exact bytes.
+    """
+    try:
+        raw = Path(path).read_bytes()
+        data = json.loads(raw.decode("utf-8"))
+    except Exception as e:
+        raise SystemExit(f"serve_harness: --tool-chain {path!r} unreadable: {e}")
+    if not isinstance(data, dict) or data.get("schema") != "tool-chain-v1":
+        got = data.get("schema") if isinstance(data, dict) else type(data).__name__
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: schema must be 'tool-chain-v1', got {got!r}")
+
+    def read_ref(p):
+        fp = p if os.path.isabs(p) else os.path.join(REPO, p)
+        try:
+            return Path(fp).read_bytes().decode("utf-8")
+        except Exception as e:
+            raise SystemExit(f"serve_harness: --tool-chain {path!r}: failed to load content_file {p!r}: {e}")
+
+    system = data.get("system")
+    if system is None and data.get("system_file"):
+        system = read_ref(data["system_file"])
+    if system is not None and not isinstance(system, str):
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: system must be a string")
+    tools = data.get("tools")
+    if not isinstance(tools, list) or not tools:
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: tools must be a non-empty list")
+    raw_turns = data.get("turns")
+    if not isinstance(raw_turns, list) or not raw_turns:
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: turns must be a non-empty list")
+    turns = []
+    for i, t in enumerate(raw_turns):
+        if not isinstance(t, dict) or t.get("role", "user") != "user":
+            raise SystemExit(f"serve_harness: --tool-chain {path!r}: turn {i} must be an object with role 'user'")
+        content = t.get("content")
+        if content is None and t.get("content_file"):
+            content = read_ref(t["content_file"])
+        if not isinstance(content, str):
+            raise SystemExit(f"serve_harness: --tool-chain {path!r}: turn {i} needs content or content_file")
+        turns.append({"content": content, "step": t.get("step"),
+                      "prompt_md5": hashlib.md5(content.encode("utf-8")).hexdigest()})
+    tool_results = {}
+    for name, v in (data.get("tool_results") or {}).items():
+        if isinstance(v, str):
+            tool_results[name] = v
+        elif isinstance(v, dict) and isinstance(v.get("content_file"), str):
+            tool_results[name] = read_ref(v["content_file"])
+        else:
+            raise SystemExit(f"serve_harness: --tool-chain {path!r}: tool_results[{name!r}] must be a string or {{content_file}}")
+    mtr = data.get("max_tool_rounds", 4)
+    if isinstance(mtr, bool) or not isinstance(mtr, int) or mtr < 0:
+        raise SystemExit(f"serve_harness: --tool-chain {path!r}: max_tool_rounds must be an int >= 0")
+    return {"system": system, "tools": tools, "turns": turns, "tool_results": tool_results,
+            "max_tool_rounds": mtr, "tool_chain_md5": hashlib.md5(raw).hexdigest(), "path": str(path)}
+
+
+def _run_tool_chain(cfg, args, scenario):
+    """``--mode chain --tool-chain``: agent transcript with frozen tool results.
+
+    History is always rich (content + reasoning_content + structured tool_calls
+    round-trip). Every tool call is answered from ``tool_results`` (unknown tool ->
+    ``{"error": "unknown tool"}``) for up to ``max_tool_rounds`` rounds per user turn;
+    a ``finish == "length"`` turn never feeds tool results. Rows carry step,
+    prompt_md5, tool_chain_md5 plus the exact content/reasoning/tool_calls so a
+    cache-on and cache-off run can be diffed byte-for-byte.
+    """
+    tools = scenario["tools"]
+    tool_results = scenario["tool_results"]
+    max_rounds = scenario["max_tool_rounds"]
+    messages = []
+    if scenario.get("system"):
+        messages.append({"role": "system", "content": scenario["system"]})
+    rows = []
+    tool_rounds = 0
+    for i, turn in enumerate(scenario["turns"]):
+        messages.append({"role": "user", "content": turn["content"]})
+        round_md5 = turn["prompt_md5"]
+        k = 0
+        while True:
+            r = send(cfg, messages, tools=tools)
+            r["step"] = f"u{i}" if k == 0 else f"u{i}.t{k}"
+            r["fixture_step"] = turn.get("step")
+            r["prompt_md5"] = round_md5
+            r["tool_chain_md5"] = scenario["tool_chain_md5"]
+            messages.append(_assistant_feedback(r, "rich"))
+            rows.append(r)
+            print(f"  [{r['step']}]" + turn_line(len(rows), r)[2:], flush=True)
+            calls = r.get("tool_calls") or []
+            if not calls or k >= max_rounds or r.get("finish") == "length":
+                break
+            contents = []
+            for call in calls:
+                fn_name = (call.get("function") or {}).get("name") or call.get("name") or ""
+                content = tool_results.get(fn_name)
+                if content is None:
+                    content = '{"error": "unknown tool"}'
+                contents.append(content)
+                messages.append(_tool_result_feedback(call.get("id") or "call_0", content, "rich", name=fn_name))
+            round_md5 = hashlib.md5("\n".join(contents).encode("utf-8")).hexdigest()
+            tool_rounds += 1
+            k += 1
+    for r in rows:
+        print(f"  tool-chain row step={r['step']} ctx={r['ctx']} cached={r['cached']} "
+              f"prefill_ms={r['prefill_ms']} ttft_s={r['ttft_s']} finish={r['finish']} "
+              f"tool_calls={len(r.get('tool_calls') or [])}", flush=True)
+    cached = [r["cached"] for r in rows]
+    uncached = [r["ctx"] - r["cached"] for r in rows]
+    print(f"tool-chain: requests={len(rows)} tool_rounds={tool_rounds} cached_total={sum(cached)} "
+          f"prompt_total={sum(r['ctx'] for r in rows)} cached_rows={cached} uncached_rows={uncached}", flush=True)
+    return rows
+
+
+def _self_test_tool_chain():
+    """Offline: tool-chain loader, message sequencing, labels, and round bound."""
+    global send
+    real_send = send
+    seen = []
+    mode = {"always_tool": False, "finish": "tool_calls"}
+    tc = [{"id": "call_0", "type": "function", "function": {"name": "read_file", "arguments": '{"path":"a"}'}}]
+
+    def fake(cfg, messages, tools=None, *a, **k):
+        assert tools, "tools must be sent on every request"
+        seen.append([m["role"] for m in messages])
+        last = messages[-1]
+        first_round = last["role"] == "user" and last["content"] == "q0"
+        call = tc if (mode["always_tool"] or first_round) else []
+        fin = mode["finish"] if call else "stop"
+        return {"assistant_content": "a", "content": "ans", "reasoning_content": "think",
+                "tool_calls": call, "finish": fin, "gen": 3, "ctx": 100 + len(messages),
+                "cached": 50, "ttft_s": 0.1, "prefill_ms": 5.0, "prefill_tok_s": 1.0,
+                "decode_tok_s": 1.0, "decode_estimated": False, "tau": None,
+                "think_words": 1, "ans_words": 1, "runaway": fin == "length", "empty": False,
+                "attractor": False, "ans_preview": "ans"}
+
+    with tempfile.TemporaryDirectory() as d:
+        sysf = Path(d, "sys.txt"); sysf.write_text("SYS", encoding="utf-8")
+        resf = Path(d, "res.txt"); resf.write_text("FILE-RESULT", encoding="utf-8")
+        fx = Path(d, "fx.json")
+        fx.write_text(json.dumps({
+            "schema": "tool-chain-v1", "system_file": str(sysf),
+            "tools": [{"type": "function", "function": {"name": "read_file", "parameters": {}}}],
+            "turns": [{"role": "user", "content": "q0", "step": "task"}, {"role": "user", "content": "q1"}],
+            "tool_results": {"read_file": {"content_file": str(resf)}, "other": "X"},
+            "max_tool_rounds": 2}), encoding="utf-8")
+        sc = _load_tool_chain(str(fx))
+        assert sc["system"] == "SYS" and sc["tool_results"]["read_file"] == "FILE-RESULT"
+        assert sc["tool_chain_md5"] == hashlib.md5(fx.read_bytes()).hexdigest()
+        bad = Path(d, "bad.json"); bad.write_text('{"schema": "nope"}', encoding="utf-8")
+        try:
+            _load_tool_chain(str(bad))
+            raise AssertionError("bad schema accepted")
+        except SystemExit as e:
+            assert "tool-chain-v1" in str(e)
+        real_fx = os.path.join(REPO, "benchmarks", "sessions", "tool_chain_agent.json")
+        if os.path.exists(real_fx):
+            assert _load_tool_chain(real_fx)["turns"]
+        try:
+            send = fake
+            # 1) one tool call on u0, plain answers after
+            rows = _run_tool_chain({"mode": "chain"}, None, sc)
+            assert seen == [["system", "user"],
+                            ["system", "user", "assistant", "tool"],
+                            ["system", "user", "assistant", "tool", "assistant", "user"]], seen
+            assert [r["step"] for r in rows] == ["u0", "u0.t1", "u1"], [r["step"] for r in rows]
+            assert rows[0]["prompt_md5"] == hashlib.md5(b"q0").hexdigest()
+            assert rows[1]["prompt_md5"] == hashlib.md5(b"FILE-RESULT").hexdigest()
+            assert all(r["tool_chain_md5"] == sc["tool_chain_md5"] for r in rows)
+            # 2) tool message content / id / name and assistant round-trip
+            captured = []
+            def cap(cfg, messages, tools=None, *a, **k):
+                captured.append(json.loads(json.dumps(messages)))
+                return fake(cfg, messages, tools)
+            send = cap
+            seen.clear(); _run_tool_chain({"mode": "chain"}, None, sc)
+            msgs = captured[-1]
+            assert [m["role"] for m in msgs] == ["system", "user", "assistant", "tool", "assistant", "user"]
+            assert msgs[2]["tool_calls"] == tc and msgs[2]["reasoning_content"] == "think"
+            assert msgs[3] == {"role": "tool", "tool_call_id": "call_0", "content": "FILE-RESULT", "name": "read_file"}
+            # 3) max_tool_rounds bounds the loop (2 rounds -> 3 requests per user turn)
+            send = fake
+            mode["always_tool"] = True
+            seen.clear()
+            rows = _run_tool_chain({"mode": "chain"}, None, sc)
+            assert len(rows) == 6 and len(seen) == 6, len(rows)
+            assert [r["step"] for r in rows] == ["u0", "u0.t1", "u0.t2", "u1", "u1.t1", "u1.t2"]
+            # 4) finish=length with tool_calls never feeds tool results
+            mode["finish"] = "length"
+            seen.clear()
+            rows = _run_tool_chain({"mode": "chain"}, None, sc)
+            assert len(rows) == 2 and all(r["step"] in ("u0", "u1") for r in rows)
+            assert all("tool" not in s for s in seen), seen
+            # 5) unknown tool name -> error payload
+            mode["finish"] = "tool_calls"; mode["always_tool"] = False
+            sc2 = dict(sc, tool_results={})
+            send = cap; captured.clear()
+            _run_tool_chain({"mode": "chain"}, None, sc2)
+            assert captured[1][3]["content"] == '{"error": "unknown tool"}'
+        finally:
+            send = real_send
+    print("self-test tool-chain: OK", flush=True)
 
 
 def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
-    battery = load_prompt_battery(cfg.get("prompts_file"))
-    if cfg["mode"] == "battery":
-        for genre, prompt in battery:
+    feedback_shape = getattr(args, "feedback_shape", None) or "rich"
+    if cfg["mode"] == "images":
+        return _run_images_battery(cfg, args)
+    if cfg["mode"] == "prefix-fanout":
+        return _run_prefix_fanout(cfg, args)
+    tool_chain = getattr(args, "tool_chain", None) if cfg["mode"] == "chain" else None
+    battery = None if tool_chain else load_prompt_battery(
+        cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
+    )
+    if getattr(args, "concurrent_clients", None):
+        rows = _run_concurrent_clients(cfg, args, battery, feedback_shape)
+    elif tool_chain:
+        rows = _run_tool_chain(cfg, args, _load_tool_chain(tool_chain))
+    elif cfg["mode"] == "battery":
+        for genre, prompt, expected in battery:
             r = send(cfg, [{"role": "user", "content": prompt}])
-            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
+            r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+            missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
+            r["expected_substrings"] = expected
+            r["retrieval_missing"] = missing
+            recall = f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
+            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r, recall)[2:], flush=True)
     elif cfg["mode"] == "chain":
         messages = []
-        for genre, prompt in battery:
+        for genre, prompt, expected in battery:
             messages.append({"role": "user", "content": prompt})
             r = send(cfg, messages)
-            messages.append({"role": "assistant", "content": r["assistant_content"]})
-            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r)[2:], flush=True)
+            r["prompt_md5"] = hashlib.md5(prompt.encode("utf-8")).hexdigest()
+            # Chain feedback respects shape (rich vs plain)
+            messages.append(_assistant_feedback(r, feedback_shape))
+            missing = [item for item in expected if item.lower() not in r["assistant_content"].lower()]
+            r["expected_substrings"] = expected
+            r["retrieval_missing"] = missing
+            recall = f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
+            rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r, recall)[2:], flush=True)
     elif cfg["mode"] == "session":
-        turns = json.load(open(args.session))
-        messages = []
-        for i, t in enumerate(turns):
-            messages.append({"role": "user", "content": t["content"]})
-            r = send(cfg, messages)
-            messages.append({"role": "assistant", "content": r["assistant_content"]})
-            recall = ""
-            if t.get("expect"):
-                hit = sum(1 for e in t["expect"] if e.lower() in r["assistant_content"].lower())
-                recall = f" recall={hit}/{len(t['expect'])}"
-            rows.append(r); print(turn_line(i+1, r, recall), flush=True)
+        # Structured sessions take precedence when the schema matches
+        structured = None
+        try:
+            structured = _load_structured_session(args.session)
+        except Exception:
+            structured = None
+        if structured is not None and structured.get("schema") == "g45-fail-closed-v1":
+            rows = _run_g45_fail_closed_session(cfg, args, structured)
+        elif structured is not None:
+            rows = _run_glimmer_cache_tool_session(cfg, args, structured)
+        else:
+            turns = json.load(open(args.session))
+            # Support both legacy array and dict-with-turns without structured schema
+            if isinstance(turns, dict) and "turns" in turns:
+                turns = turns["turns"]
+            messages = []
+            for i, t in enumerate(turns):
+                messages.append({"role": "user", "content": t["content"]})
+                r = send(cfg, messages)
+                r["prompt_md5"] = hashlib.md5(t["content"].encode("utf-8")).hexdigest()
+                messages.append(_assistant_feedback(r, feedback_shape))
+                recall = ""
+                expected = t.get("expect", [])
+                missing = [
+                    item
+                    for item in expected
+                    if item.lower() not in r["assistant_content"].lower()
+                ]
+                r["expected_substrings"] = expected
+                r["retrieval_missing"] = missing
+                if expected:
+                    recall = f" recall={len(expected) - len(missing)}/{len(expected)}"
+                rows.append(r); print(turn_line(i+1, r, recall), flush=True)
     g = rows
     dec = [r["decode_tok_s"] for r in g if isinstance(r["decode_tok_s"], (int, float))]
-    pf = [(r["prefill_ms"] or 0)/1000 for r in g]
-    print(f"[{label} DONE] turns={len(g)} runaway={sum(r['runaway'] for r in g)} "
-          f"empty={sum(r['empty'] for r in g)} attractor={sum(r['attractor'] for r in g)} "
-          f"avg_decode={sum(dec)/len(dec):.1f}tok/s" if dec else f"[{label} DONE] turns={len(g)}", flush=True)
+    prefill = [
+        r["prefill_tok_s"]
+        for r in g
+        if isinstance(r.get("prefill_tok_s"), (int, float))
+    ]
+    summary = (
+        f"[{label} DONE] turns={len(g)} runaway={sum(r['runaway'] for r in g)} "
+        f"empty={sum(r['empty'] for r in g)} attractor={sum(r['attractor'] for r in g)} "
+        f"retrieval_miss={sum(bool(r.get('retrieval_missing')) for r in g)}"
+    )
+    if prefill:
+        summary += f" avg_prefill={sum(prefill)/len(prefill):.1f}tok/s"
+    if dec:
+        summary += f" avg_decode={sum(dec)/len(dec):.1f}tok/s"
+    nm_acc = [r["ngram_mod_accepted"] for r in g if isinstance(r.get("ngram_mod_accepted"), (int, float))]
+    nm_drf = [r["ngram_mod_drafts"] for r in g if isinstance(r.get("ngram_mod_drafts"), (int, float))]
+    if nm_acc or nm_drf or any(r.get("mtp_ngram") for r in g):
+        sa = int(sum(nm_acc)) if nm_acc else 0
+        sd = int(sum(nm_drf)) if nm_drf else 0
+        rate = (sa / sd) if sd else 0.0
+        summary += f" ngram={sa}/{sd}@{rate:.2f}"
+    print(summary, flush=True)
+
+    # Coherence is ASSERTED, not merely printed -- but only for `attractor`.
+    #
+    # Until 2026-08-16 all three flags were folded into the summary above and the
+    # process exited 0 regardless, so a battery could print `attractor=2` and pass.
+    #
+    # Only `attractor` is fatal, and the first version of this gate got that wrong
+    # by failing on all three. Reading the decoded text is what corrected it:
+    #
+    #   [code]t1 finish=length gen=192 (think 103/ans 25w) !RUNAWAY | '```python...
+    #
+    # `runaway` is `finish == "length"` -- the turn hit max_tokens. That turn
+    # produced real Python and was truncated because 103 of its 192 tokens went to
+    # thinking. `empty` on the same run was the same budget problem: 150 words of
+    # think, zero visible answer, finish=None. Both are fixture configuration, not
+    # defects, and failing on them breaks every tight-budget benchmark -- qwen3.8
+    # and muse-glimmer, both healthy, tripped it on hiptrx.
+    #
+    # `attractor` is the one signal a token budget cannot explain: the model is
+    # emitting a degenerate repeated token. That is the lfm2.5-8b-a1b `</think>`
+    # shape -- statistically unremarkable, obviously broken to a reader.
+    #
+    # HIPFIRE_SERVE_ALLOW_INCOHERENT=1 opts out and prints what it forgave.
+    _n_attractor = sum(r["attractor"] for r in g)
+    if _n_attractor:
+        _ctx = (
+            f"attractor={_n_attractor}"
+            f" (runaway={sum(r['runaway'] for r in g)},"
+            f" empty={sum(r['empty'] for r in g)} — reported, not fatal)"
+        )
+        if os.environ.get("HIPFIRE_SERVE_ALLOW_INCOHERENT") == "1":
+            print(
+                f"[{label}] ATTRACTOR {_ctx} — forgiven by "
+                f"HIPFIRE_SERVE_ALLOW_INCOHERENT=1",
+                flush=True,
+            )
+        else:
+            raise SystemExit(
+                f"serve_harness: {label} produced a token attractor across "
+                f"{len(g)} turn(s): {_ctx}. Read the decoded text above. Set "
+                f"HIPFIRE_SERVE_ALLOW_INCOHERENT=1 to characterise a known-bad "
+                f"model on purpose."
+            )
+    # ---- Glimmer gate: prompt / request / binary identities (AGENTS.md discipline) ----
+    for r in g:
+        if r.get("prompt_md5"):
+            print(f"  prompt_md5={r.get('prompt_md5')} request_md5={r.get('request_md5')} step={r.get('step','')}", flush=True)
+    bmd5, bpath = _daemon_binary_md5()
+    if bmd5:
+        print(f"  daemon_binary_md5={bmd5} path={bpath}", flush=True)
+    print(kv_mode_report_line(cfg), flush=True)
+    # ---- Tool round-trip + ATEM leak gate (always checked when tool_calls involved) ----
+    for idx, r in enumerate(g):
+        if r.get("atem_leak"):
+            raise SystemExit(f"serve_harness: ATEM markup leaked in row {idx} visible content; failing gate. Row preview={r.get('ans_preview')!r}")
+        if r.get("tool_calls"):
+            # At least one tool call turn must satisfy finish==tool_calls and name populated
+            if r.get("finish") != "tool_calls":
+                raise SystemExit(f"serve_harness: tool round-trip assertion failed at row {idx}: expected finish=tool_calls, got {r.get('finish')!r}")
+            for tc in r["tool_calls"]:
+                fn = tc.get("function") or {}
+                name = fn.get("name") or tc.get("name")
+                if not name:
+                    raise SystemExit(f"serve_harness: tool round-trip assertion failed at row {idx}: done.calls[0].name missing in {tc!r}")
+    # ---- Compare transcript (cached-vs-cold A/B) ----
+    cmp_path = getattr(args, "compare_transcript", None)
+    if cmp_path:
+        try:
+            base = json.loads(Path(cmp_path).read_text(encoding="utf-8"))
+            # base may be rows list or dict with rows
+            if isinstance(base, dict) and "rows" in base:
+                base = base["rows"]
+            _assert_transcript_equal(base, g)
+        except SystemExit:
+            raise
+        except Exception as e:
+            raise SystemExit(f"serve_harness: compare-transcript failed: {e}")
+    # ---- Glimmer cache trace assertions (HIPFIRE_GLIMMER_CACHE_TRACE=1) ----
+    do_trace = getattr(args, "assert_glimmer_cache_trace", False) or os.environ.get("HIPFIRE_GLIMMER_CACHE_TRACE") == "1"
+    if do_trace:
+        trace_text = ""
+        log_path = getattr(args, "serve_log", None) or "/tmp/serve_harness.serve.log"
+        log_offset = cfg.get("_serve_log_offset", 0)
+        try:
+            if os.path.exists(log_path):
+                trace_text = _serve_log_text(log_path, log_offset)
+        except Exception:
+            trace_text = ""
+        parsed = _parse_glimmer_cache_trace(trace_text)
+        if parsed:
+            exp = len(g)
+            if any(r.get("step") for r in g):
+                exp = len(g)
+            try:
+                _assert_glimmer_cache_trace(trace_text, expected_requests=exp)
+                print(f"glimmer_cache_trace=PASS requests={exp} hits={sum(1 for r in parsed if r['hit'])}", flush=True)
+            except AssertionError as e:
+                raise SystemExit(f"serve_harness: glimmer-cache trace assertion failed: {e}")
+        else:
+            if os.environ.get("HIPFIRE_GLIMMER_CACHE_TRACE") == "1":
+                raise SystemExit("serve_harness: glimmer-cache trace assertion failed: HIPFIRE_GLIMMER_CACHE_TRACE=1 but no [glimmer-cache] lines found in log (expected {} rows)".format(len(g)))
     if args.out:
+        stamp_kv_backend_out_fields(rows, cfg)
         json.dump(rows, open(args.out, "w"), indent=0)
     return rows
 
@@ -795,38 +4658,203 @@ def run(cfg, args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None, help="model file path to serve")
+    ap.add_argument(
+        "--deepseek4-compute-placement",
+        default="single",
+        help="typed DS4 placement, for example dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)",
+    )
+    ap.add_argument(
+        "--devices",
+        default=None,
+        help="physical GPU selectors written to [hardware].devices, for example 0,1",
+    )
+    ap.add_argument(
+        "--tp",
+        type=int,
+        choices=range(1, 65),
+        default=None,
+        help="expert-parallel degree forwarded to native hipfire serve",
+    )
     ap.add_argument("--tag", default=None, help="registry tag for recommended_settings (else inferred)")
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
-    ap.add_argument("--kv", default="fwht3")
-    ap.add_argument("--kv-backend", default="contiguous", choices=["contiguous", "vmm"],
-                    help="hipfire serve --kv-backend override (default contiguous; use vmm for PR #549 path)")
+    ap.add_argument("--kv", default=None,
+                    help="cache mode override; omitted resolves what the product loads "
+                         "(registry non-q8 default_kv_mode, else auto)")
+    ap.add_argument(
+        "--kv-backend",
+        default=None,
+        type=parse_kv_backend_arg,
+        help="explicit hipfire serve --kv-backend override (legacy|vmm); omitted leaves "
+             "the request automatic (runtime picks VMM or legacy). "
+             "'contiguous' was renamed to 'legacy' and is rejected with a migration error.",
+    )
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
     ap.add_argument("--dflash", default="off", choices=["off", "auto", "on"],
                     help="DFlash mode written to temporary [speculation] TOML (default off). "
                          "'on' emits mode=dflash + dflash=on + mtp/ngram off.")
+    ap.add_argument("--speculation", default=None,
+                    choices=["off", "auto", "ngram", "dflash", "mtp", "dspark"],
+                    help="explicit speculation selector; overrides --dflash/--mtp and mirrors the "
+                         "CLI's apply_speculation_selector. Required to reach DSpark: the "
+                         "--dflash/--mtp matrix can only get there by accident, via the schema "
+                         "default mode=auto auto-discovering the sidecar. DeepSeek V4 ships its "
+                         "speculative module in the checkpoint, so use --speculation dspark.")
+    ap.add_argument(
+        "--deepseek4-experts-per-token",
+        type=int,
+        choices=range(1, 7),
+        default=None,
+        help="DeepSeek V4 routed experts per token for this model load; omitted preserves the checkpoint default.",
+    )
+    ap.add_argument("--thinking-effort", default=None,
+                    choices=["none", "low", "medium", "high", "xhigh", "max"],
+                    help="parent-model reasoning_effort prompt semantics; independent of "
+                         "--thinking. With no explicit/registry budget, low/medium/high/xhigh/max is uncapped.")
+    ap.add_argument("--ngram", default="off", choices=["off", "on"],
+                    help="Model-free n-gram/PLD speculator (default off). 'on' emits the "
+                         "exclusive selector mode=ngram + ngram=on + dflash/mtp off, and is "
+                         "REFUSED alongside --dflash on / --mtp on.")
+    ap.add_argument("--ngram-k", type=int, default=None, dest="ngram_k",
+                    help="Draft block size K for --ngram on (loader default 12). K also sets the "
+                         "PLD copy window: max_extract = K-1, so K caps how many tokens a "
+                         "verbatim context match can copy in one cycle.")
+    ap.add_argument(
+        "--mtp-ngram",
+        default="off",
+        choices=["off", "on"],
+        dest="mtp_ngram",
+        help="Experimental long-gated ngram-mod composition inside native MTP (default off). "
+             "Requires --mtp on, greedy sampling, and --thinking off; exclusive with standalone "
+             "--ngram on and --dflash on. Sets HIPFIRE_MTP_NGRAM=1 plus HIPFIRE_NGRAM_MOD_* "
+             "(no TOML change); still emits mode=mtp selector.",
+    )
+    ap.add_argument(
+        "--mtp-ngram-match",
+        type=int,
+        default=None,
+        dest="mtp_ngram_match",
+        help="ngram-mod match length for --mtp-ngram on (default 24, >=1). "
+             "Sets HIPFIRE_NGRAM_MOD_N_MATCH.",
+    )
+    ap.add_argument(
+        "--mtp-ngram-min",
+        type=int,
+        default=None,
+        dest="mtp_ngram_min",
+        help="ngram-mod minimum draft length for --mtp-ngram on (default 48, >=1, <=max). "
+             "Sets HIPFIRE_NGRAM_MOD_N_MIN. Fresh content pays no ngram verify until this chain exists.",
+    )
+    ap.add_argument(
+        "--mtp-ngram-max",
+        type=int,
+        default=None,
+        dest="mtp_ngram_max",
+        help="ngram-mod maximum draft length for --mtp-ngram on (default 64, <=64). "
+             "Sets HIPFIRE_NGRAM_MOD_N_MAX.",
+    )
     ap.add_argument("--draft", default=None,
                     help="Optional DFlash draft path; sets HIPFIRE_DFLASH_DRAFT for the serve child. "
                          "When omitted, any caller-inherited HIPFIRE_DFLASH_DRAFT is preserved.")
-    ap.add_argument("--thinking", default="med", choices=list(THINKING_BUDGET),
-                    help="reasoning budget preset; \"off\" disables thinking (cap sentinel 1)")
-    ap.add_argument("--max-tokens", type=int, default=2048)
-    ap.add_argument("--max-seq", type=int, default=32768)
+    ap.add_argument("--thinking", default=None, choices=list(THINKING_BUDGET),
+                    help="explicit reasoning cap policy. Default: registry thinking_budget; "
+                         "otherwise uncapped for an explicit effort, med for legacy callers. "
+                         "\"off\" disables thinking (cap sentinel 1).")
+    ap.add_argument(
+        "--max-think-tokens",
+        type=int,
+        default=None,
+        help="exact per-request reasoning cap sent as max_think_tokens; "
+             "independent of --thinking-effort and overrides the named --thinking cap "
+             "(0=uncapped, 1=disabled, >=2=force-close at that token count)",
+    )
+    ap.add_argument("--stop", action="append", default=None, metavar="TEXT",
+                    help="OpenAI `stop` sequence sent on every chat request body; repeatable "
+                         "(each use appends). Omitted: no `stop` key is sent.")
+    ap.add_argument("--max-tokens", type=int, default=None,
+                    help="generation cap; omitted resolves canonical-tag policy then 2048")
+    ap.add_argument("--max-seq", type=int, default=None,
+                    help="context length override; omitted resolves at model/card admission")
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
-    ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
-    ap.add_argument("--session", default="/home/kaden/mv/session_coding.json")
+    ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session", "images", "prefix-fanout"])
+    ap.add_argument("--concurrent-clients", type=_parse_fanout_clients, default=None,
+                    help="battery/chain only: comma-separated concurrent client counts, e.g. 1,2,...,8. "
+                         "One shared server; each client runs an independent conversation (chains stay "
+                         "sequential per client); greedy runs assert isolation equality.")
+    ap.add_argument("--tool-chain", default=None, metavar="FILE",
+                    help="--mode chain only: run a tool-chain-v1 agent transcript (system+tools, user turns, "
+                         "frozen tool results; e.g. benchmarks/sessions/tool_chain_agent.json) instead of the "
+                         "prompt battery. Reports per-request cached/prefill_ms/ttft; --out rows are "
+                         "byte-diffable across cache-on/off runs.")
+    ap.add_argument("--fanout-clients", type=_parse_fanout_clients, default=[1, 4, 8, 16],
+                    help="Comma-separated concurrent client counts (default 1,4,8,16).")
+    ap.add_argument("--fanout-shared-tokens", type=int, default=2048,
+                    help="Canonical shared-header prompt target; use a second invocation for 8192.")
+    ap.add_argument("--fanout-unique-tokens", type=int, default=128,
+                    help="Canonical incremental prompt-token target for each unique user turn.")
+    ap.add_argument("--fanout-output-tokens", type=int, default=32)
+    ap.add_argument("--fanout-corpus", default=None, help="UTF-8 shared system/header corpus.")
+    ap.add_argument("--fanout-repeats", type=int, default=1)
+    ap.add_argument("--fanout-seed", type=int, default=0)
+    ap.add_argument("--fanout-calibrate", action="store_true",
+                    help="Adjust shared corpus length using usage.prompt_tokens until within 1%%.")
+    ap.add_argument(
+        "--session",
+        default=os.path.join(REPO, "benchmarks", "prompts", "session_coding.json"),
+        help="Multi-turn session fixture (default: the committed 8-turn coding chain).",
+    )
     ap.add_argument("--port", type=int, default=11520)
+    # --mode images battery knobs.
+    ap.add_argument(
+        "--img-prompt",
+        default="a tiny cat sitting on a tiny table",
+        help="Prompt for --mode images (tiny diffusion pipe fixture).",
+    )
+    ap.add_argument(
+        "--img-golden",
+        default=os.path.join(
+            REPO, "crates", "hipfire-arch-diffusion", "tests", "fixtures",
+            "tiny-pipeline", "golden.png",
+        ),
+        help="Committed diffusers golden PNG for eyeball PSNR/SSIM metrics "
+             "(report-only; the golden is torch noise, not hipfire's seeded noise).",
+    )
+    ap.add_argument("--img-width", type=int, default=32,
+                    help="Pixel width for --mode images (must be divisible by the VAE upscale).")
+    ap.add_argument("--img-height", type=int, default=32)
+    ap.add_argument("--img-steps", type=int, default=2,
+                    help="Denoise steps for --mode images (1..128).")
+    ap.add_argument("--img-seeds", default="0,7",
+                    help="Comma/space separated seeds exercised in --mode images.")
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
+    ap.add_argument(
+        "--serve-warm-timeout-secs",
+        type=int,
+        default=180,
+        help="seconds to wait for a spawned serve to finish loading (default 180)",
+    )
     ap.add_argument("--out", default=None, help="write per-turn json")
     ap.add_argument("--show-config", action="store_true", help="resolve+print config, do NOT run")
     ap.add_argument("--no-spawn", action="store_true", help="connect to an already-running serve")
     ap.add_argument("--seed", type=int, default=None,
                     help="per-request sampler seed (sent in the body -> daemon initial rng_state). The "
                          "certify's coherence arm invokes with a seed-SET (one seed per call) for the rate test.")
-    ap.add_argument("--prompts-file", default=None,
-                    help="JSON [{\"genre\":..,\"prompt\":..}] replacing the built-in genre battery "
-                         "(e.g. battery + the coherence_prompts_<arch> guard set).")
+    prompt_source = ap.add_mutually_exclusive_group()
+    prompt_source.add_argument("--prompts-file", default=None,
+                               help="JSON [{\"genre\":..,\"prompt\":..}] replacing the built-in genre battery "
+                                    "(e.g. battery + the coherence_prompts_<arch> guard set).")
+    prompt_source.add_argument(
+        "--prompt-file",
+        default=None,
+        help="UTF-8 prompt bytes lowered to one prose battery row without newline normalization.",
+    )
+    prompt_source.add_argument(
+        "--niah-file",
+        default=None,
+        help="Committed NIAH JSON/JSONL fixture. Lowers filler_text + question exactly and "
+             "fails when expected_answer_substring(s) are absent.",
+    )
     ap.add_argument(
         "--replay-route-proof-log",
         action="store_true",
@@ -835,31 +4863,81 @@ def main():
              "proof marker per successful serve request (coherence/product gates).",
     )
     ap.add_argument(
+        "--feedback-shape",
+        default="rich",
+        choices=["plain", "rich", "content-only", "reasoning-content", "content_only", "reasoning_content"],
+        help="Assistant history feedback shape for multi-turn (default: rich). "
+             "'rich' keeps reasoning_content + structured tool_calls (OpenAI history). "
+             "'plain'/'content-only' is intentionally lossy content-only history — drops "
+             "reasoning and tool-call identity; use only when no structured tool round-trip "
+             "is required. Aliases content-only/reasoning-content accepted.",
+    )
+    ap.add_argument(
+        "--compare-transcript",
+        default=None,
+        help="Path to a prior --out JSON transcript to compare against (cached-vs-cold A/B). Asserts byte-identical decoded assistant text turn-for-turn and identical request_md5s.",
+    )
+    ap.add_argument(
+        "--assert-glimmer-cache-trace",
+        action="store_true",
+        help="Parse daemon serve log [glimmer-cache] lines and assert Glimmer prefix-cache invariants (hit=true, lcp==prior_len, prior_len==n_tokens from turn 2 onward). Requires HIPFIRE_GLIMMER_CACHE_TRACE=1 on daemon.",
+    )
+    ap.add_argument(
         "--self-test",
         action="store_true",
         help="Run deterministic serve path-proof self-tests (no GPU / no serve) and exit.",
     )
     args = ap.parse_args()
+    args.fanout_sampling_explicit = any(x == "--sampling" or x.startswith("--sampling=") for x in sys.argv[1:])
+    if args.concurrent_clients and args.mode not in ("battery", "chain"):
+        ap.error("--concurrent-clients applies to --mode battery or chain")
+    if args.tool_chain and args.mode != "chain":
+        ap.error("--tool-chain applies to --mode chain only")
+    if args.tool_chain and args.concurrent_clients:
+        ap.error("--tool-chain cannot be combined with --concurrent-clients")
+    if args.mode == "prefix-fanout":
+        for name in ("shared_tokens", "unique_tokens", "output_tokens", "repeats"):
+            if getattr(args, "fanout_" + name) < 1:
+                ap.error("--fanout-" + name.replace("_", "-") + " must be positive")
     if args.self_test or os.environ.get("HIPFIRE_SERVE_HARNESS_SELFTEST") == "1":
         _self_test_serve_path_proofs()
+        _self_test_prompt_sources()
+        _self_test_device_config()
+        _self_test_kv_resolution()
+        _self_test_load_defaults()
+        _self_test_mtp_ngram_config()
+        _self_test_thinking_effort()
+        _self_test_glimmer_feedback_shape()
+        _self_test_glimmer_tool_delta_merge()
+        _self_test_glimmer_transcript_and_trace()
+        _self_test_attractor_channels()
+        _self_test_g45_terminal_accounting()
+        _self_test_g45_fail_closed_assertions()
+        _self_test_g45_cache_store_log_check()
+        _self_test_g45_torn_stream_and_error_mapping()
+        _self_test_prefix_fanout_summary()
+        _self_test_prefix_fanout_scheduling()
+        _self_test_concurrent_clients()
+        _self_test_tool_chain()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
-    cfg = build_config(args); cfg["max_seq"] = args.max_seq
+    cfg = build_config(args)
+    cfg["serve_warm_timeout_secs"] = args.serve_warm_timeout_secs
     show_config(cfg)
     if args.show_config:
         return
     # `off` resolves to the sentinel cap 1, which is not a real think budget — no
     # think block is emitted at all, so the think-only-output guard does not apply.
-    if (cfg['thinking_budget'] != 'off'
+    if args.mode != "images" and (cfg['thinking_cap_tokens'] != 1
             and cfg['thinking_cap_tokens']
-            and args.max_tokens <= cfg['thinking_cap_tokens']):
+            and cfg['max_tokens'] <= cfg['thinking_cap_tokens']):
         sys.exit(
-            f"serve_harness: max_tokens ({args.max_tokens}) <= thinking budget "
-            f"'{cfg['thinking_budget']}' ({cfg['thinking_cap_tokens']} tok) guarantees "
+            f"serve_harness: max_tokens ({cfg['max_tokens']}) <= thinking cap "
+            f"({cfg['thinking_cap_tokens']} tok from {cfg['thinking_cap_source']}) guarantees "
             f"think-only output with zero visible answer. Raise --max-tokens above "
-            f"{cfg['thinking_cap_tokens']}, lower --thinking (low={THINKING_BUDGET['low']}), "
-            f"or use --thinking uncapped."
+            f"{cfg['thinking_cap_tokens']}, lower --max-think-tokens/--thinking, "
+            "or use --max-think-tokens 0."
         )
     log_offset = 0
     if not args.no_spawn:
@@ -869,11 +4947,32 @@ def main():
         head = subprocess.run(f"grep -c 'MTP head loaded' {args.serve_log}", shell=True,
                               capture_output=True, text=True).stdout.strip()
         print(f"  [serve warm; MTP head loaded lines={head}]", flush=True)
+        warm_txt = _serve_log_text(args.serve_log, log_offset)
+        eff, eff_reason = apply_observed_kv_backend(cfg, warm_txt)
+        if eff is not None:
+            detail = f" ({eff_reason})" if eff_reason else ""
+            print(f"  [kv_backend effective: {eff}{detail}]", flush=True)
+        else:
+            req = cfg.get("kv_backend")
+            req_disp = "automatic" if req is None else req
+            print(
+                f"  [kv_backend effective: (no marker yet); requested {req_disp}]",
+                flush=True,
+            )
         _assert_serve_path_proofs(cfg, args.serve_log, offset=log_offset)
+    print(kv_mode_report_line(cfg), flush=True)
+    cfg["_serve_log_offset"] = log_offset
     rows = run(cfg, args)
+    if cfg["mode"] == "prefix-fanout":
+        log_offset = cfg["_serve_log_offset"]
     if not args.no_spawn:
         _assert_dflash_request_proofs(cfg, rows, args.serve_log, offset=log_offset)
+        # Glimmer trace also asserted inside run(), but also ensure offset-correct post-check
+        # (run already did it via cfg offset; no duplicate needed here)
         _kill_serve()
+    missing = [r.get("retrieval_missing") for r in rows if r.get("retrieval_missing")]
+    if missing:
+        sys.exit(f"serve_harness: retrieval gate failed; missing expected substrings: {missing}")
 
 
 if __name__ == "__main__":

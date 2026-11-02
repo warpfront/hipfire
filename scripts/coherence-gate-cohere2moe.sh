@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# lifecycle: deprecated since 0.4.0, removal 0.5.0 — retired coherence-gate battery; historical reproduction only (docs/VALIDATION.md)
+echo "warning: coherence-gate-cohere2moe.sh is deprecated and will be removed in 0.5.0; retired coherence-gate battery, not acceptance evidence (docs/VALIDATION.md)" >&2
 
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2026 Kaden Schutt
@@ -52,7 +54,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-EXE="./target/release/examples/daemon"
+EXE="./target/release/daemon"
 MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-cohere2moe-$(date +%Y%m%d-%H%M%S).md}"
 LOCK_SCRIPT="./scripts/gpu-lock.sh"
@@ -68,7 +70,7 @@ else
                crates/hipfire-arch-cohere2moe/src/config.rs \
                crates/hipfire-runtime/src/prompt_frame.rs \
                crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/examples/daemon.rs \
+               crates/hipfire-daemon/src/main.rs \
                crates/rdna-compute/src/attention.rs \
                kernels/src/attention_flash_q8_0_tile.hip \
                kernels/src/attention_flash_q8_0_tile_batched.hip \
@@ -78,7 +80,7 @@ else
 fi
 if [ "$rebuild" -eq 1 ]; then
     echo "coherence-gate-cohere2moe: rebuilding daemon..."
-    if ! cargo build --release --example daemon --features deltanet >&2; then
+ if ! cargo build --release -p hipfire-daemon >&2; then
         echo "coherence-gate-cohere2moe: build failed" >&2
         exit 2
     fi

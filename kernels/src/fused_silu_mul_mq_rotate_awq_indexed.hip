@@ -5,8 +5,10 @@
 // the AWQ scale is selected PER BATCH ROW (per routed expert) from a device
 // pointer table — each token's K_TOP experts have a different down.awq_scale.
 //
-// grid = [groups_total = K/256, K_TOP, 1]; blockIdx.y = krank (the routed-expert
-// rank). gate/up/x_rot are [K_TOP × K] row-major (the per-expert SwiGLU outputs).
+// grid = [N_ROWS * groups_total, 1, 1] with groups_total = K/256; x folds
+// (krank, group) as x = krank * groups_total + group (group fastest), so the
+// row count never rides the 65535-bounded grid.y. krank is the routed-expert
+// rank (row). gate/up/x_rot are [N_ROWS × K] row-major (the per-expert SwiGLU outputs).
 //   awq_scale = expert_down_awq_ptrs[topk_indices[krank]]   (the selected expert's [K] f32 vector)
 // Pattern matches the indexed gate_up GEMV's `expert_ptrs[topk_indices[krank]]`.
 //
@@ -24,18 +26,18 @@ __global__ void fused_silu_mul_mq_rotate_awq_indexed(
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     float* __restrict__ x_rot,
-    int K
+    int K,
+    int n_exp
 ) {
-    const int group = blockIdx.x;
     const int tid = threadIdx.x;
     const int groups_total = K / 256;
-    if (group >= groups_total) return;
+    if (groups_total <= 0) return;
+    const unsigned bx = blockIdx.x;
 
     // Per-expert select: this batch row's routed expert id → its awq_scale base.
-    const int krank = blockIdx.y;
+    const int krank = (int)(bx / (unsigned)groups_total);
+    const int group = (int)(bx - (unsigned)krank * (unsigned)groups_total);
     const int expert_id = topk_indices[krank];
-    const float* __restrict__ awq_scale =
-        reinterpret_cast<const float*>(expert_down_awq_ptrs[expert_id]);
 
     const long long batch_off = (long long)krank * K;
     const float* gate_b  = gate  + batch_off;
@@ -44,6 +46,17 @@ __global__ void fused_silu_mul_mq_rotate_awq_indexed(
 
     int d0 = tid * 8;
     int base = group * 256 + d0;
+
+    // Unrouted slot (id outside [0, n_exp), e.g. the router's -1 marker): no
+    // awq table entry exists, so none is read; the row is written as zeros
+    // (never stale/uninitialised) and the block (uniform on krank) exits.
+    if (expert_id < 0 || expert_id >= n_exp) {
+#pragma unroll
+        for (int e = 0; e < 8; ++e) x_rot_b[base + e] = 0.0f;
+        return;
+    }
+    const float* __restrict__ awq_scale =
+        reinterpret_cast<const float*>(expert_down_awq_ptrs[expert_id]);
 
     // Phase 1: silu(gate)*up, AWQ divide (per-expert scale), signs1.
     #define SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))

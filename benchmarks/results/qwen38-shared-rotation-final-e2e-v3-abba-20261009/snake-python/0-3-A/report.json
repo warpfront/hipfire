@@ -1,0 +1,202 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/media/990Pro/hipfire/models/qwen3.8-27b.mq4-xts",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "automatic",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 16384,
+    "max_seq_bound": "user",
+    "max_seq_reason": null,
+    "model_ctx": 262144,
+    "card_cap": 870671,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 28370,
+    "vram_total_mb": 46064,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "automatic",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "vram_free_before_mb": 46016,
+  "max_seq": {
+    "effective": 16384,
+    "requested": 16384,
+    "source": "flag",
+    "run_need": null,
+    "model_limit": null
+  },
+  "max_tokens": 8192,
+  "runs": 1,
+  "warmups": 2,
+  "batch": 1,
+  "prompt_tokens": 126,
+  "prompt_md5": "0c6464135367951bcee596c9a4a62211",
+  "prompt_chars": 212,
+  "warnings": [
+    "prompt is 126 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "power_device": {
+    "card": "card0",
+    "pci": "0000:9e:00.0",
+    "arch": "gfx1100",
+    "selected_by": "ROCR_VISIBLE_DEVICES=1",
+    "sample_period_ms": 500
+  },
+  "power": [
+    {
+      "samples": 37,
+      "duration_s": 17.7,
+      "gpu_metrics_format": "1.3",
+      "gfxclk_mhz": "unavailable",
+      "gfx_maxfreq_mhz_min": "unavailable",
+      "socket_power_w": "unavailable",
+      "gfx_power_w": "unavailable",
+      "gfx_temp_c_max": "unavailable",
+      "fclk_mhz_avg": "unavailable",
+      "throttle_pct": "unavailable",
+      "tctl_c_max": 67.8,
+      "perf_level": "auto",
+      "od_sclk": "unavailable",
+      "hwmon": {
+        "temp_c": {
+          "edge": {
+            "max": 81.0
+          },
+          "junction": {
+            "max": 96.0
+          },
+          "mem": {
+            "max": 86.0
+          }
+        },
+        "freq_mhz": {
+          "sclk": {
+            "avg": 2006.9,
+            "min": 853.0,
+            "max": 2230.0
+          },
+          "mclk": {
+            "avg": 1124.0,
+            "min": 1124.0,
+            "max": 1124.0
+          }
+        }
+      },
+      "memory": {
+        "vram_total_mib": 46064.0,
+        "vram_used_mib": 18094.2,
+        "vram_free_mib": 27969.8,
+        "gtt_total_mib": 112655.5,
+        "gtt_used_mib": 17.1,
+        "gtt_free_mib": 112638.4,
+        "mem_total_mib": 225310.9,
+        "mem_available_mib": 207171.7
+      }
+    }
+  ],
+  "decode_tok_s": {
+    "median": 120.0,
+    "mean": 120.0,
+    "min": 120.0,
+    "max": 120.0,
+    "stdev": 0.0
+  },
+  "prefill_tok_s": {
+    "median": 631.9,
+    "mean": 631.9,
+    "min": 631.9,
+    "max": 631.9,
+    "stdev": 0.0
+  },
+  "wall_tok_s": {
+    "median": 118.7,
+    "mean": 118.7,
+    "min": 118.7,
+    "max": 118.7,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 199.4,
+    "mean": 199.4,
+    "min": 199.4,
+    "max": 199.4,
+    "stdev": 0.0
+  },
+  "spec_requested": "dflash",
+  "spec_route": [
+    "dflash"
+  ],
+  "spec_tau": [
+    5.67
+  ],
+  "run_events": [
+    {
+      "type": "done",
+      "id": "chatcmpl-983985-3",
+      "tokens": 2100,
+      "tok_s": 118.7,
+      "prefill_tokens": 126,
+      "prefill_ms": 199.4,
+      "prefill_tok_s": 631.9,
+      "decode_tok_s": 120.0,
+      "ttft_ms": 199.4,
+      "dflash": true,
+      "tau": 5.67,
+      "cycles": 315,
+      "cached_tokens": 0,
+      "finish_reason": "stop",
+      "attempt_id": 1,
+      "bench_output": "运行方法：安装 pygame（`pip install pygame`），保存为 `snake.py`，执行 `python snake.py`。\n设计说明：采用状态机管理游戏流程，使用网格坐标系确保窗口缩放后绘制正确，通过事件队列防止快速按键导致的反向移动。\n\n```python\nimport pygame\nimport random\nimport sys\n\n# 初始化 pygame\npygame.init()\n\n# 游戏常量\nGRID_SIZE = 20\nCELL_SIZE = 20\nWINDOW_WIDTH = 600\nWINDOW_HEIGHT = 600\nFPS = 60\n\n# 颜色定义\nBLACK = (0, 0, 0)\nWHITE = (255, 255, 255)\nRED = (255, 0, 0)\nGREEN = (0, 255, 0)\nDARK_GREEN = (0, 100, 0)\nGRAY = (128, 128, 128)\n\nclass SnakeGame:\n    def __init__(self):\n        self.screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))\n        pygame.display.set_caption(\"贪吃蛇游戏\")\n        self.clock = pygame.time.Clock()\n        self.font = pygame.font.SysFont(None, 36)\n        self.large_font = pygame.font.SysFont(None, 72)\n        \n        # 游戏状态: 'playing', 'paused', 'game_over'\n        self.state = 'playing'\n        \n        # 初始化游戏变量\n        self.reset_game()\n        \n        # 最高分记录\n        self.high_score = 0\n\n    def reset_game(self):\n        \"\"\"重置游戏状态\"\"\"\n        # 蛇初始位置在中间\n        start_x = WINDOW_WIDTH // (2 * GRID_SIZE)\n        start_y = WINDOW_HEIGHT // (2 * GRID_SIZE)\n        self.snake = [(start_x, start_y)]\n        self.direction = (1, 0)  # 初始向右\n        self.next_direction = (1, 0)  # 防止快速按键导致反向\n        \n        # 初始速度（毫秒/帧），分数越高速度越快\n        self.base_speed = 100\n        self.current_speed = self.base_speed\n        \n        self.score = 0\n        self.high_score = max(self.high_score, self.score)\n        \n        # 生成食物\n        self.spawn_food()\n        \n        # 重置计时器\n        self.last_move_time = pygame.time.get_ticks()\n\n    def spawn_food(self):\n        \"\"\"生成食物，确保不在蛇身上\"\"\"\n        while True:\n            food_x = random.randint(0, WINDOW_WIDTH // GRID_SIZE - 1)\n            food_y = random.randint(0, WINDOW_HEIGHT // GRID_SIZE - 1)\n            if (food_x, food_y) not in self.snake:\n                self.food = (food_x, food_y)\n                break\n\n    def handle_events(self):\n        \"\"\"处理用户输入事件\"\"\"\n        for event in pygame.event.get():\n            if event.type == pygame.QUIT:\n                pygame.quit()\n                sys.exit()\n            \n            if event.type == pygame.KEYDOWN:\n                # 暂停/继续\n                if event.key == pygame.K_p:\n                    if self.state == 'playing':\n                        self.state = 'paused'\n                    elif self.state == 'paused':\n                        self.state = 'playing'\n                        self.last_move_time = pygame.time.get_ticks()\n                \n                # 重新开始\n                if event.key == pygame.K_r:\n                    if self.state == 'game_over' or self.state == 'paused':\n                        self.reset_game()\n                        self.state = 'playing'\n                \n                # 方向控制（仅在 playing 状态下有效）\n                if self.state == 'playing':\n                    if event.key in (pygame.K_UP, pygame.K_w):\n                        self.next_direction = (0, -1)\n                    elif event.key in (pygame.K_DOWN, pygame.K_s):\n                        self.next_direction = (0, 1)\n                    elif event.key in (pygame.K_LEFT, pygame.K_a):\n                        self.next_direction = (-1, 0)\n                    elif event.key in (pygame.K_RIGHT, pygame.K_d):\n                        self.next_direction = (1, 0)\n\n    def update(self):\n        \"\"\"更新游戏逻辑\"\"\"\n        if self.state != 'playing':\n            return\n\n        current_time = pygame.time.get_ticks()\n        \n        # 根据分数调整速度：每10分减少10ms，最低50ms\n        self.current_speed = max(50, self.base_speed - (self.score // 10) * 10)\n        \n        # 控制移动频率\n        if current_time - self.last_move_time >= self.current_speed:\n            self.last_move_time = current_time\n            \n            # 检查是否反向（禁止直接反向）\n            if self.next_direction != (-self.direction[0], -self.direction[1]):\n                self.direction = self.next_direction\n            \n            # 计算新头部位置\n            head_x, head_y = self.snake[0]\n            new_head_x = head_x + self.direction[0]\n            new_head_y = head_y + self.direction[1]\n            \n            # 碰撞检测：墙壁\n            if new_head_x < 0 or new_head_x >= WINDOW_WIDTH // GRID_SIZE or \\\n               new_head_y < 0 or new_head_y >= WINDOW_HEIGHT // GRID_SIZE:\n                self.state = 'game_over'\n                self.high_score = max(self.high_score, self.score)\n                return\n            \n            # 碰撞检测：自身\n            if (new_head_x, new_head_y) in self.snake:\n                self.state = 'game_over'\n                self.high_score = max(self.high_score, self.score)\n                return\n            \n            # 移动蛇\n            self.snake.insert(0, (new_head_x, new_head_y))\n            \n            # 检查是否吃到食物\n            if (new_head_x, new_head_y) == self.food:\n                self.score += 10\n                self.high_score = max(self.high_score, self.score)\n                self.spawn_food()\n            else:\n                # 没吃到食物，移除尾部\n                self.snake.pop()\n\n    def draw(self):\n        \"\"\"绘制游戏画面\"\"\"\n        self.screen.fill(BLACK)\n        \n        # 绘制网格（可选，增加视觉效果）\n        for x in range(0, WINDOW_WIDTH, GRID_SIZE):\n            pygame.draw.line(self.screen, GRAY, (x, 0), (x, WINDOW_HEIGHT), 1)\n        for y in range(0, WINDOW_HEIGHT, GRID_SIZE):\n            pygame.draw.line(self.screen, GRAY, (0, y), (WINDOW_WIDTH, y), 1)\n        \n        # 绘制食物\n        food_rect = pygame.Rect(self.food[0] * GRID_SIZE, self.food[1] * GRID_SIZE, GRID_SIZE, GRID_SIZE)\n        pygame.draw.rect(self.screen, RED, food_rect)\n        \n        # 绘制蛇\n        for i, segment in enumerate(self.snake):\n            rect = pygame.Rect(segment[0] * GRID_SIZE, segment[1] * GRID_SIZE, GRID_SIZE, GRID_SIZE)\n            if i == 0:\n                pygame.draw.rect(self.screen, GREEN, rect)  # 头部\n            else:\n                pygame.draw.rect(self.screen, DARK_GREEN, rect)  # 身体\n        \n        # 绘制分数\n        score_text = self.font.render(f\"Score: {self.score}\", True, WHITE)\n        high_score_text = self.font.render(f\"High Score: {self.high_score}\", True, WHITE)\n        self.screen.blit(score_text, (10, 10))\n        self.screen.blit(high_score_text, (10, 40))\n        \n        # 绘制状态信息\n        if self.state == 'paused':\n            pause_text = self.large_font.render(\"PAUSED\", True, WHITE)\n            pause_rect = pause_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2))\n            self.screen.blit(pause_text, pause_rect)\n            \n            hint_text = self.font.render(\"Press P to Resume, R to Restart\", True, WHITE)\n            hint_rect = hint_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 50))\n            self.screen.blit(hint_text, hint_rect)\n            \n        elif self.state == 'game_over':\n            game_over_text = self.large_font.render(\"GAME OVER\", True, RED)\n            game_over_rect = game_over_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 - 30))\n            self.screen.blit(game_over_text, game_over_rect)\n            \n            final_score_text = self.font.render(f\"Final Score: {self.score}\", True, WHITE)\n            final_score_rect = final_score_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 20))\n            self.screen.blit(final_score_text, final_score_rect)\n            \n            restart_text = self.font.render(\"Press R to Restart\", True, WHITE)\n            restart_rect = restart_text.get_rect(center=(WINDOW_WIDTH // 2, WINDOW_HEIGHT // 2 + 60))\n            self.screen.blit(restart_text, restart_rect)\n        \n        pygame.display.flip()\n\n    def run(self):\n        \"\"\"主游戏循环\"\"\"\n        while True:\n            self.handle_events()\n            self.update()\n            self.draw()\n            self.clock.tick(FPS)\n\nif __name__ == \"__main__\":\n    game = SnakeGame()\n    game.run()\n```"
+    }
+  ],
+  "samples": {
+    "decode": [
+      120.0
+    ],
+    "prefill": [
+      631.9
+    ],
+    "wall": [
+      118.7
+    ],
+    "ttft_ms": [
+      199.4
+    ]
+  },
+  "kv_backend": "vmm",
+  "kv_backend_request": "automatic",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null,
+  "kv_mode": "q8"
+}

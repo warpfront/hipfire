@@ -1,0 +1,1 @@
+{"block":[64,1,1],"buffers":[{"dtype":"u32","expect":[19,22,25,28,31],"name":"out"}],"grid":[1,1,1],"kernargs":{"fields":[{"offset":0,"ptr":"out"},{"offset":8,"u32":5},{"offset":12,"u32":3},{"offset":16,"u32":19}],"size":24},"name":"n=5,k=3,c=19"}

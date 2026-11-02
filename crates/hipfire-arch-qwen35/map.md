@@ -1,0 +1,1174 @@
+# hipfire-arch-qwen35 — map
+
+> **Status:** `production` (vocabulary owned by [`docs/GLOSSARY.md`](../../docs/GLOSSARY.md)).
+> **Layer:** Arch forward — hangs off `hipfire-loader` via `Carrier` (`arch_id` 5 dense / 6 MoE A3B); see the layering table in [`docs/ARCHITECTURE.md`](../../docs/ARCHITECTURE.md).
+
+## Purpose
+
+Qwen3.5 dense + MoE (A3B/A10B/A17B) hybrid: DeltaNet + full attention, MTP/DSpark hooks. Owns `qwen35/` model forward (config/weights/state/tiled attention), `speculative.rs` qwen35-specific spec glue (deeply coupled to `qwen35::*` symbols; `pflash.rs` branch evacuated to `hipfire-pflash` per B3), arch-specific kernels, and the `Architecture` impl used by `Qwen35Carrier`/`Qwen35VL` text path. The `//!` docs in [`src/lib.rs`](src/lib.rs) note the future move of `speculative.rs` back to runtime once it becomes arch-generic.
+
+## Gotchas
+
+- `speculative.rs` is still qwen35-coupled — do not move it to `hipfire-runtime` without de-tangling the `qwen35::*` deps.
+- PFlash text path now lives in `hipfire-pflash` — this crate must not reintroduce a `pflash.rs` sibling.
+- Compact root-routed EP decode, `prefill_lane`, `forward_tick`, and `forward_prefill_batch_ep` use runtime's checked collective schedule. The pure prefill parameter builder is shared with all-rank preflight; do not reintroduce local zero/transfer/reduce/add sequencing.
+- Native MTP is explicit-only here: `MTP_MEASURED_AR_FLOOR` (`src/lib.rs`) is `false`, so `speculation.mtp = auto` keeps plain AR and loads no head (`hipfire_config::mtp_mode_admits`); only `--spec mtp` / `speculation.mtp = on` arms it. Do not rearm `auto` from head presence.
+- Resident Qwen35 MoE ordinary prefill admits the 8192-row `RESIDENT_MOE_CHUNK_ROWS` rung only when actual resident placement, supported producer dtypes, full-width IU4 scratch reservation and coverage, and `resident_moe_rung_fits` all pass. The fit charges projected full PBS/grouped scratch, the checked `rows*(2*v_dim+256)*4` DeltaNet addition, projection and full-row Q16 deficits, mapped KV capacity and 1 GiB headroom against actual free VRAM; refusal keeps `prefill_max_batch_for_model`. Explicit `HIPFIRE_PREFILL_MAX_BATCH` or `prefill.chunk_rows` below the rung keep the incumbent. Production and installed-facts tests share `plan_ordinary_prefill`; the default is planned as a virtual explicit-8192 PBS owner. Credit applies only to a genuinely reusable widened cache or the kept same-target wrapper owner; smaller, mismatched and lean owners are replaced and the full rung is charged. The allocation-free `DeltaNetStateGeometry` exposes every S/EF owner's extent. The wrapper checks actual-row and 512-row-seam eligibility before mapping/querying/allocating; small/config-off/capture refusals retain their prior resource plan. Generic `commit_stride=512` is not proof of any particular MoE/GDN kernel route; actual launch evidence is separate.
+- Native cache support and implicit selection are separate in [`src/carrier.rs`](src/carrier.rs) and [`hipfire-runtime/src/kv_mode.rs`](../hipfire-runtime/src/kv_mode.rs). Exact-gfx1201 single-GPU native FP8 support and `qwen35_native_auto_eligible` include both H16/KV2/D256 A3B and H24/KV4/D256, without adaptive tiering or CASK. KV selection and FA2 selection are independent, stackable decisions: observing native Auto FP8 does not prove that a particular FA2 or PM/Qprep subroute launched.
+- [`hipfire-dispatch/src/pipeline/batched_attention.rs`](../hipfire-dispatch/src/pipeline/batched_attention.rs) names the PM cache with `fa_pm_kv_codec(kv_cache) -> Option<FaPrefillKvCodec>`: Q8 K with 8-bit V is `Some(Q8_0)`, native FP8 is `Some(Fp8E4M3)`, all other caches are `None` and keep the incumbent. `batch_chunk_fa_attend` asks the shared codec-aware `Gpu::fa_prefill_pm_admitted` before commit-stride segmentation and multirow fallback. An admitted whole chunk takes PM once; dense H24/KV4, tree/independent layouts and every refusal retain their existing paths. The F5 Q-prep helpers (`fa_pm_qprep_admitted`, `batch_chunk_fa_pm_qprep_{prep,direct}`) and the GDN chunk-scan views/layer live there and in `batched_deltanet.rs`; the arch-side MoE bodies call those copies.
+- `HIPFIRE_FA_PREFILL_PM` and `HIPFIRE_FA_PREFILL_PM_QPREP` are the same typed public flags for both codecs, resolved through `Gpu::fa_prefill_pm_flag` / `fa_prefill_pm_qprep_flag`. Q8 retains its exact-gfx1201 qualification; the existing `FP8_KV_QUALIFIED` table separately qualifies `FaPrefillPm` and `FaPrefillPmQprep` on gfx1201. Unset follows the corresponding qualified table and explicit `0`/`1` overrides it; PM `0` refuses F5 for either codec. The core carry adds no qualification rows or default promotions.
+- The FP8 PM direct kernel preserves F16 Q and its arithmetic order while reusing one 32-KiB dynamic LDS stage for K then V, with all five waves participating in four ordered barrier pairs. Its descriptor has fixed LDS 0 and the production codec-specific launcher supplies dynamic LDS 32768; Q8 retains its original two-plane image and dynamic LDS 65536. The direct ABI remains 60 bytes. A driver occupancy comparison at dynamic 32768 versus 65536 uses the same new FP8 kernel; it is not an old-image occupancy comparison. Resident IU4 down remains the qualified NT4 route; the regressing streamed down-NT8 experiment is excluded.
+- F5's `fa_pm_kv_keys` requires the exact paired tier plan: `KvWriteQ8_0Batched` + `AttnQ8_0KvBatchedMasked`, or `KvWriteFp8E4m3Batched` + `AttnFp8E4m3KvBatchedMasked`. `fa_pm_qprep_admitted` additionally requires resolved flags/raw inventory, H16/KV2/D256, `n_rot = 64`, half-split RoPE (legacy interleaved RoPE is refused), eager full-causal whole-chunk `start_pos + n == max_ctx_len <= physical_cap` and no triattn tap. Dense additionally excludes DFlash fusion and fp8q/A4/in-place-gate epilogues; other layouts/capture/recording keep the incumbent.
+- A3B H16/KV2 native FA2 runs the checked Raw two-plane Q (`fa_q_batch` codes + scales) through the A3B Direct/Range pair: general true-prefill tails (2..=32768, tiny tails included) take the whole-batch native Direct (`fa_a3b_native_prefill_rows`) before the F32 fallback; `batch_chunk_fa_attend_ragged_fp8q` still writes native-FP8 K/V once and launches prefix (`start_pos + prefix`) plus 64..=511 tail Range attentions over segment views of the whole-chunk F32 output (legacy `fa_ragged_packet_split` unchanged); Range supports 1+ rows but GEN Range unobserved. AR/verify, legacy H24/F16/Q8 and default behavior unchanged.
+- The F5 single-chunk wrappers `batch_chunk_full_attn_attn` and `hipfire_dispatch::pipeline::batched_moe::execute_attention_moe_layer_batched` (via `attention_moe_prep_batched` / `attention_moe_finish_batched`) call `batch_chunk_fa_pm_qprep_prep`: K RMSNorm, K-only half-split RoPE capturing this chunk's `[n,64]` angles, then codec-independent `Gpu::fa_pm_qprep_exact` producing gate and final F16 Q. `fa_pm_qprep_views` places Q16 and angles disjointly in this chunk's `fa_q_batch`, not shared scratch. `batch_chunk_fa_pm_qprep_direct` then writes K followed by V with the selected `kv_cache_write_q8_0_batched` or `kv_cache_write_fp8_e4m3_batched` and calls `Gpu::fa_prefill_pm_direct_codec`, without a second Q preconvert. MoE prep/finish carry `fa_pm_qprep` so prepared Q is consumed once; paired-chunk merged attend passes `false`, and independent/multi-request lanes do not consume these bytes.
+- Accepted F1/F2/F4 prerequisites are the existing IU4 combine-v2, resident NT8 gate/up and sealed two-row router gates in [`hipfire-dispatch/src/pipeline/moe_program.rs`](../hipfire-dispatch/src/pipeline/moe_program.rs), [`rdna-compute/src/gemm.rs`](../rdna-compute/src/gemm.rs) and [`hipfire-dispatch/src/pipeline/sealed_moe.rs`](../hipfire-dispatch/src/pipeline/sealed_moe.rs). F3's `prefill_iu4_producer_fused_admitted` selects exact runtime-eight-candidate norm/rotate and FA-output-rotate producers under `HIPFIRE_PREFILL_IU4_PRODUCER_FUSED`, uniform MQ4G256V2, raw inventory and existing eager IU4 admission. Its checked fused-QKV boundary is `FusedQkvFamily::emit_rmsnorm_iu4_exact` / `run_iu4_prepared` in [`hipfire-dispatch/src/families/fused_qkv.rs`](../hipfire-dispatch/src/families/fused_qkv.rs); dense/C2 defaults remain unchanged. F1–F4 do not key on KV format; historical Q8 evidence is not a new FP8 measurement.
+- MoE GDN route order in [`hipfire-dispatch/src/pipeline/batched_moe.rs`](../hipfire-dispatch/src/pipeline/batched_moe.rs) is chunk scan (`HIPFIRE_GDN_MOE_CHUNK_SCAN`) over fused preamble (`HIPFIRE_GDN_MOE_PRE_FUSED`) over indexed Q/K (`HIPFIRE_GDN_QK_INDEXED`) over legacy. `GdnMoeChunkScanInputs` in [`src/qwen35/prefill.rs`](src/qwen35/prefill.rs) supplies the common admission; each layer additionally checks MQ4G256V2 wqkv/wz/w_beta/w_alpha and its EF slot. `gdn_chunk_scan_prepare_views` validates geometry, scratch/state extents and resolves modules before projection or conv-ring mutation; `gdn_chunk_scan_layer` runs prep, batched KKT and mseg/per-segment scan with actual value-head-scaled A offsets. Dense shares these helpers at 16/48 heads; MoE uses the generalized 16/32 route and `deltanet_moe_output_batched` preserves its admitted F32/BF16 output contract. The indexed branch calls `Gpu::gated_delta_net_q8_batch_seq_indexed` on raw Q/K with the actual head ratio, skipping repeat/copy; paired-half callers pass `None, false` for chunk-scan admission. [`rdna-compute/src/norm.rs`](../rdna-compute/src/norm.rs) and the corresponding HIP kernels carry the indexed/head-count ABIs. Existing [`src/qwen35/batch.rs`](src/qwen35/batch.rs) scratch allocation/census already covers these views; no new allocation is introduced.
+- The four late-H routes are qualified exact-gfx1201 defaults (unset on there, explicit `0` kills each). `HIPFIRE_GDN_CHUNK_PREP_PM` nests `Gpu::gdn_chunk_prep_pm_admitted` / `gdn_chunk_prep_pm` beneath the admitted MoE scan (exact gfx1201, 16 key / 32 value heads): `GdnChunkPrepModule::Pm` in `GdnChunkScanViews` is resolved with the other modules before projection/conv-ring mutation, then replaces the incumbent prep launch. Dense 16/48 uses `Incumbent` or `Fixup`, not PM. `HIPFIRE_PREFILL_IU4_C8_PM` nests PM exact rotate/RMSNorm twins beneath resolved F3; `HIPFIRE_MOE_ROTATE_I4_PM` nests the frozen-candidate PM down-A4 producer beneath symmetric IU4; `HIPFIRE_MOE_SHARED_DOWN_SIGMOID_EPI` selects the shared-down HIP V3 epilogue with its existing collector/capture/recording refusals. Leaf sources are [`gdn_chunk_prep_pm.rs`](../rdna-compute/src/gdn_chunk_prep_pm.rs), [`iu4_c8_pm.rs`](../rdna-compute/src/iu4_c8_pm.rs), [`moe_rotate_i4_pm.rs`](../rdna-compute/src/moe_rotate_i4_pm.rs) and [`hipfire-dispatch/src/pipeline/mod.rs`](../hipfire-dispatch/src/pipeline/mod.rs); no obsolete source-text module/filter is part of this route.
+
+## Crate map
+
+<!-- crate-map:generated:begin -->
+
+_Generated by `scripts/check-crate-maps.py` from the tree — do not edit inside the markers._
+
+### Modules and exported symbols
+
+- [`src/arch.rs`](src/arch.rs)
+  - `Qwen35`
+- [`src/arch_model.rs`](src/arch_model.rs)
+- [`src/carrier.rs`](src/carrier.rs)
+  - `free_qwen35_bundle`
+  - `host_alive`
+  - `load_bundle`
+  - `loader_abi`
+  - `Qwen35Bundle`
+  - `release`
+  - `SharedWeightLease`
+  - `validate_ddtree_cask`
+  - `validate_gfx1100_split_verify_kv`
+  - `validate_native_kv_admission`
+  - `weight_host_card_identity`
+  - `weight_host_provenance`
+  - `weight_host_socket`
+  - `weight_host_source_certificate_path`
+  - `weight_host_source_sha256`
+- [`src/checkpoint.rs`](src/checkpoint.rs)
+  - `capture_checkpoint`
+  - `hipfire_runtime`
+  - `restore_private`
+- [`src/dflash_cb.rs`](src/dflash_cb.rs)
+  - `cold`
+  - `dflash_block_for_emit`
+  - `dflash_cb_draft`
+  - `dflash_cb_head_argmax`
+  - `dflash_cb_verify`
+  - `dflash_lane_draft`
+  - `DflashCbDraftLane`
+  - `DflashCbScratch`
+  - `DflashCbVerifyLane`
+  - `DflashVmmLaneState`
+  - `draft_rows`
+  - `free_gpu`
+  - `from_snapshot`
+  - `lend_mq`
+  - `max_rows`
+  - `new`
+  - `reclaim_mq`
+  - `reserve_draft`
+  - `sample_cfg`
+- [`src/dflash_draft_emit.rs`](src/dflash_draft_emit.rs)
+  - `accepts`
+  - `bind_draft_ops`
+  - `draft_family_key`
+  - `DRAFT_ROWS`
+  - `draft_staged_words`
+  - `draft_state_tensors`
+  - `DraftEmission`
+  - `DraftEmitArgs`
+  - `DraftFamilyKey`
+  - `DraftResource`
+  - `DraftStagedWords`
+  - `DraftStagingLayout`
+  - `kernel_count`
+  - `plan_dflash_draft`
+  - `resource`
+  - `SCALAR_DRAFT_SEED`
+  - `scalars`
+- [`src/dflash_railgun.rs`](src/dflash_railgun.rs)
+  - `admit_static`
+  - `admit_window`
+  - `clear_route`
+  - `counters`
+  - `hip_total`
+  - `install_builder`
+  - `invalidate`
+  - `is_quarantined`
+  - `key`
+  - `last_route`
+  - `LookupFacts`
+  - `new`
+  - `note_hip_window`
+  - `PreparedInputs`
+  - `RAILGUN_WINDOW_VAR`
+  - `RailgunAttempt`
+  - `RailgunCounters`
+  - `RailgunRefusal`
+  - `RailgunVerify`
+  - `RailgunWindowOwner`
+  - `RailgunWindowRun`
+  - `refuse`
+  - `release`
+  - `run`
+  - `shape_hint`
+  - `SKELETON_BUILDING`
+  - `static_verdict`
+  - `StaticFacts`
+  - `WINDOW_ROWS`
+  - `window_var_enabled`
+  - `WindowBuilder`
+  - `WindowFacts`
+  - `WindowOwners`
+  - `WindowRequest`
+  - `WindowResults`
+- [`src/dflash_railgun_builder.rs`](src/dflash_railgun_builder.rs)
+  - `CORPUS_VAR`
+  - `DEBUG_VAR`
+  - `free`
+  - `from_env`
+  - `MANIFEST_VAR`
+  - `RailgunWindowBuilder`
+  - `SEQUENCE_OUT_VAR`
+  - `SYNC_BUILD_VAR`
+  - `TWIN_VAR`
+- [`src/dflash_slot.rs`](src/dflash_slot.rs)
+  - `dflash_slot_draft_step`
+  - `dflash_slot_verify_accept`
+  - `DflashShared`
+  - `DflashSlotDraft`
+  - `DflashSlotState`
+  - `free_gpu`
+  - `hidden_capture`
+  - `load_dflash_shared`
+  - `n_verify`
+  - `new_dflash_slot_state`
+  - `reset_dflash_slot`
+  - `scatter_staging_rows_to_interleaved`
+- [`src/dflash_spec.rs`](src/dflash_spec.rs)
+  - `admit_dflash_verify_pm4`
+  - `begin_request`
+  - `build_dflash_speculator`
+  - `checkpoint_policy`
+  - `configure_lookup`
+  - `DdtreeState`
+  - `DEFAULT_DFLASH_CTX_CAP`
+  - `DenseTpDflashRankState`
+  - `DenseTpDflashSpeculator`
+  - `dflash_prefill_host_required`
+  - `dflash_prefill_lane_parts`
+  - `dflash_repair_terminal_prefix_parts`
+  - `DflashCheckpointPolicy`
+  - `DflashLaneSnapshot`
+  - `DflashOwnerKind`
+  - `DflashSpeculator`
+  - `DflashState`
+  - `DflashVmmAssets`
+  - `DflashWindowMark`
+  - `disarm_lookup`
+  - `enable_railgun_window`
+  - `end_request`
+  - `ensure_live`
+  - `free_gpu`
+  - `is_vacant`
+  - `load_dflash_speculator_dense_tp2`
+  - `load_dflash_state`
+  - `mark_dirty`
+  - `matches_state`
+  - `new`
+  - `new_dflash_lane_state`
+  - `plan_window`
+  - `prefill`
+  - `quiesce_all`
+  - `railgun_window_mut`
+  - `release_shared_dflash_weights`
+  - `reset_all`
+  - `restore_vmm_lane`
+  - `rows`
+  - `shed_vmm_lane_scratch`
+  - `step`
+  - `step_traced`
+  - `sync_history`
+  - `take_vmm_lane`
+  - `verify_pm4`
+  - `verify_pm4_mut`
+  - `vmm_assets`
+- [`src/dflash_verify_emit.rs`](src/dflash_verify_emit.rs)
+  - `COMMIT5_HEAD_OFFSET`
+  - `DflashVerifyPlan`
+  - `kernels`
+  - `patch_table`
+  - `plan_dflash_verify`
+  - `plan_dflash_verify_full`
+  - `undeclared_varying_words`
+- [`src/dflash_verify_pm4.rs`](src/dflash_verify_pm4.rs)
+  - `admitted`
+  - `armed`
+  - `armed_after_context`
+  - `binding`
+  - `calibration`
+  - `controller_mut`
+  - `counters`
+  - `DFLASH_VERIFY_PM4_BLOCK`
+  - `DflashVerifyBinding`
+  - `DflashVerifyPm4`
+  - `DflashVerifyPm4Counters`
+  - `DflashVerifyPm4Phase`
+  - `DflashVerifyRoute`
+  - `DflashVerifyWindow`
+  - `disabled`
+  - `fingerprint_u64`
+  - `is_live`
+  - `label`
+  - `new`
+  - `note_calibration_capture`
+  - `note_capture`
+  - `note_contract_failure`
+  - `note_position_bindings`
+  - `note_prepare_failure`
+  - `note_prime_success`
+  - `note_ready`
+  - `note_replay_failure`
+  - `note_replay_success`
+  - `note_safe_hip_retry`
+  - `phase`
+  - `plan_route`
+  - `poison`
+  - `prepared_identity`
+  - `reason`
+  - `report_json`
+  - `same_route`
+  - `shutdown`
+- [`src/dflash_window_build.rs`](src/dflash_window_build.rs)
+  - `build_window`
+  - `BuildInput`
+  - `BuildRefusal`
+  - `BuiltWindow`
+  - `NodeOrigin`
+  - `SCALAR_RING_WRITTEN`
+  - `SealedRetarget`
+  - `SequenceNode`
+  - `TransportCopy`
+  - `TransportDigests`
+  - `window_sequence`
+  - `WindowFactsSource`
+- [`src/draft_vocab.rs`](src/draft_vocab.rs)
+  - `add_ids`
+  - `attach_trunk_draft_vocab`
+  - `COMMITTED`
+  - `committed_sources`
+  - `CountSource`
+  - `DRAFT_VOCAB_ENV`
+  - `DraftVocab`
+  - `new`
+  - `parse`
+  - `QWEN35_DRAFT_VOCAB`
+  - `QWEN35_DRAFT_VOCAB_K`
+  - `QWEN35_LM_HEAD_ROWS`
+  - `rank_draft_vocab`
+  - `RankParams`
+  - `SOURCE_IDS_JSONL`
+  - `SOURCE_TEXTS`
+  - `SOURCE_TOKENIZER`
+  - `to_bytes`
+  - `tokenizer_identity`
+  - `total`
+- [`src/forward_slots.rs`](src/forward_slots.rs)
+  - `advance_slot_seq_lens`
+  - `DECODE_GRAPH_CTX_BUCKET`
+  - `DESC_BYTES`
+  - `forward_batch_slots`
+  - `forward_batch_slots_graphed`
+  - `forward_batch_slots_graphed_opts`
+  - `forward_batch_slots_opts`
+  - `forward_batch_slots_with_max_layer`
+  - `free_gpu`
+  - `is_q8`
+  - `is_verify_slot`
+  - `new`
+  - `q8`
+  - `release`
+  - `SlotDecodeGraph`
+  - `SlotDescStaging`
+  - `SlotKvTier`
+  - `SlotStepOpts`
+  - `spec_verify_graph_shape`
+  - `SpecHiddenCapture`
+  - `SpecVerifyCapture`
+  - `stats`
+  - `upload_block_tables`
+  - `upload_step_inputs`
+  - `vmm`
+- [`src/forward_slots/vmm.rs`](src/forward_slots/vmm.rs)
+  - `abort_step`
+  - `admission_check`
+  - `admit`
+  - `budget_report`
+  - `commit_step`
+  - `copy_dn_from`
+  - `dflash`
+  - `exact_prefill_chunk_len`
+  - `executor`
+  - `format`
+  - `forward_step`
+  - `free_gpu`
+  - `hidden`
+  - `logits`
+  - `mapped_kv_bytes`
+  - `max_slots`
+  - `memory_state`
+  - `new`
+  - `new_like`
+  - `occupancy`
+  - `provision_step`
+  - `Qwen35RequestState`
+  - `Qwen35VmmExecutor`
+  - `Qwen35VmmStore`
+  - `receipt`
+  - `request_state`
+  - `request_state_mut`
+  - `retire`
+  - `route`
+  - `row_budget`
+  - `sampled`
+  - `set_sampled`
+  - `spec`
+  - `step_grants`
+  - `swap_with_bundle`
+  - `vmm_admission_fits`
+  - `vmm_executor_supports`
+  - `vmm_grant_growth`
+  - `vmm_lanes_safe`
+  - `vmm_map_room`
+  - `VMM_RESERVE_SLACK_ROWS`
+  - `VMM_SEED_CEILING_MARGIN_BYTES`
+  - `vmm_seed_free_deduction`
+  - `vmm_spec_bytes`
+  - `VmmAdmission`
+  - `VmmBatchReceipt`
+  - `VmmLaneNeed`
+  - `VmmLaneSpec`
+  - `VmmLayerKv`
+  - `VmmMemoryState`
+  - `VmmPrefixEntry`
+  - `VmmRequestInit`
+  - `VmmRoute`
+- [`src/forward_slots/vmm/dflash.rs`](src/forward_slots/vmm/dflash.rs)
+  - `block_size`
+  - `checkpoint_bound`
+  - `checkpoint_bound_unplanned`
+  - `ctx_capacity`
+  - `dflash_adopt`
+  - `dflash_engine`
+  - `DFLASH_LANE_CHECKPOINT_READERS`
+  - `dflash_prefill`
+  - `dflash_repair_terminal_prefix`
+  - `dflash_set_max_emit`
+  - `DflashLaneCheckpointReaders`
+  - `fn`
+  - `free_gpu`
+  - `install_dflash`
+  - `lane_bytes`
+  - `lane_checkpoint_policy`
+  - `max_rows`
+  - `new`
+  - `receipt`
+  - `set_keep_lane_rows`
+  - `snapshot_bytes`
+  - `supports_sampled`
+  - `VmmDflashEngine`
+  - `VmmDflashReceipt`
+- [`src/forward_slots/vmm/exact.rs`](src/forward_slots/vmm/exact.rs)
+- [`src/forward_slots/vmm/spec.rs`](src/forward_slots/vmm/spec.rs)
+  - `capture`
+  - `free_gpu`
+  - `head_cap`
+  - `install_spec`
+  - `k`
+  - `lane_bytes`
+  - `MtpLaneSnapshot`
+  - `new`
+  - `rows`
+  - `spec_adopt`
+  - `spec_engine`
+  - `spec_prefill`
+  - `VmmSpecEngine`
+- [`src/gguf_map.rs`](src/gguf_map.rs)
+  - `AS_STORED`
+  - `expected_tensors`
+  - `ExpectedTensor`
+  - `GGUF_ARCHITECTURE`
+  - `GgufTransform`
+  - `hparams_from_gguf`
+  - `is_as_stored`
+  - `lookup`
+  - `new`
+  - `Qwen35GgufHparams`
+  - `Qwen35GgufMap`
+  - `TensorClass`
+  - `TensorGroup`
+  - `VHeadOrder`
+- [`src/gguf_source.rs`](src/gguf_source.rs)
+  - `A8_EMU_ENV`
+  - `CODEC_ONLY_ENV`
+  - `elem_bytes`
+  - `from_env`
+  - `ggml_type_dtype`
+  - `GgufSource`
+  - `materialize_bytes`
+  - `new`
+  - `prefill_dequant`
+  - `PrefillDequant`
+- [`src/grammar_config.rs`](src/grammar_config.rs)
+  - `resolve_grammar_config`
+  - `resolve_qwen35_grammar_config`
+- [`src/layer_driver.rs`](src/layer_driver.rs)
+- [`src/lib.rs`](src/lib.rs)
+  - `arch`
+  - `arch_model`
+  - `carrier`
+  - `checkpoint`
+  - `dflash_cb`
+  - `dflash_draft_emit`
+  - `dflash_railgun`
+  - `dflash_railgun_builder`
+  - `dflash_slot`
+  - `dflash_spec`
+  - `dflash_verify_emit`
+  - `dflash_verify_pm4`
+  - `dflash_window_build`
+  - `draft_vocab`
+  - `forward_slots`
+  - `gguf_map`
+  - `gguf_source`
+  - `grammar_config`
+  - `mtp_compose`
+  - `mtp_dense_tp`
+  - `mtp_head`
+  - `MTP_MEASURED_AR_FLOOR`
+  - `mtp_probe`
+  - `mtp_spec`
+  - `mtp_speculator`
+  - `qwen35`
+  - `saddle_core`
+  - `serve_engine`
+  - `shared_weights`
+  - `spec_emit`
+  - `speculative`
+- [`src/mtp_cb.rs`](src/mtp_cb.rs)
+  - `free_gpu`
+  - `mtp_cb_accept`
+  - `mtp_cb_cycle`
+  - `mtp_cb_draft`
+  - `mtp_cb_draft_batched`
+  - `mtp_cb_verify`
+  - `MtpCbDraftLane`
+  - `MtpCbLane`
+  - `MtpCbScratch`
+  - `MtpCbTiming`
+  - `MtpCbVerified`
+  - `MtpCbVerifyLane`
+  - `new`
+- [`src/mtp_compose.rs`](src/mtp_compose.rs)
+  - `free_gpu`
+  - `MtpComposeResult`
+  - `MtpComposeState`
+  - `MtpComposeTreeResult`
+  - `MtpComposeTreeState`
+  - `new`
+  - `spec_step_dflash_mtp`
+  - `spec_step_dflash_mtp_tree`
+- [`src/mtp_dense_tp.rs`](src/mtp_dense_tp.rs)
+  - `free_on_ranks`
+  - `last_logits`
+  - `MtpTpRuntime`
+  - `new`
+  - `prefill_trunk_and_mtp_cache_dense_tp`
+  - `Qwen35DenseTpTarget`
+  - `restore_last_window`
+  - `spec_step_mtp_dense_tp`
+- [`src/mtp_head.rs`](src/mtp_head.rs)
+  - `BUNDLE_TRAILER_LEN`
+  - `BUNDLE_TRAILER_MAGIC`
+  - `check_mtp_head_for_trunk`
+  - `detect_bundled_mtp_offset`
+  - `ensure_compressed_logits`
+  - `find_mtp_sidecar`
+  - `free_gpu`
+  - `legacy_prompt_fill_bytes`
+  - `load_mtp_head`
+  - `load_mtp_head_at_offset`
+  - `load_mtp_head_bundled`
+  - `mtp_head_apply_lm_head_batched`
+  - `mtp_head_apply_lm_head_draft`
+  - `mtp_head_forward`
+  - `mtp_head_forward_block_batched`
+  - `mtp_head_forward_block_only`
+  - `mtp_head_forward_block_only_with_pos_buf`
+  - `mtp_head_forward_compressed`
+  - `mtp_sidecar_candidates`
+  - `MtpKvMode`
+  - `new`
+  - `new_with_kv_mode`
+  - `parse`
+  - `q8_requested_bytes`
+  - `Qwen35MtpDenseFfnWeights`
+  - `Qwen35MtpFfnKind`
+  - `Qwen35MtpFfnWeights`
+  - `Qwen35MtpHead`
+  - `Qwen35MtpHeadBatchedScratch`
+  - `Qwen35MtpHeadConfig`
+  - `Qwen35MtpHeadKvCache`
+  - `Qwen35MtpHeadScratch`
+  - `Qwen35MtpHeadWeights`
+  - `requested_bytes`
+  - `reset`
+- [`src/mtp_probe.rs`](src/mtp_probe.rs)
+  - `free_gpu`
+  - `MASK_SENTINEL`
+  - `mtp_probe_step`
+  - `MtpProbeState`
+  - `MtpProbeStats`
+  - `new_for_prompt`
+  - `tau`
+  - `update_mask`
+- [`src/mtp_spec.rs`](src/mtp_spec.rs)
+  - `arm_mtp_full_reject`
+  - `capture_prev_hidden_from_scratch_tmp`
+  - `capture_prev_hidden_from_verify_row`
+  - `cb`
+  - `ensure_compressed_lm_logits`
+  - `free_gpu`
+  - `from_own_prefill`
+  - `from_state`
+  - `is_greedy`
+  - `mtp_batched_verify_accept_from_batch`
+  - `mtp_dn_repair_from_tape`
+  - `mtp_draft_phase_inner`
+  - `mtp_head_fills_batched`
+  - `mtp_prefill_committed_boundaries`
+  - `mtp_prompt_fill_requested_bytes`
+  - `mtp_verify_graph_captures`
+  - `mtp_verify_graph_mode`
+  - `mtp_verify_graph_replays`
+  - `MtpDraftOutput`
+  - `MtpPenaltyTiming`
+  - `MtpPrefillTarget`
+  - `MtpPromptRoute`
+  - `MtpRng`
+  - `MtpSamplingConfig`
+  - `MtpSpecResult`
+  - `MtpSpecState`
+  - `n_verify`
+  - `new`
+  - `new_for_components`
+  - `new_for_components_with_verify_capacity`
+  - `new_for_slot`
+  - `new_for_slot_with_kv_mode`
+  - `new_for_slot_with_kv_mode_and_verify_capacity`
+  - `next_u64`
+  - `next_uniform_f32`
+  - `penalized`
+  - `PENALTY_REPEAT_CAP`
+  - `prefill_trunk_and_mtp_cache`
+  - `prefill_trunk_and_mtp_cache_parts`
+  - `prefill_trunk_and_mtp_cache_with_boundary`
+  - `requested_bytes`
+  - `reset`
+  - `sample_from_logits`
+  - `set_p_min`
+  - `set_sampling`
+  - `softmax_prob_at_temp`
+  - `spec_step_mtp`
+  - `spec_step_mtp_compressed`
+  - `spec_step_mtp_compressed_serial`
+  - `spec_step_mtp_compressed_serial_inner`
+  - `spec_step_mtp_compressed_serial_with_k`
+  - `spec_step_mtp_compressed_serial_with_takeover_candidates`
+  - `spec_step_mtp_trunk_spine`
+  - `spec_step_mtp_trunk_spine_with_k`
+  - `state`
+  - `TrunkSpinePrefillTimings`
+  - `verify_tokens`
+- [`src/mtp_speculator.rs`](src/mtp_speculator.rs)
+  - `build_qwen35_mtp_speculator`
+  - `mtp_drafter_max_n`
+  - `mtp_live_state`
+  - `mtp_verify_capacity`
+  - `new`
+  - `new_qwen35_mtp_lane_state`
+  - `Qwen35MtpDrafter`
+- [`src/paro_moe.rs`](src/paro_moe.rs)
+- [`src/qwen35.rs`](src/qwen35.rs)
+  - `batch`
+  - `config`
+  - `ep_batch`
+  - `forward`
+  - `load`
+  - `mesh_tp`
+  - `oracle`
+  - `prefill`
+  - `vl_prefill`
+  - `weights`
+- [`src/qwen35/batch.rs`](src/qwen35/batch.rs)
+  - `forward_decode_batch`
+  - `forward_decode_batch_prepared`
+  - `free_gpu`
+  - `new`
+  - `new_opt`
+  - `new_opt_lean`
+  - `prefill_lane`
+  - `PrefillBatchScratch`
+  - `prepare_decode_batch_inputs`
+  - `projected_allocation_bytes`
+  - `Qwen35DecodeBatchState`
+  - `reset`
+  - `reset_lane`
+  - `sample`
+  - `sample_lane`
+  - `sample_lane_product`
+  - `sample_product`
+- [`src/qwen35/config.rs`](src/qwen35/config.rs)
+  - `apply_reap_plan`
+  - `config_from_hfq`
+  - `config_from_metadata_json`
+  - `config_from_safetensors`
+  - `decode_partial_bytes`
+  - `dense_tp_rank_layouts`
+  - `DenseTpRankLayout`
+  - `epoch`
+  - `hipfire_dispatch`
+  - `lane_capacity`
+  - `LayerType`
+  - `local_dense_tp_config`
+  - `MaskEmbedOverride`
+  - `max_batch`
+  - `moe_collectives`
+  - `moe_layer_count`
+  - `MropeCtx`
+  - `new`
+  - `parallelism`
+  - `peer_bytes_per_rank`
+  - `per_rank_decode_bytes`
+  - `per_rank_seed_pbs_bytes`
+  - `per_rank_total_bytes`
+  - `pos3`
+  - `prefill_chunk`
+  - `Qwen35BatchCompatibility`
+  - `Qwen35BatchLoadConfig`
+  - `Qwen35BatchParallelism`
+  - `Qwen35Config`
+  - `Qwen35EpBatchReceipt`
+  - `Qwen35EpReduce`
+  - `Qwen35EpTopology`
+  - `rank_count`
+  - `rank_mask`
+  - `reduce`
+  - `repeat_capacity`
+  - `rows`
+  - `seed_partial_bytes`
+  - `topology`
+  - `validate_dense_tp`
+- [`src/qwen35/ep_batch.rs`](src/qwen35/ep_batch.rs)
+  - `download_rank_outputs`
+  - `epoch`
+  - `forward_ep`
+  - `forward_prefill_batch_ep`
+  - `forward_prefill_batch_multi`
+  - `forward_scratch_multi`
+  - `forward_tick`
+  - `free_gpu`
+  - `lane_capacity`
+  - `lane_state`
+  - `max_batch`
+  - `new`
+  - `peer_reduce_lease`
+  - `poison_mask`
+  - `prefill_lane`
+  - `Qwen35DecodeBatchEpState`
+  - `reset_all`
+  - `reset_lane`
+  - `sample`
+  - `sample_lane`
+  - `sample_product`
+  - `sequential_prefill_scratch_mut`
+  - `validate_ep_batch_compatibility`
+- [`src/qwen35/forward.rs`](src/qwen35/forward.rs)
+  - `ATTEND_DN_PREP`
+  - `ATTEND_FULL`
+  - `dump_expert_stats`
+  - `forward`
+  - `forward_gpu`
+  - `forward_prefill_dense_tp`
+  - `forward_prefill_dense_tp_with_hidden`
+  - `forward_scratch`
+  - `forward_scratch_dense_tp`
+  - `forward_scratch_embed`
+  - `forward_scratch_embed_mrope`
+  - `forward_scratch_mrope`
+  - `forward_scratch_with_hidden`
+  - `forward_with_embedding`
+  - `free_gpu`
+  - `free_gpu_multi`
+  - `MOE_FFN`
+  - `new`
+  - `new_with_kv_max`
+  - `new_with_kv_max_multi`
+  - `NORM_GATED`
+  - `prepare_scratch_inputs`
+  - `PROJ_GATE_UP`
+  - `PROJ_QKV`
+  - `PROJ_QKVZA`
+  - `Qwen35Scratch`
+  - `Qwen35ScratchSet`
+  - `RECUR_GDN`
+  - `RESID_DOWN_SWIGLU`
+  - `RESID_WO`
+  - `shard_all_moe_layers`
+  - `shard_all_moe_layers_with_fault`
+  - `shard_moe_experts`
+- [`src/qwen35/load.rs`](src/qwen35/load.rs)
+  - `EpFault`
+  - `EpLoadStage`
+  - `HfqSource`
+  - `hipfire_runtime`
+  - `host_mapped_expert_accounting`
+  - `load_weight_tensor`
+  - `load_weights`
+  - `load_weights_dense_tp_rank`
+  - `load_weights_ep_rank`
+  - `load_weights_ep_rank_with_fault`
+  - `load_weights_with_fault`
+  - `new`
+  - `ParoSource`
+  - `preflight_weights_dense_tp`
+  - `qwen35_layer_bytes`
+  - `qwen35_tensor_name_candidates`
+  - `report_cpu_exec_coverage`
+- [`src/qwen35/mesh_tp.rs`](src/qwen35/mesh_tp.rs)
+  - `clear_kv`
+  - `free_gpu`
+  - `layer_dtypes`
+  - `load`
+  - `logits`
+  - `max_batch`
+  - `new`
+  - `position`
+  - `QWEN35_FFN_OUT_RESOURCE`
+  - `QWEN35_MIX_OUT_RESOURCE`
+  - `qwen35_tp_plan`
+  - `qwen35_tp_plan_for_ranks`
+  - `Qwen35TpBindings`
+  - `Qwen35TpProgram`
+  - `Qwen35TpRank`
+  - `reset`
+  - `run_epoch`
+  - `set_tokens`
+  - `tp_rank_layouts`
+- [`src/qwen35/oracle.rs`](src/qwen35/oracle.rs)
+  - `ArrayRef`
+  - `begin`
+  - `compare`
+  - `compare_sequences`
+  - `decode_after`
+  - `decode_before`
+  - `decode_position`
+  - `finish`
+  - `Observation`
+  - `prefill_after`
+  - `prefill_before`
+  - `prefill_start`
+  - `record_ownership`
+  - `record_step`
+  - `SCHEMA_FIELDS`
+  - `SCHEMA_VERSION`
+  - `set_decode_position`
+  - `set_prefill_start`
+  - `set_sequence`
+  - `Snapshot`
+- [`src/qwen35/prefill.rs`](src/qwen35/prefill.rs)
+  - `forward_prefill_batch`
+  - `forward_prefill_batch_capped`
+  - `forward_prefill_batch_capture_hidden`
+  - `forward_prefill_batch_single_chunk_captured`
+  - `forward_prefill_batch_single_chunk_captured_opts`
+  - `forward_prefill_batch_with_pbs`
+  - `forward_prefill_batch_with_pbs_opts`
+  - `gfx1100_split_verify_admitted`
+  - `gfx1100_split_verify_min_ctx`
+  - `minimum_prefill_reservation_bytes`
+  - `multi`
+  - `next_exact_prefill_chunk_len`
+  - `ordinary_prefill_chunk_limit`
+  - `ordinary_prefill_chunk_limit_deducting`
+  - `ordinary_serve_prefill_chunk_len`
+  - `prefill_batch_pbs_eligible`
+  - `prefill_chunk_rows_requested`
+  - `PREFILL_MAX_BATCH`
+  - `prefill_max_batch`
+  - `prefill_max_batch_ep`
+  - `prefill_max_batch_tp`
+  - `qwen35_layer_batch_admissible`
+  - `request_kv_growth_deduction`
+  - `upload_prefill_batch_inputs`
+  - `vmm_kv_token_bytes`
+- [`src/qwen35/prefill_multi.rs`](src/qwen35/prefill_multi.rs)
+  - `dflash_iu4_verify_admitted`
+  - `forward_prefill_batch_multi`
+  - `free_gpu`
+  - `max_rows`
+  - `MULTI_CHUNK_MAX_LANE_ROWS`
+  - `MULTI_CHUNK_MAX_ROWS`
+  - `multi_chunk_pack_cap`
+  - `MULTI_CHUNK_PRODUCT_MAX_ROWS`
+  - `multi_chunk_row_cap`
+  - `multi_chunk_scratch_rows`
+  - `multi_chunk_wide_admitted`
+  - `MultiChunkRequest`
+  - `MultiChunkScratch`
+  - `new`
+  - `pack_whole_lanes`
+- [`src/qwen35/program.rs`](src/qwen35/program.rs)
+  - `mixer`
+- [`src/qwen35/vl_prefill.rs`](src/qwen35/vl_prefill.rs)
+  - `check_chunk_route`
+  - `ChunkRoute`
+  - `embed_rows_needed`
+  - `image_spans`
+  - `ImageSpan`
+  - `in_prompt`
+  - `install`
+  - `is_active`
+  - `needs_rope`
+  - `new`
+  - `overlaps`
+  - `pos3_rows`
+  - `prompt_end`
+  - `prompt_start`
+  - `refusal`
+  - `refuse_active`
+  - `refuse_overlap`
+  - `release`
+  - `RowCopy`
+  - `section`
+  - `splice_ranges`
+  - `splices`
+  - `vl_batched_prefill_admitted`
+  - `VlPlan`
+  - `VlPrefillGuard`
+  - `VlPrefillInputs`
+- [`src/qwen35/weights.rs`](src/qwen35/weights.rs)
+  - `capture`
+  - `capture_dense`
+  - `config_fingerprint`
+  - `DeltaNetLayerWeights`
+  - `DeltaNetMoeLayerWeights`
+  - `DeltaNetState`
+  - `device_id`
+  - `ef_residual`
+  - `ep_shard`
+  - `expert_to_rank`
+  - `ExpertWeights`
+  - `for_each_dense_tensor`
+  - `for_each_dense_tensor_mut`
+  - `free_gpu`
+  - `free_gpu_multi`
+  - `from_dense_seal`
+  - `from_tensor`
+  - `from_weight`
+  - `FullAttnLayerWeights`
+  - `FullAttnMoeLayerWeights`
+  - `GpuTensorDescriptor`
+  - `has_cpu_deferred_experts`
+  - `hipfire_dispatch`
+  - `LayerWeights`
+  - `matches_config`
+  - `mixed_expert_tag`
+  - `MoeFfnWeights`
+  - `MoeParoSidecars`
+  - `native_mtp_refusal`
+  - `new`
+  - `new_batched_with_quant`
+  - `new_with_quant`
+  - `new_with_quant_multi`
+  - `ParoDescriptor`
+  - `Qwen35DenseHydrateError`
+  - `Qwen35EpConfigFingerprint`
+  - `Qwen35EpShardInfo`
+  - `Qwen35HfqSourceIdentity`
+  - `Qwen35LayerSeal`
+  - `Qwen35LocalExpertDescriptor`
+  - `Qwen35MoeFfnSeal`
+  - `Qwen35RankSeal`
+  - `Qwen35Weights`
+  - `rank`
+  - `rank_count`
+  - `rank_seal`
+  - `reset`
+  - `SharedExpertWeights`
+  - `source_identity`
+  - `validate_dense`
+  - `WeightTensorDescriptor`
+- [`src/serve_engine.rs`](src/serve_engine.rs)
+  - `cancel_waiting`
+  - `close`
+  - `EngineConfig`
+  - `MTP_RETIRE_MIN_ADVANCE`
+  - `MTP_RETIRE_WINDOW`
+  - `MTP_RETIRE_WINDOWS`
+  - `reset`
+  - `shutdown_engine`
+  - `SlotEngine`
+  - `spawn`
+  - `stats`
+  - `submit`
+  - `take_closed_sessions`
+- [`src/shared_weights.rs`](src/shared_weights.rs)
+  - `apply_source_dispatch_flags`
+  - `census_dense_weights`
+  - `CensusAlias`
+  - `CensusOwner`
+  - `check_dense_config`
+  - `decode_dense_seal`
+  - `dense_config_fields`
+  - `dense_imported_physical_bytes`
+  - `DENSE_MANIFEST_ARCH`
+  - `DENSE_RECIPE_SCHEMA`
+  - `DENSE_REPRESENTATION_TAG`
+  - `dense_typed_tensor_lengths`
+  - `DenseCensus`
+  - `DenseRecipeFlags`
+  - `DenseSealMeta`
+  - `dtype_from_tag`
+  - `dtype_name`
+  - `dtype_tag`
+  - `encode_dense_seal`
+  - `expected_physical_bytes`
+  - `export_dense_weights`
+  - `EXPORT_WEIGHT_TAIL_PAD_BYTES`
+  - `ExportedDenseWeights`
+  - `free_gpu`
+  - `import_dense_weights`
+  - `manifest_config`
+  - `MAX_SEAL_BYTES`
+  - `resolve_dense_flags`
+  - `resolve_dense_recipe`
+  - `SharedWeightError`
+  - `sorted_owner_ids`
+  - `SUPPORTED_DEVICE_ARCH`
+  - `validate_dense_seal`
+  - `views_from_seal`
+- [`src/spec_emit.rs`](src/spec_emit.rs)
+  - `decoded_eot`
+  - `from_ctx`
+  - `from_ctx_template_think_close`
+  - `Qwen35Emit`
+  - `visible_text`
+- [`src/spec_impl.rs`](src/spec_impl.rs)
+  - `Qwen35SpecScratch`
+- [`src/speculative.rs`](src/speculative.rs)
+  - `advance_head`
+  - `advance_head_by`
+  - `append_prefill_hidden_host`
+  - `apply_commit_delta`
+  - `apply_eviction_retain_to_draft`
+  - `block_row_slot`
+  - `build_dflash_noise_embeddings`
+  - `build_dflash_noise_embeddings_weights`
+  - `bulk_n_items`
+  - `bytes_for`
+  - `bytes_len`
+  - `clear`
+  - `commit_delta`
+  - `commit_staging_to_ring`
+  - `copy_to`
+  - `DdtreeMetaStats`
+  - `DdtreeScratch`
+  - `DeltaNetSnapshot`
+  - `DeltaNetTape`
+  - `dense`
+  - `DenseTpTargetView`
+  - `dflash_commit_decision_parts`
+  - `dflash_device_accept_eligible`
+  - `dflash_device_accept_enabled`
+  - `dflash_draft_batch_eligible`
+  - `DFLASH_DRAFT_BATCH_MAX_ROWS`
+  - `dflash_draft_batch_max_rows`
+  - `DFLASH_DRAFT_BATCH_ROWS64`
+  - `dflash_eager_hip_verify_receipt`
+  - `dflash_extract_layer_ids`
+  - `dflash_finish_retained_lm_head_argmax`
+  - `dflash_greedy_accept_commit_parts`
+  - `dflash_legacy_prefill`
+  - `DFLASH_LOOKUP_MAX_CANDIDATES`
+  - `dflash_sampled_accept_device`
+  - `dflash_sampled_accept_rows`
+  - `dflash_sampled_selector_draft_into`
+  - `dflash_seed_ceiling`
+  - `dflash_seed_checkpoint_bound`
+  - `dflash_seed_checkpoint_count`
+  - `dflash_seed_checkpoint_positions`
+  - `DFLASH_SPARSE_CAP`
+  - `dflash_sparse_target_enabled`
+  - `dflash_target_rows_into`
+  - `DflashCbDraft`
+  - `DflashDraftLane`
+  - `DflashLookup`
+  - `DflashSampleCfg`
+  - `DflashSampledDraft`
+  - `DflashSampledDraftLane`
+  - `DflashTailSource`
+  - `DflashTargetParts`
+  - `DflashVerifyOutput`
+  - `DflashVerifyReceipt`
+  - `download_hidden_block`
+  - `draft_dflash_block_rank`
+  - `draft_dflash_blocks_batched`
+  - `draft_dflash_sampled_blocks_batched`
+  - `emit_commit_staging`
+  - `extract_slot`
+  - `FastTargetRows`
+  - `finish_prefill_chunk`
+  - `forward`
+  - `free_gpu`
+  - `from_bundle`
+  - `from_slot`
+  - `GdnTape`
+  - `HiddenCommitDelta`
+  - `HiddenStateRingBuffer`
+  - `hipfire_runtime`
+  - `into_bundle`
+  - `is_sparse`
+  - `KvMode`
+  - `last_dflash_seed_ceiling`
+  - `load`
+  - `load_tokenizer`
+  - `mean_committed`
+  - `mirrors`
+  - `ModelSlot`
+  - `ModelSlotConfig`
+  - `n_slots`
+  - `new`
+  - `new_capture_only`
+  - `new_for`
+  - `new_for_config`
+  - `new_for_dflash`
+  - `new_for_layers`
+  - `offsets`
+  - `plan_dense_rows`
+  - `push_row`
+  - `RailgunStep`
+  - `read_ddtree_meta_stats`
+  - `read_seed_oracle_stats`
+  - `record`
+  - `record_ddtree_meta_nodes`
+  - `replay_from_snapshot_admits`
+  - `replay_gdn`
+  - `replay_gdn_from_snapshot`
+  - `requested_bytes`
+  - `reserve_rows`
+  - `reset`
+  - `reset_ddtree_meta_stats`
+  - `reset_seed_oracle_stats`
+  - `reset_state`
+  - `restore_from`
+  - `restore_to`
+  - `rides_ordinary_prefill`
+  - `row`
+  - `rows`
+  - `run_sparse`
+  - `s_ef_len`
+  - `sampled_target_bonus`
+  - `sampled_target_row_into`
+  - `SampledWindowDecision`
+  - `save_at`
+  - `save_from`
+  - `save_from_async_on`
+  - `scatter_hidden_block_to_interleaved`
+  - `scatter_hidden_prefill_to_interleaved`
+  - `seed_target_hidden_dense_tp2_abortable`
+  - `seed_target_hidden_from_prompt`
+  - `seed_target_hidden_from_prompt_abortable`
+  - `seed_target_hidden_from_prompt_abortable_parts`
+  - `seed_target_hidden_suffix_abortable`
+  - `seed_target_hidden_suffix_abortable_parts`
+  - `SeedOracleStats`
+  - `smoke_test`
+  - `snapshot_source_armed`
+  - `SparseQRows`
+  - `spec_step_ddtree`
+  - `spec_step_ddtree_batched`
+  - `spec_step_dflash`
+  - `spec_step_dflash_dense_tp2`
+  - `spec_step_dflash_with_railgun`
+  - `spec_step_greedy`
+  - `SpecPair`
+  - `SpecStats`
+  - `SpecStepResult`
+  - `split_lane_into`
+  - `take_dn_checkpoint`
+  - `TargetRowRef`
+  - `TargetRowsScratch`
+  - `tau`
+  - `truncate_rows`
+  - `verify_dflash_block`
+  - `verify_dflash_block_dense_tp2`
+  - `verify_dflash_block_retained`
+  - `verify_dflash_block_tree`
+  - `VerifyScratch`
+  - `with_capacity`
+  - `with_prefill`
+  - `write_at_head`
+  - `write_chunk_rows`
+  - `write_rows_at_head`
+  - `write_rows_to_staging`
+  - `writes_direct`
+
+### Dependencies (from `Cargo.toml`)
+
+#### path
+
+- `hip-bridge`
+- `hipfire-arch-qwen35-vl`
+- `hipfire-config`
+- `hipfire-dispatch`
+- `hipfire-reap`
+- `hipfire-runtime`
+- `railgun`
+- `rdna-compute`
+- `saddle-core`
+
+#### external
+
+- `serde`
+- `serde_json`
+- `sha2`
+
+#### dev
+
+- `hipfire-cpu`
+
+#### build
+
+- `sha2`
+
+### Reverse dependencies
+
+Workspace crates with a path dependency on this crate:
+
+- `hipfire-daemon`
+- `hipfire-generate`
+- `hipfire-loader`
+- `hipfire-pflash`
+- `hipfire-runtime`
+- `saddle-lab`
+
+<!-- crate-map:generated:end -->
