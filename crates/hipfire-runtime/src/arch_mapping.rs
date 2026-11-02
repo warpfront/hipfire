@@ -110,6 +110,16 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
     ("muse_glimmer_assistant", 23),
+    // arch 24 — LFM3 family (LiquidAI): hybrid conv + full-attn + sliding-attn
+    // with partial RoPE and sandwich norm. Text (`lfm3`) is the backbone; the
+    // VL / audio / omni checkpoints reuse 24 — their towers are detected by
+    // tensor presence in `Lfm3Carrier` (the qwen35-vl precedent). Dirs
+    // `lfm3` / `lfm3_vl` / `lfm3_audio` / `lfm3_omni` → 24. (Renumbered off 13,
+    // which upstream assigned to gemma4.)
+    ("lfm3", 24),
+    ("lfm3_vl", 24),
+    ("lfm3_audio", 24),
+    ("lfm3_omni", 24),
     // arch 40 — flux MMDiT diffusion trunk (image-gen component block 40–47;
     // high by design so the sequential primary range 17–19 stays free for
     // future text arches; never a chat-serve trunk — see
