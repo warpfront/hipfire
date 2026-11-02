@@ -2144,12 +2144,12 @@ impl Qwen4ExpertStage {
         // placement's pinned experts: refused here as the S2 stage refuses its own (the loader's
         // plan-time aggregate check already counted them).
         if let Some(lent) = borrow {
-            let layer_bytes = (0..placement.ranks)
-                .map(|rank| plan.stage_borrow_buffer_bytes(rank).iter().sum::<u64>())
-                .max()
-                .unwrap_or(0) as usize;
+            // Each rank's own lent bytes, summed (not the largest rank's times `ranks`).
+            let rank_layer_bytes: Vec<usize> = (0..placement.ranks)
+                .map(|rank| plan.stage_borrow_buffer_bytes(rank).iter().sum::<u64>() as usize)
+                .collect();
             let mirror_bytes =
-                crate::expert_residency::expert_stage_mirror_bytes(layer_bytes, placement.ranks)
+                crate::expert_residency::expert_stage_mirror_bytes(&rank_layer_bytes)
                     .map_err(invalid)?;
             let admitted = crate::expert_residency::check_host_ram(
                 mirror_bytes,
