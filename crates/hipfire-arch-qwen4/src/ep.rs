@@ -714,7 +714,10 @@ fn install_unit_tail(
         config,
         hipfire_config::developer_bool(tail::EP_UNIT_TAIL_FREEZE_ENV, false),
         hipfire_config::developer_bool(tail::EP_UNIT_TAIL_LOG_ENV, false),
-        forward.tail_layers(),
+        forward.tail_layers(hipfire_config::developer_bool(
+            tail::EP_UNIT_TAIL_PREFILL_ENV,
+            false,
+        )),
     )?;
     hook.install_tail(installed)
 }

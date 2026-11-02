@@ -13042,32 +13042,60 @@ impl Qwen4GpuForward {
     /// the label, non-owning aliases of the two decode pointer tables and the host entries they
     /// were uploaded from. Only layers running the static `e % ranks` owners over a unit plan
     /// qualify (the tail itself keeps just the plan's mixed ones); empty outside EP.
-    pub(crate) fn tail_layers(&self) -> Vec<crate::expert_unit_tail_rank::TailLayerInit> {
-        if self.ep.is_none() {
+    /// `with_full` (`HIPFIRE_EP_UNIT_TAIL_PREFILL`) also hands over the layer's FULL (chunk /
+    /// prefill) table of the same ordinal, so published slots serve the full-table prefill too.
+    pub(crate) fn tail_layers(
+        &self,
+        with_full: bool,
+    ) -> Vec<crate::expert_unit_tail_rank::TailLayerInit> {
+        let Some(ep) = self.ep.as_ref() else {
             return Vec::new();
-        }
+        };
         self.moe
             .iter()
             .flatten()
-            .filter(|moe| moe.static_owners && moe.host_mapped)
-            .map(|moe| crate::expert_unit_tail_rank::TailLayerInit {
-                label: moe.label,
-                // SAFETY: non-owning aliases of tables this forward owns until `free_gpu`;
-                // the tail that holds them is released first (`release_gpu` in
-                // `Qwen4ForwardEp::free_gpu`) and is never used after the forward is freed.
-                gate_up_table: GpuTensor {
-                    buf: unsafe { moe.expert_gate_up_ptrs.buf.alias() },
-                    shape: moe.expert_gate_up_ptrs.shape.clone(),
-                    dtype: moe.expert_gate_up_ptrs.dtype,
+            .enumerate()
+            .filter(|(_, moe)| moe.static_owners && moe.host_mapped)
+            .map(
+                |(ordinal, moe)| crate::expert_unit_tail_rank::TailLayerInit {
+                    label: moe.label,
+                    // SAFETY: non-owning aliases of tables this forward owns until `free_gpu`;
+                    // the tail that holds them is released first (`release_gpu` in
+                    // `Qwen4ForwardEp::free_gpu`) and is never used after the forward is freed.
+                    gate_up_table: GpuTensor {
+                        buf: unsafe { moe.expert_gate_up_ptrs.buf.alias() },
+                        shape: moe.expert_gate_up_ptrs.shape.clone(),
+                        dtype: moe.expert_gate_up_ptrs.dtype,
+                    },
+                    down_table: GpuTensor {
+                        buf: unsafe { moe.expert_down_ptrs.buf.alias() },
+                        shape: moe.expert_down_ptrs.shape.clone(),
+                        dtype: moe.expert_down_ptrs.dtype,
+                    },
+                    gate_up_entries: moe.expert_gate_up_entries.clone(),
+                    down_entries: moe.expert_down_entries.clone(),
+                    full: ep
+                        .moe_full
+                        .get(ordinal)
+                        .filter(|full| with_full && full.label == moe.label)
+                        .map(|full| crate::expert_unit_tail_rank::TailFullInit {
+                            // SAFETY: as above; `moe_full` is freed by the same `free_gpu`, after
+                            // the tail's release.
+                            gate_up_table: GpuTensor {
+                                buf: unsafe { full.expert_gate_up_ptrs.buf.alias() },
+                                shape: full.expert_gate_up_ptrs.shape.clone(),
+                                dtype: full.expert_gate_up_ptrs.dtype,
+                            },
+                            down_table: GpuTensor {
+                                buf: unsafe { full.expert_down_ptrs.buf.alias() },
+                                shape: full.expert_down_ptrs.shape.clone(),
+                                dtype: full.expert_down_ptrs.dtype,
+                            },
+                            gate_up_entries: full.expert_gate_up_entries.clone(),
+                            down_entries: full.expert_down_entries.clone(),
+                        }),
                 },
-                down_table: GpuTensor {
-                    buf: unsafe { moe.expert_down_ptrs.buf.alias() },
-                    shape: moe.expert_down_ptrs.shape.clone(),
-                    dtype: moe.expert_down_ptrs.dtype,
-                },
-                gate_up_entries: moe.expert_gate_up_entries.clone(),
-                down_entries: moe.expert_down_entries.clone(),
-            })
+            )
             .collect()
     }
 

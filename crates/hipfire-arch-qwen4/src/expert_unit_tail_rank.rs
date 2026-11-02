@@ -54,6 +54,52 @@ pub(crate) struct TailLayerInit {
     /// The entries the tables were uploaded from (canonical pointers).
     pub gate_up_entries: Vec<usize>,
     pub down_entries: Vec<usize>,
+    /// The layer's full (chunk / prefill) table, when `HIPFIRE_EP_UNIT_TAIL_PREFILL` is on.
+    pub full: Option<TailFullInit>,
+}
+
+/// The layer's FULL (chunk / prefill) pointer tables: non-owning aliases and the host entries
+/// they were uploaded from. Entries this rank owns that equal the decode table's canonical
+/// pointers follow the decode table's slot publications; every other entry is never written.
+pub(crate) struct TailFullInit {
+    pub gate_up_table: GpuTensor,
+    pub down_table: GpuTensor,
+    pub gate_up_entries: Vec<usize>,
+    pub down_entries: Vec<usize>,
+}
+
+/// The rank's mirror of one layer's full tables: byte images as last uploaded and which experts
+/// follow the decode table.
+struct FullTable {
+    table_gate_up: GpuTensor,
+    table_down: GpuTensor,
+    image_gate_up: Vec<u8>,
+    image_down: Vec<u8>,
+    /// `shared[expert]`: the full table's canonical entries of `expert` are the decode table's
+    /// (so a slot copy of the unit is a valid byte copy for both tables).
+    shared: Vec<bool>,
+}
+
+/// Which experts of a layer the full table shares with the decode table: the rank's OWNED experts
+/// (`e % ranks == rank`) whose full-table entries name exactly the decode table's canonical
+/// pointers (same unit bytes, so one slot copy serves both tables). Peer-owned entries name the
+/// peer's memory and are never touched; an owned entry that differs (a different residency view)
+/// stays canonical in the full table.
+fn full_shared(
+    rank: usize,
+    ranks: usize,
+    decode: (&[u64], &[u64]),
+    full: (&[u64], &[u64]),
+) -> Vec<bool> {
+    (0..decode.0.len())
+        .map(|expert| {
+            expert % ranks == rank
+                && decode.0[expert] != 0
+                && decode.1[expert] != 0
+                && decode.0[expert] == full.0[expert]
+                && decode.1[expert] == full.1[expert]
+        })
+        .collect()
 }
 
 /// How one `(layer, expert)` read is served, for this rank.
@@ -77,12 +123,20 @@ struct TailLayer {
     /// The byte images of the two tables as last uploaded (u64 LE per expert).
     image_gate_up: Vec<u8>,
     image_down: Vec<u8>,
+    /// The layer's full (prefill) tables, mirrored for the experts that share canonical entries.
+    full: Option<FullTable>,
 }
 
 impl TailLayer {
+    /// Point `expert` at `(gate_up, down)` in the decode table and, when its canonical entries
+    /// are shared, in the full table.
     fn set(&mut self, expert: usize, gate_up: u64, down: u64) {
         self.image_gate_up[expert * 8..expert * 8 + 8].copy_from_slice(&gate_up.to_le_bytes());
         self.image_down[expert * 8..expert * 8 + 8].copy_from_slice(&down.to_le_bytes());
+        if let Some(full) = self.full.as_mut().filter(|full| full.shared[expert]) {
+            full.image_gate_up[expert * 8..expert * 8 + 8].copy_from_slice(&gate_up.to_le_bytes());
+            full.image_down[expert * 8..expert * 8 + 8].copy_from_slice(&down.to_le_bytes());
+        }
     }
 }
 
@@ -178,6 +232,7 @@ impl UnitTailRank {
         // Managed layers: this rank's Mixed layers with a decode runtime.
         let mut layer_of: Vec<Option<usize>> = vec![None; geometry.layers];
         let mut managed: Vec<TailLayer> = Vec::new();
+        let (mut full_layers, mut shared_entries) = (0usize, 0usize);
         for init in layers {
             let label = init.label;
             if label >= geometry.layers
@@ -205,6 +260,38 @@ impl UnitTailRank {
                     "layer {label}: a decode pointer table is too small"
                 ));
             }
+            let full = match init.full {
+                None => None,
+                Some(full) => {
+                    if full.gate_up_entries.len() != experts
+                        || full.down_entries.len() != experts
+                        || full.gate_up_table.buf.size() < experts * 8
+                        || full.down_table.buf.size() < experts * 8
+                    {
+                        return Err(format!(
+                            "layer {label}: the full prefill table does not hold {experts} entries"
+                        ));
+                    }
+                    let full_gate_up: Vec<u64> =
+                        full.gate_up_entries.iter().map(|&p| p as u64).collect();
+                    let full_down: Vec<u64> = full.down_entries.iter().map(|&p| p as u64).collect();
+                    let shared = full_shared(
+                        rank,
+                        ranks,
+                        (&canon_gate_up, &canon_down),
+                        (&full_gate_up, &full_down),
+                    );
+                    shared_entries += shared.iter().filter(|&&s| s).count();
+                    full_layers += 1;
+                    Some(FullTable {
+                        table_gate_up: full.gate_up_table,
+                        table_down: full.down_table,
+                        image_gate_up: image(&full_gate_up),
+                        image_down: image(&full_down),
+                        shared,
+                    })
+                }
+            };
             layer_of[label] = Some(managed.len());
             managed.push(TailLayer {
                 table_gate_up: init.gate_up_table,
@@ -213,6 +300,7 @@ impl UnitTailRank {
                 canon_down,
                 image_gate_up,
                 image_down,
+                full,
             });
         }
         if managed.is_empty() {
@@ -304,6 +392,13 @@ impl UnitTailRank {
             },
             if freeze { ", FROZEN (no admission)" } else { "" }
         );
+        if full_layers > 0 {
+            eprintln!(
+                "qwen4 EP rank {rank}: D2 tail prefill slots on: {full_layers} full (chunk) tables follow the slot \
+                 publications of {shared_entries} owned entries (full-table prefill reads a live slot from VRAM, not \
+                 the pinned host arena)"
+            );
+        }
         Ok(Self {
             inner: Mutex::new(state),
         })
@@ -410,6 +505,23 @@ impl Inner {
                     &layer.image_down,
                 )
                 .map_err(io)?;
+            if let Some(full) = layer.full.as_ref() {
+                gpu.hip
+                    .memcpy_htod(
+                        &full
+                            .table_gate_up
+                            .buf
+                            .byte_view(0, full.image_gate_up.len()),
+                        &full.image_gate_up,
+                    )
+                    .map_err(io)?;
+                gpu.hip
+                    .memcpy_htod(
+                        &full.table_down.buf.byte_view(0, full.image_down.len()),
+                        &full.image_down,
+                    )
+                    .map_err(io)?;
+            }
         }
         Ok(())
     }
@@ -617,6 +729,25 @@ impl Inner {
                     compute,
                 )
                 .map_err(io)?;
+            if let Some(full) = layer.full.as_ref() {
+                gpu.hip
+                    .memcpy_htod_async_on(
+                        &full
+                            .table_gate_up
+                            .buf
+                            .byte_view(0, full.image_gate_up.len()),
+                        &full.image_gate_up,
+                        compute,
+                    )
+                    .map_err(io)?;
+                gpu.hip
+                    .memcpy_htod_async_on(
+                        &full.table_down.buf.byte_view(0, full.image_down.len()),
+                        &full.image_down,
+                        compute,
+                    )
+                    .map_err(io)?;
+            }
             self.uploads += 1;
         }
         let t_upload = Instant::now();
@@ -736,5 +867,33 @@ impl Inner {
         {
             let _ = gpu.free_tensor(tensor);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::full_shared;
+
+    #[test]
+    fn full_table_shares_only_owned_experts_with_equal_canonical_entries() {
+        // 6 experts, 2 ranks, this rank 1: owned = 1, 3, 5.
+        let decode_gu = [10u64, 11, 12, 13, 14, 15];
+        let decode_dn = [20u64, 21, 22, 23, 24, 25];
+        let mut full_gu = decode_gu;
+        let mut full_dn = decode_dn;
+        // Expert 3: the full table names a different gate/up pointer; expert 5: a different down.
+        full_gu[3] = 99;
+        full_dn[5] = 99;
+        // Expert 0 (peer-owned) is equal in both tables but must never be shared.
+        let shared = full_shared(1, 2, (&decode_gu, &decode_dn), (&full_gu, &full_dn));
+        assert_eq!(shared, [false, true, false, false, false, false]);
+    }
+
+    #[test]
+    fn full_table_never_shares_a_null_entry() {
+        let decode_gu = [0u64, 7];
+        let decode_dn = [5u64, 0];
+        let shared = full_shared(0, 1, (&decode_gu, &decode_dn), (&decode_gu, &decode_dn));
+        assert_eq!(shared, [false, false]);
     }
 }

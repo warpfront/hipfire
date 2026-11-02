@@ -38,6 +38,11 @@ pub const EP_UNIT_TAIL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL";
 /// `1`: build the tail (pool, seed, usage log) but never admit or evict: the
 /// A/B arm that prices the tail's bookkeeping without any fill traffic.
 pub const EP_UNIT_TAIL_FREEZE_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_FREEZE";
+/// `1`: the rank's FULL (chunk / prefill) pointer tables follow the tail's slot publications for
+/// the owned units whose canonical entries they share with the decode tables, so a full-table
+/// prefill forward reads a live slot from VRAM instead of the pinned host arena (the decode
+/// tables alone see slots without it). Needs the tail; default off.
+pub const EP_UNIT_TAIL_PREFILL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PREFILL";
 /// `1`: print a `[unit-tail]` counter line every 64 windows and at release.
 pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
 
