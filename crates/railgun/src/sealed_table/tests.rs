@@ -537,6 +537,11 @@ fn a_table_bound_equal_to_the_entry_count_is_in_range_and_a_constant_bound_is_ch
     ] {
         let fx = Fixture::with(&record(), n, Vec::new(), true);
         match (fx.bind(), ok) {
+            // A zero bound is vacuous: discharged without a bound table.
+            (Ok(w), true) if n == 0 => {
+                assert!(w.nodes()[0].tables.is_empty());
+                assert_eq!(w.nodes()[0].vacuous, vec![0]);
+            }
             (Ok(w), true) => assert_eq!(w.nodes()[0].tables[0].bound, n),
             (
                 Err(SealedTableError::BoundExceedsEntries {
@@ -1409,4 +1414,95 @@ fn a_null_guarded_receipt_record_parses_into_the_table_fact() {
         };
         assert_eq!(c.tables[0].null_guarded, want);
     }
+}
+
+// ------------------------------------------------------------ vacuous cases
+
+const VEC: u64 = 0x7800_0000;
+const VEC_BYTES: u64 = 0x20_0000;
+const VEC_AT: u64 = 0x18_8000;
+
+/// The same kernel in its "plain vector" mode: the table argument points
+/// `VEC_AT` bytes into a larger allocation and `n = 0`, so the certified guard
+/// can never pass.
+pub(crate) fn vector_mode_launch(k: &KernelRecord) -> LaunchRecord {
+    let mut l = gather_launch(node_facts(k).unwrap(), VEC + VEC_AT, 0);
+    l.allocations = vec![
+        (
+            0,
+            Ok(Binding {
+                base: VEC,
+                bytes: VEC_BYTES,
+            }),
+        ),
+        (8, Ok(out_binding())),
+    ];
+    l
+}
+
+fn discharged(w: &SealedTableWitness) -> Vec<usize> {
+    w.discharged_cases().iter().map(|c| c.0).collect()
+}
+
+#[test]
+fn a_zero_bound_node_is_vacuous_beside_a_real_table_node() {
+    // Node 0: a real 4-entry table (mode 2). Node 1: the same kernel with the
+    // table argument an interior pointer into a plain vector and n = 0.
+    let k = record();
+    let fx = Fixture::with(&k, 4, vec![vector_mode_launch(&k)], true);
+    let w = fx.bind().expect("both nodes are discharged");
+    assert_eq!(discharged(&w), vec![0, 1]);
+    assert_eq!(w.nodes()[0].tables.len(), 1);
+    assert!(w.nodes()[0].vacuous.is_empty());
+    assert!(w.nodes()[1].tables.is_empty());
+    assert_eq!(w.nodes()[1].vacuous, vec![0]);
+    // Both are still bound under the receipt's case digest.
+    assert!(w.discharged_cases().iter().all(|c| c.1 == fx.case_digest));
+    // The real node's content is still verified once.
+    assert_eq!(fx.content.reads.load(Ordering::Relaxed), 1);
+    // A vacuous node alone needs no seal and no content read.
+    let fx = Fixture::with(&k, 0, Vec::new(), false);
+    let w = fx.bind().expect("vacuous: nothing to seal");
+    assert_eq!(discharged(&w), vec![0]);
+    assert_eq!(fx.content.reads.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn a_nonzero_bound_on_an_interior_pointer_is_still_refused() {
+    let k = record();
+    let mut fx = Fixture::with(&k, 4, vec![vector_mode_launch(&k)], true);
+    // Node 1's bound becomes 1: the interior vector is no sealed table.
+    let at = 16;
+    fx.images[1][at..at + 4].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(
+        fx.bind(),
+        Err(SealedTableError::NotSealed(_) | SealedTableError::WrongAllocation(_))
+    ));
+}
+
+#[test]
+fn a_constant_zero_bound_is_vacuous_whatever_the_launch_scalar() {
+    let k = record_with(vec![sealed_record(receipt::SEALED_BOUND_CONST, 0)]);
+    let fx = Fixture::with(&k, 999, vec![vector_mode_launch(&k)], false);
+    let w = fx.bind().expect("const 0 bound");
+    assert_eq!(discharged(&w), vec![0, 1]);
+    assert!(w.nodes().iter().all(|n| n.tables.is_empty()));
+    // A nonzero constant still needs the seal.
+    let k = record_with(vec![sealed_record(receipt::SEALED_BOUND_CONST, 1)]);
+    let fx = Fixture::with(&k, 0, Vec::new(), false);
+    assert!(matches!(fx.bind(), Err(SealedTableError::NotSealed(_))));
+}
+
+#[test]
+fn a_vacuous_witness_is_void_once_its_bound_image_changes() {
+    let k = record();
+    let fx = Fixture::with(&k, 4, vec![vector_mode_launch(&k)], true);
+    let w = fx.bind().unwrap();
+    let mut images = fx.images.clone();
+    assert!(w.matches_window(1, 7, &images, &fx.grids).is_ok());
+    images[1][16..20].copy_from_slice(&1u32.to_le_bytes());
+    assert!(matches!(
+        w.matches_window(1, 7, &images, &fx.grids),
+        Err(SealedTableError::Node { node: 1, .. })
+    ));
 }

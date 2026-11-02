@@ -489,7 +489,8 @@ impl SealedTableRegistry {
     ///   table's allocation exactly, the bound kernarg pointer is that
     ///   allocation's base, and the allocation generation is the sealed one;
     /// * the guard bound `n` (the bound kernarg scalar of the **encoded
-    ///   image**, or the receipt constant) is `<=` the sealed entry count;
+    ///   image**, or the receipt constant) is `<=` the sealed entry count (a
+    ///   table whose bound is 0 is vacuous and needs no seal at all);
     /// * the live table content hashes to the sealed digest;
     ///
     /// and for the whole program: no node (kernel effect, atomic, copy or fill
@@ -564,8 +565,31 @@ impl SealedTableRegistry {
         }
         let image = &input.images[index];
         let mut tables = Vec::with_capacity(case.tables.len());
+        let mut vacuous = Vec::new();
         for t in &case.tables {
             let off = t.table_arg_offset;
+            // The guard bound this launch carries: the encoded image's scalar,
+            // or the receipt constant.
+            let bound = match t.bound {
+                TableBound::Const(c) => c,
+                TableBound::Kernarg(at) => {
+                    le32(image, at).ok_or_else(|| SealedTableError::Node {
+                        node: index,
+                        detail: format!("short kernarg image: no bound at +{at}"),
+                    })?
+                }
+            };
+            // A zero bound makes the certified guard `index < 0` (unsigned, or
+            // the signed pair `0 <= index < 0`) unsatisfiable: no entry load
+            // can execute, so the case is vacuous for this launch and needs no
+            // seal, allocation equality or content digest (the argument's own
+            // read stays an ordinary effect). The bound lives in the encoded
+            // image, which `matches_window` re-checks at submit; every nonzero
+            // bound is still bound strictly below.
+            if bound == 0 {
+                vacuous.push(off);
+                continue;
+            }
             let Some(resource) = node.args.iter().find_map(|(o, a)| match a {
                 Arg::Resource { resource, .. } if *o == off => Some(*resource),
                 _ => None,
@@ -618,15 +642,6 @@ impl SealedTableRegistry {
                     table_arg: off,
                 });
             }
-            let bound = match t.bound {
-                TableBound::Const(c) => c,
-                TableBound::Kernarg(at) => {
-                    le32(image, at).ok_or_else(|| SealedTableError::Node {
-                        node: index,
-                        detail: format!("short kernarg image: no bound at +{at}"),
-                    })?
-                }
-            };
             if bound > sealed.entries {
                 return Err(SealedTableError::BoundExceedsEntries {
                     node: index,
@@ -667,6 +682,7 @@ impl SealedTableRegistry {
             receipt_sha256: kref.receipt_sha256.clone(),
             case_digest: case.case_digest.clone(),
             tables,
+            vacuous,
             kernarg_digest: digest(image),
             grid: input.grids[index],
         })
@@ -816,6 +832,10 @@ pub struct BoundTableNode {
     pub receipt_sha256: String,
     pub case_digest: String,
     pub tables: Vec<BoundTable>,
+    /// Table argument offsets whose recorded bound is 0 in this launch: the
+    /// certified guard is unsatisfiable, so the case is vacuous and needs no
+    /// seal (the node is still discharged under its case digest).
+    pub vacuous: Vec<u32>,
     pub kernarg_digest: [u8; 32],
     pub grid: [u32; 3],
 }

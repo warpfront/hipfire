@@ -3942,7 +3942,7 @@ impl<'k> Analyzer<'k> {
                         self.atom_pc.borrow().get(&a).cloned().unwrap_or_default()
                     };
                     let mut here: BTreeMap<SealedBound, BTreeSet<u32>> = BTreeMap::new();
-                    for &(a, pol) in facts.iter().filter(|f| f.1) {
+                    for &(a, _) in facts.iter().filter(|f| f.1) {
                         let n = match it.node(a) {
                             Some(Node::Ltu { a: x, b: n }) if x == *index => Some(n),
                             Some(Node::Lts { a: x, b: n }) if x == *index && zero_half => Some(n),

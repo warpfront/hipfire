@@ -3110,6 +3110,35 @@ mod tests {
         assert_eq!(log.lock().unwrap().submits, 0);
     }
 
+    /// A real table node and a zero-bound (vector mode) node in one window:
+    /// both are discharged, and raising the vacuous node's bound after the bind
+    /// voids the witness at submit.
+    #[test]
+    fn a_vacuous_sealed_node_is_discharged_and_its_bound_is_rechecked_at_submit() {
+        let k = st::record();
+        let (fx, mut w, log) = sealed_window(vec![st::vector_mode_launch(&k)]);
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        attach(&w, &mut bound, &fx).unwrap();
+        let cases = bound
+            .sealed_table_witness()
+            .expect("attached")
+            .discharged_cases();
+        assert_eq!(cases.iter().map(|c| c.0).collect::<Vec<_>>(), vec![0, 1]);
+        w.certify_exact(&mut bound).unwrap();
+        w.submit(bound).unwrap().complete().unwrap();
+
+        let (fx, mut w, log2) = sealed_window(vec![st::vector_mode_launch(&k)]);
+        let mut bound = sealed_bind(&mut w, &fx, 1);
+        attach(&w, &mut bound, &fx).unwrap();
+        w.images[1][16..20].copy_from_slice(&1u32.to_le_bytes());
+        assert!(matches!(
+            w.submit(bound),
+            Err(Refusal::SealedTable(SealedTableError::Node { node: 1, .. }))
+        ));
+        assert_eq!(log2.lock().unwrap().submits, 0);
+        assert_eq!(log.lock().unwrap().submits, 1);
+    }
+
     #[test]
     fn unknown_quiescence_quarantines_the_table_and_a_proven_failure_releases_it() {
         // Unknown after submit: the window may still read the table.
