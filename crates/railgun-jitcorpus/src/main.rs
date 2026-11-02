@@ -34,6 +34,14 @@
 //!     railgun's own kernels must resolve, under the runtime's current JIT
 //!     key (twin nodes: by embedded image digest), to a verified record.
 //!     Exit 1 and name every missing node otherwise.
+//! verify-install  --corpus DIR --install-root DIR [--arch A]...
+//!     CPU-only dry run of the runtime's kernel loader: with the CWD set to
+//!     `DIR` (the runtime probes `kernels/compiled/<arch>` under its CWD), load
+//!     every hipcc module of the selected programs through
+//!     `KernelCompiler::compile_for_symbol` and require the object it resolves
+//!     to to be a file of that pack with the corpus record's SHA-256 (embedded
+//!     images: the `pm_native` record). Exit 1 names every module that would not
+//!     run the corpus bytes. Set `HIPFIRE_KERNEL_CACHE` to a private dir.
 //! repro  --corpus DIR [--arch A]... [--jobs N] [--json FILE]
 //!     Recompile every corpus module: at the build paths, through runtime-style
 //!     unique temporaries twice, with the include order permuted, and with
@@ -62,6 +70,7 @@ struct Args {
     program_sequences: Vec<PathBuf>,
     program_arch: String,
     only_programs: Vec<String>,
+    install_root: Option<PathBuf>,
 }
 
 fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
@@ -78,6 +87,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
         program_sequences: Vec::new(),
         program_arch: "gfx1201".to_owned(),
         only_programs: Vec::new(),
+        install_root: None,
     };
     while let Some(flag) = it.next() {
         let mut value = || it.next().ok_or(format!("{flag} needs a value"));
@@ -93,6 +103,7 @@ fn parse(mut it: impl Iterator<Item = String>) -> Result<Args> {
             "--program-sequence" => a.program_sequences.push(value()?.into()),
             "--program-arch" => a.program_arch = value()?,
             "--only-program" => a.only_programs.push(value()?),
+            "--install-root" => a.install_root = Some(value()?.into()),
             "--jobs" => a.jobs = value()?.parse().map_err(|e| format!("--jobs: {e}"))?,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -217,6 +228,56 @@ fn run() -> Result<bool> {
             }
             if !ok {
                 eprintln!("ERROR railgun JIT corpus check FAILED: admitted default programs or railgun's own kernels have nodes without records");
+            }
+            Ok(ok)
+        }
+        "verify-install" => {
+            let dir = args.corpus.ok_or("verify-install needs --corpus")?;
+            let root = args
+                .install_root
+                .ok_or("verify-install needs --install-root")?;
+            let jit =
+                JitCorpus::open(&dir).map_err(|e| format!("railgun JIT corpus rejected: {e}"))?;
+            // `verify_install` changes the working directory: resolve the report path first.
+            let json_out = args
+                .json
+                .as_ref()
+                .map(|p| std::path::absolute(p).map_err(|e| format!("{}: {e}", p.display())))
+                .transpose()?;
+            let verdicts = corpus::verify_install(&inventory, &jit, &root, &args.archs)?;
+            let mut ok = true;
+            for v in &verdicts {
+                ok &= v.ok;
+                println!(
+                    "{:<8} {:<56} {:<9} {} {}",
+                    v.arch,
+                    v.module,
+                    v.source,
+                    v.loaded_sha256.as_deref().unwrap_or("-"),
+                    if v.ok {
+                        "ok".to_owned()
+                    } else {
+                        format!("FAIL: {}", v.detail)
+                    }
+                );
+            }
+            let modules = verdicts.iter().filter(|v| v.source != "toolchain");
+            println!(
+                "{} modules: {} load the corpus bytes (toolchain pin {})",
+                modules.clone().count(),
+                modules.filter(|v| v.ok).count(),
+                if verdicts.iter().any(|v| v.source == "toolchain" && !v.ok) {
+                    "MISMATCH"
+                } else {
+                    "ok"
+                }
+            );
+            if let Some(path) = &json_out {
+                std::fs::write(
+                    path,
+                    serde_json::to_vec_pretty(&verdicts).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?;
             }
             Ok(ok)
         }

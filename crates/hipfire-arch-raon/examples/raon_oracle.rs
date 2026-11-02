@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-//! Raon oracle CLI (PLAN §6.2): module | state | logits | generate | bench | session. Owner: slice O.
+//! Raon oracle CLI (PLAN §6.2): module | state | logits | generate | bench | session | railgun-state. Owner: slice O.
 //!
 //! This file is argument parsing, dispatch and verdict logic only. Each
 //! subcommand calls `raon_oracle::<module>::run(fixtures, &opts)` in
@@ -17,6 +17,10 @@
 //! raon_oracle bench  --model M --pp 512,8192 --tg 128 --out FILE [--k v ...]
 //! raon_oracle session --model M --tokens F --out FILE [--split N] [--decode 16] [--budget-mib 4096] [--prefill serial|batched] [--k v ...]
 //!     (a session-cache hit is bit-identical to a cold prefill: resident follow-up, pool restore after an unrelated prompt, budget; per-case verdict)
+//! raon_oracle railgun-state --model M --arm graph|railgun [--corpus DIR] --ctx 127,128,129 --steps 256 --out FILE [--k v ...]
+//! raon_oracle railgun-state --compare A.json B.json [--flip-byte STEP:TENSOR:OFFSET]
+//!     (product railgun state oracle: one arm per fresh process, then a byte-for-byte comparison of the dumps;
+//!      railgun_state::main owns its arguments, verdict, JSON and exit status; see its module docs)
 //! ```
 //!
 //! `--negative` points the module at `<fixtures>/negative_controls` and
@@ -37,6 +41,7 @@ mod raon_oracle {
     pub mod mhc;
     pub mod mla;
     pub mod moe;
+    pub mod railgun_state;
     pub mod rda;
     pub mod session;
     pub mod state;
@@ -52,6 +57,8 @@ const USAGE: &str = "usage:
   raon_oracle bench  --model M --pp 512,8192 --tg 128 [--reps 3] [--warmup 1] [--profile] --out FILE
   raon_oracle bench  --bucket-json PROFILE.json --out FILE   (CPU-only re-bucketing of a saved --profile result)
   raon_oracle session --model M --tokens F [--split N] [--decode 16] [--budget-mib 4096] [--prefill serial|batched] --out FILE
+  raon_oracle railgun-state --model M --arm graph|railgun [--corpus DIR] --ctx 127,128,129 --steps 256 --out FILE (see railgun-state module docs)
+  raon_oracle railgun-state --compare GRAPH.json RAILGUN.json [--flip-byte STEP:TENSOR:OFFSET]
 (extra `--key value` pairs are forwarded to the module as opts)";
 
 struct Cli {
@@ -320,6 +327,23 @@ fn run(cli: &Cli) -> Result<(bool, Value), String> {
 }
 
 fn main() {
+    // `railgun-state` owns its arguments (two-path `--compare`, boolean `--boundaries`),
+    // verdict, JSON and exit status; it is not a `run_fn` module.
+    if std::env::args().nth(1).as_deref() == Some("railgun-state") {
+        let argv: Vec<String> = std::env::args().skip(2).collect();
+        match raon_oracle::railgun_state::main(&argv) {
+            Ok(true) => return,
+            Ok(false) => std::process::exit(1),
+            Err(raon_oracle::railgun_state::Exit::Usage(e)) => {
+                eprintln!("raon_oracle: {e}\n{}", raon_oracle::railgun_state::USAGE);
+                std::process::exit(2);
+            }
+            Err(raon_oracle::railgun_state::Exit::Fail(e)) => {
+                eprintln!("raon_oracle: ERROR {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let cli = match parse_cli() {
         Ok(c) => c,
         Err(e) => {

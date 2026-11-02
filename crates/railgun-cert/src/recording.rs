@@ -1187,6 +1187,28 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "raon-railgun-plan-capture-route",
+        predicates: &[CaptureMode],
+        condition: "hipfire-arch-raon railgun_decode.rs plan_body: the Raon railgun owner sets `gpu.graphs.capture_mode = true` for the duration of `decode_body` under the plan sink and restores the prior value afterwards; nothing executes and no stream capture begins",
+        effect: KernelSelection,
+        switches: "planned (capture route flags): every launcher takes its captured branch (F32 to F16 `convert_f32_to_f16` before each consumer, blob-path launches); eager: the cache-hit conversion skip",
+        kernels: &["convert_f32_to_f16"],
+        verdict: ByteExact,
+        evidence: "the body under the plan sink takes exactly the branches the Raon HIP graph capture takes (the probe inventory phase compared the plan sink of the ctx512 body, 1132 kernel launches and 75 fills, op for op with the launch witness of an actual HIP-graph capture of the same step: symbol, geometry, LDS, kernarg bytes and object digest equal, 0 mismatches, `raon-railgun/PROBE.md` section 1), so the owner is invariant against the HIP graph arm (arm 3); against eager the only kernel-set difference is the conversion cache of `fp16-fp8-x-conversion-cache`, whose argument applies unchanged. State parity of the graph route against eager: `raon_oracle state --mode graph`; of the railgun route against the graph route: `raon_oracle railgun-state --compare`",
+        reaches: &[reach(RaonArGfx1201, "every decode body the owner plans (the whole body shares the capture-route flag; the observable kernel-set difference from eager is the F16 conversion)", "g0")],
+    },
+    Decision {
+        id: "raon-railgun-owner-replay-decline",
+        predicates: &[ReplayEnabled],
+        condition: "hipfire-arch-raon railgun_decode.rs try_step admission: `retained_replay: gpu.replay.is_enabled()` (a retained-replay controller owns the launch stream)",
+        effect: Refusal,
+        switches: "retained replay enabled: the owner declines (`RetainedReplay` refusal) before any launch and the HIP graph step runs once; disabled: the owner continues its other admission checks",
+        kernels: &[],
+        verdict: Invariant,
+        evidence: "a pre-submit decline launches nothing and consumes no token, position or RDA state (the owner's Declined contract); the step then takes the unchanged HIP-graph route, which `raon-decode-mode-retained-replay` already classifies. No kernel, shape or argument depends on it",
+        reaches: &[],
+    },
+    Decision {
         id: "dspark-capture-safe-verify-body",
         predicates: &[DeclaredCaptureBody, IsRecording, CaptureMode],
         condition: "DS4 DSpark verify body parameter `capture_safe` (spec_impl.rs:155-230; forward.rs forward_prefill_batch_chunk_impl, carried by rows_program.rs RowsWindow into push_attention / compressed_attention_rows and the hipfire-dispatch pipeline/mla/{rows,attention}.rs operations) and dspark_requires_typed_device_copy = is_recording() || capture_mode || force_blob_path (forward.rs)",
@@ -1765,6 +1787,18 @@ pub const SITES: &[Site] = &[
         function: "resolve",
         occurrences: 1,
         decisions: &["raon-decode-mode-retained-replay"],
+    },
+    Site {
+        file: "hipfire-arch-raon/src/railgun_decode.rs",
+        function: "plan_body",
+        occurrences: 3,
+        decisions: &["raon-railgun-plan-capture-route"],
+    },
+    Site {
+        file: "hipfire-arch-raon/src/railgun_decode.rs",
+        function: "try_step",
+        occurrences: 1,
+        decisions: &["raon-railgun-owner-replay-decline"],
     },
     Site {
         file: "hipfire-arch-raon/src/verify_graph.rs",
@@ -4255,6 +4289,13 @@ mod tests {
                 .any(|d| d.id == "fp16-fp8-x-conversion-cache" && d.seen_by == "g0"),
             "{decisions:?}"
         );
+        // The owner's own predicate sites are classified: the plan's capture-route flag reaches the
+        // program (ByteExact, g0), the retained-replay decline reaches nothing.
+        assert!(decisions
+            .iter()
+            .any(|d| d.id == "raon-railgun-plan-capture-route" && d.verdict == Verdict::ByteExact));
+        assert!(decision("raon-railgun-owner-replay-decline")
+            .is_some_and(|d| d.verdict == Verdict::Invariant && d.reaches.is_empty()));
         for d in &decisions {
             assert!(decision(d.id).is_some(), "{}", d.id);
             assert_ne!(d.verdict, Verdict::NotEquivalent, "{}", d.id);

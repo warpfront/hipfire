@@ -1239,6 +1239,171 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
     Ok(dest)
 }
 
+// ---------------------------------------------------------------- install
+
+/// What the runtime loads for one module of an installed pack.
+#[derive(Clone, Debug, Serialize)]
+pub struct InstallVerdict {
+    pub arch: String,
+    pub module: String,
+    /// `pack` (the object file the runtime verified and loads),
+    /// `embedded` (a sealed image compiled into the binary), or `elsewhere`
+    /// (the runtime would JIT-compile or take a hot-cache object instead).
+    pub source: String,
+    /// SHA-256 of the object the runtime would load, when known.
+    pub loaded_sha256: Option<String>,
+    /// SHA-256 of the corpus record of that module under the runtime's current key.
+    pub corpus_sha256: Option<String>,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Load every hipcc module of `inventory` on `archs` through the runtime's own
+/// loader (`KernelCompiler::compile_for_symbol`) with the current directory set to
+/// `install_root` (the runtime probes `kernels/compiled/<arch>` under its CWD) and
+/// report, per module, whether the object it resolves to is a file of that pack
+/// whose SHA-256 is the corpus record's. Embedded images are checked against the
+/// corpus' `pm_native` record by digest. The hot JIT cache is whatever
+/// `HIPFIRE_KERNEL_CACHE` names; the loader tries the verified pack first, so a hot
+/// object can never mask a pack miss here: it is reported as `elsewhere`.
+/// Changes the process working directory.
+pub fn verify_install(
+    inventory: &Inventory,
+    corpus: &JitCorpus,
+    install_root: &Path,
+    archs: &[String],
+) -> Result<Vec<InstallVerdict>> {
+    install_product_defaults()?;
+    let root = std::fs::canonicalize(install_root)
+        .map_err(|e| format!("{}: {e}", install_root.display()))?;
+    std::env::set_current_dir(&root).map_err(|e| format!("{}: {e}", root.display()))?;
+    let pin = corpus.toolchain_pin().to_owned();
+    let mut out = Vec::new();
+    for arch in archs {
+        let plan = plan(inventory, arch)?;
+        let pack = root.join("kernels").join("compiled").join(arch);
+        let mut compiler = KernelCompiler::new(arch, plan.extra_flags.clone())
+            .map_err(|e| format!("{arch}: {e}"))?;
+        // The owner opens the corpus only under the toolchain it was built with.
+        let now = sha256_hex(compiler.toolchain_id().as_bytes());
+        out.push(InstallVerdict {
+            arch: arch.clone(),
+            module: "<toolchain pin>".to_owned(),
+            source: "toolchain".into(),
+            loaded_sha256: Some(now.clone()),
+            corpus_sha256: Some(pin.clone()),
+            ok: now == pin,
+            detail: if now == pin {
+                String::new()
+            } else {
+                format!("the runtime compiles with toolchain `{}` (pin {now}), the corpus pin is {pin}: the owner would refuse the corpus", compiler.toolchain_id())
+            },
+        });
+        for entry in &plan.entries {
+            let verdict = |source: &str,
+                           loaded: Option<String>,
+                           corpus_sha: Option<String>,
+                           ok: bool,
+                           detail: String| InstallVerdict {
+                arch: arch.clone(),
+                module: entry.module.to_owned(),
+                source: source.to_owned(),
+                loaded_sha256: loaded,
+                corpus_sha256: corpus_sha,
+                ok,
+                detail,
+            };
+            if let Some(twin) = plan.twins.iter().find(|t| t.module == entry.module) {
+                let sha = hex(&twin.image_sha256);
+                let key = ArtifactKey {
+                    arch,
+                    toolchain_pin: &pin,
+                    artifact_sha256: &sha,
+                };
+                let found = corpus
+                    .record(&key)
+                    .is_some_and(|r| r.origin == ObjectOrigin::PmNative);
+                out.push(verdict(
+                    "embedded",
+                    Some(sha.clone()),
+                    found.then(|| sha.clone()),
+                    found,
+                    if found {
+                        String::new()
+                    } else {
+                        "no pm_native record for the embedded twin".into()
+                    },
+                ));
+                continue;
+            }
+            let packaging_key = KernelCompiler::packaging_hash_for(
+                arch,
+                entry.module,
+                entry.source(),
+                &plan.extra_flags,
+            );
+            let record = corpus.record_for_module(arch, entry.module, &packaging_key);
+            let corpus_sha = record.map(|r| r.artifact_sha256.clone());
+            let symbol = entry.symbols.first().copied().unwrap_or(entry.module);
+            let path = match compiler.compile_for_symbol(entry.module, entry.source(), symbol) {
+                Ok(p) => p.to_path_buf(),
+                Err(e) => {
+                    out.push(verdict(
+                        "elsewhere",
+                        None,
+                        corpus_sha,
+                        false,
+                        format!("the runtime loader failed: {e}"),
+                    ));
+                    continue;
+                }
+            };
+            let canonical = std::fs::canonicalize(&path).unwrap_or(path.clone());
+            let in_pack = canonical.parent() == std::fs::canonicalize(&pack).ok().as_deref();
+            let loaded = std::fs::read(&canonical).ok().map(|b| sha256_hex(&b));
+            let (ok, detail) = match (&record, in_pack, &loaded) {
+                (None, ..) => (false, format!("no corpus record under the runtime's current key {packaging_key}")),
+                (Some(_), false, _) => (false, format!("the runtime loads {} (not a file of {}): it would not run the corpus bytes", canonical.display(), pack.display())),
+                (Some(_), true, None) => (false, format!("{} is unreadable", canonical.display())),
+                (Some(r), true, Some(l)) if *l != r.artifact_sha256 => (false, format!("the pack object {} has sha256 {l}, the corpus record is {}", canonical.display(), r.artifact_sha256)),
+                (Some(_), true, Some(_)) => (true, String::new()),
+            };
+            out.push(verdict(
+                if in_pack { "pack" } else { "elsewhere" },
+                loaded,
+                corpus_sha,
+                ok,
+                detail,
+            ));
+        }
+        // Embedded images that are not accepted twins (never loaded from a pack).
+        for native in &plan.embedded {
+            let key = ArtifactKey {
+                arch,
+                toolchain_pin: &pin,
+                artifact_sha256: native.image_sha256,
+            };
+            let found = corpus
+                .record(&key)
+                .is_some_and(|r| r.origin == ObjectOrigin::PmNative);
+            out.push(InstallVerdict {
+                arch: arch.clone(),
+                module: native.module.to_owned(),
+                source: "embedded".into(),
+                loaded_sha256: Some(native.image_sha256.to_owned()),
+                corpus_sha256: found.then(|| native.image_sha256.to_owned()),
+                ok: found,
+                detail: if found {
+                    String::new()
+                } else {
+                    "no pm_native record for the embedded image".into()
+                },
+            });
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------- repro
 
 /// One module's reproducibility result. `raw` compares object bytes;
