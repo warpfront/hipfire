@@ -268,6 +268,7 @@ fn load_weight_tensor_raw_with(
             })
         }
         7 => {
+            hipfire_runtime::weight_backend::validate_hfq4g128_extent(data.len(), m, k, "qt7")?;
             let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
