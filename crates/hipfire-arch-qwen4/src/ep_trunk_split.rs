@@ -266,6 +266,7 @@ impl TrunkSplitRank {
                 .collect(),
             transport,
             next: AtomicUsize::new(0),
+            exchanges: AtomicUsize::new(0),
         }));
     }
 
@@ -332,6 +333,9 @@ pub(crate) struct Qwen4TrunkSplitHook {
     buffers: Vec<(usize, usize)>,
     transport: Arc<EpRowGather>,
     next: AtomicUsize,
+    /// Exchanges taken so far: mixed into the tag so ranks that drift out of
+    /// call order fail the compare instead of swapping equal-shaped bands.
+    exchanges: AtomicUsize,
 }
 
 impl ProjectionSplit for Qwen4TrunkSplitHook {
@@ -374,6 +378,7 @@ impl ProjectionSplit for Qwen4TrunkSplitHook {
         let mut mix = |value: usize| {
             tag = (tag ^ value as u64).wrapping_mul(0x0100_0000_01b3);
         };
+        mix(self.exchanges.fetch_add(1, Ordering::Relaxed));
         let gathered: Vec<EpBand<'_>> = bands
             .iter()
             .map(|band| {
