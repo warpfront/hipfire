@@ -368,6 +368,48 @@ impl Gpu {
         probe(&self.hip, addr)
     }
 
+    /// Read `len` bytes from the start of the live device allocation `a`
+    /// (exactly the allocation `hipMemGetAddressRange` reports for `a.base`:
+    /// a binding that is not one is refused, so no arbitrary address is ever
+    /// dereferenced). For owners that seal loader-written tables.
+    pub fn railgun_read_allocation(&self, a: Binding, len: usize) -> Result<Vec<u8>, String> {
+        let live = probe(&self.hip, a.base)?;
+        if live != a {
+            return Err(format!(
+                "allocation {:#x}+{} is not the live allocation {:#x}+{}",
+                a.base, a.bytes, live.base, live.bytes
+            ));
+        }
+        if len as u64 > a.bytes {
+            return Err(format!(
+                "{len} bytes exceed the {}-byte allocation {:#x}",
+                a.bytes, a.base
+            ));
+        }
+        // SAFETY: `a` is exactly the live allocation the runtime reports for
+        // its base address; the borrowed buffer is only read through and its
+        // drop never frees (it is not the owner).
+        let buf = unsafe {
+            hip_bridge::DeviceBuffer::from_raw(
+                a.base as usize as *mut std::ffi::c_void,
+                a.bytes as usize,
+            )
+        };
+        let mut host = vec![0u8; len];
+        self.hip
+            .memcpy_dtoh_at(&mut host, &buf, 0)
+            .map_err(|e| format!("device read {:#x}: {e:?}", a.base))?;
+        Ok(host)
+    }
+
+    /// SHA-256 of the code object `symbol` is loaded from (lowercase hex): the
+    /// exact-artifact identity an owner keys its program on.
+    pub fn railgun_loaded_digest(&self, symbol: &str) -> Result<String, String> {
+        self.loaded_owner(symbol)
+            .map(|(_, artifact)| artifact.id().to_hex())
+            .map_err(|e| format!("{symbol}: {e}"))
+    }
+
     /// Load railgun's copy and fill kernels (idempotent) and return the
     /// digests of the code objects that own them. Refused inside plan mode:
     /// a plan-mode load would be recorded, not performed.
