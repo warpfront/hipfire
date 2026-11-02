@@ -625,6 +625,17 @@ pub struct TrunkShardApplied {
     pub after_bytes: usize,
 }
 
+/// The first `bytes` bytes of a resident tensor's device buffer (no `byte_size` guess).
+fn download_exact(gpu: &mut Gpu, tensor: &GpuTensor, bytes: usize) -> Result<Vec<u8>, String> {
+    gpu.bind_thread().map_err(|e| e.to_string())?;
+    let mut data = vec![0u8; bytes];
+    gpu.hip
+        .memcpy_dtoh(&mut data, &tensor.buf)
+        .map_err(|e| e.to_string())?;
+    gpu.take_device_wait_error().map_err(|e| e.to_string())?;
+    Ok(data)
+}
+
 impl Qwen4Weights {
     /// Whether [`Self::shard_trunk`] ran.
     pub fn trunk_sharded(&self) -> Option<(usize, usize)> {
@@ -664,7 +675,36 @@ impl Qwen4Weights {
             ));
         }
         let dtype = tensor.dtype;
-        let bytes = gpu.download_raw_bytes(tensor).map_err(|e| e.to_string())?;
+        // The exact payload bytes, from the logical shape and the format's geometry: a
+        // quantized resident carries its logical `[m, k]` shape, so `GpuTensor::byte_size`
+        // (numel x `dtype.size()`) is NOT its device extent (MQ6: 1 B/elt vs 0.78 B/elt).
+        let expected = if raw_rows {
+            reference
+                .shape
+                .iter()
+                .product::<usize>()
+                .checked_mul(dtype.size())
+        } else {
+            match (reference.shape.as_slice(), matrix_geometry(dtype)) {
+                ([rows, cols], Some(g)) => row_bytes(g, *cols)
+                    .ok()
+                    .and_then(|row| row.checked_mul(*rows)),
+                _ => None,
+            }
+        }
+        .ok_or_else(|| {
+            format!(
+                "{context}: no payload extent for {dtype:?} of logical shape {:?}",
+                reference.shape
+            )
+        })?;
+        if expected > tensor.buf.size() {
+            return Err(format!(
+                "{context}: payload {expected} B exceeds the device buffer of {} B",
+                tensor.buf.size()
+            ));
+        }
+        let bytes = download_exact(gpu, tensor, expected)?;
         if raw_rows {
             // vector / depthwise-conv tensors: rows of any element type
             let rows = reference.shape[0];
@@ -1337,6 +1377,18 @@ mod tests {
 
     /// The switch does nothing until the forward route is complete: a half-wired shard must
     /// never run, whatever the environment says.
+    /// A quantized resident's device extent is rows x row_bytes, NOT `numel x dtype.size()`
+    /// (card finding j6850: the MQ6 `[10240, 2560]` qkv is 20,480,000 B on device while
+    /// `byte_size()` says 26,214,400).
+    #[test]
+    fn quantized_extent_is_the_geometry_not_byte_size() {
+        let g = matrix_geometry(Dt::MQ6G256V2).unwrap();
+        assert_eq!(row_bytes(g, 2560).unwrap() * 10240, 20_480_000);
+        assert_ne!(10240 * 2560 * Dt::MQ6G256V2.size(), 20_480_000);
+        let q8 = matrix_geometry(Dt::Q8_0).unwrap();
+        assert_eq!(row_bytes(q8, 2560).unwrap() * 10240, 10240 * 2560 / 32 * 34);
+    }
+
     #[test]
     fn switch_is_inert_until_the_route_is_ready() {
         assert!(!TRUNK_SHARD_ROUTE_READY);
