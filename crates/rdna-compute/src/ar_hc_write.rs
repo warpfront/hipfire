@@ -49,6 +49,69 @@ pub const AR_HC_TICKET_WORD: usize = 16;
 pub const AR_HC_GEN_BYTES: usize = 256;
 
 const KERNEL: &str = "ar_hc_write_gfx1201";
+const KERNEL_F32S: &str = "ar_hc_write_f32s_gfx1201";
+
+/// Storage of the HC streams the fused write updates in place (the two production HC
+/// writes): BF16 bits (`hyper_write_bf16x2`, the F16 prefill route, rows at or above
+/// `QWEN4_F16_WMMA_MIN_TOKENS`) or F32 words holding BF16-exact values (`hyper_write_f32`:
+/// decode, few-row verify and short chunks). The arithmetic per element is the same; only
+/// the stream load/store width and row stride differ.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum StreamKind {
+    Bf16,
+    F32,
+}
+
+impl StreamKind {
+    /// The kind of the forward's HC streams (`state_bf16` of the HC ops).
+    pub fn from_state_bf16(state_bf16: bool) -> Self {
+        if state_bf16 {
+            Self::Bf16
+        } else {
+            Self::F32
+        }
+    }
+
+    /// The device entry of this kind.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Bf16 => KERNEL,
+            Self::F32 => KERNEL_F32S,
+        }
+    }
+
+    /// Bytes per stream element.
+    pub fn element_bytes(self) -> usize {
+        match self {
+            Self::Bf16 => 2,
+            Self::F32 => 4,
+        }
+    }
+
+    /// Bytes of one row of the four streams (`[4][2560]`).
+    pub fn row_bytes(self) -> usize {
+        4 * AR_HC_HIDDEN * self.element_bytes()
+    }
+
+    /// Required byte alignment of the stream base (8 for the u16 pair loads, 16 for the
+    /// four-float loads).
+    pub fn alignment(self) -> usize {
+        match self {
+            Self::Bf16 => 8,
+            Self::F32 => 16,
+        }
+    }
+
+    /// Both kinds, in report order.
+    pub const ALL: [Self; 2] = [Self::Bf16, Self::F32];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::F32 => "f32",
+        }
+    }
+}
 
 /// Bytes of one mailbox bank able to hold `max_rows` rows of partials.
 pub fn ar_hc_bank_bytes(max_rows: usize) -> usize {
@@ -98,7 +161,7 @@ pub fn ar_hc_geometry(rows: usize) -> Option<(u32, u32)> {
 
 impl Gpu {
     /// Resolve the kernel before graph capture (JIT is not capture-safe).
-    pub fn ensure_ar_hc_write_gfx1201_kernel(&mut self) -> HipResult<()> {
+    pub fn ensure_ar_hc_write_gfx1201_kernel(&mut self, kind: StreamKind) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
             return Err(HipError::new(
@@ -106,12 +169,12 @@ impl Gpu {
                 &format!("ar_hc_write_gfx1201 requires gfx1201, got {}", self.arch),
             ));
         }
-        self.ensure_kernel(KERNEL, kernels::AR_HC_WRITE_GFX1201_SRC, KERNEL)
+        self.ensure_kernel(KERNEL, kernels::AR_HC_WRITE_GFX1201_SRC, kind.symbol())
     }
 
     /// Push this rank's f32 partial `[rows, 2560]` (bf16-rounded) into the peer's mailbox,
     /// wait (bounded) for the peer's, fold in rank order and apply the production BF16
-    /// HC write to `streams` (`[rows, 4, 2560]` bf16 bits, in place) with the row gate
+    /// HC write to `streams` (`[rows, 4, 2560]` of `kind`, in place) with the row gate
     /// logits `gates` (`[rows, 4]` f32). Operands are device pointers (the caller slices
     /// long row ranges into <= [`AR_HC_ROW_CAP`] launches by offsetting them).
     /// `peer_mailbox` is the PEER's mailbox (peer access enabled), `local_mailbox` this
@@ -128,6 +191,7 @@ impl Gpu {
         &mut self,
         partial: *mut c_void,
         streams: *mut c_void,
+        kind: StreamKind,
         gates: *const c_void,
         peer_mailbox: *mut c_void,
         local_mailbox: *const c_void,
@@ -138,7 +202,7 @@ impl Gpu {
         geometry: (u32, u32),
         mixed_dbg: *mut c_void,
     ) -> HipResult<()> {
-        self.ensure_ar_hc_write_gfx1201_kernel()?;
+        self.ensure_ar_hc_write_gfx1201_kernel(kind)?;
         let fail = |what: &str| HipError::new(0, &format!("ar_hc_write_gfx1201: {what}"));
         if ar_hc_geometry_with(rows, geometry.0, geometry.1).is_none() {
             return Err(fail(&format!("unsupported row count {rows}")));
@@ -159,11 +223,15 @@ impl Gpu {
                 "bank stride {bank_stride} cannot hold {rows} rows"
             )));
         }
-        if (streams as usize) % 8 != 0 || (partial as usize) % 16 != 0 || (gates as usize) % 16 != 0
+        if (streams as usize) % kind.alignment() != 0
+            || (partial as usize) % 16 != 0
+            || (gates as usize) % 16 != 0
         {
-            return Err(fail(
-                "operands are not aligned (streams 8, partial/gates 16 bytes)",
-            ));
+            return Err(fail(&format!(
+                "operands are not aligned ({} streams {}, partial/gates 16 bytes)",
+                kind.name(),
+                kind.alignment()
+            )));
         }
         let gen_ptr = generation.as_ptr();
         let stride_arg = u32::try_from(bank_stride).map_err(|_| fail("bank stride exceeds u32"))?;
@@ -184,7 +252,7 @@ impl Gpu {
             &mixed_dbg as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            KERNEL,
+            kind.symbol(),
             [geometry.0, 1, 1],
             [geometry.1, 1, 1],
             0,
@@ -256,6 +324,47 @@ pub fn hc_gate(logit: f32) -> f32 {
 pub fn hc_inject(gate: f32, m: f32, stream_bits: u16) -> u16 {
     let inj = bf16_round(gate * bf16_round(m));
     bf16_bits(inj + f32::from_bits(u32::from(stream_bits) << 16))
+}
+
+/// One stream word update of `hyper_write_f32`: `bf16(bf16(stream) + bf16(g * bf16(m)))`,
+/// stored as an f32 (the stream holds BF16-exact values; the input is rounded on read).
+pub fn hc_inject_f32(gate: f32, m: f32, stream: f32) -> f32 {
+    let inj = bf16_round(gate * bf16_round(m));
+    bf16_round(bf16_round(stream) + inj)
+}
+
+/// [`ar_hc_write_model`] for F32 streams (`[rows][4][2560]` f32, `hyper_write_f32`'s
+/// arithmetic): the folded `m` is the same; every stream goes through [`hc_inject_f32`].
+pub fn ar_hc_write_model_f32(
+    p0: &[f32],
+    p1: &[f32],
+    streams: &mut [f32],
+    gates: &[f32],
+    rows: usize,
+) -> Vec<f32> {
+    assert_eq!(p0.len(), rows * AR_HC_HIDDEN);
+    assert_eq!(p1.len(), rows * AR_HC_HIDDEN);
+    assert_eq!(streams.len(), rows * 4 * AR_HC_HIDDEN);
+    assert_eq!(gates.len(), rows * 4);
+    let mut mixed = vec![0f32; rows * AR_HC_HIDDEN];
+    for row in 0..rows {
+        let g = [
+            hc_gate(gates[row * 4]),
+            hc_gate(gates[row * 4 + 1]),
+            hc_gate(gates[row * 4 + 2]),
+            hc_gate(gates[row * 4 + 3]),
+        ];
+        for col in 0..AR_HC_HIDDEN {
+            let i = row * AR_HC_HIDDEN + col;
+            let m = ar_hc_fold(p0[i], p1[i]);
+            mixed[i] = m;
+            for (br, gate) in g.iter().enumerate() {
+                let s = &mut streams[row * 4 * AR_HC_HIDDEN + br * AR_HC_HIDDEN + col];
+                *s = hc_inject_f32(*gate, m, *s);
+            }
+        }
+    }
+    mixed
 }
 
 /// Host model of the whole fused launch for one rank-agnostic result: folds the two ranks'
@@ -480,6 +589,87 @@ mod tests {
         }
     }
 
+    /// The F32-stream model is the `hyper_write_f32` expression verbatim (written out here
+    /// independently: gate rounds, injection `bf16(gate * bf16(mixed))`, value
+    /// `bf16(input) + injection`, one bf16 round on store), element for element, and agrees
+    /// with the BF16-bit model when the streams hold the same bf16 values.
+    #[test]
+    fn f32_stream_model_is_hyper_write_f32() {
+        let mut rng = Rng(0xf32f_0000_0000_0001);
+        for rows in [1usize, 2, 7] {
+            let n = rows * AR_HC_HIDDEN;
+            let p0: Vec<f32> = (0..n).map(|_| (rng.unit() - 0.5) * 3.0).collect();
+            let p1: Vec<f32> = (0..n).map(|_| (rng.unit() - 0.5) * 3.0).collect();
+            let gates: Vec<f32> = (0..rows * 4).map(|_| (rng.unit() - 0.5) * 10.0).collect();
+            // F32 streams hold bf16-exact values mostly; a few unrounded ones prove the read
+            // rounding (`bf16(input)`).
+            let s0: Vec<f32> = (0..rows * 4 * AR_HC_HIDDEN)
+                .map(|i| {
+                    let v = (rng.unit() - 0.5) * 8.0;
+                    if i % 17 == 0 {
+                        v
+                    } else {
+                        bf16_round(v)
+                    }
+                })
+                .collect();
+            let mut got = s0.clone();
+            let m = ar_hc_write_model_f32(&p0, &p1, &mut got, &gates, rows);
+            for row in 0..rows {
+                for br in 0..4 {
+                    let gate_logit = bf16_round(gates[row * 4 + br]);
+                    let gate_scaled = bf16_round(gate_logit / 4.0);
+                    let gate = bf16_round(2.0 * bf16_round(1.0 / (1.0 + (-gate_scaled).exp())));
+                    for col in 0..AR_HC_HIDDEN {
+                        let mixed = m[row * AR_HC_HIDDEN + col];
+                        let injection = bf16_round(gate * bf16_round(mixed));
+                        let at = row * 4 * AR_HC_HIDDEN + br * AR_HC_HIDDEN + col;
+                        let value = bf16_round(s0[at]) + injection;
+                        assert_eq!(got[at].to_bits(), bf16_round(value).to_bits());
+                    }
+                }
+            }
+            // Same bf16 streams: the F32 and BF16-bit models agree bit for bit.
+            let bits: Vec<u16> = s0.iter().map(|&v| bf16_bits(v)).collect();
+            let mut bf = bits.clone();
+            let mut f = bits
+                .iter()
+                .map(|&b| f32::from_bits(u32::from(b) << 16))
+                .collect::<Vec<_>>();
+            let mb = ar_hc_write_model(&p0, &p1, &mut bf, &gates, rows);
+            let mf = ar_hc_write_model_f32(&p0, &p1, &mut f, &gates, rows);
+            assert_eq!(mb, mf);
+            for (b, f) in bf.iter().zip(&f) {
+                assert_eq!(f32::from_bits(u32::from(*b) << 16).to_bits(), f.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn stream_kinds_have_the_documented_strides() {
+        assert_eq!(StreamKind::Bf16.row_bytes(), 4 * 2560 * 2);
+        assert_eq!(StreamKind::F32.row_bytes(), 4 * 2560 * 4);
+        assert_eq!(StreamKind::from_state_bf16(true), StreamKind::Bf16);
+        assert_eq!(StreamKind::from_state_bf16(false), StreamKind::F32);
+        assert_ne!(StreamKind::Bf16.symbol(), StreamKind::F32.symbol());
+        assert_eq!(StreamKind::F32.alignment(), 16);
+    }
+
+    /// The device source declares one extern entry per kind and the F32 entry is
+    /// the F32 instantiation.
+    #[test]
+    fn kernel_source_has_both_entries() {
+        let src = kernels::AR_HC_WRITE_GFX1201_SRC;
+        for kind in StreamKind::ALL {
+            assert!(
+                src.contains(&format!("void {}(", kind.symbol())),
+                "{}",
+                kind.symbol()
+            );
+        }
+        assert!(src.contains("arhc_entry<true>") && src.contains("arhc_entry<false>"));
+    }
+
     /// The kernel source compiles offline for gfx1201 (hipcc `--genco`, no GPU touched) and
     /// exports the symbol. Skipped when hipcc is absent.
     #[test]
@@ -523,10 +713,13 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let image = std::fs::read(&obj).unwrap();
-        assert!(
-            image.windows(KERNEL.len()).any(|w| w == KERNEL.as_bytes()),
-            "{KERNEL} missing"
-        );
+        for kind in StreamKind::ALL {
+            let symbol = kind.symbol();
+            assert!(
+                image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+                "{symbol} missing"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -22,8 +22,8 @@
 
 use hip_bridge::{DeviceBuffer, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED};
 use rdna_compute::ar_hc_write::{
-    ar_hc_bank_bytes, ar_hc_fold, ar_hc_geometry, ar_hc_write_model, AR_HC_GEN_BYTES, AR_HC_HIDDEN,
-    AR_HC_ROW_CAP,
+    ar_hc_bank_bytes, ar_hc_fold, ar_hc_geometry, ar_hc_write_model, ar_hc_write_model_f32,
+    StreamKind, AR_HC_GEN_BYTES, AR_HC_HIDDEN, AR_HC_ROW_CAP,
 };
 use rdna_compute::Gpu;
 use std::ffi::c_void;
@@ -95,7 +95,9 @@ impl ArHcExchange {
             return Err(err(format!("ar_hc_exchange: rank {rank} outside 2 ranks")));
         }
         gpu.bind_thread()?;
-        gpu.ensure_ar_hc_write_gfx1201_kernel()?;
+        for kind in StreamKind::ALL {
+            gpu.ensure_ar_hc_write_gfx1201_kernel(kind)?;
+        }
         gpu.ensure_device_wait_block()?;
         let mut slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_some() {
@@ -197,7 +199,7 @@ impl ArHcExchange {
     }
 
     /// One fused all-reduce + HC write of `rows` rows on `rank`: `partial` `[rows, 2560]` f32,
-    /// `streams` `[rows, 4, 2560]` bf16 bits (in place), `gates` `[rows, 4]` f32 (device
+    /// `streams` `[rows, 4, 2560]` of `kind` (BF16 bits or F32 words, in place), `gates` `[rows, 4]` f32 (device
     /// pointers; rows beyond [`AR_HC_ROW_CAP`] or `max_rows` are launched in slices, each
     /// its own generation, in order, identically on both ranks).
     ///
@@ -209,6 +211,7 @@ impl ArHcExchange {
         gpu: &mut Gpu,
         partial: *mut c_void,
         streams: *mut c_void,
+        kind: StreamKind,
         gates: *const c_void,
         rows: usize,
         mixed_dbg: *mut c_void,
@@ -261,8 +264,9 @@ impl ArHcExchange {
                     .cast::<c_void>(),
                 streams
                     .cast::<u8>()
-                    .add(done * 4 * AR_HC_HIDDEN * 2)
+                    .add(done * kind.row_bytes())
                     .cast::<c_void>(),
+                kind,
                 gates.cast::<u8>().add(done * 4 * 4).cast::<c_void>(),
                 peer_mail as *mut c_void,
                 local_mail as *const c_void,
@@ -278,13 +282,9 @@ impl ArHcExchange {
         Ok(())
     }
 
-    /// Load-time qualification of rank `rank`, run CONCURRENTLY on both ranks' threads (the
-    /// kernels rendezvous): `exchanges` eager fused launches over `rows` rows with
-    /// deterministic partials, the folded `m` and the HC streams (gates 0, so the gate is
-    /// exactly 1 whatever libm computes) compared bit for bit with the host model. A failure
-    /// (including a bounded-wait timeout) returns `Err`, [`Self::disable`]s the route and
-    /// leaves the generations unequal, so the caller must [`Self::reset`] both ranks before
-    /// reuse.
+    /// Load-time qualification of rank `rank` over BOTH stream kinds (BF16 bits, then F32
+    /// words), run CONCURRENTLY on both ranks' threads (the kernels rendezvous): see
+    /// [`Self::qualify_kind`].
     pub fn qualify(
         &self,
         rank: usize,
@@ -292,10 +292,30 @@ impl ArHcExchange {
         rows: usize,
         exchanges: usize,
     ) -> HipResult<()> {
+        for kind in StreamKind::ALL {
+            self.qualify_kind(rank, gpu, kind, rows, exchanges)?;
+        }
+        Ok(())
+    }
+
+    /// Qualification of one stream kind: `exchanges` eager fused launches over `rows` rows with
+    /// deterministic partials, the folded `m` and the HC streams (gates 0, so the gate is
+    /// exactly 1 whatever libm computes) compared bit for bit with the host model. A failure
+    /// (including a bounded-wait timeout) returns `Err`, [`Self::disable`]s the route and
+    /// leaves the generations unequal, so the caller must [`Self::reset`] both ranks before
+    /// reuse.
+    pub fn qualify_kind(
+        &self,
+        rank: usize,
+        gpu: &mut Gpu,
+        kind: StreamKind,
+        rows: usize,
+        exchanges: usize,
+    ) -> HipResult<()> {
         let n = rows * AR_HC_HIDDEN;
         let alloc = |gpu: &mut Gpu, bytes: usize| gpu.hip.malloc(bytes);
         let partial = alloc(gpu, n * 4)?;
-        let streams = alloc(gpu, rows * 4 * AR_HC_HIDDEN * 2)?;
+        let streams = alloc(gpu, rows * kind.row_bytes())?;
         let gates = alloc(gpu, rows * 16)?;
         let dbg = alloc(gpu, n * 4)?;
         let result = (|| -> HipResult<()> {
@@ -304,52 +324,83 @@ impl ArHcExchange {
                 let p0: Vec<f32> = (0..n).map(|i| qualify_partial(exchange, 0, i)).collect();
                 let p1: Vec<f32> = (0..n).map(|i| qualify_partial(exchange, 1, i)).collect();
                 let mine = if rank == 0 { &p0 } else { &p1 };
-                let mut streams_host = vec![0u16; rows * 4 * AR_HC_HIDDEN];
-                for (i, s) in streams_host.iter_mut().enumerate() {
-                    *s =
-                        rdna_compute::ar_hc_write::bf16_bits(qualify_partial(exchange, 7, i) * 4.0);
-                }
-                gpu.hip.memcpy_htod(&partial, f32_bytes(mine))?;
-                gpu.hip.memcpy_htod(&streams, u16_bytes(&streams_host))?;
-                // SAFETY: the buffers above are live on this device with exactly these extents.
-                unsafe {
-                    self.write(
-                        rank,
-                        gpu,
-                        partial.as_ptr(),
-                        streams.as_ptr(),
-                        gates.as_ptr(),
-                        rows,
-                        dbg.as_ptr(),
-                    )?;
-                }
-                gpu.hip.device_synchronize()?;
-                gpu.take_device_wait_error()?;
-                let mut want_streams = streams_host.clone();
                 let gates_host = vec![0f32; rows * 4];
-                let want_m = ar_hc_write_model(&p0, &p1, &mut want_streams, &gates_host, rows);
+                let want_m;
                 let mut got_m = vec![0f32; n];
-                gpu.hip.memcpy_dtoh(f32_bytes_mut(&mut got_m), &dbg)?;
-                let mut got_streams = vec![0u16; want_streams.len()];
-                gpu.hip
-                    .memcpy_dtoh(u16_bytes_mut(&mut got_streams), &streams)?;
+                match kind {
+                    StreamKind::Bf16 => {
+                        let mut streams_host = vec![0u16; rows * 4 * AR_HC_HIDDEN];
+                        for (i, s) in streams_host.iter_mut().enumerate() {
+                            *s = rdna_compute::ar_hc_write::bf16_bits(
+                                qualify_partial(exchange, 7, i) * 4.0,
+                            );
+                        }
+                        gpu.hip.memcpy_htod(&partial, f32_bytes(mine))?;
+                        gpu.hip.memcpy_htod(&streams, u16_bytes(&streams_host))?;
+                        self.qualify_write(
+                            rank, gpu, &partial, &streams, kind, &gates, rows, &dbg,
+                        )?;
+                        let mut want_streams = streams_host.clone();
+                        want_m = ar_hc_write_model(&p0, &p1, &mut want_streams, &gates_host, rows);
+                        gpu.hip.memcpy_dtoh(f32_bytes_mut(&mut got_m), &dbg)?;
+                        let mut got_streams = vec![0u16; want_streams.len()];
+                        gpu.hip
+                            .memcpy_dtoh(u16_bytes_mut(&mut got_streams), &streams)?;
+                        if let Some(i) = got_streams
+                            .iter()
+                            .zip(&want_streams)
+                            .position(|(a, b)| a != b)
+                        {
+                            return Err(err(format!(
+                                "ar_hc_exchange: qualification (bf16) exchange {exchange}: stream differs at {i}: {:#06x} vs {:#06x}",
+                                got_streams[i], want_streams[i]
+                            )));
+                        }
+                    }
+                    StreamKind::F32 => {
+                        // Mostly bf16-exact words (what the forward stores), every 7th
+                        // unrounded: the kernel rounds on read like `hyper_write_f32`.
+                        let mut streams_host = vec![0f32; rows * 4 * AR_HC_HIDDEN];
+                        for (i, s) in streams_host.iter_mut().enumerate() {
+                            let v = qualify_partial(exchange, 7, i) * 4.0;
+                            *s = if i % 7 == 0 {
+                                v
+                            } else {
+                                rdna_compute::ar_hc_write::bf16_round(v)
+                            };
+                        }
+                        gpu.hip.memcpy_htod(&partial, f32_bytes(mine))?;
+                        gpu.hip.memcpy_htod(&streams, f32_bytes(&streams_host))?;
+                        self.qualify_write(
+                            rank, gpu, &partial, &streams, kind, &gates, rows, &dbg,
+                        )?;
+                        let mut want_streams = streams_host.clone();
+                        want_m =
+                            ar_hc_write_model_f32(&p0, &p1, &mut want_streams, &gates_host, rows);
+                        gpu.hip.memcpy_dtoh(f32_bytes_mut(&mut got_m), &dbg)?;
+                        let mut got_streams = vec![0f32; want_streams.len()];
+                        gpu.hip
+                            .memcpy_dtoh(f32_bytes_mut(&mut got_streams), &streams)?;
+                        if let Some(i) = got_streams
+                            .iter()
+                            .zip(&want_streams)
+                            .position(|(a, b)| a.to_bits() != b.to_bits())
+                        {
+                            return Err(err(format!(
+                                "ar_hc_exchange: qualification (f32) exchange {exchange}: stream differs at {i}: {} vs {}",
+                                got_streams[i], want_streams[i]
+                            )));
+                        }
+                    }
+                }
                 for (i, (a, b)) in got_m.iter().zip(&want_m).enumerate() {
                     if a.to_bits() != b.to_bits() {
                         return Err(err(format!(
-                            "ar_hc_exchange: qualification exchange {exchange}: folded m differs at {i}: {a} vs {b}"
+                            "ar_hc_exchange: qualification ({}) exchange {exchange}: folded m differs at {i}: {a} vs {b}",
+                            kind.name()
                         )));
                     }
                     debug_assert_eq!(b.to_bits(), ar_hc_fold(p0[i], p1[i]).to_bits());
-                }
-                if let Some(i) = got_streams
-                    .iter()
-                    .zip(&want_streams)
-                    .position(|(a, b)| a != b)
-                {
-                    return Err(err(format!(
-                        "ar_hc_exchange: qualification exchange {exchange}: stream differs at {i}: {:#06x} vs {:#06x}",
-                        got_streams[i], want_streams[i]
-                    )));
                 }
             }
             Ok(())
@@ -362,6 +413,39 @@ impl ArHcExchange {
             self.disable();
         }
         result.and(freed)
+    }
+}
+
+impl ArHcExchange {
+    /// One synchronous qualification launch (write, drain, wait-error check).
+    #[allow(clippy::too_many_arguments)]
+    fn qualify_write(
+        &self,
+        rank: usize,
+        gpu: &mut Gpu,
+        partial: &DeviceBuffer,
+        streams: &DeviceBuffer,
+        kind: StreamKind,
+        gates: &DeviceBuffer,
+        rows: usize,
+        dbg: &DeviceBuffer,
+    ) -> HipResult<()> {
+        // SAFETY: the buffers are live on this device with exactly the extents `kind` and
+        // `rows` imply (allocated by `qualify_kind`).
+        unsafe {
+            self.write(
+                rank,
+                gpu,
+                partial.as_ptr(),
+                streams.as_ptr(),
+                kind,
+                gates.as_ptr(),
+                rows,
+                dbg.as_ptr(),
+            )?;
+        }
+        gpu.hip.device_synchronize()?;
+        gpu.take_device_wait_error()
     }
 }
 

@@ -1641,10 +1641,11 @@ pub struct HyperWriteOp<'a> {
     pub ar: Option<&'a dyn HyperWriteAr>,
 }
 
-/// The fused TP2 all-reduce + BF16 HC write of one block output (the Flash-Next trunk
+/// The fused TP2 all-reduce + HC write of one block output (the Flash-Next trunk
 /// shard, `HIPFIRE_QWEN4_EP_TRUNK_SHARD`): folds this rank's `partial` (`[rows, hidden]`
-/// f32) with the peer's and applies the production HC write to `streams` (BF16 bits,
-/// in place) with the row `gates`. The architecture crate owns the transport.
+/// f32) with the peer's and applies the production HC write to `streams` (in place: BF16
+/// bits when `state_bf16`, else F32 words holding BF16-exact values, the two `hyper_write`
+/// flavours) with the row `gates`. The architecture crate owns the transport.
 pub trait HyperWriteAr: Send + Sync {
     fn ar_hyper_write(
         &self,
@@ -1653,6 +1654,7 @@ pub trait HyperWriteAr: Send + Sync {
         streams: &GpuTensor,
         gates: &GpuTensor,
         rows: usize,
+        state_bf16: bool,
     ) -> Result<(), String>;
 }
 
@@ -1918,14 +1920,17 @@ fn execute_hyper_write_inner(
         hyper_write_gates(gpu, op, &input, &normalized, &gates)?;
     }
     if let Some(ar) = op.ar {
-        if !op.state_bf16 || op.input.buf.as_ptr() != op.output.buf.as_ptr() || op.hidden != 2560 {
+        if op.input.buf.as_ptr() != op.output.buf.as_ptr() || op.hidden != 2560 || op.branches != 4
+        {
             return Err(DispatchError::Hip(
-                "hyper write: the fused all-reduce write needs BF16 streams updated in place at hidden 2560"
+                "hyper write: the fused all-reduce write needs streams updated in place at 4 x 2560"
                     .into(),
             ));
         }
+        // BF16-bit streams (`state_bf16`) or F32 words holding BF16-exact values: the two
+        // production `hyper_write` flavours, one kernel entry each.
         return ar
-            .ar_hyper_write(gpu, &mixed, &input, &gates, op.rows)
+            .ar_hyper_write(gpu, &mixed, &input, &gates, op.rows, op.state_bf16)
             .map_err(|e| DispatchError::Hip(format!("hyper write: fused all-reduce: {e}")));
     }
     hip(hyper_write(

@@ -13,6 +13,7 @@
 
 use hipfire_dispatch::pipeline::HyperWriteAr;
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
+use rdna_compute::ar_hc_write::StreamKind;
 use rdna_compute::{Gpu, GpuTensor};
 use std::cell::Cell;
 use std::sync::Arc;
@@ -47,9 +48,10 @@ impl HyperWriteAr for TrunkShardRoute {
         streams: &GpuTensor,
         gates: &GpuTensor,
         rows: usize,
+        state_bf16: bool,
     ) -> Result<(), String> {
         // SAFETY: the tensors are live device buffers of this rank's forward with the
-        // `[rows, 2560]` f32 partial, `[rows, 4, 2560]` bf16-bit streams and `[rows, 4]` f32
+        // `[rows, 2560]` f32 partial, `[rows, 4, 2560]` streams of the `state_bf16` kind and `[rows, 4]` f32
         // gate extents (`execute_hyper_write_inner` validated the op).
         unsafe {
             self.exchange.write(
@@ -57,6 +59,7 @@ impl HyperWriteAr for TrunkShardRoute {
                 gpu,
                 partial.buf.as_ptr(),
                 streams.buf.as_ptr(),
+                StreamKind::from_state_bf16(state_bf16),
                 gates.buf.as_ptr(),
                 rows,
                 std::ptr::null_mut(),

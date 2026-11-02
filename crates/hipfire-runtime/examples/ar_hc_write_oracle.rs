@@ -7,9 +7,15 @@
 //!
 //! ```text
 //! ar_hc_write_oracle [--rows 1,8,32,100,256] [--iters 2000] [--devices 0,1] [--out DIR]
+//!                    [--stream f32|bf16|both]
 //! ```
 //!
-//! Per iteration (one "layer" of chained BF16 streams): fresh random partials (distinct per
+//! `--stream` picks the HC stream kind(s) under test (default `both`): `bf16` = BF16 bits
+//! (`hyper_write_bf16x2`, REF `state_bf16 = true`), `f32` = F32 words holding BF16-exact
+//! values (`hyper_write_f32`, REF `state_bf16 = false`: decode, verify, short chunks). Every
+//! row of the receipt carries its `stream` kind.
+//!
+//! Per iteration (one "layer" of chained streams): fresh random partials (distinct per
 //! rank), fresh gate logits. The fused launch is checked against REF = the host fold
 //! (`ar_hc_fold`, exact IEEE adds of the two bf16-rounded partials) uploaded as `mixed` and
 //! applied by the PRODUCTION `hyper_write` kernel to an identical copy of the streams:
@@ -22,7 +28,9 @@
 //! Exit code 3 on any failure; a JSON receipt lands in `--out` (default `.`).
 
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
-use rdna_compute::ar_hc_write::{ar_hc_fold, ar_hc_fold_bound, bf16_bits, AR_HC_HIDDEN};
+use rdna_compute::ar_hc_write::{
+    ar_hc_fold, ar_hc_fold_bound, bf16_bits, bf16_round, StreamKind, AR_HC_HIDDEN,
+};
 use rdna_compute::tensor_ops::{hyper_write, HyperWrite};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
@@ -71,7 +79,7 @@ fn alloc_f32(gpu: &mut Gpu, n: usize) -> GpuTensor {
 }
 
 struct RankResult {
-    tallies: Vec<(usize, Tally)>,
+    tallies: Vec<(StreamKind, usize, Tally)>,
     streams: Vec<(usize, Vec<u8>)>,
     fault: Option<String>,
 }
@@ -81,6 +89,7 @@ fn run_rank(
     rank: usize,
     device: i32,
     rows_list: Vec<usize>,
+    kinds: Vec<StreamKind>,
     iters: usize,
     fault: bool,
     x: Arc<ArHcExchange>,
@@ -98,11 +107,15 @@ fn run_rank(
     barrier.wait();
     let mut tallies = Vec::new();
     let mut last_streams = Vec::new();
-    for &rows in &rows_list {
+    let cases: Vec<(StreamKind, usize)> = kinds
+        .iter()
+        .flat_map(|&kind| rows_list.iter().map(move |&rows| (kind, rows)))
+        .collect();
+    for &(kind, rows) in &cases {
         let n = rows * AR_HC_HIDDEN;
         let wide = rows * 4 * AR_HC_HIDDEN;
-        // streams hold BF16 bits: allocate F32-typed tensors of `wide` elements (2x oversize,
-        // the production hyper_write view of bf16 state)
+        // BF16-bit streams: F32-typed tensors of `wide` elements (2x oversize, the production
+        // hyper_write view of bf16 state); F32 streams fill them exactly.
         let streams = alloc_f32(&mut gpu, wide);
         let ref_streams = alloc_f32(&mut gpu, wide);
         let partial = alloc_f32(&mut gpu, n);
@@ -127,10 +140,26 @@ fn run_rank(
                 );
             }
             let host_gates: Vec<f32> = (0..rows * 4).map(|_| (rng.unit() - 0.5) * 8.0).collect();
-            let init: Option<Vec<u16>> = reset.then(|| {
-                (0..wide)
-                    .map(|_| bf16_bits((rng.unit() - 0.5) * 4.0))
-                    .collect()
+            let init: Option<Vec<u8>> = reset.then(|| match kind {
+                StreamKind::Bf16 => bytes_u16(
+                    &(0..wide)
+                        .map(|_| bf16_bits((rng.unit() - 0.5) * 4.0))
+                        .collect::<Vec<u16>>(),
+                ),
+                // bf16-exact words like the forward stores, every 16th unrounded (both the
+                // kernel and the production write round the input on read)
+                StreamKind::F32 => bytes_f32(
+                    &(0..wide)
+                        .map(|i| {
+                            let v = (rng.unit() - 0.5) * 4.0;
+                            if i % 16 == 0 {
+                                v
+                            } else {
+                                bf16_round(v)
+                            }
+                        })
+                        .collect::<Vec<f32>>(),
+                ),
             });
             let m_host: Vec<f32> = (0..n)
                 .map(|i| ar_hc_fold(host_p[0][i], host_p[1][i]))
@@ -145,7 +174,7 @@ fn run_rank(
                 .memcpy_htod(&mixed_ref.buf, &bytes_f32(&m_host))
                 .map_err(|e| e.to_string())?;
             if let Some(init) = &init {
-                let b = bytes_u16(init);
+                let b = init;
                 gpu.hip
                     .memcpy_htod(&streams.buf, &b)
                     .map_err(|e| e.to_string())?;
@@ -161,6 +190,7 @@ fn run_rank(
                     &mut gpu,
                     partial.buf.as_ptr(),
                     streams.buf.as_ptr(),
+                    kind,
                     gates.buf.as_ptr(),
                     rows,
                     dbg.buf.as_ptr(),
@@ -178,7 +208,7 @@ fn run_rank(
                     output: &ref_streams,
                     branches: 4,
                     hidden: AR_HC_HIDDEN,
-                    state_bf16: true,
+                    state_bf16: kind == StreamKind::Bf16,
                 },
             )
             .map_err(|e| e.to_string())?;
@@ -187,17 +217,20 @@ fn run_rank(
                 .map_err(|e| format!("iter {it}: {e}"))?;
             let got = gpu
                 .download_raw_bytes(&streams)
-                .map_err(|e| e.to_string())?[..wide * 2]
+                .map_err(|e| e.to_string())?[..wide * kind.element_bytes()]
                 .to_vec();
             let want = gpu
                 .download_raw_bytes(&ref_streams)
-                .map_err(|e| e.to_string())?[..wide * 2]
+                .map_err(|e| e.to_string())?[..wide * kind.element_bytes()]
                 .to_vec();
             let got_m = f32s(&gpu.download_raw_bytes(&dbg).map_err(|e| e.to_string())?);
             tally.iters += 1;
             let note = |t: &mut Tally, what: String| {
                 if t.first.is_none() {
-                    t.first = Some(format!("rows {rows} iter {it} rank {rank}: {what}"));
+                    t.first = Some(format!(
+                        "{} rows {rows} iter {it} rank {rank}: {what}",
+                        kind.name()
+                    ));
                 }
             };
             if got != want {
@@ -251,12 +284,15 @@ fn run_rank(
             if g[0] != g[1] {
                 tally.fused_ne_ref += 1;
                 tally.first.get_or_insert_with(|| {
-                    format!("rows {rows}: rank 0 and rank 1 final streams differ")
+                    format!(
+                        "{} rows {rows}: rank 0 and rank 1 final streams differ",
+                        kind.name()
+                    )
                 });
             }
         }
         barrier.wait();
-        tallies.push((rows, tally));
+        tallies.push((kind, rows, tally));
         for t in [
             streams,
             ref_streams,
@@ -284,6 +320,7 @@ fn run_rank(
                     &mut gpu,
                     partial.buf.as_ptr(),
                     streams.buf.as_ptr(),
+                    StreamKind::Bf16,
                     gates.buf.as_ptr(),
                     rows,
                     std::ptr::null_mut::<c_void>(),
@@ -325,6 +362,7 @@ fn main() {
     let mut devices = [0i32, 1i32];
     let mut out = ".".to_string();
     let mut fault = true;
+    let mut kinds = StreamKind::ALL.to_vec();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -352,6 +390,15 @@ fn main() {
                 i += 1;
                 out = args[i].clone();
             }
+            "--stream" => {
+                i += 1;
+                kinds = match args[i].as_str() {
+                    "bf16" => vec![StreamKind::Bf16],
+                    "f32" => vec![StreamKind::F32],
+                    "both" => StreamKind::ALL.to_vec(),
+                    other => panic!("--stream takes f32|bf16|both, got {other}"),
+                };
+            }
             "--no-fault" => fault = false,
             other => panic!("unknown argument {other}"),
         }
@@ -366,14 +413,15 @@ fn main() {
     let shared = Arc::new(Mutex::new(Vec::new()));
     let handles: Vec<_> = (0..2)
         .map(|rank| {
-            let (x, b, s, rl) = (
+            let (x, b, s, rl, kinds) = (
                 x.clone(),
                 barrier.clone(),
                 shared.clone(),
                 rows_list.clone(),
+                kinds.clone(),
             );
             let dev = devices[rank];
-            std::thread::spawn(move || run_rank(rank, dev, rl, iters, fault, x, b, s))
+            std::thread::spawn(move || run_rank(rank, dev, rl, kinds, iters, fault, x, b, s))
         })
         .collect();
     let results: Vec<Result<RankResult, String>> = handles
@@ -389,17 +437,17 @@ fn main() {
                 failed = true;
             }
             Ok(res) => {
-                for (rows, t) in &res.tallies {
+                for (kind, rows, t) in &res.tallies {
                     let bad = t.fused_ne_ref + t.m_ne_ref + t.bound;
                     eprintln!(
-                        "rank {rank} rows {rows}: {} iters fused!=REF {} m!=host {} bound {} (max ratio {:.3}){}",
-                        t.iters, t.fused_ne_ref, t.m_ne_ref, t.bound, t.max_bound_ratio,
+                        "rank {rank} {} rows {rows}: {} iters fused!=REF {} m!=host {} bound {} (max ratio {:.3}){}",
+                        kind.name(), t.iters, t.fused_ne_ref, t.m_ne_ref, t.bound, t.max_bound_ratio,
                         t.first.as_deref().map_or(String::new(), |f| format!(" FIRST: {f}"))
                     );
                     failed |= bad != 0;
                     json_rows.push(format!(
-                        "{{\"rank\":{rank},\"rows\":{rows},\"iters\":{},\"fused_ne_ref\":{},\"m_ne_host\":{},\"bound_violations\":{},\"max_bound_ratio\":{:.4},\"pass\":{}}}",
-                        t.iters, t.fused_ne_ref, t.m_ne_ref, t.bound, t.max_bound_ratio, bad == 0
+                        "{{\"rank\":{rank},\"stream\":\"{}\",\"rows\":{rows},\"iters\":{},\"fused_ne_ref\":{},\"m_ne_host\":{},\"bound_violations\":{},\"max_bound_ratio\":{:.4},\"pass\":{}}}",
+                        kind.name(), t.iters, t.fused_ne_ref, t.m_ne_ref, t.bound, t.max_bound_ratio, bad == 0
                     ));
                 }
                 if let Some(f) = &res.fault {
@@ -410,8 +458,10 @@ fn main() {
         }
     }
     let receipt = format!(
-        "{{\"oracle\":\"ar_hc_write_oracle\",\"pass\":{},\"iters\":{iters},\"devices\":[{},{}],\"results\":[{}]}}",
-        !failed, devices[0], devices[1], json_rows.join(",")
+        "{{\"oracle\":\"ar_hc_write_oracle\",\"pass\":{},\"iters\":{iters},\"streams\":[{}],\"devices\":[{},{}],\"results\":[{}]}}",
+        !failed,
+        kinds.iter().map(|k| format!("\"{}\"", k.name())).collect::<Vec<_>>().join(","),
+        devices[0], devices[1], json_rows.join(",")
     );
     let _ = std::fs::create_dir_all(&out);
     let path = format!("{out}/ar_hc_write_oracle.json");
