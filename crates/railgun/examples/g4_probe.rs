@@ -999,14 +999,26 @@ fn run() -> R<()> {
     } else {
         Value::Null
     };
-    let driver = std::fs::read_to_string("/sys/module/amdgpu/version")
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
-    let rocm = std::fs::read_to_string("/opt/rocm/.info/version")
-        .unwrap_or_default()
-        .trim()
-        .to_owned();
+    // `/sys/module/amdgpu/version` is absent on in-tree kernels (then the module's
+    // srcversion hash identifies the driver build); ROCm 7.x relocated `.info`
+    // under `core/`.
+    let first_file = |paths: &[&str], prefix: &str| {
+        paths
+            .iter()
+            .find_map(|p| std::fs::read_to_string(p).ok())
+            .map(|s| format!("{prefix}{}", s.trim()))
+            .unwrap_or_default()
+    };
+    let driver = first_file(&["/sys/module/amdgpu/version"], "");
+    let driver = if driver.is_empty() {
+        first_file(&["/sys/module/amdgpu/srcversion"], "srcversion:")
+    } else {
+        driver
+    };
+    let rocm = first_file(
+        &["/opt/rocm/.info/version", "/opt/rocm/core/.info/version"],
+        "",
+    );
     let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .unwrap_or_default()
         .trim()
