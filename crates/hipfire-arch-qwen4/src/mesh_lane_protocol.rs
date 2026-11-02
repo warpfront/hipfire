@@ -767,19 +767,20 @@ pub struct VerifyLane {
     /// Arm the per-lane capture ring (a window with more than one row).
     pub capture: bool,
     /// The lane verifies in the wide pass (flag on and unseeded sampled, or the lab
-    /// all-lanes override): its rows pack into 32-row groups with other wide lanes.
+    /// all-lanes override): its rows pack into wide groups (32 rows by default, see
+    /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS`) with other wide lanes.
     pub wide: bool,
 }
 
 /// One packed once-over-all-rows group: consecutive whole lanes, at most
-/// [`LANE_MAX_ROWS`] rows.
+/// [`LANE_MAX_ROWS`] rows (row-exact class) or at most the wide cap (wide class).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RowGroup {
     pub first_lane: usize,
     pub lanes: usize,
     pub rows: usize,
-    /// A wide-class group (up to `QWEN4_EP_GATHER_VERIFY_ROWS` rows); the row-exact
-    /// groups hold at most [`LANE_MAX_ROWS`].
+    /// A wide-class group (up to [`crate::gpu_forward::qwen4_ep_wide_group_cap`] rows:
+    /// 32 by default); the row-exact groups hold at most [`LANE_MAX_ROWS`].
     pub wide: bool,
 }
 
@@ -843,19 +844,33 @@ pub fn pack_row_groups(rows: &[usize], max_rows: usize) -> Vec<RowGroup> {
 
 /// [`pack_row_groups`] over lanes of two classes: consecutive whole lanes of the SAME
 /// class pack together, row-exact lanes up to [`LANE_MAX_ROWS`] rows and wide lanes up
-/// to [`crate::gpu_forward::QWEN4_EP_GATHER_VERIFY_ROWS`] (a lane wider than its cap
-/// is its own group). Classes never share a group, so a mixed step runs its greedy /
-/// seeded lanes row-exact and its unseeded sampled lanes wide, in lane order. With no
-/// wide lane this is exactly [`pack_row_groups`] at [`LANE_MAX_ROWS`].
+/// to [`crate::gpu_forward::qwen4_ep_wide_group_cap`] (32 by default;
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` widens it to at most the tightest stage limit,
+/// [`crate::gpu_forward::ep_wide_stage_limits`]; a lane wider than its cap is its own
+/// group). Classes never share a group, so a mixed step runs its greedy / seeded /
+/// forced lanes row-exact and its unseeded sampled lanes wide, in lane order: only
+/// CONSECUTIVE same-class lanes merge (`W W E W` is three groups: the lane order is the
+/// row order of every per-lane output, so lanes are never reordered). An AR (1-row) lane
+/// packs by its own class like any other: an unseeded sampled AR lane joins the wide
+/// group, a greedy AR lane the row-exact one. With no wide lane this is exactly
+/// [`pack_row_groups`] at [`LANE_MAX_ROWS`]. This is the single packing rule: the root's
+/// `seal_verify`, every rank's lane forward (`classed_segments`) and the rank counts
+/// (`row_group_count`) all call it, so the sealed ledger and the executed groups agree
+/// (every rank must run with the same `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS`).
 pub fn pack_classed_row_groups(rows: &[usize], wide: &[bool]) -> Vec<RowGroup> {
+    pack_classed_row_groups_with_cap(rows, wide, crate::gpu_forward::qwen4_ep_wide_group_cap())
+}
+
+/// [`pack_classed_row_groups`] with an explicit wide-class cap `wide_cap` (rows).
+pub fn pack_classed_row_groups_with_cap(
+    rows: &[usize],
+    wide: &[bool],
+    wide_cap: usize,
+) -> Vec<RowGroup> {
     debug_assert_eq!(rows.len(), wide.len());
     let mut groups: Vec<RowGroup> = Vec::new();
     for (lane, (&r, &w)) in rows.iter().zip(wide).enumerate() {
-        let cap = if w {
-            crate::gpu_forward::QWEN4_EP_GATHER_VERIFY_ROWS
-        } else {
-            LANE_MAX_ROWS
-        };
+        let cap = if w { wide_cap } else { LANE_MAX_ROWS };
         match groups.last_mut() {
             Some(g) if g.wide == w && g.rows + r <= cap => {
                 g.rows += r;
@@ -5154,6 +5169,186 @@ mod tests {
         assert_eq!(packed.len(), 1);
         assert!(packed[0].wide);
         TEST_WIDE_VERIFY.with(|c| c.set(None));
+    }
+
+    fn group_shape(groups: &[RowGroup]) -> Vec<(usize, usize, usize, bool)> {
+        groups
+            .iter()
+            .map(|g| (g.first_lane, g.lanes, g.rows, g.wide))
+            .collect()
+    }
+
+    /// `pack_classed_row_groups_with_cap` at the wide caps 32 / 48 / 64: the code-lane
+    /// shapes of BEAT-PAITON (C8 K=5 = 8 lanes x 6 rows = 48; C4 K=5 = 24; C1 K=7 = 8),
+    /// lanes wider than the cap, mixed classes and AR rows. The row-exact class never
+    /// leaves its 8-row cap, whatever the wide cap.
+    #[test]
+    fn classed_row_groups_pack_at_wide_caps_32_48_64() {
+        let all = |n: usize| vec![true; n];
+        // 8 lanes x 6 rows (C8, K=5): 5+3 lanes at 32, one 48-row group at 48 / 64.
+        let rows = [6usize; 8];
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&rows, &all(8), 32)),
+            vec![(0, 5, 30, true), (5, 3, 18, true)]
+        );
+        for cap in [48, 64] {
+            assert_eq!(
+                group_shape(&pack_classed_row_groups_with_cap(&rows, &all(8), cap)),
+                vec![(0, 8, 48, true)],
+                "cap {cap}"
+            );
+        }
+        // C4 K=5 (24 rows) and C1 K=7 (8 rows): one wide group at every cap.
+        for cap in [32, 48, 64] {
+            assert_eq!(
+                group_shape(&pack_classed_row_groups_with_cap(&[6; 4], &all(4), cap)),
+                vec![(0, 4, 24, true)]
+            );
+            assert_eq!(
+                group_shape(&pack_classed_row_groups_with_cap(&[8], &all(1), cap)),
+                vec![(0, 1, 8, true)]
+            );
+        }
+        // 8 lanes x 8 rows (K=7, 64 rows): 4+4 lanes at 32, 6+2 at 48, one group at 64.
+        let rows = [8usize; 8];
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&rows, &all(8), 32)),
+            vec![(0, 4, 32, true), (4, 4, 32, true)]
+        );
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&rows, &all(8), 48)),
+            vec![(0, 6, 48, true), (6, 2, 16, true)]
+        );
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&rows, &all(8), 64)),
+            vec![(0, 8, 64, true)]
+        );
+        // The kernel-limit fallback: a 48-row request on a stage that serves only 42
+        // rows (top-12: 512 owner slots / 12) splits into two wide groups of whole lanes.
+        let (limited, binding) = crate::gpu_forward::ep_wide_group_cap_for(48, 12);
+        assert_eq!(limited, 42);
+        assert!(binding.is_some());
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&[6; 8], &all(8), limited)),
+            vec![(0, 7, 42, true), (7, 1, 6, true)]
+        );
+        // Lanes wider than the cap are their own group; a lane exactly filling the
+        // cap closes it; a lane that does not fit starts the next group.
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&[40, 8], &all(2), 32)),
+            vec![(0, 1, 40, true), (1, 1, 8, true)]
+        );
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&[40, 8], &all(2), 48)),
+            vec![(0, 2, 48, true)]
+        );
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&[40, 9], &all(2), 48)),
+            vec![(0, 1, 40, true), (1, 1, 9, true)]
+        );
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&[3, 70, 3], &all(3), 64)),
+            vec![(0, 1, 3, true), (1, 1, 70, true), (2, 1, 3, true)]
+        );
+        // Row-exact lanes ignore the wide cap: 4 lanes x 6 rows are four groups,
+        // 4 x 4 are two, 8 x 1 is one.
+        for cap in [32, 48, 64] {
+            assert_eq!(
+                pack_classed_row_groups_with_cap(&[6; 4], &[false; 4], cap).len(),
+                4
+            );
+            assert_eq!(
+                group_shape(&pack_classed_row_groups_with_cap(&[4; 4], &[false; 4], cap)),
+                vec![(0, 2, 8, false), (2, 2, 8, false)]
+            );
+            assert_eq!(
+                pack_classed_row_groups_with_cap(&[1; 8], &[false; 8], cap).len(),
+                1
+            );
+        }
+        // MIXED step, lane order, only consecutive same-class lanes merge: W W E W at
+        // 6 rows is wide(12) / exact(6) / wide(6) at 48; greedy / seeded lanes
+        // (`false`) and forced lanes stay row-exact.
+        let wide = [true, true, false, true];
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&[6; 4], &wide, 48)),
+            vec![(0, 2, 12, true), (2, 1, 6, false), (3, 1, 6, true)]
+        );
+        // With AR (1-row) lanes in the step: an unseeded AR lane joins the wide group,
+        // a greedy AR lane the row-exact one.
+        let rows = [1usize, 6, 1, 6, 1, 1];
+        let wide = [true, true, false, true, true, false];
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&rows, &wide, 48)),
+            vec![
+                (0, 2, 7, true),
+                (2, 1, 1, false),
+                (3, 2, 7, true),
+                (5, 1, 1, false)
+            ]
+        );
+        // Greedy-only AR8 step: one row-exact group of eight rows.
+        assert_eq!(
+            group_shape(&pack_classed_row_groups_with_cap(&[1; 8], &[false; 8], 64)),
+            vec![(0, 8, 8, false)]
+        );
+    }
+
+    /// Invariants of the classed packing over every lane count 1..=8, row width 1..=8
+    /// (uniform and ramped) and class mask: groups are consecutive whole lanes covering
+    /// every lane and row once, of one class, within their class cap (or a single
+    /// lane), and a wider wide cap never makes more groups.
+    #[test]
+    fn classed_row_groups_cover_and_respect_caps_for_every_shape() {
+        for lanes in 1..=8usize {
+            for width in 1..=8usize {
+                for ramp in [false, true] {
+                    let rows: Vec<usize> = (0..lanes)
+                        .map(|lane| if ramp { 1 + (lane + width) % 8 } else { width })
+                        .collect();
+                    for mask in 0..(1u32 << lanes) {
+                        let wide: Vec<bool> = (0..lanes).map(|l| mask >> l & 1 == 1).collect();
+                        let mut counts = Vec::new();
+                        for cap in [32usize, 48, 64] {
+                            let groups = pack_classed_row_groups_with_cap(&rows, &wide, cap);
+                            let mut next_lane = 0;
+                            for g in &groups {
+                                assert_eq!(g.first_lane, next_lane);
+                                let members = &rows[g.first_lane..g.first_lane + g.lanes];
+                                assert_eq!(g.rows, members.iter().sum::<usize>());
+                                assert!(wide[g.first_lane..g.first_lane + g.lanes]
+                                    .iter()
+                                    .all(|&w| w == g.wide));
+                                let class_cap = if g.wide { cap } else { LANE_MAX_ROWS };
+                                assert!(g.rows <= class_cap || g.lanes == 1);
+                                next_lane += g.lanes;
+                            }
+                            assert_eq!(next_lane, lanes);
+                            assert_eq!(
+                                groups.iter().map(|g| g.rows).sum::<usize>(),
+                                rows.iter().sum::<usize>()
+                            );
+                            counts.push(groups.len());
+                        }
+                        assert!(
+                            counts[0] >= counts[1] && counts[1] >= counts[2],
+                            "{counts:?}"
+                        );
+                        // No wide lane: the plain 8-row packing at every cap.
+                        if mask == 0 {
+                            let plain = pack_row_groups(&rows, LANE_MAX_ROWS).len();
+                            assert!(counts.iter().all(|&n| n == plain));
+                        }
+                    }
+                }
+            }
+        }
+        // The process default (no wide flag set in the test process) packs at 32.
+        let rows = [6usize; 8];
+        assert_eq!(
+            pack_classed_row_groups(&rows, &[true; 8]),
+            pack_classed_row_groups_with_cap(&rows, &[true; 8], 32)
+        );
     }
 
     #[test]

@@ -4702,6 +4702,41 @@ pub fn qwen4_ep_wide_verify_all_lanes() -> bool {
     developer_bool("HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES", false)
 }
 
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` (developer, default 32): the rows one wide-class
+/// verify group may carry (`pack_classed_row_groups`' wide cap) and, with it, the EP
+/// row-gather capacity of the verify scope. An unsigned integer clamped to
+/// [`QWEN4_EP_WIDE_VERIFY_ROWS_MIN`]`..=`[`QWEN4_EP_WIDE_VERIFY_ROWS_MAX`]; unset or
+/// unparsable is the default (32, today's shipped width). Read only when a wide verify
+/// flag is on ([`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] or `HIPFIRE_QWEN4_EP_WIDE_VERIFY`);
+/// the arch forward lowers it further to the lowest hard limit of any stage that runs
+/// the wide group (`gpu_forward::qwen4_ep_wide_group_cap`). Every rank of a mesh must
+/// run with the same value (the packing rule is shared by the root's verify seal and
+/// every rank's lane forward).
+pub const QWEN4_EP_WIDE_VERIFY_ROWS_ENV: &str = "HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS";
+/// Floor and default of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: the 32-row wide pass.
+pub const QWEN4_EP_WIDE_VERIFY_ROWS_MIN: usize = 32;
+/// Ceiling of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: the physical verify window
+/// ([`QWEN4_VERIFY_MAX_ROWS`]).
+pub const QWEN4_EP_WIDE_VERIFY_ROWS_MAX: usize = QWEN4_VERIFY_MAX_ROWS;
+
+/// Pure parse of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: trimmed unsigned integer clamped
+/// to the documented range; `None`, empty or unparsable (including negative) is
+/// [`QWEN4_EP_WIDE_VERIFY_ROWS_MIN`].
+pub fn qwen4_ep_wide_verify_rows_value(raw: Option<&str>) -> usize {
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map_or(QWEN4_EP_WIDE_VERIFY_ROWS_MIN, |rows| {
+            rows.clamp(QWEN4_EP_WIDE_VERIFY_ROWS_MIN, QWEN4_EP_WIDE_VERIFY_ROWS_MAX)
+        })
+}
+
+/// [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`] read once through the process snapshot.
+pub fn qwen4_ep_wide_verify_rows() -> usize {
+    static ROWS: LazyLock<usize> = LazyLock::new(|| {
+        qwen4_ep_wide_verify_rows_value(process_value(QWEN4_EP_WIDE_VERIFY_ROWS_ENV).as_deref())
+    });
+    *ROWS
+}
+
 pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
     process_value(name).map(Into::into)
 }
@@ -8223,6 +8258,27 @@ mod tests {
         assert!(line.contains(mtp_host_spill_reason()), "{line}");
         assert!(line.contains("21 expert blobs"), "{line}");
         assert!(line.contains("offload_exec=pcie"), "{line}");
+    }
+
+    #[test]
+    fn ep_wide_verify_rows_clamps_to_32_to_64_and_defaults_to_32() {
+        assert_eq!(qwen4_ep_wide_verify_rows_value(None), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("x")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("-48")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("4.5")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("0")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("8")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("31")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("32")), 32);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some(" 48 ")), 48);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("63")), 63);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("64")), 64);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("65")), 64);
+        assert_eq!(qwen4_ep_wide_verify_rows_value(Some("99999")), 64);
+        assert_eq!(QWEN4_EP_WIDE_VERIFY_ROWS_MAX, QWEN4_VERIFY_MAX_ROWS);
+        // The live snapshot (nothing sets it in the test process) is the default.
+        assert_eq!(qwen4_ep_wide_verify_rows(), 32);
     }
 
     #[test]

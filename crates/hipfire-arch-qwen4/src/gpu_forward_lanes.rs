@@ -1137,8 +1137,13 @@ pub const fn lane_is_wide_for(flag: bool, all_lanes: bool, plan_wide: bool) -> b
 /// The decode groups of a step as GPU segments: [`pack_classed_row_groups`] with each
 /// group's first row and first lane.
 fn classed_segments(rows: &[usize], wide: &[bool]) -> Vec<Segment> {
+    segments_of_groups(pack_classed_row_groups(rows, wide))
+}
+
+/// Packed row groups as GPU segments (first row, rows, first lane of each).
+fn segments_of_groups(groups: Vec<crate::mesh_lane_protocol::RowGroup>) -> Vec<Segment> {
     let mut begin = 0;
-    pack_classed_row_groups(rows, wide)
+    groups
         .into_iter()
         .map(|group| {
             let segment = Segment {
@@ -2141,8 +2146,9 @@ fn forward_lanes_scoped(
         }
         state
     } else {
-        // The singleton's one-row stream storage; every segment here is at
-        // most LANE_MAX_ROWS rows and must agree with it.
+        // The singleton's one-row stream storage; every segment here (at most
+        // LANE_MAX_ROWS rows row-exact, at most the wide cap -- below the 512-row
+        // F16 WMMA threshold -- when wide) must agree with it, else the step refuses.
         let state = gpu.qwen4_bf16_streams(1);
         if gpu.qwen4_bf16_streams(widest) != state {
             return Err(invalid("lane segments disagree on the HC stream storage"));
@@ -4866,6 +4872,48 @@ mod tests {
                 .map(|g| (g.begin, g.rows, g.first_lane))
                 .collect::<Vec<_>>(),
             vec![(0, 16, 0), (16, 8, 4), (24, 8, 6)]
+        );
+    }
+
+    /// The GPU segments of the wide groups at caps 32 / 48 / 64 are the protocol's
+    /// groups (first row, rows, first lane), so the executed stage launches match the
+    /// sealed ledger at every cap; 8 lanes x 6 rows is two segments at 32 and one at 48.
+    #[test]
+    fn wide_segments_follow_the_protocol_groups_at_every_cap() {
+        use crate::mesh_lane_protocol::pack_classed_row_groups_with_cap;
+        let shape = |segs: &[Segment]| {
+            segs.iter()
+                .map(|s| (s.begin, s.rows, s.first_lane))
+                .collect::<Vec<_>>()
+        };
+        let rows = [6usize; 8];
+        let all = [true; 8];
+        assert_eq!(
+            shape(&segments_of_groups(pack_classed_row_groups_with_cap(
+                &rows, &all, 32
+            ))),
+            vec![(0, 30, 0), (30, 18, 5)]
+        );
+        for cap in [48, 64] {
+            assert_eq!(
+                shape(&segments_of_groups(pack_classed_row_groups_with_cap(
+                    &rows, &all, cap
+                ))),
+                vec![(0, 48, 0)]
+            );
+        }
+        // Mixed step at cap 48: wide(12) / exact(6) / wide(6) back to back in row order.
+        let wide = [true, true, false, true];
+        assert_eq!(
+            shape(&segments_of_groups(pack_classed_row_groups_with_cap(
+                &[6; 4], &wide, 48
+            ))),
+            vec![(0, 12, 0), (12, 6, 2), (18, 6, 3)]
+        );
+        // The process default (no wide flag in the test process) is the 32-row cap.
+        assert_eq!(
+            shape(&classed_segments(&rows, &all)),
+            vec![(0, 30, 0), (30, 18, 5)]
         );
     }
 

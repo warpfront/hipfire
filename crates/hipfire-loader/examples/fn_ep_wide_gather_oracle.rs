@@ -34,6 +34,11 @@
 //! before its call; the wide arm is compared with the ref arm each iteration; a
 //! watchdog aborts the process (exit 3) when one call exceeds `--hang-secs`.
 //!
+//! `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS=48` (32..=64, lowered to the tightest stage limit,
+//! 51 rows at top-10: the 512-slot owner assignment) widens the gather capacity, the
+//! `--rows` ceiling and the soak's row range to that many rows; run
+//! `--closed-scope --rows 33,40,48` for the 48-row closeness proof.
+//!
 //! ```text
 //! HIPFIRE_QWEN4_EP_WIDE_VERIFY=1 fn_ep_wide_gather_oracle --model M --max-seq 4096 \
 //!     [--layers 0,1,..|all] [--rows 9,12,16,17,24,31,32] [--seeds 3] \
@@ -126,8 +131,12 @@ fn parse_args() -> R<Args> {
     if args.model.is_empty() {
         return Err("--model is required".into());
     }
-    if args.rows.iter().any(|&n| n == 0 || n > 32) {
-        return Err("--rows values must be 1..=32".into());
+    let wide_cap = hipfire_arch_qwen4::gpu_forward::qwen4_ep_wide_group_cap();
+    if args.rows.iter().any(|&n| n == 0 || n > wide_cap) {
+        return Err(format!(
+            "--rows values must be 1..={wide_cap} (HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS={}, lowered to the stage limit; needs a wide verify flag above 32)",
+            hipfire_config::qwen4_ep_wide_verify_rows()
+        ));
     }
     Ok(args)
 }
@@ -271,7 +280,7 @@ fn main() {
 fn run(args: Args) -> R<i32> {
     let started = Instant::now();
     let wide_flag = hipfire_arch_qwen4::gpu_forward::qwen4_ep_gather_rows()
-        == hipfire_arch_qwen4::gpu_forward::QWEN4_EP_GATHER_VERIFY_ROWS;
+        > hipfire_arch_qwen4::gpu_forward::QWEN4_EP_GATHER_MAX_ROWS;
     eprintln!(
         "[fn_ep_wide_gather_oracle] loading {} (wide verify gather {})",
         args.model,
@@ -320,6 +329,8 @@ fn run(args: Args) -> R<i32> {
         "top_k": top_k,
         "gather_rows": gather_rows,
         "gather_slots": gather_rows * top_k,
+        "wide_group_cap": hipfire_arch_qwen4::gpu_forward::qwen4_ep_wide_group_cap(),
+        "wide_rows_env": hipfire_config::qwen4_ep_wide_verify_rows(),
         "gather_capacity_bytes_per_rank": capacity_bytes,
         "gather_capacity_bytes_flag_off": off_bytes,
         "gather_capacity_extra_bytes": capacity_bytes - off_bytes,
@@ -468,7 +479,7 @@ fn run(args: Args) -> R<i32> {
         let mut max_call_ms = 0u128;
         while soak_started.elapsed() < Duration::from_secs(args.soak_secs) {
             let layer = layers[(rng.next() % layers.len() as u64) as usize];
-            let n = 9 + (rng.next() % 24) as usize;
+            let n = 9 + (rng.next() % (gather_rows as u64 - 8)) as usize;
             let input = input_rows(rng.next(), n, hidden);
             let delay = rng.next() % (args.skew_ms * 1000 + 1);
             let rank0_lags = iters % 2 == 0;

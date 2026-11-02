@@ -1859,7 +1859,8 @@ mod tests {
         let mut cost = vec![1.0f32];
         cost.extend((1..=k).map(|d| {
             let rows = vec![1 + d; lanes];
-            let spill = crate::gpu_forward_lanes::row_group_count(&rows).saturating_sub(1);
+            let spill = crate::gpu_forward_lanes::row_group_count(&rows, &vec![false; rows.len()])
+                .saturating_sub(1);
             model.window_units(lanes, d, spill as f64 / lanes as f64)
         }));
         let depth = batched_depth(agreement, k, &cost);

@@ -100,6 +100,13 @@ pub const MAX_RANKS: usize = 8;
 pub const MIN_BUFFERS: usize = 2;
 pub const MAX_BUFFERS: usize = 4;
 
+/// Slots a crossing tag's slot field holds without saturating ([`CrossingTag`]): the
+/// ceiling of the slot count a call can carry while a rank disagreement on it stays
+/// detectable. `slots = rows * top_k`, so 6,553 rows at top-10. Callers that size a
+/// gather (the EP lane wide cap) stay below it; the transport itself does not refuse
+/// larger specs (`ep2_boundary_micro` builds 65,536 slots).
+pub const MAX_CALL_SLOTS: usize = 0xFFFF;
+
 /// Where one gather call takes the owner rank of each slot from. Both are
 /// device tensors of `slots` i32 values in slot order, valid on the calling
 /// rank's stream before the gather runs.
@@ -385,7 +392,7 @@ impl CrossingTag {
             (kind as u64)
                 | ((buffer as u64 & 0xF) << 4)
                 | ((layer.min(NO_LAYER) as u64) << 8)
-                | ((slots.min(0xFFFF) as u64) << 24)
+                | ((slots.min(MAX_CALL_SLOTS) as u64) << 24)
                 | ((seq & 0xFF_FFFF) << 40),
         )
     }
@@ -1177,6 +1184,32 @@ pub(crate) mod tests {
             let tag = CrossingTag::new(GatherKind::ExpertModulo, 1, 7, rows * 10, 3);
             assert_eq!(tag.slots(), rows * 10);
         }
+    }
+
+    /// The wider wide-verify capacities (`HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS`): 48 rows
+    /// (480 slots), 51 (510, the owner-assign ceiling at top-10) and 64 (640) all
+    /// validate and size, admit every call up to their row count and refuse one
+    /// more; a crossing tag carries each count without saturating.
+    #[test]
+    fn wide_verify_capacity_48_to_64_rows() {
+        for cap_rows in [48usize, 51, 64] {
+            let s = spec(2, cap_rows * 10, 2048 * 4);
+            assert!(s.validate().is_ok(), "{cap_rows} rows");
+            assert_eq!(s.buffer_bytes(), cap_rows * 10 * 8192);
+            for rows in 1..=cap_rows {
+                assert!(s.check_call_slots(rows * 10).is_ok(), "{rows}/{cap_rows}");
+            }
+            assert!(s.check_call_slots((cap_rows + 1) * 10).is_err());
+            assert!(s.check_buffer_len(0, cap_rows * 10 * 8192).is_ok());
+            assert!(s.check_buffer_len(0, 320 * 8192).is_err());
+            let tag = CrossingTag::new(GatherKind::Explicit, 2, 11, cap_rows * 10, 9);
+            assert_eq!(tag.slots(), cap_rows * 10);
+            assert!(cap_rows * 10 <= MAX_CALL_SLOTS);
+        }
+        // The tag saturates (and so stops resolving a slot-count disagreement) past
+        // its field; the arch wide-cap stage limits keep callers below it.
+        let tag = CrossingTag::new(GatherKind::ExpertModulo, 0, 0, MAX_CALL_SLOTS + 10, 0);
+        assert_eq!(tag.slots(), MAX_CALL_SLOTS);
     }
 
     #[test]

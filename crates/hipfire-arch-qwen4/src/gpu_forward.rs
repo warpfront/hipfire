@@ -2296,7 +2296,7 @@ pub(crate) fn ep_lane_moe_rows(
     }
     if rows > cap {
         return Err(invalid(format!(
-            "an EP lane MoE invocation of {rows} rows exceeds the {cap}-row gather cap"
+            "an EP lane MoE invocation of {rows} rows exceeds the {cap}-row gather cap (stage EP row gather: buffers, transport slots and the 512-slot owner assignment; HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS sizes it when a wide verify flag is on)"
         )));
     }
     if route_rows != rows {
@@ -2574,34 +2574,145 @@ pub const QWEN4_EP_GATHER_BUFFERS: usize = 4;
 /// the EP table + row gather; larger chunks run the full (P2P) table.
 pub const QWEN4_EP_GATHER_MAX_ROWS: usize = 8;
 
-/// Gather capacity (rows) of the verify scope under
-/// [`QWEN4_EP_WIDE_VERIFY_ENV`]: one 32-row lane verify pass (8 lanes x 4 rows).
-/// A row-exactness bound is separate ([`crate::gpu_forward_lanes::LANE_MAX_ROWS`]).
-pub const QWEN4_EP_GATHER_VERIFY_ROWS: usize = 32;
+/// Default wide-class verify width (rows) and the gather capacity of the verify scope
+/// under [`QWEN4_EP_WIDE_VERIFY_ENV`] / `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`: one
+/// 32-row lane verify pass (8 lanes x 4 rows). `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS`
+/// (`hipfire_config::qwen4_ep_wide_verify_rows`, 32..=64) widens it, subject to
+/// [`ep_wide_stage_limits`]; this constant is that flag's floor and default. A
+/// row-exactness bound is separate ([`crate::gpu_forward_lanes::LANE_MAX_ROWS`]).
+pub const QWEN4_EP_GATHER_VERIFY_ROWS: usize = hipfire_config::QWEN4_EP_WIDE_VERIFY_ROWS_MIN;
 
 /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY=1` (developer, default off): size every EP
 /// rank's row-gather buffers, the gather transport's slot capacity and the
-/// balanced-owner slot array for [`QWEN4_EP_GATHER_VERIFY_ROWS`] rows instead of
+/// balanced-owner slot array for [`qwen4_ep_wide_group_cap`] rows (32 unless
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` says otherwise) instead of
 /// [`QWEN4_EP_GATHER_MAX_ROWS`]. Capacity only: no route, segmentation or kernel
 /// choice changes with it; off allocates exactly what it always did.
 pub const QWEN4_EP_WIDE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_WIDE_VERIFY";
 
-/// The rows one gathered EP call may carry on this process: 8 by default, 32
-/// with [`QWEN4_EP_WIDE_VERIFY_ENV`]. Every rank reads the same process snapshot.
-pub fn qwen4_ep_gather_rows() -> usize {
-    ep_gather_rows(
-        hipfire_config::developer_bool(QWEN4_EP_WIDE_VERIFY_ENV, false)
-            || hipfire_config::qwen4_ep_sampled_wide_verify(),
-    )
+/// Routed experts per token of every Flash-Next trunk MoE layer: the grouped MoE
+/// kernels of the lane route are `*_top10` (`gemm_mq4g128v2_moe_grouped_top10`,
+/// `moe_down_combine_top10_batched`). The packer's process-wide wide cap
+/// ([`qwen4_ep_wide_group_cap`]) is derived at this top-k; a model that routes more
+/// is refused when its gather state is built ([`ep_gather_capacity_check`]).
+pub const QWEN4_EP_WIDE_TOP_K: usize = 10;
+
+/// One hard row limit of a stage that runs a wide-class verify group.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpWideStageLimit {
+    /// The stage and the code that owns the limit.
+    pub stage: &'static str,
+    /// Most rows of one wide group the stage serves.
+    pub max_rows: usize,
 }
 
-/// [`qwen4_ep_gather_rows`] for an explicit flag value.
-pub const fn ep_gather_rows(wide_verify: bool) -> usize {
+/// The hard row limits of the stages a wide group runs through, at `top_k` routed
+/// experts per row. Every other stage of the wide path (dense prefill-class GEMMs,
+/// the grouped MoE scatter / gate-up / down / unscatter / combine chain, the lane
+/// step scratch, `StepStore` rows) is sized by the step's rows or by
+/// `QWEN4_VERIFY_MAX_ROWS` and appears here only through the last entry.
+pub const fn ep_wide_stage_limits(top_k: usize) -> [EpWideStageLimit; 3] {
+    let top_k = if top_k == 0 { 1 } else { top_k };
+    [
+        // One 512-thread workgroup; `slots` routed ids, `1..=512`.
+        EpWideStageLimit {
+            stage: "EP balanced-owner assignment (rdna_compute::moe::qwen4_ep_owner_assign, 512-slot contract)",
+            max_rows: rdna_compute::moe::QWEN4_EP_OWNER_EXPERTS / top_k,
+        },
+        // The crossing tag carries the call's slot count in a 16-bit field.
+        EpWideStageLimit {
+            stage: "EP row-gather crossing tag (hipfire_runtime::ep_row_gather, 16-bit slot field)",
+            max_rows: hipfire_runtime::ep_row_gather::MAX_CALL_SLOTS / top_k,
+        },
+        // hyper_write / row-tile twins / GDN ring and verify scratch bound.
+        EpWideStageLimit {
+            stage: "physical verify window (hipfire_config::QWEN4_VERIFY_MAX_ROWS)",
+            max_rows: hipfire_config::QWEN4_VERIFY_MAX_ROWS,
+        },
+    ]
+}
+
+/// The effective wide-class group cap for a requested width and `top_k`: the request
+/// lowered to the tightest stage limit. The second value is the stage that lowered it
+/// (`None` when the request fits every stage).
+pub fn ep_wide_group_cap_for(requested: usize, top_k: usize) -> (usize, Option<EpWideStageLimit>) {
+    let mut cap = requested;
+    let mut binding = None;
+    for limit in ep_wide_stage_limits(top_k) {
+        if limit.max_rows < cap {
+            cap = limit.max_rows;
+            binding = Some(limit);
+        }
+    }
+    (cap, binding)
+}
+
+/// Whether a wide verify flag is on: `HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY` or
+/// [`QWEN4_EP_WIDE_VERIFY_ENV`].
+pub fn qwen4_ep_wide_flags_on() -> bool {
+    hipfire_config::developer_bool(QWEN4_EP_WIDE_VERIFY_ENV, false)
+        || hipfire_config::qwen4_ep_sampled_wide_verify()
+}
+
+/// The rows one wide-class verify group (and one gathered EP call of the verify scope)
+/// may carry on this process, resolved once: [`QWEN4_EP_GATHER_VERIFY_ROWS`] (32)
+/// unless a wide verify flag is on, in which case
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` (32..=64), lowered to the tightest
+/// [`ep_wide_stage_limits`] entry at [`QWEN4_EP_WIDE_TOP_K`]. A request above the
+/// limit is logged once, naming the stage: the packer then splits the request into
+/// more wide groups of whole lanes (the shipped behaviour above 32 rows). Every rank
+/// reads the same process snapshot.
+pub fn qwen4_ep_wide_group_cap() -> usize {
+    static CAP: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        if !qwen4_ep_wide_flags_on() {
+            return QWEN4_EP_GATHER_VERIFY_ROWS;
+        }
+        let requested = hipfire_config::qwen4_ep_wide_verify_rows();
+        let (cap, binding) = ep_wide_group_cap_for(requested, QWEN4_EP_WIDE_TOP_K);
+        if let Some(limit) = binding {
+            eprintln!(
+                "qwen4 EP wide verify: {}={requested} exceeds the limit of stage {} ({} rows at top-{QWEN4_EP_WIDE_TOP_K}); wide groups cap at {cap} rows (larger requests split into more wide groups of whole lanes)",
+                hipfire_config::QWEN4_EP_WIDE_VERIFY_ROWS_ENV,
+                limit.stage,
+                limit.max_rows,
+            );
+        }
+        cap
+    });
+    *CAP
+}
+
+/// The rows one gathered EP call may carry on this process: 8 by default,
+/// [`qwen4_ep_wide_group_cap`] with a wide verify flag. Every rank reads the same
+/// process snapshot.
+pub fn qwen4_ep_gather_rows() -> usize {
+    ep_gather_rows(qwen4_ep_wide_flags_on(), qwen4_ep_wide_group_cap())
+}
+
+/// [`qwen4_ep_gather_rows`] for explicit flag and wide-cap values.
+pub const fn ep_gather_rows(wide_verify: bool, wide_cap: usize) -> usize {
     if wide_verify {
-        QWEN4_EP_GATHER_VERIFY_ROWS
+        wide_cap
     } else {
         QWEN4_EP_GATHER_MAX_ROWS
     }
+}
+
+/// Refuse, naming the stage and its limit, a gather capacity of `rows` rows that some
+/// stage cannot serve at `top_k` routed experts per row. Run when a rank's gather
+/// state is built (load time), so an over-wide request never reaches a launch.
+pub fn ep_gather_capacity_check(rows: usize, top_k: usize) -> Result<(), Qwen4GpuForwardError> {
+    for limit in ep_wide_stage_limits(top_k) {
+        if rows > limit.max_rows {
+            return Err(invalid(format!(
+                "EP gather capacity of {rows} rows exceeds the limit of stage {}: {} rows at top-{top_k}; lower {}",
+                limit.stage,
+                limit.max_rows,
+                hipfire_config::QWEN4_EP_WIDE_VERIFY_ROWS_ENV,
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Device bytes of one rank's EP gather state that scale with the gather
@@ -4151,6 +4262,9 @@ impl Qwen4ForwardEp {
     ) -> Result<Self, Qwen4GpuForwardError> {
         validate_ep_placement(placement, config.num_experts)?;
         let gather_rows = qwen4_ep_gather_rows();
+        // Refuse at load, naming the stage, a capacity some stage cannot serve at this
+        // model's top-k (the packer's process cap assumes `QWEN4_EP_WIDE_TOP_K`).
+        ep_gather_capacity_check(gather_rows, config.num_experts_per_tok)?;
         let elements = gather_rows
             .checked_mul(config.num_experts_per_tok)
             .and_then(|slots| slots.checked_mul(config.hidden_size))
@@ -7449,7 +7563,7 @@ pub(crate) fn seal_moe_rows<'a>(
         ));
     }
     if row_gather.is_some() {
-        ep_lane_moe_rows(rows, rows, ep_gather_rows(false))?;
+        ep_lane_moe_rows(rows, rows, QWEN4_EP_GATHER_MAX_ROWS)?;
     }
     let shared = MoeSharedWeights {
         selector: runtime.shared_scalar.dispatch_ref(),
@@ -22261,11 +22375,12 @@ mod seal_view_identity_tests {
     #[test]
     fn ep_wide_verify_gather_accounting_covers_9_to_32_rows() {
         const TOP_K: usize = 10;
-        assert_eq!(ep_gather_rows(false), 8);
-        assert_eq!(ep_gather_rows(true), 32);
-        assert_eq!(ep_gather_slots(ep_gather_rows(false), TOP_K), 80);
-        assert_eq!(ep_gather_slots(ep_gather_rows(true), TOP_K), 320);
-        let wide = ep_gather_rows(true);
+        assert_eq!(ep_gather_rows(false, 32), 8);
+        assert_eq!(ep_gather_rows(false, 64), 8);
+        assert_eq!(ep_gather_rows(true, 32), 32);
+        assert_eq!(ep_gather_slots(ep_gather_rows(false, 32), TOP_K), 80);
+        assert_eq!(ep_gather_slots(ep_gather_rows(true, 32), TOP_K), 320);
+        let wide = ep_gather_rows(true, 32);
         for rows in 1..=wide {
             assert!(ep_lane_moe_rows(rows, rows, wide).is_ok(), "{rows} rows");
             // The call's slots never exceed the transport capacity or the
@@ -22276,7 +22391,7 @@ mod seal_view_identity_tests {
         }
         for rows in 9..=wide {
             assert!(
-                ep_lane_moe_rows(rows, rows, ep_gather_rows(false)).is_err(),
+                ep_lane_moe_rows(rows, rows, ep_gather_rows(false, 32)).is_err(),
                 "{rows} rows stay refused with the flag off"
             );
         }
@@ -22299,6 +22414,67 @@ mod seal_view_identity_tests {
             next = range.end;
         }
         assert_eq!(next, ep_gather_slots(wide, TOP_K));
+    }
+
+    /// The wide cap at 32 / 48 / 64 rows: the default is today's 32; 48 fits every
+    /// stage at top-10; 64 is lowered to the 512-slot owner-assign contract (51 rows)
+    /// and the packer then splits instead of mis-running; the load-time check names
+    /// the stage; flag off never reads the requested width.
+    #[test]
+    fn ep_wide_group_cap_follows_the_request_and_the_tightest_stage() {
+        const TOP_K: usize = QWEN4_EP_WIDE_TOP_K;
+        assert_eq!(TOP_K, 10);
+        assert_eq!(QWEN4_EP_GATHER_VERIFY_ROWS, 32);
+        let owner_rows = rdna_compute::moe::QWEN4_EP_OWNER_EXPERTS / TOP_K;
+        assert_eq!(owner_rows, 51);
+        for requested in [32, 40, 48, 51] {
+            assert_eq!(ep_wide_group_cap_for(requested, TOP_K), (requested, None));
+        }
+        for requested in [52, 56, 64] {
+            let (cap, binding) = ep_wide_group_cap_for(requested, TOP_K);
+            assert_eq!(cap, owner_rows, "{requested}");
+            let binding = binding.expect("a stage lowers the request");
+            assert!(binding.stage.contains("owner"), "{}", binding.stage);
+            assert_eq!(binding.max_rows, owner_rows);
+        }
+        // Every stage limit holds the 32-row default at any top-k up to 16 (the
+        // owner-assign contract is the tightest at 512 / top_k).
+        for top_k in 1..=16 {
+            assert_eq!(ep_wide_group_cap_for(32, top_k).0, 32, "top-{top_k}");
+        }
+        // The gather state of every cap the packer can ask for passes the load check
+        // at top-10, with slots within the owner contract; 64 rows is refused.
+        for rows in [8, 32, 40, 48, 51] {
+            assert!(ep_gather_capacity_check(rows, TOP_K).is_ok(), "{rows}");
+            assert!(ep_gather_slots(rows, TOP_K) <= rdna_compute::moe::QWEN4_EP_OWNER_EXPERTS);
+        }
+        for rows in [52, 64] {
+            let error = ep_gather_capacity_check(rows, TOP_K)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("owner"), "{error}");
+            assert!(error.contains("51"), "{error}");
+            assert!(
+                error.contains("HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS"),
+                "{error}"
+            );
+        }
+        // A wider-routing model lowers the cap further (top-16: 32 rows).
+        assert_eq!(ep_wide_group_cap_for(48, 16).0, 32);
+        assert!(ep_gather_capacity_check(48, 16).is_err());
+        assert!(ep_gather_capacity_check(32, 16).is_ok());
+        // Flag off ignores the request; flag on takes the (already limited) cap.
+        for cap in [32, 48, 51] {
+            assert_eq!(ep_gather_rows(false, cap), QWEN4_EP_GATHER_MAX_ROWS);
+            assert_eq!(ep_gather_rows(true, cap), cap);
+        }
+        // Device bytes at hidden 2048 (Flash-Next): 8 / 32 / 48 / 51 rows.
+        let mib = |rows| ep_gather_capacity_bytes(rows, TOP_K, 2048) as f64 / (1 << 20) as f64;
+        assert!((mib(8) - 2.5).abs() < 0.01);
+        assert!((mib(32) - 10.0).abs() < 0.01);
+        assert!((mib(48) - 15.0).abs() < 0.01);
+        // The process default (no wide flag in the test process) is the shipped 32.
+        assert_eq!(qwen4_ep_wide_group_cap(), 32);
     }
 
     /// The buffer sequence of the emitted MoE invocations: lane-major (every
