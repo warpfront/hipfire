@@ -286,11 +286,95 @@ pub struct KernargFacts {
     /// argument's `accesses`; the index source is credited as an ordinary
     /// read of its pointer argument.
     pub indexed: Vec<IndexedArgEffect>,
+    /// Sealed-table analysis only ([`crate::passes::kernargs::analyze_sealed`]):
+    /// the pointer tables the kernel reads entries from, with every access
+    /// whose base derives from such an entry. Not credited to any argument
+    /// (the pointees are not arguments); a `Conditional` status is void without
+    /// a matching `sealed_table` runtime witness.
+    pub sealed: Vec<SealedTableUse>,
 }
 impl KernargFacts {
     pub fn arg_at(&self, offset: u32) -> Option<&ArgFacts> {
         self.args.iter().find(|a| a.offset == offset)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sealed pointer tables: a 64-bit pointer loaded from `table[i]`, `i` guarded
+// by `i < n`, then only read through.
+// ---------------------------------------------------------------------------
+
+/// The bound a sealed-table index is compared against (unsigned).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum SealedBound {
+    /// The 4-byte kernarg scalar at this byte offset.
+    Kernarg {
+        offset: u32,
+    },
+    Const(u32),
+}
+
+/// What the table index of an entry load is. Canonical text: `load@<pc>`,
+/// `karg32:<offset>`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum SealedIndex {
+    /// The 32-bit value loaded by the instruction at layout position `pc`.
+    Load { pc: u32 },
+    /// The kernarg scalar at this byte offset.
+    Kernarg { offset: u32 },
+}
+impl std::fmt::Display for SealedIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Load { pc } => write!(f, "load@{pc}"),
+            Self::Kernarg { offset } => write!(f, "karg32:{offset}"),
+        }
+    }
+}
+
+/// A 64-bit load of `table[index]` that executes only when `index < bound`
+/// (unsigned), on every path from the kernel entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedEntryLoad {
+    pub inst: InstId,
+    pub pc: u32,
+    pub class: AccessClass,
+    pub path: MemPath,
+    pub cache: CacheBits,
+    pub width_bytes: u8,
+    pub index: SealedIndex,
+    /// Layout positions of the unsigned compares that establish
+    /// `index < bound` on the paths reaching the load (sorted).
+    pub guard_pcs: Vec<u32>,
+}
+
+/// A read whose base derives from sealed-table entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedAccess {
+    pub inst: InstId,
+    pub pc: u32,
+    pub class: AccessClass,
+    pub path: MemPath,
+    pub cache: CacheBits,
+    pub width_bytes: u8,
+    /// `pc`s of this table's entry loads the base may derive from (sorted).
+    pub entry_pcs: Vec<u32>,
+}
+
+/// One sealed table of a kernel: argument, bound, entry loads and the reads
+/// through its entries.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SealedTableUse {
+    /// Kernarg byte offset of the pointer argument holding the table base.
+    pub table_arg_offset: u32,
+    pub bound: SealedBound,
+    pub entry_bytes: u8,
+    pub entries: Vec<SealedEntryLoad>,
+    pub accesses: Vec<SealedAccess>,
+    /// Every read through an entry of this table is reachable only with that
+    /// entry nonzero (proved on every path): a table holding null entries is
+    /// safe for this kernel.
+    pub null_guarded: bool,
 }
 
 // ---------------------------------------------------------------------------

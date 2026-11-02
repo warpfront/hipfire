@@ -4,7 +4,9 @@
 
 //! The `peacemaker-receipt` schema (receipt v1 = radiowave `PeacemakerRecord`
 //! schema 6; the `railgun` section makes it 7; the conditional indexed-argument
-//! amendment makes it 8 / section 2). `railgun-cert` writes these
+//! amendment makes it 8 / section 2; the sealed-table amendment (pointer tables
+//! loaded from a loader-sealed immutable region) makes it 9 / section 3).
+//! `railgun-cert` writes these
 //! records offline; the runtime reads them through this crate, which depends
 //! on no peacemaker crate (railgun design D12).
 use std::collections::BTreeMap;
@@ -13,10 +15,25 @@ use serde::{Deserialize, Serialize};
 
 pub const RECEIPT_SCHEMA: &str = "peacemaker-receipt";
 /// Receipt v1 (architecture.md §3) is schema 6; the `railgun` section is 7;
-/// guarded/indexed facts (design A §A9.2) are 8. A v7 receipt is never
-/// reinterpreted: unknown versions fail admission.
-pub const RECEIPT_SCHEMA_VERSION: u32 = 8;
-pub const RAILGUN_SECTION_VERSION: u32 = 2;
+/// guarded/indexed facts (design A §A9.2) are 8; sealed-table facts (the
+/// `sealed_table` witness) are 9. A v7/v8 receipt is never reinterpreted:
+/// unknown versions fail admission.
+pub const RECEIPT_SCHEMA_VERSION: u32 = 9;
+pub const RAILGUN_SECTION_VERSION: u32 = 3;
+
+/// Witness kind of a conditional indexed-argument case (design A §A9.2).
+pub const WITNESS_INDEXED_BIND: &str = "indexed_bind";
+/// Witness kind of a sealed-table case: a loader-sealed immutable pointer
+/// table whose pointees are immutable (`railgun::sealed_table`).
+pub const WITNESS_SEALED_TABLE: &str = "sealed_table";
+/// Every witness kind a receipt may name.
+pub const KNOWN_WITNESSES: &[&str] = &[WITNESS_INDEXED_BIND, WITNESS_SEALED_TABLE];
+
+/// `SealedTableRecord.bound_kind`: the guard bound is the 4-byte kernarg
+/// scalar at byte offset `bound_value` (unsigned compare).
+pub const SEALED_BOUND_KERNARG: &str = "kernarg_u32";
+/// The guard bound is the constant `bound_value` (`<= u32::MAX`).
+pub const SEALED_BOUND_CONST: &str = "const_u32";
 
 /// `KernelRecord.status` values.
 pub const STATUS_PROVEN: &str = "proven";
@@ -73,6 +90,120 @@ pub struct IndexedEffectRecord {
     pub index_loads: Vec<IndexLoadRecord>,
     /// Guard `kind@arg_offset` names this effect depends on.
     pub guards: Vec<String>,
+}
+
+/// One entry load of a sealed table (design: `SealedTable` certificate): a
+/// 64-bit load of `table[index]` whose index is, on every path from the kernel
+/// entry, strictly below the table's bound (unsigned).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SealedEntryRecord {
+    /// Layout position of the entry load.
+    pub pc: u32,
+    /// `smem_load` or `vmem_load`.
+    pub class: String,
+    pub path: String,
+    /// Raw cache bits, `th=.. scope=.. glc=.. slc=.. dlc=.. nv=..`.
+    pub cache: String,
+    /// Bytes loaded (the table's entry width).
+    pub width: u32,
+    /// Canonical text of the table index (`load@<pc>`, `karg32:<offset>`).
+    pub index_expr: String,
+    /// Layout positions of the unsigned compares of the index against the
+    /// bound that establish `index < bound` on the paths reaching the load.
+    pub guard_pcs: Vec<u32>,
+}
+
+/// One access whose base derives from sealed-table entries and that only
+/// reads (`vmem_load`/`smem_load`).
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SealedAccessRecord {
+    pub pc: u32,
+    pub class: String,
+    pub path: String,
+    pub cache: String,
+    pub width: u32,
+    /// `pc`s of the table's entry loads this access's base may derive from.
+    pub entry_pcs: Vec<u32>,
+}
+
+/// One sealed table of a kernel: the pointer argument that holds the table, the
+/// bound its index is checked against, and what the kernel does with the
+/// loaded entries. Valid only with a matching `sealed_table` runtime witness:
+/// the argument resolves to a loader-sealed immutable region holding at least
+/// `bound` entries, every entry points into an immutable allocation, and
+/// nothing in the program writes either.
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+pub struct SealedTableRecord {
+    /// Kernarg byte offset of the (pointer) argument holding the table base.
+    pub table_arg_offset: u32,
+    /// [`SEALED_BOUND_KERNARG`] or [`SEALED_BOUND_CONST`].
+    pub bound_kind: String,
+    /// Kernarg byte offset of the 4-byte bound, or the constant.
+    pub bound_value: u64,
+    /// Bytes per table entry (a pointer: 8).
+    pub entry_bytes: u32,
+    pub entries: Vec<SealedEntryRecord>,
+    pub accesses: Vec<SealedAccessRecord>,
+    /// Every read through an entry is reachable only with that entry nonzero
+    /// (proved on every path): the sealed table may then hold null entries.
+    /// Absent (false) for a table whose entries must all be non-null.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub null_guarded: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+impl SealedTableRecord {
+    /// Fail-closed structure check (the digest binds the content; this rejects
+    /// shapes no certifier emits).
+    pub fn validate(&self, symbol: &str) -> Result<(), String> {
+        let bad = |what: &str| {
+            Err(format!(
+                "{symbol}: sealed table @{}: {what}",
+                self.table_arg_offset
+            ))
+        };
+        match self.bound_kind.as_str() {
+            SEALED_BOUND_KERNARG => {
+                if self.bound_value % 4 != 0 || self.bound_value > u64::from(u32::MAX) {
+                    return bad("kernarg bound offset is not a 4-aligned u32");
+                }
+            }
+            SEALED_BOUND_CONST => {
+                if self.bound_value > u64::from(u32::MAX) {
+                    return bad("constant bound exceeds u32");
+                }
+            }
+            _ => return bad("unknown bound kind"),
+        }
+        if self.entry_bytes != 8 {
+            return bad("entry width is not 8 bytes");
+        }
+        if self.entries.is_empty() {
+            return bad("no entry load");
+        }
+        for e in &self.entries {
+            if e.width != self.entry_bytes
+                || !matches!(e.class.as_str(), "smem_load" | "vmem_load")
+                || e.guard_pcs.is_empty()
+                || e.index_expr.is_empty()
+            {
+                return bad("malformed entry load");
+            }
+        }
+        let entry_pcs: Vec<u32> = self.entries.iter().map(|e| e.pc).collect();
+        for a in &self.accesses {
+            if !matches!(a.class.as_str(), "smem_load" | "vmem_load")
+                || a.entry_pcs.is_empty()
+                || !a.entry_pcs.iter().all(|p| entry_pcs.contains(p))
+            {
+                return bad("an access is not a read derived from this table's entries");
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -242,8 +373,14 @@ pub struct KernelRecord {
     pub guards: Vec<GuardRecord>,
     /// Indexed argument effects of the guarded case.
     pub indexed_effects: Vec<IndexedEffectRecord>,
+    /// Sealed pointer tables of the case (`sealed_table` witness). Absent from
+    /// kernels without one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sealed_tables: Vec<SealedTableRecord>,
     /// Witness kinds the runtime must hold before the executable may use the
-    /// effects (`indexed_bind`); non-empty iff conditional.
+    /// effects (`indexed_bind` for `indexed_effects`, `sealed_table` for
+    /// `sealed_tables`); exactly the kinds those fields imply, sorted;
+    /// non-empty iff conditional.
     pub required_witnesses: Vec<String>,
     /// SHA-256 binding object, kernel, status, guards, effects and witnesses
     /// ([`case_digest`]); empty unless conditional.
@@ -256,7 +393,8 @@ pub struct KernelRecord {
     pub guard_flag: Option<u32>,
 }
 
-/// The guarded-case digest under the exact object receipt (§A9.2).
+/// The guarded-case digest under the exact object receipt (§A9.2; v2 binds
+/// `sealed_tables` as well).
 pub fn case_digest(
     object_sha256: &str,
     device_elf_sha256: &str,
@@ -264,7 +402,7 @@ pub fn case_digest(
     k: &KernelRecord,
 ) -> String {
     let bytes = serde_json::to_vec(&(
-        "railgun-case-v1",
+        "railgun-case-v2",
         object_sha256,
         device_elf_sha256,
         arch,
@@ -273,6 +411,7 @@ pub fn case_digest(
         k.kernarg_size,
         &k.guards,
         &k.indexed_effects,
+        &k.sealed_tables,
         &k.required_witnesses,
     ))
     .expect("case digest input serialises");
@@ -280,8 +419,22 @@ pub fn case_digest(
 }
 
 impl KernelRecord {
+    /// The witness kinds this record's case fields imply, sorted.
+    pub fn implied_witnesses(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.indexed_effects.is_empty() {
+            out.push(WITNESS_INDEXED_BIND.to_owned());
+        }
+        if !self.sealed_tables.is_empty() {
+            out.push(WITNESS_SEALED_TABLE.to_owned());
+        }
+        out.sort();
+        out
+    }
+
     /// Fail-closed structural check of the guarded fields against `status`.
-    /// A conditional record needs guards, effects, witnesses and a matching
+    /// A conditional record needs its effects (indexed effects with guards,
+    /// and/or sealed tables), exactly the witnesses they imply and a matching
     /// digest; a proven/unknown record must carry none of them (a v1 row is
     /// never promoted); any other status is rejected.
     pub fn validate_case(
@@ -292,6 +445,7 @@ impl KernelRecord {
     ) -> Result<(), String> {
         let empty = self.guards.is_empty()
             && self.indexed_effects.is_empty()
+            && self.sealed_tables.is_empty()
             && self.required_witnesses.is_empty()
             && self.case_digest.is_empty();
         match self.status.as_str() {
@@ -305,14 +459,34 @@ impl KernelRecord {
                 Ok(())
             }
             STATUS_CONDITIONAL => {
-                if self.guards.is_empty()
-                    || self.indexed_effects.is_empty()
+                let indexed = !self.indexed_effects.is_empty();
+                if (!indexed && self.sealed_tables.is_empty())
+                    || (indexed && self.guards.is_empty())
+                    || (!indexed && !self.guards.is_empty())
                     || self.required_witnesses.is_empty()
                 {
                     return Err(format!(
-                        "{}: conditional record lacks guards, indexed effects or required witnesses",
+                        "{}: conditional record lacks guards, effects or required witnesses",
                         self.symbol
                     ));
+                }
+                if self.required_witnesses != self.implied_witnesses() {
+                    return Err(format!(
+                        "{}: required witnesses {:?} are not the kinds the case implies {:?}",
+                        self.symbol,
+                        self.required_witnesses,
+                        self.implied_witnesses()
+                    ));
+                }
+                for (i, t) in self.sealed_tables.iter().enumerate() {
+                    t.validate(&self.symbol)?;
+                    if self.sealed_tables[..i].iter().any(|o| {
+                        o.table_arg_offset == t.table_arg_offset
+                            && o.bound_kind == t.bound_kind
+                            && o.bound_value == t.bound_value
+                    }) {
+                        return Err(format!("{}: duplicate sealed table", self.symbol));
+                    }
                 }
                 if !self.differential.guarded || self.differential.guards != self.guards {
                     return Err(format!(

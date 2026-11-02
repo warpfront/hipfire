@@ -76,13 +76,16 @@ use crate::isa::OpRow;
 use crate::kernarg::{
     AccessClass, AccessMode, ArgAccess, ArgFacts, ArgRole, CacheBits, DwordFacts, EntryReg, Guard,
     IdxExpr, ImplicitUse, IndexElem, IndexLoad, IndexedArgEffect, KernargFacts, KernelStatus,
-    MemPath, ReadCacheClass, RegionBound, SideReads, Sinks, Unresolved, HIDDEN_GRID_KINDS,
+    MemPath, ReadCacheClass, RegionBound, SealedAccess, SealedBound, SealedEntryLoad, SealedIndex,
+    SealedTableUse, SideReads, Sinks, Unresolved, HIDDEN_GRID_KINDS,
 };
 use crate::metadata::Kernarg;
 use crate::operand::{ImmField, InlineConst, Operand, Special};
 use crate::reg::Kind;
 
-use super::kernarg_ix::{certify, certify_source, load_ext, Interner, Ix, KargKind, CARRY_SCALAR};
+use super::kernarg_ix::{
+    certify, certify_source, load_ext, table_entry, Interner, Ix, KargKind, Node, CARRY_SCALAR,
+};
 
 /// Kernarg dwords tracked individually (512 bytes). Kernels with a larger
 /// segment fall back to the overflow flags: an overflowing pointer root is
@@ -126,6 +129,8 @@ const WI: u8 = 1;
 const WG: u8 = 2;
 const MEM: u8 = 4;
 const TAINT_OVF: u8 = 8;
+/// Influenced by a value loaded from a sealed-table entry (sealed analysis).
+const TBL: u8 = 16;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct Val {
@@ -133,6 +138,10 @@ struct Val {
     src: u8,
     taint: DwSet,
     tf: u8,
+    /// Sealed analysis: bit `k` set when the value may be a derived copy of
+    /// the 64-bit entry loaded by qualified entry site `k` (provenance, like
+    /// `roots`: dropped by `kill`).
+    tbl: u8,
     konst: Option<u32>,
     /// Byte offset from the kernarg segment base, for a `KSEG`-rooted value.
     koff: Option<i64>,
@@ -215,6 +224,7 @@ impl Val {
                 None
             },
             ix: self.ix.join(other.ix),
+            tbl: self.tbl | other.tbl,
         }
     }
     /// Arithmetic combination keeping provenance (add, logic, unknown ops).
@@ -225,6 +235,7 @@ impl Val {
             out.src |= v.src;
             out.taint = out.taint.union(v.taint);
             out.tf |= v.tf;
+            out.tbl |= v.tbl;
         }
         out
     }
@@ -233,6 +244,7 @@ impl Val {
         let mut out = Val::mix(vals);
         out.roots = DwSet::default();
         out.src = 0;
+        out.tbl = 0;
         out
     }
 }
@@ -353,6 +365,10 @@ struct State {
     exec: [Val; 2],
     m0: Val,
     scc: Val,
+    /// Sealed analysis: EXEC is known nonzero (a decided EXECZ/EXECNZ edge
+    /// set it; any EXEC write but a superset `s_or_b32 exec_lo, exec_lo, x`
+    /// clears it; joins keep it only when both sides know it).
+    exec_nz: bool,
 }
 
 impl State {
@@ -368,6 +384,7 @@ impl State {
             exec: [Val::default(); 2],
             m0: Val::default(),
             scc: Val::default(),
+            exec_nz: false,
         }
     }
     fn top(&self) -> u8 {
@@ -441,6 +458,7 @@ impl State {
         self.exec = [self.exec[0].join(o.exec[0]), self.exec[1].join(o.exec[1])];
         self.m0 = self.m0.join(o.m0);
         self.scc = self.scc.join(o.scc);
+        self.exec_nz &= o.exec_nz;
     }
     /// EXEC ⊆ its old value: lanes being disabled keep their current values.
     fn exec_narrow(&mut self) {
@@ -795,13 +813,41 @@ fn mem_op(name: &str) -> MemOp {
 
 /// Resolution of one access base.
 enum Base {
-    Args { hi: DwSet, lo: DwSet },
+    Args {
+        hi: DwSet,
+        lo: DwSet,
+    },
     Side(u8),
+    /// Derived only from the sealed-table entries named by the site mask.
+    Table(u8),
+    /// Either a sealed-table entry (site mask) or an argument pointer (the
+    /// roots): both are plain candidates of one read.
+    Both {
+        mask: u8,
+        hi: DwSet,
+        lo: DwSet,
+    },
     Unresolved(&'static str),
 }
 fn resolve_base(lo: &Val, hi: &Val) -> Base {
     if hi.src & ROOT_OVF != 0 || lo.src & ROOT_OVF != 0 {
         return Base::Unresolved("base-root-overflow");
+    }
+    if hi.tbl != 0 || lo.tbl != 0 {
+        // A sealed-table pointer is a base only as a whole, with nothing else
+        // mixed into either half.
+        let clean = hi.tbl != 0 && hi.tbl == lo.tbl && hi.src == 0 && lo.src == 0;
+        return if clean && hi.roots.is_empty() && lo.roots.is_empty() {
+            Base::Table(hi.tbl)
+        } else if clean && !hi.roots.is_empty() {
+            Base::Both {
+                mask: hi.tbl,
+                hi: hi.roots,
+                lo: lo.roots,
+            }
+        } else {
+            Base::Unresolved("sealed-table-base-mixed")
+        };
     }
     if hi.src & OPAQUE != 0 {
         return Base::Unresolved("base-memory-derived");
@@ -885,6 +931,57 @@ struct Pending {
     loads: Vec<InstId>,
 }
 
+/// A sealed-table entry load seen by the collecting pass: its shape is right,
+/// its guard is not yet proved.
+struct SealedCand {
+    inst: InstId,
+    pos: usize,
+    table_arg_offset: u32,
+    /// The 32-bit index value (`Load(_)` or `K32(_)` node).
+    index: Ix,
+    index_inst: Option<InstId>,
+    index_kernarg: Option<u32>,
+}
+
+/// A qualified entry load: its table, bound and guard compares.
+struct SealedSite {
+    /// Bit in `Val::tbl`.
+    bit: u8,
+    table_arg_offset: u32,
+    bound: SealedBound,
+    index: SealedIndex,
+    guard_pcs: Vec<u32>,
+}
+
+#[derive(Default)]
+struct SealedCtx {
+    /// Entry loads of the right shape, collected by the recording pass.
+    cands: RefCell<BTreeMap<InstId, SealedCand>>,
+    /// `None` while collecting; then the loads whose index is proved below
+    /// its bound on every path.
+    qualified: Option<BTreeMap<InstId, SealedSite>>,
+}
+
+/// A qualified entry load as the recording pass executed it.
+struct EntryRec {
+    pc: u32,
+    class: AccessClass,
+    path: MemPath,
+    cache: CacheBits,
+    width: u8,
+}
+
+/// A read through a base derived from sealed-table entries.
+struct TableAccessRec {
+    inst: InstId,
+    pc: u32,
+    mask: u8,
+    class: AccessClass,
+    path: MemPath,
+    cache: CacheBits,
+    width: u8,
+}
+
 struct Rec {
     accesses: BTreeMap<Target, Vec<ArgAccess>>,
     unresolved: Vec<Unresolved>,
@@ -899,6 +996,8 @@ struct Rec {
     /// Indices (into the supplied guards) of kernarg guards whose constant
     /// was substituted on the replayed CFG.
     guards_used: BTreeSet<usize>,
+    sealed_entries: BTreeMap<InstId, EntryRec>,
+    sealed_accesses: Vec<TableAccessRec>,
 }
 impl Rec {
     fn new(loaded: DwSet) -> Self {
@@ -914,6 +1013,8 @@ impl Rec {
             loads: BTreeMap::new(),
             pending: Vec::new(),
             guards_used: BTreeSet::new(),
+            sealed_entries: BTreeMap::new(),
+            sealed_accesses: Vec::new(),
         }
     }
     fn sink(&mut self, taint: DwSet, tf: u8, bit: u8) {
@@ -961,13 +1062,20 @@ struct Analyzer<'k> {
     /// `Some` for the guarded analysis: constants are substituted and
     /// branches whose SCC is then known are pruned.
     guard: Option<GuardCtx>,
+    /// `Some` for the sealed-table analysis ([`analyze_sealed`]).
+    sealed: Option<SealedCtx>,
+    /// Compare positions that produced each flag atom (sealed analysis).
+    atom_pc: RefCell<BTreeMap<Ix, BTreeSet<u32>>>,
+    /// The access the null-guard replay watches and the table bits its base
+    /// carried when it was replayed.
+    probe: RefCell<(Option<InstId>, u8)>,
 }
 
 /// A1/A3/A4 facts for `kernel`. Never fails: an unsupported arch or ABI, or
 /// an instruction the pass does not model, yields `KernelStatus::Unknown`
 /// with the reason in `unresolved`.
 pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
-    analyze_impl(kernel, arch, None)
+    analyze_impl(kernel, arch, None, false)
 }
 
 /// The guarded analysis of amendment 2026-10-25 §A9.1/§A9.3: the same pass
@@ -983,10 +1091,42 @@ pub fn analyze(kernel: &Kernel, arch: Arch) -> KernargFacts {
 /// (guards cleared), `Unknown` otherwise. The unguarded [`analyze`] result is
 /// unaffected and stays the diagnostic baseline.
 pub fn analyze_guarded(kernel: &Kernel, arch: Arch, guards: &[Guard]) -> KernargFacts {
-    analyze_impl(kernel, arch, Some(guards))
+    analyze_impl(kernel, arch, Some(guards), false)
 }
 
-fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> KernargFacts {
+/// The sealed-table analysis (design: `SealedTable` certificate). The same
+/// pass with extra proof obligations for kernels that read a 64-bit pointer
+/// from `table[i]` and then only read through it (`base-memory-derived` in the
+/// unguarded analysis):
+///
+/// 1. the entry load's address is exactly `table pointer argument +
+///    (ext(i) << 3)` with `i` the 32-bit value one instruction loaded (or a
+///    kernarg scalar), outside every CFG cycle;
+/// 2. on **every** feasible path from the kernel entry to the entry load a
+///    scalar unsigned compare established `i < n` (`n` a kernarg scalar or a
+///    constant). Paths are enumerated and replayed with the pass's own
+///    transfer function (exact constants, SCC, VCC; infeasible branch edges
+///    are pruned), so a flag materialised by a diamond is followed, not
+///    guessed;
+/// 3. every access whose base derives from such an entry is a plain load
+///    (`vmem_load`/`smem_load`), no entry-derived value is stored, used in a
+///    write/LDS address or recombined with another base, and a loaded base is
+///    never an address again.
+///
+/// Returns `Conditional` (with [`KernargFacts::sealed`]) when everything
+/// resolves, else `Unknown` with the exact rule; unqualifiable entry loads add
+/// `sealed-*` rules. The result is void without a matching `sealed_table`
+/// runtime witness.
+pub fn analyze_sealed(kernel: &Kernel, arch: Arch) -> KernargFacts {
+    analyze_impl(kernel, arch, None, true)
+}
+
+fn analyze_impl(
+    kernel: &Kernel,
+    arch: Arch,
+    guards: Option<&[Guard]>,
+    sealed: bool,
+) -> KernargFacts {
     let (args, size) = match &kernel.abi {
         Abi::Hsa {
             metadata,
@@ -1012,7 +1152,7 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
             rule: "unsupported-arch",
             detail: format!("{arch:?}"),
         });
-        return finish(facts, &layout, None, &[]);
+        return finish(facts, &layout, None, &[], Vec::new());
     }
     let body = &kernel.body;
     if body.blocks.is_empty() {
@@ -1021,7 +1161,7 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
             rule: "blocks-not-built",
             detail: String::new(),
         });
-        return finish(facts, &layout, None, &[]);
+        return finish(facts, &layout, None, &[], Vec::new());
     }
     let mut decoded = Vec::with_capacity(body.layout.len());
     for (pos, &id) in body.layout.iter().enumerate() {
@@ -1091,17 +1231,35 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
         decoded,
         ix: RefCell::new(interner),
         guard,
+        sealed: sealed.then(SealedCtx::default),
+        atom_pc: RefCell::new(BTreeMap::new()),
+        probe: RefCell::new((None, 0)),
     };
     let ins = an.fixpoint();
-    for (b, block) in body.blocks.iter().enumerate() {
-        let Some(mut st) = ins[b].clone() else {
-            continue;
-        };
-        for pos in block.range.0..block.range.1 {
-            an.step(&mut st, pos, Some(&mut rec), an.cyclic[b]);
+    an.record(&ins, &mut rec);
+    let mut rejected: Vec<Unresolved> = Vec::new();
+    let mut sealed_uses: Vec<SealedTableUse> = Vec::new();
+    if let Some(ctx) = &an.sealed {
+        let mut cands: Vec<SealedCand> = std::mem::take(&mut *ctx.cands.borrow_mut())
+            .into_values()
+            .collect();
+        cands.sort_by_key(|c| c.pos);
+        let (qualified, rej) = an.qualify(cands);
+        rejected = rej;
+        if !qualified.is_empty() {
+            if let Some(ctx) = an.sealed.as_mut() {
+                ctx.qualified = Some(qualified);
+            }
+            // Second run: the qualified entry loads now carry their table
+            // provenance, so every access through them is attributed.
+            let ins = an.fixpoint();
+            rec = Rec::new(entry_loaded);
+            an.record(&ins, &mut rec);
+            sealed_uses = an.assemble_sealed(&rec);
         }
     }
-    facts.unresolved = std::mem::take(&mut rec.unresolved);
+    rejected.append(&mut rec.unresolved);
+    facts.unresolved = rejected;
     let supplied = an.guard.take().map(|g| g.supplied).unwrap_or_default();
     let layout = std::mem::replace(
         &mut an.layout,
@@ -1110,7 +1268,7 @@ fn analyze_impl(kernel: &Kernel, arch: Arch, guards: Option<&[Guard]>) -> Kernar
             size: 0,
         },
     );
-    finish(facts, &layout, Some(rec), &supplied)
+    finish(facts, &layout, Some(rec), &supplied, sealed_uses)
 }
 
 fn cyclic_blocks(body: &Body) -> Vec<bool> {
@@ -1340,22 +1498,42 @@ impl<'k> Analyzer<'k> {
         ins
     }
 
-    /// Successors of `block` that can execute after `st`. In the guarded
-    /// analysis a conditional SCC branch whose SCC is a known constant keeps
-    /// only its live edge (the guarded CFG); otherwise every edge.
+    /// Which edge of a conditional branch `st` decides: `Some(true)` the taken
+    /// edge only, `Some(false)` the fall-through only, `None` both. The
+    /// guarded analysis decides SCC branches whose SCC is a known constant;
+    /// the sealed analysis additionally decides wave32 VCC branches on a
+    /// known `vcc_lo` (the hardware sets VCCZ from `vcc_lo` alone in wave32,
+    /// which the compiler relies on). EXEC branches are never decided.
+    fn branch_outcome(&self, cond: crate::cfg::Cond, st: &State) -> Option<bool> {
+        use crate::cfg::Cond;
+        if self.guard.is_none() && self.sealed.is_none() {
+            return None;
+        }
+        match cond {
+            Cond::Scc0 | Cond::Scc1 => {
+                let scc = st.scc.konst?;
+                Some((scc != 0) == (cond == Cond::Scc1))
+            }
+            Cond::Vccz | Cond::Vccnz if self.sealed.is_some() && self.wave == Wave::Wave32 => {
+                let vcc = st.s[VCC_LO].konst?;
+                Some((vcc == 0) == (cond == Cond::Vccz))
+            }
+            _ => None,
+        }
+    }
+
+    /// Successors of `block` that can execute after `st`. In the guarded and
+    /// sealed analyses a conditional branch decided by [`Self::branch_outcome`]
+    /// keeps only its live edge; otherwise every edge.
     fn live_succs(&self, block: &crate::cfg::Block, st: &State) -> SmallVec<[usize; 2]> {
-        use crate::cfg::{Cond, Terminator};
-        if self.guard.is_some() {
-            if let (
-                Terminator::Branch {
-                    cond: cond @ (Cond::Scc0 | Cond::Scc1),
-                    taken,
-                    fallthrough,
-                },
-                Some(scc),
-            ) = (&block.term, st.scc.konst)
-            {
-                let take = (scc != 0) == (*cond == Cond::Scc1);
+        use crate::cfg::Terminator;
+        if let Terminator::Branch {
+            cond,
+            taken,
+            fallthrough,
+        } = &block.term
+        {
+            if let Some(take) = self.branch_outcome(*cond, st) {
                 return smallvec::smallvec![if take { taken.0 } else { fallthrough.0 }];
             }
         }
@@ -1552,6 +1730,11 @@ impl<'k> Analyzer<'k> {
                 rec.fail(self.arch, dec, "call");
             }
         }
+        let fx = if self.sealed.is_some() {
+            self.sealed_scalar(st, dec)
+        } else {
+            SealedFx::default()
+        };
         let mut carry: Option<(CarryTo, Ix)> = None;
         let mut scc_konst: Option<bool> = None;
         if inst.effects.mem.is_some() || matches!(inst.form, Form::Vmem(_) | Form::Smem | Form::Ds)
@@ -1641,6 +1824,60 @@ impl<'k> Analyzer<'k> {
             Some((CarryTo::Scc, ix)) => st.scc.ix = ix,
             Some((CarryTo::Vcc, ix)) => st.s[VCC_LO].ix = ix,
             None => {}
+        }
+        // Sealed analysis: exact scalar results (constants through logic ops
+        // and decided selects) and the unsigned-compare witness of SCC.
+        if let Some((i, vals)) = fx.dst_vals {
+            for (k, v) in vals.into_iter().enumerate() {
+                if i + k < NS {
+                    st.s[i + k] = v;
+                    st.masks[i + k] = Mask::Unknown;
+                }
+            }
+        }
+        if let Some((i, c)) = fx.dst_konst {
+            if i < NS {
+                st.s[i].konst = Some(c);
+            }
+        }
+        if let Some(ix) = fx.scc_ix {
+            st.scc.ix = ix;
+        }
+        if let Some(k) = fx.scc_konst {
+            st.scc.konst = Some(u32::from(k));
+        }
+        if let Some((i, ix)) = fx.dst_ix {
+            if i < NS {
+                st.s[i].ix = ix;
+            }
+        }
+        if self.sealed.is_some() && st.exec_nz {
+            let writes_exec = inst.effects.implicit.writes & ImplicitSet::EXEC != 0
+                || dec.parts.iter().any(|p| {
+                    p.fields.iter().any(|f| {
+                        f.def
+                            && matches!(
+                                f.op,
+                                Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi)
+                            )
+                    })
+                });
+            // `s_or_b32 exec_lo, exec_lo, x` only adds lanes: still nonzero.
+            let superset = dec.parts.len() == 1
+                && norm_name(dec.parts[0].name) == "s_or_b32"
+                && dec.parts[0]
+                    .fields
+                    .iter()
+                    .any(|f| f.def && matches!(f.op, Operand::Special(Special::ExecLo)))
+                && dec.parts[0]
+                    .sources()
+                    .any(|f| matches!(f.op, Operand::Special(Special::ExecLo)));
+            if writes_exec && !superset {
+                st.exec_nz = false;
+            }
+        }
+        if fx.exec_nz {
+            st.exec_nz = true;
         }
     }
 
@@ -2372,12 +2609,14 @@ impl<'k> Analyzer<'k> {
                         for v in self.vals(st, addr) {
                             rec.sink(v.taint, v.tf, Sinks::LDS_ADDRESS);
                         }
+                        self.sealed_flow(st, addr, dec, rec, "sealed-table-value-in-address");
                     }
                     if !passthrough {
                         for f in &data_fields {
                             for v in self.vals(st, f) {
                                 rec.sink(v.taint, v.tf, Sinks::STORED);
                             }
+                            self.sealed_flow(st, f, dec, rec, "sealed-table-value-stored");
                         }
                     }
                 }
@@ -2454,6 +2693,7 @@ impl<'k> Analyzer<'k> {
                 let mut vals: SmallVec<[Val; 8]> =
                     std::iter::repeat(Val::loaded()).take(width).collect();
                 let resolved = resolve_base(&lo, &hi);
+                self.probe_hit(dec.id, &lo, &hi);
                 if let Base::Side(side) = resolved {
                     if side == KSEG && !buffer {
                         match (lo.koff, offset) {
@@ -2516,6 +2756,28 @@ impl<'k> Analyzer<'k> {
                         cache,
                         rec.as_deref_mut(),
                     );
+                }
+                if self.sealed.is_some() && !buffer && !self.pos_cyclic[dec.pos] {
+                    if width == 1 && name == "s_load_b32" {
+                        // The identity of the value this load produces: the
+                        // index leaf of a sealed-table entry address and of
+                        // the compare that guards it.
+                        vals[0].ix = self.ix.borrow_mut().load(dec.id);
+                    }
+                }
+                if self.sealed.is_some() && !buffer && width == 2 && name == "s_load_b64" {
+                    if let Some(v) = self.entry_load(
+                        dec,
+                        addr,
+                        &resolved,
+                        AccessClass::SmemLoad,
+                        MemPath::Smem,
+                        cache,
+                        rec.as_deref_mut(),
+                    ) {
+                        vals[0] = v[0];
+                        vals[1] = v[1];
+                    }
                 }
                 if let Some(rec) = rec.as_deref_mut() {
                     let path = if buffer {
@@ -2580,6 +2842,7 @@ impl<'k> Analyzer<'k> {
                             for v in self.vals(st, f) {
                                 rec.sink(v.taint, v.tf, Sinks::STORED);
                             }
+                            self.sealed_flow(st, f, dec, rec, "sealed-table-value-stored");
                         }
                     }
                     if let Some(d) = dst {
@@ -2648,6 +2911,7 @@ impl<'k> Analyzer<'k> {
                     Ix::NONE
                 };
                 let resolved = resolve_base(&lo, &hi);
+                self.probe_hit(dec.id, &lo, &hi);
                 let mut out = result;
                 if let Base::Side(KSEG) = resolved {
                     if matches!(op, MemOp::Load) {
@@ -2671,11 +2935,31 @@ impl<'k> Analyzer<'k> {
                         rec.as_deref_mut(),
                     );
                 }
+                if self.sealed.is_some()
+                    && form == VmemForm::Global
+                    && matches!(op, MemOp::Load)
+                    && name == "global_load_b64"
+                    && loaded_width == 2
+                {
+                    if let Some(v) = self.entry_load(
+                        dec,
+                        addr,
+                        &resolved,
+                        class,
+                        path,
+                        cache,
+                        rec.as_deref_mut(),
+                    ) {
+                        out[0] = v[0];
+                        out[1] = v[1];
+                    }
+                }
                 if let Some(rec) = rec.as_deref_mut() {
                     for f in &data_fields {
                         for v in self.vals(st, f) {
                             rec.sink(v.taint, v.tf, Sinks::STORED);
                         }
+                        self.sealed_flow(st, f, dec, rec, "sealed-table-value-stored");
                     }
                     self.attribute(
                         rec,
@@ -2754,7 +3038,52 @@ impl<'k> Analyzer<'k> {
                 }
             }
         }
+        if self.sealed.is_some() {
+            let infl_addr = (lo.tf | hi.tf | offset_taint.1) & TBL != 0;
+            match &resolved {
+                Base::Table(mask) | Base::Both { mask, .. } => {
+                    if offset_taint.1 & TBL != 0 {
+                        rec.fail(self.arch, dec, "sealed-table-value-in-offset");
+                    } else if !matches!(class, AccessClass::VmemLoad | AccessClass::SmemLoad) {
+                        rec.fail(
+                            self.arch,
+                            dec,
+                            if writes {
+                                "sealed-table-write"
+                            } else {
+                                "sealed-table-access-class"
+                            },
+                        );
+                    } else if let Some(width) = width {
+                        rec.sealed_accesses.push(TableAccessRec {
+                            inst: dec.id,
+                            pc: dec.pos as u32,
+                            mask: *mask,
+                            class,
+                            path,
+                            cache,
+                            width,
+                        });
+                    } else {
+                        rec.fail(self.arch, dec, "sealed-table-access-width");
+                    }
+                }
+                Base::Unresolved(_) => {}
+                _ if infl_addr => rec.fail(self.arch, dec, "sealed-table-value-in-address"),
+                _ => {}
+            }
+        }
+        if let Base::Both { hi, lo, .. } = resolved {
+            resolved = Base::Args { hi, lo };
+        }
         match resolved {
+            Base::Table(_) | Base::Both { .. } => {
+                rec.sink(
+                    lo.taint.union(hi.taint).union(offset_taint.0),
+                    lo.tf | hi.tf | offset_taint.1,
+                    Sinks::ADDRESS_OFFSET,
+                );
+            }
             Base::Unresolved(rule) => {
                 rec.fail(self.arch, dec, rule);
                 rec.sink(
@@ -3038,6 +3367,806 @@ impl<'k> Analyzer<'k> {
             loads: cert.loads,
         })
     }
+
+    // -----------------------------------------------------------------
+    // Sealed-table analysis (`analyze_sealed`).
+    // -----------------------------------------------------------------
+
+    /// Replay every reachable block of `ins` once with recording on.
+    fn record(&self, ins: &[Option<State>], rec: &mut Rec) {
+        for (b, block) in self.body.blocks.iter().enumerate() {
+            let Some(mut st) = ins[b].clone() else {
+                continue;
+            };
+            for pos in block.range.0..block.range.1 {
+                self.step(&mut st, pos, Some(&mut *rec), self.cyclic[b]);
+            }
+        }
+    }
+
+    /// Null-guard replay: remember the table bits the watched access's base
+    /// carried.
+    fn probe_hit(&self, id: InstId, lo: &Val, hi: &Val) {
+        if self.sealed.is_none() {
+            return;
+        }
+        let mut p = self.probe.borrow_mut();
+        if p.0 == Some(id) {
+            p.1 = hi.tbl | lo.tbl;
+        }
+    }
+
+    /// Sealed analysis: a value influenced by a sealed-table entry must not
+    /// reach `field` (store data, LDS address): the loaded pointer would
+    /// escape the read-only use the certificate covers.
+    fn sealed_flow(&self, st: &State, field: &Field, dec: &Dec, rec: &mut Rec, rule: &'static str) {
+        if self.sealed.is_some() && self.vals(st, field).iter().any(|v| v.tf & TBL != 0) {
+            rec.fail(self.arch, dec, rule);
+        }
+    }
+
+    /// Exact scalar results of the sealed analysis, computed on the pre-state:
+    /// the SCC witness of an unsigned compare, constants through scalar logic
+    /// (including the annihilators `x & 0` and `x | -1`, so a flag that is
+    /// zero on one path stays zero through `s_and_b32 s, flag, exec_lo`), and
+    /// `s_cselect` with a decided SCC. Exec operands never have a constant
+    /// here. Everything else is left to the ordinary transfer function.
+    fn sealed_scalar(&self, st: &State, dec: &Dec) -> SealedFx {
+        let mut fx = SealedFx::default();
+        if dec.parts.len() != 1 {
+            return fx;
+        }
+        let part = &dec.parts[0];
+        let name = norm_name(part.name);
+        let srcs: SmallVec<[&Field; 4]> = part.sources().collect();
+        if let Some(rest) = name.strip_prefix("s_cmp_") {
+            if let (Some((rel, ty)), 2) = (rest.split_once('_'), srcs.len()) {
+                let mut it = self.ix.borrow_mut();
+                let it = &mut *it;
+                // `v == c`, where `v` may hold a flag (`Bit`/`Mask`).
+                let eq_flag = |it: &mut Interner, v: Ix, c: Ix| -> Ix {
+                    if let (Some((f, t)), Some(k)) = (it.flag_value(v), it.const32(c)) {
+                        return if k == t {
+                            f
+                        } else if k == 0 {
+                            it.flag_not(f)
+                        } else {
+                            Ix::NONE
+                        };
+                    }
+                    it.eq32(v, c)
+                };
+                let flag = match ty {
+                    "u32" | "i32" => {
+                        let (vx, vy) = (self.vals(st, srcs[0])[0], self.vals(st, srcs[1])[0]);
+                        let (x, y) = (ixof(it, vx), ixof(it, vy));
+                        let signed = ty == "i32";
+                        let lt = |it: &mut Interner, a: Ix, b: Ix| {
+                            if signed {
+                                it.lts(a, b)
+                            } else {
+                                it.ltu(a, b)
+                            }
+                        };
+                        match rel {
+                            "eq" | "lg" => {
+                                let mut f = eq_flag(it, x, y);
+                                if f.is_none() {
+                                    f = eq_flag(it, y, x);
+                                }
+                                if rel == "lg" {
+                                    it.flag_not(f)
+                                } else {
+                                    f
+                                }
+                            }
+                            "lt" => lt(it, x, y),
+                            "gt" => lt(it, y, x),
+                            "ge" => {
+                                let f = lt(it, x, y);
+                                it.flag_not(f)
+                            }
+                            "le" => {
+                                let f = lt(it, y, x);
+                                it.flag_not(f)
+                            }
+                            _ => Ix::NONE,
+                        }
+                    }
+                    "u64" if matches!(rel, "eq" | "lg") => {
+                        // `w == 0` / `w != 0` of a matched 64-bit pair.
+                        let (a, b) = (self.vals(st, srcs[0]), self.vals(st, srcs[1]));
+                        let zero = |v: &SmallVec<[Val; 4]>| {
+                            v.len() >= 2 && v[0].konst == Some(0) && v[1].konst == Some(0)
+                        };
+                        let wide = |it: &mut Interner, v: &SmallVec<[Val; 4]>| {
+                            if v.len() < 2 {
+                                return Ix::NONE;
+                            }
+                            let (lo, hi) = (ixof(it, v[0]), ixof(it, v[1]));
+                            it.as64(lo, hi)
+                        };
+                        let w = if zero(&b) {
+                            wide(it, &a)
+                        } else if zero(&a) {
+                            wide(it, &b)
+                        } else {
+                            Ix::NONE
+                        };
+                        let f = it.zero64(w);
+                        if rel == "lg" {
+                            it.flag_not(f)
+                        } else {
+                            f
+                        }
+                    }
+                    _ => Ix::NONE,
+                };
+                if !flag.is_none() {
+                    fx.scc_ix = Some(flag);
+                    let mut atom = flag;
+                    while let Some(Node::Not(g)) = it.node(atom) {
+                        atom = g;
+                    }
+                    self.atom_pc
+                        .borrow_mut()
+                        .entry(atom)
+                        .or_default()
+                        .insert(dec.pos as u32);
+                }
+            }
+            return fx;
+        }
+        let dst = part.fields.iter().find(|f| f.def && f.name == "SDST");
+        let dst_idx = |len: usize| -> Option<usize> {
+            match dst?.op {
+                Operand::Reg(r) if r.kind == Kind::S && usize::from(r.len) == len => {
+                    Some(usize::from(r.base))
+                }
+                Operand::Special(Special::VccLo) if len == 1 => Some(VCC_LO),
+                _ => None,
+            }
+        };
+        let kon = |f: &Field| -> Option<u32> {
+            if matches!(
+                f.op,
+                Operand::Special(Special::Exec | Special::ExecLo | Special::ExecHi)
+            ) {
+                return None;
+            }
+            self.vals(st, f).first().and_then(|v| v.konst)
+        };
+        let is_exec = |f: &Field| matches!(f.op, Operand::Special(Special::Exec | Special::ExecLo));
+        // The flag a value holds as an all-ones/zero mask.
+        let mask_flag = |f: &Field| -> Option<Ix> {
+            let v = self.vals(st, f).first().copied()?;
+            let it = self.ix.borrow();
+            it.flag_value(v.ix.live())
+                .filter(|&(_, t)| t == u32::MAX)
+                .map(|(f, _)| f)
+        };
+        match name.as_str() {
+            // A saved copy of a nonzero EXEC is a nonzero value; OR-ing a
+            // nonzero value into EXEC leaves EXEC nonzero.
+            "s_mov_b32" if st.exec_nz && srcs.len() == 1 && is_exec(srcs[0]) => {
+                if let Some(i) = dst_idx(1) {
+                    let mut it = self.ix.borrow_mut();
+                    let t = it.flag_true();
+                    fx.dst_ix = Some((i, it.nz_flag(t)));
+                }
+            }
+            "s_or_b32"
+                if srcs.len() == 2
+                    && matches!(dst.map(|d| d.op), Some(Operand::Special(Special::ExecLo)))
+                    && (is_exec(srcs[0]) || is_exec(srcs[1])) =>
+            {
+                let other = if is_exec(srcs[0]) { srcs[1] } else { srcs[0] };
+                let v = self.vals(st, other).first().copied().unwrap_or_default();
+                let it = self.ix.borrow();
+                let nz = v.konst.is_some_and(|k| k != 0)
+                    || matches!(it.node(v.ix.live()),
+                        Some(Node::NzFlag(f)) if matches!(it.node(f), Some(Node::True)));
+                fx.exec_nz = nz;
+            }
+            "s_and_b32" | "s_or_b32" | "s_xor_b32" | "s_and_not1_b32" | "s_or_not1_b32"
+                if srcs.len() == 2 =>
+            {
+                let (a, b) = (kon(srcs[0]), kon(srcs[1]));
+                let res = match (name.as_str(), a, b) {
+                    ("s_and_b32", Some(x), Some(y)) => Some(x & y),
+                    ("s_and_b32", Some(0), _) | ("s_and_b32", _, Some(0)) => Some(0),
+                    ("s_or_b32", Some(x), Some(y)) => Some(x | y),
+                    ("s_or_b32", Some(u32::MAX), _) | ("s_or_b32", _, Some(u32::MAX)) => {
+                        Some(u32::MAX)
+                    }
+                    ("s_xor_b32", Some(x), Some(y)) => Some(x ^ y),
+                    ("s_and_not1_b32", Some(x), Some(y)) => Some(x & !y),
+                    ("s_and_not1_b32", Some(0), _) | ("s_and_not1_b32", _, Some(u32::MAX)) => {
+                        Some(0)
+                    }
+                    ("s_or_not1_b32", Some(x), Some(y)) => Some(x | !y),
+                    ("s_or_not1_b32", Some(u32::MAX), _) | ("s_or_not1_b32", _, Some(0)) => {
+                        Some(u32::MAX)
+                    }
+                    _ => None,
+                };
+                if let Some(r) = res {
+                    fx.scc_konst = Some(r != 0);
+                    if let Some(i) = dst_idx(1) {
+                        fx.dst_konst = Some((i, r));
+                    }
+                }
+                // Flags: `exec & mask(F)` is nonzero exactly when `F` holds
+                // while EXEC is nonzero; two masks combine bitwise.
+                let (ma, mb) = (mask_flag(srcs[0]), mask_flag(srcs[1]));
+                let mut it = self.ix.borrow_mut();
+                let combined = match (name.as_str(), ma, mb) {
+                    ("s_and_b32", Some(f), None) if st.exec_nz && is_exec(srcs[1]) => {
+                        Some((f, it.nz_flag(f)))
+                    }
+                    ("s_and_b32", None, Some(f)) if st.exec_nz && is_exec(srcs[0]) => {
+                        Some((f, it.nz_flag(f)))
+                    }
+                    ("s_and_b32", Some(f), Some(g)) => {
+                        let a = it.flag_and(f, g);
+                        Some((a, it.mask(a)))
+                    }
+                    ("s_or_b32", Some(f), Some(g)) => {
+                        let o = it.flag_or(f, g);
+                        Some((o, it.mask(o)))
+                    }
+                    _ => None,
+                };
+                if let Some((flag, value)) = combined {
+                    if !flag.is_none() {
+                        fx.scc_ix = Some(flag);
+                    }
+                    if let (Some(i), false) = (dst_idx(1), value.is_none()) {
+                        fx.dst_ix = Some((i, value));
+                    }
+                }
+            }
+            "s_cselect_b32" | "s_cselect_b64" if srcs.len() == 2 => {
+                if let Some(c) = st.scc.konst {
+                    let pick = if c != 0 { srcs[0] } else { srcs[1] };
+                    let len = if name.ends_with("b64") { 2 } else { 1 };
+                    let vals = self.vals(st, pick);
+                    if let (Some(i), true) = (dst_idx(len), vals.len() >= len) {
+                        fx.dst_vals = Some((i, vals.into_iter().take(len).collect()));
+                    }
+                }
+                // A flag-decided select: `-1/1` when SCC holds, else `0`.
+                let scc = st.scc.ix.live();
+                let mut it_ref = self.ix.borrow_mut();
+                let it = &mut *it_ref;
+                if it.is_flag(scc) && name == "s_cselect_b32" {
+                    let value = match (kon(srcs[0]), kon(srcs[1])) {
+                        (Some(u32::MAX), Some(0)) => it.mask(scc),
+                        (Some(1), Some(0)) => it.bit(scc),
+                        (Some(0), Some(u32::MAX)) => {
+                            let n = it.flag_not(scc);
+                            it.mask(n)
+                        }
+                        (Some(0), Some(1)) => {
+                            let n = it.flag_not(scc);
+                            it.bit(n)
+                        }
+                        _ => Ix::NONE,
+                    };
+                    if let (Some(i), false) = (dst_idx(1), value.is_none()) {
+                        fx.dst_ix = Some((i, value));
+                    }
+                }
+            }
+            _ => {}
+        }
+        fx
+    }
+
+    /// A qualified entry load's result, or (collecting pass) record the load
+    /// as a candidate when its shape is a sealed-table entry. `None` for every
+    /// other load.
+    #[allow(clippy::too_many_arguments)]
+    fn entry_load(
+        &self,
+        dec: &Dec,
+        addr: Ix,
+        resolved: &Base,
+        class: AccessClass,
+        path: MemPath,
+        cache: CacheBits,
+        rec: Option<&mut Rec>,
+    ) -> Option<[Val; 2]> {
+        let ctx = self.sealed.as_ref()?;
+        if let Some(qualified) = &ctx.qualified {
+            let site = qualified.get(&dec.id)?;
+            if let Some(rec) = rec {
+                rec.sealed_entries.insert(
+                    dec.id,
+                    EntryRec {
+                        pc: dec.pos as u32,
+                        class,
+                        path,
+                        cache,
+                        width: 8,
+                    },
+                );
+            }
+            let (lo, hi) = {
+                let mut it = self.ix.borrow_mut();
+                let ent = it.ent(dec.id);
+                (it.lo_of(ent), it.hi_of(ent))
+            };
+            let half = |ix: Ix| Val {
+                tbl: site.bit,
+                tf: MEM | TBL,
+                ix,
+                ..Val::default()
+            };
+            return Some([half(lo), half(hi)]);
+        }
+        // Collecting pass: only the recording replay registers candidates.
+        rec?;
+        if addr.is_none() {
+            return None;
+        }
+        let it = self.ix.borrow();
+        let shape = table_entry(&it, addr, &|o| self.karg_kind(o)).ok()?;
+        if !matches!(resolved, Base::Args { hi, .. } if *hi == DwSet::one(shape.table_arg_offset / 4 + 1))
+        {
+            return None;
+        }
+        let (index_inst, index_kernarg) = match it.node(shape.index) {
+            Some(Node::Load(i)) => (Some(i), None),
+            Some(Node::K32(o)) => (None, Some(o)),
+            _ => return None,
+        };
+        ctx.cands.borrow_mut().insert(
+            dec.id,
+            SealedCand {
+                inst: dec.id,
+                pos: dec.pos,
+                table_arg_offset: shape.table_arg_offset,
+                index: shape.index,
+                index_inst,
+                index_kernarg,
+            },
+        );
+        None
+    }
+
+    fn pos_of(&self, inst: InstId) -> u32 {
+        self.body
+            .layout
+            .iter()
+            .position(|&i| i == inst)
+            .unwrap_or(0) as u32
+    }
+
+    /// The unsigned bound `n` of a compare `index < n` as a certificate bound.
+    fn bound_of(&self, n: Ix) -> Option<SealedBound> {
+        let it = self.ix.borrow();
+        match it.node(n)? {
+            Node::C32(c) => Some(SealedBound::Const(c)),
+            Node::K32(o) if o % 4 == 0 && self.karg_kind(o) == KargKind::Scalar => {
+                Some(SealedBound::Kernarg { offset: o })
+            }
+            _ => None,
+        }
+    }
+
+    /// Prove the guard of every candidate entry load (see [`analyze_sealed`]).
+    fn qualify(&self, cands: Vec<SealedCand>) -> (BTreeMap<InstId, SealedSite>, Vec<Unresolved>) {
+        let mut out: BTreeMap<InstId, SealedSite> = BTreeMap::new();
+        let mut rejected = Vec::new();
+        for c in cands {
+            let detail = self.decoded[c.pos]
+                .as_ref()
+                .and_then(|d| d.inst.text(self.arch).ok())
+                .unwrap_or_default();
+            if out.len() >= 8 {
+                rejected.push(Unresolved {
+                    inst: Some(c.inst),
+                    rule: "sealed-too-many-entries",
+                    detail,
+                });
+                continue;
+            }
+            match self.table_guard(&c) {
+                Ok((bound, guard_pcs)) => {
+                    let index = match (c.index_inst, c.index_kernarg) {
+                        (Some(i), _) => SealedIndex::Load { pc: self.pos_of(i) },
+                        (None, Some(offset)) => SealedIndex::Kernarg { offset },
+                        (None, None) => unreachable!("a candidate has an index"),
+                    };
+                    let bit = 1u8 << out.len();
+                    out.insert(
+                        c.inst,
+                        SealedSite {
+                            bit,
+                            table_arg_offset: c.table_arg_offset,
+                            bound,
+                            index,
+                            guard_pcs,
+                        },
+                    );
+                }
+                Err(rule) => rejected.push(Unresolved {
+                    inst: Some(c.inst),
+                    rule,
+                    detail,
+                }),
+            }
+        }
+        (out, rejected)
+    }
+
+    /// The blocks that can reach the block of layout position `pos` (all
+    /// outside every CFG cycle, so their paths are finite), and that block.
+    fn walk_setup(&self, pos: usize) -> Result<(usize, Vec<bool>), &'static str> {
+        let blocks = &self.body.blocks;
+        let site = blocks
+            .iter()
+            .position(|b| b.range.0 <= pos && pos < b.range.1)
+            .ok_or("sealed-site-block")?;
+        if self.cyclic[site] {
+            return Err("sealed-entry-in-cycle");
+        }
+        let mut anc = vec![false; blocks.len()];
+        anc[site] = true;
+        let mut stack = vec![site];
+        while let Some(b) = stack.pop() {
+            for p in &blocks[b].preds {
+                if !anc[p.0] {
+                    anc[p.0] = true;
+                    stack.push(p.0);
+                }
+            }
+        }
+        if !anc[0] {
+            return Err("sealed-site-unreachable");
+        }
+        if (0..blocks.len()).any(|b| anc[b] && self.cyclic[b]) {
+            return Err("sealed-guard-cyclic-prefix");
+        }
+        Ok((site, anc))
+    }
+
+    /// The bound `index < bound` is established on every feasible path from
+    /// the kernel entry to the entry load, and the compares that do so.
+    /// Every block that can reach the load must be outside every CFG cycle, so
+    /// the paths are finite; each is replayed with the ordinary transfer
+    /// function from the entry state, branch edges the replay decides are
+    /// pruned, and a decided compare branch adds the compare facts the edge
+    /// implies (through exact flag algebra: masks, `or`/`and`, `exec` known
+    /// nonzero). `0 <=s i <s n` counts as `i <u n`.
+    fn table_guard(&self, c: &SealedCand) -> Result<(SealedBound, Vec<u32>), &'static str> {
+        let (site, anc) = self.walk_setup(c.pos)?;
+        let mut walk = GuardWalk {
+            site,
+            anc,
+            paths: 0,
+            steps: 0,
+            err: None,
+            goal: Goal::Bound {
+                index: c.index,
+                common: None,
+            },
+        };
+        self.walk(0, self.entry.clone(), &mut Vec::new(), &mut walk);
+        if let Some(e) = walk.err {
+            return Err(e);
+        }
+        let Goal::Bound { common, .. } = walk.goal else {
+            unreachable!()
+        };
+        let Some(common) = common else {
+            return Err("sealed-site-unreachable");
+        };
+        let (bound, pcs) = common.into_iter().next().ok_or("sealed-index-unguarded")?;
+        Ok((bound, pcs.into_iter().collect()))
+    }
+
+    /// Every path to the access at `pos` on which its base derives from the
+    /// entry load `ents[k].1` (site bit `ents[k].0`) knows that entry is
+    /// nonzero. False when anything cannot be shown (a cycle before the
+    /// access, an undecodable instruction, the path budget).
+    fn access_nonnull(&self, id: InstId, pos: usize, ents: Vec<(u8, Ix)>) -> bool {
+        let Ok((site, anc)) = self.walk_setup(pos) else {
+            return false;
+        };
+        let mut walk = GuardWalk {
+            site,
+            anc,
+            paths: 0,
+            steps: 0,
+            err: None,
+            goal: Goal::NonNull {
+                id,
+                pos,
+                ents,
+                ok: true,
+            },
+        };
+        self.walk(0, self.entry.clone(), &mut Vec::new(), &mut walk);
+        walk.err.is_none() && matches!(walk.goal, Goal::NonNull { ok: true, .. })
+    }
+
+    /// Facts the decided edge of a conditional branch adds.
+    fn edge_facts(
+        &self,
+        cond: crate::cfg::Cond,
+        is_taken: bool,
+        st: &State,
+        facts: &mut Vec<(Ix, bool)>,
+    ) {
+        use crate::cfg::Cond;
+        let it = self.ix.borrow();
+        match cond {
+            Cond::Scc0 | Cond::Scc1 => {
+                let f = st.scc.ix.live();
+                if it.is_flag(f) {
+                    it.assume(f, (cond == Cond::Scc1) == is_taken, facts);
+                }
+            }
+            Cond::Vccz | Cond::Vccnz if self.wave == Wave::Wave32 => {
+                if let Some(Node::NzFlag(f)) = it.node(st.s[VCC_LO].ix.live()) {
+                    it.assume(f, (cond == Cond::Vccnz) == is_taken, facts);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn walk(&self, b: usize, mut st: State, facts: &mut Vec<(Ix, bool)>, w: &mut GuardWalk) {
+        use crate::cfg::{Cond, Terminator};
+        if w.err.is_some() {
+            return;
+        }
+        let block = &self.body.blocks[b];
+        if b == w.site {
+            w.paths += 1;
+            if w.paths > GUARD_PATHS {
+                w.err = Some("sealed-guard-path-budget");
+                return;
+            }
+            match &mut w.goal {
+                Goal::Bound { index, common } => {
+                    let it = self.ix.borrow();
+                    let zero_half = facts.iter().any(|&(a, pol)| {
+                        !pol && matches!(it.node(a),
+                            Some(Node::Lts { a: x, b: z })
+                                if x == *index && it.const32(z) == Some(0))
+                    });
+                    let pcs_of = |a: Ix| -> BTreeSet<u32> {
+                        self.atom_pc.borrow().get(&a).cloned().unwrap_or_default()
+                    };
+                    let mut here: BTreeMap<SealedBound, BTreeSet<u32>> = BTreeMap::new();
+                    for &(a, pol) in facts.iter().filter(|f| f.1) {
+                        let n = match it.node(a) {
+                            Some(Node::Ltu { a: x, b: n }) if x == *index => Some(n),
+                            Some(Node::Lts { a: x, b: n }) if x == *index && zero_half => Some(n),
+                            _ => None,
+                        };
+                        let Some(bound) = n.and_then(|n| self.bound_of(n)) else {
+                            continue;
+                        };
+                        let pcs = here.entry(bound).or_default();
+                        pcs.extend(pcs_of(a));
+                        if matches!(it.node(a), Some(Node::Lts { .. })) {
+                            for &(z, pol) in facts.iter().filter(|f| !f.1) {
+                                if matches!(it.node(z),
+                                    Some(Node::Lts { a: x, b: zz })
+                                        if x == *index && it.const32(zz) == Some(0))
+                                {
+                                    pcs.extend(pcs_of(z));
+                                    let _ = pol;
+                                }
+                            }
+                        }
+                    }
+                    *common = Some(match common.take() {
+                        None => here,
+                        Some(mut prev) => {
+                            prev.retain(|k, _| here.contains_key(k));
+                            for (k, pcs) in prev.iter_mut() {
+                                pcs.extend(here[k].iter().copied());
+                            }
+                            prev
+                        }
+                    });
+                }
+                Goal::NonNull { id, pos, ents, ok } => {
+                    *self.probe.borrow_mut() = (Some(*id), 0);
+                    for p in block.range.0..=*pos {
+                        w.steps += 1;
+                        if self.decoded[p].is_none() || w.steps > GUARD_STEPS {
+                            w.err = Some("sealed-guard-undecoded");
+                            return;
+                        }
+                        self.step(&mut st, p, None, false);
+                    }
+                    let tbl = self.probe.borrow().1;
+                    let it = self.ix.borrow();
+                    for &(bit, ent) in ents.iter().filter(|e| tbl & e.0 != 0) {
+                        let known = facts.iter().any(|&(a, pol)| {
+                            !pol && matches!(it.node(a), Some(Node::Zero64(w)) if w == ent)
+                        });
+                        *ok &= known;
+                        let _ = bit;
+                    }
+                }
+            }
+            return;
+        }
+        for pos in block.range.0..block.range.1 {
+            w.steps += 1;
+            if w.steps > GUARD_STEPS {
+                w.err = Some("sealed-guard-path-budget");
+                return;
+            }
+            if self.decoded[pos].is_none() {
+                w.err = Some("sealed-guard-undecoded");
+                return;
+            }
+            self.step(&mut st, pos, None, false);
+        }
+        match &block.term {
+            Terminator::Branch {
+                cond,
+                taken,
+                fallthrough,
+            } => {
+                let decided = self.branch_outcome(*cond, &st);
+                for (target, is_taken) in [(taken.0, true), (fallthrough.0, false)] {
+                    if decided.is_some_and(|d| d != is_taken) || !w.anc[target] {
+                        continue;
+                    }
+                    let mut next = facts.clone();
+                    self.edge_facts(*cond, is_taken, &st, &mut next);
+                    let mut child = st.clone();
+                    if self.wave == Wave::Wave32
+                        && matches!(
+                            (cond, is_taken),
+                            (Cond::Execz, false) | (Cond::Execnz, true)
+                        )
+                    {
+                        child.exec_nz = true;
+                    }
+                    self.walk(target, child, &mut next, w);
+                }
+            }
+            Terminator::FallThrough | Terminator::Jump(_) => {
+                for s in &block.succs {
+                    if w.anc[s.0] {
+                        self.walk(s.0, st.clone(), facts, w);
+                    }
+                }
+            }
+            Terminator::EndPgm | Terminator::Unreachable => {}
+        }
+    }
+
+    /// The sealed tables of the final (qualified) run: entry loads grouped by
+    /// `(table argument, bound)` with every read whose base derives from them.
+    fn assemble_sealed(&self, rec: &Rec) -> Vec<SealedTableUse> {
+        let Some(qualified) = self.sealed.as_ref().and_then(|s| s.qualified.as_ref()) else {
+            return Vec::new();
+        };
+        let mut groups: BTreeMap<(u32, SealedBound), Vec<(&InstId, &SealedSite)>> = BTreeMap::new();
+        for (inst, site) in qualified {
+            groups
+                .entry((site.table_arg_offset, site.bound))
+                .or_default()
+                .push((inst, site));
+        }
+        let mut out = Vec::new();
+        for ((table_arg_offset, bound), mut sites) in groups {
+            sites.sort_by_key(|(inst, _)| rec.sealed_entries.get(*inst).map_or(0, |e| e.pc));
+            let mask = sites.iter().fold(0u8, |m, (_, s)| m | s.bit);
+            let mut entries = Vec::new();
+            for (inst, site) in &sites {
+                let Some(er) = rec.sealed_entries.get(*inst) else {
+                    continue;
+                };
+                entries.push(SealedEntryLoad {
+                    inst: **inst,
+                    pc: er.pc,
+                    class: er.class,
+                    path: er.path,
+                    cache: er.cache,
+                    width_bytes: er.width,
+                    index: site.index,
+                    guard_pcs: site.guard_pcs.clone(),
+                });
+            }
+            // `null_guarded`: every read through an entry of this table is
+            // reachable only with that entry nonzero (proved path by path).
+            let ent_of = |inst: &InstId| self.ix.borrow_mut().ent(*inst);
+            let mut null_guarded = true;
+            let mut accesses = Vec::new();
+            for a in rec.sealed_accesses.iter().filter(|a| a.mask & mask != 0) {
+                if null_guarded {
+                    let ents: Vec<(u8, Ix)> = sites
+                        .iter()
+                        .filter(|(_, s)| a.mask & s.bit != 0)
+                        .map(|(inst, s)| (s.bit, ent_of(inst)))
+                        .collect();
+                    null_guarded = self.access_nonnull(a.inst, a.pc as usize, ents);
+                }
+                let mut entry_pcs: Vec<u32> = sites
+                    .iter()
+                    .filter(|(_, s)| a.mask & s.bit != 0)
+                    .filter_map(|(inst, _)| rec.sealed_entries.get(*inst).map(|e| e.pc))
+                    .collect();
+                entry_pcs.sort_unstable();
+                accesses.push(SealedAccess {
+                    inst: a.inst,
+                    pc: a.pc,
+                    class: a.class,
+                    path: a.path,
+                    cache: a.cache,
+                    width_bytes: a.width,
+                    entry_pcs,
+                });
+            }
+            accesses.sort_by_key(|a| a.pc);
+            out.push(SealedTableUse {
+                table_arg_offset,
+                bound,
+                entry_bytes: 8,
+                entries,
+                accesses,
+                null_guarded,
+            });
+        }
+        out
+    }
+}
+
+/// The exact scalar results the sealed analysis adds to one instruction's
+/// ordinary transfer (see [`Analyzer::sealed_scalar`]).
+#[derive(Default)]
+struct SealedFx {
+    scc_ix: Option<Ix>,
+    scc_konst: Option<bool>,
+    dst_konst: Option<(usize, u32)>,
+    dst_vals: Option<(usize, SmallVec<[Val; 2]>)>,
+    dst_ix: Option<(usize, Ix)>,
+    /// `s_or_b32 exec_lo, exec_lo, x` with `x` known nonzero.
+    exec_nz: bool,
+}
+
+/// Path budget of the entry-guard replay.
+const GUARD_PATHS: usize = 4096;
+const GUARD_STEPS: usize = 400_000;
+
+/// What a path enumeration proves at its target block.
+enum Goal {
+    /// `index < bound` on every path, at an entry load.
+    Bound {
+        index: Ix,
+        /// Bounds established on every path reached so far, with their
+        /// compares.
+        common: Option<BTreeMap<SealedBound, BTreeSet<u32>>>,
+    },
+    /// Every table-derived base at the access is a known-nonzero entry.
+    NonNull {
+        id: InstId,
+        pos: usize,
+        ents: Vec<(u8, Ix)>,
+        ok: bool,
+    },
+}
+
+/// State of one path enumeration.
+struct GuardWalk {
+    site: usize,
+    anc: Vec<bool>,
+    paths: usize,
+    steps: usize,
+    err: Option<&'static str>,
+    goal: Goal,
 }
 
 fn other_is_negative(op: &Operand) -> bool {
@@ -3227,16 +4356,21 @@ fn finish(
     layout: &Layout,
     rec: Option<Rec>,
     supplied: &[Guard],
+    sealed: Vec<SealedTableUse>,
 ) -> KernargFacts {
     let rec = rec.unwrap_or_else(|| Rec::new(DwSet::default()));
     let (mut indexed, entry_used) = resolve_pending(&rec, supplied, &mut facts.unresolved);
     facts.status = if !facts.unresolved.is_empty() {
         KernelStatus::Unknown
-    } else if !indexed.is_empty() || !rec.guards_used.is_empty() || entry_used {
+    } else if !indexed.is_empty() || !rec.guards_used.is_empty() || entry_used || !sealed.is_empty()
+    {
         KernelStatus::Conditional
     } else {
         KernelStatus::Proven
     };
+    if facts.status == KernelStatus::Conditional {
+        facts.sealed = sealed;
+    }
     if facts.status != KernelStatus::Proven {
         facts.guards = supplied.to_vec();
         for e in &mut indexed {
@@ -4047,5 +5181,394 @@ mod tests {
             ],
             "nested P[Q[i]] indexing",
         );
+    }
+    const POSITIVE: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const CONST_BOUND: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0ac00b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const STORE_THROUGH: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000c, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0x7e040280, 0xee06800e, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    const UNGUARDED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    const WRONG_VALUE: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a11, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const SIGNED_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf040a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const REVERSED_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0b0a, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const BYPASSED_GUARD: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf068010, 0xbfa20002, 0xbf0a0a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c,
+        0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002,
+        0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const FLAG_DIAMOND: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe9400c1, 0xbf0a0a0b, 0xbfa20001, 0xbe940080, 0x8b157e14, 0x98158081, 0xbf078115,
+        0xbfa2000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const FLAG_DIAMOND_BROKEN: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbe9400c1, 0xbf0a0a0b, 0xbfa20001, 0xbe9400c1, 0x8b157e14, 0x98158081, 0xbf078115,
+        0xbfa2000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const POINTER_AS_INDEX: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10013, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05400e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee05007c, 0x00000004, 0x00000002, 0xbfc00000, 0xee068008, 0x02000000, 0x00000001,
+        0xbfb00000,
+    ];
+    const POINTER_STORED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000d, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0x7e04020e, 0x7e06020f, 0xee06c008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    const POINTER_MIXED_WITH_ARG: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000c, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xa99c0e08, 0xee06801c, 0x00800000, 0x00000001,
+        0xbfb00000,
+    ];
+    const ATOMIC_THROUGH: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000b, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee0d400e, 0x00800000, 0x00000001, 0xbfb00000,
+    ];
+    const SCALE4: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c820c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const ENTRY_OFFSET: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000008, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const LOOP_ENTRY: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10013, 0xbe9e0082, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04,
+        0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001,
+        0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0x819e811e, 0xbf07801e, 0xbfa2ffee,
+        0xbfb00000,
+    ];
+    const TWO_LOADS_ONE_TABLE: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa1001d, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa99a0c04,
+        0xf400258d, 0xf8000000, 0xbfc70000, 0xee050016, 0x00000003, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01800000, 0x00000001, 0xbfb00000,
+    ];
+
+    // ---------------------------------------------------------------------
+    // Sealed-table analysis. Kernels assembled with llvm-mc (gfx1201): table
+    // pointer +0, index pointer +8, output +16, bound `n` +24, flag +28.
+    // ---------------------------------------------------------------------
+    const SEALED_ARGS: &[(&str, u32, u32, &str)] = &[
+        ("table", 0, 8, "global_buffer"),
+        ("idx", 8, 8, "global_buffer"),
+        ("out", 16, 8, "global_buffer"),
+        ("n", 24, 4, "by_value"),
+        ("flag", 28, 4, "by_value"),
+    ];
+    fn sealed(words: &[u32]) -> KernargFacts {
+        analyze_sealed(&kernel(words, SEALED_ARGS), Arch::Gfx1201)
+    }
+    fn first_rule(f: &KernargFacts) -> &'static str {
+        f.unresolved.first().map_or("", |u| u.rule)
+    }
+    fn refuses(words: &[u32], rule: &str) {
+        let f = sealed(words);
+        assert_eq!(f.status, KernelStatus::Unknown, "{:?}", f.unresolved);
+        assert!(f.sealed.is_empty());
+        assert_eq!(first_rule(&f), rule, "{:?}", f.unresolved);
+    }
+
+    #[test]
+    fn guarded_table_entry_read_through_is_a_conditional_sealed_table() {
+        let f = sealed(POSITIVE);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        assert!(f.guards.is_empty() && f.indexed.is_empty());
+        let [t] = &f.sealed[..] else {
+            panic!("one table: {:?}", f.sealed)
+        };
+        assert_eq!(t.table_arg_offset, 0);
+        assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
+        assert_eq!(t.entry_bytes, 8);
+        let [e] = &t.entries[..] else { panic!() };
+        assert_eq!(
+            (e.pc, e.class, e.path, e.width_bytes),
+            (14, AccessClass::SmemLoad, MemPath::Smem, 8)
+        );
+        assert_eq!(e.index, SealedIndex::Load { pc: 5 });
+        assert_eq!(e.guard_pcs, [8]);
+        let [a] = &t.accesses[..] else { panic!() };
+        assert_eq!(
+            (a.class, a.path, a.width_bytes, a.entry_pcs.clone()),
+            (AccessClass::VmemLoad, MemPath::Global, 4, vec![e.pc])
+        );
+        // The table argument is read (its entry load is an ordinary read);
+        // the output argument is written; the loaded pointer is no argument.
+        assert_eq!(mode(&f, 0), Some(AccessMode::Read));
+        assert_eq!(mode(&f, 16), Some(AccessMode::Write));
+        // The unguarded analysis is unchanged: Unknown, memory-derived.
+        let base = analyze(&kernel(POSITIVE, SEALED_ARGS), Arch::Gfx1201);
+        assert_eq!(base.status, KernelStatus::Unknown);
+        assert_eq!(rules(&base), ["base-memory-derived"]);
+        assert!(base.sealed.is_empty());
+    }
+
+    #[test]
+    fn constant_bound_and_two_entry_loads_of_one_table() {
+        let f = sealed(CONST_BOUND);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        assert_eq!(f.sealed[0].bound, SealedBound::Const(64));
+        let f = sealed(TWO_LOADS_ONE_TABLE);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.entries.len(), 2);
+        assert_eq!(t.accesses.len(), 2);
+        assert_ne!(t.accesses[0].entry_pcs, t.accesses[1].entry_pcs);
+    }
+
+    #[test]
+    fn a_flag_materialised_by_a_diamond_is_followed_not_guessed() {
+        // `ok = idx < n ? -1 : 0; if (!(ok & exec)) return;` as the compiler
+        // writes it: the guard holds only through the flag.
+        let f = sealed(FLAG_DIAMOND);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        assert_eq!(f.sealed[0].entries[0].guard_pcs.len(), 1);
+        // The same shape with the flag set on both paths guards nothing.
+        refuses(FLAG_DIAMOND_BROKEN, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn only_a_complete_unsigned_guard_of_the_loaded_index_qualifies() {
+        refuses(UNGUARDED, "sealed-index-unguarded");
+        refuses(WRONG_VALUE, "sealed-index-unguarded");
+        refuses(SIGNED_GUARD, "sealed-index-unguarded");
+        refuses(REVERSED_GUARD, "sealed-index-unguarded");
+        refuses(BYPASSED_GUARD, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn writes_and_escapes_through_the_loaded_base_stay_unknown() {
+        refuses(STORE_THROUGH, "sealed-table-write");
+        refuses(ATOMIC_THROUGH, "sealed-table-write");
+        refuses(POINTER_STORED, "sealed-table-value-stored");
+        // An argument candidate beside the entry makes the base `Both`; the
+        // access is a store, so it is refused as a write through an entry.
+        refuses(POINTER_MIXED_WITH_ARG, "sealed-table-write");
+        // A loaded base used as an address again is memory-derived.
+        refuses(POINTER_AS_INDEX, "base-memory-derived");
+    }
+
+    #[test]
+    fn entry_shapes_the_certificate_does_not_cover_keep_the_plain_rule() {
+        for words in [SCALE4, ENTRY_OFFSET] {
+            let f = sealed(words);
+            assert_eq!(f.status, KernelStatus::Unknown);
+            assert!(f.unresolved.iter().all(|u| u.rule == "base-memory-derived"));
+            assert!(f.sealed.is_empty());
+        }
+        refuses(LOOP_ENTRY, "sealed-entry-in-cycle");
+    }
+    const SIGNED_GUARD_FLAGS: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbfa50016, 0xbf04800b, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbfa4000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const SIGNED_NO_EXEC_FACT: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf04800b, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbfa4000f,
+        0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    const SIGNED_MISSING_NONNEG: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbfa50015, 0xbe940080, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e, 0xbfa4000f,
+        0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000, 0xbfc70000,
+        0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000,
+        0x00000001, 0xbfb00000,
+    ];
+    const SIGNED_NONNEG_OF_OTHER: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbfa50016, 0xbf048011, 0x981480c1, 0xbf030a0b, 0x981580c1, 0x8c141514, 0x8b6a147e,
+        0xbfa4000f, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389, 0xf8000000,
+        0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const NULL_CHECKED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10011, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0xbfa10007, 0xee05000e, 0x00000002,
+        0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const DEREF_BEFORE_NULL_CHECK: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10011, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbf11800e, 0xbfa10000, 0xbfb00000,
+    ];
+    const NULL_CHECK_OTHER_REGISTER: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10011, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf118008, 0xbfa10007, 0xee05000e, 0x00000002,
+        0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const NULL_CHECK_BYPASSED: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10013, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf068010, 0xbfa20002, 0xbf11800e, 0xbfa10007,
+        0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001,
+        0xbfb00000,
+    ];
+    const NULL_CHECK_FLAGS: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbfa50017, 0xbf0a0a0b, 0xbfa10015, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04,
+        0xf4002389, 0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0x981480c1, 0x8b157e14,
+        0x98158081, 0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000,
+        0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const NULL_CHECK_FLAGS_NO_EXEC_FACT: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10015, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf11800e, 0x981480c1, 0x8b157e14, 0x98158081,
+        0xbf078115, 0xbfa20007, 0xee05000e, 0x00000002, 0x00000001, 0xbfc00000, 0xee068008,
+        0x01000000, 0x00000001, 0xbfb00000,
+    ];
+    const ARG_OR_ENTRY_BASE: &[u32] = &[
+        0xf4004100, 0xf8000000, 0xf4002200, 0xf8000010, 0xf4000280, 0xf8000018, 0xf4000400,
+        0xf800001c, 0xbfc70000, 0xf40002c3, 0xf8000000, 0xf4000443, 0xf8000004, 0xbfc70000,
+        0xbf0a0a0b, 0xbfa10011, 0xbe8c000b, 0x860d9f0b, 0x848c830c, 0xa9920c04, 0xf4002389,
+        0xf8000000, 0xbfc70000, 0x7e020280, 0xbf068110, 0x9896080e, 0xee050016, 0x00000002,
+        0x00000001, 0xbfc00000, 0xee068008, 0x01000000, 0x00000001, 0xbfb00000,
+    ];
+
+    #[test]
+    fn a_signed_pair_guard_through_flags_and_exec_is_followed() {
+        // `if (e < 0 || e >= n) return;` as the compiler writes it: two
+        // compares into masks, `or`, `exec & mask`, `vccnz`. It proves `e < n`
+        // only because EXEC is known nonzero (the EXECZ edge before it).
+        let f = sealed(SIGNED_GUARD_FLAGS);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.bound, SealedBound::Kernarg { offset: 24 });
+        assert_eq!(t.entries[0].guard_pcs.len(), 2, "both signed compares");
+        refuses(SIGNED_NO_EXEC_FACT, "sealed-index-unguarded");
+        refuses(SIGNED_MISSING_NONNEG, "sealed-index-unguarded");
+        refuses(SIGNED_NONNEG_OF_OTHER, "sealed-index-unguarded");
+    }
+
+    #[test]
+    fn only_an_entry_checked_nonzero_before_every_read_is_null_guarded() {
+        for (name, words, want) in [
+            ("scc null check", NULL_CHECKED, true),
+            ("flag null check with exec known", NULL_CHECK_FLAGS, true),
+            ("no null check", POSITIVE, false),
+            ("deref before the check", DEREF_BEFORE_NULL_CHECK, false),
+            (
+                "check of another register",
+                NULL_CHECK_OTHER_REGISTER,
+                false,
+            ),
+            ("check bypassed on a path", NULL_CHECK_BYPASSED, false),
+            (
+                "flag check without the exec fact",
+                NULL_CHECK_FLAGS_NO_EXEC_FACT,
+                false,
+            ),
+        ] {
+            let f = sealed(words);
+            assert_eq!(
+                f.status,
+                KernelStatus::Conditional,
+                "{name}: {:?}",
+                f.unresolved
+            );
+            assert_eq!(f.sealed[0].null_guarded, want, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_base_that_is_an_argument_on_one_path_and_an_entry_on_another_reads_both() {
+        let f = sealed(ARG_OR_ENTRY_BASE);
+        assert_eq!(f.status, KernelStatus::Conditional, "{:?}", f.unresolved);
+        let [t] = &f.sealed[..] else { panic!() };
+        assert_eq!(t.accesses.len(), 1);
+        assert!(!t.null_guarded);
+        // The read is also an ordinary read of the argument it may name.
+        let out = f.arg_at(16).expect("out argument");
+        assert!(out
+            .accesses
+            .iter()
+            .any(|a| a.class == AccessClass::VmemLoad));
     }
 }
