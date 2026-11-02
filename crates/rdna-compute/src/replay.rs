@@ -5756,6 +5756,11 @@ impl ReplayController {
         self.pm4_queue_policy
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_pm4_queue_policy(&mut self, policy: QueuePolicy) {
+        self.pm4_queue_policy = policy;
+    }
+
     /// Pace the next single-queue gfx12 PM4 preparation (ignored on gfx10/11,
     /// multi-queue tapes and the per-dispatch profile).
     pub fn set_pm4_gfx12_dispatch_pacing(&mut self, pacing: Gfx12DispatchPacing) {
@@ -6410,7 +6415,9 @@ impl ReplayController {
             let ring = Gfx11ScratchRing::new(max_private, engines, waves).ok_or_else(|| {
                     format!("gfx11 scratch ring does not fit TMPRING: private={max_private} engines={engines} waves={waves}")
                 })?;
-            let buffer = KernargPool::discover_device_local(&device)
+            // The pool allocator zeroes from the host, so small-BAR boards must
+            // refuse here (HIP fallback) rather than fault.
+            let buffer = KernargPool::discover_host_writable_device_local(&device)
                 .and_then(|pool| pool.allocate_fine_grained_bytes(ring.bytes() as usize, 256))
                 .map_err(|error| format!("allocate gfx11 scratch ring: {error}"))?;
             let ring = ring.at(buffer.address() as u64).ok_or_else(|| {
@@ -6963,7 +6970,9 @@ impl ReplayController {
                                 dispatch_interleave,
                                 resource_limits_policy,
                             )
-                            .with_scratch_ring(scratch_ring);
+                            // Parallel lanes on one ring overwrite each other's
+                            // scratch (HIPF-259 B2): refuse scratch kernels here.
+                            .with_scratch_ring(None);
                             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                             commands
                         })

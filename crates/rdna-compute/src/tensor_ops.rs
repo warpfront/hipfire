@@ -17073,16 +17073,22 @@ mod tests {
     }
 
     /// gfx1151's vocabulary-head MQ6 GEMV (`gemv_mq6g256v2_k2560_u2`) spills
-    /// to scratch. Its retained PM4 replay runs on the tape's own GFX11
-    /// scratch ring and must equal the plain HIP launch byte for byte; the
-    /// output is NaN-poisoned before each run so a skipped dispatch fails.
+    /// to scratch. A retained PM4 tape `[u2, add, u2, add]` (scratch dispatches
+    /// separated by scratch-free ones, default stateful register policy) runs
+    /// on the tape's own GFX11 scratch ring and must equal the plain HIP
+    /// launches byte for byte; outputs are NaN-poisoned before each run so a
+    /// skipped dispatch fails. A parallel two-queue phase of independent u2
+    /// dispatches must refuse at prepare: its lanes would share one ring.
     #[test]
     fn retained_pm4_scratch_kernel_matches_hip_on_gfx1151() {
         use crate::replay::{ReplayBackendRequest, ReplayController};
+        use redline_dispatch::aql::QueuePolicy;
 
         const M: usize = 248_320;
         const K: usize = 2560;
         const GROUP_BYTES: usize = 200;
+        const F: usize = 1 << 20;
+        const GEMVS: usize = 6;
 
         let Some(mut gpu) = try_gpu() else {
             eprintln!("skip: no GPU");
@@ -17109,20 +17115,43 @@ mod tests {
                 half[1] = 0x14 + (half[0] & 0x1f);
             }
         }
-        let x: Vec<f32> = (0..K)
-            .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
-            .collect();
         let a = gpu.upload_raw(&weights, &[weights.len()]).expect("weights");
-        let x = gpu.upload_f32(&x, &[K]).expect("x");
-        let y = gpu.zeros(&[M], DType::F32).expect("y");
+        drop(weights);
+        let xs: Vec<GpuTensor> = (0..GEMVS)
+            .map(|_| {
+                let x: Vec<f32> = (0..K)
+                    .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+                    .collect();
+                gpu.upload_f32(&x, &[K]).expect("x")
+            })
+            .collect();
+        let ys: Vec<GpuTensor> = (0..GEMVS)
+            .map(|_| gpu.zeros(&[M], DType::F32).expect("y"))
+            .collect();
+        let pq: Vec<f32> = (0..F).map(|i| i as f32 * 0.5).collect();
+        let p = gpu.upload_f32(&pq, &[F]).expect("p");
+        let q = gpu.upload_f32(&pq, &[F]).expect("q");
+        let rs: Vec<GpuTensor> = (0..2)
+            .map(|_| gpu.zeros(&[F], DType::F32).expect("r"))
+            .collect();
+        // The interleaved tape: gemv i writes ys[i], add i writes rs[i].
+        let interleaved = |gpu: &mut Gpu| {
+            for i in 0..2 {
+                gpu.gemv_mq6g256v2(&a, &xs[i], &ys[i], M, K).expect("gemv");
+                gpu.add_f32(&p, &q, &rs[i]).expect("add");
+            }
+        };
+        let outputs = || ys[..2].iter().chain(&rs);
 
-        let run = |gpu: &mut Gpu, replay: bool| -> Vec<u8> {
-            gpu.hip
-                .memcpy_htod(&y.buf, &f32::NAN.to_ne_bytes().repeat(M))
-                .expect("poison y");
+        let run = |gpu: &mut Gpu, replay: bool| -> Vec<Vec<u8>> {
+            for t in outputs() {
+                gpu.hip
+                    .memcpy_htod(&t.buf, &f32::NAN.to_ne_bytes().repeat(t.numel()))
+                    .expect("poison");
+            }
             gpu.hip.device_synchronize().expect("sync poison");
             if replay {
-                // SAFETY: `a`, `x` and `y` stay live at their captured addresses.
+                // SAFETY: every captured tensor stays live at its captured address.
                 unsafe { gpu.replay.replay_pm4(0) }
                     .unwrap_or_else(|reason| panic!("PM4 replay: {reason}"));
             } else {
@@ -17130,38 +17159,65 @@ mod tests {
                     &mut gpu.replay,
                     ReplayController::new(ReplayBackendRequest::Hip),
                 );
-                gpu.gemv_mq6g256v2(&a, &x, &y, M, K).expect("HIP gemv");
+                interleaved(gpu);
                 gpu.replay = retained;
             }
             gpu.hip.device_synchronize().expect("sync run");
-            gpu.download_raw_bytes(&y).expect("read y")
+            outputs()
+                .map(|t| gpu.download_raw_bytes(t).expect("read"))
+                .collect()
         };
 
         gpu.replay = ReplayController::new_manual_pm4();
         gpu.replay.begin_capture().expect("open recording window");
-        gpu.gemv_mq6g256v2(&a, &x, &y, M, K).expect("captured gemv");
+        interleaved(gpu);
         gpu.hip.device_synchronize().expect("sync capture");
         gpu.replay.finish_capture().expect("close recording window");
-        let launches = gpu.replay.recorded_launches();
-        assert_eq!(launches.len(), 1);
-        assert_eq!(launches[0].kernel, "gemv_mq6g256v2_k2560_u2");
+        let kernels: Vec<&str> = gpu
+            .replay
+            .recorded_launches()
+            .iter()
+            .map(|launch| launch.kernel.as_str())
+            .collect();
+        assert_eq!(kernels.len(), 4);
+        assert_eq!(kernels[0], "gemv_mq6g256v2_k2560_u2");
+        assert_eq!(kernels[2], "gemv_mq6g256v2_k2560_u2");
         gpu.replay
-            .prepare_pm4_prefix(gpu.device_id as usize, 1)
+            .prepare_pm4_prefix(gpu.device_id as usize, 4)
             .unwrap_or_else(|reason| panic!("PM4 prepare: {reason}"));
 
         let reference = run(gpu, false);
-        assert!(
-            reference
-                .chunks_exact(4)
-                .all(|v| f32::from_ne_bytes(v.try_into().unwrap()).is_finite()),
-            "HIP reference has non-finite outputs"
-        );
+        for (i, out) in reference.iter().enumerate() {
+            assert!(
+                out.chunks_exact(4)
+                    .all(|v| f32::from_ne_bytes(v.try_into().unwrap()).is_finite()),
+                "HIP reference output {i} has non-finite values"
+            );
+        }
         for round in 0..3 {
             assert!(
                 run(gpu, true) == reference,
                 "PM4 replay {round} differs from HIP"
             );
         }
+
+        gpu.replay = ReplayController::new_manual_pm4();
+        gpu.replay.set_pm4_queue_policy(QueuePolicy::Two);
+        gpu.replay.begin_capture().expect("open recording window");
+        for (x, y) in xs.iter().zip(&ys) {
+            gpu.gemv_mq6g256v2(&a, x, y, M, K).expect("gemv");
+        }
+        gpu.hip.device_synchronize().expect("sync capture");
+        gpu.replay.finish_capture().expect("close recording window");
+        let refused = gpu
+            .replay
+            .prepare_pm4_prefix(gpu.device_id as usize, GEMVS)
+            .expect_err("a multi-queue phase must refuse scratch kernels");
+        assert!(
+            refused.contains("cannot back this kernel's scratch"),
+            "unexpected refusal: {refused}"
+        );
+        gpu.replay = ReplayController::new(ReplayBackendRequest::Hip);
     }
 
     /// The retained-replay shape pin (a fixed grid or LDS bound larger than the

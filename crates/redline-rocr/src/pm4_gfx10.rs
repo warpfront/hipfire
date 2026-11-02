@@ -128,7 +128,8 @@ pub struct Gfx11ScratchRing {
 }
 
 impl Gfx11ScratchRing {
-    /// ROCr sizes per-wave scratch for 64 lanes; wave32 waves use half.
+    /// Sized for 64 lanes (wave64). ROCr sizes wave32 dispatches for 32 lanes,
+    /// so wave32 kernels use half of each slot: safe, just not minimal.
     const LANES: u64 = 64;
     const GRANULE: u64 = 256;
 
@@ -682,11 +683,14 @@ impl Gfx10Pm4CommandBuffer {
         }
         let ring = self.scratch_ring.filter(|ring| ring.base != 0);
         if image.private_segment_size != 0 {
-            // The private-segment buffer SGPRs are materialized as zero; only
-            // GFX11 architected flat scratch is backed by the ring.
-            let Some(ring) = ring
-                .filter(|_| image.kernel_code_properties & ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER == 0)
-            else {
+            // Those SGPRs would be materialized as zero; only GFX11
+            // architected flat scratch is backed by the ring.
+            if image.kernel_code_properties & ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER != 0 {
+                return Err(Gfx10Pm4BuildError::PrivateSegmentBufferUnsupported {
+                    private_bytes: image.private_segment_size,
+                });
+            }
+            let Some(ring) = ring else {
                 return Err(Gfx10Pm4BuildError::ScratchUnsupported {
                     private_bytes: image.private_segment_size,
                     dynamic_callstack: false,
@@ -733,12 +737,23 @@ impl Gfx10Pm4CommandBuffer {
         );
         self.set_sh_regs(COMPUTE_PGM_RSRC1, &[image.compute_pgm_rsrc1, rsrc2]);
         self.set_sh_regs(COMPUTE_PGM_RSRC3_GFX10, &[image.compute_pgm_rsrc3]);
-        // Only scratch dispatches see the ring: programming it on every
-        // dispatch hung Qwen4's gfx1151 tape (HIPF-253).
+        // Only scratch dispatches see the ring; scratch-free ones keep TMPRING
+        // zero. The ring registers bypass the stateful cache: after a TMPRING=0
+        // dispatch an elided SCRATCH_BASE left later scratch waves faulting
+        // against base 0 on gfx1151 (HIPF-259 B1).
         match ring.filter(|_| image.private_segment_size != 0) {
             Some(ring) => {
-                self.set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[ring.tmpring_size()]);
-                self.set_sh_regs(
+                if let Some(register_state) = self.register_state.as_mut() {
+                    for register in [
+                        COMPUTE_TMPRING_SIZE_GFX10,
+                        COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11,
+                        COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11 + 1,
+                    ] {
+                        register_state.remove(&register);
+                    }
+                }
+                self.emit_set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[ring.tmpring_size()]);
+                self.emit_set_sh_regs(
                     COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11,
                     &[(ring.base >> 8) as u32, (ring.base >> 40) as u32],
                 );
@@ -971,6 +986,9 @@ pub enum Gfx10Pm4BuildError {
         private_bytes: u32,
         dynamic_callstack: bool,
     },
+    PrivateSegmentBufferUnsupported {
+        private_bytes: u32,
+    },
     ScratchRingTooSmall {
         private_bytes: u32,
         ring_lane_bytes: u32,
@@ -1000,7 +1018,11 @@ impl fmt::Display for Gfx10Pm4BuildError {
                 dynamic_callstack,
             } => write!(
                 formatter,
-                "GFX10/GFX11 PM4 dispatch does not yet support scratch (private={private_bytes}, dynamic_callstack={dynamic_callstack})"
+                "GFX10/GFX11 PM4 cannot back this kernel's scratch (private={private_bytes}, dynamic_callstack={dynamic_callstack}): rings cover static private segments in gfx11 single-queue phases only"
+            ),
+            Self::PrivateSegmentBufferUnsupported { private_bytes } => write!(
+                formatter,
+                "kernel takes the private-segment buffer SGPRs (private={private_bytes}); GFX10/GFX11 PM4 backs only architected flat scratch"
             ),
             Self::ScratchRingTooSmall {
                 private_bytes,
@@ -1118,7 +1140,7 @@ mod tests {
                 Some(ring),
                 scratch(16, kernarg_only | ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER)
             ),
-            Err(Gfx10Pm4BuildError::ScratchUnsupported { .. })
+            Err(Gfx10Pm4BuildError::PrivateSegmentBufferUnsupported { private_bytes: 16 })
         ));
         let dynamic = Gfx10KernelImage {
             dynamic_callstack: true,
@@ -1131,6 +1153,32 @@ mod tests {
                 ..
             })
         ));
+
+        // Stateful streams never elide the ring registers: each scratch
+        // dispatch of [scratch, plain, scratch] is preceded by both writes.
+        let mut stateful = Gfx10Pm4CommandBuffer::new_stateful().with_scratch_ring(Some(ring));
+        for private in [16, 0, 16] {
+            stateful
+                .dispatch_image(&scratch(private, kernarg_only), geometry, 0, &[4, 5])
+                .unwrap();
+        }
+        let dispatch = packet3(PACKET3_DISPATCH_DIRECT, 4, true);
+        let mut segments = stateful.dwords().split(|word| *word == dispatch);
+        for private in [16, 0, 16] {
+            let segment = segments.next().unwrap();
+            let writes = |register: u32| {
+                segment
+                    .windows(2)
+                    .filter(|w| w[0] >> 8 & 0xff == PACKET3_SET_SH_REG && w[1] == register)
+                    .count()
+            };
+            let expected = usize::from(private != 0);
+            assert_eq!(
+                (writes(0x218), writes(0x210)),
+                (1, expected),
+                "private={private}"
+            );
+        }
     }
 
     #[test]
