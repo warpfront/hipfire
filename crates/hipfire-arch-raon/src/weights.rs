@@ -1385,6 +1385,10 @@ fn load_mq8_attn(
     let buf = gpu
         .upload_raw(&packed, &[packed.len()])
         .map_err(|e| format!("raon1_mini weights: upload {name}: {e:?}"))?;
+    // Verify graphs (up to `ROWS_EXACT_MAX` rows) quantize into the MQ8 activation scratch while
+    // capturing; growing it there is refused, so size it for the largest K at load.
+    gpu.mq8_reserve_x(k, crate::projection::ROWS_EXACT_MAX)
+        .map_err(|e| format!("raon1_mini weights: {name}: MQ8 activation scratch: {e:?}"))?;
     MQ8_ATTN_TENSORS.fetch_add(1, Ordering::Relaxed);
     MQ8_ATTN_BYTES.fetch_add(packed.len(), Ordering::Relaxed);
     Ok(rows_weight_tensor(buf, DType::MQ8G256, m, k))

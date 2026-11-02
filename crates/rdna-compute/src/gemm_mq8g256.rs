@@ -317,8 +317,40 @@ impl Gpu {
     }
 
     /// Whether `acts` still describes its planes (no scratch quantizer ran since; caller planes never go stale).
+    /// Only scratch planes ([`Self::mq8_quantize_x`]) carry a generation; planes from
+    /// [`Self::mq8_quantize_x_into`] / [`Self::mq8_acts_from_planes`] are `MQ8_ACTS_EXTERNAL` and always
+    /// count as current, so their owner alone guarantees they still hold the intended `x` (never hand
+    /// such planes to a consumer that relies on this check to detect staleness).
     pub fn mq8_acts_current(&self, acts: &Mq8Activations) -> bool {
         acts.generation == MQ8_ACTS_EXTERNAL || acts.generation == self.scratch.mq8_x_generation
+    }
+
+    /// Grow the MQ8 activation scratch to hold `(k, n)` now (eager, no launch), so a later
+    /// [`Self::mq8_quantize_x`] of at most that size inside a graph capture or Redline recording
+    /// never has to grow it (which [`Self::mq8_quantize_x`] refuses there). Call at load time with
+    /// the largest captured row count and K. Advances the scratch generation (any prepared plane is
+    /// stale afterwards).
+    pub fn mq8_reserve_x(&mut self, k: usize, n: usize) -> HipResult<()> {
+        if n == 0 || k == 0 || k % GROUP != 0 {
+            return Err(HipError::new(1, "mq8_reserve_x: n > 0 and k % 256 == 0"));
+        }
+        self.bind_thread()?;
+        let (_, needed) = crate::scratch::mq8_x_layout(k, n);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.mq8_x_scratch_bytes,
+            self.scratch.mq8_x_scratch.is_some(),
+            needed,
+        ) {
+            if self.graphs.capture_mode || self.replay.is_recording() {
+                return Err(HipError::new(
+                    1,
+                    "mq8_reserve_x: cannot grow the MQ8 scratch during capture/recording",
+                ));
+            }
+            self.invalidate_for_scratch_growth();
+            self.scratch.reserve_mq8_x(&self.hip, k, n)?;
+        }
+        Ok(())
     }
 
     /// Kernel family module + source of this device.
@@ -345,6 +377,15 @@ impl Gpu {
             self.scratch.mq8_x_scratch.is_some(),
             needed,
         ) {
+            // Growing replaces the buffer that earlier captured/recorded nodes already reference:
+            // refuse instead of corrupting the graph (pre-size with `mq8_reserve_x`).
+            if self.graphs.capture_mode || self.replay.is_recording() {
+                return Err(HipError::new(
+                    1,
+                    "mq8_quantize_x: the MQ8 activation scratch would grow during graph capture or \
+                     Redline recording; pre-size it with Gpu::mq8_reserve_x at load",
+                ));
+            }
             self.invalidate_for_scratch_growth();
         }
         let (xq, xs) = self.scratch.reserve_mq8_x(&self.hip, k, n)?;

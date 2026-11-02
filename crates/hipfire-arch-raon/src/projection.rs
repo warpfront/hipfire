@@ -200,8 +200,10 @@ pub fn project_rows_batched(
     project_batched(gpu, w, x, y, rows, round, tier, None)
 }
 
-/// `HIPFIRE_RAON_A8_REUSE=0` restores one activation quantization per A8 projection call (the
-/// pre-reuse behavior); anything else, or unset, shares one quantization per node. Read once.
+/// `HIPFIRE_RAON_A8_REUSE=0` restores one activation quantization per projection call (the
+/// pre-reuse behavior): the Q8_0 A8 quantization and, for MQ8G256 weights, the shared rotated
+/// int8 plane of prefill and of row-exact verify blocks of 3+ rows. Anything else, or unset,
+/// shares one quantization per node. Bit-identical either way. Read once.
 fn a8_reuse_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> =
         std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_RAON_A8_REUSE", true));
@@ -216,6 +218,9 @@ fn a8_reuse_enabled() -> bool {
 /// `tier`/`rows`, in which case every consumer takes its ordinary route. The result is valid for
 /// one node: pass it to [`project_prepared`] for consumers of the same `x` before anything else
 /// quantizes (a stale value is detected and ignored; a plane of the other format is never served).
+/// Contract: `x` must not be written between this call and the last consumer that receives the
+/// result; the staleness check compares the plane's address, rows, K and the quantizer generation,
+/// not `x`'s contents.
 pub fn prepare_a8(
     gpu: &mut Gpu,
     w: &WeightTensor,
@@ -304,9 +309,10 @@ fn project_batched(
     Ok(())
 }
 
-/// `HIPFIRE_RAON_A8_FUSE_ROUND=0` runs the Q8_0 projection's BF16 output round as its own pass
-/// (`bf16_round_trip_f32_strided`) instead of the GEMM epilogue (the W8A8 i8-MMQ `_bf16` entries on
-/// gfx1201 / gfx1100, the F16 wmma `gemm_q8_0_wmma_bf16` on gfx1100); bit-identical either way. Read once.
+/// `HIPFIRE_RAON_A8_FUSE_ROUND=0` runs the projection's BF16 output round as its own pass
+/// (`bf16_round_trip_f32_strided`) instead of the GEMM epilogue (Q8_0: the W8A8 i8-MMQ `_bf16`
+/// entries on gfx1201 / gfx1100 and the F16 wmma `gemm_q8_0_wmma_bf16` on gfx1100; MQ8G256: the
+/// prefill GEMM's BF16 epilogue); bit-identical either way. Read once.
 fn a8_fuse_round_enabled() -> bool {
     static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         hipfire_config::developer_bool("HIPFIRE_RAON_A8_FUSE_ROUND", true)
