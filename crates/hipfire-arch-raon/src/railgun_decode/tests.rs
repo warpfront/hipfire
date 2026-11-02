@@ -728,7 +728,7 @@ fn the_forced_owner_logs_each_kind_once_and_counts_every_decline() {
         RaonRailgunRefusal::TapArmed,
         RaonRailgunRefusal::NotWarm,
     ] {
-        o.note_decline(&r);
+        o.decline(r);
     }
     assert_eq!(
         o.logged_kinds.iter().copied().collect::<Vec<_>>(),
@@ -751,11 +751,11 @@ fn the_auto_owner_stays_quiet_for_the_routine_warm_up_and_logs_one_line() {
         provision: false,
     });
     assert!(!o.is_forced());
-    o.note_decline(&RaonRailgunRefusal::NotWarm);
+    o.decline(RaonRailgunRefusal::NotWarm);
     assert!(!o.auto_logged, "the warm-up step is routine");
-    o.note_decline(&RaonRailgunRefusal::AbsorbedRoute);
+    o.decline(RaonRailgunRefusal::AbsorbedRoute);
     assert!(o.auto_logged);
-    o.note_decline(&RaonRailgunRefusal::TapArmed);
+    o.decline(RaonRailgunRefusal::TapArmed);
     assert!(o.logged_kinds.is_empty(), "auto keeps no per-kind log");
     assert_eq!(o.stats().declined, 3);
 }
@@ -850,8 +850,8 @@ fn every_key_field_invalidates_and_is_named() {
         ("route", |k| k.base.absorbed = true),
         ("scratch_rows", |k| k.base.scratch_rows += 1),
         ("scratch_epoch", |k| k.base.scratch_epoch += 1),
-        ("model_digest", |k| k.base.model_digest.push('x')),
-        ("flags_digest", |k| k.base.flags_digest.push('x')),
+        ("model_digest", |k| k.base.model_digest = "modelx".into()),
+        ("flags_digest", |k| k.base.flags_digest = "flagsx".into()),
         ("object_digests", |k| k.object_digests[1].1 = "23".into()),
         ("object_digests", |k| {
             k.object_digests.push(("c".into(), "33".into()))
@@ -1340,7 +1340,7 @@ fn a_refused_binding_is_remembered_until_the_binding_changes() {
     exec.decline(k.base.clone(), RaonRailgunRefusal::NotWarm);
     assert_eq!(
         exec.lookup(&k.base, &mut live_extra(&k)),
-        Lookup::Declined(RaonRailgunRefusal::NotWarm)
+        Lookup::Declined(Arc::new(RaonRailgunRefusal::NotWarm))
     );
     let mut moved = k.base.clone();
     moved.binding += 1;
@@ -1407,7 +1407,7 @@ fn a_lowering_self_check_failure_is_the_one_decline_after_submit() {
     // Cached for the binding: not rebuilt and resubmitted per token.
     assert_eq!(
         exec.lookup(&k.base, &mut live_extra(&k)),
-        Lookup::Declined(want)
+        Lookup::Declined(Arc::new(want))
     );
     assert_eq!(log.lock().unwrap().submits, 0);
 }
@@ -1587,12 +1587,12 @@ fn the_build_is_pending_until_run_and_runs_only_once_per_process() {
     assert_eq!(o.provision_status(), "pending");
     // The run is refused (the corpus parent cannot be created): that is the
     // owner's final answer for this process.
-    o.provision_now();
+    o.run_provision(&mut || Ok(()), &|| None);
     let first = o.provision_status();
     assert!(first.starts_with("refused:"), "{first}");
     assert!(o.corpus_dir.is_none());
     // A second call has nothing pending: it neither re-runs nor changes state.
-    o.provision_now();
+    o.run_provision(&mut || Ok(()), &|| None);
     assert_eq!(o.provision_status(), first);
     let _ = std::fs::remove_dir_all(root);
 }
@@ -1605,4 +1605,156 @@ fn an_owner_with_a_corpus_never_builds() {
         provision: false,
     });
     assert_eq!(o.provision_status(), "off");
+}
+
+// ------------------------------------------------- hook order, O(1) declines
+
+/// The `from-cache` fake: refuses with a missing-entry report unless the
+/// transport module is in the hot cache directory it is given.
+#[cfg(unix)]
+const NEEDS_TRANSPORT: &str = "#!/bin/sh\n\
+    OUT=\"\"; CACHE=\"\"\n\
+    while [ $# -gt 0 ]; do [ \"$1\" = --out ] && OUT=\"$2\"; [ \"$1\" = --cache ] && CACHE=\"$2\"; shift; done\n\
+    if [ -f \"$CACHE/railgun_copy.hsaco\" ]; then mkdir -p \"$OUT\" && echo '{}' > \"$OUT/index.json\"; \
+    echo '{\"status\":\"ok\"}'; \
+    else echo '{\"status\":\"refused\",\"reason\":\"no hot cache entry for railgun_copy\",\"missing\":[{\"module\":\"railgun_copy\"}]}'; exit 2; fi\n";
+
+#[cfg(unix)]
+fn fake_binary(root: &Path, text: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let path = root.join("from-cache-fake");
+    std::fs::write(&path, text).expect("script");
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    path
+}
+
+fn ordered_spec(tag: &str) -> (ProvisionSpec, PathBuf) {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/railgun-owner-tests")
+        .join(format!("{}-{tag}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let hot = root.join("cache/gfx1201");
+    std::fs::create_dir_all(&hot).expect("hot dir");
+    let spec = ProvisionSpec {
+        arch: "gfx1201".into(),
+        program: "raon-ar-decode-gfx1201".into(),
+        toolchain_id: "t".into(),
+        hot_dir: hot,
+        pack_dir: None,
+        out_dir: root.join("cache/railgun-corpus/gfx1201"),
+    };
+    (spec, root)
+}
+
+fn pending_owner(spec: ProvisionSpec) -> RaonRailgunOwner {
+    RaonRailgunOwner::new(
+        OwnerPlan {
+            corpus_dir: None,
+            loud: false,
+            provision: true,
+        },
+        GFX1201,
+        Some(spec),
+        "model".into(),
+    )
+}
+
+#[cfg(unix)]
+#[test]
+fn the_transport_kernels_are_loaded_before_the_subcommand_is_spawned() {
+    let (spec, root) = ordered_spec("order");
+    let hot = spec.hot_dir.clone();
+    let script = fake_binary(&root, NEEDS_TRANSPORT);
+    let mut o = pending_owner(spec);
+    let prepared = Cell::new(0);
+    // The load puts the module in the hot cache, as `railgun_transport_digests`
+    // does; the subcommand only succeeds if it is there when it runs.
+    o.run_provision(
+        &mut || {
+            prepared.set(prepared.get() + 1);
+            std::fs::write(hot.join("railgun_copy.hsaco"), b"obj").map_err(|e| e.to_string())
+        },
+        &|| Some(script.clone()),
+    );
+    assert_eq!(prepared.get(), 1);
+    let status = o.provision_status();
+    assert!(status.starts_with("done:"), "{status}");
+    assert!(o.corpus_dir.is_some() && o.permanent.is_none());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[cfg(unix)]
+#[test]
+fn without_the_pre_spawn_load_the_missing_entry_refusal_is_not_persisted() {
+    let (spec, root) = ordered_spec("missing");
+    let marker = spec.hot_dir.join(crate::railgun_provision::MARKER);
+    let script = fake_binary(&root, NEEDS_TRANSPORT);
+    let mut o = pending_owner(spec.clone());
+    o.run_provision(&mut || Ok(()), &|| Some(script.clone()));
+    assert!(
+        o.provision_status().contains("no hot cache entry"),
+        "{}",
+        o.provision_status()
+    );
+    assert!(
+        !marker.exists(),
+        "a missing-entry refusal must not be recorded"
+    );
+    // A fresh process (a fresh owner) tries again, and now succeeds.
+    std::fs::write(spec.hot_dir.join("railgun_copy.hsaco"), b"obj").unwrap();
+    let mut o2 = pending_owner(spec);
+    o2.run_provision(&mut || Ok(()), &|| Some(script.clone()));
+    assert!(o2.provision_status().starts_with("done:"));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_failing_pre_spawn_load_fails_the_build_without_spawning_or_recording() {
+    let (spec, root) = ordered_spec("prepfail");
+    let marker = spec.hot_dir.join(crate::railgun_provision::MARKER);
+    let mut o = pending_owner(spec);
+    let spawned = Cell::new(false);
+    o.run_provision(&mut || Err("hipcc failed".into()), &|| {
+        spawned.set(true);
+        None
+    });
+    let s = o.provision_status();
+    assert!(
+        s.starts_with("refused:") && s.contains("hipcc failed"),
+        "{s}"
+    );
+    assert!(!spawned.get() && !marker.exists());
+    assert!(o.permanent.is_some());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn a_failed_build_latches_and_every_later_decline_is_the_same_allocation() {
+    let (spec, root) = ordered_spec("latch");
+    let mut o = pending_owner(spec);
+    o.run_provision(&mut || Ok(()), &|| None);
+    let latched = o.permanent.clone().expect("the refusal latches");
+    assert_eq!(latched.kind(), "corpus_provision");
+    // Replaying the latched refusal (what every later step does) allocates
+    // nothing: the stored decline stays the very same `Arc`.
+    o.note_decline(Arc::clone(&latched));
+    let first = o.last_decline.clone().unwrap();
+    for _ in 0..1000 {
+        let again = Arc::clone(o.permanent.as_ref().unwrap());
+        o.note_decline(again);
+    }
+    assert!(Arc::ptr_eq(&first, o.last_decline.as_ref().unwrap()));
+    let s = o.stats();
+    assert_eq!(s.declined_by_kind["corpus_provision"], 1001);
+    assert_eq!(s.declined, 1001);
+    assert_eq!(
+        s.last_refusal.as_deref(),
+        Some(latched.to_string().as_str())
+    );
+    // A repeated freshly computed unit refusal reuses its allocation too.
+    o.decline(RaonRailgunRefusal::AbsorbedRoute);
+    let a = o.last_decline.clone().unwrap();
+    o.decline(RaonRailgunRefusal::AbsorbedRoute);
+    assert!(Arc::ptr_eq(&a, o.last_decline.as_ref().unwrap()));
+    let _ = std::fs::remove_dir_all(root);
 }

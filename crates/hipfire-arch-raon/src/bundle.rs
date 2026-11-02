@@ -704,7 +704,7 @@ impl RaonBundle {
                 if let (Some(token), true) = (token, self.railgun.is_some()) {
                     // A refusal runs the HIP graph step below exactly once; the
                     // owner never retries a submitted token through it.
-                    if let RaonRailgunAttempt::Completed = self.railgun_decode_try(gpu, token)? {
+                    if self.railgun_step(gpu, token)? {
                         return Ok(());
                     }
                 }
@@ -725,6 +725,18 @@ impl RaonBundle {
     ) -> Result<RaonRailgunAttempt, String> {
         let Some(mut owner) = self.railgun.take() else {
             return Ok(RaonRailgunAttempt::Declined(RaonRailgunRefusal::Disabled));
+        };
+        let r = owner.attempt(self, gpu, token);
+        self.railgun = Some(owner);
+        r
+    }
+
+    /// [`Self::railgun_decode_try`] without building the refusal: `true` when
+    /// the program executed the step, `false` when it declined (the caller
+    /// runs the HIP-graph step once). Allocation-free for a repeated decline.
+    fn railgun_step(&mut self, gpu: &mut Gpu, token: u32) -> Result<bool, String> {
+        let Some(mut owner) = self.railgun.take() else {
+            return Ok(false);
         };
         let r = owner.try_step(self, gpu, token);
         self.railgun = Some(owner);

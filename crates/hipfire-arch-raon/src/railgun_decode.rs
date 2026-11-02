@@ -62,7 +62,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::mem::ManuallyDrop;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -633,9 +633,9 @@ pub struct BaseKey {
     pub scratch_epoch: u64,
     /// Digest of the model identity (config, precision plan, band, weight
     /// anchors): fixed for the bundle's lifetime.
-    pub model_digest: String,
+    pub model_digest: Arc<str>,
     /// Digest of the device feature flags every kernel route reads.
-    pub flags_digest: String,
+    pub flags_digest: Arc<str>,
 }
 
 /// The full program identity: equality, not a hash.
@@ -1108,7 +1108,7 @@ pub enum Slot<Q: WindowQueue> {
     /// This binding was refused: reuse the refusal instead of re-planning.
     Declined {
         key: BaseKey,
-        refusal: RaonRailgunRefusal,
+        refusal: Arc<RaonRailgunRefusal>,
     },
 }
 
@@ -1134,7 +1134,7 @@ pub enum Lookup {
     /// A built program with exactly this key.
     Hit,
     /// This binding was refused.
-    Declined(RaonRailgunRefusal),
+    Declined(Arc<RaonRailgunRefusal>),
     /// Rebuild; `Some(field)` names what changed from the old program.
     Miss(Option<&'static str>),
 }
@@ -1201,7 +1201,10 @@ impl<Q: WindowQueue> Exec<Q> {
     /// Drop the held program (it is quiescent: `submit` blocks) and remember
     /// that `base` was refused.
     pub fn decline(&mut self, base: BaseKey, refusal: RaonRailgunRefusal) {
-        self.slot = Slot::Declined { key: base, refusal };
+        self.slot = Slot::Declined {
+            key: base,
+            refusal: Arc::new(refusal),
+        };
     }
 
     pub fn install(&mut self, built: Built<Q>) {
@@ -1254,7 +1257,7 @@ impl<Q: WindowQueue> Exec<Q> {
                 let refusal = RaonRailgunRefusal::SelfCheck(f.message);
                 self.slot = Slot::Declined {
                     key: built.key.base.clone(),
-                    refusal: refusal.clone(),
+                    refusal: Arc::new(refusal.clone()),
                 };
                 StepOutcome::Declined(refusal)
             }
@@ -1319,8 +1322,8 @@ pub struct RaonRailgunOwner {
     corpus: Option<Result<WindowCorpus, String>>,
     ctx: Option<RailgunLoweringContext>,
     table: Option<Result<CacheTable, String>>,
-    model_digest: String,
-    flags: Option<(usize, String)>,
+    model_digest: Arc<str>,
+    flags: Option<(usize, Arc<str>)>,
     exec: Exec<RailgunWindowQueue>,
     stats: RaonRailgunStats,
     /// `1`: every decline is logged once per kind.
@@ -1328,6 +1331,16 @@ pub struct RaonRailgunOwner {
     logged_kinds: BTreeSet<&'static str>,
     /// `auto`: the one line for the first non-routine decline was written.
     auto_logged: bool,
+    /// The bundle's band label (fixed for its lifetime).
+    band: Arc<str>,
+    /// A decline no later step can change (the first-load corpus build was
+    /// refused, the corpus or cache table cannot be opened): every step then
+    /// declines in O(1), without re-evaluating anything.
+    permanent: Option<Arc<RaonRailgunRefusal>>,
+    /// The last decline (shared, so a repeated one allocates nothing).
+    last_decline: Option<Arc<RaonRailgunRefusal>>,
+    /// Declines by refusal kind.
+    kind_counts: BTreeMap<&'static str, u64>,
 }
 
 /// The structural facts of `b` on `gpu`. `retained_replay` is passed in so
@@ -1414,7 +1427,9 @@ impl RaonRailgunOwner {
                     pack_dir: prov.installed_pack_dir,
                     out_dir: prov.local_corpus_dir,
                 });
-                Some(Box::new(Self::new(plan, &gpu.arch, spec, model_digest(b))))
+                let mut owner = Self::new(plan, &gpu.arch, spec, model_digest(b));
+                owner.band = band.as_str().into();
+                Some(Box::new(owner))
             }
             Err(NoOwner::NoCorpus(why)) if env_corpus.is_some() => {
                 eprintln!("[raon-railgun] auto: HIP graph route ({why})");
@@ -1434,13 +1449,17 @@ impl RaonRailgunOwner {
             corpus: None,
             ctx: None,
             table: None,
-            model_digest,
+            model_digest: model_digest.into(),
             flags: None,
             exec: Exec::default(),
             stats: RaonRailgunStats::default(),
             loud: plan.loud,
             logged_kinds: BTreeSet::new(),
             auto_logged: false,
+            band: Arc::from(""),
+            permanent: None,
+            last_decline: None,
+            kind_counts: BTreeMap::new(),
         }
     }
 
@@ -1455,10 +1474,27 @@ impl RaonRailgunOwner {
         }
     }
 
-    /// Run the pending first-load build, once, blocking. The caller has
-    /// checked that the decode graph has warmed (every decode module is in
-    /// the hot cache) and that nothing else declines the step.
-    fn provision_now(&mut self) {
+    /// Run the pending first-load build, once, blocking: first load the
+    /// transport kernels (the program's copy and fill nodes name their
+    /// modules, which only exist in the hot cache once something loaded
+    /// them), then run the subcommand. The caller has checked that the decode
+    /// graph has warmed (every decode module is in the hot cache) and that
+    /// nothing else declines the step.
+    fn provision_now(&mut self, gpu: &mut Gpu) {
+        self.run_provision(
+            &mut || gpu.railgun_transport_digests().map(|_| ()),
+            &locate_default_binary,
+        );
+    }
+
+    /// [`Self::provision_now`] with the pre-spawn step injected. A failing
+    /// `prepare` fails the build with its message (nothing is spawned or
+    /// recorded).
+    fn run_provision(
+        &mut self,
+        prepare: &mut dyn FnMut() -> Result<(), String>,
+        locate: &dyn Fn() -> Option<PathBuf>,
+    ) {
         if !matches!(self.provision, Provision::Pending(_)) {
             return;
         }
@@ -1466,19 +1502,13 @@ impl RaonRailgunOwner {
         else {
             return;
         };
-        let exe_dir = std::env::current_exe()
-            .ok()
-            .and_then(|e| e.parent().map(Path::to_path_buf));
-        let home_bin = hipfire_config::hipfire_home().ok().map(|h| h.join("bin"));
-        let path = std::env::var_os("PATH");
-        let binary = locate_binary(
-            &BinaryLookup {
-                exe_dir: exe_dir.as_deref(),
-                home_bin: home_bin.as_deref(),
-                path: path.as_deref(),
-            },
-            BINARY,
-        );
+        if let Err(e) = prepare() {
+            self.fail_provision(format!(
+                "the railgun transport kernels could not be loaded: {e}"
+            ));
+            return;
+        }
+        let binary = locate();
         if binary.is_some() {
             eprintln!(
                 "[raon-railgun] building the local receipt corpus for this install (first load, \
@@ -1486,7 +1516,7 @@ impl RaonRailgunOwner {
                 spec.out_dir.display()
             );
         }
-        self.provision = match provision(&spec, binary.as_deref(), TIMEOUT) {
+        match provision(&spec, binary.as_deref(), TIMEOUT) {
             Ok(done) => {
                 eprintln!(
                     "[raon-railgun] local receipt corpus built in {} ms: {}",
@@ -1496,15 +1526,28 @@ impl RaonRailgunOwner {
                 let dir = done.out_dir.to_string_lossy().into_owned();
                 self.corpus_dir = Some(dir.clone());
                 self.corpus = None;
-                Provision::Done(dir)
+                self.provision = Provision::Done(dir);
             }
-            Err(why) => Provision::Failed(why),
-        };
+            Err(why) => self.fail_provision(why),
+        }
+    }
+
+    /// The first-load build failed: this process never retries it, and every
+    /// later step declines in O(1).
+    fn fail_provision(&mut self, why: String) {
+        self.permanent = Some(Arc::new(RaonRailgunRefusal::CorpusProvision(why.clone())));
+        self.provision = Provision::Failed(why);
     }
 
     pub fn stats(&self) -> RaonRailgunStats {
         let mut s = self.stats.clone();
         s.quarantined = self.exec.is_quarantined();
+        s.last_refusal = self.last_decline.as_ref().map(|r| r.to_string());
+        s.declined_by_kind = self
+            .kind_counts
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), *v))
+            .collect();
         s
     }
 
@@ -1523,53 +1566,96 @@ impl RaonRailgunOwner {
         self.exec.quarantine_reason()
     }
 
-    fn note_decline(&mut self, r: &RaonRailgunRefusal) {
+    /// Count a decline and log it per the mode. Allocation-free once the
+    /// refusal kind has been seen.
+    fn note_decline(&mut self, r: Arc<RaonRailgunRefusal>) {
         self.stats.declined += 1;
-        *self
-            .stats
-            .declined_by_kind
-            .entry(r.kind().to_owned())
-            .or_default() += 1;
-        let text = r.to_string();
-        if self.loud {
-            if self.logged_kinds.insert(r.kind()) {
-                eprintln!("[raon-railgun] declined ({}): {text}", r.kind());
-            }
+        *self.kind_counts.entry(r.kind()).or_default() += 1;
+        let first = if self.loud {
+            self.logged_kinds.insert(r.kind())
         } else if !self.auto_logged && *r != RaonRailgunRefusal::NotWarm {
             // `NotWarm` is the routine first step (the HIP graph's warm-up).
             self.auto_logged = true;
-            eprintln!("[raon-railgun] auto: HIP graph step ({}): {text}", r.kind());
+            true
+        } else {
+            false
+        };
+        if first {
+            if self.loud {
+                eprintln!("[raon-railgun] declined ({}): {r}", r.kind());
+            } else {
+                eprintln!("[raon-railgun] auto: HIP graph step ({}): {r}", r.kind());
+            }
         }
-        self.stats.last_refusal = Some(text);
+        self.last_decline = Some(r);
     }
 
-    fn flags_digest(&mut self, gpu: &Gpu) -> String {
+    /// Decline with a freshly computed refusal, reusing the previous one's
+    /// allocation when it is the same; always `false` (not completed).
+    fn decline(&mut self, r: RaonRailgunRefusal) -> bool {
+        let shared = match &self.last_decline {
+            Some(last) if **last == r => Arc::clone(last),
+            _ => Arc::new(r),
+        };
+        self.note_decline(shared);
+        false
+    }
+
+    fn flags_digest(&mut self, gpu: &Gpu) -> Arc<str> {
         let ptr = Arc::as_ptr(&gpu.flags) as usize;
         if let Some((p, d)) = &self.flags {
             if *p == ptr {
-                return d.clone();
+                return Arc::clone(d);
             }
         }
-        let d = sha256_hex(format!("{:?}", *gpu.flags).as_bytes());
-        self.flags = Some((ptr, d.clone()));
+        let d: Arc<str> = sha256_hex(format!("{:?}", *gpu.flags).as_bytes()).into();
+        self.flags = Some((ptr, Arc::clone(&d)));
         d
     }
 
-    /// One decode step through the program. See the module docs.
-    pub(crate) fn try_step(
+    /// One decode step through the program, as the API result: see
+    /// [`Self::try_step`].
+    pub(crate) fn attempt(
         &mut self,
         b: &mut RaonBundle,
         gpu: &mut Gpu,
         token: u32,
     ) -> Result<RaonRailgunAttempt, String> {
+        Ok(if self.try_step(b, gpu, token)? {
+            RaonRailgunAttempt::Completed
+        } else {
+            RaonRailgunAttempt::Declined(
+                self.last_decline
+                    .as_deref()
+                    .cloned()
+                    .unwrap_or(RaonRailgunRefusal::Disabled),
+            )
+        })
+    }
+
+    /// One decode step through the program. See the module docs. `true` =
+    /// completed; `false` = declined (the refusal is `last_decline`; nothing
+    /// was consumed, the caller runs the HIP graph step once). The decline
+    /// path allocates nothing for a repeated refusal.
+    pub(crate) fn try_step(
+        &mut self,
+        b: &mut RaonBundle,
+        gpu: &mut Gpu,
+        token: u32,
+    ) -> Result<bool, String> {
         self.stats.attempts += 1;
         if let Some(why) = self.exec.quarantine_reason() {
             return Err(format!(
                 "raon1_mini: the railgun owner is quarantined after an unknown-quiescence failure: {why}"
             ));
         }
+        if let Some(r) = &self.permanent {
+            let r = Arc::clone(r);
+            self.note_decline(r);
+            return Ok(false);
+        }
         let pos = b.state.n_tokens();
-        let band = b.weights.band.label();
+        let band = Arc::clone(&self.band);
         let identity = if gpu.arch != self.arch {
             eprintln!(
                 "[raon-railgun] owner of a {} bundle stepped on a {} device",
@@ -1579,7 +1665,7 @@ impl RaonRailgunOwner {
         } else {
             self.device_identity_ok(gpu)
         };
-        let structural = observe_structural(b, gpu, &band, gpu.replay.is_enabled(), identity);
+        let retained_replay = gpu.replay.is_enabled();
         let (tap_armed, dump_armed) = (
             b.spec.census_tap.is_some(),
             hipfire_dispatch::pipeline::moe_capture::enabled(),
@@ -1589,10 +1675,18 @@ impl RaonRailgunOwner {
         if matches!(self.provision, Provision::Pending(_))
             && warmed
             && !(tap_armed || dump_armed || absorbed_route)
-            && check_structural(&structural).is_ok()
+            && check_structural(&observe_structural(
+                b,
+                gpu,
+                &band,
+                retained_replay,
+                identity,
+            ))
+            .is_ok()
         {
-            self.provision_now();
+            self.provision_now(gpu);
         }
+        let structural = observe_structural(b, gpu, &band, retained_replay, identity);
         let step = StepFacts {
             tap_armed,
             dump_armed,
@@ -1605,8 +1699,7 @@ impl RaonRailgunOwner {
             },
         };
         if let Err(r) = check_admission(&structural, &step) {
-            self.note_decline(&r);
-            return Ok(RaonRailgunAttempt::Declined(r));
+            return Ok(self.decline(r));
         }
         // Context admission, outside any program (same call the graph route
         // makes; it may grow the mapping or mirror).
@@ -1634,7 +1727,7 @@ impl RaonRailgunOwner {
             absorbed: false,
             scratch_rows: b.scratch.rows,
             scratch_epoch: rdna_compute::scratch::scratch_growth_epoch(),
-            model_digest: self.model_digest.clone(),
+            model_digest: Arc::clone(&self.model_digest),
             flags_digest: self.flags_digest(gpu),
         };
         let gpu_ref: &Gpu = gpu;
@@ -1664,8 +1757,8 @@ impl RaonRailgunOwner {
         match lookup {
             Lookup::Hit => {}
             Lookup::Declined(r) => {
-                self.note_decline(&r);
-                return Ok(RaonRailgunAttempt::Declined(r));
+                self.note_decline(r);
+                return Ok(false);
             }
             Lookup::Miss(cause) => {
                 let rebuild = matches!(self.exec.slot, Slot::Ready(_));
@@ -1687,9 +1780,19 @@ impl RaonRailgunOwner {
                         self.exec.install(built);
                     }
                     Err(r) => {
-                        self.exec.decline(base, r.clone());
-                        self.note_decline(&r);
-                        return Ok(RaonRailgunAttempt::Declined(r));
+                        let r = Arc::new(r);
+                        if matches!(
+                            *r,
+                            RaonRailgunRefusal::Corpus(_)
+                                | RaonRailgunRefusal::CacheTable(_)
+                                | RaonRailgunRefusal::CorpusUnset
+                        ) {
+                            // Nothing a later step could change.
+                            self.permanent = Some(Arc::clone(&r));
+                        }
+                        self.exec.decline(base, (*r).clone());
+                        self.note_decline(r);
+                        return Ok(false);
                     }
                 }
             }
@@ -1708,12 +1811,9 @@ impl RaonRailgunOwner {
             StepOutcome::Completed => {
                 self.stats.completed += 1;
                 b.state.note_host_tokens(1);
-                Ok(RaonRailgunAttempt::Completed)
+                Ok(true)
             }
-            StepOutcome::Declined(r) => {
-                self.note_decline(&r);
-                Ok(RaonRailgunAttempt::Declined(r))
-            }
+            StepOutcome::Declined(r) => Ok(self.decline(r)),
             StepOutcome::Failed(m) => Err(format!(
                 "raon1_mini: railgun decode submit failed (quiescent, request aborted): {m}"
             )),
@@ -1893,6 +1993,24 @@ fn attach_g4(table: &mut CacheTable, path: &str, bytes: &[u8]) -> Result<usize, 
     let probe: G4Table = serde_json::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
     let source = format!("{path} sha256={}", sha256_hex(bytes));
     table.attach_receipts(&probe, &source, G4_MIN_TRIALS)
+}
+
+/// The `railgun-jit-corpus` binary beside the running executable, in
+/// `$HIPFIRE_HOME/bin`, or on `PATH`.
+fn locate_default_binary() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf));
+    let home_bin = hipfire_config::hipfire_home().ok().map(|h| h.join("bin"));
+    let path = std::env::var_os("PATH");
+    locate_binary(
+        &BinaryLookup {
+            exe_dir: exe_dir.as_deref(),
+            home_bin: home_bin.as_deref(),
+            path: path.as_deref(),
+        },
+        BINARY,
+    )
 }
 
 /// Digest of the bundle's model identity: fixed for its lifetime.

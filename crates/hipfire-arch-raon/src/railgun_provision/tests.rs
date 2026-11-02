@@ -270,3 +270,31 @@ fn the_binary_is_found_beside_the_executable_then_the_home_then_path() {
     assert_eq!(locate_binary(&skipped, BINARY), Some(home.join(BINARY)));
     assert_eq!(locate_binary(&BinaryLookup::default(), BINARY), None);
 }
+
+#[test]
+fn a_refusal_naming_missing_cache_entries_is_not_persisted_but_other_refusals_are() {
+    let rig = Rig::new("missing");
+    let bin = rig.script(
+        "fc-missing",
+        "echo '{\"status\":\"refused\",\"reason\":\"no hot cache entry for mod_x\",\"missing\":[{\"module\":\"mod_x\"}]}'\nexit 2",
+    );
+    let e = rig.run(Some(&bin)).expect_err("refused");
+    assert!(e.contains("no hot cache entry for mod_x"), "{e}");
+    assert!(
+        !rig.spec.hot_dir.join(MARKER).exists(),
+        "a retryable refusal must not be recorded"
+    );
+    // The same cache is tried again next time (nothing recorded to read back).
+    rig.run(Some(&bin)).expect_err("refused again");
+    assert_eq!(rig.calls(), 2);
+    // An empty `missing` list is an ordinary refusal: recorded.
+    let rig = Rig::new("emptymissing");
+    let bin = rig.script(
+        "fc-plain",
+        "echo '{\"status\":\"refused\",\"reason\":\"toolchain pin differs\",\"missing\":[]}'\nexit 2",
+    );
+    rig.run(Some(&bin)).expect_err("refused");
+    assert!(rig.spec.hot_dir.join(MARKER).is_file());
+    rig.run(Some(&bin)).expect_err("recorded");
+    assert_eq!(rig.calls(), 1);
+}
