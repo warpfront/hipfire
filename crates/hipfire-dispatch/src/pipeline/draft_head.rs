@@ -14,6 +14,7 @@ use super::layer_ops::{execute_argmax, hip, project_weight};
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use rdna_compute::{DType, Gpu, GpuTensor};
+use smallvec::SmallVec;
 
 /// Ranking-copy policy: an optional lower-bit copy of the language head
 /// that drafts rank the vocabulary with, and whether its top 8 are
@@ -247,8 +248,36 @@ impl DraftHead {
     /// An input id in `[front, special)` ranks the whole vocabulary for
     /// `full_hold` drafts.
     pub fn observe(&mut self, token: u32) {
-        if (self.front..self.special).contains(&(token as usize)) {
-            self.full_steps = self.full_hold;
+        Self::observe_into(
+            self.front,
+            self.special,
+            self.full_hold,
+            &mut self.full_steps,
+            token,
+        );
+    }
+
+    /// [`Self::observe`] on a lane's own request state (the head's resident
+    /// state is left alone): the same rule on `request.full_steps`.
+    pub fn observe_request(&self, request: &mut DraftHeadRequestState, token: u32) {
+        Self::observe_into(
+            self.front,
+            self.special,
+            self.full_hold,
+            &mut request.full_steps,
+            token,
+        );
+    }
+
+    fn observe_into(
+        front: usize,
+        special: usize,
+        full_hold: u32,
+        full_steps: &mut u32,
+        token: u32,
+    ) {
+        if (front..special).contains(&(token as usize)) {
+            *full_steps = full_hold;
         }
     }
 
@@ -298,8 +327,144 @@ impl DraftHead {
         hidden: &GpuTensor,
         top1_out: &GpuTensor,
     ) -> Result<(), DispatchError> {
-        let (ranked, order) = ranking(self.front, self.special, self.vocab, self.full_steps);
-        self.full_steps = self.full_steps.saturating_sub(1);
+        let full_steps = self.full_steps;
+        self.full_steps = full_steps.saturating_sub(1);
+        self.rank_row(gpu, head, hidden, top1_out, full_steps)
+    }
+
+    /// [`Self::draft_enqueue`] for `requests.len()` lanes' rows in one call:
+    /// `hidden_rows` holds row `i` (`[hidden]` F32, at `i * hidden`) for
+    /// `requests[i]`, and row `i`'s result lands in `top1_out`'s `i`-th
+    /// `Gpu::TOPK8_OUT_BYTES` slot. Each row is ranked under that lane's own
+    /// full-vocabulary hold (`requests[i].full_steps`, counted down as
+    /// `draft_enqueue` does); the resident request state is not touched.
+    ///
+    /// Without `batch` scratch every row runs exactly the launches of a
+    /// one-row `draft_enqueue` (the shared logits and rotation scratch is
+    /// reused row after row). With `batch` = (`logits` of at least `rows *
+    /// vocab` F32, `rotation` of at least `rows * hidden` F32) and an
+    /// MQ2G256V2 ranking copy, the rows that rank the same layout share one
+    /// x-batched GEMV over the copy (every weight row read once per chunk of
+    /// four rows): each row is rotated by the one-row rotate, the x-batched
+    /// kernel is byte-identical per row to the one-row GEMV, and each row's
+    /// top-8 re-score runs on its own logits row, so every slot holds the
+    /// bytes a one-row `draft_enqueue` writes. Every lane's result is parsed
+    /// by [`Self::draft_finish_request`].
+    pub fn draft_rows_enqueue(
+        &mut self,
+        gpu: &mut Gpu,
+        head: &GpuTensor,
+        hidden_rows: &GpuTensor,
+        requests: &mut [&mut DraftHeadRequestState],
+        top1_out: &GpuTensor,
+        batch: Option<(&GpuTensor, &GpuTensor)>,
+    ) -> Result<(), DispatchError> {
+        let rows = requests.len();
+        let slot = Gpu::TOPK8_OUT_BYTES;
+        let hidden = self.hidden;
+        if hidden_rows.dtype != DType::F32
+            || hidden_rows.numel() < rows * hidden
+            || top1_out.byte_size() < rows * slot
+        {
+            return Err(DispatchError::Hip(format!(
+                "draft rows: {rows} rows need {} F32 hidden elements and {} output bytes",
+                rows * hidden,
+                rows * slot
+            )));
+        }
+        let holds: SmallVec<[u32; 8]> = requests.iter().map(|r| r.full_steps).collect();
+        for request in requests.iter_mut() {
+            request.full_steps = request.full_steps.saturating_sub(1);
+        }
+        let ranking_copy_mq2 = self
+            .copy
+            .as_ref()
+            .is_some_and(|copy| copy.dtype == DType::MQ2G256V2);
+        let batch = batch.filter(|(logits, rotation)| {
+            ranking_copy_mq2
+                && rows >= 2
+                && hidden % 256 == 0
+                && logits.dtype == DType::F32
+                && logits.numel() >= rows * self.vocab
+                && rotation.dtype == DType::F32
+                && rotation.numel() >= rows * hidden
+        });
+        let Some((logits_rows, rotation_rows)) = batch else {
+            for (row, &hold) in holds.iter().enumerate() {
+                let hidden_row = hidden_rows.sub_offset(row * hidden, hidden);
+                let out = top1_out.sub_offset(row * slot, slot);
+                self.rank_row(gpu, head, &hidden_row, &out, hold)?;
+            }
+            return Ok(());
+        };
+        // Rows with a full-vocabulary hold rank a different layout than the
+        // rest: each class is one batch.
+        for full_class in [false, true] {
+            let members: SmallVec<[usize; 8]> = (0..rows)
+                .filter(|&row| (holds[row] > 0) == full_class)
+                .collect();
+            match members.len() {
+                0 => {}
+                1 => {
+                    let row = members[0];
+                    let hidden_row = hidden_rows.sub_offset(row * hidden, hidden);
+                    let out = top1_out.sub_offset(row * slot, slot);
+                    self.rank_row(gpu, head, &hidden_row, &out, holds[row])?;
+                }
+                count => {
+                    let (ranked, order) =
+                        ranking(self.front, self.special, self.vocab, holds[members[0]]);
+                    let copy = self.copy.as_ref().expect("MQ2 ranking copy");
+                    for (slot_in_batch, &row) in members.iter().enumerate() {
+                        let hidden_row = hidden_rows.sub_offset(row * hidden, hidden);
+                        let rotated = rotation_rows.sub_offset(slot_in_batch * hidden, hidden);
+                        hip(gpu.rotate_x_mq(&hidden_row, &rotated, hidden))?;
+                    }
+                    let x = rotation_rows.sub_offset(0, count * hidden);
+                    let y = logits_rows.sub_offset(0, count * ranked);
+                    hip(gpu.gemv_mq2g256v2_xbatch(copy, &x, &y, ranked, hidden, count))?;
+                    for (slot_in_batch, &row) in members.iter().enumerate() {
+                        let logits_row = logits_rows.sub_offset(slot_in_batch * ranked, ranked);
+                        let out = top1_out.sub_offset(row * slot, slot);
+                        if let Some(partial) = self.partial.as_ref() {
+                            let hidden_row = hidden_rows.sub_offset(row * hidden, hidden);
+                            let rotated = rotation_rows.sub_offset(slot_in_batch * hidden, hidden);
+                            // An MQ6 head reads the ranking copy's FWHT-rotated input.
+                            let x = if head.dtype == DType::Q8_0 {
+                                &hidden_row
+                            } else {
+                                &rotated
+                            };
+                            hip(gpu.topk8_rescore_k2560(
+                                &logits_row,
+                                ranked,
+                                order,
+                                head,
+                                x,
+                                partial,
+                                &out,
+                            ))?;
+                        } else {
+                            execute_argmax(gpu, &logits_row, &out, 1, ranked)?;
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One row's ranking launches (see [`Self::draft_enqueue`]) under an
+    /// explicit full-vocabulary hold.
+    fn rank_row(
+        &mut self,
+        gpu: &mut Gpu,
+        head: &GpuTensor,
+        hidden: &GpuTensor,
+        top1_out: &GpuTensor,
+        full_steps: u32,
+    ) -> Result<(), DispatchError> {
+        let (ranked, order) = ranking(self.front, self.special, self.vocab, full_steps);
         let ranking_head = self.copy.as_ref().unwrap_or(head);
         project_weight(
             gpu,
@@ -372,6 +537,22 @@ impl DraftHead {
             )));
         }
         Ok(token)
+    }
+
+    /// [`Self::draft_finish`] for a lane's own request state: the draft token,
+    /// with the margin written to `request` (the head's resident request state
+    /// keeps its margin; the re-scored candidates are the head's, as after
+    /// `draft_finish`).
+    pub fn draft_finish_request(
+        &mut self,
+        request: &mut DraftHeadRequestState,
+        top: &[u8],
+    ) -> Result<u32, DispatchError> {
+        let resident = self.margin;
+        let token = self.draft_finish(top);
+        request.margin = self.margin;
+        self.margin = resident;
+        token
     }
 
     /// Exact logit margin of the last draft over its runner-up among the

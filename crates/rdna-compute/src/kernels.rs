@@ -2555,6 +2555,16 @@ pub const GEMV_MQ5G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq5
 pub const GEMV_MQ3G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256v2.hip");
 /// MQ2G256V2: dual-scale 2-bit (qt=50).
 pub const GEMV_MQ2G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq2g256v2.hip");
+/// x-batched MQ2G256V2 GEMV (`y[b] = A . x[b]`, B <= 4) built from the scalar
+/// kernel's own source: each weight row is decoded once per launch and every
+/// row keeps the scalar kernel's accumulation order (the MTP draft head's
+/// ranking copy over several lanes' rows).
+pub const GEMV_MQ2G256V2_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_MQ2G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ2G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ2G256V2_XBATCH_KERNEL gemv_mq2g256v2_xbatch\n",
+    include_str!("../../../kernels/src/gemv_mq2g256v2.hip")
+);
 /// MQ6G256V2: dual-scale 6-bit (qt=47).
 pub const GEMV_MQ6G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq6g256v2.hip");
 /// gfx1151 K2560 scalar MQ6: fold the group/tail control at compile time.

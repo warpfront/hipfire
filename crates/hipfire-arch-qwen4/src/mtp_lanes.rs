@@ -499,6 +499,129 @@ pub(crate) fn lane_call<R>(
         .map_err(|error| error.to_string())
 }
 
+/// Whether one draft round of `ops` ops runs as ONE batched head call
+/// (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`, rows scratch allocated): 2..=8 ops, and
+/// no op reads a distribution the batched ranking does not leave in the head's
+/// shared logit row (`any_distribution_read` with a head that does not
+/// re-score; a re-scoring head's read is its host-resident candidates).
+///
+/// The decision must be the same on every EP rank (the head's gather parity
+/// advances once per batched call and once per op serially): it depends only
+/// on the root's plan, the process flag and the head's build, never on which
+/// rank owns the sampler.
+pub(crate) fn draft_round_batchable(
+    bundle: &Qwen4Bundle,
+    ops: usize,
+    any_distribution_read: bool,
+) -> bool {
+    batchable_round(
+        ops,
+        bundle.mtp_rows_ready(),
+        any_distribution_read,
+        bundle.mtp_draft_rescored(),
+    )
+}
+
+/// [`draft_round_batchable`]'s pure rule.
+fn batchable_round(
+    ops: usize,
+    rows_ready: bool,
+    any_distribution_read: bool,
+    rescored: bool,
+) -> bool {
+    rows_ready
+        && (2..=crate::mtp_gpu::MTP_DRAFT_LANES_MAX).contains(&ops)
+        && (rescored || !any_distribution_read)
+}
+
+/// The device work of one draft round as one batched head call: `ops[i]` is
+/// `(input token, position)` of `lanes[i]`; lane `i`'s result lands in slot
+/// `i` of `top1_out`. Each lane's own head state and draft request state are
+/// passed in place (nothing is swapped); the step is the lane's `j`-th draft
+/// (`j = position - window.position`), fresh selection exactly at `j == 0`.
+pub(crate) fn enqueue_batched_draft(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    lanes: &mut [&mut Qwen4LaneState],
+    ops: &[(u32, usize)],
+    top1_out: &GpuTensor,
+) -> Result<(), String> {
+    let mut rows: Vec<crate::mtp_gpu::DraftRow<'_>> = Vec::with_capacity(ops.len());
+    for (lane, &(token, position)) in lanes.iter_mut().zip(ops) {
+        let LaneSpec {
+            head,
+            draft,
+            pending_hidden,
+            window,
+            ..
+        } = lane
+            .spec
+            .as_mut()
+            .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
+        let window_position = window
+            .as_ref()
+            .ok_or_else(|| "draft op without a pending window".to_string())?
+            .position;
+        let j = position - window_position;
+        rows.push(crate::mtp_gpu::DraftRow {
+            state: head,
+            request: draft,
+            token,
+            backbone_hidden: (j == 0).then_some(&*pending_hidden),
+            position,
+            fresh_qsa_selection: j == 0,
+        });
+    }
+    bundle
+        .mtp_forward_rows_deferred(gpu, &mut rows, top1_out)
+        .map_err(|e| format!("batched draft step: {e}"))
+}
+
+/// Parse lane's slot of a batched draft round: the draft token and the lane's
+/// own margin (written to the lane's request state, the head's resident one
+/// untouched). A re-scoring head's candidates are the head's, valid until the
+/// next lane's finish: read them (`mtp_draft_read`) before finishing another.
+pub(crate) fn finish_batched_draft(
+    bundle: &mut Qwen4Bundle,
+    lane: &mut Qwen4LaneState,
+    top: &[u8],
+) -> Result<(u32, f32), String> {
+    let spec = lane
+        .spec
+        .as_mut()
+        .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
+    let token = bundle
+        .mtp_draft_finish_request(&mut spec.draft, top)
+        .map_err(|e| e.to_string())?;
+    Ok((token, spec.draft.margin))
+}
+
+#[cfg(test)]
+mod batched_draft_tests {
+    use super::batchable_round;
+
+    #[test]
+    fn batched_round_needs_two_to_eight_ops_and_the_rows_scratch() {
+        for ops in [0, 1, 9, 16] {
+            assert!(!batchable_round(ops, true, false, true), "{ops} ops");
+        }
+        for ops in 2..=8 {
+            assert!(batchable_round(ops, true, false, true), "{ops} ops");
+            assert!(
+                !batchable_round(ops, false, false, true),
+                "{ops} ops, no scratch"
+            );
+        }
+    }
+
+    #[test]
+    fn a_full_row_read_keeps_the_round_serial_unless_the_head_rescores() {
+        assert!(!batchable_round(4, true, true, false));
+        assert!(batchable_round(4, true, true, true));
+        assert!(batchable_round(4, true, false, false));
+    }
+}
+
 /// A lane window whose every fallible operation succeeded and whose tickets
 /// validated but are still live; [`publish_lane_window`] consumes them.
 pub(crate) struct PreparedLaneWindow {

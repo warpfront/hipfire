@@ -53,6 +53,21 @@ use std::fmt;
 const MTP_APPEND_BRANCHES: usize = 4;
 /// Rows of every MTP HC read and write: one token.
 const MTP_HC_ROWS: usize = 1;
+/// Most lanes one batched head round (`Qwen4MtpGpu::forward_rows_deferred`)
+/// carries: the EP row gather's capacity and the few-row route's limit
+/// (`LANE_MAX_DRAFTS` is 7).
+pub(crate) const MTP_DRAFT_LANES_MAX: usize = 8;
+
+/// Env switch of the batched head rounds: `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`.
+/// Default off; unset, `0` or anything else leaves the head's scratch and
+/// every code path exactly as without the feature. Read at load (the rows
+/// scratch is allocated then) and at every batched call.
+pub(crate) const MTP_DRAFT_ROUNDS_ENV: &str = "HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS";
+
+mod rows;
+pub(crate) use rows::{draft_rounds_enabled, DraftRow, MtpRowsScratch};
+#[cfg(feature = "lab")]
+mod lab;
 /// Metadata words of an MTP head session snapshot: the boundary-row word
 /// (the boundary position plus one, or 0) and the state mark.
 const MTP_SESSION_WORDS: usize = 7;
@@ -143,50 +158,75 @@ fn invalid(message: impl Into<String>) -> MtpGpuError {
     MtpGpuError::Invalid(message.into())
 }
 
-/// One-row HC read of the MTP streams into `hc_mixed`.
+/// The tensors the head's row stages read and write. [`MtpGpuScratch`] (one
+/// row, [`MTP_HC_ROWS`]) and [`rows::MtpRowsScratch`] (up to
+/// [`MTP_DRAFT_LANES_MAX`] lanes) each lend one, so the stage sequences are
+/// written once and take the row count as a parameter.
+#[derive(Clone, Copy)]
+struct HeadRowTensors<'a> {
+    token_ids: &'a GpuTensor,
+    embedding_rot: &'a GpuTensor,
+    token_embedding: &'a GpuTensor,
+    embedding_norm: &'a GpuTensor,
+    hidden_norm: &'a GpuTensor,
+    projected_embedding: &'a GpuTensor,
+    projected_hidden: &'a GpuTensor,
+    wide: &'a GpuTensor,
+    hc_normalized: &'a GpuTensor,
+    hc_low: &'a GpuTensor,
+    hc_up: &'a GpuTensor,
+    hc_mixed: &'a GpuTensor,
+    hc_gates: &'a GpuTensor,
+    rotation: &'a GpuTensor,
+    ffn_output: &'a GpuTensor,
+}
+
+/// HC read of `rows` rows of the MTP streams into `hc_mixed`.
 fn hc_read<'a>(
     read: &Qwen4HyperReadWeights<'a>,
-    scratch: &'a MtpGpuScratch,
+    t: &HeadRowTensors<'a>,
     config: &Qwen4Config,
+    rows: usize,
 ) -> HyperReadOp<'a> {
     HyperReadOp {
         state_bf16: false,
-        input: &scratch.wide,
+        input: t.wide,
         norm_weight: read.norm,
         input_mix_down: read.input_mix_down,
         input_mix_up: read.input_mix_up,
-        normalized: &scratch.hc_normalized,
-        low: &scratch.hc_low,
-        up: &scratch.hc_up,
-        mixed: &scratch.hc_mixed,
-        rows: MTP_HC_ROWS,
+        normalized: t.hc_normalized,
+        low: t.hc_low,
+        up: t.hc_up,
+        mixed: t.hc_mixed,
+        rows,
         branches: config.hc_count,
         hidden: config.hidden_size,
         low_rank: config.hc_lowrank,
-        rotation: &scratch.rotation,
+        rotation: t.rotation,
     }
 }
 
-/// One-row HC write of `mixed` into the MTP streams, in place.
+/// HC write of `mixed` (`rows` rows) into the MTP streams, in place.
 fn hc_write<'a>(
     write: &Qwen4HyperWriteWeights<'a>,
     mixed: &'a GpuTensor,
-    scratch: &'a MtpGpuScratch,
+    t: &HeadRowTensors<'a>,
     config: &Qwen4Config,
+    rows: usize,
 ) -> HyperWriteOp<'a> {
     HyperWriteOp {
         state_bf16: false,
-        input: &scratch.wide,
+        input: t.wide,
         norm_weight: write.norm,
         block_inject: write.block_inject,
-        normalized: &scratch.hc_normalized,
+        normalized: t.hc_normalized,
         mixed,
-        gates: &scratch.hc_gates,
-        output: &scratch.wide,
-        rows: MTP_HC_ROWS,
+        gates: t.hc_gates,
+        output: t.wide,
+        rows,
         branches: config.hc_count,
         hidden: config.hidden_size,
-        rotation: &scratch.rotation,
+        rotation: t.rotation,
     }
 }
 
@@ -280,6 +320,29 @@ pub struct MtpGpuScratch {
     moe_down_expanded: GpuTensor,
     moe_scalar: GpuTensor,
     host_token_bytes: [u8; 4],
+}
+
+impl MtpGpuScratch {
+    /// The one-row head step's operand tensors (see [`HeadRowTensors`]).
+    fn row_tensors(&self) -> HeadRowTensors<'_> {
+        HeadRowTensors {
+            token_ids: &self.token_ids,
+            embedding_rot: &self.embedding_rot,
+            token_embedding: &self.token_embedding,
+            embedding_norm: &self.embedding_norm,
+            hidden_norm: &self.hidden_norm,
+            projected_embedding: &self.projected_embedding,
+            projected_hidden: &self.projected_hidden,
+            wide: &self.wide,
+            hc_normalized: &self.hc_normalized,
+            hc_low: &self.hc_low,
+            hc_up: &self.hc_up,
+            hc_mixed: &self.hc_mixed,
+            hc_gates: &self.hc_gates,
+            rotation: &self.rotation,
+            ffn_output: &self.ffn_output,
+        }
+    }
 }
 
 /// Allocations of one [`MtpGpuScratch`], in field order.
@@ -2149,6 +2212,9 @@ pub struct Qwen4MtpGpu {
     /// head's gather buffer `2 + j % 2`, so a probe-and-restore never reuses
     /// a buffer on two consecutive invocations.
     pub(crate) moe_steps: u64,
+    /// The batched head rounds' scratch (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`,
+    /// MoE head); `None` otherwise.
+    pub(crate) rows: Option<MtpRowsScratch>,
 }
 
 /// Draft-head front: tokens below this id, plus EOS and the control ids
@@ -2170,82 +2236,165 @@ pub(crate) enum MtpStep {
     Append,
 }
 
+/// Row-offset views of a multi-lane head step: the per-lane broadcast-add
+/// operands and the chunks of the branch-row FC projection. Empty for one
+/// row, where the whole tensors are the operands.
+struct HeadRowViews {
+    /// Per lane: (`projected_hidden` rows, `projected_embedding` row, `wide`
+    /// rows).
+    broadcast: SmallVec<[(GpuTensor, GpuTensor, GpuTensor); MTP_DRAFT_LANES_MAX]>,
+    /// Chunks of the `rows * hc_count` branch rows of the hidden FC
+    /// projection: (`hidden_norm` rows, `projected_hidden` rows, row count).
+    /// No chunk is wider than the few-row route (`FEW_ROW_ROUTE_ROWS`) unless
+    /// one lane's own `hc_count` rows are, so every projected row stays on the
+    /// route whose per-row bytes are the one-row step's.
+    fc_hidden: SmallVec<[(GpuTensor, GpuTensor, usize); 4]>,
+}
+
+impl HeadRowViews {
+    fn new(t: &HeadRowTensors<'_>, config: &Qwen4Config, rows: usize) -> Self {
+        let mut views = Self {
+            broadcast: SmallVec::new(),
+            fc_hidden: SmallVec::new(),
+        };
+        if rows <= 1 {
+            return views;
+        }
+        let hidden = config.hidden_size;
+        let hc = config.hc_count;
+        let wide = hc * hidden;
+        for row in 0..rows {
+            views.broadcast.push((
+                t.projected_hidden.sub_offset(row * wide, wide),
+                t.projected_embedding.sub_offset(row * hidden, hidden),
+                t.wide.sub_offset(row * wide, wide),
+            ));
+        }
+        let total = rows * hc;
+        let chunk = (rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS / hc).max(1) * hc;
+        let mut first = 0;
+        while first < total {
+            let count = chunk.min(total - first);
+            views.fc_hidden.push((
+                t.hidden_norm.sub_offset(first * hidden, count * hidden),
+                t.projected_hidden
+                    .sub_offset(first * hidden, count * hidden),
+                count,
+            ));
+            first += count;
+        }
+        views
+    }
+}
+
 /// Head step stage 2a (row stage, rows-shaped): the token embedding, the two
 /// pre-FC norms, both FC projections, their broadcast add and the attention
-/// HC read. Every op here is row-local (`rows` is 1 at present); a batched
-/// round runs it once over all drafting lanes.
+/// HC read, over `rows` lanes' rows at once. Every op here is row-local: a
+/// batched round runs it once over all drafting lanes (`rows` up to
+/// [`MTP_DRAFT_LANES_MAX`]); `rows == 1` is the one-token step. `views` is
+/// [`HeadRowViews::new`] for the same `t` and `rows`.
+#[allow(clippy::too_many_arguments)]
 fn push_head_rows_front<'a>(
     steps: &mut SmallVec<[Step<'a>; 16]>,
     weights: &'a Qwen4Weights,
     config: &Qwen4Config,
     mtp: &'a crate::weights::Qwen4MtpWeights,
-    scratch: &'a MtpGpuScratch,
+    t: &HeadRowTensors<'a>,
+    views: &'a HeadRowViews,
+    rows: usize,
     backbone_hidden: &'a GpuTensor,
     attn_read: &Qwen4HyperReadWeights<'a>,
 ) -> Result<(), MtpGpuError> {
     let hidden = config.hidden_size;
     steps.push(Step::Embed(EmbeddingOp {
         table: weights.resident(&weights.root.embedding)?,
-        rotated: &scratch.embedding_rot,
-        token_ids: &scratch.token_ids,
-        output: &scratch.token_embedding,
-        rows: 1,
+        rotated: t.embedding_rot,
+        token_ids: t.token_ids,
+        output: t.token_embedding,
+        rows,
         dim: hidden,
     }));
     steps.push(Step::HyperNorm(HyperNormOp {
-        input: &scratch.token_embedding,
+        input: t.token_embedding,
         norm_weight: weights.resident(&mtp.pre_fc_norm_embedding)?,
-        normalized: &scratch.embedding_norm,
+        normalized: t.embedding_norm,
         branches: 1,
         hidden,
         state_bf16: false,
     }));
     steps.push(Step::Project(ProjectOp {
         weight: dense_ref(weights, &mtp.fc_embedding)?,
-        input: &scratch.embedding_norm,
-        output: &scratch.projected_embedding,
-        rows: 1,
-        rotation: Some(&scratch.rotation),
+        input: t.embedding_norm,
+        output: t.projected_embedding,
+        rows,
+        rotation: Some(t.rotation),
         ladder: ProjectLadder::Trunk,
         residual: None,
     }));
     steps.push(Step::HyperNorm(HyperNormOp {
         input: backbone_hidden,
         norm_weight: weights.resident(&mtp.pre_fc_norm_hidden)?,
-        normalized: &scratch.hidden_norm,
+        normalized: t.hidden_norm,
         branches: config.hc_count,
         hidden,
         state_bf16: false,
     }));
-    // Both branch rows in one projection (each bitwise its own).
-    steps.push(Step::Project(ProjectOp {
-        weight: dense_ref(weights, &mtp.fc_hidden)?,
-        input: &scratch.hidden_norm,
-        output: &scratch.projected_hidden,
-        rows: config.hc_count,
-        rotation: Some(&scratch.rotation),
-        ladder: ProjectLadder::Trunk,
-        residual: None,
-    }));
-    steps.push(Step::BroadcastAdd(BroadcastAddOp {
-        rows_input: &scratch.projected_hidden,
-        row: &scratch.projected_embedding,
-        output: &scratch.wide,
-        rows: config.hc_count,
-        width: hidden,
-    }));
-    steps.push(Step::HyperRead(hc_read(attn_read, scratch, config)));
+    if rows == 1 {
+        // Both branch rows in one projection (each bitwise its own).
+        steps.push(Step::Project(ProjectOp {
+            weight: dense_ref(weights, &mtp.fc_hidden)?,
+            input: t.hidden_norm,
+            output: t.projected_hidden,
+            rows: config.hc_count,
+            rotation: Some(t.rotation),
+            ladder: ProjectLadder::Trunk,
+            residual: None,
+        }));
+        steps.push(Step::BroadcastAdd(BroadcastAddOp {
+            rows_input: t.projected_hidden,
+            row: t.projected_embedding,
+            output: t.wide,
+            rows: config.hc_count,
+            width: hidden,
+        }));
+    } else {
+        for (input, output, count) in &views.fc_hidden {
+            steps.push(Step::Project(ProjectOp {
+                weight: dense_ref(weights, &mtp.fc_hidden)?,
+                input,
+                output,
+                rows: *count,
+                rotation: Some(t.rotation),
+                ladder: ProjectLadder::Trunk,
+                residual: None,
+            }));
+        }
+        for (rows_input, row, output) in &views.broadcast {
+            steps.push(Step::BroadcastAdd(BroadcastAddOp {
+                rows_input,
+                row,
+                output,
+                rows: config.hc_count,
+                width: hidden,
+            }));
+        }
+    }
+    steps.push(Step::HyperRead(hc_read(attn_read, t, config, rows)));
     Ok(())
 }
 
 /// Head step stage 3 (per lane): the lane's own indexed attention over its
-/// head arena (`state`), one row. Stateful, never shared across lanes.
+/// head arena (`state`), one row: `input` is the lane's row of the attention
+/// HC read, `attention_output` the row the attention writes. Stateful, never
+/// shared across lanes.
 fn head_attention_op<'a>(
     config: &Qwen4Config,
     scratch: &'a MtpGpuScratch,
     state: &'a MtpGpuState,
     qsa: Qwen4QsaWeights<'a>,
     mode: IndexedAttentionMode<'a>,
+    input: &'a GpuTensor,
+    attention_output: &'a GpuTensor,
 ) -> IndexedAttentionOp<'a> {
     let hidden = config.hidden_size;
     IndexedAttentionOp {
@@ -2279,14 +2428,14 @@ fn head_attention_op<'a>(
             selected_len: state.selected_len,
             position: state.position,
         },
-        input: &scratch.hc_mixed,
+        input,
         index_scratch: &scratch.index,
         qgate_scratch: &scratch.q_and_gate,
         k_scratch: &scratch.qsa_k,
         v_scratch: &scratch.qsa_v,
         qsa_output: &scratch.qsa_output,
         selected_scratch: &scratch.qsa_selected,
-        attention_output: &scratch.projected_embedding,
+        attention_output,
         bf16_scratch: &scratch.hc_bf16,
         rows: 1,
         index_heads: config.indexer_n_heads,
@@ -2315,7 +2464,8 @@ fn head_attention_op<'a>(
 fn push_head_rows_back<'a>(
     steps: &mut SmallVec<[Step<'a>; 16]>,
     config: &Qwen4Config,
-    scratch: &'a MtpGpuScratch,
+    t: &HeadRowTensors<'a>,
+    rows: usize,
     attn_write: &Qwen4HyperWriteWeights<'a>,
     mlp_read: &Qwen4HyperReadWeights<'a>,
     mlp_write: &Qwen4HyperWriteWeights<'a>,
@@ -2327,16 +2477,17 @@ fn push_head_rows_back<'a>(
     if let Some(ffn) = ffn {
         steps.push(Step::HyperWrite(hc_write(
             attn_write,
-            &scratch.projected_embedding,
-            scratch,
+            t.projected_embedding,
+            t,
             config,
+            rows,
         )));
-        steps.push(Step::HyperRead(hc_read(mlp_read, scratch, config)));
+        steps.push(Step::HyperRead(hc_read(mlp_read, t, config, rows)));
         match ffn {
             MtpFfnCall::Moe(moe) => {
                 steps.push(Step::Clear(ClearOp {
-                    tensor: &scratch.ffn_output,
-                    elements: hidden,
+                    tensor: t.ffn_output,
+                    elements: rows * hidden,
                 }));
                 steps.push(Step::Moe(moe));
             }
@@ -2344,12 +2495,13 @@ fn push_head_rows_back<'a>(
         }
         steps.push(Step::HyperWrite(hc_write(
             mlp_write,
-            &scratch.ffn_output,
-            scratch,
+            t.ffn_output,
+            t,
             config,
+            rows,
         )));
         if predict {
-            steps.push(Step::HyperRead(hc_read(final_read, scratch, config)));
+            steps.push(Step::HyperRead(hc_read(final_read, t, config, rows)));
         }
     }
 }
@@ -2526,7 +2678,8 @@ impl Qwen4MtpGpu {
             .checked_add(MtpGpuState::device_bytes(config, context)?)?
             .checked_add(Qwen4MoeLayerRuntime::device_bytes(config)?)?
             .checked_add(head_d2_device_bytes(config, head_d2)?)?
-            .checked_add(draft)?;
+            .checked_add(draft)?
+            .checked_add(MtpRowsScratch::device_bytes(config)?)?;
         Some((resident, scratch))
     }
 
@@ -2557,6 +2710,7 @@ impl Qwen4MtpGpu {
             resident.push(u64::try_from(head_d2_device_bytes(config, true)?).ok()?);
         }
         resident.extend(widen(draft)?);
+        resident.extend(MtpRowsScratch::allocation_sizes(config)?);
         Some((resident, widen(draft_scratch)?))
     }
 
@@ -2666,6 +2820,18 @@ impl Qwen4MtpGpu {
                 return Err(error);
             }
         };
+        // The batched head rounds' rows scratch: allocated last, only under
+        // `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1` (otherwise nothing changes).
+        let rows = match MtpRowsScratch::new(gpu, config) {
+            Ok(rows) => rows,
+            Err(error) => {
+                let _ = draft.free_gpu(gpu);
+                let _ = moe.map(|moe| moe.free_gpu(gpu));
+                let _ = state.free_gpu(gpu);
+                let _ = scratch.free_gpu(gpu);
+                return Err(error);
+            }
+        };
         Ok(Self {
             scratch,
             state,
@@ -2674,6 +2840,7 @@ impl Qwen4MtpGpu {
             draft,
             ep_bound,
             moe_steps: 0,
+            rows,
         })
     }
 
@@ -2731,16 +2898,19 @@ impl Qwen4MtpGpu {
             state,
             moe,
             draft,
+            rows,
             ..
         } = self;
         let draft_error = draft.free_gpu(gpu);
         let scratch_error = scratch.free_gpu(gpu);
         let state_error = state.free_gpu(gpu);
         let moe_error = moe.and_then(|moe| moe.free_gpu(gpu));
+        let rows_error = rows.and_then(|rows| rows.free_gpu(gpu));
         draft_error
             .or(scratch_error)
             .or(state_error)
             .or(moe_error)
+            .or(rows_error)
             .map_or(Ok(()), |error| Err(MtpGpuError::Hip(error)))
     }
     /// Deliberately dirty the reusable MoE buffers for the bounded profile
@@ -3072,13 +3242,7 @@ impl Qwen4MtpGpu {
         &mut self,
         gpu: &mut Gpu,
         step: MtpStep,
-        (full_len, raw_len, pooled_len, selected_len, next_position): (
-            usize,
-            usize,
-            usize,
-            usize,
-            usize,
-        ),
+        lengths: (usize, usize, usize, usize, usize),
     ) -> Result<(), MtpGpuError> {
         if step != MtpStep::Append {
             gpu.copy_d2d(
@@ -3087,13 +3251,7 @@ impl Qwen4MtpGpu {
                 self.scratch.wide.byte_size(),
             )?;
         }
-        let state = &mut self.state;
-        state.position = next_position;
-        state.full_len = full_len;
-        state.raw_len = raw_len;
-        state.pooled_len = pooled_len;
-        state.selected_len = selected_len;
-        state.step_index = state.step_index.wrapping_add(1);
+        self.state.commit_step(lengths);
         Ok(())
     }
 
@@ -3186,7 +3344,16 @@ impl Qwen4MtpGpu {
                     selected_len_out: &state.selected_len_out,
                 },
             };
-            let attention = head_attention_op(config, scratch, state, qsa, mode);
+            let row_tensors = scratch.row_tensors();
+            let attention = head_attention_op(
+                config,
+                scratch,
+                state,
+                qsa,
+                mode,
+                &scratch.hc_mixed,
+                &scratch.projected_embedding,
+            );
             let lengths = attention.next_lengths()?;
             // Under EP a MoE head step exchanges its expanded rows through the
             // forward's row gather: gather buffer `2 + j % 2` and layer index
@@ -3274,13 +3441,16 @@ impl Qwen4MtpGpu {
                     _ => return Err(invalid("MTP FFN weights and runtime disagree")),
                 })
             };
+            let views = HeadRowViews::new(&row_tensors, config, MTP_HC_ROWS);
             let mut steps: SmallVec<[Step<'_>; 16]> = SmallVec::new();
             push_head_rows_front(
                 &mut steps,
                 weights,
                 config,
                 mtp,
-                scratch,
+                &row_tensors,
+                &views,
+                MTP_HC_ROWS,
                 backbone_hidden,
                 &attn.read,
             )?;
@@ -3288,7 +3458,8 @@ impl Qwen4MtpGpu {
             push_head_rows_back(
                 &mut steps,
                 config,
-                scratch,
+                &row_tensors,
+                MTP_HC_ROWS,
                 &attn.write,
                 &mlp.read,
                 &mlp.write,

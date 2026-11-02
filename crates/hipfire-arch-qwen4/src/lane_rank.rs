@@ -525,8 +525,44 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         let spec_store = spec_store
             .ok_or_else(|| rank_error("draft_step: batched window in a store without MTP lanes"))?;
         let slot_bytes = Gpu::TOPK8_OUT_BYTES;
-        // Every still-drafting lane enqueues its draft step, in plan order.
-        for (slot, (op, lane)) in round.ops.iter().zip(lanes.iter_mut()).enumerate() {
+        #[cfg(feature = "lab")]
+        crate::lab_draft_rounds::fill_stale(gpu, &lanes).map_err(rank_error)?;
+        // Lab oracle of the batched head round: serial vs batched on scratch
+        // twins of this round's lanes, before the round's own work.
+        #[cfg(feature = "lab")]
+        if crate::lab_draft_rounds::probe_enabled() && round.ops.len() >= 2 {
+            let inputs: Vec<(u32, usize)> =
+                round.ops.iter().map(|op| (op.input, op.position)).collect();
+            crate::lab_draft_rounds::probe_round(bundle, gpu, &mut lanes, &inputs, 0, round.round)
+                .map_err(rank_error)?;
+        }
+        // One batched head call for the round (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`),
+        // else every still-drafting lane enqueues its own draft step, in plan order.
+        let batched = crate::mtp_lanes::draft_round_batchable(bundle, round.ops.len(), false);
+        if batched {
+            let mut inputs = Vec::with_capacity(round.ops.len());
+            for (slot, (op, lane)) in round.ops.iter().zip(lanes.iter_mut()).enumerate() {
+                if is_probe_op(&flight.start.lanes[plan_of[slot]], op.position) {
+                    save_probe_state(&mut **lane);
+                }
+                inputs.push((op.input, op.position));
+            }
+            crate::mtp_lanes::enqueue_batched_draft(
+                bundle,
+                gpu,
+                &mut lanes,
+                &inputs,
+                &spec_store.draft_top1,
+            )
+            .map_err(|e| rank_error(format!("draft_step: {e}")))?;
+        }
+        for (slot, (op, lane)) in round
+            .ops
+            .iter()
+            .zip(lanes.iter_mut())
+            .enumerate()
+            .filter(|_| !batched)
+        {
             // The confirmation probe's Draft is abandoned on a hit: save the
             // head's request state it is about to move.
             if is_probe_op(&flight.start.lanes[plan_of[slot]], op.position) {
@@ -574,7 +610,11 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
             let i = plan_of[slot];
             let plan = &flight.start.lanes[i];
             let k_max = native_keep_cap(plan);
-            let (token, margin) = {
+            let (token, margin) = if batched {
+                crate::mtp_lanes::finish_batched_draft(bundle, &mut **lane, top).map_err(|e| {
+                    rank_error(format!("draft_step: draft finish {}: {e}", round.round))
+                })?
+            } else {
                 let Qwen4LaneState { state, spec, .. } = &mut **lane;
                 let spec = spec
                     .as_mut()

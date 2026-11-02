@@ -42466,6 +42466,37 @@ impl Gpu {
         self.gemm_mq4g256v2_xbatch(a_raw, x, y, m, k, batch_size, false)
     }
 
+    /// Plain `Y = W·X` over `batch_size` rows of an MQ2G256V2 weight with the
+    /// x-batched scalar GEMV (chunks of 4): each row is byte-identical to the
+    /// singleton `gemv_mq2g256v2` on that row (same per-row accumulation
+    /// order), and every weight row is read once per chunk. `x` holds the rows
+    /// already in the weight's FWHT basis, `y` is `[batch_size, m]`.
+    pub fn gemv_mq2g256v2_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error(
+                "gemv_mq2g256v2_xbatch",
+            ));
+        }
+        self.gemv_v2_xbatch_rows(
+            "gemv_mq2g256v2_xbatch",
+            kernels::GEMV_MQ2G256V2_XBATCH_SRC,
+            a_raw,
+            x,
+            y,
+            m,
+            k,
+            batch_size,
+        )
+    }
+
     /// MQ4G256V2 without WMMA: the x-batched scalar GEMV decodes each weight
     /// row once for up to four input rows, keeping the scalar kernel's per-row
     /// accumulation order. `residual` selects `Y += W·X` over `Y = W·X`.

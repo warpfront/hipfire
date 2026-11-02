@@ -1085,6 +1085,10 @@ name = "pm_xbatch_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "mq2_xbatch_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "lane_rows_pm_oracle"
 required-features = ["lab"]
 

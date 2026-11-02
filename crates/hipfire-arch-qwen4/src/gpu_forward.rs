@@ -6704,6 +6704,97 @@ pub(crate) fn seal_moe_decode<'a>(
         .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 MoE: {error:?}")))
 }
 
+/// Seal the MTP head's routed-expert MoE call over `rows` lanes' rows
+/// (2..=[`QWEN4_EP_GATHER_MAX_ROWS`] under EP): the few-row grouped route the
+/// trunk's lane steps run (`program::seal_moe_for_layer` with `rows` routing
+/// rows), bound to the head's own runtime, raw shared-expert weights (the
+/// head keeps no decode copies) and scratch. Under EP `row_gather` is the
+/// forward's row-gather hook with the head's shared-down output tensor
+/// (`MoeSharedPrefill`'s unfused shared down) and `layer_index` the head's
+/// gather index (`num_hidden_layers + parity`); otherwise `layer_index` is 0.
+pub(crate) fn seal_moe_rows<'a>(
+    ctx: &'a DispatchCtx,
+    config: &Qwen4Config,
+    layer_index: usize,
+    runtime: &'a Qwen4MoeLayerRuntime,
+    rows: usize,
+    scratch: &'a Qwen4LayerScratch<'a>,
+    row_gather: Option<(&'a dyn MoeRowGather, &'a GpuTensor)>,
+) -> Result<SealedMoeCall<'a>, Qwen4GpuForwardError> {
+    if runtime.fp8 {
+        return Err(invalid(
+            "qt=55 FP8 experts have no head row route; the MTP head rows need QT44/QT53 experts",
+        ));
+    }
+    if row_gather.is_some() {
+        ep_lane_moe_rows(rows, rows)?;
+    }
+    let shared = MoeSharedWeights {
+        selector: runtime.shared_scalar.dispatch_ref(),
+        gate: runtime.shared_gate.dispatch_ref(),
+        up: runtime.shared_up.dispatch_ref(),
+        down: runtime.shared_down.dispatch_ref(),
+    };
+    let binding = Qwen4MoeBinding {
+        cpu_deferred_experts: runtime.cpu_deferred_experts,
+        route_policy: qwen4_route_policy(
+            config,
+            &shared,
+            runtime.route_capability(rows),
+            runtime.slab_cold_codec(),
+            runtime
+                .expert_keep_mask
+                .as_ref()
+                .map_or(0, |mask| mask.buf.as_ptr() as usize),
+        ),
+        table: &runtime.table,
+        cache: &runtime.cache,
+        routed_experts: runtime.routed_view(true, rows, rows, false, 8),
+        router: runtime.router.dispatch_ref(),
+        shared,
+        intermediate: runtime
+            .experts
+            .first()
+            .map(|expert| expert.gate_up.m)
+            .unwrap_or_default()
+            / 2,
+        experts_all_gate_up_mq4: runtime.experts_all_gate_up_mq4,
+        expert_gate_up_dtypes: runtime
+            .slab
+            .as_ref()
+            .filter(|slab| slab.mixed())
+            .map(|slab| slab.gate_up_dtypes.as_slice()),
+        expert_down_dtypes: runtime
+            .slab
+            .as_ref()
+            .filter(|slab| slab.mixed())
+            .map(|slab| slab.down_dtypes.as_slice()),
+        expert_codec_tags: runtime
+            .slab
+            .as_ref()
+            .and_then(|slab| slab.codec_tags.as_ref()),
+        expert_gate_up_ptrs: &runtime.expert_gate_up_ptrs,
+        expert_down_ptrs: &runtime.expert_down_ptrs,
+        expert_stage_ptrs: None,
+        expert_gate_up_entries: &runtime.expert_gate_up_entries,
+        expert_down_entries: &runtime.expert_down_entries,
+        layer_idx: layer_index as u16,
+        norm_topk_prob: config.norm_topk_prob,
+        row_gather: row_gather.map(|(gather, _)| gather),
+        shared_down_out: row_gather
+            .filter(|_| ep_lane_shared_down(rows))
+            .map(|(_, shared_down)| shared_down),
+        tile_exchange: None,
+    };
+    let seal_started = qwen4_profile_start();
+    let sealed =
+        crate::program::seal_moe_for_layer(ctx, program_dims(config), binding, scratch, rows, rows);
+    qwen4_profile_record(Qwen4ProfilePhase::MoeSeal, seal_started);
+    sealed.map_err(|error| {
+        Qwen4GpuForwardError::Dispatch(format!("seal Qwen4 head rows MoE: {error:?}"))
+    })
+}
+
 /// Every device field of [`Qwen4GpuForwardScratch`], in allocation order.
 /// The order is the plan's index: `plan` refuses to push a slot out of it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

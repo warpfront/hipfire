@@ -555,6 +555,32 @@ impl RankLane<'_> {
                     spec_store.draft_top1_host.len() / slot_bytes
                 ));
             }
+            // Lab settling test of the draft-history mask (PARITY.md 4.3): head
+            // arena rows beyond each lane's valid lengths are overwritten
+            // (`HIPFIRE_LAB_MTP_STALE_FILL`); every output must stay identical.
+            #[cfg(feature = "lab")]
+            crate::lab_draft_rounds::fill_stale(gpu, &lanes)?;
+            // Lab oracle of the batched head round: compare this round's lanes'
+            // serial and batched head steps on scratch twins of their states
+            // (no effect on the lanes; armed by env only, `lab` builds only).
+            #[cfg(feature = "lab")]
+            if crate::lab_draft_rounds::probe_enabled()
+                && round.ops.len() >= 2
+                && !round.ops.iter().try_fold(false, |any, op| {
+                    Ok::<_, String>(any || is_probe_op(plan_of(&op.key)?, op.position))
+                })?
+            {
+                let ops: Vec<(u32, usize)> =
+                    round.ops.iter().map(|op| (op.input, op.position)).collect();
+                crate::lab_draft_rounds::probe_round(
+                    bundle,
+                    gpu,
+                    &mut lanes,
+                    &ops,
+                    exec.rank,
+                    round.round,
+                )?;
+            }
             // The draft head's logit row is one shared buffer: a sampled lane's
             // read of a head without re-scoring is that whole row, so with
             // more than one op in the round each op must be enqueued, finished
@@ -570,54 +596,86 @@ impl RankLane<'_> {
                         && plan.source == ProposalSource::Native),
                 )
             })?;
+            // One batched head call per round (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`):
+            // decided from the root's plan alone (every rank takes the same
+            // branch: the head's gather parity advances once per batched call).
+            let any_distribution_read = round.ops.iter().try_fold(false, |any, op| {
+                let plan = plan_of(&op.key)?;
+                Ok::<_, String>(
+                    any || (plan.sampling == SamplingMode::Leviathan
+                        && plan.source == ProposalSource::Native),
+                )
+            })?;
+            let batched = crate::mtp_lanes::draft_round_batchable(
+                bundle,
+                round.ops.len(),
+                any_distribution_read,
+            );
             let chunks =
                 draft_read_plan(want_read_any, bundle.mtp_draft_rescored(), round.ops.len())
                     .chunks(round.ops.len());
             let mut reads = Vec::with_capacity(round.ops.len());
             for chunk in chunks {
-                for (slot, op) in round
-                    .ops
-                    .iter()
-                    .enumerate()
-                    .skip(chunk.start)
-                    .take(chunk.len())
-                {
-                    // The confirmation probe's Draft is abandoned on a hit: save
-                    // the head's request state it is about to move.
-                    if is_probe_op(plan_of(&op.key)?, op.position) {
-                        save_probe_state(&mut *lanes[slot]);
+                if batched {
+                    let mut inputs = Vec::with_capacity(round.ops.len());
+                    for (slot, op) in round.ops.iter().enumerate() {
+                        if is_probe_op(plan_of(&op.key)?, op.position) {
+                            save_probe_state(&mut *lanes[slot]);
+                        }
+                        inputs.push((op.input, op.position));
                     }
-                    let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
-                    let spec = spec
-                        .as_mut()
-                        .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
-                    let LaneSpec {
-                        head,
-                        draft,
-                        pending_hidden,
-                        window,
-                        ..
-                    } = spec;
-                    let window_position = window
-                        .as_ref()
-                        .ok_or_else(|| "draft op without a pending window".to_string())?
-                        .position;
-                    let top1 = spec_store
-                        .draft_top1
-                        .sub_offset(slot * slot_bytes, slot_bytes);
-                    let j = op.position - window_position;
-                    let hidden = (j == 0).then_some(&*pending_hidden);
-                    lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
-                        b.mtp_forward_token_deferred(
-                            gpu,
-                            op.input,
-                            hidden,
-                            op.position,
-                            j == 0,
-                            &top1,
-                        )
-                    }))
-                    .map_err(|e| format!("draft step {j}: {e}"))?;
+                    crate::mtp_lanes::enqueue_batched_draft(
+                        bundle,
+                        gpu,
+                        &mut lanes,
+                        &inputs,
+                        &spec_store.draft_top1,
+                    )?;
+                } else {
+                    for (slot, op) in round
+                        .ops
+                        .iter()
+                        .enumerate()
+                        .skip(chunk.start)
+                        .take(chunk.len())
+                    {
+                        // The confirmation probe's Draft is abandoned on a hit: save
+                        // the head's request state it is about to move.
+                        if is_probe_op(plan_of(&op.key)?, op.position) {
+                            save_probe_state(&mut *lanes[slot]);
+                        }
+                        let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
+                        let spec = spec
+                            .as_mut()
+                            .ok_or_else(|| "drafting lane lost its MTP state".to_string())?;
+                        let LaneSpec {
+                            head,
+                            draft,
+                            pending_hidden,
+                            window,
+                            ..
+                        } = spec;
+                        let window_position = window
+                            .as_ref()
+                            .ok_or_else(|| "draft op without a pending window".to_string())?
+                            .position;
+                        let top1 = spec_store
+                            .draft_top1
+                            .sub_offset(slot * slot_bytes, slot_bytes);
+                        let j = op.position - window_position;
+                        let hidden = (j == 0).then_some(&*pending_hidden);
+                        lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+                            b.mtp_forward_token_deferred(
+                                gpu,
+                                op.input,
+                                hidden,
+                                op.position,
+                                j == 0,
+                                &top1,
+                            )
+                        }))
+                        .map_err(|e| format!("draft step {j}: {e}"))?;
+                    }
                 }
                 let (from, to) = (chunk.start * slot_bytes, chunk.end * slot_bytes);
                 let chunk_top1 = spec_store.draft_top1.sub_offset(from, to - from);
@@ -639,7 +697,21 @@ impl RankLane<'_> {
                     let want_read = sampler
                         && plan.sampling == SamplingMode::Leviathan
                         && plan.source == ProposalSource::Native;
-                    let (token, margin, read) = {
+                    let (token, margin, read) = if batched {
+                        let (token, margin) =
+                            crate::mtp_lanes::finish_batched_draft(bundle, &mut *lanes[slot], top)
+                                .map_err(|e| format!("draft finish: {e}"))?;
+                        let read = if want_read {
+                            Some(
+                                bundle
+                                    .mtp_draft_read(gpu)
+                                    .map_err(|e| format!("draft finish: {e}"))?,
+                            )
+                        } else {
+                            None
+                        };
+                        (token, margin, read)
+                    } else {
                         let Qwen4LaneState { state, spec, .. } = &mut *lanes[slot];
                         let spec = spec
                             .as_mut()

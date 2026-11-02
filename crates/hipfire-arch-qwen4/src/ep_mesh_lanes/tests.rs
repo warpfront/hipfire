@@ -1063,3 +1063,164 @@ fn full_row_reads_of_two_ops_are_distinct_only_when_sequential() {
     assert_eq!(plan, DraftReadPlan::Sequential);
     assert_eq!(run_round_on_shared_row(plan, 3), vec![100, 101, 102]);
 }
+
+// ---- eight sampled lanes: every lane draws from its OWN reads and rows ------
+
+/// Lane `tag`'s target rows and head candidates are a spike at token `tag`
+/// (the lane's marker): whatever a lane emits must be its own marker, so a
+/// read or a row taken from another lane's slot, offset or key shows as a
+/// foreign token.
+struct KeyedRows;
+
+impl TargetRowSource for KeyedRows {
+    fn row_logits(
+        &mut self,
+        key: &LaneWindowKey,
+        row: usize,
+        host: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        assert!(
+            row < 4,
+            "a K<=3 window has at most 4 verify rows, asked row {row}"
+        );
+        host.clear();
+        host.extend((0..SAMPLED_VOCAB).map(|t| {
+            if t as u64 == key.request_epoch.request_tag {
+                60.0
+            } else {
+                0.0
+            }
+        }));
+        Ok(())
+    }
+}
+
+struct KeyedFan {
+    inner: ThreadedFanout,
+}
+
+impl MeshFanout for KeyedFan {
+    fn admit(&mut self, admit: &LaneAdmit) -> Result<(), RankError> {
+        self.inner.admit(admit)
+    }
+    fn release(&mut self, epoch: &RequestEpoch) -> Result<(), RankError> {
+        self.inner.release(epoch)
+    }
+    fn begin(&mut self, start: &WindowStart) -> Result<Vec<RankReady>, RankError> {
+        self.inner.begin(start)
+    }
+    fn reject(&mut self, key: &MeshStepKey) {
+        self.inner.reject(key)
+    }
+    fn draft(&mut self, round: &DraftRound) -> Result<Vec<RankDraftResult>, RankError> {
+        let mut results = self.inner.draft(round)?;
+        for proposal in results
+            .iter_mut()
+            .filter_map(|r| r.proposals.as_mut())
+            .flatten()
+        {
+            let marker = proposal.key.request_epoch.request_tag as u32;
+            let mut candidates = vec![(marker, 60.0f32)];
+            candidates.extend(
+                (0..SAMPLED_VOCAB as u32)
+                    .filter(|&t| t != marker)
+                    .take(7)
+                    .map(|t| (t, -60.0f32)),
+            );
+            proposal.read = Some(DraftRead::Candidates(candidates));
+        }
+        Ok(results)
+    }
+    fn verify(&mut self, plan: &VerifyPlan) -> Result<Vec<RankVerifyResult>, RankError> {
+        let mut results = self.inner.verify(plan)?;
+        let rows = RowHandle::new(KeyedRows);
+        for sampler in results.iter_mut().filter_map(|r| r.sampler.as_mut()) {
+            sampler.rows = Some(rows.clone());
+        }
+        Ok(results)
+    }
+    fn prepare(&mut self, d: &CommitDecision) -> Result<Vec<PreparedReceipt>, RankError> {
+        self.inner.prepare(d)
+    }
+    fn publish(&mut self, d: &CommitDecision) -> Vec<Option<String>> {
+        self.inner.publish(d)
+    }
+    fn abort(&mut self, key: &MeshStepKey, phase: StepPhase, reason: &str) {
+        self.inner.abort(key, phase, reason)
+    }
+    fn evidence(&mut self, key: &MeshStepKey) -> Vec<Option<RankCostEvidence>> {
+        self.inner.evidence(key)
+    }
+}
+
+#[test]
+fn mesh_lane_ep_eight_sampled_lanes_each_emit_their_own_marker() {
+    for k in [2usize, 3] {
+        let tags: Vec<u64> = (1..=8).collect();
+        let mut root = root(false);
+        let mut fan = KeyedFan {
+            inner: fanout_with(
+                tags.iter()
+                    .map(|&tag| script(tag, 0, &vec![0; k], &vec![0; k + 1]))
+                    .collect(),
+                |_, _| {},
+            ),
+        };
+        let mut sampler = LaneSampler::new(SAMPLED_VOCAB);
+        for &tag in &tags {
+            let a = root
+                .admit_lane(LaneAdmission {
+                    epoch: epoch(tag),
+                    position: 10,
+                    seed: 9,
+                    eos: None,
+                    rng_seed: 1000 + tag,
+                    prompt: vec![1, 2, 3],
+                    spec_k: Some(k),
+                    head: HeadState::Aligned,
+                    copy: false,
+                    head_lag: Vec::new(),
+                })
+                .unwrap();
+            fan.admit(&a).unwrap();
+            sampler
+                .admit(
+                    epoch(tag),
+                    &SpecRequestConfig {
+                        temp: 1.0,
+                        rng_seed: 1000 + tag,
+                        ..SpecRequestConfig::default()
+                    },
+                    &[1, 2, 3],
+                    9,
+                )
+                .unwrap();
+        }
+        let requests: Vec<LaneRequest> = tags.iter().map(|&tag| sampled_req(tag)).collect();
+        let driven = drive_step(
+            &mut root,
+            &mut fan,
+            None,
+            &requests,
+            &budgets(LabRoutes::Batched, k),
+            &mut sampler,
+        )
+        .expect("an eight-lane sampled step on two scripted ranks");
+        assert_eq!(driven.output.lanes.len(), 8);
+        for (lane, &tag) in driven.output.lanes.iter().zip(&tags) {
+            assert!(
+                !lane.emitted.is_empty() && lane.emitted.iter().all(|&t| u64::from(t) == tag),
+                "K={k}: lane {tag} (slot {}) emitted {:?}, expected only its marker {tag}",
+                tag - 1,
+                lane.emitted
+            );
+            assert_eq!(
+                lane.emitted.len(),
+                k + 1,
+                "K={k}: lane {tag} emitted {:?}",
+                lane.emitted
+            );
+        }
+        fan.inner.finish();
+    }
+}

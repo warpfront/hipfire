@@ -3145,6 +3145,63 @@ impl Qwen4Bundle {
             .map_err(|error| BundleError::Forward(error.to_string()))
     }
 
+    /// One batched head round over `rows.len()` lanes (2..=8) with the draft
+    /// read deferred into `top1_out` (`Raw`, one `Gpu::TOPK8_OUT_BYTES` slot
+    /// per lane, in row order): `n` [`Self::mtp_forward_token_deferred`]
+    /// steps in one call, each lane carrying its own head state and draft
+    /// request state (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`). Each lane's QSA
+    /// context is mapped through its position first, as `mapped_mtp` does
+    /// for the one-token step. Parse slot `i` with
+    /// [`Self::mtp_draft_finish_request`].
+    pub(crate) fn mtp_forward_rows_deferred(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: &mut [crate::mtp_gpu::DraftRow<'_>],
+        top1_out: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        let mtp = self.mtp.as_mut().ok_or_else(|| {
+            BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+        })?;
+        for lane in rows.iter_mut() {
+            let required = lane
+                .position
+                .checked_add(1)
+                .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
+            lane.state
+                .ensure_mapped_capacity(gpu, required)
+                .map_err(|error| BundleError::Forward(error.to_string()))?;
+        }
+        mtp.forward_rows_deferred(
+            gpu,
+            &self.weights,
+            &self.config,
+            rows,
+            top1_out,
+            self.execution
+                .as_ref()
+                .and_then(Qwen4GpuForward::mtp_ep_gather),
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// [`Self::mtp_draft_finish`] for a lane's own draft request state: the
+    /// margin lands in `request`, the head's resident request state is left
+    /// alone (a batched round's lanes are never swapped in).
+    pub(crate) fn mtp_draft_finish_request(
+        &mut self,
+        request: &mut hipfire_dispatch::pipeline::DraftHeadRequestState,
+        top: &[u8],
+    ) -> Result<u32, BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .draft
+            .draft_finish_request(request, top)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     /// Arm (or disarm and clear) the lab taps: the speculative-forward logits
     /// tap (`keep_logits` also keeps the rows) and the state's residual/ring
     /// event tap. Arm before a restore to observe its pre-window events.
@@ -3409,6 +3466,12 @@ impl Qwen4Bundle {
         self.mtp
             .as_ref()
             .is_some_and(|mtp| mtp.draft.rescored_candidates().is_some())
+    }
+
+    /// The batched head round's rows scratch is allocated
+    /// (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1` at load, MoE head).
+    pub(crate) fn mtp_rows_ready(&self) -> bool {
+        self.mtp.as_ref().is_some_and(|mtp| mtp.rows.is_some())
     }
 
     /// The last MTP prediction's raw draft material, copied out of the head's
