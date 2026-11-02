@@ -3371,6 +3371,7 @@ fn pcm16_wav_bytes(pcm: &[u8], rate: u32) -> Vec<u8> {
 fn tts_generate(
     shared: &ServeShared,
     input: &str,
+    voice: Option<&str>,
     max_steps: u64,
     _guard: AdmissionGuard,
     cancel: Option<&std::sync::atomic::AtomicBool>,
@@ -3390,7 +3391,14 @@ fn tts_generate(
         "type": "generate",
         "id": request_id(),
         "tts": true,
-        "mode": "interleaved",
+        // VERBATIM-TTS: mode "audio" (the assistant frame opens <|audio_start|>
+        // and speaks the input verbatim, ending at audio eos). The old
+        // "interleaved" mode made the model CONVERSE — it generated its own
+        // reply text first and then spoke that paraphrase instead of the
+        // input. The daemon wraps the request in the reference "Perform TTS
+        // in American English using a <voice> voice." system turn.
+        "mode": "audio",
+        "voice": voice.unwrap_or("female"),
         "prompt": input,
         "max_tokens": max_steps,
         "max_steps": max_steps,
@@ -3471,12 +3479,18 @@ fn respond_tts(
         .filter(|text| !text.is_empty())
         .ok_or_else(|| anyhow!("tts request requires a non-empty \"input\" string"))?
         .to_owned();
-    // `voice` is accepted-and-ignored: LFM3-Omni has a single voice.
+    // `voice` selects the TTS system framing ("female" default; LFM3-Omni has
+    // male + female voices — previously accepted-and-ignored entirely).
+    let voice = body
+        .get("voice")
+        .and_then(serde_json::Value::as_str)
+        .filter(|v| *v == "male" || *v == "female")
+        .map(str::to_owned);
     let max_steps = tts_max_steps_for_input(&input);
     let (sender, receiver) = mpsc::channel::<ResponseChunk>();
     let (status_tx, status_rx) = mpsc::channel::<Result<usize, String>>();
     thread::spawn(move || {
-        match tts_generate(&shared, &input, max_steps, guard, None) {
+        match tts_generate(&shared, &input, voice.as_deref(), max_steps, guard, None) {
             Ok(wav) => {
                 let len = wav.len();
                 let (ack_tx, ack_rx) = mpsc::channel();
@@ -4090,7 +4104,7 @@ fn run_realtime_turn(
             let cancel_flag =
                 std::sync::Arc::clone(&state.lock().unwrap_or_else(|e| e.into_inner()).cancel);
             let max_steps = tts_max_steps_for_input(&chunk);
-            let pcm = match tts_generate_no_guard(shared, &chunk, max_steps, Some(&cancel_flag)) {
+            let pcm = match tts_generate_no_guard(shared, &chunk, None, max_steps, Some(&cancel_flag)) {
                 Ok(pcm) => pcm,
                 Err(error) => {
                     let was_cancelled = cancel_flag.load(std::sync::atomic::Ordering::Relaxed);
@@ -4229,6 +4243,7 @@ fn realtime_asr(shared: &Arc<ServeShared>, pcm16_mono_16k: &[u8]) -> Result<Stri
 fn tts_generate_no_guard(
     shared: &Arc<ServeShared>,
     input: &str,
+    voice: Option<&str>,
     max_steps: u64,
     cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<Vec<u8>> {
@@ -4236,7 +4251,7 @@ fn tts_generate_no_guard(
         .admission
         .acquire()
         .map_err(|error| anyhow!("admission: {error}"))?;
-    tts_generate(shared, input, max_steps, guard, cancel)
+    tts_generate(shared, input, voice, max_steps, guard, cancel)
 }
 
 /// Strip LFM3 native tool-call markers from a voice reply so nothing gets

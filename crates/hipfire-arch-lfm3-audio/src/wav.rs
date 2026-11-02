@@ -49,6 +49,17 @@ impl std::fmt::Display for WavError {
 
 /// Decode a 16-bit PCM WAV to a mono F32 waveform at `expected_sr`.
 pub fn decode_wav(bytes: &[u8], expected_sr: u32) -> Result<Waveform, WavError> {
+    let w = decode_wav_any(bytes)?;
+    if w.sample_rate != expected_sr {
+        return Err(WavError::SampleRateMismatch { got: w.sample_rate, expected: expected_sr });
+    }
+    Ok(w)
+}
+
+/// Decode a PCM WAV to a mono F32 waveform at its own sample rate (the caller
+/// decides whether to resample — the daemon's ASR route resamples to the
+/// model's rate so 24 kHz TTS/browser audio works without pre-conversion).
+pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
     if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(WavError::NotWav);
     }
@@ -85,9 +96,6 @@ pub fn decode_wav(bytes: &[u8], expected_sr: u32) -> Result<Waveform, WavError> 
 
     if fmt_sample_rate == 0 {
         return Err(WavError::BadHeader("no fmt chunk".into()));
-    }
-    if fmt_sample_rate != expected_sr {
-        return Err(WavError::SampleRateMismatch { got: fmt_sample_rate, expected: expected_sr });
     }
     if data.is_empty() {
         return Err(WavError::NoData);

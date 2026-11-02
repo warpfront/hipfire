@@ -1063,7 +1063,6 @@ pub fn encoder_forward(
             // operator_norm → tmp
             gpu.rmsnorm_f32(&st.h, &layer.operator_norm, &st.tmp, eps)
                 .map_err(|e| format!("lfm3-audio L{l}: operator rmsnorm: {e:?}"))?;
-
             match &layer.mixer {
                 EncMixer::Conv(c) => enc_conv_mixer(gpu, cfg, c, st, l)?,
                 EncMixer::Attention(a) => enc_attn_mixer(gpu, cfg, a, st, l, seq_len)?,
@@ -1071,6 +1070,9 @@ pub fn encoder_forward(
 
             // Residual (no sandwich norm in the audio encoder).
             gpu.add_f32(&st.proj_out, &st.h, &st.h).map_err(|e| format!("lfm3-audio L{l}: operator residual: {e:?}"))?;
+
+            // AUDIO-DBG: per-layer hidden hash — the first layer whose hash
+            // diverges across identical runs pins the nondeterministic op.
 
             // FFN: ffn_norm → SwiGLU.
             gpu.rmsnorm_f32(&st.h, &layer.ffn_norm, &st.ffn_tmp, eps)
@@ -1139,6 +1141,21 @@ pub fn projector_forward(
 
 // ─── Full audio forward: mel → downsampler → encoder → projector ─────────────
 
+// AUDIO-DBG helpers (HIPFIRE_AUDIO_DEBUG=1): per-stage FNV-1a hashes so a
+// hash that differs across identical runs pins the nondeterministic GPU stage.
+fn dbg_audio() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("HIPFIRE_AUDIO_DEBUG").ok().as_deref() == Some("1"))
+}
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 pub fn audio_forward(
     gpu: &mut Gpu,
     weights: &AudioWeights,
@@ -1147,9 +1164,21 @@ pub fn audio_forward(
     num_frames: usize,
 ) -> HipResult<Vec<f32>> {
     let n_mels = cfg.mel.n_mels;
+    // AUDIO-DBG: per-stage FNV-1a hashes (HIPFIRE_AUDIO_DEBUG=1). The mel is
+    // pure CPU (deterministic); a hash that differs across identical runs pins
+    // the nondeterministic GPU stage (encoder vs projector).
+    let dbg = dbg_audio();
     // 1. CPU downsampler: mel [n_mels, num_frames] → [n_tokens, 768].
     let tokens = downsampler_forward(mel, n_mels, num_frames, &weights.downsampler);
     let n_tokens = tokens.len() / cfg.enc.hidden_size;
+    if dbg {
+        let b: Vec<u8> = tokens.iter().flat_map(|f| f.to_le_bytes()).collect();
+        eprintln!(
+            "[lfm3-audio][dbg] downsampler hash {:016x} ({} tok)",
+            fnv1a(&b),
+            n_tokens
+        );
+    }
 
     // 2. GPU encoder: [n_tokens, 768] → last_hidden_state [n_tokens, 768].
     let enc_out = {
@@ -1160,12 +1189,20 @@ pub fn audio_forward(
         let out = encoder_forward(gpu, &weights.encoder, &cfg.enc, &mut st, &tokens, n_tokens)
             .map_err(|e| HipError::new(999, &e))?;
         st.free_gpu(gpu);
+        if dbg {
+            let b: Vec<u8> = out.iter().flat_map(|f| f.to_le_bytes()).collect();
+            eprintln!("[lfm3-audio][dbg] encoder hash {:016x}", fnv1a(&b));
+        }
         out
     };
 
     // 3. GPU projector: [n_tokens, 768] → [n_tokens, 2048] (text-hidden audio tokens).
     let proj = projector_forward(gpu, &weights.projector, &cfg.proj, &enc_out, n_tokens)
         .map_err(|e| HipError::new(999, &e))?;
+    if dbg {
+        let b: Vec<u8> = proj.iter().flat_map(|f| f.to_le_bytes()).collect();
+        eprintln!("[lfm3-audio][dbg] projector hash {:016x}", fnv1a(&b));
+    }
 
     eprintln!("  LFM3-Audio forward done: {n_tokens} audio tokens x {} dims", cfg.proj.out_features);
     Ok(proj)

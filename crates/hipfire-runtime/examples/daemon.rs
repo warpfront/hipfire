@@ -6017,6 +6017,13 @@ fn main() {
                 };
                 // Streaming TTS: emit audio chunks as frames are generated.
                 let tts_stream = msg.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+                // TTS voice (Phase 5a: accepted-and-ignored by the CLI body
+                // contract, but the AUDIO-mode TTS framing uses it in the
+                // "Perform TTS in … using a <voice> voice." system prompt).
+                let tts_voice = msg
+                    .get("voice")
+                    .and_then(|v| v.as_str())
+                    .filter(|v| *v == "male" || *v == "female");
                 // Omni step budget override (Phase 5a `/tts`): without it the
                 // route clamps max_tokens → 200 steps ≈ ~13 s of speech; a
                 // long speak() request (1200 chars ≈ 60–90 s) needs ~800–1000
@@ -6364,6 +6371,7 @@ fn main() {
                         id,
                         prompt,
                         system,
+                        tts_voice,
                         temp,
                         top_p,
                         max_tokens,
@@ -19637,8 +19645,31 @@ fn generate_lfm3_audio(
     let sr = audio_config.mel.sample_rate;
 
     // ── Audio decode (WAV → mono F32 @ 16 kHz) ──
-    let waveform = match lfm3_wav::decode_wav(audio_bytes, sr) {
-        Ok(w) => w,
+    // Any input rate is accepted: a mismatching WAV is linearly resampled to
+    // the model's rate (the HF `load_audio` backend resamples too; 24 kHz
+    // browser/TTS audio no longer has to be pre-converted).
+    let waveform = match lfm3_wav::decode_wav_any(audio_bytes) {
+        Ok(w) if w.sample_rate == sr => w,
+        Ok(w) => {
+            let n = ((w.samples.len() as u64) * (sr as u64) / (w.sample_rate as u64)) as usize;
+            let mut out = vec![0.0f32; n.max(1)];
+            let ratio = w.sample_rate as f64 / sr as f64;
+            for (i, o) in out.iter_mut().enumerate() {
+                let src = i as f64 * ratio;
+                let i0 = src as usize;
+                let i1 = (i0 + 1).min(w.samples.len() - 1);
+                let f = (src - i0 as f64) as f32;
+                *o = w.samples[i0] * (1.0 - f) + w.samples[i1] * f;
+            }
+            eprintln!(
+                "[lfm3-audio] resampled {} samples @ {}Hz → {} samples @ {}Hz (linear)",
+                w.samples.len(),
+                w.sample_rate,
+                out.len(),
+                sr
+            );
+            lfm3_wav::Waveform { samples: out, sample_rate: sr }
+        }
         Err(e) => {
             write_error(stdout, id, &format!("lfm3-audio: WAV decode failed: {e}"));
             return;
@@ -19654,6 +19685,25 @@ fn generate_lfm3_audio(
     // ── Mel + encoder + projector → projected audio tokens ──
     let mel = lfm3_mel::log_mel_from_waveform(&waveform.samples, &audio_config.mel);
     let num_frames = mel.len() / audio_config.mel.n_mels;
+    // AUDIO-DBG: FNV-1a hash of a stage's bytes — run-to-run identical requests
+    // must produce identical hashes; a mismatch pins the nondeterministic stage.
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+    let dbg = std::env::var("HIPFIRE_AUDIO_DEBUG").ok().as_deref() == Some("1");
+    if dbg {
+        let mel_bytes: Vec<u8> = mel.iter().flat_map(|f| f.to_le_bytes()).collect();
+        eprintln!(
+            "[lfm3-audio][dbg] mel hash {:016x} ({} f32)",
+            fnv1a(&mel_bytes),
+            mel.len()
+        );
+    }
     let audio_tokens = {
         let aw = m.lfm3_audio_weights.as_ref().unwrap();
         match lfm3_audio::audio_forward(gpu, aw, audio_config, &mel, num_frames) {
@@ -19670,6 +19720,15 @@ fn generate_lfm3_audio(
     };
     let text_hidden = m.lfm3().unwrap().config.hidden_size;
     let n_audio_tokens = audio_tokens.len() / text_hidden;
+    if dbg {
+        let tok_bytes: Vec<u8> = audio_tokens.iter().flat_map(|f| f.to_le_bytes()).collect();
+        eprintln!(
+            "[lfm3-audio][dbg] audio_tokens hash {:016x} ({} tok x {} dims)",
+            fnv1a(&tok_bytes),
+            n_audio_tokens,
+            text_hidden
+        );
+    }
     eprintln!(
         "[lfm3-audio] encoder produced {n_audio_tokens} audio tokens x {text_hidden} dims (from {num_frames} mel frames)"
     );
@@ -20014,7 +20073,8 @@ fn generate_lfm3_omni(
     stdout: &mut std::io::Stdout,
     id: &str,
     prompt: &str,
-    _system_prompt: Option<&str>,
+    system_prompt: Option<&str>,
+    system_voice: Option<&str>,
     _temp: f32,
     _top_p: f32,
     max_tokens: usize,
@@ -20067,16 +20127,45 @@ fn generate_lfm3_omni(
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
-    // Build the prompt: BOS + ChatML user turn + assistant prefix + thinking-end + mode marker.
-    // "audio" → <|audio_start|> (pure TTS); "interleaved" → <|mixed_start|> (text+audio blocks).
+    // Build the prompt: BOS + ChatML + assistant prefix + mode marker.
+    // "audio" → <|audio_start|> (verbatim TTS); "interleaved" → <|mixed_start|>
+    // (text+audio blocks, a conversational reply).
+    //
+    // VERBATIM-TTS (AUDIO mode): the /tts contract is "speak THIS text" — the
+    // input must be SPOKEN, not answered. The old framing (mode=interleaved,
+    // no system prompt) asked the model to CONVERSE about the text: it
+    // generated its own reply text first (the daemon logged 100+ text tokens
+    // for a one-line input) and then spoke what IT had written — a paraphrase.
+    // The reference contract (checkpoint README "Speech synthesis") is a
+    // "Perform TTS in <language> using a <gender> voice." system turn, the
+    // text as the USER message, and generation_mode="audio" — the assistant
+    // frame opens with <|audio_start|> and speaks the user's text verbatim,
+    // ending at the audio eos (which fires in this framing; the Phase-4c
+    // "pure AUDIO never terminates" observation was made WITHOUT the TTS
+    // system prompt — the model had no text-terminus context then).
     let marker = if mode == "interleaved" {
         omni::MIXED_START_TOKEN
     } else {
         omni::AUDIO_START_TOKEN
     };
     let tok = m.tokenizer.as_ref().unwrap();
-    let chatml =
-        format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>");
+    let chatml = if mode == "interleaved" {
+        match system_prompt.filter(|s| !s.trim().is_empty()) {
+            Some(sys) => format!(
+                "<|im_start|>system\n{sys}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>"
+            ),
+            None => format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>"),
+        }
+    } else {
+        let voice = system_voice.unwrap_or("female");
+        let tts_system = system_prompt
+            .filter(|s| !s.trim().is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("Perform TTS in American English using a {voice} voice."));
+        format!(
+            "<|im_start|>system\n{tts_system}<|im_end|>\n<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>"
+        )
+    };
     let mut prompt_tokens = tok.encode(&chatml);
     prompt_tokens.insert(0, 124_894); // BOS <|startoftext|>
     prompt_tokens.push(marker);
