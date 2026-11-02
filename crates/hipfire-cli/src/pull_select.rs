@@ -595,6 +595,23 @@ pub(crate) fn plan_items(
     choice: &PullChoice<'_>,
     force: bool,
 ) -> Vec<PlanItem> {
+    plan_items_with_ep(
+        ctx,
+        choice,
+        force,
+        hipfire_registry::EP_EXPERT_HOTSET_PINS,
+        hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+    )
+}
+
+/// [`plan_items`] with the EP2 ranking pin table and its gate supplied.
+fn plan_items_with_ep(
+    ctx: &PullContext<'_, '_>,
+    choice: &PullChoice<'_>,
+    force: bool,
+    ep_pins: &[ExpertHotsetPin],
+    ep_gate: bool,
+) -> Vec<PlanItem> {
     let entry = choice.entry;
     let item = |label: String, file: &str, size: Option<u64>| PlanItem {
         label,
@@ -696,6 +713,19 @@ pub(crate) fn plan_items(
                 "Expert hot set".to_owned(),
                 &local,
                 hotset.sidecar.size_bytes,
+            ));
+        }
+    }
+    if choice.expert_hotset {
+        if let Some(ep) = hipfire_registry::ep_expert_hotset_in(identity, ep_pins, ep_gate) {
+            let local = format!(
+                "{model_file}{}",
+                hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX
+            );
+            items.push(item(
+                "EP expert hot set".to_owned(),
+                &local,
+                ep.sidecar.size_bytes,
             ));
         }
     }
@@ -1283,6 +1313,58 @@ mod tests {
             .find(|line| line.contains(LOCAL_HOTSET_FILE))
             .unwrap();
         assert!(line.contains("Expert hot set") && line.ends_with("download"));
+    }
+
+    #[test]
+    fn the_ep_expert_hotset_rides_the_expert_hotset_choice_behind_its_gate() {
+        const EP_SIZE: u64 = 312_036;
+        const EP_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
+            base_sha256: BASE_DIGEST,
+            base_size: 70_900_000_000,
+            repo: "hipfire-models/qwen3.8-flash-next",
+            file: "ignored-remote-name.ep.expert-hotset",
+            sha256: HOTSET_DIGEST,
+            size_bytes: EP_SIZE,
+        }];
+        const LOCAL_EP_FILE: &str = "qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset";
+        let registry = registry();
+        let host = host();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let ctx = PullContext {
+            registry: &registry,
+            host: &host,
+            overlay_pins: &[],
+            grandfather_pins: &[],
+            hotset_pins: HOTSET_PINS,
+            present: &absent,
+        };
+        let mut choice = PullChoice {
+            tag,
+            entry,
+            ple: PleSelection::Skip,
+            draft: false,
+            expert_hotset: true,
+        };
+        let baseline = plan_items(&ctx, &choice, false);
+        let off = plan_items_with_ep(&ctx, &choice, false, EP_PINS, false);
+        assert_eq!(off, baseline);
+        assert!(off.iter().all(|item| item.label != "EP expert hot set"));
+
+        let on = plan_items_with_ep(&ctx, &choice, false, EP_PINS, true);
+        let extra: Vec<&PlanItem> = on
+            .iter()
+            .filter(|item| item.label == "EP expert hot set")
+            .collect();
+        assert_eq!(extra.len(), 1);
+        assert_eq!(extra[0].file, LOCAL_EP_FILE);
+        assert_eq!(extra[0].size, Some(EP_SIZE));
+        assert_eq!(on.len(), baseline.len() + 1);
+
+        choice.expert_hotset = false;
+        let declined = plan_items_with_ep(&ctx, &choice, false, EP_PINS, true);
+        assert!(declined
+            .iter()
+            .all(|item| item.label != "EP expert hot set"));
     }
 
     #[test]

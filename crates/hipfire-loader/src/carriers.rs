@@ -806,7 +806,9 @@ impl Carrier for Qwen4Carrier {
         // `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` needs expert parallelism and composes
         // with none of the whole-layer levers (single device, pipeline
         // parallelism, the EP expert stage, ...): refused before any allocation.
-        if qwen4_ep_units_flag().is_some() {
+        // An invalid `topology.ep` reads as 1 here (no discovery); the EP path reports it.
+        let ep_probe = hipfire_config::topology::qwen4_ep().unwrap_or(1);
+        if qwen4_ep_units_flag(&src, ep_probe, ctx.pp, &ctx.gpu.arch, false).is_some() {
             let ep = hipfire_config::topology::qwen4_ep()?;
             hipfire_arch_qwen4::expert_ep_units::ep_units_refusal(&qwen4_ep_units_facts(
                 ep, ctx.pp,
@@ -2921,7 +2923,7 @@ pub fn qwen4_ep_vram_layers(
     // carrier checks them first). The decoupled reserve, which sizes whole-layer
     // placements, is off with a note, unless `HIPFIRE_EP_UNIT_RESERVE=1` plans the
     // units under it with whole-resident donor layers (`qwen4_ep_units_donor_plan`).
-    let units_path = qwen4_ep_units_flag();
+    let units_path = qwen4_ep_units_flag(src, ranks, 1, &gpu.arch, true);
     if units_path.is_some() {
         hipfire_arch_qwen4::expert_ep_units::ep_units_refusal(&qwen4_ep_units_facts(ranks, 1))
             .map_err(|error| format!("qwen4: {error}"))?;
@@ -3401,9 +3403,11 @@ pub fn qwen4_ep_vram_layers(
     Ok(split)
 }
 
-/// `HIPFIRE_EP_UNIT_RESERVE=1`: with a per-expert plan, keep the decoupled EP reserve (units
-/// budgeted against its census, whole-resident donor layers) instead of forcing it off. Default
-/// off: the flag behaves as before.
+/// `HIPFIRE_EP_UNIT_RESERVE`: with a per-expert plan, keep the decoupled EP reserve (units
+/// budgeted against its census, whole-resident donor layers) instead of forcing it off. `1` forces
+/// it on, exact `0` kills it, anything else follows the units: on under the shipped default
+/// (`hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON`), off while that gate is off (the flag's
+/// historical opt-in).
 const QWEN4_EP_UNIT_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE";
 
 /// `HIPFIRE_EP_UNIT_RESERVE_SHADOWS=1` (lab, default off): under `HIPFIRE_EP_UNIT_RESERVE=1`, host
@@ -3411,17 +3415,91 @@ const QWEN4_EP_UNIT_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE";
 const QWEN4_EP_UNIT_RESERVE_SHADOWS_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE_SHADOWS";
 
 fn qwen4_ep_unit_reserve_on() -> bool {
-    hipfire_config::developer_var(QWEN4_EP_UNIT_RESERVE_ENV).as_deref() == Ok("1")
-}
-
-/// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, read once from the process configuration:
-/// the explicit sidecar path, `None` when unset, empty or `0`.
-fn qwen4_ep_units_flag() -> Option<std::path::PathBuf> {
-    hipfire_arch_qwen4::expert_ep_units::ep_expert_hotset_path(
-        hipfire_config::developer_var(hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV)
+    hipfire_arch_qwen4::expert_ep_units::ep_unit_reserve_on(
+        hipfire_config::developer_var(QWEN4_EP_UNIT_RESERVE_ENV)
             .ok()
             .as_deref(),
+        hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
     )
+}
+
+/// The per-expert plan sidecar of this load, or `None` for today's whole-layer placement.
+/// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, read once from the process configuration: a path is the
+/// explicit sidecar (it must bind; a refusal is a load error), `0` or blank is off, and unset
+/// follows the shipped default ([`hipfire_arch_qwen4::expert_ep_units::ep_units_source`]): with
+/// the gate on, an EP2 gfx1201 load that finds `<model>.ep.expert-hotset` bound to its base plans
+/// per unit; a candidate that cannot be used (wrong base, a conflicting lever) is skipped with one
+/// note and the load keeps whole-layer placement. Both call sites resolve the same way; only
+/// `announce` prints.
+fn qwen4_ep_units_flag(
+    src: &ModelSource,
+    ep: usize,
+    pp: usize,
+    gpu_arch: &str,
+    announce: bool,
+) -> Option<std::path::PathBuf> {
+    use hipfire_arch_qwen4::expert_ep_units as units;
+    let policy = units::ep_units_policy(
+        hipfire_config::developer_var(units::EP_EXPERT_HOTSET_ENV)
+            .ok()
+            .as_deref(),
+    );
+    let sidecar = match src {
+        ModelSource::Hfq(hfq) => Some(hipfire_config::memory::ep_expert_hotset_sidecar_path(
+            hfq.path(),
+        )),
+        ModelSource::Dir(_) => None,
+    };
+    let found = units::EpUnitsDiscovery {
+        gate: hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+        gpu_arch,
+        facts: qwen4_ep_units_facts(ep, pp),
+        sidecar_exists: sidecar.as_deref().is_some_and(std::path::Path::is_file),
+        sidecar: sidecar.unwrap_or_default(),
+    };
+    let note = |why: &str, path: &std::path::Path| {
+        if announce {
+            eprintln!(
+                "qwen4 EP expert hot set: {} present, not applied ({why}); whole-layer placement",
+                path.display()
+            );
+        }
+    };
+    match units::ep_units_source(&policy, &found) {
+        units::EpUnitsSource::Off => None,
+        units::EpUnitsSource::Explicit(path) => Some(path),
+        units::EpUnitsSource::Skipped(why) => {
+            note(&why, &found.sidecar);
+            None
+        }
+        units::EpUnitsSource::Discovered(path) => {
+            let ModelSource::Hfq(hfq) = src else {
+                return None;
+            };
+            let bound = hipfire_arch_qwen4::expert_hotset::HotsetBase::from_hfq(hfq)
+                .map_err(hipfire_arch_qwen4::expert_hotset::HotsetSkip::InvalidSidecar)
+                .and_then(|base| {
+                    hipfire_arch_qwen4::expert_hotset::HotsetSidecar::peek_bound(&path, &base)
+                });
+            match bound {
+                Ok(()) => {
+                    if announce {
+                        eprintln!(
+                            "qwen4 EP expert hot set: discovered {} ({} unset; {}=0 turns it off)",
+                            path.display(),
+                            units::EP_EXPERT_HOTSET_ENV,
+                            units::EP_EXPERT_HOTSET_ENV
+                        );
+                    }
+                    Some(path)
+                }
+                Err(skip) => {
+                    note(&skip.to_string(), &path);
+                    None
+                }
+            }
+        }
+    }
 }
 
 /// The facts [`hipfire_arch_qwen4::expert_ep_units::ep_units_refusal`] judges

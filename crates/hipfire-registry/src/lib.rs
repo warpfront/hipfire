@@ -415,6 +415,19 @@ pub const EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[
     },
 ];
 
+/// EP2 expert-ranking sidecars, distinct from [`EXPERT_HOTSET_PINS`]: the name
+/// is the canonical base file plus
+/// `hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX`. Only the split
+/// base is pinned; the ranking is bound to its tensor index.
+pub const EP_EXPERT_HOTSET_PINS: &[ExpertHotsetPin] = &[ExpertHotsetPin {
+    base_sha256: FLASH_NEXT_XTS_SPLIT_BASE_SHA256,
+    base_size: FLASH_NEXT_XTS_SPLIT_BASE_SIZE,
+    repo: FLASH_NEXT_XTS_REPO,
+    file: "qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset",
+    sha256: "77540499adecb1cbca1186051d24aaa329b986dddd52f6d950c887088e61d7b6",
+    size_bytes: 312_036,
+}];
+
 /// A resolved expert hotset: the repo that hosts it and its sidecar identity.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ExpertHotset {
@@ -438,6 +451,18 @@ pub fn expert_hotset_in(entry: &ModelEntry, pins: &[ExpertHotsetPin]) -> Option<
                 size_bytes: Some(pin.size_bytes),
             },
         })
+}
+
+/// [`expert_hotset_in`] over the EP2 ranking pins, `None` while `gate` is off.
+pub fn ep_expert_hotset_in(
+    entry: &ModelEntry,
+    pins: &[ExpertHotsetPin],
+    gate: bool,
+) -> Option<ExpertHotset> {
+    if !gate {
+        return None;
+    }
+    expert_hotset_in(entry, pins)
 }
 
 /// A monolithic artifact a published split base was cut from, pinned in the
@@ -852,6 +877,16 @@ impl ModelEntry {
     /// the compiled-in [`EXPERT_HOTSET_PINS`]; `None` for every other entry.
     pub fn expert_hotset(&self) -> Option<ExpertHotset> {
         expert_hotset_in(self, EXPERT_HOTSET_PINS)
+    }
+
+    /// The EP2 expert-ranking sidecar of this entry's base artifact; `None`
+    /// while `hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON` is off.
+    pub fn ep_expert_hotset(&self) -> Option<ExpertHotset> {
+        ep_expert_hotset_in(
+            self,
+            EP_EXPERT_HOTSET_PINS,
+            hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+        )
     }
 
     /// True when this entry is a split base that publishes PLE row sidecars.
@@ -2244,6 +2279,68 @@ mod tests {
         let mut other = split;
         other.sha256 = None;
         assert!(other.expert_hotset().is_none());
+    }
+
+    #[test]
+    fn ep_expert_hotset_pin_has_exact_metadata_and_is_gated() {
+        assert_eq!(EP_EXPERT_HOTSET_PINS.len(), 1);
+        let pin = &EP_EXPERT_HOTSET_PINS[0];
+        let split_hotset = &EXPERT_HOTSET_PINS[1];
+        assert_eq!(
+            pin.file,
+            format!(
+                "{FLASH_NEXT_XTS_SPLIT_BASE_FILE}{}",
+                hipfire_config::memory::EP_EXPERT_HOTSET_SIDECAR_SUFFIX
+            )
+        );
+        assert_eq!(pin.file, "qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset");
+        assert_ne!(pin.file, split_hotset.file);
+        assert_eq!(pin.base_sha256, split_hotset.base_sha256);
+        assert_eq!(pin.base_size, split_hotset.base_size);
+        assert_eq!(pin.base_sha256, FLASH_NEXT_XTS_SPLIT_BASE_SHA256);
+        assert_eq!(pin.base_size, FLASH_NEXT_XTS_SPLIT_BASE_SIZE);
+        assert_eq!(pin.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            pin.sha256,
+            "77540499adecb1cbca1186051d24aaa329b986dddd52f6d950c887088e61d7b6"
+        );
+        assert_eq!(pin.size_bytes, 312_036);
+
+        let split = stock_split_base_entry();
+        assert!(ep_expert_hotset_in(&split, EP_EXPERT_HOTSET_PINS, false).is_none());
+        let ep = ep_expert_hotset_in(&split, EP_EXPERT_HOTSET_PINS, true).unwrap();
+        assert_eq!(ep.repo, FLASH_NEXT_XTS_REPO);
+        assert_eq!(
+            ep.sidecar,
+            Sidecar {
+                file: pin.file.into(),
+                sha256: Some(pin.sha256.into()),
+                size_bytes: Some(312_036),
+            }
+        );
+        // The method follows the compiled-in gate.
+        assert_eq!(
+            split.ep_expert_hotset().is_some(),
+            hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON
+        );
+
+        let monolithic = pinned_flash_next_entry(FLASH_NEXT_XTS_CANONICAL_FILE);
+        assert!(ep_expert_hotset_in(&monolithic, EP_EXPERT_HOTSET_PINS, true).is_none());
+        let mut other = split.clone();
+        other.size_bytes = Some(FLASH_NEXT_XTS_SPLIT_BASE_SIZE - 1);
+        assert!(ep_expert_hotset_in(&other, EP_EXPERT_HOTSET_PINS, true).is_none());
+        let mut other = split.clone();
+        other.sha256 = Some(digest('c'));
+        assert!(ep_expert_hotset_in(&other, EP_EXPERT_HOTSET_PINS, true).is_none());
+        let mut unpinned = split;
+        unpinned.sha256 = None;
+        assert!(ep_expert_hotset_in(&unpinned, EP_EXPERT_HOTSET_PINS, true).is_none());
+    }
+
+    #[test]
+    fn registry_sidecar_files_contains_the_ep_expert_hotset_file() {
+        let registry = RegistryV1::parse(BUNDLED_REGISTRY, "bundled").unwrap();
+        assert!(registry_sidecar_files(&registry).contains(EP_EXPERT_HOTSET_PINS[0].file));
     }
 
     #[test]

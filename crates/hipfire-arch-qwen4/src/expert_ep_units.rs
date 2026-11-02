@@ -915,20 +915,107 @@ pub fn ep_unit_pin_plane(plan: &EpUnitPlan, layer: usize) -> Vec<u8> {
         .collect()
 }
 
-/// The flag of the per-expert EP hot set (D1): an explicit `.expert-hotset`
-/// sidecar path. Unset, empty or `0` is off; the loader never discovers a
-/// sibling `<model>.expert-hotset` for it.
+/// The flag of the per-expert EP hot set (D1): a sidecar path, or `0` off.
+/// Unset follows the shipped default ([`EpUnitsPolicy::Default`]): with
+/// `hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON` off (today) that is
+/// off; with it on, an EP2 gfx1201 load discovers `<model>.ep.expert-hotset`.
 pub const EP_EXPERT_HOTSET_ENV: &str = "HIPFIRE_QWEN4_EP_EXPERT_HOTSET";
 
-/// The sidecar path [`EP_EXPERT_HOTSET_ENV`] names, from its raw value: `None`
-/// (off) for an unset, blank or `0` value, the trimmed value as a path
-/// otherwise.
-pub fn ep_expert_hotset_path(raw: Option<&str>) -> Option<std::path::PathBuf> {
-    let raw = raw?.trim();
-    if raw.is_empty() || raw == "0" {
-        None
-    } else {
-        Some(std::path::PathBuf::from(raw))
+/// What [`EP_EXPERT_HOTSET_ENV`] says, from its raw value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EpUnitsPolicy {
+    /// Unset: the shipped default (discovery when the gate is on).
+    Default,
+    /// Blank or `0`: never plan per unit. The explicit off switch.
+    Off,
+    /// A sidecar path (trimmed); never discovered, always required to bind.
+    Explicit(std::path::PathBuf),
+}
+
+/// Parse the raw value of [`EP_EXPERT_HOTSET_ENV`] (`None` = unset).
+pub fn ep_units_policy(raw: Option<&str>) -> EpUnitsPolicy {
+    match raw.map(str::trim) {
+        None => EpUnitsPolicy::Default,
+        Some("") | Some("0") => EpUnitsPolicy::Off,
+        Some(path) => EpUnitsPolicy::Explicit(std::path::PathBuf::from(path)),
+    }
+}
+
+/// The GPU architecture the shipped (discovered) EP hot set runs on.
+pub const EP_UNITS_DISCOVERY_ARCH: &str = "gfx1201";
+/// The expert-parallel width the shipped (discovered) EP hot set is built for.
+pub const EP_UNITS_DISCOVERY_RANKS: usize = 2;
+
+/// What the loader knows when [`EpUnitsPolicy::Default`] may discover a sidecar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpUnitsDiscovery<'a> {
+    /// `hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON`.
+    pub gate: bool,
+    /// GPU architecture name, e.g. `gfx1201`.
+    pub gpu_arch: &'a str,
+    /// The load's refusal facts (`ep`, `pp`, the conflicting levers).
+    pub facts: EpUnitsFacts,
+    /// `<model>.ep.expert-hotset`.
+    pub sidecar: std::path::PathBuf,
+    /// Whether that file exists.
+    pub sidecar_exists: bool,
+}
+
+/// Where a load's per-expert plan comes from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EpUnitsSource {
+    /// No per-expert plan; today's whole-layer placement.
+    Off,
+    /// [`EP_EXPERT_HOTSET_ENV`] named this file.
+    Explicit(std::path::PathBuf),
+    /// The shipped sidecar next to the model, found by the default policy.
+    Discovered(std::path::PathBuf),
+    /// A shipped sidecar exists but this load cannot use it (carries why); the load
+    /// keeps whole-layer placement. Never a load failure.
+    Skipped(String),
+}
+
+/// The pure source decision. Discovery needs the gate, a present sidecar and an
+/// EP2 [`EP_UNITS_DISCOVERY_ARCH`] load that no whole-layer-only lever refuses
+/// ([`ep_units_refusal`]); a single-device or pipeline load never notices the
+/// file. An explicit path or `0` ignores the gate.
+pub fn ep_units_source(policy: &EpUnitsPolicy, found: &EpUnitsDiscovery<'_>) -> EpUnitsSource {
+    match policy {
+        EpUnitsPolicy::Off => EpUnitsSource::Off,
+        EpUnitsPolicy::Explicit(path) => EpUnitsSource::Explicit(path.clone()),
+        EpUnitsPolicy::Default => {
+            if !found.gate || !found.sidecar_exists || found.facts.pp > 1 || found.facts.ep < 2 {
+                return EpUnitsSource::Off;
+            }
+            if found.facts.ep != EP_UNITS_DISCOVERY_RANKS {
+                return EpUnitsSource::Skipped(format!(
+                    "topology.ep is {}; the shipped hot set is built for ep = {EP_UNITS_DISCOVERY_RANKS}",
+                    found.facts.ep
+                ));
+            }
+            if found.gpu_arch != EP_UNITS_DISCOVERY_ARCH {
+                return EpUnitsSource::Skipped(format!(
+                    "gpu is {}; the shipped hot set runs on {EP_UNITS_DISCOVERY_ARCH} only",
+                    found.gpu_arch
+                ));
+            }
+            match ep_units_refusal(&found.facts) {
+                Ok(()) => EpUnitsSource::Discovered(found.sidecar.clone()),
+                Err(why) => EpUnitsSource::Skipped(why),
+            }
+        }
+    }
+}
+
+/// `HIPFIRE_EP_UNIT_RESERVE` for a load that plans per unit, from its raw
+/// value: exact `0` kills the decoupled reserve, exact `1` forces it, anything
+/// else follows the units (`gate`: on with the shipped default, off while the
+/// gate is off, which is the flag's historical opt-in).
+pub fn ep_unit_reserve_on(raw: Option<&str>, gate: bool) -> bool {
+    match raw {
+        Some("0") => false,
+        Some("1") => true,
+        _ => gate,
     }
 }
 
@@ -1933,17 +2020,123 @@ mod loader_support_tests {
     #[test]
     fn the_flag_names_an_explicit_path_and_off_values_are_off() {
         assert_eq!(EP_EXPERT_HOTSET_ENV, "HIPFIRE_QWEN4_EP_EXPERT_HOTSET");
-        for off in [None, Some(""), Some("   "), Some("0"), Some(" 0 ")] {
-            assert_eq!(ep_expert_hotset_path(off), None, "{off:?}");
+        assert_eq!(ep_units_policy(None), EpUnitsPolicy::Default);
+        for off in [Some(""), Some("   "), Some("0"), Some(" 0 ")] {
+            assert_eq!(ep_units_policy(off), EpUnitsPolicy::Off, "{off:?}");
         }
         assert_eq!(
-            ep_expert_hotset_path(Some(" /models/fn.mq4.expert-hotset ")),
-            Some(std::path::PathBuf::from("/models/fn.mq4.expert-hotset"))
+            ep_units_policy(Some(" /models/fn.mq4.expert-hotset ")),
+            EpUnitsPolicy::Explicit(std::path::PathBuf::from("/models/fn.mq4.expert-hotset"))
         );
         assert_eq!(
-            ep_expert_hotset_path(Some("rel/path")),
-            Some(std::path::PathBuf::from("rel/path"))
+            ep_units_policy(Some("rel/path")),
+            EpUnitsPolicy::Explicit(std::path::PathBuf::from("rel/path"))
         );
+    }
+
+    fn discovery(
+        gate: bool,
+        arch: &'static str,
+        ep: usize,
+        pp: usize,
+    ) -> EpUnitsDiscovery<'static> {
+        EpUnitsDiscovery {
+            gate,
+            gpu_arch: arch,
+            facts: EpUnitsFacts {
+                ep,
+                pp,
+                ..Default::default()
+            },
+            sidecar: std::path::PathBuf::from("/m/base.mq4-xts.ep.expert-hotset"),
+            sidecar_exists: true,
+        }
+    }
+
+    #[test]
+    fn the_gate_off_discovers_nothing_but_an_explicit_path_still_applies() {
+        let off = discovery(false, "gfx1201", 2, 1);
+        assert_eq!(
+            ep_units_source(&EpUnitsPolicy::Default, &off),
+            EpUnitsSource::Off
+        );
+        let path = std::path::PathBuf::from("/x/h.expert-hotset");
+        assert_eq!(
+            ep_units_source(&EpUnitsPolicy::Explicit(path.clone()), &off),
+            EpUnitsSource::Explicit(path)
+        );
+        assert_eq!(
+            ep_units_source(&EpUnitsPolicy::Off, &off),
+            EpUnitsSource::Off
+        );
+    }
+
+    #[test]
+    fn the_gate_on_discovers_for_ep2_gfx1201_and_zero_is_the_off_switch() {
+        let on = discovery(true, "gfx1201", 2, 1);
+        assert_eq!(
+            ep_units_source(&EpUnitsPolicy::Default, &on),
+            EpUnitsSource::Discovered(on.sidecar.clone())
+        );
+        assert_eq!(
+            ep_units_source(&EpUnitsPolicy::Off, &on),
+            EpUnitsSource::Off
+        );
+        let mut absent = on.clone();
+        absent.sidecar_exists = false;
+        assert_eq!(
+            ep_units_source(&EpUnitsPolicy::Default, &absent),
+            EpUnitsSource::Off
+        );
+    }
+
+    #[test]
+    fn discovery_is_silent_off_for_single_device_and_pipeline_and_skips_the_rest() {
+        for (ep, pp) in [(1, 1), (0, 1), (2, 2)] {
+            assert_eq!(
+                ep_units_source(&EpUnitsPolicy::Default, &discovery(true, "gfx1201", ep, pp)),
+                EpUnitsSource::Off,
+                "ep {ep} pp {pp}"
+            );
+        }
+        let skipped =
+            |found: &EpUnitsDiscovery<'_>| match ep_units_source(&EpUnitsPolicy::Default, found) {
+                EpUnitsSource::Skipped(why) => why,
+                other => panic!("expected Skipped, got {other:?}"),
+            };
+        assert!(skipped(&discovery(true, "gfx1201", 4, 1)).contains("ep = 2"));
+        assert!(skipped(&discovery(true, "gfx1100", 2, 1)).contains("gfx1201 only"));
+        for lever in 0..3 {
+            let mut found = discovery(true, "gfx1201", 2, 1);
+            match lever {
+                0 => found.facts.single_card_hotset = true,
+                1 => found.facts.chunk_autofit = true,
+                _ => found.facts.lab_resident_cap = true,
+            }
+            assert!(skipped(&found).starts_with(EP_EXPERT_HOTSET_ENV), "{lever}");
+        }
+    }
+
+    #[test]
+    fn the_unit_reserve_follows_the_units_and_zero_kills_it() {
+        // Gate off: the historical opt-in (only an exact 1 turns it on).
+        for (raw, want) in [
+            (None, false),
+            (Some("1"), true),
+            (Some("0"), false),
+            (Some("yes"), false),
+        ] {
+            assert_eq!(ep_unit_reserve_on(raw, false), want, "{raw:?} gate off");
+        }
+        // Gate on: on with the units, an exact 0 kills it.
+        for (raw, want) in [
+            (None, true),
+            (Some("1"), true),
+            (Some("0"), false),
+            (Some("yes"), true),
+        ] {
+            assert_eq!(ep_unit_reserve_on(raw, true), want, "{raw:?} gate on");
+        }
     }
 
     #[test]

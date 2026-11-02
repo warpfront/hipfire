@@ -510,6 +510,24 @@ impl HotsetBase {
     pub fn index_sha256(&self) -> &str {
         &self.index_sha256
     }
+
+    /// Check a sidecar's binding keys (`base_size`, then `base_index_sha256`) name this base.
+    fn check_binding(&self, base_size: u64, base_index_sha256: &str) -> Result<(), String> {
+        if base_size != self.size {
+            return Err(format!(
+                "base is {} bytes, sidecar binds {base_size}",
+                self.size
+            ));
+        }
+        if base_index_sha256 != self.index_sha256 {
+            return Err(format!(
+                "base index sha256 {} differs from the sidecar's {}",
+                short(&self.index_sha256),
+                short(base_index_sha256)
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Wire form; unknown keys are refused so v1 stays closed.
@@ -736,20 +754,34 @@ impl HotsetSidecar {
 
     /// Check the sidecar is bound to exactly `base` (size, then index hash).
     pub fn check_base(&self, base: &HotsetBase) -> Result<(), String> {
-        if self.base_size != base.size {
-            return Err(format!(
-                "base is {} bytes, sidecar binds {}",
-                base.size, self.base_size
-            ));
+        base.check_binding(self.base_size, &self.base_index_sha256)
+    }
+
+    /// Cheap pre-check used where a sidecar is only a candidate (default discovery): the file at
+    /// `path` is a v1 sidecar bound to exactly `base`. Reads the file and its binding keys; the
+    /// ranking itself is not validated here (the load's [`Self::load_bound`] does that).
+    pub fn peek_bound(path: impl AsRef<Path>, base: &HotsetBase) -> Result<(), HotsetSkip> {
+        #[derive(Deserialize)]
+        struct Binding {
+            version: u64,
+            kind: String,
+            base_size: u64,
+            base_index_sha256: String,
         }
-        if self.base_index_sha256 != base.index_sha256 {
-            return Err(format!(
-                "base index sha256 {} differs from the sidecar's {}",
-                short(&base.index_sha256),
-                short(&self.base_index_sha256)
-            ));
+        let path = path.as_ref();
+        let bytes = std::fs::read(path).map_err(|e| {
+            HotsetSkip::InvalidSidecar(format!("cannot read {}: {e}", path.display()))
+        })?;
+        let binding: Binding = serde_json::from_slice(&bytes)
+            .map_err(|e| HotsetSkip::InvalidSidecar(format!("not a v1 hotset JSON: {e}")))?;
+        if binding.kind != SIDECAR_KIND || binding.version != SIDECAR_VERSION {
+            return Err(HotsetSkip::InvalidSidecar(format!(
+                "kind {:?} version {}, expected {SIDECAR_KIND:?} version {SIDECAR_VERSION}",
+                binding.kind, binding.version
+            )));
         }
-        Ok(())
+        base.check_binding(binding.base_size, &binding.base_index_sha256)
+            .map_err(HotsetSkip::BaseMismatch)
     }
 
     /// [`Self::load`] then [`Self::check_base`], as a skip.
@@ -1184,6 +1216,40 @@ mod tests {
         std::fs::write(&path, sidecar().to_string()).unwrap();
         let bound = HotsetSidecar::load_bound(&path, LAYERS, EXPERTS, TOP_K, &base()).unwrap();
         assert_eq!(bound, parsed);
+    }
+
+    #[test]
+    fn peek_bound_checks_only_the_binding_of_a_candidate_file() {
+        let dir = temp_dir("peek");
+        let path = dir.join("candidate.json");
+        std::fs::write(&path, sidecar().to_string()).unwrap();
+        assert_eq!(HotsetSidecar::peek_bound(&path, &base()), Ok(()));
+        // A different base (size, then index) is a base mismatch.
+        assert!(matches!(
+            HotsetSidecar::peek_bound(&path, &HotsetBase::new(BASE_SIZE + 1, [0xab; 32])),
+            Err(HotsetSkip::BaseMismatch(_))
+        ));
+        assert!(matches!(
+            HotsetSidecar::peek_bound(&path, &HotsetBase::new(BASE_SIZE, [0xcd; 32])),
+            Err(HotsetSkip::BaseMismatch(_))
+        ));
+        // Not a v1 sidecar / unreadable: invalid, never a panic.
+        let mut other = sidecar();
+        other["kind"] = json!("something.else");
+        std::fs::write(&path, other.to_string()).unwrap();
+        assert!(matches!(
+            HotsetSidecar::peek_bound(&path, &base()),
+            Err(HotsetSkip::InvalidSidecar(_))
+        ));
+        std::fs::write(&path, b"not json").unwrap();
+        assert!(matches!(
+            HotsetSidecar::peek_bound(&path, &base()),
+            Err(HotsetSkip::InvalidSidecar(_))
+        ));
+        assert!(matches!(
+            HotsetSidecar::peek_bound(dir.join("absent"), &base()),
+            Err(HotsetSkip::InvalidSidecar(_))
+        ));
     }
 
     #[test]

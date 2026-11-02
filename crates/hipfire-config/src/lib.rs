@@ -10316,6 +10316,27 @@ pub mod memory {
         PathBuf::from(path)
     }
 
+    /// Suffix of the Flash-Next expert-parallel (EP2) expert hot set sidecar: an `.expert-hotset`
+    /// v1 file whose ranking was pooled on EP lane traffic. It is a distinct sidecar from
+    /// [`EXPERT_HOTSET_SIDECAR_SUFFIX`] (the single-card decode ranking), so one base can carry
+    /// both; it still ends in `.expert-hotset`, so model listing treats it as a sidecar.
+    pub const EP_EXPERT_HOTSET_SIDECAR_SUFFIX: &str = ".ep.expert-hotset";
+
+    /// Path of the EP expert hot set sidecar of `model`: `<model file name>.ep.expert-hotset`.
+    pub fn ep_expert_hotset_sidecar_path(model: &Path) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(EP_EXPERT_HOTSET_SIDECAR_SUFFIX);
+        PathBuf::from(path)
+    }
+
+    /// THE gate of the shipped EP expert hot set (D1). `false`: nothing changes unless
+    /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET=<path>` names a sidecar (the loader never discovers one,
+    /// the unit reserve stays opt-in, `hipfire pull` does not fetch the sidecar). `true`: an EP2
+    /// gfx1201 Flash-Next load discovers `<base>.ep.expert-hotset` when the variable is unset,
+    /// the unit reserve follows the units (`HIPFIRE_EP_UNIT_RESERVE=0` kills it) and `hipfire
+    /// pull` fetches the pinned sidecar. Flipping this one constant is the whole switch.
+    pub const EP_EXPERT_HOTSET_DEFAULT_ON: bool = false;
+
     /// Optional override of the PLE hot-rank sidecar path
     /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.
     pub fn ple_hot_rank_file() -> Option<String> {
@@ -11269,6 +11290,19 @@ pub mod memory {
                 expert_hotset_sidecar_path(Path::new("model")),
                 PathBuf::from("model.expert-hotset")
             );
+        }
+
+        #[test]
+        fn ep_expert_hotset_sidecar_is_distinct_from_the_single_card_hotset() {
+            let base = Path::new("/m/qwen3.8-flash-next-base.mq4-xts");
+            let ep = ep_expert_hotset_sidecar_path(base);
+            assert_eq!(
+                ep,
+                PathBuf::from("/m/qwen3.8-flash-next-base.mq4-xts.ep.expert-hotset")
+            );
+            assert_ne!(ep, expert_hotset_sidecar_path(base));
+            // Still a `.expert-hotset` name: model listing keeps treating it as a sidecar.
+            assert!(ep.to_string_lossy().ends_with(EXPERT_HOTSET_SIDECAR_SUFFIX));
         }
 
         #[test]

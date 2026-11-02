@@ -2142,6 +2142,20 @@ fn pull_with_sidecar_pins(
                 args.force,
             );
         }
+        if let Some(ep) = hipfire_registry::ep_expert_hotset_in(
+            identity,
+            hipfire_registry::EP_EXPERT_HOTSET_PINS,
+            hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
+        ) {
+            fetch_registry_sidecar(
+                &VerifiedCache::in_home(&paths.root),
+                "EP expert hot set",
+                ep.repo,
+                &ep.sidecar,
+                &hipfire_config::memory::ep_expert_hotset_sidecar_path(&model_path),
+                args.force,
+            );
+        }
     }
     for (name, sidecar) in &entry.heads {
         let destination = paths.models.join(&sidecar.file);
@@ -2470,6 +2484,14 @@ fn rm_with_sidecar_pins(
                 targets.insert(hotset_path);
             }
         }
+        if let Some(ep) =
+            hipfire_registry::expert_hotset_in(entry, hipfire_registry::EP_EXPERT_HOTSET_PINS)
+        {
+            let ep_path = paths.models.join(&ep.sidecar.file);
+            if ep_path.is_file() {
+                targets.insert(ep_path);
+            }
+        }
         if let Some(sidecar) = entry.dflash.as_ref() {
             let sidecar_path = paths.models.join(&sidecar.file);
             if sidecar_path.is_file() {
@@ -2676,6 +2698,10 @@ fn rm_with_sidecar_pins(
     let hotset = hipfire_config::memory::expert_hotset_sidecar_path(&path);
     if hotset.is_file() {
         targets.insert(hotset);
+    }
+    let ep_hotset = hipfire_config::memory::ep_expert_hotset_sidecar_path(&path);
+    if ep_hotset.is_file() {
+        targets.insert(ep_hotset);
     }
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
@@ -24422,6 +24448,32 @@ effort = "high"
         .unwrap();
         assert!(!paths.models.join("local.mq4").exists());
         assert!(!paths.models.join("local.mq4.expert-hotset").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_the_ep_expert_hotset_with_its_base() {
+        let paths = test_paths("ep-hotset-rm");
+        let registry = RegistryV1::parse(&overlay_registry_raw(), "ep hotset rm").unwrap();
+        fs::create_dir_all(&paths.models).unwrap();
+        let ep_file = "overlay-model.mq4.ep.expert-hotset";
+        for file in ["overlay-model.mq4", ep_file, "untouched.mq4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_with_sidecar_pins(
+            &paths,
+            &registry,
+            &[],
+            &hotset_pins(),
+            RmArgs {
+                model: "overlay-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("overlay-model.mq4").exists());
+        assert!(!paths.models.join(ep_file).exists());
+        assert!(paths.models.join("untouched.mq4").exists());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
