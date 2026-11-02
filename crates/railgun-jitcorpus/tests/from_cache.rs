@@ -607,6 +607,8 @@ fn refuses_unknown_program_bad_arch_and_an_empty_cache_with_exact_reasons() {
     );
     assert!(known.contains(&"raon-ar-decode-gfx1201"));
     assert!(known.contains(&"raon-ar-decode-a8attn-gfx1201"));
+    assert!(known.contains(&"raon-ar-decode-gfx1100"));
+    assert!(known.contains(&"raon-ar-decode-a8attn-gfx1100"));
 
     let mut opts = env.options();
     opts.program = "raon-ar-decode-gfx1201".into();
@@ -726,7 +728,7 @@ fn the_cli_prints_one_json_status_line_and_exits_2_on_refusal_and_1_on_error() {
     assert_eq!(v["status"], "refused");
     assert_eq!(
         v["reason"],
-        "unknown program id `nope` (known: raon-ar-decode-gfx1201, raon-ar-decode-a8attn-gfx1201)"
+        "unknown program id `nope` (known: raon-ar-decode-gfx1201, raon-ar-decode-a8attn-gfx1201, raon-ar-decode-gfx1100, raon-ar-decode-a8attn-gfx1100)"
     );
     assert_eq!(v["missing"], serde_json::json!([]));
     assert!(v["out"].is_null());
@@ -797,27 +799,41 @@ fn a_node_with_one_object_missing_is_named_with_symbol_module_and_why_in_the_cli
 #[test]
 fn the_embedded_raon_programs_are_the_recorded_sequences_node_sets() {
     install_product_defaults().unwrap();
-    for (id, fixture, nodes) in [
+    for (id, arch, fixture, nodes) in [
         (
             "raon-ar-decode-gfx1201",
+            "gfx1201",
             include_str!("fixtures/raon-mq8-decode-nodes.jsonl"),
             33,
         ),
         (
             "raon-ar-decode-a8attn-gfx1201",
+            "gfx1201",
             include_str!("fixtures/raon-ar-decode-nodes.jsonl"),
             32,
         ),
+        (
+            "raon-ar-decode-gfx1100",
+            "gfx1100",
+            include_str!("fixtures/raon-mq8-decode-nodes-gfx1100.jsonl"),
+            33,
+        ),
+        (
+            "raon-ar-decode-a8attn-gfx1100",
+            "gfx1100",
+            include_str!("fixtures/raon-ar-decode-nodes-gfx1100.jsonl"),
+            33,
+        ),
     ] {
         let embedded = EMBEDDED_PROGRAMS.iter().find(|p| p.id == id).unwrap();
-        assert_eq!(embedded.arch, ARCH);
+        assert_eq!(embedded.arch, arch);
         let mut from_list = inventory().unwrap();
         from_list
-            .add_program_nodes(embedded.id, ARCH, embedded.jsonl)
+            .add_program_nodes(embedded.id, arch, embedded.jsonl)
             .unwrap();
         let mut from_fixture = inventory().unwrap();
         from_fixture
-            .add_program_sequence(embedded.id, ARCH, fixture)
+            .add_program_sequence(embedded.id, arch, fixture)
             .unwrap();
         assert_eq!(
             from_list.sequence_sets[0].nodes, from_fixture.sequence_sets[0].nodes,
@@ -827,7 +843,7 @@ fn the_embedded_raon_programs_are_the_recorded_sequences_node_sets() {
         assert!(from_list.sequence_sets[0].loaded_sha256.is_empty());
         // Every module of the list is in the registry or an embedded native image.
         let plan =
-            railgun_jitcorpus::plan(&from_list, ARCH).unwrap_or_else(|e| panic!("{id}: {e}"));
+            railgun_jitcorpus::plan(&from_list, arch).unwrap_or_else(|e| panic!("{id}: {e}"));
         for (_, module) in &from_list.sequence_sets[0].nodes {
             assert!(
                 plan.entries.iter().any(|e| &e.module == module)

@@ -80,6 +80,18 @@ pub const EMBEDDED_PROGRAMS: &[EmbeddedProgram] = &[
         arch: "gfx1201",
         jsonl: include_str!("../programs/raon-ar-decode-a8attn-gfx1201.jsonl"),
     },
+    // The same two decode bodies on the 7900 XTX (exact gfx1100; the owner asks for
+    // `raon-ar-decode-<arch>`).
+    EmbeddedProgram {
+        id: "raon-ar-decode-gfx1100",
+        arch: "gfx1100",
+        jsonl: include_str!("../programs/raon-ar-decode-gfx1100.jsonl"),
+    },
+    EmbeddedProgram {
+        id: "raon-ar-decode-a8attn-gfx1100",
+        arch: "gfx1100",
+        jsonl: include_str!("../programs/raon-ar-decode-a8attn-gfx1100.jsonl"),
+    },
 ];
 
 pub struct FromCacheOptions {
