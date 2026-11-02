@@ -205,6 +205,23 @@ pub trait SpecTarget {
     /// Downcast hook: `target.as_any_mut().downcast_mut::<ModelSlot>()`.
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
+    /// Begin a speculative prefill of `prompt` on session `route` that skips
+    /// the `reused` tokens the session plan returned (a live continuation, a
+    /// snapshot restore, or a cold start at 0), arming the snapshot
+    /// boundaries the prefill publishes. The engine calls it for a planned
+    /// route whose drafter does not begin the session itself
+    /// (`SessionRoute::Ar`). `Ok(false)` (default): the target keeps no
+    /// session.
+    fn session_begin(
+        &mut self,
+        _gpu: &mut Gpu,
+        _prompt: &[u32],
+        _reused: usize,
+        _route: crate::session_cache::SessionRoute,
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Zero the target's recurrent (DeltaNet) state and reset the KV eviction
     /// offset — used by the daemon's mid-generation abort path in place of its
     /// current inline memset loop. Returns `Err` when any HIP memset/bind fails

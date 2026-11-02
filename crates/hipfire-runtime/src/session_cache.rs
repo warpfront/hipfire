@@ -3625,17 +3625,18 @@ fn plan_with_parked(base: usize, parked: Option<usize>) -> usize {
 /// [`crate::spec::Speculator::can_resume_at`]), else 0 (cold). `plan_capped(cap)`
 /// is the model's plan restricted to reuse points `<= cap`
 /// ([`crate::arch_model::ArchModel::session_plan_capped`]); the walk starts at
-/// its top plan and replans below each rejected hit. Host-only; each step is
-/// clamped below the previous hit, so it ends even if `plan_capped` ignores
-/// its cap.
+/// its top plan and replans below each rejected hit. Host-only. A plan above
+/// its cap is not a reuse point of that prefix, so it plans cold (0); the
+/// walk is strictly decreasing and always ends.
 pub fn plan_resumable(
     len: usize,
     plan_capped: impl Fn(usize) -> usize,
     resumable: impl Fn(usize) -> bool,
 ) -> usize {
-    let mut start = plan_capped(len);
+    let capped = |cap: usize| Some(plan_capped(cap)).filter(|&p| p <= cap).unwrap_or(0);
+    let mut start = capped(len);
     while start > 0 && !resumable(start) {
-        start = plan_capped(start - 1).min(start - 1);
+        start = capped(start - 1);
     }
     start
 }
@@ -4363,8 +4364,10 @@ mod tests {
         assert_eq!(plan_resumable(len, reuse_points(len), leaves_window), 10000);
         assert_eq!(plan_resumable(len, reuse_points(len), |s| s <= 8192), 8192);
         assert_eq!(plan_resumable(len, reuse_points(len), |_| false), 0);
-        // A plan that ignores its cap still ends.
+        // A plan above its cap is no reuse point of that prefix: cold, and the
+        // walk ends.
         assert_eq!(plan_resumable(len, |_| 300, |_| false), 0);
+        assert_eq!(plan_resumable(len, |_| 12288, |s| s < 12288), 0);
     }
 
     #[test]
