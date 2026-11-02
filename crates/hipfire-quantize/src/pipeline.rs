@@ -6227,7 +6227,25 @@ fn handle_moe_expert_3d(
                 .as_ref()
                 .and_then(|t| t.get(x))
                 .filter(|v| v.len() == inner_k_e)
-                .map(|v| compute_awq_scales(v, awq_alpha_e));
+                // A4-aware: search the alpha on THIS expert's W4A4 block-output
+                // error (its own routed activation row), the same surrogate the
+                // dense arm uses. Only `expert_awq_active` parents reach here,
+                // which requires supports_g256, so `k % 256 == 0` holds. With
+                // AWQ_A4_AWARE off this is the previous fixed-alpha path
+                // (`compute_awq_scales`) and stays bit-identical.
+                .map(|v| {
+                    compute_awq_scales_for_weight(
+                        name,
+                        v,
+                        awq_alpha_e,
+                        &f32_slice,
+                        inner_m,
+                        inner_k_e,
+                        &signs1,
+                        &signs2,
+                    )
+                    .scales
+                });
             let (quantized, qt, gs) = if moe_expert_down_sym && base_name == "down_proj" {
                 // Validated recipe (uniform symmetric MQ4, no promotion / AWQ /
                 // Lloyd / graded / tier-map) — the override is exclusive.

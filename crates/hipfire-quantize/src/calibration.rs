@@ -2641,3 +2641,98 @@ mod hf_snapshot_tests {
         );
     }
 }
+
+/// AWQ alpha-selection contracts for the routed-expert call site
+/// (`handle_moe_expert_3d` routes every expert's `down_proj` through
+/// [`compute_awq_scales_for_weight`]). The A4 search owns the
+/// `AWQ_A4_AWARE` global, so the flag-off assertions skip when another test in
+/// this binary armed it; the alpha/scale consistency check holds in both modes.
+#[cfg(test)]
+mod awq_alpha_tests {
+    use super::*;
+    use crate::quant_fwht::gen_fwht_signs;
+
+    /// Deterministic routed-weight fixture (integer-derived, libm-free).
+    fn synth_expert(m: usize, k: usize) -> Vec<f32> {
+        (0..m * k)
+            .map(|i| (((i * 37 + (i / 7) * 11) % 211) as f32 - 105.0) * 0.003)
+            .collect()
+    }
+
+    /// Per-channel activation profile with a realistic dynamic range.
+    fn synth_in_sum2(k: usize) -> Vec<f32> {
+        (0..k)
+            .map(|i| 1e-3 + ((i * 53 + i / 5) % 4096) as f32 * 1e-2)
+            .collect()
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|x| x.to_bits()).collect()
+    }
+
+    /// The scales a weight is encoded with must always be the vector the
+    /// reported alpha produces (the runtime inverse-divides exactly that one).
+    /// With A4 off that alpha is the caller's fixed alpha, i.e. the pre-change
+    /// `compute_awq_scales` bytes.
+    #[test]
+    fn scales_match_the_reported_alpha() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        for (m, k) in [(8, 512), (2048, 512), (64, 2048)] {
+            let in_sum2 = synth_in_sum2(k);
+            let weights = synth_expert(m, k);
+            let got = compute_awq_scales_for_weight(
+                "model.language_model.layers.3.mlp.experts.down_proj.weight",
+                &in_sum2,
+                0.55,
+                &weights,
+                m,
+                k,
+                &s1,
+                &s2,
+            );
+            assert_eq!(got.scales.len(), k);
+            assert_eq!(
+                bits(&got.scales),
+                bits(&compute_awq_scales(&in_sum2, got.alpha))
+            );
+            if AWQ_A4_AWARE.get().copied().unwrap_or(false) {
+                assert!(AWQ_A4_CANDIDATE_ALPHAS.contains(&got.alpha));
+            } else {
+                assert_eq!(got.alpha, 0.55);
+            }
+        }
+    }
+
+    /// The A4 search is deterministic: identical inputs must select the same
+    /// alpha and the same bytes, or a re-quantize silently changes the artifact.
+    #[test]
+    fn a4_search_is_deterministic_on_expert_shapes() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let in_sum2 = synth_in_sum2(512);
+        let weights = synth_expert(2048, 512);
+        let first = compute_a4_aware_awq_scales(
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight",
+            &in_sum2,
+            &weights,
+            2048,
+            512,
+            &s1,
+            &s2,
+        );
+        let second = compute_a4_aware_awq_scales(
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight",
+            &in_sum2,
+            &weights,
+            2048,
+            512,
+            &s1,
+            &s2,
+        );
+        assert!(AWQ_A4_CANDIDATE_ALPHAS.contains(&first.alpha));
+        assert_eq!(first.alpha, second.alpha);
+        assert_eq!(bits(&first.scales), bits(&second.scales));
+        assert!(first.relative_output_mse.is_finite());
+    }
+}
