@@ -268,7 +268,12 @@ fn load_weight_tensor_raw_with(
             })
         }
         7 => {
-            hipfire_runtime::weight_backend::validate_hfq4g128_extent(data.len(), m, k, "qt7")?;
+            hipfire_runtime::weight_backend::validate_hfq4g128_extent(
+                data.len(),
+                m,
+                k,
+                "HFQ4G128",
+            )?;
             let buf = upload_codes(gpu, target, data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
@@ -1127,6 +1132,14 @@ fn load_weight_tensor_raw(
     load_weight_tensor_raw_with(gpu, quant_type, data, m, k, target)
 }
 
+/// Prefix a load error with the tensor it came from.
+fn named(name: &str) -> impl FnOnce(HipError) -> HipError + '_ {
+    move |mut e| {
+        e.message = format!("{name}: {}", e.message);
+        e
+    }
+}
+
 pub fn load_weight_tensor(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -1146,13 +1159,19 @@ pub fn load_weight_tensor(
         for candidate in candidates(name) {
             if let Some((info, data)) = hfq.tensor_data(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k, target)?);
+                wt = Some(
+                    load_weight_tensor_raw(gpu, qt, data, m, k, target)
+                        .map_err(named(&candidate))?,
+                );
                 matched = Some(candidate);
                 break;
             }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k, target)?);
+                wt = Some(
+                    load_weight_tensor_raw(gpu, qt, &buf, m, k, target)
+                        .map_err(named(&candidate))?,
+                );
                 matched = Some(candidate);
                 break;
             }
@@ -1206,7 +1225,8 @@ pub fn load_weight_tensor(
             }
             found.unwrap_or_else(|| panic!("tensor not found: {name}"))
         };
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k, target)?;
+        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k, target)
+            .map_err(named(&matched_name))?;
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
