@@ -81,7 +81,9 @@ pub(crate) fn is_split(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
 }
 
 /// A band the launch can take: equal bands of whole rows whose byte view
-/// lies inside the weight's allocation. BF16 weights never band: their lazy
+/// lies inside the weight's allocation, with the allocation's row stride
+/// equal to the dtype's encoded row (planar formats and pooled buffers larger
+/// than the weight never band). BF16 weights never band: their lazy
 /// F16 shadows are keyed by the weight's device pointer, which the first band
 /// shares with the whole matrix.
 fn band_of(
@@ -94,7 +96,8 @@ fn band_of(
         return None;
     }
     let (lo, hi) = hook.band(gpu, weight, rows)?;
-    let row_bytes = weight_row_bytes(weight)?;
+    let row_bytes =
+        weight_row_bytes(weight).filter(|&b| weight.dtype.row_bytes(weight.k) == Some(b))?;
     let width = hi.checked_sub(lo)?;
     (width > 0 && hi <= weight.m && lo.is_multiple_of(width) && weight.m.is_multiple_of(width))
         .then_some((lo, hi, row_bytes))
