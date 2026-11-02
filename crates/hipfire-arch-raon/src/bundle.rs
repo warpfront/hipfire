@@ -162,9 +162,10 @@ pub struct RaonBundle {
     /// Prefill snapshot cache shared by every session; `None` = off. Taken out
     /// of the bundle while it drives the bundle as its `SessionState`.
     pub(crate) session: Option<SessionDriver>,
-    /// The railgun decode owner: `Some` only when `HIPFIRE_RAON_RAILGUN=1`
-    /// (default off). `None` keeps the decode route byte-identical and
-    /// allocation-free.
+    /// The railgun decode owner, per the tri-state `HIPFIRE_RAON_RAILGUN`
+    /// (`auto` default: `Some` only with an admissible context and a receipt
+    /// corpus; `1` forces it; `0` never). `None` keeps the decode route
+    /// byte-identical and allocation-free.
     pub(crate) railgun: Option<Box<RaonRailgunOwner>>,
 }
 
@@ -236,7 +237,7 @@ impl RaonBundle {
                     session: None,
                     railgun: None,
                 };
-                bundle.railgun = RaonRailgunOwner::from_config(&bundle);
+                bundle.railgun = RaonRailgunOwner::from_config(&bundle, gpu);
                 Ok(bundle)
             }
             Err(e) => {
@@ -724,7 +725,14 @@ impl RaonBundle {
         r
     }
 
-    /// Railgun owner counters; `None` when `HIPFIRE_RAON_RAILGUN` is off.
+    /// `Some(true)` when `HIPFIRE_RAON_RAILGUN=1` forced the owner, `Some(false)`
+    /// under `auto`, `None` when the bundle has no owner (`0`, or `auto` found no
+    /// admissible context and corpus).
+    pub fn railgun_forced(&self) -> Option<bool> {
+        self.railgun.as_ref().map(|o| o.is_forced())
+    }
+
+    /// Railgun owner counters; `None` when the bundle has no owner.
     pub fn railgun_stats(&self) -> Option<RaonRailgunStats> {
         self.railgun.as_ref().map(|o| o.stats())
     }

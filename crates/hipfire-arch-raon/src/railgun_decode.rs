@@ -3,10 +3,21 @@
 //! Raon plain-AR decode as a certified railgun program (raon-redline PLAN §3-5).
 //!
 //! One [`RaonRailgunOwner`] per [`RaonBundle`] (no global or pointer-keyed
-//! cache), created by `RaonBundle::new` only when `HIPFIRE_RAON_RAILGUN=1`
-//! (developer variable, default OFF, `0` is the kill switch). With the
-//! variable unset the bundle holds no owner, allocates nothing and the decode
-//! route is the unchanged HIP graph.
+//! cache), created by `RaonBundle::new` per `HIPFIRE_RAON_RAILGUN`
+//! (developer variable, tri-state, default `auto`):
+//!
+//! * `0` is the hard kill: no owner is created (no corpus discovery, no
+//!   allocation), the decode route is the unchanged HIP graph.
+//! * `auto` (default, also unset/empty) creates the owner only when the
+//!   structural admission checks pass (exact gfx1201, whole band, graph route,
+//!   no `HIPFIRE_GRAPH=0`, no retained replay, no CPU-executed weights) AND a
+//!   receipt corpus is found (`HIPFIRE_RAON_RAILGUN_CORPUS`, else the
+//!   `railgun-corpus` directory beside the installed kernel pack). Otherwise
+//!   the bundle holds no owner. A step the owner then declines silently runs
+//!   the HIP graph step (one log line per bundle for the first
+//!   non-routine decline).
+//! * `1` forces the owner (whatever the arch or corpus) and logs every
+//!   decline once per kind.
 //!
 //! A step through the owner:
 //!
@@ -46,6 +57,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::mem::ManuallyDrop;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,16 +83,15 @@ use crate::forward::{
 };
 use crate::mla::MlaRoute;
 
-/// `HIPFIRE_RAON_RAILGUN` (`0|1`, default `0`; `0` is the kill switch).
+/// `HIPFIRE_RAON_RAILGUN`: `auto` (default) | `1` | `0` (hard kill).
 pub const ENV_ENABLE: &str = "HIPFIRE_RAON_RAILGUN";
-/// `HIPFIRE_RAON_RAILGUN_CORPUS`: directory of the railgun JIT receipt corpus.
+/// `HIPFIRE_RAON_RAILGUN_CORPUS`: directory of the railgun JIT receipt corpus
+/// (a `railgun-jit-corpus` build's `v2/<host key>` directory).
 pub const ENV_CORPUS: &str = "HIPFIRE_RAON_RAILGUN_CORPUS";
 /// Receipt trials a G4 row needs to back a cache-table rung.
 const G4_MIN_TRIALS: u64 = 1 << 20;
 /// The only architecture the owner admits.
 const ARCH: &str = "gfx1201";
-/// Distinct refusal texts logged (then only counted).
-const LOG_LIMIT: usize = 32;
 
 // ------------------------------------------------------------------ refusal
 
@@ -193,7 +204,11 @@ impl RaonRailgunRefusal {
 impl fmt::Display for RaonRailgunRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Disabled => write!(f, "{ENV_ENABLE} is off"),
+            Self::Disabled => write!(
+                f,
+                "no railgun owner on this bundle ({ENV_ENABLE}=0, or auto found no admissible \
+                 context and receipt corpus)"
+            ),
             Self::WrongArch { arch } => write!(f, "arch {arch} is not {ARCH}"),
             Self::PartitionedBand { band } => {
                 write!(f, "band {band} is not the whole single-device model")
@@ -257,9 +272,14 @@ pub enum RaonRailgunAttempt {
 
 // ------------------------------------------------------------ admission facts
 
-/// Everything the cheap admission checks read, as plain data.
+/// What decides, once per bundle and again at every step, whether the context
+/// is one the owner can ever serve: read from the device and the bundle, plain
+/// data. `retained_replay` is the caller's reading (the step reads the live
+/// flag; construction relies on `graph_mode`, which the load-time route
+/// resolution already made false when retained replay owned the launch
+/// stream).
 #[derive(Clone, Debug)]
-pub struct Admission<'a> {
+pub struct Structural<'a> {
     pub arch: &'a str,
     pub whole_band: bool,
     pub band: &'a str,
@@ -267,6 +287,11 @@ pub struct Admission<'a> {
     pub graph_mode: bool,
     pub retained_replay: bool,
     pub host_weights: bool,
+}
+
+/// What can change from one step to the next.
+#[derive(Clone, Debug)]
+pub struct StepFacts<'a> {
     pub tap_armed: bool,
     pub dump_armed: bool,
     pub absorbed_route: bool,
@@ -274,9 +299,9 @@ pub struct Admission<'a> {
     pub corpus_dir: Option<&'a str>,
 }
 
-/// The first reason `a` is refused, in a fixed order (cheapest and most
-/// structural first); `Ok` when every cheap check passes.
-pub fn check_admission(a: &Admission<'_>) -> Result<(), RaonRailgunRefusal> {
+/// The first structural reason the context is refused, in a fixed order
+/// (cheapest and most structural first); `Ok` when none applies.
+pub fn check_structural(a: &Structural<'_>) -> Result<(), RaonRailgunRefusal> {
     use RaonRailgunRefusal as R;
     if a.arch != ARCH {
         return Err(R::WrongArch {
@@ -300,22 +325,144 @@ pub fn check_admission(a: &Admission<'_>) -> Result<(), RaonRailgunRefusal> {
     if !a.graph_mode {
         return Err(R::NotGraphMode);
     }
-    if a.tap_armed {
+    Ok(())
+}
+
+/// The first reason this step is refused: the structural checks, then the
+/// per-step ones (census tap, MoE dump, absorbed route, cold decode graph,
+/// no corpus); `Ok` when every cheap check passes.
+pub fn check_admission(s: &Structural<'_>, step: &StepFacts<'_>) -> Result<(), RaonRailgunRefusal> {
+    use RaonRailgunRefusal as R;
+    check_structural(s)?;
+    if step.tap_armed {
         return Err(R::TapArmed);
     }
-    if a.dump_armed {
+    if step.dump_armed {
         return Err(R::DumpArmed);
     }
-    if a.absorbed_route {
+    if step.absorbed_route {
         return Err(R::AbsorbedRoute);
     }
-    if !a.warmed {
+    if !step.warmed {
         return Err(R::NotWarm);
     }
-    if a.corpus_dir.is_none_or(str::is_empty) {
+    if step.corpus_dir.is_none_or(str::is_empty) {
         return Err(R::CorpusUnset);
     }
     Ok(())
+}
+
+// ----------------------------------------------------------- tri-state mode
+
+/// The three states of `HIPFIRE_RAON_RAILGUN`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RailgunMode {
+    /// `0`: hard kill, no owner.
+    Off,
+    /// Unset, empty or `auto` (the default).
+    Auto,
+    /// `1`: the owner always exists and every decline is logged.
+    Force,
+}
+
+/// Parse the variable (ASCII case-insensitive, trimmed): unset / empty /
+/// `auto` -> `Auto`; `1` / `true` / `on` -> `Force`; `0` / `false` / `off` ->
+/// `Off`. Any other spelling is an error (the caller fails closed to `Off`).
+pub fn parse_mode(raw: Option<&str>) -> Result<RailgunMode, String> {
+    let Some(raw) = raw else {
+        return Ok(RailgunMode::Auto);
+    };
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" => Ok(RailgunMode::Auto),
+        "1" | "true" | "on" => Ok(RailgunMode::Force),
+        "0" | "false" | "off" => Ok(RailgunMode::Off),
+        _ => Err(format!(
+            "{ENV_ENABLE}={raw:?} is not auto, 1 or 0; the railgun route is off"
+        )),
+    }
+}
+
+/// How the owner is to behave once created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OwnerPlan {
+    pub corpus_dir: Option<String>,
+    /// `1`: log every decline once per kind.
+    pub loud: bool,
+}
+
+/// Why a bundle got no owner.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NoOwner {
+    /// `HIPFIRE_RAON_RAILGUN=0`.
+    Killed,
+    /// `auto`: the context is structurally refused.
+    Refused(RaonRailgunRefusal),
+    /// `auto`: no usable receipt corpus; names what was looked at.
+    NoCorpus(String),
+}
+
+impl fmt::Display for NoOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Killed => write!(f, "{ENV_ENABLE}=0"),
+            Self::Refused(r) => write!(f, "{r}"),
+            Self::NoCorpus(why) => write!(f, "{why}"),
+        }
+    }
+}
+
+/// Decide whether a bundle gets an owner. `env_corpus` is
+/// `HIPFIRE_RAON_RAILGUN_CORPUS`, `pack_corpus` the directory beside the
+/// installed kernel pack, `has_index` whether a directory holds a corpus.
+///
+/// `Off` creates nothing and looks at nothing. `Force` always creates the
+/// owner, with the explicit corpus, else the pack's when it holds one (an
+/// absent corpus then declines every step, loudly). `Auto` creates it only
+/// when the structural checks pass and a corpus is found: the explicit
+/// directory when set (it must hold a corpus), else the pack's.
+pub fn decide_owner(
+    mode: RailgunMode,
+    s: &Structural<'_>,
+    env_corpus: Option<&str>,
+    pack_corpus: Option<&str>,
+    has_index: &dyn Fn(&str) -> bool,
+) -> Result<OwnerPlan, NoOwner> {
+    let env_corpus = env_corpus.filter(|d| !d.is_empty());
+    match mode {
+        RailgunMode::Off => Err(NoOwner::Killed),
+        RailgunMode::Force => Ok(OwnerPlan {
+            corpus_dir: env_corpus
+                .or_else(|| pack_corpus.filter(|d| has_index(d)))
+                .map(str::to_owned),
+            loud: true,
+        }),
+        RailgunMode::Auto => {
+            check_structural(s).map_err(NoOwner::Refused)?;
+            let dir = match (env_corpus, pack_corpus) {
+                (Some(d), _) if has_index(d) => d,
+                (Some(d), _) => {
+                    return Err(NoOwner::NoCorpus(format!(
+                        "{ENV_CORPUS}={d} holds no receipt corpus"
+                    )))
+                }
+                (None, Some(d)) if has_index(d) => d,
+                (None, Some(d)) => {
+                    return Err(NoOwner::NoCorpus(format!(
+                        "no receipt corpus beside the installed kernel pack ({d}); set {ENV_CORPUS}"
+                    )))
+                }
+                (None, None) => {
+                    return Err(NoOwner::NoCorpus(format!(
+                        "no installed kernel pack to pair a receipt corpus with; set {ENV_CORPUS}"
+                    )))
+                }
+            };
+            Ok(OwnerPlan {
+                corpus_dir: Some(dir.to_owned()),
+                loud: false,
+            })
+        }
+    }
 }
 
 // ------------------------------------------------------------------------ key
@@ -997,8 +1144,8 @@ pub struct RaonRailgunStats {
     pub last_rebuild_cause: Option<String>,
 }
 
-/// The per-bundle owner. Created by `RaonBundle::new` when
-/// `HIPFIRE_RAON_RAILGUN=1`.
+/// The per-bundle owner. Created by `RaonBundle::new` per the tri-state
+/// `HIPFIRE_RAON_RAILGUN` (see [`decide_owner`]); never exists under `0`.
 pub struct RaonRailgunOwner {
     corpus_dir: Option<String>,
     corpus: Option<Result<WindowCorpus, String>>,
@@ -1008,27 +1155,77 @@ pub struct RaonRailgunOwner {
     flags: Option<(usize, String)>,
     exec: Exec<RailgunWindowQueue>,
     stats: RaonRailgunStats,
-    logged: BTreeSet<String>,
+    /// `1`: every decline is logged once per kind.
+    loud: bool,
+    logged_kinds: BTreeSet<&'static str>,
+    /// `auto`: the one line for the first non-routine decline was written.
+    auto_logged: bool,
+}
+
+/// The structural facts of `b` on `gpu`. `retained_replay` is passed in so
+/// the one live read of that state stays in [`RaonRailgunOwner::try_step`].
+fn observe_structural<'a>(
+    b: &RaonBundle,
+    gpu: &'a Gpu,
+    band: &'a str,
+    retained_replay: bool,
+) -> Structural<'a> {
+    Structural {
+        arch: &gpu.arch,
+        whole_band: b.weights.band.is_whole(),
+        band,
+        graph_forward_disabled: gpu.flags.graph_forward == Some(false),
+        graph_mode: b.decode_route() == DecodeMode::Graph,
+        retained_replay,
+        host_weights: gpu.owns_host_cpu_weights(),
+    }
 }
 
 impl RaonRailgunOwner {
-    /// The owner for `bundle`, when enabled by `HIPFIRE_RAON_RAILGUN=1`
-    /// (read once; anything but `1` is off, `0` is the kill switch).
-    pub(crate) fn from_config(b: &RaonBundle) -> Option<Box<Self>> {
-        if !hipfire_config::developer_bool("HIPFIRE_RAON_RAILGUN", false) {
+    /// The owner for `b` under `HIPFIRE_RAON_RAILGUN` (read once). `0` returns
+    /// before reading anything else. An unrecognised spelling fails closed to
+    /// `0` with a message. In `auto` an explicitly set
+    /// `HIPFIRE_RAON_RAILGUN_CORPUS` that holds no corpus is reported once;
+    /// every other reason for no owner is silent.
+    pub(crate) fn from_config(b: &RaonBundle, gpu: &Gpu) -> Option<Box<Self>> {
+        let raw = hipfire_config::developer_var(ENV_ENABLE).ok();
+        let mode = parse_mode(raw.as_deref()).unwrap_or_else(|e| {
+            eprintln!("[raon-railgun] {e}");
+            RailgunMode::Off
+        });
+        if mode == RailgunMode::Off {
             return None;
         }
-        Some(Box::new(Self::new(
-            hipfire_config::developer_var("HIPFIRE_RAON_RAILGUN_CORPUS")
-                .ok()
-                .filter(|s| !s.is_empty()),
-            model_digest(b),
-        )))
+        let env_corpus = hipfire_config::developer_var(ENV_CORPUS)
+            .ok()
+            .filter(|s| !s.is_empty());
+        let pack_corpus = gpu
+            .railgun_pack_corpus_dir()
+            .map(|p| p.to_string_lossy().into_owned());
+        let band = b.weights.band.label();
+        // `graph_mode` already carries a retained-replay load (the route
+        // resolution picked eager), so the live replay state is not re-read.
+        let structural = observe_structural(b, gpu, &band, false);
+        let plan = decide_owner(
+            mode,
+            &structural,
+            env_corpus.as_deref(),
+            pack_corpus.as_deref(),
+            &|dir| Path::new(dir).join(railgun_corpus::CORPUS_INDEX).is_file(),
+        );
+        match plan {
+            Ok(plan) => Some(Box::new(Self::new(plan, model_digest(b)))),
+            Err(NoOwner::NoCorpus(why)) if env_corpus.is_some() => {
+                eprintln!("[raon-railgun] auto: HIP graph route ({why})");
+                None
+            }
+            Err(_) => None,
+        }
     }
 
-    fn new(corpus_dir: Option<String>, model_digest: String) -> Self {
+    fn new(plan: OwnerPlan, model_digest: String) -> Self {
         Self {
-            corpus_dir,
+            corpus_dir: plan.corpus_dir,
             corpus: None,
             ctx: None,
             table: None,
@@ -1036,7 +1233,9 @@ impl RaonRailgunOwner {
             flags: None,
             exec: Exec::default(),
             stats: RaonRailgunStats::default(),
-            logged: BTreeSet::new(),
+            loud: plan.loud,
+            logged_kinds: BTreeSet::new(),
+            auto_logged: false,
         }
     }
 
@@ -1044,6 +1243,12 @@ impl RaonRailgunOwner {
         let mut s = self.stats.clone();
         s.quarantined = self.exec.is_quarantined();
         s
+    }
+
+    /// `HIPFIRE_RAON_RAILGUN=1` (owner forced, declines logged per kind);
+    /// `false` = `auto`.
+    pub fn is_forced(&self) -> bool {
+        self.loud
     }
 
     pub fn is_quarantined(&self) -> bool {
@@ -1063,8 +1268,14 @@ impl RaonRailgunOwner {
             .entry(r.kind().to_owned())
             .or_default() += 1;
         let text = r.to_string();
-        if self.logged.len() < LOG_LIMIT && self.logged.insert(text.clone()) {
-            eprintln!("[raon-railgun] declined: {text}");
+        if self.loud {
+            if self.logged_kinds.insert(r.kind()) {
+                eprintln!("[raon-railgun] declined ({}): {text}", r.kind());
+            }
+        } else if !self.auto_logged && *r != RaonRailgunRefusal::NotWarm {
+            // `NotWarm` is the routine first step (the HIP graph's warm-up).
+            self.auto_logged = true;
+            eprintln!("[raon-railgun] auto: HIP graph step ({}): {text}", r.kind());
         }
         self.stats.last_refusal = Some(text);
     }
@@ -1096,21 +1307,15 @@ impl RaonRailgunOwner {
         }
         let pos = b.state.n_tokens();
         let band = b.weights.band.label();
-        let facts = Admission {
-            arch: &gpu.arch,
-            whole_band: b.weights.band.is_whole(),
-            band: &band,
-            graph_forward_disabled: gpu.flags.graph_forward == Some(false),
-            graph_mode: b.decode_route() == DecodeMode::Graph,
-            retained_replay: gpu.replay.is_enabled(),
-            host_weights: gpu.owns_host_cpu_weights(),
+        let structural = observe_structural(b, gpu, &band, gpu.replay.is_enabled());
+        let step = StepFacts {
             tap_armed: b.spec.census_tap.is_some(),
             dump_armed: hipfire_dispatch::pipeline::moe_capture::enabled(),
             absorbed_route: mla_route(&b.work, &b.state, pos + 1) == MlaRoute::Absorbed,
             warmed: b.graph.warmed,
             corpus_dir: self.corpus_dir.as_deref(),
         };
-        if let Err(r) = check_admission(&facts) {
+        if let Err(r) = check_admission(&structural, &step) {
             self.note_decline(&r);
             return Ok(RaonRailgunAttempt::Declined(r));
         }

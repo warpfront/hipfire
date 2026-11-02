@@ -1182,6 +1182,13 @@ impl KernelCompiler {
         &self.toolchain_id
     }
 
+    /// The installed kernel pack (`kernels/compiled/<arch>`) this compiler
+    /// loads packaged objects from; `None` when no pack was found. Read-only:
+    /// the loaded objects are validated copies of this directory's files.
+    pub fn installed_pack_dir(&self) -> Option<&Path> {
+        self.cold_dir.as_deref()
+    }
+
     /// The target the compiler builds for (`gfx1201`, …).
     pub fn arch(&self) -> &str {
         &self.arch

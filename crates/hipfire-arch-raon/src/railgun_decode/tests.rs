@@ -256,36 +256,46 @@ fn table() -> CacheTable {
 
 // ----------------------------------------------------------------- admission
 
-fn ok_facts() -> Admission<'static> {
-    Admission {
-        arch: ARCH,
-        whole_band: true,
-        band: "whole",
-        graph_forward_disabled: false,
-        graph_mode: true,
-        retained_replay: false,
-        host_weights: false,
-        tap_armed: false,
-        dump_armed: false,
-        absorbed_route: false,
-        warmed: true,
-        corpus_dir: Some("corpus"),
-    }
+type Facts = (Structural<'static>, StepFacts<'static>);
+
+fn ok_facts() -> Facts {
+    (
+        Structural {
+            arch: ARCH,
+            whole_band: true,
+            band: "whole",
+            graph_forward_disabled: false,
+            graph_mode: true,
+            retained_replay: false,
+            host_weights: false,
+        },
+        StepFacts {
+            tap_armed: false,
+            dump_armed: false,
+            absorbed_route: false,
+            warmed: true,
+            corpus_dir: Some("corpus"),
+        },
+    )
+}
+
+fn admit(f: &Facts) -> Result<(), RaonRailgunRefusal> {
+    check_admission(&f.0, &f.1)
 }
 
 #[test]
 fn a_clean_context_is_admitted() {
-    assert_eq!(check_admission(&ok_facts()), Ok(()));
+    assert_eq!(admit(&ok_facts()), Ok(()));
 }
 
 #[test]
 fn every_cheap_admission_check_declines_with_its_exact_reason() {
     use RaonRailgunRefusal as R;
-    type Mutate = fn(&mut Admission<'static>);
+    type Mutate = fn(&mut Facts);
     let cases: Vec<(&str, Mutate, R)> = vec![
         (
             "arch",
-            |a| a.arch = "gfx1100",
+            |a| a.0.arch = "gfx1100",
             R::WrongArch {
                 arch: "gfx1100".into(),
             },
@@ -293,8 +303,8 @@ fn every_cheap_admission_check_declines_with_its_exact_reason() {
         (
             "band",
             |a| {
-                a.whole_band = false;
-                a.band = "pp 0/2";
+                a.0.whole_band = false;
+                a.0.band = "pp 0/2";
             },
             R::PartitionedBand {
                 band: "pp 0/2".into(),
@@ -302,38 +312,251 @@ fn every_cheap_admission_check_declines_with_its_exact_reason() {
         ),
         (
             "graph=0",
-            |a| a.graph_forward_disabled = true,
+            |a| a.0.graph_forward_disabled = true,
             R::GraphDisabled,
         ),
-        ("replay", |a| a.retained_replay = true, R::RetainedReplay),
-        ("host weights", |a| a.host_weights = true, R::HostWeights),
-        ("eager route", |a| a.graph_mode = false, R::NotGraphMode),
-        ("census tap", |a| a.tap_armed = true, R::TapArmed),
-        ("dumps", |a| a.dump_armed = true, R::DumpArmed),
-        ("absorbed", |a| a.absorbed_route = true, R::AbsorbedRoute),
-        ("cold graph", |a| a.warmed = false, R::NotWarm),
-        ("no corpus", |a| a.corpus_dir = None, R::CorpusUnset),
-        ("empty corpus", |a| a.corpus_dir = Some(""), R::CorpusUnset),
+        ("replay", |a| a.0.retained_replay = true, R::RetainedReplay),
+        ("host weights", |a| a.0.host_weights = true, R::HostWeights),
+        ("eager route", |a| a.0.graph_mode = false, R::NotGraphMode),
+        ("census tap", |a| a.1.tap_armed = true, R::TapArmed),
+        ("dumps", |a| a.1.dump_armed = true, R::DumpArmed),
+        ("absorbed", |a| a.1.absorbed_route = true, R::AbsorbedRoute),
+        ("cold graph", |a| a.1.warmed = false, R::NotWarm),
+        ("no corpus", |a| a.1.corpus_dir = None, R::CorpusUnset),
+        (
+            "empty corpus",
+            |a| a.1.corpus_dir = Some(""),
+            R::CorpusUnset,
+        ),
     ];
     for (name, mutate, want) in cases {
         let mut a = ok_facts();
         mutate(&mut a);
-        assert_eq!(check_admission(&a), Err(want), "{name}");
+        assert_eq!(admit(&a), Err(want), "{name}");
     }
 }
 
 #[test]
 fn the_first_failing_admission_check_wins() {
     let mut a = ok_facts();
-    a.arch = "gfx1100";
-    a.tap_armed = true;
-    a.warmed = false;
+    a.0.arch = "gfx1100";
+    a.1.tap_armed = true;
+    a.1.warmed = false;
     assert_eq!(
-        check_admission(&a),
+        admit(&a),
         Err(RaonRailgunRefusal::WrongArch {
             arch: "gfx1100".into()
         })
     );
+}
+
+// ----------------------------------------------------------------- tri-state
+
+#[test]
+fn the_variable_parses_as_auto_1_or_0_and_defaults_to_auto() {
+    use RailgunMode::{Auto, Force, Off};
+    for (raw, want) in [
+        (None, Auto),
+        (Some(""), Auto),
+        (Some("auto"), Auto),
+        (Some(" AUTO "), Auto),
+        (Some("1"), Force),
+        (Some("true"), Force),
+        (Some("On"), Force),
+        (Some("0"), Off),
+        (Some("false"), Off),
+        (Some("OFF"), Off),
+    ] {
+        assert_eq!(parse_mode(raw), Ok(want), "{raw:?}");
+    }
+    for bad in ["2", "yes", "enable", "autoo", "-1"] {
+        let e = parse_mode(Some(bad)).expect_err(bad);
+        assert!(e.contains("auto, 1 or 0") && e.contains(bad), "{e}");
+    }
+}
+
+fn has_index(dirs: &'static [&'static str]) -> impl Fn(&str) -> bool {
+    move |d| dirs.contains(&d)
+}
+
+fn structural() -> Structural<'static> {
+    ok_facts().0
+}
+
+#[test]
+fn zero_is_a_hard_kill_that_looks_at_nothing() {
+    let looked = Cell::new(0);
+    let probe = |_: &str| {
+        looked.set(looked.get() + 1);
+        true
+    };
+    let mut s = structural();
+    for arch in [ARCH, "gfx1100"] {
+        s.arch = arch;
+        assert_eq!(
+            decide_owner(RailgunMode::Off, &s, Some("env"), Some("pack"), &probe),
+            Err(NoOwner::Killed)
+        );
+    }
+    assert_eq!(
+        looked.get(),
+        0,
+        "the kill switch must not touch the file system"
+    );
+}
+
+#[test]
+fn auto_without_a_corpus_creates_no_owner() {
+    let s = structural();
+    let none = has_index(&[]);
+    // No pack at all (objects are JIT-compiled), a pack without a corpus, and
+    // an explicit directory without one: no owner in each case.
+    for (env, pack) in [(None, None), (None, Some("pack")), (Some("env"), None)] {
+        match decide_owner(RailgunMode::Auto, &s, env, pack, &none) {
+            Err(NoOwner::NoCorpus(why)) => assert!(why.contains(ENV_CORPUS), "{why}"),
+            other => panic!("expected NoCorpus, got {other:?}"),
+        }
+    }
+    // An empty explicit directory is the same as unset.
+    assert!(matches!(
+        decide_owner(RailgunMode::Auto, &s, Some(""), None, &none),
+        Err(NoOwner::NoCorpus(_))
+    ));
+}
+
+#[test]
+fn auto_creates_the_owner_for_an_explicit_or_pack_corpus_quietly() {
+    let s = structural();
+    let both = has_index(&["env", "pack"]);
+    let plan = |env, pack| decide_owner(RailgunMode::Auto, &s, env, pack, &both);
+    let want = |dir: &str| {
+        Ok(OwnerPlan {
+            corpus_dir: Some(dir.into()),
+            loud: false,
+        })
+    };
+    assert_eq!(plan(Some("env"), Some("pack")), want("env"));
+    assert_eq!(plan(None, Some("pack")), want("pack"));
+    assert_eq!(plan(Some("env"), None), want("env"));
+    // An explicit directory wins even over a good pack corpus, and is not
+    // silently replaced by it when it holds nothing.
+    let only_pack = has_index(&["pack"]);
+    assert!(matches!(
+        decide_owner(RailgunMode::Auto, &s, Some("env"), Some("pack"), &only_pack),
+        Err(NoOwner::NoCorpus(w)) if w.contains("env")
+    ));
+}
+
+#[test]
+fn auto_refuses_a_structurally_unsuitable_context_before_looking_for_a_corpus() {
+    let looked = Cell::new(0);
+    let probe = |_: &str| {
+        looked.set(looked.get() + 1);
+        true
+    };
+    type Mutate = fn(&mut Structural<'static>);
+    let cases: Vec<(Mutate, RaonRailgunRefusal)> = vec![
+        (
+            |s| s.arch = "gfx1100",
+            RaonRailgunRefusal::WrongArch {
+                arch: "gfx1100".into(),
+            },
+        ),
+        (
+            |s| s.whole_band = false,
+            RaonRailgunRefusal::PartitionedBand {
+                band: "whole".into(),
+            },
+        ),
+        (
+            |s| s.graph_forward_disabled = true,
+            RaonRailgunRefusal::GraphDisabled,
+        ),
+        (
+            |s| s.retained_replay = true,
+            RaonRailgunRefusal::RetainedReplay,
+        ),
+        (|s| s.host_weights = true, RaonRailgunRefusal::HostWeights),
+        (|s| s.graph_mode = false, RaonRailgunRefusal::NotGraphMode),
+    ];
+    for (mutate, want) in cases {
+        let mut s = structural();
+        mutate(&mut s);
+        assert_eq!(
+            decide_owner(RailgunMode::Auto, &s, Some("env"), Some("pack"), &probe),
+            Err(NoOwner::Refused(want))
+        );
+    }
+    assert_eq!(looked.get(), 0);
+}
+
+#[test]
+fn one_forces_the_owner_loudly_whatever_the_context() {
+    let mut s = structural();
+    s.arch = "gfx1100";
+    s.graph_forward_disabled = true;
+    let pack_only = has_index(&["pack"]);
+    let plan = |env, pack| decide_owner(RailgunMode::Force, &s, env, pack, &pack_only);
+    let loud = |dir: Option<&str>| {
+        Ok(OwnerPlan {
+            corpus_dir: dir.map(str::to_owned),
+            loud: true,
+        })
+    };
+    assert_eq!(plan(Some("env"), Some("pack")), loud(Some("env")));
+    assert_eq!(plan(None, Some("pack")), loud(Some("pack")));
+    // No corpus anywhere: the owner still exists and declines CorpusUnset on
+    // every step (loudly), instead of the route silently not existing.
+    assert_eq!(plan(None, Some("elsewhere")), loud(None));
+    assert_eq!(plan(None, None), loud(None));
+}
+
+fn owner(plan: OwnerPlan) -> RaonRailgunOwner {
+    RaonRailgunOwner::new(plan, "model".into())
+}
+
+#[test]
+fn the_forced_owner_logs_each_kind_once_and_counts_every_decline() {
+    let mut o = owner(OwnerPlan {
+        corpus_dir: None,
+        loud: true,
+    });
+    assert!(o.is_forced());
+    for r in [
+        RaonRailgunRefusal::NotWarm,
+        RaonRailgunRefusal::NotWarm,
+        RaonRailgunRefusal::TapArmed,
+        RaonRailgunRefusal::NotWarm,
+    ] {
+        o.note_decline(&r);
+    }
+    assert_eq!(
+        o.logged_kinds.iter().copied().collect::<Vec<_>>(),
+        vec!["not_warm", "tap_armed"]
+    );
+    let s = o.stats();
+    assert_eq!(s.declined, 4);
+    assert_eq!(s.declined_by_kind["not_warm"], 3);
+    assert_eq!(
+        s.last_refusal.as_deref(),
+        Some("the decode graph warm-up step has not run")
+    );
+}
+
+#[test]
+fn the_auto_owner_stays_quiet_for_the_routine_warm_up_and_logs_one_line() {
+    let mut o = owner(OwnerPlan {
+        corpus_dir: Some("corpus".into()),
+        loud: false,
+    });
+    assert!(!o.is_forced());
+    o.note_decline(&RaonRailgunRefusal::NotWarm);
+    assert!(!o.auto_logged, "the warm-up step is routine");
+    o.note_decline(&RaonRailgunRefusal::AbsorbedRoute);
+    assert!(o.auto_logged);
+    o.note_decline(&RaonRailgunRefusal::TapArmed);
+    assert!(o.logged_kinds.is_empty(), "auto keeps no per-kind log");
+    assert_eq!(o.stats().declined, 3);
 }
 
 #[test]

@@ -410,6 +410,17 @@ impl Gpu {
             .map_err(|e| format!("{symbol}: {e}"))
     }
 
+    /// The railgun receipt corpus directory that ships beside the installed
+    /// kernel pack this process loads objects from: `<pack arch dir>/../../
+    /// railgun-corpus` (see [`corpus_beside_pack`]). `None` when no pack is
+    /// installed (objects are JIT-compiled, so no corpus can name them). The
+    /// directory is not checked for existence or contents here.
+    pub fn railgun_pack_corpus_dir(&self) -> Option<PathBuf> {
+        self.compiler
+            .installed_pack_dir()
+            .and_then(corpus_beside_pack)
+    }
+
     /// Load railgun's copy and fill kernels (idempotent) and return the
     /// digests of the code objects that own them. Refused inside plan mode:
     /// a plan-mode load would be recorded, not performed.
@@ -871,6 +882,14 @@ impl WindowQueue for RailgunWindowQueue {
     }
 }
 
+/// The corpus directory paired with the installed pack arch directory
+/// `<root>/kernels/compiled/<arch>`: its grandparent's `railgun-corpus`, i.e.
+/// `<root>/kernels/railgun-corpus` (a `railgun-jit-corpus` build's
+/// `v2/<host key>` directory). `None` for a path without two parents.
+pub fn corpus_beside_pack(pack_arch_dir: &Path) -> Option<PathBuf> {
+    Some(pack_arch_dir.parent()?.parent()?.join("railgun-corpus"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,5 +1223,17 @@ mod tests {
                 .expect("a foreign toolchain pin is refused");
         assert!(error.contains("is not the corpus pin"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn the_corpus_ships_beside_the_pack_not_inside_an_arch_dir() {
+        assert_eq!(
+            corpus_beside_pack(Path::new("/opt/hipfire/bin/kernels/compiled/gfx1201")),
+            Some(PathBuf::from("/opt/hipfire/bin/kernels/railgun-corpus"))
+        );
+        assert_eq!(
+            corpus_beside_pack(Path::new("kernels/compiled/gfx1201")),
+            Some(PathBuf::from("kernels/railgun-corpus"))
+        );
+        assert_eq!(corpus_beside_pack(Path::new("gfx1201")), None);
     }
 }
