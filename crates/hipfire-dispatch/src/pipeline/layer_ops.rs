@@ -2529,8 +2529,12 @@ fn project_output_into_hyper_write(
         || gpu.flags.qwen4_hc_fuse_level() < 2
         || !covered
         || weight.m != write.hidden
-        // A split output projection is gathered before its HC write reads it.
-        || is_split(gpu, weight, rows)
+        // A split output projection is gathered before its HC write reads it;
+        // where the unfused route would be INT8/FP8 (not bitwise hcw), the
+        // whole-weight hcw keeps every rank equal to the single card.
+        || (is_split(gpu, weight, rows)
+            && !mq6_i8_route(gpu, weight, rows)
+            && !mq6_fp8_route(gpu, weight, rows))
         || write.branches != 4
         || write.rows != rows
         || write.input.dtype != DType::F32
