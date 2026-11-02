@@ -700,6 +700,11 @@ pub struct Qwen4Config {
     /// [`rdna_compute::qwen4_trunk_iu4_route`]): the shape contract above does
     /// not depend on it.
     pub trunk_iu4_default: Option<TrunkIu4Default>,
+    /// `Some((rank, parts))` on the RANK-LOCAL config of a TP trunk shard
+    /// (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`, [`Self::trunk_shard_local`]): the GDN key/value heads,
+    /// the q heads and the shared-expert intermediate are this rank's share; `None` on every
+    /// parsed (global) config.
+    pub trunk_shard: Option<(usize, usize)>,
 }
 
 impl Qwen4Config {
@@ -1038,6 +1043,7 @@ impl Qwen4Config {
                 .unwrap_or(false),
             mtp,
             trunk_iu4_default,
+            trunk_shard: None,
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1048,6 +1054,20 @@ impl Qwen4Config {
     /// HC/GDN/QSA equations for a synthetic developer profile; then the typed
     /// `ffn`/`ple`/`mtp` and the retained scalar mirrors must agree.
     pub fn validate(&self) -> Result<(), String> {
+        if let Some((rank, parts)) = self.trunk_shard {
+            // A rank-local shard config is the global config scaled by its own constructor:
+            // validate the reconstructed global one against every pin, then require this
+            // config to be exactly what the constructor makes of it.
+            let global = self.trunk_shard_global()?;
+            global.validate()?;
+            if global.trunk_shard_local(rank, parts)? != *self {
+                return Err(format!(
+                    "qwen4: the rank-local trunk-shard config (rank {rank} of {parts}) is not the \
+                     shard of its global config"
+                ));
+            }
+            return self.validate_typed_agreement();
+        }
         expect(self.architecture_id, ARCH_ID, "architecture_id")?;
         expect_str(&self.model_type, MODEL_TYPE, "model_type")?;
         expect_str(&self.text_model_type, TEXT_MODEL_TYPE, "text_model_type")?;
@@ -1090,6 +1110,97 @@ impl Qwen4Config {
             Qwen4Profile::Synthetic(profile) => self.validate_synthetic(profile)?,
         }
         self.validate_typed_agreement()
+    }
+
+    /// Shared-expert intermediate rows of `rank` of `parts` in `SHARED_UNIT`-wide units
+    /// (640 = 384 + 256 at two parts).
+    fn trunk_shard_shared(total: usize, rank: usize, parts: usize) -> Result<usize, String> {
+        const UNIT: usize = 128;
+        if total % UNIT != 0 || parts == 0 || total / UNIT < parts {
+            return Err(format!(
+                "qwen4: shared intermediate {total} cannot shard over {parts} parts"
+            ));
+        }
+        let units = total / UNIT;
+        let (base, extra) = (units / parts, units % parts);
+        Ok((base + usize::from(rank < extra)) * UNIT)
+    }
+
+    /// The rank-local config of `rank` of `parts` of a TP trunk shard: GDN key/value heads and
+    /// q heads divided by `parts` (KV heads stay: the q heads of a rank are an equal share of
+    /// every KV group), the shared-expert intermediate this rank's share. Defined only for a
+    /// validated global AR-only Flash-Next config (the native MTP head reads the global
+    /// geometry and is not sharded).
+    pub fn trunk_shard_local(&self, rank: usize, parts: usize) -> Result<Self, String> {
+        if self.trunk_shard.is_some() {
+            return Err("qwen4: the config is already a trunk-shard config".into());
+        }
+        if !self.profile.is_ar_only() || self.mtp.is_some() {
+            return Err(
+                "qwen4: the trunk shard needs the AR-only Flash-Next profile (no native MTP head)"
+                    .into(),
+            );
+        }
+        if parts < 2 || rank >= parts {
+            return Err(format!(
+                "qwen4: trunk shard rank {rank} of {parts} parts is invalid"
+            ));
+        }
+        let divides = |n: usize| n % parts == 0;
+        if !divides(self.linear_num_key_heads)
+            || !divides(self.linear_num_value_heads)
+            || !divides(self.num_attention_heads)
+            || (self.num_attention_heads / parts) % self.num_key_value_heads != 0
+        {
+            return Err(format!(
+                "qwen4: heads {}/{}/{} (kv {}) do not shard over {parts} parts",
+                self.linear_num_key_heads,
+                self.linear_num_value_heads,
+                self.num_attention_heads,
+                self.num_key_value_heads
+            ));
+        }
+        let shared = Self::trunk_shard_shared(self.shared_expert_intermediate_size, rank, parts)?;
+        let mut local = self.clone();
+        local.linear_num_key_heads /= parts;
+        local.linear_num_value_heads /= parts;
+        local.num_attention_heads /= parts;
+        local.shared_expert_intermediate_size = shared;
+        if let Qwen4FfnConfig::Moe {
+            shared_intermediate_size,
+            ..
+        } = &mut local.ffn
+        {
+            *shared_intermediate_size = Some(shared);
+        }
+        local.trunk_shard = Some((rank, parts));
+        Ok(local)
+    }
+
+    /// The global config a rank-local trunk-shard config was cut from (`self` when it is not
+    /// one): heads scaled back, the pinned shared-expert intermediate restored.
+    pub fn trunk_shard_global(&self) -> Result<Self, String> {
+        let Some((rank, parts)) = self.trunk_shard else {
+            return Ok(self.clone());
+        };
+        if parts < 2 || rank >= parts {
+            return Err(format!(
+                "qwen4: trunk shard rank {rank} of {parts} parts is invalid"
+            ));
+        }
+        let mut global = self.clone();
+        global.trunk_shard = None;
+        global.linear_num_key_heads *= parts;
+        global.linear_num_value_heads *= parts;
+        global.num_attention_heads *= parts;
+        global.ffn = Qwen4FfnConfig::flash_next();
+        global.shared_expert_intermediate_size = 640;
+        Ok(global)
+    }
+
+    /// The geometry ranks must agree on (`check_replica`): the global config.
+    pub fn replica_geometry(&self) -> Self {
+        self.trunk_shard_global().unwrap_or_else(|_| self.clone())
     }
 
     /// The AR-only form of a validated Flash-Next config: the
@@ -2815,6 +2926,61 @@ mod tests {
         assert!(error.contains("num_experts=512"), "{error}");
         // Without keep metadata the same synthetic geometry stays admitted.
         dev(&synthetic()).expect("dense synthetic is unaffected");
+    }
+
+    /// The rank-local config of a TP trunk shard: half the GDN/q heads, KV heads kept, the
+    /// shared expert split 384 + 256, validated through its reconstructed global config,
+    /// round-tripping, and refused on a profile that carries the MTP head.
+    #[test]
+    fn trunk_shard_local_config_is_the_shard_of_its_global_config() {
+        let flash = compact_test_config();
+        let ar = flash.clone().into_ar_only().unwrap();
+        // MTP-bearing Flash-Next is refused: the head reads the global geometry.
+        assert!(flash.trunk_shard_local(0, 2).is_err());
+        let locals: Vec<Qwen4Config> = (0..2)
+            .map(|r| ar.trunk_shard_local(r, 2).expect("local"))
+            .collect();
+        for (rank, local) in locals.iter().enumerate() {
+            assert_eq!(local.trunk_shard, Some((rank, 2)));
+            assert_eq!(local.linear_num_key_heads, ar.linear_num_key_heads / 2);
+            assert_eq!(local.linear_num_value_heads, ar.linear_num_value_heads / 2);
+            assert_eq!(local.num_attention_heads, ar.num_attention_heads / 2);
+            assert_eq!(local.num_key_value_heads, ar.num_key_value_heads);
+            assert_eq!(local.hidden_size, ar.hidden_size);
+            assert_eq!(local.vocab_size, ar.vocab_size);
+            local.validate().expect("the local config validates");
+            assert_eq!(local.trunk_shard_global().unwrap(), ar);
+            assert_eq!(local.replica_geometry(), ar);
+        }
+        assert_eq!(
+            (
+                locals[0].shared_expert_intermediate_size,
+                locals[1].shared_expert_intermediate_size
+            ),
+            (384, 256)
+        );
+        // the typed ffn mirrors the scalar
+        for local in &locals {
+            assert_eq!(
+                local.ffn.scalar_mirror().3,
+                local.shared_expert_intermediate_size
+            );
+        }
+        // ranks agree on the replica geometry although their configs differ
+        assert_ne!(locals[0], locals[1]);
+        assert_eq!(locals[0].replica_geometry(), locals[1].replica_geometry());
+        // a tampered local config is not the shard of its global config
+        let mut bad = locals[0].clone();
+        bad.linear_num_value_heads += 1;
+        assert!(bad.validate().is_err());
+        let mut bad = locals[1].clone();
+        bad.shared_expert_intermediate_size = 384;
+        assert!(bad.validate().is_err());
+        // sharding twice, a bad rank/part count and indivisible heads are refused
+        assert!(locals[0].trunk_shard_local(0, 2).is_err());
+        assert!(ar.trunk_shard_local(2, 2).is_err());
+        assert!(ar.trunk_shard_local(0, 1).is_err());
+        assert!(ar.trunk_shard_local(0, 5).is_err());
     }
 
     /// The AR-only profile is derived, never parsed: Flash-Next converts (the

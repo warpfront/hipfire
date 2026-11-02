@@ -28,6 +28,7 @@ use crate::gpu_forward::{
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
 use hipfire_dispatch::pipeline::projection_split::split_scope;
+use hipfire_runtime::ar_hc_exchange::ArHcExchange;
 use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::ep_row_gather::{EpRowGather, EpRowGatherSpec, EpSlotOwners};
 use hipfire_runtime::ep_tile_exchange::{EpTileExchange, EpTileExchangeSpec};
@@ -182,6 +183,8 @@ pub struct Qwen4EpPeer {
     gather: Option<Arc<EpRowGather>>,
     tile: Option<Arc<EpTileExchange>>,
     split: Option<TrunkSplitRank>,
+    /// Trunk-shard fused all-reduce mailboxes (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`).
+    ar_hc: Option<Arc<ArHcExchange>>,
 }
 
 impl Qwen4EpPeer {
@@ -210,6 +213,14 @@ impl Qwen4EpPeer {
         }
         if let Some(split) = self.split.take() {
             note(split.release(&mut self.gpu));
+        }
+        crate::trunk_route::install(None);
+        if let Some(ar_hc) = self.ar_hc.take() {
+            note(
+                ar_hc
+                    .release(self.rank, &mut self.gpu)
+                    .map_err(|error| format!("release trunk-shard mailboxes: {error}")),
+            );
         }
         note(
             self.bundle
@@ -689,6 +700,13 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         if lab_unit_hits::enabled() && (layer_idx as usize) < self.trunk_layers {
             self.lab_note_unit_hits(gpu, layer_idx, slots, topk_indices);
         }
+        // Trunk-shard partial route (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): a trunk layer's FFN is
+        // reduced by the fused all-reduce of its HC write, not gathered. Non-owned slots ran
+        // on the zero dummy tables, so this rank's replicated combine yields its owned-slot
+        // partial; the MTP head (layer >= trunk layers) keeps the gather (its write is local).
+        if usize::from(layer_idx) < self.trunk_layers && crate::trunk_route::ffn_partial_active() {
+            return Ok(());
+        }
         // A balanced layer gathers from the owners its own assignment wrote
         // this call; every other layer keeps the static `e % ranks` placement.
         let balanced = self
@@ -952,6 +970,8 @@ pub struct Qwen4EpMesh {
     tile: Option<Arc<EpTileExchange>>,
     /// Rank 0's trunk output split (`HIPFIRE_EP_TRUNK_SPLIT`); `None` when off.
     split: Option<TrunkSplitRank>,
+    /// Rank 0's handle of the trunk-shard fused all-reduce mailboxes; `None` when off.
+    ar_hc: Option<Arc<ArHcExchange>>,
     ranks: usize,
     /// The EP reserve-sharing plan receipt every rank agreed on at attach;
     /// `None` on an ordinary (non-reserve-sharing) load.
@@ -1055,6 +1075,7 @@ impl Qwen4EpMesh {
             gather,
             tile,
             split,
+            ar_hc,
             ..
         } = self;
         let mut first: Option<String> = None;
@@ -1078,6 +1099,12 @@ impl Qwen4EpMesh {
         if let Some(split) = split {
             if let Err(error) = split.release(gpu) {
                 first.get_or_insert(format!("rank 0: {error}"));
+            }
+        }
+        crate::trunk_route::install(None);
+        if let Some(ar_hc) = ar_hc {
+            if let Err(error) = ar_hc.release(0, gpu) {
+                first.get_or_insert(format!("rank 0: release trunk-shard mailboxes: {error}"));
             }
         }
         first.map_or(Ok(()), Err)
@@ -1248,6 +1275,7 @@ impl Qwen4Bundle {
                         gather: None,
                         tile: None,
                         split: None,
+                        ar_hc: None,
                     };
                     let checked = peer
                         .check_seal(&seal)
@@ -1317,9 +1345,15 @@ impl Qwen4Bundle {
         let tile_slot: Mutex<Option<Arc<EpTileExchange>>> = Mutex::new(None);
         let split_slot: Mutex<Option<TrunkSplitRank>> = Mutex::new(None);
         let split_transport: Mutex<Option<Arc<EpRowGather>>> = Mutex::new(None);
+        let ar_hc_slot: Mutex<Option<Arc<ArHcExchange>>> = Mutex::new(None);
         let release_rank0 = |gpu: &mut Gpu, error: String| -> String {
             gather.abort();
             let _ = gather.release(0, gpu);
+            crate::trunk_route::install(None);
+            if let Some(ar_hc) = lock(&ar_hc_slot).as_ref() {
+                ar_hc.disable();
+                let _ = ar_hc.release(0, gpu);
+            }
             if let Some(tile) = lock(&tile_slot).as_ref() {
                 tile.abort();
                 let _ = tile.release(0, gpu);
@@ -1505,6 +1539,45 @@ impl Qwen4Bundle {
             );
         }
 
+        // 2d. Trunk shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): every rank allocates its fused
+        // all-reduce mailbox (fine-grained, before P2P is enabled below).
+        let ar_hc: Option<Arc<ArHcExchange>> =
+            if crate::weights::trunk_shard::trunk_shard_requested() {
+                if ranks != 2 {
+                    return Err(release_rank0(
+                        gpu,
+                        format!("HIPFIRE_QWEN4_EP_TRUNK_SHARD needs two EP ranks, got {ranks}"),
+                    ));
+                }
+                let exchange = match ArHcExchange::new(rdna_compute::ar_hc_write::AR_HC_ROW_CAP) {
+                    Ok(exchange) => Arc::new(exchange),
+                    Err(error) => return Err(release_rank0(gpu, error.to_string())),
+                };
+                *lock(&ar_hc_slot) = Some(exchange.clone());
+                let registered = {
+                    let gpu0 = &mut *gpu;
+                    pool.run_all(
+                        || {
+                            exchange
+                                .register(0, gpu0)
+                                .map_err(|e| format!("register trunk-shard mailbox: {e}"))
+                        },
+                        &|rank, peer: &mut Qwen4EpPeer| {
+                            peer.ar_hc = Some(exchange.clone());
+                            exchange
+                                .register(rank, &mut peer.gpu)
+                                .map_err(|e| format!("register trunk-shard mailbox: {e}"))
+                        },
+                    )
+                };
+                if let Err(error) = registered {
+                    return Err(release_rank0(gpu, error));
+                }
+                Some(exchange)
+            } else {
+                None
+            };
+
         // 3. P2P after every load/allocation exists.
         let tile = lock(&tile_slot).clone();
         let split_transport = lock(&split_transport).clone();
@@ -1521,6 +1594,11 @@ impl Qwen4Bundle {
                     .enable_peers(rank, gpu)
                     .map_err(|error| format!("enable trunk split peer access: {error}"))?;
             }
+            if let Some(ar_hc) = ar_hc.as_ref() {
+                ar_hc
+                    .enable_peers(rank, gpu)
+                    .map_err(|error| format!("enable trunk-shard peer access: {error}"))?;
+            }
             Ok(())
         };
         let enabled = {
@@ -1533,6 +1611,30 @@ impl Qwen4Bundle {
         };
         if let Err(error) = enabled {
             return Err(release_rank0(gpu, error));
+        }
+
+        // 3a. Trunk-shard qualification: a short eager fused exchange on every rank at once
+        // (the kernels rendezvous), compared bit for bit with the host model. A failure
+        // refuses the load (the sharded weights cannot fall back to the incumbent route).
+        if let Some(ar_hc) = ar_hc.as_ref() {
+            let qualified = {
+                let gpu0 = &mut *gpu;
+                pool.run_all(
+                    || {
+                        ar_hc
+                            .qualify(0, gpu0, 8, 16)
+                            .map_err(|e| format!("trunk-shard qualification: {e}"))
+                    },
+                    &|rank, peer: &mut Qwen4EpPeer| {
+                        ar_hc
+                            .qualify(rank, &mut peer.gpu, 8, 16)
+                            .map_err(|e| format!("trunk-shard qualification: {e}"))
+                    },
+                )
+            };
+            if let Err(error) = qualified {
+                return Err(release_rank0(gpu, error));
+            }
         }
 
         // 3b. Every rank's split hook over its own banded weights.
@@ -1610,6 +1712,11 @@ impl Qwen4Bundle {
                     None => Ok(()),
                 });
             bundle.execution = Some(forward);
+            if result.is_ok() {
+                crate::trunk_route::install(ar_hc.as_ref().map(|exchange| {
+                    crate::trunk_route::TrunkShardRoute::new(exchange.clone(), rank, true, true)
+                }));
+            }
             result
         };
         let attached = {
@@ -1751,6 +1858,7 @@ impl Qwen4Bundle {
             gather,
             tile,
             split,
+            ar_hc,
             reserve,
             ranks,
             device_ids,
@@ -2993,7 +3101,7 @@ impl Qwen4EpPeer {
                 forward.ep_placement()
             ));
         }
-        if self.bundle.config != *config {
+        if self.bundle.config.replica_geometry() != config.replica_geometry() {
             return Err("the loaded peer's model configuration differs from rank 0".to_string());
         }
         let theirs = self.bundle.ep_replication_fingerprint();

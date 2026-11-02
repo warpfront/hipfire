@@ -2174,6 +2174,11 @@ fn forward_lanes_scoped(
                                 &descs[layer - band_first].attn_hyper.write
                             };
                             steps.push(Step::HyperWrite(HyperWriteOp {
+                                ar: if mlp {
+                                    crate::trunk_route::ffn_writer()
+                                } else {
+                                    crate::trunk_route::attn_writer()
+                                },
                                 rotation: &scratch.rotation,
                                 state_bf16: bf16_state,
                                 input: &v.streams,

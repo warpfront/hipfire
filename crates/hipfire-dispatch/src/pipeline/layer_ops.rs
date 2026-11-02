@@ -1620,6 +1620,27 @@ pub struct HyperWriteOp<'a> {
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
     pub rotation: &'a GpuTensor,
+    /// `Some`: `mixed` is this rank's PARTIAL block output (a K-split projection, or the
+    /// FFN partial) and the all-reduce with the peer rank is fused into the HC write
+    /// ([`HyperWriteAr`]). Every fusion that would fold this write into a producer's
+    /// epilogue or a following read is declined for such a write (the folded kernels
+    /// would write the unreduced partial).
+    pub ar: Option<&'a dyn HyperWriteAr>,
+}
+
+/// The fused TP2 all-reduce + BF16 HC write of one block output (the Flash-Next trunk
+/// shard, `HIPFIRE_QWEN4_EP_TRUNK_SHARD`): folds this rank's `partial` (`[rows, hidden]`
+/// f32) with the peer's and applies the production HC write to `streams` (BF16 bits,
+/// in place) with the row `gates`. The architecture crate owns the transport.
+pub trait HyperWriteAr: Send + Sync {
+    fn ar_hyper_write(
+        &self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+        streams: &GpuTensor,
+        gates: &GpuTensor,
+        rows: usize,
+    ) -> Result<(), String>;
 }
 
 impl HyperWriteOp<'_> {
@@ -1693,6 +1714,9 @@ pub fn hyper_write_read_fold_applies(
     read: &HyperReadOp<'_>,
     next_write: &HyperWriteOp<'_>,
 ) -> bool {
+    if write.ar.is_some() {
+        return false;
+    }
     let Some(wide) = write.branches.checked_mul(write.hidden) else {
         return false;
     };
@@ -1803,7 +1827,8 @@ fn project_output_into_hyper_write(
         }
         _ => false,
     };
-    if wide_exact_rows(gpu, rows)
+    if write.ar.is_some()
+        || wide_exact_rows(gpu, rows)
         || gpu.flags.qwen4_hc_fuse_level() < 2
         || !covered
         || weight.m != write.hidden
@@ -1879,6 +1904,17 @@ fn execute_hyper_write_inner(
     if !gates_ready {
         hyper_write_gates(gpu, op, &input, &normalized, &gates)?;
     }
+    if let Some(ar) = op.ar {
+        if !op.state_bf16 || op.input.buf.as_ptr() != op.output.buf.as_ptr() || op.hidden != 2560 {
+            return Err(DispatchError::Hip(
+                "hyper write: the fused all-reduce write needs BF16 streams updated in place at hidden 2560"
+                    .into(),
+            ));
+        }
+        return ar
+            .ar_hyper_write(gpu, &mixed, &input, &gates, op.rows)
+            .map_err(|e| DispatchError::Hip(format!("hyper write: fused all-reduce: {e}")));
+    }
     hip(hyper_write(
         gpu,
         &HyperWrite {
@@ -1927,6 +1963,9 @@ pub fn execute_hyper_write_then_read(
     clear: Option<&ClearOp<'_>>,
     rotate_into: Option<&GpuTensor>,
 ) -> Result<Option<bool>, DispatchError> {
+    if write.ar.is_some() {
+        return Ok(None);
+    }
     let fusable = (1..=gpu.few_row_limit()).contains(&gpu.route_rows(write.rows))
         && read.rows == write.rows
         && !write.state_bf16
@@ -6268,6 +6307,7 @@ mod tests {
                     macro_rules! write_op {
                         ($streams:expr) => {
                             HyperWriteOp {
+                                ar: None,
                                 state_bf16,
                                 input: $streams,
                                 norm_weight: &norm,

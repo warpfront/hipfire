@@ -1278,7 +1278,9 @@ fn execute_window<'a>(
             {
                 let write = match steps[..end].get(i + 2) {
                     Some(Step::HyperWrite(write))
-                        if (hc_level >= 3 || row_fold_moe_1201) && *pregated == Some(i + 2) =>
+                        if (hc_level >= 3 || row_fold_moe_1201)
+                            && *pregated == Some(i + 2)
+                            && write.ar.is_none() =>
                     {
                         Some(write)
                     }

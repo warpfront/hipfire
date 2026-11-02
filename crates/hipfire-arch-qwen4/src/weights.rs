@@ -29,6 +29,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::ops::Range;
 
+pub mod trunk_shard;
+
 /// Rank-local ownership projected from the admitted, absolute trunk partition.
 /// This value owns neither devices nor an independent topology.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2765,6 +2767,8 @@ pub struct Qwen4Weights {
     device: usize,
     /// `Some((rank, parts))` once [`Self::shard_dense_ffn`] kept that slice.
     tp_shard: Option<(usize, usize)>,
+    /// `Some((rank, parts))` once [`Self::shard_trunk`] kept that slice of the trunk.
+    trunk_shard: Option<(usize, usize)>,
 }
 
 impl Qwen4Weights {
@@ -3067,6 +3071,7 @@ impl Qwen4Weights {
             device,
             tp_shard: None,
             ep_units,
+            trunk_shard: None,
         })
     }
 

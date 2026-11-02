@@ -272,6 +272,7 @@ pub(super) fn build_program<'a>(
 
         let attn_write = &description.attn_hyper.write;
         steps.push(Step::HyperWrite(HyperWriteOp {
+            ar: None,
             rotation: &scratch.rotation,
             state_bf16: bf16_state,
             input: &scratch.streams,
@@ -355,6 +356,7 @@ pub(super) fn build_program<'a>(
 
         let mlp_write = &description.mlp_hyper.write;
         steps.push(Step::HyperWrite(HyperWriteOp {
+            ar: None,
             rotation: &scratch.rotation,
             state_bf16: bf16_state,
             input: &scratch.streams,

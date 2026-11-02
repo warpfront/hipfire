@@ -2070,19 +2070,20 @@ impl Qwen4MoeLayerRuntime {
 
 /// The runtime one layer's call binds: a balanced live runtime (gathered EP
 /// few-row forward), else for an EP forward's full chunk (`full_chunk`) the
-/// static runtime under a tile route or the EP full table (`ep_full`: `None`
-/// outside EP, `Some(layer's full runtime)` under EP), else the static runtime.
+/// static (compact) runtime under a tile route or the trunk-shard partial route
+/// (`compact_chunk`) or the EP full table (`ep_full`: `None` outside EP,
+/// `Some(layer's full runtime)` under EP), else the static runtime.
 pub(crate) fn select_layer_moe<'a, R>(
     balanced_live: Option<&'a R>,
     ep_full: Option<Option<&'a R>>,
     full_chunk: bool,
-    tile_route: bool,
+    compact_chunk: bool,
     static_moe: Option<&'a R>,
 ) -> Option<&'a R> {
     match (balanced_live, ep_full) {
         (Some(live), _) => Some(live),
         (None, Some(full)) if full_chunk => {
-            if tile_route {
+            if compact_chunk {
                 static_moe
             } else {
                 full
@@ -8995,6 +8996,9 @@ pub(crate) struct LayerPhaseEnv<'a> {
     pub(crate) streams: &'a GpuTensor,
     /// The HC gate tensor of both hyper writes of the layer.
     pub(crate) gates: &'a GpuTensor,
+    /// The MoE FFN of this program is the rank's PARTIAL (trunk-shard route): its HC write
+    /// carries the all-reduce. False outside the route and for the S1 layer-major schedule.
+    pub(crate) ffn_partial: bool,
 }
 
 impl<'a> LayerPhaseEnv<'a> {
@@ -9229,6 +9233,7 @@ impl<'a> LayerPhaseEnv<'a> {
 
         let attn_write = &description.attn_hyper.write;
         steps.push(Step::HyperWrite(HyperWriteOp {
+            ar: crate::trunk_route::attn_writer(),
             rotation: &scratch.rotation,
             state_bf16: bf16_state,
             input: self.streams,
@@ -9346,6 +9351,13 @@ impl<'a> LayerPhaseEnv<'a> {
         let scratch = self.scratch;
         let mlp_write = &description.mlp_hyper.write;
         Step::HyperWrite(HyperWriteOp {
+            // Under the trunk-shard route every forward's FFN is this rank's partial (decode and
+            // few-row verify: owned slots on the dummy tables with the gather skipped; a full
+            // chunk: the compact table), so the all-reduce replaces the HC write; a call whose
+            // output is not `scratch.ffn_output` keeps the local write.
+            ar: crate::trunk_route::ffn_writer().filter(|_| {
+                self.ffn_partial && mixed.buf.as_ptr() == scratch.ffn_output.buf.as_ptr()
+            }),
             rotation: &scratch.rotation,
             state_bf16: self.bf16_state,
             input: self.streams,
@@ -10522,15 +10534,20 @@ fn prepare_trunk_iu4(
                     .any(|d| *d != DType::MQ4G256V2)
                 || g.in_proj_a.k != k
                 || g.in_proj_b.k != k
-                || g.in_proj_a.m != 48
-                || g.in_proj_b.m != 48
+                || g.in_proj_a.m == 0
+                || g.in_proj_a.m != g.in_proj_b.m
+                || g.in_proj_a.m != bundle.config.linear_num_value_heads
             {
                 folds.push(None);
                 continue;
             }
             let row_bytes = k / 256 * rdna_compute::MQ4V2_GROUP_BYTES;
             let mut rows = vec![0u8; (g.z.m + 256) * row_bytes];
-            for (w, start) in [(&g.z, 0), (&g.in_proj_b, g.z.m), (&g.in_proj_a, g.z.m + 48)] {
+            for (w, start) in [
+                (&g.z, 0),
+                (&g.in_proj_b, g.z.m),
+                (&g.in_proj_a, g.z.m + g.in_proj_b.m),
+            ] {
                 let span = start * row_bytes..(start + w.m) * row_bytes;
                 gpu.hip.memcpy_dtoh(&mut rows[span], &w.buf.buf)?;
             }
@@ -15133,6 +15150,22 @@ impl Qwen4GpuForward {
             }
         }
         let ep_gathered = route_n == 1 || ep_few_rows;
+        // Trunk-shard partial route (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): the FFN of EVERY forward
+        // is this rank's partial (owned routed slots + its K-half of the shared expert), reduced
+        // by the fused all-reduce of its HC write. A full chunk therefore binds the rank's
+        // compact table (non-owned experts are the zero dummy: exactly-zero rows, no peer
+        // reads) instead of the full table that would complete the routed FFN on both ranks,
+        // and it cannot take the owner-routed tile exchange (which completes it too).
+        let trunk_chunk_partial =
+            ep.is_some() && !ep_gathered && crate::trunk_route::ffn_partial_active();
+        if trunk_chunk_partial
+            && ep.is_some_and(|ep| ep.tile.as_ref().is_some_and(|route| route.hook.is_some()))
+        {
+            return Err(invalid(
+                "trunk shard: the owner-routed chunk exchange (HIPFIRE_EP_OWNER_ROUTED_PREFILL) \
+                 completes the routed FFN on every rank and cannot ride the partial FFN route",
+            ));
+        }
         let ep_gather: Option<&dyn MoeRowGather> = ep.filter(|_| ep_gathered).and_then(|ep| {
             ep.gather
                 .as_deref()
@@ -15284,6 +15317,9 @@ impl Qwen4GpuForward {
             start_position: bundle.state.position,
             streams: &self.scratch.streams,
             gates: &self.scratch.hc_gates,
+            // Every forward's FFN is this rank's partial under the trunk-shard route (gathered
+            // shapes: the gather is skipped; chunks: the compact table above).
+            ffn_partial: ep.is_some() && crate::trunk_route::ffn_partial_active(),
         };
         // DFlash2 layer capture: each captured layer's slot, keyed by the
         // step (the next layer's mixer) before which the streams hold its
@@ -15337,7 +15373,7 @@ impl Qwen4GpuForward {
                 balanced_live,
                 ep.map(|ep| ep.moe_full.get(layer_index)),
                 route_n > 1 && !ep_few_rows,
-                tile_route.is_some(),
+                tile_route.is_some() || trunk_chunk_partial,
                 tile_moe.get(layer_index).and_then(Option::as_ref),
             );
             if let Some(stage) = expert_stage {

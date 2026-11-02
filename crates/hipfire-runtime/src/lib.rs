@@ -14,6 +14,7 @@
 //! [`arch::Architecture`] trait.
 
 pub mod admission;
+pub mod ar_hc_exchange;
 pub mod arch;
 pub mod arch_mapping;
 pub mod arch_model;

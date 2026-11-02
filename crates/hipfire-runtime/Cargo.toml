@@ -873,3 +873,9 @@ required-features = ["lab"]
 [[example]]
 name = "dflash_selector_greedy_oracle"
 required-features = ["lab"]
+
+# Two-card exactness oracle of the fused TP2 all-reduce + HC write (Flash-Next trunk shard);
+# `--features lab`.
+[[example]]
+name = "ar_hc_write_oracle"
+required-features = ["lab"]

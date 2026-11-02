@@ -9039,6 +9039,30 @@ fn qsa_attention_hg4_lite(flags: &crate::feature_flags::FeatureFlags, format: Qs
     format == QsaKvFormat::Q8 && flags.qwen4_qsa_hg4_q8_lite_enabled()
 }
 
+/// Which GQA-group-specialised batch attention routes a (`n_heads`, `n_kv_heads`) shape
+/// admits (query heads per KV head = `group`; head_dim / format / arch / row terms are the
+/// callers'): the grouped hg12 kernel needs exactly 12 heads per KV head, the grouped hg4
+/// and the dense WMMA route whole four-head sub-groups, the gathered WMMA route up to 16.
+/// Any other group (a trunk shard's 12 q heads over 2 KV heads = group 6) takes the
+/// per-head kernels, or the gathered route, which carries the group at run time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QsaGroupAdmits {
+    hg12: bool,
+    hg4: bool,
+    dense: bool,
+    gathered: bool,
+}
+
+fn qsa_group_admits(n_heads: usize, n_kv_heads: usize) -> QsaGroupAdmits {
+    let group = n_heads / n_kv_heads;
+    QsaGroupAdmits {
+        hg12: n_heads == n_kv_heads * QSA_ATTENTION_HG12_HEADS,
+        hg4: group % QSA_ATTENTION_HG4_HEADS == 0,
+        dense: group % 4 == 0,
+        gathered: group <= 16,
+    }
+}
+
 /// Dynamic LDS bytes of the grouped kernel for `shape_selected` selected rows.
 /// Shipped kernels: weights[sel][4] + tokens[sel] + partial maxes[4][256] +
 /// maxes[4]. The lite twin recomputes the validated token and reduces the
@@ -9064,10 +9088,9 @@ fn qsa_attention_hg4_lds_bytes(
     p: &IndexedAttentionAttentionBatch<'_>,
     shape_selected: usize,
 ) -> Option<u32> {
-    let group = p.n_heads / p.n_kv_heads;
     if !gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         || p.head_dim != 256
-        || group % QSA_ATTENTION_HG4_HEADS != 0
+        || !qsa_group_admits(p.n_heads, p.n_kv_heads).hg4
         || gpu.route_rows(p.rows) < QSA_ATTENTION_HG4_MIN_ROWS
     {
         return None;
@@ -9322,7 +9345,7 @@ fn indexed_attention_attention_batch_launch(
         && p.format == QsaKvFormat::F32
         && gpu.arch_caps.has_qwen4_parallel_qsa_gdn()
         && p.head_dim == 256
-        && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
+        && qsa_group_admits(p.n_heads, p.n_kv_heads).hg12
         && gpu.route_rows(p.rows) >= QSA_ATTENTION_HG12_MIN_ROWS
         && shape_selected <= QSA_ATTENTION_HG12_MAX_SELECTED;
     let hg4_bytes = (allow_fast && !decode && !hg12)
@@ -10468,7 +10491,7 @@ fn qsa_dense_wmma_applies(
         && !gpu.graphs.capture_mode
         && p.head_dim == 256
         && p.format == QsaKvFormat::F32
-        && (p.n_heads / p.n_kv_heads) % 4 == 0
+        && qsa_group_admits(p.n_heads, p.n_kv_heads).dense
         && end_position / p.compress <= p.budget_blocks
         && end_position <= p.capacity
 }
@@ -10746,7 +10769,7 @@ fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) 
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.head_dim == 256
-        && p.n_heads / p.n_kv_heads <= 16
+        && qsa_group_admits(p.n_heads, p.n_kv_heads).gathered
         && p.capacity.div_ceil(128) * 128 * 4 + QSA_GATHERED_STATIC_LDS_BYTES
             <= QSA_ATTENTION_DYNAMIC_LDS_LIMIT_BYTES
 }
@@ -11664,6 +11687,82 @@ mod tests {
             ),
             per_head
         );
+    }
+
+    /// Trunk shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): a rank runs 12 q heads over the SAME 2
+    /// KV heads (GQA group 6). Every group-specialised route must refuse that shape (it
+    /// falls back to the per-head kernels, or the gathered WMMA route that reads the group
+    /// at run time) while the production 24 / 2 shape (group 12) keeps its routes.
+    #[test]
+    fn qsa_group_routes_at_the_trunk_shard_shape_fall_back_and_production_is_unchanged() {
+        let production = qsa_group_admits(24, 2);
+        assert_eq!(
+            production,
+            QsaGroupAdmits {
+                hg12: true,
+                hg4: true,
+                dense: true,
+                gathered: true
+            }
+        );
+        let shard = qsa_group_admits(12, 2);
+        assert_eq!(
+            shard,
+            QsaGroupAdmits {
+                hg12: false,
+                hg4: false,
+                dense: false,
+                gathered: true
+            }
+        );
+        // The decode policy: never split-K layout 2 / split-KV q8 at group 6, on any
+        // architecture, format or launch mode.
+        assert!(!qsa_decode_splitk_layout_fits(
+            256,
+            12,
+            2,
+            QSA_DECODE_SPLITK_SCORING_LAYOUT
+        ));
+        assert!(qsa_decode_splitk_layout_fits(
+            256,
+            24,
+            2,
+            QSA_DECODE_SPLITK_SCORING_LAYOUT
+        ));
+        for layout in [0, 1] {
+            assert!(qsa_decode_splitk_layout_fits(256, 12, 2, layout));
+        }
+        assert!(!qsa_decode_splitkv_q8_geometry_fits(
+            QsaKvFormat::Q8,
+            256,
+            12,
+            2
+        ));
+        assert!(qsa_decode_splitkv_q8_geometry_fits(
+            QsaKvFormat::Q8,
+            256,
+            24,
+            2
+        ));
+        for arch in ["gfx1100", "gfx1101", "gfx1151", "gfx1201"] {
+            for format in [QsaKvFormat::F32, QsaKvFormat::Q8, QsaKvFormat::Fp8] {
+                for eager in [true, false] {
+                    let mut flags = crate::feature_flags::FeatureFlags::for_test(arch);
+                    flags.qwen4_qsa_decode_splitk = true;
+                    let flags = std::sync::Arc::new(flags);
+                    let caps = crate::arch_caps::ArchCaps::new(arch, flags.clone());
+                    for selected in [1usize, 2051, 8192] {
+                        assert_eq!(
+                            qsa_decode_attention_policy_with(
+                                &flags, &caps, format, 256, 12, 2, selected, eager
+                            ),
+                            QsaDecodeAttentionPolicy::PerHead,
+                            "{arch} {format:?} eager={eager} selected={selected}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

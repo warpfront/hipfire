@@ -511,6 +511,25 @@ const FIXED_ROUTE_GEOMETRY: MoeRouteGeometry = MoeRouteGeometry {
     shared_intermediate: 640,
 };
 
+/// [`FIXED_ROUTE_GEOMETRY`] but for the shared-expert width, which the QT44/QT53 and slab
+/// routes also take at a K-slice of the model's 640: a trunk shard rank
+/// (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`) runs the shared expert at 384 or 256 and its FFN write
+/// all-reduces the two halves. Every kernel the shared expert reaches is generic in that
+/// width over the 128-wide activation/rotation unit (the BF16 x4 gate-side GEMV, the fused
+/// routed+shared activation and the BF16 shared-down GEMV at any K; the INT8 and F16 WMMA
+/// prefill routes at `% 128`), so any 128-multiple below the model's width is admitted.
+/// The FP8 route stays on the exact geometry.
+pub(crate) fn fixed_route_geometry_up_to_shared_width(geometry: MoeRouteGeometry) -> bool {
+    let fixed = FIXED_ROUTE_GEOMETRY;
+    MoeRouteGeometry {
+        shared_intermediate: fixed.shared_intermediate,
+        ..geometry
+    } == fixed
+        && geometry.shared_intermediate != 0
+        && geometry.shared_intermediate <= fixed.shared_intermediate
+        && geometry.shared_intermediate % 128 == 0
+}
+
 /// Exact geometry and wire-format contract of the available grouped kernels.
 /// The route also requires `admitted_on` and live operands matching the policy.
 #[allow(clippy::too_many_arguments)]
@@ -528,9 +547,8 @@ pub(crate) fn grouped_route_geometry_supported(
 ) -> bool {
     let geometry = policy.geometry;
     let formats = policy.formats;
-    let fixed_geometry = FIXED_ROUTE_GEOMETRY;
     policy.capability.is_qt44_qt53_grouped()
-        && geometry == fixed_geometry
+        && fixed_route_geometry_up_to_shared_width(geometry)
         && experts == geometry.experts
         && top_k == geometry.top_k
         && hidden == geometry.hidden
@@ -672,7 +690,7 @@ pub(crate) fn slab_route_geometry_supported(
 ) -> bool {
     let geometry = policy.geometry;
     let shape = policy.capability.is_slab()
-        && geometry == FIXED_ROUTE_GEOMETRY
+        && fixed_route_geometry_up_to_shared_width(geometry)
         && experts == geometry.experts
         && top_k == geometry.top_k
         && hidden == geometry.hidden

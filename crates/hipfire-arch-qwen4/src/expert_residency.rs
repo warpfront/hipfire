@@ -287,6 +287,54 @@ pub fn resident_split_ranks(
     Ok((non_expert, layer_experts + layer_arena_max))
 }
 
+/// [`resident_split_ranks`] for a load whose trunk projections are TP-sharded over `ranks`
+/// (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`, [`crate::weights::trunk_shard`]): every non-expert tensor
+/// the shard cuts counts its BUSIEST rank's share
+/// ([`crate::weights::trunk_shard::trunk_share_bytes`]); the routed-expert bytes are
+/// unchanged. `trunk == None` is exactly [`resident_split_ranks`].
+pub fn resident_split_ranks_trunk(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    ranks: usize,
+    trunk: Option<(
+        &crate::weights::trunk_shard::TrunkDims,
+        crate::weights::trunk_shard::QsaMode,
+    )>,
+) -> Result<(u64, u64), String> {
+    let Some((dims, mode)) = trunk else {
+        return resident_split_ranks(weights, bytes_of, ranks);
+    };
+    let failure = std::cell::RefCell::new(None::<String>);
+    let split = resident_split_ranks(
+        weights,
+        |entry| {
+            let bytes = bytes_of(entry)?;
+            if is_routed_expert(&entry.name) {
+                return Some(bytes);
+            }
+            match crate::weights::trunk_shard::trunk_share_bytes(
+                dims,
+                mode,
+                &entry.name,
+                &entry.logical_shape,
+                bytes,
+                ranks,
+            ) {
+                Ok(share) => Some(share),
+                Err(error) => {
+                    failure.borrow_mut().get_or_insert(error);
+                    None
+                }
+            }
+        },
+        ranks,
+    );
+    if let Some(error) = failure.into_inner() {
+        return Err(format!("trunk shard census: {error}"));
+    }
+    split
+}
+
 /// Gate/up and down payload bytes of the largest trunk layer of a packed
 /// (one tensor per projection per layer) manifest, separately: what the S1
 /// expert page layout splits over the layer's experts
@@ -4087,8 +4135,14 @@ fn placement_inputs_charged(
         chunk_rows,
     } = *args;
     let qsa_format = state_format.qsa;
-    let (non_expert, layer_experts) = resident_split_ranks(weights, bytes_of, ranks)
-        .map_err(|error| format!("qwen4: {error}"))?;
+    let trunk = crate::weights::trunk_shard::census_trunk(config, ranks);
+    let (non_expert, layer_experts) = resident_split_ranks_trunk(
+        weights,
+        bytes_of,
+        ranks,
+        trunk.as_ref().map(|(dims, mode)| (dims, *mode)),
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
     // `chunk_rows` is the caller's: it never probes the host link here.
     let context = crate::Qwen4ContextCommit::for_expert_reserve(
         backend,

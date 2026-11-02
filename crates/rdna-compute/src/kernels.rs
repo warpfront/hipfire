@@ -10792,6 +10792,15 @@ pub const TP_PEER_PUSHN_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/tp_peer_pushn.gfx1201.hip")
 );
 
+/// gfx1201 TP2 all-reduce fused into the BF16 Hyper-Connection write
+/// (`ar_hc_write_gfx1201`: bf16 partial pushed as tagged granules into the peer's
+/// fine-grained mailbox, bounded poll, rank-ordered fold, in-place `hyper_write_bf16x2`
+/// arithmetic on the four streams; device-resident generation).
+pub const AR_HC_WRITE_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/ar_hc_write.gfx1201.hip")
+);
+
 /// 16-bit partial-sum exchange for the dense TP residual reduction
 /// (`HIPFIRE_TP_EXCHANGE=bf16|f16`): `tp_pack16_{bf16,f16}` converts an f32
 /// partial to 16 bits, `tp_fold16_{bf16,f16}` sums rank-ordered 16-bit

@@ -83,7 +83,7 @@ pub use layer_ops::{
     project_weight, project_weights, qsa_projection_hook_installed, reset_qsa_projection_slot,
     set_qsa_projection_hook, validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp,
     GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp,
-    HyperNormOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    HyperNormOp, HyperReadOp, HyperWriteAr, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
     IndexedAttentionState, LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp,
     QsaProjectionHook, QsaTrunkArenas,
 };
@@ -649,6 +649,62 @@ mod qt53_fallback_tests {
                 ..
             })
         )
+    }
+
+    /// A trunk shard rank (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`) seals the MoE with its K-slice of
+    /// the shared expert (384 / 256 of 640): the grouped route is still selected, for a
+    /// policy and call that agree on the width; the model's own 640 is unchanged; widths that
+    /// are not a 128-multiple within the model's, or a call that disagrees with its policy,
+    /// are refused.
+    #[cfg(feature = "deltanet")]
+    #[test]
+    fn trunk_shard_shared_slices_keep_the_grouped_route() {
+        let dtypes = fallback_dtypes();
+        let route = |policy_shared: usize, call_shared: usize| {
+            let mut policy = flash_next_policy(DType::BF16);
+            policy.geometry.shared_intermediate = policy_shared;
+            select_grouped_route_by(
+                &dtypes,
+                512,
+                10,
+                2560,
+                640,
+                call_shared,
+                2560,
+                2560,
+                640,
+                None,
+                false,
+                Some(policy),
+                &|_| true,
+            )
+        };
+        for shared in [640usize, 512, 384, 256, 128] {
+            assert_eq!(
+                route(shared, shared),
+                Some(MoeRouteCapability::Qt44Qt53Grouped),
+                "shared {shared}"
+            );
+        }
+        for shared in [0usize, 64, 320, 641, 768, 1280] {
+            assert_eq!(route(shared, shared), None, "shared {shared}");
+        }
+        assert_eq!(route(384, 640), None);
+        assert_eq!(route(640, 384), None);
+        // The slab route applies the same geometry rule (its codec admission is separate).
+        assert!(
+            crate::families::moe::fixed_route_geometry_up_to_shared_width(
+                flash_next_policy(DType::BF16).geometry
+            )
+        );
+        let mut other = flash_next_policy(DType::BF16).geometry;
+        other.shared_intermediate = 384;
+        assert!(crate::families::moe::fixed_route_geometry_up_to_shared_width(other));
+        other.routed_intermediate = 512;
+        assert!(!crate::families::moe::fixed_route_geometry_up_to_shared_width(other));
+        other.routed_intermediate = 640;
+        other.shared_intermediate = 0;
+        assert!(!crate::families::moe::fixed_route_geometry_up_to_shared_width(other));
     }
 
     #[test]

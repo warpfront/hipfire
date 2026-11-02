@@ -215,6 +215,7 @@ fn hc_write<'a>(
     rows: usize,
 ) -> HyperWriteOp<'a> {
     HyperWriteOp {
+        ar: None,
         state_bf16: false,
         input: t.wide,
         norm_weight: write.norm,

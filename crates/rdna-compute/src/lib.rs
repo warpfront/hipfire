@@ -159,6 +159,7 @@ pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation,
     Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared,
 };
+pub mod ar_hc_write;
 pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;

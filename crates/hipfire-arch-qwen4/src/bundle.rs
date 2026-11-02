@@ -887,6 +887,27 @@ impl Qwen4Bundle {
             }
             _ => None,
         };
+        // Trunk shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): from here on this rank runs under its
+        // rank-local config (half the GDN/QSA heads, its shared-expert share), so the state
+        // below is allocated at the local sizes; the weights are cut after the overlay
+        // ([`Self::apply_trunk_shard`]).
+        let config =
+            match crate::weights::trunk_shard::load_local_config(&config, weights.ep_placement()) {
+                Ok(Some(local)) => local,
+                Ok(None) => config,
+                Err(error) => {
+                    if let Some(ple) = ple {
+                        let _ = ple.rows.unload();
+                    }
+                    let weight_result = weights.free_gpu(gpu);
+                    let cleanup = transaction.rollback(gpu);
+                    return Err(cleanup_bundle_failure(
+                        BundleError::Forward(error),
+                        weight_result,
+                        cleanup,
+                    ));
+                }
+            };
         let mut state = match Qwen4State::new_with_backend_scoped(
             gpu,
             &config,
@@ -1134,6 +1155,56 @@ impl Qwen4Bundle {
             }
         }
         Ok(None)
+    }
+
+    /// `HIPFIRE_QWEN4_EP_TRUNK_SHARD`: keep this rank's half of the trunk projections
+    /// ([`crate::weights::trunk_shard`]). Runs after the overlay and requantization and
+    /// before the forward is built. A no-op unless the switch is on and the route is
+    /// ready; an enabled switch on anything but a two-rank EP load is refused.
+    fn apply_trunk_shard(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        use crate::weights::trunk_shard::{trunk_shard_requested, QsaMode};
+        if !trunk_shard_requested() {
+            return Ok(());
+        }
+        let placement = self
+            .weights
+            .ep_placement()
+            .filter(|p| p.ranks == 2)
+            .ok_or_else(|| {
+                BundleError::Forward(
+                    "HIPFIRE_QWEN4_EP_TRUNK_SHARD needs a two-rank expert-parallel load"
+                        .to_string(),
+                )
+            })?;
+        if self.config.trunk_shard != Some((placement.rank, placement.ranks)) {
+            return Err(BundleError::Forward(format!(
+                "trunk shard: the bundle config is {:?}, expected the rank-local config of rank {} of {}",
+                self.config.trunk_shard, placement.rank, placement.ranks
+            )));
+        }
+        let global = self
+            .config
+            .trunk_shard_global()
+            .map_err(BundleError::Forward)?;
+        let applied = self
+            .weights
+            .shard_trunk(
+                gpu,
+                &global,
+                QsaMode::GroupInterleaved,
+                placement.rank,
+                placement.ranks,
+            )
+            .map_err(BundleError::Forward)?;
+        eprintln!(
+            "  qwen4 trunk shard: rank {} of {}: {} tensors, {} -> {} MiB resident",
+            placement.rank,
+            placement.ranks,
+            applied.tensors,
+            applied.before_bytes >> 20,
+            applied.after_bytes >> 20
+        );
+        Ok(())
     }
 
     /// Whether every call of this load runs host arithmetic: the D1 CPU
@@ -1593,6 +1664,7 @@ impl Qwen4Bundle {
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
+        self.apply_trunk_shard(gpu)?;
         // The largest rung whose chunk-sized resources fit the free device
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
@@ -6587,6 +6659,7 @@ impl Qwen4Bundle {
         self.weights
             .requant_from_env(gpu)
             .map_err(BundleError::Forward)?;
+        self.apply_trunk_shard(gpu)?;
         eprintln!("  qwen4 prefill chunk: {rows} rows (EP reserve plan; no rung search)");
         let forward = Qwen4GpuForward::new_inner_with_reserve(
             gpu,
