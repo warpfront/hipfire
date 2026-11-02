@@ -5,7 +5,7 @@ acceptance, tokens per step, or window cost regress beyond pre-registered noise.
 It compares hipfire EP2/PP2 MTP against another engine's `/stats draft_positions`
 on **identical prompt bytes**, and it is the durability gate for MTP lanes.
 
-- `fixture.json`: six prompts (story, code, prose_long, agentic, math,
+- `fixture.json`: six single prompts plus the W2 mix (eight different prompts, stream i sends entry i % 8; `w2mix-C4/C8`, un-gated until a lane baseline exists) (story, code, prose_long, agentic, math,
   multilingual), md5 + size pinned, 28 cells (`<prompt>-C<n>-<t1|greedy>`).
   `story` and `code` are the core pair at C1/C4/C8; the four breadth classes run
   at C1/C8. A pass needs **every** gated cell of **every** class: acceptance
@@ -49,3 +49,10 @@ A hipfire baseline on this fixture does not exist yet. The card job that
 produces records is `HIPFIRE_MTP_TRACE=1` serve runs (singleton) or, for EP2/PP2
 lanes, per-depth lane counters that the daemon does not export yet; see
 `docs/perf-checkpoints/2026-11-01-mtp-parity-ratchet-registration.md`.
+
+`mtp-parity-drive.py` writes, per cell, a `summary` that reports TTFT and steady decode separately from the end-to-end figure:
+`ttft_ms` (client time to the first content chunk: p50/p95/max), `reported_tok_s` (all completion tokens / cell wall, what a loadgen
+timing the whole request sees, prefill and straggler tail included) and `steady_tok_s` (sum over streams of tokens after the first /
+decode seconds after the first token). The ratchet carries `steady_tok_s` and `ttft_ms_p50` into the record and checks them for any
+baseline that was registered with them (`steady_floor_rel` 5%, `ttft_floor_rel` 10%, or 3x the cell's own cv).
+

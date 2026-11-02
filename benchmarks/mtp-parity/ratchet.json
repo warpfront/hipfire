@@ -8,7 +8,9 @@
   "window_floor_rel": 0.05,
   "min_reps": 3,
   "min_trials_per_depth": 50,
-  "max_cv_register": 0.15
+  "max_cv_register": 0.15,
+  "steady_floor_rel": 0.05,
+  "ttft_floor_rel": 0.1
  },
  "provenance": {
   "registered": "2026-11-01, before any hipfire baseline exists on this fixture",
@@ -18,7 +20,8 @@
    "hipfire_pp2_sampled_singleton_l2": "r9700x2-par/l2/runs/l2-c1-on{1,2,3}: window-weighted tau sd 0.028-0.113 across 6 categories (range 0.056-0.216), yield cv 0.007-0.028",
    "hipfire_ep2_lanes_fresh_process": "epserve/runs e8-bench-on{1,2,3} and g3-bench-on{1,2}: out tok/s range 0.1-3.2% across fresh servers for C1-C4,C8, one 6.0% outlier (C6, n=2); AR step ms (FLOOR kREF1, n=4/3): range 0.4%",
    "reading": "z=3 against binomial SE covers within-cell sampling noise; floors cover the smallest observed cv; wider cells register wider tolerances from their own reps, so C1 cells are weak detectors and C8 cells (8x the trials) are the sharp ones"
-  }
+  },
+  "throughput_rule": "steady_tok_s fails if below base*(1 - max(steady_floor_rel, z*cv_rep)); ttft_ms_p50 fails if above base*(1 + max(ttft_floor_rel, z*cv_rep)); both are checked only for baselines registered from records that carry them (driver cell summaries), 2026-11-02. Floors from Radiance b1 cv (step ms <= 0.055, so 5% steady; TTFT is dominated by joint prefill of the burst and is noisier, 10%)."
  },
  "cells": {
   "story-C1-t1": {
@@ -572,6 +575,30 @@
    "tier": "breadth",
    "baseline": null,
    "pending": "ep2-lanes: native-MTP lanes are not on beta (branch-only), so there is no per-position count to register at C>1; re-gate with the lane baseline"
+  },
+  "w2mix-C4-t1": {
+   "gate": false,
+   "tier": "breadth",
+   "baseline": null,
+   "pending": "W2 mix needs a lane baseline (per-position counters + a card job); un-gated until registered"
+  },
+  "w2mix-C4-greedy": {
+   "gate": false,
+   "tier": "breadth",
+   "baseline": null,
+   "pending": "W2 mix needs a lane baseline (per-position counters + a card job); un-gated until registered"
+  },
+  "w2mix-C8-t1": {
+   "gate": false,
+   "tier": "breadth",
+   "baseline": null,
+   "pending": "W2 mix needs a lane baseline (per-position counters + a card job); un-gated until registered"
+  },
+  "w2mix-C8-greedy": {
+   "gate": false,
+   "tier": "breadth",
+   "baseline": null,
+   "pending": "W2 mix needs a lane baseline (per-position counters + a card job); un-gated until registered"
   }
  }
 }

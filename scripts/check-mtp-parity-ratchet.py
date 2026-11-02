@@ -74,6 +74,19 @@ def new_record(cell, depths, steps, committed, window_ms=None, window_src=None,
     return rec
 
 
+def with_throughput(rec, summary):
+    """Attach a driver cell `summary` (TTFT and steady decode, reported separately)."""
+    if not summary:
+        return rec
+    tt = (summary.get("ttft_ms") or {}).get("p50")
+    if tt is not None:
+        rec["ttft_ms_p50"] = tt
+    for key in ("steady_tok_s", "reported_tok_s"):
+        if summary.get(key) is not None:
+            rec[key] = summary[key]
+    return rec
+
+
 def depth_row(depth, offered, reached, accepted):
     return {"depth": depth, "offered": offered, "reached": reached, "accepted": accepted}
 
@@ -120,13 +133,17 @@ def pool(recs):
             acc[1] += row["reached"]
             acc[2] += row["accepted"]
     wms = [r["window_ms"] for r in recs if r.get("window_ms") is not None]
-    return {
+    out = {
         "depths": [depth_row(d, *v) for d, v in sorted(depths.items())],
         "steps": sum(r["steps"] for r in recs),
         "committed": sum(r["committed"] for r in recs),
         "window_ms": sum(wms) / len(wms) if wms else None,
         "reps": len(recs),
     }
+    for key in ("steady_tok_s", "reported_tok_s", "ttft_ms_p50"):
+        vals = [r[key] for r in recs if r.get(key) is not None]
+        out[key] = sum(vals) / len(vals) if vals else None
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -273,8 +290,9 @@ def from_driver_obj(d, trace_reqs=None, max_depth=3, build="", engine=""):
             wms, wsrc = None, None
     else:
         raise ValueError(f"{d['cell']}: no draft_positions in /stats and no --trace given")
-    return new_record(d["cell"], depths, steps, committed, window_ms=wms, window_src=wsrc if wms else None,
-                      engine=engine, build=build, rep=d.get("rep", 0), extra=extra)
+    rec = new_record(d["cell"], depths, steps, committed, window_ms=wms, window_src=wsrc if wms else None,
+                     engine=engine, build=build, rep=d.get("rep", 0), extra=extra)
+    return with_throughput(rec, d.get("summary"))
 
 
 # --------------------------------------------------------------------------
@@ -326,6 +344,13 @@ def derive_baseline(recs, rule):
         "reps": len(recs), "steps": p["steps"],
         "build": recs[0].get("build", ""), "engine": recs[0].get("engine", ""),
     }
+    # Throughput metrics: registered only when every rep carries them, so a cell registered
+    # from trace-only records keeps its older, narrower contract.
+    for key in ("steady_tok_s", "ttft_ms_p50"):
+        vals = [r[key] for r in recs if r.get(key) is not None]
+        if len(vals) == len(recs):
+            out[key] = sum(vals) / len(vals)
+            out[key + "_cv_rep"] = cv(vals)
     return out
 
 
@@ -361,6 +386,30 @@ def compare_cell(base, newp, rule):
     rows.append(("yield", yb, yn, ytol, "FAIL" if ybad else "ok"))
     if ybad:
         verdict = "FAIL"
+    # Throughput (only for baselines registered with it): steady decode must not fall, TTFT must
+    # not rise, beyond the pre-registered floors or three times the cell's own spread.
+    if base.get("steady_tok_s") is not None:
+        if newp.get("steady_tok_s") is None:
+            rows.append(("steady_tok_s", base["steady_tok_s"], None, None, "INSUFFICIENT (no steady_tok_s in record)"))
+            if verdict == "PASS":
+                verdict = "INSUFFICIENT"
+        else:
+            stol = max(rule.get("steady_floor_rel", 0.05), rule["z"] * (base.get("steady_tok_s_cv_rep") or 0.0)) * base["steady_tok_s"]
+            sbad = newp["steady_tok_s"] < base["steady_tok_s"] - stol
+            rows.append(("steady_tok_s", base["steady_tok_s"], newp["steady_tok_s"], stol, "FAIL" if sbad else "ok"))
+            if sbad:
+                verdict = "FAIL"
+    if base.get("ttft_ms_p50") is not None:
+        if newp.get("ttft_ms_p50") is None:
+            rows.append(("ttft_p50", base["ttft_ms_p50"], None, None, "INSUFFICIENT (no ttft in record)"))
+            if verdict == "PASS":
+                verdict = "INSUFFICIENT"
+        else:
+            ttol = max(rule.get("ttft_floor_rel", 0.10), rule["z"] * (base.get("ttft_ms_p50_cv_rep") or 0.0)) * base["ttft_ms_p50"]
+            tbad = newp["ttft_ms_p50"] > base["ttft_ms_p50"] + ttol
+            rows.append(("ttft_p50", base["ttft_ms_p50"], newp["ttft_ms_p50"], ttol, "FAIL" if tbad else "ok"))
+            if tbad:
+                verdict = "FAIL"
     if base.get("window_ms") is not None:
         if newp.get("window_ms") is None:
             rows.append(("window_ms", base["window_ms"], None, None, "INSUFFICIENT (no window_ms in record)"))
@@ -506,6 +555,10 @@ def lowers(old, new):
         if nd is None or nd["rate"] < od["rate"]:
             return True
     if new["yield"] < old["yield"]:
+        return True
+    if old.get("steady_tok_s") is not None and (new.get("steady_tok_s") is None or new["steady_tok_s"] < old["steady_tok_s"]):
+        return True
+    if old.get("ttft_ms_p50") is not None and (new.get("ttft_ms_p50") is None or new["ttft_ms_p50"] > old["ttft_ms_p50"]):
         return True
     if old.get("window_ms") is not None and (new.get("window_ms") is None or new["window_ms"] > old["window_ms"]):
         return True
@@ -696,6 +749,27 @@ def self_test():
         assert not check_fixture(fx, t)
         (t / "p.txt").write_bytes(b"hellO")
         assert check_fixture(fx, t)
+    # throughput metrics: registered only when every rep has them; steady falls / TTFT rises fail
+    def tp(rep_i, steady=100.0, ttft=200.0, wms=40.0):
+        return with_throughput(rec(rep_i, wms=wms), {"steady_tok_s": steady, "ttft_ms": {"p50": ttft},
+                                                      "reported_tok_s": steady * 0.8})
+    tps = [tp(i, steady=100.0 + i, ttft=200.0 + i) for i in range(3)]
+    tbase = derive_baseline(tps, rule)
+    assert abs(tbase["steady_tok_s"] - 101.0) < 1e-9 and "ttft_ms_p50_cv_rep" in tbase
+    assert "steady_tok_s" not in derive_baseline(reps, rule)  # trace-only records keep the narrow contract
+    v, _ = compare_cell(tbase, pool(tps), rule)
+    assert v == "PASS", v
+    slowtp = [tp(i, steady=80.0) for i in range(3)]
+    v, rows = compare_cell(tbase, pool(slowtp), rule)
+    assert v == "FAIL" and any(n == "steady_tok_s" and s == "FAIL" for n, _, _, _, s in rows), rows
+    laggy = [tp(i, ttft=300.0) for i in range(3)]
+    v, rows = compare_cell(tbase, pool(laggy), rule)
+    assert v == "FAIL" and any(n == "ttft_p50" and s == "FAIL" for n, _, _, _, s in rows), rows
+    v, _ = compare_cell(tbase, pool(reps), rule)  # records without throughput against a baseline that has it
+    assert v == "INSUFFICIENT", v
+    weaker_tp = copy.deepcopy(tbase)
+    weaker_tp["steady_tok_s"] -= 5.0
+    assert lowers(tbase, weaker_tp) and not lowers(tbase, tbase)
     # from-driver: lane serve (stats delta) and singleton serve (trace slice)
     req = lambda cyc: {"error": None, "timings": {"cycles": cyc, "latency_ms": 100.0, "ttft_ms": 20.0}}
     before = {"draft_positions": [{"depth": 1, "offered": 10, "reached": 10, "accepted": 8, "rate": .8}],
