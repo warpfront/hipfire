@@ -853,8 +853,11 @@ pub struct DraftContext<'a> {
 ///     tiled     28.65  28.55  28.38  28.20  27.86  27.20
 /// ```
 ///
-/// Both kernels read the same cache with the same mask; the output is
-/// byte-identical on either side of the threshold.
+/// Both kernels read the same cache with the same mask but reduce in a
+/// different order, so the output is not byte-identical across the threshold:
+/// on gfx1151 most of the 4096 output floats differ, by at most about 6e-6
+/// (HIPF-249). A given position always takes the same kernel, so decode stays
+/// deterministic.
 pub const WINDOWED_Q8_TILED_MIN_SEQ: usize = 1280;
 
 /// F32 elements of the tiled kernel's partials for a cache of `cap` rows.
