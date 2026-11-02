@@ -211,7 +211,7 @@ struct CqArm {
     /// Free-form tag echoed into the result (cross-binary comparisons).
     label: Option<String>,
     /// Hit arm commits each prior turn with `session_commit_live` (serve's
-    /// `commit_qwen4_session`), so the final request resumes the live
+    /// `commit_session`), so the final request resumes the live
     /// decode-lineage state instead of a snapshot.
     live: bool,
 }
