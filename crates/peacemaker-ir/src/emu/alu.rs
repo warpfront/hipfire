@@ -2665,6 +2665,24 @@ fn scalar(name: &str, i: &Inst, s: &mut State) -> Result<()> {
             (fin(num(a)?.mul_add(num(b)?, num(k)?))?, None)
         }
         "s_bcnt1_i32_b32" => nonzero(a.count_ones()),
+        // gfx12 SOP2 `s_min_num_f32` / `s_max_num_f32`: D = S0 when S0 < S1 (S0 > S1) else S1, with -0 < +0 (the ISA's
+        // LT_NEG_ZERO rule); no SCC. The result is one operand bit for bit, denormals included (State::new preserves
+        // them). A NaN operand is an error: the scalar unit's NaN selection, payload quieting and sNaN handling are not
+        // measured (only the VALU `v_min_num_f32`/`v_max_num_f32` rules are, see float_edges.md).
+        "s_min_num_f32" | "s_max_num_f32" => {
+            if is_nan(a) || is_nan(b) {
+                return Err(format!(
+                    "{name}: NaN operand: the scalar-unit NaN selection/payload is not measured"
+                ));
+            }
+            let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+            let first = if name == "s_min_num_f32" {
+                min_lt(x, y)
+            } else {
+                max_gt(x, y)
+            };
+            (if first { a } else { b }, None)
+        }
         _ => return Err(format!("unsupported scalar opcode {name}")),
     };
     s.put(&o[0], 0, 0, value)?;

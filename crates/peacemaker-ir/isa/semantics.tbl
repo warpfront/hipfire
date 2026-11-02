@@ -541,3 +541,12 @@ s_code_end	control
 v_mbcnt_hi_u32_b32	alu
 s_wait_storecnt_dscnt	wait
 s_prefetch_data	memory
+s_min_num_f32	alu
+s_max_num_f32	alu
+v_ashrrev_i64	alu
+v_cmp_eq_i64_e64	alu
+v_cmp_le_i64_e64	alu
+v_cmp_ne_i64_e64	alu
+v_cmp_le_u64_e64	alu
+v_cmp_ge_u64_e64	alu
+v_cmp_gt_u64_e64	alu

@@ -26,6 +26,8 @@ pub mod convert;
 mod dot;
 #[cfg(test)]
 mod gate_ops_tests;
+#[cfg(test)]
+mod gfx12_decode_gap_tests;
 mod hw;
 pub use hw::RunReport;
 mod memory;

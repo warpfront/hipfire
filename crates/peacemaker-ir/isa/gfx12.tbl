@@ -537,3 +537,11 @@ s_and_not1_b64	sop2	0x23	SDST:64,SSRC0:64,SSRC1:64	SDST	SSRC0,SSRC1	scc:w	-	s_an
 s_and_not1_saveexec_b64	sop1	0x31	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_and_not1_saveexec_b64 s[0:1], s[24:25]	BE803118	-
 s_or_saveexec_b64	sop1	0x23	SDST:64,SSRC0:64	SDST	SSRC0	exec:w,scc:w,exec:r	-	s_or_saveexec_b64 s[0:1], s[0:1]	BE802300	-
 s_code_end	sopp	0x1f	-	-	-	-	-	s_code_end	BF9F0000	-
+v_add_f32_e64	vop3	0x103	VDST:32,SRC0:32,SRC1:32	VDST	SRC0,SRC1	-	-	v_add_f32_e64 v4, |v3|, |v3|	D5030304 02020703	src2_unused:ignored:0x1ff:0x00/0x80/0x101,neg:honored:0x7,abs:honored:0x7,omod:ignored:0x3:0x0/0x1/0x2/0x3
+s_min_num_f32	sop2	0x42	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_min_num_f32 s16, s16, 0	A1108010	-
+v_ashrrev_i64	vop3	0x33e	VDST:64,SRC0:32,SRC1:64	VDST	SRC0,SRC1	-	-	v_ashrrev_i64 v[2:3], 31, v[2:3]	D73E0002 0202049F	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_eq_i64_e64	vop3	0x52	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_eq_i64_e64 s0, s[2:3], s[4:5]	D4520000 02000802	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_le_i64_e64	vop3	0x53	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_le_i64_e64 s0, s[2:3], s[4:5]	D4530000 02000802	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_ne_i64_e64	vop3	0x55	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_ne_i64_e64 s0, s[2:3], s[4:5]	D4550000 02000802	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_le_u64_e64	vop3	0x5b	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_le_u64_e64 s0, s[2:3], s[4:5]	D45B0000 02000802	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmp_ge_u64_e64	vop3	0x5e	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_ge_u64_e64 s0, s[2:3], s[4:5]	D45E0000 02000802	src2_unused:ignored:0x1ff:0x00/0x80/0x101
