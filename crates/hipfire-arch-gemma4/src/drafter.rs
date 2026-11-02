@@ -387,6 +387,10 @@ fn load_wt(
             ))
         }
     };
+    if dtype == DType::HFQ4G128 {
+        hipfire_runtime::weight_backend::validate_hfq4g128_extent(data.len(), m, k, name)
+            .map_err(|e| format!("gemma4-drafter: {e:?}"))?;
+    }
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("gemma4-drafter: upload {name}: {e:?}"))?;
