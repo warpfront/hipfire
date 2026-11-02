@@ -631,6 +631,18 @@ pub(crate) struct EpReserveRootPlacement {
     pub bytes: u64,
 }
 
+/// One weight-shadow member's place inside a donor segment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpReserveShadowPlacement {
+    /// Index in the caller's shadow member list.
+    pub index: usize,
+    pub segment: usize,
+    pub layer: usize,
+    pub slot: EpDonorSlot,
+    pub offset: u64,
+    pub bytes: u64,
+}
+
 /// The bytes of a segment the borrowed bank dirties: `[offset, offset + len)`
 /// of the donor tensor; `len` is the used bytes rounded to 256.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -716,6 +728,10 @@ pub struct EpReservePlan {
     pub(crate) placements: Vec<EpReserveRootPlacement>,
     /// Used prefix of each used segment, in segment order.
     pub touched: Vec<EpReserveTouchedExtent>,
+    /// Where each weight-shadow member lives in the donor segments, in the
+    /// caller's member order; empty unless planned with
+    /// [`plan_ep_reserve_with_donors_and_shadows`].
+    pub shadow_placements: Vec<EpReserveShadowPlacement>,
     /// Pinned scratch-donor mirror bytes of one rank (full donor tensors).
     pub mirror_bytes_per_rank: u64,
     /// Mirror bytes of all ranks together (checked against the host budget).
@@ -803,6 +819,12 @@ fn digest_of(plan: &EpReservePlan) -> u64 {
         h.u64(placement.offset);
         h.u64(placement.bytes);
     }
+    for shadow in &plan.shadow_placements {
+        h.u64(shadow.index as u64);
+        h.u64(shadow.segment as u64);
+        h.u64(shadow.offset);
+        h.u64(shadow.bytes);
+    }
     for extent in &plan.touched {
         h.u64(extent.layer as u64);
         h.u64(extent.slot as u64);
@@ -889,7 +911,16 @@ pub fn plan_ep_reserve(
         s2.swap(0, 1);
     }
     assemble_plan(
-        forward, geometry, capacity, resident, layers, s2, false, segments, placed,
+        forward,
+        geometry,
+        capacity,
+        resident,
+        layers,
+        s2,
+        false,
+        segments,
+        placed,
+        Vec::new(),
     )
 }
 
@@ -944,6 +975,33 @@ pub fn plan_ep_reserve_with_donors(
     resident_layers: usize,
     candidates: &[usize],
 ) -> Result<EpReservePlan, Refusal> {
+    plan_ep_reserve_with_donors_and_shadows(
+        forward,
+        geometry,
+        capacity,
+        resident_layers,
+        candidates,
+        &[],
+    )
+}
+
+/// [`plan_ep_reserve_with_donors`] that also hosts the weight shadows (F16 /
+/// INT8 members, `shadow_bytes[i]` bytes each, in the caller's member order)
+/// in the donor segments, beside the scratch roots: the shortest candidate
+/// prefix whose segments hold the roots AND every shadow. Shadows are packed
+/// after the scratch roots, descending size, 256-byte aligned, never
+/// straddling a segment; the placements are in
+/// [`EpReservePlan::shadow_placements`] (member order) and their extents
+/// join the touched (restored) extents. An empty `shadow_bytes` is exactly
+/// [`plan_ep_reserve_with_donors`].
+pub fn plan_ep_reserve_with_donors_and_shadows(
+    forward: &EpReserveForwardPlan,
+    geometry: &EpRankGeometry,
+    capacity: &EpReserveCapacity,
+    resident_layers: usize,
+    candidates: &[usize],
+    shadow_bytes: &[u64],
+) -> Result<EpReservePlan, Refusal> {
     if geometry.ranks == 0 || geometry.trunk_layers == 0 {
         return Err(Refusal::new("invalid layer geometry"));
     }
@@ -967,19 +1025,26 @@ pub fn plan_ep_reserve_with_donors(
         .iter()
         .map(|root| (root.field, root.bytes))
         .collect();
-    let needed = forward.remaining_bytes()?;
+    let shadow_total = checked_sum(shadow_bytes.iter().copied())
+        .ok_or_else(|| Refusal::new("shadow bytes overflow"))?;
+    let needed = forward
+        .remaining_bytes()?
+        .checked_add(shadow_total)
+        .ok_or_else(|| Refusal::new("remaining roots plus shadows overflow"))?;
     let mut found = None;
     for donors in 1..=candidates.len() {
         let mut layers = candidates[..donors].to_vec();
         layers.sort_unstable();
         if let Some((segments, placed)) = pack_donor_layers(&roots, needed, geometry, &layers) {
-            found = Some((layers, segments, placed));
-            break;
+            if let Some(shadows) = pack_shadows_after(&segments, &placed, shadow_bytes) {
+                found = Some((layers, segments, placed, shadows));
+                break;
+            }
         }
     }
-    let (layers, segments, placed) = found.ok_or_else(|| {
+    let (layers, segments, placed, shadows) = found.ok_or_else(|| {
         Refusal::new(format!(
-            "the remaining roots ({} MiB) do not pack into the {} whole-resident donor candidates",
+            "the remaining roots plus shadows ({} MiB) do not pack into the {} whole-resident donor candidates",
             needed / MIB,
             candidates.len()
         ))
@@ -994,7 +1059,47 @@ pub fn plan_ep_reserve_with_donors(
         true,
         segments,
         placed,
+        shadows,
     )
+}
+
+/// Pack `shadow_bytes` into the free tails of `segments` after the scratch
+/// `placed` roots: first-fit, descending size (ties by member index), starts
+/// 256-aligned, no straddling. `None` when a shadow does not fit.
+fn pack_shadows_after(
+    segments: &[EpReserveSegment],
+    placed: &[(ScratchField, usize, u64, u64)],
+    shadow_bytes: &[u64],
+) -> Option<Vec<EpReserveShadowPlacement>> {
+    let mut cursor = vec![0u64; segments.len()];
+    for &(_, segment, offset, bytes) in placed {
+        cursor[segment] = cursor[segment].max(offset.checked_add(bytes)?);
+    }
+    let mut order: Vec<usize> = (0..shadow_bytes.len())
+        .filter(|&index| shadow_bytes[index] > 0)
+        .collect();
+    order.sort_by(|&a, &b| shadow_bytes[b].cmp(&shadow_bytes[a]).then(a.cmp(&b)));
+    let mut out = Vec::with_capacity(order.len());
+    for index in order {
+        let bytes = shadow_bytes[index];
+        let slot = segments.iter().enumerate().find_map(|(segment, seg)| {
+            let start = align_up(cursor[segment])?;
+            let end = start.checked_add(bytes)?;
+            (end <= seg.capacity).then_some((segment, start, end))
+        });
+        let (segment, offset, end) = slot?;
+        cursor[segment] = end;
+        out.push(EpReserveShadowPlacement {
+            index,
+            segment,
+            layer: segments[segment].layer,
+            slot: segments[segment].slot,
+            offset,
+            bytes,
+        });
+    }
+    out.sort_by_key(|placement| placement.index);
+    Some(out)
 }
 
 /// The plan tail shared by both donor choices: placements, touched extents,
@@ -1010,6 +1115,7 @@ fn assemble_plan(
     explicit_donors: bool,
     segments: Vec<EpReserveSegment>,
     placed: Vec<(ScratchField, usize, u64, u64)>,
+    shadow_placements: Vec<EpReserveShadowPlacement>,
 ) -> Result<EpReservePlan, Refusal> {
     let layer_bytes = geometry
         .layer_bytes()
@@ -1033,6 +1139,12 @@ fn assemble_plan(
             .iter()
             .filter(|placement| placement.segment == index)
             .map(|placement| placement.offset + placement.bytes)
+            .chain(
+                shadow_placements
+                    .iter()
+                    .filter(|shadow| shadow.segment == index)
+                    .map(|shadow| shadow.offset + shadow.bytes),
+            )
             .max();
         if let Some(used) = used {
             let len = align_up(used)
@@ -1073,6 +1185,7 @@ fn assemble_plan(
         segments,
         placements,
         touched,
+        shadow_placements,
         mirror_bytes_per_rank,
         mirror_bytes_total,
         restore_bytes_per_rank,
@@ -1588,6 +1701,90 @@ mod tests {
         let mut broken = plan.clone();
         broken.donor_layers.reverse();
         assert!(crate::gpu_forward::ep_reserve_forward::check_stage_plan(&broken).is_err());
+    }
+
+    #[test]
+    fn shadows_pack_into_the_donor_segments_beside_the_scratch_roots() {
+        let fwd = forward();
+        let g = geometry();
+        let weights = crate::expert_residency::j1778_bf16_manifest();
+        let region =
+            crate::decode_share_shadows::plan_shadow_region(&weights, 48, true, true).unwrap();
+        let sizes: Vec<u64> = region.spans().iter().map(|span| span.2).collect();
+        let candidates: Vec<usize> = (20..33).collect();
+        let cap = capacity_for(33, 0);
+        let bare = plan_ep_reserve_with_donors(&fwd, &g, &cap, 33, &candidates).unwrap();
+        assert_eq!(bare.donor_layers.len(), 7);
+        assert!(bare.shadow_placements.is_empty());
+        let with = plan_ep_reserve_with_donors_and_shadows(&fwd, &g, &cap, 33, &candidates, &sizes)
+            .unwrap();
+        // 3853 MiB of roots + 1549 MiB of shadows need nine 637.5 MiB layers.
+        assert!(with.donor_layers.len() >= 9 && with.donor_layers.len() <= 10);
+        assert_eq!(with.shadow_placements.len(), sizes.len());
+        assert_eq!(
+            with.mirror_bytes_per_rank,
+            with.donor_layers.len() as u64 * g.layer_bytes().unwrap()
+        );
+        // Every shadow is aligned, inside its segment, and disjoint from the
+        // scratch roots and from every other shadow.
+        let mut ranges: Vec<(usize, u64, u64)> = Vec::new();
+        for placement in &with.placements {
+            ranges.push((placement.segment, placement.offset, placement.bytes));
+        }
+        for (index, shadow) in with.shadow_placements.iter().enumerate() {
+            assert_eq!(shadow.index, index);
+            assert_eq!(shadow.bytes, sizes[index]);
+            assert_eq!(shadow.offset % EP_RESERVE_ROOT_ALIGN, 0);
+            let segment = &with.segments[shadow.segment];
+            assert_eq!((segment.layer, segment.slot), (shadow.layer, shadow.slot));
+            assert!(shadow.offset + shadow.bytes <= segment.capacity);
+            ranges.push((shadow.segment, shadow.offset, shadow.bytes));
+        }
+        ranges.sort_unstable();
+        for pair in ranges.windows(2) {
+            if pair[0].0 == pair[1].0 {
+                assert!(pair[0].1 + pair[0].2 <= pair[1].1, "overlap {pair:?}");
+            }
+        }
+        // The restore covers the shadow extents too.
+        for extent in &with.touched {
+            let used = ranges
+                .iter()
+                .filter(|(segment, _, _)| {
+                    (with.segments[*segment].layer, with.segments[*segment].slot)
+                        == (extent.layer, extent.slot)
+                })
+                .map(|(_, offset, bytes)| offset + bytes)
+                .max()
+                .unwrap();
+            assert!(extent.len >= used.min(with.segments[0].capacity.max(used)) - 255);
+        }
+        assert!(with.restore_bytes_per_rank > bare.restore_bytes_per_rank);
+        assert_ne!(with.digest, bare.digest);
+        assert_eq!(
+            with,
+            plan_ep_reserve_with_donors_and_shadows(&fwd, &g, &cap, 33, &candidates, &sizes)
+                .unwrap()
+        );
+        // Too few candidates, or a shadow bigger than any segment: refused.
+        assert!(plan_ep_reserve_with_donors_and_shadows(
+            &fwd,
+            &g,
+            &cap,
+            33,
+            &candidates[..8],
+            &sizes
+        )
+        .is_err());
+        assert!(plan_ep_reserve_with_donors_and_shadows(
+            &fwd,
+            &g,
+            &cap,
+            33,
+            &candidates,
+            &[g.gate_up_bytes + 1]
+        )
+        .is_err());
     }
 
     #[test]

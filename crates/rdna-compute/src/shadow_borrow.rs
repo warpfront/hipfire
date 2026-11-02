@@ -65,6 +65,11 @@ impl SharedI8ShadowSpan {
 pub struct ShadowBorrowPlan {
     pub region_ptr: usize,
     pub region_bytes: usize,
+    /// Further borrowed regions a destination may lie in (an EP donor set:
+    /// one allocation per donor segment); never freed here. Empty for the
+    /// single-region decode-share borrow. The byte oracle
+    /// ([`Gpu::verify_borrowed_shadows`]) covers the primary region only.
+    pub extra_regions: Vec<(usize, usize)>,
     pub f16: Vec<F16ShadowSpan>,
     pub shared_i8: Vec<SharedI8ShadowSpan>,
 }
@@ -88,7 +93,15 @@ impl ShadowBorrowPlan {
             let end = start
                 .checked_add(bytes)
                 .ok_or_else(|| format!("{label}: destination range overflows"))?;
-            if start < self.region_ptr || end > region_end {
+            let within = |lo: usize, bytes: usize| {
+                start >= lo && lo.checked_add(bytes).is_some_and(|hi| end <= hi)
+            };
+            if !within(self.region_ptr, self.region_bytes)
+                && !self
+                    .extra_regions
+                    .iter()
+                    .any(|&(lo, bytes)| within(lo, bytes))
+            {
                 return Err(format!(
                     "{label}: destination [0x{start:x}, 0x{end:x}) is outside the region \
                      [0x{:x}, 0x{region_end:x})",
@@ -233,12 +246,27 @@ impl ShadowBorrowState {
         let base = self.plan.region_ptr;
         let mut out = Vec::new();
         for s in &self.plan.f16 {
-            out.push((s.dst_ptr - base, s.bytes()));
+            if let Some(at) = s
+                .dst_ptr
+                .checked_sub(base)
+                .filter(|o| o + s.bytes() <= self.plan.region_bytes)
+            {
+                out.push((at, s.bytes()));
+            }
         }
         for s in &self.plan.shared_i8 {
             if let Some((gu, dn)) = s.plane_bytes() {
-                out.push((s.gate_up_dst - base, gu));
-                out.push((s.down_dst - base, dn));
+                if let (Some(gu_at), Some(dn_at)) = (
+                    s.gate_up_dst
+                        .checked_sub(base)
+                        .filter(|o| o + gu <= self.plan.region_bytes),
+                    s.down_dst
+                        .checked_sub(base)
+                        .filter(|o| o + dn <= self.plan.region_bytes),
+                ) {
+                    out.push((gu_at, gu));
+                    out.push((dn_at, dn));
+                }
             }
         }
         out.sort();
@@ -310,6 +338,7 @@ mod tests {
         ShadowBorrowPlan {
             region_ptr: BASE,
             region_bytes: dn_dst + dn - BASE,
+            extra_regions: Vec::new(),
             f16: vec![F16ShadowSpan {
                 name: "w0".into(),
                 src_ptr: 0x9000,

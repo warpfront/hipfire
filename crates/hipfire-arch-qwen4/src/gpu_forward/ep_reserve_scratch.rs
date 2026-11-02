@@ -343,6 +343,8 @@ pub(crate) struct EpExchangeCapacity {
 pub(crate) struct EpReserveBanks {
     prompt_rows: usize,
     resident_rows: usize,
+    /// Calls of at most this many rows run on the resident bank.
+    resident_call_limit: usize,
     /// Plan of the borrowed bank, in [`ScratchField`] order.
     prompt_slots: Vec<ScratchSlot>,
     /// Plan of the resident bank, in [`ScratchField`] order.
@@ -500,6 +502,7 @@ impl EpReserveBanks {
                 let banks = Self {
                     prompt_rows,
                     resident_rows,
+                    resident_call_limit: resident_rows,
                     prompt_slots,
                     resident_slots,
                     owned: allocation.owned,
@@ -675,6 +678,19 @@ impl EpReserveBanks {
         self.resident_rows
     }
 
+    /// Largest call the resident bank serves (`resident_rows` unless lowered
+    /// by [`Self::set_resident_call_limit`]); larger calls borrow.
+    pub(crate) fn resident_call_limit(&self) -> usize {
+        self.resident_call_limit
+    }
+
+    /// Lower the resident bank's call limit (never above its rows): a load
+    /// whose weight shadows live in the donor segments must borrow every call
+    /// that routes to the shadow-reading arms (512 rows and up).
+    pub(crate) fn set_resident_call_limit(&mut self, rows: usize) {
+        self.resident_call_limit = rows.clamp(1, self.resident_rows);
+    }
+
     pub(crate) fn active(&self) -> EpBankKind {
         self.active
     }
@@ -749,7 +765,7 @@ impl EpReserveBanks {
     /// `scratch`: the parked borrowed bank for more than the resident rows while
     /// the resident bank is active. `None`: use the forward's own `scratch`.
     pub(crate) fn bank_for_rows(&self, rows: usize) -> Option<&Qwen4GpuForwardScratch> {
-        if rows > self.resident_rows && self.active == EpBankKind::Resident {
+        if rows > self.resident_call_limit && self.active == EpBankKind::Resident {
             self.borrowed.as_ref()
         } else {
             None
@@ -797,7 +813,7 @@ impl EpReserveBanks {
                 self.prompt_rows
             )));
         }
-        let wanted = if rows <= self.resident_rows {
+        let wanted = if rows <= self.resident_call_limit {
             EpBankKind::Resident
         } else {
             if route == EpBankRoute::FullTable {

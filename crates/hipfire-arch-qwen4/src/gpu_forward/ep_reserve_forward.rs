@@ -718,6 +718,10 @@ pub(crate) struct EpReserveForward {
     pub(super) receipts: bool,
     /// `HIPFIRE_EP_RESERVE_RECEIPT_HASH` (receipts only): read the donor hashes.
     pub(super) hashes: bool,
+    /// The weight shadows live in the donor segments (rebuilt at every epoch
+    /// open, never ready outside one) and the resident bank serves only calls
+    /// below the shadow-reading routes' 512 rows.
+    pub(super) shadows: bool,
     pub(super) prompt: Option<EpPromptRecord>,
     pub(super) prompt_seq: u64,
     /// Per-rank entry counts within one `(prompt, phase)` (receipts only).
@@ -763,6 +767,125 @@ impl EpReserveForward {
         })
     }
 
+    /// Register the weight shadows of the plan's `shadow_placements` as
+    /// non-owning views into the donor segments and lower the resident bank's
+    /// call limit below the F16 route's row threshold, so no call that reads a
+    /// shadow can run outside a borrowed epoch.
+    fn install_shadows(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        use rdna_compute::shadow_borrow::{F16ShadowSpan, ShadowBorrowPlan, SharedI8ShadowSpan};
+        let plan = self.plan.clone();
+        let (f16, shared_i8) = crate::decode_share_shadows::shadow_flags(
+            &gpu.arch,
+            gpu.qwen4_f16_shadow_capable(),
+            gpu.qwen4_shared_i8_enabled(),
+            plan.forward.prompt_rows,
+        )
+        .map_err(|reason| invalid(format!("EP reserve shadows: {reason}")))?;
+        let region = crate::decode_share_shadows::plan_shadow_region(
+            &bundle.weights.manifest.weights,
+            bundle.config.num_hidden_layers,
+            f16,
+            shared_i8,
+        )
+        .map_err(invalid)?;
+        let spans = region.spans();
+        if spans.len() != plan.shadow_placements.len()
+            || spans
+                .iter()
+                .zip(&plan.shadow_placements)
+                .any(|(span, placement)| span.2 != placement.bytes)
+        {
+            return Err(invalid(
+                "EP reserve shadows: the plan's shadow members are not the manifest's shadow region",
+            ));
+        }
+        let base_of = |layer: usize, slot: EpDonorSlot| -> Result<usize, Qwen4GpuForwardError> {
+            self.loan
+                .mirror(layer, slot)
+                .map(|mirror| mirror.donor_device_base)
+                .ok_or_else(|| invalid(format!("EP reserve shadows: no donor {layer} {slot:?}")))
+        };
+        let at = |member: usize| -> Result<usize, Qwen4GpuForwardError> {
+            let placement = &plan.shadow_placements[member];
+            usize::try_from(placement.offset)
+                .ok()
+                .and_then(|offset| {
+                    base_of(placement.layer, placement.slot)
+                        .ok()?
+                        .checked_add(offset)
+                })
+                .ok_or_else(|| invalid("EP reserve shadow address overflows"))
+        };
+        let resident = |name: &str, layer: Option<usize>| {
+            bundle
+                .weights
+                .resident_by_name(name, layer)
+                .map_err(|error| invalid(format!("EP reserve shadow source '{name}': {error}")))
+        };
+        let mut f16_spans = Vec::with_capacity(region.f16.len());
+        for (index, member) in region.f16.iter().enumerate() {
+            let tensor = resident(&member.name, member.layer)?;
+            f16_spans.push(F16ShadowSpan {
+                name: member.name.clone(),
+                src_ptr: tensor.buf.as_ptr() as usize,
+                dst_ptr: at(index)?,
+                rows: member.rows,
+                cols: member.cols,
+            });
+        }
+        let mut i8_spans = Vec::with_capacity(region.shared_i8.len());
+        for (j, member) in region.shared_i8.iter().enumerate() {
+            let ptr = |proj: &str| -> Result<usize, Qwen4GpuForwardError> {
+                let name = format!(
+                    "model.language_model.layers.{}.mlp.shared_expert.{proj}.weight",
+                    member.layer
+                );
+                Ok(resident(&name, Some(member.layer))?.buf.as_ptr() as usize)
+            };
+            i8_spans.push(SharedI8ShadowSpan {
+                layer: member.layer,
+                gate_ptr: ptr("gate_proj")?,
+                up_ptr: ptr("up_proj")?,
+                down_ptr: ptr("down_proj")?,
+                intermediate: member.intermediate,
+                hidden: member.hidden,
+                down_rows: member.down_rows,
+                gate_up_dst: at(region.f16.len() + 2 * j)?,
+                down_dst: at(region.f16.len() + 2 * j + 1)?,
+            });
+        }
+        let mut extra_regions = Vec::with_capacity(plan.segments.len());
+        for segment in &plan.segments {
+            extra_regions.push((
+                base_of(segment.layer, segment.slot)?,
+                usize::try_from(segment.capacity)
+                    .map_err(|_| invalid("EP reserve segment bytes overflow"))?,
+            ));
+        }
+        gpu.install_shadow_borrow(ShadowBorrowPlan {
+            region_ptr: 0,
+            region_bytes: 0,
+            extra_regions,
+            f16: f16_spans,
+            shared_i8: i8_spans,
+        })?;
+        self.banks
+            .set_resident_call_limit(rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS - 1);
+        self.shadows = true;
+        eprintln!(
+            "  qwen4 EP reserve: {} F16 + {} INT8 weight shadows live in the donor segments \
+             (rebuilt per borrow epoch); the resident bank serves calls of at most {} rows",
+            region.f16.len(),
+            region.shared_i8.len(),
+            self.banks.resident_call_limit()
+        );
+        Ok(())
+    }
+
     /// Mirror every scratch-donor tensor, bind the touched extents and the S2
     /// host sources. On failure the banks are released (nothing else exists
     /// yet) and the original error returned.
@@ -774,22 +897,33 @@ impl EpReserveForward {
     ) -> Result<Self, Qwen4GpuForwardError> {
         let built = Self::materialize_inner(gpu, bundle, &plan, &banks);
         match built {
-            Ok((source_generation, loan, host_sources, exchange_root, receipts)) => Ok(Self {
-                plan,
-                source_generation,
-                banks,
-                loan,
-                host_sources,
-                exchange_root,
-                epoch: EpEpoch::default(),
-                poisoned: None,
-                receipts,
-                hashes: receipts
-                    && hipfire_config::developer_bool(EP_RESERVE_RECEIPT_HASH_ENV, true),
-                prompt: None,
-                prompt_seq: 0,
-                ordinals: EpReceiptOrdinals::default(),
-            }),
+            Ok((source_generation, loan, host_sources, exchange_root, receipts)) => {
+                let mut forward = Self {
+                    plan,
+                    source_generation,
+                    banks,
+                    loan,
+                    host_sources,
+                    exchange_root,
+                    epoch: EpEpoch::default(),
+                    poisoned: None,
+                    receipts,
+                    hashes: receipts
+                        && hipfire_config::developer_bool(EP_RESERVE_RECEIPT_HASH_ENV, true),
+                    shadows: false,
+                    prompt: None,
+                    prompt_seq: 0,
+                    ordinals: EpReceiptOrdinals::default(),
+                };
+                if !forward.plan.shadow_placements.is_empty() {
+                    if let Err(error) = forward.install_shadows(gpu, bundle) {
+                        release_unused_loan(gpu, forward.loan);
+                        let _ = forward.banks.release(gpu);
+                        return Err(error);
+                    }
+                }
+                Ok(forward)
+            }
             Err(error) => {
                 let _ = banks.release(gpu);
                 Err(error)
@@ -880,6 +1014,9 @@ impl EpReserveForward {
     /// leaks the loan (never frees it under a possibly pending copy).
     pub(crate) fn teardown(mut self, gpu: &mut Gpu) -> EpReserveTeardown {
         let torn = self.loan.teardown(gpu);
+        if self.shadows {
+            gpu.clear_shadow_borrow();
+        }
         eprintln!(
             "  qwen4 EP reserve: {} borrowed epochs; {} bank swaps in, {} out; loan {}",
             self.epoch.epochs(),
@@ -1165,6 +1302,7 @@ impl Qwen4GpuForward {
         match outcome {
             Ok((bytes, restore_ms, barrier_wait_ms, s2_dma_tail_ms)) => {
                 reserve.epoch.restored();
+                gpu.shadow_borrow_set_ready(false);
                 if let Some(prompt) = reserve.prompt.as_mut() {
                     prompt.restores.push(EpRestoreEvent {
                         before_chunk: prompt.chunk_rows.len(),
@@ -1206,6 +1344,9 @@ impl Qwen4GpuForward {
         reserve.loan.acquire_all(gpu).map_err(invalid)?;
         if barrier {
             reserve.epoch.acquired();
+            if reserve.shadows {
+                gpu.rebuild_borrowed_shadows()?;
+            }
         }
         Ok(())
     }
@@ -1234,7 +1375,10 @@ impl Qwen4GpuForward {
         let (resident_rows, prompt_rows) = {
             let reserve = self.ep_reserve.as_ref().expect("an EP reserve forward");
             reserve.check()?;
-            (reserve.banks.resident_rows(), reserve.banks.prompt_rows())
+            (
+                reserve.banks.resident_call_limit(),
+                reserve.banks.prompt_rows(),
+            )
         };
         let route = if n > resident_rows {
             // The same decision `forward_chunk_scoped` takes, under the same scopes.
@@ -1517,6 +1661,7 @@ impl Qwen4GpuForward {
                 // and the load is poisoned either way.
                 let recovered = reserve.loan.finish_prompt(gpu, false).map_err(invalid);
                 reserve.epoch.restored();
+                gpu.shadow_borrow_set_ready(false);
                 reserve.poison("a prompt ended with an error while a borrowed epoch was open");
                 recovered
             }

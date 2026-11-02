@@ -2104,6 +2104,11 @@ pub struct AutoReserve {
     /// `Some(bytes)` when an EP reserve-decoupled load charged its dedicated
     /// forward (`bytes` includes the fixed table charges); `None` otherwise.
     pub ep_reserve_forward: Option<u64>,
+    /// Bytes of F16 + INT8 weight shadows an EP reserve-decoupled load hosts in
+    /// the donor segments instead of resident VRAM (their census terms are not
+    /// charged, [`placement_inputs_with_ep_reserve_shadows_in_donors`]); 0 when
+    /// they stay resident.
+    pub ep_reserve_shadows: u64,
 }
 
 impl AutoReserve {
@@ -2116,6 +2121,7 @@ impl AutoReserve {
             decode_share_borrowed: None,
             decode_share_shadows: 0,
             ep_reserve_forward: None,
+            ep_reserve_shadows: 0,
         })
     }
 
@@ -2141,12 +2147,27 @@ impl AutoReserve {
         self
     }
 
+    /// Record `bytes` of weight shadows hosted in the EP reserve's donor
+    /// segments (the census `f16_shadows` / `shared_i8_shadows` terms are 0).
+    pub fn with_ep_reserve_shadows(mut self, bytes: u64) -> Self {
+        self.ep_reserve_shadows = bytes;
+        self
+    }
+
     /// The census with its `forward` term annotated when decode-share charged
     /// the dedicated forward.
     fn census_text(&self) -> String {
         if let Some(charged) = self.ep_reserve_forward {
+            let shadows = if self.ep_reserve_shadows == 0 {
+                String::new()
+            } else {
+                format!(
+                    "; {} MiB weight shadows hosted in the donor segments",
+                    self.ep_reserve_shadows >> 20
+                )
+            };
             return self.census.describe_with(Some(&format!(
-                "EP reserve-decoupled dedicated forward; {} MiB charged",
+                "EP reserve-decoupled dedicated forward; {} MiB charged{shadows}",
                 charged >> 20
             )));
         }
@@ -3945,6 +3966,12 @@ enum ForwardCharge {
     EpReserve {
         charged: u64,
     },
+    /// [`Self::EpReserve`] whose F16 + shared-INT8 weight shadows live in the
+    /// reserve's donor segments ([`crate::ep_reserve::EpReservePlan::shadow_placements`]):
+    /// the census `f16_shadows` and `shared_i8_shadows` terms are not charged.
+    EpReserveShadowsInDonors {
+        charged: u64,
+    },
 }
 
 impl ForwardCharge {
@@ -3952,7 +3979,9 @@ impl ForwardCharge {
         match self {
             Self::Ordinary => None,
             Self::DecodeShare(share) => Some(share.dedicated),
-            Self::EpReserve { charged } => Some(charged),
+            Self::EpReserve { charged } | Self::EpReserveShadowsInDonors { charged } => {
+                Some(charged)
+            }
         }
     }
 
@@ -3961,8 +3990,25 @@ impl ForwardCharge {
     fn shadows_borrowed(self) -> u64 {
         match self {
             Self::DecodeShare(share) => share.shadows_borrowed,
-            Self::Ordinary | Self::EpReserve { .. } => 0,
+            Self::Ordinary | Self::EpReserve { .. } | Self::EpReserveShadowsInDonors { .. } => 0,
         }
+    }
+
+    /// The weight shadows are hosted in an EP reserve's donor segments, so the
+    /// census does not charge them as dedicated VRAM.
+    fn shadows_in_donors(self) -> bool {
+        matches!(self, Self::EpReserveShadowsInDonors { .. })
+    }
+}
+/// The census `(f16_shadows, shared_i8_shadows)` terms `charge` charges out of the manifest's
+/// `(f16, shared_i8)` shadow bytes, and the bytes an EP reserve hosts in its donor segments
+/// (the part not charged; 0 for every other charge).
+fn charged_shadow_terms(charge: ForwardCharge, f16: u64, shared_i8: u64) -> (u64, u64, u64) {
+    let (f16, shared_i8) = census_shadow_terms(f16, shared_i8, charge.shadows_borrowed());
+    if charge.shadows_in_donors() {
+        (0, 0, f16.saturating_add(shared_i8))
+    } else {
+        (f16, shared_i8, 0)
     }
 }
 
@@ -3987,16 +4033,36 @@ pub fn placement_inputs_with_ep_reserve(
     args: &PlacementInputsArgs<'_>,
     plan: &crate::ep_reserve::EpReserveForwardPlan,
 ) -> Result<PlacementInputs, String> {
+    let charged = ep_reserve_charged(args, plan)?;
+    placement_inputs_charged(args, ForwardCharge::EpReserve { charged })
+}
+
+/// [`placement_inputs_with_ep_reserve`] for a plan that hosts the weight
+/// shadows in its donor segments
+/// ([`crate::ep_reserve::plan_ep_reserve_with_donors_and_shadows`]): the census
+/// `f16_shadows` and `shared_i8_shadows` terms (and nothing else) are 0, since
+/// the shadows occupy donor bytes the reserve already covers. A plan with no
+/// `shadow_placements` MUST use [`placement_inputs_with_ep_reserve`].
+pub fn placement_inputs_with_ep_reserve_shadows_in_donors(
+    args: &PlacementInputsArgs<'_>,
+    plan: &crate::ep_reserve::EpReserveForwardPlan,
+) -> Result<PlacementInputs, String> {
+    let charged = ep_reserve_charged(args, plan)?;
+    placement_inputs_charged(args, ForwardCharge::EpReserveShadowsInDonors { charged })
+}
+
+fn ep_reserve_charged(
+    args: &PlacementInputsArgs<'_>,
+    plan: &crate::ep_reserve::EpReserveForwardPlan,
+) -> Result<u64, String> {
     if args.chunk_rows != plan.prompt_rows || args.scratch_mode != plan.mode {
         return Err(format!(
             "qwen4: EP reserve plan is for {} rows in {:?} mode, not {} rows in {:?} mode",
             plan.prompt_rows, plan.mode, args.chunk_rows, args.scratch_mode
         ));
     }
-    let charged = plan
-        .charged_forward_bytes()
-        .map_err(|error| format!("qwen4: {error}"))?;
-    placement_inputs_charged(args, ForwardCharge::EpReserve { charged })
+    plan.charged_forward_bytes()
+        .map_err(|error| format!("qwen4: {error}"))
 }
 
 fn placement_inputs_charged(
@@ -4134,12 +4200,12 @@ fn placement_inputs_charged(
     )
     .map_err(|error| format!("qwen4: {error}"))?;
     // A decode-share load that keeps the shadows in the donor tail
-    // ([`DecodeShareForward::shadows_borrowed`]) never holds them resident:
-    // they are rebuilt into the donor tail per borrow epoch, so neither term
+    // ([`DecodeShareForward::shadows_borrowed`]) or an EP reserve that hosts them in its
+    // donor segments ([`ForwardCharge::EpReserveShadowsInDonors`]) never holds them
+    // resident: they are rebuilt into the donor bytes per borrow epoch, so neither term
     // is charged (the hot budget grows by that much).
-    let shadows_borrowed = charge.shadows_borrowed();
-    let (f16_shadows, shared_i8_shadows) =
-        census_shadow_terms(f16_shadows, shared_i8_shadows, shadows_borrowed);
+    let (f16_shadows, shared_i8_shadows, hosted_shadows) =
+        charged_shadow_terms(charge, f16_shadows, shared_i8_shadows);
     // The kernels' pool workspaces at the largest requested chunk, exactly
     // (every short-tail remainder included). The dense GDN scan's scratch is
     // charged wherever `fn_gdn_dense::applies` can hold at load: exact gfx1201,
@@ -4206,6 +4272,9 @@ fn placement_inputs_charged(
             .with_decode_share(share.borrowed)
             .with_decode_share_shadows(share.shadows_borrowed),
         ForwardCharge::EpReserve { charged } => reserve.with_ep_reserve(charged),
+        ForwardCharge::EpReserveShadowsInDonors { charged } => reserve
+            .with_ep_reserve(charged)
+            .with_ep_reserve_shadows(hosted_shadows),
     };
     Ok(PlacementInputs {
         non_expert,
@@ -5403,6 +5472,107 @@ mod tests {
             shadow / MIB,
             tail.class_donors
         );
+    }
+
+    /// An EP reserve that hosts the weight shadows in its donor segments drops exactly the
+    /// census `f16_shadows` and `shared_i8_shadows` terms (the reserve falls by their sum, no
+    /// other term moves); without hosted shadows the charge is the ordinary EP reserve's.
+    #[test]
+    fn ep_reserve_shadows_in_donors_drop_exactly_the_two_shadow_terms() {
+        const MIB: u64 = 1 << 20;
+        let config = crate::config::compact_test_config();
+        let manifest = j1778_bf16_manifest();
+        let f16 = f16_shadow_bytes(&manifest, config.num_hidden_layers).unwrap();
+        let i8 = shared_i8_shadow_bytes(&manifest, config.num_hidden_layers).unwrap();
+        assert_eq!(f16, 1_298_923_520);
+        assert!(i8 > 0);
+        let charged = 123 * MIB;
+        let ordinary = ForwardCharge::EpReserve { charged };
+        let donors = ForwardCharge::EpReserveShadowsInDonors { charged };
+        // The forward term is the same dedicated charge; only the shadow terms differ.
+        assert_eq!(ordinary.forward_override(), donors.forward_override());
+        assert_eq!(charged_shadow_terms(ordinary, f16, i8), (f16, i8, 0));
+        assert_eq!(
+            charged_shadow_terms(ForwardCharge::Ordinary, f16, i8),
+            (f16, i8, 0)
+        );
+        assert_eq!(charged_shadow_terms(donors, f16, i8), (0, 0, f16 + i8));
+        // Nothing hosted (no shadow applies on this arch/config): the ordinary EP charge.
+        assert_eq!(charged_shadow_terms(donors, 0, 0), (0, 0, 0));
+        assert_eq!(
+            charged_shadow_terms(donors, 0, 0),
+            charged_shadow_terms(ordinary, 0, 0)
+        );
+        // Decode-share borrowing is a separate charge and keeps its own accounting.
+        let share = ForwardCharge::DecodeShare(DecodeShareForward {
+            dedicated: 1 << 30,
+            borrowed: 1 << 30,
+            shadows_borrowed: f16 + i8,
+        });
+        assert_eq!(charged_shadow_terms(share, f16, i8), (0, 0, 0));
+
+        let mut census = census_at(&config, 16384, 4096, Full, 700 << 20);
+        census.f16_shadows = f16;
+        census.shared_i8_shadows = i8;
+        let (zf, zi, hosted) = charged_shadow_terms(donors, f16, i8);
+        let hosted_census = ReserveCensus {
+            f16_shadows: zf,
+            shared_i8_shadows: zi,
+            ..census
+        };
+        for historical in [None, Some(1u64)] {
+            let before = AutoReserve::new(historical, census)
+                .unwrap()
+                .with_ep_reserve(charged);
+            let after = AutoReserve::new(historical, hosted_census)
+                .unwrap()
+                .with_ep_reserve(charged)
+                .with_ep_reserve_shadows(hosted);
+            assert_eq!(before.bytes() - after.bytes(), f16 + i8, "{historical:?}");
+            assert_eq!(before.census_total - after.census_total, f16 + i8);
+            // Every other census term is untouched.
+            assert_eq!(
+                after.census,
+                ReserveCensus {
+                    f16_shadows: 0,
+                    shared_i8_shadows: 0,
+                    ..before.census
+                }
+            );
+            let text = after.describe();
+            assert!(
+                text.contains(&format!(
+                    "{} MiB weight shadows hosted in the donor segments",
+                    (f16 + i8) >> 20
+                )),
+                "{text}"
+            );
+            assert!(text.contains("F16 weight shadows 0 MiB"), "{text}");
+            assert!(!before.describe().contains("hosted in the donor segments"));
+            // Nothing hosted: byte-identical to the ordinary EP reserve.
+            let (nf, ni, none) = charged_shadow_terms(donors, 0, 0);
+            let bare = ReserveCensus {
+                f16_shadows: nf,
+                shared_i8_shadows: ni,
+                ..census
+            };
+            assert_eq!(
+                AutoReserve::new(
+                    historical,
+                    ReserveCensus {
+                        f16_shadows: 0,
+                        shared_i8_shadows: 0,
+                        ..census
+                    }
+                )
+                .unwrap()
+                .with_ep_reserve(charged),
+                AutoReserve::new(historical, bare)
+                    .unwrap()
+                    .with_ep_reserve(charged)
+                    .with_ep_reserve_shadows(none)
+            );
+        }
     }
 
     /// Placement of the reproduction card with the real census: the layers

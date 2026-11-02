@@ -2438,6 +2438,11 @@ fn qwen4_placement_inputs(
         Qwen4PlacementForward::EpReserve(plan) => {
             hipfire_arch_qwen4::expert_residency::placement_inputs_with_ep_reserve(&args, plan)?
         }
+        Qwen4PlacementForward::EpReserveShadowsInDonors(plan) => {
+            hipfire_arch_qwen4::expert_residency::placement_inputs_with_ep_reserve_shadows_in_donors(
+                &args, plan,
+            )?
+        }
     };
     Ok((
         inputs.non_expert,
@@ -3125,30 +3130,43 @@ pub fn qwen4_ep_vram_layers(
     // The same census every reader of the frozen plan shares: the 4096-row
     // placement inputs with the dedicated forward charged in BOTH the
     // historical floor and the bottom-up census.
+    let decoupled_reserve_at = |forward: &hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan,
+                                shadows_in_donors: bool|
+     -> Result<u64, String> {
+        let (_, _, reserve, ..) = qwen4_placement_inputs(
+            gpu,
+            &config,
+            &manifest.weights,
+            &bytes_of,
+            shared.backend,
+            false,
+            shared.max_seq,
+            shared.vmm_granularity,
+            shared.spec,
+            shared.max_k,
+            shared.native_mtp,
+            !config.ffn.is_dense(),
+            state_format,
+            scratch_mode,
+            ranks,
+            chunk_rows,
+            qwen4_ep_reserve_forward_charge(forward, shadows_in_donors),
+        )?;
+        qwen4_shared_charges(layer_experts, false, false, 0)
+            .and_then(|charges| charges.reserve(reserve.bytes()))
+            .map_err(|error| format!("qwen4: {error}"))
+    };
     let decoupled_reserve =
         |forward: &hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan| -> Result<u64, String> {
-            let (_, _, reserve, ..) = qwen4_placement_inputs(
-                gpu,
-                &config,
-                &manifest.weights,
-                &bytes_of,
-                shared.backend,
-                false,
-                shared.max_seq,
-                shared.vmm_granularity,
-                shared.spec,
-                shared.max_k,
-                shared.native_mtp,
-                !config.ffn.is_dense(),
-                state_format,
-                scratch_mode,
-                ranks,
-                chunk_rows,
-                Qwen4PlacementForward::EpReserve(forward),
-            )?;
-            qwen4_shared_charges(layer_experts, false, false, 0)
-                .and_then(|charges| charges.reserve(reserve.bytes()))
-                .map_err(|error| format!("qwen4: {error}"))
+            decoupled_reserve_at(forward, false)
+        };
+    // The same census with the weight shadows hosted in the donor segments
+    // (`HIPFIRE_EP_UNIT_RESERVE=1`, `qwen4_ep_units_donor_plan`): no F16 / INT8
+    // shadow terms. Every rank of such a plan recomputes exactly this value
+    // (`qwen4_ep_rank_placement_forward`).
+    let decoupled_reserve_no_shadows =
+        |forward: &hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan| -> Result<u64, String> {
+            decoupled_reserve_at(forward, true)
         };
     // Every rank's host-mapped experts at a resident count, from the agreed
     // placement applied to a scratch copy of the manifest (nothing is mutated).
@@ -3172,6 +3190,7 @@ pub fn qwen4_ep_vram_layers(
         admission,
         fixed_table_bytes,
         decoupled_reserve: &decoupled_reserve,
+        decoupled_reserve_no_shadows: &decoupled_reserve_no_shadows,
         host: Qwen4EpReserveHost {
             mem_available: rdna_compute::kv_slots::mem_available_bytes(),
             ttm_pool: hipfire_arch_qwen4::expert_residency::ttm_pool_estimate_on(gpu),
@@ -3255,20 +3274,33 @@ pub fn qwen4_ep_vram_layers(
                         .reservation
                         .as_ref()
                         .map_or(0, |reservation| reservation.lane_bytes);
-                    match qwen4_ep_units_donor_plan(&Qwen4EpUnitsDonorInputs {
-                        path,
-                        base: &base,
-                        dims,
-                        config: &config,
-                        ranks,
-                        free_per_rank,
-                        non_expert,
-                        stacks: &stacks,
-                        stage_on,
-                        suffix,
-                        lane_bytes,
-                        host: &attempt.host,
-                    }) {
+                    let planned = qwen4_ep_shadow_member_bytes(
+                        &gpu.arch,
+                        gpu.qwen4_f16_shadow_capable(),
+                        gpu.qwen4_shared_i8_enabled(),
+                        suffix.forward.prompt_rows,
+                        &manifest.weights,
+                        config.num_hidden_layers,
+                    )
+                    .and_then(|shadow_bytes| {
+                        qwen4_ep_units_donor_plan(&Qwen4EpUnitsDonorInputs {
+                            path,
+                            base: &base,
+                            dims,
+                            config: &config,
+                            ranks,
+                            free_per_rank,
+                            non_expert,
+                            stacks: &stacks,
+                            stage_on,
+                            suffix,
+                            lane_bytes,
+                            host: &attempt.host,
+                            shadow_bytes: &shadow_bytes,
+                            reserve_no_shadows: attempt.decoupled_reserve_no_shadows,
+                        })
+                    });
+                    match planned {
                         Ok(done) => Some(done),
                         Err(why) if !attempt.forced => {
                             eprintln!(
@@ -3493,6 +3525,15 @@ struct Qwen4EpUnitsDonorInputs<'a> {
     suffix: &'a hipfire_arch_qwen4::ep_reserve::EpReservePlan,
     lane_bytes: u64,
     host: &'a Qwen4EpReserveHost<'a>,
+    /// The weight-shadow members (`decode_share_shadows::plan_shadow_region(..).spans()` order,
+    /// bytes each) the donor segments host beside the scratch roots
+    /// ([`qwen4_ep_shadow_member_bytes`]). Empty: no shadow applies on this arch/config and the
+    /// plan is exactly the shadow-less one.
+    shadow_bytes: &'a [u64],
+    /// [`Qwen4EpReserveAttempt::decoupled_reserve_no_shadows`]: the reserve a plan hosting
+    /// `shadow_bytes` is sized from (read only when `shadow_bytes` is non-empty).
+    reserve_no_shadows:
+        &'a dyn Fn(&hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan) -> Result<u64, String>,
 }
 
 /// The per-expert plan under the DECOUPLED reserve (`HIPFIRE_EP_UNIT_RESERVE=1`): every rank's
@@ -3521,9 +3562,15 @@ fn qwen4_ep_units_donor_plan(
             "the unit stage is off on this arch: it serves the donor layers' borrowed view".into(),
         );
     }
-    let reserve_total = input
-        .suffix
-        .reserve_bytes
+    // With shadows hosted in the donors the reserve is the census WITHOUT the F16 and shared-INT8
+    // shadow terms (every rank recomputes exactly this: `qwen4_ep_rank_placement_forward`); the
+    // suffix plan's reserve charged them as dedicated VRAM.
+    let reserve_bytes = if input.shadow_bytes.is_empty() {
+        input.suffix.reserve_bytes
+    } else {
+        (input.reserve_no_shadows)(&input.suffix.forward)?
+    };
+    let reserve_total = reserve_bytes
         .checked_add(input.lane_bytes)
         .ok_or("the decoupled reserve plus the lane store overflows")?;
     let geometry = ep::EpRankGeometry::flash_next(input.config, input.ranks)
@@ -3549,17 +3596,18 @@ fn qwen4_ep_units_donor_plan(
     let probe_capacity = ep::EpReserveCapacity {
         free_per_rank: input.free_per_rank.to_vec(),
         non_expert_bytes: input.non_expert,
-        reserve_bytes: input.suffix.reserve_bytes,
+        reserve_bytes,
         lane_bytes: input.lane_bytes,
         host_budget_bytes: u64::MAX,
         min_resident_layers: 0,
     };
-    let probe = ep::plan_ep_reserve_with_donors(
+    let probe = ep::plan_ep_reserve_with_donors_and_shadows(
         &input.suffix.forward,
         &geometry,
         &probe_capacity,
         input.suffix.resident_layers,
         &candidates,
+        input.shadow_bytes,
     )
     .map_err(|refusal| format!("qwen4: {refusal}"))?;
     let forced: Vec<usize> = candidates[..probe.donor_layers.len()].to_vec();
@@ -3580,14 +3628,22 @@ fn qwen4_ep_units_donor_plan(
         host_budget_bytes: allowance.saturating_sub(host_experts),
         ..probe_capacity
     };
-    let plan = ep::plan_ep_reserve_with_donors(
+    let plan = ep::plan_ep_reserve_with_donors_and_shadows(
         &input.suffix.forward,
         &geometry,
         &capacity,
         input.suffix.resident_layers,
         &forced,
+        input.shadow_bytes,
     )
     .map_err(|refusal| format!("qwen4: {refusal}"))?;
+    if plan.shadow_placements.len() != input.shadow_bytes.len() {
+        return Err(format!(
+            "the reserve plan hosts {} of the {} weight shadows",
+            plan.shadow_placements.len(),
+            input.shadow_bytes.len()
+        ));
+    }
     let mirrors = qwen4_ep_reserve_mirror_host_bytes(&plan).saturating_mul(input.ranks as u64);
     let total = host_experts.saturating_add(mirrors);
     let aggregate = |error: String| {
@@ -3604,6 +3660,54 @@ fn qwen4_ep_units_donor_plan(
     residency::check_gtt_cap(total, input.host.gtt).map_err(&aggregate)?;
     (input.host.emu_check)(total)?;
     Ok((staged, plan))
+}
+
+/// The weight-shadow member sizes (bytes, in the order
+/// `decode_share_shadows::plan_shadow_region(..).spans()` lists them, the order
+/// `EpReserveForward::install_shadows` checks against `plan.shadow_placements`) a decoupled EP
+/// reserve of `prompt_rows` hosts in its donor segments. The families follow
+/// `shadow_flags` exactly as `install_shadows` does; empty when none applies on this
+/// arch/config (including a `shadow_flags` refusal), so the plan stays the shadow-less one.
+fn qwen4_ep_shadow_member_bytes(
+    arch: &str,
+    f16_capable: bool,
+    shared_i8_enabled: bool,
+    prompt_rows: usize,
+    weights: &[hipfire_runtime::weight_manifest::WeightEntry],
+    num_layers: usize,
+) -> Result<Vec<u64>, String> {
+    use hipfire_arch_qwen4::decode_share_shadows as shadows;
+    let Ok((f16, shared_i8)) =
+        shadows::shadow_flags(arch, f16_capable, shared_i8_enabled, prompt_rows)
+    else {
+        return Ok(Vec::new());
+    };
+    let region = shadows::plan_shadow_region(weights, num_layers, f16, shared_i8)
+        .map_err(|error| format!("qwen4: EP reserve shadows: {error}"))?;
+    Ok(region.spans().into_iter().map(|span| span.2).collect())
+}
+
+/// The placement forward charge of a decoupled-reserve forward `forward`: the plan-time
+/// reserve closures and every rank's census share this one mapping.
+fn qwen4_ep_reserve_forward_charge(
+    forward: &hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan,
+    shadows_in_donors: bool,
+) -> Qwen4PlacementForward<'_> {
+    if shadows_in_donors {
+        Qwen4PlacementForward::EpReserveShadowsInDonors(forward)
+    } else {
+        Qwen4PlacementForward::EpReserve(forward)
+    }
+}
+
+/// The placement forward a rank loaded under the frozen `plan` charges: the shadow-free census
+/// exactly when the plan hosts the weight shadows in its donor segments
+/// (`plan.shadow_placements` non-empty), so every rank recomputes the reserve the plan was
+/// sized from ([`qwen4_ep_reserve_rank_terms`] compares it with `plan.reserve_bytes`).
+fn qwen4_ep_rank_placement_forward(
+    plan: &hipfire_arch_qwen4::ep_reserve::EpReservePlan,
+) -> Qwen4PlacementForward<'_> {
+    qwen4_ep_reserve_forward_charge(&plan.forward, !plan.shadow_placements.is_empty())
 }
 
 /// The aggregate host-memory allowance (all ranks together): RAM plus the TTM pool less the
@@ -3791,6 +3895,10 @@ enum Qwen4PlacementForward<'a> {
     /// An admitted EP reserve-decoupled load's dedicated forward
     /// ([`hipfire_arch_qwen4::expert_residency::placement_inputs_with_ep_reserve`]).
     EpReserve(&'a hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan),
+    /// [`Self::EpReserve`] for a plan whose weight shadows live in its donor segments
+    /// ([`hipfire_arch_qwen4::expert_residency::placement_inputs_with_ep_reserve_shadows_in_donors`]):
+    /// the census carries neither shadow term.
+    EpReserveShadowsInDonors(&'a hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan),
 }
 
 /// Explicit prompt-chunk override knob (`gpu_forward` keeps its constant
@@ -3923,6 +4031,10 @@ struct Qwen4EpReserveAttempt<'a> {
     /// The rank-census reserve (`PlacementCharges` applied) with the plan's
     /// dedicated forward charged: the value every rank recomputes.
     decoupled_reserve:
+        &'a dyn Fn(&hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan) -> Result<u64, String>,
+    /// [`Self::decoupled_reserve`] without the F16 / shared-INT8 shadow census terms: the
+    /// reserve of a plan that hosts the shadows in its donor segments.
+    decoupled_reserve_no_shadows:
         &'a dyn Fn(&hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan) -> Result<u64, String>,
     host: Qwen4EpReserveHost<'a>,
 }
@@ -6084,7 +6196,7 @@ fn load_qwen4_rank_unscoped(
                 placement_chunk,
                 expert_vram_layers,
             )?;
-            Qwen4PlacementForward::EpReserve(&plan.forward)
+            qwen4_ep_rank_placement_forward(plan)
         }
         None => Qwen4PlacementForward::Ordinary,
     };
@@ -15934,6 +16046,9 @@ mod qwen4_ep_reserve_loader_tests {
     const NON_EXPERT: u64 = 6 * GIB;
     const BASE_RESERVE: u64 = 3 * GIB;
     const TABLES: u64 = 400 << 10;
+    /// The census `f16_shadows` (1,298,923,520 B) + `shared_i8_shadows` (250,675,200 B) terms of
+    /// the real Flash-Next manifest.
+    const SHADOW_TERMS: u64 = 1_298_923_520 + 250_675_200;
 
     fn config() -> Qwen4Config {
         let layers: Vec<_> = (0..48)
@@ -16120,6 +16235,9 @@ mod qwen4_ep_reserve_loader_tests {
         let decoupled = |forward: &ep::EpReserveForwardPlan| -> Result<u64, String> {
             Ok(BASE_RESERVE + forward.charged_forward_bytes().unwrap())
         };
+        let decoupled_no_shadows = |forward: &ep::EpReserveForwardPlan| -> Result<u64, String> {
+            Ok(BASE_RESERVE + forward.charged_forward_bytes().unwrap() - SHADOW_TERMS)
+        };
         let hosts = |layers: usize| -> Result<u64, String> { Ok((49 - layers) as u64 * layer * 2) };
         let emu = |_: u64| -> Result<(), String> {
             if mock.emu_fails {
@@ -16133,6 +16251,7 @@ mod qwen4_ep_reserve_loader_tests {
             admission,
             fixed_table_bytes: tables,
             decoupled_reserve: &decoupled,
+            decoupled_reserve_no_shadows: &decoupled_no_shadows,
             host: Qwen4EpReserveHost {
                 mem_available: mock.mem_available,
                 ttm_pool: 0,
@@ -16453,6 +16572,7 @@ mod qwen4_ep_reserve_loader_tests {
             admission,
             fixed_table_bytes: TABLES,
             decoupled_reserve: &unreachable,
+            decoupled_reserve_no_shadows: &unreachable,
             host: Qwen4EpReserveHost {
                 mem_available: Some(512 * GIB),
                 ttm_pool: 0,
@@ -16743,6 +16863,130 @@ mod qwen4_ep_reserve_loader_tests {
             200 + per_rank
         );
         assert_eq!(plan.mirror_bytes_total, plan.mirror_bytes_per_rank * 2);
+    }
+
+    /// The ranks recompute exactly the reserve a shadow-hosting plan was sized from: the
+    /// shadow-free census iff `shadow_placements` is non-empty, the ordinary decoupled
+    /// census otherwise; a rank charging the shadows as dedicated VRAM would exceed the plan.
+    #[test]
+    fn a_shadow_hosting_plan_is_sized_from_the_shadow_free_reserve_every_rank_recomputes() {
+        let config = config();
+        let forward = forward(&config, TABLES);
+        let geometry = ep::EpRankGeometry::flash_next(&config, 2).unwrap();
+        let with_shadows = reserve_of(&config, TABLES);
+        let without = with_shadows - SHADOW_TERMS;
+        let free = free_for(&config, 33, without);
+        let capacity = ep::EpReserveCapacity {
+            free_per_rank: vec![free, free],
+            non_expert_bytes: NON_EXPERT,
+            reserve_bytes: without,
+            lane_bytes: 0,
+            host_budget_bytes: u64::MAX,
+            min_resident_layers: 0,
+        };
+        let candidates: Vec<usize> = (30..46).collect();
+        let bare = ep::plan_ep_reserve_with_donors(&forward, &geometry, &capacity, 33, &candidates)
+            .unwrap();
+        // 291 F16 members + 96 shared-INT8 planes, about the real manifest's 1.55 GiB.
+        let shadows: Vec<u64> = std::iter::repeat(4_463_680u64)
+            .take(291)
+            .chain(std::iter::repeat(2_611_200u64).take(96))
+            .collect();
+        let plan = ep::plan_ep_reserve_with_donors_and_shadows(
+            &forward,
+            &geometry,
+            &capacity,
+            33,
+            &candidates,
+            &shadows,
+        )
+        .unwrap();
+        assert_eq!(plan.shadow_placements.len(), shadows.len());
+        assert!(plan.donor_layers.len() > bare.donor_layers.len());
+        assert_eq!(plan.reserve_bytes, without);
+        // Donors grew, so the aggregate pinned mirrors (read by the load-time host checks
+        // through `plan`) grow with them.
+        assert!(
+            qwen4_ep_reserve_mirror_host_bytes(&plan) > qwen4_ep_reserve_mirror_host_bytes(&bare)
+        );
+        assert_eq!(
+            qwen4_ep_reserve_mirror_host_bytes(&plan),
+            plan.mirror_bytes_per_rank
+                + plan.donor_layers.len() as u64 * 2 * residency::HOST_MAPPED_PAD_BYTES
+        );
+        assert!(matches!(
+            qwen4_ep_rank_placement_forward(&plan),
+            Qwen4PlacementForward::EpReserveShadowsInDonors(_)
+        ));
+        assert!(matches!(
+            qwen4_ep_rank_placement_forward(&bare),
+            Qwen4PlacementForward::EpReserve(_)
+        ));
+        qwen4_ep_reserve_rank_terms(&plan, 33, without).unwrap();
+        assert!(qwen4_ep_reserve_rank_terms(&plan, 33, with_shadows).is_err());
+        // Shadows that cannot pack into the candidates refuse the plan (the donor plan then
+        // falls back to the ordinary-reserve units).
+        assert!(ep::plan_ep_reserve_with_donors_and_shadows(
+            &forward,
+            &geometry,
+            &capacity,
+            33,
+            &candidates[..bare.donor_layers.len()],
+            &shadows,
+        )
+        .is_err());
+    }
+
+    fn shadow_owner(
+        name: &str,
+        rows: usize,
+        cols: usize,
+    ) -> hipfire_runtime::weight_manifest::WeightEntry {
+        hipfire_runtime::weight_manifest::WeightEntry::model(
+            name,
+            vec![rows, cols],
+            rdna_compute::DType::BF16,
+            hipfire_runtime::weight_manifest::ShardPolicy::Replicate,
+        )
+    }
+
+    /// The member list is the shadow region's span order (what `install_shadows` checks),
+    /// empty when no family applies.
+    #[test]
+    fn shadow_member_bytes_follow_the_region_spans_and_are_empty_when_none_applies() {
+        use hipfire_arch_qwen4::decode_share_shadows::{plan_shadow_region, shadow_flags};
+        let weights = vec![
+            shadow_owner(
+                "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight",
+                320,
+                10240,
+            ),
+            shadow_owner("model.language_model.layers.0.mlp.gate.weight", 512, 2560),
+            shadow_owner("model.language_model.layers.1.mlp.gate.weight", 512, 2560),
+        ];
+        let members =
+            qwen4_ep_shadow_member_bytes("gfx1201", true, false, 4096, &weights, 48).unwrap();
+        assert_eq!(
+            members,
+            vec![2 * 320 * 10240, 2 * 512 * 2560, 2 * 512 * 2560]
+        );
+        let (f16, shared_i8) = shadow_flags("gfx1201", true, false, 4096).unwrap();
+        let region = plan_shadow_region(&weights, 48, f16, shared_i8).unwrap();
+        assert_eq!(
+            members,
+            region.spans().iter().map(|span| span.2).collect::<Vec<_>>()
+        );
+        // Neither family applies: the plan stays the shadow-less one.
+        assert!(
+            qwen4_ep_shadow_member_bytes("gfx1201", false, false, 4096, &weights, 48)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            qwen4_ep_shadow_member_bytes("gfx1201", true, true, 4096, &[], 48)
+                .unwrap()
+                .is_empty()
+        );
     }
 }
 

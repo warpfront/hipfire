@@ -10896,6 +10896,7 @@ impl Qwen4GpuForward {
         gpu.install_shadow_borrow(ShadowBorrowPlan {
             region_ptr: base,
             region_bytes: ranges.shadow_bytes,
+            extra_regions: Vec::new(),
             f16: f16_spans,
             shared_i8: i8_spans,
         })?;
