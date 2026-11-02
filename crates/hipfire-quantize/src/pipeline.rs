@@ -1968,17 +1968,15 @@ pub(crate) fn run() {
     // linear_attn.{in_proj_qkv,in_proj_z,in_proj_a,in_proj_b,out_proj}
     // (linear-attention layers via SSM-naming). Norms / biases / 1D scalars /
     // conv1d / lookup tables have no imatrix entry.
+    // The table itself is loaded once config.json is parsed (below): the
+    // `--awq-fix-la-head-order` V-head permutation needs the model's
+    // linear_num_{key,value}_heads / linear_value_head_dim.
     let imatrix_path = args.imatrix.clone();
     if let Some(path) = &imatrix_path {
         if !path.exists() {
             eprintln!("error: --imatrix path not found: {}", path.display());
             std::process::exit(1);
         }
-        let table = load_imatrix(path, args.awq_fix_la_head_order);
-        IMATRIX
-            .set(table)
-            .expect("IMATRIX set twice — should not happen");
-        eprintln!("imatrix loaded from {}", path.display());
     }
 
     // ── Phase A Stage A: AWQ (Activation-aware Weight Quantization) ──
@@ -2208,7 +2206,7 @@ pub(crate) fn run() {
         );
     }
     if awq_enabled {
-        if IMATRIX.get().is_none() {
+        if imatrix_path.is_none() {
             eprintln!(
                 "error: --awq requires --imatrix (we derive RMS_act per channel from imatrix in_sum2 values)"
             );
@@ -2481,6 +2479,27 @@ pub(crate) fn run() {
         eprintln!("Architecture: {arch_str} (id={arch_id})");
     }
     let is_moe = arch_id == 6;
+
+    // Load the imatrix now that the checkpoint's config is available: the
+    // grouped-V-head (GatedDeltaNet) out_proj re-index is geometry-driven, so
+    // the loader needs linear_num_{key,value}_heads / linear_value_head_dim.
+    if let Some(path) = &imatrix_path {
+        match load_imatrix(path, la_head_geometry(&config), args.awq_fix_la_head_order) {
+            Ok(loaded) => {
+                for warning in &loaded.warnings {
+                    eprintln!("{warning}");
+                }
+                IMATRIX
+                    .set(loaded.table)
+                    .expect("IMATRIX set twice — should not happen");
+                eprintln!("imatrix loaded from {}", path.display());
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     // DeepSeek V4 (arch_id=9 post-2026-05-26 upstream merge that promoted
     // Qwen2-dense to 7 and dots.ocr to 8) is also MoE but ships per-expert
     // separate 2D tensors (`layers.L.ffn.experts.E.{w1,w2,w3}.weight`)
