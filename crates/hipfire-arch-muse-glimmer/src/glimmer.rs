@@ -1268,6 +1268,10 @@ fn load_wt(
         19 => DType::MQ4G256,
         qt => return Err(format!("glimmer: unsupported quant_type {qt} for {name}")),
     };
+    if dtype == DType::HFQ4G128 {
+        hipfire_runtime::weight_backend::validate_hfq4g128_extent(data.len(), m, k, name)
+            .map_err(|e| format!("glimmer: {e:?}"))?;
+    }
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("glimmer: upload {name}: {e:?}"))?;
@@ -1469,7 +1473,14 @@ impl GlimmerWeights {
                 embd_format = EmbeddingFormat::HFQ4G256;
             }
             7 => {
-                let t = match gpu.upload_raw(embed_data, &[embed_data.len()]) {
+                let t = match hipfire_runtime::weight_backend::validate_hfq4g128_extent(
+                    embed_data.len(),
+                    cfg.vocab_size,
+                    dim,
+                    embed_name,
+                )
+                .and_then(|()| gpu.upload_raw(embed_data, &[embed_data.len()]))
+                {
                     Ok(v) => v,
                     Err(e) => {
                         guard.cleanup(gpu);
