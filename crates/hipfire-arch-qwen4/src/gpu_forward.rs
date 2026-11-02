@@ -7449,7 +7449,7 @@ pub(crate) fn seal_moe_rows<'a>(
         ));
     }
     if row_gather.is_some() {
-        ep_lane_moe_rows(rows, rows)?;
+        ep_lane_moe_rows(rows, rows, ep_gather_rows(false))?;
     }
     let shared = MoeSharedWeights {
         selector: runtime.shared_scalar.dispatch_ref(),
