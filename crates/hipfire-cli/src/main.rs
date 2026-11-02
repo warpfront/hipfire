@@ -1934,6 +1934,27 @@ fn pull_with_sidecar_pins(
     hotset_pins: &[ExpertHotsetPin],
     grandfather_pins: &[GrandfatheredMonolithic],
 ) -> Result<Option<PathBuf>> {
+    pull_with_all_pins(
+        paths,
+        args,
+        overlay_pins,
+        hotset_pins,
+        hipfire_registry::EP_EXPERT_HOTSET_PINS,
+        grandfather_pins,
+    )
+}
+
+/// [`pull_with_sidecar_pins`] with the EP2 expert-ranking pin table injectable too: on an
+/// already-installed base the pull fetches (SHA-verified) only the sidecars that are missing or
+/// stale and never downloads the base again.
+fn pull_with_all_pins(
+    paths: &Paths,
+    args: PullArgs,
+    overlay_pins: &[TrunkOverlayPin],
+    hotset_pins: &[ExpertHotsetPin],
+    ep_hotset_pins: &[ExpertHotsetPin],
+    grandfather_pins: &[GrandfatheredMonolithic],
+) -> Result<Option<PathBuf>> {
     // A retired tag is refused before any credential check or network work,
     // with or without --force: the registry no longer publishes it.
     if let Some(pin) = hipfire_registry::retired_model_named(&args.model, &retired_table()) {
@@ -2144,7 +2165,7 @@ fn pull_with_sidecar_pins(
         }
         if let Some(ep) = hipfire_registry::ep_expert_hotset_in(
             identity,
-            hipfire_registry::EP_EXPERT_HOTSET_PINS,
+            ep_hotset_pins,
             hipfire_config::memory::EP_EXPERT_HOTSET_DEFAULT_ON,
         ) {
             fetch_registry_sidecar(
@@ -24357,6 +24378,87 @@ effort = "high"
         handle.join().unwrap();
         DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3));
         assert_eq!(fs::read(&hotset).unwrap(), HOTSET_BYTES);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    const EP_HOTSET_BYTES: &[u8] = br#"{"kind":"hipfire.qwen4.expert_hotset","version":1,"ep":2}"#;
+    const EP_HOTSET_FILE: &str = "overlay-model.mq4.ep.expert-hotset";
+
+    fn ep_hotset_pins() -> Vec<ExpertHotsetPin> {
+        vec![ExpertHotsetPin {
+            base_sha256: ple_sha(OVERLAY_BASE).leak(),
+            base_size: OVERLAY_BASE.len() as u64,
+            repo: "test/repo",
+            file: EP_HOTSET_FILE,
+            sha256: ple_sha(EP_HOTSET_BYTES).leak(),
+            size_bytes: EP_HOTSET_BYTES.len() as u64,
+        }]
+    }
+
+    fn pull_ep_hotset_model(paths: &Paths) {
+        pull_with_all_pins(
+            paths,
+            PullArgs {
+                no_draft: true,
+                ..PullArgs::defaults("overlay-model")
+            },
+            &[],
+            &[],
+            &ep_hotset_pins(),
+            &grandfather_table(),
+        )
+        .unwrap();
+    }
+
+    /// `hipfire pull` on an already-installed model fetches a missing (or stale) EP2 expert-ranking
+    /// sidecar, SHA-verified, without downloading the base again: the second server holds the
+    /// sidecar ONLY, so a base request would 404 and fail the pull.
+    #[test]
+    fn pull_fetches_a_missing_ep_expert_hotset_on_an_installed_base_without_the_base() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ep-hotset-pull");
+        write_test_registry_cache(&paths, &overlay_registry_raw());
+        let ep_hotset = hipfire_config::memory::ep_expert_hotset_sidecar_path(
+            &paths.models.join("overlay-model.mq4"),
+        );
+        // Fresh install: base + sidecar.
+        let mut files = std::collections::HashMap::new();
+        files.insert("overlay-model.mq4".to_owned(), OVERLAY_BASE.to_vec());
+        files.insert(EP_HOTSET_FILE.to_owned(), EP_HOTSET_BYTES.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        pull_ep_hotset_model(&paths);
+        handle.join().unwrap();
+        assert_eq!(fs::read(&ep_hotset).unwrap(), EP_HOTSET_BYTES);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // Nothing missing: no request at all.
+        let (base, handle) = exact_http_server(std::collections::HashMap::new());
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_ep_hotset_model(&paths);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+
+        // The sidecar is removed: the pull fetches it back, and only it.
+        fs::remove_file(&ep_hotset).unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert(EP_HOTSET_FILE.to_owned(), EP_HOTSET_BYTES.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf3 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        pull_ep_hotset_model(&paths);
+        handle.join().unwrap();
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 3));
+        assert_eq!(fs::read(&ep_hotset).unwrap(), EP_HOTSET_BYTES);
+        assert_eq!(
+            ple_sha(&fs::read(&ep_hotset).unwrap()),
+            ep_hotset_pins()[0].sha256
+        );
+        assert_eq!(
+            fs::read(paths.models.join("overlay-model.mq4")).unwrap(),
+            OVERLAY_BASE
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 

@@ -3580,6 +3580,16 @@ fn qwen4_ep_units_flag(
             note(&why, &found.sidecar);
             None
         }
+        units::EpUnitsSource::Missing => {
+            if announce {
+                let file = found.sidecar.file_name().and_then(std::ffi::OsStr::to_str);
+                let model_file = file.and_then(|name| name.strip_suffix(".ep.expert-hotset"));
+                if let Some(hint) = model_file.and_then(units::ep_hotset_missing_hint) {
+                    eprintln!("{hint}");
+                }
+            }
+            None
+        }
         units::EpUnitsSource::Discovered(path) => {
             let ModelSource::Hfq(hfq) = src else {
                 return None;

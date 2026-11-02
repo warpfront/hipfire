@@ -1070,6 +1070,11 @@ pub enum EpUnitsSource {
     /// A shipped sidecar exists but this load cannot use it (carries why); the load
     /// keeps whole-layer placement. Never a load failure.
     Skipped(String),
+    /// The default policy would discover the shipped sidecar on this load (gate on, EP2
+    /// [`EP_UNITS_DISCOVERY_ARCH`], no lever refuses), but `<model>.ep.expert-hotset` is not
+    /// there: the load keeps whole-layer placement and tells the user how to fetch it
+    /// ([`ep_hotset_missing_hint`]).
+    Missing,
 }
 
 /// The pure source decision. Discovery needs the gate, a present sidecar and an
@@ -1081,8 +1086,18 @@ pub fn ep_units_source(policy: &EpUnitsPolicy, found: &EpUnitsDiscovery<'_>) -> 
         EpUnitsPolicy::Off => EpUnitsSource::Off,
         EpUnitsPolicy::Explicit(path) => EpUnitsSource::Explicit(path.clone()),
         EpUnitsPolicy::Default => {
-            if !found.gate || !found.sidecar_exists || found.facts.pp > 1 || found.facts.ep < 2 {
+            if !found.gate || found.facts.pp > 1 || found.facts.ep < 2 {
                 return EpUnitsSource::Off;
+            }
+            if !found.sidecar_exists {
+                return if found.facts.ep == EP_UNITS_DISCOVERY_RANKS
+                    && found.gpu_arch == EP_UNITS_DISCOVERY_ARCH
+                    && ep_units_refusal(&found.facts).is_ok()
+                {
+                    EpUnitsSource::Missing
+                } else {
+                    EpUnitsSource::Off
+                };
             }
             if found.facts.ep != EP_UNITS_DISCOVERY_RANKS {
                 return EpUnitsSource::Skipped(format!(
@@ -1102,6 +1117,25 @@ pub fn ep_units_source(policy: &EpUnitsPolicy, found: &EpUnitsDiscovery<'_>) -> 
             }
         }
     }
+}
+
+/// The registry tag `hipfire pull` takes to fetch the shipped EP hot set of the published
+/// Flash-Next MQ4 XTS base (split base or the canonical monolithic it is a view of).
+pub const EP_HOTSET_PULL_TAG: &str = "qwen3.8:flash-next";
+
+/// The one-line hint of [`EpUnitsSource::Missing`] for a model file named `model_file_name`,
+/// or `None` for every file no shipped sidecar is published for (only the Flash-Next MQ4 XTS
+/// base and its canonical monolithic have one).
+pub fn ep_hotset_missing_hint(model_file_name: &str) -> Option<String> {
+    matches!(
+        model_file_name,
+        "qwen3.8-flash-next-base.mq4-xts" | "qwen3.8-flash-next.mq4-xts"
+    )
+    .then(|| {
+        format!(
+            "EP expert hot set missing: run `hipfire pull {EP_HOTSET_PULL_TAG}` to fetch it (placement falls back to whole-layer)"
+        )
+    })
 }
 
 /// `HIPFIRE_EP_UNIT_RESERVE` for a load that plans per unit, from its raw value: only an exact
@@ -2479,8 +2513,48 @@ mod loader_support_tests {
         absent.sidecar_exists = false;
         assert_eq!(
             ep_units_source(&EpUnitsPolicy::Default, &absent),
+            EpUnitsSource::Missing
+        );
+        // The hint is for the load that would have discovered the file, nothing else: the other
+        // arch, ep != 2, a pipeline, a lever that refuses the units, the gate off, an explicit
+        // off or path stay silent.
+        let silent = |found: &EpUnitsDiscovery<'_>| {
+            assert_eq!(
+                ep_units_source(&EpUnitsPolicy::Default, found),
+                EpUnitsSource::Off
+            )
+        };
+        for (gate, arch, ep, pp) in [
+            (true, "gfx1100", 2, 1),
+            (true, "gfx1201", 4, 1),
+            (true, "gfx1201", 1, 1),
+            (true, "gfx1201", 2, 2),
+            (false, "gfx1201", 2, 1),
+        ] {
+            let mut found = discovery(gate, arch, ep, pp);
+            found.sidecar_exists = false;
+            silent(&found);
+        }
+        let mut lever = absent.clone();
+        lever.facts.chunk_autofit = true;
+        silent(&lever);
+        assert_eq!(
+            ep_units_source(&EpUnitsPolicy::Off, &absent),
             EpUnitsSource::Off
         );
+    }
+
+    #[test]
+    fn the_missing_hotset_hint_names_the_pull_tag_for_the_published_flash_next_base_only() {
+        let hint = ep_hotset_missing_hint("qwen3.8-flash-next-base.mq4-xts").unwrap();
+        assert_eq!(
+            hint,
+            "EP expert hot set missing: run `hipfire pull qwen3.8:flash-next` to fetch it (placement falls back to whole-layer)"
+        );
+        assert!(!hint.contains('\n'));
+        assert!(ep_hotset_missing_hint("qwen3.8-flash-next.mq4-xts").is_some());
+        assert!(ep_hotset_missing_hint("qwen3.8-flash-next-base.mq3-xts").is_none());
+        assert!(ep_hotset_missing_hint("qwen3.8-27b.mq4-xts").is_none());
     }
 
     #[test]
