@@ -6478,6 +6478,14 @@ impl Gpu {
         self.hip.slab_scope_begin();
     }
 
+    /// [`Self::weight_slab_scope_begin`] with the load's own default packing
+    /// mode, used when `HIPFIRE_WEIGHT_SLAB` is unset (an outermost scope only;
+    /// a nested scope keeps the outer one's mode).
+    pub fn weight_slab_scope_begin_with(&self, default: Option<hip_bridge::SlabMode>) {
+        // bind_thread: skip — host-side bookkeeping only.
+        self.hip.slab_scope_begin_with(default);
+    }
+
     /// Close a weight-load scope. The outermost close seals every open slab
     /// and logs what the scope packed.
     pub fn weight_slab_scope_end(&self) {

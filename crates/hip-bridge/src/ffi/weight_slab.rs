@@ -115,12 +115,22 @@ impl SlabMode {
     /// weight_slab` in the config snapshot). An unparsable value is reported
     /// on stderr and treated as the default.
     pub fn from_env() -> SlabMode {
+        SlabMode::from_env_explicit().unwrap_or(DEFAULT_SLAB_MODE)
+    }
+
+    /// [`Self::from_env`] when `HIPFIRE_WEIGHT_SLAB` is set (an unparsable
+    /// value is reported and means [`DEFAULT_SLAB_MODE`]); `None` when unset or
+    /// empty, so a load's own default ([`HipRuntime::slab_scope_begin_with`])
+    /// applies.
+    pub fn from_env_explicit() -> Option<SlabMode> {
         match hipfire_config::developer_var("HIPFIRE_WEIGHT_SLAB") {
-            Ok(value) if !value.trim().is_empty() => SlabMode::parse(&value).unwrap_or_else(|e| {
-                eprintln!("[weight-slab] {e}; using {}", DEFAULT_SLAB_MODE.name());
-                DEFAULT_SLAB_MODE
-            }),
-            _ => DEFAULT_SLAB_MODE,
+            Ok(value) if !value.trim().is_empty() => {
+                Some(SlabMode::parse(&value).unwrap_or_else(|e| {
+                    eprintln!("[weight-slab] {e}; using {}", DEFAULT_SLAB_MODE.name());
+                    DEFAULT_SLAB_MODE
+                }))
+            }
+            _ => None,
         }
     }
 }
@@ -367,9 +377,12 @@ pub(crate) struct WeightSlabs {
 }
 
 struct SlabInner {
-    /// Resolved at the first scope (the daemon installs its config snapshot
-    /// after the runtime is created), or set explicitly.
+    /// Explicit override ([`HipRuntime::set_slab_mode`], or `Off` for the
+    /// recording modes); `None` resolves per outermost scope.
     mode: Option<SlabMode>,
+    /// Mode of the open outermost scope, resolved when it opened (the daemon
+    /// installs its config snapshot after the runtime is created).
+    scope_mode: Option<SlabMode>,
     depth: u32,
     /// Counters when the outermost scope opened.
     scope_start: SlabStats,
@@ -382,6 +395,7 @@ impl Default for WeightSlabs {
         WeightSlabs {
             inner: Mutex::new(SlabInner {
                 mode: None,
+                scope_mode: None,
                 depth: 0,
                 scope_start: SlabStats::default(),
                 book: SlabBook::default(),
@@ -398,8 +412,14 @@ impl WeightSlabs {
 }
 
 impl SlabInner {
-    fn mode(&mut self) -> SlabMode {
-        *self.mode.get_or_insert_with(SlabMode::from_env)
+    /// The mode a scope opened now resolves to: the override, else
+    /// `HIPFIRE_WEIGHT_SLAB`, else the load's `default`, else
+    /// [`DEFAULT_SLAB_MODE`].
+    fn resolve(&self, default: Option<SlabMode>) -> SlabMode {
+        self.mode
+            .or_else(SlabMode::from_env_explicit)
+            .or(default)
+            .unwrap_or(DEFAULT_SLAB_MODE)
     }
 }
 
@@ -413,37 +433,45 @@ fn view(ptr: usize, size: usize) -> DeviceBuffer {
 }
 
 impl HipRuntime {
-    /// Packing mode of this runtime.
+    /// Packing mode of this runtime: the open scope's, else what a scope
+    /// without a load default would resolve to.
     pub fn slab_mode(&self) -> SlabMode {
-        self.slabs.lock().mode()
+        let inner = self.slabs.lock();
+        inner.scope_mode.unwrap_or_else(|| inner.resolve(None))
     }
 
-    /// Override the packing mode (resolved from `HIPFIRE_WEIGHT_SLAB` at the
-    /// first scope). Only affects scopes opened afterwards.
+    /// Override the packing mode (otherwise resolved from `HIPFIRE_WEIGHT_SLAB`
+    /// and the load's default at every outermost scope). Only affects scopes
+    /// opened afterwards.
     pub fn set_slab_mode(&self, mode: SlabMode) {
         self.slabs.lock().mode = Some(mode);
     }
 
     /// Whether uploads inside this scope are currently packed.
     pub fn slab_scope_active(&self) -> bool {
-        let mut inner = self.slabs.lock();
-        inner.depth > 0 && inner.mode() != SlabMode::Off
+        let inner = self.slabs.lock();
+        inner.depth > 0 && inner.scope_mode.unwrap_or(SlabMode::Off) != SlabMode::Off
     }
 
     /// Open (or nest) a weight-load scope. Packing needs the mode on, no
     /// railgun registry recording and no plan tape, otherwise the scope is
-    /// inert.
+    /// inert. Same as [`Self::slab_scope_begin_with`] without a load default.
     pub fn slab_scope_begin(&self) {
+        self.slab_scope_begin_with(None)
+    }
+
+    /// [`Self::slab_scope_begin`] with the load's own default mode: an
+    /// outermost scope packs per the override, else `HIPFIRE_WEIGHT_SLAB`, else
+    /// `default`, else [`DEFAULT_SLAB_MODE`]. A nested scope keeps the outer
+    /// scope's mode (`default` is ignored).
+    pub fn slab_scope_begin_with(&self, default: Option<SlabMode>) {
         let mut inner = self.slabs.lock();
         if inner.depth == 0 && (crate::registry::enabled() || self.plan.active()) {
             // Recording modes pair allocations one to one; stay out of them.
             inner.mode = Some(SlabMode::Off);
         }
         if inner.depth == 0 {
-            // Resolve now: the config snapshot is installed by the first load.
-            let _ = inner.mode();
-        }
-        if inner.depth == 0 {
+            inner.scope_mode = Some(inner.resolve(default));
             inner.scope_start = inner.book.snapshot();
         }
         inner.depth += 1;
@@ -465,7 +493,7 @@ impl HipRuntime {
             let now = inner.book.snapshot();
             let start = inner.scope_start;
             let summary = SlabScopeSummary {
-                mode: inner.mode,
+                mode: inner.scope_mode.take(),
                 tensors: now.views_created - start.views_created,
                 payload_bytes: now.payload_bytes - start.payload_bytes,
                 slabs: now.slabs_created - start.slabs_created,
@@ -485,7 +513,7 @@ impl HipRuntime {
     /// directly. The memory is zero-filled.
     pub fn slab_alloc(&self, size: usize) -> HipResult<Option<DeviceBuffer>> {
         let mut inner = self.slabs.lock();
-        let mode = inner.mode.unwrap_or(SlabMode::Off);
+        let mode = inner.scope_mode.unwrap_or(SlabMode::Off);
         if inner.depth == 0 || size == 0 || size > mode.max_tensor_bytes() {
             return Ok(None);
         }

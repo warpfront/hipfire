@@ -2109,12 +2109,24 @@ pub fn load_raon_weights_band(
     cfg: &RaonConfig,
     band: &RaonBand,
 ) -> Result<RaonWeights, String> {
-    // The band's weight uploads are packed into slabs (`HIPFIRE_WEIGHT_SLAB`);
-    // the scope seals them on success and on error.
-    gpu.weight_slab_scope_begin();
+    // The band's weight uploads are packed into slabs (`HIPFIRE_WEIGHT_SLAB`,
+    // else [`weight_slab_default`]); the scope seals them on success and on error.
+    gpu.weight_slab_scope_begin_with(weight_slab_default(&gpu.arch));
     let loaded = load_raon_weights_band_unscoped(hfq, gpu, cfg, band);
     gpu.weight_slab_scope_end();
     loaded
+}
+
+/// Raon's weight-slab packing when `HIPFIRE_WEIGHT_SLAB` is unset: 16 MiB on
+/// gfx1100, the global default elsewhere. On the 24 GB 7900 XTX the 2 MiB
+/// policy leaves Raon's 2-16 MiB tensors at ROCr's 2 MiB rounding, and the
+/// expanded K/V mirror only gets what is left: 12,208 of 16,416 rows at
+/// `--max-seq 16416`, so every prefill chunk ending past it runs the absorbed
+/// route (39% of the pp16384 pass in the wide kernel). 16 MiB frees about
+/// 3.4 GiB and the mirror covers the reserved context; weight bytes and
+/// outputs are unchanged.
+pub fn weight_slab_default(arch: &str) -> Option<hip_bridge::SlabMode> {
+    (arch == "gfx1100").then_some(hip_bridge::SlabMode::Up16M)
 }
 
 fn load_raon_weights_band_unscoped(

@@ -166,6 +166,12 @@ pub trait Carrier: Send + Sync {
         ))
     }
 
+    /// Weight-slab packing of this carrier's load on a device of `gpu_arch`
+    /// when `HIPFIRE_WEIGHT_SLAB` is unset (`None`: the global default).
+    fn weight_slab_default(&self, _gpu_arch: &str) -> Option<hip_bridge::SlabMode> {
+        None
+    }
+
     /// Read-only, per-carrier request-option refusal before GPU allocation.
     /// The default leaves other architectures' option behavior unchanged.
     fn admit_options(
@@ -4312,9 +4318,10 @@ pub fn load_admitted_with_gemma4_drafter(
         batch_request,
     };
     // Weight uploads of this load are packed into slabs per
-    // `HIPFIRE_WEIGHT_SLAB` (a no-op when off); the scope closes — sealing
-    // every slab — whether or not the carrier succeeds.
-    ctx.gpu.weight_slab_scope_begin();
+    // `HIPFIRE_WEIGHT_SLAB`, else the carrier's default (a no-op when off); the
+    // scope closes — sealing every slab — whether or not the carrier succeeds.
+    let slab_default = carrier.weight_slab_default(&ctx.gpu.arch);
+    ctx.gpu.weight_slab_scope_begin_with(slab_default);
     let carrier_result = carrier.load(source, &mut ctx);
     ctx.gpu.weight_slab_scope_end();
     let mut result = match carrier_result {

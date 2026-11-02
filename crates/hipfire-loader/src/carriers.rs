@@ -11204,6 +11204,9 @@ impl Carrier for RaonCarrier {
     fn name(&self) -> &'static str {
         "raon1_mini"
     }
+    fn weight_slab_default(&self, gpu_arch: &str) -> Option<hip_bridge::SlabMode> {
+        hipfire_arch_raon::weights::weight_slab_default(gpu_arch)
+    }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 19
     }
