@@ -1041,21 +1041,18 @@ fn forward_rows(
         if want_rows {
             let vocab = cfg.vocab_size;
             if weights.lm_head.gpu_dtype == DType::Q8_0 {
-                // FAST PATH (the spec-verify perf lever): a single batched Q8 WMMA
-                // lm_head reads the ~1 GB Q8 weight ONCE for all B rows, instead of
-                // the per-row weight_gemv that re-streamed the whole weight B times
-                // (~90% of the verify, ~4× off roofline). On gfx12 (RDNA4)
-                // `gemm_q8_0_batched_chunked` auto-routes to the WMMA Q8 GEMM (now
-                // correct after the stale-fp16-cache fix); elsewhere it sub-batches
-                // the scalar Q8 GEMM — either way Y[B, vocab] row-major.
+                // FAST PATH (the spec-verify perf lever): one batched Q8 lm_head
+                // reads the ~1 GB Q8 weight ONCE for all B rows, instead of the
+                // per-row weight_gemv that re-streamed the whole weight B times
+                // (~90% of the verify, ~4× off roofline). Y[B, vocab] row-major.
                 //
                 // The argmax skips the softcap: it's a strictly-monotonic
                 // per-element map (tanh-scaled), so argmax(softcap(z)) ==
                 // argmax(z). The host rows of (3) take it.
                 let logits_b = bufs.alloc(b * vocab, "spec_logits_b")?;
-                // Not `_chunked`: verify stays on the scalar kernel rather
-                // than the gfx12 WMMA variant, whose drift accumulates in KV.
-                // `_f32_chunked` is that scalar kernel split at its 64-row
+                // Not `_chunked` (gfx12 WMMA, whose drift accumulates in KV):
+                // `_f32_chunked` keeps decode's arithmetic, a few-row decode
+                // GEMV on gfx1151, else the scalar kernel split at its 64-row
                 // cap, so a block wider than 64 rows cannot assert (#732).
                 let lm_result = gpu.gemm_q8_0_batched_f32_chunked(
                     &weights.lm_head.buf,

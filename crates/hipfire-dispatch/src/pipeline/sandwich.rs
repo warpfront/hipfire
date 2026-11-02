@@ -96,9 +96,11 @@ fn need_projection_scratch(
 }
 
 /// Greedy EAGLE (`HIPFIRE_GEMMA4_EAGLE=1`) turns off the fusions that are not
-/// byte-identical to their unfused form and keeps batched Q8 GEMMs on the
-/// unchunked scalar kernel, so batched verify and single-row decode share one
-/// arithmetic.
+/// byte-identical to their unfused form and sends batched Q8 GEMMs to
+/// `gemm_q8_0_batched_f32_chunked` (decode GEMVs over the rows on gfx1151's
+/// few-row verify, else the scalar kernel), so batched verify and single-row
+/// decode share one arithmetic. The scalar kernel is decode's only for
+/// K > 1536; the Gemma 4 EAGLE targets (12B, 26B-A4B) have no smaller K.
 static EAGLE_STRICT: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
         .ok()
@@ -266,7 +268,7 @@ pub fn gemm_rows(
             .gemm_f32_batched(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
         DType::Q8_0 if strict => gpu
-            .gemm_q8_0_batched(w.buf, x, y, w.m, w.k, rows)
+            .gemm_q8_0_batched_f32_chunked(w.buf, x, y, w.m, w.k, rows)
             .map_err(hip),
         // gfx1151: the 4-warp 64x64 tile reads each weight tile once per 64
         // rows (the 16x16 kernel re-reads it per 16 rows); a sub-64 row tail
