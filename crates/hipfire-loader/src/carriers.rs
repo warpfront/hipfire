@@ -3096,20 +3096,16 @@ pub fn qwen4_ep_vram_layers(
         reserve,
         lane,
     } = ordinary_at(chunk_rows)?;
-    // DESIGN F1: the decoupled reserve's donor/stage banks are sized from the shipped
-    // 1,740,800/870,400 B expert strides; until they are migrated a drop-zero planar load keeps
-    // the ordinary placement (which already charges the planar bytes through the manifest).
+    // DESIGN F1: a drop-zero planar load (`MQ4G256V2P` / `MQ4G128V2P` experts) takes the
+    // decoupled reserve and the unit plan under it like the shipped layout: the donor segments,
+    // loan mirrors and unit stage regions are sized from the planar per-expert strides
+    // ([`hipfire_arch_qwen4::ep_reserve::EpRankGeometry::flash_next_layout`]), the census charges the
+    // planar bytes through the manifest.
     let planar_experts = manifest
         .weights
         .iter()
         .any(|entry| entry.dtype.is_mq4_planar());
-    if planar_experts && request.attempts() {
-        eprintln!(
-            "  qwen4 EP reserve: ordinary placement (drop-zero planar experts; the decoupled \
-             reserve banks are not planar-aware yet)"
-        );
-    }
-    let attempt = if request.attempts() && !planar_experts {
+    let attempt = if request.attempts() {
         let geometry = hipfire_arch_qwen4::ep_reserve::EpRankGeometry::flash_next_layout(
             &config,
             ranks,
@@ -3250,6 +3246,7 @@ pub fn qwen4_ep_vram_layers(
         fixed_table_bytes,
         decoupled_reserve: &decoupled_reserve,
         decoupled_reserve_no_shadows: &decoupled_reserve_no_shadows,
+        planar: planar_experts,
         host: Qwen4EpReserveHost {
             mem_available: rdna_compute::kv_slots::mem_available_bytes(),
             ttm_pool: hipfire_arch_qwen4::expert_residency::ttm_pool_estimate_on(gpu),
@@ -3371,6 +3368,7 @@ pub fn qwen4_ep_vram_layers(
                                 suffix,
                                 lane_bytes,
                                 host: &attempt.host,
+                                planar: attempt.planar,
                                 stage_borrow,
                                 shadow_bytes: &shadow_bytes,
                                 reserve_no_shadows: attempt.decoupled_reserve_no_shadows,
@@ -3740,6 +3738,8 @@ struct Qwen4EpUnitsDonorInputs<'a> {
     suffix: &'a hipfire_arch_qwen4::ep_reserve::EpReservePlan,
     lane_bytes: u64,
     host: &'a Qwen4EpReserveHost<'a>,
+    /// [`Qwen4EpReserveAttempt::planar`].
+    planar: bool,
     /// `HIPFIRE_EP_UNIT_STAGE_BORROW=1`: the unit stage lends two whole-resident layers
     /// ([`hipfire_arch_qwen4::expert_ep_units::EP_UNIT_STAGE_BORROW_LAYERS`]) instead of two
     /// dedicated buffers; the scratch donors never include them.
@@ -3792,7 +3792,7 @@ fn qwen4_ep_units_donor_plan(
     let reserve_total = reserve_bytes
         .checked_add(input.lane_bytes)
         .ok_or("the decoupled reserve plus the lane store overflows")?;
-    let geometry = ep::EpRankGeometry::flash_next(input.config, input.ranks)
+    let geometry = ep::EpRankGeometry::flash_next_layout(input.config, input.ranks, input.planar)
         .ok_or("the rank geometry overflows")?;
     let plan_with = |forced: &[usize], borrow: bool| {
         qwen4_ep_unit_plan(
@@ -4264,6 +4264,9 @@ struct Qwen4EpReserveAttempt<'a> {
     /// reserve of a plan that hosts the shadows in its donor segments.
     decoupled_reserve_no_shadows:
         &'a dyn Fn(&hipfire_arch_qwen4::ep_reserve::EpReserveForwardPlan) -> Result<u64, String>,
+    /// The experts are the drop-zero planar layout (`MQ4G256V2P` / `MQ4G128V2P`, DESIGN F1): the
+    /// reserve geometry takes the planar per-expert strides.
+    planar: bool,
     host: Qwen4EpReserveHost<'a>,
 }
 
@@ -4324,7 +4327,8 @@ fn qwen4_ep_reserve_try(
         Err(refusal) => return Ok(Qwen4EpReserveResolution::Ordinary(refusal.to_string())),
     };
     let ranks = free_per_rank.len();
-    let Some(geometry) = ep::EpRankGeometry::flash_next(config, ranks) else {
+    let Some(geometry) = ep::EpRankGeometry::flash_next_layout(config, ranks, attempt.planar)
+    else {
         return Ok(Qwen4EpReserveResolution::Ordinary(
             "the rank geometry overflows".to_string(),
         ));
@@ -16511,6 +16515,7 @@ mod qwen4_ep_reserve_loader_tests {
             fixed_table_bytes: tables,
             decoupled_reserve: &decoupled,
             decoupled_reserve_no_shadows: &decoupled_no_shadows,
+            planar: false,
             host: Qwen4EpReserveHost {
                 mem_available: mock.mem_available,
                 ttm_pool: 0,
@@ -16832,6 +16837,7 @@ mod qwen4_ep_reserve_loader_tests {
             fixed_table_bytes: TABLES,
             decoupled_reserve: &unreachable,
             decoupled_reserve_no_shadows: &unreachable,
+            planar: false,
             host: Qwen4EpReserveHost {
                 mem_available: Some(512 * GIB),
                 ttm_pool: 0,
