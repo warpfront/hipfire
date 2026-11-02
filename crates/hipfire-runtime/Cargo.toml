@@ -188,7 +188,7 @@ required-features = ["lab"]
 # Raw PM K1 MoE decode-GEMV G1 byte oracle + timing runner (no production dispatch wiring).
 [[example]]
 name = "mq_i4_moe_gemv_byte_oracle"
-required-features = ["lab"]
+required-features = ["lab", "rdna-compute/lab"]
 
 # F1 drop-zero planar vs shipped MQ4 expert launcher byte oracle (real layers, on card).
 [[example]]
