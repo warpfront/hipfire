@@ -285,7 +285,7 @@ pub(super) fn execute(_arch: Arch, name: &str, i: &Inst, s: &mut State) -> Resul
         {
             s.put_mask(src(1)?, carry)?
         }
-        "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => s.vcc = carry,
+        "v_sub_co_ci_u32" | "v_subrev_co_ci_u32" => s.set_vcc_mask(carry),
         "v_mad_u64_u32" if !sdst_null => s.put_mask(src(1)?, carry)?,
         _ => {}
     }

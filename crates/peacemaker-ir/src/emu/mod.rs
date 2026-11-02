@@ -472,6 +472,11 @@ impl State {
         })
     }
     fn read64(&self, op: &Operand, lane: usize) -> Result<u64> {
+        // An explicit 64-bit `vcc` (SGPR pair 106:107 as scalar DATA, e.g. an SMEM base) is VCC_LO and VCC_HI in full,
+        // also in wave32, where VCC_HI is an ordinary 32-bit register above the lane mask.
+        if let Operand::Special(Special::Vcc) = op {
+            return Ok(self.vcc);
+        }
         Ok(u64::from(self.read(op, lane, 0)?) | u64::from(self.read(op, lane, 1)?) << 32)
     }
     /// 64-bit source of a 64-bit vector/scalar operation. `Reg` is a register pair, a wave32 `vcc`/`exec` pair has a
@@ -485,7 +490,8 @@ impl State {
             }
             Operand::Special(Special::SrcSharedBase) => u64::from(SHARED_APERTURE_HI) << 32,
             Operand::Special(Special::SrcPrivateBase) => u64::from(PRIVATE_APERTURE_HI) << 32,
-            Operand::Special(Special::Vcc | Special::VccLo) => self.vcc & self.lane_mask(),
+            Operand::Special(Special::Vcc) => self.vcc,
+            Operand::Special(Special::VccLo) => self.vcc & self.lane_mask(),
             Operand::Special(Special::Exec | Special::ExecLo) => self.exec & self.lane_mask(),
             Operand::Special(Special::Null) => 0,
             Operand::Inline(InlineConst::Integer(n)) => i64::from(*n) as u64,
@@ -511,8 +517,13 @@ impl State {
                 self.exec = value & self.lane_mask();
                 Ok(())
             }
-            Operand::Special(Special::Vcc | Special::VccLo) => {
-                self.vcc = value & self.lane_mask();
+            // Explicit 64-bit `vcc`: both halves are data (see `read64`).
+            Operand::Special(Special::Vcc) => {
+                self.vcc = value;
+                Ok(())
+            }
+            Operand::Special(Special::VccLo) => {
+                self.set_vcc_mask(value);
                 Ok(())
             }
             Operand::Special(Special::Null) => Ok(()),
@@ -564,11 +575,17 @@ impl State {
             _ => return Err(format!("not a lane-mask operand {op}")),
         })
     }
+    /// Write VCC as a lane mask: only the wave's lanes change. In wave32 VCC_HI is an ordinary 32-bit register above
+    /// the lane mask (scalar data, readable as `vcc` / `vcc_hi`), so a mask write must not clear it.
+    fn set_vcc_mask(&mut self, mask: u64) {
+        let lanes = self.lane_mask();
+        self.vcc = (self.vcc & !lanes) | (mask & lanes);
+    }
     fn put_mask(&mut self, op: &Operand, value: u64) -> Result<()> {
         let wide = self.lanes == 64;
         let value = value & self.lane_mask();
         match op {
-            Operand::Special(Special::Vcc | Special::VccLo) => self.vcc = value,
+            Operand::Special(Special::Vcc | Special::VccLo) => self.set_vcc_mask(value),
             Operand::Special(Special::Exec | Special::ExecLo) => self.exec = value,
             Operand::Special(Special::Null) => (),
             Operand::Reg(r) if r.kind != Kind::V => {

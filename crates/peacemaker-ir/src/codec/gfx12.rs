@@ -194,6 +194,16 @@ fn operand(
 ) -> Result<Operand, DecodeError> {
     let form = row.form;
     let width = (bits / 32).max(1) as u8;
+    // A 64-bit scalar-ALU operand at selector 106 is the whole VCC pair (s[106:107]), not VCC_LO: the wave32 lane-mask
+    // slots of VALU compares keep `vcc_lo`, but SALU 64-bit data (`s_add_nc_u64 vcc, s[4:5], vcc`) names both halves.
+    if bits == 64
+        && code == 106
+        && row.name.starts_with("s_")
+        && matches!(name, "SDST" | "SSRC0" | "SSRC1")
+        && matches!(form, Form::Sop1 | Form::Sop2 | Form::Sopc)
+    {
+        return Ok(Operand::Special(Special::Vcc));
+    }
     if name == "SIMM16" {
         if row.name == "s_sendmsg" && code == 3 {
             return Ok(Operand::SendMsg(Msg { id: 3, op: 0 }));
@@ -217,6 +227,10 @@ fn operand(
         )));
     }
     if name == "SBASE" {
+        // The pair selector 53 is s[106:107]: VCC (LO/HI), not an SGPR (the SGPR file ends at s105).
+        if code * 2 == 106 {
+            return Ok(Operand::Special(Special::Vcc));
+        }
         return Ok(reg(Kind::S, code * 2, bits));
     }
     if name == "RSRC" {
@@ -360,6 +374,7 @@ fn encoded_operand(
         ("SBASE", Operand::Reg(r)) if r.kind == Kind::S && r.base % 2 == 0 => {
             Ok(u32::from(r.base / 2))
         }
+        ("SBASE", Operand::Special(Special::Vcc | Special::VccLo)) => Ok(53),
         ("SADDR", Operand::Vmem(VmemToken::Off)) => Ok(124),
         ("VADDR", Operand::Vmem(VmemToken::Off))
             if form == Form::Vmem(crate::inst::VmemForm::Scratch) =>

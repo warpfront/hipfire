@@ -427,7 +427,7 @@ fn add_carry(name: &str, i: &Inst, s: &mut State) -> Result<()> {
         s.put(&o[0], lane, 0, out[lane])?;
     }
     if implicit_vcc {
-        s.vcc = carry;
+        s.set_vcc_mask(carry);
         Ok(())
     } else {
         s.put_mask(&o[1], carry)
@@ -2225,7 +2225,7 @@ fn compare(name: &str, i: &Inst, s: &mut State) -> Result<()> {
     } else if o.len() >= 3 {
         s.put_mask(&o[0], mask)
     } else {
-        s.vcc = mask;
+        s.set_vcc_mask(mask);
         Ok(())
     }
 }

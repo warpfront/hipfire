@@ -13,12 +13,12 @@
 //! RDNA4 ISA pseudocode rules (never from the implementation under test); each test carries the edge lanes a wrong
 //! semantic fails: signed zero, infinity, overflow, denormal, INT64_MIN/MAX, 64-bit high-word-only differences,
 //! shift counts 0/31/63/64+ and execution-mask holes.
-use super::{alu, Result, State};
+use super::{alu, memory, Memory, Result, State};
 use crate::{
     codec::gfx12,
     effects::ImplicitSet,
     inst::Wave,
-    operand::Omod,
+    operand::{Omod, Operand, Special},
     provenance::Provenance,
     reg::{Kind, RegRef},
     Arch, Inst,
@@ -723,4 +723,122 @@ fn new_i64_compare_rows_pin_their_llvm_text() {
             assert!(e.contains("undefined"), "{arch:?} {name}: {e}");
         }
     }
+}
+
+// ---- VCC as 64-bit scalar data: the Raon MQ8 o-projection GEMV address computation ------------------------------
+//
+// `s_add_nc_u64 vcc, s[4:5], vcc` then `s_load_b32 s11, vcc, 0x0` (SGPR pair selector 53 = s[106:107] = VCC_LO/HI).
+
+/// `s_add_nc_u64 vcc, s[4:5], vcc`
+const ADD_NC_VCC: &[u32] = &[0xa9ea_6a04];
+/// `s_load_b32 s11, vcc, 0x0`
+const LOAD_B32_VCC: &[u32] = &[0xf400_02f5, 0xf800_0000];
+/// `s_load_b64 s[2:3], vcc, 0x10`
+const LOAD_B64_VCC_OFF: &[u32] = &[0xf400_20b5, 0xf800_0010];
+/// `s_load_b32 s11, vcc, s4 offset:0x0`
+const LOAD_B32_VCC_S4: &[u32] = &[0xf400_02f5, 0x0800_0000];
+/// `s_mov_b64 vcc, s[2:3]`
+const MOV_B64_VCC: &[u32] = &[0xbeea_0102];
+/// `s_add_nc_u64 vcc, vcc, 8`
+const ADD_NC_VCC_VCC_8: &[u32] = &[0xa9ea_886a];
+
+#[test]
+fn vcc_pair_as_scalar_data_decodes_roundtrips_and_has_exact_effects() {
+    let add = roundtrip(ADD_NC_VCC, "s_add_nc_u64");
+    assert_eq!(add.operands[0], Operand::Special(Special::Vcc));
+    assert_eq!(add.operands[2], Operand::Special(Special::Vcc));
+    assert_eq!(add.effects.defs.as_slice(), &[]);
+    assert_eq!(add.effects.uses.as_slice(), &[reg(Kind::S, 4, 2)]);
+    // vcc is both written (SDST) and read (SSRC1) as the implicit VCC bit.
+    assert_eq!(add.effects.implicit.writes, ImplicitSet::VCC);
+    assert_eq!(add.effects.implicit.reads, ImplicitSet::VCC);
+    for words in [LOAD_B32_VCC, LOAD_B64_VCC_OFF, LOAD_B32_VCC_S4] {
+        let load = roundtrip(
+            words,
+            if words == LOAD_B64_VCC_OFF {
+                "s_load_b64"
+            } else {
+                "s_load_b32"
+            },
+        );
+        assert_eq!(
+            load.operands[1],
+            Operand::Special(Special::Vcc),
+            "{words:08x?}"
+        );
+        assert_eq!(load.effects.implicit.reads, ImplicitSet::VCC);
+        assert_eq!(load.effects.implicit.writes, 0);
+    }
+    let mov = roundtrip(MOV_B64_VCC, "s_mov_b64");
+    assert_eq!(mov.operands[0], Operand::Special(Special::Vcc));
+    assert_eq!(mov.effects.implicit.writes, ImplicitSet::VCC);
+    roundtrip(ADD_NC_VCC_VCC_8, "s_add_nc_u64");
+    // A wave32 lane-mask slot keeps `vcc_lo`: the 64-bit rewrite is scalar-ALU only.
+    let cmp = roundtrip(&[0xd441_0004, 0x0203_b680], "v_cmp_lt_i32_e64");
+    assert!(matches!(cmp.operands[0], Operand::Reg(_)));
+}
+
+/// 64-bit add into VCC in wave32: the carry crosses into VCC_HI (data, not a lane mask), and the load reads the full
+/// pair as its base: it must fetch from `s[4:5] + vcc`, not from a 32-bit-truncated address.
+#[test]
+fn s_add_nc_u64_vcc_then_s_load_uses_the_full_64_bit_pair() {
+    const BASE: u64 = 0x1_ffff_f000;
+    let mut st = state();
+    assert_eq!(st.lanes, 32);
+    st.s[4] = BASE as u32;
+    st.s[5] = (BASE >> 32) as u32;
+    st.vcc = 0x0000_0000_0000_0800;
+    run(ADD_NC_VCC, &mut st).unwrap();
+    // 0x1_ffff_f000 + 0x800 = 0x1_ffff_f800: both halves are data.
+    assert_eq!(st.vcc, 0x1_ffff_f800);
+    // Wrap into the high half: + 0x800 again carries out of the low dword.
+    run(ADD_NC_VCC_VCC_8, &mut st).unwrap();
+    assert_eq!(st.vcc, 0x1_ffff_f808);
+    st.vcc = 0xffff_ffff_ffff_fff8;
+    run(ADD_NC_VCC_VCC_8, &mut st).unwrap();
+    assert_eq!(st.vcc, 0, "wraps mod 2^64");
+    // s_load_b32 s11, vcc, 0x0 from a mapped buffer at 0x1_ffff_f800.
+    let mut mem = Memory::default();
+    let mut bytes = vec![0u8; 0x40];
+    bytes[..4].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+    bytes[4..8].copy_from_slice(&0x9abc_def0u32.to_le_bytes());
+    bytes[0x10..0x14].copy_from_slice(&0x0bad_f00du32.to_le_bytes());
+    mem.map("buf".into(), 0x1_ffff_f800, bytes).unwrap();
+    st.vcc = 0x1_ffff_f800;
+    let exec = |words: &[u32], st: &mut State, mem: &mut Memory| {
+        let (inst, name) = dec(words);
+        assert_eq!(crate::emu::semantic_class(name), Some("memory"), "{name}");
+        memory::execute(name, &inst, st, mem, &mut [])
+    };
+    exec(LOAD_B32_VCC, &mut st, &mut mem).unwrap();
+    assert_eq!(st.s[11], 0x1234_5678);
+    // b64 with the immediate offset 0x10.
+    exec(LOAD_B64_VCC_OFF, &mut st, &mut mem).unwrap();
+    assert_eq!((st.s[2], st.s[3]), (0x0bad_f00d, 0));
+    // SGPR soffset form: vcc + s4.
+    st.s[4] = 4;
+    exec(LOAD_B32_VCC_S4, &mut st, &mut mem).unwrap();
+    assert_eq!(st.s[11], 0x9abc_def0);
+    // A base whose high half is wrong (truncated 32-bit pair) is an unmapped access, never a silent wrong load.
+    st.vcc = 0x0000_0000_ffff_f800;
+    st.s[4] = 0;
+    assert!(exec(LOAD_B32_VCC, &mut st, &mut mem).is_err());
+}
+
+/// `s_mov_b64 vcc, s[2:3]` writes both halves; a VALU compare into `vcc_lo` (wave32) leaves VCC_HI alone.
+#[test]
+fn vcc_hi_is_data_in_wave32() {
+    let mut st = state();
+    st.s[2] = 0xaaaa_5555;
+    st.s[3] = 0xdead_beef;
+    run(MOV_B64_VCC, &mut st).unwrap();
+    assert_eq!(st.vcc, 0xdead_beef_aaaa_5555);
+    // v_cmp_lt_i32_e32 vcc_lo, s15, v11 -> 7c82160f: writes the wave32 mask, VCC_HI keeps its data.
+    st.exec = 0b11;
+    st.s[15] = 5;
+    st.v[11][0] = 9;
+    st.v[11][1] = 1;
+    run(&[0x7c82_160f], &mut st).unwrap();
+    assert_eq!(st.vcc & 0xffff_ffff, 0b01);
+    assert_eq!(st.vcc >> 32, 0xdead_beef, "VCC_HI is not a lane");
 }
