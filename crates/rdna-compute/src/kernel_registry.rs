@@ -6571,8 +6571,8 @@ pub fn railgun_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>
 /// lists are those of the loaded objects (`railgun-cert` receipts of the
 /// probe's `run/objs`); each source is the expression the cited launcher passes
 /// to `ensure_kernel` on the shipped route, so `railgun-jitcorpus` compiles the
-/// runtime's own recipe. Exact gfx1201 only: the Raon railgun program is a
-/// gfx1201 program, and gfx1100 gets its own inventory once it has a transport.
+/// runtime's own recipe. Exact gfx1201 and exact gfx1100 (the 7900 XTX loads the same module
+/// set except `ffn_moe_combine_policy_w2`, a gfx1201-only route).
 pub fn raon_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, RegistryError> {
     let arch: &'static str = SUPPORTED_ARCHES
         .iter()
@@ -6585,7 +6585,7 @@ pub fn raon_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, R
             entries.push(entry(arch, $module, &[$($symbol),+], ($src).into(), extra_flags))
         };
     }
-    if arch == "gfx1201" {
+    if matches!(arch, "gfx1201" | "gfx1100") {
         add!(
             "stream_mix_broadcast",
             crate::stream_mix::STREAM_MIX_BROADCAST_SRC,
@@ -6647,11 +6647,13 @@ pub fn raon_entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, R
             crate::ffn_activation::COMBINE_SRC,
             ["ffn_moe_combine_f32", "ffn_round_bf16_f32"]
         ); // ffn_activation.rs:1188,1259
-        add!(
-            "ffn_moe_combine_policy_w2",
-            crate::ffn_activation::COMBINE_W2_SRC,
-            ["ffn_moe_combine_f32_w2"]
-        ); // ffn_activation.rs:1188 (combine_w2_route: exact gfx1201)
+        if arch == "gfx1201" {
+            add!(
+                "ffn_moe_combine_policy_w2",
+                crate::ffn_activation::COMBINE_W2_SRC,
+                ["ffn_moe_combine_f32_w2"]
+            ); // ffn_activation.rs:1188 (combine_w2_route: exact gfx1201)
+        }
         add!(
             "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched",
             kernels::gemv_mq4g256v2_moe_gate_up_k8_indexed_batched_src(false),
@@ -6734,6 +6736,20 @@ pub fn native_object_entries(arch: &str) -> Result<Vec<NativeObject>, RegistryEr
             symbols: &[
                 "gated_delta_net_vector_serial_f32_pm_gfx1201",
                 "causal_conv_depthwise_silu_rows_f32_pm_gfx1201",
+            ],
+        });
+    }
+    if arch == "gfx1100" {
+        // `gated_delta_vector_pm::GFX1100` (the 7900 XTX twin of the same RDA recurrence and
+        // depthwise causal conv; every shape the incumbent accepts).
+        out.push(NativeObject {
+            arch,
+            module: "gated_delta_vector_pm_gfx1100",
+            image: kernels::GATED_DELTA_VECTOR_PM_GFX1100,
+            image_sha256: kernels::GATED_DELTA_VECTOR_PM_GFX1100_SHA256.trim(),
+            symbols: &[
+                "gated_delta_net_vector_serial_f32_pm_gfx1100",
+                "causal_conv_depthwise_silu_rows_f32_pm_gfx1100",
             ],
         });
     }
@@ -11651,7 +11667,25 @@ mod tests {
                 .source(),
             crate::ffn_activation::SITU_SRC
         );
-        for arch in SUPPORTED_ARCHES.iter().filter(|a| **a != "gfx1201") {
+        // Exact gfx1100 loads the same modules (same sources) except the gfx1201-only
+        // `ffn_moe_combine_policy_w2` route.
+        let xtx = raon_entries("gfx1100", "").unwrap();
+        let xtx_modules: Vec<&str> = xtx.iter().map(|e| e.module).collect();
+        let want: Vec<&str> = modules
+            .iter()
+            .copied()
+            .filter(|m| *m != "ffn_moe_combine_policy_w2")
+            .collect();
+        assert_eq!(xtx_modules, want);
+        for e in &xtx {
+            let r = raon.iter().find(|r| r.module == e.module).unwrap();
+            assert_eq!(e.source(), r.source(), "{}", e.module);
+            assert_eq!(e.symbols, r.symbols, "{}", e.module);
+        }
+        for arch in SUPPORTED_ARCHES
+            .iter()
+            .filter(|a| !matches!(**a, "gfx1201" | "gfx1100"))
+        {
             assert!(raon_entries(arch, "").unwrap().is_empty(), "{arch}");
         }
         assert!(matches!(
@@ -11678,9 +11712,33 @@ mod tests {
         // Not a hipcc module and not an accepted pm_decode twin: no registry source to recompile.
         assert!(lookup("gfx1201", n.module, "").is_err());
         assert!(crate::pm_decode_twins::pm_decode_module("gfx1201", true, n.module).is_none());
-        for arch in SUPPORTED_ARCHES.iter().filter(|a| **a != "gfx1201") {
+        for arch in SUPPORTED_ARCHES
+            .iter()
+            .filter(|a| !matches!(**a, "gfx1201" | "gfx1100"))
+        {
             assert!(native_object_entries(arch).unwrap().is_empty(), "{arch}");
         }
+        // The 7900 XTX loads its own pinned twin of the same RDA / conv kernels.
+        let xtx = native_object_entries("gfx1100").unwrap();
+        assert_eq!(xtx.len(), 1);
+        assert_eq!(xtx[0].module, "gated_delta_vector_pm_gfx1100");
+        assert_eq!(
+            xtx[0].symbols,
+            [
+                "gated_delta_net_vector_serial_f32_pm_gfx1100",
+                "causal_conv_depthwise_silu_rows_f32_pm_gfx1100"
+            ]
+        );
+        assert_eq!(
+            format!("{:x}", Sha256::digest(xtx[0].image)),
+            xtx[0].image_sha256
+        );
+        assert_eq!(xtx[0].image, kernels::GATED_DELTA_VECTOR_PM_GFX1100);
+        assert_eq!(
+            xtx[0].image_sha256,
+            kernels::GATED_DELTA_VECTOR_PM_GFX1100_SHA256.trim()
+        );
+        assert!(lookup("gfx1100", xtx[0].module, "").is_err());
     }
 
     #[test]

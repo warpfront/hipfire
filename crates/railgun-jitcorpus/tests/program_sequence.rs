@@ -221,3 +221,65 @@ fn retain_programs_keeps_the_named_set_and_the_railgun_kernels() {
         .unwrap_err()
         .contains("no such program"));
 }
+
+/// First launch of each distinct node of the real gfx1100 (7900 XTX) Raon decode body.
+const REAL_NODES_GFX1100: &str = include_str!("fixtures/raon-ar-decode-nodes-gfx1100.jsonl");
+
+fn add_gfx1100(jsonl: &str) -> Result<Inventory, String> {
+    let mut inv = inventory()?;
+    inv.add_program_sequence(&raon_ar_program_id("gfx1100", 0), "gfx1100", jsonl)?;
+    Ok(inv)
+}
+
+/// `--program-arch gfx1100` adds `raon-ar-decode-gfx1100` under arch gfx1100 and every module of the
+/// real gfx1100 decode body resolves in the gfx1100 registry (hipcc module or sealed embedded
+/// image), with the arch's own `_pm_gfx1100` RDA twins and no gfx1201 name.
+#[test]
+fn the_gfx1100_raon_decode_sequence_plans_on_its_own_arch() {
+    let inv = add_gfx1100(REAL_NODES_GFX1100).unwrap();
+    let set = &inv.sequence_sets[0];
+    assert_eq!(set.id, "raon-ar-decode-gfx1100");
+    assert_eq!(set.arch, "gfx1100");
+    assert_eq!(set.nodes.len(), 33);
+    assert_eq!(set.loaded_sha256.len(), 33);
+    assert!(set
+        .nodes
+        .iter()
+        .all(|(s, m)| !s.contains("gfx1201") && !m.contains("gfx1201")));
+    assert!(archs(&inv).iter().any(|a| a == "gfx1100"));
+    let plan = plan(&inv, "gfx1100").unwrap_or_else(|e| panic!("{e}"));
+    for (_, module) in &set.nodes {
+        assert!(
+            plan.entries.iter().any(|e| e.module == module)
+                || plan.embedded.iter().any(|n| n.module == module)
+                || plan.twins.iter().any(|t| t.module == module),
+            "module {module} missing from the gfx1100 plan"
+        );
+    }
+    let keys = current_program_keys(&inv).unwrap();
+    let raon = keys
+        .iter()
+        .find(|k| k.id == "raon-ar-decode-gfx1100")
+        .expect("raon gfx1100 program");
+    assert_eq!(raon.arch, "gfx1100");
+    assert_eq!(raon.nodes.len(), 33);
+    assert_eq!(raon.loaded_sha256.as_ref().map(Vec::len), Some(33));
+}
+
+/// The gfx1100 program is selected alone (plus railgun's own kernels) by `--only-program`, and a
+/// gfx1201 sequence cannot be relabelled as gfx1100 by id.
+#[test]
+fn only_program_selects_the_gfx1100_decode_set() {
+    let mut inv = add_gfx1100(REAL_NODES_GFX1100).unwrap();
+    inv.retain_programs(&["raon-ar-decode-gfx1100".to_owned()])
+        .unwrap();
+    assert!(inv.programs.is_empty());
+    let sets = inv.node_sets();
+    assert!(sets
+        .iter()
+        .any(|s| s.id == "raon-ar-decode-gfx1100" && s.arch == "gfx1100"));
+    assert!(sets
+        .iter()
+        .filter(|s| s.id != "raon-ar-decode-gfx1100")
+        .all(|s| s.id.starts_with("railgun-kernels-")));
+}

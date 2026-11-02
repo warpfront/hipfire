@@ -453,6 +453,24 @@ impl Gpu {
         })
     }
 
+    /// The canonical `domain:bus:device.function` PCI address of this `Gpu`'s
+    /// HIP device: the identity an owned gfx1100 window matches to its ROCr
+    /// agent ([`Self::railgun_lowering_context`]). One `hipDeviceGetPCIBusId`
+    /// call and a parse; no HSA runtime is touched, so an owner can check it
+    /// at admission.
+    pub fn railgun_device_pci_address(&self) -> Result<String, String> {
+        self.railgun_device_pci().map(|p| p.to_string())
+    }
+
+    fn railgun_device_pci(&self) -> Result<redline_dispatch::aql::PciBusId, String> {
+        let bdf = self
+            .hip
+            .device_pci_bus_id(self.device_id)
+            .map_err(|e| format!("device {} PCI address: {e}", self.device_id))?;
+        bdf.parse::<redline_dispatch::aql::PciBusId>()
+            .map_err(|e| format!("device {} PCI address {bdf:?}: {e}", self.device_id))
+    }
+
     /// The shared lowering context of this device: one HSA runtime and device,
     /// the host and retained kernarg pools and every loaded code object,
     /// created once by the owner and handed to every
@@ -461,14 +479,7 @@ impl Gpu {
     /// gfx11 part refuses).
     pub fn railgun_lowering_context(&self) -> Result<RailgunLoweringContext, String> {
         let select = if self.arch == "gfx1100" {
-            let bdf = self
-                .hip
-                .device_pci_bus_id(self.device_id)
-                .map_err(|e| format!("device {} PCI address: {e}", self.device_id))?;
-            DeviceSelect::Pci(
-                bdf.parse::<redline_dispatch::aql::PciBusId>()
-                    .map_err(|e| format!("device {} PCI address {bdf:?}: {e}", self.device_id))?,
-            )
+            DeviceSelect::Pci(self.railgun_device_pci()?)
         } else {
             DeviceSelect::Ordinal(
                 usize::try_from(self.device_id)

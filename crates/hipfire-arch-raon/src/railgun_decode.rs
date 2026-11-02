@@ -9,7 +9,7 @@
 //! * `0` is the hard kill: no owner is created (no corpus discovery, no
 //!   allocation), the decode route is the unchanged HIP graph.
 //! * `auto` (default, also unset/empty) creates the owner only when the
-//!   structural admission checks pass (exact gfx1201, whole band, graph route,
+//!   structural admission checks pass (exact gfx1201 or gfx1100, whole band, graph route,
 //!   no `HIPFIRE_GRAPH=0`, no retained replay, no CPU-executed weights) AND a
 //!   receipt corpus is found (`HIPFIRE_RAON_RAILGUN_CORPUS`, else the
 //!   `railgun-corpus` directory beside the installed kernel pack). Otherwise
@@ -21,7 +21,8 @@
 //!
 //! A step through the owner:
 //!
-//! 1. **Admission checks** ([`check_admission`]): exact gfx1201, whole band,
+//! 1. **Admission checks** ([`check_admission`]): exact gfx1201 or exact gfx1100
+//!    ([`ARCH_POLICIES`]; gfx1100 also needs a resolvable PCI identity), whole band,
 //!    graph route, no retained replay, no CPU-executed weights, no census tap,
 //!    no MoE route/activation dump, decompressed MLA route, decode graph
 //!    warmed, corpus configured. Any failure is a [`RaonRailgunRefusal`]
@@ -90,8 +91,86 @@ pub const ENV_ENABLE: &str = "HIPFIRE_RAON_RAILGUN";
 pub const ENV_CORPUS: &str = "HIPFIRE_RAON_RAILGUN_CORPUS";
 /// Receipt trials a G4 row needs to back a cache-table rung.
 const G4_MIN_TRIALS: u64 = 1 << 20;
-/// The only architecture the owner admits.
-const ARCH: &str = "gfx1201";
+
+// ----------------------------------------------------------------- arch policy
+
+/// What differs per admitted architecture; everything else (admission checks,
+/// key, authoring, execution) is shared.
+///
+/// * the cache table is `CacheTable::for_arch(arch)` and the lowering
+///   parameters `rp::ArchLowering::for_arch(arch)` (applied by the device
+///   lowering from the program's arch);
+/// * the receipt corpus directory and the optional G4 silicon-receipt table
+///   file are read from arch-qualified variables first (a corpus or probe
+///   table of another arch can never be reached by accident; the table file
+///   must also carry this arch's identity), then the generic ones;
+/// * `pci_identity`: the HIP device is matched to its ROCr agent by PCI bus
+///   address (gfx1100: the 7900 XTX hosts are multi-GPU and ordinals are not
+///   a device identity), so an unresolvable address refuses at admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArchPolicy {
+    pub arch: &'static str,
+    pub pci_identity: bool,
+    /// Corpus directory variables, first set wins.
+    pub corpus_vars: &'static [&'static str],
+    /// G4 cache-table file variables, first set wins.
+    pub cache_table_vars: &'static [&'static str],
+}
+
+/// The admitted architectures (exact names; every other part, gfx1101 and
+/// gfx1151 included, is refused).
+pub const ARCH_POLICIES: &[ArchPolicy] = &[
+    ArchPolicy {
+        arch: "gfx1201",
+        pci_identity: false,
+        corpus_vars: &["HIPFIRE_RAON_RAILGUN_CORPUS_GFX1201", ENV_CORPUS],
+        cache_table_vars: &[
+            "HIPFIRE_RAILGUN_CACHE_TABLE_GFX1201",
+            "HIPFIRE_RAILGUN_CACHE_TABLE",
+        ],
+    },
+    ArchPolicy {
+        arch: "gfx1100",
+        pci_identity: true,
+        corpus_vars: &["HIPFIRE_RAON_RAILGUN_CORPUS_GFX1100", ENV_CORPUS],
+        cache_table_vars: &[
+            "HIPFIRE_RAILGUN_CACHE_TABLE_GFX1100",
+            "HIPFIRE_RAILGUN_CACHE_TABLE",
+        ],
+    },
+];
+
+/// The policy of exactly `arch`.
+pub fn arch_policy(arch: &str) -> Option<&'static ArchPolicy> {
+    ARCH_POLICIES.iter().find(|p| p.arch == arch)
+}
+
+fn supported_arches() -> String {
+    ARCH_POLICIES
+        .iter()
+        .map(|p| p.arch)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+impl ArchPolicy {
+    /// The first of `vars` the process configuration sets to a non-empty
+    /// value: `(variable, value)`.
+    fn env_value(&self, vars: &[&'static str]) -> Option<(&'static str, String)> {
+        vars.iter().find_map(|v| {
+            hipfire_config::developer_var(v)
+                .ok()
+                .filter(|s| !s.is_empty())
+                .map(|s| (*v, s))
+        })
+    }
+
+    /// The lowering parameters of this arch (`gfx1201`'s post-dispatch pacing
+    /// `NOP`; explicitly unpaced on gfx1100).
+    pub fn lowering(&self) -> rp::ArchLowering {
+        rp::ArchLowering::for_arch(self.arch)
+    }
+}
 
 // ------------------------------------------------------------------ refusal
 
@@ -101,13 +180,13 @@ const ARCH: &str = "gfx1201";
 pub enum RaonRailgunRefusal {
     /// The bundle has no owner (`HIPFIRE_RAON_RAILGUN` is off).
     Disabled,
-    WrongArch {
-        arch: String,
-    },
+    /// The arch is not one of [`ARCH_POLICIES`].
+    WrongArch { arch: String },
+    /// The device's PCI identity cannot be resolved (an arch whose ROCr agent
+    /// is matched by PCI address, not by ordinal).
+    DeviceIdentity { arch: String },
     /// A band other than the whole single-device model (pipeline/tensor split).
-    PartitionedBand {
-        band: String,
-    },
+    PartitionedBand { band: String },
     /// `HIPFIRE_GRAPH=0`.
     GraphDisabled,
     /// The decode route is not the HIP graph (eager / retained replay).
@@ -143,14 +222,9 @@ pub enum RaonRailgunRefusal {
         tier: String,
     },
     /// A node carries per-window declared words the program cannot supply.
-    DeclaredWords {
-        node: usize,
-    },
+    DeclaredWords { node: usize },
     /// A D2D copy or fill the typed transport nodes cannot express.
-    UntypedCopy {
-        node: usize,
-        what: String,
-    },
+    UntypedCopy { node: usize, what: String },
     /// A node that is not PM4 after the witnesses.
     NonPm4 {
         node: usize,
@@ -175,6 +249,7 @@ impl RaonRailgunRefusal {
         match self {
             Self::Disabled => "disabled",
             Self::WrongArch { .. } => "wrong_arch",
+            Self::DeviceIdentity { .. } => "device_identity",
             Self::PartitionedBand { .. } => "partitioned_band",
             Self::GraphDisabled => "graph_disabled",
             Self::NotGraphMode => "not_graph_mode",
@@ -209,7 +284,13 @@ impl fmt::Display for RaonRailgunRefusal {
                 "no railgun owner on this bundle ({ENV_ENABLE}=0, or auto found no admissible \
                  context and receipt corpus)"
             ),
-            Self::WrongArch { arch } => write!(f, "arch {arch} is not {ARCH}"),
+            Self::WrongArch { arch } => {
+                write!(f, "arch {arch} is not one of {}", supported_arches())
+            }
+            Self::DeviceIdentity { arch } => write!(
+                f,
+                "{arch}: the device's PCI address does not resolve (the ROCr agent is matched by it)"
+            ),
             Self::PartitionedBand { band } => {
                 write!(f, "band {band} is not the whole single-device model")
             }
@@ -281,6 +362,9 @@ pub enum RaonRailgunAttempt {
 #[derive(Clone, Debug)]
 pub struct Structural<'a> {
     pub arch: &'a str,
+    /// The device's PCI address resolved, for an arch whose ROCr agent is
+    /// matched by it (always `true` for an arch that needs none).
+    pub device_identity: bool,
     pub whole_band: bool,
     pub band: &'a str,
     pub graph_forward_disabled: bool,
@@ -303,8 +387,13 @@ pub struct StepFacts<'a> {
 /// (cheapest and most structural first); `Ok` when none applies.
 pub fn check_structural(a: &Structural<'_>) -> Result<(), RaonRailgunRefusal> {
     use RaonRailgunRefusal as R;
-    if a.arch != ARCH {
+    if arch_policy(a.arch).is_none() {
         return Err(R::WrongArch {
+            arch: a.arch.to_owned(),
+        });
+    }
+    if !a.device_identity {
+        return Err(R::DeviceIdentity {
             arch: a.arch.to_owned(),
         });
     }
@@ -728,7 +817,7 @@ pub fn author_and_plan(
             Ok(_) => {}
         }
     }
-    let mut program = rk::author(ARCH, records);
+    let mut program = rk::author(&table.arch, records);
     let sealed: BTreeSet<usize> = program.sealed_table_nodes().into_iter().collect();
     for (i, n) in program.nodes.iter().enumerate() {
         let ok = n.lowering.is_pm4() || (sealed.contains(&i) && n.indexed.is_none());
@@ -1147,6 +1236,12 @@ pub struct RaonRailgunStats {
 /// The per-bundle owner. Created by `RaonBundle::new` per the tri-state
 /// `HIPFIRE_RAON_RAILGUN` (see [`decide_owner`]); never exists under `0`.
 pub struct RaonRailgunOwner {
+    /// The device architecture of the bundle (`Gpu::arch`).
+    arch: String,
+    /// The per-arch policy; `None` for an arch the owner does not admit.
+    policy: Option<&'static ArchPolicy>,
+    /// Whether the HIP device's PCI address resolved (arches that need it).
+    pci_ok: Option<bool>,
     corpus_dir: Option<String>,
     corpus: Option<Result<WindowCorpus, String>>,
     ctx: Option<RailgunLoweringContext>,
@@ -1169,9 +1264,11 @@ fn observe_structural<'a>(
     gpu: &'a Gpu,
     band: &'a str,
     retained_replay: bool,
+    device_identity: bool,
 ) -> Structural<'a> {
     Structural {
         arch: &gpu.arch,
+        device_identity,
         whole_band: b.weights.band.is_whole(),
         band,
         graph_forward_disabled: gpu.flags.graph_forward == Some(false),
@@ -1196,16 +1293,29 @@ impl RaonRailgunOwner {
         if mode == RailgunMode::Off {
             return None;
         }
-        let env_corpus = hipfire_config::developer_var(ENV_CORPUS)
-            .ok()
-            .filter(|s| !s.is_empty());
+        let policy = arch_policy(&gpu.arch);
+        let env_corpus = match policy {
+            Some(p) => p.env_value(p.corpus_vars).map(|(_, v)| v),
+            None => hipfire_config::developer_var(ENV_CORPUS)
+                .ok()
+                .filter(|s| !s.is_empty()),
+        };
         let pack_corpus = gpu
             .railgun_pack_corpus_dir()
             .map(|p| p.to_string_lossy().into_owned());
         let band = b.weights.band.label();
         // `graph_mode` already carries a retained-replay load (the route
         // resolution picked eager), so the live replay state is not re-read.
-        let structural = observe_structural(b, gpu, &band, false);
+        // The PCI identity resolves here only for an arch that needs it.
+        let identity = !policy.is_some_and(|p| p.pci_identity)
+            || match gpu.railgun_device_pci_address() {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("[raon-railgun] {} device identity: {e}", gpu.arch);
+                    false
+                }
+            };
+        let structural = observe_structural(b, gpu, &band, false, identity);
         let plan = decide_owner(
             mode,
             &structural,
@@ -1214,7 +1324,7 @@ impl RaonRailgunOwner {
             &|dir| Path::new(dir).join(railgun_corpus::CORPUS_INDEX).is_file(),
         );
         match plan {
-            Ok(plan) => Some(Box::new(Self::new(plan, model_digest(b)))),
+            Ok(plan) => Some(Box::new(Self::new(plan, &gpu.arch, model_digest(b)))),
             Err(NoOwner::NoCorpus(why)) if env_corpus.is_some() => {
                 eprintln!("[raon-railgun] auto: HIP graph route ({why})");
                 None
@@ -1223,8 +1333,11 @@ impl RaonRailgunOwner {
         }
     }
 
-    fn new(plan: OwnerPlan, model_digest: String) -> Self {
+    fn new(plan: OwnerPlan, arch: &str, model_digest: String) -> Self {
         Self {
+            arch: arch.to_owned(),
+            policy: arch_policy(arch),
+            pci_ok: None,
             corpus_dir: plan.corpus_dir,
             corpus: None,
             ctx: None,
@@ -1307,7 +1420,16 @@ impl RaonRailgunOwner {
         }
         let pos = b.state.n_tokens();
         let band = b.weights.band.label();
-        let structural = observe_structural(b, gpu, &band, gpu.replay.is_enabled());
+        let identity = if gpu.arch != self.arch {
+            eprintln!(
+                "[raon-railgun] owner of a {} bundle stepped on a {} device",
+                self.arch, gpu.arch
+            );
+            false
+        } else {
+            self.device_identity_ok(gpu)
+        };
+        let structural = observe_structural(b, gpu, &band, gpu.replay.is_enabled(), identity);
         let step = StepFacts {
             tap_armed: b.spec.census_tap.is_some(),
             dump_armed: hipfire_dispatch::pipeline::moe_capture::enabled(),
@@ -1443,9 +1565,29 @@ impl RaonRailgunOwner {
     }
 
     fn cache_table(&mut self) -> Result<&CacheTable, RaonRailgunRefusal> {
-        let t = self.table.get_or_insert_with(cache_table);
+        let policy = self.policy.ok_or_else(|| RaonRailgunRefusal::WrongArch {
+            arch: self.arch.clone(),
+        })?;
+        let t = self.table.get_or_insert_with(|| cache_table(policy));
         t.as_ref()
             .map_err(|e| RaonRailgunRefusal::CacheTable(e.clone()))
+    }
+
+    /// Whether the HIP device's PCI address resolves, for an arch whose ROCr
+    /// agent is matched by it (always `true` for the others); read once.
+    fn device_identity_ok(&mut self, gpu: &Gpu) -> bool {
+        if !self.policy.is_some_and(|p| p.pci_identity) {
+            return true;
+        }
+        *self
+            .pci_ok
+            .get_or_insert_with(|| match gpu.railgun_device_pci_address() {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!("[raon-railgun] {} device identity: {e}", gpu.arch);
+                    false
+                }
+            })
     }
 
     /// Plan, author, witness, hazard-plan and lower the program for the
@@ -1557,25 +1699,33 @@ fn plan_body(
     Ok((sink.ops, take_declared_words()))
 }
 
-/// The gfx12 cache table with the optional G4 silicon receipts attached,
-/// exactly as the DFlash window builds it.
-fn cache_table() -> Result<CacheTable, String> {
-    let mut table = CacheTable::for_arch(ARCH)
-        .ok_or_else(|| format!("railgun has no cache table for {ARCH}"))?;
-    if let Some(path) = hipfire_config::developer_var("HIPFIRE_RAILGUN_CACHE_TABLE")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        let bytes = std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
-        let probe: G4Table = serde_json::from_slice(&bytes).map_err(|e| format!("{path}: {e}"))?;
-        let source = format!("{path} sha256={}", sha256_hex(&bytes));
-        let attached = table.attach_receipts(&probe, &source, G4_MIN_TRIALS)?;
+/// The arch's cache table with the optional G4 silicon receipts attached,
+/// exactly as the DFlash window builds it. The receipt file must be the
+/// probe table of this arch (`cache-table.<arch>.json`; `attach_receipts`
+/// refuses another arch's identity).
+fn cache_table(policy: &ArchPolicy) -> Result<CacheTable, String> {
+    let arch = policy.arch;
+    let mut table = CacheTable::for_arch(arch)
+        .ok_or_else(|| format!("railgun has no cache table for {arch}"))?;
+    if let Some((var, path)) = policy.env_value(policy.cache_table_vars) {
+        let bytes = std::fs::read(&path).map_err(|e| format!("{var}={path}: {e}"))?;
+        let attached = attach_g4(&mut table, &path, &bytes).map_err(|e| format!("{var}: {e}"))?;
         eprintln!(
-            "[raon-railgun] G4 receipts {attached}/{} rows backed by {source}",
-            table.rows.len()
+            "[raon-railgun] {arch} G4 receipts {attached}/{} rows backed by {path} sha256={}",
+            table.rows.len(),
+            sha256_hex(&bytes)
         );
     }
     Ok(table)
+}
+
+/// Attach the receipts of the G4 probe table `bytes` (read from `path`) to
+/// `table`: the number of rows backed. A probe table of another arch, or one
+/// that saw a table rung stale, is an error.
+fn attach_g4(table: &mut CacheTable, path: &str, bytes: &[u8]) -> Result<usize, String> {
+    let probe: G4Table = serde_json::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
+    let source = format!("{path} sha256={}", sha256_hex(bytes));
+    table.attach_receipts(&probe, &source, G4_MIN_TRIALS)
 }
 
 /// Digest of the bundle's model identity: fixed for its lifetime.

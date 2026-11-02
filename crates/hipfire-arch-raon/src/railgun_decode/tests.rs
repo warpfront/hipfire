@@ -250,8 +250,15 @@ impl DeviceView for FakeDevice {
     }
 }
 
+const GFX1201: &str = "gfx1201";
+const GFX1100: &str = "gfx1100";
+
+fn table_for(arch: &str) -> CacheTable {
+    CacheTable::for_arch(arch).unwrap_or_else(|| panic!("{arch} cache table"))
+}
+
 fn table() -> CacheTable {
-    CacheTable::for_arch(ARCH).expect("gfx1201 cache table")
+    table_for(GFX1201)
 }
 
 // ----------------------------------------------------------------- admission
@@ -261,7 +268,8 @@ type Facts = (Structural<'static>, StepFacts<'static>);
 fn ok_facts() -> Facts {
     (
         Structural {
-            arch: ARCH,
+            arch: GFX1201,
+            device_identity: true,
             whole_band: true,
             band: "whole",
             graph_forward_disabled: false,
@@ -295,9 +303,19 @@ fn every_cheap_admission_check_declines_with_its_exact_reason() {
     let cases: Vec<(&str, Mutate, R)> = vec![
         (
             "arch",
-            |a| a.0.arch = "gfx1100",
+            |a| a.0.arch = "gfx1151",
             R::WrongArch {
-                arch: "gfx1100".into(),
+                arch: "gfx1151".into(),
+            },
+        ),
+        (
+            "identity",
+            |a| {
+                a.0.arch = GFX1100;
+                a.0.device_identity = false;
+            },
+            R::DeviceIdentity {
+                arch: GFX1100.into(),
             },
         ),
         (
@@ -339,15 +357,160 @@ fn every_cheap_admission_check_declines_with_its_exact_reason() {
 #[test]
 fn the_first_failing_admission_check_wins() {
     let mut a = ok_facts();
-    a.0.arch = "gfx1100";
+    a.0.arch = "gfx1101";
+    a.0.device_identity = false;
     a.1.tap_armed = true;
     a.1.warmed = false;
     assert_eq!(
         admit(&a),
         Err(RaonRailgunRefusal::WrongArch {
-            arch: "gfx1100".into()
+            arch: "gfx1101".into()
         })
     );
+    // The identity check precedes every other structural check.
+    a.0.arch = GFX1100;
+    a.0.whole_band = false;
+    assert_eq!(
+        admit(&a),
+        Err(RaonRailgunRefusal::DeviceIdentity {
+            arch: GFX1100.into()
+        })
+    );
+}
+
+#[test]
+fn both_admitted_arches_pass_the_same_checks_in_the_same_order() {
+    for arch in [GFX1201, GFX1100] {
+        let mut a = ok_facts();
+        a.0.arch = arch;
+        assert_eq!(admit(&a), Ok(()), "{arch}");
+        a.1.tap_armed = true;
+        a.1.warmed = false;
+        assert_eq!(admit(&a), Err(RaonRailgunRefusal::TapArmed), "{arch}");
+    }
+}
+
+#[test]
+fn only_the_exact_arches_are_admitted() {
+    for arch in [
+        "gfx1200", "gfx1101", "gfx1102", "gfx1103", "gfx1150", "gfx1151", "gfx1152", "gfx1030",
+        "gfx942", "GFX1100", "gfx1100 ", "gfx11", "",
+    ] {
+        assert!(arch_policy(arch).is_none(), "{arch:?}");
+        let mut a = ok_facts();
+        a.0.arch = arch;
+        assert_eq!(
+            admit(&a),
+            Err(RaonRailgunRefusal::WrongArch {
+                arch: arch.to_owned()
+            }),
+            "{arch:?}"
+        );
+    }
+    let arches: Vec<_> = ARCH_POLICIES.iter().map(|p| p.arch).collect();
+    assert_eq!(arches, [GFX1201, GFX1100]);
+    let text = RaonRailgunRefusal::WrongArch {
+        arch: "gfx1151".into(),
+    }
+    .to_string();
+    assert_eq!(text, "arch gfx1151 is not one of gfx1201, gfx1100");
+}
+
+#[test]
+fn only_gfx1100_needs_a_pci_identity() {
+    assert!(!arch_policy(GFX1201).expect("gfx1201 policy").pci_identity);
+    assert!(arch_policy(GFX1100).expect("gfx1100 policy").pci_identity);
+}
+
+#[test]
+fn every_policy_variable_is_arch_qualified_before_the_generic_one() {
+    for p in ARCH_POLICIES {
+        let suffix = p.arch.to_ascii_uppercase();
+        assert_eq!(
+            p.corpus_vars,
+            [
+                format!("HIPFIRE_RAON_RAILGUN_CORPUS_{suffix}").as_str(),
+                ENV_CORPUS
+            ]
+        );
+        // The generic table variable is the one the DFlash window and the M2
+        // shadow read: unchanged for gfx1201.
+        assert_eq!(
+            p.cache_table_vars,
+            [
+                format!("HIPFIRE_RAILGUN_CACHE_TABLE_{suffix}").as_str(),
+                "HIPFIRE_RAILGUN_CACHE_TABLE"
+            ]
+        );
+    }
+}
+
+#[test]
+fn the_lowering_parameters_are_per_arch() {
+    assert_eq!(
+        arch_policy(GFX1201).unwrap().lowering().post_dispatch_nop,
+        rp::GFX1201_POST_DISPATCH_NOP
+    );
+    assert_eq!(
+        arch_policy(GFX1100).unwrap().lowering().post_dispatch_nop,
+        0
+    );
+}
+
+#[test]
+fn the_cache_table_is_the_arch_table() {
+    for p in ARCH_POLICIES {
+        let t = cache_table(p).expect("table");
+        assert_eq!(t.arch, p.arch);
+        assert!(t.rows.iter().all(|r| r.g4_receipt.is_none()));
+    }
+}
+
+fn g4_json(arch: &str, stale: u64, trials: u64) -> Vec<u8> {
+    let row = |name: &str, rung: &str| {
+        format!(
+            r#"{{"row":"{name}","weakest_safe_rung":"{rung}","trials":[{{"rung":"{rung}","trials":{trials},"stale_trials":{stale}}}]}}"#
+        )
+    };
+    format!(
+        r#"{{"identity":{{"arch":"{arch}"}},"rows":[{},{},{},{},{}]}}"#,
+        row("raw_vmem", "wait_inter_node"),
+        row("raw_smem", "wait_inter_node"),
+        row("war", "wait_inter_node"),
+        row("waw", "wait_inter_node"),
+        row("war_pre_writer", "wait_system"),
+    )
+    .into_bytes()
+}
+
+#[test]
+fn a_g4_table_attaches_only_to_its_own_arch() {
+    for p in ARCH_POLICIES {
+        let mut t = CacheTable::for_arch(p.arch).unwrap();
+        let other = ARCH_POLICIES.iter().find(|q| q.arch != p.arch).unwrap();
+        let err = attach_g4(&mut t, "other.json", &g4_json(other.arch, 0, 1 << 20)).unwrap_err();
+        assert!(
+            err.contains(other.arch) && err.contains(p.arch),
+            "{}: {err}",
+            p.arch
+        );
+        assert!(t.rows.iter().all(|r| r.g4_receipt.is_none()));
+    }
+}
+
+#[test]
+fn a_stale_g4_row_fails_and_too_few_trials_back_nothing() {
+    for p in ARCH_POLICIES {
+        let mut t = CacheTable::for_arch(p.arch).unwrap();
+        let stale = attach_g4(&mut t, "g4.json", &g4_json(p.arch, 3, 1 << 20)).unwrap_err();
+        assert!(stale.contains("stale"), "{}: {stale}", p.arch);
+        let mut t = CacheTable::for_arch(p.arch).unwrap();
+        let few = attach_g4(&mut t, "g4.json", &g4_json(p.arch, 0, 1000)).unwrap();
+        assert_eq!(few, 0, "{}", p.arch);
+        assert!(t.rows.iter().all(|r| r.g4_receipt.is_none()));
+        let err = attach_g4(&mut t, "g4.json", b"{not json").unwrap_err();
+        assert!(err.starts_with("g4.json:"), "{err}");
+    }
 }
 
 // ----------------------------------------------------------------- tri-state
@@ -391,7 +554,7 @@ fn zero_is_a_hard_kill_that_looks_at_nothing() {
         true
     };
     let mut s = structural();
-    for arch in [ARCH, "gfx1100"] {
+    for arch in [GFX1201, GFX1100] {
         s.arch = arch;
         assert_eq!(
             decide_owner(RailgunMode::Off, &s, Some("env"), Some("pack"), &probe),
@@ -457,9 +620,9 @@ fn auto_refuses_a_structurally_unsuitable_context_before_looking_for_a_corpus() 
     type Mutate = fn(&mut Structural<'static>);
     let cases: Vec<(Mutate, RaonRailgunRefusal)> = vec![
         (
-            |s| s.arch = "gfx1100",
+            |s| s.arch = "gfx1151",
             RaonRailgunRefusal::WrongArch {
-                arch: "gfx1100".into(),
+                arch: "gfx1151".into(),
             },
         ),
         (
@@ -512,7 +675,25 @@ fn one_forces_the_owner_loudly_whatever_the_context() {
 }
 
 fn owner(plan: OwnerPlan) -> RaonRailgunOwner {
-    RaonRailgunOwner::new(plan, "model".into())
+    RaonRailgunOwner::new(plan, GFX1201, "model".into())
+}
+
+#[test]
+fn an_owner_of_an_unadmitted_arch_has_no_policy_and_no_cache_table() {
+    let plan = |loud| OwnerPlan {
+        corpus_dir: Some("c".into()),
+        loud,
+    };
+    let mut o = RaonRailgunOwner::new(plan(false), "gfx1151", "m".into());
+    assert!(o.policy.is_none());
+    assert_eq!(
+        o.cache_table().err(),
+        Some(RaonRailgunRefusal::WrongArch {
+            arch: "gfx1151".into()
+        })
+    );
+    let o = RaonRailgunOwner::new(plan(false), GFX1100, "m".into());
+    assert_eq!(o.policy, arch_policy(GFX1100));
 }
 
 #[test]
@@ -565,6 +746,7 @@ fn every_refusal_has_a_distinct_kind_and_a_message() {
     let all = vec![
         R::Disabled,
         R::WrongArch { arch: "x".into() },
+        R::DeviceIdentity { arch: "x".into() },
         R::PartitionedBand { band: "x".into() },
         R::GraphDisabled,
         R::NotGraphMode,
@@ -865,6 +1047,49 @@ fn a_sealed_table_node_is_sealed_bound_witnessed_and_planned() {
     assert_eq!(a.images.len(), 1);
     assert_eq!(a.grids, vec![[4, 1, 1]]);
     assert_eq!(dev.reads.load(Ordering::SeqCst) > 0, true);
+}
+
+/// Two gathers writing the same output: a WAW boundary before node 1.
+fn authored_pair_for(table: &CacheTable) -> Authored {
+    let dev = FakeDevice::new(&entry_ptrs());
+    let l = || gather_launch(Ok(node_facts(&gather_record(false), "D")), TABLE, 4);
+    author_and_plan(&[l(), l()], table, &dev).expect("authored")
+}
+
+#[test]
+fn the_program_is_authored_for_the_cache_table_arch() {
+    for arch in [GFX1201, GFX1100] {
+        let a = authored_pair_for(&table_for(arch));
+        assert_eq!(a.program.arch, arch);
+        assert!(a.plan.is_single_segment(a.program.nodes.len()), "{arch}");
+        assert_eq!(a.plan.policy, RowPolicy::UnreceiptedSystem);
+        assert!(
+            a.program.nodes.iter().all(|n| n.lowering.is_pm4()),
+            "{arch}"
+        );
+    }
+}
+
+#[test]
+fn a_dependent_boundary_is_system_scope_until_a_g4_receipt_backs_the_arch_row() {
+    use railgun::plan::Rung;
+    for arch in [GFX1201, GFX1100] {
+        let unreceipted = authored_pair_for(&table_for(arch));
+        let v = unreceipted.plan.boundaries[1].visibility;
+        assert!(v.wait_idle, "{arch}");
+        assert_eq!(
+            v.acquire,
+            Rung::System,
+            "{arch}: strict row 3 without a receipt"
+        );
+
+        let mut t = table_for(arch);
+        attach_g4(&mut t, "g4.json", &g4_json(arch, 0, 1 << 20)).expect("attach");
+        let receipted = authored_pair_for(&t);
+        let v = receipted.plan.boundaries[1].visibility;
+        assert!(v.wait_idle, "{arch}");
+        assert_eq!(v.acquire, Rung::InterNode, "{arch}: receipted tier-D rung");
+    }
 }
 
 #[test]
