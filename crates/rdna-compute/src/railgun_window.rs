@@ -31,7 +31,9 @@ use railgun_corpus::window::{ConditionalWitness, NodeRoute, RuntimeNode, WindowM
 use railgun_corpus::{sha256_hex, JitCorpus};
 
 pub use crate::replay::railgun_lower::LowerTiming;
-use crate::replay::railgun_lower::{LoweringContext, OwnedWindowLowering, SelfCheckFailure};
+use crate::replay::railgun_lower::{
+    DeviceSelect, LoweringContext, OwnedWindowLowering, SelfCheckFailure,
+};
 use crate::replay::railgun_shadow::{arch_lowering, lookup_facts, probe};
 use crate::replay::ReplayQuiescence;
 use crate::Gpu;
@@ -454,12 +456,27 @@ impl Gpu {
     /// The shared lowering context of this device: one HSA runtime and device,
     /// the host and retained kernarg pools and every loaded code object,
     /// created once by the owner and handed to every
-    /// [`Self::lower_railgun_window`]. gfx12 only.
+    /// [`Self::lower_railgun_window`]. gfx12, or exact gfx1100 (this `Gpu`'s
+    /// HIP device is matched to its ROCr agent by PCI bus address; every other
+    /// gfx11 part refuses).
     pub fn railgun_lowering_context(&self) -> Result<RailgunLoweringContext, String> {
-        let ordinal = usize::try_from(self.device_id)
-            .map_err(|_| format!("device ordinal {} is negative", self.device_id))?;
+        let select = if self.arch == "gfx1100" {
+            let bdf = self
+                .hip
+                .device_pci_bus_id(self.device_id)
+                .map_err(|e| format!("device {} PCI address: {e}", self.device_id))?;
+            DeviceSelect::Pci(
+                bdf.parse::<redline_dispatch::aql::PciBusId>()
+                    .map_err(|e| format!("device {} PCI address {bdf:?}: {e}", self.device_id))?,
+            )
+        } else {
+            DeviceSelect::Ordinal(
+                usize::try_from(self.device_id)
+                    .map_err(|_| format!("device ordinal {} is negative", self.device_id))?,
+            )
+        };
         Ok(RailgunLoweringContext {
-            inner: LoweringContext::new(ordinal)?,
+            inner: LoweringContext::new(select)?,
         })
     }
 

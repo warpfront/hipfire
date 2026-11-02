@@ -398,6 +398,36 @@ impl Pm4Commands {
             }
         }
     }
+
+    /// The architecture-matched system-scope `ACQUIRE_MEM` for a railgun
+    /// `Rung::System` boundary: `acquire_system_gfx12` (GCR 0xc3b1) on gfx12,
+    /// ROCr's gfx10+ system acquire on a legacy stream.
+    fn system_acquire(&mut self) {
+        match self {
+            Self::Gfx12(commands) => commands.acquire_system_gfx12(),
+            Self::Legacy { commands, .. } => commands.acquire_system(),
+        }
+    }
+
+    /// The PM4 architecture this stream was built for.
+    fn architecture(&self) -> Pm4Architecture {
+        match self {
+            Self::Gfx12(_) => Pm4Architecture::Gfx12,
+            Self::Legacy { architecture, .. } => *architecture,
+        }
+    }
+
+    /// The gfx11 command dwords (railgun's owned gfx1100 lowering checks them).
+    fn gfx11_dwords(&self) -> Option<&[u32]> {
+        match self {
+            Self::Legacy {
+                architecture: Pm4Architecture::Gfx11,
+                commands,
+                ..
+            } => Some(commands.dwords()),
+            _ => None,
+        }
+    }
     /// Trailing release at the tape terminal: drain shaders, then emit the
     /// architecture-matched full-system acquire so GL2 is written back for a
     /// non-shader next consumer (e.g. an SDMA H2D copy). `CS_PARTIAL_FLUSH`
