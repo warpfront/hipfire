@@ -18,7 +18,15 @@ use hipfire_quantize::float16::{f16_to_f32, f32_to_f16};
 pub(crate) static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 pub(crate) static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
 pub(crate) static AWQ_A4_AWARE: OnceLock<bool> = OnceLock::new();
-pub(crate) const AWQ_A4_CANDIDATE_ALPHAS: [f32; 5] = [0.35, 0.45, 0.55, 0.65, 0.75];
+/// Candidate smoothing exponents for the A4-aware search.
+///
+/// The historical grid started at 0.35. A BF16-teacher MQ4G256 alpha sweep
+/// (`docs/perf-checkpoints/2026-08-16-qwen38-27b-mq4-awq-alpha-kld.md`)
+/// measured the whole `[0.05, 0.25]` band beating the shipped 0.55 by
+/// 15-24 % slice-mean KLD, with a flat curve inside that band. The grid
+/// therefore reaches down to 0.05; `0.45`/`0.65` are dropped because the
+/// sweep showed no measurable separation from their neighbors there.
+pub(crate) const AWQ_A4_CANDIDATE_ALPHAS: [f32; 6] = [0.05, 0.15, 0.25, 0.35, 0.55, 0.75];
 static AWQ_A4_ALPHA_BY_ACTIVATION: LazyLock<Mutex<HashMap<Vec<u32>, f32>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Opt-in QAT producer rows; absent leaves the historical surrogate unchanged.
