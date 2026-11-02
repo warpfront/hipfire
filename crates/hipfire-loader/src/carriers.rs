@@ -3103,7 +3103,7 @@ pub fn qwen4_ep_vram_layers(
     // carrier checks them first). The decoupled reserve, which sizes whole-layer
     // placements, is off with a note, unless `HIPFIRE_EP_UNIT_RESERVE=1` plans the
     // units under it with whole-resident donor layers (`qwen4_ep_units_donor_plan`).
-    let units_path = qwen4_ep_units_flag(src, ranks, 1, &gpu.arch, true);
+    let units_path = qwen4_ep_units_flag(src, spans.ranks(), 1, &gpu.arch, true);
     if units_path.is_none() {
         // The D2 tail only exists over a per-expert unit plan: refuse before any load work.
         use hipfire_arch_qwen4::expert_unit_tail as tail;
