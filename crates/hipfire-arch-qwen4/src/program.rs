@@ -1097,8 +1097,10 @@ fn build_moe_decode<'a>(
             down: moe.shared.down.dtype,
         }),
         experts_all_gate_up_mq4,
-        routed_gate_up: first_gate_up.dtype,
-        routed_down: first_down.dtype,
+        // DESIGN F1: route selection reads the shipped layout; the launchers branch on the
+        // device-wide planar binding, not on the dtype.
+        routed_gate_up: first_gate_up.dtype.shipped_layout(),
+        routed_down: first_down.dtype.shipped_layout(),
         routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
         per_expert_gate_up: moe.expert_gate_up_dtypes,
@@ -1208,8 +1210,10 @@ fn build_moe_prefill<'a>(
             down: moe.shared.down.dtype,
         }),
         experts_all_gate_up_mq4: moe.experts_all_gate_up_mq4,
-        routed_gate_up: first_gate_up.dtype,
-        routed_down: first_down.dtype,
+        // DESIGN F1: route selection reads the shipped layout; the launchers branch on the
+        // device-wide planar binding, not on the dtype.
+        routed_gate_up: first_gate_up.dtype.shipped_layout(),
+        routed_down: first_down.dtype.shipped_layout(),
         routed_has_mixed_experts: moe.expert_codec_tags.is_some(),
         has_paro_shared: false,
         per_expert_gate_up: moe.expert_gate_up_dtypes,

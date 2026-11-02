@@ -20,6 +20,7 @@ use hipfire_arch_qwen4::weights::Qwen4TierRecipe;
 use hipfire_runtime::hfq::HfqModelSource;
 use hipfire_runtime::model_source::{ModelSource as _, SourcePayload, TensorInfo};
 use hipfire_runtime::weight_manifest::WeightEntry;
+use rdna_compute::DType;
 
 /// Physical source bytes of `entry` for placement sizing.
 ///
@@ -49,6 +50,12 @@ pub(crate) fn qwen4_entry_bytes(
                 .and_then(|layer| arenas.layer(layer))
                 .map(|layer| layer.bytes as u64);
         }
+    }
+    // A drop-zero planar expert stack (DESIGN F1) is sized from its declared
+    // dtype and shape: the loader repacks it, so its device bytes are not the
+    // source tensor's.
+    if let Some(bytes) = planar_entry_bytes(entry) {
+        return Some(bytes);
     }
     ordinary(entry)
 }
@@ -95,8 +102,14 @@ pub(crate) fn qwen4_unit_arena_payload<'a>(
                 .map(|(_, data)| data)
                 .ok_or_else(|| format!("missing resident tensor '{name}'"))
         };
-        let gathered =
-            unit_arena_entry_bytes(&map, &entry.name, stack(&gate_up_name)?, stack(&down_name)?)?;
+        // The entry's tier (`tier`, above) selects the arena half.
+        // DESIGN F1: a drop-zero planar plan (geometry = the planar Flash-Next bytes) gathers
+        // the shipped source stacks repacked planar into each slot.
+        let gathered = if plan.geometry().is_mq4_planar() {
+            map.gather_arena_mq4_planar(tier, stack(&gate_up_name)?, stack(&down_name)?)?
+        } else {
+            unit_arena_entry_bytes(&map, &entry.name, stack(&gate_up_name)?, stack(&down_name)?)?
+        };
         Ok(SourcePayload::Owned {
             info: TensorInfo {
                 name: entry.name.clone(),
@@ -112,6 +125,22 @@ pub(crate) fn qwen4_unit_arena_payload<'a>(
     Some(result)
 }
 
+/// Payload bytes of a stacked `[experts, rows, K]` `MQ4G256V2P` / `MQ4G128V2P`
+/// entry; `None` for every other dtype.
+fn planar_entry_bytes(entry: &WeightEntry) -> Option<u64> {
+    use hipfire_runtime::mq4_planar::{stack_planar_bytes, Mq4PlanarKind};
+    let kind = match entry.dtype {
+        DType::MQ4G256V2P => Mq4PlanarKind::GateUp,
+        DType::MQ4G128V2P => Mq4PlanarKind::Down,
+        _ => return None,
+    };
+    let [experts, rows, k] = entry.logical_shape[..] else {
+        return None;
+    };
+    stack_planar_bytes(kind, experts, rows, k)
+        .ok()
+        .map(|bytes| bytes as u64)
+}
 /// The fulfillment payload of one manifest entry: a slab layer arena (one
 /// container span) when the recipe declares it, otherwise the tensor read the
 /// carrier always made. `use_range` is the caller's

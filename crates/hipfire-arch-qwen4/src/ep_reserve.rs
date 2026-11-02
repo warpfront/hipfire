@@ -126,6 +126,10 @@ pub const EP_RESERVE_MIN_RESIDENT_LAYERS: usize = 33;
 pub const EP2_GATE_UP_EXPERT_BYTES: u64 = 1_740_800;
 /// Bytes of one expert's down tensor in the pinned QT53 recipe.
 pub const EP2_DOWN_EXPERT_BYTES: u64 = 870_400;
+/// One expert's gate/up bytes in the drop-zero planar layout (`MQ4G256V2P`, DESIGN F1).
+pub const EP2_PLANAR_GATE_UP_EXPERT_BYTES: u64 = 1_689_600;
+/// One expert's down bytes in the drop-zero planar layout (`MQ4G128V2P`).
+pub const EP2_PLANAR_DOWN_EXPERT_BYTES: u64 = 844_800;
 
 const MIB: u64 = 1 << 20;
 
@@ -670,13 +674,27 @@ pub struct EpRankGeometry {
 impl EpRankGeometry {
     /// The pinned Flash-Next QT44/QT53 geometry of `ranks` stride-owned ranks.
     pub fn flash_next(config: &Qwen4Config, ranks: usize) -> Option<Self> {
+        Self::flash_next_layout(config, ranks, false)
+    }
+
+    /// [`Self::flash_next`] in the shipped (`planar == false`, 2,611,200 B per expert) or the
+    /// drop-zero planar (DESIGN F1, 2,534,400 B per expert) expert layout.
+    pub fn flash_next_layout(config: &Qwen4Config, ranks: usize, planar: bool) -> Option<Self> {
         let local = config.num_experts.checked_add(ranks.checked_sub(1)?)? / ranks;
+        let (gate_up, down) = if planar {
+            (
+                EP2_PLANAR_GATE_UP_EXPERT_BYTES,
+                EP2_PLANAR_DOWN_EXPERT_BYTES,
+            )
+        } else {
+            (EP2_GATE_UP_EXPERT_BYTES, EP2_DOWN_EXPERT_BYTES)
+        };
         Some(Self {
             ranks,
             trunk_layers: config.num_hidden_layers,
             moe_layers: crate::expert_residency::moe_layer_count(config),
-            gate_up_bytes: (local as u64).checked_mul(EP2_GATE_UP_EXPERT_BYTES)?,
-            down_bytes: (local as u64).checked_mul(EP2_DOWN_EXPERT_BYTES)?,
+            gate_up_bytes: (local as u64).checked_mul(gate_up)?,
+            down_bytes: (local as u64).checked_mul(down)?,
         })
     }
 

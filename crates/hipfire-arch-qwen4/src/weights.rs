@@ -1645,6 +1645,50 @@ impl Qwen4Manifest {
         Ok(self)
     }
 
+    /// This expert-parallel manifest with its routed expert stacks declared
+    /// drop-zero planar (DESIGN F1, `HIPFIRE_QWEN4_EXPERT_DROP_ZERO`): every
+    /// `ExpertSharded` routed gate/up (`MQ4G256V2`) and down (`MQ4G128V2`)
+    /// stack whose name satisfies `include` becomes `MQ4G256V2P` / `MQ4G128V2P`.
+    /// The source constraint is unchanged (the shipped symmetric payload is the
+    /// source); the weight store repacks it on the host while each rank
+    /// compacts its owned experts ([`hipfire_runtime::mq4_planar`]), so every
+    /// size derived from the entry dtype (census, placement, resident layers)
+    /// is the planar one. The caller proves the source symmetric first
+    /// ([`crate::artifact::apply_expert_drop_zero`]); this only declares.
+    /// Returns the number of entries redeclared.
+    pub fn with_expert_drop_zero(
+        mut self,
+        include: impl Fn(&WeightEntry) -> bool,
+    ) -> Result<(Self, usize), WeightError> {
+        let refuse = |why: String| WeightError::EpPlacement(format!("expert drop-zero: {why}"));
+        let mut redeclared = 0usize;
+        for entry in self
+            .weights
+            .iter_mut()
+            .filter(|entry| is_routed_expert_tensor(&entry.name) && include(entry))
+        {
+            if !matches!(entry.policy, ShardPolicy::ExpertSharded { .. }) {
+                return Err(refuse(format!(
+                    "{} is not expert-sharded (drop-zero repacks during the EP compact upload)",
+                    entry.name
+                )));
+            }
+            let target = match (entry.dtype, &entry.logical_shape[..]) {
+                (DType::MQ4G256V2, [_, 1280, 2560]) => DType::MQ4G256V2P,
+                (DType::MQ4G128V2, [_, 2560, 640]) => DType::MQ4G128V2P,
+                (dtype, shape) => {
+                    return Err(refuse(format!(
+                        "{} is {dtype:?} {shape:?}, not a Flash-Next QT44/QT53 routed stack",
+                        entry.name
+                    )))
+                }
+            };
+            entry.dtype = target;
+            redeclared += 1;
+        }
+        Ok((self, redeclared))
+    }
+
     /// This manifest declared for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the
     /// 48 trunk layers' aggregate routed `gate_up`/`down` entries are owned by
     /// the expert-tier lease instead of the weight store, so they are removed
@@ -1806,7 +1850,7 @@ impl Qwen4Manifest {
             } else {
                 (ROUTED_DOWN_DTYPE, &mut down_seen)
             };
-            if entry.dtype != dtype
+            if entry.dtype.shipped_layout() != dtype
                 || entry.logical_shape.first() != Some(&geometry.experts_per_layer)
                 || std::mem::replace(&mut seen[layer], true)
             {
@@ -3113,6 +3157,44 @@ impl Qwen4Weights {
             vram: self.resident(vram)?,
             host: self.resident(host)?,
         }))
+    }
+
+    /// Whether this rank's routed expert tensors are in the drop-zero planar layout
+    /// (`MQ4G256V2P` / `MQ4G128V2P`, DESIGN F1). Read from what was actually uploaded (the
+    /// assembly rebuilds the manifest with the shipped dtypes; the resident tensors carry the
+    /// dtype the weight store gave them) plus, for a per-expert unit plan, its geometry (the
+    /// arenas are raw bytes). All-or-nothing: the Qwen4 MQ4 MoE launchers bind one layout per
+    /// device, so a load mixing planar and shipped routed tensors (trunk, MTP head or arenas)
+    /// is refused.
+    pub fn expert_layout_planar(&self) -> Result<bool, WeightError> {
+        let (mut planar, mut shipped) = (0usize, 0usize);
+        for taken in self
+            .taken
+            .iter()
+            .filter(|taken| is_routed_expert_tensor(&taken.key.name))
+        {
+            if let WeightHandle::Resident(tensor) = &taken.handle {
+                if tensor.dtype.is_mq4_planar() {
+                    planar += 1;
+                } else {
+                    shipped += 1;
+                }
+            }
+        }
+        if let Some(state) = &self.ep_units {
+            if state.plan.geometry().is_mq4_planar() {
+                planar += 1;
+            } else if !state.maps.is_empty() {
+                shipped += 1;
+            }
+        }
+        if planar > 0 && shipped > 0 {
+            return Err(WeightError::EpPlacement(format!(
+                "expert drop-zero is all-or-nothing: {planar} routed expert tensors are planar, \
+                 {shipped} are shipped"
+            )));
+        }
+        Ok(planar > 0)
     }
 
     /// Resolve one immutable typed reference to its resident GPU buffer.

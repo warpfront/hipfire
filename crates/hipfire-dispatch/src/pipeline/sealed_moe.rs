@@ -1402,7 +1402,7 @@ fn tier_identity_suffix(tier: &ExpertTierIdentity) -> String {
 /// Codec byte of an expert's down dtype: `0` = MQ4, `1` = W3, `3` = E8P-I4,
 /// `255` = unknown.
 fn expert_codec_byte(down: DType) -> u8 {
-    match down {
+    match down.shipped_layout() {
         DType::MQ4G128V2 => 0,
         DType::MQ3I4G128R128 => 1,
         DType::E8PI4G128R128 => 3,
@@ -4194,7 +4194,7 @@ fn validate_expert_shape_and_dtype(
         let resources = expert.resources();
         let expected_gate_up = per_gate_up.map_or(representative_gate_up, |values| values[index]);
         let gate_up_dtype = if let Some(gate_up) = resources.gate_up() {
-            if gate_up.dtype() != expected_gate_up {
+            if gate_up.dtype().shipped_layout() != expected_gate_up.shipped_layout() {
                 return Err(invalid(format!(
                     "expert {index} gate/up source '{}' dtype differs from the declared source metadata",
                     gate_up.source_name()
@@ -4229,7 +4229,7 @@ fn validate_expert_shape_and_dtype(
                 )));
             }
             for (role, source) in [("gate", gate), ("up", up)] {
-                if source.dtype() != expected_gate_up {
+                if source.dtype().shipped_layout() != expected_gate_up.shipped_layout() {
                     return Err(invalid(format!(
                         "expert {index} separate {role} source '{}' dtype differs from the declared source metadata",
                         source.source_name()
@@ -4251,7 +4251,7 @@ fn validate_expert_shape_and_dtype(
             }
             gate.dtype()
         };
-        if gate_up_dtype != expected_gate_up {
+        if gate_up_dtype.shipped_layout() != expected_gate_up.shipped_layout() {
             return Err(invalid(format!(
                 "expert {index} gate/up dtype differs from the declared source metadata"
             )));
@@ -4264,7 +4264,7 @@ fn validate_expert_shape_and_dtype(
 
         let down = resources.down();
         let expected_down = per_down.map_or(representative_down, |values| values[index]);
-        if down.dtype() != expected_down {
+        if down.dtype().shipped_layout() != expected_down.shipped_layout() {
             return Err(invalid(format!(
                 "expert {index} down dtype differs from the declared source metadata"
             )));
@@ -4660,7 +4660,12 @@ fn expected_live_weight_geometry(
     if gate_up {
         if let Some(resource) = resources.gate_up() {
             let (rows, cols) = resource_dims(resource, index, role)?;
-            Ok((rows, cols, resource.dtype(), resource.encoded_bytes()))
+            Ok((
+                rows,
+                cols,
+                resource.dtype().shipped_layout(),
+                resource.encoded_bytes(),
+            ))
         } else {
             let gate = resources.gate().ok_or_else(|| {
                 invalid(format!("expert {index} separate resources have no gate"))
@@ -4684,12 +4689,17 @@ fn expected_live_weight_geometry(
                 .ok_or_else(|| {
                     invalid(format!("expert {index} separate gate/up bytes overflow"))
                 })?;
-            Ok((rows, gate_cols, gate.dtype(), bytes))
+            Ok((rows, gate_cols, gate.dtype().shipped_layout(), bytes))
         }
     } else {
         let resource = resources.down();
         let (rows, cols) = resource_dims(resource, index, role)?;
-        Ok((rows, cols, resource.dtype(), resource.encoded_bytes()))
+        Ok((
+            rows,
+            cols,
+            resource.dtype().shipped_layout(),
+            resource.encoded_bytes(),
+        ))
     }
 }
 

@@ -72,6 +72,9 @@ pub mod mesh_placement;
 pub mod mesh_split;
 pub mod model_load;
 pub mod model_source;
+/// MQ4 drop-zero planar routed-expert layout (qt=137/138), the load-time repack of
+/// the symmetric MQ4-XTS experts (`HIPFIRE_QWEN4_EXPERT_DROP_ZERO`). CPU-only.
+pub mod mq4_planar;
 /// MQ3-I4 / MQ2-I4 planar tensor codec (qt=131..=134). CPU-only wire format.
 pub mod mq_i4;
 /// CPU arithmetic twins for future MQ-I4 expert kernels; no dispatch changes.

@@ -3754,8 +3754,9 @@ pub const GEMV_MQ4G256V2P_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC: &str = concat!(
 
 /// DESIGN F1: the drop-zero planar (`MQ4G128V2P`, qt=138) twin of
 /// [`GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC`] (decode down, expanded rows).
-pub const GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str =
-    include_str!("../../../kernels/src/gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded.hip");
+pub const GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str = include_str!(
+    "../../../kernels/src/gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded.hip"
+);
 
 /// MQ6G256V2 (qt=47) N-batched sister of
 /// [`GEMV_MQ6G256V2_MOE_GATE_UP_K8_INDEXED_SRC`]. Same batched ABI as the

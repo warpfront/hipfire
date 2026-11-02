@@ -883,7 +883,12 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
 
     // MoE: the gfx1151/gfx1201 modules of every codec (MQ4, MQ3-I4 W3, E8P-I4).
     for arch in [IsaArch::Gfx1151, IsaArch::Gfx1201] {
-        for codec in [WeightCodec::Mq4Sym, WeightCodec::Mq3I4, WeightCodec::E8pI4] {
+        for codec in [
+            WeightCodec::Mq4Sym,
+            WeightCodec::Mq3I4,
+            WeightCodec::E8pI4,
+            WeightCodec::Mq4SymPlanar,
+        ] {
             for spec in moe_gen::module_specs_codec(arch, codec) {
                 entries.push(moe_entry(spec));
             }
@@ -907,13 +912,16 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
         }
     }
     // MoE: grouped-position down twins (`qwen4_moe_down_gp`) and the stream8 gate/up.
-    for nt in [4u8, 8u8] {
+    for (nt, codec) in [4u8, 8u8]
+        .into_iter()
+        .flat_map(|nt| [(nt, WeightCodec::Mq4Sym), (nt, WeightCodec::Mq4SymPlanar)])
+    {
         let spec = MoeSpec {
             arch: IsaArch::Gfx1201,
             kind: Kind::Down,
             nt,
             rr: 1,
-            codec: WeightCodec::Mq4Sym,
+            codec,
         };
         let emitted = moe_gen::emit_down_gp(spec)
             .unwrap_or_else(|e| panic!("qwen4_moe_sym::emit_down_gp nt{nt}: {e}"));

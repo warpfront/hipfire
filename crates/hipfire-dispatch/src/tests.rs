@@ -808,6 +808,8 @@ const ALL_DTYPES: &[DType] = &[
     DType::MQ2I4G128R128,
     DType::E8PI4G128R256,
     DType::E8PI4G128R128,
+    DType::MQ4G256V2P,
+    DType::MQ4G128V2P,
     DType::GgmlQ4K,
     DType::GgmlQ5K,
     DType::GgmlQ6K,

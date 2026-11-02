@@ -829,6 +829,8 @@ mod residual_coverage_tests {
             MQ2I4G128R128,
             E8PI4G128R256,
             E8PI4G128R128,
+            MQ4G256V2P,
+            MQ4G128V2P,
             GgmlQ4K,
             GgmlQ5K,
             GgmlQ6K,

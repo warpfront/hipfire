@@ -1143,6 +1143,8 @@ pub(crate) fn source_dtype(dtype: &str) -> Result<DType, String> {
         "MQ4G256" => DType::MQ4G256,
         "MQ4G256V2" => DType::MQ4G256V2,
         "MQ4G128V2" => DType::MQ4G128V2,
+        "MQ4G256V2P" => DType::MQ4G256V2P,
+        "MQ4G128V2P" => DType::MQ4G128V2P,
         "MQ4CG256" => DType::MQ4CG256,
         "MQ6G256V2" => DType::MQ6G256V2,
         "MQ5G256V2" => DType::MQ5G256V2,
@@ -2335,11 +2337,145 @@ fn compact_owned_expert_spans(
     Ok(compact)
 }
 
+/// `(shipped, planar)` bytes of one expert of a `len`-byte stack, checked
+/// against the stack length.
+fn planar_expert_extents(
+    kind: crate::mq4_planar::Mq4PlanarKind,
+    rows: usize,
+    k: usize,
+    len: usize,
+    n_experts: usize,
+) -> Result<(usize, usize), String> {
+    let shipped = crate::mq4_planar::shipped_bytes(kind, rows, k).map_err(|e| e.to_string())?;
+    let planar = crate::mq4_planar::planar_bytes(kind, rows, k).map_err(|e| e.to_string())?;
+    if n_experts.checked_mul(shipped) != Some(len) {
+        return Err(format!(
+            "{len} payload bytes are not {n_experts} shipped experts of {shipped} bytes \
+             ([{rows}, {k}] {})",
+            kind.name()
+        ));
+    }
+    Ok((shipped, planar))
+}
+
+/// The geometry checks shared by every compact expert upload.
+fn check_compact_geometry(
+    n_experts: usize,
+    rank: usize,
+    ranks: usize,
+    assign: ExpertAssign,
+) -> Result<(), String> {
+    if assign != ExpertAssign::Stride {
+        return Err(format!(
+            "compact expert upload supports Stride assignment, got {assign:?}"
+        ));
+    }
+    if ranks == 0 || rank >= ranks {
+        return Err(format!("expert rank {rank} is outside {ranks} ranks"));
+    }
+    if n_experts < ranks {
+        return Err(format!("{n_experts} experts cannot cover {ranks} ranks"));
+    }
+    Ok(())
+}
+
+/// The `[rows, k]` expert geometry and planar kind of a drop-zero entry:
+/// `Some` exactly when `entry.dtype` is `MQ4G256V2P` / `MQ4G128V2P`.
+fn planar_entry_geometry(
+    entry: &WeightEntry,
+) -> Result<Option<(crate::mq4_planar::Mq4PlanarKind, usize, usize)>, String> {
+    let kind = match entry.dtype {
+        DType::MQ4G256V2P => crate::mq4_planar::Mq4PlanarKind::GateUp,
+        DType::MQ4G128V2P => crate::mq4_planar::Mq4PlanarKind::Down,
+        _ => return Ok(None),
+    };
+    match entry.logical_shape[..] {
+        [_, rows, k] => Ok(Some((kind, rows, k))),
+        _ => Err(format!(
+            "drop-zero entry shape {:?} is not [experts, rows, K]",
+            entry.logical_shape
+        )),
+    }
+}
+
+/// [`compact_owned_expert_spans`] with the DESIGN F1 drop-zero repack: rank
+/// `rank`'s owned experts of a stacked shipped `[n_experts, rows, k]` MQ4G256V2
+/// / MQ4G128V2 payload of `len` bytes, each repacked planar (`kind`) into the
+/// compact buffer (`planar_bytes` per expert). `read(offset, dst)` fills one
+/// expert's shipped span; every header is checked symmetric.
+#[allow(clippy::too_many_arguments)]
+fn compact_owned_expert_spans_planar(
+    kind: crate::mq4_planar::Mq4PlanarKind,
+    rows: usize,
+    k: usize,
+    len: usize,
+    n_experts: usize,
+    rank: usize,
+    ranks: usize,
+    assign: ExpertAssign,
+    mut read: impl FnMut(usize, &mut [u8]) -> Result<(), String>,
+) -> Result<Vec<u8>, String> {
+    let (per_expert_src, per_expert_dst) = planar_expert_extents(kind, rows, k, len, n_experts)?;
+    check_compact_geometry(n_experts, rank, ranks, assign)?;
+    let mut compact = vec![0u8; per_expert_dst * ep_local_expert_count(n_experts, rank, ranks)];
+    let mut scratch = vec![0u8; per_expert_src];
+    for (slot, expert) in (rank..n_experts).step_by(ranks).enumerate() {
+        read(expert * per_expert_src, &mut scratch)?;
+        crate::mq4_planar::repack_tensor(
+            kind,
+            rows,
+            k,
+            &scratch,
+            &mut compact[slot * per_expert_dst..(slot + 1) * per_expert_dst],
+        )
+        .map_err(|error| format!("expert {expert}: {error}"))?;
+    }
+    Ok(compact)
+}
+
+/// [`compact_owned_expert_spans_planar`] over resident bytes, repacked on every
+/// core (each owned expert is an independent slot of the compact buffer).
+#[allow(clippy::too_many_arguments)]
+fn compact_owned_experts_planar(
+    kind: crate::mq4_planar::Mq4PlanarKind,
+    rows: usize,
+    k: usize,
+    bytes: &[u8],
+    n_experts: usize,
+    rank: usize,
+    ranks: usize,
+    assign: ExpertAssign,
+) -> Result<Vec<u8>, String> {
+    use rayon::prelude::*;
+    let (per_expert_src, per_expert_dst) =
+        planar_expert_extents(kind, rows, k, bytes.len(), n_experts)?;
+    check_compact_geometry(n_experts, rank, ranks, assign)?;
+    let mut compact = vec![0u8; per_expert_dst * ep_local_expert_count(n_experts, rank, ranks)];
+    compact
+        .par_chunks_mut(per_expert_dst)
+        .enumerate()
+        .try_for_each(|(slot, dst)| {
+            let expert = rank + slot * ranks;
+            crate::mq4_planar::repack_tensor(
+                kind,
+                rows,
+                k,
+                &bytes[expert * per_expert_src..(expert + 1) * per_expert_src],
+                dst,
+            )
+            .map_err(|error| format!("expert {expert}: {error}"))
+        })?;
+    Ok(compact)
+}
+
 /// Validate one expert-stack payload against its manifest entry and upload
 /// the rank's owned experts compactly (device-pooled or pinned host-mapped per
 /// the entry's residency). Returns the tensor, shaped
 /// `[ep_local_expert_count(n_experts, rank, ranks), ..]`,
-/// and the source dtype.
+/// and the dtype of the uploaded bytes: the source dtype, or for a drop-zero
+/// entry (`MQ4G256V2P` / `MQ4G128V2P`, DESIGN F1) the planar dtype the shipped
+/// symmetric payload was repacked into on the host (every header verified
+/// `zp == -8*sc`; an asymmetric expert fails the load).
 fn upload_expert_compact(
     gpu: &mut Gpu,
     entry: &WeightEntry,
@@ -2348,8 +2484,15 @@ fn upload_expert_compact(
     assign: ExpertAssign,
     payload: SourcePayload<'_>,
 ) -> Result<(GpuTensor, DType, usize), String> {
-    let compact_of =
-        |bytes: &[u8]| compact_owned_experts(bytes, n_experts, ep.rank, ep.ranks, assign);
+    let planar = planar_entry_geometry(entry)?;
+    // The shipped dtype a drop-zero entry may be repacked from.
+    let planar_source_ok = |dtype: DType| planar.is_none() || dtype == entry.dtype.shipped_layout();
+    let compact_of = |bytes: &[u8]| match planar {
+        Some((kind, rows, k)) => {
+            compact_owned_experts_planar(kind, rows, k, bytes, n_experts, ep.rank, ep.ranks, assign)
+        }
+        None => compact_owned_experts(bytes, n_experts, ep.rank, ep.ranks, assign),
+    };
     let (dtype, compact) = match &payload {
         SourcePayload::Borrowed { info, bytes } => (
             checked_expert_payload(entry, &info.dtype, &info.shape, bytes.len())?,
@@ -2377,11 +2520,25 @@ fn upload_expert_compact(
                 descriptor.release_uploaded(absolute, dst.len() as u64);
                 Ok(())
             };
-            let compact =
-                compact_owned_expert_spans(len, n_experts, ep.rank, ep.ranks, assign, read)?;
+            let compact = match planar {
+                Some((kind, rows, k)) => compact_owned_expert_spans_planar(
+                    kind, rows, k, len, n_experts, ep.rank, ep.ranks, assign, read,
+                )?,
+                None => {
+                    compact_owned_expert_spans(len, n_experts, ep.rank, ep.ranks, assign, read)?
+                }
+            };
             (dtype, compact)
         }
     };
+    if !planar_source_ok(dtype) {
+        return Err(format!(
+            "drop-zero entry {:?} must repack from {:?}, the source is {dtype:?}",
+            entry.dtype,
+            entry.dtype.shipped_layout()
+        ));
+    }
+    let dtype = if planar.is_some() { entry.dtype } else { dtype };
     let mut shape = entry.logical_shape.clone();
     shape[0] = ep_local_expert_count(n_experts, ep.rank, ep.ranks);
     let mut tensor = upload_resident_bytes(gpu, entry.residency, &compact, &shape)

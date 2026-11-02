@@ -68,6 +68,24 @@ impl EpUnitGeometry {
         self.gate_up_bytes + self.down_bytes
     }
 
+    /// Whether this geometry is the drop-zero planar Flash-Next expert
+    /// (`MQ4G256V2P` 1,689,600 + `MQ4G128V2P` 844,800 bytes), as opposed to the shipped
+    /// 1,740,800 + 870,400.
+    pub fn is_mq4_planar(&self) -> bool {
+        use hipfire_runtime::mq4_planar::{
+            planar_bytes, Mq4PlanarKind, FLASH_NEXT_DOWN, FLASH_NEXT_GATE_UP,
+        };
+        planar_bytes(
+            Mq4PlanarKind::GateUp,
+            FLASH_NEXT_GATE_UP.0,
+            FLASH_NEXT_GATE_UP.1,
+        )
+        .ok()
+            == Some(self.gate_up_bytes as usize)
+            && planar_bytes(Mq4PlanarKind::Down, FLASH_NEXT_DOWN.0, FLASH_NEXT_DOWN.1).ok()
+                == Some(self.down_bytes as usize)
+    }
+
     /// Units (experts) of one layer that `rank` holds.
     pub fn owned_per_layer(&self, rank: usize) -> usize {
         Qwen4EpPlacement {
@@ -790,6 +808,66 @@ impl EpUnitLayerMap {
             arena[down..down + self.down_bytes].copy_from_slice(
                 &down_all[expert * self.down_bytes..(expert + 1) * self.down_bytes],
             );
+        }
+        Ok(arena)
+    }
+}
+
+impl EpUnitLayerMap {
+    /// [`Self::gather_arena`] for a drop-zero planar plan (DESIGN F1): the layer's full SHIPPED
+    /// QT44/QT53 stacks (`gate_up_all` / `down_all`, expert `e` at `e * shipped bytes`) are
+    /// repacked planar (`hipfire_runtime::mq4_planar`, every header verified symmetric) into each
+    /// owned expert's slot, so the arena holds `2,534,400` bytes per expert. `self`'s per-expert
+    /// bytes must be the planar Flash-Next sizes ([`EpUnitGeometry::is_mq4_planar`]).
+    pub fn gather_arena_mq4_planar(
+        &self,
+        tier: UnitTier,
+        gate_up_all: &[u8],
+        down_all: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        use hipfire_runtime::mq4_planar::{
+            repack_tensor, shipped_bytes, Mq4PlanarKind, FLASH_NEXT_DOWN, FLASH_NEXT_GATE_UP,
+        };
+        let experts = self.slots.len();
+        let (gu_rows, gu_k) = FLASH_NEXT_GATE_UP;
+        let (dn_rows, dn_k) = FLASH_NEXT_DOWN;
+        let gu_src =
+            shipped_bytes(Mq4PlanarKind::GateUp, gu_rows, gu_k).map_err(|e| e.to_string())?;
+        let dn_src =
+            shipped_bytes(Mq4PlanarKind::Down, dn_rows, dn_k).map_err(|e| e.to_string())?;
+        if gate_up_all.len() != experts * gu_src || down_all.len() != experts * dn_src {
+            return Err(format!(
+                "EP unit arena layer {}: shipped source stacks hold {}+{} bytes, {experts} experts need {}+{}",
+                self.layer,
+                gate_up_all.len(),
+                down_all.len(),
+                experts * gu_src,
+                experts * dn_src
+            ));
+        }
+        let mut arena = vec![0u8; self.arena_entry_bytes(tier)];
+        for (expert, slot) in self.slots.iter().enumerate() {
+            let Some(slot) = slot.filter(|slot| slot.tier == tier) else {
+                continue;
+            };
+            let gate_up = self.gate_up_offset(slot);
+            repack_tensor(
+                Mq4PlanarKind::GateUp,
+                gu_rows,
+                gu_k,
+                &gate_up_all[expert * gu_src..(expert + 1) * gu_src],
+                &mut arena[gate_up..gate_up + self.gate_up_bytes],
+            )
+            .map_err(|error| format!("layer {} expert {expert} gate/up: {error}", self.layer))?;
+            let down = self.down_offset(slot);
+            repack_tensor(
+                Mq4PlanarKind::Down,
+                dn_rows,
+                dn_k,
+                &down_all[expert * dn_src..(expert + 1) * dn_src],
+                &mut arena[down..down + self.down_bytes],
+            )
+            .map_err(|error| format!("layer {} expert {expert} down: {error}", self.layer))?;
         }
         Ok(arena)
     }
@@ -1823,6 +1901,157 @@ mod tests {
             "{line}"
         );
         assert_eq!(plan.receipt_lines().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod planar_arena_tests {
+    //! DESIGN F1 x D1: the unit arena of a drop-zero planar plan, CPU oracle. The shipped
+    //! (qt44/qt53) stacks are repacked planar into each owned expert's slot; every slot re-read
+    //! and dequantised planar must equal the shipped dequant of the same source expert bit for
+    //! bit, and the plan charges 2,534,400 B per expert.
+    use super::*;
+    use hipfire_runtime::mq4_planar::{
+        dequant_planar, dequant_shipped, planar_bytes, shipped_bytes, zero_bits_for_scale,
+        Mq4PlanarKind, FLASH_NEXT_DOWN, FLASH_NEXT_GATE_UP,
+    };
+
+    const EXPERTS: usize = 6;
+
+    fn symmetric_stack(kind: Mq4PlanarKind, rows: usize, k: usize, seed: u64) -> Vec<u8> {
+        let mut s = seed | 1;
+        let mut next = move || {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            s
+        };
+        let groups = rows * (k / kind.shipped_group_cols());
+        let header = kind.shipped_group_bytes() - 64 * kind.shipped_group_cols() / 128;
+        let mut out = vec![0u8; groups * kind.shipped_group_bytes()];
+        for group in out.chunks_exact_mut(kind.shipped_group_bytes()) {
+            for half in 0..kind.shipped_group_cols() / 128 {
+                let scale = (next() % 0x6c00) as u16;
+                group[4 * half..4 * half + 2].copy_from_slice(&scale.to_le_bytes());
+                group[4 * half + 2..4 * half + 4]
+                    .copy_from_slice(&zero_bits_for_scale(scale).to_le_bytes());
+            }
+            for b in &mut group[header..] {
+                *b = next() as u8;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn planar_geometry_is_2_534_400_bytes_per_expert() {
+        let (gr, gk) = FLASH_NEXT_GATE_UP;
+        let (dr, dk) = FLASH_NEXT_DOWN;
+        let planar = EpUnitGeometry {
+            layers: 1,
+            experts_per_layer: EXPERTS,
+            ranks: 2,
+            gate_up_bytes: planar_bytes(Mq4PlanarKind::GateUp, gr, gk).unwrap() as u64,
+            down_bytes: planar_bytes(Mq4PlanarKind::Down, dr, dk).unwrap() as u64,
+        };
+        assert!(planar.is_mq4_planar());
+        assert_eq!(planar.unit_bytes(), 2_534_400);
+        let shipped = EpUnitGeometry {
+            gate_up_bytes: shipped_bytes(Mq4PlanarKind::GateUp, gr, gk).unwrap() as u64,
+            down_bytes: shipped_bytes(Mq4PlanarKind::Down, dr, dk).unwrap() as u64,
+            ..planar
+        };
+        assert!(!shipped.is_mq4_planar());
+        assert_eq!(shipped.unit_bytes(), 2_611_200);
+        // The unit budget buys more units by exactly the byte ratio.
+        assert!(planar.unit_bytes() % 256 == 0 && shipped.unit_bytes() % 256 == 0);
+    }
+
+    #[test]
+    fn planar_unit_arena_dequants_bit_equal_to_the_shipped_source() {
+        let (gr, gk) = FLASH_NEXT_GATE_UP;
+        let (dr, dk) = FLASH_NEXT_DOWN;
+        let g = EpUnitGeometry {
+            layers: 1,
+            experts_per_layer: EXPERTS,
+            ranks: 2,
+            gate_up_bytes: planar_bytes(Mq4PlanarKind::GateUp, gr, gk).unwrap() as u64,
+            down_bytes: planar_bytes(Mq4PlanarKind::Down, dr, dk).unwrap() as u64,
+        };
+        // Rank 0 owns experts 0, 2, 4; keep exactly one of them resident so the layer is
+        // MIXED (one VRAM slot, two host slots).
+        let ids: Vec<u32> = vec![0, 2, 4, 1, 3, 5];
+        let budget = g.unit_bytes() + 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        let plan = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ids,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![budget; 2],
+            },
+        )
+        .unwrap();
+        let map = plan.layer_map(0, 0);
+        assert!(map.is_mixed(), "the test needs a mixed layer");
+        let gu_src = shipped_bytes(Mq4PlanarKind::GateUp, gr, gk).unwrap();
+        let dn_src = shipped_bytes(Mq4PlanarKind::Down, dr, dk).unwrap();
+        let mut gate_up_all = Vec::new();
+        let mut down_all = Vec::new();
+        for expert in 0..EXPERTS {
+            gate_up_all.extend(symmetric_stack(
+                Mq4PlanarKind::GateUp,
+                gr,
+                gk,
+                11 + expert as u64,
+            ));
+            down_all.extend(symmetric_stack(
+                Mq4PlanarKind::Down,
+                dr,
+                dk,
+                97 + expert as u64,
+            ));
+        }
+        for tier in [UnitTier::Vram, UnitTier::Host] {
+            let arena = map
+                .gather_arena_mq4_planar(tier, &gate_up_all, &down_all)
+                .unwrap();
+            assert_eq!(arena.len(), map.arena_entry_bytes(tier));
+            for expert in (0..EXPERTS).filter(|e| e % 2 == 0) {
+                let (slot_tier, gu_off, dn_off) = map.expert_offsets(expert).unwrap();
+                if slot_tier != tier {
+                    continue;
+                }
+                let gu = &arena[gu_off..gu_off + map.gate_up_bytes()];
+                let dn = &arena[dn_off..dn_off + map.down_bytes()];
+                let src_gu = &gate_up_all[expert * gu_src..(expert + 1) * gu_src];
+                let src_dn = &down_all[expert * dn_src..(expert + 1) * dn_src];
+                for r in (0..gr).step_by(61) {
+                    for c in (0..gk).step_by(3) {
+                        assert_eq!(
+                            dequant_shipped(Mq4PlanarKind::GateUp, gk, src_gu, r, c).to_bits(),
+                            dequant_planar(gr, gk, gu, r, c).to_bits(),
+                            "{tier:?} expert {expert} gate/up r{r} c{c}"
+                        );
+                    }
+                }
+                for r in (0..dr).step_by(97) {
+                    for c in (0..dk).step_by(3) {
+                        assert_eq!(
+                            dequant_shipped(Mq4PlanarKind::Down, dk, src_dn, r, c).to_bits(),
+                            dequant_planar(dr, dk, dn, r, c).to_bits(),
+                            "{tier:?} expert {expert} down r{r} c{c}"
+                        );
+                    }
+                }
+            }
+        }
+        // A source stack of the wrong (planar) size is refused.
+        assert!(map
+            .gather_arena_mq4_planar(UnitTier::Vram, &gate_up_all[1..], &down_all)
+            .is_err());
     }
 }
 

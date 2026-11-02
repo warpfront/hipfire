@@ -2086,8 +2086,26 @@ fn plan_qwen4_ep(
         hfq,
         std::path::Path::new(&shared.path),
     )?;
+    // DESIGN F1: seal the manifest the ranks will load: with the drop-zero flag on and every
+    // header proven symmetric, the routed stacks are declared planar so the sealed table
+    // describes the repacked bytes (same decision, same verdict cache as the planner and ranks).
+    let sealed_manifest = hipfire_arch_qwen4::artifact::apply_expert_drop_zero(
+        receipt
+            .manifest
+            .clone()
+            .with_expert_parallel(hipfire_arch_qwen4::weights::Qwen4EpPlacement {
+                rank: 0,
+                ranks: ep,
+            })
+            .map_err(|error| format!("qwen4: {error}"))?,
+        hfq,
+        &gpu.arch,
+        hipfire_arch_qwen4::artifact::expert_drop_zero_requested(),
+    )
+    .map_err(|error| error.to_string())?
+    .0;
     let seal = hipfire_arch_qwen4::ep_seal::Qwen4EpSeal::seal(
-        &receipt.manifest,
+        &sealed_manifest,
         receipt.config.num_hidden_layers,
         ep,
         &devices,
@@ -2962,6 +2980,16 @@ pub fn qwen4_ep_vram_layers(
         .manifest
         .with_expert_parallel(hipfire_arch_qwen4::weights::Qwen4EpPlacement { rank: 0, ranks })
         .map_err(|error| format!("qwen4: {error}"))?;
+    // DESIGN F1: the planner charges the planar (drop-zero) expert bytes exactly
+    // when each rank's load will repack (same decision, same verdict cache).
+    manifest = hipfire_arch_qwen4::artifact::apply_expert_drop_zero(
+        manifest,
+        hfq,
+        &gpu.arch,
+        hipfire_arch_qwen4::artifact::expert_drop_zero_requested(),
+    )
+    .map_err(|error| error.to_string())?
+    .0;
     qwen4_apply_ep_embed_host(&mut manifest.weights, ranks, &gpu.arch);
     let state_format = hipfire_arch_qwen4::resolve_state_format(
         &shared.kv_mode,
@@ -3056,8 +3084,25 @@ pub fn qwen4_ep_vram_layers(
         reserve,
         lane,
     } = ordinary_at(chunk_rows)?;
-    let attempt = if request.attempts() {
-        let geometry = hipfire_arch_qwen4::ep_reserve::EpRankGeometry::flash_next(&config, ranks);
+    // DESIGN F1: the decoupled reserve's donor/stage banks are sized from the shipped
+    // 1,740,800/870,400 B expert strides; until they are migrated a drop-zero planar load keeps
+    // the ordinary placement (which already charges the planar bytes through the manifest).
+    let planar_experts = manifest
+        .weights
+        .iter()
+        .any(|entry| entry.dtype.is_mq4_planar());
+    if planar_experts && request.attempts() {
+        eprintln!(
+            "  qwen4 EP reserve: ordinary placement (drop-zero planar experts; the decoupled \
+             reserve banks are not planar-aware yet)"
+        );
+    }
+    let attempt = if request.attempts() && !planar_experts {
+        let geometry = hipfire_arch_qwen4::ep_reserve::EpRankGeometry::flash_next_layout(
+            &config,
+            ranks,
+            planar_experts,
+        );
         let (explicit_chunk, owner_routed_prefill, stage_min_rows) =
             qwen4_ep_reserve_env(&gpu.arch, chunk_rows);
         let admission = qwen4_ep_reserve_admission(&Qwen4EpReserveAdmission {
@@ -6081,6 +6126,23 @@ fn load_qwen4_rank_unscoped(
             manifest = manifest
                 .with_expert_parallel(placement)
                 .map_err(|error| format!("qwen4: {error}"))?;
+            // DESIGN F1: declare the planar expert stacks the weight store repacks
+            // on the host during the compact upload (a verdict-proven symmetric
+            // artifact only); sizes below follow the declaration.
+            let (declared, drop_zero) = hipfire_arch_qwen4::artifact::apply_expert_drop_zero(
+                manifest,
+                &hfq,
+                &ctx.gpu.arch,
+                hipfire_arch_qwen4::artifact::expert_drop_zero_requested(),
+            )
+            .map_err(|error| error.to_string())?;
+            manifest = declared;
+            if let hipfire_arch_qwen4::artifact::ExpertDropZero::Applied { entries } = drop_zero {
+                eprintln!(
+                    "  qwen4 expert drop-zero: {entries} routed expert stacks repack planar \
+                     (2,611,200 -> 2,534,400 B per expert)"
+                );
+            }
             qwen4_apply_ep_embed_host(&mut manifest.weights, placement.ranks, &ctx.gpu.arch)
         }
         None => false,

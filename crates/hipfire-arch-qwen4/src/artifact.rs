@@ -1796,6 +1796,115 @@ pub fn routed_headers_symmetric_verdict(
     routed_headers_symmetric_cached(hfq, manifest, hfq.path(), home.as_deref())
 }
 
+/// DESIGN F1: repack the symmetric MQ4-XTS routed experts without their zero
+/// plane while each expert-parallel rank compacts them to the device
+/// (`2,611,200 -> 2,534,400` bytes per expert). `=0` keeps the shipped layout.
+pub const EXPERT_DROP_ZERO_ENV: &str = "HIPFIRE_QWEN4_EXPERT_DROP_ZERO";
+
+/// Default of [`EXPERT_DROP_ZERO_ENV`] when it is unset.
+pub const EXPERT_DROP_ZERO_DEFAULT: bool = false;
+
+/// Whether the drop-zero repack is requested for this process.
+pub fn expert_drop_zero_requested() -> bool {
+    hipfire_config::developer_bool(EXPERT_DROP_ZERO_ENV, EXPERT_DROP_ZERO_DEFAULT)
+}
+
+/// What [`apply_expert_drop_zero`] did.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExpertDropZero {
+    /// Not requested: the manifest is untouched.
+    Off,
+    /// `entries` routed expert stacks were redeclared planar.
+    Applied { entries: usize },
+    /// Requested but not applicable; the manifest is untouched.
+    Declined(String),
+}
+
+impl ExpertDropZero {
+    /// Whether any entry was redeclared.
+    pub fn applied(&self) -> bool {
+        matches!(self, Self::Applied { .. })
+    }
+}
+
+/// Declare the routed expert stacks of an expert-parallel `manifest` drop-zero
+/// planar when `requested` and every header of the stacks to repack is proven
+/// symmetric (`zp == -8*sc`, both finite) from the artifact's own bytes: the
+/// trunk layers by the cached whole-artifact verdict (the one the symmetric IU4
+/// route uses), the MTP head's stacks by a direct scan. The planar kernels
+/// exist on exact gfx1201 only. Anything else (other arch, non-packed recipe,
+/// not expert-parallel, an asymmetric or non-QT44/QT53 trunk or MTP stack)
+/// declines and leaves the whole manifest shipped: the launchers bind one
+/// layout per device, so the repack is all-or-nothing.
+pub fn apply_expert_drop_zero(
+    manifest: Qwen4Manifest,
+    hfq: &HfqFile,
+    arch: &str,
+    requested: bool,
+) -> Result<(Qwen4Manifest, ExpertDropZero), Qwen4ArtifactError> {
+    if !requested {
+        return Ok((manifest, ExpertDropZero::Off));
+    }
+    let decline = |manifest: Qwen4Manifest, why: String| {
+        eprintln!("  qwen4 expert drop-zero: declined ({why})");
+        Ok((manifest, ExpertDropZero::Declined(why)))
+    };
+    if arch != "gfx1201" {
+        return decline(
+            manifest,
+            format!("the planar expert kernels exist on gfx1201 only, this is {arch}"),
+        );
+    }
+    // D1 per-expert EP units compose: the planner derives the unit geometry from the planar
+    // aggregate sizes declared below, and the unit-arena gather repacks the shipped stacks
+    // planar (`EpUnitLayerMap::gather_arena_mq4_planar`).
+    if !matches!(
+        manifest.identity.recipe,
+        crate::weights::Qwen4TierRecipe::FlashNextPacked { .. }
+    ) {
+        return decline(
+            manifest,
+            "only the packed aggregate Flash-Next recipe repacks".to_string(),
+        );
+    }
+    let routed = |entry: &WeightEntry| {
+        entry.name.ends_with(ROUTED_GATE_UP_SUFFIX) || entry.name.ends_with(ROUTED_DOWN_SUFFIX)
+    };
+    if !manifest
+        .weights
+        .iter()
+        .filter(|entry| routed(entry))
+        .all(|entry| matches!(entry.policy, ShardPolicy::ExpertSharded { .. }))
+    {
+        return decline(
+            manifest,
+            "the routed experts are not expert-parallel sharded".to_string(),
+        );
+    }
+    if !routed_headers_symmetric_verdict(hfq, &manifest)? {
+        return decline(
+            manifest,
+            "a trunk routed header is not symmetric (zp != -8*sc)".to_string(),
+        );
+    }
+    let mtp_names: Vec<&str> = manifest
+        .weights
+        .iter()
+        .filter(|entry| entry.layer.is_none() && routed(entry))
+        .map(|entry| entry.name.as_str())
+        .collect();
+    if !mtp_names.is_empty() && !routed_tensors_symmetric(hfq, &mtp_names)? {
+        return decline(
+            manifest,
+            "an MTP head routed stack is not a symmetric QT44/QT53 payload".to_string(),
+        );
+    }
+    let (manifest, entries) = manifest
+        .with_expert_drop_zero(|_| true)
+        .map_err(|error| Qwen4ArtifactError::new(format!("qwen4: {error}")))?;
+    Ok((manifest, ExpertDropZero::Applied { entries }))
+}
+
 fn hotset_refusal(reason: impl fmt::Display) -> String {
     format!(
         "qwen4: {HOTSET_ENV} requires the packed Flash-Next aggregate MQ4-XTS routed experts \

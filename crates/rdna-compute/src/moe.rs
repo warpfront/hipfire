@@ -3589,20 +3589,19 @@ impl Gpu {
         )?;
         // DESIGN F1: drop-zero planar experts bind the planar O8R16 twin; the other down arms
         // (X-in-LDS twin, generic multirow) read the shipped layout only and refuse.
-        let kernel = if self.mq4_experts_planar {
-            match kernel {
-                MoeDownKernel::O8R16 => MoeDownKernel::PlanarO8R16,
-                _ => {
-                    return Err(hip_bridge::HipError::new(
+        let kernel =
+            if self.mq4_experts_planar {
+                match kernel {
+                    MoeDownKernel::O8R16 => MoeDownKernel::PlanarO8R16,
+                    _ => return Err(hip_bridge::HipError::new(
                         1,
                         "gemm_mq4g128v2_moe_grouped_top10: this arm has no drop-zero planar twin \
                          (only the gfx11+/gfx12 O8R16 arm at M=2560, K=640)",
-                    ))
+                    )),
                 }
-            }
-        } else {
-            kernel
-        };
+            } else {
+                kernel
+            };
         let (func, module, source, grid_x, grid_z, block_x) = match kernel {
             MoeDownKernel::PlanarO8R16 => (
                 "gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201",

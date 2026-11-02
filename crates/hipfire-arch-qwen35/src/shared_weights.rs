@@ -191,6 +191,8 @@ dtype_table! {
     E8PI4G128R256 = 57, E8PI4G128R128 = 58, ParoQ4G64 = 59,
     // GGUF block formats (additive tags; no export route produces them yet).
     GgmlQ4K = 60, GgmlQ5K = 61, GgmlQ6K = 62, GgmlQ8_0 = 63, GgmlIQ4XS = 64,
+    // Drop-zero planar MQ4 routed experts (loader-produced qwen4 layout; additive tags).
+    MQ4G256V2P = 65, MQ4G128V2P = 66,
 }
 
 fn embd_tag(f: EmbeddingFormat) -> SwResult<u8> {

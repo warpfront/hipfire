@@ -190,6 +190,11 @@ required-features = ["lab"]
 name = "mq_i4_moe_gemv_byte_oracle"
 required-features = ["lab"]
 
+# F1 drop-zero planar vs shipped MQ4 expert launcher byte oracle (real layers, on card).
+[[example]]
+name = "f1_planar_byte_oracle"
+required-features = ["lab"]
+
 # K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV oracle + row-time runner (raw PM module; no production dispatch wiring).
 [[example]]
 name = "e8p_i4_moe_gemv_oracle"

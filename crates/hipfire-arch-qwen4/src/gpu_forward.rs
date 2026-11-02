@@ -790,6 +790,23 @@ pub const QWEN4_EXPERT_STAGE_CAPTURE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_CAP
 const QWEN4_EXPERT_STAGE_GATE_UP_BYTES: usize = 1_740_800;
 const QWEN4_EXPERT_STAGE_DOWN_BYTES: usize = 870_400;
 
+/// DESIGN F1: set once a load binds the device launchers to the drop-zero planar expert layout
+/// (every rank of a load shares one layout); the G2 expert stage then strides planar experts.
+static QWEN4_EXPERT_STAGE_PLANAR: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// One routed expert's `[gate/up, down]` stage bytes in the layout the load uses.
+fn qwen4_expert_stage_bytes() -> [usize; 2] {
+    if QWEN4_EXPERT_STAGE_PLANAR.load(std::sync::atomic::Ordering::Relaxed) {
+        [1_689_600, 844_800]
+    } else {
+        [
+            QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
+            QWEN4_EXPERT_STAGE_DOWN_BYTES,
+        ]
+    }
+}
+
 /// Where the effective stage `min_rows` came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StageMinRowsSource {
@@ -3330,17 +3347,48 @@ pub(crate) struct Qwen4EpDummyExpert {
     down: GpuTensor,
 }
 
-impl Qwen4EpDummyExpert {
-    /// Encoded bytes of one routed expert `(gate_up, down)`.
-    fn expert_bytes(config: &Qwen4Config) -> Result<(usize, usize), Qwen4GpuForwardError> {
-        let gate_up = checked_bytes(
+/// Encoded bytes of one routed expert `(gate_up, down)`: the shipped qt44/qt53
+/// rows, or with `planar` the drop-zero planar tensors
+/// (`hipfire_runtime::mq4_planar`, 2,534,400 B per Flash-Next expert).
+pub(crate) fn routed_expert_encoded_bytes(
+    config: &Qwen4Config,
+    planar: bool,
+) -> Result<(usize, usize), Qwen4GpuForwardError> {
+    if planar {
+        use hipfire_runtime::mq4_planar::{planar_bytes, Mq4PlanarKind};
+        let gate_up = planar_bytes(
+            Mq4PlanarKind::GateUp,
             2 * config.moe_intermediate_size,
-            row_stride(DType::MQ4G256V2, config.hidden_size),
-        )?;
-        let down = checked_bytes(
             config.hidden_size,
-            row_stride(DType::MQ4G128V2, config.moe_intermediate_size),
-        )?;
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        let down = planar_bytes(
+            Mq4PlanarKind::Down,
+            config.hidden_size,
+            config.moe_intermediate_size,
+        )
+        .map_err(|error| invalid(error.to_string()))?;
+        return Ok((gate_up, down));
+    }
+    let gate_up = checked_bytes(
+        2 * config.moe_intermediate_size,
+        row_stride(DType::MQ4G256V2, config.hidden_size),
+    )?;
+    let down = checked_bytes(
+        config.hidden_size,
+        row_stride(DType::MQ4G128V2, config.moe_intermediate_size),
+    )?;
+    Ok((gate_up, down))
+}
+
+impl Qwen4EpDummyExpert {
+    /// Encoded bytes of one routed expert `(gate_up, down)` in the layout the
+    /// device's routed experts use ([`Gpu::mq4_experts_planar`]).
+    fn expert_bytes(
+        config: &Qwen4Config,
+        planar: bool,
+    ) -> Result<(usize, usize), Qwen4GpuForwardError> {
+        let (gate_up, down) = routed_expert_encoded_bytes(config, planar)?;
         if gate_up % 4 != 0 || down % 4 != 0 {
             return Err(invalid("EP dummy expert byte size is not a multiple of 4"));
         }
@@ -3348,7 +3396,7 @@ impl Qwen4EpDummyExpert {
     }
 
     fn new(gpu: &mut Gpu, config: &Qwen4Config) -> Result<Self, Qwen4GpuForwardError> {
-        let (gate_up_bytes, down_bytes) = Self::expert_bytes(config)?;
+        let (gate_up_bytes, down_bytes) = Self::expert_bytes(config, gpu.mq4_experts_planar())?;
         let gate_up = gpu.zeros(&[gate_up_bytes / 4], DType::F32)?;
         let down = match gpu.zeros(&[down_bytes / 4], DType::F32) {
             Ok(tensor) => tensor,
@@ -3477,8 +3525,8 @@ fn tile_owner_table_bytes(owners: &[usize]) -> Vec<u8> {
 fn stage_donor_bytes(experts: usize, rank: usize, ranks: usize) -> [usize; 2] {
     let local_experts = Qwen4EpPlacement { rank, ranks }.local_count(experts);
     [
-        local_experts * QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
-        local_experts * QWEN4_EXPERT_STAGE_DOWN_BYTES,
+        local_experts * qwen4_expert_stage_bytes()[0],
+        local_experts * qwen4_expert_stage_bytes()[1],
     ]
 }
 
@@ -4390,16 +4438,22 @@ impl Qwen4MoeLayerRuntime {
                     .ok_or_else(|| invalid("expert tiers have no payload owner"))
             })
             .transpose()?;
+        // DESIGN F1: a drop-zero planar load's tier payloads and unit arenas hold planar experts.
+        let (unit_gate_dtype, unit_down_dtype) = if gpu.mq4_experts_planar() {
+            (DType::MQ4G256V2P, DType::MQ4G128V2P)
+        } else {
+            (DType::MQ4G256V2, DType::MQ4G128V2)
+        };
         let tier_gate_source = tier_source_range
-            .map(|(base, bytes)| foreign_packed_source(base, bytes, DType::MQ4G256V2));
+            .map(|(base, bytes)| foreign_packed_source(base, bytes, unit_gate_dtype));
         let tier_down_source = tier_source_range
-            .map(|(base, bytes)| foreign_packed_source(base, bytes, DType::MQ4G128V2));
+            .map(|(base, bytes)| foreign_packed_source(base, bytes, unit_down_dtype));
         // A unit layer's descriptors are windows over its VRAM arena (dtype carriers only: unit
         // entries and views name per-expert arena windows, `local` is never indexed).
         let unit_sources = unit_arenas.as_ref().map(|arenas| {
             (
-                foreign_packed_source(arenas.vram_base, arenas.vram_bytes, DType::MQ4G256V2),
-                foreign_packed_source(arenas.vram_base, arenas.vram_bytes, DType::MQ4G128V2),
+                foreign_packed_source(arenas.vram_base, arenas.vram_bytes, unit_gate_dtype),
+                foreign_packed_source(arenas.vram_base, arenas.vram_bytes, unit_down_dtype),
             )
         });
         let gate_up_source = match tier_gate_source.as_ref() {
@@ -4421,8 +4475,39 @@ impl Qwen4MoeLayerRuntime {
         let gate_up_dtype = gate_up_source.dtype;
         let down_dtype = down_source.dtype;
         let gate_up_rows = 2 * config.moe_intermediate_size;
-        let gate_up_row_stride = row_stride(gate_up_dtype, config.hidden_size);
-        let down_row_stride = row_stride(down_dtype, config.moe_intermediate_size);
+        // DESIGN F1: drop-zero planar routed experts (`MQ4G256V2P` / `MQ4G128V2P`) have no
+        // per-row stride; the encoded row stride is the codes plane's (`k / 2`), the
+        // scale plane rides in the encoded bytes.
+        let planar = gate_up_dtype.is_mq4_planar() || down_dtype.is_mq4_planar();
+        if planar {
+            if gate_up_dtype != DType::MQ4G256V2P || down_dtype != DType::MQ4G128V2P {
+                return Err(invalid(format!(
+                    "layer {layer_label} drop-zero experts must be MQ4G256V2P/MQ4G128V2P, got \
+                     {gate_up_dtype:?}/{down_dtype:?}"
+                )));
+            }
+            if !gpu.mq4_experts_planar() {
+                return Err(invalid(format!(
+                    "layer {layer_label} holds drop-zero planar experts but the device launchers \
+                     are bound to the shipped layout"
+                )));
+            }
+        } else if gpu.mq4_experts_planar() {
+            return Err(invalid(format!(
+                "layer {layer_label} holds shipped experts but the device launchers are bound to \
+                 the drop-zero planar layout"
+            )));
+        }
+        let gate_up_row_stride = if planar {
+            config.hidden_size / 2
+        } else {
+            row_stride(gate_up_dtype, config.hidden_size)
+        };
+        let down_row_stride = if planar {
+            config.moe_intermediate_size / 2
+        } else {
+            row_stride(down_dtype, config.moe_intermediate_size)
+        };
         // Stock FP8: the loader accessor's immutable qt=55 tables. Expert `e`
         // is the block at `base + e * stride` (codes, then its BF16 `s_inv`
         // grid), so an expert's byte extent is the block stride, not rows *
@@ -4435,6 +4520,7 @@ impl Qwen4MoeLayerRuntime {
         };
         let (gate_up_expert_bytes, down_expert_bytes) = match &fp8_tables {
             Some(tables) => (tables.gate_up.stride, tables.down.stride),
+            None if planar => routed_expert_encoded_bytes(config, true)?,
             None => (
                 checked_bytes(gate_up_rows, gate_up_row_stride)?,
                 checked_bytes(config.hidden_size, down_row_stride)?,
@@ -4445,6 +4531,15 @@ impl Qwen4MoeLayerRuntime {
         } else {
             "qwen4-resident-mqv2-v1"
         };
+        // DESIGN F1: dispatch, the sealed table and the expert views see the SHIPPED dtype
+        // (route selection and every admission key on QT44/QT53); the planar layout is the
+        // device-wide launcher binding (`Gpu::mq4_experts_planar`) plus the planar encoded
+        // bytes and strides computed above.
+        // The sealed resource metadata keeps the exact (planar) dtype: its header validation
+        // checks the encoded bytes and row stride of the layout actually resident.
+        let (gate_up_resource_dtype, down_resource_dtype) = (gate_up_dtype, down_dtype);
+        let gate_up_dtype = gate_up_dtype.shipped_layout();
+        let down_dtype = down_dtype.shipped_layout();
         let kept_ids = config.kept_expert_ids(layer_label, moe.gate.name.starts_with("mtp."));
         if unit_arenas.is_some() && kept_ids.is_some() {
             return Err(invalid(format!(
@@ -4535,7 +4630,8 @@ impl Qwen4MoeLayerRuntime {
         if matches!(
             layout,
             Qwen4ExpertTableLayout::Ep { .. } | Qwen4ExpertTableLayout::EpUnits { .. }
-        ) && (gate_up_dtype != DType::MQ4G256V2 || down_dtype != DType::MQ4G128V2)
+        ) && (gate_up_dtype.shipped_layout() != DType::MQ4G256V2
+            || down_dtype.shipped_layout() != DType::MQ4G128V2)
         {
             return Err(invalid(format!(
                 "layer {layer_label} EP dummy expert is QT44/QT53 but the experts are {gate_up_dtype:?}/{down_dtype:?}"
@@ -4768,11 +4864,11 @@ impl Qwen4MoeLayerRuntime {
                 gate_up_source_name,
                 resident_format,
                 vec![gate_up_rows, config.hidden_size],
-                gate_up_dtype,
+                gate_up_resource_dtype,
                 gate_up_expert_bytes,
                 gate_up_row_stride,
                 16,
-                dtype_rotation_plan(gate_up_dtype),
+                dtype_rotation_plan(gate_up_resource_dtype),
             )
             .map_err(|error| {
                 Qwen4GpuForwardError::Dispatch(format!("expert resource: {error:?}"))
@@ -4781,11 +4877,11 @@ impl Qwen4MoeLayerRuntime {
                 down_source_name,
                 resident_format,
                 vec![config.hidden_size, config.moe_intermediate_size],
-                down_dtype,
+                down_resource_dtype,
                 down_expert_bytes,
                 down_row_stride,
                 16,
-                dtype_rotation_plan(down_dtype),
+                dtype_rotation_plan(down_resource_dtype),
             )
             .map_err(|error| {
                 Qwen4GpuForwardError::Dispatch(format!("expert resource: {error:?}"))
@@ -5067,7 +5163,7 @@ impl Qwen4MoeLayerRuntime {
             shared_gate,
             shared_up,
             shared_down,
-            experts_all_gate_up_mq4: gate_up_dtype == DType::MQ4G256V2,
+            experts_all_gate_up_mq4: gate_up_dtype.shipped_layout() == DType::MQ4G256V2,
             experts,
             identity,
             expert_gate_up_ptrs,
@@ -5698,6 +5794,13 @@ impl Qwen4MoeLayerRuntime {
             self.symmetric = false;
             return Ok(false);
         }
+        if !self.experts.is_empty() && gpu.mq4_experts_planar() {
+            // DESIGN F1: a drop-zero planar layer is symmetric by construction (the host repack
+            // verified `zp == -8*sc` on every header and dropped the zero plane, so the
+            // `qwen4_moe_sym_check` header layout it reads no longer exists).
+            self.symmetric = self.qt44_qt53_formats();
+            return Ok(self.symmetric);
+        }
         if self.expert_keep_mask.is_some() && self.qt44_qt53_formats() {
             let gu: Vec<u8> = self
                 .expert_gate_up_entries
@@ -5794,7 +5897,8 @@ impl Qwen4MoeLayerRuntime {
     /// grouped GEMMs take.
     fn qt44_qt53_formats(&self) -> bool {
         self.experts.iter().all(|expert| {
-            expert.gate_up.dtype == DType::MQ4G256V2 && expert.down.dtype == DType::MQ4G128V2
+            expert.gate_up.dtype.shipped_layout() == DType::MQ4G256V2
+                && expert.down.dtype.shipped_layout() == DType::MQ4G128V2
         })
     }
 
@@ -6170,12 +6274,12 @@ impl Qwen4ExpertStage {
                     (
                         &weights.experts_gate_up,
                         bytes[0],
-                        QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
+                        qwen4_expert_stage_bytes()[0],
                     ),
                     (
                         &weights.experts_down,
                         bytes[1],
-                        QWEN4_EXPERT_STAGE_DOWN_BYTES,
+                        qwen4_expert_stage_bytes()[1],
                     ),
                 ])
             };
@@ -6376,10 +6480,7 @@ impl Qwen4ExpertStage {
     fn redirect_entries(&self, layer: usize, kind: usize, entries: &[usize]) -> Vec<u8> {
         let placement = self.placement.expect("EP tables");
         let base = self.donor_views[2 * (layer % 2) + kind].buf.as_ptr() as usize;
-        let stride = [
-            QWEN4_EXPERT_STAGE_GATE_UP_BYTES,
-            QWEN4_EXPERT_STAGE_DOWN_BYTES,
-        ][kind];
+        let stride = qwen4_expert_stage_bytes()[kind];
         redirect_owned_entries(placement, base, stride, entries)
     }
 
@@ -6763,16 +6864,16 @@ pub(crate) fn seal_moe_decode<'a>(
         experts_all_gate_up_mq4: runtime
             .experts
             .iter()
-            .all(|expert| expert.gate_up.dtype == DType::MQ4G256V2),
+            .all(|expert| expert.gate_up.dtype.shipped_layout() == DType::MQ4G256V2),
         routed_gate_up: runtime
             .experts
             .first()
-            .map(|expert| expert.gate_up.dtype)
+            .map(|expert| expert.gate_up.dtype.shipped_layout())
             .ok_or_else(|| invalid("MoE expert table is empty"))?,
         routed_down: runtime
             .experts
             .first()
-            .map(|expert| expert.down.dtype)
+            .map(|expert| expert.down.dtype.shipped_layout())
             .ok_or_else(|| invalid("MoE expert table is empty"))?,
         routed_has_mixed_experts: false,
         has_paro_shared: false,
@@ -11441,6 +11542,15 @@ impl Qwen4GpuForward {
                 let seal = bundle.ep_seal().cloned().ok_or_else(|| {
                     invalid("an EP placement needs the load's seal (bind_ep_seal)")
                 })?;
+                // DESIGN F1: bind this device's Qwen4 MQ4 MoE launchers to the layout the
+                // rank's routed experts were uploaded in (drop-zero planar or shipped)
+                // before the dummy expert or any layer runtime is built.
+                let planar = bundle
+                    .weights
+                    .expert_layout_planar()
+                    .map_err(|error| invalid(error.to_string()))?;
+                gpu.set_mq4_experts_planar(planar);
+                QWEN4_EXPERT_STAGE_PLANAR.store(planar, std::sync::atomic::Ordering::Relaxed);
                 let state = ep.insert(Qwen4ForwardEp::new(gpu, &bundle.config, placement, seal)?);
                 populate_moe_runtimes(&mut moe, &bundle.weights.layer_refs, |layer, weights| {
                     Qwen4MoeLayerRuntime::from_moe_ep(

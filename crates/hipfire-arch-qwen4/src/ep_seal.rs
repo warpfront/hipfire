@@ -72,6 +72,62 @@ pub fn qwen4_source_generation(hfq: &HfqFile, model_path: &Path) -> Result<Strin
     Ok(source_generation_fingerprint(&files))
 }
 
+/// DESIGN F1: `source` with every routed expert stack that `manifest` declares drop-zero planar
+/// (`MQ4G256V2P` / `MQ4G128V2P`) re-described as its planar representation: the dtype name and
+/// the stack's total encoded bytes (`experts * planar bytes per expert`). `None` when the
+/// manifest declares no planar stack. All-or-nothing across the stacks (one layout per device).
+fn planar_source_identity(
+    manifest: &Qwen4Manifest,
+    source: &SourceIdentity,
+) -> Result<Option<SourceIdentity>, String> {
+    use hipfire_runtime::mq4_planar::{self, Mq4PlanarKind};
+    let mut rewritten = source.clone();
+    let (mut planar, mut shipped) = (0usize, 0usize);
+    for entry in manifest
+        .weights
+        .iter()
+        .filter(|entry| entry.name.ends_with(GATE_UP) || entry.name.ends_with(DOWN))
+    {
+        if !entry.dtype.is_mq4_planar() {
+            shipped += 1;
+            continue;
+        }
+        planar += 1;
+        let kind = if entry.name.ends_with(GATE_UP) {
+            Mq4PlanarKind::GateUp
+        } else {
+            Mq4PlanarKind::Down
+        };
+        let range = rewritten
+            .manifest
+            .iter_mut()
+            .find(|range| range.name == entry.name)
+            .ok_or_else(|| format!("{} is absent from the source index", entry.name))?;
+        let [experts, rows, k] = range.logical_shape[..] else {
+            return Err(format!(
+                "{} shape {:?} is not [experts, rows, cols]",
+                entry.name, range.logical_shape
+            ));
+        };
+        let per_expert = mq4_planar::planar_bytes(kind, rows, k)
+            .map_err(|error| format!("{}: {error}", entry.name))?;
+        range.length = (experts as u64)
+            .checked_mul(per_expert as u64)
+            .ok_or_else(|| format!("{} planar bytes overflow", entry.name))?;
+        range.dtype = match kind {
+            Mq4PlanarKind::GateUp => mq4_planar::NAME_GATE_UP,
+            Mq4PlanarKind::Down => mq4_planar::NAME_DOWN,
+        }
+        .to_string();
+    }
+    if planar > 0 && shipped > 0 {
+        return Err(format!(
+            "expert drop-zero is all-or-nothing: {planar} routed stacks planar, {shipped} shipped"
+        ));
+    }
+    Ok((planar > 0).then_some(rewritten))
+}
+
 impl Qwen4EpSeal {
     /// Seal the routed expert groups of `manifest` (trunk layers labelled by
     /// layer, the MTP head as `trunk_layers`) over a fresh `ranks`-way EP mesh
@@ -112,6 +168,11 @@ impl Qwen4EpSeal {
                 "the manifest declares no routed expert stacks".into(),
             ));
         }
+        // DESIGN F1: a drop-zero planar manifest seals the PLANAR representation of the routed
+        // stacks (dtype and per-expert encoded bytes), so the sealed table's resources describe
+        // the bytes the compact upload / unit arenas actually put on the device.
+        let planar_source = planar_source_identity(manifest, source).map_err(refuse)?;
+        let source = planar_source.as_ref().unwrap_or(source);
         let plans = plan_packed_expert_parallel(
             &groups,
             "qwen4",
