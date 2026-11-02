@@ -763,12 +763,15 @@ impl Qwen4Bundle {
             state_format,
             backend,
             expert_tiers,
+            None,
             &scope,
         )
     }
 
     /// Assemble precisely one admitted pipeline band, including only its
-    /// pinned PLE/input resources and band-local mutable state.
+    /// pinned PLE/input resources and band-local mutable state. `ep_units` is
+    /// `Some((plan, rank))` on a per-expert EP rank
+    /// (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, [`Qwen4Weights::assemble_with_ep_units`]).
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_band_with_ple_rows(
         config: Qwen4Config,
@@ -782,6 +785,7 @@ impl Qwen4Bundle {
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
         expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+        ep_units: Option<(std::sync::Arc<crate::expert_ep_units::EpUnitPlan>, usize)>,
         scope: &crate::weights::Qwen4BandScope,
     ) -> Result<Self, BundleError> {
         if let Err(error) = scope.validate(&config) {
@@ -806,8 +810,8 @@ impl Qwen4Bundle {
                 return Err(cleanup_transaction(error, transaction.rollback(gpu)));
             }
         };
-        let assembled = match expert_tiers {
-            Some(lease) => Qwen4Weights::assemble_with_expert_tiers(
+        let assembled = match (expert_tiers, ep_units) {
+            (Some(lease), None) => Qwen4Weights::assemble_with_expert_tiers(
                 &mut transaction,
                 &config,
                 recipe,
@@ -815,7 +819,22 @@ impl Qwen4Bundle {
                 scope,
                 lease,
             ),
-            None => Qwen4Weights::assemble(&mut transaction, &config, recipe, placements, scope),
+            (None, Some((plan, rank))) => Qwen4Weights::assemble_with_ep_units(
+                &mut transaction,
+                &config,
+                recipe,
+                placements,
+                scope,
+                plan,
+                rank,
+            ),
+            (None, None) => {
+                Qwen4Weights::assemble(&mut transaction, &config, recipe, placements, scope)
+            }
+            (Some(_), Some(_)) => Err(crate::weights::WeightError::EpPlacement(
+                "per-expert EP units cannot be combined with the single-device expert tiers"
+                    .to_string(),
+            )),
         };
         let weights = match assembled {
             Ok(weights) => weights,

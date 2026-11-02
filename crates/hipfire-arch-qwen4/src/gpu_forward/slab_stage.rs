@@ -67,6 +67,20 @@
 //! slot order and combine order as in place; the codec table is untouched.
 //! Host layers need not be a suffix: each parity's next host layer is found by
 //! scanning `layer + 2, layer + 4, ...`.
+//!
+//! EP loads with a per-expert unit plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, D1)
+//! have a mixed layer that is neither a whole resident donor nor a whole host
+//! layer, and a plan may leave no resident layer at all, so the donor stage
+//! cannot apply. They take the same dedicated-buffer stage, built by
+//! [`Qwen4ExpertStage::new_units`] ([`crate::expert_ep_units::ep_unit_stage_kind`]):
+//! a layer with host experts copies its whole pinned HOST REGION (a mixed
+//! layer's single host arena, a host layer's two aggregates) into its
+//! parity's stage buffer, and its compact EP pointer tables rebase only the
+//! entries that point inside that region; entries into the VRAM arena (the
+//! mixed layer's resident experts) and the zero dummy stay as they are. It
+//! shares the tier stage's tables, events, prime/after-MoE protocol and
+//! stage buffers; there are no mirrors and nothing to restore. The loader
+//! charges the buffers (`place_routed_experts_units_staged`).
 
 use super::*;
 use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
@@ -96,7 +110,8 @@ struct StageCopy {
     len: usize,
 }
 
-/// Staged copies of the layers with a host-tier expert.
+/// Staged copies of the layers with a host-tier expert (a per-expert tier
+/// stage) or host region (a per-expert-unit EP stage).
 struct TierStageMeta {
     /// Per trunk layer: its slot in `copies`/`used` and in the stage's
     /// `tables` (two per slot: gate/up, down), `None` for a layer with no
@@ -105,7 +120,9 @@ struct TierStageMeta {
     copies: Vec<Vec<StageCopy>>,
     /// Bytes of each slot's staged payload (the zeroed tail pad follows).
     used: Vec<usize>,
-    /// Keeps both model-level owners alive while the stage exists.
+    /// Keeps both model-level owners alive while the stage exists (tier
+    /// stage). The unit stage reads the bundle's pinned arenas, which every
+    /// forward holds the bundle for; it keeps a unit `()`.
     _keepalive: std::sync::Arc<dyn std::any::Any + Send + Sync>,
 }
 
@@ -247,6 +264,113 @@ pub(super) fn tier_stage_table(
         table.extend_from_slice(&value.to_ne_bytes());
     }
     Ok(table)
+}
+
+/// One pinned host region a unit-stage layer copies whole into the stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct UnitStageRegion {
+    /// Device-visible address of the region's first byte (the address the
+    /// layer's pointer-table entries use).
+    pub(super) base: usize,
+    pub(super) len: usize,
+}
+
+/// Where each region of one unit-stage layer sits in its parity's buffer.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct UnitStageLayout {
+    /// Stage offset of each region.
+    pub(super) dst: Vec<usize>,
+    /// End of the staged payload; the zeroed tail pad starts here.
+    pub(super) used: usize,
+}
+
+/// Pack `regions` back to back at 256-byte alignment. Empty or overlapping
+/// regions are refused.
+pub(super) fn unit_stage_layout(regions: &[UnitStageRegion]) -> Result<UnitStageLayout, String> {
+    let mut cursor = 0usize;
+    let mut dst = Vec::with_capacity(regions.len());
+    for (index, region) in regions.iter().enumerate() {
+        let end = region
+            .base
+            .checked_add(region.len)
+            .ok_or_else(|| format!("host region {index} overflows the address space"))?;
+        if region.len == 0 {
+            return Err(format!("host region {index} is empty"));
+        }
+        if regions[..index]
+            .iter()
+            .any(|other| region.base < other.base + other.len && other.base < end)
+        {
+            return Err(format!("host region {index} overlaps an earlier region"));
+        }
+        let at = cursor
+            .checked_add(STAGE_ALIGN - 1)
+            .ok_or_else(|| "unit stage layout overflows".to_string())?
+            & !(STAGE_ALIGN - 1);
+        cursor = at
+            .checked_add(region.len)
+            .ok_or_else(|| "unit stage layout overflows".to_string())?;
+        dst.push(at);
+    }
+    Ok(UnitStageLayout { dst, used: cursor })
+}
+
+/// A unit-stage layer's little-endian device pointer table and the number of
+/// entries rebased: every entry inside region `i` moves to
+/// `stage_base + dst[i] + (entry - region.base)`, every other entry (the VRAM
+/// arena, the zero dummy) is unchanged.
+pub(super) fn unit_stage_table(
+    entries: &[usize],
+    regions: &[UnitStageRegion],
+    dst: &[usize],
+    stage_base: usize,
+) -> Result<(Vec<u8>, usize), String> {
+    if regions.len() != dst.len() {
+        return Err(format!(
+            "{} host regions but {} stage offsets",
+            regions.len(),
+            dst.len()
+        ));
+    }
+    let mut table = Vec::with_capacity(entries.len() * std::mem::size_of::<u64>());
+    let mut rebased = 0usize;
+    for (expert, &entry) in entries.iter().enumerate() {
+        let value = match regions
+            .iter()
+            .position(|region| entry >= region.base && entry - region.base < region.len)
+        {
+            Some(region) => {
+                rebased += 1;
+                stage_base
+                    .checked_add(dst[region])
+                    .and_then(|at| at.checked_add(entry - regions[region].base))
+                    .ok_or_else(|| format!("expert {expert} rebased entry overflows"))?
+            }
+            None => entry,
+        };
+        table.extend_from_slice(&value.to_ne_bytes());
+    }
+    Ok((table, rebased))
+}
+
+/// The stage slot of every trunk layer of `rank` under `plan`: layers with a
+/// host region take consecutive slots, `layers` entries long.
+pub(super) fn unit_stage_slots(
+    plan: &crate::expert_ep_units::EpUnitPlan,
+    rank: usize,
+    layers: usize,
+) -> Vec<Option<usize>> {
+    let mut next = 0usize;
+    (0..layers)
+        .map(|layer| {
+            (layer < plan.geometry().layers && plan.stage_host_region_bytes(rank, layer) > 0).then(
+                || {
+                    next += 1;
+                    next - 1
+                },
+            )
+        })
+        .collect()
 }
 
 /// The next layer after `layer` of the same parity with a staged slot.
@@ -1200,6 +1324,302 @@ impl Qwen4ExpertStage {
         Ok(Some(stage))
     }
 
+    /// Per-expert-unit EP stage (D1), or `None` (printed) when it cannot
+    /// stage. Every layer of this rank with host experts takes a slot; its
+    /// compact decode-table entries that point inside its pinned host region
+    /// are rebased onto the parity's dedicated stage buffer, all others (the
+    /// mixed layer's VRAM arena, the zero dummy) keep their address. Nothing
+    /// is overwritten and nothing is restored.
+    pub(super) fn new_units(
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        moe: &[Option<Qwen4MoeLayerRuntime>],
+        chunk_rows: usize,
+    ) -> Result<Option<Self>, Qwen4GpuForwardError> {
+        let off = |reason: &str| {
+            eprintln!("  qwen4 long-prefill expert staging: off ({reason})");
+            hipfire_config::load_summary::note(
+                hipfire_config::load_summary::Facet::Prefill,
+                format!("long-prefill expert staging off ({reason})"),
+            );
+            Ok(None)
+        };
+        let (Some(plan), Some(placement)) =
+            (bundle.weights.ep_unit_plan(), bundle.weights.ep_placement())
+        else {
+            return off("a unit stage needs an EP rank with a per-expert plan");
+        };
+        if !rdna_compute::expert_capabilities::stage_eligible(
+            &gpu.arch,
+            [rdna_compute::expert_capabilities::QT_MQ4_XTS],
+        ) {
+            return off(&format!("no MQ4 stage capability on {}", gpu.arch));
+        }
+        let config = &bundle.config;
+        let rank = placement.rank;
+        let slots = unit_stage_slots(plan, rank, moe.len());
+        let owned = placement.local_count(config.num_experts);
+        // (layer, regions, CPU addresses of the regions, layout, expected rebased entries)
+        let mut layouts: Vec<(
+            usize,
+            Vec<UnitStageRegion>,
+            Vec<usize>,
+            UnitStageLayout,
+            usize,
+        )> = Vec::new();
+        for (layer, runtime) in moe.iter().enumerate() {
+            let planned = slots[layer].is_some();
+            let Some(runtime) = runtime.as_ref() else {
+                if planned {
+                    return Err(invalid(format!(
+                        "unit stage: layer {layer} holds host experts but has no MoE runtime"
+                    )));
+                }
+                continue;
+            };
+            // The forward's stage selection and `before_moe` wait read the
+            // runtime's layer bit; it must be exactly the plan's host layers.
+            if runtime.host_mapped() != planned {
+                return Err(invalid(format!(
+                    "unit stage: layer {layer} runtime host_mapped {} disagrees with the plan ({planned})",
+                    runtime.host_mapped()
+                )));
+            }
+            if !planned {
+                continue;
+            }
+            let mut regions = Vec::with_capacity(2);
+            let mut cpu = Vec::with_capacity(2);
+            let expected = match bundle.weights.ep_unit_layer(layer)? {
+                Some(unit) => {
+                    let bytes = unit.map.arena_entry_bytes(UnitTier::Host);
+                    let Some(host) = gpu.host_bytes(unit.host) else {
+                        return off("a mixed layer's host arena has no pinned host bytes");
+                    };
+                    if host.len() < bytes
+                        || bytes as u64 != plan.stage_host_region_bytes(rank, layer)
+                    {
+                        return Err(invalid(format!(
+                            "unit stage: layer {layer} host arena holds {} B, the plan stages {} B",
+                            host.len(),
+                            plan.stage_host_region_bytes(rank, layer)
+                        )));
+                    }
+                    regions.push(UnitStageRegion {
+                        base: unit.host.buf.as_ptr() as usize,
+                        len: bytes,
+                    });
+                    cpu.push(host.as_ptr() as usize);
+                    unit.map.count(UnitTier::Host)
+                }
+                None => {
+                    let weights = bundle
+                        .weights
+                        .layer(layer)
+                        .ok_or_else(|| invalid("unit stage layer is not owned"))?
+                        .ffn
+                        .moe()
+                        .ok_or_else(|| invalid("unit stage layer has no MoE FFN"))?;
+                    for source in [&weights.experts_gate_up, &weights.experts_down] {
+                        let owner = bundle.weights.resident(source)?;
+                        let Some(host) = gpu.host_bytes(owner) else {
+                            return off("a host expert owner has no pinned host bytes");
+                        };
+                        regions.push(UnitStageRegion {
+                            base: owner.buf.as_ptr() as usize,
+                            len: host.len(),
+                        });
+                        cpu.push(host.as_ptr() as usize);
+                    }
+                    let total = regions.iter().map(|region| region.len as u64).sum::<u64>();
+                    if total != plan.stage_host_region_bytes(rank, layer) {
+                        return Err(invalid(format!(
+                            "unit stage: layer {layer} host aggregates hold {total} B, the plan stages {} B",
+                            plan.stage_host_region_bytes(rank, layer)
+                        )));
+                    }
+                    owned
+                }
+            };
+            let layout = unit_stage_layout(&regions)
+                .map_err(|reason| invalid(format!("unit stage: layer {layer}: {reason}")))?;
+            // Every owned host expert of both tables must lie inside the region
+            // (validated here with a null stage base, before anything is allocated).
+            for (name, entries) in [
+                ("gate/up", &runtime.expert_gate_up_entries),
+                ("down", &runtime.expert_down_entries),
+            ] {
+                if entries.len() != config.num_experts {
+                    return Err(invalid(format!(
+                        "unit stage: layer {layer} {name} table length differs from num_experts"
+                    )));
+                }
+                let (_, rebased) = unit_stage_table(entries, &regions, &layout.dst, 0)
+                    .map_err(|reason| invalid(format!("unit stage: layer {layer}: {reason}")))?;
+                if rebased != expected {
+                    return Err(invalid(format!(
+                        "unit stage: layer {layer} {name} table has {rebased} entries in its host region, the plan has {expected} host experts"
+                    )));
+                }
+            }
+            layouts.push((layer, regions, cpu, layout, expected));
+        }
+        let Some(first_host) = layouts.first().map(|(layer, ..)| *layer) else {
+            return off("this rank has no host expert layer");
+        };
+        // One buffer per layer parity: the largest staged payload of that
+        // parity plus the zeroed tail pad; the loader charged the largest
+        // region of any layer for each.
+        let capacity = plan.max_stage_host_region_bytes() as usize;
+        let mut sizes = [ARENA_TAIL_PAD_BYTES; 2];
+        for (layer, _, _, layout, _) in &layouts {
+            if layout.used > capacity {
+                return Err(invalid(format!(
+                    "unit stage: layer {layer} stages {} B, above the {capacity} B the placement charged",
+                    layout.used
+                )));
+            }
+            let need = layout
+                .used
+                .checked_add(ARENA_TAIL_PAD_BYTES)
+                .ok_or_else(|| invalid("unit stage buffer size overflows"))?;
+            sizes[layer % 2] = sizes[layer % 2].max(need);
+        }
+        let mut copies = Vec::with_capacity(layouts.len());
+        let mut used = Vec::with_capacity(layouts.len());
+        for (_, regions, cpu, layout, _) in &layouts {
+            copies.push(
+                regions
+                    .iter()
+                    .zip(cpu)
+                    .zip(&layout.dst)
+                    .map(|((region, &src), &dst)| StageCopy {
+                        src,
+                        dst,
+                        len: region.len,
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            used.push(layout.used);
+        }
+        gpu.ensure_capture_stream()?;
+        // Staging is an optimisation: buffers that do not fit VRAM leave every
+        // host expert read in place.
+        let mut buffers = Vec::with_capacity(2);
+        for size in sizes {
+            match gpu.alloc_tensor(&[size], DType::Raw) {
+                Ok(buffer) => buffers.push(buffer),
+                Err(error) => {
+                    for buffer in buffers {
+                        let _ = gpu.free_tensor(buffer);
+                    }
+                    return off(&format!(
+                        "stage buffers of {} and {} MiB do not fit VRAM: {error}",
+                        sizes[0] >> 20,
+                        sizes[1] >> 20
+                    ));
+                }
+            }
+        }
+        let copy_stream = match gpu.hip.stream_create_non_blocking() {
+            Ok(stream) => stream,
+            Err(error) => {
+                for buffer in buffers {
+                    let _ = gpu.free_tensor(buffer);
+                }
+                return Err(error.into());
+            }
+        };
+        let (min_rows, min_rows_source) = qwen4_expert_stage_min_rows(gpu, chunk_rows);
+        let mut stage = Self {
+            min_rows,
+            min_rows_source,
+            capture: hipfire_config::developer_bool(QWEN4_EXPERT_STAGE_CAPTURE_ENV, true),
+            donors: [usize::MAX; 2],
+            donor_views: Vec::new(),
+            mirrors: buffers,
+            tables: Vec::with_capacity(2 * layouts.len()),
+            compact_tables: Vec::new(),
+            compact_keys: Vec::new(),
+            full_keys: Vec::new(),
+            compact_bound: Vec::new(),
+            first_host,
+            placement: Some(placement),
+            bytes: [0, 0],
+            copy_stream,
+            ready: Vec::with_capacity(2),
+            free: Vec::with_capacity(2),
+            state: std::cell::Cell::new([DonorState::Resident; 2]),
+            slab: Some(SlabStageMeta {
+                sources: Vec::new(),
+                tier: Some(TierStageMeta {
+                    slots,
+                    copies,
+                    used,
+                    _keepalive: std::sync::Arc::new(()),
+                }),
+                borrowed: false,
+            }),
+        };
+        let result = (|| {
+            for _ in 0..2 {
+                stage.ready.push(
+                    gpu.hip
+                        .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
+                );
+                stage.free.push(
+                    gpu.hip
+                        .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?,
+                );
+            }
+            for (layer, regions, _, layout, _) in &layouts {
+                let runtime = moe[*layer].as_ref().expect("checked above");
+                let stage_base = stage.mirrors[layer % 2].buf.as_ptr() as usize;
+                for entries in [
+                    &runtime.expert_gate_up_entries,
+                    &runtime.expert_down_entries,
+                ] {
+                    let (table, _) = unit_stage_table(entries, regions, &layout.dst, stage_base)
+                        .map_err(|reason| {
+                            invalid(format!("unit stage: layer {layer} table: {reason}"))
+                        })?;
+                    let tensor = gpu.alloc_tensor(&[2 * config.num_experts], DType::F32)?;
+                    stage.tables.push(tensor);
+                    gpu.memcpy_htod_auto(
+                        &stage.tables.last().expect("table just allocated").buf,
+                        &table,
+                    )?;
+                }
+            }
+            Ok::<(), Qwen4GpuForwardError>(())
+        })();
+        if let Err(error) = result {
+            let _ = stage.free_gpu(gpu);
+            return Err(error);
+        }
+        let host_experts = layouts
+            .iter()
+            .map(|(.., expected)| *expected)
+            .sum::<usize>();
+        eprintln!(
+            "  qwen4 long-prefill expert staging: forwards of >= {} rows stage the {host_experts} host experts of {} EP unit layers through two VRAM stage buffers of {} and {} MiB (resident experts keep their VRAM arena address; nothing overwritten, nothing to restore; wide-hidden capture forwards {}; min_rows from {}, prefill chunk {chunk_rows})",
+            stage.min_rows,
+            layouts.len(),
+            sizes[0] >> 20,
+            sizes[1] >> 20,
+            if stage.capture { "stage" } else { "mapped" },
+            stage.min_rows_source.label()
+        );
+        hipfire_config::load_summary::note(
+            hipfire_config::load_summary::Facet::Prefill,
+            format!(
+                "long-prefill expert staging on (>= {} rows)",
+                stage.min_rows
+            ),
+        );
+        Ok(Some(stage))
+    }
+
     /// The VRAM a staged host layer's arena (tier: experts) is copied into:
     /// the dedicated stage buffer, or the borrowed donor arena of that parity.
     fn stage_buffer(&self, parity: usize) -> &GpuTensor {
@@ -1283,9 +1703,10 @@ impl Qwen4ExpertStage {
                 .stream_wait_event(&self.copy_stream, &self.free[parity])?;
             let buffer = &self.mirrors[parity].buf;
             for copy in &tier.copies[slot] {
-                // SAFETY: `copy.src` lies inside the lease's pinned host owner
-                // (checked against its range in `new_tier`), which `_keepalive`
-                // retains and nothing writes after materialization.
+                // SAFETY: `copy.src` lies inside a pinned host owner (the lease's
+                // for a tier stage, the bundle's host arena or aggregate for a
+                // unit stage; checked against its range at construction), which
+                // outlives the stage and nothing writes after materialization.
                 let source = unsafe { std::slice::from_raw_parts(copy.src as *const u8, copy.len) };
                 gpu.hip.memcpy_htod_async(
                     &buffer.byte_view(copy.dst, copy.len),
@@ -2148,5 +2569,222 @@ mod tests {
                 next: BorrowedNext::Nothing
             }
         );
+    }
+
+    // ---- D1 unit stage (`ep_unit_stage_*`) ----
+
+    /// Flash-Next-sized geometry: gate/up 1,740,800 B and down 870,400 B per
+    /// expert, small expert count for the pure tests.
+    const UNIT_GU: usize = 1_740_800;
+    const UNIT_DN: usize = 870_400;
+
+    #[test]
+    fn ep_unit_stage_mixed_layer_rebases_only_host_entries_by_one_delta() {
+        // Rank 0 of 2 owns even experts of a 12-expert layer: experts 0,2,4 in
+        // the VRAM arena, 6,8,10 in the host arena, odd experts are the dummy.
+        let (vram, host, dummy) = (0x7000_0000usize, 0x9000_0000usize, 0x5000_0000usize);
+        let n_host = 3;
+        let host_len = n_host * (UNIT_GU + UNIT_DN);
+        let gate_up: Vec<usize> = (0..12)
+            .map(|e| match e {
+                e if e % 2 == 1 => dummy,
+                0 | 2 | 4 => vram + (e / 2) * UNIT_GU,
+                e => host + (e / 2 - 3) * UNIT_GU,
+            })
+            .collect();
+        let down: Vec<usize> = (0..12)
+            .map(|e| match e {
+                e if e % 2 == 1 => dummy,
+                0 | 2 | 4 => vram + 3 * UNIT_GU + (e / 2) * UNIT_DN,
+                e => host + n_host * UNIT_GU + (e / 2 - 3) * UNIT_DN,
+            })
+            .collect();
+        let regions = [UnitStageRegion {
+            base: host,
+            len: host_len,
+        }];
+        let layout = unit_stage_layout(&regions).unwrap();
+        assert_eq!(layout.dst, vec![0]);
+        assert_eq!(layout.used, host_len);
+        let stage = 0x2_0000_0000usize;
+        for entries in [&gate_up, &down] {
+            let (table, rebased) = unit_stage_table(entries, &regions, &layout.dst, stage).unwrap();
+            assert_eq!(rebased, n_host);
+            let out = decode(&table);
+            for (e, (&before, &after)) in entries.iter().zip(&out).enumerate() {
+                if (6..12).contains(&e) && e % 2 == 0 {
+                    // Host experts moved by one delta: stage_base - host base.
+                    assert_eq!(after, before - host + stage, "expert {e}");
+                } else {
+                    // Resident (VRAM arena) and dummy entries are untouched.
+                    assert_eq!(after, before, "expert {e}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ep_unit_stage_host_layer_rebases_two_aggregate_sources() {
+        // A wholly host layer: two pinned aggregates, one region each, packed
+        // back to back at 256-byte alignment (gate/up block, then down).
+        let (gate, down_base, dummy) = (0x9000_0000usize, 0xA000_0000usize, 0x5000_0000usize);
+        let owned = 4;
+        let regions = [
+            UnitStageRegion {
+                base: gate,
+                len: owned * UNIT_GU,
+            },
+            UnitStageRegion {
+                base: down_base,
+                len: owned * UNIT_DN,
+            },
+        ];
+        let layout = unit_stage_layout(&regions).unwrap();
+        assert_eq!(layout.dst, vec![0, owned * UNIT_GU]);
+        assert_eq!(layout.used, owned * (UNIT_GU + UNIT_DN));
+        // Odd regions pad up to the next 256 boundary.
+        let odd = unit_stage_layout(&[
+            UnitStageRegion {
+                base: 0x1000,
+                len: 100,
+            },
+            UnitStageRegion {
+                base: 0x2000,
+                len: 100,
+            },
+        ])
+        .unwrap();
+        assert_eq!(odd.dst, vec![0, 256]);
+        assert_eq!(odd.used, 356);
+        let gate_up: Vec<usize> = (0..8)
+            .map(|e| {
+                if e % 2 == 0 {
+                    gate + (e / 2) * UNIT_GU
+                } else {
+                    dummy
+                }
+            })
+            .collect();
+        let down: Vec<usize> = (0..8)
+            .map(|e| {
+                if e % 2 == 0 {
+                    down_base + (e / 2) * UNIT_DN
+                } else {
+                    dummy
+                }
+            })
+            .collect();
+        let stage = 0x2_0000_0000usize;
+        let (table, rebased) = unit_stage_table(&gate_up, &regions, &layout.dst, stage).unwrap();
+        assert_eq!(rebased, owned);
+        let out = decode(&table);
+        for e in 0..8 {
+            if e % 2 == 0 {
+                assert_eq!(out[e], stage + (e / 2) * UNIT_GU);
+            } else {
+                assert_eq!(out[e], dummy);
+            }
+        }
+        let (table, rebased) = unit_stage_table(&down, &regions, &layout.dst, stage).unwrap();
+        assert_eq!(rebased, owned);
+        let out = decode(&table);
+        for e in (0..8).step_by(2) {
+            // The down aggregate sits after the gate/up block in the stage.
+            assert_eq!(out[e], stage + owned * UNIT_GU + (e / 2) * UNIT_DN);
+        }
+    }
+
+    #[test]
+    fn ep_unit_stage_layout_and_table_refuse_malformed_input() {
+        let region = |base, len| UnitStageRegion { base, len };
+        assert!(unit_stage_layout(&[region(0x1000, 0)]).is_err());
+        assert!(unit_stage_layout(&[region(0x1000, 0x100), region(0x1080, 0x100)]).is_err());
+        assert!(unit_stage_layout(&[region(usize::MAX - 4, 16)]).is_err());
+        assert!(unit_stage_layout(&[region(0x1000, 0x100), region(0x1100, 0x100)]).is_ok());
+        let regions = [region(0x1000, 0x100)];
+        assert!(unit_stage_table(&[0x1000], &regions, &[], 0).is_err());
+        assert!(unit_stage_table(&[0x1010], &regions, &[0], usize::MAX).is_err());
+        // An entry one past the region end is not in it (stays unchanged).
+        let (table, rebased) = unit_stage_table(&[0x1100, 0xfff], &regions, &[0], 0x9000).unwrap();
+        assert_eq!(rebased, 0);
+        assert_eq!(decode(&table), vec![0x1100, 0xfff]);
+    }
+
+    #[test]
+    fn ep_unit_stage_next_staged_layer_scans_mixed_host_and_resident_layers() {
+        use crate::expert_ep_units::{
+            place_routed_experts_units, EpLayerState, EpRanking, EpUnitGeometry, EpUnitPlan,
+            EpUnitSource,
+        };
+        // 8 layers x 8 experts, 2 ranks: rank 0 owns 4 per layer. A hand-made
+        // ranking keeps layer 1 fully resident (its 4 rank-0 units), layer 3
+        // and 6 partly (mixed), every other layer stays wholly host.
+        let geometry = EpUnitGeometry {
+            layers: 8,
+            experts_per_layer: 8,
+            ranks: 2,
+            gate_up_bytes: UNIT_GU as u64,
+            down_bytes: UNIT_DN as u64,
+        };
+        let id = |layer: usize, expert: usize| (layer * 8 + expert) as u32;
+        let mut order: Vec<u32> = Vec::new();
+        order.extend((0..8).filter(|e| e % 2 == 0).map(|e| id(1, e)));
+        order.extend([id(3, 0), id(3, 2), id(6, 4)]);
+        let hot: std::collections::BTreeSet<u32> = order.iter().copied().collect();
+        order.extend((0..64u32).filter(|id| !hot.contains(id)));
+        let units = 4 + 2 + 1;
+        let charge = |layers: u64| {
+            units as u64 * geometry.unit_bytes()
+                + layers * 2 * crate::expert_ep_units::VRAM_ARENA_TAIL_PAD_BYTES
+        };
+        let plan: EpUnitPlan = place_routed_experts_units(
+            &geometry,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &order,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![charge(3), 0],
+            },
+        )
+        .unwrap();
+        let states: Vec<_> = (0..8).map(|l| plan.layer_state(0, l)).collect();
+        assert_eq!(states[1], EpLayerState::Resident);
+        assert!(matches!(states[3], EpLayerState::Mixed { .. }));
+        assert!(matches!(states[6], EpLayerState::Mixed { .. }));
+        for l in [0, 2, 4, 5, 7] {
+            assert_eq!(states[l], EpLayerState::Host, "layer {l}");
+        }
+        // Slots follow the host-bearing layers (everything but layer 1).
+        let slots = unit_stage_slots(&plan, 0, 8);
+        assert_eq!(
+            slots,
+            vec![
+                Some(0),
+                None,
+                Some(1),
+                Some(2),
+                Some(3),
+                Some(4),
+                Some(5),
+                Some(6)
+            ]
+        );
+        // Even parity: 0 -> 2 -> 4 -> 6 (mixed, host and mixed alike).
+        assert_eq!(next_staged_layer(&slots, 0), Some(2));
+        assert_eq!(next_staged_layer(&slots, 2), Some(4));
+        assert_eq!(next_staged_layer(&slots, 4), Some(6));
+        assert_eq!(next_staged_layer(&slots, 6), None);
+        // Odd parity skips the resident layer 1 entirely: 3 -> 5 -> 7.
+        assert_eq!(slots[1], None);
+        assert_eq!(next_staged_layer(&slots, 1), Some(3));
+        assert_eq!(next_staged_layer(&slots, 3), Some(5));
+        assert_eq!(next_staged_layer(&slots, 5), Some(7));
+        assert_eq!(next_staged_layer(&slots, 7), None);
+        // Rank 1 holds nothing (zero budget): all host, every layer a slot.
+        assert!(unit_stage_slots(&plan, 1, 8).iter().all(Option::is_some));
+        // A layer past the plan (an MTP head) is never staged.
+        assert_eq!(unit_stage_slots(&plan, 0, 9)[8], None);
     }
 }

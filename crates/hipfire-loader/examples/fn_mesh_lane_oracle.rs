@@ -2643,6 +2643,13 @@ fn run(args: Args) -> R<Verdict> {
         report["error"] = json!(error);
     }
     finalize_manifest(&mut manifest, &report);
+    // `HIPFIRE_EP_LAB_UNIT_HITS=1` with a unit plan: the per-rank, per-layer VRAM hit counters.
+    let hits = hipfire_arch_qwen4::ep::lab_unit_hits::take();
+    if !hits.is_empty() {
+        let text = hipfire_arch_qwen4::ep::lab_unit_hits::report(&hits, 2_611_200);
+        eprint!("{text}");
+        let _ = std::fs::write(args.out.join("unit_hits.txt"), text);
+    }
     write_ids(&args.out.join("ids.jsonl"), &ids_lines)?;
     write_json(&args.out.join("report.json"), &report)?;
     if !manifest.is_null() {

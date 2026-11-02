@@ -23,6 +23,7 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig};
 use crate::ep_seal::Qwen4EpRankSeal;
+use crate::expert_ep_units::{EpLayerState, EpUnitLayerMap, EpUnitPlan, UnitTier};
 use crate::ple_stage::{
     ple_async_upload, ple_async_upload_enabled, PleHostStage, PLE_ASYNC_UPLOAD_ENV,
 };
@@ -1613,6 +1614,11 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// local owning tensor's residency, never a dummy or peer view's bit.
     /// Residency changes weight-stream reuse, not each output's fold order.
     host_mapped: bool,
+    /// The layer runs the static `e % ranks` owners although it holds host-resident experts
+    /// (D1 per-expert units): a mixed arena layer, or a host layer of a unit plan whose peers
+    /// are not all host ([`ep_unit_static_owners`]). Such a layer is never a balanced layer
+    /// (no owner-assign, no live table rewrite). `false` without a unit plan.
+    static_owners: bool,
     /// Opt-in routed CPU splice, only for whole host-mapped trunk aggregates.
     pub(crate) cpu_deferred_experts: bool,
     cpu_expert_owners: Option<cpu_splice::CpuExpertOwners>,
@@ -1768,6 +1774,11 @@ impl Qwen4MoeLayerRuntime {
                 "slow-link layer {layer} is not S1 qualified: {why}"
             ))
         })?;
+        if self.static_owners {
+            return Err(invalid(format!(
+                "slow-link layer {layer}: a per-expert unit layer (HIPFIRE_QWEN4_EP_EXPERT_HOTSET) is not an S1 stream source"
+            )));
+        }
         if !self.host_mapped {
             return Err(invalid(format!(
                 "slow-link layer {layer} has no host-mapped experts to stream"
@@ -2181,6 +2192,10 @@ pub(crate) enum EpLaneExpertKind {
     StaticResidentPacked,
     /// The live balanced-ownership runtime over a host-mapped packed aggregate.
     BalancedHostMappedPacked,
+    /// The static EP decode runtime over a host-bearing layer of a per-expert unit plan
+    /// (D1): a mixed VRAM/host arena layer, or a host layer whose peers are not all host.
+    /// Static `e % ranks` owners, never a balanced layer.
+    StaticUnitsPacked,
 }
 
 /// What [`classify_ep_lane_expert`] needs of one layer's [`Qwen4MoeLayerRuntime`].
@@ -2193,6 +2208,9 @@ struct EpLaneRuntimeFacts {
     packed_mq4: bool,
     /// No CPU-deferred/split/cold owner, tier, slab, stock FP8 or keep mask.
     plain: bool,
+    /// The layer runs static owners although host-mapped (D1 unit plan, see
+    /// [`Qwen4MoeLayerRuntime::static_owners`]): never balanced.
+    static_owners: bool,
 }
 
 /// Classify one EP layer's lane expert binding from plain facts: the row gather
@@ -2200,9 +2218,11 @@ struct EpLaneRuntimeFacts {
 /// when that is the layer's live balanced runtime) and the layer's `static_moe`
 /// runtime are both labelled for `layer` and plain packed QT44/QT53, and the
 /// residency agrees with the selection: a live balanced runtime over a
-/// host-mapped layer, else the static runtime over a resident layer. Anything
+/// host-mapped layer without static owners, the static runtime over a resident
+/// layer, or the static runtime over a host-bearing unit-plan layer
+/// (`static_owners` on both runtimes, no balanced selection). Anything
 /// else (a host-mapped layer without a live balanced runtime, a balanced
-/// selection over a resident layer, a missing runtime) is `None`.
+/// selection over a resident or static-owner layer, a missing runtime) is `None`.
 fn classify_ep_lane_expert(
     layer: usize,
     gather_installed: bool,
@@ -2219,13 +2239,21 @@ fn classify_ep_lane_expert(
             return None;
         }
     }
+    let static_owners = (selected.static_owners, static_moe.static_owners);
     match (
         balanced_selected,
         selected.host_mapped,
         static_moe.host_mapped,
     ) {
-        (true, true, true) => Some(EpLaneExpertKind::BalancedHostMappedPacked),
-        (false, false, false) => Some(EpLaneExpertKind::StaticResidentPacked),
+        (true, true, true) if static_owners == (false, false) => {
+            Some(EpLaneExpertKind::BalancedHostMappedPacked)
+        }
+        (false, false, false) if static_owners == (false, false) => {
+            Some(EpLaneExpertKind::StaticResidentPacked)
+        }
+        (false, true, true) if static_owners == (true, true) => {
+            Some(EpLaneExpertKind::StaticUnitsPacked)
+        }
         _ => None,
     }
 }
@@ -2360,6 +2388,73 @@ pub struct Qwen4PeerExpertSource {
     pub down_bytes: usize,
 }
 
+/// The slot-addressed arenas of one MIXED trunk layer of one rank (D1 per-expert units): one
+/// device arena and one pinned-host arena, `[gate/up block | down block]` each, whose expert
+/// addresses are the layer map's arithmetic ([`EpUnitLayerMap::expert_offsets`]). `*_bytes`
+/// are the arena entry lengths ([`EpUnitLayerMap::arena_entry_bytes`]); a tier the layer holds
+/// no expert in (`map.count(tier) == 0`) is never read and its window is ignored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnitArenas<'a> {
+    pub(crate) map: &'a EpUnitLayerMap,
+    pub(crate) vram_base: usize,
+    pub(crate) vram_bytes: usize,
+    pub(crate) host_base: usize,
+    pub(crate) host_bytes: usize,
+}
+
+impl UnitArenas<'_> {
+    /// `(base, bytes)` of `tier`'s arena.
+    fn window(&self, tier: UnitTier) -> (usize, usize) {
+        match tier {
+            UnitTier::Vram => (self.vram_base, self.vram_bytes),
+            UnitTier::Host => (self.host_base, self.host_bytes),
+        }
+    }
+}
+
+/// One rank's source of a layer's routed experts as the EP chunk table sees it: today's
+/// compact tensors, or the two arenas of a mixed layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PeerLayerSource<'a> {
+    Compact(Qwen4PeerExpertSource),
+    Units(UnitArenas<'a>),
+}
+
+/// Owning form of [`UnitArenas`]: what a rank publishes to its peers for one mixed layer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4PeerUnitSource {
+    /// That rank's slot map of the layer.
+    pub map: EpUnitLayerMap,
+    pub vram_base: usize,
+    pub vram_bytes: usize,
+    pub host_base: usize,
+    pub host_bytes: usize,
+}
+
+/// One rank's published source of one trunk MoE layer (what every peer's full table names):
+/// the compact routed-expert tensors, or the unit arenas of a mixed layer (D1).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Qwen4PeerLayerSource {
+    Compact(Qwen4PeerExpertSource),
+    Units(Qwen4PeerUnitSource),
+}
+
+impl Qwen4PeerLayerSource {
+    /// The table builder's borrowed view of this source.
+    pub(crate) fn table_source(&self) -> PeerLayerSource<'_> {
+        match self {
+            Self::Compact(source) => PeerLayerSource::Compact(*source),
+            Self::Units(unit) => PeerLayerSource::Units(UnitArenas {
+                map: &unit.map,
+                vram_base: unit.vram_base,
+                vram_bytes: unit.vram_bytes,
+                host_base: unit.host_base,
+                host_bytes: unit.host_bytes,
+            }),
+        }
+    }
+}
+
 /// How one rank's per-layer expert pointer table is populated.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Qwen4ExpertTableLayout<'a> {
@@ -2383,6 +2478,22 @@ pub(crate) enum Qwen4ExpertTableLayout<'a> {
         placement: Qwen4EpPlacement,
         peers: &'a [Qwen4PeerExpertSource],
     },
+    /// EP decode table of a MIXED layer (D1 per-expert units): owned experts name the VRAM or
+    /// pinned-host arena slot of `layer.map`, every other expert the rank's zero dummy, exactly
+    /// as [`Self::Ep`]. The `local` source of the table builder is unused (the arenas carry it).
+    EpUnits {
+        placement: Qwen4EpPlacement,
+        dummy: Qwen4PeerExpertSource,
+        layer: UnitArenas<'a>,
+    },
+    /// EP chunk table where at least one rank's layer source is a unit arena pair (D1): every
+    /// expert names its owner's own source, `peers` indexed by rank (`peers[placement.rank]` is
+    /// this rank's own). A compact `peers[placement.rank]` must equal the table builder's `local`;
+    /// a unit one is proven against the weights by the caller.
+    FullUnits {
+        placement: Qwen4EpPlacement,
+        peers: &'a [PeerLayerSource<'a>],
+    },
 }
 
 /// The allocation one expert-table entry names.
@@ -2396,6 +2507,10 @@ pub(crate) enum Qwen4ExpertOrigin {
     Dummy,
     /// The compact expert tensors of the named peer rank.
     Peer(usize),
+    /// This rank's own unit arena (D1 mixed layer); `host` selects the pinned-host arena.
+    Unit { host: bool },
+    /// The named peer rank's unit arena (D1 mixed layer of that rank).
+    PeerUnit { rank: usize, host: bool },
 }
 
 /// Host pointer entries of one expert in the gate/up and down tables.
@@ -2430,11 +2545,22 @@ impl Qwen4ExpertTableLayout<'_> {
     fn local_experts(&self, num_experts: usize) -> Result<usize, Qwen4GpuForwardError> {
         match self {
             Self::Single | Self::Tier { .. } => Ok(num_experts),
-            Self::Ep { placement, .. } | Self::Full { placement, .. } => {
+            Self::Ep { placement, .. }
+            | Self::Full { placement, .. }
+            | Self::EpUnits { placement, .. }
+            | Self::FullUnits { placement, .. } => {
                 validate_ep_placement(*placement, num_experts)?;
                 Ok(placement.local_count(num_experts))
             }
         }
+    }
+
+    /// An EP decode or chunk table (sealed rank binding required).
+    fn is_ep(&self) -> bool {
+        matches!(
+            self,
+            Self::Ep { .. } | Self::Full { .. } | Self::EpUnits { .. } | Self::FullUnits { .. }
+        )
     }
 }
 
@@ -2669,6 +2795,163 @@ pub(crate) fn qwen4_expert_table_entries(
                 });
             }
         }
+        Qwen4ExpertTableLayout::EpUnits {
+            placement,
+            dummy,
+            layer,
+        } => {
+            let per_rank = layout.local_experts(num_experts)?;
+            check_unit_layer(
+                "EP unit arenas",
+                layer,
+                placement.rank,
+                per_rank,
+                gate_up_expert_bytes,
+                down_expert_bytes,
+            )?;
+            if dummy.gate_up_bytes != gate_up_expert_bytes || dummy.down_bytes != down_expert_bytes
+            {
+                return Err(invalid(format!(
+                    "EP dummy expert holds {}+{} bytes, one expert is {gate_up_expert_bytes}+{down_expert_bytes}",
+                    dummy.gate_up_bytes, dummy.down_bytes
+                )));
+            }
+            for expert in 0..num_experts {
+                let slot = unit_expert_ptrs("EP unit", layer, expert)?;
+                entries.push(match (placement.owns(expert), slot) {
+                    (true, Some((tier, gate_up_ptr, down_ptr))) => Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Unit {
+                            host: tier == UnitTier::Host,
+                        },
+                        gate_up_ptr,
+                        down_ptr,
+                    },
+                    (false, None) => Qwen4ExpertEntry {
+                        origin: Qwen4ExpertOrigin::Dummy,
+                        gate_up_ptr: expert_slot_ptr(
+                            "dummy gate/up",
+                            dummy.gate_up_base,
+                            dummy.gate_up_bytes,
+                            0,
+                            gate_up_expert_bytes,
+                        )?,
+                        down_ptr: expert_slot_ptr(
+                            "dummy down",
+                            dummy.down_base,
+                            dummy.down_bytes,
+                            0,
+                            down_expert_bytes,
+                        )?,
+                    },
+                    _ => {
+                        return Err(invalid(format!(
+                        "EP unit map of rank {} disagrees with the placement at expert {expert}",
+                        placement.rank
+                    )))
+                    }
+                });
+            }
+        }
+        Qwen4ExpertTableLayout::FullUnits { placement, peers } => {
+            layout.local_experts(num_experts)?;
+            if peers.len() != placement.ranks {
+                return Err(invalid(format!(
+                    "EP full table needs {} peer sources, got {}",
+                    placement.ranks,
+                    peers.len()
+                )));
+            }
+            // Each peer's source holds exactly that rank's own count (uneven splits: the
+            // low ranks hold one more), as compact tensors or as its two unit arenas.
+            for (peer_rank, peer) in peers.iter().enumerate() {
+                let peer_count = Qwen4EpPlacement {
+                    rank: peer_rank,
+                    ranks: placement.ranks,
+                }
+                .local_count(num_experts);
+                match peer {
+                    PeerLayerSource::Compact(source) => check_exact_compact(
+                        *source,
+                        peer_count,
+                        gate_up_expert_bytes,
+                        down_expert_bytes,
+                    )?,
+                    PeerLayerSource::Units(arenas) => check_unit_layer(
+                        "EP peer unit arenas",
+                        arenas,
+                        peer_rank,
+                        peer_count,
+                        gate_up_expert_bytes,
+                        down_expert_bytes,
+                    )?,
+                }
+            }
+            if let PeerLayerSource::Compact(own) = peers[placement.rank] {
+                if own != local {
+                    return Err(invalid(format!(
+                        "EP peer source of rank {} does not name this rank's own expert tensors",
+                        placement.rank
+                    )));
+                }
+            }
+            for expert in 0..num_experts {
+                let owner = expert % placement.ranks;
+                let own = owner == placement.rank;
+                entries.push(match peers[owner] {
+                    PeerLayerSource::Compact(source) => {
+                        let slot = expert / placement.ranks;
+                        let (gate_up_what, down_what) = if own {
+                            ("gate/up", "down")
+                        } else {
+                            ("peer gate/up", "peer down")
+                        };
+                        Qwen4ExpertEntry {
+                            origin: if own {
+                                Qwen4ExpertOrigin::Local
+                            } else {
+                                Qwen4ExpertOrigin::Peer(owner)
+                            },
+                            gate_up_ptr: expert_slot_ptr(
+                                gate_up_what,
+                                source.gate_up_base,
+                                source.gate_up_bytes,
+                                slot,
+                                gate_up_expert_bytes,
+                            )?,
+                            down_ptr: expert_slot_ptr(
+                                down_what,
+                                source.down_base,
+                                source.down_bytes,
+                                slot,
+                                down_expert_bytes,
+                            )?,
+                        }
+                    }
+                    PeerLayerSource::Units(arenas) => {
+                        let (tier, gate_up_ptr, down_ptr) = unit_expert_ptrs(
+                            if own { "EP unit" } else { "EP peer unit" },
+                            &arenas,
+                            expert,
+                        )?
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "EP unit map of rank {owner} has no slot for its own expert {expert}"
+                            ))
+                        })?;
+                        let host = tier == UnitTier::Host;
+                        Qwen4ExpertEntry {
+                            origin: if own {
+                                Qwen4ExpertOrigin::Unit { host }
+                            } else {
+                                Qwen4ExpertOrigin::PeerUnit { rank: owner, host }
+                            },
+                            gate_up_ptr,
+                            down_ptr,
+                        }
+                    }
+                });
+            }
+        }
     }
     Ok(entries)
 }
@@ -2738,6 +3021,186 @@ fn check_exact_compact(
         return Err(invalid(format!(
             "EP compact expert tensors hold {}+{} bytes, expected exactly {per_rank} experts = {gate_up}+{down}",
             local.gate_up_bytes, local.down_bytes
+        )));
+    }
+    Ok(())
+}
+
+/// Prove one rank's unit arenas of a layer before any pointer is derived from them: the map is
+/// that rank's, it holds the rank's `owned` experts, its per-expert bytes are the layer's (and
+/// 256-multiples, so every slot inherits the arena base alignment), and every non-empty tier's
+/// arena is a non-null 256-aligned window of exactly [`EpUnitLayerMap::arena_entry_bytes`].
+fn check_unit_layer(
+    what: &str,
+    arenas: &UnitArenas<'_>,
+    rank: usize,
+    owned: usize,
+    gate_up_expert_bytes: usize,
+    down_expert_bytes: usize,
+) -> Result<(), Qwen4GpuForwardError> {
+    let map = arenas.map;
+    if map.rank() != rank {
+        return Err(invalid(format!(
+            "{what}: the unit map is rank {}'s, expected rank {rank}",
+            map.rank()
+        )));
+    }
+    let held = map.count(UnitTier::Vram) + map.count(UnitTier::Host);
+    if held != owned {
+        return Err(invalid(format!(
+            "{what}: the unit map holds {held} experts, rank {rank} owns {owned}"
+        )));
+    }
+    if map.gate_up_bytes() != gate_up_expert_bytes || map.down_bytes() != down_expert_bytes {
+        return Err(invalid(format!(
+            "{what}: the unit map holds {}+{} byte experts, one expert is {gate_up_expert_bytes}+{down_expert_bytes}",
+            map.gate_up_bytes(),
+            map.down_bytes()
+        )));
+    }
+    if gate_up_expert_bytes % 256 != 0 || down_expert_bytes % 256 != 0 {
+        return Err(invalid(format!(
+            "{what}: a {gate_up_expert_bytes}+{down_expert_bytes} byte expert is not a multiple of 256, slot pointers would lose the arena alignment"
+        )));
+    }
+    for tier in [UnitTier::Vram, UnitTier::Host] {
+        if map.count(tier) == 0 {
+            continue;
+        }
+        let name = match tier {
+            UnitTier::Vram => "VRAM",
+            UnitTier::Host => "host",
+        };
+        let (base, bytes) = arenas.window(tier);
+        if base == 0 {
+            return Err(invalid(format!(
+                "{what}: {name} arena base pointer is null"
+            )));
+        }
+        if base % 256 != 0 {
+            return Err(invalid(format!(
+                "{what}: {name} arena base {base:#x} is not 256-byte aligned"
+            )));
+        }
+        let want = map.arena_entry_bytes(tier);
+        if bytes != want {
+            return Err(invalid(format!(
+                "{what}: {name} arena holds {bytes} bytes, the unit map needs exactly {want}"
+            )));
+        }
+        if base.checked_add(bytes).is_none() {
+            return Err(invalid(format!(
+                "{what}: {name} arena address range overflows"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// `(tier, gate/up pointer, down pointer)` of global `expert` in `arenas`, `None` when the
+/// map's rank does not hold it. The gate/up slot must end inside the arena's gate/up block,
+/// the down slot start at or after the down block and end inside the arena, and both pointers
+/// be 256-aligned. Run [`check_unit_layer`] first.
+fn unit_expert_ptrs(
+    what: &str,
+    arenas: &UnitArenas<'_>,
+    expert: usize,
+) -> Result<Option<(UnitTier, usize, usize)>, Qwen4GpuForwardError> {
+    let map = arenas.map;
+    let Some((tier, gate_up_offset, down_offset)) = map.expert_offsets(expert) else {
+        return Ok(None);
+    };
+    let (base, bytes) = arenas.window(tier);
+    let overflow = || invalid(format!("{what} expert {expert} offset overflows"));
+    let gate_up_block = map
+        .count(tier)
+        .checked_mul(map.gate_up_bytes())
+        .ok_or_else(overflow)?;
+    let gate_up_end = gate_up_offset
+        .checked_add(map.gate_up_bytes())
+        .ok_or_else(overflow)?;
+    let down_end = down_offset
+        .checked_add(map.down_bytes())
+        .ok_or_else(overflow)?;
+    if gate_up_end > gate_up_block || down_offset < gate_up_block || down_end > bytes {
+        return Err(invalid(format!(
+            "{what} expert {expert} slots [{gate_up_offset}, {gate_up_end}) + [{down_offset}, {down_end}) leave the {bytes}-byte arena"
+        )));
+    }
+    let gate_up_ptr = base.checked_add(gate_up_offset).ok_or_else(overflow)?;
+    let down_ptr = base.checked_add(down_offset).ok_or_else(overflow)?;
+    if gate_up_ptr % 256 != 0 || down_ptr % 256 != 0 {
+        return Err(invalid(format!(
+            "{what} expert {expert} pointers {gate_up_ptr:#x} / {down_ptr:#x} are not 256-byte aligned"
+        )));
+    }
+    Ok(Some((tier, gate_up_ptr, down_ptr)))
+}
+
+/// A non-owning window pair over one unit arena (the gate/up and down byte windows, each
+/// typed with its own dtype) that per-expert views are cut from.
+struct UnitWindow {
+    rank: usize,
+    host: bool,
+    base: usize,
+    gate_up: GpuTensor,
+    down: GpuTensor,
+}
+
+/// The windows of every non-empty tier of `rank`'s unit arenas.
+fn cut_unit_windows(
+    rank: usize,
+    arenas: &UnitArenas<'_>,
+    gate_up_dtype: DType,
+    down_dtype: DType,
+) -> Vec<UnitWindow> {
+    [UnitTier::Vram, UnitTier::Host]
+        .into_iter()
+        .filter(|&tier| arenas.map.count(tier) > 0)
+        .map(|tier| {
+            let (base, bytes) = arenas.window(tier);
+            UnitWindow {
+                rank,
+                host: tier == UnitTier::Host,
+                base,
+                gate_up: foreign_packed_source(base, bytes, gate_up_dtype),
+                down: foreign_packed_source(base, bytes, down_dtype),
+            }
+        })
+        .collect()
+}
+
+/// Whether `rank`'s `layer` of a per-expert unit plan runs the static `e % ranks` owners
+/// although it holds host-resident experts. Balanced (live) ownership is one decision per
+/// layer across the mesh and exists only where EVERY rank holds the layer wholly in host
+/// RAM (today's host layer); a layer that is mixed on some rank, or host on this rank but
+/// not on every rank, is a static-owner layer on every rank (no owner-assign kernel pins,
+/// `OWNER-ASSIGN.md`). A whole-layer plan has the same state on every rank, so this is
+/// `false` for it. `layer` must be a planned trunk layer.
+pub(crate) fn ep_unit_static_owners(plan: &EpUnitPlan, rank: usize, layer: usize) -> bool {
+    let all_host =
+        (0..plan.geometry().ranks).all(|peer| plan.layer_state(peer, layer) == EpLayerState::Host);
+    !all_host
+        && matches!(
+            plan.layer_state(rank, layer),
+            EpLayerState::Host | EpLayerState::Mixed { .. }
+        )
+}
+
+/// Refuse a feature that needs whole-layer expert tensors (the EP reserve's scratch
+/// donors) on a load whose unit plan splits any layer (the loader already forces these
+/// features off; this is the belt-and-braces admission check). The G2 expert stage is
+/// not one of them: a unit plan has its own stage ([`slab_stage`], `new_units`).
+pub(crate) fn ep_unit_split_refusal(
+    weights: &Qwen4Weights,
+    what: &str,
+) -> Result<(), Qwen4GpuForwardError> {
+    let Some(plan) = weights.ep_unit_plan() else {
+        return Ok(());
+    };
+    if (0..plan.geometry().ranks).any(|rank| plan.layer_counts(rank).1 > 0) {
+        return Err(invalid(format!(
+            "{what} is not admitted on a load with per-expert VRAM units (HIPFIRE_QWEN4_EP_EXPERT_HOTSET): a mixed layer has no whole-layer expert tensors to stage or donate"
         )));
     }
     Ok(())
@@ -3568,22 +4031,41 @@ impl Qwen4MoeLayerRuntime {
         layer_label: usize,
         config: &Qwen4Config,
         placement: Qwen4EpPlacement,
-        peers_for_layer: &[Qwen4PeerExpertSource],
+        peers_for_layer: &[Qwen4PeerLayerSource],
         seal: &Qwen4EpRankSeal,
     ) -> Result<Self, Qwen4GpuForwardError> {
         let sealed = seal
             .expert_binding(layer_label, placement, gpu.device_id)
             .map_err(invalid)?;
+        // Compact peers everywhere (no unit layer on any rank): today's table, unchanged.
+        let table_peers: Vec<PeerLayerSource<'_>> = peers_for_layer
+            .iter()
+            .map(Qwen4PeerLayerSource::table_source)
+            .collect();
+        let compact: Option<Vec<Qwen4PeerExpertSource>> = table_peers
+            .iter()
+            .map(|peer| match peer {
+                PeerLayerSource::Compact(source) => Some(*source),
+                PeerLayerSource::Units(_) => None,
+            })
+            .collect();
+        let layout = match compact.as_deref() {
+            Some(compact) => Qwen4ExpertTableLayout::Full {
+                placement,
+                peers: compact,
+            },
+            None => Qwen4ExpertTableLayout::FullUnits {
+                placement,
+                peers: &table_peers,
+            },
+        };
         Self::build(
             gpu,
             weights,
             moe,
             layer_label,
             config,
-            Qwen4ExpertTableLayout::Full {
-                placement,
-                peers: peers_for_layer,
-            },
+            layout,
             None,
             Some(sealed),
             true,
@@ -3615,10 +4097,7 @@ impl Qwen4MoeLayerRuntime {
         head_split: bool,
         source_override: Option<(&GpuTensor, &GpuTensor)>,
     ) -> Result<Self, Qwen4GpuForwardError> {
-        let ep_layout = matches!(
-            layout,
-            Qwen4ExpertTableLayout::Ep { .. } | Qwen4ExpertTableLayout::Full { .. }
-        );
+        let ep_layout = layout.is_ep();
         if ep_layout != sealed.is_some() {
             return Err(invalid(format!(
                 "layer {layer_label}: EP tables need the sealed rank binding, single-device tables none"
@@ -3679,6 +4158,69 @@ impl Qwen4MoeLayerRuntime {
             },
             None => layout,
         };
+        // D1 per-expert units: a mixed trunk layer of this rank has no aggregate
+        // `experts_{gate_up,down}_proj` tensors (`weights.resident` of them fails); its experts
+        // are slots of one VRAM arena and one pinned-host arena (`ep_unit_layer`).
+        let unit_trunk =
+            layer_label < config.num_hidden_layers && !moe.gate.name.starts_with("mtp.");
+        let unit_layer = if unit_trunk {
+            weights.ep_unit_layer(layer_label)?
+        } else {
+            None
+        };
+        let unit_arenas = unit_layer.as_ref().map(|unit| UnitArenas {
+            map: unit.map,
+            vram_base: unit.vram.buf.as_ptr() as usize,
+            vram_bytes: unit.vram.buf.size(),
+            host_base: unit.host.buf.as_ptr() as usize,
+            host_bytes: unit.host.buf.size(),
+        });
+        let static_owners = match (unit_trunk, weights.ep_unit_plan(), weights.ep_placement()) {
+            (true, Some(plan), Some(placement)) if layer_label < plan.geometry().layers => {
+                ep_unit_static_owners(plan, placement.rank, layer_label)
+            }
+            _ => false,
+        };
+        if unit_arenas.is_some()
+            && (tier_layer.is_some()
+                || moe.expert_arena.is_some()
+                || source_override.is_some()
+                || weights.manifest.identity.recipe.is_stock_fp8())
+        {
+            return Err(invalid(format!(
+                "layer {layer_label}: a per-expert unit layer (HIPFIRE_QWEN4_EP_EXPERT_HOTSET) takes no expert tier, slab arena, borrowed donor mirror or stock FP8 table"
+            )));
+        }
+        let layout = match (unit_arenas, layout) {
+            (Some(layer), Qwen4ExpertTableLayout::Ep { placement, dummy }) => {
+                Qwen4ExpertTableLayout::EpUnits {
+                    placement,
+                    dummy,
+                    layer,
+                }
+            }
+            (Some(_), layout @ Qwen4ExpertTableLayout::FullUnits { .. }) => layout,
+            (Some(_), _) => {
+                return Err(invalid(format!(
+                    "layer {layer_label}: a per-expert unit layer binds only the EP decode table or a chunk table with unit peer sources"
+                )));
+            }
+            (None, layout) => layout,
+        };
+        if let Qwen4ExpertTableLayout::FullUnits { placement, peers } = layout {
+            let own_matches = match (peers.get(placement.rank), unit_arenas.as_ref()) {
+                (Some(PeerLayerSource::Units(peer)), Some(own)) => peer == own,
+                (Some(PeerLayerSource::Compact(_)), None) => true,
+                _ => false,
+            };
+            if !own_matches {
+                return Err(invalid(format!(
+                    "layer {layer_label}: the EP peer source of rank {} does not match this rank's own {} expert tensors",
+                    placement.rank,
+                    if unit_arenas.is_some() { "unit arena" } else { "compact" }
+                )));
+            }
+        }
         if let Some(arena_ref) = moe.expert_arena.as_ref() {
             // A slab layer never takes the D1 splice, so the explicit `cpu`
             // mode requests its D2 split exactly as it does a tier layer's.
@@ -3713,18 +4255,28 @@ impl Qwen4MoeLayerRuntime {
             .map(|(base, bytes)| foreign_packed_source(base, bytes, DType::MQ4G256V2));
         let tier_down_source = tier_source_range
             .map(|(base, bytes)| foreign_packed_source(base, bytes, DType::MQ4G128V2));
+        // A unit layer's descriptors are windows over its VRAM arena (dtype carriers only: unit
+        // entries and views name per-expert arena windows, `local` is never indexed).
+        let unit_sources = unit_arenas.as_ref().map(|arenas| {
+            (
+                foreign_packed_source(arenas.vram_base, arenas.vram_bytes, DType::MQ4G256V2),
+                foreign_packed_source(arenas.vram_base, arenas.vram_bytes, DType::MQ4G128V2),
+            )
+        });
         let gate_up_source = match tier_gate_source.as_ref() {
             Some(source) => source,
-            None => match source_override {
-                Some((gate_up, _)) => gate_up,
-                None => weights.resident(&moe.experts_gate_up)?,
+            None => match (unit_sources.as_ref(), source_override) {
+                (Some((gate_up, _)), _) => gate_up,
+                (None, Some((gate_up, _))) => gate_up,
+                (None, None) => weights.resident(&moe.experts_gate_up)?,
             },
         };
         let down_source = match tier_down_source.as_ref() {
             Some(source) => source,
-            None => match source_override {
-                Some((_, down)) => down,
-                None => weights.resident(&moe.experts_down)?,
+            None => match (unit_sources.as_ref(), source_override) {
+                (Some((_, down)), _) => down,
+                (None, Some((_, down))) => down,
+                (None, None) => weights.resident(&moe.experts_down)?,
             },
         };
         let gate_up_dtype = gate_up_source.dtype;
@@ -3755,6 +4307,11 @@ impl Qwen4MoeLayerRuntime {
             "qwen4-resident-mqv2-v1"
         };
         let kept_ids = config.kept_expert_ids(layer_label, moe.gate.name.starts_with("mtp."));
+        if unit_arenas.is_some() && kept_ids.is_some() {
+            return Err(invalid(format!(
+                "layer {layer_label}: qwen4.expert_keep cannot prune a per-expert unit layer"
+            )));
+        }
         let source_experts = if let Some(ids) = kept_ids {
             match &layout {
                 Qwen4ExpertTableLayout::Ep { placement, .. }
@@ -3768,7 +4325,10 @@ impl Qwen4MoeLayerRuntime {
         };
         let expected_gate_up_bytes = checked_bytes(source_experts, gate_up_expert_bytes)?;
         let expected_down_bytes = checked_bytes(source_experts, down_expert_bytes)?;
-        if tier_layer.is_none() && gate_up_source.buf.size() < expected_gate_up_bytes {
+        if tier_layer.is_none()
+            && unit_arenas.is_none()
+            && gate_up_source.buf.size() < expected_gate_up_bytes
+        {
             return Err(invalid(format!(
                 "layer {} gate/up packed bytes {} < expected {}",
                 layer_label,
@@ -3776,7 +4336,10 @@ impl Qwen4MoeLayerRuntime {
                 expected_gate_up_bytes
             )));
         }
-        if tier_layer.is_none() && down_source.buf.size() < expected_down_bytes {
+        if tier_layer.is_none()
+            && unit_arenas.is_none()
+            && down_source.buf.size() < expected_down_bytes
+        {
             return Err(invalid(format!(
                 "layer {} down packed bytes {} < expected {}",
                 layer_label,
@@ -3825,12 +4388,15 @@ impl Qwen4MoeLayerRuntime {
         // (chunk). Peer pointers into pinned host memory rely on ROCm's UVA:
         // pinned host allocations are device-visible from every GPU, so a
         // peer's host-mapped compact tensor is read through the same address.
-        let local_host_mapped = tier_layer.as_ref().map_or_else(
-            || gate_up_source.buf.is_host_mapped(),
-            |view| view.any_host(),
-        );
-        if matches!(layout, Qwen4ExpertTableLayout::Ep { .. })
-            && (gate_up_dtype != DType::MQ4G256V2 || down_dtype != DType::MQ4G128V2)
+        let local_host_mapped = match (tier_layer.as_ref(), unit_arenas.as_ref()) {
+            (Some(view), _) => view.any_host(),
+            (None, Some(arenas)) => arenas.map.count(UnitTier::Host) > 0,
+            (None, None) => gate_up_source.buf.is_host_mapped(),
+        };
+        if matches!(
+            layout,
+            Qwen4ExpertTableLayout::Ep { .. } | Qwen4ExpertTableLayout::EpUnits { .. }
+        ) && (gate_up_dtype != DType::MQ4G256V2 || down_dtype != DType::MQ4G128V2)
         {
             return Err(invalid(format!(
                 "layer {layer_label} EP dummy expert is QT44/QT53 but the experts are {gate_up_dtype:?}/{down_dtype:?}"
@@ -3893,15 +4459,47 @@ impl Qwen4MoeLayerRuntime {
         // Whole-tensor windows over each peer rank's compact experts; the
         // per-expert views below are cut from them. `qwen4_expert_table_entries`
         // proved every slot lies inside its window.
-        let peer_sources: Vec<(GpuTensor, GpuTensor)> = match layout {
-            Qwen4ExpertTableLayout::Full { peers, .. } => peers
+        let peer_sources: Vec<Option<(GpuTensor, GpuTensor)>> = {
+            let cut = |peer: &Qwen4PeerExpertSource| {
+                (
+                    foreign_packed_source(peer.gate_up_base, peer.gate_up_bytes, gate_up_dtype),
+                    foreign_packed_source(peer.down_base, peer.down_bytes, down_dtype),
+                )
+            };
+            match layout {
+                Qwen4ExpertTableLayout::Full { peers, .. } => {
+                    peers.iter().map(|peer| Some(cut(peer))).collect()
+                }
+                Qwen4ExpertTableLayout::FullUnits { peers, .. } => peers
+                    .iter()
+                    .map(|peer| match peer {
+                        PeerLayerSource::Compact(peer) => Some(cut(peer)),
+                        PeerLayerSource::Units(_) => None,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        // Windows over the unit arenas of this rank and every unit peer, indexed by (rank, tier).
+        let unit_self_rank = match layout {
+            Qwen4ExpertTableLayout::EpUnits { placement, .. }
+            | Qwen4ExpertTableLayout::FullUnits { placement, .. } => placement.rank,
+            _ => 0,
+        };
+        let unit_windows: Vec<UnitWindow> = match layout {
+            Qwen4ExpertTableLayout::EpUnits {
+                placement, layer, ..
+            } => cut_unit_windows(placement.rank, &layer, gate_up_dtype, down_dtype),
+            Qwen4ExpertTableLayout::FullUnits { peers, .. } => peers
                 .iter()
-                .map(|peer| {
-                    (
-                        foreign_packed_source(peer.gate_up_base, peer.gate_up_bytes, gate_up_dtype),
-                        foreign_packed_source(peer.down_base, peer.down_bytes, down_dtype),
-                    )
+                .enumerate()
+                .filter_map(|(rank, peer)| match peer {
+                    PeerLayerSource::Units(arenas) => {
+                        Some(cut_unit_windows(rank, arenas, gate_up_dtype, down_dtype))
+                    }
+                    PeerLayerSource::Compact(_) => None,
                 })
+                .flatten()
                 .collect(),
             _ => Vec::new(),
         };
@@ -3945,16 +4543,40 @@ impl Qwen4MoeLayerRuntime {
                     (&dummy.gate_up, 0, &dummy.down, 0)
                 }
                 Qwen4ExpertOrigin::Peer(rank) => {
-                    let (peer_gate_up, peer_down) = peer_sources.get(rank).ok_or_else(|| {
-                        invalid(format!(
-                            "layer {layer_label}: peer rank {rank} has no source"
-                        ))
-                    })?;
+                    let (peer_gate_up, peer_down) = peer_sources
+                        .get(rank)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "layer {layer_label}: peer rank {rank} has no source"
+                            ))
+                        })?;
                     (
                         peer_gate_up,
                         entry.gate_up_ptr - peer_gate_up.buf.as_ptr() as usize,
                         peer_down,
                         entry.down_ptr - peer_down.buf.as_ptr() as usize,
+                    )
+                }
+                Qwen4ExpertOrigin::Unit { host } | Qwen4ExpertOrigin::PeerUnit { host, .. } => {
+                    let owner = match entry.origin {
+                        Qwen4ExpertOrigin::PeerUnit { rank, .. } => rank,
+                        _ => unit_self_rank,
+                    };
+                    let window = unit_windows
+                        .iter()
+                        .find(|window| window.rank == owner && window.host == host)
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "layer {layer_label}: rank {owner} has no {} unit arena window",
+                                if host { "host" } else { "VRAM" }
+                            ))
+                        })?;
+                    (
+                        &window.gate_up,
+                        entry.gate_up_ptr - window.base,
+                        &window.down,
+                        entry.down_ptr - window.base,
                     )
                 }
             };
@@ -3985,6 +4607,12 @@ impl Qwen4MoeLayerRuntime {
             if let Some(view) = tier_layer.as_ref() {
                 let host =
                     view.placement(expert) == Some(crate::expert_tier_plan::Placement::HostMapped);
+                gate_up.host_mapped = host;
+                down.host_mapped = host;
+            }
+            if let Qwen4ExpertOrigin::Unit { host } | Qwen4ExpertOrigin::PeerUnit { host, .. } =
+                entry.origin
+            {
                 gate_up.host_mapped = host;
                 down.host_mapped = host;
             }
@@ -4146,7 +4774,10 @@ impl Qwen4MoeLayerRuntime {
                 && allow_tiers
                 && layer_label < config.num_hidden_layers
                 && kept_ids.is_none(),
-            host_mapped: local_host_mapped && down_source.buf.is_host_mapped(),
+            // A unit layer is never a whole-layer host aggregate: nothing arms.
+            host_mapped: local_host_mapped
+                && unit_arenas.is_none()
+                && down_source.buf.is_host_mapped(),
             ep: weights.ep_placement().is_some(),
             slab: false,
             tier: tier_layer.is_some(),
@@ -4190,6 +4821,7 @@ impl Qwen4MoeLayerRuntime {
         let whole_layer = tier_layer.is_none()
             && !cpu_deferred_experts
             && local_host_mapped
+            && unit_arenas.is_none()
             && down_source.buf.is_host_mapped();
         let split_kind = match tier_layer.as_ref() {
             Some(_) => Some(cpu_splice::SplitOwnerKind::Tier),
@@ -4306,6 +4938,7 @@ impl Qwen4MoeLayerRuntime {
             symmetric: false,
             fp8: fp8_tables.is_some(),
             host_mapped: local_host_mapped,
+            static_owners,
             cpu_deferred_experts,
             cpu_expert_owners,
             cpu_cold_owners,
@@ -4759,6 +5392,7 @@ impl Qwen4MoeLayerRuntime {
             symmetric: false,
             fp8: false,
             host_mapped,
+            static_owners: false,
             cpu_deferred_experts: false,
             cpu_expert_owners: None,
             cpu_cold_owners,
@@ -5000,6 +5634,7 @@ impl Qwen4MoeLayerRuntime {
         EpLaneRuntimeFacts {
             label: self.label,
             host_mapped: self.host_mapped,
+            static_owners: self.static_owners,
             packed_mq4: !self.experts.is_empty() && self.qt44_qt53_formats(),
             plain: !self.cpu_deferred_experts
                 && self.cpu_expert_owners.is_none()
@@ -5170,7 +5805,8 @@ pub(crate) struct Qwen4ExpertStage {
     /// and the host sources ([`slab_stage`]). Its stage buffers are either
     /// dedicated VRAM buffers (in `mirrors`) or, when `borrowed`, two
     /// resident slab layers (`donors`, `donor_views`) restored from pinned
-    /// copies in `mirrors`.
+    /// copies in `mirrors`. A per-expert tier stage and an EP unit stage
+    /// (`new_units`) are dedicated-buffer stages with per-layer slots.
     slab: Option<slab_stage::SlabStageMeta>,
 }
 
@@ -5236,6 +5872,20 @@ impl Qwen4ExpertStage {
         // must not compete with the buffers. gfx1201 never reads it.
         if rdna_compute::expert_capabilities::stage_reads_link(&gpu.arch) {
             let _ = crate::host_link::host_link(gpu);
+        }
+        // A per-expert unit plan that is not a whole-layer split has mixed and
+        // wholly-host layers and may have no resident layer: the donor design
+        // cannot apply, so it takes the dedicated-buffer unit stage (the loader
+        // charged those buffers by the same shared switches). A whole-layer
+        // plan, and every load without a plan, keeps the donor path below.
+        if crate::expert_ep_units::ep_unit_stage_kind(
+            bundle.weights.ep_unit_plan().map(|plan| &**plan),
+        ) == crate::expert_ep_units::EpUnitStageKind::Units
+        {
+            if host_sources.is_some() || !crate::expert_ep_units::ep_unit_stage_on(&gpu.arch) {
+                return Ok(None);
+            }
+            return Self::new_units(gpu, bundle, moe, chunk_rows);
         }
         let Some(first_host) = moe
             .iter()
@@ -5584,7 +6234,9 @@ impl Qwen4ExpertStage {
         layer: usize,
         runtime: Option<&Qwen4MoeLayerRuntime>,
     ) -> Result<(), Qwen4GpuForwardError> {
-        if self.placement.is_none() || layer < self.first_host {
+        // A unit stage (EP) stages only the compact owner-routed runtime
+        // (`begin_forward`), which needs no initialization here.
+        if self.placement.is_none() || self.slab.is_some() || layer < self.first_host {
             return Ok(());
         }
         let runtime = runtime.ok_or_else(|| invalid("G2 staged EP runtime missing"))?;
@@ -10469,6 +11121,14 @@ impl Qwen4GpuForward {
                 Qwen4GpuForwardScratch::new_scoped(gpu, &bundle.config, max_chunk, mode, &scope)?;
             (scratch, host_token_bytes, host_ple_bytes, None)
         };
+        if ep_reserve_plan.is_some() {
+            if let Err(error) =
+                ep_unit_split_refusal(&bundle.weights, "the EP reserve (scratch-donor views)")
+            {
+                let _ = scratch.free_gpu(gpu);
+                return Err(error);
+            }
+        }
         let reserve = match (ep_reserve_plan, reserve_banks) {
             (Some(plan), Some(banks)) => {
                 match ep_reserve_forward::EpReserveForward::materialize(gpu, bundle, plan, banks) {
@@ -11456,7 +12116,7 @@ impl Qwen4GpuForward {
     pub(crate) fn ep_expert_sources(
         &self,
         bundle: &Qwen4Bundle,
-    ) -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
+    ) -> Result<Vec<Qwen4PeerLayerSource>, Qwen4GpuForwardError> {
         if self.ep.is_none() {
             return Err(invalid(
                 "EP expert sources of a forward without an EP placement",
@@ -11465,14 +12125,26 @@ impl Qwen4GpuForward {
         let mut sources = Vec::with_capacity(self.moe.len());
         for layer in &bundle.weights.layer_refs {
             if let Some(weights) = layer.ffn.moe() {
+                // A mixed layer (D1 per-expert units) has no aggregate tensors: it publishes
+                // its two arenas and its slot map; every other layer its compact tensors.
+                if let Some(unit) = bundle.weights.ep_unit_layer(layer.layer)? {
+                    sources.push(Qwen4PeerLayerSource::Units(Qwen4PeerUnitSource {
+                        map: unit.map.clone(),
+                        vram_base: unit.vram.buf.as_ptr() as usize,
+                        vram_bytes: unit.vram.buf.size(),
+                        host_base: unit.host.buf.as_ptr() as usize,
+                        host_bytes: unit.host.buf.size(),
+                    }));
+                    continue;
+                }
                 let gate_up = bundle.weights.resident(&weights.experts_gate_up)?;
                 let down = bundle.weights.resident(&weights.experts_down)?;
-                sources.push(Qwen4PeerExpertSource {
+                sources.push(Qwen4PeerLayerSource::Compact(Qwen4PeerExpertSource {
                     gate_up_base: gate_up.buf.as_ptr() as usize,
                     gate_up_bytes: gate_up.buf.size(),
                     down_base: down.buf.as_ptr() as usize,
                     down_bytes: down.buf.size(),
-                });
+                }));
             }
         }
         if sources.len() != self.moe_count() {
@@ -11551,7 +12223,7 @@ impl Qwen4GpuForward {
         &mut self,
         gpu: &mut Gpu,
         bundle: &Qwen4Bundle,
-        peers: &[Vec<Qwen4PeerExpertSource>],
+        peers: &[Vec<Qwen4PeerLayerSource>],
         gather: Arc<dyn MoeRowGather + Send + Sync>,
     ) -> Result<(), Qwen4GpuForwardError> {
         if self.share.is_some() {
@@ -11564,11 +12236,18 @@ impl Qwen4GpuForward {
         // The EP decode runtime's route-selecting properties per MoE ordinal
         // (host-mapped, symmetric, all-MQ4 gate/up): a balanced layer's live
         // runtime must select the same sealed route.
-        let moe_traits: Vec<(bool, bool, bool)> = self
+        let moe_traits: Vec<(bool, bool, bool, bool)> = self
             .moe
             .iter()
             .flatten()
-            .map(|moe| (moe.host_mapped, moe.symmetric, moe.experts_all_gate_up_mq4))
+            .map(|moe| {
+                (
+                    moe.host_mapped,
+                    moe.static_owners,
+                    moe.symmetric,
+                    moe.experts_all_gate_up_mq4,
+                )
+            })
             .collect();
         let Some(ep) = self.ep.as_mut() else {
             return Err(invalid("attach_ep on a forward without an EP placement"));
@@ -11607,11 +12286,11 @@ impl Qwen4GpuForward {
         let dummy = ep.dummy.source();
         let seal = ep.seal.clone();
         let layer_peers_of =
-            |ordinal: usize| -> Result<Vec<Qwen4PeerExpertSource>, Qwen4GpuForwardError> {
+            |ordinal: usize| -> Result<Vec<Qwen4PeerLayerSource>, Qwen4GpuForwardError> {
                 peers
                     .iter()
                     .map(|sources| {
-                        sources.get(ordinal).copied().ok_or_else(|| {
+                        sources.get(ordinal).cloned().ok_or_else(|| {
                             invalid(format!("attach_ep is missing MoE layer {ordinal}"))
                         })
                     })
@@ -11672,8 +12351,8 @@ impl Qwen4GpuForward {
                     let Some(weights) = layer.ffn.moe() else {
                         continue;
                     };
-                    let (host_mapped, symmetric, all_mq4) = moe_traits[ordinal];
-                    if !host_mapped {
+                    let (host_mapped, static_owners, symmetric, all_mq4) = moe_traits[ordinal];
+                    if !host_mapped || static_owners {
                         balanced.push(None);
                         ordinal += 1;
                         continue;
@@ -15679,6 +16358,7 @@ mod ep_table_tests {
             host_mapped,
             packed_mq4: true,
             plain: true,
+            static_owners: false,
         }
     }
 
@@ -15732,6 +16412,68 @@ mod ep_table_tests {
             assert_eq!(kind(3, true, false, bad, bad), None);
             assert_eq!(kind(3, true, false, bad, resident), None);
             assert_eq!(kind(3, true, false, resident, bad), None);
+        }
+    }
+
+    /// (static, host, mixed) layers x balanced on/off (`balanced_selected`): a mixed or
+    /// static-owner host layer is the static unit kind and NEVER the balanced one; a whole
+    /// host layer stays balanced exactly as today.
+    #[test]
+    fn ep_lane_expert_kind_of_static_host_and_mixed_layers_with_balanced_on_and_off() {
+        use super::EpLaneExpertKind::{
+            BalancedHostMappedPacked, StaticResidentPacked, StaticUnitsPacked,
+        };
+        let kind = super::classify_ep_lane_expert;
+        let unit = |label, host_mapped, static_owners| {
+            Some(super::EpLaneRuntimeFacts {
+                static_owners,
+                ..ep_runtime(label, host_mapped)
+            })
+        };
+        let resident = unit(3, false, false);
+        let host = unit(3, true, false);
+        // Mixed arena layer, and a host layer whose peers are not all host: both static owners.
+        let mixed = unit(3, true, true);
+        // Balanced off: no live runtime is selected.
+        assert_eq!(
+            kind(3, true, false, resident, resident),
+            Some(StaticResidentPacked)
+        );
+        assert_eq!(kind(3, true, false, host, host), None);
+        assert_eq!(kind(3, true, false, mixed, mixed), Some(StaticUnitsPacked));
+        // Balanced on: the layer's live balanced runtime is selected.
+        assert_eq!(kind(3, true, true, resident, resident), None);
+        assert_eq!(
+            kind(3, true, true, host, host),
+            Some(BalancedHostMappedPacked)
+        );
+        assert_eq!(kind(3, true, true, mixed, mixed), None);
+        // Mismatched selected / static runtimes, a missing gather or runtime, a wrong label.
+        assert_eq!(kind(3, true, false, mixed, host), None);
+        assert_eq!(kind(3, true, false, host, mixed), None);
+        assert_eq!(kind(3, true, true, host, mixed), None);
+        assert_eq!(kind(3, false, false, mixed, mixed), None);
+        assert_eq!(kind(3, true, false, None, mixed), None);
+        assert_eq!(kind(3, true, false, mixed, None), None);
+        assert_eq!(
+            kind(3, true, false, unit(4, true, true), unit(4, true, true)),
+            None
+        );
+        // A static-owner flag on a resident layer is not a proven binding.
+        let odd = unit(3, false, true);
+        assert_eq!(kind(3, true, false, odd, odd), None);
+        // The packed / plain facts still gate a mixed layer.
+        for (packed_mq4, plain) in [(false, true), (true, false)] {
+            let bad = Some(super::EpLaneRuntimeFacts {
+                packed_mq4,
+                plain,
+                ..ep_runtime(3, true)
+            });
+            let bad = bad.map(|facts| super::EpLaneRuntimeFacts {
+                static_owners: true,
+                ..facts
+            });
+            assert_eq!(kind(3, true, false, bad, bad), None);
         }
     }
 
@@ -15836,6 +16578,565 @@ mod ep_table_tests {
         };
         let text = message(entries(&layout_null, null[0]));
         assert!(text.contains("null"), "{text}");
+    }
+
+    // ---- D1 per-expert units: pure table builders -------------------------------------
+
+    use super::{ep_unit_static_owners, PeerLayerSource, UnitArenas};
+    use crate::expert_ep_units::{
+        place_routed_experts_units, EpLayerState, EpRanking, EpUnitGeometry, EpUnitLayerMap,
+        EpUnitPlan, EpUnitSource, UnitTier, VRAM_ARENA_TAIL_PAD_BYTES,
+    };
+
+    const UNIT_LAYERS: usize = 2;
+    const NO_LOCAL: Qwen4PeerExpertSource = Qwen4PeerExpertSource {
+        gate_up_base: 0,
+        gate_up_bytes: 0,
+        down_base: 0,
+        down_bytes: 0,
+    };
+
+    /// Deterministic pseudo-random permutation of `0..n` (Fisher-Yates over an LCG).
+    fn permutation(n: usize, mut state: u64) -> Vec<u32> {
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        for i in (1..n).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ids.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        ids
+    }
+
+    fn unit_geometry(ranks: usize) -> EpUnitGeometry {
+        EpUnitGeometry {
+            layers: UNIT_LAYERS,
+            experts_per_layer: EXPERTS,
+            ranks,
+            gate_up_bytes: GATE_UP as u64,
+            down_bytes: DOWN as u64,
+        }
+    }
+
+    /// The plan of `ranking` keeping about `units_per_rank` units per rank in VRAM.
+    fn plan_from(ranks: usize, ranking: &[u32], units_per_rank: u64) -> EpUnitPlan {
+        let geometry = unit_geometry(ranks);
+        let budget = units_per_rank * geometry.unit_bytes()
+            + 2 * UNIT_LAYERS as u64 * VRAM_ARENA_TAIL_PAD_BYTES;
+        place_routed_experts_units(
+            &geometry,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: ranking,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![budget; ranks],
+            },
+        )
+        .unwrap()
+    }
+
+    /// A random-ranking plan keeping about `units_per_rank` units per rank in VRAM.
+    fn unit_plan(ranks: usize, seed: u64, units_per_rank: u64) -> EpUnitPlan {
+        plan_from(
+            ranks,
+            &permutation(UNIT_LAYERS * EXPERTS, seed),
+            units_per_rank,
+        )
+    }
+
+    /// Plans of every layer-state mix: all host (no budget), mixed layers (random rankings of
+    /// several budgets), and a skewed ranking whose layer `l` is resident on one rank while
+    /// other ranks hold it mixed or host.
+    fn unit_plans(ranks: usize) -> Vec<EpUnitPlan> {
+        let mut plans: Vec<EpUnitPlan> = [(11u64, 0u64), (12, 30), (13, 200), (14, 330)]
+            .into_iter()
+            .map(|(seed, units)| unit_plan(ranks, seed + ranks as u64, units))
+            .collect();
+        let total = (UNIT_LAYERS * EXPERTS) as u32;
+        let selected =
+            |id: u32| (id as usize % EXPERTS) % ranks == (id as usize / EXPERTS + 1) % ranks;
+        let mut ranking: Vec<u32> = (0..total).filter(|&id| selected(id)).collect();
+        ranking.extend((0..total).filter(|&id| !selected(id)));
+        plans.push(plan_from(ranks, &ranking, 300));
+        plans
+    }
+
+    /// Synthetic 256-aligned, non-overlapping `(vram, host)` arena bases of `(rank, layer)`.
+    fn arena_bases(rank: usize, layer: usize) -> (usize, usize) {
+        (
+            0x100_0000_0000 * (rank + 1) + layer * 0x4000_0000,
+            0x800_0000_0000 + 0x100_0000_0000 * rank + layer * 0x4000_0000,
+        )
+    }
+
+    fn arenas_of(map: &EpUnitLayerMap, rank: usize, layer: usize) -> UnitArenas<'_> {
+        let (vram_base, host_base) = arena_bases(rank, layer);
+        UnitArenas {
+            map,
+            vram_base,
+            vram_bytes: map.arena_entry_bytes(UnitTier::Vram),
+            host_base,
+            host_bytes: map.arena_entry_bytes(UnitTier::Host),
+        }
+    }
+
+    /// `(tier, gate/up pointer, down pointer)` of `expert` of `(rank, layer)` from the plan alone:
+    /// slot = rank among the rank's experts of the same tier in ascending id, the gate/up block
+    /// first, then the down block.
+    fn expected_unit(
+        plan: &EpUnitPlan,
+        rank: usize,
+        layer: usize,
+        expert: usize,
+    ) -> (UnitTier, usize, usize) {
+        let ranks = plan.geometry().ranks;
+        let (vram_base, host_base) = arena_bases(rank, layer);
+        let resident = |e: usize| plan.is_resident(rank, layer, e);
+        let in_vram = resident(expert);
+        let same_tier = |e: &usize| e % ranks == rank && resident(*e) == in_vram;
+        let slot = (0..expert).filter(same_tier).count();
+        let total = (0..EXPERTS).filter(same_tier).count();
+        let base = if in_vram { vram_base } else { host_base };
+        (
+            if in_vram {
+                UnitTier::Vram
+            } else {
+                UnitTier::Host
+            },
+            base + slot * GATE_UP,
+            base + total * GATE_UP + slot * DOWN,
+        )
+    }
+
+    #[test]
+    fn ep_unit_decode_table_points_every_owned_expert_into_its_tier_arena() {
+        for ranks in [2usize, 3, 4] {
+            let plan = unit_plan(ranks, 0x5eed + ranks as u64, 200);
+            for rank in 0..ranks {
+                let placement = Qwen4EpPlacement { rank, ranks };
+                let mixed = plan.mixed_layers(rank);
+                assert!(
+                    !mixed.is_empty(),
+                    "ranks {ranks} rank {rank} has no mixed layer"
+                );
+                for layer in mixed {
+                    let map = plan.layer_map(rank, layer);
+                    assert!(map.is_mixed());
+                    let arenas = arenas_of(&map, rank, layer);
+                    let layout = Qwen4ExpertTableLayout::EpUnits {
+                        placement,
+                        dummy: dummy(),
+                        layer: arenas,
+                    };
+                    let table = entries(&layout, NO_LOCAL).unwrap();
+                    assert_eq!(table.len(), EXPERTS);
+                    for (expert, entry) in table.iter().enumerate() {
+                        if expert % ranks == rank {
+                            let (tier, gate_up_ptr, down_ptr) =
+                                expected_unit(&plan, rank, layer, expert);
+                            let host = tier == UnitTier::Host;
+                            assert_eq!(host, !plan.is_resident(rank, layer, expert));
+                            assert_eq!(
+                                entry.origin,
+                                Qwen4ExpertOrigin::Unit { host },
+                                "rank {rank} layer {layer} expert {expert}"
+                            );
+                            assert_eq!(entry.gate_up_ptr, gate_up_ptr, "expert {expert}");
+                            assert_eq!(entry.down_ptr, down_ptr, "expert {expert}");
+                            // 256-aligned and inside its tier's arena.
+                            let (base, bytes) = if host {
+                                (arenas.host_base, arenas.host_bytes)
+                            } else {
+                                (arenas.vram_base, arenas.vram_bytes)
+                            };
+                            for (ptr, len) in [(gate_up_ptr, GATE_UP), (down_ptr, DOWN)] {
+                                assert_eq!(ptr % 256, 0);
+                                assert!(ptr >= base && ptr + len <= base + bytes);
+                            }
+                        } else {
+                            assert_eq!(entry.origin, Qwen4ExpertOrigin::Dummy, "expert {expert}");
+                            assert_eq!(entry.gate_up_ptr, dummy().gate_up_base);
+                            assert_eq!(entry.down_ptr, dummy().down_base);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The compact source whole-layer states (`Resident` / `Host`) would publish for `map`.
+    fn compact_of(map: &EpUnitLayerMap, rank: usize, layer: usize) -> Qwen4PeerExpertSource {
+        assert!(!map.is_mixed());
+        let (vram_base, host_base) = arena_bases(rank, layer);
+        let (base, count) = if map.count(UnitTier::Vram) > 0 {
+            (vram_base, map.count(UnitTier::Vram))
+        } else {
+            (host_base, map.count(UnitTier::Host))
+        };
+        Qwen4PeerExpertSource {
+            gate_up_base: base,
+            gate_up_bytes: count * GATE_UP,
+            down_base: base + count * GATE_UP,
+            down_bytes: count * DOWN,
+        }
+    }
+
+    #[test]
+    fn ep_unit_full_table_names_every_owners_own_source() {
+        let mut unit_peers_seen = 0usize;
+        let mut compact_peers_seen = 0usize;
+        for ranks in [2usize, 3] {
+            for plan in unit_plans(ranks) {
+                for layer in 0..UNIT_LAYERS {
+                    let maps: Vec<EpUnitLayerMap> =
+                        (0..ranks).map(|rank| plan.layer_map(rank, layer)).collect();
+                    let sources: Vec<PeerLayerSource<'_>> = maps
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, map)| {
+                            if map.is_mixed() {
+                                unit_peers_seen += 1;
+                                PeerLayerSource::Units(arenas_of(map, rank, layer))
+                            } else {
+                                compact_peers_seen += 1;
+                                PeerLayerSource::Compact(compact_of(map, rank, layer))
+                            }
+                        })
+                        .collect();
+                    for rank in 0..ranks {
+                        let placement = Qwen4EpPlacement { rank, ranks };
+                        let layout = Qwen4ExpertTableLayout::FullUnits {
+                            placement,
+                            peers: &sources,
+                        };
+                        let local = match sources[rank] {
+                            PeerLayerSource::Compact(source) => source,
+                            PeerLayerSource::Units(_) => NO_LOCAL,
+                        };
+                        let table = entries(&layout, local).unwrap();
+                        assert_eq!(table.len(), EXPERTS);
+                        for (expert, entry) in table.iter().enumerate() {
+                            let owner = expert % ranks;
+                            let own = owner == rank;
+                            match sources[owner] {
+                                PeerLayerSource::Units(_) => {
+                                    let (tier, gate_up_ptr, down_ptr) =
+                                        expected_unit(&plan, owner, layer, expert);
+                                    let host = tier == UnitTier::Host;
+                                    assert_eq!(
+                                        entry.origin,
+                                        if own {
+                                            Qwen4ExpertOrigin::Unit { host }
+                                        } else {
+                                            Qwen4ExpertOrigin::PeerUnit { rank: owner, host }
+                                        },
+                                        "rank {rank} owner {owner} expert {expert}"
+                                    );
+                                    assert_eq!(entry.gate_up_ptr, gate_up_ptr);
+                                    assert_eq!(entry.down_ptr, down_ptr);
+                                }
+                                PeerLayerSource::Compact(source) => {
+                                    let slot = expert / ranks;
+                                    assert_eq!(
+                                        entry.origin,
+                                        if own {
+                                            Qwen4ExpertOrigin::Local
+                                        } else {
+                                            Qwen4ExpertOrigin::Peer(owner)
+                                        }
+                                    );
+                                    assert_eq!(
+                                        entry.gate_up_ptr,
+                                        source.gate_up_base + slot * GATE_UP
+                                    );
+                                    assert_eq!(entry.down_ptr, source.down_base + slot * DOWN);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(unit_peers_seen > 0, "no mixed layer was exercised");
+        assert!(compact_peers_seen > 0, "no whole-layer peer was exercised");
+    }
+
+    /// Flag-off identity: a whole-layer plan's unit tables name exactly the pointers today's
+    /// compact `Ep` / `Full` tables name (arena `[gate/up block | down block]` = the two compact
+    /// tensors), with the origin mapped Local<->Unit, Peer<->PeerUnit.
+    #[test]
+    fn ep_unit_tables_equal_ep_tables_for_whole_layer_plans() {
+        for ranks in [2usize, 3] {
+            for vram_layers in [0usize, 1, 2] {
+                let plan = place_routed_experts_units(
+                    &unit_geometry(ranks),
+                    &EpUnitSource::WholeLayers { vram_layers },
+                )
+                .unwrap();
+                for layer in 0..UNIT_LAYERS {
+                    let host = layer >= vram_layers;
+                    let maps: Vec<EpUnitLayerMap> =
+                        (0..ranks).map(|rank| plan.layer_map(rank, layer)).collect();
+                    let compacts: Vec<Qwen4PeerExpertSource> = maps
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, map)| compact_of(map, rank, layer))
+                        .collect();
+                    let units: Vec<PeerLayerSource<'_>> = maps
+                        .iter()
+                        .enumerate()
+                        .map(|(rank, map)| PeerLayerSource::Units(arenas_of(map, rank, layer)))
+                        .collect();
+                    let same = |today: &[Qwen4ExpertEntry], unit: &[Qwen4ExpertEntry]| {
+                        assert_eq!(today.len(), unit.len());
+                        for (expert, (a, b)) in today.iter().zip(unit).enumerate() {
+                            assert_eq!(a.gate_up_ptr, b.gate_up_ptr, "expert {expert}");
+                            assert_eq!(a.down_ptr, b.down_ptr, "expert {expert}");
+                            let mapped = match b.origin {
+                                Qwen4ExpertOrigin::Unit { host: h } => {
+                                    assert_eq!(h, host);
+                                    Qwen4ExpertOrigin::Local
+                                }
+                                Qwen4ExpertOrigin::PeerUnit { rank, host: h } => {
+                                    assert_eq!(h, host);
+                                    Qwen4ExpertOrigin::Peer(rank)
+                                }
+                                other => other,
+                            };
+                            assert_eq!(a.origin, mapped, "expert {expert}");
+                        }
+                    };
+                    for rank in 0..ranks {
+                        let placement = Qwen4EpPlacement { rank, ranks };
+                        let ep = entries(
+                            &Qwen4ExpertTableLayout::Ep {
+                                placement,
+                                dummy: dummy(),
+                            },
+                            compacts[rank],
+                        )
+                        .unwrap();
+                        let ep_units = entries(
+                            &Qwen4ExpertTableLayout::EpUnits {
+                                placement,
+                                dummy: dummy(),
+                                layer: match units[rank] {
+                                    PeerLayerSource::Units(arenas) => arenas,
+                                    PeerLayerSource::Compact(_) => unreachable!(),
+                                },
+                            },
+                            NO_LOCAL,
+                        )
+                        .unwrap();
+                        same(&ep, &ep_units);
+                        let full = entries(
+                            &Qwen4ExpertTableLayout::Full {
+                                placement,
+                                peers: &compacts,
+                            },
+                            compacts[rank],
+                        )
+                        .unwrap();
+                        let full_units = entries(
+                            &Qwen4ExpertTableLayout::FullUnits {
+                                placement,
+                                peers: &units,
+                            },
+                            NO_LOCAL,
+                        )
+                        .unwrap();
+                        same(&full, &full_units);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ep_unit_tables_refuse_null_short_misaligned_and_inconsistent_arenas() {
+        let plan = unit_plan(2, 7, 200);
+        let layer = (0..UNIT_LAYERS)
+            .find(|layer| (0..2).all(|rank| plan.mixed_layers(rank).contains(layer)))
+            .expect("a layer mixed on both ranks");
+        let map = plan.layer_map(0, layer);
+        assert!(map.count(UnitTier::Vram) > 0 && map.count(UnitTier::Host) > 0);
+        let good = arenas_of(&map, 0, layer);
+        let placement = Qwen4EpPlacement { rank: 0, ranks: 2 };
+        let decode = |arenas: UnitArenas<'_>| {
+            entries(
+                &Qwen4ExpertTableLayout::EpUnits {
+                    placement,
+                    dummy: dummy(),
+                    layer: arenas,
+                },
+                NO_LOCAL,
+            )
+        };
+        assert!(decode(good).is_ok());
+        // Null arenas.
+        let text = message(decode(UnitArenas {
+            vram_base: 0,
+            ..good
+        }));
+        assert!(text.contains("VRAM arena base pointer is null"), "{text}");
+        let text = message(decode(UnitArenas {
+            host_base: 0,
+            ..good
+        }));
+        assert!(text.contains("host arena base pointer is null"), "{text}");
+        // Short or long arenas (the length must be exactly the map's entry bytes).
+        let text = message(decode(UnitArenas {
+            vram_bytes: good.vram_bytes - 1,
+            ..good
+        }));
+        assert!(text.contains("VRAM arena holds"), "{text}");
+        let text = message(decode(UnitArenas {
+            host_bytes: good.host_bytes + 1,
+            ..good
+        }));
+        assert!(text.contains("host arena holds"), "{text}");
+        // A pointer that is not 256-aligned.
+        let text = message(decode(UnitArenas {
+            host_base: good.host_base + 8,
+            ..good
+        }));
+        assert!(text.contains("not 256-byte aligned"), "{text}");
+        // Another rank's map, or a map for another rank count.
+        let other = plan.layer_map(1, layer);
+        let text = message(decode(arenas_of(&other, 1, layer)));
+        assert!(text.contains("the unit map is rank 1's"), "{text}");
+        let three = unit_plan(3, 7, 200);
+        let wrong_ranks = three.layer_map(0, three.mixed_layers(0)[0]);
+        let text = message(decode(arenas_of(&wrong_ranks, 0, layer)));
+        assert!(text.contains("the unit map holds"), "{text}");
+        // Expert bytes that are not the map's.
+        let text = message(qwen4_expert_table_entries(
+            &Qwen4ExpertTableLayout::EpUnits {
+                placement,
+                dummy: dummy(),
+                layer: good,
+            },
+            NO_LOCAL,
+            EXPERTS,
+            GATE_UP + 256,
+            DOWN,
+        ));
+        assert!(text.contains("byte experts"), "{text}");
+        // A dummy that is not one expert.
+        let mut short_dummy = dummy();
+        short_dummy.down_bytes -= 4;
+        let text = message(entries(
+            &Qwen4ExpertTableLayout::EpUnits {
+                placement,
+                dummy: short_dummy,
+                layer: good,
+            },
+            NO_LOCAL,
+        ));
+        assert!(text.contains("dummy expert"), "{text}");
+
+        // Chunk table: peer count, the own compact source, a peer with another rank's map.
+        let peer_map = plan.layer_map(1, layer);
+        let peers = [
+            PeerLayerSource::Units(good),
+            PeerLayerSource::Units(arenas_of(&peer_map, 1, layer)),
+        ];
+        let full = |placement: Qwen4EpPlacement,
+                    peers: &[PeerLayerSource<'_>],
+                    local: Qwen4PeerExpertSource| {
+            entries(
+                &Qwen4ExpertTableLayout::FullUnits { placement, peers },
+                local,
+            )
+        };
+        assert!(full(placement, &peers, NO_LOCAL).is_ok());
+        let text = message(full(placement, &peers[..1], NO_LOCAL));
+        assert!(text.contains("needs 2 peer sources"), "{text}");
+        let swapped = [peers[1], peers[0]];
+        let text = message(full(placement, &swapped, NO_LOCAL));
+        assert!(text.contains("the unit map is rank"), "{text}");
+        let own_compact = compact(0, 0x1000_0000, EXPERTS / 2);
+        let with_compact = [PeerLayerSource::Compact(own_compact), peers[1]];
+        assert!(full(placement, &with_compact, own_compact).is_ok());
+        let text = message(full(placement, &with_compact, NO_LOCAL));
+        assert!(text.contains("does not name this rank's own"), "{text}");
+        let mut null_peer = peers;
+        if let PeerLayerSource::Units(arenas) = &mut null_peer[1] {
+            arenas.vram_base = 0;
+        }
+        let text = message(full(placement, &null_peer, NO_LOCAL));
+        assert!(text.contains("null"), "{text}");
+    }
+
+    #[test]
+    fn ep_unit_static_owners_are_static_unless_every_rank_holds_the_layer_on_host() {
+        // A whole-layer plan has one state per layer on every rank: never static owners, so
+        // today's host layers stay exactly the balanced layers.
+        for ranks in [2usize, 3] {
+            for vram_layers in [0usize, 1, 2] {
+                let plan = place_routed_experts_units(
+                    &unit_geometry(ranks),
+                    &EpUnitSource::WholeLayers { vram_layers },
+                )
+                .unwrap();
+                for rank in 0..ranks {
+                    for layer in 0..UNIT_LAYERS {
+                        assert!(!ep_unit_static_owners(&plan, rank, layer));
+                    }
+                }
+            }
+        }
+        // 3 layers x 8 experts over 2 ranks, 256-byte experts.
+        let geometry = EpUnitGeometry {
+            layers: 3,
+            experts_per_layer: 8,
+            ranks: 2,
+            gate_up_bytes: 256,
+            down_bytes: 256,
+        };
+        let plan_of = |hot: &[u32], budgets: [u64; 2]| {
+            let mut ranking = hot.to_vec();
+            ranking.extend((0..24u32).filter(|id| !hot.contains(id)));
+            place_routed_experts_units(
+                &geometry,
+                &EpUnitSource::Ranking {
+                    ranking: EpRanking {
+                        rank: &ranking,
+                        counts: None,
+                        sha256: None,
+                    },
+                    rank_budget_bytes: budgets.to_vec(),
+                },
+            )
+            .unwrap()
+        };
+        let pad = 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        // Rank 1 keeps experts 1 and 3 of layer 1 (mixed); rank 0 keeps nothing (layer 1 host).
+        let plan = plan_of(&[9, 11], [0, pad + 2 * 512]);
+        assert!(matches!(plan.layer_state(1, 1), EpLayerState::Mixed { .. }));
+        assert_eq!(plan.layer_state(0, 1), EpLayerState::Host);
+        assert!(
+            ep_unit_static_owners(&plan, 0, 1),
+            "host beside a mixed rank"
+        );
+        assert!(ep_unit_static_owners(&plan, 1, 1), "the mixed layer");
+        for layer in [0, 2] {
+            assert_eq!(plan.layer_state(0, layer), EpLayerState::Host);
+            assert_eq!(plan.layer_state(1, layer), EpLayerState::Host);
+            for rank in 0..2 {
+                assert!(
+                    !ep_unit_static_owners(&plan, rank, layer),
+                    "all-host layer {layer}"
+                );
+            }
+        }
+        // Rank 1 keeps all four owned experts of layer 1 (resident): rank 0's host layer is static.
+        let plan = plan_of(&[9, 11, 13, 15], [0, pad + 4 * 512]);
+        assert_eq!(plan.layer_state(1, 1), EpLayerState::Resident);
+        assert!(ep_unit_static_owners(&plan, 0, 1));
+        assert!(!ep_unit_static_owners(&plan, 1, 1));
     }
 }
 

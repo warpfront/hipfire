@@ -1,0 +1,2235 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Per-expert VRAM/host unit planner of an expert-parallel (EP) rank (D1.2).
+//!
+//! A *unit* is one routed expert of one trunk layer, `(layer, expert)`, held by
+//! rank `expert % ranks` (the seal's static ownership). Today the EP placement
+//! is whole-layer: every owned expert of trunk layers `0..vram_layers` is
+//! device-resident, every other one pinned host RAM
+//! ([`crate::expert_residency::place_routed_experts`]). This planner decides
+//! residency per unit instead, from a global hot-set ranking
+//! ([`crate::expert_hotset`], `.expert-hotset` v1: global ids
+//! `layer * experts_per_layer + expert`, hottest first) and a per-rank byte
+//! budget, and reproduces today's split exactly when no ranking is given.
+//!
+//! Pure CPU arithmetic: no file, environment, device or manifest access. Only
+//! the trunk layers are planned; the MTP head's experts stay on today's
+//! placement (always host).
+//!
+//! # Walk
+//!
+//! For each rank independently: walk the ranking from the hottest unit, skip
+//! units another rank holds, keep a unit while its charge fits the rank's
+//! remaining budget, and close the rank at the first unit that does not fit
+//! (the ranked *prefix* that fits, as the single-card hot set does). A kept
+//! unit charges [`EpUnitGeometry::unit_bytes`]; the first kept unit of a
+//! `(rank, layer)` also charges the two arena tail pads of that layer's VRAM
+//! arena ([`VRAM_ARENA_TAIL_PAD_BYTES`] each, one per projection block), never
+//! a per-expert pad.
+//!
+//! # Host accounting
+//!
+//! A layer of a rank is [`EpLayerState::Resident`] (all owned experts kept,
+//! today's resident path), [`EpLayerState::Host`] (none kept, today's
+//! host-mapped path: two pinned allocations, two 1 MiB pads) or
+//! [`EpLayerState::Mixed`] (one VRAM arena plus ONE pinned host arena per rank,
+//! one 1 MiB pad: [`MIXED_HOST_ARENA_PAD_BYTES`]).
+
+use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
+use crate::expert_residency::HOST_MAPPED_PAD_BYTES;
+use crate::weights::Qwen4EpPlacement;
+
+/// Tail pad of one VRAM arena block (gate/up or down) of a mixed layer.
+pub const VRAM_ARENA_TAIL_PAD_BYTES: u64 = ARENA_TAIL_PAD_BYTES as u64;
+
+/// Pinned-host pad of one mixed layer's single host arena (gate/up block then
+/// down block in one `hipHostMalloc`).
+pub const MIXED_HOST_ARENA_PAD_BYTES: u64 = HOST_MAPPED_PAD_BYTES;
+
+/// Shape of the planned expert space and the byte size of one expert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EpUnitGeometry {
+    /// Trunk MoE layers planned (ids `>= layers * experts_per_layer` are not units).
+    pub layers: usize,
+    pub experts_per_layer: usize,
+    pub ranks: usize,
+    /// Encoded bytes of one expert's gate/up projection.
+    pub gate_up_bytes: u64,
+    /// Encoded bytes of one expert's down projection.
+    pub down_bytes: u64,
+}
+
+impl EpUnitGeometry {
+    /// Gate/up plus down bytes of one expert.
+    pub fn unit_bytes(&self) -> u64 {
+        self.gate_up_bytes + self.down_bytes
+    }
+
+    /// Units (experts) of one layer that `rank` holds.
+    pub fn owned_per_layer(&self, rank: usize) -> usize {
+        Qwen4EpPlacement {
+            rank,
+            ranks: self.ranks,
+        }
+        .local_count(self.experts_per_layer)
+    }
+
+    /// Total unit ids (`layers * experts_per_layer`).
+    pub fn total_ids(&self) -> usize {
+        self.layers * self.experts_per_layer
+    }
+
+    fn check(&self) -> Result<(), String> {
+        if self.ranks == 0 || self.layers == 0 || self.experts_per_layer < self.ranks {
+            return Err(format!(
+                "EP unit plan: {} layers x {} experts cannot cover {} ranks",
+                self.layers, self.experts_per_layer, self.ranks
+            ));
+        }
+        if self.unit_bytes() == 0 {
+            return Err("EP unit plan: an expert has no bytes".to_string());
+        }
+        Ok(())
+    }
+}
+
+/// A ranking read from an `.expert-hotset` v1 sidecar.
+#[derive(Clone, Copy, Debug)]
+pub struct EpRanking<'a> {
+    /// Global unit ids `layer * experts_per_layer + expert`, hottest first; a
+    /// permutation of `0..layers * experts_per_layer`.
+    pub rank: &'a [u32],
+    /// Pooled slot-read counts per global id (for the receipt's coverage).
+    pub counts: Option<&'a [u64]>,
+    /// SHA-256 of the sidecar bytes (for the receipt).
+    pub sha256: Option<&'a str>,
+}
+
+/// What decides residency.
+#[derive(Clone, Debug)]
+pub enum EpUnitSource<'a> {
+    /// No ranking: trunk layers `0..vram_layers` fully resident on every rank,
+    /// every other layer fully host (today's per-layer split).
+    WholeLayers { vram_layers: usize },
+    /// Ranking walk under a per-rank byte budget (`rank_budget_bytes[r]` is the
+    /// expert bytes rank `r` may keep in VRAM, including arena pads).
+    Ranking {
+        ranking: EpRanking<'a>,
+        rank_budget_bytes: Vec<u64>,
+    },
+}
+
+/// Residency of one rank's owned experts of one layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpLayerState {
+    /// Every owned expert device-resident (today's resident layer).
+    Resident,
+    /// No owned expert device-resident (today's host-mapped layer).
+    Host,
+    /// `resident` owned experts in the VRAM arena, `host` in the host arena.
+    Mixed { resident: usize, host: usize },
+}
+
+/// Per-(rank, layer, expert) residency of one EP load.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpUnitPlan {
+    geometry: EpUnitGeometry,
+    /// `[rank][layer][expert]`; true only for experts the rank owns.
+    resident: Vec<bool>,
+    ranking_sha256: Option<String>,
+    /// Pooled counts mass of the units each rank keeps and of all units it owns.
+    coverage: Vec<Option<(u64, u64)>>,
+    rank_budget_bytes: Option<Vec<u64>>,
+}
+
+impl EpUnitPlan {
+    fn index(&self, rank: usize, layer: usize, expert: usize) -> usize {
+        let g = &self.geometry;
+        (rank * g.layers + layer) * g.experts_per_layer + expert
+    }
+
+    pub fn geometry(&self) -> &EpUnitGeometry {
+        &self.geometry
+    }
+
+    /// Whether `rank` keeps `(layer, expert)` in VRAM.
+    pub fn is_resident(&self, rank: usize, layer: usize, expert: usize) -> bool {
+        self.resident[self.index(rank, layer, expert)]
+    }
+
+    /// Whether `rank` holds (owns) `expert`.
+    pub fn owns(&self, rank: usize, expert: usize) -> bool {
+        expert % self.geometry.ranks == rank
+    }
+
+    /// One layer's resident bitmap of `rank` over all `experts_per_layer`
+    /// experts (never true for an expert another rank owns).
+    pub fn layer_resident(&self, rank: usize, layer: usize) -> &[bool] {
+        let at = self.index(rank, layer, 0);
+        &self.resident[at..at + self.geometry.experts_per_layer]
+    }
+
+    pub fn layer_state(&self, rank: usize, layer: usize) -> EpLayerState {
+        let owned = self.geometry.owned_per_layer(rank);
+        let resident = self
+            .layer_resident(rank, layer)
+            .iter()
+            .filter(|&&kept| kept)
+            .count();
+        match resident {
+            0 => EpLayerState::Host,
+            n if n == owned => EpLayerState::Resident,
+            n => EpLayerState::Mixed {
+                resident: n,
+                host: owned - n,
+            },
+        }
+    }
+
+    /// Layers of `rank` in each state: `(resident, mixed, host)`.
+    pub fn layer_counts(&self, rank: usize) -> (usize, usize, usize) {
+        let mut counts = (0, 0, 0);
+        for layer in 0..self.geometry.layers {
+            match self.layer_state(rank, layer) {
+                EpLayerState::Resident => counts.0 += 1,
+                EpLayerState::Mixed { .. } => counts.1 += 1,
+                EpLayerState::Host => counts.2 += 1,
+            }
+        }
+        counts
+    }
+
+    /// Units `rank` holds in the planned (trunk) layers.
+    pub fn owned_units(&self, rank: usize) -> usize {
+        self.geometry.owned_per_layer(rank) * self.geometry.layers
+    }
+
+    /// Units `rank` keeps in VRAM.
+    pub fn resident_units(&self, rank: usize) -> usize {
+        let layer = self.geometry.layers * self.geometry.experts_per_layer;
+        self.resident[rank * layer..(rank + 1) * layer]
+            .iter()
+            .filter(|&&kept| kept)
+            .count()
+    }
+
+    /// Units `rank` leaves in pinned host RAM.
+    pub fn host_units(&self, rank: usize) -> usize {
+        self.owned_units(rank) - self.resident_units(rank)
+    }
+
+    /// Expert payload bytes `rank` keeps in VRAM (no pads).
+    pub fn resident_payload_bytes(&self, rank: usize) -> u64 {
+        self.resident_units(rank) as u64 * self.geometry.unit_bytes()
+    }
+
+    /// Device bytes of `rank`'s routed experts: payload plus the two arena tail
+    /// pads of every mixed layer.
+    pub fn vram_bytes(&self, rank: usize) -> u64 {
+        let (_, mixed, _) = self.layer_counts(rank);
+        self.resident_payload_bytes(rank) + mixed as u64 * 2 * VRAM_ARENA_TAIL_PAD_BYTES
+    }
+
+    /// Pinned host bytes of `rank`'s trunk experts including pads: a host layer
+    /// keeps today's two allocations (two 1 MiB pads), a mixed layer one host
+    /// arena (one pad).
+    pub fn host_pinned_bytes(&self, rank: usize) -> u64 {
+        let (_, mixed, host) = self.layer_counts(rank);
+        self.host_units(rank) as u64 * self.geometry.unit_bytes()
+            + host as u64 * 2 * HOST_MAPPED_PAD_BYTES
+            + mixed as u64 * MIXED_HOST_ARENA_PAD_BYTES
+    }
+
+    /// Layers with at least one resident unit on `rank` (distinct layers touched).
+    pub fn layers_touched(&self, rank: usize) -> usize {
+        let (resident, mixed, _) = self.layer_counts(rank);
+        resident + mixed
+    }
+
+    /// `rank`'s resident units expressed in whole layers of its own experts.
+    pub fn whole_layer_equivalent(&self, rank: usize) -> f64 {
+        self.resident_units(rank) as f64 / self.geometry.owned_per_layer(rank) as f64
+    }
+
+    /// The whole-layer split this plan *is*: `Some(n)` when on every rank
+    /// exactly the layers `0..n` are fully resident and every other layer fully
+    /// host; `None` for any per-expert plan.
+    pub fn whole_layer_split(&self) -> Option<usize> {
+        let layers = self.geometry.layers;
+        let mut split: Option<usize> = None;
+        for rank in 0..self.geometry.ranks {
+            let (resident, mixed, host) = self.layer_counts(rank);
+            if mixed != 0 || resident + host != layers {
+                return None;
+            }
+            if (0..resident).any(|l| self.layer_state(rank, l) != EpLayerState::Resident) {
+                return None;
+            }
+            match split {
+                Some(n) if n != resident => return None,
+                _ => split = Some(resident),
+            }
+        }
+        split
+    }
+
+    /// Whether the plan is exactly today's whole-layer split with `vram_layers`
+    /// resident trunk layers on every rank.
+    pub fn equals_whole_layers(&self, vram_layers: usize) -> bool {
+        self.whole_layer_split() == Some(vram_layers.min(self.geometry.layers))
+    }
+
+    /// Fraction of the counts mass of `rank`'s owned units the resident set
+    /// covers (`None` without counts).
+    pub fn coverage(&self, rank: usize) -> Option<f64> {
+        self.coverage[rank].map(|(kept, all)| {
+            if all == 0 {
+                0.0
+            } else {
+                kept as f64 / all as f64
+            }
+        })
+    }
+
+    /// The byte budget the ranking walk gave `rank` (net of any stage charge); `None` for a
+    /// whole-layer plan.
+    pub fn rank_budget(&self, rank: usize) -> Option<u64> {
+        self.rank_budget_bytes
+            .as_ref()
+            .and_then(|budgets| budgets.get(rank).copied())
+    }
+
+    /// The one-line load receipt of `rank` (see module docs); stable format:
+    /// `qwen4 EP expert tier rank r/n: resident U/O units (X GiB VRAM) | host H units (Y GiB pinned) |
+    /// layers R resident, M mixed, H host | whole-layer equivalent W | ranking ...`.
+    pub fn receipt_line(&self, rank: usize) -> String {
+        const GIB: f64 = (1u64 << 30) as f64;
+        let (resident, mixed, host) = self.layer_counts(rank);
+        let ranking = match (&self.ranking_sha256, self.coverage(rank)) {
+            (Some(sha), Some(coverage)) => {
+                format!(
+                    "ranking sha256 {} coverage {:.2}% budget {:.2} GiB",
+                    &sha[..sha.len().min(16)],
+                    coverage * 100.0,
+                    self.rank_budget_bytes
+                        .as_ref()
+                        .map_or(0.0, |budget| budget[rank] as f64 / GIB)
+                )
+            }
+            (Some(sha), None) => format!(
+                "ranking sha256 {} budget {:.2} GiB",
+                &sha[..sha.len().min(16)],
+                self.rank_budget_bytes
+                    .as_ref()
+                    .map_or(0.0, |budget| budget[rank] as f64 / GIB)
+            ),
+            (None, _) => "ranking none (whole layers)".to_string(),
+        };
+        format!(
+            "qwen4 EP expert tier rank {rank}/{}: resident {}/{} units ({:.2} GiB VRAM) | host {} units ({:.2} GiB pinned) | layers {resident} resident, {mixed} mixed, {host} host ({} touched) | whole-layer equivalent {:.2} | {ranking}",
+            self.geometry.ranks,
+            self.resident_units(rank),
+            self.owned_units(rank),
+            self.vram_bytes(rank) as f64 / GIB,
+            self.host_units(rank),
+            self.host_pinned_bytes(rank) as f64 / GIB,
+            resident + mixed,
+            self.whole_layer_equivalent(rank),
+        )
+    }
+
+    /// [`Self::receipt_line`] of every rank.
+    pub fn receipt_lines(&self) -> Vec<String> {
+        (0..self.geometry.ranks)
+            .map(|rank| self.receipt_line(rank))
+            .collect()
+    }
+}
+
+/// Plan the per-unit residency of every rank of an EP load.
+///
+/// [`EpUnitSource::WholeLayers`] reproduces
+/// [`crate::expert_residency::place_routed_experts`]: trunk layers
+/// `< vram_layers` fully resident, all others fully host, the same on every
+/// rank. [`EpUnitSource::Ranking`] walks the ranking (see the module docs).
+pub fn place_routed_experts_units(
+    geometry: &EpUnitGeometry,
+    source: &EpUnitSource<'_>,
+) -> Result<EpUnitPlan, String> {
+    geometry.check()?;
+    let g = *geometry;
+    let layer_span = g.experts_per_layer;
+    let mut resident = vec![false; g.ranks * g.layers * layer_span];
+    let at =
+        |rank: usize, layer: usize, expert: usize| (rank * g.layers + layer) * layer_span + expert;
+    match source {
+        EpUnitSource::WholeLayers { vram_layers } => {
+            for rank in 0..g.ranks {
+                for layer in 0..g.layers.min(*vram_layers) {
+                    for expert in (rank..g.experts_per_layer).step_by(g.ranks) {
+                        resident[at(rank, layer, expert)] = true;
+                    }
+                }
+            }
+            Ok(EpUnitPlan {
+                geometry: g,
+                resident,
+                ranking_sha256: None,
+                coverage: vec![None; g.ranks],
+                rank_budget_bytes: None,
+            })
+        }
+        EpUnitSource::Ranking {
+            ranking,
+            rank_budget_bytes,
+        } => {
+            if rank_budget_bytes.len() != g.ranks {
+                return Err(format!(
+                    "EP unit plan: {} rank budgets for {} ranks",
+                    rank_budget_bytes.len(),
+                    g.ranks
+                ));
+            }
+            let total = g.total_ids();
+            if ranking.rank.len() != total {
+                return Err(format!(
+                    "EP unit plan: the ranking has {} ids, the model has {} units ({} layers x {} experts)",
+                    ranking.rank.len(),
+                    total,
+                    g.layers,
+                    g.experts_per_layer
+                ));
+            }
+            if let Some(counts) = ranking.counts {
+                if counts.len() != total {
+                    return Err(format!(
+                        "EP unit plan: {} counts for {total} units",
+                        counts.len()
+                    ));
+                }
+            }
+            let mut seen = vec![false; total];
+            let mut remaining = rank_budget_bytes.clone();
+            let mut open = vec![true; g.ranks];
+            let mut touched = vec![false; g.ranks * g.layers];
+            let unit = g.unit_bytes();
+            for &id in ranking.rank {
+                let id = id as usize;
+                if id >= total {
+                    return Err(format!(
+                        "EP unit plan: ranking id {id} is outside the {total} units"
+                    ));
+                }
+                if std::mem::replace(&mut seen[id], true) {
+                    return Err(format!("EP unit plan: ranking id {id} appears twice"));
+                }
+                let (layer, expert) = (id / layer_span, id % layer_span);
+                let rank = expert % g.ranks;
+                if !open[rank] {
+                    continue;
+                }
+                let first = !touched[rank * g.layers + layer];
+                let charge = unit
+                    + if first {
+                        2 * VRAM_ARENA_TAIL_PAD_BYTES
+                    } else {
+                        0
+                    };
+                if charge > remaining[rank] {
+                    open[rank] = false;
+                    continue;
+                }
+                remaining[rank] -= charge;
+                touched[rank * g.layers + layer] = true;
+                resident[at(rank, layer, expert)] = true;
+            }
+            let coverage = (0..g.ranks)
+                .map(|rank| {
+                    ranking.counts.map(|counts| {
+                        let (mut kept, mut all) = (0u64, 0u64);
+                        for layer in 0..g.layers {
+                            for expert in (rank..g.experts_per_layer).step_by(g.ranks) {
+                                let count = counts[layer * layer_span + expert];
+                                all += count;
+                                if resident[at(rank, layer, expert)] {
+                                    kept += count;
+                                }
+                            }
+                        }
+                        (kept, all)
+                    })
+                })
+                .collect();
+            Ok(EpUnitPlan {
+                geometry: g,
+                resident,
+                ranking_sha256: ranking.sha256.map(str::to_owned),
+                coverage,
+                rank_budget_bytes: Some(rank_budget_bytes.clone()),
+            })
+        }
+    }
+}
+
+/// Per-rank expert byte budget of a per-unit EP load: the bytes `auto`
+/// ([`crate::expert_residency::auto_vram_layers`]) divides by the layer size,
+/// before the division. `free_per_rank[r]` is rank `r`'s free VRAM,
+/// `non_expert_bytes` the replicated trunk, `reserve_bytes` the whole reserve
+/// every rank keeps free (the ordinary reserve with the placement charges, plus
+/// the AR-lane store when a lane reservation applies). A rank that cannot hold
+/// the trunk and the reserve gets `0` (every expert in host RAM).
+pub fn ep_unit_rank_budgets(
+    free_per_rank: &[u64],
+    non_expert_bytes: u64,
+    reserve_bytes: u64,
+) -> Vec<u64> {
+    free_per_rank
+        .iter()
+        .map(|&free| {
+            free.saturating_sub(non_expert_bytes)
+                .saturating_sub(reserve_bytes)
+        })
+        .collect()
+}
+
+/// Suffix of a mixed layer's VRAM arena entry (`...layers.{L}.mlp.experts.unit_vram_arena`).
+pub const UNIT_VRAM_ARENA_SUFFIX: &str = ".mlp.experts.unit_vram_arena";
+/// Suffix of a mixed layer's pinned-host arena entry (`...layers.{L}.mlp.experts.unit_host_arena`).
+pub const UNIT_HOST_ARENA_SUFFIX: &str = ".mlp.experts.unit_host_arena";
+
+/// Which arena of a mixed layer holds an expert.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UnitTier {
+    /// The compact device arena.
+    Vram,
+    /// The pinned host arena.
+    Host,
+}
+
+/// Position of one owned expert inside its tier's arena.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnitSlot {
+    pub tier: UnitTier,
+    /// Rank among the owned experts of the same tier, ascending expert id.
+    pub slot: usize,
+}
+
+/// Where every expert of one `(rank, layer)` lives under a per-expert plan: the
+/// address arithmetic shared by the loader (arena bytes), the table builders
+/// and the peer sources. Owned experts of each tier take consecutive slots in
+/// ascending expert id; an arena is `[gate/up block | down block]`, the gate/up
+/// block `n * gate_up_bytes` bytes, the down block `n * down_bytes` bytes (both
+/// multiples of 256 for Flash-Next MQ4), so every expert pointer inherits the
+/// arena base alignment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpUnitLayerMap {
+    rank: usize,
+    layer: usize,
+    gate_up_bytes: usize,
+    down_bytes: usize,
+    /// Per global expert; `None` = another rank's expert.
+    slots: Vec<Option<UnitSlot>>,
+    n_vram: usize,
+    n_host: usize,
+}
+
+impl EpUnitLayerMap {
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+
+    pub fn layer(&self) -> usize {
+        self.layer
+    }
+
+    /// The slot of global expert `expert`, `None` when this rank does not hold it.
+    pub fn slot(&self, expert: usize) -> Option<UnitSlot> {
+        self.slots.get(expert).copied().flatten()
+    }
+
+    /// Experts in `tier`'s arena.
+    pub fn count(&self, tier: UnitTier) -> usize {
+        match tier {
+            UnitTier::Vram => self.n_vram,
+            UnitTier::Host => self.n_host,
+        }
+    }
+
+    /// Whether the layer has both a VRAM and a host arena (the only case that
+    /// is arena-backed; otherwise today's whole-layer path applies).
+    pub fn is_mixed(&self) -> bool {
+        self.n_vram > 0 && self.n_host > 0
+    }
+
+    /// Per-expert gate/up bytes.
+    pub fn gate_up_bytes(&self) -> usize {
+        self.gate_up_bytes
+    }
+
+    /// Per-expert down bytes.
+    pub fn down_bytes(&self) -> usize {
+        self.down_bytes
+    }
+
+    /// Payload bytes of `tier`'s arena (gate/up block then down block, no pad).
+    pub fn arena_payload_bytes(&self, tier: UnitTier) -> usize {
+        self.count(tier) * (self.gate_up_bytes + self.down_bytes)
+    }
+
+    /// Bytes the loader hands the weight store for `tier`'s arena entry: the
+    /// payload plus, for the VRAM arena, [`VRAM_ARENA_TAIL_PAD_BYTES`] zeroed
+    /// tail pad per projection block (the host arena's 1 MiB pad is the pinned
+    /// allocator's own).
+    pub fn arena_entry_bytes(&self, tier: UnitTier) -> usize {
+        let pad = match tier {
+            UnitTier::Vram => 2 * VRAM_ARENA_TAIL_PAD_BYTES as usize,
+            UnitTier::Host => 0,
+        };
+        self.arena_payload_bytes(tier) + pad
+    }
+
+    /// Offset of the gate/up of `slot` inside its arena.
+    pub fn gate_up_offset(&self, slot: UnitSlot) -> usize {
+        slot.slot * self.gate_up_bytes
+    }
+
+    /// Offset of the down of `slot` inside its arena.
+    pub fn down_offset(&self, slot: UnitSlot) -> usize {
+        self.count(slot.tier) * self.gate_up_bytes + slot.slot * self.down_bytes
+    }
+
+    /// `(tier, gate_up offset, down offset)` of global expert `expert`.
+    pub fn expert_offsets(&self, expert: usize) -> Option<(UnitTier, usize, usize)> {
+        let slot = self.slot(expert)?;
+        Some((slot.tier, self.gate_up_offset(slot), self.down_offset(slot)))
+    }
+
+    /// Build `tier`'s arena entry bytes from the layer's full stacks
+    /// (`gate_up_all` / `down_all`: all `experts_per_layer` experts, expert `e` at
+    /// `e * per-expert bytes`): every owned expert of the tier copied to its
+    /// slot, the VRAM tail pad zeroed. The loader's fulfilment payload and the
+    /// CPU round-trip reference are this one function.
+    pub fn gather_arena(
+        &self,
+        tier: UnitTier,
+        gate_up_all: &[u8],
+        down_all: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let experts = self.slots.len();
+        if gate_up_all.len() != experts * self.gate_up_bytes
+            || down_all.len() != experts * self.down_bytes
+        {
+            return Err(format!(
+                "EP unit arena layer {}: source stacks hold {}+{} bytes, {experts} experts need {}+{}",
+                self.layer,
+                gate_up_all.len(),
+                down_all.len(),
+                experts * self.gate_up_bytes,
+                experts * self.down_bytes
+            ));
+        }
+        let mut arena = vec![0u8; self.arena_entry_bytes(tier)];
+        for (expert, slot) in self.slots.iter().enumerate() {
+            let Some(slot) = slot.filter(|slot| slot.tier == tier) else {
+                continue;
+            };
+            let gate_up = self.gate_up_offset(slot);
+            arena[gate_up..gate_up + self.gate_up_bytes].copy_from_slice(
+                &gate_up_all[expert * self.gate_up_bytes..(expert + 1) * self.gate_up_bytes],
+            );
+            let down = self.down_offset(slot);
+            arena[down..down + self.down_bytes].copy_from_slice(
+                &down_all[expert * self.down_bytes..(expert + 1) * self.down_bytes],
+            );
+        }
+        Ok(arena)
+    }
+}
+
+impl EpUnitPlan {
+    /// The slot map of `rank`'s `layer`.
+    pub fn layer_map(&self, rank: usize, layer: usize) -> EpUnitLayerMap {
+        let g = &self.geometry;
+        let resident = self.layer_resident(rank, layer);
+        let (mut n_vram, mut n_host) = (0, 0);
+        let slots = (0..g.experts_per_layer)
+            .map(|expert| {
+                if expert % g.ranks != rank {
+                    return None;
+                }
+                Some(if resident[expert] {
+                    n_vram += 1;
+                    UnitSlot {
+                        tier: UnitTier::Vram,
+                        slot: n_vram - 1,
+                    }
+                } else {
+                    n_host += 1;
+                    UnitSlot {
+                        tier: UnitTier::Host,
+                        slot: n_host - 1,
+                    }
+                })
+            })
+            .collect();
+        EpUnitLayerMap {
+            rank,
+            layer,
+            gate_up_bytes: g.gate_up_bytes as usize,
+            down_bytes: g.down_bytes as usize,
+            slots,
+            n_vram,
+            n_host,
+        }
+    }
+
+    /// Trunk layers of `rank` that are arena-backed ([`EpLayerState::Mixed`]).
+    pub fn mixed_layers(&self, rank: usize) -> Vec<usize> {
+        (0..self.geometry.layers)
+            .filter(|&layer| matches!(self.layer_state(rank, layer), EpLayerState::Mixed { .. }))
+            .collect()
+    }
+}
+
+/// The flag of the per-expert EP hot set (D1): an explicit `.expert-hotset`
+/// sidecar path. Unset, empty or `0` is off; the loader never discovers a
+/// sibling `<model>.expert-hotset` for it.
+pub const EP_EXPERT_HOTSET_ENV: &str = "HIPFIRE_QWEN4_EP_EXPERT_HOTSET";
+
+/// The sidecar path [`EP_EXPERT_HOTSET_ENV`] names, from its raw value: `None`
+/// (off) for an unset, blank or `0` value, the trimmed value as a path
+/// otherwise.
+pub fn ep_expert_hotset_path(raw: Option<&str>) -> Option<std::path::PathBuf> {
+    let raw = raw?.trim();
+    if raw.is_empty() || raw == "0" {
+        None
+    } else {
+        Some(std::path::PathBuf::from(raw))
+    }
+}
+
+/// The tier a manifest entry name denotes when it is a mixed layer's arena
+/// entry ([`UNIT_VRAM_ARENA_SUFFIX`] / [`UNIT_HOST_ARENA_SUFFIX`]), else `None`.
+pub fn unit_arena_tier(name: &str) -> Option<UnitTier> {
+    if name.ends_with(UNIT_VRAM_ARENA_SUFFIX) {
+        Some(UnitTier::Vram)
+    } else if name.ends_with(UNIT_HOST_ARENA_SUFFIX) {
+        Some(UnitTier::Host)
+    } else {
+        None
+    }
+}
+
+/// Whether `name` is a mixed layer's arena entry.
+pub fn is_unit_arena_name(name: &str) -> bool {
+    unit_arena_tier(name).is_some()
+}
+
+/// The names of a mixed layer's two aggregate stacks, from the arena entry
+/// name: `(gate_up_proj, down_proj)` of the same layer prefix. `None` when
+/// `arena_name` is not an arena entry.
+pub fn unit_arena_source_names(arena_name: &str) -> Option<(String, String)> {
+    let suffix = match unit_arena_tier(arena_name)? {
+        UnitTier::Vram => UNIT_VRAM_ARENA_SUFFIX,
+        UnitTier::Host => UNIT_HOST_ARENA_SUFFIX,
+    };
+    let prefix = arena_name.strip_suffix(suffix)?;
+    Some((
+        format!("{prefix}.mlp.experts.gate_up_proj"),
+        format!("{prefix}.mlp.experts.down_proj"),
+    ))
+}
+
+/// The bytes of the arena entry `arena_name` of `map`'s layer, gathered from
+/// the layer's full stacks (the loader's fulfilment payload: the entry's tier
+/// comes from its name, the bytes from [`EpUnitLayerMap::gather_arena`]).
+pub fn unit_arena_entry_bytes(
+    map: &EpUnitLayerMap,
+    arena_name: &str,
+    gate_up_all: &[u8],
+    down_all: &[u8],
+) -> Result<Vec<u8>, String> {
+    let tier = unit_arena_tier(arena_name)
+        .ok_or_else(|| format!("'{arena_name}' is not an EP unit arena entry"))?;
+    map.gather_arena(tier, gate_up_all, down_all)
+}
+
+/// The per-expert geometry of an EP unit plan from the byte sizes of every
+/// trunk layer's aggregate stacks (`gate_up_stack_bytes[layer]` /
+/// `down_stack_bytes[layer]`, each stack holding `experts_per_layer` experts):
+/// every layer must have the same sizes, each a whole number of experts whose
+/// per-expert bytes are 256-aligned (so every arena pointer inherits the arena
+/// base alignment).
+pub fn ep_unit_geometry(
+    layers: usize,
+    experts_per_layer: usize,
+    ranks: usize,
+    gate_up_stack_bytes: &[u64],
+    down_stack_bytes: &[u64],
+) -> Result<EpUnitGeometry, String> {
+    if gate_up_stack_bytes.len() != layers || down_stack_bytes.len() != layers {
+        return Err(format!(
+            "EP unit plan: {} gate/up and {} down stack sizes for {layers} trunk layers",
+            gate_up_stack_bytes.len(),
+            down_stack_bytes.len()
+        ));
+    }
+    if experts_per_layer == 0 {
+        return Err("EP unit plan: no routed experts per layer".to_string());
+    }
+    let per_expert = |what: &str, sizes: &[u64]| -> Result<u64, String> {
+        let first = *sizes.first().ok_or("EP unit plan: no trunk layers")?;
+        if let Some(layer) = sizes.iter().position(|&bytes| bytes != first) {
+            return Err(format!(
+                "EP unit plan: layer {layer} {what} stack holds {} bytes, layer 0 holds {first}: the layers are not uniform",
+                sizes[layer]
+            ));
+        }
+        let experts = experts_per_layer as u64;
+        if first == 0 || first % experts != 0 {
+            return Err(format!(
+                "EP unit plan: the {what} stack of {first} bytes is not a whole number of {experts} experts"
+            ));
+        }
+        let bytes = first / experts;
+        if bytes % 256 != 0 {
+            return Err(format!(
+                "EP unit plan: {bytes} {what} bytes per expert is not 256-byte aligned"
+            ));
+        }
+        Ok(bytes)
+    };
+    let geometry = EpUnitGeometry {
+        layers,
+        experts_per_layer,
+        ranks,
+        gate_up_bytes: per_expert("gate/up", gate_up_stack_bytes)?,
+        down_bytes: per_expert("down", down_stack_bytes)?,
+    };
+    geometry.check()?;
+    Ok(geometry)
+}
+
+/// The facts of one load [`ep_units_refusal`] judges.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EpUnitsFacts {
+    /// `topology.ep` of the load.
+    pub ep: usize,
+    /// `topology.pp` of the load.
+    pub pp: usize,
+    /// `HIPFIRE_QWEN4_EXPERT_HOTSET` names an explicit sidecar.
+    pub single_card_hotset: bool,
+    /// `HIPFIRE_EP_CHUNK_AUTOFIT=1`.
+    pub chunk_autofit: bool,
+    /// `HIPFIRE_EP_LAB_RESIDENT_LAYERS` is set.
+    pub lab_resident_cap: bool,
+}
+
+/// Why a load with [`EP_EXPERT_HOTSET_ENV`] set is refused, if it is: the
+/// flag needs expert parallelism and composes with none of the single-device
+/// or whole-layer-only levers. The EP long-prefill expert stage is NOT one of
+/// them: a unit plan has its own stage ([`EpUnitStageKind::Units`]). Every
+/// message names the flag.
+pub fn ep_units_refusal(facts: &EpUnitsFacts) -> Result<(), String> {
+    let refuse = |why: &str| Err(format!("{EP_EXPERT_HOTSET_ENV}: {why}"));
+    if facts.pp > 1 {
+        return refuse("pipeline parallelism (topology.pp > 1) is not supported; the per-expert hot set needs expert parallelism (topology.ep >= 2)");
+    }
+    if facts.ep < 2 {
+        return refuse(
+            "needs expert parallelism (topology.ep >= 2); unset the flag for a single-device load",
+        );
+    }
+    if facts.single_card_hotset {
+        return refuse("HIPFIRE_QWEN4_EXPERT_HOTSET names the single-device hot set, which expert parallelism never applies; unset one of the two");
+    }
+    if facts.chunk_autofit {
+        return refuse("HIPFIRE_EP_CHUNK_AUTOFIT=1 re-plans the prefill chunk and the reserve under the per-expert budget; unset it");
+    }
+    if facts.lab_resident_cap {
+        return refuse("HIPFIRE_EP_LAB_RESIDENT_LAYERS caps whole resident layers, which the per-expert plan does not use; unset it");
+    }
+    Ok(())
+}
+
+/// `HIPFIRE_EP_EXPERT_STAGE`: the EP long-prefill expert stage lever (default
+/// on, exact `0` off).
+pub const EP_EXPERT_STAGE_ENV: &str = "HIPFIRE_EP_EXPERT_STAGE";
+
+/// Zeroed tail pad after the staged payload of each unit-stage buffer (the
+/// kernels' tail over-read, as the tier stage's).
+pub const EP_UNIT_STAGE_PAD_BYTES: u64 = ARENA_TAIL_PAD_BYTES as u64;
+
+/// Which G2 stage an EP load builds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpUnitStageKind {
+    /// Today's donor stage: two resident layers lent as stage buffers. No
+    /// unit plan (flag off), or a plan that IS a whole-layer split
+    /// ([`EpUnitPlan::whole_layer_split`]).
+    Donors,
+    /// Two dedicated VRAM stage buffers; a host-bearing layer (mixed or
+    /// wholly host) copies its host region into its parity's buffer.
+    Units,
+}
+
+/// The stage kind `plan` (the load's unit plan, `None` without the flag) calls
+/// for. The one chooser `Qwen4ExpertStage::new` and the loader's charge share.
+pub fn ep_unit_stage_kind(plan: Option<&EpUnitPlan>) -> EpUnitStageKind {
+    match plan {
+        Some(plan) if plan.whole_layer_split().is_none() => EpUnitStageKind::Units,
+        _ => EpUnitStageKind::Donors,
+    }
+}
+
+impl EpUnitPlan {
+    /// Bytes `rank`'s `layer` copies into a unit-stage buffer: the pinned host
+    /// region the layer's host experts live in (a mixed layer's single host
+    /// arena, a host layer's two aggregates), `0` for a resident layer.
+    pub fn stage_host_region_bytes(&self, rank: usize, layer: usize) -> u64 {
+        let host = match self.layer_state(rank, layer) {
+            EpLayerState::Resident => 0,
+            EpLayerState::Host => self.geometry.owned_per_layer(rank),
+            EpLayerState::Mixed { host, .. } => host,
+        };
+        host as u64 * self.geometry.unit_bytes()
+    }
+
+    /// Whether `rank` holds host experts in any trunk layer.
+    pub fn rank_has_host_layer(&self, rank: usize) -> bool {
+        (0..self.geometry.layers).any(|layer| self.stage_host_region_bytes(rank, layer) > 0)
+    }
+
+    /// The largest [`Self::stage_host_region_bytes`] over every rank and layer.
+    pub fn max_stage_host_region_bytes(&self) -> u64 {
+        (0..self.geometry.ranks)
+            .flat_map(|rank| {
+                (0..self.geometry.layers)
+                    .map(move |layer| self.stage_host_region_bytes(rank, layer))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// The switches that decide whether an EP rank builds a unit stage.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EpUnitStageSwitches<'a> {
+    pub arch: &'a str,
+    /// `HIPFIRE_QWEN4_EXPERT_STAGE`.
+    pub expert_stage: Option<&'a str>,
+    /// [`EP_EXPERT_STAGE_ENV`].
+    pub ep_stage: Option<&'a str>,
+    /// `HIPFIRE_EP_OWNER_ROUTED_PREFILL`.
+    pub owner_routed: Option<&'a str>,
+}
+
+/// Whether the switches admit the EP expert stage on this arch: the arch
+/// admits it under EP (gfx1201, `stage_policy(arch).expert_parallel_stage`),
+/// the stage switch is on (`HIPFIRE_QWEN4_EXPERT_STAGE` explicit `1`, or the
+/// arch default; probe-free: gfx1201 never reads the host link, so this is the
+/// same value `expert_stage_enabled` settles on), and neither
+/// `HIPFIRE_EP_EXPERT_STAGE` nor `HIPFIRE_EP_OWNER_ROUTED_PREFILL` is `0`. The
+/// loader's VRAM charge and the forward's build decision both read this. The
+/// owner-routed route's own runtime admission (S1 symmetric headers) can still
+/// decline the stage after the load; the bytes are then charged and unused.
+pub fn ep_unit_stage_switches_on(switches: &EpUnitStageSwitches<'_>) -> bool {
+    rdna_compute::expert_capabilities::stage_policy(switches.arch).expert_parallel_stage
+        && crate::expert_residency::expert_stage_switch(
+            switches.arch,
+            switches.expert_stage,
+            || crate::host_link::HostLink::Unmeasured,
+        )
+        && switches.ep_stage != Some("0")
+        && switches.owner_routed != Some("0")
+}
+
+/// [`ep_unit_stage_switches_on`] with the switches read from the process
+/// configuration, for `arch`.
+pub fn ep_unit_stage_on(arch: &str) -> bool {
+    let var = |name: &str| hipfire_config::developer_var(name).ok();
+    let (expert_stage, ep_stage, owner_routed) = (
+        var(crate::gpu_forward::QWEN4_EXPERT_STAGE_ENV),
+        var(EP_EXPERT_STAGE_ENV),
+        var(crate::gpu_forward::QWEN4_EP_OWNER_ROUTED_PREFILL_ENV),
+    );
+    ep_unit_stage_switches_on(&EpUnitStageSwitches {
+        arch,
+        expert_stage: expert_stage.as_deref(),
+        ep_stage: ep_stage.as_deref(),
+        owner_routed: owner_routed.as_deref(),
+    })
+}
+
+/// Whether `rank` builds a unit stage: the switches are on, the plan calls for
+/// the unit stage and the rank holds a host expert. The forward builds exactly
+/// when this holds; the loader charges when it holds on any rank.
+pub fn ep_unit_stage_builds(stage_on: bool, plan: Option<&EpUnitPlan>, rank: usize) -> bool {
+    stage_on
+        && ep_unit_stage_kind(plan) == EpUnitStageKind::Units
+        && plan.is_some_and(|plan| plan.rank_has_host_layer(rank))
+}
+
+/// VRAM one unit stage takes on every rank: capacity of the stage buffers and
+/// the bytes charged for them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct EpUnitStageCharge {
+    /// Payload capacity `C` of each of the two stage buffers (largest host
+    /// region of any layer of any rank); `0` when no stage is built.
+    pub capacity: u64,
+    /// `2 * (C + pad)` plus the stage pointer tables; `0` when `capacity` is.
+    pub bytes: u64,
+}
+
+/// Device bytes of the stage pointer tables of every trunk layer (two tables
+/// of `2 * experts` f32 per layer), an upper bound of what a rank allocates.
+pub fn ep_unit_stage_table_bytes(geometry: &EpUnitGeometry) -> u64 {
+    geometry.layers as u64 * 16 * geometry.experts_per_layer as u64
+}
+
+fn ep_unit_stage_charge_for(capacity: u64, tables: u64) -> EpUnitStageCharge {
+    if capacity == 0 {
+        return EpUnitStageCharge::default();
+    }
+    EpUnitStageCharge {
+        capacity,
+        bytes: capacity
+            .saturating_add(EP_UNIT_STAGE_PAD_BYTES)
+            .saturating_mul(2)
+            .saturating_add(tables),
+    }
+}
+
+/// The stage VRAM of the FINAL `plan`: zero unless some rank builds a unit
+/// stage ([`ep_unit_stage_builds`]), else `C` = the plan's largest host region.
+pub fn ep_unit_plan_stage_charge(plan: &EpUnitPlan, stage_on: bool) -> EpUnitStageCharge {
+    let builds =
+        (0..plan.geometry().ranks).any(|rank| ep_unit_stage_builds(stage_on, Some(plan), rank));
+    if !builds {
+        return EpUnitStageCharge::default();
+    }
+    ep_unit_stage_charge_for(
+        plan.max_stage_host_region_bytes(),
+        ep_unit_stage_table_bytes(plan.geometry()),
+    )
+}
+
+/// The load receipt's stage clause.
+pub fn ep_unit_stage_receipt(stage: &EpUnitStageCharge) -> String {
+    if stage.capacity == 0 {
+        "stage none".to_string()
+    } else {
+        format!(
+            "stage {} MiB x 2 charged ({} MiB with tables)",
+            stage.capacity >> 20,
+            stage.bytes >> 20
+        )
+    }
+}
+
+/// Iteration cap of the stage-capacity fixed point.
+pub const EP_UNIT_STAGE_FIXED_POINT_ITERATIONS: usize = 8;
+
+/// A unit plan placed under its own stage charge.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EpUnitStagedPlan {
+    pub plan: EpUnitPlan,
+    pub stage: EpUnitStageCharge,
+    /// Placements made.
+    pub iterations: usize,
+    /// The fixed point converged within the cap (`false`: `C` is the largest
+    /// whole-layer region).
+    pub converged: bool,
+}
+
+/// The fixed point, over any placement function of the per-rank charge (bytes
+/// taken off every rank's budget): `C_0 = 0`, `plan_k = place(charge(C_k))`,
+/// `C_{k+1}` = the largest host region of `plan_k` (zero when the plan does
+/// not take the unit stage), stop at the first `C_{k+1} <= C_k`; the plan and
+/// `C_k` are returned. After [`EP_UNIT_STAGE_FIXED_POINT_ITERATIONS`]
+/// placements without a fixed point `C` is the largest whole-layer region. A
+/// plan that needs no unit stage returns zero charge (its placement was made
+/// under a possibly larger charge, so it still fits).
+fn solve_stage_capacity(
+    geometry: &EpUnitGeometry,
+    stage_on: bool,
+    mut place: impl FnMut(u64) -> Result<EpUnitPlan, String>,
+) -> Result<EpUnitStagedPlan, String> {
+    let tables = ep_unit_stage_table_bytes(geometry);
+    let need = |plan: &EpUnitPlan| {
+        if ep_unit_stage_kind(Some(plan)) == EpUnitStageKind::Units {
+            plan.max_stage_host_region_bytes()
+        } else {
+            0
+        }
+    };
+    if !stage_on {
+        return Ok(EpUnitStagedPlan {
+            plan: place(0)?,
+            stage: EpUnitStageCharge::default(),
+            iterations: 1,
+            converged: true,
+        });
+    }
+    let mut capacity = 0u64;
+    for iteration in 1..=EP_UNIT_STAGE_FIXED_POINT_ITERATIONS {
+        let plan = place(ep_unit_stage_charge_for(capacity, tables).bytes)?;
+        let region = need(&plan);
+        if region <= capacity {
+            let capacity = if region == 0 { 0 } else { capacity };
+            return Ok(EpUnitStagedPlan {
+                plan,
+                stage: ep_unit_stage_charge_for(capacity, tables),
+                iterations: iteration,
+                converged: true,
+            });
+        }
+        capacity = region;
+    }
+    let full = (0..geometry.ranks)
+        .map(|rank| geometry.owned_per_layer(rank) as u64)
+        .max()
+        .unwrap_or(0)
+        .saturating_mul(geometry.unit_bytes());
+    let plan = place(ep_unit_stage_charge_for(full, tables).bytes)?;
+    let region = need(&plan);
+    if region > full {
+        return Err(format!(
+            "EP unit stage: a host region of {region} bytes exceeds the whole-layer region of {full} bytes"
+        ));
+    }
+    Ok(EpUnitStagedPlan {
+        plan,
+        stage: ep_unit_stage_charge_for(if region == 0 { 0 } else { full }, tables),
+        iterations: EP_UNIT_STAGE_FIXED_POINT_ITERATIONS + 1,
+        converged: false,
+    })
+}
+
+/// [`place_routed_experts_units`] over a ranking with the unit stage paid for:
+/// the two stage buffers are fresh VRAM on every rank, so every rank's budget
+/// is reduced by `2 * (C + pad)` plus the stage tables before the ranking walk,
+/// `C` the largest host region of the returned plan (fixed point, see
+/// [`solve_stage_capacity`]). With `stage_on` false nothing is charged and the
+/// plan is exactly the plain ranking plan.
+pub fn place_routed_experts_units_staged(
+    geometry: &EpUnitGeometry,
+    ranking: EpRanking<'_>,
+    rank_budget_bytes: &[u64],
+    stage_on: bool,
+) -> Result<EpUnitStagedPlan, String> {
+    solve_stage_capacity(geometry, stage_on, |charge| {
+        place_routed_experts_units(
+            geometry,
+            &EpUnitSource::Ranking {
+                ranking,
+                rank_budget_bytes: rank_budget_bytes
+                    .iter()
+                    .map(|budget| budget.saturating_sub(charge))
+                    .collect(),
+            },
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::expert_residency::{host_mapped_bytes, place_routed_experts};
+    use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry, WeightResidency};
+    use rdna_compute::DType;
+
+    // Flash-Next mq4-xts: 1280 x 10 x 136 gate/up, 2560 x 5 x 68 down.
+    const GATE_UP: u64 = 1280 * 10 * 136;
+    const DOWN: u64 = 2560 * 5 * 68;
+
+    fn geometry(ranks: usize) -> EpUnitGeometry {
+        EpUnitGeometry {
+            layers: 48,
+            experts_per_layer: 512,
+            ranks,
+            gate_up_bytes: GATE_UP,
+            down_bytes: DOWN,
+        }
+    }
+
+    /// Deterministic pseudo-random permutation of `0..n` (Fisher-Yates, LCG).
+    fn permutation(n: usize, mut state: u64) -> Vec<u32> {
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        for i in (1..n).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ids.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        ids
+    }
+
+    fn entry(name: String, layer: usize, experts: usize) -> WeightEntry {
+        let mut entry = WeightEntry::model(
+            name,
+            vec![experts, 4, 256],
+            DType::MQ4G256V2,
+            ShardPolicy::Replicate,
+        );
+        entry.layer = Some(layer);
+        entry
+    }
+
+    #[test]
+    fn unit_bytes_are_the_flash_next_expert() {
+        assert_eq!(geometry(2).unit_bytes(), 2_611_200);
+        assert_eq!(GATE_UP % 256, 0);
+        assert_eq!(DOWN % 256, 0);
+    }
+
+    /// The flag-off identity: with no ranking the unit plan is exactly today's
+    /// per-layer split, per rank, per expert, and its host-mapped bytes equal
+    /// `place_routed_experts` + `host_mapped_bytes` on a manifest.
+    #[test]
+    fn no_ranking_equals_todays_per_layer_split() {
+        for ranks in [2usize, 3] {
+            let g = geometry(ranks);
+            for vram_layers in [0usize, 1, 17, 33, 47, 48, 60] {
+                let plan =
+                    place_routed_experts_units(&g, &EpUnitSource::WholeLayers { vram_layers })
+                        .unwrap();
+                assert!(plan.equals_whole_layers(vram_layers));
+                assert_eq!(plan.whole_layer_split(), Some(vram_layers.min(48)));
+                for rank in 0..ranks {
+                    for layer in 0..48 {
+                        let want = layer < vram_layers;
+                        for expert in 0..512 {
+                            assert_eq!(
+                                plan.is_resident(rank, layer, expert),
+                                want && expert % ranks == rank,
+                                "rank {rank} layer {layer} expert {expert} vram_layers {vram_layers}"
+                            );
+                        }
+                    }
+                    assert_eq!(
+                        plan.resident_units(rank),
+                        vram_layers.min(48) * g.owned_per_layer(rank)
+                    );
+                    assert_eq!(plan.layer_counts(rank).1, 0);
+                }
+                // Manifest cross-check: residency per layer entry and pinned bytes.
+                let mut weights = Vec::new();
+                for layer in 0..48 {
+                    for proj in ["gate_up_proj", "down_proj"] {
+                        weights.push(entry(
+                            format!("model.language_model.layers.{layer}.mlp.experts.{proj}"),
+                            layer,
+                            512,
+                        ));
+                    }
+                }
+                place_routed_experts(&mut weights, vram_layers);
+                for rank in 0..ranks {
+                    let bytes_of = |entry: &WeightEntry| {
+                        let per_expert = if entry.name.ends_with("gate_up_proj") {
+                            GATE_UP
+                        } else {
+                            DOWN
+                        };
+                        Some(per_expert * g.owned_per_layer(rank) as u64)
+                    };
+                    let manifest_host = host_mapped_bytes(&weights, bytes_of).unwrap();
+                    assert_eq!(plan.host_pinned_bytes(rank), manifest_host, "rank {rank}");
+                    for (layer, state) in (0..48).map(|l| (l, plan.layer_state(rank, l))) {
+                        let host = weights
+                            .iter()
+                            .find(|e| e.layer == Some(layer))
+                            .unwrap()
+                            .residency
+                            == WeightResidency::HostMapped;
+                        assert_eq!(state == EpLayerState::Host, host, "layer {layer}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ranking_walk_keeps_owned_units_until_the_budget_is_spent() {
+        let g = geometry(2);
+        let rank = permutation(g.total_ids(), 7);
+        // Budget for exactly 1,000 units on rank 0 and 500 on rank 1 plus pads.
+        let budget = vec![
+            1_000 * g.unit_bytes() + 48 * 2 * VRAM_ARENA_TAIL_PAD_BYTES,
+            500 * g.unit_bytes() + 48 * 2 * VRAM_ARENA_TAIL_PAD_BYTES,
+        ];
+        let plan = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &rank,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: budget,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.resident_units(0), 1_000);
+        assert_eq!(plan.resident_units(1), 500);
+        // The kept set is the ranked prefix per rank: the hottest owned units.
+        for r in 0..2 {
+            let want: Vec<usize> = rank
+                .iter()
+                .map(|&id| id as usize)
+                .filter(|id| (id % 512) % 2 == r)
+                .take(plan.resident_units(r))
+                .collect();
+            let mut got = Vec::new();
+            for layer in 0..48 {
+                for expert in 0..512 {
+                    if plan.is_resident(r, layer, expert) {
+                        assert_eq!(expert % 2, r, "never an expert the rank does not own");
+                        got.push(layer * 512 + expert);
+                    }
+                }
+            }
+            let mut want_sorted = want;
+            want_sorted.sort_unstable();
+            assert_eq!(got, want_sorted, "rank {r}");
+        }
+        assert!(plan.vram_bytes(0) <= 1_000 * g.unit_bytes() + 48 * 2 * VRAM_ARENA_TAIL_PAD_BYTES);
+        assert_eq!(plan.owned_units(0), 48 * 256);
+        assert_eq!(plan.host_units(0), 48 * 256 - 1_000);
+    }
+
+    /// A whole-layers ranking at the whole-layer budget is the whole-layer split
+    /// (identical bytes): rank the units of layers 0..N hottest, give each rank
+    /// N layers of bytes plus the arena pads.
+    #[test]
+    fn a_whole_layers_ranking_reproduces_the_whole_layer_split() {
+        let g = geometry(2);
+        let layers_kept = 33usize;
+        let mut rank: Vec<u32> = (0..g.total_ids() as u32).collect(); // layer-major: layers 0.. first
+        rank.sort_by_key(|&id| id as usize / 512);
+        let per_rank = layers_kept as u64 * 256 * g.unit_bytes()
+            + layers_kept as u64 * 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        let plan = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &rank,
+                    counts: None,
+                    sha256: Some("00".repeat(32).as_str()),
+                },
+                rank_budget_bytes: vec![per_rank; 2],
+            },
+        )
+        .unwrap();
+        let whole = place_routed_experts_units(
+            &g,
+            &EpUnitSource::WholeLayers {
+                vram_layers: layers_kept,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.resident, whole.resident);
+        assert_eq!(plan.resident_units(0), 8_448);
+        assert_eq!(plan.whole_layer_split(), Some(33));
+        assert_eq!(plan.host_pinned_bytes(0), whole.host_pinned_bytes(0));
+    }
+
+    #[test]
+    fn coverage_is_the_counts_mass_of_the_kept_units() {
+        let g = EpUnitGeometry {
+            layers: 2,
+            experts_per_layer: 4,
+            ranks: 2,
+            gate_up_bytes: 256,
+            down_bytes: 256,
+        };
+        // Ids: layer 0 experts 0..4 = ids 0..4, layer 1 = ids 4..8. Counts favour id 6, 1, 0.
+        let counts = vec![10, 30, 0, 5, 0, 0, 100, 5];
+        let rank = vec![6, 1, 0, 3, 7, 2, 4, 5];
+        let budget_per_rank = 2 * g.unit_bytes() + 4 * VRAM_ARENA_TAIL_PAD_BYTES;
+        let plan = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &rank,
+                    counts: Some(&counts),
+                    sha256: Some(&"ab".repeat(32)),
+                },
+                rank_budget_bytes: vec![budget_per_rank; 2],
+            },
+        )
+        .unwrap();
+        // Rank 0 owns experts 0, 2: ranked 6 (l1 e2), 0 (l0 e0); then 2, 4 (no budget left).
+        assert!(plan.is_resident(0, 1, 2) && plan.is_resident(0, 0, 0));
+        assert_eq!(plan.resident_units(0), 2);
+        // Rank 1 owns experts 1, 3: ranked 1 (l0 e1), 3 (l0 e3).
+        assert!(plan.is_resident(1, 0, 1) && plan.is_resident(1, 0, 3));
+        assert_eq!(plan.resident_units(1), 2);
+        // Rank 0 mass: owned = ids 0,2,4,6 = 10+0+0+100 = 110; kept ids 6,0 = 110 -> 100%.
+        assert!((plan.coverage(0).unwrap() - 1.0).abs() < 1e-12);
+        // Rank 1 mass: owned = ids 1,3,5,7 = 30+5+0+5 = 40; kept 1,3 = 35.
+        assert!((plan.coverage(1).unwrap() - 35.0 / 40.0).abs() < 1e-12);
+        assert_eq!(plan.layer_state(1, 0), EpLayerState::Resident);
+        assert_eq!(plan.layer_state(1, 1), EpLayerState::Host);
+        assert_eq!(
+            plan.layer_state(0, 0),
+            EpLayerState::Mixed {
+                resident: 1,
+                host: 1
+            }
+        );
+    }
+
+    #[test]
+    fn a_rank_closes_at_the_first_unit_that_does_not_fit() {
+        let g = EpUnitGeometry {
+            layers: 1,
+            experts_per_layer: 4,
+            ranks: 2,
+            gate_up_bytes: 256,
+            down_bytes: 256,
+        };
+        // Budget fits one unit plus the layer's pads, not two.
+        let budget = g.unit_bytes() + 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        let rank = vec![0, 2, 1, 3];
+        let plan = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &rank,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![budget, budget + g.unit_bytes()],
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.resident_units(0), 1);
+        assert_eq!(plan.resident_units(1), 2);
+        assert!(plan.is_resident(0, 0, 0) && !plan.is_resident(0, 0, 2));
+    }
+
+    #[test]
+    fn a_malformed_ranking_is_refused() {
+        let g = EpUnitGeometry {
+            layers: 1,
+            experts_per_layer: 4,
+            ranks: 2,
+            gate_up_bytes: 256,
+            down_bytes: 256,
+        };
+        let run = |rank: &[u32]| {
+            place_routed_experts_units(
+                &g,
+                &EpUnitSource::Ranking {
+                    ranking: EpRanking {
+                        rank,
+                        counts: None,
+                        sha256: None,
+                    },
+                    rank_budget_bytes: vec![1 << 20; 2],
+                },
+            )
+        };
+        assert!(run(&[0, 1, 2]).unwrap_err().contains("3 ids"));
+        assert!(run(&[0, 1, 2, 2]).unwrap_err().contains("twice"));
+        assert!(run(&[0, 1, 2, 9]).unwrap_err().contains("outside"));
+        assert!(run(&[0, 1, 2, 3]).is_ok());
+        let wrong = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &[0, 1, 2, 3],
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![1 << 20],
+            },
+        );
+        assert!(wrong.unwrap_err().contains("rank budgets"));
+    }
+
+    #[test]
+    fn receipt_line_formats_both_sources() {
+        let g = geometry(2);
+        let whole =
+            place_routed_experts_units(&g, &EpUnitSource::WholeLayers { vram_layers: 33 }).unwrap();
+        let line = whole.receipt_line(0);
+        assert!(line.starts_with("qwen4 EP expert tier rank 0/2: resident 8448/12288 units"));
+        assert!(line.contains("layers 33 resident, 0 mixed, 15 host (33 touched)"));
+        assert!(line.contains("whole-layer equivalent 33.00"));
+        assert!(line.ends_with("ranking none (whole layers)"));
+
+        let rank = permutation(g.total_ids(), 3);
+        let counts: Vec<u64> = (0..g.total_ids() as u64).map(|i| 1 + i % 7).collect();
+        let budget = 8_448 * g.unit_bytes() + 48 * 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        let sha = "ef".repeat(32);
+        let plan = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &rank,
+                    counts: Some(&counts),
+                    sha256: Some(&sha),
+                },
+                rank_budget_bytes: vec![budget; 2],
+            },
+        )
+        .unwrap();
+        let line = plan.receipt_line(1);
+        println!("{line}");
+        assert!(
+            line.contains("rank 1/2: resident 8448/12288 units"),
+            "{line}"
+        );
+        assert!(
+            line.contains("ranking sha256 efefefefefefefef coverage "),
+            "{line}"
+        );
+        assert_eq!(plan.receipt_lines().len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod layer_map_tests {
+    use super::*;
+
+    const GU: usize = 512;
+    const DN: usize = 256;
+
+    fn source_stacks(experts: usize, layer: usize) -> (Vec<u8>, Vec<u8>) {
+        let mut gate_up = Vec::with_capacity(experts * GU);
+        let mut down = Vec::with_capacity(experts * DN);
+        for expert in 0..experts {
+            gate_up.extend((0..GU).map(|i| (layer * 31 + expert * 7 + i) as u8));
+            down.extend((0..DN).map(|i| (layer * 17 + expert * 13 + i * 3) as u8));
+        }
+        (gate_up, down)
+    }
+
+    fn plan(ranks: usize, experts: usize, kept_per_rank: usize) -> EpUnitPlan {
+        let g = EpUnitGeometry {
+            layers: 3,
+            experts_per_layer: experts,
+            ranks,
+            gate_up_bytes: GU as u64,
+            down_bytes: DN as u64,
+        };
+        // Rank order: layer-major, but within a layer every third expert first so the
+        // resident set is neither a prefix nor a stride.
+        let mut ids: Vec<u32> = Vec::new();
+        for layer in 0..3 {
+            for pass in 0..3 {
+                for expert in (0..experts).filter(|e| e % 3 == pass) {
+                    ids.push((layer * experts + expert) as u32);
+                }
+            }
+        }
+        let budget = kept_per_rank as u64 * (GU + DN) as u64 + 3 * 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ids,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![budget; ranks],
+            },
+        )
+        .unwrap()
+    }
+
+    /// The arena round trip: every unit re-read through the slot map equals the
+    /// source bytes, for both tiers, three layers, two and three ranks, uneven
+    /// ownership included.
+    #[test]
+    fn arena_round_trip_re_reads_every_unit() {
+        for (ranks, experts) in [(2usize, 32usize), (3, 32)] {
+            let plan = plan(ranks, experts, 11);
+            for rank in 0..ranks {
+                for layer in 0..3 {
+                    let map = plan.layer_map(rank, layer);
+                    let (gate_up_all, down_all) = source_stacks(experts, layer);
+                    let vram = map
+                        .gather_arena(UnitTier::Vram, &gate_up_all, &down_all)
+                        .unwrap();
+                    let host = map
+                        .gather_arena(UnitTier::Host, &gate_up_all, &down_all)
+                        .unwrap();
+                    assert_eq!(vram.len(), map.arena_entry_bytes(UnitTier::Vram));
+                    assert_eq!(host.len(), map.arena_entry_bytes(UnitTier::Host));
+                    let owned = (0..experts).filter(|e| e % ranks == rank).count();
+                    assert_eq!(map.count(UnitTier::Vram) + map.count(UnitTier::Host), owned);
+                    for expert in 0..experts {
+                        let Some((tier, gate_up, down)) = map.expert_offsets(expert) else {
+                            assert_ne!(expert % ranks, rank);
+                            continue;
+                        };
+                        assert_eq!(expert % ranks, rank);
+                        assert_eq!(
+                            map.slot(expert).unwrap().tier == UnitTier::Vram,
+                            plan.is_resident(rank, layer, expert)
+                        );
+                        let arena = if tier == UnitTier::Vram { &vram } else { &host };
+                        assert_eq!(
+                            &arena[gate_up..gate_up + GU],
+                            &gate_up_all[expert * GU..(expert + 1) * GU],
+                            "rank {rank} layer {layer} expert {expert} gate/up"
+                        );
+                        assert_eq!(
+                            &arena[down..down + DN],
+                            &down_all[expert * DN..(expert + 1) * DN],
+                            "rank {rank} layer {layer} expert {expert} down"
+                        );
+                    }
+                    // The VRAM tail pad is zeroed and the two blocks tile the payload.
+                    let payload = map.arena_payload_bytes(UnitTier::Vram);
+                    assert!(vram[payload..].iter().all(|&byte| byte == 0));
+                    assert_eq!(
+                        map.down_offset(UnitSlot {
+                            tier: UnitTier::Vram,
+                            slot: 0
+                        }),
+                        map.count(UnitTier::Vram) * GU
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_layers_need_both_tiers_and_slots_are_ascending() {
+        let plan = plan(2, 32, 11);
+        for rank in 0..2 {
+            for layer in plan.mixed_layers(rank) {
+                let map = plan.layer_map(rank, layer);
+                assert!(map.is_mixed());
+                let mut last = [None, None];
+                for expert in 0..32 {
+                    if let Some(slot) = map.slot(expert) {
+                        let at = usize::from(slot.tier == UnitTier::Host);
+                        assert_eq!(slot.slot, last[at].map_or(0, |previous| previous + 1));
+                        last[at] = Some(slot.slot);
+                    }
+                }
+            }
+        }
+        // A whole-layer plan has no mixed layers and one tier per layer map.
+        let whole = place_routed_experts_units(
+            &EpUnitGeometry {
+                layers: 3,
+                experts_per_layer: 32,
+                ranks: 2,
+                gate_up_bytes: GU as u64,
+                down_bytes: DN as u64,
+            },
+            &EpUnitSource::WholeLayers { vram_layers: 1 },
+        )
+        .unwrap();
+        assert!(whole.mixed_layers(0).is_empty());
+        assert!(!whole.layer_map(0, 0).is_mixed());
+        assert_eq!(whole.layer_map(0, 0).count(UnitTier::Host), 0);
+        assert_eq!(whole.layer_map(0, 2).count(UnitTier::Vram), 0);
+    }
+
+    #[test]
+    fn gather_refuses_wrong_stack_sizes() {
+        let plan = plan(2, 32, 11);
+        let map = plan.layer_map(0, 0);
+        let (gate_up_all, down_all) = source_stacks(32, 0);
+        assert!(map
+            .gather_arena(UnitTier::Host, &gate_up_all[1..], &down_all)
+            .is_err());
+        assert!(map
+            .gather_arena(UnitTier::Host, &gate_up_all, &down_all[..10])
+            .is_err());
+    }
+
+    #[test]
+    fn rank_budgets_are_the_bytes_auto_divides_by_the_layer_size() {
+        use crate::expert_residency::auto_vram_layers;
+        let layer = 637 << 20;
+        for (free, non_expert, reserve) in [
+            (31u64 << 30, 5u64 << 30, 7u64 << 30),
+            (20 << 30, 5 << 30, 7 << 30),
+            (3 << 30, 5 << 30, 7 << 30),
+        ] {
+            let budgets = ep_unit_rank_budgets(&[free, free / 2], non_expert, reserve);
+            assert_eq!(budgets.len(), 2);
+            for (rank, &f) in [free, free / 2].iter().enumerate() {
+                assert_eq!(
+                    (budgets[rank] / layer).min(48) as usize,
+                    auto_vram_layers(f, non_expert, layer, 48, reserve)
+                );
+            }
+        }
+        assert_eq!(ep_unit_rank_budgets(&[1 << 30], 5 << 30, 1 << 30), vec![0]);
+    }
+}
+
+#[cfg(test)]
+mod loader_support_tests {
+    use super::*;
+    use crate::expert_residency::{
+        ep_unit_host_bytes_ranks, host_mapped_bytes_ranks, place_routed_experts,
+    };
+    use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
+    use rdna_compute::DType;
+
+    // Flash-Next mq4-xts per-expert bytes.
+    const GATE_UP: u64 = 1280 * 10 * 136;
+    const DOWN: u64 = 2560 * 5 * 68;
+
+    #[test]
+    fn the_flag_names_an_explicit_path_and_off_values_are_off() {
+        assert_eq!(EP_EXPERT_HOTSET_ENV, "HIPFIRE_QWEN4_EP_EXPERT_HOTSET");
+        for off in [None, Some(""), Some("   "), Some("0"), Some(" 0 ")] {
+            assert_eq!(ep_expert_hotset_path(off), None, "{off:?}");
+        }
+        assert_eq!(
+            ep_expert_hotset_path(Some(" /models/fn.mq4.expert-hotset ")),
+            Some(std::path::PathBuf::from("/models/fn.mq4.expert-hotset"))
+        );
+        assert_eq!(
+            ep_expert_hotset_path(Some("rel/path")),
+            Some(std::path::PathBuf::from("rel/path"))
+        );
+    }
+
+    #[test]
+    fn arena_entry_names_carry_their_tier_and_source_stacks() {
+        let prefix = "model.language_model.layers.17";
+        let vram = format!("{prefix}{UNIT_VRAM_ARENA_SUFFIX}");
+        let host = format!("{prefix}{UNIT_HOST_ARENA_SUFFIX}");
+        assert_eq!(unit_arena_tier(&vram), Some(UnitTier::Vram));
+        assert_eq!(unit_arena_tier(&host), Some(UnitTier::Host));
+        assert!(is_unit_arena_name(&vram) && is_unit_arena_name(&host));
+        for ordinary in [
+            format!("{prefix}.mlp.experts.gate_up_proj"),
+            format!("{prefix}.mlp.experts.down_proj"),
+            format!("{prefix}.mlp.experts.slab_arena"),
+            "model.embed_tokens.weight".to_string(),
+        ] {
+            assert_eq!(unit_arena_tier(&ordinary), None, "{ordinary}");
+            assert_eq!(unit_arena_source_names(&ordinary), None);
+        }
+        for name in [&vram, &host] {
+            assert_eq!(
+                unit_arena_source_names(name),
+                Some((
+                    format!("{prefix}.mlp.experts.gate_up_proj"),
+                    format!("{prefix}.mlp.experts.down_proj")
+                ))
+            );
+        }
+    }
+
+    /// The payload helper is `gather_arena` selected by the entry name: both
+    /// tiers of a two-rank, eight-expert mixed layer.
+    #[test]
+    fn arena_entry_bytes_is_gather_arena_picked_by_name() {
+        const GU: usize = 256;
+        const DN: usize = 256;
+        let geometry = EpUnitGeometry {
+            layers: 1,
+            experts_per_layer: 8,
+            ranks: 2,
+            gate_up_bytes: GU as u64,
+            down_bytes: DN as u64,
+        };
+        let ids: Vec<u32> = (0..8).collect();
+        let plan = place_routed_experts_units(
+            &geometry,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ids,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![
+                    2 * geometry.unit_bytes() + 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+                    2
+                ],
+            },
+        )
+        .unwrap();
+        let gate_up: Vec<u8> = (0..8 * GU).map(|i| (i % 251) as u8).collect();
+        let down: Vec<u8> = (0..8 * DN).map(|i| (i % 241) as u8).collect();
+        for rank in 0..2 {
+            let map = plan.layer_map(rank, 0);
+            assert!(map.is_mixed());
+            for (suffix, tier) in [
+                (UNIT_VRAM_ARENA_SUFFIX, UnitTier::Vram),
+                (UNIT_HOST_ARENA_SUFFIX, UnitTier::Host),
+            ] {
+                let name = format!("model.language_model.layers.0{suffix}");
+                assert_eq!(
+                    unit_arena_entry_bytes(&map, &name, &gate_up, &down).unwrap(),
+                    map.gather_arena(tier, &gate_up, &down).unwrap()
+                );
+            }
+            assert!(unit_arena_entry_bytes(
+                &map,
+                "model.language_model.layers.0.mlp.experts.gate_up_proj",
+                &gate_up,
+                &down
+            )
+            .is_err());
+            assert!(unit_arena_entry_bytes(
+                &map,
+                &format!("model.language_model.layers.0{UNIT_VRAM_ARENA_SUFFIX}"),
+                &gate_up[..GU],
+                &down
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn geometry_comes_from_uniform_aligned_stack_sizes() {
+        let stacks = |gu: u64, dn: u64| (vec![gu; 48], vec![dn; 48]);
+        let (gate_up, down) = stacks(512 * GATE_UP, 512 * DOWN);
+        let geometry = ep_unit_geometry(48, 512, 2, &gate_up, &down).unwrap();
+        assert_eq!(geometry.gate_up_bytes, GATE_UP);
+        assert_eq!(geometry.down_bytes, DOWN);
+        assert_eq!(
+            (geometry.layers, geometry.experts_per_layer, geometry.ranks),
+            (48, 512, 2)
+        );
+        // A layer of another size.
+        let mut odd = gate_up.clone();
+        odd[7] += 256 * 512;
+        assert!(ep_unit_geometry(48, 512, 2, &odd, &down).is_err());
+        // Not a whole number of experts.
+        let (bad, _) = stacks(512 * GATE_UP + 1, 0);
+        assert!(ep_unit_geometry(48, 512, 2, &bad, &down).is_err());
+        // Unaligned per-expert bytes.
+        let (unaligned, _) = stacks(512 * (GATE_UP + 8), 0);
+        assert!(ep_unit_geometry(48, 512, 2, &unaligned, &down).is_err());
+        // Wrong layer count, empty stacks, fewer experts than ranks.
+        assert!(ep_unit_geometry(47, 512, 2, &gate_up, &down).is_err());
+        let (empty, _) = stacks(0, 0);
+        assert!(ep_unit_geometry(48, 512, 2, &empty, &down).is_err());
+        assert!(ep_unit_geometry(48, 512, 600, &gate_up, &down).is_err());
+    }
+
+    #[test]
+    fn ep_unit_stage_loader_refuses_only_the_remaining_incompatibilities() {
+        let ok = EpUnitsFacts {
+            ep: 2,
+            pp: 1,
+            ..EpUnitsFacts::default()
+        };
+        assert_eq!(ep_units_refusal(&ok), Ok(()));
+        let refused = |facts: EpUnitsFacts, needle: &str| {
+            let error = ep_units_refusal(&facts).unwrap_err();
+            assert!(error.starts_with(EP_EXPERT_HOTSET_ENV), "{error}");
+            assert!(error.contains(needle), "{error}");
+        };
+        refused(EpUnitsFacts { ep: 1, ..ok }, "needs expert parallelism");
+        refused(EpUnitsFacts { ep: 0, ..ok }, "needs expert parallelism");
+        refused(EpUnitsFacts { pp: 2, ..ok }, "pipeline parallelism");
+        refused(
+            EpUnitsFacts {
+                single_card_hotset: true,
+                ..ok
+            },
+            "HIPFIRE_QWEN4_EXPERT_HOTSET",
+        );
+        refused(
+            EpUnitsFacts {
+                chunk_autofit: true,
+                ..ok
+            },
+            "HIPFIRE_EP_CHUNK_AUTOFIT",
+        );
+        refused(
+            EpUnitsFacts {
+                lab_resident_cap: true,
+                ..ok
+            },
+            "HIPFIRE_EP_LAB_RESIDENT_LAYERS",
+        );
+        // The EP expert stage is no incompatibility: no refusal names its lever.
+        for facts in [
+            EpUnitsFacts { ep: 1, ..ok },
+            EpUnitsFacts { pp: 2, ..ok },
+            EpUnitsFacts {
+                single_card_hotset: true,
+                ..ok
+            },
+            EpUnitsFacts {
+                chunk_autofit: true,
+                ..ok
+            },
+            EpUnitsFacts {
+                lab_resident_cap: true,
+                ..ok
+            },
+        ] {
+            let error = ep_units_refusal(&facts).unwrap_err();
+            assert!(!error.contains(EP_EXPERT_STAGE_ENV), "{error}");
+        }
+    }
+
+    /// A whole-layers plan's per-rank pinned census equals the manifest census
+    /// of the whole-layer placement, MTP head and embedding included, for
+    /// even and uneven splits.
+    #[test]
+    fn unit_host_census_equals_the_manifest_census_for_a_whole_layers_plan() {
+        let entry = |name: String, layer: Option<usize>| {
+            let mut entry = WeightEntry::model(
+                name,
+                vec![512, 4, 256],
+                DType::MQ4G256V2,
+                ShardPolicy::Replicate,
+            );
+            entry.layer = layer;
+            entry
+        };
+        let bytes_of = |entry: &WeightEntry| {
+            Some(if entry.name == crate::weights::QWEN4_EMBED {
+                5_000_000
+            } else if entry.name.ends_with("gate_up_proj") {
+                512 * GATE_UP
+            } else {
+                512 * DOWN
+            })
+        };
+        for ranks in [2usize, 3] {
+            let geometry = EpUnitGeometry {
+                layers: 48,
+                experts_per_layer: 512,
+                ranks,
+                gate_up_bytes: GATE_UP,
+                down_bytes: DOWN,
+            };
+            for vram_layers in [0usize, 5, 31, 48] {
+                let mut weights = Vec::new();
+                for layer in 0..48 {
+                    for proj in ["gate_up_proj", "down_proj"] {
+                        weights.push(entry(
+                            format!("model.language_model.layers.{layer}.mlp.experts.{proj}"),
+                            Some(layer),
+                        ));
+                    }
+                }
+                for proj in ["gate_up_proj", "down_proj"] {
+                    weights.push(entry(format!("mtp.layers.0.mlp.experts.{proj}"), None));
+                }
+                let mut embed = entry(crate::weights::QWEN4_EMBED.to_string(), None);
+                embed.logical_shape = vec![4, 4];
+                weights.push(embed);
+                place_routed_experts(&mut weights, vram_layers);
+                crate::expert_residency::place_embedding_host(&mut weights);
+                let plan = place_routed_experts_units(
+                    &geometry,
+                    &EpUnitSource::WholeLayers { vram_layers },
+                )
+                .unwrap();
+                assert_eq!(
+                    ep_unit_host_bytes_ranks(&weights, bytes_of, &plan).unwrap(),
+                    host_mapped_bytes_ranks(&weights, bytes_of, ranks).unwrap(),
+                    "ranks {ranks} vram_layers {vram_layers}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ep_unit_stage_tests {
+    use super::*;
+
+    const GATE_UP: u64 = 1280 * 10 * 136;
+    const DOWN: u64 = 2560 * 5 * 68;
+
+    fn geometry(layers: usize, experts: usize, ranks: usize) -> EpUnitGeometry {
+        EpUnitGeometry {
+            layers,
+            experts_per_layer: experts,
+            ranks,
+            gate_up_bytes: GATE_UP,
+            down_bytes: DOWN,
+        }
+    }
+
+    fn permutation(n: usize, mut state: u64) -> Vec<u32> {
+        let mut ids: Vec<u32> = (0..n as u32).collect();
+        for i in (1..n).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            ids.swap(i, (state >> 33) as usize % (i + 1));
+        }
+        ids
+    }
+
+    fn ranking_plan(g: &EpUnitGeometry, order: &[u32], budget: u64) -> EpUnitPlan {
+        place_routed_experts_units(
+            g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: order,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![budget; g.ranks],
+            },
+        )
+        .unwrap()
+    }
+
+    fn staged(g: &EpUnitGeometry, order: &[u32], budget: u64, on: bool) -> EpUnitStagedPlan {
+        place_routed_experts_units_staged(
+            g,
+            EpRanking {
+                rank: order,
+                counts: None,
+                sha256: None,
+            },
+            &vec![budget; g.ranks],
+            on,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ep_unit_stage_chooser_is_todays_path_for_no_plan_and_whole_layer_plans() {
+        assert_eq!(ep_unit_stage_kind(None), EpUnitStageKind::Donors);
+        let g = geometry(8, 32, 2);
+        let whole =
+            place_routed_experts_units(&g, &EpUnitSource::WholeLayers { vram_layers: 3 }).unwrap();
+        assert_eq!(ep_unit_stage_kind(Some(&whole)), EpUnitStageKind::Donors);
+        let none =
+            place_routed_experts_units(&g, &EpUnitSource::WholeLayers { vram_layers: 0 }).unwrap();
+        assert_eq!(ep_unit_stage_kind(Some(&none)), EpUnitStageKind::Donors);
+        // A per-expert plan (mixed layers) takes the unit stage.
+        let order = permutation(8 * 32, 7);
+        let mixed = ranking_plan(&g, &order, 40 * g.unit_bytes());
+        assert!(mixed.whole_layer_split().is_none());
+        assert_eq!(ep_unit_stage_kind(Some(&mixed)), EpUnitStageKind::Units);
+    }
+
+    #[test]
+    fn ep_unit_stage_switches_are_one_shared_predicate() {
+        let on = EpUnitStageSwitches {
+            arch: "gfx1201",
+            ..EpUnitStageSwitches::default()
+        };
+        assert!(ep_unit_stage_switches_on(&on));
+        assert!(ep_unit_stage_switches_on(&EpUnitStageSwitches {
+            expert_stage: Some("1"),
+            ..on
+        }));
+        for off in [
+            EpUnitStageSwitches {
+                expert_stage: Some("0"),
+                ..on
+            },
+            EpUnitStageSwitches {
+                ep_stage: Some("0"),
+                ..on
+            },
+            EpUnitStageSwitches {
+                owner_routed: Some("0"),
+                ..on
+            },
+            // Only gfx1201 builds the EP stage, whatever the explicit switch.
+            EpUnitStageSwitches {
+                arch: "gfx1100",
+                expert_stage: Some("1"),
+                ..on
+            },
+            EpUnitStageSwitches {
+                arch: "gfx1151",
+                ..on
+            },
+        ] {
+            assert!(!ep_unit_stage_switches_on(&off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn ep_unit_stage_charge_is_zero_unless_a_stage_is_built() {
+        let g = geometry(8, 32, 2);
+        let order = permutation(8 * 32, 11);
+        let mixed = ranking_plan(&g, &order, 40 * g.unit_bytes());
+        let charged = ep_unit_plan_stage_charge(&mixed, true);
+        assert_eq!(charged.capacity, mixed.max_stage_host_region_bytes());
+        assert!(charged.capacity > 0);
+        assert_eq!(
+            charged.bytes,
+            2 * (charged.capacity + EP_UNIT_STAGE_PAD_BYTES) + ep_unit_stage_table_bytes(&g)
+        );
+        // Stage off: nothing.
+        assert_eq!(
+            ep_unit_plan_stage_charge(&mixed, false),
+            EpUnitStageCharge::default()
+        );
+        // Whole-layer plan (donor stage) and a fully resident plan: nothing.
+        let whole =
+            place_routed_experts_units(&g, &EpUnitSource::WholeLayers { vram_layers: 3 }).unwrap();
+        assert_eq!(
+            ep_unit_plan_stage_charge(&whole, true),
+            EpUnitStageCharge::default()
+        );
+        let all = ranking_plan(&g, &order, u64::MAX / 4);
+        assert!(all.max_stage_host_region_bytes() == 0);
+        assert_eq!(
+            ep_unit_plan_stage_charge(&all, true),
+            EpUnitStageCharge::default()
+        );
+        // Charge > 0 exactly when some rank builds.
+        for plan in [&mixed, &whole, &all] {
+            let builds = (0..g.ranks).any(|rank| ep_unit_stage_builds(true, Some(plan), rank));
+            assert_eq!(builds, ep_unit_plan_stage_charge(plan, true).bytes > 0);
+        }
+        assert!(!ep_unit_stage_builds(true, None, 0));
+        assert!(!ep_unit_stage_builds(false, Some(&mixed), 0));
+    }
+
+    #[test]
+    fn ep_unit_stage_host_regions_follow_the_layer_state() {
+        let g = geometry(8, 32, 2);
+        let order = permutation(8 * 32, 3);
+        let plan = ranking_plan(&g, &order, 30 * g.unit_bytes());
+        let mut saw_mixed = false;
+        for rank in 0..g.ranks {
+            for layer in 0..g.layers {
+                let bytes = plan.stage_host_region_bytes(rank, layer);
+                match plan.layer_state(rank, layer) {
+                    EpLayerState::Resident => assert_eq!(bytes, 0),
+                    EpLayerState::Host => {
+                        assert_eq!(bytes, g.owned_per_layer(rank) as u64 * g.unit_bytes());
+                    }
+                    EpLayerState::Mixed { host, .. } => {
+                        saw_mixed = true;
+                        assert_eq!(bytes, host as u64 * g.unit_bytes());
+                        // The host arena the weights hold is exactly this region.
+                        assert_eq!(
+                            plan.layer_map(rank, layer)
+                                .arena_entry_bytes(UnitTier::Host)
+                                as u64,
+                            bytes
+                        );
+                    }
+                }
+            }
+            assert!(plan.rank_has_host_layer(rank));
+        }
+        assert!(saw_mixed);
+        // A wholly host layer stages both aggregates: every owned expert.
+        let host = ranking_plan(&g, &order, 0);
+        for rank in 0..g.ranks {
+            for layer in 0..g.layers {
+                assert_eq!(host.layer_state(rank, layer), EpLayerState::Host);
+                assert_eq!(
+                    host.stage_host_region_bytes(rank, layer),
+                    g.owned_per_layer(rank) as u64 * g.unit_bytes()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ep_unit_stage_capacity_is_monotone_in_the_budget() {
+        // The regions the fixed point reads shrink (never grow) as the budget grows.
+        let g = geometry(12, 64, 2);
+        let order = permutation(12 * 64, 5);
+        let mut last = u64::MAX;
+        for step in 0..40u64 {
+            let plan = ranking_plan(&g, &order, step * 12 * g.unit_bytes());
+            let region = plan.max_stage_host_region_bytes();
+            assert!(region <= last, "step {step}: {region} > {last}");
+            last = region;
+        }
+        assert_eq!(last, 0, "the largest budget keeps every unit");
+    }
+
+    #[test]
+    fn ep_unit_stage_capacity_converges_and_covers_the_final_plan() {
+        let g = geometry(48, 512, 2);
+        let order = permutation(48 * 512, 9);
+        let unit = g.unit_bytes();
+        for budget_units in [1200u64, 4000, 9000, 14_000] {
+            let budget = budget_units * unit;
+            let result = staged(&g, &order, budget, true);
+            assert!(result.converged, "budget {budget_units}");
+            assert!(result.iterations <= EP_UNIT_STAGE_FIXED_POINT_ITERATIONS);
+            let plan = &result.plan;
+            // C covers every layer of every rank of the final plan.
+            assert!(result.stage.capacity >= plan.max_stage_host_region_bytes());
+            if plan.max_stage_host_region_bytes() > 0 {
+                assert!(result.stage.capacity > 0 && result.stage.bytes > 0);
+            }
+            // The plan fits the budget net of the stage.
+            for rank in 0..g.ranks {
+                assert!(
+                    plan.vram_bytes(rank) + result.stage.bytes <= budget,
+                    "budget {budget_units} rank {rank}"
+                );
+            }
+            // The final plan's own charge is never above what the walk paid.
+            assert!(ep_unit_plan_stage_charge(plan, true).bytes <= result.stage.bytes);
+            // The stage costs resident units against the plain plan.
+            let plain = ranking_plan(&g, &order, budget);
+            for rank in 0..g.ranks {
+                assert!(plan.resident_units(rank) <= plain.resident_units(rank));
+            }
+        }
+    }
+
+    #[test]
+    fn ep_unit_stage_off_is_the_plain_plan_with_nothing_charged() {
+        let g = geometry(48, 512, 2);
+        let order = permutation(48 * 512, 21);
+        let budget = 5000 * g.unit_bytes();
+        let result = staged(&g, &order, budget, false);
+        assert_eq!(result.plan, ranking_plan(&g, &order, budget));
+        assert_eq!(result.stage, EpUnitStageCharge::default());
+        assert_eq!((result.iterations, result.converged), (1, true));
+    }
+
+    #[test]
+    fn ep_unit_stage_capacity_without_a_fixed_point_is_the_whole_layer_region() {
+        // A placement whose host region grows by one unit on every call never
+        // settles within the cap.
+        let g = geometry(1, 64, 1);
+        let order: Vec<u32> = (0..64).collect();
+        let unit = g.unit_bytes();
+        let mut calls = 0u64;
+        let result = solve_stage_capacity(&g, true, |_charge| {
+            calls += 1;
+            // `calls` host units, the rest resident (budget in units + the pads).
+            let keep = 64 - calls.min(63);
+            Ok(ranking_plan(
+                &g,
+                &order,
+                keep * unit + 2 * VRAM_ARENA_TAIL_PAD_BYTES,
+            ))
+        })
+        .unwrap();
+        assert!(!result.converged);
+        assert_eq!(calls as usize, EP_UNIT_STAGE_FIXED_POINT_ITERATIONS + 1);
+        assert_eq!(result.stage.capacity, 64 * unit);
+        assert!(result.stage.capacity >= result.plan.max_stage_host_region_bytes());
+    }
+
+    #[test]
+    fn ep_unit_stage_receipt_clause_names_the_charge() {
+        assert_eq!(
+            ep_unit_stage_receipt(&EpUnitStageCharge::default()),
+            "stage none"
+        );
+        let charge = EpUnitStageCharge {
+            capacity: 640 << 20,
+            bytes: (1280 << 20) + 8192,
+        };
+        let line = ep_unit_stage_receipt(&charge);
+        assert!(line.starts_with("stage 640 MiB x 2 charged"), "{line}");
+    }
+}

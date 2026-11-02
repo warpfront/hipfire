@@ -23,7 +23,7 @@ use crate::ep_trunk_split::{
     agree_layouts, split_buffer_bytes, split_census, SplitWeight, TrunkSplitMode, TrunkSplitRank,
 };
 use crate::gpu_forward::{
-    Qwen4BalancedPlan, Qwen4PeerExpertSource, QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
+    Qwen4BalancedPlan, Qwen4PeerLayerSource, QWEN4_EP_GATHER_BUFFERS, QWEN4_EP_GATHER_MAX_ROWS,
 };
 use crate::weights::Qwen4EpPlacement;
 use hipfire_dispatch::families::moe::{MoeRowGather, MoeTileExchange};
@@ -230,6 +230,220 @@ fn sync_device(gpu: &mut Gpu) -> Result<(), String> {
 /// `last_buffer` before any invocation.
 const NO_BUFFER: usize = usize::MAX;
 
+/// Lab measurement of the per-expert VRAM hit rate of a unit plan
+/// (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, enabled by `HIPFIRE_EP_LAB_UNIT_HITS=1`): per
+/// (rank, trunk layer, slots of the call), the routed slots and distinct experts per gather
+/// call that the rank holds (static `e % ranks` ownership, the K0 census's rank view) split
+/// into VRAM-resident and host-read by the plan. A call's slot count is `rows x top-k`, so it
+/// separates one-row AR calls (10 slots, the oracle's reference pass) from 8-lane AR calls
+/// (80) and verify windows. The hook downloads the layer's routing, so it adds a sync per
+/// layer: lab only, default off, never changes an output. The tally is process-global (every
+/// rank's worker thread writes it) so the oracle can report it.
+pub mod lab_unit_hits {
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    /// `(rank, trunk layer, slots of the call)`.
+    pub type Key = (usize, usize, usize);
+
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static TALLY: Mutex<BTreeMap<Key, UnitHits>> = Mutex::new(BTreeMap::new());
+
+    /// Totals of one key over the measured calls.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct UnitHits {
+        pub calls: u64,
+        /// Routed slots of every call (`rows x top-k`).
+        pub slots: u64,
+        /// Slots routed to an expert this rank holds.
+        pub owned_slots: u64,
+        pub resident_slots: u64,
+        pub host_slots: u64,
+        /// Distinct held experts per call, summed over calls.
+        pub owned_distinct: u64,
+        pub resident_distinct: u64,
+        pub host_distinct: u64,
+    }
+
+    impl UnitHits {
+        fn add(&mut self, other: &UnitHits) {
+            self.calls += other.calls;
+            self.slots += other.slots;
+            self.owned_slots += other.owned_slots;
+            self.resident_slots += other.resident_slots;
+            self.host_slots += other.host_slots;
+            self.owned_distinct += other.owned_distinct;
+            self.resident_distinct += other.resident_distinct;
+            self.host_distinct += other.host_distinct;
+        }
+    }
+
+    pub fn enable(on: bool) {
+        ENABLED.store(on, Ordering::Relaxed);
+    }
+
+    pub(crate) fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    /// Record one gather call of `rank`'s `layer`: `ids[s]` is slot `s`'s expert (negative
+    /// = routes nothing), `held(e)` whether `rank` holds `e`, `resident(layer, e)` whether
+    /// the plan keeps `(layer, e)` in the rank's VRAM.
+    pub(crate) fn note_call(
+        rank: usize,
+        layer: usize,
+        ids: &[i32],
+        held: impl Fn(usize) -> bool,
+        resident: impl Fn(usize, usize) -> bool,
+    ) {
+        let mut call = UnitHits {
+            calls: 1,
+            slots: ids.len() as u64,
+            ..UnitHits::default()
+        };
+        let mut distinct: HashSet<usize> = HashSet::new();
+        for &id in ids {
+            let Ok(expert) = usize::try_from(id) else {
+                continue;
+            };
+            if !held(expert) {
+                continue;
+            }
+            call.owned_slots += 1;
+            let hit = resident(layer, expert);
+            if hit {
+                call.resident_slots += 1;
+            } else {
+                call.host_slots += 1;
+            }
+            if distinct.insert(expert) {
+                call.owned_distinct += 1;
+                if hit {
+                    call.resident_distinct += 1;
+                } else {
+                    call.host_distinct += 1;
+                }
+            }
+        }
+        let mut tally = TALLY
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        tally
+            .entry((rank, layer, ids.len()))
+            .or_default()
+            .add(&call);
+    }
+
+    /// The tally so far, resetting it.
+    pub fn take() -> BTreeMap<Key, UnitHits> {
+        std::mem::take(
+            &mut *TALLY
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
+    }
+
+    /// The counter report of `tally`: one summary line per (rank, slots per call) with the
+    /// slot hit rate, the distinct hit rate and the host experts read per call, then one
+    /// line per key. `unit_bytes` prices a distinct host read.
+    pub fn report(tally: &BTreeMap<Key, UnitHits>, unit_bytes: u64) -> String {
+        let pct = |num: u64, den: u64| {
+            if den == 0 {
+                0.0
+            } else {
+                100.0 * num as f64 / den as f64
+            }
+        };
+        let mut out = String::new();
+        let groups: BTreeSet<(usize, usize)> = tally
+            .keys()
+            .map(|&(rank, _, slots)| (rank, slots))
+            .collect();
+        for (rank, slots) in groups {
+            let mut sum = UnitHits::default();
+            let mut layers = 0u64;
+            for (&(r, _, s), hits) in tally {
+                if r == rank && s == slots {
+                    layers += 1;
+                    sum.add(hits);
+                }
+            }
+            let per_call = if sum.calls == 0 {
+                0.0
+            } else {
+                sum.host_distinct as f64 / sum.calls as f64
+            };
+            out.push_str(&format!(
+                "[unit-hits] rank {rank} slots/call {slots}: layers {layers} calls {} owned slots {} slot hit {:.2}% (resident {} host {}) distinct hit {:.2}% (resident {} host {}) host distinct/call {:.2} ({:.3} MB/call)\n",
+                sum.calls,
+                sum.owned_slots,
+                pct(sum.resident_slots, sum.owned_slots),
+                sum.resident_slots,
+                sum.host_slots,
+                pct(sum.resident_distinct, sum.owned_distinct),
+                sum.resident_distinct,
+                sum.host_distinct,
+                per_call,
+                per_call * unit_bytes as f64 / 1e6,
+            ));
+        }
+        for (&(rank, layer, slots), hits) in tally {
+            out.push_str(&format!(
+                "[unit-hits] rank {rank} layer {layer} slots/call {slots}: calls {} owned {} resident {} host {} distinct owned {} resident {} host {}\n",
+                hits.calls,
+                hits.owned_slots,
+                hits.resident_slots,
+                hits.host_slots,
+                hits.owned_distinct,
+                hits.resident_distinct,
+                hits.host_distinct,
+            ));
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn counts_held_slots_and_distinct_experts_against_the_plan() {
+            let _ = take();
+            // Rank 0 holds even experts; (layer 3, expert) resident iff expert < 10.
+            let held = |e: usize| e % 2 == 0;
+            let resident = |_: usize, e: usize| e < 10;
+            note_call(0, 3, &[2, 2, 4, 12, 7, -1, 14, 6, 8, 12], held, resident);
+            note_call(0, 3, &[0, 1, 1, 1, 1, 1, 1, 1, 1, 1], held, resident);
+            note_call(0, 3, &[2, 4], held, resident);
+            let tally = take();
+            let hits = tally[&(0, 3, 10)];
+            // call 1 held slots: 2,2,4,12,14,6,8,12 = 8; resident (<10): 2,2,4,6,8 = 5; host: 12,14,12 = 3.
+            assert_eq!(hits.calls, 2);
+            assert_eq!(hits.slots, 20);
+            assert_eq!(hits.owned_slots, 8 + 1);
+            assert_eq!(hits.resident_slots, 5 + 1);
+            assert_eq!(hits.host_slots, 3);
+            // distinct per call 1: {2,4,12,14,6,8} = 6 (resident 4, host 2); call 2: {0}.
+            assert_eq!(hits.owned_distinct, 6 + 1);
+            assert_eq!(hits.resident_distinct, 4 + 1);
+            assert_eq!(hits.host_distinct, 2);
+            // A different call width is its own key.
+            assert_eq!(tally[&(0, 3, 2)].owned_slots, 2);
+            let text = report(&tally, 2_611_200);
+            assert!(
+                text.contains("[unit-hits] rank 0 slots/call 10: layers 1 calls 2 owned slots 9 slot hit 66.67%"),
+                "{text}"
+            );
+            assert!(
+                text.contains("[unit-hits] rank 0 layer 3 slots/call 10: calls 2"),
+                "{text}"
+            );
+            assert!(take().is_empty());
+        }
+    }
+}
+
 /// Row-gather exchanges this thread's rank has crossed: the evidence of the
 /// mesh lane ledger. A rank's forward runs the hook synchronously on its own
 /// thread (rank 0 on the caller's, a peer on its worker's), so a thread-local
@@ -293,6 +507,9 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// disables), installed once after the forward attached its live tables.
     /// Never set when disabled.
     balanced: OnceLock<BalancedOwners>,
+    /// The mesh's per-expert unit plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`), installed once for
+    /// the lab hit counters ([`lab_unit_hits`]); never set without a unit plan.
+    unit_plan: OnceLock<Arc<crate::expert_ep_units::EpUnitPlan>>,
 }
 
 /// What the hook knows of the rank's balanced trunk layers.
@@ -358,7 +575,38 @@ impl Qwen4EpRowGatherHook {
             buffer_ptrs,
             last_buffer: AtomicUsize::new(NO_BUFFER),
             balanced: OnceLock::new(),
+            unit_plan: OnceLock::new(),
         })
+    }
+
+    /// Install the load's unit plan for [`lab_unit_hits`] (once, after construction).
+    fn install_unit_plan(&self, plan: Arc<crate::expert_ep_units::EpUnitPlan>) {
+        let _ = self.unit_plan.set(plan);
+    }
+
+    /// [`lab_unit_hits`]: download this call's routed ids and tally, against the unit plan,
+    /// the slots and distinct experts this rank holds (static `e % ranks` ownership) that
+    /// are VRAM-resident versus host-read. Adds a sync per layer: lab only.
+    fn lab_note_unit_hits(&self, gpu: &mut Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
+        let Some(plan) = self.unit_plan.get() else {
+            return;
+        };
+        let mut raw = vec![0u8; slots * 4];
+        if gpu.hip.memcpy_dtoh(&mut raw, &topk.buf).is_err() {
+            return;
+        }
+        let ids: Vec<i32> = raw
+            .chunks_exact(4)
+            .map(|b| i32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let ranks = self.gather.ranks();
+        lab_unit_hits::note_call(
+            self.rank,
+            layer_idx as usize,
+            &ids,
+            |expert| expert % ranks == self.rank,
+            |layer, expert| plan.is_resident(self.rank, layer, expert),
+        );
     }
 
     /// Install the rank's balanced layers (once, after `attach_ep`).
@@ -422,6 +670,9 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
                 )
             })?;
         note_gather_buffer(&self.last_buffer, self.rank, buffer)?;
+        if lab_unit_hits::enabled() && (layer_idx as usize) < self.trunk_layers {
+            self.lab_note_unit_hits(gpu, layer_idx, slots, topk_indices);
+        }
         // A balanced layer gathers from the owners its own assignment wrote
         // this call; every other layer keeps the static `e % ranks` placement.
         let balanced = self
@@ -1280,7 +1531,7 @@ impl Qwen4Bundle {
                 rank_sources(&peer.bundle)
             })
         };
-        let sources: Vec<Vec<Qwen4PeerExpertSource>> = match sources {
+        let sources: Vec<Vec<Qwen4PeerLayerSource>> = match sources {
             Ok(sources) => sources,
             Err(error) => return Err(release_rank0(gpu, error)),
         };
@@ -1306,6 +1557,12 @@ impl Qwen4Bundle {
                 .execution
                 .take()
                 .ok_or("the forward is not attached")?;
+            if let Some(plan) = bundle.weights.ep_unit_plan() {
+                hook.install_unit_plan(plan.clone());
+                if hipfire_config::developer_var("HIPFIRE_EP_LAB_UNIT_HITS").as_deref() == Ok("1") {
+                    lab_unit_hits::enable(true);
+                }
+            }
             let installed: Arc<dyn MoeRowGather + Send + Sync> = hook.clone();
             let result = forward
                 .attach_ep(gpu, bundle, &sources, installed)
@@ -2629,7 +2886,7 @@ fn align_peer_session(
     bundle.set_turn_snapshots(rank0.turn_snapshots);
 }
 
-fn rank_sources(bundle: &Qwen4Bundle) -> Result<Vec<Qwen4PeerExpertSource>, String> {
+fn rank_sources(bundle: &Qwen4Bundle) -> Result<Vec<Qwen4PeerLayerSource>, String> {
     bundle
         .execution
         .as_ref()

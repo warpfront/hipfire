@@ -803,6 +803,16 @@ impl Carrier for Qwen4Carrier {
             ctx.pp,
             ctx.kv_backend,
         )?;
+        // `HIPFIRE_QWEN4_EP_EXPERT_HOTSET` needs expert parallelism and composes
+        // with none of the whole-layer levers (single device, pipeline
+        // parallelism, the EP expert stage, ...): refused before any allocation.
+        if qwen4_ep_units_flag().is_some() {
+            let ep = hipfire_config::topology::qwen4_ep()?;
+            hipfire_arch_qwen4::expert_ep_units::ep_units_refusal(&qwen4_ep_units_facts(
+                ep, ctx.pp,
+            ))
+            .map_err(|error| format!("qwen4: {error}"))?;
+        }
         // Pipeline-parallel (topology.pp 2..=8): the mesh-executor route. The
         // Single and expert-parallel paths below are untouched.
         if ctx.pp > 1 {
@@ -910,6 +920,7 @@ impl Carrier for Qwen4Carrier {
             )?;
             plan.expert_vram_layers = split.vram.layers;
             plan.ep_reserve = split.reserve.clone();
+            plan.ep_units = split.ep_units.clone();
             eprintln!(
                 "qwen4 EP plan: {} ranks on devices {:?} (mesh epoch {}, {} sealed expert groups), free VRAM per rank {:?} MiB, expert VRAM split {} MoE layers on every rank",
                 plan.seal.ranks(),
@@ -940,6 +951,16 @@ impl Carrier for Qwen4Carrier {
             if let Some(reserve_plan) = &plan.ep_reserve {
                 eprintln!("{}", reserve_plan.describe());
             }
+            // One receipt line per rank (rank-0 load log, beside the fit lines
+            // each rank prints) and the MTP head's placement.
+            if let Some(units) = &plan.ep_units {
+                for line in units.receipt_lines() {
+                    eprintln!("{line}");
+                }
+                eprintln!(
+                    "qwen4 EP expert tier: the MTP head's experts stay host-mapped (today's placement, pinned on every rank)"
+                );
+            }
         }
         let mut loaded = load_qwen4_rank_ep_reserve(
             ctx.gpu,
@@ -947,6 +968,7 @@ impl Carrier for Qwen4Carrier {
             &shared,
             ep_plan.as_ref().map(|plan| plan.expert_vram_layers),
             ep_plan.as_ref().and_then(|plan| plan.ep_reserve.clone()),
+            ep_plan.as_ref().and_then(|plan| plan.ep_units.clone()),
             Some(Qwen4SessionSeed {
                 tokenizer: &meta.tokenizer,
                 chat_template: meta.chat_template.as_deref(),
@@ -1985,6 +2007,12 @@ pub struct Qwen4EpPlan {
     /// loads under, with the split above equal to its resident layers; `None`
     /// for the ordinary placement. Rank loads and the peers' attach carry it.
     pub ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
+    /// The per-expert residency plan of the whole mesh
+    /// (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`) every rank loads under, with the
+    /// split above equal to the whole-layer baseline it replaces; `None` for
+    /// the ordinary whole-layer placement. Rank loads and the peers' attach
+    /// carry the same `Arc`.
+    pub ep_units: Option<std::sync::Arc<hipfire_arch_qwen4::expert_ep_units::EpUnitPlan>>,
 }
 
 impl Qwen4EpPlan {
@@ -2070,6 +2098,7 @@ fn plan_qwen4_ep(
         shared: shared.clone(),
         expert_vram_layers: 0,
         ep_reserve: None,
+        ep_units: None,
     }))
 }
 
@@ -2122,6 +2151,7 @@ pub fn attach_qwen4_ep_peers(
                     &plan.shared,
                     Some(plan.expert_vram_layers),
                     plan.ep_reserve.clone(),
+                    plan.ep_units.clone(),
                     None,
                     source,
                 )
@@ -2881,6 +2911,24 @@ pub fn qwen4_ep_vram_layers(
     batch: &hipfire_runtime::loader_api::BatchLoadRequest,
     request: hipfire_arch_qwen4::ep_reserve::EpReserveRequest,
 ) -> Result<Qwen4EpVramSplit, String> {
+    // `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`: the per-expert plan replaces the
+    // whole-layer residency below. The load's refusals are re-checked here (the
+    // carrier checks them first) and the decoupled reserve, which sizes
+    // whole-layer placements, is off with a note.
+    let units_path = qwen4_ep_units_flag();
+    if units_path.is_some() {
+        hipfire_arch_qwen4::expert_ep_units::ep_units_refusal(&qwen4_ep_units_facts(ranks, 1))
+            .map_err(|error| format!("qwen4: {error}"))?;
+    }
+    let request = if units_path.is_some() && request.attempts() {
+        eprintln!(
+            "qwen4 EP reserve decoupling: off ({} plans the experts per unit under the ordinary reserve)",
+            hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
+        );
+        hipfire_arch_qwen4::ep_reserve::EpReserveRequest::Off
+    } else {
+        request
+    };
     let ModelSource::Hfq(hfq) = src else {
         return Err(crate::admission::QWEN4_SAFETENSORS_REFUSAL.into());
     };
@@ -2893,6 +2941,14 @@ pub fn qwen4_ep_vram_layers(
         .map_err(|error| error.to_string())?;
     let recipe = receipt.recipe().clone();
     let config = receipt.config;
+    if units_path.is_some() {
+        receipt.manifest.check_expert_tiers().map_err(|error| {
+            format!(
+                "qwen4: {}: the artifact is not the dense MQ4 Flash-Next packed declaration ({error})",
+                hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
+            )
+        })?;
+    }
     let mut manifest = receipt
         .manifest
         .with_expert_parallel(hipfire_arch_qwen4::weights::Qwen4EpPlacement { rank: 0, ranks })
@@ -3160,7 +3216,164 @@ pub fn qwen4_ep_vram_layers(
             split.vram.layers = cap;
         }
     }
+    if let Some(path) = &units_path {
+        let moe_layers = hipfire_arch_qwen4::expert_residency::moe_layer_count(&config);
+        if split.vram.layers >= moe_layers {
+            eprintln!(
+                "qwen4 EP expert hot set: {} not applied (every MoE layer is already resident on every rank)",
+                hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
+            );
+        } else {
+            let base =
+                hipfire_arch_qwen4::expert_hotset::HotsetBase::from_hfq(hfq).map_err(|error| {
+                    format!(
+                        "qwen4: {}: hotset base: {error}",
+                        hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
+                    )
+                })?;
+            let stacks = qwen4_ep_unit_stack_bytes(&manifest, &bytes_of, config.num_hidden_layers)?;
+            // The same reserve the whole-layer split above holds back: the
+            // ordinary reserve (placement charges applied) and, when a lane
+            // reservation applied, the AR-lane store.
+            let lane_bytes = split
+                .vram
+                .reservation
+                .as_ref()
+                .map_or(0, |reservation| reservation.lane_bytes);
+            // The unit stage's two VRAM buffers are fresh bytes: charged to every
+            // rank's budget before the ranking walk, exactly where the forward
+            // builds the stage (one shared predicate).
+            let stage_on = hipfire_arch_qwen4::expert_ep_units::ep_unit_stage_on(&gpu.arch);
+            let staged = qwen4_ep_unit_plan(
+                path,
+                &base,
+                (
+                    config.num_hidden_layers,
+                    config.num_experts,
+                    config.num_experts_per_tok,
+                ),
+                ranks,
+                free_per_rank,
+                non_expert,
+                reserve.saturating_add(lane_bytes),
+                stacks,
+                stage_on,
+            )?;
+            if staged.stage.capacity > 0 {
+                eprintln!(
+                    "qwen4 EP expert stage: {} MiB x 2 dedicated stage buffers + {} KiB pointer tables charged to every rank before the ranking walk ({} placements, {})",
+                    staged.stage.capacity >> 20,
+                    hipfire_arch_qwen4::expert_ep_units::ep_unit_stage_table_bytes(
+                        staged.plan.geometry()
+                    ) >> 10,
+                    staged.iterations,
+                    if staged.converged {
+                        "fixed point"
+                    } else {
+                        "no fixed point: whole-layer region"
+                    }
+                );
+            }
+            split.ep_units = Some(std::sync::Arc::new(staged.plan));
+        }
+    }
     Ok(split)
+}
+
+/// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, read once from the process configuration:
+/// the explicit sidecar path, `None` when unset, empty or `0`.
+fn qwen4_ep_units_flag() -> Option<std::path::PathBuf> {
+    hipfire_arch_qwen4::expert_ep_units::ep_expert_hotset_path(
+        hipfire_config::developer_var(hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The facts [`hipfire_arch_qwen4::expert_ep_units::ep_units_refusal`] judges
+/// for a load of `topology.ep = ep`, `topology.pp = pp`, from the process
+/// configuration.
+fn qwen4_ep_units_facts(ep: usize, pp: usize) -> hipfire_arch_qwen4::expert_ep_units::EpUnitsFacts {
+    hipfire_arch_qwen4::expert_ep_units::EpUnitsFacts {
+        ep,
+        pp,
+        single_card_hotset: matches!(
+            hipfire_arch_qwen4::expert_hotset::HotsetPolicy::from_env(),
+            Ok(hipfire_arch_qwen4::expert_hotset::HotsetPolicy::Explicit(_))
+        ),
+        chunk_autofit: hipfire_config::developer_var(QWEN4_EP_CHUNK_AUTOFIT_ENV).as_deref()
+            == Ok("1"),
+        lab_resident_cap: hipfire_config::developer_var("HIPFIRE_EP_LAB_RESIDENT_LAYERS").is_ok(),
+    }
+}
+
+/// Byte sizes of every trunk layer's aggregate `gate_up_proj` and `down_proj`
+/// stack of `manifest`, from `bytes_of`.
+fn qwen4_ep_unit_stack_bytes(
+    manifest: &hipfire_arch_qwen4::weights::Qwen4Manifest,
+    bytes_of: &impl Fn(&hipfire_runtime::weight_manifest::WeightEntry) -> Option<u64>,
+    layers: usize,
+) -> Result<(Vec<u64>, Vec<u64>), String> {
+    let mut gate_up = Vec::with_capacity(layers);
+    let mut down = Vec::with_capacity(layers);
+    for layer in 0..layers {
+        for (suffix, sizes) in [("gate_up_proj", &mut gate_up), ("down_proj", &mut down)] {
+            let name = format!("model.language_model.layers.{layer}.mlp.experts.{suffix}");
+            let entry = manifest
+                .entry(&name, Some(layer))
+                .ok_or_else(|| format!("qwen4: the manifest lacks {name}"))?;
+            sizes.push(
+                bytes_of(entry).ok_or_else(|| format!("qwen4: no payload size for '{name}'"))?,
+            );
+        }
+    }
+    Ok((gate_up, down))
+}
+
+/// The per-expert EP plan of `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`: the sidecar at
+/// `path` is loaded and bound to the base artifact (a refusal is a load error,
+/// never a fallback), the geometry comes from the artifact's own stack sizes,
+/// every rank's byte budget is `free - non_expert - reserve_total`
+/// ([`hipfire_arch_qwen4::expert_ep_units::ep_unit_rank_budgets`]) minus the
+/// unit stage's VRAM when `stage_on`, and the ranking is walked per rank
+/// ([`hipfire_arch_qwen4::expert_ep_units::place_routed_experts_units_staged`]).
+#[allow(clippy::too_many_arguments)]
+fn qwen4_ep_unit_plan(
+    path: &std::path::Path,
+    base: &hipfire_arch_qwen4::expert_hotset::HotsetBase,
+    (layers, experts, top_k): (usize, usize, usize),
+    ranks: usize,
+    free_per_rank: &[u64],
+    non_expert: u64,
+    reserve_total: u64,
+    stacks: (Vec<u64>, Vec<u64>),
+    stage_on: bool,
+) -> Result<hipfire_arch_qwen4::expert_ep_units::EpUnitStagedPlan, String> {
+    use hipfire_arch_qwen4::expert_ep_units as units;
+    let flag = units::EP_EXPERT_HOTSET_ENV;
+    let sidecar = hipfire_arch_qwen4::expert_hotset::HotsetSidecar::load_bound(
+        path, layers, experts, top_k, base,
+    )
+    .map_err(|skip| format!("qwen4: {flag}={}: {skip}", path.display()))?;
+    let geometry = units::ep_unit_geometry(layers, experts, ranks, &stacks.0, &stacks.1)
+        .map_err(|error| format!("qwen4: {flag}: {error}"))?;
+    if free_per_rank.len() != ranks {
+        return Err(format!(
+            "qwen4: {flag}: {} free-memory readings for {ranks} ranks",
+            free_per_rank.len()
+        ));
+    }
+    units::place_routed_experts_units_staged(
+        &geometry,
+        units::EpRanking {
+            rank: sidecar.rank(),
+            counts: Some(sidecar.counts()),
+            sha256: Some(sidecar.sha256()),
+        },
+        &units::ep_unit_rank_budgets(free_per_rank, non_expert, reserve_total),
+        stage_on,
+    )
+    .map_err(|error| format!("qwen4: {flag}: {error}"))
 }
 
 /// Developer opt-in of the EP prefill-chunk auto-fit: exact `1` lets the load
@@ -3240,6 +3453,7 @@ fn qwen4_ep_chunk_autofit(
         },
         chunk_rows: Some(rows),
         fit_note: Some(fit_note),
+        ep_units: None,
     })
 }
 
@@ -3358,6 +3572,9 @@ pub struct Qwen4EpVramSplit {
     pub chunk_rows: Option<usize>,
     /// The load line of an auto-fit that moved the chunk.
     pub fit_note: Option<String>,
+    /// The per-expert residency plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`); `None`
+    /// without the flag and when the load is fully resident anyway.
+    pub ep_units: Option<std::sync::Arc<hipfire_arch_qwen4::expert_ep_units::EpUnitPlan>>,
 }
 
 /// The facts of one load [`admit_ep_reserve`](hipfire_arch_qwen4::ep_reserve::admit_ep_reserve)
@@ -3679,6 +3896,7 @@ fn qwen4_ep_vram_split(
                     reserve_note: None,
                     chunk_rows: None,
                     fit_note: None,
+                    ep_units: None,
                 });
             }
             Qwen4EpReserveResolution::Ordinary(why) => {
@@ -3694,6 +3912,7 @@ fn qwen4_ep_vram_split(
         reserve_note,
         chunk_rows: None,
         fit_note: None,
+        ep_units: None,
     })
 }
 
@@ -5016,20 +5235,23 @@ pub fn load_qwen4_rank(
         None,
         None,
         None,
+        None,
     )
 }
 
 /// [`load_qwen4_rank`] of one expert-parallel rank under the load's frozen EP
 /// reserve plan (`HIPFIRE_EP_RESERVE_DECOUPLE=1`, [`qwen4_ep_vram_layers`]):
 /// the rank's reserve, agreed-split check, fit line and host charge all read
-/// `ep_reserve`, and its forward attaches that plan. `None` is
-/// [`load_qwen4_rank`] exactly.
+/// `ep_reserve`, and its forward attaches that plan. `ep_units` is the load's
+/// per-expert residency plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`), the same
+/// `Arc` on every rank. Both `None` is [`load_qwen4_rank`] exactly.
 pub fn load_qwen4_rank_ep_reserve(
     gpu: &mut rdna_compute::Gpu,
     ep_seal: Option<hipfire_arch_qwen4::ep_seal::Qwen4EpRankSeal>,
     shared: &Qwen4RankShared,
     expert_vram_layers: Option<usize>,
     ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
+    ep_units: Option<std::sync::Arc<hipfire_arch_qwen4::expert_ep_units::EpUnitPlan>>,
     session: Option<Qwen4SessionSeed<'_>>,
     src: ModelSource,
 ) -> Result<Qwen4RankLoad, String> {
@@ -5043,6 +5265,7 @@ pub fn load_qwen4_rank_ep_reserve(
         None,
         None,
         ep_reserve,
+        ep_units,
     )
 }
 
@@ -5072,6 +5295,7 @@ fn load_qwen4_rank_scoped(
     band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
     pp_chunk_rows: Option<usize>,
     ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
+    ep_units: Option<std::sync::Arc<hipfire_arch_qwen4::expert_ep_units::EpUnitPlan>>,
 ) -> Result<Qwen4RankLoad, String> {
     // Every rank (single device, EP rank thread, PP band) packs its small
     // weight tensors into slabs on its own device (`HIPFIRE_WEIGHT_SLAB`);
@@ -5087,6 +5311,7 @@ fn load_qwen4_rank_scoped(
         band,
         pp_chunk_rows,
         ep_reserve,
+        ep_units,
     );
     gpu.weight_slab_scope_end();
     loaded
@@ -5103,6 +5328,7 @@ fn load_qwen4_rank_unscoped(
     band: Option<&hipfire_arch_qwen4::weights::Qwen4BandScope>,
     pp_chunk_rows: Option<usize>,
     ep_reserve: Option<std::sync::Arc<hipfire_arch_qwen4::ep_reserve::EpReservePlan>>,
+    ep_units: Option<std::sync::Arc<hipfire_arch_qwen4::expert_ep_units::EpUnitPlan>>,
 ) -> Result<Qwen4RankLoad, String> {
     let backend = shared.backend;
     let vmm_granularity = shared.vmm_granularity;
@@ -5128,6 +5354,21 @@ fn load_qwen4_rank_unscoped(
         None => None,
     };
     let ep_ranks = ep.map_or(1, |placement| placement.ranks);
+    // The per-expert plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`) is one EP rank's
+    // residency under the agreed whole-layer baseline split: never a band, never
+    // under the decoupled reserve, and the plan must be this mesh's.
+    if let Some(units) = &ep_units {
+        let consistent = ep.is_some_and(|placement| units.geometry().ranks == placement.ranks)
+            && band.is_none()
+            && ep_reserve.is_none()
+            && expert_vram_layers.is_some();
+        if !consistent {
+            return Err(format!(
+                "qwen4: {}: the per-expert plan needs an expert-parallel rank of its own mesh under an agreed split, no pipeline band and no decoupled reserve",
+                hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
+            ));
+        }
+    }
     // A band carries a session cache (`session`) like a Single load (except
     // under native MTP) and the output band the native MTP head; the other
     // Single-only features stay refused.
@@ -6416,6 +6657,12 @@ fn load_qwen4_rank_unscoped(
     if config.expert_keep.is_some() && placement.is_some() {
         return Err("qwen4.expert_keep artifacts require fully resident single-device expert payloads; host-mapped/streamed expert placement is not supported (unset HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS and ensure the kept payload fits)".into());
     }
+    if ep_units.is_some() && placement.is_none() {
+        return Err(format!(
+            "qwen4: {}: the per-expert plan applies only under a split that leaves experts in host RAM, but the agreed split is fully resident",
+            hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
+        ));
+    }
     // The agreed split must fit this rank: refuse before allocating.
     if let Some(layers) = expert_vram_layers {
         let (free, non_expert, layer_experts, reserve, ..) = auto_inputs()?;
@@ -6429,9 +6676,52 @@ fn load_qwen4_rank_unscoped(
         if let Some(plan) = &ep_reserve {
             qwen4_ep_reserve_rank_terms(plan, layers, reserve)?;
         }
-        let own = residency::ep_rank_layers(&config, free, non_expert, layer_experts, reserve);
-        if own < layers.min(moe_layers) {
-            return Err(format!(
+        if let Some(units) = &ep_units {
+            // Per-expert plan: this rank's planned device bytes (resident
+            // payload plus arena pads) plus the unit stage's dedicated buffers
+            // (the plan was budgeted net of them) must fit what its free VRAM
+            // leaves for experts at the same reserve the plan was budgeted with
+            // (the lane store, which only shrinks the budget, is not known here).
+            let rank = ep.map_or(0, |placement| placement.rank);
+            let budget = hipfire_arch_qwen4::expert_ep_units::ep_unit_rank_budgets(
+                &[free],
+                non_expert,
+                reserve,
+            )[0];
+            let stage = hipfire_arch_qwen4::expert_ep_units::ep_unit_plan_stage_charge(
+                units,
+                hipfire_arch_qwen4::expert_ep_units::ep_unit_stage_on(&ctx.gpu.arch),
+            );
+            let need = units.vram_bytes(rank).saturating_add(stage.bytes);
+            // The plan was budgeted against the planned capacity (total minus this process's own
+            // allocations; the census carries the runtime reserve), not the instantaneous free
+            // this check reads, which sits tens of MiB lower (driver context). A plan that fits
+            // its own planned budget is admitted with a note; whole-layer splits absorb the same
+            // gap in their floor.
+            let planned = units
+                .rank_budget(rank)
+                .map(|planned| planned.saturating_add(stage.bytes));
+            if need > budget && planned.is_some_and(|planned| need <= planned) {
+                eprintln!(
+                    "qwen4 EP rank {rank}: per-expert plan needs {} MiB, {} MiB above the live free-VRAM budget but inside the planned capacity it was budgeted against ({} MiB); the placement census carries the runtime reserve",
+                    need / MIB,
+                    (need - budget) / MIB,
+                    planned.unwrap_or(0) / MIB
+                );
+            } else if need > budget {
+                return Err(format!(
+                    "qwen4: the agreed per-expert plan keeps {} MiB of experts in VRAM on rank {rank} but this device has {} MiB for them ({} MiB free, trunk {} MiB, {} MiB reserve). Free GPU memory or lower the number of units kept on the GPU",
+                    need / MIB,
+                    budget / MIB,
+                    free / MIB,
+                    non_expert / MIB,
+                    reserve / MIB
+                ));
+            }
+        } else {
+            let own = residency::ep_rank_layers(&config, free, non_expert, layer_experts, reserve);
+            if own < layers.min(moe_layers) {
+                return Err(format!(
                     "qwen4: the agreed expert VRAM split of {layers} of {moe_layers} MoE layers does not fit this device: \
                      {} MiB free keeps only {own} (trunk {} MiB, {} MiB per expert layer, {} MiB reserve). Free GPU memory or lower the number of expert layers kept on the GPU",
                     free / MIB,
@@ -6439,6 +6729,7 @@ fn load_qwen4_rank_unscoped(
                     layer_experts / MIB,
                     reserve / MIB
                 ));
+            }
         }
     }
     if !routed_experts && placement.is_some() {
@@ -6604,12 +6895,53 @@ fn load_qwen4_rank_unscoped(
         applied_layers = resident_set
             .as_ref()
             .map_or(vram_layers.min(config.num_hidden_layers), Vec::len);
+        // The per-expert plan overlays the whole-layer baseline just applied:
+        // its Resident/Host layers keep (or take) the plan's residency, its
+        // MIXED layers swap their aggregates for the two arena entries, and
+        // the placement set follows the manifest.
+        let moved = match (&ep_units, ep) {
+            (Some(units), Some(placement)) => {
+                manifest = manifest
+                    .with_expert_units(placement, units)
+                    .map_err(|error| format!("qwen4: {error}"))?;
+                let expected: std::collections::BTreeSet<_> = manifest.resident_keys().collect();
+                placements.retain(|kept| expected.contains(&(kept.name.as_str(), kept.layer)));
+                let device = placements.first().map_or(0, |kept| kept.device);
+                for entry in manifest.weights.iter().filter(|entry| {
+                    hipfire_arch_qwen4::expert_ep_units::is_unit_arena_name(&entry.name)
+                }) {
+                    placements.push(hipfire_arch_qwen4::weights::Qwen4Placement {
+                        name: entry.name.clone(),
+                        layer: entry.layer,
+                        device,
+                    });
+                }
+                // Host-mapped routed tensors after the overlay: the aggregates of
+                // host layers, the host arenas of mixed layers, the MTP head's.
+                manifest
+                    .weights
+                    .iter()
+                    .filter(|entry| {
+                        entry.residency
+                            == hipfire_runtime::weight_manifest::WeightResidency::HostMapped
+                            && (entry.name.ends_with(".mlp.experts.gate_up_proj")
+                                || entry.name.ends_with(".mlp.experts.down_proj")
+                                || entry.name.ends_with(
+                                    hipfire_arch_qwen4::expert_ep_units::UNIT_HOST_ARENA_SUFFIX,
+                                ))
+                    })
+                    .count()
+            }
+            _ => moved,
+        };
         // This rank's pinned bytes; the host check covers every rank that
         // has not pinned yet (this one and the later ranks), each at its own
         // share (an uneven split gives the low ranks one more expert).
-        let rank_host_bytes =
-            residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
-                .map_err(|error| format!("qwen4: {error}"))?;
+        let rank_host_bytes = match &ep_units {
+            Some(units) => residency::ep_unit_host_bytes_ranks(&manifest.weights, bytes_of, units),
+            None => residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks),
+        }
+        .map_err(|error| format!("qwen4: {error}"))?;
         let own_rank = ep.map_or(0, |placement| placement.rank);
         let host_bytes = rank_host_bytes[own_rank];
         // The experts' share of it: the embedding table (when host-mapped) is
@@ -6630,7 +6962,17 @@ fn load_qwen4_rank_unscoped(
             .emu_check_host_allocation(host_check_bytes, true)
             .map_err(|error| format!("qwen4: {error}"))?;
         let gib = |bytes: u64| bytes as f64 / (1u64 << 30) as f64;
-        if let Some(resident) = &resident_set {
+        if let Some(units) = &ep_units {
+            eprintln!(
+                "  qwen4 routed experts: per-expert plan, {moved} host-mapped expert tensors ({:.1} GiB incl. pads) in pinned host RAM, {} units ({:.1} GiB) in VRAM \
+                 (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
+                gib(expert_host_bytes),
+                units.resident_units(own_rank),
+                gib(units.vram_bytes(own_rank)),
+                gib(mem_available.unwrap_or(0)),
+                gib(ttm_pool)
+            );
+        } else if let Some(resident) = &resident_set {
             eprintln!(
                 "  qwen4 routed experts: layers {resident:?} in VRAM, {moved} expert tensors ({:.1} GiB) in pinned host RAM \
                  (MemAvailable - CMA {:.1} GiB + {:.1} GiB estimated in TTM's page pool)",
@@ -6650,13 +6992,18 @@ fn load_qwen4_rank_unscoped(
         }
         hipfire_config::load_summary::note(
             hipfire_config::load_summary::Facet::Placement,
-            match &resident_set {
-                Some(resident) => format!(
+            match (&ep_units, &resident_set) {
+                (Some(units), _) => format!(
+                    "experts: per-expert plan, {} units in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
+                    units.resident_units(own_rank),
+                    gib(expert_host_bytes)
+                ),
+                (None, Some(resident)) => format!(
                     "experts: {} layers in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
                     resident.len(),
                     gib(expert_host_bytes)
                 ),
-                None => format!(
+                (None, None) => format!(
                     "experts: layers 0..{} in VRAM, {moved} tensors ({:.1} GiB) host-mapped",
                     vram_layers.min(config.num_hidden_layers),
                     gib(expert_host_bytes)
@@ -6789,6 +7136,18 @@ fn load_qwen4_rank_unscoped(
             )
         );
     }
+    // The per-expert plan's receipt for this rank, beside its fit line.
+    if let (Some(units), Some(placement)) = (&ep_units, ep) {
+        let stage = hipfire_arch_qwen4::expert_ep_units::ep_unit_plan_stage_charge(
+            units,
+            hipfire_arch_qwen4::expert_ep_units::ep_unit_stage_on(&ctx.gpu.arch),
+        );
+        eprintln!(
+            "{} | {}",
+            units.receipt_line(placement.rank),
+            hipfire_arch_qwen4::expert_ep_units::ep_unit_stage_receipt(&stage)
+        );
+    }
     if let Some(plan) = &ep_reserve {
         eprintln!("  qwen4 {}", plan.describe());
         if let Some((_, _, reserve, ..)) = placement_inputs {
@@ -6838,7 +7197,11 @@ fn load_qwen4_rank_unscoped(
     let host_expert_bytes: u64 = if use_ranges || (rank_table.is_none() && q4_prewarm.is_none()) {
         0
     } else {
-        residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks)
+        let per_rank = match &ep_units {
+            Some(units) => residency::ep_unit_host_bytes_ranks(&manifest.weights, bytes_of, units),
+            None => residency::host_mapped_bytes_ranks(&manifest.weights, bytes_of, ep_ranks),
+        };
+        per_rank
             .map(|per_rank| {
                 per_rank[ep.map_or(0, |placement| placement.rank)]
                     + ep_reserve_mirror_bytes
@@ -7265,6 +7628,15 @@ fn load_qwen4_rank_unscoped(
     let weights_io0 = rdna_compute::load_phases::thread_io();
     let weights_started = std::time::Instant::now();
     let payload_source = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
+        // A mixed layer's arena entries are gathered from the layer's full
+        // stacks (read by their original names), before the by-name read.
+        if let (Some(units), Some(placement)) = (&ep_units, ep) {
+            if let Some(payload) =
+                crate::qwen4_slab::qwen4_unit_arena_payload(&source, units, placement.rank, entry)
+            {
+                return payload;
+            }
+        }
         crate::qwen4_slab::qwen4_fulfillment_payload(
             &source,
             &recipe,
@@ -7362,6 +7734,7 @@ fn load_qwen4_rank_unscoped(
             state_format,
             backend,
             expert_tiers,
+            ep_units.clone().zip(ep.map(|placement| placement.rank)),
             &scope,
         )
         .map_err(|error| match backend {
@@ -8894,6 +9267,7 @@ fn load_qwen4_pp_bundle(
                 source,
                 Some(&scopes[stage]),
                 Some(chunk_rows),
+                None,
                 None,
             )
         });
@@ -16130,5 +16504,35 @@ mod raon_carrier_tests {
         assert!(!caps.supports_continuous_batch);
         assert!(!caps.supports_mtp);
         assert_eq!(caps.semantic_contract_version, Some(2));
+    }
+}
+
+#[cfg(test)]
+mod ep_unit_plan_tests {
+    use super::*;
+
+    /// A sidecar the loader cannot read is a load error naming the flag and
+    /// the path, never a silent whole-layer fallback.
+    #[test]
+    fn an_unreadable_sidecar_is_a_named_load_error() {
+        let path = std::path::Path::new("/nonexistent/hipfire-ep-units/model.expert-hotset");
+        let base = hipfire_arch_qwen4::expert_hotset::HotsetBase::new(1 << 30, [7u8; 32]);
+        let error = qwen4_ep_unit_plan(
+            path,
+            &base,
+            (48, 512, 10),
+            2,
+            &[1 << 33, 1 << 33],
+            1 << 30,
+            1 << 30,
+            (vec![512 * 1_740_800; 48], vec![512 * 870_400; 48]),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            error.contains(hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV),
+            "{error}"
+        );
+        assert!(error.contains("model.expert-hotset"), "{error}");
     }
 }

@@ -1733,6 +1733,141 @@ impl Qwen4Manifest {
         }
         Ok(())
     }
+
+    /// This manifest declared for a per-expert EP load
+    /// (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, [`crate::expert_ep_units`]), for
+    /// rank `ep.rank`: apply it AFTER [`Self::with_expert_parallel`] and the
+    /// whole-layer placement (or on the unsharded declaration `assemble`
+    /// rebuilds). Each trunk layer follows `plan`'s state of this rank:
+    /// [`EpLayerState::Resident`] and [`EpLayerState::Host`] layers keep their
+    /// two aggregate entries with the residency the state names (so a
+    /// whole-layers plan declares exactly what `place_routed_experts` does);
+    /// an [`EpLayerState::Mixed`] layer replaces them with two raw replicated
+    /// arena entries, `...mlp.experts.unit_vram_arena` (resident) and
+    /// `...unit_host_arena` (host-mapped), shaped `[arena entry bytes]` of the
+    /// layer's slot map. The MTP head's experts are untouched (they keep the
+    /// whole-layer placement's host residency).
+    ///
+    /// Only the dense MQ4 Flash-Next packed declaration qualifies; every other
+    /// recipe, a dense FFN, kept-expert artifacts and rank/plan mismatches are
+    /// refused.
+    pub fn with_expert_units(
+        mut self,
+        ep: Qwen4EpPlacement,
+        plan: &crate::expert_ep_units::EpUnitPlan,
+    ) -> Result<Self, WeightError> {
+        use crate::expert_ep_units::{
+            EpLayerState, UnitTier, EP_EXPERT_HOTSET_ENV, UNIT_HOST_ARENA_SUFFIX,
+            UNIT_VRAM_ARENA_SUFFIX,
+        };
+        let refuse =
+            |why: String| WeightError::EpPlacement(format!("{EP_EXPERT_HOTSET_ENV}: {why}"));
+        let geometry = *plan.geometry();
+        if ep.ranks < 2 || ep.rank >= ep.ranks || geometry.ranks != ep.ranks {
+            return Err(refuse(format!(
+                "rank {} of {} does not match the plan's {} ranks",
+                ep.rank, ep.ranks, geometry.ranks
+            )));
+        }
+        if self.expert_keep.is_some() {
+            return Err(refuse(
+                "qwen4.expert_keep artifacts are not supported".into(),
+            ));
+        }
+        if !matches!(
+            self.identity.recipe,
+            Qwen4TierRecipe::FlashNextPacked { .. }
+        ) || self.identity.ffn_kind != "moe"
+        {
+            return Err(refuse(
+                "only the dense MQ4 Flash-Next packed MoE recipe has per-expert units".into(),
+            ));
+        }
+        let mut gate_up_seen = vec![false; geometry.layers];
+        let mut down_seen = vec![false; geometry.layers];
+        let mut weights = Vec::with_capacity(self.weights.len());
+        for mut entry in self.weights.drain(..) {
+            if !is_trunk_routed_expert_entry(&entry) {
+                weights.push(entry);
+                continue;
+            }
+            let layer = entry
+                .layer
+                .expect("a trunk routed expert entry has a layer");
+            if layer >= geometry.layers {
+                return Err(refuse(format!(
+                    "{} names trunk layer {layer}, the plan covers {}",
+                    entry.name, geometry.layers
+                )));
+            }
+            let gate_up = entry.name.ends_with(".mlp.experts.gate_up_proj");
+            let (dtype, seen) = if gate_up {
+                (ROUTED_GATE_UP_DTYPE, &mut gate_up_seen)
+            } else {
+                (ROUTED_DOWN_DTYPE, &mut down_seen)
+            };
+            if entry.dtype != dtype
+                || entry.logical_shape.first() != Some(&geometry.experts_per_layer)
+                || std::mem::replace(&mut seen[layer], true)
+            {
+                return Err(refuse(format!(
+                    "{} is not the {dtype:?} aggregate of {} experts (or is declared twice)",
+                    entry.name, geometry.experts_per_layer
+                )));
+            }
+            match plan.layer_state(ep.rank, layer) {
+                EpLayerState::Resident => {
+                    entry.residency = WeightResidency::Resident;
+                    weights.push(entry);
+                }
+                EpLayerState::Host => {
+                    entry.residency = WeightResidency::HostMapped;
+                    weights.push(entry);
+                }
+                EpLayerState::Mixed { .. } => {
+                    if !gate_up {
+                        continue;
+                    }
+                    let prefix = entry
+                        .name
+                        .strip_suffix(".mlp.experts.gate_up_proj")
+                        .expect("suffix checked above")
+                        .to_string();
+                    let map = plan.layer_map(ep.rank, layer);
+                    for (suffix, tier, residency) in [
+                        (
+                            UNIT_VRAM_ARENA_SUFFIX,
+                            UnitTier::Vram,
+                            WeightResidency::Resident,
+                        ),
+                        (
+                            UNIT_HOST_ARENA_SUFFIX,
+                            UnitTier::Host,
+                            WeightResidency::HostMapped,
+                        ),
+                    ] {
+                        let mut arena = WeightEntry::layer_with_dtype_constraint(
+                            format!("{prefix}{suffix}"),
+                            layer,
+                            vec![map.arena_entry_bytes(tier)],
+                            DType::Raw,
+                            DTypeConstraint::source_exact(DType::Raw),
+                            ShardPolicy::Replicate,
+                        );
+                        arena.residency = residency;
+                        weights.push(arena);
+                    }
+                }
+            }
+        }
+        if let Some(layer) = (0..geometry.layers).find(|&l| !gate_up_seen[l] || !down_seen[l]) {
+            return Err(refuse(format!(
+                "the manifest lacks trunk layer {layer}'s routed expert pair"
+            )));
+        }
+        self.weights = weights;
+        Ok(self)
+    }
 }
 
 /// A trunk layer's aggregate routed expert entry (`layers.{L}.mlp.experts.*`);
@@ -2299,6 +2434,12 @@ pub struct MoeWeights {
     /// 512 experts (per-expert format and offsets live in the recipe's plan).
     /// `experts_gate_up` / `experts_down` then name no fulfilled tensor.
     pub expert_arena: Option<TensorRef>,
+    /// `Some((vram arena, host arena))` on a MIXED layer of a per-expert EP
+    /// load (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`): the two raw arenas holding this
+    /// rank's owned experts of the layer. `experts_gate_up` / `experts_down`
+    /// then name no fulfilled tensor (resolving them fails): ask
+    /// [`Qwen4Weights::ep_unit_layer`] first. `None` everywhere else.
+    pub unit_arenas: Option<(TensorRef, TensorRef)>,
     /// The pinned checkpoint carries one stacked gate/up source.  Gate and up
     /// remain distinct logical projection slices in the sealed runtime plan;
     /// do not rewrite the artifact merely to spell them as separate sources.
@@ -2536,6 +2677,24 @@ pub struct Fp8MoeExpertTables {
     pub down: Fp8B128ExpertTable,
 }
 
+/// The per-expert EP state of one rank's weights: the mesh's plan, this rank
+/// and the slot maps of its mixed trunk layers.
+struct EpUnitState {
+    plan: std::sync::Arc<crate::expert_ep_units::EpUnitPlan>,
+    rank: usize,
+    maps: HashMap<usize, crate::expert_ep_units::EpUnitLayerMap>,
+}
+
+/// One MIXED trunk layer of this rank ([`Qwen4Weights::ep_unit_layer`]).
+pub struct EpUnitLayer<'a> {
+    /// This rank's slot map for the layer.
+    pub map: &'a crate::expert_ep_units::EpUnitLayerMap,
+    /// The device arena (`unit_vram_arena`).
+    pub vram: &'a GpuTensor,
+    /// The pinned host-mapped arena (`unit_host_arena`).
+    pub host: &'a GpuTensor,
+}
+
 /// Published resident ownership.  External PLE descriptors remain in the
 /// attached transaction census; no fake handle is stored here.
 pub struct Qwen4Weights {
@@ -2555,6 +2714,9 @@ pub struct Qwen4Weights {
     /// experts); `None` on the single-device route.
     ep: Option<Qwen4EpPlacement>,
     pub expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+    /// `Some` on a per-expert EP load (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`): the
+    /// mesh's plan, this rank and the slot maps of its mixed layers.
+    ep_units: Option<EpUnitState>,
     scope: Qwen4BandScope,
     device: usize,
     /// `Some((rank, parts))` once [`Self::shard_dense_ffn`] kept that slice.
@@ -2578,7 +2740,7 @@ impl Qwen4Weights {
         placements: &[Qwen4Placement],
         scope: &Qwen4BandScope,
     ) -> Result<Self, WeightError> {
-        Self::assemble_impl(tx, config, recipe, placements, scope, None)
+        Self::assemble_impl(tx, config, recipe, placements, scope, None, None)
     }
 
     /// [`Self::assemble`] for a `HIPFIRE_QWEN4_EXPERT_HOTSET` load: the trunk
@@ -2594,7 +2756,35 @@ impl Qwen4Weights {
         scope: &Qwen4BandScope,
         lease: crate::expert_tier_owners::ExpertTierLease,
     ) -> Result<Self, WeightError> {
-        Self::assemble_impl(tx, config, recipe, placements, scope, Some(lease))
+        Self::assemble_impl(tx, config, recipe, placements, scope, Some(lease), None)
+    }
+
+    /// [`Self::assemble`] for a per-expert EP load
+    /// (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`): rank `rank` of `plan`'s mesh. The
+    /// manifest is [`Qwen4Manifest::with_expert_units`] (each mixed trunk layer's
+    /// aggregates replaced by its two arena entries) and `placements` must cover
+    /// exactly its resident keys. The mesh's plan and the rank's slot maps are
+    /// retained by the returned weights ([`Self::ep_unit_plan`],
+    /// [`Self::ep_unit_layer`]). The EP placement is the plan's even when
+    /// every trunk layer is mixed (no aggregate carries a projection tag then).
+    pub fn assemble_with_ep_units(
+        tx: &mut WeightLoadTransaction,
+        config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        placements: &[Qwen4Placement],
+        scope: &Qwen4BandScope,
+        plan: std::sync::Arc<crate::expert_ep_units::EpUnitPlan>,
+        rank: usize,
+    ) -> Result<Self, WeightError> {
+        Self::assemble_impl(
+            tx,
+            config,
+            recipe,
+            placements,
+            scope,
+            None,
+            Some((plan, rank)),
+        )
     }
 
     fn assemble_impl(
@@ -2604,10 +2794,31 @@ impl Qwen4Weights {
         placements: &[Qwen4Placement],
         scope: &Qwen4BandScope,
         expert_tiers: Option<crate::expert_tier_owners::ExpertTierLease>,
+        ep_units: Option<(std::sync::Arc<crate::expert_ep_units::EpUnitPlan>, usize)>,
     ) -> Result<Self, WeightError> {
         let mut manifest = assembly_manifest(config, recipe)?;
         if expert_tiers.is_some() {
             manifest = manifest.with_expert_tiers()?;
+        }
+        if let Some((plan, rank)) = &ep_units {
+            if expert_tiers.is_some() {
+                return Err(WeightError::EpPlacement(
+                    "per-expert EP units cannot be combined with the single-device expert tiers"
+                        .to_string(),
+                ));
+            }
+            if *scope != Qwen4BandScope::single(config) {
+                return Err(WeightError::EpPlacement(
+                    "Qwen4 pipeline bands cannot be combined with expert parallelism".to_string(),
+                ));
+            }
+            manifest = manifest.with_expert_units(
+                Qwen4EpPlacement {
+                    rank: *rank,
+                    ranks: plan.geometry().ranks,
+                },
+                plan,
+            )?;
         }
         let placements = if *scope == Qwen4BandScope::single(config) {
             Cow::Borrowed(placements)
@@ -2636,6 +2847,21 @@ impl Qwen4Weights {
             ));
         }
         let ep = ep_from_projections(&manifest, |name, layer| tx.projection(name, layer, device))?;
+        let ep = match &ep_units {
+            Some((plan, rank)) => {
+                let want = Qwen4EpPlacement {
+                    rank: *rank,
+                    ranks: plan.geometry().ranks,
+                };
+                if ep.is_some_and(|found| found != want) {
+                    return Err(WeightError::EpPlacement(format!(
+                        "the fulfilled projections carry placement {ep:?}, the unit plan's is {want:?}"
+                    )));
+                }
+                Some(want)
+            }
+            None => ep,
+        };
         if ep.is_some() && *scope != Qwen4BandScope::single(config) {
             return Err(WeightError::EpPlacement(
                 "Qwen4 pipeline bands cannot be combined with expert parallelism".to_string(),
@@ -2720,6 +2946,56 @@ impl Qwen4Weights {
                 )?);
             }
         }
+        let ep_units = match ep_units {
+            Some((plan, rank)) => {
+                use crate::expert_ep_units::{UNIT_HOST_ARENA_SUFFIX, UNIT_VRAM_ARENA_SUFFIX};
+                let mut maps = HashMap::new();
+                for layer in &mut layer_refs {
+                    let Qwen4FfnWeights::Moe(moe) = &mut layer.ffn else {
+                        continue;
+                    };
+                    if layer.layer >= plan.geometry().layers
+                        || !matches!(
+                            plan.layer_state(rank, layer.layer),
+                            crate::expert_ep_units::EpLayerState::Mixed { .. }
+                        )
+                    {
+                        continue;
+                    }
+                    let map = plan.layer_map(rank, layer.layer);
+                    let prefix = moe
+                        .experts_gate_up
+                        .name
+                        .strip_suffix(".mlp.experts.gate_up_proj")
+                        .ok_or_else(|| {
+                            WeightError::DescriptorMismatch(moe.experts_gate_up.name.clone())
+                        })?
+                        .to_string();
+                    let arena = |suffix: &str, tier| {
+                        TensorRef::new(
+                            format!("{prefix}{suffix}"),
+                            TensorRole::RoutedArena,
+                            Some(layer.layer),
+                            vec![map.arena_entry_bytes(tier)],
+                            DType::Raw,
+                        )
+                    };
+                    moe.unit_arenas = Some((
+                        arena(
+                            UNIT_VRAM_ARENA_SUFFIX,
+                            crate::expert_ep_units::UnitTier::Vram,
+                        )?,
+                        arena(
+                            UNIT_HOST_ARENA_SUFFIX,
+                            crate::expert_ep_units::UnitTier::Host,
+                        )?,
+                    ));
+                    maps.insert(layer.layer, map);
+                }
+                Some(EpUnitState { plan, rank, maps })
+            }
+            None => None,
+        };
         let mtp = config
             .mtp
             .as_ref()
@@ -2746,6 +3022,7 @@ impl Qwen4Weights {
             scope: scope.clone(),
             device,
             tp_shard: None,
+            ep_units,
         })
     }
 
@@ -2800,6 +3077,42 @@ impl Qwen4Weights {
     /// `None` on the single-device route.
     pub fn ep_placement(&self) -> Option<Qwen4EpPlacement> {
         self.ep
+    }
+
+    /// The per-expert EP plan of the whole mesh (every rank) this load was
+    /// assembled under, shared by all ranks of the load; `None` without
+    /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`.
+    pub fn ep_unit_plan(&self) -> Option<&std::sync::Arc<crate::expert_ep_units::EpUnitPlan>> {
+        self.ep_units.as_ref().map(|state| &state.plan)
+    }
+
+    /// One MIXED trunk layer of this rank: its slot map and the two arenas
+    /// (device, pinned host). `Ok(None)` for a layer that is not mixed on this
+    /// rank (whole-layer compact path) and for a load with no unit plan. The
+    /// aggregate `MoeWeights::experts_*` of a mixed layer do not resolve, so
+    /// every consumer asks here first.
+    pub fn ep_unit_layer(&self, layer: usize) -> Result<Option<EpUnitLayer<'_>>, WeightError> {
+        let Some(state) = &self.ep_units else {
+            return Ok(None);
+        };
+        let Some(map) = state.maps.get(&layer) else {
+            return Ok(None);
+        };
+        debug_assert_eq!(map.rank(), state.rank);
+        let (vram, host) = self
+            .layer(layer)
+            .and_then(|weights| weights.ffn.moe())
+            .and_then(|moe| moe.unit_arenas.as_ref())
+            .ok_or_else(|| {
+                WeightError::DescriptorMismatch(format!(
+                    "mixed EP unit layer {layer} has no arena references"
+                ))
+            })?;
+        Ok(Some(EpUnitLayer {
+            map,
+            vram: self.resident(vram)?,
+            host: self.resident(host)?,
+        }))
     }
 
     /// Resolve one immutable typed reference to its resident GPU buffer.
@@ -3963,6 +4276,13 @@ fn stock_fp8_dtype(name: &str, shape: &[usize]) -> DType {
 /// routed expert stack of `manifest` was fulfilled `ExpertCompact` for one
 /// `(rank, ranks)`, `None` iff none was. A mixture, or disagreeing
 /// placements, is a corrupt load and is refused before assembly takes handles.
+///
+/// A per-expert EP manifest ([`Qwen4Manifest::with_expert_units`]) replaces a
+/// mixed layer's two aggregates by raw replicated arenas, which are not routed
+/// expert tensors (no `gate_up_proj`/`down_proj` name) and carry no projection
+/// tag: they are skipped, and the placement is recovered from the other trunk
+/// layers and the MTP head (the caller falls back to the unit plan's own
+/// placement when no tagged stack remains).
 fn ep_from_projections<'a>(
     manifest: &Qwen4Manifest,
     lookup: impl Fn(&str, Option<usize>) -> Option<&'a hipfire_runtime::weight_store::WeightProjection>,
@@ -4089,6 +4409,7 @@ fn build_ffn_refs(
                 .map_or(experts, <[u16]>::len);
             Ok(Qwen4FfnWeights::Moe(MoeWeights {
                 expert_arena: None,
+                unit_arenas: None,
                 experts_down: tr(
                     "experts.down_proj",
                     TensorRole::RoutedDown,
@@ -4781,6 +5102,225 @@ mod tests {
             }
         })
         .is_err());
+    }
+
+    /// A two-rank unit plan over the real Flash-Next geometry: trunk layers
+    /// 0..3 fully resident, layer 3 half resident (mixed), layers 4.. host.
+    fn ep_units_test_plan() -> crate::expert_ep_units::EpUnitPlan {
+        use crate::expert_ep_units::{
+            place_routed_experts_units, EpRanking, EpUnitGeometry, EpUnitSource,
+            VRAM_ARENA_TAIL_PAD_BYTES,
+        };
+        let geometry = EpUnitGeometry {
+            layers: 48,
+            experts_per_layer: 512,
+            ranks: 2,
+            gate_up_bytes: 1280 * 10 * 136,
+            down_bytes: 2560 * 5 * 68,
+        };
+        let ids: Vec<u32> = (0..48 * 512).collect();
+        let budget = (3 * 256 + 128) * geometry.unit_bytes() + 4 * 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        place_routed_experts_units(
+            &geometry,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ids,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![budget; 2],
+            },
+        )
+        .unwrap()
+    }
+
+    /// `with_expert_parallel` + the whole-layer placement of `vram_layers`:
+    /// what the loader's rank manifest is before the unit overlay.
+    fn ep_placed_manifest(ep: Qwen4EpPlacement, vram_layers: usize) -> Qwen4Manifest {
+        let mut manifest = Qwen4Manifest::build(&pinned_config())
+            .unwrap()
+            .with_expert_parallel(ep)
+            .unwrap();
+        crate::expert_residency::place_routed_experts(&mut manifest.weights, vram_layers);
+        manifest
+    }
+
+    /// Flag off the loader never calls `with_expert_units`, so the manifest is
+    /// the placed one. The overlay of a whole-layers plan (the same split) is
+    /// that manifest byte for byte: nothing but arenas of MIXED layers ever
+    /// changes a declaration.
+    #[test]
+    fn ep_units_flag_off_manifest_is_identical() {
+        use crate::expert_ep_units::{place_routed_experts_units, EpUnitGeometry, EpUnitSource};
+        for (rank, ranks, vram_layers) in [(0usize, 2usize, 0usize), (1, 2, 20), (2, 3, 48)] {
+            let ep = Qwen4EpPlacement { rank, ranks };
+            let today = ep_placed_manifest(ep, vram_layers);
+            let plan = place_routed_experts_units(
+                &EpUnitGeometry {
+                    layers: 48,
+                    experts_per_layer: 512,
+                    ranks,
+                    gate_up_bytes: 1280 * 10 * 136,
+                    down_bytes: 2560 * 5 * 68,
+                },
+                &EpUnitSource::WholeLayers { vram_layers },
+            )
+            .unwrap();
+            assert!(plan.mixed_layers(rank).is_empty());
+            let overlaid = today.clone().with_expert_units(ep, &plan).unwrap();
+            assert_eq!(
+                overlaid, today,
+                "rank {rank}/{ranks} vram_layers {vram_layers}"
+            );
+        }
+    }
+
+    #[test]
+    fn ep_units_manifest_replaces_mixed_layers_with_arenas() {
+        use crate::expert_ep_units::{UnitTier, UNIT_HOST_ARENA_SUFFIX, UNIT_VRAM_ARENA_SUFFIX};
+        let plan = ep_units_test_plan();
+        for rank in 0..2 {
+            let ep = Qwen4EpPlacement { rank, ranks: 2 };
+            let today = ep_placed_manifest(ep, 3);
+            let units = today.clone().with_expert_units(ep, &plan).unwrap();
+            assert_eq!(plan.mixed_layers(rank), vec![3]);
+            let prefix = |layer: usize| format!("model.language_model.layers.{layer}");
+            for layer in 0..48 {
+                let gate_up = format!("{}.mlp.experts.gate_up_proj", prefix(layer));
+                let down = format!("{}.mlp.experts.down_proj", prefix(layer));
+                let vram = format!("{}{UNIT_VRAM_ARENA_SUFFIX}", prefix(layer));
+                let host = format!("{}{UNIT_HOST_ARENA_SUFFIX}", prefix(layer));
+                if layer == 3 {
+                    assert!(units.entry(&gate_up, Some(layer)).is_none());
+                    assert!(units.entry(&down, Some(layer)).is_none());
+                    let map = plan.layer_map(rank, layer);
+                    assert!(map.is_mixed());
+                    for (name, tier, residency) in [
+                        (&vram, UnitTier::Vram, WeightResidency::Resident),
+                        (&host, UnitTier::Host, WeightResidency::HostMapped),
+                    ] {
+                        let entry = units.entry(name, Some(layer)).expect("arena entry");
+                        assert_eq!(entry.dtype, DType::Raw);
+                        assert_eq!(entry.logical_shape, vec![map.arena_entry_bytes(tier)]);
+                        assert_eq!(entry.policy, ShardPolicy::Replicate);
+                        assert_eq!(entry.residency, residency);
+                    }
+                } else {
+                    assert!(units.entry(&vram, Some(layer)).is_none());
+                    assert!(units.entry(&host, Some(layer)).is_none());
+                    let want = if layer < 3 {
+                        WeightResidency::Resident
+                    } else {
+                        WeightResidency::HostMapped
+                    };
+                    for name in [&gate_up, &down] {
+                        let entry = units.entry(name, Some(layer)).expect("aggregate entry");
+                        assert_eq!(entry.residency, want, "layer {layer}");
+                        assert_eq!(Some(entry), today.entry(name, Some(layer)));
+                    }
+                }
+            }
+            // Everything that is not a trunk routed pair of layer 3 is today's,
+            // the MTP head's host-mapped experts included.
+            let mtp_routed = |entry: &&WeightEntry| {
+                entry.name.starts_with("mtp.") && is_routed_expert_tensor(&entry.name)
+            };
+            assert!(today.weights.iter().filter(mtp_routed).count() > 0);
+            for entry in today.weights.iter().filter(mtp_routed) {
+                assert_eq!(entry.residency, WeightResidency::HostMapped);
+                assert_eq!(units.entry(&entry.name, entry.layer), Some(entry));
+            }
+            assert_eq!(units.weights.len(), today.weights.len());
+            for entry in &today.weights {
+                if entry.layer == Some(3) && is_routed_expert_tensor(&entry.name) {
+                    continue;
+                }
+                assert_eq!(units.entry(&entry.name, entry.layer), Some(entry));
+            }
+        }
+    }
+
+    #[test]
+    fn ep_units_manifest_refuses_a_mismatched_rank_or_plan() {
+        let plan = ep_units_test_plan();
+        let ep = Qwen4EpPlacement { rank: 0, ranks: 2 };
+        let placed = ep_placed_manifest(ep, 3);
+        // The plan is a 2-rank plan.
+        assert!(placed
+            .clone()
+            .with_expert_units(Qwen4EpPlacement { rank: 0, ranks: 3 }, &plan)
+            .is_err());
+        assert!(placed
+            .clone()
+            .with_expert_units(Qwen4EpPlacement { rank: 2, ranks: 2 }, &plan)
+            .is_err());
+        assert!(placed
+            .clone()
+            .with_expert_units(Qwen4EpPlacement { rank: 0, ranks: 1 }, &plan)
+            .is_err());
+        // A manifest without a trunk layer's routed pair is refused.
+        let mut missing = placed.clone();
+        missing
+            .weights
+            .retain(|entry| !(entry.layer == Some(7) && is_routed_expert_tensor(&entry.name)));
+        assert!(missing.with_expert_units(ep, &plan).is_err());
+        // The stock-FP8 recipe has no packed aggregate pair to overlay.
+        let mut stock = placed.clone();
+        stock.identity.recipe = Qwen4TierRecipe::StockFp8;
+        assert!(stock.with_expert_units(ep, &plan).is_err());
+    }
+
+    /// Mixed layers declare no routed projection tag: the placement is
+    /// recovered from the layers and the MTP head that still carry one, and a
+    /// lookup is never made for an arena.
+    #[test]
+    fn ep_from_projections_tolerates_mixed_layer_arenas() {
+        use hipfire_runtime::weight_store::{WeightProjection, WeightProjectionKind};
+        let plan = ep_units_test_plan();
+        let ep = Qwen4EpPlacement { rank: 1, ranks: 2 };
+        let manifest = ep_placed_manifest(ep, 3)
+            .with_expert_units(ep, &plan)
+            .unwrap();
+        assert!(manifest
+            .weights
+            .iter()
+            .any(|entry| crate::expert_ep_units::is_unit_arena_name(&entry.name)));
+        let compact = WeightProjection {
+            kind: WeightProjectionKind::ExpertCompact,
+            axis: None,
+            rank: 1,
+            world_size: 2,
+            logical_shape: vec![512, 1, 1],
+            dtype: DType::MQ4G256V2,
+        };
+        assert_eq!(
+            ep_from_projections(&manifest, |name, _| {
+                assert!(
+                    !crate::expert_ep_units::is_unit_arena_name(name),
+                    "{name} has no projection tag"
+                );
+                Some(&compact)
+            })
+            .unwrap(),
+            Some(ep)
+        );
+        // Arena and MTP only: still recovered from the head.
+        let mut arenas_and_mtp = manifest.clone();
+        arenas_and_mtp
+            .weights
+            .retain(|entry| !is_trunk_routed_expert_entry(entry));
+        assert_eq!(
+            ep_from_projections(&arenas_and_mtp, |_, _| Some(&compact)).unwrap(),
+            Some(ep)
+        );
+        // No tagged routed stack at all: no placement (the unit plan names it).
+        arenas_and_mtp
+            .weights
+            .retain(|entry| !is_routed_expert_tensor(&entry.name));
+        assert_eq!(
+            ep_from_projections(&arenas_and_mtp, |_, _| Some(&compact)).unwrap(),
+            None
+        );
     }
     fn pinned_config() -> Qwen4Config {
         crate::config::compact_test_config()

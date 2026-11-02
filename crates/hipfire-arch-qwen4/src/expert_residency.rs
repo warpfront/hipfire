@@ -236,6 +236,7 @@ fn is_routed_expert(name: &str) -> bool {
     name.ends_with(".mlp.experts.gate_up_proj")
         || name.ends_with(".mlp.experts.down_proj")
         || name.ends_with(crate::expert_arena::ARENA_SUFFIX)
+        || crate::expert_ep_units::is_unit_arena_name(name)
 }
 
 /// Resident bytes outside the routed experts, and the routed-expert bytes of
@@ -274,6 +275,9 @@ pub fn resident_split_ranks(
             if takes_device_non_expert_bytes(entry) {
                 non_expert += bytes;
             }
+        } else if crate::expert_ep_units::is_unit_arena_name(&entry.name) {
+            // A mixed layer's arena entry is a per-rank value the unit plan
+            // charges (`EpUnitPlan::vram_bytes`), never a layer-0 charge.
         } else if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {
             layer_arena_max = layer_arena_max.max(rank_share(entry, bytes, 0, ranks)?);
         } else if !entry.name.starts_with("mtp.") && entry.layer == Some(0) {
@@ -3058,7 +3062,10 @@ pub fn resident_routed_expert_bytes(
 pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> usize {
     let mut moved = 0;
     for entry in weights.iter_mut() {
-        if entry.residency != WeightResidency::Resident || !is_routed_expert(&entry.name) {
+        if entry.residency != WeightResidency::Resident
+            || !is_routed_expert(&entry.name)
+            || crate::expert_ep_units::is_unit_arena_name(&entry.name)
+        {
             continue;
         }
         let trunk_resident =
@@ -3081,7 +3088,10 @@ pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> 
 pub fn place_routed_experts_set(weights: &mut [WeightEntry], resident: &[usize]) -> usize {
     let mut moved = 0;
     for entry in weights.iter_mut() {
-        if entry.residency != WeightResidency::Resident || !is_routed_expert(&entry.name) {
+        if entry.residency != WeightResidency::Resident
+            || !is_routed_expert(&entry.name)
+            || crate::expert_ep_units::is_unit_arena_name(&entry.name)
+        {
             continue;
         }
         let trunk_resident = !entry.name.starts_with("mtp.")
@@ -3209,6 +3219,43 @@ pub fn host_mapped_bytes_ranks(
     Ok(per_rank)
 }
 
+/// [`host_mapped_bytes_ranks`] of a per-expert EP load (D1): the pinned host
+/// bytes of every rank, from the manifest's non-trunk-expert
+/// [`WeightResidency::HostMapped`] entries (the embedding table, the MTP
+/// head's experts: sized exactly as [`host_mapped_bytes_ranks`] sizes them)
+/// plus `plan.host_pinned_bytes(rank)` for the trunk experts. Trunk routed
+/// entries of `weights` (aggregates or unit arenas, whatever their placement)
+/// are left out: the plan owns their residency and pads. For a whole-layers
+/// plan this equals [`host_mapped_bytes_ranks`] on the manifest
+/// [`place_routed_experts`] placed.
+pub fn ep_unit_host_bytes_ranks(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+    plan: &crate::expert_ep_units::EpUnitPlan,
+) -> Result<Vec<u64>, String> {
+    let ranks = plan.geometry().ranks;
+    if ranks == 0 {
+        return Err("expert-parallel rank count must be at least 1".to_string());
+    }
+    let mut per_rank: Vec<u64> = (0..ranks)
+        .map(|rank| plan.host_pinned_bytes(rank))
+        .collect();
+    for entry in weights {
+        let trunk_expert = is_routed_expert(&entry.name)
+            && !entry.name.starts_with("mtp.")
+            && entry.layer.is_some();
+        if entry.residency != WeightResidency::HostMapped || trunk_expert {
+            continue;
+        }
+        let bytes =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        for (rank, charge) in per_rank.iter_mut().enumerate() {
+            *charge += rank_share(entry, bytes, rank, ranks)? + HOST_MAPPED_PAD_BYTES;
+        }
+    }
+    Ok(per_rank)
+}
+
 /// Two donor mirrors per rank share one host RAM/GTT budget. Each donor has
 /// separate gate/up and down pinned allocations, including their padding.
 pub(crate) fn expert_stage_mirror_bytes(layer_bytes: usize, ranks: usize) -> Result<u64, String> {
@@ -3244,7 +3291,12 @@ fn rank_share(entry: &WeightEntry, bytes: u64, rank: usize, ranks: usize) -> Res
     if ranks == 0 {
         return Err("expert-parallel rank count must be at least 1".to_string());
     }
-    if ranks == 1 || !is_routed_expert(&entry.name) {
+    // A mixed layer's arena entry already is this rank's bytes (`[arena bytes]`,
+    // one entry per rank's own manifest): never divided by the rank count.
+    if ranks == 1
+        || !is_routed_expert(&entry.name)
+        || crate::expert_ep_units::is_unit_arena_name(&entry.name)
+    {
         return Ok(bytes);
     }
     if entry.name.ends_with(crate::expert_arena::ARENA_SUFFIX) {

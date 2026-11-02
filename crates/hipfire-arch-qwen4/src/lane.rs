@@ -187,9 +187,11 @@ struct EpOwnedLayer {
 
 /// Every owned layer positively one valid kind: QT44/QT53, both aggregates
 /// resident (the static runtime) or both host-mapped (the live balanced
-/// runtime), and the forward's kind agreeing with that residence. Any mix of
-/// the two kinds across layers qualifies; there is no layer, expert or rank
-/// count in the rule. An empty band owns nothing to classify.
+/// runtime), or a host-bearing layer of a per-expert unit plan (a mixed
+/// VRAM/host arena layer: the static-owner units kind, which is host-mapped
+/// and never balanced), and the forward's kind agreeing with that residence.
+/// Any mix of the kinds across layers qualifies; there is no layer, expert or
+/// rank count in the rule. An empty band owns nothing to classify.
 fn classify_ep_layers(layers: impl IntoIterator<Item = Option<EpOwnedLayer>>) -> LaneExpertRoute {
     let mut owned = false;
     for layer in layers {
@@ -200,6 +202,7 @@ fn classify_ep_layers(layers: impl IntoIterator<Item = Option<EpOwnedLayer>>) ->
                     (layer.kind, layer.gate_up_mapped),
                     (Some(EpLaneExpertKind::StaticResidentPacked), false)
                         | (Some(EpLaneExpertKind::BalancedHostMappedPacked), true)
+                        | (Some(EpLaneExpertKind::StaticUnitsPacked), true)
                 )
         });
         if !valid {
@@ -256,6 +259,20 @@ fn ep_owned_layer(
     if moe.expert_arena.is_some() {
         return None;
     }
+    // A mixed layer of a per-expert unit plan has no aggregate tensors (`resident` of them
+    // fails): its arenas are the frozen QT44/QT53 pair, host-bearing, bound as the units kind.
+    match weights.ep_unit_layer(absolute) {
+        Ok(Some(_)) => {
+            return Some(EpOwnedLayer {
+                qt: ExpertQt::of_dtypes(DType::MQ4G256V2, DType::MQ4G128V2),
+                gate_up_mapped: true,
+                down_mapped: true,
+                kind: forward.lane_ep_expert_kind(absolute),
+            });
+        }
+        Ok(None) => {}
+        Err(_) => return None,
+    }
     let gate_up = weights.resident(&moe.experts_gate_up).ok()?;
     let down = weights.resident(&moe.experts_down).ok()?;
     Some(EpOwnedLayer {
@@ -308,6 +325,15 @@ fn classify_owned_layer(
             })
         }
         (None, None) => {
+            if weights
+                .ep_unit_layer(absolute)
+                .map_err(|error| format!("layer {absolute}: {error}"))?
+                .is_some()
+            {
+                return Err(format!(
+                    "layer {absolute}: a per-expert unit layer is classified only by the EP route"
+                ));
+            }
             let gate_up = resident(&moe.experts_gate_up)?;
             let down = resident(&moe.experts_down)?;
             let host_mapped = gate_up.buf.is_host_mapped() || down.buf.is_host_mapped();
@@ -536,6 +562,12 @@ fn gather_stage_facts(bundle: &Qwen4Bundle) -> StageFacts {
                 Some(slab_layer_expert_qts(arenas.layer(layer)?))
             }
             Qwen4TierRecipe::FlashNextPacked { .. } => {
+                // A mixed unit layer has no aggregate tensors: its arenas are the frozen
+                // QT44/QT53 pair.
+                if weights.ep_unit_layer(layer).ok()?.is_some() {
+                    return ExpertQt::of_dtypes(DType::MQ4G256V2, DType::MQ4G128V2)
+                        .map(|qt| vec![qt]);
+                }
                 ExpertQt::of_dtypes(source(&moe.experts_gate_up)?, source(&moe.experts_down)?)
                     .map(|qt| vec![qt])
             }
@@ -3761,6 +3793,58 @@ mod tests {
             kind: Some(EpLaneExpertKind::BalancedHostMappedPacked),
             ..band[0].unwrap()
         });
+        assert_eq!(classify_ep_layers(band), unclassified);
+    }
+
+    /// A host-bearing layer of a per-expert unit plan (D1) is valid only as the static units
+    /// kind, and that kind only on a host-bearing layer.
+    #[test]
+    fn ep_class_takes_a_unit_layer_only_as_the_static_units_kind() {
+        let unclassified = LaneExpertRoute::Unclassified;
+        let unit = |mapped: bool, kind: EpLaneExpertKind| {
+            Some(EpOwnedLayer {
+                qt: Some(expert_capabilities::QT_MQ4_XTS),
+                gate_up_mapped: mapped,
+                down_mapped: mapped,
+                kind: Some(kind),
+            })
+        };
+        let mixed = unit(true, EpLaneExpertKind::StaticUnitsPacked);
+        // A mixed layer amid resident and balanced-host layers.
+        let mut band = ep_band(27, 20);
+        band.push(mixed);
+        assert_eq!(
+            classify_ep_layers(band),
+            LaneExpertRoute::EpPackedStaticOrBalanced
+        );
+        assert_eq!(
+            classify_ep_layers([mixed]),
+            LaneExpertRoute::EpPackedStaticOrBalanced
+        );
+        // The units kind on a layer that is not host-bearing.
+        assert_eq!(
+            classify_ep_layers([unit(false, EpLaneExpertKind::StaticUnitsPacked)]),
+            unclassified
+        );
+        // A host-bearing unit layer bound as the static resident kind.
+        assert_eq!(
+            classify_ep_layers([unit(true, EpLaneExpertKind::StaticResidentPacked)]),
+            unclassified
+        );
+        // One mixed layer with a missing kind or another quant pair spoils the band.
+        let mut band = ep_band(27, 20);
+        band.push(
+            unit(true, EpLaneExpertKind::StaticUnitsPacked).map(|layer| EpOwnedLayer {
+                kind: None,
+                ..layer
+            }),
+        );
+        assert_eq!(classify_ep_layers(band), unclassified);
+        let mut band = ep_band(27, 20);
+        band.push(mixed.map(|layer| EpOwnedLayer {
+            qt: Some(expert_capabilities::QT_E8P),
+            ..layer
+        }));
         assert_eq!(classify_ep_layers(band), unclassified);
     }
 
