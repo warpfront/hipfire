@@ -13097,7 +13097,8 @@ pub fn take_dn_checkpoint(
 
 /// Whether one more DeltaNet snapshot can be allocated without eating what the
 /// admitted context still needs: `free_now >= snapshot + KV mapping growth to
-/// the admitted tokens + the fit's reserve`. No floor set => always true; a
+/// the admitted tokens + the fit's reserve`, where `free_now` includes memory parked in
+/// the pool. No floor set => always true; a
 /// memory query or growth-plan error => false (do not allocate).
 fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState) -> bool {
     let Some(floor) = gpu.kv_fit_floor else {
@@ -13106,13 +13107,17 @@ fn checkpoint_fits_admitted_context(gpu: &Gpu, kv: &KvCache, dn: &DeltaNetState)
     let Ok((free_now, _)) = gpu.device_mem_info() else {
         return false;
     };
+    // Buffers parked in the pool are allocated from HIP (so `hipMemGetInfo` counts them as used)
+    // but owned by no tensor, and every pool allocation and VMM map returns them to HIP on demand.
+    // They are available to the KV growth this gate protects, so count them as free.
+    let available = free_now.saturating_add(gpu.pool_parked_bytes());
     let Ok(growth) = kv.planned_mapped_growth_bytes(gpu, floor.admitted_tokens) else {
         return false;
     };
     let Ok(snapshot) = usize::try_from(DeltaNetSnapshot::bytes_for(dn)) else {
         return false;
     };
-    free_now
+    available
         >= snapshot
             .saturating_add(growth)
             .saturating_add(floor.reserve_bytes)

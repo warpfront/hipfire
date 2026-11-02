@@ -1969,7 +1969,8 @@ pub struct Gpu {
 pub struct KvFitFloor {
     /// The published (admitted) context in tokens.
     pub admitted_tokens: usize,
-    /// The fit's full per-request reserve (prefill + charged checkpoints + MTP).
+    /// What a request still allocates after its prefill scratch is resident (the fit's MTP
+    /// scratch; the prefill scratch and the charged checkpoints are not counted again).
     pub reserve_bytes: usize,
 }
 /// Per-256-block XX^T accumulator for ONE weight tensor (one expert), keyed
