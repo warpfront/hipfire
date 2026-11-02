@@ -56,7 +56,20 @@ pub const TRUNK_SHARD_ROUTE_READY: bool = false;
 
 /// Whether the developer switch asks for the shard (`1`/`true`/`on`) and the route exists.
 pub fn trunk_shard_requested() -> bool {
-    requested_given(TRUNK_SHARD_ROUTE_READY, trunk_shard_env_set())
+    requested_given(TRUNK_SHARD_ROUTE_READY, trunk_shard_env_set()) || trunk_shard_lab_set()
+}
+
+/// `HIPFIRE_QWEN4_EP_TRUNK_SHARD=lab`: the lab value that runs the route on the cards BEFORE
+/// `TRUNK_SHARD_ROUTE_READY` is flipped (identity/KLD/timing checkpoints). Not a user switch:
+/// a user value of `1` stays inert until the const flips.
+pub fn trunk_shard_lab_set() -> bool {
+    matches!(
+        hipfire_config::developer_var(TRUNK_SHARD_ENV)
+            .ok()
+            .as_deref()
+            .map(str::trim),
+        Some("lab")
+    )
 }
 
 /// [`trunk_shard_requested`] with both inputs passed in: the route's readiness and the raw
