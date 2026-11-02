@@ -49,6 +49,19 @@
 //! verify-runtime-cache --capture FILE --arch A
 //!     Check a Redline capture's content-keyed JIT cache entries against the
 //!     registry source and the runtime's cache-key function.
+//! from-cache --arch A --program ID --cache DIR [--pack DIR] --out DIR [--jobs N]
+//!     Build a LOCAL corpus from the user's own already-compiled objects: no
+//!     hipcc compile, no network, no GPU, seconds. `ID` names a checked program
+//!     list embedded in the binary (`raon-ar-decode-gfx1201`); every node's
+//!     object comes from the installed pack `--pack` (verified as the runtime
+//!     loads it) else the hot cache `--cache` (the cache root or its `<arch>`
+//!     dir), under the runtime's current key, and is certified with railgun-cert
+//!     exactly as `build` does. `DIR` (`--out`) is the corpus directory itself
+//!     (`index.json` inside), written atomically via `<out>.tmp-<pid>`. The last
+//!     stdout line is one JSON status: exit 0 `{"status":"ok",..}`; exit 2
+//!     `{"status":"refused","reason":..,"missing":[..],"out":null}` (nothing
+//!     published, an existing `--out` untouched); exit 1 `{"status":"error",..}`.
+//!     Logs go to stderr. See `from_cache.rs` for the toolchain pin rule.
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -359,7 +372,84 @@ fn run() -> Result<bool> {
     }
 }
 
+/// `from-cache` flags: all values required except `--pack` and `--jobs`.
+fn from_cache_options(mut it: impl Iterator<Item = String>) -> Result<corpus::FromCacheOptions> {
+    let (mut arch, mut program, mut cache, mut pack, mut out) = (None, None, None, None, None);
+    let mut jobs = std::thread::available_parallelism().map_or(8, |n| n.get().min(16));
+    while let Some(flag) = it.next() {
+        let mut value = || it.next().ok_or(format!("{flag} needs a value"));
+        match flag.as_str() {
+            "--arch" => arch = Some(value()?),
+            "--program" => program = Some(value()?),
+            "--cache" => cache = Some(PathBuf::from(value()?)),
+            "--pack" => pack = Some(PathBuf::from(value()?)),
+            "--out" => out = Some(PathBuf::from(value()?)),
+            "--jobs" => jobs = value()?.parse().map_err(|e| format!("--jobs: {e}"))?,
+            other => return Err(format!("from-cache: unknown argument {other}")),
+        }
+    }
+    fn need<T>(value: Option<T>, flag: &str) -> Result<T> {
+        value.ok_or(format!("from-cache needs {flag}"))
+    }
+    Ok(corpus::FromCacheOptions {
+        arch: need(arch, "--arch")?,
+        program: need(program, "--program")?,
+        cache: need(cache, "--cache")?,
+        pack,
+        out: need(out, "--out")?,
+        jobs,
+        toolchain_id: None,
+    })
+}
+
+/// Run `from-cache`; the status line is the last (only) stdout line.
+fn from_cache_main(args: impl Iterator<Item = String>) -> ExitCode {
+    let status = |value: serde_json::Value| println!("{value}");
+    let outcome = from_cache_options(args).and_then(|o| corpus::from_cache(&o));
+    match outcome {
+        Ok(corpus::FromCacheOutcome::Ok(ok)) => {
+            status(serde_json::json!({
+                "status": "ok",
+                "program": ok.program,
+                "arch": ok.arch,
+                "out": ok.out.display().to_string(),
+                "toolchain_pin": ok.toolchain_pin,
+                "nodes": ok.nodes,
+                "objects": ok.objects,
+                "proven": ok.proven,
+                "conditional": ok.conditional,
+                "unknown": ok.unknown,
+                "millis": ok.millis,
+            }));
+            ExitCode::SUCCESS
+        }
+        Ok(corpus::FromCacheOutcome::Refused(r)) => {
+            eprintln!("railgun-jit-corpus from-cache: refused: {}", r.reason);
+            status(serde_json::json!({
+                "status": "refused",
+                "reason": r.reason.replace('\n', " "),
+                "missing": r.missing,
+                "out": serde_json::Value::Null,
+            }));
+            ExitCode::from(2)
+        }
+        Err(reason) => {
+            eprintln!("railgun-jit-corpus from-cache: {reason}");
+            status(serde_json::json!({
+                "status": "error",
+                "reason": reason.replace('\n', " "),
+            }));
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
+    let mut argv = std::env::args().skip(1).peekable();
+    if argv.peek().is_some_and(|c| c == "from-cache") {
+        argv.next();
+        return from_cache_main(argv);
+    }
     match run() {
         Ok(true) => ExitCode::SUCCESS,
         Ok(false) => ExitCode::FAILURE,

@@ -91,6 +91,50 @@ pub fn verify_dir(
     Ok(verified)
 }
 
+/// One module's object in an installed pack, as the runtime loader admits it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedObject {
+    pub object: PathBuf,
+    /// The toolchain identity the pack index records for the object.
+    pub toolchain_id: String,
+}
+
+/// The runtime loader's own check of one module of an installed pack
+/// (`KernelCompiler::compile_for_symbol`'s indexed lookup): the index in `dir`
+/// must match `source` and the recipe this build computes for
+/// `arch`/`extra_flags` (packaging key, flags, ABI, object SHA-256, a
+/// `.hash` sidecar), name every one of `symbols`, and, when
+/// `local_toolchain_id` is `Some`, have been built by that device compiler.
+/// `Ok(None)`: the pack has neither an index nor an object for `module`.
+/// `Err`: the loader would reject the object and rebuild it instead.
+pub fn verify_module(
+    dir: &Path,
+    arch: &str,
+    extra_flags: &str,
+    module: &str,
+    source: &str,
+    symbols: &[&str],
+    local_toolchain_id: Option<&str>,
+) -> Result<Option<VerifiedObject>, String> {
+    let key = KernelCompiler::packaging_hash_for(arch, module, source, extra_flags);
+    KernelCompiler::check_indexed_object(
+        dir,
+        arch,
+        module,
+        source,
+        symbols,
+        extra_flags,
+        &key,
+        local_toolchain_id.unwrap_or(""),
+    )
+    .map(|found| {
+        found.map(|(object, toolchain_id)| VerifiedObject {
+            object,
+            toolchain_id,
+        })
+    })
+}
+
 /// Every indexed symbol of every registry module must be exported by the
 /// module's object. All offenders are reported, not the first.
 pub(crate) fn verify_exports(

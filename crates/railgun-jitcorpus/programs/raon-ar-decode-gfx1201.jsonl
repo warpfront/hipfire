@@ -1,0 +1,34 @@
+# checked program list for `railgun-jit-corpus from-cache --program raon-ar-decode-gfx1201`: the (symbol, module) node set; the per-node sha256 is the recorded probe run's object digest, kept as provenance and NOT required of a user's own objects (from-cache certifies the object it finds)
+# first launch of each distinct node of the Raon-1-mini-preview plain-AR decode body (gfx1201, ctx512), from raon-railgun/run/objs/sequence.jsonl (the probe inventory phase)
+{"kind": "kernel", "symbol": "embedding_q8_batched", "module": "embedding_q8_batched", "sha256": "737484c8eae52e4e09fdfb7752e0b3449a93856bb500ae52946f47ffe386ca07"}
+{"kind": "kernel", "symbol": "stream_mix_broadcast_bf16", "module": "stream_mix_broadcast", "sha256": "ac0bebbb956d9b4d178a4cce600ba2d2c46e994ab47e6885ed669d67286ddf4f"}
+{"kind": "kernel", "symbol": "gemm_bf16_xbf16_small_rows_s1", "module": "gemm_bf16_small_rows", "sha256": "427dce263abdd4ef65401bd1df4d8afd558e99cb1630a012a2a3840d0ec5ddbc"}
+{"kind": "kernel", "symbol": "stream_mix_route_aggregate_n4_k10_bf16", "module": "stream_mix_route_aggregate", "sha256": "98ec7bfd7ffc80c2d7c3aaf901ca53e526fbe902903f50e32822a93e4726336a"}
+{"kind": "kernel", "symbol": "gemv_q8_0", "module": "gemv_q8_0", "sha256": "3412294b921bff7c0d507e9cd82a0a185d3fb8c70d85707a602c4b4c8bce5135"}
+{"kind": "kernel", "symbol": "bf16_round_trip_f32_strided", "module": "qwen4_bf16_round_trip", "sha256": "93c0417cba14930650ca56c4bcd5d77b8397f486e4bae60053b91602d6f82154"}
+{"kind": "kernel", "symbol": "gemv_q8_0_wide", "module": "gemv_q8_0_wide", "sha256": "c73681f5f83d563701e02b34ee40bdc8852494d177f84c42f00cb3f7445b11c1"}
+{"kind": "kernel", "symbol": "causal_conv_depthwise_silu_rows_f32_pm_gfx1201", "module": "gated_delta_vector_pm_gfx1201", "sha256": "fa1cc2c3cbc0db8ceaf8f8dd71ff9046b357e00a72ddf3f5fbbd40152a206448"}
+{"kind": "kernel", "symbol": "raon_rda_prepare_f32", "module": "raon_rda_prepare", "sha256": "b278b7870636ccba342e0f8f4f6f49c73706eb65baecd281f85e64c3da3d1d99"}
+{"kind": "kernel", "symbol": "gated_delta_net_vector_serial_f32_pm_gfx1201", "module": "gated_delta_vector_pm_gfx1201", "sha256": "fa1cc2c3cbc0db8ceaf8f8dd71ff9046b357e00a72ddf3f5fbbd40152a206448"}
+{"kind": "kernel", "symbol": "gated_rmsnorm_sigmoid_rows_f32", "module": "gated_rmsnorm_sigmoid_rows", "sha256": "9a5d38f8b5e8b32ef03c492ebe0beb1bd2facf0baebbeb66272bb67bee2bdc16"}
+{"kind": "kernel", "symbol": "stream_mix_postmix_bf16", "module": "stream_mix_postmix", "sha256": "33e6429c4bff86a41eccdea935d9587486b7c7c2fa6022e2340111cfa610d6e6"}
+{"kind": "kernel", "symbol": "rotate_x_mq_awq", "module": "rotate_x_mq_awq", "sha256": "9ba940e070e453fd81cef39c79190f9a9e5b6ce489d603e376b132fec70509ea"}
+{"kind": "kernel", "symbol": "convert_f32_to_f16", "module": "convert_f32_to_f16", "sha256": "a299aba8e91d4e8f5f42b66f1c726e1835a809d4807b903a1606a47c529d6951"}
+{"kind": "kernel", "symbol": "gemm_mq4g256v2_residual_wmma_gfx12", "module": "gemm_hfq4g256_residual_wmma_gfx12_mq4v2", "sha256": "0ee915361ca51dfa0c49b74ff98ea3502bae97271dc0a6e3bd7704204368ded7"}
+{"kind": "kernel", "symbol": "ffn_situ_rows_f32", "module": "ffn_situ", "sha256": "16286fdd66b6a3b70fea2f7ff70298e3a2c47f3e9d2e4fa7f62c7d8439fbc37f"}
+{"kind": "kernel", "symbol": "mq_rotate_x", "module": "mq_rotate_x", "sha256": "1bb867eef4ee41c8381cd13fbfb60e91b44ecd19cf5aab5a83c5008e8d045da0"}
+{"kind": "kernel", "symbol": "ffn_round_bf16_f32", "module": "ffn_moe_combine_policy", "sha256": "ad1d0b6f2d3324db5573be5e6b74299670c9f40e594deb05e5dd4c3dfbc8d499"}
+{"kind": "kernel", "symbol": "gemm_bf16_xf32_small_rows_r1", "module": "gemm_bf16_small_rows", "sha256": "427dce263abdd4ef65401bd1df4d8afd558e99cb1630a012a2a3840d0ec5ddbc"}
+{"kind": "kernel", "symbol": "ffn_moe_router_topk_f32", "module": "ffn_router_renorm", "sha256": "75fd64316878c3751c14b10fe4ed0d7c58186a02a1fb426e58b06e9438f17987"}
+{"kind": "kernel", "symbol": "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched", "module": "gemv_mq4g256v2_moe_gate_up_k8_indexed_batched", "sha256": "c9825392e4265bb9f126a4ba0a1741d7882f9af3dfb402cbf01429a4ffc5f0e1"}
+{"kind": "kernel", "symbol": "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded", "module": "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded", "sha256": "e35437ef9525ddcfb1268c595bc3caf8ac8d5f2695a1cbf2214d8b959658f46b"}
+{"kind": "kernel", "symbol": "ffn_moe_combine_f32_w2", "module": "ffn_moe_combine_policy_w2", "sha256": "a70919e8ccc9a75350588c7aa13335865049a56fd8463a9bd0b45422780c4956"}
+{"kind": "kernel", "symbol": "latent_attention_rms_rows_bf16", "module": "latent_attention_split", "sha256": "dddf44e6bb86629afa143088f6c6bbc2383efe401d5768c261bd166ab413ef55"}
+{"kind": "kernel", "symbol": "latent_attention_split_kv_bf16", "module": "latent_attention_split", "sha256": "dddf44e6bb86629afa143088f6c6bbc2383efe401d5768c261bd166ab413ef55"}
+{"kind": "kernel", "symbol": "latent_attention_gather_latent_f32", "module": "latent_attention_decompress", "sha256": "fe1ea44b3373a69cc75a47d45fa340be2487c9020888024f2a18255fbb36ef6e"}
+{"kind": "kernel", "symbol": "latent_attention_scatter_expanded_q8", "module": "latent_attention_decompress", "sha256": "fe1ea44b3373a69cc75a47d45fa340be2487c9020888024f2a18255fbb36ef6e"}
+{"kind": "kernel", "symbol": "latent_attention_decode_partial_q8", "module": "latent_attention_decode", "sha256": "bb969f7e3dee1ed865dec12fce3653bc6b171f2a255e7d476e519052ec39cdd6"}
+{"kind": "kernel", "symbol": "latent_attention_decode_merge", "module": "latent_attention_decode", "sha256": "bb969f7e3dee1ed865dec12fce3653bc6b171f2a255e7d476e519052ec39cdd6"}
+{"kind": "kernel", "symbol": "latent_attention_gate_bf16", "module": "latent_attention_gate", "sha256": "8d593ebf06328519a042beb810b113dbdd8ddb426eaa0e52c25e2ad952ed3aad"}
+{"kind": "kernel", "symbol": "stream_mix_mean_bf16", "module": "stream_mix_mean", "sha256": "65f53b513d43928f57f97c2cf1bb0fab1a105a072d7016b9b953ffdd91111027"}
+{"kind": "kernel", "symbol": "device_counter_add_i32", "module": "device_counter_add", "sha256": "23444e5d1b7cc172daab00557b8f7a0010b63d50359606dffac39a5d651eee55"}

@@ -871,6 +871,32 @@ impl KernelCompiler {
     /// Resolves `gfx1151` CU-mode modules from the environment so the key
     /// matches what a runtime constructed with the same env would compute.
     pub fn packaging_hash_for(arch: &str, name: &str, source: &str, extra_flags: &str) -> String {
+        Self::cache_hash_for(arch, name, source, extra_flags, "")
+    }
+
+    /// Static [`Self::jit_cache_key`]: the hot-cache key a runtime on `arch`
+    /// with `extra_flags` and device-compiler identity `toolchain_id` (what
+    /// [`Self::local_toolchain_id`] returns, empty without a compiler) names
+    /// `{name}.{key}.hsaco` with. Needs no `KernelCompiler`, hipcc or GPU, and
+    /// resolves `gfx1151` CU-mode modules and the scheduler-profile override
+    /// from the environment like [`Self::packaging_hash_for`].
+    pub fn jit_cache_key_for(
+        arch: &str,
+        name: &str,
+        source: &str,
+        extra_flags: &str,
+        toolchain_id: &str,
+    ) -> String {
+        Self::cache_hash_for(arch, name, source, extra_flags, toolchain_id)
+    }
+
+    fn cache_hash_for(
+        arch: &str,
+        name: &str,
+        source: &str,
+        extra_flags: &str,
+        toolchain_id: &str,
+    ) -> String {
         let gfx1151_cumode_modules = if arch == "gfx1151" {
             hipfire_config::developer_var("HIPFIRE_GFX1151_CUMODE_MODULES")
                 .unwrap_or_default()
@@ -893,7 +919,7 @@ impl KernelCompiler {
             arch,
             extra_flags,
             &module_flags,
-            "",
+            toolchain_id,
             scheduler_profile,
             "hipcc",
             "",
@@ -3278,6 +3304,24 @@ mod tests {
         assert_ne!(
             packaging_via_instance, builder_hash,
             "packaging (empty toolchain) must differ from normal cache hash"
+        );
+    }
+
+    #[test]
+    fn static_jit_cache_key_matches_the_instance_key_under_its_toolchain() {
+        let name = "keyed_kernel";
+        let source = "__global__ void keyed_kernel() {}";
+        for toolchain in ["", "HIP version: 7.2.0-test"] {
+            let compiler = test_compiler("-O3", toolchain);
+            assert_eq!(
+                KernelCompiler::jit_cache_key_for("gfx1151", name, source, "-O3", toolchain),
+                compiler.jit_cache_key(name, source),
+                "toolchain `{toolchain}`"
+            );
+        }
+        assert_ne!(
+            KernelCompiler::jit_cache_key_for("gfx1151", name, source, "-O3", "a"),
+            KernelCompiler::jit_cache_key_for("gfx1151", name, source, "-O3", "b")
         );
     }
     // Exercise both public lookup paths with separate instances so an earlier
