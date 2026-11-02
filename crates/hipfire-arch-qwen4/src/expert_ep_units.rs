@@ -40,6 +40,7 @@
 use crate::expert_arena::ARENA_TAIL_PAD_BYTES;
 use crate::expert_residency::HOST_MAPPED_PAD_BYTES;
 use crate::weights::Qwen4EpPlacement;
+use rdna_compute::moe::QWEN4_EP_OWNER_PIN_FREE;
 
 /// Tail pad of one VRAM arena block (gate/up or down) of a mixed layer.
 pub const VRAM_ARENA_TAIL_PAD_BYTES: u64 = ARENA_TAIL_PAD_BYTES as u64;
@@ -837,6 +838,81 @@ impl EpUnitPlan {
             .filter(|&layer| matches!(self.layer_state(rank, layer), EpLayerState::Mixed { .. }))
             .collect()
     }
+}
+
+/// The kill switch of pinned-owner balanced ownership on per-expert unit layers (D1.9):
+/// with a unit plan, a layer that is mixed on some rank, or host on some rank but not on
+/// every rank, runs the balanced per-call owner assignment with the resident experts pinned
+/// to their holder ([`ep_unit_pin_plane`]) instead of the static `e % ranks` owners. Only the
+/// exact value `0` is off (D1 behaviour: static owners on those layers); unset or any other
+/// value is on. It only matters where balanced ownership itself is admitted
+/// (`HIPFIRE_EP_BALANCED_OWNERS`, exact gfx1201 at 2..=4 ranks).
+pub const EP_UNIT_PINNED_OWNERS_ENV: &str = "HIPFIRE_EP_UNIT_PINNED_OWNERS";
+
+/// Whether [`EP_UNIT_PINNED_OWNERS_ENV`] allows pinned owners, from its raw value: on unless
+/// exactly `0`.
+pub fn ep_unit_pinned_owners_on(raw: Option<&str>) -> bool {
+    raw != Some("0")
+}
+
+/// How one trunk layer of a unit plan is owned across the mesh, decided from the plan alone
+/// so every rank agrees ([`ep_unit_layer_balance`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EpUnitLayerBalance {
+    /// No rank holds a host expert of the layer: every expert is device-resident on its
+    /// holder, the static `e % ranks` route (today's resident layer).
+    StaticResident,
+    /// Every rank holds the layer wholly in host RAM: today's balanced host layer, the
+    /// UNPINNED owner-assign kernel.
+    BalancedHost,
+    /// Some rank holds a host expert of the layer and not every rank holds it wholly on host:
+    /// the PINNED owner-assign kernel (resident experts pinned to their holder, host experts
+    /// free). A rank whose own layer is wholly resident runs it too, with every pin its own.
+    BalancedPinned,
+}
+
+/// The balanced-ownership decision of `layer`, from the plan only (see
+/// [`EpUnitLayerBalance`]); the kill switch ([`EP_UNIT_PINNED_OWNERS_ENV`]) is the caller's.
+pub fn ep_unit_layer_balance(plan: &EpUnitPlan, layer: usize) -> EpUnitLayerBalance {
+    let ranks = plan.geometry().ranks;
+    let (mut with_host, mut wholly_host) = (0usize, 0usize);
+    for rank in 0..ranks {
+        match plan.layer_state(rank, layer) {
+            EpLayerState::Resident => {}
+            EpLayerState::Mixed { .. } => with_host += 1,
+            EpLayerState::Host => {
+                with_host += 1;
+                wholly_host += 1;
+            }
+        }
+    }
+    if with_host == 0 {
+        EpUnitLayerBalance::StaticResident
+    } else if wholly_host == ranks {
+        EpUnitLayerBalance::BalancedHost
+    } else {
+        EpUnitLayerBalance::BalancedPinned
+    }
+}
+
+/// The pin plane of `layer` for the pinned owner assignment (`experts_per_layer` bytes, the
+/// shared plan: identical on every rank): expert `e`, held by `h = e % ranks`, is pinned to
+/// `h` when `h` keeps it device-resident (it exists only in `h`'s VRAM arena), otherwise
+/// [`rdna_compute::moe::QWEN4_EP_OWNER_PIN_FREE`] (a host expert is readable from every GPU
+/// over the pinned host arena's device-visible address, so any rank may compute it).
+pub fn ep_unit_pin_plane(plan: &EpUnitPlan, layer: usize) -> Vec<u8> {
+    let g = plan.geometry();
+    (0..g.experts_per_layer)
+        .map(|expert| {
+            let holder = expert % g.ranks;
+            if plan.is_resident(holder, layer, expert) {
+                // The owner-assign kernels cover at most 4 ranks; a pin byte is a rank index.
+                holder as u8
+            } else {
+                QWEN4_EP_OWNER_PIN_FREE
+            }
+        })
+        .collect()
 }
 
 /// The flag of the per-expert EP hot set (D1): an explicit `.expert-hotset`
@@ -2540,5 +2616,352 @@ mod ep_unit_stage_tests {
                 .unwrap();
         assert_eq!(off.stage, EpUnitStageCharge::default());
         assert_eq!(off.plan, forced_plan(&g, &order, budget, &[9]).unwrap());
+    }
+}
+
+/// D1.9: the pin plane, the plan-derived balance decision and the device-free equivalence of
+/// the pinned owner map with the plan.
+#[cfg(test)]
+mod ep_unit_pin_tests {
+    use super::*;
+    use rdna_compute::moe::{
+        qwen4_ep_owner_map_pinned, qwen4_ep_owner_pins_check, QWEN4_EP_OWNER_EXPERTS,
+    };
+
+    const LAYERS: usize = 3;
+    const UNIT: u64 = 512;
+    const PAD: u64 = 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+
+    fn lcg(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        *state >> 33
+    }
+
+    fn geometry(ranks: usize, experts: usize) -> EpUnitGeometry {
+        EpUnitGeometry {
+            layers: LAYERS,
+            experts_per_layer: experts,
+            ranks,
+            gate_up_bytes: UNIT / 2,
+            down_bytes: UNIT / 2,
+        }
+    }
+
+    /// A plan over a random ranking where rank `r` keeps about `kept[r]` units.
+    fn ranked_plan(ranks: usize, experts: usize, kept: &[usize], seed: u64) -> EpUnitPlan {
+        let total = LAYERS * experts;
+        let mut state = seed;
+        let mut ranking: Vec<u32> = (0..total as u32).collect();
+        for i in (1..total).rev() {
+            ranking.swap(i, lcg(&mut state) as usize % (i + 1));
+        }
+        let budgets: Vec<u64> = (0..ranks)
+            .map(|rank| match kept[rank] {
+                0 => 0,
+                kept => kept as u64 * UNIT + LAYERS as u64 * PAD,
+            })
+            .collect();
+        place_routed_experts_units(
+            &geometry(ranks, experts),
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ranking,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: budgets,
+            },
+        )
+        .unwrap()
+    }
+
+    /// 3 layers x 8 experts over 2 ranks; `hot` is ranked first, `budgets` the per-rank bytes.
+    fn small_plan(hot: &[u32], budgets: [u64; 2]) -> EpUnitPlan {
+        let mut ranking = hot.to_vec();
+        ranking.extend((0..24u32).filter(|id| !hot.contains(id)));
+        place_routed_experts_units(
+            &geometry(2, 8),
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ranking,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: budgets.to_vec(),
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_pinned_owner_switch_is_on_unless_exactly_zero() {
+        assert_eq!(EP_UNIT_PINNED_OWNERS_ENV, "HIPFIRE_EP_UNIT_PINNED_OWNERS");
+        assert!(ep_unit_pinned_owners_on(None));
+        for on in ["1", "", " 0", "0 ", "off", "true", "2"] {
+            assert!(ep_unit_pinned_owners_on(Some(on)), "{on:?}");
+        }
+        assert!(!ep_unit_pinned_owners_on(Some("0")));
+    }
+
+    #[test]
+    fn the_pin_plane_of_a_whole_layer_plan_is_all_holders_or_all_free() {
+        for ranks in [2usize, 3, 4] {
+            for vram_layers in [0usize, 1, 2, 3] {
+                let plan = place_routed_experts_units(
+                    &geometry(ranks, 512),
+                    &EpUnitSource::WholeLayers { vram_layers },
+                )
+                .unwrap();
+                for layer in 0..LAYERS {
+                    let plane = ep_unit_pin_plane(&plan, layer);
+                    assert_eq!(plane.len(), QWEN4_EP_OWNER_EXPERTS);
+                    qwen4_ep_owner_pins_check(&plane, ranks).unwrap();
+                    for (expert, &pin) in plane.iter().enumerate() {
+                        if layer < vram_layers {
+                            assert_eq!(usize::from(pin), expert % ranks);
+                        } else {
+                            assert_eq!(pin, QWEN4_EP_OWNER_PIN_FREE);
+                        }
+                    }
+                    // A whole-layer plan has the same state on every rank.
+                    assert_eq!(
+                        ep_unit_layer_balance(&plan, layer),
+                        if layer < vram_layers {
+                            EpUnitLayerBalance::StaticResident
+                        } else {
+                            EpUnitLayerBalance::BalancedHost
+                        },
+                        "ranks {ranks} vram_layers {vram_layers} layer {layer}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_pin_plane_follows_the_plan_on_mixed_layers() {
+        for ranks in [2usize, 3, 4] {
+            let plan = ranked_plan(ranks, 512, &vec![200; ranks], 0x5EED_0000 + ranks as u64);
+            for layer in 0..LAYERS {
+                let plane = ep_unit_pin_plane(&plan, layer);
+                assert_eq!(plane.len(), 512);
+                qwen4_ep_owner_pins_check(&plane, ranks).unwrap();
+                for (expert, &pin) in plane.iter().enumerate() {
+                    let holder = expert % ranks;
+                    if plan.is_resident(holder, layer, expert) {
+                        assert_eq!(usize::from(pin), holder);
+                    } else {
+                        assert_eq!(pin, QWEN4_EP_OWNER_PIN_FREE);
+                    }
+                    // Only the holder ever keeps an expert resident.
+                    for rank in (0..ranks).filter(|&rank| rank != holder) {
+                        assert!(!plan.is_resident(rank, layer, expert));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_balance_of_a_layer_is_decided_from_the_plan_for_every_rank_state_combination() {
+        use EpUnitLayerBalance::{BalancedHost, BalancedPinned, StaticResident};
+        let pad = PAD;
+        // Layer 1 holds ids 8..16: rank 0 holds the even experts, rank 1 the odd ones.
+        let balance = |plan: &EpUnitPlan| {
+            (0..LAYERS)
+                .map(|layer| ep_unit_layer_balance(plan, layer))
+                .collect::<Vec<_>>()
+        };
+        let states = |plan: &EpUnitPlan| {
+            (0..2)
+                .map(|rank| plan.layer_state(rank, 1))
+                .collect::<Vec<_>>()
+        };
+        // Host + host: today's balanced host layer (every layer of an empty budget).
+        let plan = small_plan(&[9, 11], [0, 0]);
+        assert_eq!(states(&plan), vec![EpLayerState::Host; 2]);
+        assert_eq!(balance(&plan), vec![BalancedHost; 3]);
+        // Host + mixed.
+        let plan = small_plan(&[9, 11], [0, pad + 2 * UNIT]);
+        assert_eq!(plan.layer_state(0, 1), EpLayerState::Host);
+        assert!(matches!(plan.layer_state(1, 1), EpLayerState::Mixed { .. }));
+        assert_eq!(
+            balance(&plan),
+            vec![BalancedHost, BalancedPinned, BalancedHost]
+        );
+        // Host + resident.
+        let plan = small_plan(&[9, 11, 13, 15], [0, pad + 4 * UNIT]);
+        assert_eq!(
+            states(&plan),
+            vec![EpLayerState::Host, EpLayerState::Resident]
+        );
+        assert_eq!(
+            balance(&plan),
+            vec![BalancedHost, BalancedPinned, BalancedHost]
+        );
+        // Mixed + mixed.
+        let plan = small_plan(&[8, 9, 10, 11], [pad + 2 * UNIT, pad + 2 * UNIT]);
+        assert!(matches!(plan.layer_state(0, 1), EpLayerState::Mixed { .. }));
+        assert!(matches!(plan.layer_state(1, 1), EpLayerState::Mixed { .. }));
+        assert_eq!(balance(&plan)[1], BalancedPinned);
+        // Mixed + resident.
+        let plan = small_plan(&[9, 11, 13, 15, 8], [pad + 2 * UNIT, pad + 4 * UNIT]);
+        assert!(matches!(plan.layer_state(0, 1), EpLayerState::Mixed { .. }));
+        assert_eq!(plan.layer_state(1, 1), EpLayerState::Resident);
+        assert_eq!(balance(&plan)[1], BalancedPinned);
+        // Resident + resident: the static route, no host expert anywhere in the layer.
+        let plan = small_plan(
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            [pad + 4 * UNIT, pad + 4 * UNIT],
+        );
+        assert_eq!(
+            states(&plan),
+            vec![EpLayerState::Resident, EpLayerState::Resident]
+        );
+        assert_eq!(balance(&plan)[1], StaticResident);
+        // The pin plane of every balanced-pinned layer has a pin and a free expert; the other
+        // two kinds are all-free (host) or all-pinned (resident).
+        let plane = ep_unit_pin_plane(&plan, 1);
+        assert!((0..8).all(|expert| usize::from(plane[expert]) == expert % 2));
+        let plan = small_plan(&[9, 11], [0, pad + 2 * UNIT]);
+        let plane = ep_unit_pin_plane(&plan, 1);
+        assert_eq!(
+            plane,
+            vec![
+                QWEN4_EP_OWNER_PIN_FREE,
+                1,
+                QWEN4_EP_OWNER_PIN_FREE,
+                1,
+                QWEN4_EP_OWNER_PIN_FREE,
+                QWEN4_EP_OWNER_PIN_FREE,
+                QWEN4_EP_OWNER_PIN_FREE,
+                QWEN4_EP_OWNER_PIN_FREE
+            ]
+        );
+    }
+
+    #[test]
+    fn a_balanced_layer_has_a_host_expert_on_some_rank_and_a_static_layer_has_none() {
+        for (ranks, kept, seed) in [
+            (2usize, [0usize, 0, 0, 0], 11u64),
+            (2, [60, 90, 0, 0], 12),
+            (3, [250, 120, 300, 0], 13),
+            (4, [400, 400, 400, 400], 14),
+            (4, [511, 511, 511, 511], 15),
+        ] {
+            let plan = ranked_plan(ranks, 512, &kept[..ranks], seed);
+            for layer in 0..LAYERS {
+                let any_host =
+                    (0..ranks).any(|rank| plan.layer_state(rank, layer) != EpLayerState::Resident);
+                let all_host =
+                    (0..ranks).all(|rank| plan.layer_state(rank, layer) == EpLayerState::Host);
+                let want = if !any_host {
+                    EpUnitLayerBalance::StaticResident
+                } else if all_host {
+                    EpUnitLayerBalance::BalancedHost
+                } else {
+                    EpUnitLayerBalance::BalancedPinned
+                };
+                assert_eq!(ep_unit_layer_balance(&plan, layer), want);
+                let plane = ep_unit_pin_plane(&plan, layer);
+                let pinned = plane
+                    .iter()
+                    .filter(|&&pin| pin != QWEN4_EP_OWNER_PIN_FREE)
+                    .count();
+                match want {
+                    EpUnitLayerBalance::StaticResident => assert_eq!(pinned, 512),
+                    EpUnitLayerBalance::BalancedHost => assert_eq!(pinned, 0),
+                    EpUnitLayerBalance::BalancedPinned => {
+                        assert!(pinned < 512, "a host expert exists, so some expert is free")
+                    }
+                }
+            }
+        }
+    }
+
+    /// Device-free equivalence: the pinned owner map (the byte twin of the kernel) over a
+    /// plan's pin plane gives every routed resident expert to its holder, deals the routed
+    /// free experts across the ranks within one expert of each other, and so never asks a
+    /// rank to read a peer's VRAM expert.
+    #[test]
+    fn the_pinned_owner_map_over_a_plan_keeps_residents_home_and_balances_the_free_experts() {
+        let mut state = 0x9150_0000_0000_0D19u64;
+        for ranks in [2usize, 3, 4] {
+            for (variant, kept) in [
+                [30usize, 60, 90, 120],
+                [200, 150, 100, 50],
+                [0, 300, 0, 300],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let plan = ranked_plan(
+                    ranks,
+                    512,
+                    &kept[..ranks],
+                    0xD19 + variant as u64 * 7 + ranks as u64,
+                );
+                for layer in 0..LAYERS {
+                    let pins = ep_unit_pin_plane(&plan, layer);
+                    qwen4_ep_owner_pins_check(&pins, ranks).unwrap();
+                    for slots in [1usize, 10, 40, 80, 200] {
+                        let ids: Vec<i32> = (0..slots)
+                            .map(|_| match lcg(&mut state) % 9 {
+                                0 => -1,
+                                _ => (lcg(&mut state) % 512) as i32,
+                            })
+                            .collect();
+                        let (owners, slot_owners) =
+                            qwen4_ep_owner_map_pinned(&ids, 512, ranks, &pins);
+                        let mut free_per_rank = vec![0usize; ranks];
+                        for (expert, owner) in owners.iter().enumerate() {
+                            let Some(owner) = *owner else { continue };
+                            let holder = expert % ranks;
+                            if plan.is_resident(holder, layer, expert) {
+                                assert_eq!(owner, holder, "resident expert {expert} left home");
+                            } else {
+                                assert_eq!(pins[expert], QWEN4_EP_OWNER_PIN_FREE);
+                                free_per_rank[owner] += 1;
+                            }
+                        }
+                        let (lo, hi) = (
+                            *free_per_rank.iter().min().unwrap(),
+                            *free_per_rank.iter().max().unwrap(),
+                        );
+                        assert!(
+                            hi - lo <= 1,
+                            "ranks {ranks} layer {layer} slots {slots}: free experts {free_per_rank:?}"
+                        );
+                        for (slot, &id) in ids.iter().enumerate() {
+                            let want = usize::try_from(id)
+                                .ok()
+                                .and_then(|expert| owners[expert])
+                                .map_or(-1, |owner| owner as i32);
+                            assert_eq!(slot_owners[slot], want);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A wholly-host layer's plane is all free: the pinned map equals the unpinned one, which
+    /// is why a `BalancedHost` layer keeps today's unpinned kernel.
+    #[test]
+    fn an_all_host_layer_plane_reproduces_the_unpinned_owner_map() {
+        use rdna_compute::moe::qwen4_ep_owner_map;
+        let plan = ranked_plan(3, 512, &[0, 0, 0], 77);
+        let pins = ep_unit_pin_plane(&plan, 0);
+        assert!(pins.iter().all(|&pin| pin == QWEN4_EP_OWNER_PIN_FREE));
+        let mut state = 0xFEED_0D19u64;
+        for slots in [1usize, 10, 80, 200] {
+            let ids: Vec<i32> = (0..slots).map(|_| (lcg(&mut state) % 512) as i32).collect();
+            assert_eq!(
+                qwen4_ep_owner_map_pinned(&ids, 512, 3, &pins),
+                qwen4_ep_owner_map(&ids, 512, 3)
+            );
+        }
     }
 }

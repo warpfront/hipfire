@@ -313,8 +313,11 @@ pub enum LaneExpertRoute {
     /// host-mapped balanced-live gathered runtime route, gather installed, no
     /// CPU-deferred, tier, slab, D1/D2 or pruned experts. Any per-layer mix
     /// (all resident, all mapped, or both) is the class; the measured EP2
-    /// scope carried both kinds. Set only from bound EP placement and the
-    /// installed gather, never from arch, env or layer counts.
+    /// scope carried both kinds. A per-expert unit layer (D1) joins it as the
+    /// static units kind (static owners) or, with pinned owners on, as the
+    /// balanced units kind (the pinned owner-assign kernel). Set only from
+    /// bound EP placement and the installed gather, never from arch, env or
+    /// layer counts.
     EpPackedStaticOrBalanced,
     Unclassified,
 }

@@ -23,7 +23,10 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig};
 use crate::ep_seal::Qwen4EpRankSeal;
-use crate::expert_ep_units::{EpLayerState, EpUnitLayerMap, EpUnitPlan, UnitTier};
+use crate::expert_ep_units::{
+    ep_unit_layer_balance, ep_unit_pin_plane, ep_unit_pinned_owners_on, EpLayerState,
+    EpUnitLayerBalance, EpUnitLayerMap, EpUnitPlan, UnitTier, EP_UNIT_PINNED_OWNERS_ENV,
+};
 use crate::ple_stage::{
     ple_async_upload, ple_async_upload_enabled, PleHostStage, PLE_ASYNC_UPLOAD_ENV,
 };
@@ -67,7 +70,7 @@ use hipfire_dispatch::types::DispatchError;
 use hipfire_runtime::external_rows::{RowFetch, RowTicket};
 use hipfire_runtime::multi_gpu::executor::MeshRoute;
 use hipfire_runtime::weight_manifest::ExpertSourceLayout;
-use rdna_compute::moe::Qwen4EpOwnerTables;
+use rdna_compute::moe::{qwen4_ep_owner_pins_check, Qwen4EpOwnerTables};
 use rdna_compute::replay::{ReplayState, ShadowBodyRoute};
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor, TrunkFamily};
@@ -1616,9 +1619,16 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     host_mapped: bool,
     /// The layer runs the static `e % ranks` owners although it holds host-resident experts
     /// (D1 per-expert units): a mixed arena layer, or a host layer of a unit plan whose peers
-    /// are not all host ([`ep_unit_static_owners`]). Such a layer is never a balanced layer
-    /// (no owner-assign, no live table rewrite). `false` without a unit plan.
+    /// are not all host ([`ep_unit_static_owners`]), on a load where pinned owners are not in
+    /// effect (`HIPFIRE_EP_UNIT_PINNED_OWNERS=0`, or balanced ownership not admitted:
+    /// [`ep_unit_layer_owner_kind`]). Such a layer is never a balanced layer (no owner-assign,
+    /// no live table rewrite). `false` without a unit plan.
     static_owners: bool,
+    /// The layer is a PINNED unit layer (D1.9, [`ep_unit_layer_owner_kind`]): host on some rank
+    /// but not on all, with pinned owners in effect. It is a balanced layer on every rank
+    /// (the pinned owner assignment: resident experts stay with their holder, host experts are
+    /// dealt freely), never a static-owner layer. `false` without a unit plan.
+    pinned_units: bool,
     /// Opt-in routed CPU splice, only for whole host-mapped trunk aggregates.
     pub(crate) cpu_deferred_experts: bool,
     cpu_expert_owners: Option<cpu_splice::CpuExpertOwners>,
@@ -1774,7 +1784,7 @@ impl Qwen4MoeLayerRuntime {
                 "slow-link layer {layer} is not S1 qualified: {why}"
             ))
         })?;
-        if self.static_owners {
+        if self.static_owners || self.pinned_units {
             return Err(invalid(format!(
                 "slow-link layer {layer}: a per-expert unit layer (HIPFIRE_QWEN4_EP_EXPERT_HOTSET) is not an S1 stream source"
             )));
@@ -2196,6 +2206,11 @@ pub(crate) enum EpLaneExpertKind {
     /// (D1): a mixed VRAM/host arena layer, or a host layer whose peers are not all host.
     /// Static `e % ranks` owners, never a balanced layer.
     StaticUnitsPacked,
+    /// The live balanced-ownership runtime of a PINNED unit layer (D1.9): host on some rank but
+    /// not on all, owners assigned per call by the pinned kernel (resident experts stay with
+    /// their holder, host experts are dealt freely). The rank's own layer may be mixed, host or
+    /// wholly resident.
+    BalancedUnitsPacked,
 }
 
 /// What [`classify_ep_lane_expert`] needs of one layer's [`Qwen4MoeLayerRuntime`].
@@ -2211,6 +2226,8 @@ struct EpLaneRuntimeFacts {
     /// The layer runs static owners although host-mapped (D1 unit plan, see
     /// [`Qwen4MoeLayerRuntime::static_owners`]): never balanced.
     static_owners: bool,
+    /// The layer is a pinned unit layer (see [`Qwen4MoeLayerRuntime::pinned_units`]): balanced.
+    pinned_units: bool,
 }
 
 /// Classify one EP layer's lane expert binding from plain facts: the row gather
@@ -2223,6 +2240,10 @@ struct EpLaneRuntimeFacts {
 /// (`static_owners` on both runtimes, no balanced selection). Anything
 /// else (a host-mapped layer without a live balanced runtime, a balanced
 /// selection over a resident or static-owner layer, a missing runtime) is `None`.
+///
+/// A pinned unit layer (`pinned_units` on both runtimes, no static owners) with its live
+/// balanced runtime selected is [`EpLaneExpertKind::BalancedUnitsPacked`] whatever this
+/// rank holds of it (both runtimes of a layer share the rank's local residency bit).
 fn classify_ep_lane_expert(
     layer: usize,
     gather_installed: bool,
@@ -2240,18 +2261,26 @@ fn classify_ep_lane_expert(
         }
     }
     let static_owners = (selected.static_owners, static_moe.static_owners);
+    let pinned = (selected.pinned_units, static_moe.pinned_units);
     match (
         balanced_selected,
         selected.host_mapped,
         static_moe.host_mapped,
     ) {
-        (true, true, true) if static_owners == (false, false) => {
+        (true, true, true) if static_owners == (false, false) && pinned == (false, false) => {
             Some(EpLaneExpertKind::BalancedHostMappedPacked)
         }
-        (false, false, false) if static_owners == (false, false) => {
+        (true, selected_mapped, static_mapped)
+            if selected_mapped == static_mapped
+                && static_owners == (false, false)
+                && pinned == (true, true) =>
+        {
+            Some(EpLaneExpertKind::BalancedUnitsPacked)
+        }
+        (false, false, false) if static_owners == (false, false) && pinned == (false, false) => {
             Some(EpLaneExpertKind::StaticResidentPacked)
         }
-        (false, true, true) if static_owners == (true, true) => {
+        (false, true, true) if static_owners == (true, true) && pinned == (false, false) => {
             Some(EpLaneExpertKind::StaticUnitsPacked)
         }
         _ => None,
@@ -3171,12 +3200,14 @@ fn cut_unit_windows(
 }
 
 /// Whether `rank`'s `layer` of a per-expert unit plan runs the static `e % ranks` owners
-/// although it holds host-resident experts. Balanced (live) ownership is one decision per
-/// layer across the mesh and exists only where EVERY rank holds the layer wholly in host
-/// RAM (today's host layer); a layer that is mixed on some rank, or host on this rank but
-/// not on every rank, is a static-owner layer on every rank (no owner-assign kernel pins,
-/// `OWNER-ASSIGN.md`). A whole-layer plan has the same state on every rank, so this is
-/// `false` for it. `layer` must be a planned trunk layer.
+/// although it holds host-resident experts, WITHOUT pinned owners (D1: the pin-free owner-assign
+/// kernel cannot express them; with `HIPFIRE_EP_UNIT_PINNED_OWNERS` on and balanced ownership
+/// admitted, [`ep_unit_layer_owner_kind`] makes such a layer balanced instead). Balanced (live)
+/// ownership without pins is one decision per layer across the mesh and exists only where EVERY
+/// rank holds the layer wholly in host RAM (today's host layer); a layer that is mixed on some
+/// rank, or host on this rank but not on every rank, is a static-owner layer on every rank. A
+/// whole-layer plan has the same state on every rank, so this is `false` for it. `layer` must
+/// be a planned trunk layer.
 pub(crate) fn ep_unit_static_owners(plan: &EpUnitPlan, rank: usize, layer: usize) -> bool {
     let all_host =
         (0..plan.geometry().ranks).all(|peer| plan.layer_state(peer, layer) == EpLayerState::Host);
@@ -3226,6 +3257,24 @@ pub(crate) fn ep_unit_plan_split_refusal(
     Ok(())
 }
 
+/// How a trunk layer of a unit plan takes its owners on `rank`: `(static_owners, pinned_units)`.
+/// `pins_on` is [`qwen4_ep_unit_pins_admitted`]. With pinned owners in effect, a
+/// [`EpUnitLayerBalance::BalancedPinned`] layer is a balanced (pinned) layer on every rank and
+/// not a static-owner layer; every other layer, and every layer with pinned owners off, keeps
+/// D1's rule ([`ep_unit_static_owners`]: static owners on a host-bearing layer whose peers are
+/// not all host). `layer` must be a planned trunk layer.
+pub(crate) fn ep_unit_layer_owner_kind(
+    plan: &EpUnitPlan,
+    rank: usize,
+    layer: usize,
+    pins_on: bool,
+) -> (bool, bool) {
+    if pins_on && ep_unit_layer_balance(plan, layer) == EpUnitLayerBalance::BalancedPinned {
+        (false, true)
+    } else {
+        (ep_unit_static_owners(plan, rank, layer), false)
+    }
+}
 /// Refuse a feature that needs whole-layer expert tensors (the EP reserve's scratch
 /// donors) on a load whose unit plan splits any layer (the loader already forces these
 /// features off; this is the belt-and-braces admission check). The G2 expert stage is
@@ -3364,6 +3413,20 @@ pub(crate) fn qwen4_ep_balanced_owners_refusal(arch: &str, ranks: usize) -> Opti
     } else {
         None
     }
+}
+
+/// Whether the unit layers of an EP rank on `arch` with `ranks` ranks run pinned owners
+/// (D1.9): a unit plan's layer that is host on some rank but not on all becomes a balanced
+/// layer under the pinned owner-assign kernel. Needs `HIPFIRE_EP_UNIT_PINNED_OWNERS` not
+/// exactly `0` and balanced ownership itself on and admitted ([`qwen4_ep_balanced_owners_enabled`],
+/// [`qwen4_ep_balanced_owners_refusal`]); otherwise those layers run D1's static owners.
+pub(crate) fn qwen4_ep_unit_pins_admitted(arch: &str, ranks: usize) -> bool {
+    ep_unit_pinned_owners_on(
+        hipfire_config::developer_var(EP_UNIT_PINNED_OWNERS_ENV)
+            .ok()
+            .as_deref(),
+    ) && qwen4_ep_balanced_owners_enabled()
+        && qwen4_ep_balanced_owners_refusal(arch, ranks).is_none()
 }
 
 /// `HIPFIRE_EP_OWNER_ROUTED_PREFILL` (default ON under EP, N = 2..=8; `=0` is the kill switch):
@@ -3602,13 +3665,40 @@ pub(crate) struct Qwen4BalancedLayer {
     /// The layer's label (`layer.layer`, what the dispatch hook is called with).
     label: usize,
     tables: Qwen4EpOwnerTables,
+    /// A pinned unit layer's pin plane (D1.9): a device `u8[512]`, one owner rank or `0xFF`
+    /// per expert ([`ep_unit_pin_plane`], checked with [`qwen4_ep_owner_pins_check`]), uploaded
+    /// once at attach and read by every launch of the pinned owner assignment. `None` for an
+    /// unpinned balanced layer (the unpinned kernel). Freed with the layer.
+    pins: Option<GpuTensor>,
 }
 
-/// What the row-gather hook needs of a rank's balanced layers: the owner-assign
-/// table addresses per layer label and a non-owning view of the rank's
+impl Qwen4BalancedLayer {
+    /// Free the live runtime and the pin plane; the first error is returned.
+    fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
+        let mut first = self.live.free_gpu(gpu);
+        if let Some(pins) = self.pins {
+            if let Err(error) = gpu.free_tensor(pins) {
+                first.get_or_insert(error);
+            }
+        }
+        first
+    }
+}
+
+/// One balanced layer as the row-gather hook sees it: its owner-assign table addresses and,
+/// for a pinned unit layer, a non-owning alias of its pin plane (owned by the
+/// [`Qwen4BalancedLayer`], freed with [`Qwen4ForwardEp`]).
+pub(crate) struct Qwen4BalancedPlanLayer {
+    pub(crate) label: usize,
+    pub(crate) tables: Qwen4EpOwnerTables,
+    pub(crate) pins: Option<GpuTensor>,
+}
+
+/// What the row-gather hook needs of a rank's balanced layers: the owner-assign table addresses
+/// (and pin plane) per layer label and a non-owning view of the rank's
 /// `slot_owner` buffer (owned by [`Qwen4ForwardEp`], freed with it).
 pub(crate) struct Qwen4BalancedPlan {
-    pub(crate) layers: Vec<(usize, Qwen4EpOwnerTables)>,
+    pub(crate) layers: Vec<Qwen4BalancedPlanLayer>,
     pub(crate) slot_owner: GpuTensor,
 }
 
@@ -3698,7 +3788,7 @@ impl Qwen4ForwardEp {
             }
         }
         for layer in self.balanced.into_iter().flatten() {
-            if let Some(error) = layer.live.free_gpu(gpu) {
+            if let Some(error) = layer.free_gpu(gpu) {
                 first.get_or_insert(error);
             }
         }
@@ -4218,12 +4308,18 @@ impl Qwen4MoeLayerRuntime {
             host_base: unit.host.buf.as_ptr() as usize,
             host_bytes: unit.host.buf.size(),
         });
-        let static_owners = match (unit_trunk, weights.ep_unit_plan(), weights.ep_placement()) {
-            (true, Some(plan), Some(placement)) if layer_label < plan.geometry().layers => {
-                ep_unit_static_owners(plan, placement.rank, layer_label)
-            }
-            _ => false,
-        };
+        let (static_owners, pinned_units) =
+            match (unit_trunk, weights.ep_unit_plan(), weights.ep_placement()) {
+                (true, Some(plan), Some(placement)) if layer_label < plan.geometry().layers => {
+                    ep_unit_layer_owner_kind(
+                        plan,
+                        placement.rank,
+                        layer_label,
+                        qwen4_ep_unit_pins_admitted(&gpu.arch, placement.ranks),
+                    )
+                }
+                _ => (false, false),
+            };
         if unit_arenas.is_some()
             && (tier_layer.is_some()
                 || moe.expert_arena.is_some()
@@ -4982,6 +5078,7 @@ impl Qwen4MoeLayerRuntime {
             fp8: fp8_tables.is_some(),
             host_mapped: local_host_mapped,
             static_owners,
+            pinned_units,
             cpu_deferred_experts,
             cpu_expert_owners,
             cpu_cold_owners,
@@ -5436,6 +5533,7 @@ impl Qwen4MoeLayerRuntime {
             fp8: false,
             host_mapped,
             static_owners: false,
+            pinned_units: false,
             cpu_deferred_experts: false,
             cpu_expert_owners: None,
             cpu_cold_owners,
@@ -5678,6 +5776,7 @@ impl Qwen4MoeLayerRuntime {
             label: self.label,
             host_mapped: self.host_mapped,
             static_owners: self.static_owners,
+            pinned_units: self.pinned_units,
             packed_mq4: !self.experts.is_empty() && self.qt44_qt53_formats(),
             plain: !self.cpu_deferred_experts
                 && self.cpu_expert_owners.is_none()
@@ -12360,11 +12459,22 @@ impl Qwen4GpuForward {
     pub(crate) fn balanced_plan(&self) -> Option<Qwen4BalancedPlan> {
         let ep = self.ep.as_ref()?;
         let owners = ep.slot_owner.as_ref()?;
-        let layers: Vec<(usize, Qwen4EpOwnerTables)> = ep
+        let layers: Vec<Qwen4BalancedPlanLayer> = ep
             .balanced
             .iter()
             .flatten()
-            .map(|layer| (layer.label, layer.tables))
+            .map(|layer| Qwen4BalancedPlanLayer {
+                label: layer.label,
+                tables: layer.tables,
+                pins: layer.pins.as_ref().map(|pins| GpuTensor {
+                    // SAFETY: a `Borrowed` alias of the pin plane the balanced layer owns until
+                    // `Qwen4ForwardEp::free_gpu`; the hook that holds it lives inside that
+                    // forward and is never used after the forward is freed.
+                    buf: unsafe { pins.buf.alias() },
+                    shape: pins.shape.clone(),
+                    dtype: pins.dtype,
+                }),
+            })
             .collect();
         if layers.is_empty() {
             return None;
@@ -12451,6 +12561,16 @@ impl Qwen4GpuForward {
                 balanced_on = false;
             }
         }
+        // Pinned unit layers (D1.9): a unit plan's layer that is host on some rank but not on
+        // all balances under the pinned kernel (resident experts pinned to their holder). Off with
+        // `HIPFIRE_EP_UNIT_PINNED_OWNERS=0` (D1: static owners there) or when balanced ownership
+        // itself is off or refused.
+        let pins_on = balanced_on
+            && ep_unit_pinned_owners_on(
+                hipfire_config::developer_var(EP_UNIT_PINNED_OWNERS_ENV)
+                    .ok()
+                    .as_deref(),
+            );
         let dummy = ep.dummy.source();
         let seal = ep.seal.clone();
         let layer_peers_of =
@@ -12510,21 +12630,43 @@ impl Qwen4GpuForward {
                 }
             }
             // Balanced ownership (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0` disables): every
-            // host-mapped trunk layer gets a live runtime of the same full
+            // balanced trunk layer gets a live runtime of the same full
             // addressing, whose tables the per-call owner assignment
             // rewrites. Nothing is built, allocated or loaded when off.
+            // Without a unit plan the balanced layers are the host-mapped ones, as ever. With a
+            // unit plan (D1) the plan decides ([`ep_unit_layer_balance`], the same on every
+            // rank): its all-host layers as today (unpinned kernel) and, unless
+            // `HIPFIRE_EP_UNIT_PINNED_OWNERS=0`, every layer that is host on some rank but not
+            // on all (pinned kernel: a resident expert stays with its holder, host experts are
+            // free), whatever this rank holds of the layer.
             if balanced_on {
+                let unit_plan = bundle.weights.ep_unit_plan();
                 let mut ordinal = 0usize;
                 for layer in &bundle.weights.layer_refs {
                     let Some(weights) = layer.ffn.moe() else {
                         continue;
                     };
                     let (host_mapped, static_owners, symmetric, all_mq4) = moe_traits[ordinal];
-                    if !host_mapped || static_owners {
+                    let unit_balance = unit_plan
+                        .filter(|plan| layer.layer < plan.geometry().layers)
+                        .map(|plan| ep_unit_layer_balance(plan, layer.layer));
+                    let selected = match unit_balance {
+                        None => host_mapped && !static_owners,
+                        Some(EpUnitLayerBalance::BalancedHost) => true,
+                        Some(EpUnitLayerBalance::BalancedPinned) => pins_on,
+                        Some(EpUnitLayerBalance::StaticResident) => false,
+                    };
+                    if !selected {
                         balanced.push(None);
                         ordinal += 1;
                         continue;
                     }
+                    let pin_plane = match (unit_plan, unit_balance) {
+                        (Some(plan), Some(EpUnitLayerBalance::BalancedPinned)) => {
+                            Some(ep_unit_pin_plane(plan, layer.layer))
+                        }
+                        _ => None,
+                    };
                     let owners = match slot_owner.as_ref() {
                         Some(owners) => owners.buf.as_ptr() as usize,
                         None => {
@@ -12566,12 +12708,41 @@ impl Qwen4GpuForward {
                         dummy_gate_up: dummy.gate_up_base,
                         dummy_down: dummy.down_base,
                     };
+                    // The pin plane is the same on every rank (the plan is shared) and uploaded
+                    // once here; `upload_raw` is a blocking copy, and the device is synchronized
+                    // below before any launch reads it. A pinned expert is owned by its holder, so
+                    // the peer-VRAM addresses of a resident expert in the full table are never
+                    // read across ranks; only host experts (device-visible over UVA) move.
+                    let pins = match pin_plane {
+                        Some(host_pins) => {
+                            if let Err(why) = qwen4_ep_owner_pins_check(&host_pins, placement.ranks)
+                            {
+                                let _ = live.free_gpu(gpu);
+                                return Err(invalid(format!(
+                                    "layer {} pinned owner plane: {why}",
+                                    layer.layer
+                                )));
+                            }
+                            match gpu.upload_raw(&host_pins, &[host_pins.len()]) {
+                                Ok(tensor) => Some(tensor),
+                                Err(error) => {
+                                    let _ = live.free_gpu(gpu);
+                                    return Err(error.into());
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     balanced.push(Some(Qwen4BalancedLayer {
                         live,
                         label: layer.layer,
                         tables,
+                        pins,
                     }));
                     ordinal += 1;
+                }
+                if balanced.iter().flatten().any(|layer| layer.pins.is_some()) {
+                    gpu.hip.device_synchronize()?;
                 }
             }
             Ok(())
@@ -12581,7 +12752,7 @@ impl Qwen4GpuForward {
                 let _ = layer.free_gpu(gpu);
             }
             for layer in balanced.into_iter().flatten() {
-                let _ = layer.live.free_gpu(gpu);
+                let _ = layer.free_gpu(gpu);
             }
             if let Some(tensor) = slot_owner {
                 let _ = gpu.free_tensor(tensor);
@@ -12589,8 +12760,18 @@ impl Qwen4GpuForward {
             return Err(error);
         }
         if balanced_on {
+            let pinned = balanced
+                .iter()
+                .flatten()
+                .filter(|layer| layer.pins.is_some())
+                .count();
+            let unit_note = if bundle.weights.ep_unit_plan().is_some() {
+                format!(", {pinned} of them pinned unit layers")
+            } else {
+                String::new()
+            };
             eprintln!(
-                "qwen4 EP rank {}/{}: balanced ownership on {} host-mapped MoE layers",
+                "qwen4 EP rank {}/{}: balanced ownership on {} host-mapped MoE layers{unit_note}",
                 placement.rank,
                 placement.ranks,
                 balanced.iter().flatten().count()
@@ -16527,6 +16708,7 @@ mod ep_table_tests {
             packed_mq4: true,
             plain: true,
             static_owners: false,
+            pinned_units: false,
         }
     }
 
@@ -16643,6 +16825,72 @@ mod ep_table_tests {
             });
             assert_eq!(kind(3, true, false, bad, bad), None);
         }
+        // Pinned unit layers (D1.9, `HIPFIRE_EP_UNIT_PINNED_OWNERS` on): balanced on every rank
+        // whatever it holds of the layer (mixed or host: mapped; wholly resident: unmapped), and
+        // never a static-owner layer.
+        use super::EpLaneExpertKind::BalancedUnitsPacked;
+        let pinned = |label, host_mapped| {
+            Some(super::EpLaneRuntimeFacts {
+                pinned_units: true,
+                ..ep_runtime(label, host_mapped)
+            })
+        };
+        for mapped in [true, false] {
+            let layer = pinned(3, mapped);
+            assert_eq!(
+                kind(3, true, true, layer, layer),
+                Some(BalancedUnitsPacked),
+                "mapped {mapped}"
+            );
+            // No live balanced runtime selected, or no gather: not proven.
+            assert_eq!(kind(3, true, false, layer, layer), None);
+            assert_eq!(kind(3, false, true, layer, layer), None);
+            // Both runtimes of one layer agree on the pinned flag and on the residency.
+            assert_eq!(
+                kind(3, true, true, layer, Some(ep_runtime(3, mapped))),
+                None
+            );
+            assert_eq!(
+                kind(3, true, true, Some(ep_runtime(3, mapped)), layer),
+                None
+            );
+            assert_eq!(kind(3, true, true, layer, pinned(3, !mapped)), None);
+            // A pinned layer is not a static-owner layer.
+            let odd = Some(super::EpLaneRuntimeFacts {
+                static_owners: true,
+                ..ep_runtime(3, mapped)
+            })
+            .map(|facts| super::EpLaneRuntimeFacts {
+                pinned_units: true,
+                ..facts
+            });
+            assert_eq!(kind(3, true, true, odd, odd), None);
+            // Label, packed and plain facts still gate it.
+            assert_eq!(
+                kind(3, true, true, pinned(4, mapped), pinned(4, mapped)),
+                None
+            );
+            for (packed_mq4, plain) in [(false, true), (true, false)] {
+                let bad = Some(super::EpLaneRuntimeFacts {
+                    packed_mq4,
+                    plain,
+                    pinned_units: true,
+                    ..ep_runtime(3, mapped)
+                });
+                assert_eq!(kind(3, true, true, bad, bad), None);
+            }
+        }
+        // A pinned layer is never classified as today's plain balanced host layer, nor as a
+        // static resident layer.
+        let pinned_host = pinned(3, true);
+        assert_ne!(
+            kind(3, true, true, pinned_host, pinned_host),
+            Some(BalancedHostMappedPacked)
+        );
+        assert_ne!(
+            kind(3, true, false, pinned(3, false), pinned(3, false)),
+            Some(StaticResidentPacked)
+        );
     }
 
     fn peers(ranks: usize) -> Vec<Qwen4PeerExpertSource> {
@@ -17386,6 +17634,83 @@ mod ep_table_tests {
                 refusal(&whole, "the EP reserve", Some(&[0])).is_ok(),
                 vram_layers >= 1
             );
+        }
+    }
+
+    /// `(static_owners, pinned_units)` of a unit layer with the pinned switch on and off: with
+    /// it on, a layer that is host on some rank but not on all is balanced (pinned) on EVERY
+    /// rank; with it off (`HIPFIRE_EP_UNIT_PINNED_OWNERS=0`) D1's static owners; all-host and
+    /// all-resident layers and whole-layer plans are the same either way.
+    #[test]
+    fn ep_unit_layer_owner_kind_follows_the_pinned_switch() {
+        use super::ep_unit_layer_owner_kind as kind;
+        for ranks in [2usize, 3] {
+            for vram_layers in [0usize, 1, 2] {
+                let plan = place_routed_experts_units(
+                    &unit_geometry(ranks),
+                    &EpUnitSource::WholeLayers { vram_layers },
+                )
+                .unwrap();
+                for pins_on in [false, true] {
+                    for rank in 0..ranks {
+                        for layer in 0..UNIT_LAYERS {
+                            assert_eq!(kind(&plan, rank, layer, pins_on), (false, false));
+                        }
+                    }
+                }
+            }
+        }
+        let geometry = EpUnitGeometry {
+            layers: 3,
+            experts_per_layer: 8,
+            ranks: 2,
+            gate_up_bytes: 256,
+            down_bytes: 256,
+        };
+        let plan_of = |hot: &[u32], budgets: [u64; 2]| {
+            let mut ranking = hot.to_vec();
+            ranking.extend((0..24u32).filter(|id| !hot.contains(id)));
+            place_routed_experts_units(
+                &geometry,
+                &EpUnitSource::Ranking {
+                    ranking: EpRanking {
+                        rank: &ranking,
+                        counts: None,
+                        sha256: None,
+                    },
+                    rank_budget_bytes: budgets.to_vec(),
+                },
+            )
+            .unwrap()
+        };
+        let pad = 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        // Host beside mixed (layer 1); layers 0 and 2 all host.
+        let plan = plan_of(&[9, 11], [0, pad + 2 * 512]);
+        for rank in 0..2 {
+            assert_eq!(kind(&plan, rank, 1, true), (false, true), "rank {rank}");
+            assert_eq!(kind(&plan, rank, 1, false), (true, false), "rank {rank}");
+            for layer in [0, 2] {
+                for pins_on in [false, true] {
+                    assert_eq!(kind(&plan, rank, layer, pins_on), (false, false));
+                }
+            }
+        }
+        // Host beside wholly resident (layer 1): rank 1's layer is balanced with every pin its own,
+        // but static (not host-bearing) when pins are off, exactly as D1.
+        let plan = plan_of(&[9, 11, 13, 15], [0, pad + 4 * 512]);
+        assert_eq!(kind(&plan, 0, 1, true), (false, true));
+        assert_eq!(kind(&plan, 1, 1, true), (false, true));
+        assert_eq!(kind(&plan, 0, 1, false), (true, false));
+        assert_eq!(kind(&plan, 1, 1, false), (false, false));
+        // Every owned expert of layer 1 resident on both ranks: nothing to balance.
+        let plan = plan_of(
+            &[8, 9, 10, 11, 12, 13, 14, 15],
+            [pad + 4 * 512, pad + 4 * 512],
+        );
+        for rank in 0..2 {
+            for pins_on in [false, true] {
+                assert_eq!(kind(&plan, rank, 1, pins_on), (false, false));
+            }
         }
     }
 }

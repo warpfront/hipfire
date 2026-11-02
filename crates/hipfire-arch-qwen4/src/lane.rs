@@ -189,9 +189,11 @@ struct EpOwnedLayer {
 /// resident (the static runtime) or both host-mapped (the live balanced
 /// runtime), or a host-bearing layer of a per-expert unit plan (a mixed
 /// VRAM/host arena layer: the static-owner units kind, which is host-mapped
-/// and never balanced), and the forward's kind agreeing with that residence.
-/// Any mix of the kinds across layers qualifies; there is no layer, expert or
-/// rank count in the rule. An empty band owns nothing to classify.
+/// and never balanced, when pinned owners are off), or a PINNED unit layer (D1.9:
+/// the balanced units kind, whatever this rank holds of the layer, so mapped or
+/// not, with its live balanced runtime selected), and the forward's kind agreeing
+/// with that residence. Any mix of the kinds across layers qualifies; there is no
+/// layer, expert or rank count in the rule. An empty band owns nothing to classify.
 fn classify_ep_layers(layers: impl IntoIterator<Item = Option<EpOwnedLayer>>) -> LaneExpertRoute {
     let mut owned = false;
     for layer in layers {
@@ -203,6 +205,7 @@ fn classify_ep_layers(layers: impl IntoIterator<Item = Option<EpOwnedLayer>>) ->
                     (Some(EpLaneExpertKind::StaticResidentPacked), false)
                         | (Some(EpLaneExpertKind::BalancedHostMappedPacked), true)
                         | (Some(EpLaneExpertKind::StaticUnitsPacked), true)
+                        | (Some(EpLaneExpertKind::BalancedUnitsPacked), _)
                 )
         });
         if !valid {
@@ -260,7 +263,8 @@ fn ep_owned_layer(
         return None;
     }
     // A mixed layer of a per-expert unit plan has no aggregate tensors (`resident` of them
-    // fails): its arenas are the frozen QT44/QT53 pair, host-bearing, bound as the units kind.
+    // fails): its arenas are the frozen QT44/QT53 pair, host-bearing, bound as the units kind
+    // (static owners, or the balanced pinned kind when pinned owners are on).
     match weights.ep_unit_layer(absolute) {
         Ok(Some(_)) => {
             return Some(EpOwnedLayer {
@@ -3797,7 +3801,8 @@ mod tests {
     }
 
     /// A host-bearing layer of a per-expert unit plan (D1) is valid only as the static units
-    /// kind, and that kind only on a host-bearing layer.
+    /// kind (pinned owners off), and that kind only on a host-bearing layer, or, with pinned
+    /// owners on (D1.9), as the balanced units kind of a pinned layer.
     #[test]
     fn ep_class_takes_a_unit_layer_only_as_the_static_units_kind() {
         let unclassified = LaneExpertRoute::Unclassified;
@@ -3846,6 +3851,43 @@ mod tests {
             ..layer
         }));
         assert_eq!(classify_ep_layers(band), unclassified);
+        // A pinned unit layer (D1.9) is the balanced units kind whatever its residence: mapped
+        // (mixed or host) or not (wholly resident beside a host peer).
+        for mapped in [true, false] {
+            let pinned = unit(mapped, EpLaneExpertKind::BalancedUnitsPacked);
+            let mut band = ep_band(27, 20);
+            band.push(pinned);
+            assert_eq!(
+                classify_ep_layers(band),
+                LaneExpertRoute::EpPackedStaticOrBalanced
+            );
+            assert_eq!(
+                classify_ep_layers([pinned]),
+                LaneExpertRoute::EpPackedStaticOrBalanced
+            );
+            // The other kinds keep their residence rule.
+            assert_eq!(
+                classify_ep_layers([pinned.map(|layer| EpOwnedLayer {
+                    kind: None,
+                    ..layer
+                })]),
+                unclassified
+            );
+            assert_eq!(
+                classify_ep_layers([pinned.map(|layer| EpOwnedLayer {
+                    down_mapped: !mapped,
+                    ..layer
+                })]),
+                unclassified
+            );
+            assert_eq!(
+                classify_ep_layers([pinned.map(|layer| EpOwnedLayer {
+                    qt: Some(expert_capabilities::QT_E8P),
+                    ..layer
+                })]),
+                unclassified
+            );
+        }
     }
 
     #[test]

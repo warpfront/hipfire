@@ -516,6 +516,11 @@ pub(crate) struct Qwen4EpRowGatherHook {
 struct BalancedOwners {
     /// Owner-assign table addresses indexed by trunk layer label.
     tables: Vec<Option<Qwen4EpOwnerTables>>,
+    /// Pin plane per trunk layer label: `Some` for a PINNED unit layer (D1.9: the pinned
+    /// owner assignment, resident experts stay with their holder), `None` for every other
+    /// balanced layer (the unpinned kernel). Non-owning aliases (the forward owns the planes);
+    /// a mutex makes the hook `Sync`, a launch locks it only to name the device address.
+    pins: Vec<Option<Mutex<GpuTensor>>>,
     /// Non-owning view of the rank's slot-owner buffer (the forward owns it).
     slot_owner: Mutex<GpuTensor>,
 }
@@ -612,18 +617,22 @@ impl Qwen4EpRowGatherHook {
     /// Install the rank's balanced layers (once, after `attach_ep`).
     fn install_balanced(&self, plan: Qwen4BalancedPlan) -> Result<(), String> {
         let mut tables: Vec<Option<Qwen4EpOwnerTables>> = vec![None; self.trunk_layers];
-        for (label, layer_tables) in plan.layers {
-            let slot = tables.get_mut(label).ok_or_else(|| {
+        let mut pins: Vec<Option<Mutex<GpuTensor>>> =
+            (0..self.trunk_layers).map(|_| None).collect();
+        for layer in plan.layers {
+            let slot = tables.get_mut(layer.label).ok_or_else(|| {
                 format!(
-                    "qwen4 EP rank {}: balanced layer {label} is outside the {} trunk layers",
-                    self.rank, self.trunk_layers
+                    "qwen4 EP rank {}: balanced layer {} is outside the {} trunk layers",
+                    self.rank, layer.label, self.trunk_layers
                 )
             })?;
-            *slot = Some(layer_tables);
+            *slot = Some(layer.tables);
+            pins[layer.label] = layer.pins.map(Mutex::new);
         }
         self.balanced
             .set(BalancedOwners {
                 tables,
+                pins,
                 slot_owner: Mutex::new(plan.slot_owner),
             })
             .map_err(|_| {
@@ -728,24 +737,42 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         slots: usize,
         topk_indices: &GpuTensor,
     ) -> Result<(), String> {
-        let tables = self
-            .balanced
-            .get()
-            .and_then(|balanced| balanced.layer(layer_idx, self.trunk_layers))
+        let balanced = self.balanced.get().ok_or_else(|| {
+            format!(
+                "qwen4 EP rank {}: layer {layer_idx} is not a balanced trunk layer",
+                self.rank
+            )
+        })?;
+        let tables = balanced
+            .layer(layer_idx, self.trunk_layers)
             .ok_or_else(|| {
                 format!(
                     "qwen4 EP rank {}: layer {layer_idx} is not a balanced trunk layer",
                     self.rank
                 )
             })?;
-        gpu.qwen4_ep_owner_assign(
-            topk_indices,
-            slots,
-            self.gather.spec().ranks,
-            self.rank,
-            tables,
-        )
-        .map_err(|error| {
+        let ranks = self.gather.spec().ranks;
+        // A pinned unit layer takes the pinned kernel with its pin plane; every other balanced
+        // layer keeps the unpinned kernel. Both write the same live tables and slot owners.
+        let launched = match balanced
+            .pins
+            .get(usize::from(layer_idx))
+            .and_then(Option::as_ref)
+        {
+            Some(pins) => {
+                let pins = lock(pins);
+                gpu.qwen4_ep_owner_assign_pinned(
+                    topk_indices,
+                    slots,
+                    ranks,
+                    self.rank,
+                    tables,
+                    &pins,
+                )
+            }
+            None => gpu.qwen4_ep_owner_assign(topk_indices, slots, ranks, self.rank, tables),
+        };
+        launched.map_err(|error| {
             format!(
                 "qwen4 EP owner assignment layer {layer_idx} rank {}: {error}",
                 self.rank
