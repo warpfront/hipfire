@@ -6276,6 +6276,17 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
         }
     }
 
+    fn session_commit_live_mesh(
+        &mut self,
+        gpus: &mut hipfire_runtime::multi_gpu::Gpus,
+        consumed: &[u32],
+    ) {
+        if self.pp.is_some() {
+            return self.pp_session_commit_live(gpus, consumed);
+        }
+        hipfire_runtime::arch_model::ArchModel::session_commit_live(self, consumed)
+    }
+
     fn map_ahead_for_decode(
         &mut self,
         gpu: &mut Gpu,

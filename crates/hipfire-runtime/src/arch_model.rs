@@ -206,6 +206,13 @@ pub trait ArchModel: Send + std::any::Any {
         self.reset_session_state(gpu)
     }
 
+    /// [`Self::session_commit_live`] for a model run with the daemon's mesh
+    /// `Gpus` (a pipeline-parallel model publishes every band). Default is
+    /// the single-device commit.
+    fn session_commit_live_mesh(&mut self, _gpus: &mut Gpus, consumed: &[u32]) {
+        self.session_commit_live(consumed)
+    }
+
     /// [`Self::map_ahead_for_decode`] for a model that owns a mesh lifecycle:
     /// grow every rank's context-sized state. Default is the single-device
     /// map-ahead on the daemon `gpu`.
