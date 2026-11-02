@@ -1989,6 +1989,9 @@ mod tests {
         late: usize,
         steps: usize,
     ) -> Option<(Vec<usize>, Vec<Vec<u32>>)> {
+        // The terminal registry is process-global and other lib tests clear it
+        // wholesale: hold the crate's generation test lock for the whole run.
+        let _registry = crate::ar::generation_test_lock();
         use hipfire_engine::scheduler::{
             BatchPendingRequest, BatchSampling, ContinuousBatchScheduler,
         };
