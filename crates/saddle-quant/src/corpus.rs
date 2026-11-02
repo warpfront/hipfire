@@ -27,6 +27,9 @@ pub struct CorpusSpec {
     pub prose: Vec<PathBuf>,
     pub conversations: Vec<PathBuf>,
     pub chat_template: Option<PathBuf>,
+    /// The target model's EOS token text (e.g. `</s>`), bound as `eos_token`;
+    /// Mistral and TinyLlama templates append it to turns.
+    pub eos_token: String,
     pub separator: String,
 }
 
@@ -128,8 +131,12 @@ struct Conversation {
     tools: Option<serde_json::Value>,
 }
 
-/// Normalize `tool_calls[].function.arguments` that arrived as a JSON string
-/// into a JSON object so Qwen-style templates can index into it as a dict.
+/// Normalize messages for HF-style templates.
+///
+/// * Drops an empty `tool_calls` list, as the daemon does: Llama-3 and Mistral
+///   templates test `tool_calls is defined` and refuse an empty list.
+/// * Parses `tool_calls[].function.arguments` that arrived as a JSON string
+///   into a JSON object so Qwen-style templates can index into it as a dict.
 ///
 /// The v6 recipe stores arguments as a dict, but some encoders serialize that
 /// dict to a string. Templates such as `{{ message.tool_calls[0].function.arguments.city }}`
@@ -139,6 +146,13 @@ fn normalize_arguments_in_messages(messages: &mut [serde_json::Value]) {
         let Some(obj) = msg.as_object_mut() else {
             continue;
         };
+        if obj
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.is_empty())
+        {
+            obj.remove("tool_calls");
+        }
         let Some(tcs) = obj.get_mut("tool_calls") else {
             continue;
         };
@@ -174,11 +188,17 @@ fn normalize_arguments_in_messages(messages: &mut [serde_json::Value]) {
 /// `json` is the full content of a v6 `v6_conversations.json` file.
 /// `template_src` is the Jinja source of the target model's chat template.
 ///
-/// Binds `messages`, `tools`, and `add_generation_prompt = false`.
+/// `eos_token` is the target model's EOS token text.
+///
+/// Binds `messages`, `tools`, `eos_token`, and `add_generation_prompt = false`.
 ///
 /// Returns `QuantError::Malformed` with the failing conversation index on
 /// parse or render failure.
-pub fn render_conversations(json: &str, template_src: &str) -> Result<Vec<String>> {
+pub fn render_conversations(
+    json: &str,
+    template_src: &str,
+    eos_token: &str,
+) -> Result<Vec<String>> {
     let doc: Doc = serde_json::from_str(json)
         .map_err(|e| QuantError::Malformed(format!("conversations parse: {e}")))?;
 
@@ -214,6 +234,7 @@ pub fn render_conversations(json: &str, template_src: &str) -> Result<Vec<String
         let ctx = minijinja::context! {
             messages => messages_val,
             tools => tools_val,
+            eos_token => eos_token,
             add_generation_prompt => false,
         };
         let rendered = tmpl
@@ -250,7 +271,7 @@ pub fn build(spec: &CorpusSpec) -> Result<BuiltCorpus> {
             let template_src = std::fs::read_to_string(tmpl_path)?;
             for conv_path in &spec.conversations {
                 let json = std::fs::read_to_string(conv_path)?;
-                let rendered = render_conversations(&json, &template_src)?;
+                let rendered = render_conversations(&json, &template_src, &spec.eos_token)?;
                 n_conversations += rendered.len();
                 parts.extend(rendered);
             }
@@ -313,11 +334,33 @@ mod tests {
         .to_string()
     }
 
+    const EOS: &str = "<|endoftext|>";
+
+    /// Mistral v0.3 / Llama-3 shape: `+ eos_token` on assistant turns, and a
+    /// `tool_calls is defined` branch that refuses anything but one call.
+    #[test]
+    fn render_binds_eos_token_and_drops_empty_tool_calls() {
+        let tmpl = "{% for m in messages %}{% if m.role == 'user' %}[INST] {{ m.content }}[/INST]{% elif m.tool_calls is defined %}{% if m.tool_calls | length != 1 %}{{ raise_exception('single tool-calls only') }}{% endif %}[TOOL_CALLS]{% else %}{{ ' ' + m.content + eos_token }}{% endif %}{% endfor %}";
+        let json = serde_json::json!({
+            "conversations": [{
+                "messages": [
+                    {"role": "user", "content": "a"},
+                    {"role": "assistant", "content": "b", "tool_calls": []},
+                    {"role": "user", "content": "c"},
+                    {"role": "assistant", "content": "d"}
+                ]
+            }]
+        })
+        .to_string();
+        let rendered = render_conversations(&json, tmpl, "</s>").expect("render");
+        assert_eq!(rendered, vec!["[INST] a[/INST] b</s>[INST] c[/INST] d</s>"]);
+    }
+
     #[test]
     fn render_chatml_contains_markers_and_both_contents() {
         let json = conversations_json_one_user_one_assistant();
         let tmpl = qwen_chatml_template();
-        let rendered = render_conversations(&json, tmpl).expect("render should succeed");
+        let rendered = render_conversations(&json, tmpl, EOS).expect("render should succeed");
         assert_eq!(rendered.len(), 1);
         let r = &rendered[0];
         assert!(r.contains("<|im_start|>"), "missing <|im_start|> in {r:?}");
@@ -369,7 +412,7 @@ mod tests {
             ]
         })
         .to_string();
-        let rendered = render_conversations(&json, tmpl).expect("tool_calls render failed");
+        let rendered = render_conversations(&json, tmpl, EOS).expect("tool_calls render failed");
         assert_eq!(rendered.len(), 1);
         assert!(
             rendered[0].contains("Paris"),
@@ -419,7 +462,8 @@ mod tests {
             ]
         })
         .to_string();
-        let rendered = render_conversations(&json, tmpl).expect("reasoning/tool render failed");
+        let rendered =
+            render_conversations(&json, tmpl, EOS).expect("reasoning/tool render failed");
         assert_eq!(rendered.len(), 1);
         assert!(rendered[0].contains("explain and call tool"));
         assert!(rendered[0].contains("the answer"));
@@ -524,6 +568,7 @@ mod tests {
             prose: vec![prose1.clone(), prose2.clone()],
             conversations: vec![conv_path.clone()],
             chat_template: Some(tmpl_path.clone()),
+            eos_token: EOS.to_string(),
             separator: "\n---\n".to_string(),
         };
 
@@ -590,6 +635,7 @@ mod tests {
             prose: vec![prose.clone()],
             conversations: vec![conv_path],
             chat_template: None,
+            eos_token: EOS.to_string(),
             separator: "\n".to_string(),
         };
         let built = build(&spec).expect("build prose-only");
@@ -603,7 +649,7 @@ mod tests {
     fn render_malformed_json_errors() {
         let bad = "{ not valid json at all }";
         let tmpl = qwen_chatml_template();
-        let err = render_conversations(bad, tmpl).expect_err("should fail on malformed json");
+        let err = render_conversations(bad, tmpl, EOS).expect_err("should fail on malformed json");
         match err {
             QuantError::Malformed(msg) => {
                 assert!(!msg.is_empty(), "malformed message empty");
@@ -616,7 +662,8 @@ mod tests {
     fn render_broken_template_errors() {
         let json = conversations_json_one_user_one_assistant();
         let broken = "{% for %}";
-        let err = render_conversations(&json, broken).expect_err("should fail on broken template");
+        let err =
+            render_conversations(&json, broken, EOS).expect_err("should fail on broken template");
         match err {
             QuantError::Malformed(msg) => {
                 assert!(!msg.is_empty());
@@ -642,7 +689,7 @@ mod tests {
             ]
         })
         .to_string();
-        let err = render_conversations(&json, raising_tmpl)
+        let err = render_conversations(&json, raising_tmpl, EOS)
             .expect_err("should fail with raise_exception");
         match err {
             QuantError::Malformed(msg) => {
