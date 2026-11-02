@@ -288,6 +288,27 @@ pub const GFX1201_PP2_MQ3_RECEIPT: &str =
 pub const GFX1201_EP2_MQ4_RECEIPT: &str =
     "g0 mcb-notes/runs/ep-diag-8e148906a-1 j1570 2026-10-18 gfx1201 ep2 mq4-xts k1,2,4,8";
 
+/// G0 oracle receipt behind the gfx1201 Q8F16 QSA row-twin proofs
+/// (`QsaIn([Q8_0; 4])`, `Projection(Q8_0)` for qsa_out; EP domain, the measured
+/// Q8F16 trunk-overlay scope): `lane_q8_rows_oracle` (then named `lane_q8_qsa_rows_oracle`) over the 60 real
+/// overlay tensors (12 QSA layers x indexer/q/k/v/o), rows 1..=8, the
+/// dispatch's few-row Q8 route (`project_weights`, `gemv_q8_0_rows_exact`) vs
+/// the rows == 1 `gemv_q8_0` singleton per row: 0 mismatching bytes
+/// (17748 cells, 2,774,679,552 bytes compared, fabric j6621, card A).
+pub const GFX1201_Q8_QSA_ROWS_RECEIPT: &str =
+    "g0 pmloop/q8lanes-ev/oracle1 j6621 2026-11-02 gfx1201 q8f16 qsa in/out rows1-8";
+
+/// G0 oracle receipt behind the gfx1201 Q8F16 GDN in/out and head row-twin
+/// proofs (`GdnIn([Q8_0; 4])`, `Projection(Q8_0)` for gdn_out and the head; EP
+/// domain, the full Q8F16 trunk overlay scope): `lane_q8_rows_oracle` over all
+/// 241 real overlay tensors (60 QSA, 36 x GDN qkv/z/a/b and out_proj, lm_head),
+/// rows 1..=8 in both row orders, the dispatch's few-row Q8 route
+/// (`project_weights`, `gemv_q8_0_rows_exact`) vs the rows == 1 `gemv_q8_0`
+/// singleton per row: 0 mismatching bytes (71,307 cells, 15,172,718,592 bytes
+/// compared, fabric j6678, card A).
+pub const GFX1201_Q8_TRUNK_ROWS_RECEIPT: &str =
+    "g0 mgmtp/q8trunk/runs/oracle1 j6678 2026-11-02 gfx1201 q8f16 gdn in/out head rows1-8";
+
 /// Device topology a lane step runs on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum LaneTopology {
@@ -638,6 +659,38 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         LANE_EP_ONLY,
         GFX1201_EP2_MQ4_RECEIPT,
     ),
+    // Q8F16 (qt3) QSA trunk overlay (q/k/v/o + indexer): the few-row launches are
+    // `gemv_q8_0_rows_exact`, bitwise the rows == 1 `gemv_q8_0` singleton per row.
+    proof(
+        "gfx1201",
+        StageName::QsaInProj,
+        StageRoute::QsaIn([DType::Q8_0; 4]),
+        LANE_EP_ONLY,
+        GFX1201_Q8_QSA_ROWS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::QsaOutProj,
+        StageRoute::Projection(DType::Q8_0),
+        LANE_EP_ONLY,
+        GFX1201_Q8_QSA_ROWS_RECEIPT,
+    ),
+    // Q8F16 (qt3) GDN in/out and head (the full-trunk overlay): same few-row
+    // route, per-tensor-set oracle `lane_q8_rows_oracle` (receipt pending a card).
+    proof(
+        "gfx1201",
+        StageName::GdnInProj,
+        StageRoute::GdnIn([DType::Q8_0; 4]),
+        LANE_EP_ONLY,
+        GFX1201_Q8_TRUNK_ROWS_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::GdnOutProj,
+        StageRoute::Projection(DType::Q8_0),
+        LANE_EP_ONLY,
+        GFX1201_Q8_TRUNK_ROWS_RECEIPT,
+    ),
     proof(
         "gfx1201",
         StageName::FinalHyper,
@@ -651,6 +704,13 @@ pub static LANE_ROW_TWIN_PROOFS: &[RowTwinProof] = &[
         StageRoute::Projection(DType::MQ6G256V2),
         LANE_EP_ONLY,
         GFX1201_EP2_MQ4_RECEIPT,
+    ),
+    proof(
+        "gfx1201",
+        StageName::Head,
+        StageRoute::Projection(DType::Q8_0),
+        LANE_EP_ONLY,
+        GFX1201_Q8_TRUNK_ROWS_RECEIPT,
     ),
     proof(
         "gfx1201",
@@ -2929,8 +2989,10 @@ mod tests {
         assert_eq!(shared.len(), 12);
         // gfx1151: one all-topology row per shared stage. gfx1201: one PP row
         // and one EP row per shared stage, plus the second PP MoE row (the
-        // mq3 slab class).
-        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 3 * shared.len() + 1);
+        // mq3 slab class), the two EP Q8F16 QSA overlay rows (qsa_in x4,
+        // qsa_out) and the three EP Q8F16 trunk rows (gdn_in x4, gdn_out,
+        // head).
+        assert_eq!(LANE_ROW_TWIN_PROOFS.len(), 3 * shared.len() + 1 + 2 + 3);
         for arch in ["gfx1151", "gfx1201"] {
             for stage in StageName::ALL {
                 for topology in ALL_TOPOLOGIES {
@@ -2948,13 +3010,27 @@ mod tests {
                         ("gfx1201", LaneTopology::Ep) => shared.contains(&stage),
                         _ => false,
                     };
-                    // The PP MoE stage carries the mq2 and the mq3 slab rows.
+                    // The PP MoE stage carries the mq2 and the mq3 slab rows;
+                    // the EP QSA in/out stages the MQ6 and the Q8F16 rows.
                     let count = usize::from(expected)
                         + usize::from(
                             expected
                                 && arch == "gfx1201"
                                 && topology == LaneTopology::Pp
                                 && stage == StageName::Moe,
+                        )
+                        + usize::from(
+                            expected
+                                && arch == "gfx1201"
+                                && topology == LaneTopology::Ep
+                                && matches!(
+                                    stage,
+                                    StageName::QsaInProj
+                                        | StageName::QsaOutProj
+                                        | StageName::GdnInProj
+                                        | StageName::GdnOutProj
+                                        | StageName::Head
+                                ),
                         );
                     assert_eq!(rows.len(), count, "{arch} {topology:?} {}", stage.key());
                     for proof in rows {
@@ -3001,7 +3077,28 @@ mod tests {
                                     );
                                 }
                                 assert_eq!(proof.domain, [LaneTopology::Ep]);
-                                assert_eq!(proof.receipt, GFX1201_EP2_MQ4_RECEIPT);
+                                let q8_row = matches!(
+                                    proof.route,
+                                    StageRoute::QsaIn([
+                                        DType::Q8_0,
+                                        DType::Q8_0,
+                                        DType::Q8_0,
+                                        DType::Q8_0
+                                    ]) | StageRoute::GdnIn([
+                                        DType::Q8_0,
+                                        DType::Q8_0,
+                                        DType::Q8_0,
+                                        DType::Q8_0
+                                    ]) | StageRoute::Projection(DType::Q8_0)
+                                );
+                                let want = match (q8_row, stage) {
+                                    (false, _) => GFX1201_EP2_MQ4_RECEIPT,
+                                    (true, StageName::QsaInProj | StageName::QsaOutProj) => {
+                                        GFX1201_Q8_QSA_ROWS_RECEIPT
+                                    }
+                                    (true, _) => GFX1201_Q8_TRUNK_ROWS_RECEIPT,
+                                };
+                                assert_eq!(proof.receipt, want, "{}", stage.key());
                             }
                         }
                     }
@@ -3209,13 +3306,43 @@ mod tests {
         let table = table_routes("gfx1201", LaneTopology::Ep);
         for stage in shared_stages() {
             let rows = &table[stage.index()];
-            assert_eq!(rows.len(), 1, "{}", stage.key());
+            // The QSA, GDN in/out and head stages carry the MQ6 row first and the
+            // Q8F16 trunk-overlay row second; every other stage one row.
+            let q8_trunk = matches!(
+                stage,
+                StageName::QsaInProj
+                    | StageName::QsaOutProj
+                    | StageName::GdnInProj
+                    | StageName::GdnOutProj
+                    | StageName::Head
+            );
+            assert_eq!(rows.len(), 1 + usize::from(q8_trunk), "{}", stage.key());
             assert!(
                 routes[stage.index()].iter().all(|route| *route == rows[0]),
                 "{}",
                 stage.key()
             );
         }
+        assert_eq!(
+            table[StageName::QsaInProj.index()][1],
+            StageRoute::QsaIn([DType::Q8_0; 4])
+        );
+        assert_eq!(
+            table[StageName::QsaOutProj.index()][1],
+            StageRoute::Projection(DType::Q8_0)
+        );
+        assert_eq!(
+            table[StageName::GdnInProj.index()][1],
+            StageRoute::GdnIn([DType::Q8_0; 4])
+        );
+        assert_eq!(
+            table[StageName::GdnOutProj.index()][1],
+            StageRoute::Projection(DType::Q8_0)
+        );
+        assert_eq!(
+            table[StageName::Head.index()][1],
+            StageRoute::Projection(DType::Q8_0)
+        );
         assert_eq!(table[StageName::Moe.index()], [ep_moe()]);
 
         let resolution = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Ep, &routes);
@@ -3246,7 +3373,14 @@ mod tests {
         // The table's own routes and a band owning nothing resolve likewise.
         let from_table = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Ep, &table);
         assert_eq!(from_table.policy, LaneStagePolicy::production());
-        assert_eq!(from_table.receipts, [GFX1201_EP2_MQ4_RECEIPT]);
+        assert_eq!(
+            from_table.receipts,
+            [
+                GFX1201_EP2_MQ4_RECEIPT,
+                GFX1201_Q8_TRUNK_ROWS_RECEIPT,
+                GFX1201_Q8_QSA_ROWS_RECEIPT
+            ]
+        );
         let empty = LaneStagePolicy::for_bound_routes(
             "gfx1201",
             LaneTopology::Ep,
@@ -3254,6 +3388,180 @@ mod tests {
         );
         assert_eq!(empty.policy, LaneStagePolicy::production());
         assert!(empty.receipts.is_empty());
+    }
+
+    /// The EP2 mq4-xts routes with the Q8F16 trunk overlay bound on the first
+    /// `q8_layers` of the 12 QSA layers (indexer index_qk, q, k, v and o all
+    /// `Q8_0`), the others still MQ6G256V2, written out from the overlay's
+    /// payload class (qt3 = `DType::Q8_0`), NOT read from the proof table.
+    fn ep2_q8_overlay_routes(q8_layers: usize) -> LaneStageRoutes {
+        let mq6 = DType::MQ6G256V2;
+        let q8 = DType::Q8_0;
+        let mut routes = ep2_mq4_routes(vec![ep_moe(); 48]);
+        routes[StageName::QsaInProj.index()] = (0..12)
+            .map(|layer| StageRoute::QsaIn([if layer < q8_layers { q8 } else { mq6 }; 4]))
+            .collect();
+        routes[StageName::QsaOutProj.index()] = (0..12)
+            .map(|layer| StageRoute::Projection(if layer < q8_layers { q8 } else { mq6 }))
+            .collect();
+        routes
+    }
+
+    #[test]
+    fn gfx1201_ep_q8_overlay_qsa_in_out_are_shared_with_the_q8_receipt() {
+        for q8_layers in [12usize, 6, 1] {
+            let resolution = LaneStagePolicy::for_bound_routes(
+                "gfx1201",
+                LaneTopology::Ep,
+                &ep2_q8_overlay_routes(q8_layers),
+            );
+            assert_eq!(
+                resolution.policy,
+                LaneStagePolicy::production(),
+                "{q8_layers}"
+            );
+            assert!(fallback_stages(&resolution).is_empty(), "{q8_layers}");
+            assert_eq!(
+                resolution.receipts,
+                [GFX1201_EP2_MQ4_RECEIPT, GFX1201_Q8_QSA_ROWS_RECEIPT],
+                "{q8_layers}"
+            );
+            assert_stateful_reasons(&resolution);
+        }
+        // The unmodified MQ6 artifact keeps its single receipt.
+        let mq6 = LaneStagePolicy::for_bound_routes(
+            "gfx1201",
+            LaneTopology::Ep,
+            &ep2_q8_overlay_routes(0),
+        );
+        assert_eq!(mq6.receipts, [GFX1201_EP2_MQ4_RECEIPT]);
+        assert!(GFX1201_Q8_QSA_ROWS_RECEIPT.starts_with("g0 "));
+        assert!(GFX1201_Q8_QSA_ROWS_RECEIPT.contains("gfx1201"));
+    }
+
+    #[test]
+    fn gfx1201_q8_qsa_proofs_are_ep_only_and_demote_only_the_unproven_member() {
+        let q8 = DType::Q8_0;
+        let mq6 = DType::MQ6G256V2;
+        // Other topologies have no Q8 row.
+        for topology in [LaneTopology::Pp, LaneTopology::Single] {
+            let resolution =
+                LaneStagePolicy::for_bound_routes("gfx1201", topology, &ep2_q8_overlay_routes(12));
+            for stage in [StageName::QsaInProj, StageName::QsaOutProj] {
+                assert_eq!(
+                    resolution.policy.share(stage),
+                    StageShare::PerLane,
+                    "{topology:?} {}",
+                    stage.key()
+                );
+            }
+        }
+        // One Q8 member among MQ6 ones is not the registered x4 group.
+        let mut mixed = ep2_q8_overlay_routes(12);
+        mixed[StageName::QsaInProj.index()].push(StageRoute::QsaIn([mq6, q8, mq6, mq6]));
+        let resolution = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Ep, &mixed);
+        assert_eq!(fallback_stages(&resolution), [StageName::QsaInProj]);
+        assert!(reason_of(&resolution, StageName::QsaInProj).contains("has no row-twin proof"));
+        assert_eq!(
+            resolution.policy.share(StageName::QsaOutProj),
+            StageShare::OnceAllRows
+        );
+        // A Q8 projection on a stage with no Q8 row never rides another
+        // stage's row: the final hyper-connection read has none.
+        let mut other = ep2_q8_overlay_routes(12);
+        other[StageName::FinalHyper.index()] = vec![StageRoute::Projection(q8)];
+        let resolution = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Ep, &other);
+        assert_eq!(fallback_stages(&resolution), [StageName::FinalHyper]);
+    }
+
+    /// The EP2 mq4-xts routes with the full Q8F16 trunk overlay: all 36 GDN
+    /// in-projection groups and out_proj, the head, and `q8_qsa_layers` of the
+    /// 12 QSA layers all `Q8_0`; written from the overlay's payload class
+    /// (qt3 = `DType::Q8_0`), NOT read from the proof table.
+    fn ep2_q8_full_routes(gdn_layers: usize, head: bool, q8_qsa_layers: usize) -> LaneStageRoutes {
+        let mq6 = DType::MQ6G256V2;
+        let q8 = DType::Q8_0;
+        let mut routes = ep2_q8_overlay_routes(q8_qsa_layers);
+        routes[StageName::GdnInProj.index()] = (0..36)
+            .map(|layer| StageRoute::GdnIn([if layer < gdn_layers { q8 } else { mq6 }; 4]))
+            .collect();
+        routes[StageName::GdnOutProj.index()] = (0..36)
+            .map(|layer| StageRoute::Projection(if layer < gdn_layers { q8 } else { mq6 }))
+            .collect();
+        routes[StageName::Head.index()] = vec![StageRoute::Projection(if head { q8 } else { mq6 })];
+        routes
+    }
+
+    #[test]
+    fn gfx1201_ep_full_q8_trunk_overlay_shares_every_stage_with_both_receipts() {
+        for (gdn, head, qsa) in [
+            (36usize, true, 12usize),
+            (36, true, 0),
+            (36, false, 12),
+            (12, false, 0),
+            (0, true, 0),
+        ] {
+            let resolution = LaneStagePolicy::for_bound_routes(
+                "gfx1201",
+                LaneTopology::Ep,
+                &ep2_q8_full_routes(gdn, head, qsa),
+            );
+            let tag = format!("gdn {gdn} head {head} qsa {qsa}");
+            assert_eq!(resolution.policy, LaneStagePolicy::production(), "{tag}");
+            assert!(fallback_stages(&resolution).is_empty(), "{tag}");
+            assert!(
+                resolution.receipts.contains(&GFX1201_EP2_MQ4_RECEIPT),
+                "{tag}"
+            );
+            assert_eq!(
+                resolution.receipts.contains(&GFX1201_Q8_TRUNK_ROWS_RECEIPT),
+                gdn > 0 || head,
+                "{tag}"
+            );
+            assert_eq!(
+                resolution.receipts.contains(&GFX1201_Q8_QSA_ROWS_RECEIPT),
+                qsa > 0,
+                "{tag}"
+            );
+            assert_stateful_reasons(&resolution);
+        }
+        // A GDN in-projection group with one Q8 member among MQ6 ones is not
+        // the registered x4 group; only that stage demotes.
+        let q8 = DType::Q8_0;
+        let mq6 = DType::MQ6G256V2;
+        let mut mixed = ep2_q8_full_routes(36, true, 12);
+        mixed[StageName::GdnInProj.index()].push(StageRoute::GdnIn([q8, mq6, mq6, mq6]));
+        let resolution = LaneStagePolicy::for_bound_routes("gfx1201", LaneTopology::Ep, &mixed);
+        assert_eq!(fallback_stages(&resolution), [StageName::GdnInProj]);
+        assert!(reason_of(&resolution, StageName::GdnInProj).contains("has no row-twin proof"));
+        // Other topologies have no Q8 GDN / head row.
+        for topology in [LaneTopology::Pp, LaneTopology::Single] {
+            let resolution = LaneStagePolicy::for_bound_routes(
+                "gfx1201",
+                topology,
+                &ep2_q8_full_routes(36, true, 12),
+            );
+            for stage in [StageName::GdnInProj, StageName::GdnOutProj, StageName::Head] {
+                assert_eq!(
+                    resolution.policy.share(stage),
+                    StageShare::PerLane,
+                    "{topology:?} {}",
+                    stage.key()
+                );
+            }
+        }
+    }
+
+    /// Land gate: the GDN in/out and head Q8F16 rows must carry a real G0 card
+    /// receipt, not the staging placeholder.
+    #[test]
+    fn q8_trunk_receipts_are_g0_receipts() {
+        for receipt in [GFX1201_Q8_QSA_ROWS_RECEIPT, GFX1201_Q8_TRUNK_ROWS_RECEIPT] {
+            assert!(
+                receipt.starts_with("g0 ") && receipt.contains("gfx1201"),
+                "Q8 row-twin receipt is not a G0 card receipt: {receipt}"
+            );
+        }
     }
 
     #[test]

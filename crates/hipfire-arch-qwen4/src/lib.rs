@@ -149,5 +149,7 @@ pub use ple::{
 };
 pub use rdna_compute::tensor_ops::{GdnStateFormat, QsaKvFormat};
 pub use state::{resolve_gdn_format, resolve_qsa_format, resolve_state_format, Qwen4StateFormat};
-pub use trunk_overlay::{resolve_trunk_overlay, Qwen4TrunkOverlay, TrunkOverlayPolicy};
+pub use trunk_overlay::{
+    resolve_trunk_overlay, trunk_overlay_extra_bytes, Qwen4TrunkOverlay, TrunkOverlayPolicy,
+};
 pub use weights::{Qwen4ManifestIdentity, Qwen4TierRecipe};

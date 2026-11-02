@@ -3048,6 +3048,18 @@ pub fn qwen4_ep_vram_layers(
             chunk,
             Qwen4PlacementForward::Ordinary,
         )?;
+        // A bound trunk overlay (Q8F16 replaces six-bit trunk tensors with
+        // owned, larger copies) adds resident bytes after placement runs: every
+        // rank's budget charges them as non-expert bytes, the same number the
+        // rank's own check charges (`load_qwen4_rank_scoped`).
+        let non_expert = non_expert
+            .checked_add(hipfire_arch_qwen4::trunk_overlay_extra_bytes(
+                hfq,
+                std::path::Path::new(&shared.path),
+                &gpu.arch,
+                &config,
+            )?)
+            .ok_or("qwen4: the trunk overlay bytes overflow the non-expert census")?;
         let reserve = qwen4_shared_charges(layer_experts, false, false, 0)
             .and_then(|charges| charges.reserve(reserve.bytes()))
             .map_err(|error| format!("qwen4: {error}"))?;
@@ -6398,6 +6410,17 @@ fn load_qwen4_rank_unscoped(
     } else {
         None
     };
+    // The bound trunk overlay's net resident bytes (owned Q8F16 copies larger
+    // than the MQ6 tensors they replace) land after placement: charge them as
+    // non-expert bytes in the one census every budget below reads, identically
+    // to the plan-time charge in `qwen4_ep_vram_layers`.
+    let overlay_extra_bytes = trunk_overlay.as_ref().map_or(0u64, |overlay| {
+        u64::try_from(overlay.net_extra_bytes()).unwrap_or(0)
+    });
+    let placement_inputs = placement_inputs.map(|mut inputs| {
+        inputs.0 = inputs.0.saturating_add(overlay_extra_bytes);
+        inputs
+    });
     // Decode-share `on` (verdict change 4): an admitted load charges only the
     // dedicated forward (resident bank + persistent token ids + speculative
     // buffers) instead of the whole prefill scratch, because the prefill

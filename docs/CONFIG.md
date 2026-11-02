@@ -1590,6 +1590,25 @@ and disables the A4 route. `hipfire-quantize trunk-overlay` builds the file
 from a directory of QT44 payloads (`--base`, `--qt44-payload-dir`, `--suffix`
 (repeatable), `--trunk-iu4-default`, `--output`).
 
+A sidecar may instead carry Q8F16 (QT3, `--format qt3`: the engine's `Q8_0`
+rows, 34 bytes per 32 weights, no FWHT rotation, `K % 32 == 0`) payloads that
+replace MQ6 trunk tensors. The loader admits exactly the 241 MQ6 trunk tensors
+of the shipped mq4-xts (`lm_head.weight`; per QSA layer the `self_attn`
+q/k/v/o and indexer `index_qk` projections; per GDN layer
+`linear_attn.in_proj_{qkv,z,a,b}` and `out_proj`) and refuses the whole sidecar,
+naming the first offending tensor, for anything else: the MTP head, routed
+experts, and every tensor the artifact keeps source-exact (router, shared
+expert, hyper-connection, conv, norms, PLE, embedding), because a Q8F16 copy
+of those would lower accuracy. A replaced tensor is an owned allocation, so the
+overlay adds `payload - replaced` resident bytes on top of what placement
+budgeted (`net_extra_bytes`: +173.6 MB for the 60 QSA tensors, +938.8 MB, 0.874
+GiB, for all 241, per replicated card). The marker `gfx1201-q8f16-v1` selects no
+IU4 route and applies under `auto` on exact gfx1201 only (`1` applies it
+elsewhere; the C8 lane stages stay per lane wherever the arch has no row-twin
+proof for their Q8_0 route). A pipeline-parallel load refuses any overlay.
+`scripts/q8_overlay_writer.py encode --tier attn|gdn_in|gdn_out|head|full`
+writes the payloads from BF16 safetensors.
+
 ### Qwen4 expert hotset sidecar
 
 `<model>.expert-hotset` (JSON, `kind` `hipfire.qwen4.expert_hotset`, version

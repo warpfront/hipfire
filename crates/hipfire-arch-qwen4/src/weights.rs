@@ -16,7 +16,7 @@ use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::mesh_placement::BandPlacement;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 use hipfire_runtime::tp_shard::ExpertAssign;
-use hipfire_runtime::trunk_overlay::TrunkOverlayPayload;
+use hipfire_runtime::trunk_overlay::{TrunkOverlayFormat, TrunkOverlayPayload};
 use hipfire_runtime::weight_manifest::WeightResidency;
 use hipfire_runtime::weight_manifest::{
     DTypeConstraint, ExpertSourceLayout, PinTarget, PlacementHint, ShardPolicy, StateEntry,
@@ -3413,12 +3413,19 @@ impl Qwen4Weights {
                     payload.name, projection.logical_shape
                 )));
             }
-            if qt44_matrix_bytes(m, k) != Some(payload.bytes.len()) {
+            let format = payload.format;
+            if format.payload_bytes(m, k) != Some(payload.bytes.len()) {
                 return Ok(TrunkOverlayOutcome::Refused(format!(
-                    "tensor {}: {} bytes is not a {m}x{k} QT44 matrix",
+                    "tensor {}: {} bytes is not a {m}x{k} {} matrix",
                     payload.name,
-                    payload.bytes.len()
+                    payload.bytes.len(),
+                    format.label()
                 )));
+            }
+            if format == TrunkOverlayFormat::Qt3 {
+                if let Some(reason) = q8_overlay_consumer_refusal(&payload.name) {
+                    return Ok(TrunkOverlayOutcome::Refused(reason));
+                }
             }
             if slots.contains(&slot) {
                 return Ok(TrunkOverlayOutcome::Refused(format!(
@@ -3433,13 +3440,22 @@ impl Qwen4Weights {
             let (old_bytes, new_bytes) = replace_resident(
                 gpu,
                 &mut self.taken[slot],
-                Replacement::Qt44(Cow::Borrowed(&payload.bytes[..])),
+                match payload.format {
+                    TrunkOverlayFormat::Qt44 => {
+                        Replacement::Qt44(Cow::Borrowed(&payload.bytes[..]))
+                    }
+                    TrunkOverlayFormat::Qt3 => Replacement::Q8(Cow::Borrowed(&payload.bytes[..])),
+                },
             )?;
             before += old_bytes;
             after += new_bytes;
         }
         Ok(TrunkOverlayOutcome::Applied(TrunkOverlayApplied {
             tensors: payloads.len(),
+            qt3_tensors: payloads
+                .iter()
+                .filter(|payload| payload.format == TrunkOverlayFormat::Qt3)
+                .count(),
             before_bytes: before,
             after_bytes: after,
         }))
@@ -3558,6 +3574,8 @@ pub enum TrunkOverlayOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrunkOverlayApplied {
     pub tensors: usize,
+    /// Of `tensors`, the Q8F16 (QT3) ones.
+    pub qt3_tensors: usize,
     pub before_bytes: usize,
     pub after_bytes: usize,
 }
@@ -3565,6 +3583,107 @@ pub struct TrunkOverlayApplied {
 /// Byte size of an `m x k` QT44 matrix; `None` unless K is a multiple of 256.
 fn qt44_matrix_bytes(m: usize, k: usize) -> Option<usize> {
     (k % 256 == 0).then(|| m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES)
+}
+
+/// The consumer stage of a trunk tensor a Q8F16 (QT3) overlay may replace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Q8TrunkConsumer {
+    /// QSA indexer `index_qk` / `q` / `k` / `v` (lane stage `qsa_in`).
+    QsaIn,
+    /// QSA `o_proj` (lane stage `qsa_out`).
+    QsaOut,
+    /// GDN `in_proj_{qkv,z,a,b}` (lane stage `gdn_in`).
+    GdnIn,
+    /// GDN `out_proj` (lane stage `gdn_out`).
+    GdnOut,
+    /// `lm_head` (lane stage `head`).
+    Head,
+}
+
+/// The trunk consumer of `name`, if it is one of the 241 MQ6 (qt47) tensors of
+/// the shipped Flash-Next artifact: `lm_head.weight`, per QSA layer the
+/// `self_attn` q/k/v/o and indexer `index_qk` projections, per GDN layer
+/// `linear_attn.in_proj_{qkv,z,a,b}` and `out_proj`.
+fn q8_trunk_consumer(name: &str) -> Option<Q8TrunkConsumer> {
+    if name == "lm_head.weight" {
+        return Some(Q8TrunkConsumer::Head);
+    }
+    let role = name.strip_prefix("model.language_model.layers.")?;
+    let (index, role) = role.split_once('.')?;
+    if index.is_empty() || !index.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    match role {
+        "self_attn.q_proj.weight"
+        | "self_attn.k_proj.weight"
+        | "self_attn.v_proj.weight"
+        | "self_attn.indexer.index_qk_proj.weight" => Some(Q8TrunkConsumer::QsaIn),
+        "self_attn.o_proj.weight" => Some(Q8TrunkConsumer::QsaOut),
+        "linear_attn.in_proj_qkv.weight"
+        | "linear_attn.in_proj_z.weight"
+        | "linear_attn.in_proj_a.weight"
+        | "linear_attn.in_proj_b.weight" => Some(Q8TrunkConsumer::GdnIn),
+        "linear_attn.out_proj.weight" => Some(Q8TrunkConsumer::GdnOut),
+        _ => None,
+    }
+}
+
+/// Which tensors a Q8F16 (QT3) trunk overlay may replace, by consumer path.
+///
+/// Admitted: the 241 MQ6 trunk tensors ([`q8_trunk_consumer`]). Every consumer
+/// of those on the decode (rows == 1 `gemv_q8_0`), few-row / verify-rows
+/// (`gemv_q8_0_rows_exact`) and prefill (`gemm_q8_0_batched_f32_chunked`)
+/// paths reaches an existing `DType::Q8_0` arm: no FWHT rotation is owed, the
+/// MQ6 fold / FP8 / i8 / zba / a-b-z region routes and the fused HC-write
+/// output projection are all keyed on the member's own dtype and decline a Q8_0
+/// weight, and every Q8 arm writes the F32 output the unfused stage expects.
+/// Whether a C8 lane stage (qsa_in / qsa_out / gdn_in / gdn_out / head)
+/// stays shared is a separate, per-arch fact: only a stage with a G0 row-twin
+/// proof row for its Q8_0 route in `LANE_ROW_TWIN_PROOFS` is shared; any other
+/// stage runs per lane (correct, slower), named in the `qwen4 lanes: stage
+/// policy` line.
+///
+/// Refused by name (the whole overlay then falls back to the base weights):
+/// the MTP head (`mtp_gpu`'s own routes), and every tensor the shipped
+/// artifact stores source-exact in BF16 (router, shared expert, hyper
+/// connection, conv, norms, PLE, embedding): a Q8F16 copy of those would
+/// LOWER accuracy and has no verified consumer arm.
+fn q8_overlay_consumer_refusal(name: &str) -> Option<String> {
+    if q8_trunk_consumer(name).is_some() {
+        return None;
+    }
+    if name.starts_with("mtp.") {
+        return Some(format!(
+            "tensor {name}: the MTP head's attention projections run mtp_gpu's own \
+             (Q8_0 indexer/k/v, deterministic-PM) routes; a Q8F16 overlay is not \
+             admitted for the MTP path"
+        ));
+    }
+    if name.contains(".mlp.experts.") || name.ends_with(".slab_arena") {
+        return Some(format!(
+            "tensor {name}: routed experts are packed expert tiers, not trunk \
+             projections; a Q8F16 overlay replaces trunk tensors only"
+        ));
+    }
+    const BF16_EXACT: [&str; 6] = [
+        ".mlp.gate.weight",
+        ".shared_expert",
+        "hyper",
+        ".conv1d.",
+        "norm",
+        "embed",
+    ];
+    if BF16_EXACT.iter().any(|part| name.contains(part)) {
+        return Some(format!(
+            "tensor {name}: stored source-exact (BF16 / the artifact's own tier) in the \
+             base; a Q8F16 replacement would lower accuracy and this path has no \
+             verified Q8_0 consumer arm"
+        ));
+    }
+    Some(format!(
+        "tensor {name}: not one of the 241 MQ6 trunk tensors (lm_head, QSA q/k/v/o/indexer, \
+         GDN in_proj qkv/z/a/b/out_proj) a Q8F16 overlay may replace"
+    ))
 }
 
 /// Release every finalized handle through `free`, one owner each. A true
@@ -3593,11 +3712,13 @@ fn free_taken_handles(
 }
 
 /// What replaces a resident weight in `HIPFIRE_QWEN4_REQUANT` / a trunk
-/// overlay: a kernel-produced tensor, or pre-encoded QT44 bytes (dtype
-/// `MQ4G256V2`, shape `[len]`).
+/// overlay: a kernel-produced tensor, pre-encoded QT44 bytes (dtype
+/// `MQ4G256V2`, shape `[len]`), or pre-encoded Q8F16 bytes (dtype `Q8_0`,
+/// shape `[len]`).
 enum Replacement<'a> {
     Tensor(GpuTensor),
     Qt44(Cow<'a, [u8]>),
+    Q8(Cow<'a, [u8]>),
 }
 
 /// The device/owner operations of a replacement. [`GpuReplace`] is the only
@@ -3623,6 +3744,9 @@ trait ReplaceOps {
     fn free(&mut self, tensor: GpuTensor) -> Result<(), String>;
     /// Upload pre-encoded QT44 bytes as an owned resident tensor.
     fn upload_qt44(&mut self, bytes: &[u8]) -> Result<GpuTensor, String>;
+    /// Upload pre-encoded Q8F16 bytes (dtype `Q8_0`) as an owned resident
+    /// tensor.
+    fn upload_q8(&mut self, bytes: &[u8]) -> Result<GpuTensor, String>;
 }
 
 struct GpuReplace<'g>(&'g mut Gpu);
@@ -3665,6 +3789,15 @@ impl ReplaceOps for GpuReplace<'_> {
             .upload_raw(bytes, &[bytes.len()])
             .map_err(|error| error.to_string())?;
         copy.dtype = DType::MQ4G256V2;
+        Ok(copy)
+    }
+
+    fn upload_q8(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
+        let mut copy = self
+            .0
+            .upload_raw(bytes, &[bytes.len()])
+            .map_err(|error| error.to_string())?;
+        copy.dtype = DType::Q8_0;
         Ok(copy)
     }
 }
@@ -3715,6 +3848,7 @@ fn replace_owned(
     let copy = match replacement {
         Replacement::Tensor(copy) => copy,
         Replacement::Qt44(bytes) => ops.upload_qt44(&bytes)?,
+        Replacement::Q8(bytes) => ops.upload_q8(&bytes)?,
     };
     let WeightHandle::Resident(old) = &taken.handle else {
         let _ = ops.free(copy);
@@ -3812,6 +3946,26 @@ fn replace_in_arena_span(
     let (view, before, after, temp) = match replacement {
         Replacement::Qt44(bytes) => {
             let view = arena_replacement_view(old, bytes.len(), &[bytes.len()], DType::MQ4G256V2)?;
+            ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
+            ops.write_host(&old.buf, &bytes)?;
+            (view, old.buf.size(), bytes.len(), None)
+        }
+        Replacement::Q8(bytes) => {
+            if bytes.len() > old.buf.size() {
+                // A Q8F16 payload (34 B per 32 weights) is larger than the
+                // six-bit span it replaces, and an arena view cannot grow:
+                // the weight moves to an owned allocation. The planned span
+                // stays allocated (the arena root owns it and is released
+                // last, once), so this costs the whole payload on top of the
+                // planned bytes; the planner does not see it.
+                let before = old.buf.size();
+                ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
+                let owned = ops.upload_q8(&bytes)?;
+                let after = owned.buf.size();
+                taken.handle = WeightHandle::Resident(owned);
+                return Ok((before, after));
+            }
+            let view = arena_replacement_view(old, bytes.len(), &[bytes.len()], DType::Q8_0)?;
             ops.invalidate_arena_source(old.buf.as_ptr() as usize)?;
             ops.write_host(&old.buf, &bytes)?;
             (view, old.buf.size(), bytes.len(), None)
@@ -7692,6 +7846,10 @@ mod weight_store_arena_replacement {
                 &[bytes.len()],
             ))
         }
+        fn upload_q8(&mut self, bytes: &[u8]) -> Result<GpuTensor, String> {
+            self.log.push(format!("upload_q8:{}", bytes.len()));
+            Ok(owned(TEMP_BASE, bytes.len(), DType::Q8_0, &[bytes.len()]))
+        }
     }
 
     fn ptr_of(taken: &TakenWeight) -> usize {
@@ -7926,6 +8084,270 @@ mod weight_store_arena_replacement {
         assert!(error.contains("exceeds the planned arena span"), "{error}");
         assert_eq!(ops.log, vec![format!("free:{TEMP_BASE:#x}")]);
         assert_eq!(ptr_of(&weight), ROOT_BASE);
+    }
+
+    #[test]
+    fn q8_replacement_larger_than_the_span_falls_back_to_an_owned_allocation() {
+        // Q8F16 is 34 bytes per 32 weights, MQ6 25 per 32: the payload cannot
+        // fit the planned span.
+        let (m, k) = (4usize, 256usize);
+        let span = m * (k / 256) * 200;
+        let payload = vec![7u8; m * (k / 32) * 34];
+        assert!(payload.len() > span);
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::MQ6G256V2, &[span])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        let sizes = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Q8(Cow::Borrowed(&payload[..])),
+        )
+        .unwrap();
+        assert_eq!(sizes, (span, payload.len()));
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.buf.as_ptr() as usize, TEMP_BASE);
+        assert!(!now.buf.is_borrowed(), "the new handle owns its bytes");
+        assert_eq!(now.dtype, DType::Q8_0);
+        assert_eq!(now.shape, vec![payload.len()]);
+        assert_eq!(
+            ops.log,
+            vec![
+                format!("invalidate:{ROOT_BASE:#x}"),
+                format!("upload_q8:{}", payload.len()),
+            ],
+            "the arena span is fenced and left in place, never freed"
+        );
+    }
+
+    #[test]
+    fn q8_replacement_that_fits_is_written_into_the_span() {
+        let (m, k) = (4usize, 256usize);
+        let payload = vec![7u8; m * (k / 32) * 34];
+        let span = payload.len() + 256;
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::BF16, &[m, k])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        let sizes = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Q8(Cow::Borrowed(&payload[..])),
+        )
+        .unwrap();
+        assert_eq!(sizes, (span, payload.len()));
+        let WeightHandle::Resident(now) = &weight.handle else {
+            panic!("not resident")
+        };
+        assert_eq!(now.buf.as_ptr() as usize, ROOT_BASE);
+        assert_eq!(now.buf.size(), span);
+        assert_eq!(now.dtype, DType::Q8_0);
+        assert_eq!(
+            ops.log,
+            vec![
+                format!("invalidate:{ROOT_BASE:#x}"),
+                format!("write:{ROOT_BASE:#x}:{}", payload.len()),
+            ]
+        );
+    }
+
+    #[test]
+    fn q8_replacement_of_an_owned_weight_swaps_and_frees_the_old_tensor() {
+        let (m, k) = (4usize, 256usize);
+        let payload = vec![7u8; m * (k / 32) * 34];
+        let old_base = TEMP_BASE + 0x10_0000;
+        let mut weight = taken(
+            WeightHandle::Resident(owned(old_base, 4096, DType::MQ6G256V2, &[4096])),
+            m,
+            k,
+        );
+        let mut ops = Fake::default();
+        let sizes = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Q8(Cow::Borrowed(&payload[..])),
+        )
+        .unwrap();
+        assert_eq!(sizes, (4096, payload.len()));
+        assert_eq!(ptr_of(&weight), TEMP_BASE);
+        assert_eq!(
+            ops.log,
+            vec![
+                format!("upload_q8:{}", payload.len()),
+                format!("free:{old_base:#x}"),
+            ]
+        );
+    }
+
+    #[test]
+    fn q8_owned_fallback_keeps_the_view_when_the_fence_fails() {
+        let span = 1024usize;
+        let payload = vec![7u8; span + 64];
+        let mut weight = taken(
+            WeightHandle::Resident(view(ROOT_BASE, span, DType::MQ6G256V2, &[span])),
+            4,
+            256,
+        );
+        let mut ops = Fake {
+            fail_invalidate: true,
+            ..Fake::default()
+        };
+        let error = replace_resident_with(
+            &mut ops,
+            &mut weight,
+            Replacement::Q8(Cow::Borrowed(&payload[..])),
+        )
+        .unwrap_err();
+        assert!(error.contains("fake quiesce failure"), "{error}");
+        assert_eq!(ops.log, vec![format!("invalidate:{ROOT_BASE:#x}")]);
+        assert_eq!(ptr_of(&weight), ROOT_BASE, "the original view is untouched");
+    }
+
+    #[test]
+    fn q8_overlay_is_admitted_for_the_241_mq6_trunk_tensors_only() {
+        let layer = "model.language_model.layers.3";
+        for (role, consumer) in [
+            ("self_attn.q_proj.weight", Q8TrunkConsumer::QsaIn),
+            ("self_attn.k_proj.weight", Q8TrunkConsumer::QsaIn),
+            ("self_attn.v_proj.weight", Q8TrunkConsumer::QsaIn),
+            (
+                "self_attn.indexer.index_qk_proj.weight",
+                Q8TrunkConsumer::QsaIn,
+            ),
+            ("self_attn.o_proj.weight", Q8TrunkConsumer::QsaOut),
+            ("linear_attn.in_proj_qkv.weight", Q8TrunkConsumer::GdnIn),
+            ("linear_attn.in_proj_z.weight", Q8TrunkConsumer::GdnIn),
+            ("linear_attn.in_proj_a.weight", Q8TrunkConsumer::GdnIn),
+            ("linear_attn.in_proj_b.weight", Q8TrunkConsumer::GdnIn),
+            ("linear_attn.out_proj.weight", Q8TrunkConsumer::GdnOut),
+        ] {
+            let name = format!("{layer}.{role}");
+            assert_eq!(q8_trunk_consumer(&name), Some(consumer), "{name}");
+            assert_eq!(q8_overlay_consumer_refusal(&name), None, "{name}");
+        }
+        assert_eq!(
+            q8_overlay_consumer_refusal("lm_head.weight"),
+            None,
+            "the head is admitted"
+        );
+        assert_eq!(
+            q8_trunk_consumer("lm_head.weight"),
+            Some(Q8TrunkConsumer::Head)
+        );
+        // The MTP head never matches the trunk patterns.
+        let mtp = q8_overlay_consumer_refusal("mtp.layers.0.self_attn.q_proj.weight").unwrap();
+        assert!(mtp.starts_with("tensor mtp.layers.0.self_attn.q_proj.weight: "));
+        assert!(mtp.contains("MTP path"), "{mtp}");
+        assert_eq!(
+            q8_trunk_consumer("mtp.layers.0.self_attn.q_proj.weight"),
+            None
+        );
+        // Source-exact BF16 classes and everything else are refused by name.
+        for other in [
+            "model.language_model.layers.3.mlp.shared_expert.gate_proj.weight",
+            "model.language_model.layers.3.mlp.shared_expert.down_proj.weight",
+            "model.language_model.layers.3.mlp.gate.weight",
+            "model.language_model.layers.3.hyper_connection.attn.w",
+            "model.language_model.layers.3.linear_attn.conv1d.weight",
+            "model.language_model.layers.3.self_attn.q_norm.weight",
+            "model.language_model.embed_tokens.weight",
+            "model.language_model.layers.3.mlp.experts.gate_up_proj",
+            "model.language_model.layers.x.self_attn.q_proj.weight",
+            "model.language_model.layers.3.self_attn.indexer.weights_proj.weight",
+        ] {
+            let reason = q8_overlay_consumer_refusal(other).unwrap();
+            assert!(reason.starts_with(&format!("tensor {other}: ")), "{reason}");
+        }
+        let bf16 =
+            q8_overlay_consumer_refusal("model.language_model.layers.3.mlp.gate.weight").unwrap();
+        assert!(bf16.contains("lower accuracy"), "{bf16}");
+    }
+
+    #[test]
+    fn q8_overlay_admits_exactly_241_of_the_flash_next_trunk_names() {
+        let mut admitted = 0usize;
+        for layer in 0..48 {
+            let p = format!("model.language_model.layers.{layer}.");
+            let roles: &[&str] = if layer % 4 == 3 {
+                &[
+                    "self_attn.q_proj.weight",
+                    "self_attn.k_proj.weight",
+                    "self_attn.v_proj.weight",
+                    "self_attn.o_proj.weight",
+                    "self_attn.indexer.index_qk_proj.weight",
+                ]
+            } else {
+                &[
+                    "linear_attn.in_proj_qkv.weight",
+                    "linear_attn.in_proj_z.weight",
+                    "linear_attn.in_proj_a.weight",
+                    "linear_attn.in_proj_b.weight",
+                    "linear_attn.out_proj.weight",
+                ]
+            };
+            for role in roles {
+                assert_eq!(q8_overlay_consumer_refusal(&format!("{p}{role}")), None);
+                admitted += 1;
+            }
+        }
+        assert_eq!(admitted + 1, 241, "48 layers x 5 + lm_head");
+    }
+
+    /// CPU oracle: every distinct Flash-Next MQ6 trunk shape (from the artifact
+    /// index) is a Q8F16 matrix the multi-row Q8_0 kernels accept at 1..=8 rows
+    /// (`K % 32 == 0`, weight / x / y byte extents within u32) and takes the
+    /// same gfx1201 route class as the QSA shapes proven by the 17,748-cell
+    /// oracle (every trunk K is above the wide cutoff: the narrow arm).
+    #[test]
+    fn q8_trunk_shapes_fit_the_q8_rows_exact_kernels() {
+        // (name class, m, k, count per model)
+        let shapes: [(&str, usize, usize, usize); 11] = [
+            ("lm_head", 248_320, 2_560, 1),
+            ("gdn in_proj_a", 48, 2_560, 36),
+            ("gdn in_proj_b", 48, 2_560, 36),
+            ("gdn in_proj_qkv", 10_240, 2_560, 36),
+            ("gdn in_proj_z", 6_144, 2_560, 36),
+            ("gdn out_proj", 2_560, 6_144, 36),
+            ("qsa indexer_qk", 640, 2_560, 12),
+            ("qsa k", 512, 2_560, 12),
+            ("qsa o", 2_560, 6_144, 12),
+            ("qsa q", 12_288, 2_560, 12),
+            ("qsa v", 512, 2_560, 12),
+        ];
+        assert_eq!(shapes.iter().map(|s| s.3).sum::<usize>(), 241);
+        let mut q8_bytes = 0usize;
+        for (class, m, k, count) in shapes {
+            let payload = hipfire_runtime::trunk_overlay::TrunkOverlayFormat::Qt3
+                .payload_bytes(m, k)
+                .unwrap();
+            assert_eq!(
+                Some(payload),
+                DType::Q8_0.row_bytes(k).map(|row| row * m),
+                "{class}"
+            );
+            assert_eq!(replacement_payload_bytes(DType::Q8_0, m, k), Some(payload));
+            assert_eq!(k % 32, 0, "{class}");
+            let max_rows = 8usize;
+            for bytes in [payload, max_rows * k * 4, max_rows * m * 4] {
+                assert!(bytes <= u32::MAX as usize, "{class}: {bytes} B");
+            }
+            assert!(m <= i32::MAX as usize && k <= i32::MAX as usize);
+            assert_eq!(
+                rdna_compute::gemv::q8_0_rows_exact_route("gfx1201", k),
+                rdna_compute::gemv::Q8RowsExactRoute::Narrow,
+                "{class}"
+            );
+            q8_bytes += payload * count;
+        }
+        // The census the overlay writer reports: 3,546,705,920 B of Q8F16
+        // replacing 2,607,872,000 B of MQ6 (+0.874 GiB per replicated card).
+        assert_eq!(q8_bytes, 3_546_705_920);
     }
 
     #[test]

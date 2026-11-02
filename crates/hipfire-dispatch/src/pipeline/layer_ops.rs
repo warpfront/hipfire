@@ -963,6 +963,19 @@ fn project_rotated(
         }
         return Ok(());
     }
+    // Few-row Q8F16 (2..=`few_row_limit` route rows) where the multi-row hipcc kernels exist
+    // (gfx1100 / gfx1201): `gemv_q8_0_rows_exact`, each output row bitwise the rows == 1
+    // `gemv_q8_0` decode singleton, weights read once per group of rows. This is the Q8 twin of
+    // the MQ6 / MQ4 few-row arms below and what the lane (once-over-all-rows) QSA in / out
+    // stages bind for a Q8F16 trunk-overlay projection. gfx1151 keeps its staged-rows decode
+    // kernels in `gemm_q8_0_batched_f32_chunked`; larger row counts keep the batched GEMM.
+    if weight.dtype == DType::Q8_0
+        && (2..=gpu.few_row_limit()).contains(&route)
+        && rdna_compute::gemv::q8_0_rows_exact_route(&gpu.arch, weight.k)
+            != rdna_compute::gemv::Q8RowsExactRoute::PerRowSingleton
+    {
+        return hip(gpu.gemv_q8_0_rows_exact(weight.buf, x, output, weight.m, weight.k, rows));
+    }
     if weight.dtype == DType::MQ6G256V2 && (2..=gpu.few_row_limit()).contains(&route) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }

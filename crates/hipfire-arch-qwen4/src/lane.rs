@@ -3483,6 +3483,27 @@ mod tests {
     }
 
     #[test]
+    fn a_full_q8f16_trunk_overlay_classifies_gdn_in_out_and_head_as_q8() {
+        let q8 = DType::Q8_0;
+        let mut facts = stage_facts();
+        facts.layers[0].mixer = Some(MixerFacts::Gdn {
+            input: [Some(q8); 4],
+            output: Some(q8),
+        });
+        facts.head = Some(q8);
+        let routes = derive_stage_routes(ARCH, &facts);
+        let base = derive_stage_routes(ARCH, &stage_facts());
+        for name in StageName::ALL {
+            let want = match name {
+                StageName::GdnInProj => vec![StageRoute::GdnIn([q8; 4])],
+                StageName::GdnOutProj | StageName::Head => vec![StageRoute::Projection(q8)],
+                _ => base[name.index()].clone(),
+            };
+            assert_eq!(routes[name.index()], want, "{name:?}");
+        }
+    }
+
+    #[test]
     fn a_missing_weight_is_unclassified_for_its_stage_only() {
         let base = derive_stage_routes(ARCH, &stage_facts());
         type Mutation = Box<dyn Fn(&mut StageFacts)>;
