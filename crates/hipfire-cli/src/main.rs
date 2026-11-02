@@ -2206,8 +2206,13 @@ fn fetch_registry_sidecar(
     }
 }
 
+/// Download URL of `file` for `entry`; the entry's own artifact may come from a
+/// versioned repo path (`hipfire_registry::ArtifactUpgradePin`), sidecars never.
 pub(crate) fn artifact_url(entry: &ModelEntry, file: &str) -> String {
-    artifact_url_in(&entry.repo, file)
+    artifact_url_in(
+        &entry.repo,
+        hipfire_registry::artifact_remote_file(entry, file),
+    )
 }
 
 fn artifact_url_in(repo: &str, file: &str) -> String {

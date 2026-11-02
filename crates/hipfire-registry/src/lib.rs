@@ -306,6 +306,71 @@ pub fn trunk_overlay_in(entry: &ModelEntry, pins: &[TrunkOverlayPin]) -> Option<
         })
 }
 
+/// A replacement artifact this client pulls in place of a published one.
+///
+/// The published registry entry (repo, `file`, `sha256`, `size_bytes`) stays
+/// untouched so older clients keep pulling the artifact they can run, and so
+/// their strict `deny_unknown_fields` v1 parser keeps accepting the registry
+/// (the same reason as [`TrunkOverlayPin`]). This client applies the pin at
+/// parse time ([`RegistryV1::apply_artifact_upgrades`]): the entry takes the
+/// replacement's `sha256` / `size_bytes`, keeps its tag and local file name,
+/// and [`artifact_remote_file`] fetches the replacement from a versioned path
+/// in the same repo, so the published file is never overwritten.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArtifactUpgradePin {
+    /// Registry tag the pin applies to.
+    pub tag: &'static str,
+    /// SHA-256 of the published artifact being replaced (the entry's `sha256`).
+    pub base_sha256: &'static str,
+    /// Size in bytes of the published artifact (the entry's `size_bytes`).
+    pub base_size: u64,
+    /// Path of the replacement inside the entry's repo.
+    pub remote_file: &'static str,
+    /// SHA-256 of the replacement.
+    pub sha256: &'static str,
+    /// Size in bytes of the replacement.
+    pub size_bytes: u64,
+}
+
+/// Artifact replacements known to this client.
+pub const ARTIFACT_UPGRADE_PINS: &[ArtifactUpgradePin] = &[
+    // Raon-1-mini-preview: the attention-class projections MQ8G256 (FWHT256
+    // int8, one scale per 256) in place of Q8F16; routed experts, shared /
+    // dense FFN and lm_head byte-identical to the published file. Needs the
+    // MQ8G256 Raon route, which builds before it lack, hence a client pin.
+    ArtifactUpgradePin {
+        tag: "raon-1-mini-preview",
+        base_sha256: "e136b14c2ab7f31a8951c3ffb74439ca4299e9c835fe77fa1ed533f5dfe86688",
+        base_size: 17_865_468_284,
+        remote_file: "v2/raon-1-mini-preview.mq4-xts",
+        sha256: "fa6d150bcb2af4600aad29aa96bb8fdaf894f0bf1f6bd706af17bc65c8f8690e",
+        size_bytes: 17_772_056_444,
+    },
+];
+
+/// The repo path to fetch `file` of `entry` from: an applied
+/// [`ArtifactUpgradePin`]'s `remote_file` when `file` is the entry's own
+/// artifact and the entry carries that pin's replacement identity, else `file`.
+pub fn artifact_remote_file<'a>(entry: &ModelEntry, file: &'a str) -> &'a str {
+    artifact_remote_file_in(entry, file, ARTIFACT_UPGRADE_PINS)
+}
+
+fn artifact_remote_file_in<'a>(
+    entry: &ModelEntry,
+    file: &'a str,
+    pins: &'static [ArtifactUpgradePin],
+) -> &'a str {
+    if file != entry.file {
+        return file;
+    }
+    let (Some(sha256), Some(size_bytes)) = (entry.sha256.as_deref(), entry.size_bytes) else {
+        return file;
+    };
+    pins.iter()
+        .find(|pin| pin.size_bytes == size_bytes && pin.sha256.eq_ignore_ascii_case(sha256))
+        .map_or(file, |pin| pin.remote_file)
+}
+
 /// Content identity of one expert-hotset sidecar and of the exact base
 /// artifact it is bound to.
 ///
@@ -1023,6 +1088,7 @@ impl RegistryV1 {
             })?;
         registry.validate(&source_name)?;
         registry.normalize_flash_next_xts();
+        registry.apply_artifact_upgrades(ARTIFACT_UPGRADE_PINS);
         registry.strip_retired(RETIRED_MODELS);
         // An alias is non-authoritative convenience data. Match v1 behavior by
         // dropping dangling redirects instead of rejecting an otherwise valid
@@ -1041,6 +1107,29 @@ impl RegistryV1 {
     pub fn strip_retired(&mut self, pins: &[RetiredModel]) {
         self.models
             .retain(|tag, _| !pins.iter().any(|pin| pin.tag == tag));
+    }
+
+    /// Point every entry whose artifact identity (`sha256`, `size_bytes`)
+    /// equals a pin's base identity at the pin's replacement: the entry's
+    /// `sha256` and `size_bytes` become the replacement's, and
+    /// [`artifact_remote_file`] fetches it from the pin's repo path. The local
+    /// file name (`file`) and the tag are unchanged, so an installed copy of
+    /// the old artifact fails verification and is refreshed by the next pull.
+    pub fn apply_artifact_upgrades(&mut self, pins: &[ArtifactUpgradePin]) {
+        for (tag, entry) in self.models.iter_mut() {
+            let (Some(sha256), Some(size_bytes)) = (entry.sha256.as_deref(), entry.size_bytes)
+            else {
+                continue;
+            };
+            if let Some(pin) = pins.iter().find(|pin| {
+                pin.tag == tag
+                    && pin.base_size == size_bytes
+                    && pin.base_sha256.eq_ignore_ascii_case(sha256)
+            }) {
+                entry.sha256 = Some(pin.sha256.to_owned());
+                entry.size_bytes = Some(pin.size_bytes);
+            }
+        }
     }
 
     fn normalize_flash_next_xts(&mut self) {
@@ -1781,7 +1870,16 @@ mod tests {
             // The recipe is named MQ4 XTS; the old marketing name stays out of descs
             // (a desc may still cite the legacy FILE names in lower case).
             assert!(!entry.desc.contains("GPTQ3"), "{tag}");
-            assert_eq!(&parsed.models[tag], entry, "{tag}: nothing to normalize");
+            // An artifact upgrade pin is the one intended parse-time rewrite (identity only).
+            let mut expected = entry.clone();
+            if let Some(pin) = ARTIFACT_UPGRADE_PINS.iter().find(|pin| pin.tag == tag) {
+                expected.sha256 = Some(pin.sha256.to_owned());
+                expected.size_bytes = Some(pin.size_bytes);
+            }
+            assert_eq!(
+                &parsed.models[tag], &expected,
+                "{tag}: nothing else to normalize"
+            );
             assert!(
                 entry.ple.keys().all(|key| is_ple_format_token(key)),
                 "{tag}"
@@ -3680,6 +3778,85 @@ mod tests {
             "effort-native: absence means uncapped"
         );
     }
+    #[test]
+    fn bundled_raon_takes_the_mq8_upgrade_pin_and_keeps_its_published_entry() {
+        // The checked-in (published) entry is unchanged: old clients pull the
+        // Q8F16-attention file they can run.
+        let raw: serde_json::Value = serde_json::from_str(BUNDLED_REGISTRY).unwrap();
+        let published = &raw["models"]["raon-1-mini-preview"];
+        assert_eq!(published["file"], "raon-1-mini-preview.mq4-xts");
+        assert_eq!(
+            published["sha256"],
+            "e136b14c2ab7f31a8951c3ffb74439ca4299e9c835fe77fa1ed533f5dfe86688"
+        );
+        assert_eq!(published["size_bytes"], 17_865_468_284u64);
+        // This client: same tag and local file name, the replacement identity,
+        // fetched from the versioned repo path; sidecars and drafts unchanged.
+        let registry = bundled().unwrap();
+        let (_, entry) = registry.model("raon-1-mini-preview").unwrap();
+        assert_eq!(entry.file, "raon-1-mini-preview.mq4-xts");
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some("fa6d150bcb2af4600aad29aa96bb8fdaf894f0bf1f6bd706af17bc65c8f8690e")
+        );
+        assert_eq!(entry.size_bytes, Some(17_772_056_444));
+        assert_eq!(
+            artifact_remote_file(entry, &entry.file),
+            "v2/raon-1-mini-preview.mq4-xts"
+        );
+        let sidecar = entry.dflash.as_ref().unwrap();
+        assert_eq!(artifact_remote_file(entry, &sidecar.file), sidecar.file);
+        let (_, draft) = registry.model("raon-1-mini-preview:draft").unwrap();
+        assert_eq!(artifact_remote_file(draft, &draft.file), draft.file);
+        // Re-parsing an already-upgraded registry (e.g. the fetch cache) is a no-op.
+        let again = RegistryV1::parse(&serde_json::to_string(&registry).unwrap(), "x").unwrap();
+        assert_eq!(again.models["raon-1-mini-preview"], *entry);
+    }
+
+    #[test]
+    fn artifact_upgrade_pins_match_tag_and_exact_base_identity_only() {
+        let pin = ARTIFACT_UPGRADE_PINS[0];
+        let entry = |tag_sha: &str, size: u64| ModelEntry {
+            repo: "hipfire-models/raon-1-mini-preview".into(),
+            file: "raon-1-mini-preview.mq4-xts".into(),
+            sha256: Some(tag_sha.into()),
+            size_bytes: Some(size),
+            ..ModelEntry::default()
+        };
+        let mut registry = bundled().unwrap();
+        registry.models.clear();
+        registry
+            .models
+            .insert(pin.tag.into(), entry(pin.base_sha256, pin.base_size));
+        registry
+            .models
+            .insert("other".into(), entry(pin.base_sha256, pin.base_size));
+        registry
+            .models
+            .insert("raon-wrong-size".into(), entry(pin.base_sha256, 1));
+        registry.apply_artifact_upgrades(ARTIFACT_UPGRADE_PINS);
+        assert_eq!(registry.models[pin.tag].sha256.as_deref(), Some(pin.sha256));
+        assert_eq!(
+            registry.models["other"].sha256.as_deref(),
+            Some(pin.base_sha256)
+        );
+        let unchanged = &registry.models["other"];
+        assert_eq!(
+            artifact_remote_file(unchanged, &unchanged.file),
+            unchanged.file
+        );
+        let mut fresh = bundled().unwrap();
+        fresh.models.clear();
+        let mut wrong = entry(pin.base_sha256, pin.base_size);
+        wrong.size_bytes = Some(pin.base_size + 1);
+        fresh.models.insert(pin.tag.into(), wrong);
+        fresh.apply_artifact_upgrades(ARTIFACT_UPGRADE_PINS);
+        assert_eq!(
+            fresh.models[pin.tag].sha256.as_deref(),
+            Some(pin.base_sha256)
+        );
+    }
+
     #[test]
     fn bundled_raon_dflash2_sidecar_is_declared_and_lowers_auto_on_the_target_only() {
         let registry = bundled().unwrap();
