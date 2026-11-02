@@ -3363,6 +3363,18 @@ fn qwen4_ep_unit_plan(
             free_per_rank.len()
         ));
     }
+    let budget_delta_mib = units::ep_unit_budget_delta_mib(
+        hipfire_config::developer_var(units::EP_UNIT_BUDGET_DELTA_ENV)
+            .ok()
+            .as_deref(),
+    )
+    .map_err(|error| format!("qwen4: {error}"))?;
+    if budget_delta_mib != 0 {
+        eprintln!(
+            "qwen4 EP expert tier (lab): every rank's unit budget {budget_delta_mib:+} MiB ({})",
+            units::EP_UNIT_BUDGET_DELTA_ENV
+        );
+    }
     units::place_routed_experts_units_staged(
         &geometry,
         units::EpRanking {
@@ -3370,7 +3382,10 @@ fn qwen4_ep_unit_plan(
             counts: Some(sidecar.counts()),
             sha256: Some(sidecar.sha256()),
         },
-        &units::ep_unit_rank_budgets(free_per_rank, non_expert, reserve_total),
+        &units::ep_unit_apply_budget_delta(
+            units::ep_unit_rank_budgets(free_per_rank, non_expert, reserve_total),
+            budget_delta_mib,
+        ),
         stage_on,
     )
     .map_err(|error| format!("qwen4: {flag}: {error}"))
@@ -6683,10 +6698,21 @@ fn load_qwen4_rank_unscoped(
             // leaves for experts at the same reserve the plan was budgeted with
             // (the lane store, which only shrinks the budget, is not known here).
             let rank = ep.map_or(0, |placement| placement.rank);
-            let budget = hipfire_arch_qwen4::expert_ep_units::ep_unit_rank_budgets(
-                &[free],
-                non_expert,
-                reserve,
+            let budget_delta_mib = hipfire_arch_qwen4::expert_ep_units::ep_unit_budget_delta_mib(
+                hipfire_config::developer_var(
+                    hipfire_arch_qwen4::expert_ep_units::EP_UNIT_BUDGET_DELTA_ENV,
+                )
+                .ok()
+                .as_deref(),
+            )
+            .map_err(|error| format!("qwen4: {error}"))?;
+            let budget = hipfire_arch_qwen4::expert_ep_units::ep_unit_apply_budget_delta(
+                hipfire_arch_qwen4::expert_ep_units::ep_unit_rank_budgets(
+                    &[free],
+                    non_expert,
+                    reserve,
+                ),
+                budget_delta_mib,
             )[0];
             let stage = hipfire_arch_qwen4::expert_ep_units::ep_unit_plan_stage_charge(
                 units,

@@ -494,6 +494,37 @@ pub fn ep_unit_rank_budgets(
         .collect()
 }
 
+/// Lab knob (`HIPFIRE_EP_UNIT_BUDGET_DELTA_MIB`, signed, default 0): MiB added to (or, negative,
+/// taken from) every rank's unit budget before the ranking walk, to sweep the resident-unit count
+/// on one binary. Lab only: a positive delta can plan more experts than the free VRAM leaves.
+pub const EP_UNIT_BUDGET_DELTA_ENV: &str = "HIPFIRE_EP_UNIT_BUDGET_DELTA_MIB";
+
+/// Parse [`EP_UNIT_BUDGET_DELTA_ENV`]: unset or blank is `0`; anything but a signed integer is an
+/// error (never silently ignored).
+pub fn ep_unit_budget_delta_mib(raw: Option<&str>) -> Result<i64, String> {
+    match raw.map(str::trim).filter(|value| !value.is_empty()) {
+        None => Ok(0),
+        Some(value) => value.parse::<i64>().map_err(|_| {
+            format!("{EP_UNIT_BUDGET_DELTA_ENV}={value:?} is not a signed integer (MiB)")
+        }),
+    }
+}
+
+/// `budgets` with `delta_mib` MiB added to (or taken from, saturating at 0) every rank.
+pub fn ep_unit_apply_budget_delta(budgets: Vec<u64>, delta_mib: i64) -> Vec<u64> {
+    let delta = delta_mib.unsigned_abs().saturating_mul(1 << 20);
+    budgets
+        .into_iter()
+        .map(|budget| {
+            if delta_mib >= 0 {
+                budget.saturating_add(delta)
+            } else {
+                budget.saturating_sub(delta)
+            }
+        })
+        .collect()
+}
+
 /// Suffix of a mixed layer's VRAM arena entry (`...layers.{L}.mlp.experts.unit_vram_arena`).
 pub const UNIT_VRAM_ARENA_SUFFIX: &str = ".mlp.experts.unit_vram_arena";
 /// Suffix of a mixed layer's pinned-host arena entry (`...layers.{L}.mlp.experts.unit_host_arena`).
@@ -2231,5 +2262,28 @@ mod ep_unit_stage_tests {
         };
         let line = ep_unit_stage_receipt(&charge);
         assert!(line.starts_with("stage 640 MiB x 2 charged"), "{line}");
+    }
+
+    #[test]
+    fn the_lab_budget_delta_parses_and_applies_per_rank() {
+        assert_eq!(ep_unit_budget_delta_mib(None), Ok(0));
+        assert_eq!(ep_unit_budget_delta_mib(Some("  ")), Ok(0));
+        assert_eq!(ep_unit_budget_delta_mib(Some("1573")), Ok(1573));
+        assert_eq!(ep_unit_budget_delta_mib(Some("-512")), Ok(-512));
+        assert!(ep_unit_budget_delta_mib(Some("1.5")).is_err());
+        assert!(ep_unit_budget_delta_mib(Some("lots")).is_err());
+        assert_eq!(
+            ep_unit_apply_budget_delta(vec![10 << 20, 0], 0),
+            vec![10 << 20, 0]
+        );
+        assert_eq!(
+            ep_unit_apply_budget_delta(vec![10 << 20, 0], 5),
+            vec![15 << 20, 5 << 20]
+        );
+        assert_eq!(
+            ep_unit_apply_budget_delta(vec![10 << 20, 0], -5),
+            vec![5 << 20, 0]
+        );
+        assert_eq!(ep_unit_apply_budget_delta(vec![10 << 20], -50), vec![0]);
     }
 }
