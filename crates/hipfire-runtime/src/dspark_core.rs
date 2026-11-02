@@ -312,7 +312,7 @@ pub trait DsparkBody {
     ///
     /// Default: no-op for bodies without persistent draft-local GPU state.
     /// [`DsparkDrafter::mtp_reset`] always invokes this after clearing its own
-    /// multi-slot context cache.
+    /// multi-slot context cache, and a cold (`!cache_hit`) `mtp_prefill` too.
     fn reset_for_retry(&mut self, _gpu: &mut Gpu) {}
 }
 
@@ -1173,6 +1173,11 @@ impl MtpDrafter for DsparkDrafter {
     ) -> Result<crate::spec::PrefillOutcome, String> {
         if !cache_hit {
             target.reset_recurrent(gpu)?;
+            // A cold prefill starts a new conversation: body draft rings (DeepSeek
+            // `dspark_swa_k`) still hold the previous request's main_kv, and the
+            // next draft attends them, so greedy output followed daemon history
+            // (HIPF-257). Same clean slate as a fresh daemon or a cold retry.
+            self.body.reset_for_retry(gpu);
         }
         // Invalidate multi-slot context: mtp_step re-bootstraps for the first seed.
         // As in the deepseek4 drafter, we do NOT warm the DSpark stage rings
