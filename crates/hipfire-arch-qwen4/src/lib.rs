@@ -59,6 +59,10 @@ pub mod expert_slabs;
 pub mod expert_tier_owners;
 /// Pure per-expert device/host-mapped placement plan (B5-C1).
 pub mod expert_tier_plan;
+/// Bounded evictable expert tail over D1's static core (D2): flag, budget charge, slot policy.
+pub mod expert_unit_tail;
+/// The device part of the D2 tail on one EP rank.
+pub(crate) mod expert_unit_tail_rank;
 pub mod gpu_forward;
 pub mod gpu_forward_lanes;
 /// Measured host-to-device link class (narrow-link G2 and chunk defaults).

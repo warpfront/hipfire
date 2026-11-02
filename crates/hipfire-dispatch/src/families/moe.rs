@@ -1588,6 +1588,15 @@ pub trait MoeRowGather {
     ) -> Result<(), String> {
         Err("owner assignment not supported".into())
     }
+
+    /// End of one decode window (a trunk forward over every lane's rows) on this
+    /// rank, after its D2H sync and before the next window's launches: the D2
+    /// expert tail retires the window here. No-op by default.
+    fn decode_step_end(&self, _gpu: &mut rdna_compute::Gpu) {}
+
+    /// The forward is freed: release any device state the hook owns. No-op by
+    /// default.
+    fn release_gpu(&self, _gpu: &mut rdna_compute::Gpu) {}
 }
 
 /// Expert-parallel owner-routed chunk exchange of the grouped symmetric IU4

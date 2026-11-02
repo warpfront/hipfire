@@ -2996,6 +2996,21 @@ pub fn qwen4_ep_vram_layers(
     // placements, is off with a note, unless `HIPFIRE_EP_UNIT_RESERVE=1` plans the
     // units under it with whole-resident donor layers (`qwen4_ep_units_donor_plan`).
     let units_path = qwen4_ep_units_flag(src, ranks, 1, &gpu.arch, true);
+    if units_path.is_none() {
+        // The D2 tail only exists over a per-expert unit plan: refuse before any load work.
+        use hipfire_arch_qwen4::expert_unit_tail as tail;
+        let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
+        if tail::parse_ep_unit_tail(raw.as_deref())
+            .map_err(|error| format!("qwen4: {error}"))?
+            .is_some()
+        {
+            return Err(format!(
+                "qwen4: {} needs a per-expert unit plan ({})",
+                tail::EP_UNIT_TAIL_ENV,
+                hipfire_arch_qwen4::expert_ep_units::EP_EXPERT_HOTSET_ENV
+            ));
+        }
+    }
     if units_path.is_some() {
         hipfire_arch_qwen4::expert_ep_units::ep_units_refusal(&qwen4_ep_units_facts(ranks, 1))
             .map_err(|error| format!("qwen4: {error}"))?;
@@ -3626,6 +3641,19 @@ fn qwen4_unit_borrow_restore_bytes(
         )
 }
 
+/// The MiB the D2 tail (`HIPFIRE_EP_UNIT_TAIL`) takes from every rank's unit budget: the static
+/// core is `B - T` units and the pool of `T` evictable slots is allocated at attach. `0` with the
+/// tail off. The same value serves the plan walk and the per-rank fit check.
+fn qwen4_ep_unit_tail_delta_mib(unit_bytes: u64) -> Result<i64, String> {
+    use hipfire_arch_qwen4::expert_unit_tail as tail;
+    let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
+    let config =
+        tail::parse_ep_unit_tail(raw.as_deref()).map_err(|error| format!("qwen4: {error}"))?;
+    Ok(config.map_or(0, |config| {
+        tail::ep_unit_tail_budget_delta_mib(&config, unit_bytes)
+    }))
+}
+
 /// The per-expert plan sidecar of this load, or `None` for today's whole-layer placement.
 /// `HIPFIRE_QWEN4_EP_EXPERT_HOTSET`, read once from the process configuration: a path is the
 /// explicit sidecar (it must bind; a refusal is a load error), `0` or blank is off, and unset
@@ -3802,6 +3830,16 @@ fn qwen4_ep_unit_plan(
             units::EP_UNIT_BUDGET_DELTA_ENV
         );
     }
+    let tail_delta_mib = qwen4_ep_unit_tail_delta_mib(geometry.unit_bytes())?;
+    if tail_delta_mib != 0 {
+        eprintln!(
+            "qwen4 EP expert tier: D2 tail ({}) takes {} MiB of every rank's unit budget for its slot pool; \
+             the static core is the rest",
+            hipfire_arch_qwen4::expert_unit_tail::EP_UNIT_TAIL_ENV,
+            -tail_delta_mib
+        );
+    }
+    let budget_delta_mib = budget_delta_mib + tail_delta_mib;
     let ranking = units::EpRanking {
         rank: sidecar.rank(),
         counts: Some(sidecar.counts()),
@@ -7557,6 +7595,8 @@ fn load_qwen4_rank_unscoped(
                 .as_deref(),
             )
             .map_err(|error| format!("qwen4: {error}"))?;
+            let budget_delta_mib =
+                budget_delta_mib + qwen4_ep_unit_tail_delta_mib(units.geometry().unit_bytes())?;
             let budget = hipfire_arch_qwen4::expert_ep_units::ep_unit_apply_budget_delta(
                 hipfire_arch_qwen4::expert_ep_units::ep_unit_rank_budgets(
                     &[free],

@@ -3617,7 +3617,8 @@ pub(crate) fn qwen4_ep_unit_pins_admitted(arch: &str, ranks: usize) -> bool {
         hipfire_config::developer_var(EP_UNIT_PINNED_OWNERS_ENV)
             .ok()
             .as_deref(),
-    ) && qwen4_ep_balanced_owners_enabled()
+    ) && !crate::expert_unit_tail::ep_unit_tail_configured()
+        && qwen4_ep_balanced_owners_enabled()
         && qwen4_ep_balanced_owners_refusal(arch, ranks).is_none()
 }
 
@@ -4015,6 +4016,11 @@ impl Qwen4ForwardEp {
 
     fn free_gpu(self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
         let mut first = None;
+        // The row-gather hook may own the D2 tail's device state (pool, log, copy stream),
+        // which aliases tables of the layers freed below.
+        if let Some(gather) = self.gather.as_ref() {
+            gather.release_gpu(gpu);
+        }
         for layer in self.moe_full {
             if let Some(error) = layer.free_gpu(gpu) {
                 first.get_or_insert(error);
@@ -13032,6 +13038,39 @@ impl Qwen4GpuForward {
         })
     }
 
+    /// The rank's decode MoE layers the D2 tail may manage (`HIPFIRE_EP_UNIT_TAIL`): per layer
+    /// the label, non-owning aliases of the two decode pointer tables and the host entries they
+    /// were uploaded from. Only layers running the static `e % ranks` owners over a unit plan
+    /// qualify (the tail itself keeps just the plan's mixed ones); empty outside EP.
+    pub(crate) fn tail_layers(&self) -> Vec<crate::expert_unit_tail_rank::TailLayerInit> {
+        if self.ep.is_none() {
+            return Vec::new();
+        }
+        self.moe
+            .iter()
+            .flatten()
+            .filter(|moe| moe.static_owners && moe.host_mapped)
+            .map(|moe| crate::expert_unit_tail_rank::TailLayerInit {
+                label: moe.label,
+                // SAFETY: non-owning aliases of tables this forward owns until `free_gpu`;
+                // the tail that holds them is released first (`release_gpu` in
+                // `Qwen4ForwardEp::free_gpu`) and is never used after the forward is freed.
+                gate_up_table: GpuTensor {
+                    buf: unsafe { moe.expert_gate_up_ptrs.buf.alias() },
+                    shape: moe.expert_gate_up_ptrs.shape.clone(),
+                    dtype: moe.expert_gate_up_ptrs.dtype,
+                },
+                down_table: GpuTensor {
+                    buf: unsafe { moe.expert_down_ptrs.buf.alias() },
+                    shape: moe.expert_down_ptrs.shape.clone(),
+                    dtype: moe.expert_down_ptrs.dtype,
+                },
+                gate_up_entries: moe.expert_gate_up_entries.clone(),
+                down_entries: moe.expert_down_entries.clone(),
+            })
+            .collect()
+    }
+
     /// After every rank is loaded and P2P is enabled on every rank: build this
     /// rank's full (P2P) chunk tables from all ranks' sources
     /// (`peers[rank][moe_layer]`), take the symmetric-IU4 verdict a single
@@ -13106,6 +13145,7 @@ impl Qwen4GpuForward {
         // `HIPFIRE_EP_UNIT_PINNED_OWNERS=0` (D1: static owners there) or when balanced ownership
         // itself is off or refused.
         let pins_on = balanced_on
+            && !crate::expert_unit_tail::ep_unit_tail_configured()
             && ep_unit_pinned_owners_on(
                 hipfire_config::developer_var(EP_UNIT_PINNED_OWNERS_ENV)
                     .ok()
@@ -15179,6 +15219,12 @@ impl Qwen4GpuForward {
     ) -> Result<(), Qwen4GpuForwardError> {
         self.share_check()?;
         self.ep_ordinary_note_call(tokens.len());
+        // The previous singleton forward (a token or a verify window) is a retired window of
+        // the D2 expert tail, if one is installed (lane steps retire theirs after their own
+        // forward); a no-op when no gather call was logged since.
+        if let Some(gather) = self.ep.as_ref().and_then(|ep| ep.gather.as_deref()) {
+            gather.decode_step_end(gpu);
+        }
         if self.ep_reserve.is_some() {
             return self.ep_reserve_forward_chunk(
                 bundle,

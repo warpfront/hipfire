@@ -528,6 +528,9 @@ pub(crate) struct Qwen4EpRowGatherHook {
     /// The mesh's per-expert unit plan (`HIPFIRE_QWEN4_EP_EXPERT_HOTSET`), installed once for
     /// the lab hit counters ([`lab_unit_hits`]); never set without a unit plan.
     unit_plan: OnceLock<Arc<crate::expert_ep_units::EpUnitPlan>>,
+    /// The rank's D2 expert tail (`HIPFIRE_EP_UNIT_TAIL`), installed once after the forward
+    /// attached; never set when the tail is off.
+    tail: OnceLock<crate::expert_unit_tail_rank::UnitTailRank>,
 }
 
 /// What the hook knows of the rank's balanced trunk layers.
@@ -607,12 +610,23 @@ impl Qwen4EpRowGatherHook {
             last_buffer: AtomicUsize::new(NO_BUFFER),
             balanced: OnceLock::new(),
             unit_plan: OnceLock::new(),
+            tail: OnceLock::new(),
         })
     }
 
     /// Install the load's unit plan for [`lab_unit_hits`] (once, after construction).
     fn install_unit_plan(&self, plan: Arc<crate::expert_ep_units::EpUnitPlan>) {
         let _ = self.unit_plan.set(plan);
+    }
+
+    /// Install the rank's D2 tail (once, after `attach_ep`).
+    fn install_tail(&self, tail: crate::expert_unit_tail_rank::UnitTailRank) -> Result<(), String> {
+        self.tail.set(tail).map_err(|_| {
+            format!(
+                "qwen4 EP rank {}: the D2 tail is already installed",
+                self.rank
+            )
+        })
     }
 
     /// [`lab_unit_hits`]: download this call's routed ids and tally, against the unit plan,
@@ -670,6 +684,41 @@ impl Qwen4EpRowGatherHook {
     }
 }
 
+/// Install the rank's D2 tail when `HIPFIRE_EP_UNIT_TAIL` asks for it. The tail needs the
+/// per-expert unit plan (a plan-less load is a load error, never a silent no-op).
+fn install_unit_tail(
+    hook: &Qwen4EpRowGatherHook,
+    gpu: &mut Gpu,
+    rank: usize,
+    trunk_layers: usize,
+    bundle: &Qwen4Bundle,
+    forward: &crate::gpu_forward::Qwen4GpuForward,
+) -> Result<(), String> {
+    use crate::expert_unit_tail as tail;
+    let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
+    let Some(config) = tail::parse_ep_unit_tail(raw.as_deref())? else {
+        return Ok(());
+    };
+    let plan = bundle.weights.ep_unit_plan().ok_or_else(|| {
+        format!(
+            "{} needs a per-expert unit plan ({})",
+            tail::EP_UNIT_TAIL_ENV,
+            crate::expert_ep_units::EP_EXPERT_HOTSET_ENV
+        )
+    })?;
+    let installed = crate::expert_unit_tail_rank::UnitTailRank::install(
+        gpu,
+        rank,
+        trunk_layers,
+        plan,
+        config,
+        hipfire_config::developer_bool(tail::EP_UNIT_TAIL_FREEZE_ENV, false),
+        hipfire_config::developer_bool(tail::EP_UNIT_TAIL_LOG_ENV, false),
+        forward.tail_layers(),
+    )?;
+    hook.install_tail(installed)
+}
+
 /// Record `buffer` as the rank's current invocation in `last`; `Err` when the
 /// previous invocation used the same one.
 fn note_gather_buffer(last: &AtomicUsize, rank: usize, buffer: usize) -> Result<(), String> {
@@ -707,6 +756,9 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
         note_gather_buffer(&self.last_buffer, self.rank, buffer)?;
         if lab_unit_hits::enabled() && (layer_idx as usize) < self.trunk_layers {
             self.lab_note_unit_hits(gpu, layer_idx, slots, topk_indices);
+        }
+        if let Some(tail) = self.tail.get() {
+            tail.note_call(gpu, layer_idx, slots, topk_indices);
         }
         // Trunk-shard partial route (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): a trunk layer's FFN is
         // reduced by the fused all-reduce of its HC write, not gathered. Non-owned slots ran
@@ -815,6 +867,18 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
                 self.rank
             )
         })
+    }
+
+    fn decode_step_end(&self, gpu: &mut Gpu) {
+        if let Some(tail) = self.tail.get() {
+            tail.step_end(gpu);
+        }
+    }
+
+    fn release_gpu(&self, gpu: &mut Gpu) {
+        if let Some(tail) = self.tail.get() {
+            tail.release(gpu);
+        }
     }
 }
 
@@ -1740,7 +1804,8 @@ impl Qwen4Bundle {
                     // balanced layers).
                     Some(plan) => hook.install_balanced(plan),
                     None => Ok(()),
-                });
+                })
+                .and_then(|()| install_unit_tail(&hook, gpu, rank, trunk_layers, bundle, &forward));
             bundle.execution = Some(forward);
             if result.is_ok() {
                 crate::trunk_route::install(ar_hc.as_ref().map(|exchange| {

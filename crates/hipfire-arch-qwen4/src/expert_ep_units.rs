@@ -172,9 +172,17 @@ pub struct EpUnitPlan {
     /// parity buffers ([`place_routed_experts_units_borrowed_staged`]); `None` for every other
     /// plan (the dedicated stage, or no unit stage).
     stage_borrow: Option<[usize; 2]>,
+    /// The ranking the plan walked (global ids `layer * experts_per_layer + expert`, hottest
+    /// first); `None` for a whole-layers plan. The D2 tail seeds and orders itself by it.
+    ranking_order: Option<Vec<u32>>,
 }
 
 impl EpUnitPlan {
+    /// The walked ranking, hottest first (`None` without one).
+    pub fn ranking_order(&self) -> Option<&[u32]> {
+        self.ranking_order.as_deref()
+    }
+
     fn index(&self, rank: usize, layer: usize, expert: usize) -> usize {
         let g = &self.geometry;
         (rank * g.layers + layer) * g.experts_per_layer + expert
@@ -440,6 +448,7 @@ pub fn place_routed_experts_units(
                 coverage: vec![None; g.ranks],
                 rank_budget_bytes: None,
                 stage_borrow: None,
+                ranking_order: None,
             })
         }
         EpUnitSource::Ranking {
@@ -623,6 +632,7 @@ fn place_ranking(
         coverage,
         rank_budget_bytes: Some(rank_budget_bytes.to_vec()),
         stage_borrow: None,
+        ranking_order: Some(ranking.rank.to_vec()),
     })
 }
 
