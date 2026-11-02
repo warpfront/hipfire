@@ -8,8 +8,10 @@ use std::sync::Mutex;
 
 use super::*;
 
-/// Spawning right after writing an executable can race another test's fork
-/// (`ETXTBSY`): the tests that spawn run one at a time.
+/// Exec of a script fails with `ETXTBSY` while any process holds it open for
+/// writing, and a fork inherits every open descriptor until its exec. So
+/// writing an executable and spawning both hold this lock: no test forks while
+/// another has a script open for writing.
 static SPAWN: Mutex<()> = Mutex::new(());
 
 struct Rig {
@@ -56,6 +58,7 @@ impl Rig {
              OUT=\"\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && OUT=\"$2\"; shift; done\n{body}\n",
             calls = self.root.join("calls").display()
         );
+        let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
         fs::write(&path, text).expect("script");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
         path
