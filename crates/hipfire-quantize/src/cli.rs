@@ -216,8 +216,18 @@ pub(crate) struct QuantizeArgs {
     /// Enable AWQ pre-scaling with an explicit alpha.
     #[arg(long, value_name = "ALPHA")]
     pub awq_alpha: Option<f32>,
-    /// Correct Qwen3.8 linear-attention out_proj imatrix head order before
-    /// fitting AWQ scales. Does not change the alpha or any other tensor.
+    /// Re-index llama.cpp's tiled V-head order in the imatrix's
+    /// `linear_attn.out_proj` / `ssm_out` entries back to HF grouped order
+    /// before AWQ. llama.cpp's HF→GGUF converter permutes that tensor's input
+    /// axis (`tiled = v_slot * n_k_heads + k_head`) for `ggml_repeat`
+    /// broadcast, so the imatrix records it tiled while HF columns are grouped
+    /// (`grouped = k_head * n_v_per_k + v_slot`). Geometry is read from the
+    /// model config (`linear_num_key_heads`, `linear_num_value_heads`,
+    /// `linear_value_head_dim`); HF head `h` reads tiled head
+    /// `(h % n_v_per_k) * n_k_heads + h / n_v_per_k`. Recommended for every
+    /// llama.cpp-imatrix AWQ requant of a grouped-V-head model (Qwen3.5/3.6/
+    /// 3.8 GatedDeltaNet); off by default to keep historical recipes
+    /// byte-reproducible.
     #[arg(long, requires = "imatrix")]
     pub awq_fix_la_head_order: bool,
 
