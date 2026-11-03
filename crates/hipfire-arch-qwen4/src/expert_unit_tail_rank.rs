@@ -43,7 +43,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use hip_bridge::{Event, Stream, HIP_EVENT_DISABLE_TIMING};
+use hip_bridge::{Event, PinnedHostBuffer, Stream, HIP_EVENT_DISABLE_TIMING};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::expert_ep_units::EpUnitPlan;
@@ -121,13 +121,141 @@ pub(crate) struct TailFullInit {
     pub down_entries: Vec<usize>,
 }
 
+/// Bytes of one pointer-table entry (u64 LE per expert).
+const ENTRY_BYTES: usize = 8;
+
+/// The inclusive entry range `(lo, hi)` where two byte images of one table differ, `None` when
+/// they are equal. The pure definition of what a retirement has to upload of a table: the
+/// device holds `old`, the host image is `new`, the bytes of entries `lo..=hi` (and nothing
+/// else) make the device table equal to `new`. [`DirtyRange`] tracks it incrementally; the tests
+/// hold the two equal.
+#[cfg(test)]
+fn changed_entry_range(old: &[u8], new: &[u8]) -> Option<(usize, usize)> {
+    debug_assert_eq!(old.len(), new.len());
+    let entries = old.len().min(new.len()) / ENTRY_BYTES;
+    let differs = |entry: usize| {
+        old[entry * ENTRY_BYTES..(entry + 1) * ENTRY_BYTES]
+            != new[entry * ENTRY_BYTES..(entry + 1) * ENTRY_BYTES]
+    };
+    let lo = (0..entries).find(|&entry| differs(entry))?;
+    let hi = (lo..entries).rev().find(|&entry| differs(entry))?;
+    Some((lo, hi))
+}
+
+/// The byte span `(offset, len)` of the inclusive entry range `(lo, hi)`.
+fn entry_span((lo, hi): (usize, usize)) -> (usize, usize) {
+    (lo * ENTRY_BYTES, (hi - lo + 1) * ENTRY_BYTES)
+}
+
+/// The entries of one table image rewritten since its last upload, as an inclusive range. Only a
+/// write that changes an entry's bytes is noted, so after a retirement the range is exactly
+/// [`changed_entry_range`] of the device's table and the image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DirtyRange(Option<(usize, usize)>);
+
+impl DirtyRange {
+    fn note(&mut self, expert: usize) {
+        self.0 = Some(match self.0 {
+            None => (expert, expert),
+            Some((lo, hi)) => (lo.min(expert), hi.max(expert)),
+        });
+    }
+
+    /// The range to upload; the image is clean afterwards.
+    fn take(&mut self) -> Option<(usize, usize)> {
+        self.0.take()
+    }
+}
+
+/// One hipHostMalloc (portable) allocation that every table image of a rank is carved from.
+/// Nothing reads or writes it except through the [`TableImage`] ranges, which are disjoint.
+struct PinnedPool {
+    _buf: PinnedHostBuffer,
+}
+
+// SAFETY: `PinnedPool` only keeps the allocation alive (the buffer has no accessor here); the
+// bytes are reached only through `TableImage` ranges, each the unique accessor of its own
+// disjoint range, which the tail drives from one rank thread behind `UnitTailRank::inner`'s
+// mutex. The HIP library the buffer frees through is thread-agnostic and kept alive by the
+// buffer. A device read of an image (an async table upload) is fenced by the window protocol:
+// an image is rewritten only after the next retirement's `stream_synchronize`, and `release`
+// synchronizes the compute stream before the pool can drop.
+unsafe impl Send for PinnedPool {}
+unsafe impl Sync for PinnedPool {}
+
+/// One table's host byte image (u64 LE per expert) in pinned host memory, with the entries
+/// rewritten since its last upload. Pinned, so an `hipMemcpyAsync` from it is a plain
+/// stream-ordered DMA of just the changed entry range instead of a staged copy of the table.
+struct TableImage {
+    ptr: *mut u8,
+    len: usize,
+    dirty: DirtyRange,
+    _pool: Arc<PinnedPool>,
+}
+
+// SAFETY: see `PinnedPool`: this is the unique accessor of `ptr[..len]`, a range of an
+// allocation that `_pool` keeps alive, and it moves with its owner (`Inner`, behind a mutex).
+unsafe impl Send for TableImage {}
+
+impl std::ops::Deref for TableImage {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `ptr[..len]` is an initialized range of the live pool that only this image
+        // accesses (`TableImage`'s Send note).
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl std::ops::DerefMut for TableImage {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as `deref`; `&mut self` excludes any other host access.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+    }
+}
+
+impl TableImage {
+    /// Point `expert` at `value`; noted dirty only when the entry changed.
+    fn write_entry(&mut self, expert: usize, value: u64) {
+        let at = expert * ENTRY_BYTES;
+        let bytes = value.to_le_bytes();
+        if self[at..at + ENTRY_BYTES] != bytes {
+            self[at..at + ENTRY_BYTES].copy_from_slice(&bytes);
+            self.dirty.note(expert);
+        }
+    }
+
+    /// Enqueue the upload of the entries rewritten since the last one (nothing when clean) to
+    /// `table` on `stream`; returns the bytes enqueued. The image may not be rewritten until the
+    /// stream drained (the window protocol's `stream_synchronize` at the next retirement).
+    fn upload_dirty(
+        &mut self,
+        gpu: &Gpu,
+        table: &GpuTensor,
+        stream: Option<&Stream>,
+    ) -> Result<usize, String> {
+        let Some(range) = self.dirty.take() else {
+            return Ok(0);
+        };
+        let (offset, len) = entry_span(range);
+        gpu.hip
+            .memcpy_htod_async_on(
+                &table.buf.byte_view(offset, len),
+                &self[offset..offset + len],
+                stream,
+            )
+            .map_err(io)?;
+        Ok(len)
+    }
+}
+
 /// The rank's mirror of one layer's full tables: byte images as last uploaded and which experts
 /// follow the decode table.
 struct FullTable {
     table_gate_up: GpuTensor,
     table_down: GpuTensor,
-    image_gate_up: Vec<u8>,
-    image_down: Vec<u8>,
+    image_gate_up: TableImage,
+    image_down: TableImage,
     /// `shared[expert]`: the full table's canonical entries of `expert` are the decode table's
     /// (so a slot copy of the unit is a valid byte copy for both tables).
     shared: Vec<bool>,
@@ -224,14 +352,20 @@ fn apply_peer_delta(
 impl FullTable {
     /// [`apply_peer_delta`] on this table's image.
     fn apply_peer(&mut self, rank: usize, ranks: usize, owner: usize, delta: &PeerDelta) -> bool {
-        apply_peer_delta(
+        let changed = apply_peer_delta(
             rank,
             ranks,
             owner,
             (&self.base_gate_up, &self.base_down),
-            (&mut self.image_gate_up, &mut self.image_down),
+            (&mut self.image_gate_up[..], &mut self.image_down[..]),
             delta,
-        )
+        );
+        if changed {
+            let expert = delta.unit.1 as usize;
+            self.image_gate_up.dirty.note(expert);
+            self.image_down.dirty.note(expert);
+        }
+        changed
     }
 }
 
@@ -253,9 +387,9 @@ struct TailLayer {
     table_down: GpuTensor,
     canon_gate_up: Vec<u64>,
     canon_down: Vec<u64>,
-    /// The byte images of the two tables as last uploaded (u64 LE per expert).
-    image_gate_up: Vec<u8>,
-    image_down: Vec<u8>,
+    /// The byte images of the two tables as last uploaded (u64 LE per expert), pinned.
+    image_gate_up: TableImage,
+    image_down: TableImage,
     /// The layer's full (prefill) tables, mirrored for the experts that share canonical entries.
     full: Option<FullTable>,
 }
@@ -264,11 +398,11 @@ impl TailLayer {
     /// Point `expert` at `(gate_up, down)` in the decode table and, when its canonical entries
     /// are shared, in the full table.
     fn set(&mut self, expert: usize, gate_up: u64, down: u64) {
-        self.image_gate_up[expert * 8..expert * 8 + 8].copy_from_slice(&gate_up.to_le_bytes());
-        self.image_down[expert * 8..expert * 8 + 8].copy_from_slice(&down.to_le_bytes());
+        self.image_gate_up.write_entry(expert, gate_up);
+        self.image_down.write_entry(expert, down);
         if let Some(full) = self.full.as_mut().filter(|full| full.shared[expert]) {
-            full.image_gate_up[expert * 8..expert * 8 + 8].copy_from_slice(&gate_up.to_le_bytes());
-            full.image_down[expert * 8..expert * 8 + 8].copy_from_slice(&down.to_le_bytes());
+            full.image_gate_up.write_entry(expert, gate_up);
+            full.image_down.write_entry(expert, down);
         }
     }
 }
@@ -316,6 +450,9 @@ struct Inner {
     upload_ns: u64,
     fill_ns: u64,
     uploads: u64,
+    /// H2D calls and bytes of the retirements' table uploads (changed entry ranges only).
+    upload_calls: u64,
+    upload_bytes: u64,
     /// PEER mode: the board shared by every rank of the mesh.
     peer: Option<Arc<PeerBoard>>,
     /// Peer deltas that changed a full-table image / that did not (an unmanaged layer, an entry
@@ -374,6 +511,48 @@ impl UnitTailRank {
         let mut layer_of: Vec<Option<usize>> = vec![None; geometry.layers];
         let mut managed: Vec<TailLayer> = Vec::new();
         let (mut full_layers, mut shared_entries) = (0usize, 0usize);
+        // Every table image of the rank lives in ONE pinned host allocation (2 decode images per
+        // managed layer, 2 more with its full table), so a retirement's upload of the changed
+        // entries is a plain stream-ordered DMA.
+        let images: usize = layers
+            .iter()
+            .filter(|init| {
+                init.label < geometry.layers
+                    && matches!(
+                        plan.layer_state(rank, init.label),
+                        EpLayerState::Mixed { .. }
+                    )
+            })
+            .map(|init| 2 + 2 * usize::from(init.full.is_some()))
+            .sum();
+        let pool = if images == 0 {
+            None
+        } else {
+            let mut buf = gpu
+                .hip
+                .host_buffer(images * experts * ENTRY_BYTES)
+                .map_err(|e| format!("the tail's pinned table images ({images} tables): {e}"))?;
+            let ptr = buf.as_bytes_mut().as_mut_ptr();
+            Some((Arc::new(PinnedPool { _buf: buf }), ptr))
+        };
+        let mut carved = 0usize;
+        let mut image = |entries: &[u64]| -> TableImage {
+            let (pool, base) = pool.as_ref().expect("a managed layer has a pinned pool");
+            let len = entries.len() * ENTRY_BYTES;
+            let mut image = TableImage {
+                // SAFETY: the carve offsets are disjoint and `images * experts * 8` bytes were
+                // allocated for exactly the images carved here.
+                ptr: unsafe { base.add(carved) },
+                len,
+                dirty: DirtyRange::default(),
+                _pool: pool.clone(),
+            };
+            carved += len;
+            for (at, entry) in image.chunks_exact_mut(ENTRY_BYTES).zip(entries) {
+                at.copy_from_slice(&entry.to_le_bytes());
+            }
+            image
+        };
         for init in layers {
             let label = init.label;
             if label >= geometry.layers
@@ -390,9 +569,6 @@ impl UnitTailRank {
             }
             let canon_gate_up: Vec<u64> = init.gate_up_entries.iter().map(|&p| p as u64).collect();
             let canon_down: Vec<u64> = init.down_entries.iter().map(|&p| p as u64).collect();
-            let image = |entries: &[u64]| -> Vec<u8> {
-                entries.iter().flat_map(|e| e.to_le_bytes()).collect()
-            };
             let (image_gate_up, image_down) = (image(&canon_gate_up), image(&canon_down));
             if init.gate_up_table.buf.size() < experts * 8
                 || init.down_table.buf.size() < experts * 8
@@ -517,6 +693,8 @@ impl UnitTailRank {
             upload_ns: 0,
             fill_ns: 0,
             uploads: 0,
+            upload_calls: 0,
+            upload_bytes: 0,
             peer,
             peer_applied: 0,
             peer_skipped: 0,
@@ -630,7 +808,7 @@ impl Inner {
         live_slot_units(
             |expert| self.kind(label, expert) == Kind::Tail,
             (&layer.canon_gate_up, &layer.canon_down),
-            (&layer.image_gate_up, &layer.image_down),
+            (&layer.image_gate_up[..], &layer.image_down[..]),
         )
     }
 
@@ -730,6 +908,16 @@ impl Inner {
                         &full.image_down,
                     )
                     .map_err(io)?;
+            }
+        }
+        // The whole images are on the device: nothing is dirty for the first retirement.
+        for &index in &touched {
+            let layer = &mut self.layers[index];
+            layer.image_gate_up.dirty.take();
+            layer.image_down.dirty.take();
+            if let Some(full) = layer.full.as_mut() {
+                full.image_gate_up.dirty.take();
+                full.image_down.dirty.take();
             }
         }
         Ok(())
@@ -948,48 +1136,31 @@ impl Inner {
         let mut order: Vec<usize> = touched.union(&peer_touched).copied().collect();
         order.sort_unstable();
         let compute = gpu.active_stream.as_ref();
+        let (mut calls, mut bytes) = (0u64, 0u64);
         for &index in &order {
-            let layer = &self.layers[index];
-            if touched.contains(&index) {
-                gpu.hip
-                    .memcpy_htod_async_on(
-                        &layer
-                            .table_gate_up
-                            .buf
-                            .byte_view(0, layer.image_gate_up.len()),
-                        &layer.image_gate_up,
-                        compute,
-                    )
-                    .map_err(io)?;
-                gpu.hip
-                    .memcpy_htod_async_on(
-                        &layer.table_down.buf.byte_view(0, layer.image_down.len()),
-                        &layer.image_down,
-                        compute,
-                    )
-                    .map_err(io)?;
+            let layer = &mut self.layers[index];
+            let mut layer_calls = 0u64;
+            let mut upload = |image: &mut TableImage, table: &GpuTensor| -> Result<(), String> {
+                let sent = image.upload_dirty(gpu, table, compute)?;
+                if sent > 0 {
+                    layer_calls += 1;
+                    bytes += sent as u64;
+                }
+                Ok(())
+            };
+            upload(&mut layer.image_gate_up, &layer.table_gate_up)?;
+            upload(&mut layer.image_down, &layer.table_down)?;
+            if let Some(full) = layer.full.as_mut() {
+                upload(&mut full.image_gate_up, &full.table_gate_up)?;
+                upload(&mut full.image_down, &full.table_down)?;
             }
-            if let Some(full) = layer.full.as_ref() {
-                gpu.hip
-                    .memcpy_htod_async_on(
-                        &full
-                            .table_gate_up
-                            .buf
-                            .byte_view(0, full.image_gate_up.len()),
-                        &full.image_gate_up,
-                        compute,
-                    )
-                    .map_err(io)?;
-                gpu.hip
-                    .memcpy_htod_async_on(
-                        &full.table_down.buf.byte_view(0, full.image_down.len()),
-                        &full.image_down,
-                        compute,
-                    )
-                    .map_err(io)?;
+            if layer_calls > 0 {
+                calls += layer_calls;
+                self.uploads += 1;
             }
-            self.uploads += 1;
         }
+        self.upload_calls += calls;
+        self.upload_bytes += bytes;
         // The ACK: every peer delta this retirement applied is now enqueued on the compute
         // stream ahead of every kernel of the next window. A failed upload returned above and
         // records nothing, so the owners keep the slots this rank may still name quarantined.
@@ -1134,7 +1305,7 @@ impl Inner {
             "[unit-tail] rank {} {tag} windows {} reads/window {:.1}: core {:.2}% tail {:.2}% host {:.2}% \
              (slot hit {:.2}%, distinct hit {:.2}%) host distinct/window {:.2} ({:.3} MB) \
              fills {} published {} evictions {}{} skipped {} stale {} live {}/{} late-in-flight {} \
-             host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} ({} table uploads){} \
+             host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} ({} layer uploads: {} H2D calls, {} B){} \
              | raw unix_ms={unix_ms} unit_bytes={} core_reads={} tail_reads={} host_reads={} core_distinct={} tail_distinct={} host_distinct={} fills_issued={}",
             self.rank,
             s.windows,
@@ -1162,6 +1333,8 @@ impl Inner {
             self.upload_ns as f64 / w / 1e3,
             self.fill_ns as f64 / w / 1e3,
             self.uploads,
+            self.upload_calls,
+            self.upload_bytes,
             self.frozen
                 .as_ref()
                 .map_or(String::new(), |why| format!(" FROZEN: {why}")),
@@ -1183,6 +1356,10 @@ impl Inner {
         self.released = true;
         if let Some(board) = self.peer.as_ref() {
             board.detach(self.rank);
+        }
+        // The table images are pinned: no table upload may still read them when the pool drops.
+        if let Some(stream) = gpu.active_stream.as_ref() {
+            let _ = gpu.hip.stream_synchronize(stream);
         }
         // Nothing reads a slot or the log after this: drain the copy stream first.
         if let Some(stream) = self.copy_stream.take() {
@@ -1214,7 +1391,8 @@ impl Inner {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_peer_delta, full_shared, image_entry, live_slot_units, peer_shared, LiveSlot,
+        apply_peer_delta, changed_entry_range, entry_span, full_shared, image_entry,
+        live_slot_units, peer_shared, DirtyRange, LiveSlot, ENTRY_BYTES,
     };
     use crate::expert_unit_tail::{
         EpUnitTailConfig, PeerBoard, PeerDelta, SlotPhase, TailPolicy, UnitKey, WindowUse,
@@ -1365,6 +1543,75 @@ mod tests {
         null.canon = [0, 0];
         assert!(!apply(&mut gu, &mut dn, 0, null));
         assert_eq!((&gu, &dn), (&start_gu, &start_dn));
+    }
+
+    // ---- table uploads: only the changed entry range of a retirement ----
+
+    #[test]
+    fn changed_entry_range_spans_the_first_to_the_last_differing_entry() {
+        let old = image(&[1, 2, 3, 4, 5, 6]);
+        assert_eq!(changed_entry_range(&old, &old), None);
+        assert_eq!(
+            changed_entry_range(&old, &image(&[1, 2, 9, 4, 5, 6])),
+            Some((2, 2))
+        );
+        assert_eq!(
+            changed_entry_range(&old, &image(&[7, 2, 3, 4, 5, 8])),
+            Some((0, 5))
+        );
+        // Entries in between that did not change are inside the range (one call, not two).
+        assert_eq!(
+            changed_entry_range(&old, &image(&[1, 9, 3, 4, 9, 6])),
+            Some((1, 4))
+        );
+        // A change in one byte of an entry counts as that entry.
+        let mut bytes = old.clone();
+        bytes[3 * ENTRY_BYTES + 7] ^= 1;
+        assert_eq!(changed_entry_range(&old, &bytes), Some((3, 3)));
+        assert_eq!(entry_span((1, 4)), (8, 32));
+        assert_eq!(entry_span((0, 0)), (0, 8));
+        assert_eq!(changed_entry_range(&[], &[]), None);
+    }
+
+    #[test]
+    fn the_dirty_range_of_a_retirement_is_the_changed_range_and_uploading_it_syncs_the_device() {
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let entries = 40usize;
+        let mut host = image(&(0..entries as u64).map(|e| 0x1000 + e).collect::<Vec<_>>());
+        let mut device = host.clone();
+        let mut dirty = DirtyRange::default();
+        assert_eq!(dirty.take(), None);
+        for retirement in 0..300 {
+            // A retirement rewrites a handful of entries (some to their current value).
+            let writes = (rand(&mut state) % 5) as usize;
+            for _ in 0..writes {
+                let expert = (rand(&mut state) % entries as u64) as usize;
+                let value = if rand(&mut state) % 4 == 0 {
+                    u64::from_le_bytes(
+                        host[expert * ENTRY_BYTES..(expert + 1) * ENTRY_BYTES]
+                            .try_into()
+                            .unwrap(),
+                    )
+                } else {
+                    rand(&mut state)
+                };
+                // The write the pinned image does: noted only when the bytes change.
+                let at = expert * ENTRY_BYTES;
+                if host[at..at + ENTRY_BYTES] != value.to_le_bytes() {
+                    host[at..at + ENTRY_BYTES].copy_from_slice(&value.to_le_bytes());
+                    dirty.note(expert);
+                }
+            }
+            let expected = changed_entry_range(&device, &host);
+            let range = dirty.take();
+            assert_eq!(range, expected, "retirement {retirement}");
+            if let Some(range) = range {
+                let (offset, len) = entry_span(range);
+                device[offset..offset + len].copy_from_slice(&host[offset..offset + len]);
+            }
+            assert_eq!(device, host, "retirement {retirement}");
+            assert_eq!(dirty.take(), None);
+        }
     }
 
     // ---- two-rank lockstep simulation of the board and both policies ----
