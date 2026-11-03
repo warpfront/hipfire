@@ -6,10 +6,11 @@
 //! This is intentionally separate from the GFX12 encoder: several compute
 //! register offsets and the HSA implicit user-SGPR layout differ. GFX10 and
 //! GFX11 share the legacy register map used here. The lowering supports
-//! zero-scratch HSA kernels whose only implicit inputs are the optional
-//! private-segment buffer and kernarg pointer. Static and dynamic LDS are
-//! rounded to the hardware's 512-byte allocation granule. Other ABI contracts
-//! fail closed.
+//! HSA kernels whose only implicit inputs are the optional private-segment
+//! buffer and kernarg pointer. Kernels with a static private segment run on
+//! GFX11 only, against a caller-owned [`Gfx11ScratchRing`]. Static and dynamic
+//! LDS are rounded to the hardware's 512-byte allocation granule. Other ABI
+//! contracts fail closed.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -42,6 +43,7 @@ pub struct CondExec {
 const COMPUTE_NUM_THREAD_X: u32 = 0x207;
 const COMPUTE_PGM_LO: u32 = 0x20c;
 const COMPUTE_PGM_RSRC1: u32 = 0x212;
+const COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11: u32 = 0x210;
 const COMPUTE_RESOURCE_LIMITS: u32 = 0x215;
 const COMPUTE_TMPRING_SIZE_GFX10: u32 = 0x218;
 const COMPUTE_PGM_RSRC3_GFX10: u32 = 0x228;
@@ -107,6 +109,68 @@ impl Gfx10KernelImage {
             wave32: pm4.kernel_code_properties & ENABLE_WAVEFRONT_SIZE32 != 0,
             kernel_code_properties: pm4.kernel_code_properties,
         })
+    }
+}
+
+/// Scratch backing for GFX11 PM4 dispatches with a static private segment.
+///
+/// GFX11 SPI initializes each wave's architected flat-scratch base from
+/// `COMPUTE_DISPATCH_SCRATCH_BASE` plus its slot in `COMPUTE_TMPRING_SIZE`,
+/// whose WAVES field counts slots per shader engine (ROCr
+/// `FillComputeTmpRingSize_Gfx11`), so the backing spans every engine.
+/// Waves beyond the slot count wait for a slot; they never overrun the ring.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Gfx11ScratchRing {
+    base: u64,
+    lane_bytes: u32,
+    waves_per_se: u32,
+    shader_engines: u32,
+}
+
+impl Gfx11ScratchRing {
+    /// Sized for 64 lanes (wave64). ROCr sizes wave32 dispatches for 32 lanes,
+    /// so wave32 kernels use half of each slot: safe, just not minimal.
+    const LANES: u64 = 64;
+    const GRANULE: u64 = 256;
+
+    /// Ring for kernels with at most `lane_bytes` private bytes per lane and
+    /// `max_waves` concurrent waves over `shader_engines`. `None` when a field
+    /// does not fit `COMPUTE_TMPRING_SIZE`. Allocate [`Self::bytes`] and bind
+    /// it with [`Self::at`] before dispatching.
+    pub fn new(lane_bytes: u32, shader_engines: u32, max_waves: u32) -> Option<Self> {
+        let waves_per_se = max_waves.div_ceil(shader_engines.max(1)).min(0xfff);
+        let ring = Self {
+            base: 0,
+            lane_bytes,
+            waves_per_se,
+            shader_engines,
+        };
+        (lane_bytes != 0
+            && shader_engines != 0
+            && waves_per_se != 0
+            && ring.wave_granules() <= 0x7fff)
+            .then_some(ring)
+    }
+
+    /// Bind the backing allocation; `None` unless non-null and 256-byte aligned.
+    pub fn at(self, base: u64) -> Option<Self> {
+        (base != 0 && base.is_multiple_of(Self::GRANULE)).then_some(Self { base, ..self })
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.wave_granules()
+            * Self::GRANULE
+            * u64::from(self.waves_per_se)
+            * u64::from(self.shader_engines)
+    }
+
+    fn wave_granules(&self) -> u64 {
+        (u64::from(self.lane_bytes) * Self::LANES).div_ceil(Self::GRANULE)
+    }
+
+    /// GFX11 `COMPUTE_TMPRING_SIZE`: WAVES[11:0], WAVESIZE[26:12] in 256 B.
+    fn tmpring_size(&self) -> u32 {
+        self.waves_per_se | (self.wave_granules() as u32) << 12
     }
 }
 
@@ -222,6 +286,7 @@ pub struct Gfx10Pm4CommandBuffer {
     cond_exec_end: usize,
     dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy,
     resource_limits_policy: Gfx11ComputeResourceLimitsPolicy,
+    scratch_ring: Option<Gfx11ScratchRing>,
 }
 
 /// GFX11 uses the same legacy compute-register map as GFX10. The replay API
@@ -261,6 +326,7 @@ impl Gfx10Pm4CommandBuffer {
             cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+            scratch_ring: None,
         }
     }
 
@@ -274,6 +340,14 @@ impl Gfx10Pm4CommandBuffer {
     /// dispatches. Occupancy limits remain unlimited for every policy.
     pub fn with_resource_limits_policy(mut self, policy: Gfx11ComputeResourceLimitsPolicy) -> Self {
         self.resource_limits_policy = policy;
+        self
+    }
+
+    /// Back static private segments of subsequently encoded dispatches with
+    /// `ring` (GFX11 only). Scratch-free dispatches keep `COMPUTE_TMPRING_SIZE`
+    /// zero. `None` keeps scratch kernels refused.
+    pub fn with_scratch_ring(mut self, ring: Option<Gfx11ScratchRing>) -> Self {
+        self.scratch_ring = ring;
         self
     }
 
@@ -601,11 +675,33 @@ impl Gfx10Pm4CommandBuffer {
         dynamic_group_bytes: u32,
         user_sgprs: &[u32],
     ) -> Result<(), Gfx10Pm4BuildError> {
-        if image.private_segment_size != 0 || image.dynamic_callstack {
+        if image.dynamic_callstack {
             return Err(Gfx10Pm4BuildError::ScratchUnsupported {
                 private_bytes: image.private_segment_size,
-                dynamic_callstack: image.dynamic_callstack,
+                dynamic_callstack: true,
             });
+        }
+        let ring = self.scratch_ring.filter(|ring| ring.base != 0);
+        if image.private_segment_size != 0 {
+            // Those SGPRs would be materialized as zero; only GFX11
+            // architected flat scratch is backed by the ring.
+            if image.kernel_code_properties & ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER != 0 {
+                return Err(Gfx10Pm4BuildError::PrivateSegmentBufferUnsupported {
+                    private_bytes: image.private_segment_size,
+                });
+            }
+            let Some(ring) = ring else {
+                return Err(Gfx10Pm4BuildError::ScratchUnsupported {
+                    private_bytes: image.private_segment_size,
+                    dynamic_callstack: false,
+                });
+            };
+            if image.private_segment_size > ring.lane_bytes {
+                return Err(Gfx10Pm4BuildError::ScratchRingTooSmall {
+                    private_bytes: image.private_segment_size,
+                    ring_lane_bytes: ring.lane_bytes,
+                });
+            }
         }
         let total_group_bytes = image
             .group_segment_size
@@ -641,7 +737,30 @@ impl Gfx10Pm4CommandBuffer {
         );
         self.set_sh_regs(COMPUTE_PGM_RSRC1, &[image.compute_pgm_rsrc1, rsrc2]);
         self.set_sh_regs(COMPUTE_PGM_RSRC3_GFX10, &[image.compute_pgm_rsrc3]);
-        self.set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[0]);
+        // Only scratch dispatches see the ring; scratch-free ones keep TMPRING
+        // zero. The ring registers bypass the stateful cache: after a TMPRING=0
+        // dispatch and a drain (CS_PARTIAL_FLUSH + ACQUIRE_MEM), an elided
+        // SCRATCH_BASE left later scratch waves faulting against base 0 on
+        // gfx1151 (HIPF-259 B1).
+        match ring.filter(|_| image.private_segment_size != 0) {
+            Some(ring) => {
+                if let Some(register_state) = self.register_state.as_mut() {
+                    for register in [
+                        COMPUTE_TMPRING_SIZE_GFX10,
+                        COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11,
+                        COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11 + 1,
+                    ] {
+                        register_state.remove(&register);
+                    }
+                }
+                self.emit_set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[ring.tmpring_size()]);
+                self.emit_set_sh_regs(
+                    COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11,
+                    &[(ring.base >> 8) as u32, (ring.base >> 40) as u32],
+                );
+            }
+            None => self.set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[0]),
+        }
         self.set_sh_regs(
             COMPUTE_NUM_THREAD_X,
             &[
@@ -868,6 +987,13 @@ pub enum Gfx10Pm4BuildError {
         private_bytes: u32,
         dynamic_callstack: bool,
     },
+    PrivateSegmentBufferUnsupported {
+        private_bytes: u32,
+    },
+    ScratchRingTooSmall {
+        private_bytes: u32,
+        ring_lane_bytes: u32,
+    },
     UnsupportedKernelProperties(u16),
     NullKernarg,
     TooManyUserSgprs(usize),
@@ -893,7 +1019,18 @@ impl fmt::Display for Gfx10Pm4BuildError {
                 dynamic_callstack,
             } => write!(
                 formatter,
-                "GFX10/GFX11 PM4 dispatch does not yet support scratch (private={private_bytes}, dynamic_callstack={dynamic_callstack})"
+                "GFX10/GFX11 PM4 cannot back this kernel's scratch (private={private_bytes}, dynamic_callstack={dynamic_callstack}): rings cover static private segments in gfx11 single-queue phases only"
+            ),
+            Self::PrivateSegmentBufferUnsupported { private_bytes } => write!(
+                formatter,
+                "kernel takes the private-segment buffer SGPRs (private={private_bytes}); GFX10/GFX11 PM4 backs only architected flat scratch"
+            ),
+            Self::ScratchRingTooSmall {
+                private_bytes,
+                ring_lane_bytes,
+            } => write!(
+                formatter,
+                "kernel needs {private_bytes} private bytes per lane; the GFX11 scratch ring holds {ring_lane_bytes}"
             ),
             Self::UnsupportedKernelProperties(bits) => write!(
                 formatter,
@@ -947,6 +1084,102 @@ mod tests {
         )
         .unwrap();
         assert_eq!(values, [0, 0, 0, 0, 0x9abc_def0, 0x1234_5678]);
+    }
+
+    #[test]
+    fn gfx11_scratch_ring_programs_tmpring_and_base_or_refuses() {
+        let geometry = LaunchGeometry::new([32, 1, 1], [32, 1, 1]).unwrap();
+        let kernarg_only = ENABLE_SGPR_KERNARG_SEGMENT_PTR | ENABLE_WAVEFRONT_SIZE32;
+        let scratch = |private, properties| Gfx10KernelImage {
+            private_segment_size: private,
+            ..image(properties)
+        };
+        let ring = Gfx11ScratchRing::new(16, 2, 1280).unwrap();
+        // 16 B x 64 lanes = 4 granules per wave, 640 slots per engine, 2 engines.
+        assert_eq!(ring.bytes(), 4 * 256 * 640 * 2);
+        assert_eq!(ring.at(0x1_0080), None);
+        let ring = ring.at(0x7f12_3456_7800).unwrap();
+        let encode = |ring: Option<Gfx11ScratchRing>, image: Gfx10KernelImage| {
+            let mut commands = Gfx10Pm4CommandBuffer::new().with_scratch_ring(ring);
+            commands
+                .dispatch_image(&image, geometry, 0, &[4, 5])
+                .map(|()| commands.dwords().to_vec())
+        };
+
+        let words = encode(Some(ring), scratch(16, kernarg_only)).unwrap();
+        let set = |register: u32, values: &[u32]| {
+            let mut packet = vec![
+                packet3(PACKET3_SET_SH_REG, values.len() as u32 + 1, true),
+                register,
+            ];
+            packet.extend_from_slice(values);
+            words.windows(packet.len()).any(|window| window == packet)
+        };
+        assert!(set(0x218, &[640 | 4 << 12]));
+        assert!(set(0x210, &[0x1234_5678, 0x7f]));
+        // Scratch-free dispatches keep TMPRING zero and leave the base alone.
+        let plain = encode(Some(ring), scratch(0, kernarg_only)).unwrap();
+        assert_eq!(plain, encode(None, scratch(0, kernarg_only)).unwrap());
+
+        assert_eq!(
+            encode(None, scratch(16, kernarg_only)),
+            Err(Gfx10Pm4BuildError::ScratchUnsupported {
+                private_bytes: 16,
+                dynamic_callstack: false
+            })
+        );
+        assert_eq!(
+            encode(Some(ring), scratch(32, kernarg_only)),
+            Err(Gfx10Pm4BuildError::ScratchRingTooSmall {
+                private_bytes: 32,
+                ring_lane_bytes: 16
+            })
+        );
+        // Buffer-resource scratch would read the zeroed private-segment SGPRs.
+        assert!(matches!(
+            encode(
+                Some(ring),
+                scratch(16, kernarg_only | ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER)
+            ),
+            Err(Gfx10Pm4BuildError::PrivateSegmentBufferUnsupported { private_bytes: 16 })
+        ));
+        let dynamic = Gfx10KernelImage {
+            dynamic_callstack: true,
+            ..scratch(16, kernarg_only)
+        };
+        assert!(matches!(
+            encode(Some(ring), dynamic),
+            Err(Gfx10Pm4BuildError::ScratchUnsupported {
+                dynamic_callstack: true,
+                ..
+            })
+        ));
+
+        // Stateful streams never elide the ring registers: each scratch
+        // dispatch of [scratch, plain, scratch] is preceded by both writes.
+        let mut stateful = Gfx10Pm4CommandBuffer::new_stateful().with_scratch_ring(Some(ring));
+        for private in [16, 0, 16] {
+            stateful
+                .dispatch_image(&scratch(private, kernarg_only), geometry, 0, &[4, 5])
+                .unwrap();
+        }
+        let dispatch = packet3(PACKET3_DISPATCH_DIRECT, 4, true);
+        let mut segments = stateful.dwords().split(|word| *word == dispatch);
+        for private in [16, 0, 16] {
+            let segment = segments.next().unwrap();
+            let writes = |register: u32| {
+                segment
+                    .windows(2)
+                    .filter(|w| w[0] >> 8 & 0xff == PACKET3_SET_SH_REG && w[1] == register)
+                    .count()
+            };
+            let expected = usize::from(private != 0);
+            assert_eq!(
+                (writes(0x218), writes(0x210)),
+                (1, expected),
+                "private={private}"
+            );
+        }
     }
 
     #[test]
@@ -1305,6 +1538,7 @@ mod tests {
             cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+            scratch_ring: None,
         };
         assert_eq!(empty_value.set_sh_reg_records(), Err(0));
 
@@ -1319,6 +1553,7 @@ mod tests {
             cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+            scratch_ring: None,
         };
         assert_eq!(truncated.set_sh_reg_records(), Err(0));
 
@@ -1329,6 +1564,7 @@ mod tests {
             cond_exec_end: 0,
             dispatch_initiator_policy: Gfx10DispatchInitiatorPolicy::Legacy,
             resource_limits_policy: Gfx11ComputeResourceLimitsPolicy::Legacy,
+            scratch_ring: None,
         };
         assert_eq!(short_dispatch.set_sh_reg_records(), Err(0));
     }
