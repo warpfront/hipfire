@@ -178,7 +178,9 @@ pub(crate) fn handoff_started_in_think(
     ))
 }
 
-/// Handoff a think-open request encountered before it receives a batch lane.
+/// Hand a request to the singleton before it receives a batch lane: a
+/// think-open prompt, or (lane families) one whose `prompt + max_tokens` does
+/// not fit a lane.
 /// There is no GPU lane to reset, but ownership still transfers through the
 /// same explicit internal message and exact admission cleanup.
 pub(crate) fn handoff_admitted_started_in_think(
