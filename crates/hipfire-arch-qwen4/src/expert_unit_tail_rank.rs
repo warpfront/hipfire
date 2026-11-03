@@ -539,6 +539,15 @@ impl Inner {
             gpu.zeros(&[LOG_IDS * 4], DType::Raw)
                 .map_err(|e| format!("the usage log: {e}"))?,
         );
+        // `Gpu::zeros` is a memset on the active stream, and the seed copies below run on the
+        // non-blocking copy stream: without this drain a late memset could zero a seeded slot
+        // AFTER its copy, and the slot would be published holding zeros (a rank-local wrong
+        // read under the full-table prefill route, wrong decode sums on both ranks).
+        if let Some(active) = gpu.active_stream.as_ref() {
+            gpu.hip.stream_synchronize(active).map_err(io)?;
+        } else {
+            gpu.hip.device_synchronize().map_err(io)?;
+        }
         let stream = gpu.hip.stream_create_non_blocking().map_err(io)?;
         self.copy_stream = Some(stream);
         self.tables_ready = Some(
