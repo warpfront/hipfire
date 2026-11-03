@@ -912,9 +912,9 @@ impl Qwen4ExpertStage {
             // Stage ELIGIBILITY (the `Route::Stage` capability of every codec this layer holds on
             // this arch), separate from the default switch that decided to build a stage at all
             // (`stage_default_enabled` / `HIPFIRE_QWEN4_EXPERT_STAGE`). Every slab layer was
-            // already admitted at load by the same cells (`slab_serves`), so this never refuses a
-            // loadable layer; it keeps a measured link or an explicit `1` from staging a codec the
-            // arch has no K1/K2 for.
+            // already admitted at load for DECODE (`slab_decodes`); a decode-only codec (no K2:
+            // W3 on gfx1100) has no Stage capability, so this keeps a measured link or an
+            // explicit `1` from staging a codec the arch has no K1+K2 for.
             if !rdna_compute::expert_capabilities::stage_eligible(
                 &gpu.arch,
                 slab.codecs.iter().filter_map(|&codec| {

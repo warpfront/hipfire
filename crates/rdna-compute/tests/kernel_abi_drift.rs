@@ -894,9 +894,9 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
             }
         }
     }
-    // MoE: the gfx11 NT1 module (gfx1100 MQ4 + E8P, gfx1151 E8P).
+    // MoE: the gfx11 NT1 module (gfx1100 MQ4 + W3 + E8P, gfx1151 E8P).
     for arch in gfx11_gen::ARCHES {
-        for codec in [Gfx11Codec::Mq4, Gfx11Codec::E8p] {
+        for codec in [Gfx11Codec::Mq4, Gfx11Codec::W3, Gfx11Codec::E8p] {
             for kind in Kind::ALL {
                 let spec = Gfx11Spec {
                     arch,

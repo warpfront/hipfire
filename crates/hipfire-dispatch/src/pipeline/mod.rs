@@ -1429,7 +1429,7 @@ mod qwen4_route_tests {
         for landed in [false, true] {
             for (arch, admitted) in [
                 ("gfx1201", [true, true, true, false, false, false]),
-                ("gfx1100", [true, false, true, false, false, false]),
+                ("gfx1100", [true, true, true, false, false, false]),
                 ("gfx1151", [true, true, landed, false, false, false]),
                 ("gfx1200", [false; 6]),
                 ("gfx942", [false; 6]),
@@ -1481,7 +1481,7 @@ mod qwen4_route_tests {
                 assert_eq!(bucket(arch, pairs[4]), None);
             }
             assert_eq!(bucket("gfx1201", pairs[1]), Some(0));
-            assert_eq!(bucket("gfx1100", pairs[1]), None);
+            assert_eq!(bucket("gfx1100", pairs[1]), Some(0));
             // gfx1151: MQ4 = bucket 1, W3 = bucket 0, E8P = bucket 0 only once its receipts landed;
             // W2 has none.
             assert_eq!(bucket("gfx1151", pairs[0]), Some(1));
@@ -1498,7 +1498,8 @@ mod qwen4_route_tests {
 
     /// A mixed slab layer (per-expert pairs plus a codec table) is MQ4 plus
     /// exactly one admitted cold codec the policy declares: gfx1100 serves an
-    /// E8P layer (MQ4 first or cold first) and refuses W3, gfx1151 serves a W3 layer and, until
+    /// E8P layer (MQ4 first or cold first) and a decode-only W3 layer (K1, no K2), gfx1151 serves
+    /// a W3 layer and, until
     /// `SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED`, refuses E8P (afterwards it serves an E8P layer
     /// like gfx1100), and every arch refuses W3 + E8P in one
     /// layer, W2 anywhere, and a declaration that disagrees with the table.
@@ -1587,8 +1588,8 @@ mod qwen4_route_tests {
             assert_eq!(route("gfx1100", E8P, &[MQ4], Some(3)), deltanet);
             assert_eq!(route("gfx1201", MQ4, &[E8P], Some(3)), deltanet);
             assert_eq!(route("gfx1201", MQ4, &[W3], Some(1)), deltanet);
-            // W3 is not served on gfx1100.
-            assert!(!route("gfx1100", MQ4, &[W3], Some(1)));
+            // W3 is served on gfx1100 for decode (K1; no K2).
+            assert_eq!(route("gfx1100", MQ4, &[W3], Some(1)), deltanet);
             // W3 + E8P in one layer, W2 anywhere, a mismatched declaration.
             for arch in ["gfx1201", "gfx1100"] {
                 for cold in [None, Some(1), Some(3)] {

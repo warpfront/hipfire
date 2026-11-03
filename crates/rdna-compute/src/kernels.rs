@@ -4637,6 +4637,13 @@ pub const QWEN4_MOE_IU4_SYM_PM_GFX1100: &[u8] =
 /// superseded by the regenerated 64-byte image.
 pub const QWEN4_MOE_IU4_SYM_E8P_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/qwen4_moe_iu4_sym_e8p_pm_gfx1100.hxaco");
+/// Certified builder module of the gfx1100 NT1 grouped symmetric IU4 MoE GEMMs over MQ3-I4 planar (W3)
+/// experts (`qwen4_moe_iu4_sym_w3_pm_gfx1100`, entries `qwen4_moe_{gate_up_silu,down}_iu4_sym_w3_pm_gfx1100` plus
+/// the never-served `_acc` twins; 64-byte ABI with `n_experts@60`, no LDS, no barrier), emitted by
+/// `peacemaker-isa` `emit_qwen4_moe_sym_gfx1100 --codec w3` (the legacy B4 W3 arm; all gates and the M7 pass).
+/// The sealed slab serves it as codec 1 K2; it is the prefill half of the gfx1100 MQ3 tier.
+pub const QWEN4_MOE_IU4_SYM_W3_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/qwen4_moe_iu4_sym_w3_pm_gfx1100.hxaco");
 /// Certified builder module of the gfx1151 NT1 grouped symmetric IU4 MoE GEMMs over E8P-I4
 /// experts (`qwen4_moe_iu4_sym_e8p_pm_gfx1151`): the gfx1100 K2 arm with only the arch-forced
 /// deltas (module/symbol names, target `amdgcn-amd-amdhsa--gfx1151`, code-end tail), so the same
@@ -5100,6 +5107,16 @@ pub const E8P_I4_MOE_GEMV_PM_GFX1100: &[u8] =
 /// Bare lowercase SHA-256 of the gfx1100 narrow+rowtile E8P image.
 pub const E8P_I4_MOE_GEMV_PM_GFX1100_SHA256: &str =
     include_str!("../../../kernels/e8p_i4_moe_gemv_pm_gfx1100.hxaco.sha256");
+/// gfx1100 W3 (MQ3-I4 planar, qt131/qt132) K1 image `mq_i4_moe_gemv_mq3only_pm_gfx1100`: the
+/// `mq_i4_moe_gemv_mq3i4_{r256_gate_up,r128_down}_pm_gfx1100` narrow decode GEMVs and their `_t8`
+/// descriptor twins over pointer-addressed W3 expert tensors (96-byte kernarg ABI, shared K1
+/// `n_experts` guard). Lossy opt-in tier inventory only: gfx1100 W3 stays refused by
+/// `slab_serves_codec` (no gfx1100 W3 K2), so an embedded K1 grants no slab capability.
+pub const MQ_I4_MOE_GEMV_MQ3ONLY_PM_GFX1100: &[u8] =
+    include_bytes!("../../../kernels/mq_i4_moe_gemv_mq3only_pm_gfx1100.hxaco");
+/// Bare lowercase SHA-256 of the gfx1100 narrow+rowtile W3 K1 image.
+pub const MQ_I4_MOE_GEMV_MQ3ONLY_PM_GFX1100_SHA256: &str =
+    include_str!("../../../kernels/mq_i4_moe_gemv_mq3only_pm_gfx1100.hxaco.sha256");
 /// gfx1151 E8P-I4 K1 image: unchanged narrow projections and their `_t8`
 /// descriptor twins. The arithmetic is architecture-specific, with the
 /// 96-byte guarded pointer-table ABI and unchanged cold-codec admission.

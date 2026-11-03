@@ -51750,6 +51750,15 @@ static SLAB_K2_GFX1100_E8P: SlabK2 = SlabK2 {
     ],
     code_bits: 2,
 };
+static SLAB_K2_GFX1100_W3: SlabK2 = SlabK2 {
+    module: "qwen4_moe_iu4_sym_w3_pm_gfx1100",
+    image: kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1100,
+    entries: [
+        "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1100",
+        "qwen4_moe_down_iu4_sym_w3_pm_gfx1100",
+    ],
+    code_bits: 3,
+};
 static SLAB_K2_GFX1151_E8P: SlabK2 = SlabK2 {
     module: "qwen4_moe_iu4_sym_e8p_pm_gfx1151",
     image: kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1151,
@@ -51768,6 +51777,7 @@ pub(crate) fn slab_k2_metadata(arch: &str, codec: u8) -> Option<&'static SlabK2>
     match (arch, codec) {
         ("gfx1100", 0) => Some(&SLAB_K2_GFX1100_MQ4),
         ("gfx1100", 3) => Some(&SLAB_K2_GFX1100_E8P),
+        ("gfx1100", 1) => Some(&SLAB_K2_GFX1100_W3),
         ("gfx1201", 3) => Some(&SLAB_K2_GFX1201_E8P),
         ("gfx1151", 3) => Some(&SLAB_K2_GFX1151_E8P),
         _ => None,
@@ -54226,6 +54236,7 @@ impl Gpu {
         };
         let family = match codec {
             0 => crate::kernel_abi::MoeSymCodec::Mq4,
+            1 => crate::kernel_abi::MoeSymCodec::W3,
             3 => crate::kernel_abi::MoeSymCodec::E8p,
             other => {
                 return Err(hip_bridge::HipError::new(
@@ -54258,6 +54269,10 @@ impl Gpu {
     ) -> HipResult<()> {
         if self.arch == "gfx1151" {
             return self.qwen4_moe_sym_w3_nt4_gfx1151_gemm(down, tensors, xp, dims);
+        }
+        if self.arch == "gfx1100" {
+            // The gfx1100 W3 K2 is the sealed-slab NT1 entry of codec 1 ([`slab_k2_entry`]).
+            return self.qwen4_moe_sym_slab_gemm(1, down, tensors, xp, dims);
         }
         let (what, func) = if down {
             ("gemm_qwen4_moe_w3_down_iu4_sym", QWEN4_MOE_SYM_W3_DOWN)
@@ -56395,6 +56410,46 @@ mod tests {
         assert_eq!(m, module, "{symbol} object module");
     }
 
+    /// Every symbol the sealed-slab K2 launcher (`qwen4_moe_sym_slab_gemm`) can request on any arch, i.e. every
+    /// `slab_k2_metadata` row (codec 0 MQ4, 1 W3, 3 E8P), is a contract export with the launcher's block, the
+    /// module the metadata names and the launcher's codec family. A K2 row without a contract only fails at the
+    /// first launch ("no KernelAbiV1 export"), after the whole model has loaded.
+    #[test]
+    fn every_slab_k2_metadata_symbol_has_a_kernel_abi_contract() {
+        let mut rows = 0;
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            for codec in 0u8..=255 {
+                let Some(k2) = slab_k2_metadata(arch, codec) else {
+                    continue;
+                };
+                rows += 1;
+                for (down, symbol) in k2.entries.iter().enumerate() {
+                    // gfx1201 / gfx1151 MQ4 and W3 have their own launchers: only the slab-served rows have an
+                    // NT1 serving entry here, and every one must be a contract export.
+                    let (abi, export) = moe_export(arch, symbol);
+                    assert_eq!(
+                        export.block,
+                        [if down == 1 { 128 } else { 64 }, 1, 1],
+                        "{arch} {codec} {symbol}"
+                    );
+                    assert_eq!(abi.explicit_bytes, 64, "{arch} {codec} {symbol}");
+                    let (ObjectRefV1::Embedded { module, .. }
+                    | ObjectRefV1::HipccSource { module, .. }) = export.object;
+                    assert_eq!(module, k2.module, "{arch} {codec} {symbol}");
+                    let family = match codec {
+                        0 => MoeSymCodec::Mq4,
+                        1 => MoeSymCodec::W3,
+                        3 => MoeSymCodec::E8p,
+                        other => panic!("slab K2 codec {other} has no launcher family"),
+                    };
+                    let _ = family;
+                }
+            }
+        }
+        // gfx1100 MQ4 + W3 + E8P, gfx1151 E8P, gfx1201 E8P.
+        assert_eq!(rows, 5);
+    }
+
     /// Every symbol the MoE selectors can hand to `qwen4_moe_sym_gemm` /
     /// `qwen4_moe_sym_nt1_gemm` is a contract export with the launcher's block.
     #[test]
@@ -57513,7 +57568,6 @@ mod route_selector_tests {
         // its own launcher.
         for (arch, codec) in [
             ("gfx1100", 2u8),
-            ("gfx1100", 1),
             ("gfx1100", 255),
             ("gfx1201", 0),
             ("gfx1201", 1),
@@ -57714,6 +57768,7 @@ mod route_selector_tests {
             tabled,
             [
                 ("gfx1100", 0),
+                ("gfx1100", 1),
                 ("gfx1100", 3),
                 ("gfx1151", 3),
                 ("gfx1201", 3)
@@ -57893,12 +57948,7 @@ mod route_selector_tests {
                 "qwen4_moe_down_iu4_sym_e8p_pm_gfx1100"
             ]
         );
-        for (arch, codec) in [
-            ("gfx1201", 0u8),
-            ("gfx1151", 0),
-            ("gfx1100", 1),
-            ("gfx1100", 2),
-        ] {
+        for (arch, codec) in [("gfx1201", 0u8), ("gfx1151", 0), ("gfx1100", 2)] {
             assert!(slab_k2_entry(arch, codec).is_none(), "{arch} {codec}");
         }
         assert_eq!(

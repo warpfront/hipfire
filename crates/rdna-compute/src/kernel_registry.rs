@@ -6987,6 +6987,15 @@ static SLAB_GFX1100_E8P_K1_SYMBOLS: std::sync::LazyLock<Vec<&str>> =
         let tiled = crate::slab_moe::slab_rowtile_k1(k1).unwrap();
         k1.symbols.into_iter().chain(tiled.symbols).collect()
     });
+/// gfx1100 W3 cold K1: its own narrow and t8 exports (never the E8P list).
+static SLAB_GFX1100_W3_K1_SYMBOLS: std::sync::LazyLock<Vec<&str>> =
+    std::sync::LazyLock::new(|| {
+        let k1 = &crate::slab_moe::slab_cold_k1_metadata("gfx1100", 1)
+            .unwrap()
+            .k1;
+        let tiled = crate::slab_moe::slab_rowtile_k1(k1).unwrap();
+        k1.symbols.into_iter().chain(tiled.symbols).collect()
+    });
 
 /// Embedded certified-builder images of the sealed expert-slab serving route on `arch` for a
 /// layer whose cold bucket is codec `cold_codec` (K1 decode GEMVs, K2 NT1 grouped GEMMs, K3 down
@@ -6996,10 +7005,12 @@ static SLAB_GFX1100_E8P_K1_SYMBOLS: std::sync::LazyLock<Vec<&str>> =
 /// Qualification twins are never listed. Unknown arches are refused.
 ///
 /// gfx1100 `cold_codec == 0` (no cold bucket, MQ4-only) lists the hot K1, the MQ4 K2, K3 and the
-/// mask only: no E8P module. `cold_codec == 3` (E8P) additionally lists the cold K1 and the E8P
-/// K2 once each. Registry presence is not permission: the cold entries come only from the
-/// admission-gated [`crate::slab_moe::slab_cold_kernels`] and `slab_k2_entry`, so every other
-/// codec (W2, gfx1100 W3, unknown) is an [`RegistryError::UnsupportedRoute`].
+/// mask only: no cold module. `cold_codec == 3` (E8P) additionally lists the cold K1 and the E8P
+/// K2 once each. `cold_codec == 1` (W3, the lossy opt-in tier) is decode-only: it lists the cold
+/// W3 K1 (its own narrow + t8 exports) and no K2, because gfx1100 has no W3 K2. Registry presence
+/// is not permission: the cold K1 comes only from the K1-admission-gated
+/// [`crate::slab_moe::slab_cold_kernels`] and the cold K2 only from `slab_k2_entry`, so every other
+/// codec (W2, unknown) is an [`RegistryError::UnsupportedRoute`].
 pub fn slab_embedded_entries(
     arch: &str,
     cold_codec: u8,
@@ -7042,18 +7053,25 @@ pub fn slab_embedded_entries(
             if cold_codec != 0 {
                 let refused = || {
                     RegistryError::UnsupportedRoute(format!(
-                        "gfx1100 expert-slab cold codec {cold_codec} has no admitted K1 + K2 entries"
+                        "gfx1100 expert-slab cold codec {cold_codec} has no admitted K1 entries (E8P also needs its K2)"
                     ))
                 };
                 let cold =
                     crate::slab_moe::slab_cold_kernels(arch, cold_codec).ok_or_else(refused)?;
-                let k2_cold = crate::gemm::slab_k2_entry(arch, cold_codec).ok_or_else(refused)?;
-                plan.push(embedded(
-                    cold.k1.module,
-                    cold.k1.image,
-                    &SLAB_GFX1100_E8P_K1_SYMBOLS,
-                ));
-                plan.push(embedded(k2_cold.module, k2_cold.image, &k2_cold.entries));
+                let (k1_symbols, k2_required): (&'static [&'static str], bool) = match cold_codec {
+                    1 => (&SLAB_GFX1100_W3_K1_SYMBOLS, false),
+                    3 => (&SLAB_GFX1100_E8P_K1_SYMBOLS, true),
+                    _ => return Err(refused()),
+                };
+                plan.push(embedded(cold.k1.module, cold.k1.image, k1_symbols));
+                // E8P always lists its K2; W3 is decode-only on gfx1100 (no W3 K2 exists).
+                match crate::gemm::slab_k2_entry(arch, cold_codec) {
+                    Some(k2_cold) => {
+                        plan.push(embedded(k2_cold.module, k2_cold.image, &k2_cold.entries))
+                    }
+                    None if k2_required => return Err(refused()),
+                    None => {}
+                }
             }
             if WideTwinFamily::K1.enabled() {
                 plan.push(rowtile_planner_entry(arch).expect("gfx1100 rowtile planner"));
@@ -8707,7 +8725,9 @@ fn walked_arch_images(arch: &str) -> &'static [&'static [u8]] {
         "gfx1100" => &[
             kernels::QWEN4_MOE_IU4_SYM_PM_GFX1100,
             kernels::QWEN4_MOE_IU4_SYM_E8P_PM_GFX1100,
+            kernels::QWEN4_MOE_IU4_SYM_W3_PM_GFX1100,
             kernels::MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100,
+            kernels::MQ_I4_MOE_GEMV_MQ3ONLY_PM_GFX1100,
             kernels::E8P_I4_MOE_GEMV_PM_GFX1100,
             kernels::MQ_I4_A4_PM_GFX1100,
             kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_GFX1100,
@@ -9791,8 +9811,9 @@ mod tests {
                 "qwen4_moe_down_iu4_sym_e8p_pm_gfx1100",
             ]
         );
-        // Registry presence is not permission: W3 (1) on gfx1100, W2 (2) and unknown codecs are refused.
-        for codec in [1u8, 2, 4, 255] {
+        // Registry presence is not permission: W2 (2) and unknown codecs are refused. W3 (1) on gfx1100 is the
+        // decode-only lossy tier: the cold W3 K1 (its own narrow + t8 exports) and no K2.
+        for codec in [2u8, 4, 255] {
             assert!(
                 matches!(
                     slab_embedded_entries("gfx1100", codec),
@@ -9801,6 +9822,32 @@ mod tests {
                 "gfx1100 codec {codec}"
             );
         }
+        let w3 = slab_embedded_entries("gfx1100", 1).unwrap();
+        let mq4_only = slab_embedded_entries("gfx1100", 0).unwrap();
+        assert_eq!(w3.len(), mq4_only.len() + 2);
+        assert_eq!(w3[5].module(), "qwen4_moe_iu4_sym_w3_pm_gfx1100");
+        assert_eq!(
+            w3.iter().map(PlannedKernel::module).collect::<Vec<_>>()[..4],
+            mq4_only
+                .iter()
+                .map(PlannedKernel::module)
+                .collect::<Vec<_>>()[..4]
+        );
+        assert_eq!(w3[4].module(), "mq_i4_moe_gemv_mq3only_pm_gfx1100");
+        assert_eq!(
+            w3[4].symbols(),
+            [
+                "mq_i4_moe_gemv_mq3i4_r256_gate_up_pm_gfx1100",
+                "mq_i4_moe_gemv_mq3i4_r128_down_pm_gfx1100",
+                "mq_i4_moe_gemv_mq3i4_r256_gate_up_pm_gfx1100_t8",
+                "mq_i4_moe_gemv_mq3i4_r128_down_pm_gfx1100_t8",
+            ]
+        );
+        assert!(
+            w3.iter()
+                .all(|p| !p.module().contains("e8p")
+                    && p.symbols().iter().all(|s| !s.contains("e8p")))
+        );
         // gfx1201's inventory is untouched; unknown arches are refused.
         for codec in [0u8, 1, 3] {
             assert!(slab_embedded_entries("gfx1201", codec).unwrap().is_empty());
@@ -10524,6 +10571,10 @@ mod tests {
                 kernels::MQ_I4_MOE_GEMV_MQ4ONLY_PM_GFX1100_SHA256,
             ),
             (
+                kernels::MQ_I4_MOE_GEMV_MQ3ONLY_PM_GFX1100,
+                kernels::MQ_I4_MOE_GEMV_MQ3ONLY_PM_GFX1100_SHA256,
+            ),
+            (
                 kernels::E8P_I4_MOE_GEMV_PM_GFX1100,
                 kernels::E8P_I4_MOE_GEMV_PM_GFX1100_SHA256,
             ),
@@ -11023,14 +11074,17 @@ mod tests {
         // registry inventory. Every admitted E8P arch has both its K1 and its K2 table.
         for &arch in SUPPORTED_ARCHES {
             for codec in 0u8..=4 {
-                let admitted = crate::qwen4_slab_codec_admitted(arch, codec);
+                // Slab serving (K1 AND K2) versus decode (K1 alone, `qwen4_slab_codec_admitted`):
+                // gfx1100 W3 decodes and has no K2.
+                let admitted = crate::expert_capabilities::slab_serves_codec(arch, codec);
+                let decodes = crate::qwen4_slab_codec_admitted(arch, codec);
                 let k1_meta = crate::slab_moe::slab_cold_k1_metadata(arch, codec).is_some();
                 let k2_meta = crate::gemm::slab_k2_metadata(arch, codec).is_some();
                 let k1_served = crate::slab_moe::slab_cold_kernels(arch, codec).is_some();
                 let k2_served = crate::gemm::slab_k2_entry(arch, codec).is_some();
                 assert_eq!(
                     k1_served,
-                    k1_meta && codec != 0 && admitted,
+                    k1_meta && codec != 0 && decodes,
                     "{arch} codec {codec} K1"
                 );
                 assert_eq!(k2_served, k2_meta && admitted, "{arch} codec {codec} K2");
@@ -11048,6 +11102,14 @@ mod tests {
                 }
                 let plan = slab_embedded_entries(arch, codec);
                 match arch {
+                    "gfx1100" if codec == 1 => {
+                        // The MQ3 tier: K1 and K2 are both served; the plan lists the cold K1 and the K2.
+                        assert!(k1_served && k2_served && admitted);
+                        let modules: Vec<_> =
+                            plan.unwrap().iter().map(PlannedKernel::module).collect();
+                        assert!(modules.contains(&"mq_i4_moe_gemv_mq3only_pm_gfx1100"));
+                        assert!(!modules.iter().any(|m| m.contains("e8p")));
+                    }
                     "gfx1100" if codec == 0 || (k1_served && k2_served) => {
                         let modules: Vec<_> =
                             plan.unwrap().iter().map(PlannedKernel::module).collect();

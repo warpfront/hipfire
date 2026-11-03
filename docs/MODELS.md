@@ -268,6 +268,14 @@ rows and 101.3 GB with the q8 rows for `-mq2-xts`, and about 73.7 GB and
 98.9 GB for `-mq2-xts-4500`. Supported on the 7900 XTX (gfx1100) and R9700
 (gfx1201) only; Strix Halo (gfx1151) refuses these tags cleanly in 0.4.3.
 
+**MQ3 XTS tier on the 7900 XTX (gfx1100), opt-in, DRAFT pending card gates.** The MQ3 XTS tag
+(`qwen3.8:flash-next-mq3-xts`) also loads on gfx1100 (previously refused: no W3 kernels). It is a
+lossy tier (W3 cold experts, MQ4 hot experts): its quality contract is the measured paired KLD
+against `mq4` on the engine ruler (`qwen4_kld`, WT2 and code24), recorded next to the throughput
+when the card runs land. Resident layers run the gfx1100 W3 K1 (decode) and K2 (prefill) kernels;
+layers mapped from host RAM run through the D2 CPU planar W3 decoders (or K1 over the link when D2
+is off). Nothing changes for any other tag; the tier exists only for users who pull it.
+
 **Grandfathered monolithics.**
 The client carries a compiled-in pin for the Flash-Next MQ4 XTS split base
 (`qwen3.8-flash-next-base.mq4-xts`, sha256 `eafaff94…`, 70,888,270,360 B), a

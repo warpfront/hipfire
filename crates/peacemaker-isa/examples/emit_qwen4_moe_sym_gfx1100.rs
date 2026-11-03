@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! cargo run -p peacemaker-isa --release --features toolchain --example emit_qwen4_moe_sym_gfx1100 -- \
-//!     [--arch gfx1100|gfx1151] [--codec legacy|e8p|all] [--out-dir REPO_ROOT] [--receipt FILE] [--work-dir DIR] [--evidence-dir DIR] [--seed N] [--p1-only]
+//!     [--arch gfx1100|gfx1151] [--codec legacy|e8p|all|w3] [--out-dir REPO_ROOT] [--receipt FILE] [--work-dir DIR] [--evidence-dir DIR] [--seed N] [--p1-only]
 //! ```
 //!
 //! `--codec legacy` (default, the original behaviour): three modules `kernels/qwen4_moe_iu4_sym{,_w2,_w3}_pm_gfx1100.hxaco`;
@@ -87,13 +87,15 @@ mod app {
     ];
     const PINNED_SOURCES: [(&str, &str); 2] = [
         // Re-pinned on land2 (gfx1201 NT8 gate_up lock bake, 75f0d90173): qwen4_moe_sym.rs is
-        // f75b549cfc019fb6680b1fd7200a36285342a25ad757b66bde3bf5fb23b7864c; earlier pin below.
+        // Re-pinned on mgmtp/sc-mq3wire after the F1 drop-zero planar codec (09a3bb2331, gfx1201-only, new WeightCodec arm): the
+        // gfx1100 MQ4 and E8P modules re-emit byte-identically (MQ4 831db6f9.., E8P 1dfc5811..), so the delta touches no gfx1100 entry.
+        // Previous pin: f75b549cfc019fb6680b1fd7200a36285342a25ad757b66bde3bf5fb23b7864c; earlier pin below.
         // Re-pinned on land-rc5: qwen4_moe_sym.rs is beta 12daf4fe9 (cdb4f9c6a9ca0c4017aa17e88d134cf3e22fe3fced04e3896f2dc7b5a04c446f)
         // plus the retained consumer24 E8P dispatch; qwen4_moe_sym_w3.rs is exactly beta 12daf4fe9. rc3/rc4 pins:
         // 02ac151d8c548badb646ada96eec4516d1c3258528dad8f1fa4984ed7043c00e, b15ef478422178342b6cba2a021555dcc837aba604e95e3ce0a2008911b3bbce.
         (
             "src/kernels/qwen4_moe_sym.rs",
-            "f75b549cfc019fb6680b1fd7200a36285342a25ad757b66bde3bf5fb23b7864c",
+            "d48ca4fe9ce119ce770e56e6ac85f2f2c7a2d2aba0e9af5c8a16da7000233c79",
         ),
         (
             "src/kernels/qwen4_moe_sym_w3.rs",
@@ -103,12 +105,14 @@ mod app {
 
     type R<T> = Result<T, String>;
 
-    /// Which codec modules a run emits: the committed MQ4/W2/W3 set (default), the E8P module, or both.
+    /// Which codec modules a run emits: the committed MQ4/W2/W3 set (default), the E8P module, both,
+    /// or the W3 module alone (the gfx1100 W3 K2 of the decode+prefill MQ3 tier).
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum CodecSet {
         Legacy,
         E8p,
         All,
+        W3,
     }
 
     impl CodecSet {
@@ -117,6 +121,7 @@ mod app {
                 Self::Legacy => Codec::ALL.to_vec(),
                 Self::E8p => vec![Codec::E8p],
                 Self::All => Codec::ALL.iter().copied().chain([Codec::E8p]).collect(),
+                Self::W3 => vec![Codec::W3],
             }
         }
     }
@@ -1358,7 +1363,8 @@ mod app {
                         "legacy" => CodecSet::Legacy,
                         "e8p" => CodecSet::E8p,
                         "all" => CodecSet::All,
-                        other => return Err(format!("--codec {other} (legacy|e8p|all)")),
+                        "w3" => CodecSet::W3,
+                        other => return Err(format!("--codec {other} (legacy|e8p|all|w3)")),
                     }
                 }
                 "--work-dir" => {

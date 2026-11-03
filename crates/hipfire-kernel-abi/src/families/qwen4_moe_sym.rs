@@ -700,6 +700,11 @@ const OBJ_W3_GFX1201: ObjectRefV1 = ObjectRefV1::Embedded {
     artifact: "kernels/qwen4_moe_iu4_sym_w3_pm_gfx1201.hxaco",
     sha256: "b1c05e645d424491e3d1dd69e6145ab2d6081fb97474662fd1fa14351ba5200f",
 };
+const OBJ_W3_GFX1100: ObjectRefV1 = ObjectRefV1::Embedded {
+    module: "qwen4_moe_iu4_sym_w3_pm_gfx1100",
+    artifact: "kernels/qwen4_moe_iu4_sym_w3_pm_gfx1100.hxaco",
+    sha256: "da46eb46d4637234da818cb0a0563963b769b1e09fdc4181d02e253807beaa74",
+};
 const OBJ_P_GFX1201: ObjectRefV1 = ObjectRefV1::Embedded {
     module: "qwen4_moe_iu4_sym_p_pm_gfx1201",
     artifact: "kernels/qwen4_moe_iu4_sym_p_pm_gfx1201.hxaco",
@@ -1049,6 +1054,25 @@ const GFX1201_DOWN_E8P: ExportV1 = export(
 
 // MQ3-I4 (W3) gfx1201 NT1 entries (`QWEN4_MOE_SYM_W3_GATE_UP` / `_DOWN`, never the `_acc`
 // twins): segment 64 / align 8, no hidden words, `.group_segment_fixed_size` 0, block 64 / 128.
+// The gfx1100 entries below (`SLAB_K2_GFX1100_W3`) are the same block, grid and constants.
+const GFX1100_GATE_UP_W3: ExportV1 = export(
+    "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1100",
+    Arch::Gfx1100,
+    OBJ_W3_GFX1100,
+    64,
+    0,
+    GRID_X_RR1,
+    C_NT1_GATE_UP,
+);
+const GFX1100_DOWN_W3: ExportV1 = export(
+    "qwen4_moe_down_iu4_sym_w3_pm_gfx1100",
+    Arch::Gfx1100,
+    OBJ_W3_GFX1100,
+    128,
+    0,
+    GRID_X_RR1,
+    C_NT1_DOWN,
+);
 const GFX1201_GATE_UP_W3: ExportV1 = export(
     "qwen4_moe_gate_up_silu_iu4_sym_w3_pm_gfx1201",
     Arch::Gfx1201,
@@ -1379,7 +1403,8 @@ pub static QWEN4_MOE_SYM_DOWN_E8P: KernelAbiV1 = KernelAbiV1 {
     exports: &[GFX1100_DOWN_E8P, GFX1151_DOWN_E8P, GFX1201_DOWN_E8P],
 };
 
-/// MQ3-I4 (W3) gate/up, gfx1201 NT1 (`qwen4_moe_sym_w3_gemm` -> `qwen4_moe_sym_nt1_gemm`).
+/// MQ3-I4 (W3) gate/up, NT1: gfx1100 (sealed-slab codec 1 over `SlabK2`, `qwen4_moe_sym_slab_gemm`) and
+/// gfx1201 (`qwen4_moe_sym_w3_gemm` -> `qwen4_moe_sym_nt1_gemm`).
 /// The gfx1151 W3 NT4 launcher and its module are not part of this contract.
 pub static QWEN4_MOE_SYM_GATE_UP_W3: KernelAbiV1 = KernelAbiV1 {
     id: "qwen4_moe_sym.gate_up_w3.pm",
@@ -1394,10 +1419,10 @@ pub static QWEN4_MOE_SYM_GATE_UP_W3: KernelAbiV1 = KernelAbiV1 {
     segment_bytes: 64,
     segment_align: 8,
     domain: &DOMAIN_GATE_UP_PLANAR,
-    exports: &[GFX1201_GATE_UP_W3],
+    exports: &[GFX1100_GATE_UP_W3, GFX1201_GATE_UP_W3],
 };
 
-/// MQ3-I4 (W3) down, gfx1201 NT1.
+/// MQ3-I4 (W3) down, NT1: gfx1100 (sealed-slab codec 1, `SLAB_K2_GFX1100_W3`) and gfx1201.
 pub static QWEN4_MOE_SYM_DOWN_W3: KernelAbiV1 = KernelAbiV1 {
     id: "qwen4_moe_sym.down_w3.pm",
     version: 1,
@@ -1411,7 +1436,7 @@ pub static QWEN4_MOE_SYM_DOWN_W3: KernelAbiV1 = KernelAbiV1 {
     segment_bytes: 64,
     segment_align: 8,
     domain: &DOMAIN_DOWN_PLANAR,
-    exports: &[GFX1201_DOWN_W3],
+    exports: &[GFX1100_DOWN_W3, GFX1201_DOWN_W3],
 };
 
 /// DESIGN F1: drop-zero planar MQ4 (`MQ4G256V2P`) gate/up, gfx1201 NT4/NT8. Numerics, params and

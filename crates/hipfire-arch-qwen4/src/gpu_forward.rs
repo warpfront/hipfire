@@ -9814,6 +9814,23 @@ fn prompt_chunk_rows_of(
     share.map_or(scratch.max_chunk, |share| share.max_chunk)
 }
 
+/// The widest window a load of slab layers runs when some layer's codec has no K2 prefill
+/// kernels on `arch` ([`rdna_compute::slab_admission::qwen4_slab_layer_prefills`]): the few-row
+/// K1 width [`rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS`] (a window up to it never
+/// leaves the K1 lane-union GEMV, resident or host-mapped, and `route_rows` equals the real rows
+/// on every arch that has such a codec). `None` when every slab layer prefills (the ordinary
+/// load: no cap) or there is no slab layer. `layer_codecs` is each slab layer's per-expert codec
+/// bytes, absent (pruned) experts counted as MQ4.
+pub(crate) fn slab_decode_only_rows<'a>(
+    arch: &str,
+    layer_codecs: impl IntoIterator<Item = &'a [u8]>,
+) -> Option<usize> {
+    layer_codecs
+        .into_iter()
+        .any(|codecs| !rdna_compute::slab_admission::qwen4_slab_layer_prefills(arch, codecs))
+        .then_some(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
+}
+
 /// Memory the prefill banks of a decode-share load view.
 enum DecodeShareBacking {
     /// `bank` mode: an owned device buffer of the largest class's span (a
@@ -10245,6 +10262,9 @@ pub struct Qwen4GpuForward {
     /// (width caps and eager rules for the whole forward), not by the
     /// per-load measured default (which affects only the calls that execute it).
     cpu_split_explicit: bool,
+    /// `Some(rows)` when a slab layer holds a codec without K2 prefill kernels on this device
+    /// ([`slab_decode_only_rows`]): the widest prompt tile (and forward) the load runs.
+    slab_decode_only_rows: Option<usize>,
     expert_stage: Option<Qwen4ExpertStage>,
     /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
     /// placement): the zero dummy expert, the full per-layer tables for chunk
@@ -12554,6 +12574,20 @@ impl Qwen4GpuForward {
             }
             return Err(error);
         }
+        let slab_decode_only_rows = slab_decode_only_rows(
+            &gpu.arch,
+            moe.iter()
+                .flatten()
+                .filter_map(|layer| layer.slab.as_ref())
+                .map(|slab| slab.codecs.as_slice()),
+        );
+        if let Some(rows) = slab_decode_only_rows {
+            eprintln!(
+                "  qwen4 expert-slab: decode-only tier on {}: a slab codec has no K2 prefill kernels, \
+                 so prompts run in {rows}-row K1 tiles and no window wider than {rows} rows is served",
+                gpu.arch
+            );
+        }
         Ok(Self {
             expert_stage,
             ep,
@@ -12583,6 +12617,7 @@ impl Qwen4GpuForward {
                 .count(),
             cpu_split_explicit: hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
                 && !hipfire_dispatch::cpu_exec::passback_enabled(),
+            slab_decode_only_rows,
             moe,
             moe_borrow,
             borrow_class_rows,
@@ -13332,10 +13367,14 @@ impl Qwen4GpuForward {
     /// borrowed prefill bank, so capacity is never the selected bank's
     /// `max_chunk`; everywhere else it is `scratch.max_chunk`.
     pub(crate) fn prompt_chunk_rows(&self) -> usize {
-        if let Some(reserve) = self.ep_reserve.as_ref() {
-            return reserve.banks.prompt_rows();
-        }
-        prompt_chunk_rows_of(self.share.as_ref(), &self.scratch)
+        let rows = if let Some(reserve) = self.ep_reserve.as_ref() {
+            reserve.banks.prompt_rows()
+        } else {
+            prompt_chunk_rows_of(self.share.as_ref(), &self.scratch)
+        };
+        // A decode-only slab (a codec without K2 prefill kernels) tiles its prompt at the
+        // few-row K1 width: no tile ever reaches the missing K2.
+        self.slab_decode_only_rows.map_or(rows, |cap| rows.min(cap))
     }
 
     /// Whether this call continues a dirty borrow epoch inside a whole-prompt
@@ -15087,6 +15126,19 @@ impl Qwen4GpuForward {
         wide_hidden_capture: Option<&GpuTensor>,
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
+        // A decode-only slab has no K2 prefill kernels: a prefill tile wider than the K1 width
+        // would reach them mid-forward. Refuse it here, before any state advances (the tiling
+        // loops cap at `prompt_chunk_rows`, so only a caller that bypasses them lands here).
+        if let Some(cap) = self.slab_decode_only_rows {
+            if self.prefill_scope && tokens.len() > cap {
+                return Err(invalid(format!(
+                    "a {}-row prefill tile reaches an expert-slab codec with no K2 prefill kernels \
+                     on {} (decode-only tier: at most {cap} rows per tile)",
+                    tokens.len(),
+                    gpu.arch
+                )));
+            }
+        }
         // Latch before installing this call's routing scopes: a multi-row
         // verify remains eager but must reproduce the singleton AR arithmetic
         // that would run at this exact boundary.
@@ -20408,6 +20460,39 @@ mod tests {
         assert_eq!(
             full.len(),
             hipfire_dispatch::pipeline::slab_route::CODEC_TAG_ALLOC_BYTES
+        );
+    }
+
+    /// A slab layer whose codec has no K2 prefill kernels on the device (W3 on gfx1100) caps the
+    /// whole load at the few-row K1 width; every codec that prefills leaves the load uncapped.
+    #[test]
+    fn decode_only_slab_caps_the_prompt_tile_at_the_k1_width() {
+        use crate::expert_arena::{CODEC_E8P, CODEC_MQ4, CODEC_W3};
+        let cap = Some(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS);
+        let w3: &[u8] = &[CODEC_MQ4, CODEC_W3, CODEC_W3];
+        let e8p: &[u8] = &[CODEC_MQ4, CODEC_E8P];
+        let mq4: &[u8] = &[CODEC_MQ4; 4];
+        // Every shipped slab codec prefills on its arch (gfx1100 W3 has a K2 now): no cap.
+        for arch in ["gfx1100", "gfx1201", "gfx1151"] {
+            assert_eq!(
+                crate::gpu_forward::slab_decode_only_rows(arch, [mq4, w3, e8p]),
+                None,
+                "{arch}"
+            );
+        }
+        assert_eq!(
+            crate::gpu_forward::slab_decode_only_rows("gfx1100", std::iter::empty()),
+            None
+        );
+        // A codec an arch cannot prefill caps the load at the K1 width; an arch that serves nothing
+        // (no K2 for any codec) is the stand-in for such a cell.
+        assert_eq!(
+            crate::gpu_forward::slab_decode_only_rows("gfx942", [mq4, w3]),
+            cap
+        );
+        assert_eq!(
+            crate::gpu_forward::slab_decode_only_rows("gfx942", [w3]),
+            cap
         );
     }
 

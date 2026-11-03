@@ -225,6 +225,11 @@ required-features = ["lab"]
 name = "mq_i4_moe_gemv_gfx1100_g1"
 required-features = ["lab"]
 
+# Raw PM gfx1100 W3 (MQ3-I4) K1 decode-GEMV byte oracle + microbench (no production dispatch wiring).
+[[example]]
+name = "mq_i4_moe_gemv_gfx1100_w3_g1"
+required-features = ["lab"]
+
 # Raw PM gfx1100 MQ-I4 A4 producer G1 oracle (no production dispatch wiring).
 [[example]]
 name = "mq_i4_a4_gfx1100_g1_oracle"

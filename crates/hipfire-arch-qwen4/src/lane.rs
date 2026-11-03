@@ -3645,8 +3645,10 @@ mod tests {
         // W2 has no kernel anywhere: one missing pair refuses the layer.
         assert!(!admitted(ARCH, Some(vec![QT_MQ4_XTS, QT_W2])));
         assert!(!admitted(ARCH, Some(vec![QT_W2])));
-        // No W3 kernel on gfx1100; an unknown architecture serves nothing.
-        assert!(!admitted("gfx1100", Some(vec![QT_W3])));
+        // gfx1100 W3 has a K1 (decode) and no K2 (prefill): decode admission needs only the K1
+        // cell. An unknown architecture serves nothing.
+        assert!(admitted("gfx1100", Some(vec![QT_W3])));
+        assert!(admitted("gfx1100", Some(vec![QT_MQ4_XTS, QT_W3])));
         assert!(!admitted("gfx0000", Some(vec![QT_MQ4_XTS])));
         // Unknown or empty expert storage is never admitted.
         assert!(!admitted(ARCH, None));

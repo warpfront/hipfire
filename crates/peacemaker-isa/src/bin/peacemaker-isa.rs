@@ -148,6 +148,9 @@ const NATIVE_USAGE: &str = "       emit options: [--co FILE] [--bundle FILE [--h
        peacemaker-isa emit --kernel mq_i4_moe_gemv_mq4only [--epi mq4sym_<kind>[_t8]|all] --arch gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (artifact stem mq_i4_moe_gemv_mq4only_pm_gfx1100, internal module mq_i4_moe_gemv_pm_gfx1100:
           two genuine MQ4 narrow exports then their two t8 exports; the retired mixed W2 image is not emitted)
+       peacemaker-isa emit --kernel mq_i4_moe_gemv_mq3only [--epi mq3i4_<kind>[_t8]|all] --arch gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
+         (artifact stem mq_i4_moe_gemv_mq3only_pm_gfx1100, internal module mq_i4_moe_gemv_mq3_pm_gfx1100:
+          two W3 (MQ3-I4 planar) narrow exports then their two t8 exports; lossy opt-in tier, emission is not codec admission)
        peacemaker-isa emit --kernel mq_i4_moe_gemv_cn [--epi <codec>_<kind>[_t8]|all] --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
          (mq_i4_moe_gemv_cn_pm_gfx1151: four unchanged narrow plus four t8 exports)
        peacemaker-isa emit --kernel e8p_i4_moe_gemv [--epi r256_gate_up[_t8]|r128_down[_t8]|all] --arch gfx1151|gfx1201|gfx1100 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]
@@ -876,6 +879,12 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
             // filename and MQ4-only export set identify the production image.
             RowImage::new(kernels::mq_i4_moe_gemv_gfx1100::Spec::module(arch))
         }
+        "mq_i4_moe_gemv_mq3only" => {
+            if arch != Arch::Gfx1100 {
+                return Err("mq_i4_moe_gemv_mq3only is gfx1100 only".into());
+            }
+            RowImage::new(kernels::mq_i4_moe_gemv_gfx1100::Spec::module_mq3(arch))
+        }
         "mq_i4_moe_gemv" => RowImage::new(kernels::mq_i4_moe_gemv::Spec::module(arch)),
         "mq_i4_moe_gemv_cn" => {
             if arch != Arch::Gfx1151 {
@@ -1048,6 +1057,31 @@ fn row_image(kernel: &str, epi: &str, arch: Arch) -> Result<Option<RowImage>, St
                     .into_iter()
                     .filter(|s| s.codec == k::Codec::Mq4Sym)
                 {
+                    if selected(&spec.tag(), tiled) {
+                        let e = if tiled {
+                            k::emit_rowtiles(spec)?
+                        } else {
+                            k::emit(spec)?
+                        };
+                        let contract = k::contract(spec, &e);
+                        image.push(
+                            e,
+                            if tiled {
+                                ["ceil(M/8)", "80", "ceil(C/8)"]
+                            } else {
+                                ["M", "U", "1"]
+                            },
+                            slots(tiled),
+                            contract,
+                        )?;
+                    }
+                }
+            }
+        }
+        "mq_i4_moe_gemv_mq3only" => {
+            use kernels::mq_i4_moe_gemv_gfx1100 as k;
+            for tiled in [false, true] {
+                for spec in k::mq3_specs(arch) {
                     if selected(&spec.tag(), tiled) {
                         let e = if tiled {
                             k::emit_rowtiles(spec)?

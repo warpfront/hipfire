@@ -440,7 +440,7 @@ pub enum MoeRouteCapability {
     /// planar qt135/qt136; gfx1151 admits MQ4 and W3, and E8P-I4 only once
     /// `rdna_compute::slab_admission::SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED` is true (refused
     /// today; its kernels are selectable, the one constant is the admission); gfx1100 admits
-    /// MQ4 and E8P-I4 (not W3); W2 is
+    /// MQ4, E8P-I4 and, decode-only (a K1 and no K2: windows up to `few_row_limit` rows), W3; W2 is
     /// refused on every arch. A layer carries at most one cold codec (W3 or E8P); see
     /// `rdna_compute::qwen4_slab_codec_admitted`. Decode rows
     /// (`route_rows <= 8`) run the K1 lane-union GEMV over the two codec

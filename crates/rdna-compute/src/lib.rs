@@ -102,8 +102,8 @@ pub mod residual_lanes;
 pub mod slab_admission;
 pub mod stream_mix;
 pub use slab_admission::{
-    qwen4_slab_codec_admitted, qwen4_slab_default_cold_codec, qwen4_slab_layer_cold_codec,
-    SlabLayerCodecError,
+    qwen4_slab_codec_admitted, qwen4_slab_codec_prefill_admitted, qwen4_slab_default_cold_codec,
+    qwen4_slab_layer_cold_codec, qwen4_slab_layer_prefills, SlabLayerCodecError,
 };
 pub mod mq6_railgun;
 pub mod mq_f16_producers;

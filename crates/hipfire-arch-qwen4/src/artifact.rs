@@ -2776,8 +2776,9 @@ mod tests {
         assert!(error.to_string().contains("not available on this device"));
     }
 
-    /// The sealed route admits per (arch, cold codec): gfx1100 MQ4 + E8P,
-    /// gfx1151 MQ4 + W3 + E8P (E8P via SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED), gfx1201 MQ4 + W3 + E8P,
+    /// The sealed route admits per (arch, cold codec): gfx1100 MQ4 + E8P + W3 (W3 decode-only: no
+    /// K2), gfx1151 MQ4 + W3 + E8P (E8P via SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED), gfx1201 MQ4 +
+    /// W3 + E8P,
     /// W2 nowhere, one cold codec per layer (layers may differ), and every other architecture
     /// (or none) keeps the unchanged fail-closed refusal.
     #[test]
@@ -2798,6 +2799,7 @@ mod tests {
             ("gfx1201", Mq3I4, CODEC_W3),
             ("gfx1201", E8pI4, CODEC_E8P),
             ("gfx1100", E8pI4, CODEC_E8P),
+            ("gfx1100", Mq3I4, CODEC_W3),
             ("gfx1151", Mq3I4, CODEC_W3),
         ] {
             assert!(slab_route_admitted(arch));
@@ -2817,15 +2819,29 @@ mod tests {
                 assert_eq!(layer.cold_codec(arch), Ok(cold_codec));
             }
         }
-        // W3 on gfx1100 is an arch refusal; W2 is refused everywhere (typed).
-        let error =
-            expert_slab_plan(&slab_metadata(), &headers(Mq3I4), Some("gfx1100")).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("no sealed-route kernels on gfx1100"),
-            "{error}"
-        );
+        // gfx1100 W3 is the MQ3 tier (K1 + K2): the plan admits it, every layer's cold codec is W3,
+        // and `qwen4_slab_layer_prefills` holds there. W2 is refused everywhere (typed).
+        let plan = expert_slab_plan(&slab_metadata(), &headers(Mq3I4), Some("gfx1100"))
+            .unwrap()
+            .expect("gfx1100 W3 admitted");
+        for layer in plan.layers() {
+            assert_eq!(layer.cold_codec("gfx1100"), Ok(CODEC_W3));
+            assert!(rdna_compute::slab_admission::qwen4_slab_layer_prefills(
+                "gfx1100",
+                &layer.codec_table().unwrap()
+            ));
+        }
+        for arch in ["gfx1151", "gfx1201"] {
+            let plan = expert_slab_plan(&slab_metadata(), &headers(Mq3I4), Some(arch))
+                .unwrap()
+                .unwrap();
+            for layer in plan.layers() {
+                assert!(rdna_compute::slab_admission::qwen4_slab_layer_prefills(
+                    arch,
+                    &layer.codec_table().unwrap()
+                ));
+            }
+        }
         for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(matches!(
                 expert_slab_plan(&slab_metadata(), &headers(Mq2I4), Some(arch)),
@@ -2867,7 +2883,12 @@ mod tests {
             .expect("per-layer cold codecs admitted");
         assert_eq!(plan.layers()[0].cold_codec("gfx1201"), Ok(CODEC_W3));
         assert_eq!(plan.layers()[1].cold_codec("gfx1201"), Ok(CODEC_E8P));
-        assert!(expert_slab_plan(&slab_metadata(), &alternating, Some("gfx1100")).is_err());
+        // gfx1100 admits W3 (decode-only) next to E8P: different layers may differ there too.
+        let plan = expert_slab_plan(&slab_metadata(), &alternating, Some("gfx1100"))
+            .unwrap()
+            .expect("per-layer cold codecs admitted on gfx1100");
+        assert_eq!(plan.layers()[0].cold_codec("gfx1100"), Ok(CODEC_W3));
+        assert_eq!(plan.layers()[1].cold_codec("gfx1100"), Ok(CODEC_E8P));
         // gfx1151 admits MQ4 + E8P exactly when SLAB_ROUTE_GFX1151_E8P_RECEIPTS_LANDED (else an
         // arena arch refusal); a W3 + E8P layer is refused either way (the arch refusal, or the
         // two-cold-codecs refusal when admitted).
@@ -2930,13 +2951,14 @@ mod tests {
             expert_slab_plan(&metadata, &headers, None).unwrap_err(),
             expected
         );
-        // gfx1100 serves MQ4 + E8P only: pruned W3 experts are an arch refusal, not a count refusal.
-        let error = expert_slab_plan(&metadata, &headers, Some("gfx1100")).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("no sealed-route kernels on gfx1100"),
-            "{error}"
+        // gfx1100 admits pruned W3 experts (decode-only: its W3 has a K1 and no K2): the plan
+        // carries only the kept experts' bytes, exactly as on the arches that also prefill W3.
+        let plan = expert_slab_plan(&metadata, &headers, Some("gfx1100"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            plan.physical_bytes(),
+            (keep.total_kept() * ExpertFormat::Mq3I4.slab_bytes()) as u64,
         );
         let table = build_expert_slab_table_with_keep(
             &expert_slabs::ExpertSlabsV1::fn_v1(),
