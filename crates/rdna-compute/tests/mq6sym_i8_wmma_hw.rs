@@ -794,12 +794,13 @@ fn tiles_for(n: usize, prefill_ok: bool) -> Vec<Tile> {
     v
 }
 
-/// Dynamic LDS of the T0 dot4 entry r<N> (`mq6sym_x_lds_bytes` in kernel/t0 commit 409d6239cf:
-/// 2 * (2 * (N + B) * 144 + 8 * N), B = 2 for N == 7). The competitor source is a snapshot of that
-/// commit; a later T0 revision may change this contract.
+/// Dynamic LDS of the T0 dot4 entry r<N> (current kernels/src/gemv_mq6sym_i8.gfx1201.hip, mirrors
+/// `lds_bytes` of mq6sym_i8_decode_hw.rs): max(2 SLOT, 528 N), SLOT = 2 (N + B) 144 + 8 N,
+/// B = 2 for N == 7 else 1.
 fn t0_lds_bytes(n: usize) -> u32 {
-    let b = if n == 7 { 2 } else { 0 };
-    (2 * (2 * (n + b) * 144 + 8 * n)) as u32
+    let b = if n == 7 { 2 } else { 1 };
+    let slot = 2 * (n + b) * 144 + 8 * n;
+    (2 * slot).max(528 * n) as u32
 }
 
 /// T0 (dot4, N <= 8) vs T1 (WMMA) on the same weights / A8 blocks: both implement the one frozen
