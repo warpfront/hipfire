@@ -250,16 +250,17 @@ fn encode_hidden_segments(
         .map_err(|e| format!("qwen35-embed: upload: {e:?}"))?;
     // mRoPE positions: [n][3] i32 uploaded as raw bits into an F32-typed
     // buffer (the rope kernel's DeviceBuffer contract).
-    let pos_bytes: Vec<u8> = pos3_host
+    let pos_bits: Vec<f32> = pos3_host
         .iter()
-        .flat_map(|t| t.iter().flat_map(|v| v.to_ne_bytes()))
+        .flat_map(|t| t.iter().map(|v| f32::from_bits(*v as u32)))
         .collect();
-    let pos3 = gpu
-        .alloc_tensor(&[n * 3], rdna_compute::DType::F32)
-        .map_err(|e| format!("qwen35-embed: alloc: {e:?}"))?;
-    gpu.hip
-        .memcpy_htod(&pos3.buf, &pos_bytes)
-        .map_err(|e| format!("qwen35-embed: memcpy_htod: {e:?}"))?;
+    let pos3 = match gpu.upload_f32(&pos_bits, &[n * 3]) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = gpu.free_tensor(hidden);
+            return Err(format!("qwen35-embed: upload positions: {e:?}"));
+        }
+    };
     let s = EncodeScratch::new(gpu, cfg, n, hidden, pos3)?;
     match run_layers(gpu, w, state, cfg, segs, &s) {
         Ok(()) => Ok(s),

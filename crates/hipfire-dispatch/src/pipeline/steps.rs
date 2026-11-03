@@ -72,8 +72,9 @@ pub enum Step<'a> {
         q: &'a GpuTensor,
         k: &'a GpuTensor,
         pos_buf: &'a hip_bridge::DeviceBuffer,
-        /// `Some`: one I32 position per row (`rows` = its length), the batched
-        /// kernels; `pos_buf` is then unread. `None`: one row at `pos_buf`.
+        /// `Some`: `rope.positions_per_row()` I32 positions per row (rows =
+        /// its length divided by that), the batched kernels; `pos_buf` is then
+        /// unread. `None`: one row at `pos_buf`.
         positions: Option<&'a GpuTensor>,
         n_heads: usize,
         n_kv_heads: usize,
@@ -922,6 +923,16 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
             Step::GatedMlp(op) => op.validate_for_gpu(gpu)?,
+            Step::Rope {
+                q,
+                k,
+                positions: Some(positions),
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rope,
+                ..
+            } => rope.validate_rows(positions, q, k, *n_heads, *n_kv_heads, *head_dim)?,
             Step::SandwichAttention(op) => op.validate_for_gpu(gpu)?,
             Step::SandwichMlp(op) => op.validate_for_gpu(gpu)?,
             Step::ParallelMoeMlp(op) => op.validate_for_gpu(gpu)?,
