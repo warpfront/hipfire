@@ -427,22 +427,22 @@ struct Tile {
     ntok: usize,
     /// token-split grid ([ceil(M/rows), ceil(N/ntok)]): any N, the slices re-stream the weights
     ys: bool,
-    /// prefill only: LDS-only main-loop barrier (`_fb` entry)
-    fb: bool,
+    /// prefill only: the VGPR-capped twin (`_c192` entry)
+    cap: bool,
 }
 
 impl Tile {
     fn narrow(rows: usize, ntok: usize) -> Tile {
-        Tile { rows, ntok, ys: false, fb: false }
+        Tile { rows, ntok, ys: false, cap: false }
     }
     fn split(rows: usize, ntok: usize) -> Tile {
-        Tile { rows, ntok, ys: true, fb: false }
+        Tile { rows, ntok, ys: true, cap: false }
     }
     fn p128() -> Tile {
-        Tile { rows: 128, ntok: 0, ys: false, fb: false }
+        Tile { rows: 128, ntok: 0, ys: false, cap: false }
     }
-    fn p128fb() -> Tile {
-        Tile { rows: 128, ntok: 0, ys: false, fb: true }
+    fn p128c192() -> Tile {
+        Tile { rows: 128, ntok: 0, ys: false, cap: true }
     }
     fn is_prefill(&self) -> bool {
         self.ntok == 0
@@ -450,7 +450,7 @@ impl Tile {
     fn entry(&self, bf16: bool) -> String {
         let b = if bf16 { "_bf16" } else { "" };
         if self.is_prefill() {
-            format!("gemm_mq6sym_i8_set{b}{}_gfx1201", if self.fb { "_fb" } else { "" })
+            format!("gemm_mq6sym_i8_set{b}{}_gfx1201", if self.cap { "_c192" } else { "" })
         } else {
             let y = if self.ys { "y" } else { "" };
             format!("gemm_mq6sym_i8_set{b}_m{}n{}{y}_gfx1201", self.rows, self.ntok)
@@ -458,7 +458,7 @@ impl Tile {
     }
     fn label(&self) -> String {
         if self.is_prefill() {
-            (if self.fb { "p128fb" } else { "p128" }).to_string()
+            (if self.cap { "p128c192" } else { "p128" }).to_string()
         } else {
             format!("m{}n{}{}", self.rows, self.ntok, if self.ys { "y" } else { "" })
         }
@@ -507,7 +507,7 @@ fn narrow_tiles() -> Vec<Tile> {
 fn load_entries(gpu: &mut Gpu) {
     let mut tiles = narrow_tiles();
     tiles.push(Tile::p128());
-    tiles.push(Tile::p128fb());
+    tiles.push(Tile::p128c192());
     for t in tiles {
         for bf16 in [false, true] {
             let e = t.entry(bf16);
@@ -795,9 +795,69 @@ fn tiles_for(n: usize, prefill_ok: bool) -> Vec<Tile> {
     let mut v: Vec<Tile> = narrow_tiles().into_iter().filter(|t| t.admits(n)).collect();
     if prefill_ok {
         v.push(Tile::p128());
-        v.push(Tile::p128fb());
+        v.push(Tile::p128c192());
     }
     v
+}
+
+/// T0 (dot4, N <= 8) vs T1 (WMMA) on the same weights / A8 blocks: both implement the one frozen
+/// fold, so every visible output word must be byte-identical (F32 and BF16), tails and all.
+fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t0_src: &str) {
+    let full = format!("#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{QUANT_SRC}\n{t0_src}");
+    for n in 1..=8 {
+        for suf in ["", "_bf16"] {
+            let e = format!("gemv_mq6sym_i8_rows_r{n}{suf}_gfx1201");
+            gpu.ensure_kernel_public("t1_t0_dot4", &full, &e)
+                .unwrap_or_else(|err| panic!("load T0 {e}: {err}"));
+        }
+    }
+    let mut cmp_words = 0u64;
+    let mut mism = 0u64;
+    for &(m, k) in &[(130usize, 256usize), (1000, 2560), (2560, 6144), (48, 2560)] {
+        for n in 1..=8usize {
+            let x = rand_activations(rng, k, n);
+            let (xq_ptr, _rot, _xq_host) = produce_real(gpu, &x, k, n);
+            for (wi, wk) in [WKind::Random, WKind::EdgeScales, WKind::Exhaustive].into_iter().enumerate() {
+                let w_host = gen_weights(m, k, wk, 0x7000_0000 + (m * 8 + n) as u64 + wi as u64);
+                let w_dev = upload_bytes(gpu, &w_host);
+                for bf16 in [false, true] {
+                    let elt = if bf16 { 2 } else { 4 };
+                    let bytes = m * n * elt;
+                    let yd = gpu.alloc_tensor(&[bytes + GUARD_TAIL], DType::Raw).expect("alloc yd");
+                    gpu.hip.memset(&yd.buf, 0xA5, bytes + GUARD_TAIL).expect("memset");
+                    let mut a = KernargBlob::new();
+                    a.push_ptr(w_dev.buf.as_ptr());
+                    a.push_ptr(xq_ptr);
+                    a.push_ptr(yd.buf.as_ptr());
+                    a.push_i32(m as i32);
+                    a.push_i32(k as i32);
+                    a.push_i32(n as i32);
+                    a.pad_to(16);
+                    let e = format!("gemv_mq6sym_i8_rows_r{n}{}_gfx1201", if bf16 { "_bf16" } else { "" });
+                    gpu.launch_kernel_blob(&e, [m.div_ceil(32) as u32, 1, 1], [128, 1, 1], (528 * n) as u32, a.as_mut_slice())
+                        .unwrap_or_else(|err| panic!("launch {e}: {err}"));
+                    gpu.hip.device_synchronize().expect("sync");
+                    let hd = download_bytes(gpu, &yd, bytes + GUARD_TAIL);
+                    for tile in tiles_for(n, true) {
+                        let ym = gpu.alloc_tensor(&[bytes + GUARD_TAIL], DType::Raw).expect("alloc ym");
+                        gpu.hip.memset(&ym.buf, 0x5A, bytes + GUARD_TAIL).expect("memset");
+                        launch_sym(gpu, tile, bf16, w_dev.buf.as_ptr(), xq_ptr, ym.buf.as_ptr(), m, k, n);
+                        gpu.hip.device_synchronize().expect("sync");
+                        let hm = download_bytes(gpu, &ym, bytes + GUARD_TAIL);
+                        let d = hd[..bytes].iter().zip(&hm[..bytes]).filter(|(p, q)| p != q).count() as u64;
+                        mism += d;
+                        cmp_words += (bytes / elt) as u64;
+                        if d != 0 {
+                            st.fails.push(format!("T0 parity {:?} m{m} k{k} n{n} {} {}: {d} bytes differ", wk, tile.label(), if bf16 { "bf16" } else { "f32" }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    st.mismatches += mism;
+    js.line(&format!("{{\"kind\":\"t0_dot4_parity\",\"words\":{cmp_words},\"byte_mismatches\":{mism},\"pass\":{}}}", mism == 0 && cmp_words > 0));
+    assert!(cmp_words > 0, "vacuous T0 parity");
 }
 
 // ---------------------------------------------------------------- correctness test
@@ -974,7 +1034,7 @@ fn mq6sym_i8_wmma_bytes_hw() {
             let w_host = gen_weights(m, k, WKind::Random, 0xF00D + n as u64 + m as u64);
             let w_dev = upload_bytes(&mut gpu, &w_host);
             for bf16 in [false, true] {
-                for tile in [Tile::p128(), Tile::p128fb()] {
+                for tile in [Tile::p128(), Tile::p128c192()] {
                     run_case(
                         &mut gpu, &mut st, &mut js, "prefill/real-act/Random", tile, bf16,
                         &w_host, &w_dev, xq_ptr, &xq_host, m, k, n, &mut rng, false, false,
@@ -982,6 +1042,14 @@ fn mq6sym_i8_wmma_bytes_hw() {
                 }
             }
         }
+    }
+
+    // ---- G. T0 (dot4) parity at the overlapping rows 1..8 (when the T0 source is supplied) ----
+    if let Some(p) = std::env::var("T1_DOT4_SRC").ok() {
+        let src = std::fs::read_to_string(&p).expect("T1_DOT4_SRC");
+        t0_parity(&mut gpu, &mut js, &mut st, &mut rng, &src);
+    } else {
+        js.line("{\"kind\":\"t0_dot4_parity\",\"skipped\":true}");
     }
 
     // ---- F. negative controls: a deliberately corrupted operand must be DETECTED ----
@@ -1321,7 +1389,7 @@ fn mq6sym_i8_wmma_timing_hw() {
                                     &format!("gemv_mq6sym_i8_rows_r{r}_gfx1201"),
                                     [m.div_ceil(32) as u32, 1, 1],
                                     [128, 1, 1],
-                                    0,
+                                    (528 * r) as u32, // dynamic LDS of the T0 entry r<N>
                                     a.as_mut_slice(),
                                 )
                                 .expect("dot4 launch");
@@ -1459,9 +1527,9 @@ fn mq6sym_i8_wmma_timing_hw() {
             {
                 let wp = wp.clone();
                 arms.push(Arm {
-                    name: "sym_p128fb_f32".into(),
+                    name: "sym_p128c192_f32".into(),
                     wbytes: sym_bytes,
-                    run: Box::new(move |g, i| launch_sym(g, Tile::p128fb(), false, wp[i], xq, yp, m, k, n)),
+                    run: Box::new(move |g, i| launch_sym(g, Tile::p128c192(), false, wp[i], xq, yp, m, k, n)),
                 });
             }
             {
@@ -1511,7 +1579,7 @@ fn mq6sym_i8_wmma_timing_hw() {
                     samples[ai].push(us);
                 }
             }
-            let names = ["sym_p128_f32".to_string(), "sym_p128fb_f32".to_string(), "affine_i8_hipcc_f32".to_string(), format!("affine_i8_production({prod_entry})")];
+            let names = ["sym_p128_f32".to_string(), "sym_p128c192_f32".to_string(), "affine_i8_hipcc_f32".to_string(), format!("affine_i8_production({prod_entry})")];
             for (ai, nm) in names.iter().enumerate() {
                 let mut v = samples[ai].clone();
                 let med = median(&mut v);

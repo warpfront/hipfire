@@ -441,9 +441,7 @@ static __device__ __forceinline__ float p_sz_value(unsigned hw, int h, int w) {
     return (w == 0) ? sym_scale(hw, h) : 0.0f;
 }
 
-// FB: the main-loop rendezvous waits only for this wave's LDS traffic (sym_bar) instead of draining
-// every in-flight global load through __syncthreads' release fence.
-template <bool BF16, bool FB>
+template <bool BF16>
 static __device__ __forceinline__ void gemm_mq6sym_p128_body(
     const char*           __restrict__ A,   // [M x groups_per_row x 196]
     const block_i8_128*   __restrict__ Xq,  // [K/128 x N]
@@ -570,7 +568,7 @@ static __device__ __forceinline__ void gemm_mq6sym_p128_body(
             p_publish_w(LDS + P_SLOT0_OFF + P_A_BYTES, st_wlds[r], wd);
         }
     }
-    if constexpr (FB) { sym_bar(); } else { __syncthreads(); }
+    __syncthreads();
 
     for (int g = 0; g < groups_per_row; g++) {
         // Rolled: only cacc/acc carry across the two halves.
@@ -609,7 +607,7 @@ static __device__ __forceinline__ void gemm_mq6sym_p128_body(
                     p_publish_w(LDS + P_SLOT1_OFF + P_A_BYTES, st_wlds[r], W_pf[r]);
                 }
                 // Slot-0 retirement plus slot-1 readiness.
-                if constexpr (FB) { sym_bar(); } else { __syncthreads(); }
+                __syncthreads();
                 if (!last) {
                     // Next-block fetch epoch: raw loads into private registers,
                     // first use at the slot-0 publishes below.
@@ -696,7 +694,7 @@ static __device__ __forceinline__ void gemm_mq6sym_p128_body(
                 }
                 // Slot-1 retirement plus next slot-0 readiness; on the last
                 // block this guards store-tile reuse of LDS.
-                if constexpr (FB) { sym_bar(); } else { __syncthreads(); }
+                __syncthreads();
             }
         } // for h
     } // for g
@@ -823,7 +821,7 @@ void gemm_mq6sym_i8_set_gfx1201(
     void*                 __restrict__ Y,
     int M, int K, int N
 ) {
-    gemm_mq6sym_p128_body<false, false>((const char*)W, Xq, Y, M, K, N);
+    gemm_mq6sym_p128_body<false>((const char*)W, Xq, Y, M, K, N);
 }
 
 extern "C" __global__ __launch_bounds__(P_NTHREADS, 2)
@@ -833,27 +831,29 @@ void gemm_mq6sym_i8_set_bf16_gfx1201(
     void*                 __restrict__ Y,
     int M, int K, int N
 ) {
-    gemm_mq6sym_p128_body<true, false>((const char*)W, Xq, Y, M, K, N);
+    gemm_mq6sym_p128_body<true>((const char*)W, Xq, Y, M, K, N);
 }
 
-extern "C" __global__ __launch_bounds__(P_NTHREADS, 2)
-void gemm_mq6sym_i8_set_fb_gfx1201(
+// Twins capped at 192 VGPRs (two 256-thread CTAs per CU: 8 waves/SIMD); the uncapped kernels
+// allocate 199 (7 waves/SIMD).
+extern "C" __global__ __launch_bounds__(P_NTHREADS, 2) __attribute__((amdgpu_num_vgpr(192)))
+void gemm_mq6sym_i8_set_c192_gfx1201(
     const unsigned char*  __restrict__ W,
     const block_i8_128*   __restrict__ Xq,
     void*                 __restrict__ Y,
     int M, int K, int N
 ) {
-    gemm_mq6sym_p128_body<false, true>((const char*)W, Xq, Y, M, K, N);
+    gemm_mq6sym_p128_body<false>((const char*)W, Xq, Y, M, K, N);
 }
 
-extern "C" __global__ __launch_bounds__(P_NTHREADS, 2)
-void gemm_mq6sym_i8_set_bf16_fb_gfx1201(
+extern "C" __global__ __launch_bounds__(P_NTHREADS, 2) __attribute__((amdgpu_num_vgpr(192)))
+void gemm_mq6sym_i8_set_bf16_c192_gfx1201(
     const unsigned char*  __restrict__ W,
     const block_i8_128*   __restrict__ Xq,
     void*                 __restrict__ Y,
     int M, int K, int N
 ) {
-    gemm_mq6sym_p128_body<true, true>((const char*)W, Xq, Y, M, K, N);
+    gemm_mq6sym_p128_body<true>((const char*)W, Xq, Y, M, K, N);
 }
 
 #endif  // gfx1200 / gfx1201
