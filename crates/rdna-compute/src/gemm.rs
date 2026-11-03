@@ -50609,13 +50609,9 @@ impl Gpu {
             );
         }
         if self.arch_caps.has_gfx11_plus_simt() && m == 1280 && k == 2560 {
-            // HIPFIRE_QWEN4_MOE32_GU: wide-pass g32 family, exact gfx1201, shipped layout, > 8 rows.
-            // 9..=48 rows only: the g32 win is measured at 9-48 rows (rows 49..511 unmeasured).
-            if self.moe32_gu != 0
-                && x_src_rows > 8
-                && x_src_rows <= 48
-                && self.arch_caps.is_gfx1201()
-            {
+            // HIPFIRE_QWEN4_MOE32_GU: wide-pass g32 family, exact gfx1201, > 8 rows up to the verify window
+            // (`moe32_gu_applies`; bit-identical to o4_r8_x4, measured 9-48 rows).
+            if Self::moe32_gu_applies(self.moe32_gu, x_src_rows, self.arch_caps.is_gfx1201()) {
                 return self.gemm_mq4g256v2_moe_grouped_top10_g32_gfx1201(
                     expert_weight_ptrs,
                     expert_tile_ids,
@@ -50734,6 +50730,7 @@ impl Gpu {
             } else {
                 (module, src, func)
             };
+        crate::moe_entry_log::moe_entry_receipt("gate_up", func, grouped_rows / 10);
         self.ensure_kernel(module, src, func)?;
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
@@ -50791,6 +50788,66 @@ impl Gpu {
         result
     }
 
+    /// Whether the gfx1201 `g32` gate/up family serves a call of `rows` source rows
+    /// (`HIPFIRE_QWEN4_MOE32_GU` not `0`): 9..=[`crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS`] rows,
+    /// the verify window. The family is bit-identical to `o4_r8_x4` (same ABI and arithmetic), so the bound
+    /// is a performance choice: rows 49..=64 take it too (the wide verify pass reaches them).
+    pub(crate) fn moe32_gu_applies(mode: u8, rows: usize, gfx1201: bool) -> bool {
+        mode != 0 && gfx1201 && rows > 8 && rows <= crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS
+    }
+
+    /// `(module, source, entry)` of the `g32` gate/up family for `rows` source rows (`g32_r8` above 16
+    /// rows, `g32_r4` for 9..=16), shipped or drop-zero planar layout, with or without the dead-slot
+    /// zero stores (`_nodz`).
+    pub(crate) fn moe32_gu_entry(
+        planar: bool,
+        rows: usize,
+        nodz: bool,
+    ) -> (&'static str, &'static str, &'static str) {
+        match (planar, rows > 16, nodz) {
+            (false, true, false) => (
+                "gemm_mq4g256v2_moe_grouped_top10_g32",
+                kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r8",
+            ),
+            (false, false, false) => (
+                "gemm_mq4g256v2_moe_grouped_top10_g32",
+                kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r4",
+            ),
+            (false, true, true) => (
+                "gemm_mq4g256v2_moe_grouped_top10_g32",
+                kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r8_nodz",
+            ),
+            (false, false, true) => (
+                "gemm_mq4g256v2_moe_grouped_top10_g32",
+                kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                "gemm_mq4g256v2_moe_grouped_top10_g32_r4_nodz",
+            ),
+            (true, true, false) => (
+                "gemm_mq4g256v2p_moe_grouped_top10_g32",
+                kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                "gemm_mq4g256v2p_moe_grouped_top10_g32_r8",
+            ),
+            (true, false, false) => (
+                "gemm_mq4g256v2p_moe_grouped_top10_g32",
+                kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                "gemm_mq4g256v2p_moe_grouped_top10_g32_r4",
+            ),
+            (true, true, true) => (
+                "gemm_mq4g256v2p_moe_grouped_top10_g32",
+                kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                "gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz",
+            ),
+            (true, false, true) => (
+                "gemm_mq4g256v2p_moe_grouped_top10_g32",
+                kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                "gemm_mq4g256v2p_moe_grouped_top10_g32_r4_nodz",
+            ),
+        }
+    }
+
     /// gfx1201 wide-pass gate/up `g32` family (`HIPFIRE_QWEN4_MOE32_GU`, shipped or drop-zero planar
     /// layout; mode 2 selects the `_nodz` entries): bit-identical to
     /// [`Self::gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151`] (same ABI), one 256-thread block per
@@ -50812,49 +50869,11 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let planar = self.mq4_experts_planar;
-        let (module, src, func): (&'static str, &'static str, &'static str) =
-            match (planar, x_src_rows > 16, self.moe32_gu == 2) {
-                (false, true, false) => (
-                    "gemm_mq4g256v2_moe_grouped_top10_g32",
-                    kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
-                    "gemm_mq4g256v2_moe_grouped_top10_g32_r8",
-                ),
-                (false, false, false) => (
-                    "gemm_mq4g256v2_moe_grouped_top10_g32",
-                    kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
-                    "gemm_mq4g256v2_moe_grouped_top10_g32_r4",
-                ),
-                (false, true, true) => (
-                    "gemm_mq4g256v2_moe_grouped_top10_g32",
-                    kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
-                    "gemm_mq4g256v2_moe_grouped_top10_g32_r8_nodz",
-                ),
-                (false, false, true) => (
-                    "gemm_mq4g256v2_moe_grouped_top10_g32",
-                    kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
-                    "gemm_mq4g256v2_moe_grouped_top10_g32_r4_nodz",
-                ),
-                (true, true, false) => (
-                    "gemm_mq4g256v2p_moe_grouped_top10_g32",
-                    kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
-                    "gemm_mq4g256v2p_moe_grouped_top10_g32_r8",
-                ),
-                (true, false, false) => (
-                    "gemm_mq4g256v2p_moe_grouped_top10_g32",
-                    kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
-                    "gemm_mq4g256v2p_moe_grouped_top10_g32_r4",
-                ),
-                (true, true, true) => (
-                    "gemm_mq4g256v2p_moe_grouped_top10_g32",
-                    kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
-                    "gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz",
-                ),
-                (true, false, true) => (
-                    "gemm_mq4g256v2p_moe_grouped_top10_g32",
-                    kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
-                    "gemm_mq4g256v2p_moe_grouped_top10_g32_r4_nodz",
-                ),
-            };
+        // One dead-store switch: the default skips dead slots (HIPFIRE_QWEN4_MOE_DEAD_STORES=1 restores the
+        // +0.0 stores); `HIPFIRE_QWEN4_MOE32_GU=2` forces the `_nodz` entries whatever that switch says.
+        let nodz = self.moe32_gu == 2 || !self.moe_dead_stores;
+        let (module, src, func) = Self::moe32_gu_entry(planar, x_src_rows, nodz);
+        crate::moe_entry_log::moe_entry_receipt("gate_up", func, x_src_rows);
         self.ensure_kernel(module, src, func)?;
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();

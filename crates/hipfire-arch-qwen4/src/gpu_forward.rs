@@ -2580,7 +2580,7 @@ pub const QWEN4_EP_GATHER_MAX_ROWS: usize = 8;
 /// (`hipfire_config::qwen4_ep_wide_verify_rows`, 32..=64) widens it, subject to
 /// [`ep_wide_stage_limits`]; this constant is that flag's floor and default. A
 /// row-exactness bound is separate ([`crate::gpu_forward_lanes::LANE_MAX_ROWS`]).
-pub const QWEN4_EP_GATHER_VERIFY_ROWS: usize = hipfire_config::QWEN4_EP_WIDE_VERIFY_ROWS_MIN;
+pub const QWEN4_EP_GATHER_VERIFY_ROWS: usize = hipfire_config::QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS;
 
 /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY=1` (developer, default off): size every EP
 /// rank's row-gather buffers, the gather transport's slot capacity and the

@@ -392,6 +392,7 @@ impl Gpu {
         let xq = self.qwen4_moe_down_a8_quantize(hidden_batch.buf.as_ptr(), x_rows)?;
         self.ensure_kernel(MODULE, QWEN4_MOE_DOWN_A8_GFX1201_SRC, entry)?;
         first_launch_receipt(Kind::Indexed, batch_size, entry);
+        crate::moe_entry_log::moe_entry_receipt("down", entry, batch_size);
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
         let yp = expert_outputs.buf.as_ptr();
@@ -466,6 +467,7 @@ impl Gpu {
         let xq = self.qwen4_moe_down_a8_quantize(x_src.buf.as_ptr(), x_src_rows)?;
         self.ensure_kernel(MODULE, QWEN4_MOE_DOWN_A8_GFX1201_SRC, entry)?;
         first_launch_receipt(Kind::Grouped, x_src_rows / DOWN_K_TOP, entry);
+        crate::moe_entry_log::moe_entry_receipt("down", entry, x_src_rows / DOWN_K_TOP);
         let ep = expert_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
         let sp = sorted_slot_index.buf.as_ptr();

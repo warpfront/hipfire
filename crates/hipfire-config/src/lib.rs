@@ -4705,7 +4705,7 @@ pub fn qwen4_ep_wide_verify_all_lanes() -> bool {
 /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` (developer, default 32): the rows one wide-class
 /// verify group may carry (`pack_classed_row_groups`' wide cap) and, with it, the EP
 /// row-gather capacity of the verify scope. An unsigned integer clamped to
-/// [`QWEN4_EP_WIDE_VERIFY_ROWS_MIN`]`..=`[`QWEN4_EP_WIDE_VERIFY_ROWS_MAX`]; unset or
+/// [`QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS`]`..=`[`QWEN4_EP_WIDE_VERIFY_ROWS_MAX`]; unset or
 /// unparsable is the default (32, today's shipped width). Read only when a wide verify
 /// flag is on ([`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] or `HIPFIRE_QWEN4_EP_WIDE_VERIFY`);
 /// the arch forward lowers it further to the lowest hard limit of any stage that runs
@@ -4714,19 +4714,24 @@ pub fn qwen4_ep_wide_verify_all_lanes() -> bool {
 /// every rank's lane forward).
 pub const QWEN4_EP_WIDE_VERIFY_ROWS_ENV: &str = "HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS";
 /// Floor and default of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: the 32-row wide pass.
-pub const QWEN4_EP_WIDE_VERIFY_ROWS_MIN: usize = 32;
+pub const QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS: usize = 32;
 /// Ceiling of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: the physical verify window
 /// ([`QWEN4_VERIFY_MAX_ROWS`]).
 pub const QWEN4_EP_WIDE_VERIFY_ROWS_MAX: usize = QWEN4_VERIFY_MAX_ROWS;
 
 /// Pure parse of [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`]: trimmed unsigned integer clamped
 /// to the documented range; `None`, empty or unparsable (including negative) is
-/// [`QWEN4_EP_WIDE_VERIFY_ROWS_MIN`].
+/// [`QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS`].
 pub fn qwen4_ep_wide_verify_rows_value(raw: Option<&str>) -> usize {
-    raw.and_then(|raw| raw.trim().parse::<usize>().ok())
-        .map_or(QWEN4_EP_WIDE_VERIFY_ROWS_MIN, |rows| {
-            rows.clamp(QWEN4_EP_WIDE_VERIFY_ROWS_MIN, QWEN4_EP_WIDE_VERIFY_ROWS_MAX)
-        })
+    raw.and_then(|raw| raw.trim().parse::<usize>().ok()).map_or(
+        QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS,
+        |rows| {
+            rows.clamp(
+                QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS,
+                QWEN4_EP_WIDE_VERIFY_ROWS_MAX,
+            )
+        },
+    )
 }
 
 /// [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`] read once through the process snapshot.

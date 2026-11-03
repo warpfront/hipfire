@@ -92,6 +92,7 @@ pub mod load_phases;
 mod loaded_code_check;
 pub mod moe;
 pub mod moe_decode_lanes;
+mod moe_entry_log;
 mod moe_few;
 pub mod moe_grouped_k2_pm;
 pub mod moe_grouped_qt44_iu4;

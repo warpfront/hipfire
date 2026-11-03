@@ -93,5 +93,9 @@ name = "fn_mesh_lane_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "fn_wide_kl_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_slab_d2_capture"
 required-features = ["lab"]

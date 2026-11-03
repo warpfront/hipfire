@@ -289,7 +289,11 @@ impl RowHandle {
         Self(source)
     }
 
-    fn row_logits(
+    /// Host copy of the full-vocabulary, unpenalized logits of verify row `row`
+    /// of lane window `key` into `host`. Valid only from the verify to the
+    /// step's prepare (the `AcceptRule::accept` hook runs inside that span);
+    /// public so lab oracles can read the resident verify rows.
+    pub fn row_logits(
         &self,
         key: &LaneWindowKey,
         row: usize,

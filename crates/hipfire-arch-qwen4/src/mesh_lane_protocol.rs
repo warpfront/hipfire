@@ -4515,6 +4515,51 @@ mod tests {
     use hipfire_runtime::spec_sampling::SpecRng;
     use std::cell::RefCell;
     use std::rc::Rc;
+    /// A C8 / C4 MTP burst of K = 1, 2, 3 (16 / 24 / 32 rows at 8 lanes, 8 / 12 / 16 at 4): the
+    /// row-exact class runs `ceil(rows / 8)` serial <=8-row MoE group passes (today), the wide class
+    /// ONE group over every lane row at the default 32-row cap, and the cap splits whole lanes
+    /// above it (K = 7 at 8 lanes = 64 rows needs a 64 cap, which the owner-assign limit of 51 rows
+    /// refuses: two groups at 51..=63).
+    #[test]
+    fn a_wide_k1_k2_k3_burst_is_one_moe_group_over_all_lane_rows() {
+        for lanes in [4usize, 8] {
+            for k in 1usize..=3 {
+                let per_lane = k + 1;
+                let rows = vec![per_lane; lanes];
+                let total = lanes * per_lane;
+                let exact = pack_classed_row_groups_with_cap(&rows, &vec![false; lanes], 32);
+                // Whole lanes pack up to 8 rows per group: at least ceil(rows / 8) serial passes, and
+                // more than one whenever the burst exceeds 8 rows.
+                assert!(exact.len() >= total.div_ceil(LANE_MAX_ROWS));
+                assert!(total <= LANE_MAX_ROWS || exact.len() > 1);
+                assert!(exact.iter().all(|g| !g.wide && g.rows <= LANE_MAX_ROWS));
+                assert_eq!(exact.iter().map(|g| g.rows).sum::<usize>(), total);
+                let wide = pack_classed_row_groups_with_cap(&rows, &vec![true; lanes], 32);
+                assert_eq!(wide.len(), 1, "K={k} lanes={lanes} rows={total}");
+                assert!(wide[0].wide && wide[0].rows == total && wide[0].lanes == lanes);
+            }
+        }
+        // 8 lanes x K = 5 (48 rows): one group at a 48..=51 cap, two at 32.
+        let rows = vec![6usize; 8];
+        assert_eq!(
+            pack_classed_row_groups_with_cap(&rows, &[true; 8], 48).len(),
+            1
+        );
+        assert_eq!(
+            pack_classed_row_groups_with_cap(&rows, &[true; 8], 32).len(),
+            2
+        );
+        // 8 lanes x K = 7 (64 rows) is one group only at a cap of 64.
+        let rows = vec![8usize; 8];
+        assert_eq!(
+            pack_classed_row_groups_with_cap(&rows, &[true; 8], 64).len(),
+            1
+        );
+        assert_eq!(
+            pack_classed_row_groups_with_cap(&rows, &[true; 8], 51).len(),
+            2
+        );
+    }
 
     fn epoch(tag: u64) -> RequestEpoch {
         RequestEpoch {

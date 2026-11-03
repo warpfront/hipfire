@@ -3357,6 +3357,7 @@ impl Gpu {
                 hip_bridge::HipError::new(1, "MQ4 down pointer-table count exceeds i32")
             })?;
             require_span(expert_ptrs, &[n_exp, 8], "MQ4 down row-tile pointer table")?;
+            crate::moe_entry_log::moe_entry_receipt("down", symbol, batch_size);
             let rows_val = i32::try_from(batch_size)
                 .map_err(|_| hip_bridge::HipError::new(1, "MQ4 down row count exceeds i32"))?;
             // Device indexing is signed i32, including the complete window.
@@ -3441,6 +3442,7 @@ impl Gpu {
             ))?;
             return Ok(());
         }
+        crate::moe_entry_log::moe_entry_receipt("down", func, batch_size);
         self.ensure_kernel(module, src, func)?;
         let pp = expert_ptrs.buf.as_ptr();
         let ip = topk_indices.buf.as_ptr();
@@ -3856,6 +3858,7 @@ impl Gpu {
         } else {
             (module, source, func)
         };
+        crate::moe_entry_log::moe_entry_receipt("down", func, x_src_rows / 10);
         self.ensure_kernel(module, source, func)?;
         let ep = expert_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
