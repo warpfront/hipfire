@@ -110,11 +110,10 @@ pub(crate) struct Bufs<'a> {
     pub route: Route<'a>,
 }
 
-/// The GEMV form `weight_gemv` launched: no PARO rotation, AWQ or row stride.
+/// The GEMV form `weight_gemv` launched: no AWQ or row stride.
 fn plain_ref(w: &WeightTensor) -> WeightRef<'_> {
     WeightRef {
         row_stride: 0,
-        rotation: None,
         awq_scale: None,
         ..w.dispatch_ref()
     }
