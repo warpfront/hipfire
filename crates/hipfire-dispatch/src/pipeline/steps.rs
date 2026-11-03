@@ -946,6 +946,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::RingKv(op) if op.positions.is_empty() => {
                 return Err(DispatchError::Hip("DS4 ring KV step with no rows".into()));
             }
+            Step::Rope { head_dim, rope, .. } => rope.validate(*head_dim)?,
             _ => {}
         }
     }
