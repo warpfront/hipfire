@@ -52709,6 +52709,16 @@ impl Gpu {
         self.moe32_gu
     }
 
+    /// Override `HIPFIRE_QWEN4_MOE_DOWN_DNI` for this device (the byte oracle toggles it in one process).
+    pub fn set_moe_down_dni(&mut self, on: bool) {
+        self.moe_down_dni = on;
+    }
+
+    /// Whether the gfx1201 `dni` per-pick down is selected (see [`Gpu::set_moe_down_dni`]).
+    pub fn moe_down_dni(&self) -> bool {
+        self.moe_down_dni
+    }
+
     /// Refuse a launcher that has no drop-zero planar twin while the device is bound to the
     /// planar expert layout (it would decode the planar bytes as the shipped layout).
     pub(crate) fn require_shipped_mq4_experts(&self, what: &str) -> HipResult<()> {

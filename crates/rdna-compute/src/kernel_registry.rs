@@ -2740,6 +2740,16 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                     "gemv_mq4g256v2p_moe_gate_up_top10_indexed_batched",
                 ]
             );
+            // HIPFIRE_QWEN4_MOE_DOWN_DNI (default on, exact gfx1201, K = 640, <= 8 rows, eager):
+            // per-pick down, shipped + planar entries in one module.
+            add!(
+                "gemv_mq4g128v2_moe_down_top10_dni",
+                kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_DNI_GFX1201_SRC,
+                [
+                    "gemv_mq4g128v2_moe_down_top10_dni_k640",
+                    "gemv_mq4g128v2p_moe_down_top10_dni_k640",
+                ]
+            );
         }
         add!(
             "grouped_ops",
@@ -11818,6 +11828,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_MOE_DOWN_DNI` (default on, exact gfx1201, <=8 rows): the per-pick K=640 down kernel.
+        const MOE_DOWN_DNI_ADDED_MODULES: [&str; 1] = ["gemv_mq4g128v2_moe_down_top10_dni"];
+        for module in MOE_DOWN_DNI_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MoE down dni module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -11854,7 +11878,8 @@ mod tests {
                 + MOE_EPILOGUE_FUSE_ADDED_MODULES.len()
                 + HCFUSE_ADDED_MODULES.len()
                 + LANE_HC_ALLROWS_ADDED_MODULES.len()
-                + BF16_ALLROWS_ADDED_MODULES.len(),
+                + BF16_ALLROWS_ADDED_MODULES.len()
+                + MOE_DOWN_DNI_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

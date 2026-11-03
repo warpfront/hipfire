@@ -205,6 +205,11 @@ required-features = ["lab"]
 name = "moe_wide_oracle"
 required-features = ["lab"]
 
+# S3 per-pick routed-down byte oracle + A/B (production k640_r4 vs dni on real expert tensors).
+[[example]]
+name = "moe_down_oracle"
+required-features = ["lab"]
+
 # K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV oracle + row-time runner (raw PM module; no production dispatch wiring).
 [[example]]
 name = "e8p_i4_moe_gemv_oracle"

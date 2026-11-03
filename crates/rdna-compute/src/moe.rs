@@ -3269,16 +3269,37 @@ impl Gpu {
                 false,
             )
         };
-        let (func, rows_per_block) = match (r4, planar_func) {
-            (true, true) => (
+        // HIPFIRE_QWEN4_MOE_DOWN_DNI: gfx1201 per-pick K = 640 down, <= 8 rows, eager: eight weight
+        // rows per wave, four waves per block (32 rows), software-pipelined loads (bitwise the r4
+        // kernel). Grid [M / 32, k_top, N], block 128.
+        let dni = r4
+            && self.moe_down_dni
+            && self.arch_caps.is_gfx1201()
+            && m % 32 == 0
+            && k == 640
+            && batch_size <= 8;
+        let (module, src) = if dni {
+            (
+                "gemv_mq4g128v2_moe_down_top10_dni",
+                kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_DNI_GFX1201_SRC,
+            )
+        } else {
+            (module, src)
+        };
+        let (func, rows_per_block, block_threads) = match (dni, r4, planar_func) {
+            (true, _, true) => ("gemv_mq4g128v2p_moe_down_top10_dni_k640", 32, 128u32),
+            (true, _, false) => ("gemv_mq4g128v2_moe_down_top10_dni_k640", 32, 128u32),
+            (false, true, true) => (
                 "gemv_mq4g128v2p_moe_down_top10_indexed_batched_expanded_k640_r4",
                 4,
+                32u32,
             ),
-            (true, false) => (
+            (false, true, false) => (
                 "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded_k640_r4",
                 4,
+                32u32,
             ),
-            (false, _) => (module, 1),
+            (false, false, _) => (module, 1, 32u32),
         };
         // Only the frozen eager admission selects the physical eight-row PM
         // tile. Narrow, capture and generic prefill keep their original ABI.
@@ -3434,7 +3455,7 @@ impl Gpu {
                 k_top as u32,
                 batch_size as u32,
             ],
-            [32, 1, 1],
+            [block_threads, 1, 1],
             0,
             &mut params,
             || {

@@ -3762,6 +3762,12 @@ pub const GEMV_MQ4G256V2P_MOE_GATE_UP_TOP10_INDEXED_BATCHED_SRC: &str = concat!(
     include_str!("../../../kernels/src/qwen4_gemv_mq4g256v2p_moe_gate_up_k8_indexed_batched.hip")
 );
 
+/// gfx1201 per-pick K = 640 down `dni` (`HIPFIRE_QWEN4_MOE_DOWN_DNI`): eight weight rows per wave, four
+/// waves per block, software-pipelined loads; entries `gemv_mq4g128v2_moe_down_top10_dni_k640` (shipped
+/// layout) and `gemv_mq4g128v2p_moe_down_top10_dni_k640` (F1 planar). Same ABI and bitwise the
+/// `..._k640_r4` kernels; grid `[M / 32, k_top, N]`, block 128.
+pub const GEMV_MQ4G128V2_MOE_DOWN_TOP10_DNI_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g128v2_moe_down_top10_dni.gfx1201.hip");
 /// DESIGN F1: the drop-zero planar (`MQ4G128V2P`, qt=138) twin of
 /// [`GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC`] (decode down, expanded rows).
 pub const GEMV_MQ4G128V2P_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC: &str = include_str!(

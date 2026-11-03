@@ -1734,6 +1734,10 @@ pub struct Gpu {
     /// [`Gpu::set_moe32_gu`] overrides): the wide-pass gate/up `g32` kernel family replaces `o4_r8_x4`
     /// for more than 8 source rows on exact gfx1201 (shipped and planar layouts).
     pub(crate) moe32_gu: u8,
+    /// `HIPFIRE_QWEN4_MOE_DOWN_DNI` (default on, `0` kills; [`Gpu::set_moe_down_dni`] overrides): the
+    /// gfx1201 per-pick K = 640 down (<= 8 rows, eager) runs the `dni` kernel instead of `k640_r4`
+    /// (bitwise equal output).
+    pub(crate) moe_down_dni: bool,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -3132,6 +3136,7 @@ impl Gpu {
                 Ok("2") => 2,
                 _ => 1,
             },
+            moe_down_dni: hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DOWN_DNI", true),
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
