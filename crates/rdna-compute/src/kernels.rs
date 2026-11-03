@@ -12627,3 +12627,16 @@ mod mq6_scalar_specialization_tests {
         }
     }
 }
+
+/// Qwen4 Flash-Next EP owner-routed symmetric MoE prefill chain, A8 GEMMs (`Gpu::gemm_qwen4_moe_gate_up_silu_a8_sym`,
+/// `Gpu::gemm_qwen4_moe_down_a8_sym`, `HIPFIRE_QWEN4_MOE_EP_A8`): `block_i8_128` activations x symmetric
+/// qt44 / qt53 (or planar `MQ4G256V2P` / `MQ4G128V2P`) weights, BF16 grouped output of the A4 chain's contract.
+pub const QWEN4_MOE_EP_A8_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_moe_ep_a8.gfx12.hip");
+/// Down A8 producer of the same chain (`Gpu::qwen4_moe_rotate128_i8`): grouped BF16 SwiGLU rows -> FWHT128 ->
+/// the shared `quantize_block_i8_128_wave`, flat-slot epoch-major `block_i8_128` sidecar.
+pub const QWEN4_MOE_ROTATE128_I8_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_rotate128_i8.hip")
+);
