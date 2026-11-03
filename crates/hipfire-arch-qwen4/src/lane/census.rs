@@ -1385,21 +1385,28 @@ mod tests {
         assert_eq!(ok, vec![0, 1]);
     }
 
-    /// DESIGN §6's scale check, from the real allocation helper: about
-    /// 58.54 MiB per capture row per whole-model Q8 lane (36 GDN layers).
+    /// DESIGN §6's scale check, from the real allocation helper: per capture row
+    /// per whole-model Q8 lane (36 GDN layers) about 2.85 MiB of per-row inputs
+    /// plus `slots / rows` Q8 state sets of 27.84 MiB: 58.54 MiB/row in the
+    /// 2R-slot layout (kill switch), `rows + 1` slots by default.
     #[test]
     fn capture_ring_scale_matches_the_design_check() {
+        use crate::state::{capture_ring_slots, compact_capture_ring};
         let config = compact_test_config();
         let gdn_layers = config.n_linear_layers();
         assert_eq!(gdn_layers, 36);
+        let set_mib = (gdn_layers * 811_008) as f64 / (1u64 << 20) as f64;
         for rows in [2usize, 4, 8] {
+            assert_eq!(capture_ring_slots(false, rows), Some(2 * rows));
+            let slots = capture_ring_slots(compact_capture_ring(), rows).unwrap();
             let bytes =
                 Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, rows, gdn_layers)
                     .unwrap();
             let per_row_mib = bytes as f64 / rows as f64 / (1u64 << 20) as f64;
+            let expected = 2.85 + slots as f64 / rows as f64 * set_mib;
             assert!(
-                (58.4..58.7).contains(&per_row_mib),
-                "rows={rows}: {per_row_mib} MiB/row"
+                (per_row_mib - expected).abs() < 0.15,
+                "rows={rows} slots={slots}: {per_row_mib} MiB/row, expected {expected}"
             );
         }
     }

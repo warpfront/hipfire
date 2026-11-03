@@ -21,12 +21,13 @@ pub use npu_arena::*;
 // shares the singleton launchers' private validators and route predicates.
 #[path = "qsa_core_lanes.rs"]
 mod qsa_core_lanes;
-pub(crate) use qsa_core_lanes::QSA_LANES_SRC;
 pub use qsa_core_lanes::{
-    qsa_core_lanes, qsa_core_lanes_min, QsaCoreLane, QsaCoreLanesPlan, QSA_CORE_LANES_MAX,
-    QSA_CORE_LANE_ROWS, QSA_LANES_ATTENTION_SYMBOL, QSA_LANES_MODULE, QSA_LANES_POOL_SYMBOL,
-    QSA_LANES_PROLOGUE_SYMBOL, QSA_LANES_SELECT_SYMBOL,
+    qsa_core_lanes, qsa_core_lanes_min, qsa_lanes_fuse_enabled, QsaCoreLane, QsaCoreLanesPlan,
+    QsaOutRotate, QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS, QSA_LANES_ATTENTION_SYMBOL,
+    QSA_LANES_FUSED_ATTENTION_SYMBOL, QSA_LANES_FUSED_CORE_SYMBOL, QSA_LANES_FUSE_MODULE,
+    QSA_LANES_MODULE, QSA_LANES_POOL_SYMBOL, QSA_LANES_PROLOGUE_SYMBOL, QSA_LANES_SELECT_SYMBOL,
 };
+pub(crate) use qsa_core_lanes::{QSA_LANES_FUSE_SRC, QSA_LANES_SRC};
 
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
@@ -39,6 +40,12 @@ pub(crate) const HYPER_READ_UP_FUSED_TWIN_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_fused_twin.gfx1151.hip");
 pub(crate) const HYPER_READ_UP_FUSED_TWIN_T1_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_fused_twin_t1.gfx1201.hip");
+pub(crate) const HYPER_READ_UP_FUSED_ROT_T1_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq_fwht256.h"),
+    include_str!("../../../kernels/src/hyper_read_up_fused_rot_t1.gfx1201.hip")
+);
+pub(crate) const MOE_SHARED_DOWN_COMBINE_SRC: &str =
+    include_str!("../../../kernels/src/moe_shared_down_combine.gfx1201.hip");
 pub(crate) const HYPER_READ_UP_WMMA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/hyper_read_up_wmma.gfx1201.hip");
 pub(crate) const HYPER_READ_UP_WMMA_GFX1151_V2_SRC: &str =
@@ -513,6 +520,11 @@ const GDN_PAIR_COUNTERS: usize = 256;
 /// Bytes of the head-pair arrival counters [`ensure_gdn_pair_counters`] allocates.
 pub const GDN_PAIR_COUNTERS_BYTES: usize = GDN_PAIR_COUNTERS * 4;
 
+/// u32 counters of the fused lanes GDN Core ([`GdnCoreLanesPlan::launch_rotated`]):
+/// per lane `value_heads / 2` head-pair counters, then `key_heads` key-head
+/// counters. Only `HIPFIRE_QWEN4_GDN_LANES_FUSE` sizes the allocation this large.
+const GDN_LANE_FUSE_COUNTERS: usize = 1024;
+
 /// Allocate and zero the fused GDN step's head-pair arrival counters if they
 /// do not exist yet. Each launch leaves them zero, so the zeroing memset runs
 /// once. A retained-body boundary calls this before opening its capture
@@ -520,8 +532,13 @@ pub const GDN_PAIR_COUNTERS_BYTES: usize = GDN_PAIR_COUNTERS * 4;
 /// makes the capture effect-incomplete.
 pub fn ensure_gdn_pair_counters(gpu: &mut Gpu) -> HipResult<()> {
     if gpu.scratch.gdn_pair_counters.is_none() {
-        let counters = gpu.hip.malloc(GDN_PAIR_COUNTERS_BYTES)?;
-        gpu.hip.memset(&counters, 0, GDN_PAIR_COUNTERS_BYTES)?;
+        let bytes = if gpu.flags.qwen4_gdn_lanes_fuse_enabled() {
+            GDN_LANE_FUSE_COUNTERS * 4
+        } else {
+            GDN_PAIR_COUNTERS_BYTES
+        };
+        let counters = gpu.hip.malloc(bytes)?;
+        gpu.hip.memset(&counters, 0, bytes)?;
         gpu.scratch.gdn_pair_counters = Some(counters);
     }
     Ok(())
@@ -2359,6 +2376,117 @@ pub fn hyper_write_norm(
     )
 }
 
+/// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE` (developer, default off): on exact gfx1201 the Qwen4 MoE
+/// epilogue chain `moe_down_combine_top10_batched` -> shared-down `gemv_bf16_xf32_x4_rows_r<R>`
+/// -> `bf16_scaled_add_batched_f32` (3 launches, 1..=8 rows) runs as the one launch
+/// `moe_shared_down_combine_rows_r<R>` ([`moe_shared_down_combine`]): the combine and the shared
+/// fold ride the shared-down GEMV's epilogue. Read once.
+static QWEN4_MOE_EPILOGUE_FUSE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE", true)
+});
+
+/// Operands of [`moe_shared_down_combine`].
+pub struct MoeSharedDownCombine<'a> {
+    /// The shared down's BF16 weight `[m, k]`.
+    pub weight: &'a GpuTensor,
+    /// The shared hidden `[rows, k]` (F32).
+    pub x: &'a GpuTensor,
+    /// The combine target `[rows, m]` (F32): the accumulator seed in, the final block output
+    /// out (bitwise what the three launches leave there).
+    pub target: &'a GpuTensor,
+    /// Unweighted expanded routed rows `[rows * 10 * m]` (`moe_down_combine_top10_batched`'s).
+    pub expert_outputs: &'a GpuTensor,
+    pub topk_indices: &'a GpuTensor,
+    pub topk_weights: &'a GpuTensor,
+    /// Shared selector `[rows]` (already activated).
+    pub scalar: &'a GpuTensor,
+    pub m: usize,
+    pub k: usize,
+    pub rows: usize,
+    pub n_experts: usize,
+}
+
+impl MoeSharedDownCombine<'_> {
+    /// Whether [`moe_shared_down_combine`] can run these operands on `gpu`: the flag, exact
+    /// gfx1201, no replay recording / graph capture, 1..=8 rows (the rows-GEMV route; wider
+    /// passes take the WMMA GEMMs), `m % 8 == 0`, at most 2^20 experts (the kernel's sort key) and
+    /// the operand extents the kernel reads.
+    /// Pure: launches nothing. The caller owns every other condition of the unfused chain it
+    /// replaces (the route the shared down GEMV would have taken, the combine's arm).
+    pub fn applies(&self, gpu: &Gpu) -> bool {
+        let f32_at_least = |t: &GpuTensor, n: usize| t.dtype == DType::F32 && t.numel() >= n;
+        let (m, k, rows) = (self.m, self.k, self.rows);
+        *QWEN4_MOE_EPILOGUE_FUSE
+            && gpu.arch_caps.is_gfx1201()
+            && !gpu.replay.is_recording()
+            && !gpu.graphs.capture_mode
+            && (1..=crate::prefill_invariant::FEW_ROW_ROUTE_ROWS).contains(&rows)
+            && m > 0
+            && m % 8 == 0
+            && k > 0
+            && self.n_experts > 0
+            && self.n_experts <= 1 << 20
+            && self.weight.dtype == DType::BF16
+            && self.weight.numel() >= m * k
+            && f32_at_least(self.x, rows * k)
+            && f32_at_least(self.target, rows * m)
+            && f32_at_least(self.expert_outputs, rows * 10 * m)
+            && self.topk_indices.buf.size() >= rows * 10 * 4
+            && f32_at_least(self.topk_weights, rows * 10)
+            && f32_at_least(self.scalar, rows)
+    }
+}
+
+/// `moe_shared_down_combine_rows_r<rows>`: bitwise `moe_down_combine_top10_batched` into
+/// `target` + the shared-down rows GEMV (`gemv_bf16_xf32_x4_rows_r<rows>`, whose F32 rows are
+/// not stored) + `bf16_scaled_add_batched_f32` (selector `scalar`), in one launch of `m / 8`
+/// blocks of ten waves (eight GEMV waves, two combine waves). Callers MUST check [`MoeSharedDownCombine::applies`] first (it is the
+/// only admission); an operand set it rejects is an error with nothing launched.
+pub fn moe_shared_down_combine(gpu: &mut Gpu, p: &MoeSharedDownCombine<'_>) -> HipResult<()> {
+    if !p.applies(gpu) {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let kernel = match p.rows {
+        1 => "moe_shared_down_combine_rows_r1",
+        2 => "moe_shared_down_combine_rows_r2",
+        3 => "moe_shared_down_combine_rows_r3",
+        4 => "moe_shared_down_combine_rows_r4",
+        5 => "moe_shared_down_combine_rows_r5",
+        6 => "moe_shared_down_combine_rows_r6",
+        7 => "moe_shared_down_combine_rows_r7",
+        _ => "moe_shared_down_combine_rows_r8",
+    };
+    gpu.ensure_kernel_public(
+        "moe_shared_down_combine",
+        MOE_SHARED_DOWN_COMBINE_SRC,
+        kernel,
+    )?;
+    let mut args = KernargBlob::new();
+    for ptr in [
+        p.weight.buf.as_ptr(),
+        p.x.buf.as_ptr(),
+        p.target.buf.as_ptr(),
+        p.expert_outputs.buf.as_ptr(),
+        p.topk_indices.buf.as_ptr(),
+        p.topk_weights.buf.as_ptr(),
+        p.scalar.buf.as_ptr(),
+    ] {
+        args.push_ptr(ptr);
+    }
+    args.push_i32(checked_i32(p.m, "MoE shared down rows")?);
+    args.push_i32(checked_i32(p.k, "MoE shared down K")?);
+    args.push_i32(checked_i32(p.n_experts, "MoE epilogue expert count")?);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [(p.m / 8) as u32, 1, 1],
+        [320, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 pub struct HyperNorm<'a> {
     pub input: &'a GpuTensor,
     pub norm_weight: &'a GpuTensor,
@@ -2615,6 +2743,13 @@ fn qwen4_hc_up_twin_gfx1201_applies(enabled: bool, exact_gfx1201: bool, rows: us
 static QWEN4_HC_UP_T1: std::sync::LazyLock<bool> =
     std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_T1", true));
 
+/// `HIPFIRE_QWEN4_HC_UP_T1_K320` (developer, default off): on the gfx1201 rows that take the t1
+/// entry, `low_rank == 320` launches `hyper_read_up_fused_f32_sx_t1_k320` instead (same module,
+/// grid, block, LDS and arguments; bitwise the t1 output). Read once.
+static QWEN4_HC_UP_T1_K320: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_T1_K320", true)
+});
+
 /// Entry of the HC read tail `hyper_read_up_fused` (same arguments, block and dynamic LDS).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HyperReadUpFusedEntry {
@@ -2625,6 +2760,9 @@ pub enum HyperReadUpFusedEntry {
     /// `hyper_read_up_fused_f32_sx_t1` (module `hyper_read_up_fused_twin_t1`): one token per
     /// wave, grid `[hidden/8, ceil(rows/8)]`.
     TwinT1,
+    /// `hyper_read_up_fused_f32_sx_t1_k320` (module `hyper_read_up_fused_twin_t1`): the t1 entry
+    /// with `low_rank == 320` compiled in; only valid for `low_rank == 320`.
+    TwinT1K320,
 }
 
 /// The entry [`hyper_read_up_fused`] launches. `twin_enabled` = `HIPFIRE_QWEN4_HC_UP_TWIN`,
@@ -2656,13 +2794,16 @@ fn hyper_read_up_fused_route(
 /// (`HIPFIRE_QWEN4_HC_UP_T1=0`: the sx twin); `HIPFIRE_QWEN4_HC_UP_TWIN=0` forces the
 /// incumbent `hyper_read_up_fused_f32` everywhere.
 pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult<()> {
-    let entry = hyper_read_up_fused_route(
+    let mut entry = hyper_read_up_fused_route(
         *QWEN4_HC_UP_TWIN,
         *QWEN4_HC_UP_T1,
         gpu.arch_caps.is_gfx1151(),
         gpu.arch_caps.is_gfx1201(),
         p.rows,
     );
+    if entry == HyperReadUpFusedEntry::TwinT1 && *QWEN4_HC_UP_T1_K320 && p.low_rank == 320 {
+        entry = HyperReadUpFusedEntry::TwinT1K320;
+    }
     hyper_read_up_fused_entry(gpu, p, entry)
 }
 
@@ -2694,8 +2835,11 @@ pub fn hyper_read_up_fused_entry(
     let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
     let rows = checked_i32(p.rows, "HC read rows")?;
     let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
+    if entry == HyperReadUpFusedEntry::TwinT1K320 && p.low_rank != 320 {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
     let tokens_per_row_group = match entry {
-        HyperReadUpFusedEntry::TwinT1 => 8,
+        HyperReadUpFusedEntry::TwinT1 | HyperReadUpFusedEntry::TwinT1K320 => 8,
         HyperReadUpFusedEntry::Incumbent | HyperReadUpFusedEntry::Twin => 128,
     };
     let row_grid = checked_u32(p.rows.div_ceil(tokens_per_row_group), "HC read row grid")?;
@@ -2710,6 +2854,11 @@ pub fn hyper_read_up_fused_entry(
             "hyper_read_up_fused_twin_t1",
             HYPER_READ_UP_FUSED_TWIN_T1_SRC,
             "hyper_read_up_fused_f32_sx_t1",
+        ),
+        HyperReadUpFusedEntry::TwinT1K320 => (
+            "hyper_read_up_fused_twin_t1",
+            HYPER_READ_UP_FUSED_TWIN_T1_SRC,
+            "hyper_read_up_fused_f32_sx_t1_k320",
         ),
         HyperReadUpFusedEntry::Incumbent => {
             ("tensor_ops", TENSOR_OPS_SRC, "hyper_read_up_fused_f32")
@@ -2735,6 +2884,102 @@ pub fn hyper_read_up_fused_entry(
         crate::dispatch::ReplayLaunchBindings::NONE,
     )
 }
+/// `HIPFIRE_QWEN4_HC_UP_ROT` (developer, default off): the gfx1201 `low_rank == 320` HC read tail
+/// of at most eight rows also writes the next mixer's `mq_rotate_x` of `mixed`
+/// ([`hyper_read_up_fused_rotate`]). Read once.
+static QWEN4_HC_UP_ROT: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_HC_UP_ROT", true));
+
+/// [`hyper_read_up_fused`] on exact gfx1201 (`HIPFIRE_QWEN4_HC_UP_ROT`, `low_rank == 320`,
+/// `hidden % 256 == 0`, 2..=8 rows, F32 `rotated`, not recording or capturing) in the one launch
+/// `hyper_read_up_fused_f32_sx_t1_k320_rot`: `mixed` is bitwise the t1 entry's and `rotated`
+/// bitwise `mq_rotate_x(mixed)`; the next matching `rotate_x_mq_batched(mixed, rotated, hidden,
+/// rows)` is then a no-op ([`ScratchState::prerotated`]). Returns whether it launched; `false`
+/// launched nothing (the caller runs [`hyper_read_up_fused`] and its own rotate).
+pub fn hyper_read_up_fused_rotate(
+    gpu: &mut Gpu,
+    p: &HyperReadUpFused<'_>,
+    rotated: &GpuTensor,
+) -> HipResult<bool> {
+    let route = hyper_read_up_fused_route(
+        *QWEN4_HC_UP_TWIN,
+        *QWEN4_HC_UP_T1,
+        gpu.arch_caps.is_gfx1151(),
+        gpu.arch_caps.is_gfx1201(),
+        p.rows,
+    );
+    if !*QWEN4_HC_UP_ROT
+        || route != HyperReadUpFusedEntry::TwinT1
+        || p.low_rank != 320
+        || p.hidden % 256 != 0
+        || !(2..=8).contains(&p.rows)
+        || rotated.dtype != DType::F32
+        || rotated.numel() < p.rows * p.hidden
+        || gpu.replay.is_recording()
+        || gpu.graphs.capture_mode
+    {
+        return Ok(false);
+    }
+    ensure_f32(p.low)?;
+    ensure_f32(p.normalized)?;
+    ensure_f32(p.mixed)?;
+    let wide = checked_product(4, p.hidden, "HC read width")?;
+    if p.up_weight.dtype != DType::BF16
+        || p.up_weight.numel() < wide * p.low_rank
+        || p.low.numel() < p.rows * p.low_rank
+        || p.normalized.numel() < p.rows * wide
+        || p.mixed.numel() < p.rows * p.hidden
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    // Arrival counters: the fused GDN step's (zero between launches, every user resets what it
+    // touched), 256 u32 >= rows * hidden / 256.
+    ensure_gdn_pair_counters(gpu)?;
+    gpu.ensure_mq_signs()?;
+    let hidden = checked_i32(p.hidden, "HC read hidden width")?;
+    let low_rank = checked_i32(p.low_rank, "HC read low rank")?;
+    let rows = checked_i32(p.rows, "HC read rows")?;
+    let column_grid = checked_u32(p.hidden / 8, "HC read column grid")?;
+    let lds_bytes = checked_u32(32 * (p.low_rank / 2 + 1) * 4, "HC read LDS")?;
+    let kernel = "hyper_read_up_fused_f32_sx_t1_k320_rot";
+    gpu.ensure_kernel_public(
+        "hyper_read_up_fused_rot_t1",
+        HYPER_READ_UP_FUSED_ROT_T1_SRC,
+        kernel,
+    )?;
+    let s1 = gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+    let s2 = gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+    let counters = gpu.scratch.gdn_pair_counters.as_ref().unwrap().as_ptr();
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.up_weight.buf.as_ptr());
+    args.push_ptr(p.low.buf.as_ptr());
+    args.push_ptr(p.normalized.buf.as_ptr());
+    args.push_ptr(p.mixed.buf.as_ptr());
+    args.push_i32(hidden);
+    args.push_i32(low_rank);
+    args.push_i32(rows);
+    args.push_i32(i32::from(p.normalized_bf16));
+    args.push_ptr(rotated.buf.as_ptr());
+    args.push_ptr(s1);
+    args.push_ptr(s2);
+    args.push_ptr(counters);
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        kernel,
+        [column_grid, (p.rows.div_ceil(8)) as u32, 1],
+        [256, 1, 1],
+        lds_bytes,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )?;
+    gpu.scratch.prerotated = Some((
+        p.mixed.buf.as_ptr() as usize,
+        rotated.buf.as_ptr() as usize,
+        p.hidden * p.rows,
+    ));
+    Ok(true)
+}
+
 /// [`hyper_read_up_fused`] on gfx11 BF16 WMMA, or on gfx1201's gfx12 BF16
 /// WMMA when [`Gpu::qwen4_f16_wmma_gfx1201`] admits it; `low` is packed BF16
 /// ([`HcActivationFused::bf16_out`]) and `normalized` is
@@ -3366,6 +3611,152 @@ impl GdnCoreLanesPlan<'_, '_> {
             crate::dispatch::ReplayLaunchBindings::NONE,
         )?;
         Ok(())
+    }
+
+    /// [`Self::launch`] under `HIPFIRE_QWEN4_GDN_LANES_FUSE`: ONE launch
+    /// (`gated_delta_step_gate_norm128_q8_lanes_fuse`) runs the convolution + gate
+    /// parameters as the step block's prologue, and, with `rotation`, the output
+    /// projection's `mq_rotate_x` of every lane's gated output as its epilogue.
+    /// Every output, the conv ring and the Q8 slots are byte-identical to
+    /// [`Self::launch`]'s (plus, with `rotation`, `rotate_x_mq_batched` of the
+    /// lanes' gated outputs as one `lanes.len()`-row batch).
+    ///
+    /// `rotation` is the output projection's rotation scratch; lane `l`'s
+    /// rotated row is written at element `l * value_heads * value_dim`. It is used
+    /// only when the lanes' gated outputs are consecutive rows of one buffer
+    /// (lane `l` at `l * value_heads * value_dim` elements from lane 0's), and
+    /// then `ScratchState::prerotated` names that batch so the next matching
+    /// `rotate_x_mq_batched` skips. Returns whether the rotation was written.
+    ///
+    /// Flag off, or any shape / buffer the fused kernel does not take (ring
+    /// width other than K = 4, extra conv channels, counters too small): the two
+    /// incumbent launches run and nothing is rotated.
+    pub fn launch_rotated(self, gpu: &mut Gpu, rotation: Option<&GpuTensor>) -> HipResult<bool> {
+        let n = self.lanes.len();
+        let [channels, history_rows, kernel_size] = self.conv;
+        let [key_heads, value_heads, key_dim, value_dim] = self.step;
+        let (qk, value) = (
+            key_heads as usize * key_dim as usize,
+            value_heads as usize * value_dim as usize,
+        );
+        let pairs = value_heads as usize / 2;
+        let counters_needed = n * (pairs + key_heads as usize);
+        let fits = gpu.flags.qwen4_gdn_lanes_fuse_enabled()
+            && history_rows == 3
+            && kernel_size == 4
+            && key_dim == 128
+            && value_dim == 128
+            && channels as usize == 2 * qk + value
+            && value_heads % key_heads == 0
+            && counters_needed <= GDN_LANE_FUSE_COUNTERS;
+        if !fits {
+            self.launch(gpu)?;
+            return Ok(false);
+        }
+        ensure_gdn_pair_counters(gpu)?;
+        let (pair_counters, counters_bytes) = {
+            let counters = gpu.scratch.gdn_pair_counters.as_ref().unwrap();
+            (counters.as_ptr(), counters.size())
+        };
+        if counters_bytes < counters_needed * 4 {
+            self.launch(gpu)?;
+            return Ok(false);
+        }
+        // SAFETY: inside the allocation (`counters_needed` checked above).
+        let key_counters =
+            unsafe { (pair_counters as *mut u32).add(n * pairs) } as *mut std::ffi::c_void;
+        let lanes = self.lanes;
+        let first = &lanes[0];
+        let (s0, c0, p0, g0) = (&first.step, &first.conv, &first.params, &first.gate);
+        let out0 = g0.output.buf.as_ptr() as usize;
+        let consecutive = lanes
+            .iter()
+            .enumerate()
+            .all(|(l, lane)| lane.gate.output.buf.as_ptr() as usize == out0 + l * value * 4);
+        let rotation = rotation.filter(|r| {
+            value_heads % 2 == 0 && r.dtype == DType::F32 && r.numel() >= n * value && consecutive
+        });
+        gpu.ensure_mq_signs()?;
+        let signs1 = gpu.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let signs2 = gpu.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        gpu.ensure_kernel_public(
+            "gdn_lanes",
+            GDN_LANES_SRC,
+            "gated_delta_step_gate_norm128_q8_lanes_fuse",
+        )?;
+        let pad = |args: &mut KernargBlob, filled: usize, ptr: bool| {
+            for _ in filled..GDN_CORE_LANES_MAX {
+                if ptr {
+                    args.push_ptr(std::ptr::null());
+                } else {
+                    args.push_u32(0);
+                }
+            }
+        };
+        let mut args = KernargBlob::new();
+        for ptr in [
+            c0.kernel.buf.as_ptr(),
+            p0.a_log.buf.as_ptr(),
+            p0.dt_bias.buf.as_ptr(),
+            g0.norm.buf.as_ptr(),
+            signs1,
+            signs2,
+            pair_counters,
+            key_counters,
+        ] {
+            args.push_ptr(ptr);
+        }
+        for v in [channels, key_heads, value_heads, key_dim, value_dim] {
+            args.push_i32(v);
+        }
+        args.push_f32((s0.key_dim as f32).sqrt().recip());
+        args.push_i32(checked_i32(qk, "GDN lane q width")?);
+        // GdnFuseLanes: eleven pointer arrays, then the cursors and the Q8 frames.
+        let fields: [fn(&GdnCoreLane<'_>) -> *mut std::ffi::c_void; 10] = [
+            |l| l.conv.input.buf.as_ptr(),
+            |l| l.conv.output.buf.as_ptr(),
+            |l| l.conv.history.buf.as_ptr(),
+            |l| l.params.a.buf.as_ptr(),
+            |l| l.params.b.buf.as_ptr(),
+            |l| l.params.gate.buf.as_ptr(),
+            |l| l.params.beta.buf.as_ptr(),
+            |l| l.step.state.buf.as_ptr(),
+            |l| l.gate.z.buf.as_ptr(),
+            |l| l.gate.output.buf.as_ptr(),
+        ];
+        for field in fields {
+            for lane in lanes {
+                args.push_ptr(field(lane));
+            }
+            pad(&mut args, n, true);
+        }
+        for l in 0..n {
+            args.push_ptr(rotation.map_or(std::ptr::null_mut(), |r| {
+                (r.buf.as_ptr() as usize + l * value * 4) as *mut std::ffi::c_void
+            }));
+        }
+        pad(&mut args, n, true);
+        for lane in lanes {
+            args.push_i32(checked_i32(lane.conv.cursor, "GDN lane cursor")?);
+        }
+        pad(&mut args, n, false);
+        for lane in lanes {
+            args.push_u32(checked_u32(lane.step.position, "GDN lane Q8 frame")?);
+        }
+        pad(&mut args, n, false);
+        args.pad_to(16);
+        gpu.launch_blob_recorded(
+            "gated_delta_step_gate_norm128_q8_lanes_fuse",
+            [value_heads as u32, 1, n as u32],
+            [128, 1, 1],
+            0,
+            args.as_mut_slice(),
+            crate::dispatch::ReplayLaunchBindings::NONE,
+        )?;
+        if let Some(r) = rotation {
+            gpu.scratch.prerotated = Some((out0, r.buf.as_ptr() as usize, n * value));
+        }
+        Ok(rotation.is_some())
     }
 }
 

@@ -77,10 +77,10 @@ fn hyper_read_up_twin_matches_incumbent_hw() {
         eprintln!("SKIP: requires exact gfx1201.");
         return;
     }
-    let mut mismatches = [0usize; 2];
+    let mut mismatches = [0usize; 3];
     let mut words = 0usize;
     let mut cases = 0usize;
-    let mut first: [Option<(usize, usize, u32, u32)>; 2] = [None, None];
+    let mut first: [Option<(usize, usize, u32, u32)>; 3] = [None, None, None];
     for seed in 0..6u64 {
         let mut rng = Lcg(0x48C1_0000 + seed);
         // BF16 up projection [WIDE, LOW_RANK], magnitudes spread over a few binades.
@@ -133,9 +133,13 @@ fn hyper_read_up_twin_matches_incumbent_hw() {
                     download_u32(gpu, &mixed, rows * HIDDEN)
                 };
                 let want = run(&mut gpu, HyperReadUpFusedEntry::Incumbent);
-                for (ei, entry) in [HyperReadUpFusedEntry::Twin, HyperReadUpFusedEntry::TwinT1]
-                    .into_iter()
-                    .enumerate()
+                for (ei, entry) in [
+                    HyperReadUpFusedEntry::Twin,
+                    HyperReadUpFusedEntry::TwinT1,
+                    HyperReadUpFusedEntry::TwinT1K320,
+                ]
+                .into_iter()
+                .enumerate()
                 {
                     let got = run(&mut gpu, entry);
                     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -151,8 +155,8 @@ fn hyper_read_up_twin_matches_incumbent_hw() {
         }
     }
     eprintln!(
-        "hyper_read_up_twin: {cases} cases (6 seeds x 13 row counts x F32/BF16 normalized), {words} output words per entry, mismatches sx twin {} / t1 {}, first sx {:?} / t1 {:?}",
-        mismatches[0], mismatches[1], first[0], first[1]
+        "hyper_read_up_twin: {cases} cases (6 seeds x 13 row counts x F32/BF16 normalized), {words} output words per entry, mismatches sx twin {} / t1 {} / t1_k320 {}, first sx {:?} / t1 {:?} / t1_k320 {:?}",
+        mismatches[0], mismatches[1], mismatches[2], first[0], first[1], first[2]
     );
     assert_eq!(
         mismatches[0], 0,
@@ -161,5 +165,9 @@ fn hyper_read_up_twin_matches_incumbent_hw() {
     assert_eq!(
         mismatches[1], 0,
         "the sx_t1 twin is not bit-identical to hyper_read_up_fused_f32"
+    );
+    assert_eq!(
+        mismatches[2], 0,
+        "the sx_t1_k320 entry is not bit-identical to hyper_read_up_fused_f32"
     );
 }

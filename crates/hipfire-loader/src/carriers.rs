@@ -3123,7 +3123,7 @@ pub fn qwen4_ep_vram_layers(
                 state_format,
                 shared.backend,
                 shared.max_seq,
-                chunk,
+                hipfire_arch_qwen4::ep::ep_lane_commit_rows(chunk, shared.max_seq),
                 shared.vmm_granularity,
                 lanes,
                 row_budget,
@@ -3227,15 +3227,15 @@ pub fn qwen4_ep_vram_layers(
             dflash: shared.spec.dflash == Some(true),
             pipeline_parallel: false,
         });
-        // A native-MTP lane store (spec lanes staged) keeps the ordinary
-        // placement and reserve: the decoupled reserve admits AR lanes only
-        // (lane decode steps on the 512-row resident bank, lane prefill tiles
-        // on the borrowed bank), and the mesh lane protocol's draft/verify
-        // windows and head fill are not proven on the borrowed bank. The
-        // stage after this load refuses a spec store on a reserve-sharing
-        // load for the same reason, so the two always agree. The lab override
-        // `HIPFIRE_EP_MTP_RESERVE_SHARE=1` lifts both.
-        let share_override = hipfire_arch_qwen4::ep_reserve::ep_mtp_reserve_share_enabled();
+        // A native-MTP lane store (spec lanes staged) takes the decoupled
+        // reserve like the AR lanes by default: lane decode steps and every
+        // mesh draft/verify window run on the 512-row resident bank, lane
+        // prefill tiles (and the MTP head fill) on the borrowed bank inside
+        // the per-step bracket. The stage after this load refuses a spec
+        // store on a reserve-sharing load for the same reason, so the two
+        // always agree. `HIPFIRE_EP_MTP_RESERVE_SHARE=0` keeps the MTP store on
+        // the ordinary placement and reserve (both refusals back).
+        let share_enabled = hipfire_arch_qwen4::ep_reserve::ep_mtp_reserve_share_enabled();
         let spec_slots = lane.as_ref().map_or(0, |lane| {
             hipfire_arch_qwen4::lane_switch::spec_lane_count(
                 lane.lanes,
@@ -3247,7 +3247,7 @@ pub fn qwen4_ep_vram_layers(
                 |()| match hipfire_arch_qwen4::ep_reserve::spec_store_blocks_reserve(
                     spec_k,
                     spec_slots,
-                    share_override,
+                    share_enabled,
                 ) {
                     Some(why) => Err(why.to_string()),
                     None => Ok(()),

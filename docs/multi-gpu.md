@@ -781,24 +781,23 @@ Lane **prefill** tiles are the singleton chunk program on a lane state, so a til
 as a singleton prompt tile does; a step's tiles are one whole-prompt entry, so the donors are restored once per step,
 not once per tile. A load without lanes is unchanged.
 
-**Native-MTP lanes (`--spec mtp`, `serve.batch_spec`) keep the ordinary placement.** The decoupled reserve admits AR
-lanes only: the mesh lane protocol's draft/verify windows and head fill are not run on the borrowed bank, so a load
-that will stage MTP lanes (the mixed store, `ep_lane_store_device_bytes_mixed`) is not given the reduced reserve (the
-load logs `qwen4 EP reserve decoupling: not applied (native-MTP EP lanes are staged ...)`) and keeps the ordinary reserve
-plus the mixed store (24 resident layers at the defaults). A spec store that still reaches a reserve-sharing load is
-refused at staging with a label (`native-MTP lanes are refused on an EP reserve-sharing load`) and the daemon stages AR
-lanes instead (`spec=off (...)`). Without `--spec mtp`, or with `HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes and
-take the 32-layer decoupled placement.
+**Native-MTP lanes (`--spec mtp`, `serve.batch_spec`) take the decoupled reserve like the AR lanes.** The load charges the
+mixed store (`ep_lane_store_device_bytes_mixed`: the first 3 slots with MTP state, the rest AR-only) to the decoupled census
+and takes the plan when it holds more resident layers than the ordinary lane placement. `HIPFIRE_EP_MTP_RESERVE_SHARE=0` is
+the kill switch: the MTP store then keeps the ordinary reserve plus the mixed store (the load logs `qwen4 EP reserve
+decoupling: not applied (native-MTP EP lanes are staged ... HIPFIRE_EP_MTP_RESERVE_SHARE=0 ...)`; 25 resident layers at the
+defaults), and a spec store that still reaches a reserve-sharing load is refused at staging with a label (`native-MTP lanes
+are refused on an EP reserve-sharing load`) and the daemon stages AR lanes instead (`spec=off (...)`). Without `--spec mtp`,
+or with `HIPFIRE_EP_MTP_LANES=0`, the lanes are AR lanes.
 
-Lab override `HIPFIRE_EP_MTP_RESERVE_SHARE=1` (default off) lifts both refusals so an MTP lane store loads on the
-decoupled placement. Static audit of the mesh window phases against the borrow window (a borrowed epoch is only ever
-opened by a prompt forward of more than 512 rows, inside `forward_chunk`): the verify (`forward_lanes`) enters through
-`ep_reserve_lane_step_enter` (restores a dirty epoch, resident bank, rows checked); the head draft rounds and catch-ups
-run on the head's own scratch and weights and the EP gather buffers, never the trunk scratch bank or donor layers (the
-singleton MTP draft is the same code); prepare (ring row rollback and head rebuild) runs no trunk forward; prompt tiles
-of an MTP lane run the singleton `mtp_prefill_chunk` inside the step's `share_prompt_begin_mtp_fill` / `share_prompt_end`
-bracket, so the donors are whole before the step returns. A mesh window refuses to start on an open epoch, and the
-staging refuses a step row budget wider than the resident bank. Unmeasured on a card.
+Mesh window phases against the borrow window (a borrowed epoch is only ever opened by a prompt forward of more than 512
+rows, inside `forward_chunk`): the verify (`forward_lanes`) enters through `ep_reserve_lane_step_enter` (restores a dirty
+epoch, resident bank, rows checked); the head draft rounds and catch-ups run on the head's own scratch and weights and the
+EP gather buffers, never the trunk scratch bank or donor layers (the singleton MTP draft is the same code); prepare (ring
+row rollback and head rebuild) runs no trunk forward; prompt tiles of an MTP lane run the singleton `mtp_prefill_chunk`
+inside the step's `share_prompt_begin_mtp_fill` / `share_prompt_end` bracket, so the donors are whole before the step
+returns. A mesh window refuses to start on an open epoch, and the staging refuses a step row budget wider than the resident
+bank.
 
 **EP prefill-chunk auto-fit (opt-in, `HIPFIRE_EP_CHUNK_AUTOFIT=1`).** The PP lever steps the chunk down because a band
 must fit; an EP load always fits (host-mapped layers), so the question is only decode against prefill. EP2 mq4-xts, 2x

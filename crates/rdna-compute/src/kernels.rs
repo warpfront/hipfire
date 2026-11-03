@@ -3236,6 +3236,16 @@ pub const GEMM_MQ4G128V2_MOE_GROUPED_WMMA_GFX1151_SRC: &str =
 /// to the O2×R8 sibling.
 pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4.gfx1151.hip");
+/// gfx1201 wide-pass (9..=64 rows) QT44 grouped gate/up family `g32` (M = 1280, K = 2560): same ABI
+/// and bit-identical output to the O4×R8 X4 kernel above (production arithmetic, explicit fma
+/// chain), one block per 16-slot tile × 32 rows, live-slot-only double-buffered LDS X, 3-group
+/// register weight ring. `HIPFIRE_QWEN4_MOE32_GU` (default off).
+pub const GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_moe_grouped_top10_g32.gfx1201.hip");
+/// DESIGN F1 drop-zero planar twin of [`GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC`] (same ABI,
+/// grid and bit-identical output to the planar O4×R8 X4 kernel; `HIPFIRE_QWEN4_MOE32_GU`).
+pub const GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2p_moe_grouped_top10_g32.gfx1201.hip");
 /// DESIGN F1: drop-zero planar (`MQ4G256V2P`) twin of
 /// [`GEMM_MQ4G256V2_MOE_GROUPED_TOP10_O4_R8_X4_GFX1151_SRC`], compiled on gfx1201 for the
 /// short-prefill/verify gate/up arm (same ABI, grid, accumulation and reduction order).
@@ -4534,6 +4544,16 @@ pub const MOE_SCATTER_FUSED_TOP10_SRC: &str = concat!(
     "#define moe_scatter_fused_k8 moe_scatter_fused_top10\n",
     "#define moe_scatter_fused_k8_serial moe_scatter_fused_top10_serial\n",
     include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip")
+);
+/// Fused Qwen4 E512/top-10 router + grouped scatter in one single-CTA launch
+/// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`, exact gfx1201, 1..=8 rows). The module is the
+/// concatenation of the wave-per-token router (its `router_fast_token` body), the scatter
+/// body (`qwen4_moe_scatter_body`, scan entry) and the fused entry that runs one after the
+/// other behind a workgroup barrier; no arithmetic is new.
+pub const MOE_ROUTE_SCATTER_TOP10_F32_SRC: &str = concat!(
+    include_str!("../../../kernels/src/moe_router_softmax_top10_f32_fast.hip"),
+    include_str!("../../../kernels/src/qwen4_moe_scatter_fused_k8.hip"),
+    include_str!("../../../kernels/src/moe_route_scatter_top10_f32.gfx1201.hip")
 );
 /// Opt-in Qwen4 symmetric IU4 MoE route (fn-moe-sym, gfx1151 and gfx1201),
 /// separately named modules; no incumbent module is extended.
@@ -7993,6 +8013,14 @@ pub const QWEN4_GEMV_Q8_0_SRC: &str = concat!(
 /// [`QWEN4_GEMV_BF16_XF32_SRC`] and [`QWEN4_GEMV_Q8_0_SRC`].
 pub const QWEN4_DECODE_HEAD_FUSE_SRC: &str =
     include_str!("../../../kernels/src/qwen4_decode_head_fuse.hip");
+/// Module `qwen4_gemv_bf16_xf32_otile` (`HIPFIRE_QWEN4_BF16_ROWS_OTILE`, default
+/// off, exact gfx1201): output-tiled `gemv_bf16_xf32_k4_rows_otile_r2..r8` and
+/// `gemv_bf16_xf32_x4_rows_otile_r2..r8`, byte-identical to the
+/// [`QWEN4_GEMV_BF16_XF32_SRC`] `_k4_rows_r<R>` / `_x4_rows_r<R>` entries
+/// (verbatim incumbent per-output arithmetic, activation loads shared across
+/// outputs). Standalone source.
+pub const QWEN4_GEMV_BF16_XF32_OTILE_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_gemv_bf16_xf32_otile.hip");
 /// Module `qsa_pooled_bf16_mirror` (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, exact
 /// gfx1151): `qsa_pooled_f32_to_bf16_mirror`, the lossless high-half copy of
 /// the BF16-rounded F32 pooled index keys, and the lab exactness probe

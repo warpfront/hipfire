@@ -2451,6 +2451,15 @@ fn validate_route_receipt_pair(
     Ok(())
 }
 
+/// The route stage's offer to run the grouped scatter inside the router launch
+/// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`): the caller has already checked that the scatter stage
+/// would launch the plain grouped scatter right after this route. `launched` is set when the
+/// fused launch ran; the scatter stage then launches nothing.
+pub(super) struct RouteScatterFuse<'a> {
+    pub(super) grouped_rows: usize,
+    pub(super) launched: &'a std::cell::Cell<bool>,
+}
+
 /// Run the family-specific prefill router and mint its invocation-bound
 /// receipt.  Qwen's softmax producer and Cohere's sigmoid producer both use
 /// this boundary; model callers must not launch those operations themselves.
@@ -2459,6 +2468,7 @@ pub(super) fn produce_prefill_route<'a>(
     gpu: &mut Gpu,
     scores: &GpuTensor,
     normalize: bool,
+    fuse_scatter: Option<RouteScatterFuse<'_>>,
 ) -> Result<MoeRouteReceipt<'a>, DispatchError> {
     if !matches!(
         call.router,
@@ -2536,17 +2546,47 @@ pub(super) fn produce_prefill_route<'a>(
                     super::router_observer::RouterScoresAfterRoute::Logits,
                     params.recipe.bf16_round_trip(),
                 );
-                gpu.moe_router_softmax_top10_f32(
-                    scores,
-                    params.topk_indices,
-                    params.topk_weights,
-                    params.batch_size,
-                    normalize,
-                    params.recipe.bf16_round_trip(),
-                    router_layer,
-                    row_base,
-                )
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                let fused = match fuse_scatter.as_ref() {
+                    Some(fuse) => gpu
+                        .moe_route_scatter_top10_f32(
+                            scores,
+                            params.topk_indices,
+                            params.topk_weights,
+                            params.batch_size,
+                            normalize,
+                            params.recipe.bf16_round_trip(),
+                            router_layer,
+                            row_base,
+                            params.expert_token_counts,
+                            params.expert_offsets,
+                            params.sorted_slot_index,
+                            params.expert_tile_ids,
+                            params.inverse_perm,
+                            params.n_exp,
+                            params.k_top,
+                            fuse.grouped_rows,
+                            crate::families::moe::MOE_GROUPED_BLOCK_M,
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?,
+                    None => false,
+                };
+                if fused {
+                    if let Some(fuse) = fuse_scatter.as_ref() {
+                        fuse.launched.set(true);
+                    }
+                } else {
+                    gpu.moe_router_softmax_top10_f32(
+                        scores,
+                        params.topk_indices,
+                        params.topk_weights,
+                        params.batch_size,
+                        normalize,
+                        params.recipe.bf16_round_trip(),
+                        router_layer,
+                        row_base,
+                    )
+                    .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                }
             } else {
                 let result = if params.k_top == 10 {
                     #[cfg(feature = "moe-oracle")]

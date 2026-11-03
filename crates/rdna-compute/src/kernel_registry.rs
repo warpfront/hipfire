@@ -347,6 +347,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ["conv1d_silu_split_f32_lanes"]
         );
     }
+    // Lane-batched PLE tail of the AR lane step (`Gpu::ple_lanes_tail_f32`,
+    // ple_lanes.rs; HIPFIRE_QWEN4_LANE_PLE_BATCH, default off). The kernel has
+    // no arch guard; its only caller is admitted by
+    // `FeatureFlags::qwen4_lane_ple_batch_enabled`, which requires exact
+    // gfx1201, so only that inventory carries it.
+    if arch == "gfx1201" {
+        add!(
+            "ple_lanes_tail_f32",
+            crate::ple_lanes::PLE_LANES_SRC,
+            ["ple_lanes_tail_f32"]
+        );
+    }
 
     // Matrix-dependent default precompile modules; each name and source is
     // taken from the same constants as dispatch.rs:4900-5174.
@@ -2505,7 +2517,8 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_select_scores_rows8_f32",
                 "scale_f32",
                 "gated_delta_conv_params_bf16_f32_lanes",
-                "gated_delta_step_gate_norm128_q8_lanes"
+                "gated_delta_step_gate_norm128_q8_lanes",
+                "gated_delta_step_gate_norm128_q8_lanes_fuse"
             ]
         );
     }
@@ -2757,7 +2770,15 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!(
             "hyper_read_up_fused_twin_t1",
             crate::tensor_ops::HYPER_READ_UP_FUSED_TWIN_T1_SRC,
-            ["hyper_read_up_fused_f32_sx_t1"]
+            [
+                "hyper_read_up_fused_f32_sx_t1",
+                "hyper_read_up_fused_f32_sx_t1_k320"
+            ]
+        );
+        add!(
+            "hyper_read_up_fused_rot_t1",
+            crate::tensor_ops::HYPER_READ_UP_FUSED_ROT_T1_SRC,
+            ["hyper_read_up_fused_f32_sx_t1_k320_rot"]
         );
         add!(
             "moe_down_combine_grouped_top10",
@@ -2960,6 +2981,40 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             kernels::MOE_ROUTER_SOFTMAX_TOP10_F32_FAST_SRC,
             ["moe_router_softmax_top10_f32_fast"]
         );
+        // `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` (developer, default on): router + scatter, one launch.
+        if arch == "gfx1201" {
+            // Output-tiled Qwen4 decode BF16 rows GEMVs (HIPFIRE_QWEN4_BF16_ROWS_OTILE, default on).
+            add!(
+                "qwen4_gemv_bf16_xf32_otile",
+                kernels::QWEN4_GEMV_BF16_XF32_OTILE_SRC,
+                [
+                    "gemv_bf16_xf32_k4_rows_otile_r2",
+                    "gemv_bf16_xf32_k4_rows_otile_r3",
+                    "gemv_bf16_xf32_k4_rows_otile_r4",
+                    "gemv_bf16_xf32_k4_rows_otile_r5",
+                    "gemv_bf16_xf32_k4_rows_otile_r6",
+                    "gemv_bf16_xf32_k4_rows_otile_r7",
+                    "gemv_bf16_xf32_k4_rows_otile_r8",
+                    "gemv_bf16_xf32_x4_rows_otile_r2",
+                    "gemv_bf16_xf32_x4_rows_otile_r3",
+                    "gemv_bf16_xf32_x4_rows_otile_r4",
+                    "gemv_bf16_xf32_x4_rows_otile_r5",
+                    "gemv_bf16_xf32_x4_rows_otile_r6",
+                    "gemv_bf16_xf32_x4_rows_otile_r7",
+                    "gemv_bf16_xf32_x4_rows_otile_r8"
+                ]
+            );
+            add!(
+                "moe_route_scatter_top10_f32",
+                kernels::MOE_ROUTE_SCATTER_TOP10_F32_SRC,
+                [
+                    // The module concatenates the fast router and the fused scatter sources.
+                    "moe_route_scatter_top10_f32",
+                    "moe_router_softmax_top10_f32_fast",
+                    "moe_scatter_fused_k8"
+                ]
+            );
+        }
     }
     if matches!(arch, "gfx1100" | "gfx1151") {
         add!(
@@ -3589,117 +3644,28 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "indexed_attention_select_scores_rows8_f32",
                 "scale_f32",
                 "gated_delta_conv_params_bf16_f32_lanes",
-                "gated_delta_step_gate_norm128_q8_lanes"
+                "gated_delta_step_gate_norm128_q8_lanes",
+                "gated_delta_step_gate_norm128_q8_lanes_fuse"
             ]
         );
         // Exact-gfx1201 multi-lane fn-lanes QSA decode core (off unless HIPFIRE_QWEN4_QSA_LANES=1; qsa_core_lanes.rs qsa_core_lanes).
-        add!(
+        entries.push(entry(
+            arch,
             "qsa_lanes",
-            crate::tensor_ops::QSA_LANES_SRC,
-            [
-                // QSA_LANES_SRC also compiles the complete tensor_ops translation unit.
-                "argmax_f32",
-                "bf16_roundtrip_f32",
-                "bf16_scaled_add_batched_f32",
-                "bf16_scaled_add_f32",
-                "copy_regions_u32",
-                "gated_delta_conv_bf16_f32",
-                "gated_delta_conv_bf16_f32_batched_k4",
-                "gated_delta_conv_params_bf16_f32",
-                "gated_delta_conv_qknorm_bf16_f32_batched_k4",
-                "gated_delta_gate_bf16_f32",
-                "gated_delta_gate_bf16_f32_batched",
-                "gated_delta_gate_rotate_bf16_f32_batched",
-                "gated_delta_params_bf16_f32",
-                "gated_delta_params_bf16_f32_batched",
-                "gated_delta_params_f32",
-                "gated_delta_qk_norm_bf16_batched",
-                "gated_delta_rollback_layers_f32",
-                "gated_delta_rollback_layers_q8",
-                "gated_delta_step_f32",
-                "gated_delta_step_gate_norm128_gfx1151",
-                "gated_delta_step_gate_norm128_q8",
-                "gated_delta_step_gate_norm128_q8ef",
-                "gated_delta_step_halves_state128_persistent256_canon_q8",
-                "gated_delta_step_halves_state128_persistent256_canon_q8ef",
-                "gated_delta_step_halves_state128_persistent256_capture_f32",
-                "gated_delta_step_halves_state128_persistent256_capture_q8",
-                "gated_delta_step_halves_state128_persistent256_capture_q8ef",
-                "gated_delta_step_halves_state128_persistent256_f32",
-                "gated_delta_step_halves_state128_persistent256_q8",
-                "gated_delta_step_halves_state128_persistent256_q8ef",
-                "gated_delta_step_norm128_q8",
-                "gated_delta_step_norm128_q8ef",
-                "gated_delta_step_pipe128_f32",
-                "gated_delta_step_pipe128_q8",
-                "gated_delta_step_pipe128_q8ef",
-                "gated_delta_step_shared_norm128_gfx1151",
-                "gdn_q8ef_residual_zero",
-                "gdn_state_f32_to_q8",
-                "gdn_state_f32_to_q8ef",
-                "gdn_state_q8_to_f32",
-                "gdn_state_q8ef_to_f32",
-                "hc_activation_fused_f32",
-                "hc_state_bf16_add_f32",
-                "hc_state_bf16_to_f32",
-                "hyper_norm_f32",
-                "hyper_norm_gate_f32",
-                "hyper_norm_gate_outputs",
-                "hyper_norm_gate_outputs_f32",
-                "hyper_read_f32",
-                "hyper_read_projected_f32",
-                "hyper_read_up_fused_f32",
-                "hyper_write_bf16x2",
-                "hyper_write_bf16x8_gfx1201",
-                "hyper_write_f32",
-                "indexed_attention_attention_f32",
-                "indexed_attention_attention_f32_batched",
-                "indexed_attention_attention_f32_batched_hg12",
-                "indexed_attention_attention_f32_batched_hg4",
-                "indexed_attention_attention_f32_batched_serial",
-                "indexed_attention_attention_f32_serial",
-                "indexed_attention_attention_fp8",
-                "indexed_attention_attention_fp8_batched",
-                "indexed_attention_attention_fp8_batched_hg4",
-                "indexed_attention_attention_fp8_batched_serial",
-                "indexed_attention_attention_fp8_serial",
-                "indexed_attention_attention_q8",
-                "indexed_attention_attention_q8_batched",
-                "indexed_attention_attention_q8_batched_hg4",
-                "indexed_attention_attention_q8_batched_hg4_lite",
-                "indexed_attention_attention_q8_batched_serial",
-                "indexed_attention_attention_q8_serial",
-                "indexed_attention_cache_append_f32",
-                "indexed_attention_cache_append_f32_batched",
-                "indexed_attention_cache_append_fp8_batched",
-                "indexed_attention_cache_append_q8_batched",
-                "indexed_attention_decode_prologue_f32",
-                "indexed_attention_decode_prologue_fp8",
-                "indexed_attention_decode_prologue_q8",
-                "indexed_attention_index_key_append_bf16_batched",
-                "indexed_attention_norm_rope_f32",
-                "indexed_attention_norm_rope_f32_batched",
-                "indexed_attention_pool_rope_bf16",
-                "indexed_attention_pool_rope_f32",
-                "indexed_attention_reuse_selection",
-                "indexed_attention_rope_table_f32",
-                "indexed_attention_select_bf16_batched",
-                "indexed_attention_select_bf16_batched_serial",
-                "indexed_attention_select_f32",
-                "indexed_attention_select_f32_batched",
-                "indexed_attention_select_f32_batched_serial",
-                "indexed_attention_select_f32_serial",
-                "indexed_attention_select_from_scores",
-                "indexed_attention_select_scores_rows16_f32",
-                "indexed_attention_select_scores_rows32_f32",
-                "indexed_attention_select_scores_rows8_f32",
-                "scale_f32",
-                "indexed_attention_decode_prologue_fp8_lanes",
-                "indexed_attention_pool_rope_bf16_lanes",
-                "indexed_attention_select_bf16_lanes",
-                "indexed_attention_attention_fp8_lanes",
-            ]
-        );
+            QSA_LANES_TU_SYMBOLS,
+            crate::tensor_ops::QSA_LANES_SRC.into(),
+            extra_flags,
+        ));
+        // Default-off fused QSA lane core (`HIPFIRE_QWEN4_QSA_LANES_FUSE`; qsa_core_lanes.rs
+        // launch_fused): the qsa_lanes translation unit plus the two fused kernels, in its own
+        // module so the unfused module's source is untouched.
+        entries.push(entry(
+            arch,
+            crate::tensor_ops::QSA_LANES_FUSE_MODULE,
+            &QSA_LANES_FUSE_SYMBOLS,
+            crate::tensor_ops::QSA_LANES_FUSE_SRC.into(),
+            extra_flags,
+        ));
         // Default >= 512-row prefill: BF16 -> F16 WMMA projections (HC
         // input_mix_down 160 x 80 split-K tile + reducer, router/shared 128 x
         // 128, wider projections 128 x 256), the HC read-up tile, and the
@@ -4226,6 +4192,21 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hc_row_fold_norm_gate",
                 "hc_row_fold_moe_gfx1201",
                 "hc_row_write_norm_gate_gfx1201",
+            ]
+        );
+        // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE` (developer, default off).
+        add!(
+            "moe_shared_down_combine",
+            crate::tensor_ops::MOE_SHARED_DOWN_COMBINE_SRC,
+            [
+                "moe_shared_down_combine_rows_r1",
+                "moe_shared_down_combine_rows_r2",
+                "moe_shared_down_combine_rows_r3",
+                "moe_shared_down_combine_rows_r4",
+                "moe_shared_down_combine_rows_r5",
+                "moe_shared_down_combine_rows_r6",
+                "moe_shared_down_combine_rows_r7",
+                "moe_shared_down_combine_rows_r8",
             ]
         );
     }
@@ -6203,6 +6184,125 @@ fn entry(
         source,
     }
 }
+
+/// Kernels of the `qsa_lanes` module: the complete `tensor_ops` translation unit plus the
+/// four lane kernels.
+const QSA_LANES_TU_SYMBOLS: &[&str] = &[
+    // QSA_LANES_SRC also compiles the complete tensor_ops translation unit.
+    "argmax_f32",
+    "bf16_roundtrip_f32",
+    "bf16_scaled_add_batched_f32",
+    "bf16_scaled_add_f32",
+    "copy_regions_u32",
+    "gated_delta_conv_bf16_f32",
+    "gated_delta_conv_bf16_f32_batched_k4",
+    "gated_delta_conv_params_bf16_f32",
+    "gated_delta_conv_qknorm_bf16_f32_batched_k4",
+    "gated_delta_gate_bf16_f32",
+    "gated_delta_gate_bf16_f32_batched",
+    "gated_delta_gate_rotate_bf16_f32_batched",
+    "gated_delta_params_bf16_f32",
+    "gated_delta_params_bf16_f32_batched",
+    "gated_delta_params_f32",
+    "gated_delta_qk_norm_bf16_batched",
+    "gated_delta_rollback_layers_f32",
+    "gated_delta_rollback_layers_q8",
+    "gated_delta_step_f32",
+    "gated_delta_step_gate_norm128_gfx1151",
+    "gated_delta_step_gate_norm128_q8",
+    "gated_delta_step_gate_norm128_q8ef",
+    "gated_delta_step_halves_state128_persistent256_canon_q8",
+    "gated_delta_step_halves_state128_persistent256_canon_q8ef",
+    "gated_delta_step_halves_state128_persistent256_capture_f32",
+    "gated_delta_step_halves_state128_persistent256_capture_q8",
+    "gated_delta_step_halves_state128_persistent256_capture_q8ef",
+    "gated_delta_step_halves_state128_persistent256_f32",
+    "gated_delta_step_halves_state128_persistent256_q8",
+    "gated_delta_step_halves_state128_persistent256_q8ef",
+    "gated_delta_step_norm128_q8",
+    "gated_delta_step_norm128_q8ef",
+    "gated_delta_step_pipe128_f32",
+    "gated_delta_step_pipe128_q8",
+    "gated_delta_step_pipe128_q8ef",
+    "gated_delta_step_shared_norm128_gfx1151",
+    "gdn_q8ef_residual_zero",
+    "gdn_state_f32_to_q8",
+    "gdn_state_f32_to_q8ef",
+    "gdn_state_q8_to_f32",
+    "gdn_state_q8ef_to_f32",
+    "hc_activation_fused_f32",
+    "hc_state_bf16_add_f32",
+    "hc_state_bf16_to_f32",
+    "hyper_norm_f32",
+    "hyper_norm_gate_f32",
+    "hyper_norm_gate_outputs",
+    "hyper_norm_gate_outputs_f32",
+    "hyper_read_f32",
+    "hyper_read_projected_f32",
+    "hyper_read_up_fused_f32",
+    "hyper_write_bf16x2",
+    "hyper_write_bf16x8_gfx1201",
+    "hyper_write_f32",
+    "indexed_attention_attention_f32",
+    "indexed_attention_attention_f32_batched",
+    "indexed_attention_attention_f32_batched_hg12",
+    "indexed_attention_attention_f32_batched_hg4",
+    "indexed_attention_attention_f32_batched_serial",
+    "indexed_attention_attention_f32_serial",
+    "indexed_attention_attention_fp8",
+    "indexed_attention_attention_fp8_batched",
+    "indexed_attention_attention_fp8_batched_hg4",
+    "indexed_attention_attention_fp8_batched_serial",
+    "indexed_attention_attention_fp8_serial",
+    "indexed_attention_attention_q8",
+    "indexed_attention_attention_q8_batched",
+    "indexed_attention_attention_q8_batched_hg4",
+    "indexed_attention_attention_q8_batched_hg4_lite",
+    "indexed_attention_attention_q8_batched_serial",
+    "indexed_attention_attention_q8_serial",
+    "indexed_attention_cache_append_f32",
+    "indexed_attention_cache_append_f32_batched",
+    "indexed_attention_cache_append_fp8_batched",
+    "indexed_attention_cache_append_q8_batched",
+    "indexed_attention_decode_prologue_f32",
+    "indexed_attention_decode_prologue_fp8",
+    "indexed_attention_decode_prologue_q8",
+    "indexed_attention_index_key_append_bf16_batched",
+    "indexed_attention_norm_rope_f32",
+    "indexed_attention_norm_rope_f32_batched",
+    "indexed_attention_pool_rope_bf16",
+    "indexed_attention_pool_rope_f32",
+    "indexed_attention_reuse_selection",
+    "indexed_attention_rope_table_f32",
+    "indexed_attention_select_bf16_batched",
+    "indexed_attention_select_bf16_batched_serial",
+    "indexed_attention_select_f32",
+    "indexed_attention_select_f32_batched",
+    "indexed_attention_select_f32_batched_serial",
+    "indexed_attention_select_f32_serial",
+    "indexed_attention_select_from_scores",
+    "indexed_attention_select_scores_rows16_f32",
+    "indexed_attention_select_scores_rows32_f32",
+    "indexed_attention_select_scores_rows8_f32",
+    "scale_f32",
+    "indexed_attention_decode_prologue_fp8_lanes",
+    "indexed_attention_pool_rope_bf16_lanes",
+    "indexed_attention_select_bf16_lanes",
+    "indexed_attention_attention_fp8_lanes",
+];
+
+/// Kernels of the `qsa_lanes_fuse` module: [`QSA_LANES_TU_SYMBOLS`] plus the two fused kernels.
+static QSA_LANES_FUSE_SYMBOLS: std::sync::LazyLock<Vec<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        QSA_LANES_TU_SYMBOLS
+            .iter()
+            .copied()
+            .chain([
+                crate::tensor_ops::QSA_LANES_FUSED_CORE_SYMBOL,
+                crate::tensor_ops::QSA_LANES_FUSED_ATTENTION_SYMBOL,
+            ])
+            .collect()
+    });
 
 /// JIT modules that the admitted default Redline programs load
 /// (`hipfire-runtime` `retained_redline_default`: MQ4R on gfx1100/gfx1151/
@@ -11414,7 +11514,7 @@ mod tests {
             );
         }
         // Multi-lane fn-lanes QSA decode core (gfx1201, HIPFIRE_QWEN4_QSA_LANES).
-        const QSA_LANES_ADDED_MODULES: [&str; 1] = ["qsa_lanes"];
+        const QSA_LANES_ADDED_MODULES: [&str; 2] = ["qsa_lanes", "qsa_lanes_fuse"];
         for module in QSA_LANES_ADDED_MODULES {
             assert!(
                 by_name.contains_key(module),
@@ -11566,6 +11666,40 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the shared-down rows GEMV with the combine + shared fold epilogue.
+        const MOE_EPILOGUE_FUSE_ADDED_MODULES: [&str; 1] = ["moe_shared_down_combine"];
+        for module in MOE_EPILOGUE_FUSE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MoE epilogue fuse module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
+        // HcFuse default-on modules (exact gfx1201): lane PLE tail, output-tiled BF16 rows GEMVs, HC
+        // read tail + rotation, route + scatter.
+        const HCFUSE_ADDED_MODULES: [&str; 4] = [
+            "ple_lanes_tail_f32",
+            "qwen4_gemv_bf16_xf32_otile",
+            "hyper_read_up_fused_rot_t1",
+            "moe_route_scatter_top10_f32",
+        ];
+        for module in HCFUSE_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing HcFuse module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -11598,7 +11732,9 @@ mod tests {
                 + FFN_ROTATE_I8_ADDED_MODULES.len()
                 + QSA_LANES_ADDED_MODULES.len()
                 + DRAFT_SKINNY_TIE_ADDED_MODULES.len()
-                + F1_PLANAR_ADDED_MODULES.len(),
+                + F1_PLANAR_ADDED_MODULES.len()
+                + MOE_EPILOGUE_FUSE_ADDED_MODULES.len()
+                + HCFUSE_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
@@ -12546,6 +12682,40 @@ mod tests {
         }
     }
 
+    /// The lane-batched PLE tail (`Gpu::ple_lanes_tail_f32`) is packaged under
+    /// the module key and symbol its launcher passes to `ensure_kernel`, with
+    /// the launcher's own source constant, on exact gfx1201 only
+    /// (`qwen4_lane_ple_batch_enabled`), and the entry's recipe is the
+    /// compiler's recipe for that source.
+    #[test]
+    fn ple_lanes_tail_matches_launcher_and_compiler() {
+        use crate::ple_lanes::{PLE_LANES_SRC, PLE_LANES_SYMBOL};
+        for arch in SUPPORTED_ARCHES {
+            for extra_flags in ["", "-DIU4_A4_CANDIDATES=2"] {
+                let entry = lookup(arch, PLE_LANES_SYMBOL, extra_flags);
+                if *arch != "gfx1201" {
+                    assert!(entry.is_err(), "{arch}: leaked lane PLE tail");
+                    continue;
+                }
+                let entry = entry.unwrap();
+                assert_eq!(entry.module, PLE_LANES_SYMBOL);
+                assert_eq!(entry.symbols, [PLE_LANES_SYMBOL]);
+                assert_eq!(entry.source(), PLE_LANES_SRC);
+                let recipe = KernelCompiler::recipe_for_source(
+                    arch,
+                    PLE_LANES_SYMBOL,
+                    PLE_LANES_SRC,
+                    extra_flags,
+                );
+                assert_eq!(entry.flags, recipe.flags, "{extra_flags}");
+                assert_eq!(
+                    entry.scheduler_profile, recipe.scheduler_profile,
+                    "{extra_flags}"
+                );
+            }
+        }
+    }
+
     /// `Gpu::bf16_round_trip_f32` (norm.rs) passes module `bf16_round_trip`,
     /// source `kernels::BF16_ROUND_TRIP_SRC` and symbol `bf16_round_trip_f32`
     /// to `ensure_kernel` on every call (Qwen4 MoE / dense-FFN / QSA storage
@@ -13382,7 +13552,8 @@ mod tests {
                 extra,
                 [
                     "gated_delta_conv_params_bf16_f32_lanes",
-                    "gated_delta_step_gate_norm128_q8_lanes"
+                    "gated_delta_step_gate_norm128_q8_lanes",
+                    "gated_delta_step_gate_norm128_q8_lanes_fuse"
                 ],
                 "{arch}"
             );

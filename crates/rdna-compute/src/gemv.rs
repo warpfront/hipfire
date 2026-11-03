@@ -42,6 +42,10 @@ fn x4_rows_fit(
     x.buf.size() >= rows * k * 4 && parts.iter().all(|&(_, y, m)| y.buf.size() >= rows * m * 4)
 }
 
+/// Output rows per workgroup of `gemv_bf16_xf32_k4_rows_otile_r<R>`: the `NO`
+/// template argument in `kernels/src/qwen4_gemv_bf16_xf32_otile.hip`.
+const BF16_K4_OTILE_ROWS_PER_BLOCK: usize = 2;
+
 /// Rows of an AWQ scale tensor that carries the gfx1201 A4 RMSNorm producer's
 /// reciprocal planes: `[a 0..K-1][R K..2K-1][Rlo 2K..3K-1]` under shape
 /// `[K, AWQ_RCP_ROWS]`. Every other consumer reads only the first K floats.
@@ -21576,6 +21580,9 @@ impl Gpu {
         if rows > FEW_ROW_ROUTE_ROWS {
             return self.gemv_bf16_xf32_k4_rows_tiled(weight, x, y, m, k, hc_act_scale, rows);
         }
+        if self.flags.qwen4_bf16_rows_otile_enabled() {
+            return self.gemv_bf16_xf32_k4_rows_otile(weight, x, y, m, k, hc_act_scale, rows);
+        }
         self.bind_thread()?;
         let func = FUNCS[rows - 2];
         self.ensure_kernel(
@@ -21584,6 +21591,81 @@ impl Gpu {
             func,
         )?;
         self.launch_gemv_split(func, 128, weight, x, y, m, k, hc_act_scale, rows)
+    }
+
+    /// [`Gpu::gemv_bf16_xf32_k4_rows`] for 2..=[`FEW_ROW_ROUTE_ROWS`] rows on the
+    /// output-tiled `gemv_bf16_xf32_k4_rows_otile_r<R>` (module
+    /// `qwen4_gemv_bf16_xf32_otile`, [`BF16_K4_OTILE_ROWS_PER_BLOCK`] output rows per
+    /// workgroup). Every output word is bitwise the incumbent
+    /// `gemv_bf16_xf32_k4_rows_r<R>`'s. Needs `k % 32 == 0`. Taken by the incumbent
+    /// launcher when `HIPFIRE_QWEN4_BF16_ROWS_OTILE` is on (exact gfx1201).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_xf32_k4_rows_otile(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNCS: [&str; 7] = [
+            "gemv_bf16_xf32_k4_rows_otile_r2",
+            "gemv_bf16_xf32_k4_rows_otile_r3",
+            "gemv_bf16_xf32_k4_rows_otile_r4",
+            "gemv_bf16_xf32_k4_rows_otile_r5",
+            "gemv_bf16_xf32_k4_rows_otile_r6",
+            "gemv_bf16_xf32_k4_rows_otile_r7",
+            "gemv_bf16_xf32_k4_rows_otile_r8",
+        ];
+        if !k.is_multiple_of(32) || !(2..=FEW_ROW_ROUTE_ROWS).contains(&rows) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_bf16_xf32_k4_rows_otile needs K % 32 == 0 and 2..=8 rows",
+            ));
+        }
+        self.bind_thread()?;
+        let func = FUNCS[rows - 2];
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32_otile",
+            kernels::QWEN4_GEMV_BF16_XF32_OTILE_SRC,
+            func,
+        )?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let scale = hc_act_scale.unwrap_or(1.0);
+        let hc_act = i32::from(hc_act_scale.is_some());
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+            &hc_act as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            func,
+            [m.div_ceil(BF16_K4_OTILE_ROWS_PER_BLOCK) as u32, 1, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_f32(scale);
+                b.push_i32(hc_act);
+                b
+            },
+        )
     }
 
     /// [`Gpu::gemv_bf16_xf32_k4`] of any `rows >= 1` activation rows (x row
@@ -23809,6 +23891,21 @@ impl Gpu {
         k: usize,
         rows: usize,
     ) -> HipResult<()> {
+        self.gemv_bf16_xf32_x4_rows_route(parts, x, k, rows, true)
+    }
+
+    /// Body of [`Gpu::gemv_bf16_xf32_x4_rows`]; `otile` admits the output-tiled
+    /// entries (`HIPFIRE_QWEN4_BF16_ROWS_OTILE`) for 2..=[`FEW_ROW_ROUTE_ROWS`]
+    /// rows. The eight-row groups of a wider call pass `false`, so rows above
+    /// eight stay on the incumbent route.
+    fn gemv_bf16_xf32_x4_rows_route(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+        otile: bool,
+    ) -> HipResult<()> {
         const FUNCS: [&str; 7] = [
             "gemv_bf16_xf32_x4_rows_r2",
             "gemv_bf16_xf32_x4_rows_r3",
@@ -23841,18 +23938,76 @@ impl Gpu {
                 if n == 1 {
                     self.gemv_bf16_xf32_x4(pg, &xg, k)?;
                 } else {
-                    self.gemv_bf16_xf32_x4_rows(pg, &xg, k, n)?;
+                    self.gemv_bf16_xf32_x4_rows_route(pg, &xg, k, n, false)?;
                 }
             }
             return Ok(());
         }
-        let func = FUNCS[rows - 2];
-        self.bind_thread()?;
-        self.ensure_kernel(
+        if otile && self.flags.qwen4_bf16_rows_otile_enabled() && k.is_multiple_of(8) {
+            return self.gemv_bf16_xf32_x4_rows_otile(parts, x, k, rows);
+        }
+        self.launch_bf16_x4_rows_kernel(
+            FUNCS[rows - 2],
             "qwen4_gemv_bf16_xf32",
             kernels::QWEN4_GEMV_BF16_XF32_SRC,
-            func,
-        )?;
+            parts,
+            x,
+            k,
+        )
+    }
+
+    /// [`Gpu::gemv_bf16_xf32_x4_rows`] for 2..=[`FEW_ROW_ROUTE_ROWS`] rows on the
+    /// `gemv_bf16_xf32_x4_rows_otile_r<R>` entries (module
+    /// `qwen4_gemv_bf16_xf32_otile`): one output row per wave like the incumbent,
+    /// grid = the sum of the part row counts, with a load schedule that keeps more
+    /// weight and activation loads in flight. Every output word is bitwise the
+    /// incumbent `gemv_bf16_xf32_x4_rows_r<R>`'s. Needs `k % 8 == 0`. Taken by the
+    /// incumbent launcher when `HIPFIRE_QWEN4_BF16_ROWS_OTILE` is on (exact gfx1201).
+    pub fn gemv_bf16_xf32_x4_rows_otile(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNCS: [&str; 7] = [
+            "gemv_bf16_xf32_x4_rows_otile_r2",
+            "gemv_bf16_xf32_x4_rows_otile_r3",
+            "gemv_bf16_xf32_x4_rows_otile_r4",
+            "gemv_bf16_xf32_x4_rows_otile_r5",
+            "gemv_bf16_xf32_x4_rows_otile_r6",
+            "gemv_bf16_xf32_x4_rows_otile_r7",
+            "gemv_bf16_xf32_x4_rows_otile_r8",
+        ];
+        if !k.is_multiple_of(8) || !(2..=FEW_ROW_ROUTE_ROWS).contains(&rows) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_bf16_xf32_x4_rows_otile needs K % 8 == 0 and 2..=8 rows",
+            ));
+        }
+        self.launch_bf16_x4_rows_kernel(
+            FUNCS[rows - 2],
+            "qwen4_gemv_bf16_xf32_otile",
+            kernels::QWEN4_GEMV_BF16_XF32_OTILE_SRC,
+            parts,
+            x,
+            k,
+        )
+    }
+
+    /// Launch `func` (an incumbent `_x4_rows_r<R>` or `_x4_rows_otile_r<R>` entry,
+    /// same 14-argument ABI, one wave per output row: grid = sum of the part rows).
+    fn launch_bf16_x4_rows_kernel(
+        &mut self,
+        func: &str,
+        module: &str,
+        src: &str,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(module, src, func)?;
         let w = parts.map(|(w, _, _)| w.buf.as_ptr());
         let y = parts.map(|(_, y, _)| y.buf.as_ptr());
         let m = parts.map(|(_, _, m)| m as i32);

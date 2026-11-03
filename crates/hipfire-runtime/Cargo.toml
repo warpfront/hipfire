@@ -195,6 +195,16 @@ required-features = ["lab", "rdna-compute/lab"]
 name = "f1_planar_byte_oracle"
 required-features = ["lab"]
 
+# C8 routed-expert kernel roofline (real expert tensors, VRAM-resident, EP2 C8 AR shape).
+[[example]]
+name = "moe_c8_roofline"
+required-features = ["lab"]
+
+# S3 wide-pass routed-expert byte oracle + A/B (production vs g32 gate/up on real expert tensors).
+[[example]]
+name = "moe_wide_oracle"
+required-features = ["lab"]
+
 # K-E2 E8P-on-IU4 pointer-addressed MoE decode GEMV oracle + row-time runner (raw PM module; no production dispatch wiring).
 [[example]]
 name = "e8p_i4_moe_gemv_oracle"

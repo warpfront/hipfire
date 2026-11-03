@@ -1471,6 +1471,127 @@ pub(crate) fn combine_order_only(
     ))
 }
 
+/// Whether [`combine_stage`] takes the expanded-rows arm (`moe_down_combine_top10_batched`),
+/// its final `else`: reached directly on path 1 and through the indexed-down re-entry on
+/// path 2.
+fn combine_expanded_arm(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    let use_path2 = grouped_path(gpu, p, use_path2);
+    indexed_down(gpu, p, use_path2) || !use_path2
+}
+
+/// The shared-down F32 hidden and the combine's expanded rows of `p` (views).
+fn epilogue_inputs(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> Option<(GpuTensor, GpuTensor)> {
+    let shared = p.prelude.shared.as_ref()?;
+    let hidden = shared_down_input(gpu, p, use_path2, shared.rotated, shared.intermediate);
+    let expanded = f32_view(
+        p.down_expanded,
+        0,
+        p.batch_size.checked_mul(p.k_top)?.checked_mul(p.down_m)?,
+    );
+    Some((hidden, expanded))
+}
+
+/// The operands of `moe_shared_down_combine` for `p`: the shared-down weight, the combine's
+/// route and its target (the routed target the shared fold lands in).
+fn epilogue_operands<'a>(
+    p: &'a MoePrefillParams<'_>,
+    hidden: &'a GpuTensor,
+    expanded: &'a GpuTensor,
+) -> Option<rdna_compute::tensor_ops::MoeSharedDownCombine<'a>> {
+    let shared = p.prelude.shared.as_ref()?;
+    let down = &shared.weights.down;
+    Some(rdna_compute::tensor_ops::MoeSharedDownCombine {
+        weight: down.buf,
+        x: hidden,
+        target: p.routed_out.unwrap_or(p.x_batch),
+        expert_outputs: expanded,
+        topk_indices: p.topk_indices,
+        topk_weights: p.topk_weights,
+        scalar: shared.scalar,
+        m: down.m,
+        k: down.k,
+        rows: p.batch_size,
+        n_experts: p.n_exp,
+    })
+}
+
+/// Whether this call's combine + shared down + shared fold (`HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`)
+/// run as the one launch `moe_shared_down_combine_rows_r<rows>` ([`shared_down_combined`]):
+/// the expanded-rows combine arm, then the BF16 shared down on the few-row F32 rows GEMV
+/// (`gemv_bf16_xf32_x4_rows`, or the one-row GEMV) and `bf16_scaled_add_batched`, bytewise
+/// (NaN payload order aside) the chain the launch replaces; `target` is written exactly as
+/// the chain leaves it, so nothing downstream changes. Pure: launches nothing. The caller
+/// owns the stage-level conditions (no CPU split / deferral / tile exchange / row-fold write).
+pub(crate) fn epilogue_fuse_applies(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    if is_fp8(p) || !grouped_geometry(p) {
+        return false;
+    }
+    let Some(shared) = p.prelude.shared.as_ref() else {
+        return false;
+    };
+    let down = &shared.weights.down;
+    let rows = p.batch_size;
+    // The rows GEMV route of `project_weights_inner`: 2..=few_row_limit route rows on gfx11+
+    // (eight at most here), else the one-row GEMV; never the F16 WMMA GEMM.
+    let few_row_gemv = gpu.route_rows(rows) == rows
+        && !super::layer_ops::wide_exact_rows(gpu, rows)
+        && (rows == 1 || (rows <= gpu.few_row_limit() && gpu.arch_caps.has_gfx11_plus_simt()));
+    few_row_gemv
+        && down.dtype == DType::BF16
+        && down.rotation.is_none()
+        && down.awq_scale.is_none()
+        && p.recipe.bf16_round_trip()
+        && p.recipe.shared_after_combine()
+        && down.m == p.down_m
+        && down.k == shared.intermediate
+        && p.k_top == 10
+        && combine_expanded_arm(gpu, p, use_path2)
+        && !gpu.qwen4_shared_down_epi_enabled()
+        && !shared_int8(gpu, p, use_path2)
+        && !gpu.qwen4_f16_wmma_applies(down.buf, down.k, rows)
+        && epilogue_inputs(gpu, p, use_path2)
+            .and_then(|(hidden, expanded)| {
+                epilogue_operands(p, &hidden, &expanded).map(|o| o.applies(gpu))
+            })
+            .unwrap_or(false)
+}
+
+/// [`combine`] of a call whose combine rides the shared down ([`epilogue_fuse_applies`]):
+/// nothing launches, the scratch preflight still runs.
+pub(crate) fn combine_deferred(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    grouped_rows: usize,
+) -> Result<(), DispatchError> {
+    require_geometry(p)?;
+    validate_scratch(gpu, p, use_path2, grouped_rows)
+}
+
+/// [`shared_down`] of a call whose combine was deferred ([`combine_deferred`]): the one launch
+/// that combines the ten expanded rows into the target, computes the shared-down rows and
+/// folds them in with the selector (`bf16_scaled_add_batched`'s expression).
+pub(crate) fn shared_down_combined(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> Result<(), DispatchError> {
+    require_geometry(p)?;
+    let (hidden, expanded) = epilogue_inputs(gpu, p, use_path2).ok_or_else(|| {
+        DispatchError::Hip("qt44 epilogue fuse: shared weights vanished after admission".into())
+    })?;
+    let operands = epilogue_operands(p, &hidden, &expanded).ok_or_else(|| {
+        DispatchError::Hip("qt44 epilogue fuse: shared weights vanished after admission".into())
+    })?;
+    hip(rdna_compute::tensor_ops::moe_shared_down_combine(
+        gpu, &operands,
+    ))
+}
+
 /// The row-folded shared down: the shared-down GEMM stores its BF16 rows into
 /// the (otherwise unwritten) routed target, then one row kernel per token
 /// combines the ten expert rows, folds the shared row, writes the HC streams
@@ -1586,6 +1707,20 @@ fn sym_iu4(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
         && p.x_norm_batch.dtype == DType::F32
         && p.down_k == p.mi
         && gpu.qwen4_moe_sym_iu4_applies(p.batch_size)
+}
+
+/// Whether [`scatter`] would launch the plain `moe_scatter_fused_top10` for this call, with
+/// nothing else to do and no error to raise: the fused router + scatter launch
+/// (`HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`) replaces exactly that launch. Mirrors [`scatter`]'s own
+/// branches (FP8, geometry, wide exact rows, symmetric IU4, owner-routed tile exchange); the
+/// expert IU4 verdict is also left to the scatter stage, so a bound IU4 plan declines.
+pub(crate) fn scatter_fusable(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    !is_fp8(p)
+        && grouped_geometry(p)
+        && p.expert_iu4.is_none()
+        && !super::layer_ops::wide_exact_rows(gpu, p.batch_size)
+        && !sym_iu4(gpu, p, true)
+        && !(p.ep_tile_exchange.is_some() && wmma_tile_route(gpu, p, true))
 }
 
 /// Path-2 grouping (the stage runs on path 2 only).

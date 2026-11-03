@@ -2163,6 +2163,61 @@ fn forward_lanes_scoped(
         let ctx = DispatchCtx::new(gpu);
         let band_first = band_scope.band.start;
         let program = layer_program(bundle, policy, band_scope.input.then_some(ple_layer))?;
+        // `HIPFIRE_QWEN4_LANE_PLE_BATCH` (exact gfx1201, default off): AR lane
+        // steps of one row per lane run the PLE chain of up to
+        // `PLE_LANES_MAX` consecutive lanes as ONE op (key / value projections
+        // over the chunk's rows + one batched tail) instead of the whole chain
+        // per lane. A chunk needs 2+ lanes, every row tensor the chain touches
+        // laid out contiguously lane after lane, and each lane's own PLE conv
+        // state; anything else keeps the per-lane chain. Declared before the
+        // steps: they borrow the chunks.
+        let ple_chunks: Vec<(usize, Vec<&GpuTensor>)> = match &ple_w {
+            Some(ple_w)
+                if band_scope.input
+                    && !prefill
+                    && !bf16_state
+                    && lane_segs.iter().all(|seg| seg.rows == 1) =>
+            {
+                let width = |tensor: &GpuTensor| tensor.buf.as_ptr() as usize;
+                let lane_ids: Vec<usize> = (0..lane_segs.len()).collect();
+                let mut chunks = Vec::new();
+                for ids in lane_ids.chunks(rdna_compute::ple_lanes::PLE_LANES_MAX) {
+                    let first = ids[0];
+                    let contiguous = |select: fn(&SegViews) -> &GpuTensor, row: usize| {
+                        ids.iter().all(|&lane| {
+                            width(select(&views[lane]))
+                                == width(select(&views[first])) + (lane - first) * row * 4
+                        })
+                    };
+                    let hidden = config.hidden_size;
+                    let wide = dims.hc_count * hidden;
+                    let admitted = ids.len() >= 2
+                        && hipfire_dispatch::pipeline::grouped_depthwise_lanes_admitted(
+                            &*gpu,
+                            &ple_w.key,
+                            &ple_w.value,
+                            ids.len(),
+                        )
+                        && contiguous(|v| &v.streams, wide)
+                        && contiguous(|v| &v.ple_rows, ple_head_count * ple_row_width)
+                        && contiguous(|v| &v.ple_key, wide)
+                        && contiguous(|v| &v.ple_value, hidden)
+                        && contiguous(|v| &v.ple_normed, wide);
+                    if !admitted {
+                        continue;
+                    }
+                    let chunk: Option<Vec<&GpuTensor>> = ids
+                        .iter()
+                        .map(|&lane| states[lane_segs[lane].first_lane].ple_conv.as_ref())
+                        .collect();
+                    if let Some(chunk) = chunk {
+                        chunks.push((first, chunk));
+                    }
+                }
+                chunks
+            }
+            _ => Vec::new(),
+        };
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(program.len() * lanes.len() * 2);
         let mut qsa_commits: Vec<QsaCommit> = Vec::new();
         let mut ple_split: Option<usize> = None;
@@ -2261,40 +2316,81 @@ fn forward_lanes_scoped(
                             let ple_w = ple_w
                                 .as_ref()
                                 .ok_or_else(|| invalid("PLE weights missing"))?;
-                            let state = states[seg.first_lane];
                             if ple_split.is_none() {
                                 ple_split = Some(steps.len());
                             }
-                            steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
-                                rotation: &scratch.rotation,
-                                state_bf16: bf16_state,
-                                rows_f16: ple_rows_f16,
-                                key: ple_w.key,
-                                value: ple_w.value,
-                                norm_key: ple_w.norm_key,
-                                norm_query: ple_w.norm_query,
-                                norm_conv: ple_w.norm_conv,
-                                conv: ple_w.conv,
-                                state: state
-                                    .ple_conv
-                                    .as_ref()
-                                    .ok_or_else(|| invalid("PLE conv state missing"))?,
-                                streams: &v.streams,
-                                rows_tensor: &v.ple_rows,
-                                query: &v.ple_query,
-                                key_scratch: &v.ple_key,
-                                value_scratch: &v.ple_value,
-                                gated: &v.ple_gated,
-                                normed: &v.ple_normed,
-                                output: &v.ple_output,
-                                rows: r,
-                                branches: dims.hc_count,
-                                hidden: config.hidden_size,
-                                embed_dim: ple_head_count * ple_row_width,
-                                kernel_size: dims.ple_conv_kernel_dim,
-                                dilation: config.ple_conv_dilation(),
-                                epsilon: EPSILON,
-                            }));
+                            if let Some((first, chunk)) = ple_chunks
+                                .iter()
+                                .find(|(first, chunk)| (*first..*first + chunk.len()).contains(&i))
+                            {
+                                // `HIPFIRE_QWEN4_LANE_PLE_BATCH`: the chunk's lanes run
+                                // as one op at its first lane (lane rows are
+                                // independent; each keeps its own state).
+                                if *first == i {
+                                    let v = &views[i];
+                                    steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
+                                        rotation: &scratch.rotation,
+                                        state_bf16: bf16_state,
+                                        rows_f16: ple_rows_f16,
+                                        key: ple_w.key,
+                                        value: ple_w.value,
+                                        norm_key: ple_w.norm_key,
+                                        norm_query: ple_w.norm_query,
+                                        norm_conv: ple_w.norm_conv,
+                                        conv: ple_w.conv,
+                                        state: chunk[0],
+                                        streams: &v.streams,
+                                        rows_tensor: &v.ple_rows,
+                                        query: &v.ple_query,
+                                        key_scratch: &v.ple_key,
+                                        value_scratch: &v.ple_value,
+                                        gated: &v.ple_gated,
+                                        normed: &v.ple_normed,
+                                        output: &v.ple_output,
+                                        rows: chunk.len(),
+                                        branches: dims.hc_count,
+                                        hidden: config.hidden_size,
+                                        embed_dim: ple_head_count * ple_row_width,
+                                        kernel_size: dims.ple_conv_kernel_dim,
+                                        dilation: config.ple_conv_dilation(),
+                                        epsilon: EPSILON,
+                                        lane_states: chunk.as_slice(),
+                                    }));
+                                }
+                            } else {
+                                let state = states[seg.first_lane];
+                                steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
+                                    rotation: &scratch.rotation,
+                                    state_bf16: bf16_state,
+                                    rows_f16: ple_rows_f16,
+                                    key: ple_w.key,
+                                    value: ple_w.value,
+                                    norm_key: ple_w.norm_key,
+                                    norm_query: ple_w.norm_query,
+                                    norm_conv: ple_w.norm_conv,
+                                    conv: ple_w.conv,
+                                    state: state
+                                        .ple_conv
+                                        .as_ref()
+                                        .ok_or_else(|| invalid("PLE conv state missing"))?,
+                                    streams: &v.streams,
+                                    rows_tensor: &v.ple_rows,
+                                    query: &v.ple_query,
+                                    key_scratch: &v.ple_key,
+                                    value_scratch: &v.ple_value,
+                                    gated: &v.ple_gated,
+                                    normed: &v.ple_normed,
+                                    output: &v.ple_output,
+                                    rows: r,
+                                    branches: dims.hc_count,
+                                    hidden: config.hidden_size,
+                                    embed_dim: ple_head_count * ple_row_width,
+                                    kernel_size: dims.ple_conv_kernel_dim,
+                                    dilation: config.ple_conv_dilation(),
+                                    epsilon: EPSILON,
+                                    lane_states: &[],
+                                }));
+                            }
                         }
                         LaneOp::Gdn { layer, slot, phase } => {
                             let weights = match &descs[layer - band_first].attention {

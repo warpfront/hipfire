@@ -1146,10 +1146,19 @@ fn execute_window<'a>(
                     })
                     .collect();
                 let group = ops.len();
+                // The OutProj phase that follows the group (the fused lane attention
+                // may rotate its input, `HIPFIRE_QWEN4_QSA_LANES_FUSE`).
+                let out_proj = match steps[..end].get(i + group) {
+                    Some(Step::IndexedAttention(next)) if next.phase == MixerPhase::OutProj => {
+                        Some(next)
+                    }
+                    _ => None,
+                };
                 if group >= 2
                     && crate::pipeline::layer_ops::execute_indexed_attention_core_lanes(
                         gpu,
                         &ops,
+                        out_proj,
                         |gpu| {
                             for step in &steps[i..i + group] {
                                 hooks.before_step(gpu, step)?;

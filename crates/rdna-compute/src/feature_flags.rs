@@ -135,6 +135,16 @@ pub struct FeatureFlags {
     /// default off on every arch (exact gfx1201 only, and only with
     /// `HIPFIRE_QWEN4_GDN_LANES` on).
     pub qwen4_gdn_lanes_rows: bool,
+    /// Lane-batched PLE chain of an AR lane step (`HIPFIRE_QWEN4_LANE_PLE_BATCH`):
+    /// the key / value projections once over the lanes' rows and one batched
+    /// tail launch instead of the per-lane chain. Default off on every arch
+    /// (exact gfx1201 only).
+    pub qwen4_lane_ple_batch: bool,
+    /// Fused multi-lane fn-lanes GDN decode Core, conv/params prologue + output
+    /// rotation epilogue in the step launch (`HIPFIRE_QWEN4_GDN_LANES_FUSE`),
+    /// default off on every arch (exact gfx1201 only, and only with
+    /// `HIPFIRE_QWEN4_GDN_LANES` on).
+    pub qwen4_gdn_lanes_fuse: bool,
     /// Qwen4 MQ4G128V2 K=640 indexed MoE down with four weight rows per wave
     /// (`HIPFIRE_QWEN4_MOE_DOWN_R4`), default on for gfx1151.
     pub qwen4_moe_down_r4: bool,
@@ -148,6 +158,10 @@ pub struct FeatureFlags {
     /// plus the Q8_0 shared gate/up pair, `HIPFIRE_QWEN4_DECODE_HEAD_FUSE`),
     /// default on only for gfx1151.
     pub qwen4_decode_head_fuse: bool,
+    /// Output-tiled byte-identical decode BF16 rows GEMVs
+    /// (`HIPFIRE_QWEN4_BF16_ROWS_OTILE`): the HC down k4 rows and the x4 rows
+    /// (MoE gate-side, shared down) at 2..=8 rows, default off.
+    pub qwen4_bf16_rows_otile: bool,
     /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
@@ -1043,6 +1057,8 @@ impl FeatureFlags {
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
             qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(false),
+            qwen4_lane_ple_batch: parse_bool("HIPFIRE_QWEN4_LANE_PLE_BATCH").unwrap_or(true),
+            qwen4_gdn_lanes_fuse: parse_bool("HIPFIRE_QWEN4_GDN_LANES_FUSE").unwrap_or(true),
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
                 .unwrap_or(arch == "gfx1151" || is_gfx1201),
             qwen4_shared_down_fuse: parse_bool("HIPFIRE_QWEN4_SHARED_DOWN_FUSE")
@@ -1051,6 +1067,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1151"),
             qwen4_decode_head_fuse: parse_bool("HIPFIRE_QWEN4_DECODE_HEAD_FUSE")
                 .unwrap_or(arch == "gfx1151"),
+            qwen4_bf16_rows_otile: parse_bool("HIPFIRE_QWEN4_BF16_ROWS_OTILE").unwrap_or(true),
             qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
@@ -1723,6 +1740,20 @@ impl FeatureFlags {
         self.qwen4_gdn_lanes_rows && self.qwen4_gdn_lanes_enabled() && self.arch == "gfx1201"
     }
 
+    /// Lane-batched PLE chain of an AR lane step (`HIPFIRE_QWEN4_LANE_PLE_BATCH`).
+    /// Exact gfx1201 only, default off (`=1` enables).
+    pub fn qwen4_lane_ple_batch_enabled(&self) -> bool {
+        self.qwen4_lane_ple_batch && self.arch == "gfx1201"
+    }
+
+    /// Fused multi-lane fn-lanes GDN decode Core (`HIPFIRE_QWEN4_GDN_LANES_FUSE`): the
+    /// conv + gate-parameter launch is the step kernel's prologue and the output
+    /// projection's rotation its epilogue. Exact gfx1201 only, default off (`=1`
+    /// enables) and it needs [`Self::qwen4_gdn_lanes_enabled`] too.
+    pub fn qwen4_gdn_lanes_fuse_enabled(&self) -> bool {
+        self.qwen4_gdn_lanes_fuse && self.qwen4_gdn_lanes_enabled() && self.arch == "gfx1201"
+    }
+
     /// Multi-lane fn-lanes QSA decode core (`HIPFIRE_QWEN4_QSA_LANES`). Exact
     /// gfx1201 only, default on (`=0` kills it).
     pub fn qwen4_qsa_lanes_enabled(&self) -> bool {
@@ -1757,6 +1788,12 @@ impl FeatureFlags {
     /// launch. Exact gfx1151 only.
     pub fn qwen4_decode_head_fuse_enabled(&self) -> bool {
         self.qwen4_decode_head_fuse && self.arch == "gfx1151"
+    }
+
+    /// Output-tiled decode BF16 rows GEMVs (`HIPFIRE_QWEN4_BF16_ROWS_OTILE`,
+    /// default off). Exact gfx1201 only.
+    pub fn qwen4_bf16_rows_otile_enabled(&self) -> bool {
+        self.qwen4_bf16_rows_otile && self.arch == "gfx1201"
     }
 
     /// The fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
@@ -1909,10 +1946,13 @@ impl FeatureFlags {
             qwen4_gdn_lanes: false,
             qwen4_qsa_lanes: false,
             qwen4_gdn_lanes_rows: false,
+            qwen4_lane_ple_batch: false,
+            qwen4_gdn_lanes_fuse: false,
             qwen4_moe_down_r4: false,
             qwen4_shared_down_fuse: false,
             qwen4_decode_zba_x3: false,
             qwen4_decode_head_fuse: false,
+            qwen4_bf16_rows_otile: false,
             qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
@@ -2907,6 +2947,35 @@ mod tests {
         }
     }
 
+    /// The lane-batched PLE chain is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_lane_ple_batch_flag_is_default_on_and_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_LANE_PLE_BATCH" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_lane_ple_batch_enabled(),
+                arch == "gfx1201",
+                "{arch}"
+            );
+            assert!(!FeatureFlags::from_lookup(arch, with("0")).qwen4_lane_ple_batch_enabled());
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, with("1")).qwen4_lane_ple_batch_enabled(),
+                arch == "gfx1201",
+                "{arch}"
+            );
+        }
+    }
+
     /// The wave-per-token router defaults on for exact gfx1151 / gfx1201; `0` turns it off.
     #[test]
     fn qwen4_router_fast_defaults_on_exact_gfx1151_gfx1201() {
@@ -2989,6 +3058,39 @@ mod tests {
             });
             assert_eq!(on.qwen4_decode_head_fuse_enabled(), exact, "{arch}");
         }
+    }
+
+    /// The output-tiled BF16 rows GEMVs are default on (`=0` kills) and reach exact gfx1201 only.
+    #[test]
+    fn qwen4_bf16_rows_otile_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_QWEN4_BF16_ROWS_OTILE" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_bf16_rows_otile_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_bf16_rows_otile_enabled(), "{arch}: 0");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(
+                on.qwen4_bf16_rows_otile_enabled(),
+                arch == "gfx1201",
+                "{arch}: 1"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_bf16_rows_otile_enabled());
     }
 
     #[test]
@@ -4593,6 +4695,55 @@ mod tests {
                 "{arch}: both on"
             );
             assert!(!flags(arch, None, Some("1")).qwen4_gdn_lanes_rows_enabled());
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_GDN_LANES_FUSE`: exact gfx1201 only, default on, `=0` disables, and it
+    /// also needs `HIPFIRE_QWEN4_GDN_LANES` on (`=0` there kills it too).
+    #[test]
+    fn gdn_lanes_fuse_defaults_on_gfx1201_and_needs_the_lanes_flag() {
+        let flags = |arch: &str, fuse: Option<&str>, lanes: Option<&str>| {
+            FeatureFlags::from_lookup(arch, |name| match (name, fuse, lanes) {
+                ("HIPFIRE_QWEN4_GDN_LANES_FUSE", Some(v), _) => Ok(v.to_owned()),
+                ("HIPFIRE_QWEN4_GDN_LANES", _, Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1201:xnack-"] {
+            let exact = arch == "gfx1201";
+            assert_eq!(
+                flags(arch, None, None).qwen4_gdn_lanes_fuse_enabled(),
+                exact,
+                "{arch}: unset"
+            );
+            assert_eq!(
+                flags(arch, None, Some("1")).qwen4_gdn_lanes_fuse_enabled(),
+                exact,
+                "{arch}: lanes on alone"
+            );
+            for on in ["1", "true", "on"] {
+                assert_eq!(
+                    flags(arch, Some(on), None).qwen4_gdn_lanes_fuse_enabled(),
+                    exact,
+                    "{arch}: {on}"
+                );
+            }
+            // Only the exact spellings parse; any other value (`2`) falls back to the default (on).
+            for off in ["0", "false", "off"] {
+                assert!(
+                    !flags(arch, Some(off), None).qwen4_gdn_lanes_fuse_enabled(),
+                    "{arch}: {off}"
+                );
+            }
+            assert_eq!(
+                flags(arch, Some("2"), None).qwen4_gdn_lanes_fuse_enabled(),
+                exact,
+                "{arch}: unparsable value keeps the default"
+            );
+            assert!(
+                !flags(arch, Some("1"), Some("0")).qwen4_gdn_lanes_fuse_enabled(),
+                "{arch}: lanes off"
+            );
         }
     }
 }

@@ -1896,7 +1896,8 @@ pub(crate) fn vmm_context_arena_mapped_bytes(
         .ok()
 }
 
-/// `HIPFIRE_QWEN4_CAPTURE_RING_COMPACT` (developer, default off): lay the GDN
+/// `HIPFIRE_QWEN4_CAPTURE_RING_COMPACT` (developer, default ON, exact `0` is
+/// the kill switch back to the double ring): lay the GDN
 /// verify capture ring out as `rows + 1` state slots per layer instead of
 /// `2 * rows`. The ring is only ever written at ONE slot per half (the
 /// capture kernel and the rollback kernel both leave the last row's state in
@@ -1906,9 +1907,9 @@ pub(crate) fn vmm_context_arena_mapped_bytes(
 /// onto the compact storage.
 pub(crate) const CAPTURE_RING_COMPACT_ENV: &str = "HIPFIRE_QWEN4_CAPTURE_RING_COMPACT";
 
-/// Whether new capture rings use the compact layout.
+/// Whether new capture rings use the compact layout (unset or `1`; `0` off).
 pub(crate) fn compact_capture_ring() -> bool {
-    hipfire_config::developer_bool(CAPTURE_RING_COMPACT_ENV, false)
+    hipfire_config::developer_bool(CAPTURE_RING_COMPACT_ENV, true)
 }
 
 /// State slots one layer's capture ring of `rows` rows holds.
@@ -5375,7 +5376,7 @@ mod tests {
                 }
                 assert_eq!(sizes.len(), 3 * layers + 2);
                 let (ring, inputs, recurrence) = (
-                    (2 * rows
+                    (capture_ring_slots(compact_capture_ring(), rows).unwrap()
                         * gdn.storage().state_bytes(
                             value_heads,
                             config.linear_key_head_dim,
@@ -6699,16 +6700,19 @@ mod tests {
     #[test]
     fn row_capture_bytes_charge_the_gdn_storage_dtype() {
         let config = crate::config::compact_test_config();
-        // 36 GDN layers x (2R ring slots + F32 inputs 4R x 10240 and
+        // 36 GDN layers x (R+1 compact ring slots (2R with the kill switch) + F32 inputs 4R x 10240 and
         // recurrence 4R x 10336) + 4R x 6144 F32 output + 36 x 16 table.
+        assert_eq!(capture_ring_slots(false, 4), Some(8));
+        assert_eq!(capture_ring_slots(true, 4), Some(5));
+        assert_eq!(capture_ring_slots(compact_capture_ring(), 4), Some(5));
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::F32, 4),
-            Some(917_920_320)
+            Some(578_181_696)
         );
         // Q8 slots are 48 x 128 x 132 bytes, not 3 MiB of F32.
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 4),
-            Some(245_520_960)
+            Some(157_932_096)
         );
         assert_eq!(
             Qwen4State::row_capture_bytes(&config, GdnStateFormat::Q8, 1),
@@ -6730,22 +6734,22 @@ mod tests {
         // The global figures of `row_capture_bytes_charge_the_gdn_storage_dtype`.
         assert_eq!(
             Qwen4State::row_capture_bytes(&global, GdnStateFormat::F32, 4),
-            Some(917_920_320)
+            Some(578_181_696)
         );
         assert_eq!(
             Qwen4State::row_capture_bytes(&global, GdnStateFormat::Q8, 4),
-            Some(245_520_960)
+            Some(157_932_096)
         );
         for local in &locals {
-            // 36 x (2R ring slots + F32 inputs 4R x 5120 and recurrence 4R x 5168) + 4R x 3072
+            // 36 x ((R+1) ring slots + F32 inputs 4R x 5120 and recurrence 4R x 5168) + 4R x 3072
             // F32 output + 36 x 16 table; Q8 slots are 24 x 128 x 132 bytes.
             assert_eq!(
                 Qwen4State::row_capture_bytes(local, GdnStateFormat::F32, 4),
-                Some(458_960_448)
+                Some(289_091_136)
             );
             assert_eq!(
                 Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 4),
-                Some(122_760_768)
+                Some(78_966_336)
             );
             assert_eq!(
                 Qwen4State::row_capture_bytes(local, GdnStateFormat::Q8, 1),
@@ -6804,8 +6808,7 @@ mod tests {
                     let expected = if n < 2 || layers == 0 {
                         0
                     } else {
-                        let ring = 2
-                            * n
+                        let ring = capture_ring_slots(compact_capture_ring(), n).unwrap()
                             * format.state_bytes(
                                 config.linear_num_value_heads,
                                 config.linear_key_head_dim,

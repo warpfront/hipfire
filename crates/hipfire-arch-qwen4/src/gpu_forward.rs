@@ -9253,6 +9253,7 @@ impl<'a> LayerPhaseEnv<'a> {
             kernel_size: self.dims.ple_conv_kernel_dim,
             dilation: config.ple_conv_dilation(),
             epsilon: EPSILON,
+            lane_states: &[],
         });
         Ok((step, rows_f16))
     }

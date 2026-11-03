@@ -26,8 +26,8 @@ use rdna_compute::tensor_ops::{
     gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gate_wmma_qknormed,
     gated_delta_step_gated, hc_activation_fused_f32, hc_state_bf16_add_f32, hc_state_bf16_to_f32,
     hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_norm_gate_outputs, hyper_read_projected,
-    hyper_read_up_fused, hyper_read_up_wmma, hyper_write, hyper_write_norm,
-    indexed_attention_attention, indexed_attention_attention_batch_with_arena,
+    hyper_read_up_fused, hyper_read_up_fused_rotate, hyper_read_up_wmma, hyper_write,
+    hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch_with_arena,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
     indexed_attention_index_key_append_batch, indexed_attention_norm_rope_batch,
     indexed_attention_pool_rope_incremental, indexed_attention_reuse_selection,
@@ -47,7 +47,8 @@ use rdna_compute::tensor_ops::{
     gated_delta_step_gate_wmma_arena, gated_delta_step_gate_wmma_qknormed_arena,
     indexed_attention_cache_append_batch_arena, indexed_attention_index_key_append_batch_arena,
     indexed_attention_norm_rope_batch_arena, indexed_attention_rope_table, qsa_core_lanes,
-    Bf16Arena, GdnCoreLane, QsaCoreLane, QSA_CORE_LANES_MAX, QSA_CORE_LANE_ROWS,
+    qsa_lanes_fuse_enabled, Bf16Arena, GdnCoreLane, QsaCoreLane, QsaOutRotate, QSA_CORE_LANES_MAX,
+    QSA_CORE_LANE_ROWS,
 };
 use rdna_compute::{
     DType, Gpu, GpuTensor, TrunkFamily, QSA_NORM_EPI_HEAD_DIM, QSA_NORM_EPI_ROTARY_DIM,
@@ -1589,6 +1590,16 @@ fn execute_hyper_read_inner(
         if wmma_read {
             return hip(hyper_read_up_wmma(gpu, &read));
         }
+        // The next step rotates `mixed` into `rotated` first: the HC read tail writes that
+        // rotation too when its fused-rotate entry admits (the step's rotate then skips).
+        if let Some(rotated) = rotate_into.filter(|r| {
+            op.branches == 4 && op.hidden.is_multiple_of(256) && r.numel() >= op.rows * op.hidden
+        }) {
+            let rotated = view(rotated, 0, op.rows * op.hidden);
+            if hip(hyper_read_up_fused_rotate(gpu, &read, &rotated))? {
+                return Ok(());
+            }
+        }
         return hip(hyper_read_up_fused(gpu, &read));
     }
     project_weight(gpu, &op.input_mix_up, &low, &up, op.rows, Some(op.rotation))?;
@@ -2800,6 +2811,11 @@ pub fn execute_grouped_depthwise_rows(
     window: CoreWindow,
 ) -> Result<(), DispatchError> {
     window.within(op.rows)?;
+    if !op.lane_states.is_empty() {
+        return Err(DispatchError::Hip(
+            "lane-batched PLE has no row window".into(),
+        ));
+    }
     let CoreWindow { lo, rows } = window;
     let channels = op.branches * op.hidden;
     if channels % 2 != 0 || op.embed_dim % 2 != 0 {
@@ -2852,6 +2868,7 @@ pub fn execute_grouped_depthwise_rows(
         kernel_size: op.kernel_size,
         dilation: op.dilation,
         epsilon: op.epsilon,
+        lane_states: &[],
         rotation: op.rotation,
     };
     if window.lo == 0 && window.rows == op.rows {
@@ -2992,8 +3009,19 @@ pub fn execute_gated_delta_net_core_lanes(
         return Ok(false);
     };
     before_launch(gpu)?;
-    hip(plan.launch(gpu))?;
     gpu.scratch.prerotated = None;
+    // `HIPFIRE_QWEN4_GDN_LANES_FUSE`: the launch also rotates each lane's gated output
+    // for the batched output projection (rows = lanes, in lane order) and arms
+    // `prerotated` for it; otherwise it is the two incumbent launches and nothing is armed.
+    let rotation = ops
+        .iter()
+        .all(|op| {
+            rotation_basis(op.output.dtype) == Some(RotationBasis::Aligned256)
+                && op.output.k == value
+                && op.rotation.buf.as_ptr() == first.rotation.buf.as_ptr()
+        })
+        .then_some(first.rotation);
+    hip(plan.launch_rotated(gpu, rotation))?;
     Ok(true)
 }
 
@@ -4149,9 +4177,18 @@ pub fn execute_indexed_attention_uncovered(
 /// one by one. `before_launch` runs exactly once, after every refusal check
 /// and before the first launch; its error is returned as is and nothing
 /// launches.
+///
+/// `out_proj` is the op that runs right after the group (the layer's QSA
+/// OutProj phase), when the caller knows it: under
+/// `HIPFIRE_QWEN4_QSA_LANES_FUSE` (default off) the admitted one-row lanes run
+/// as two launches (prologue + pool + select, then attention + the output
+/// projection's FWHT rotation) instead of five, and the rotation lands in
+/// `out_proj`'s rotation scratch under the `scratch.prerotated` memo that its
+/// `rotate_x_mq_batched` consumes (see `execute_indexed_attention_hc_impl`).
 pub fn execute_indexed_attention_core_lanes(
     gpu: &mut Gpu,
     ops: &[&IndexedAttentionOp<'_>],
+    out_proj: Option<&IndexedAttentionOp<'_>>,
     before_launch: impl FnOnce(&mut Gpu) -> Result<(), DispatchError>,
 ) -> Result<bool, DispatchError> {
     if ops.len() < 2 || ops.len() > QSA_CORE_LANES_MAX || !gpu.flags.qwen4_qsa_lanes_enabled() {
@@ -4317,8 +4354,42 @@ pub fn execute_indexed_attention_core_lanes(
         return Ok(false);
     };
     before_launch(gpu)?;
-    hip(plan.launch(gpu))?;
-    gpu.scratch.prerotated = None;
+    if qsa_lanes_fuse_enabled() && plan.fusable() {
+        let q_width = ops[0].heads * ops[0].head_dim;
+        // The out-projection whose input rotation the fused attention writes: the
+        // same layer's OutProj over an Aligned256-basis F32 input (the
+        // `rotate_input` + `rotate_x_mq_batched` route), not an IU4 trunk member.
+        let rotate = out_proj
+            .filter(|o| {
+                o.phase == MixerPhase::OutProj
+                    && o.q_norm.buf.as_ptr() == ops[0].q_norm.buf.as_ptr()
+                    && o.output.k == q_width
+                    && rotation_basis(o.output.dtype) == Some(RotationBasis::Aligned256)
+                    && o.trunk_a4 & TrunkFamily::QsaO.bit() == 0
+                    && o.qsa_output.dtype == DType::F32
+                    && o.rotation.dtype == DType::F32
+                    && o.qsa_output.numel() >= o.rows * q_width
+                    && o.rotation.numel() >= o.rows * q_width
+            })
+            .map(|o| {
+                (
+                    view(o.qsa_output, 0, o.rows * q_width),
+                    view(o.rotation, 0, o.rows * q_width),
+                    o.rows,
+                )
+            });
+        let target = rotate.as_ref().map(|(x, x_rot, rows)| QsaOutRotate {
+            x,
+            x_rot,
+            rows: *rows,
+        });
+        if !hip(plan.launch_fused(gpu, target.as_ref()))? {
+            gpu.scratch.prerotated = None;
+        }
+    } else {
+        hip(plan.launch(gpu))?;
+        gpu.scratch.prerotated = None;
+    }
     Ok(true)
 }
 
@@ -4472,7 +4543,16 @@ fn execute_indexed_attention_hc_impl(
         return Ok(());
     }
     if phase == MixerPhase::OutProj {
-        return qsa_project_output(gpu, op, &qsa_output_batch, hc, fused);
+        let projected = qsa_project_output(gpu, op, &qsa_output_batch, hc, fused);
+        // A rotation the fused lane attention (`HIPFIRE_QWEN4_QSA_LANES_FUSE`) left for this
+        // projection's input lives only until this step ends.
+        if matches!(
+            gpu.scratch.prerotated,
+            Some((x, _, _)) if x == qsa_output_batch.buf.as_ptr() as usize
+        ) {
+            gpu.scratch.prerotated = None;
+        }
+        return projected;
     }
     // Admitted eager verify keeps full-width decode prologue/selection
     // arithmetic. Attention binds the actual singleton AR policy separately
@@ -4942,6 +5022,12 @@ pub struct GroupedDepthwiseOp<'a> {
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
     pub rotation: &'a GpuTensor,
+    /// Lane-batched form (`HIPFIRE_QWEN4_LANE_PLE_BATCH`): empty for the
+    /// ordinary single-stream step. Otherwise lane `i` is row `i` of every
+    /// row tensor (`rows == lane_states.len()`, one token per lane, contiguous
+    /// lane rows) with its own convolution state `lane_states[i]` (`state` is
+    /// then unused). Bitwise the per-lane steps in lane order.
+    pub lane_states: &'a [&'a GpuTensor],
 }
 
 impl GroupedDepthwiseOp<'_> {
@@ -5004,6 +5090,18 @@ impl GroupedDepthwiseOp<'_> {
         require_tensor(self.conv, conv_elements, DType::BF16, "grouped convolution")?;
         require_weight(&self.key, channels, self.embed_dim, "grouped key")?;
         require_weight(&self.value, self.hidden, self.embed_dim, "grouped value")?;
+        if !self.lane_states.is_empty() {
+            // Batched lanes: one token per lane, each with its own state.
+            if self.lane_states.len() != self.rows || self.state_bf16 || self.rows_f16 {
+                return Err(DispatchError::Hip(
+                    "lane-batched PLE needs one row per lane state, F32 streams and F32 rows"
+                        .into(),
+                ));
+            }
+            for state in self.lane_states {
+                require_tensor(state, state_elements, DType::F32, "grouped lane state")?;
+            }
+        }
         Ok(())
     }
 }
@@ -5012,6 +5110,9 @@ pub fn execute_grouped_depthwise(
     gpu: &mut Gpu,
     op: &GroupedDepthwiseOp<'_>,
 ) -> Result<(), DispatchError> {
+    if !op.lane_states.is_empty() {
+        return execute_grouped_depthwise_lanes(gpu, op);
+    }
     if op.rows_f16 && wide_exact_rows(gpu, op.rows) {
         return Err(DispatchError::Hip(
             "row-exact PLE requires the original F32 rows, not prefill F16 staging".into(),
@@ -5163,6 +5264,89 @@ pub fn execute_grouped_depthwise(
         ));
     }
     hip(gpu.add_f32(&streams, &output, &streams))
+}
+
+/// Whether `lanes` one-row AR lanes' PLE chains may run as the batched form of
+/// [`GroupedDepthwiseOp::lane_states`]: exact gfx1201 with
+/// `HIPFIRE_QWEN4_LANE_PLE_BATCH`, BF16 key / value weights on the few-row
+/// SIMT rows route (`gemv_bf16_xf32_x4_rows`, each output row bitwise the
+/// one-row `gemv_bf16_xf32`), and `2..=PLE_LANES_MAX` lanes. Both launches go
+/// through the ordinary launch path (the tail's by-value lane table rides in
+/// the retained kernarg blob), so a recorder or capture needs no exclusion.
+pub fn grouped_depthwise_lanes_admitted(
+    gpu: &Gpu,
+    key: &WeightRef<'_>,
+    value: &WeightRef<'_>,
+    lanes: usize,
+) -> bool {
+    gpu.flags.qwen4_lane_ple_batch_enabled()
+        && gpu.arch == "gfx1201"
+        && gpu.arch_caps.has_gfx11_plus_simt()
+        && key.dtype == DType::BF16
+        && value.dtype == DType::BF16
+        && (2..=rdna_compute::ple_lanes::PLE_LANES_MAX).contains(&lanes)
+        && lanes <= gpu.few_row_limit()
+        && gpu.route_rows(lanes) == lanes
+}
+
+/// The batched PLE chain of [`GroupedDepthwiseOp::lane_states`]: the key and
+/// value projections once over the lanes' rows (the few-row rows route, each
+/// output row bitwise the one-row GEMV) and one `ple_lanes_tail_f32` launch for
+/// every lane's gate / norm / convolution / stream add. 2 + 1 launches instead
+/// of 7 per lane.
+fn execute_grouped_depthwise_lanes(
+    gpu: &mut Gpu,
+    op: &GroupedDepthwiseOp<'_>,
+) -> Result<(), DispatchError> {
+    let lanes = op.lane_states.len();
+    if lanes != op.rows
+        || op.state_bf16
+        || op.rows_f16
+        || !grouped_depthwise_lanes_admitted(gpu, &op.key, &op.value, lanes)
+    {
+        return Err(DispatchError::Hip(
+            "lane-batched PLE is not admitted for this operation".into(),
+        ));
+    }
+    let channels = op.branches * op.hidden;
+    let streams = view(op.streams, 0, op.rows * channels);
+    let key = view(op.key_scratch, 0, op.rows * channels);
+    let value = view(op.value_scratch, 0, op.rows * op.hidden);
+    let normed = view(op.normed, 0, op.rows * channels);
+    project_weight(
+        gpu,
+        &op.key,
+        op.rows_tensor,
+        &key,
+        op.rows,
+        Some(op.rotation),
+    )?;
+    project_weight(
+        gpu,
+        &op.value,
+        op.rows_tensor,
+        &value,
+        op.rows,
+        Some(op.rotation),
+    )?;
+    hip(
+        gpu.ple_lanes_tail_f32(&rdna_compute::ple_lanes::PleLanesTail {
+            key: &key,
+            streams: &streams,
+            value: &value,
+            key_norm: op.norm_key,
+            query_norm: op.norm_query,
+            conv_norm: op.norm_conv,
+            conv_weight: op.conv,
+            normed: &normed,
+            states: op.lane_states,
+            groups: op.branches,
+            group_size: op.hidden,
+            kernel_size: op.kernel_size,
+            dilation: op.dilation,
+            epsilon: op.epsilon,
+        }),
+    )
 }
 
 /// Clear an F32 scratch prefix before a sealed routed execution.
@@ -6476,6 +6660,7 @@ mod tests {
             dilation: 1,
             epsilon: 1e-6,
             rotation: &rotation,
+            lane_states: &[],
         };
         assert!(op().validate_layout().is_ok());
 

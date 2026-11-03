@@ -8938,10 +8938,20 @@ mod tests {
                     let (gdn_layers, _) = crate::state::scope_layer_counts(&config, &scope);
                     let q8 = census(crate::GdnStateFormat::Q8, &scope);
                     let f32 = census(crate::GdnStateFormat::F32, &scope);
-                    // The band's own 2R ring slots per local GDN layer.
+                    // The band's own ring slots (R + 1, or 2R with the kill
+                    // switch) per local GDN layer.
+                    assert_eq!(
+                        crate::state::capture_ring_slots(false, ring),
+                        Some(2 * ring)
+                    );
+                    let slots = crate::state::capture_ring_slots(
+                        crate::state::compact_capture_ring(),
+                        ring,
+                    )
+                    .unwrap();
                     assert_eq!(
                         f32.row_capture - q8.row_capture,
-                        gdn_layers as u64 * 2 * ring as u64 * GDN_SLOT_DELTA,
+                        gdn_layers as u64 * slots as u64 * GDN_SLOT_DELTA,
                         "{counts:?} {:?} R={ring}",
                         scope.band
                     );

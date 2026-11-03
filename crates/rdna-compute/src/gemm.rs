@@ -50603,6 +50603,26 @@ impl Gpu {
             );
         }
         if self.arch_caps.has_gfx11_plus_simt() && m == 1280 && k == 2560 {
+            // HIPFIRE_QWEN4_MOE32_GU: wide-pass g32 family, exact gfx1201, shipped layout, > 8 rows.
+            // 9..=48 rows only: the g32 win is measured at 9-48 rows (rows 49..511 unmeasured).
+            if self.moe32_gu != 0
+                && x_src_rows > 8
+                && x_src_rows <= 48
+                && self.arch_caps.is_gfx1201()
+            {
+                return self.gemm_mq4g256v2_moe_grouped_top10_g32_gfx1201(
+                    expert_weight_ptrs,
+                    expert_tile_ids,
+                    sorted_slot_index,
+                    x_src,
+                    y_grouped,
+                    m,
+                    k,
+                    x_row_div,
+                    grouped_rows,
+                    x_src_rows,
+                );
+            }
             if qwen4_moe_gateup_twin_applies(
                 *QWEN4_MOE_GATEUP_TWIN,
                 self.arch_caps.is_gfx1151(),
@@ -50729,6 +50749,123 @@ impl Gpu {
                 1,
             ],
             [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(mv);
+                b.push_i32(kv);
+                b.push_i32(rd);
+                b.push_i32(gr);
+                b.push_i32(ne);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1201 wide-pass gate/up `g32` family (`HIPFIRE_QWEN4_MOE32_GU`, shipped or drop-zero planar
+    /// layout; mode 2 selects the `_nodz` entries): bit-identical to
+    /// [`Self::gemm_mq4g256v2_moe_grouped_top10_o4_r8_x4_gfx1151`] (same ABI), one 256-thread block per
+    /// 16-slot tile x 32 output rows (grid `[M / 32, ceil(grouped_rows / 16)]`); `g32_r8` for more
+    /// than 16 source rows, `g32_r4` for 9..=16.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g256v2_moe_grouped_top10_g32_gfx1201(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        grouped_rows: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let planar = self.mq4_experts_planar;
+        let (module, src, func): (&'static str, &'static str, &'static str) =
+            match (planar, x_src_rows > 16, self.moe32_gu == 2) {
+                (false, true, false) => (
+                    "gemm_mq4g256v2_moe_grouped_top10_g32",
+                    kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                    "gemm_mq4g256v2_moe_grouped_top10_g32_r8",
+                ),
+                (false, false, false) => (
+                    "gemm_mq4g256v2_moe_grouped_top10_g32",
+                    kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                    "gemm_mq4g256v2_moe_grouped_top10_g32_r4",
+                ),
+                (false, true, true) => (
+                    "gemm_mq4g256v2_moe_grouped_top10_g32",
+                    kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                    "gemm_mq4g256v2_moe_grouped_top10_g32_r8_nodz",
+                ),
+                (false, false, true) => (
+                    "gemm_mq4g256v2_moe_grouped_top10_g32",
+                    kernels::GEMM_MQ4G256V2_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                    "gemm_mq4g256v2_moe_grouped_top10_g32_r4_nodz",
+                ),
+                (true, true, false) => (
+                    "gemm_mq4g256v2p_moe_grouped_top10_g32",
+                    kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                    "gemm_mq4g256v2p_moe_grouped_top10_g32_r8",
+                ),
+                (true, false, false) => (
+                    "gemm_mq4g256v2p_moe_grouped_top10_g32",
+                    kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                    "gemm_mq4g256v2p_moe_grouped_top10_g32_r4",
+                ),
+                (true, true, true) => (
+                    "gemm_mq4g256v2p_moe_grouped_top10_g32",
+                    kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                    "gemm_mq4g256v2p_moe_grouped_top10_g32_r8_nodz",
+                ),
+                (true, false, true) => (
+                    "gemm_mq4g256v2p_moe_grouped_top10_g32",
+                    kernels::GEMM_MQ4G256V2P_MOE_GROUPED_TOP10_G32_GFX1201_SRC,
+                    "gemm_mq4g256v2p_moe_grouped_top10_g32_r4_nodz",
+                ),
+            };
+        self.ensure_kernel(module, src, func)?;
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_src.buf.as_ptr();
+        let yp = y_grouped.buf.as_ptr();
+        let mv = m as i32;
+        let kv = k as i32;
+        let rd = x_row_div as i32;
+        let gr = grouped_rows as i32;
+        let ne = moe_expert_table_len(expert_weight_ptrs);
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &mv as *const _ as *mut c_void,
+            &kv as *const _ as *mut c_void,
+            &rd as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &ne as *const _ as *mut c_void,
+        ];
+        let bytes =
+            grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
+        let result = self.launch_maybe_blob(
+            func,
+            [(m / 32) as u32, grouped_rows.div_ceil(16) as u32, 1],
+            [256, 1, 1],
             0,
             &mut params,
             || {
@@ -52515,6 +52652,18 @@ impl Gpu {
     /// Whether [`Gpu::set_mq4_experts_planar`] is in force.
     pub fn mq4_experts_planar(&self) -> bool {
         self.mq4_experts_planar
+    }
+
+    /// Override `HIPFIRE_QWEN4_MOE32_GU` for this device (the byte oracle toggles it in one process).
+    /// `0` off, `1` the byte-equal `g32` family, `2` the `_nodz` entries (no dead-slot zero stores;
+    /// live rows byte-equal, which is all the unscatter reads).
+    pub fn set_moe32_gu(&mut self, mode: u8) {
+        self.moe32_gu = mode.min(2);
+    }
+
+    /// The wide-pass `g32` gate/up mode (see [`Gpu::set_moe32_gu`]).
+    pub fn moe32_gu(&self) -> u8 {
+        self.moe32_gu
     }
 
     /// Refuse a launcher that has no drop-zero planar twin while the device is bound to the

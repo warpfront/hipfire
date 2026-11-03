@@ -10739,6 +10739,18 @@ pub mod memory {
         raw.map(str::trim) != Some("0")
     }
 
+    /// Developer kill switch `HIPFIRE_EP_SHARE_HOST` for sharing one pinned host copy of a
+    /// replicated host-mapped weight (the EP embedding table) between the ranks of one
+    /// process. Default on; exactly `0` pins one private copy per rank as before.
+    pub fn ep_share_host() -> bool {
+        parse_ep_share_host(process_value("HIPFIRE_EP_SHARE_HOST").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_share_host`]: only a trimmed `0` is off.
+    pub fn parse_ep_share_host(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
+    }
+
     /// Developer `HIPFIRE_LOAD_WEIGHT_DIGEST=<path>`: when set and not blank,
     /// the Qwen4 loader appends one JSONL record per fulfilled weight
     /// (`name`, `layer`, `residency`, `dtype`, `logical_bytes`, `sha256` of the

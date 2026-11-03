@@ -10,6 +10,14 @@ use crate::dispatch::{DType, Gpu, GpuTensor};
 use crate::kernels;
 use hip_bridge::HipResult;
 
+/// `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` (developer, default off): the sealed grouped MoE route
+/// stage of a 1..=8 row exact-gfx1201 call runs the E512/top-10 router and the grouped scatter
+/// as one launch ([`Gpu::moe_route_scatter_top10_f32`]); the scatter stage then launches
+/// nothing. Read once.
+static QWEN4_MOE_ROUTE_SCATTER: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_ROUTE_SCATTER", true)
+});
+
 /// The shared expert's BF16 activation carried by a fused MoE launch: the
 /// operands of [`Gpu::shared_expert_activation_bf16_f32`].
 pub struct SharedExpertActivation<'a> {
@@ -2573,6 +2581,133 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// The fused route + scatter launch ([`Gpu::moe_route_scatter_top10_f32`]) is admitted for
+    /// this call: `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER` set, exact gfx1201, the block-wide-scan
+    /// scatter (not the `HIPFIRE_QWEN4_MOE_SCATTER_SCAN=0` serial walk), eager launch (not
+    /// recording a replay, not capturing a graph), 1..=8 rows (one router workgroup) and the
+    /// fixed E512/top-10 grammar. Pure: reads flags and device state only.
+    pub fn moe_route_scatter_top10_admitted(
+        &self,
+        tokens: usize,
+        n_experts: usize,
+        k_top: usize,
+    ) -> bool {
+        *QWEN4_MOE_ROUTE_SCATTER
+            && self.arch_caps.is_gfx1201()
+            && !self.flags.qwen4_moe_scatter_serial_walk()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && (1..=8).contains(&tokens)
+            && n_experts == 512
+            && k_top == 10
+    }
+
+    /// Qwen4's E512/top-10 router and grouped scatter as ONE launch (single CTA of 256
+    /// threads: wave `w` routes token `w`, a workgroup barrier, then the scatter body over the
+    /// `tokens * 10` slots). Outputs are byte for byte those of
+    /// [`Gpu::moe_router_softmax_top10_f32`] followed by [`Gpu::moe_scatter_fused_top10`]
+    /// (`topk_idx`, `topk_w`, the five scatter tables, the router fault word); the router arm
+    /// is `moe_router_softmax_top10_f32_fast`'s. Returns `Ok(false)` and launches nothing when
+    /// [`Gpu::moe_route_scatter_top10_admitted`] is false: the caller runs the two-launch chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_route_scatter_top10_f32(
+        &mut self,
+        logits: &GpuTensor,
+        topk_idx: &GpuTensor,
+        topk_w: &GpuTensor,
+        tokens: usize,
+        normalize_topk_prob: bool,
+        round_logits: bool,
+        layer: usize,
+        row_base: usize,
+        expert_token_counts: &GpuTensor,
+        expert_offsets: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        n_experts: usize,
+        k_top: usize,
+        grouped_rows: usize,
+        block_m: usize,
+    ) -> HipResult<bool> {
+        if !self.moe_route_scatter_top10_admitted(tokens, n_experts, k_top) {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let func = "moe_route_scatter_top10_f32";
+        self.ensure_kernel(func, kernels::MOE_ROUTE_SCATTER_TOP10_F32_SRC, func)?;
+        let lp = logits.buf.as_ptr();
+        let ip = topk_idx.buf.as_ptr();
+        let wp = topk_w.buf.as_ptr();
+        let norm = i32::from(normalize_topk_prob);
+        let round = i32::from(round_logits);
+        let token_count = tokens as i32;
+        // Same fault word and (layer, row_base) stamping as the router launcher.
+        let fault = self.router_fault_ptr();
+        let layer_arg = layer as i32;
+        let row_base_arg = row_base as i32;
+        let cp = expert_token_counts.buf.as_ptr();
+        let op = expert_offsets.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let invp = inverse_perm.buf.as_ptr();
+        let gr = grouped_rows as i32;
+        let bm = block_m as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &lp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &norm as *const _ as *mut c_void,
+            &round as *const _ as *mut c_void,
+            &token_count as *const _ as *mut c_void,
+            &fault as *const _ as *mut c_void,
+            &layer_arg as *const _ as *mut c_void,
+            &row_base_arg as *const _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &invp as *const _ as *mut c_void,
+            &gr as *const _ as *mut c_void,
+            &bm as *const _ as *mut c_void,
+        ];
+        // Scatter's dynamic histogram LDS (512 ints); the router rows are static LDS.
+        let lds_bytes = (n_experts * 4) as u32;
+        let bytes = (tokens * 512
+            + tokens * 10 * 2
+            + tokens * 10
+            + 2 * n_experts
+            + 2 * tokens * 10
+            + n_experts)
+            * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", func, bytes);
+        let result =
+            self.launch_maybe_blob(func, [1, 1, 1], [256, 1, 1], lds_bytes, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(norm);
+                b.push_i32(round);
+                b.push_i32(token_count);
+                b.push_ptr(fault as *const c_void);
+                b.push_i32(layer_arg);
+                b.push_i32(row_base_arg);
+                b.push_ptr(cp);
+                b.push_ptr(op);
+                b.push_ptr(sp);
+                b.push_ptr(tp);
+                b.push_ptr(invp);
+                b.push_i32(gr);
+                b.push_i32(bm);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
     }
 
     /// Qwen4's independent top-10 gate/up unscatter entry.  The underlying

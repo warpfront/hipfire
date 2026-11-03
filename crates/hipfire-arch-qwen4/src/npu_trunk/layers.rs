@@ -87,6 +87,7 @@ pub(super) fn build_program<'a>(
                 kernel_size: dims.ple_conv_kernel_dim,
                 dilation: config.ple_conv_dilation(),
                 epsilon: EPSILON,
+                lane_states: &[],
             }));
         }
 

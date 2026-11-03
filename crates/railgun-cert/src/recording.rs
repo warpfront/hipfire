@@ -1371,10 +1371,10 @@ pub const DECISIONS: &[Decision] = &[
         predicates: &[IsRecording, CaptureMode],
         condition: "qsa_core_lanes_min (qsa_core_lanes.rs): 2..=QSA_CORE_LANES_MAX consecutive QSA Core steps (fp8 K/V, BF16 index keys, 1..=8 rows per lane, fused LDS-resident select below QSA_BF16_SPLIT_MIN_BLOCKS, per-head attention), HIPFIRE_QWEN4_QSA_LANES (exact gfx1201, default on, 0 kills) and `!is_recording() && !capture_mode`",
         effect: KernelSelection,
-        switches: "eager lane step: qsa_lanes (indexed_attention_decode_prologue_fp8_lanes, indexed_attention_pool_rope_bf16_lanes, indexed_attention_select_bf16_lanes, indexed_attention_attention_fp8_lanes), one launch per kernel for every lane; recorded or captured: the per-lane incumbent launches",
+        switches: "eager lane step: qsa_lanes (indexed_attention_decode_prologue_fp8_lanes, indexed_attention_pool_rope_bf16_lanes, indexed_attention_select_bf16_lanes, indexed_attention_attention_fp8_lanes), one launch per kernel for every lane; with HIPFIRE_QWEN4_QSA_LANES_FUSE (developer, default off) and one row per lane, qsa_lanes_fuse (indexed_attention_core_fused_fp8_lanes = prologue + pool + select, indexed_attention_attention_rot_fp8_lanes = attention + the out-projection's mq_rotate_x) instead of those four and the rotation; recorded or captured: the per-lane incumbent launches",
         kernels: &["indexed_attention_decode_prologue_fp8", "indexed_attention_pool_rope_bf16", "indexed_attention_select_bf16_batched", "indexed_attention_attention_fp8_batched"],
         verdict: ByteExact,
-        evidence: "by construction: the lane kernels call the incumbent device templates (qsa_decode_prologue, qsa_pool_rope, qsa_select_batched, qsa_attention_row_parallel) on lane-derived pointers, positions and rows; the GPU byte oracle rdna-compute examples/qsa_lanes_oracle (per-lane singleton launches vs the grouped launches, N = 1..8 lanes, rows 1..8, cross-block-boundary and budget-saturating contexts, negative controls) PASSED on gfx1201 (126/126 cases, 3 controls detected, mgmtp/gdnbatch/runs/oracle-k1-qsa), and the EP2 mq4 / PP2 mq3 A/B text md5s are identical",
+        evidence: "by construction: the lane kernels call the incumbent device templates (qsa_decode_prologue, qsa_pool_rope, qsa_select_batched, qsa_attention_row_parallel) on lane-derived pointers, positions and rows; the GPU byte oracle rdna-compute examples/qsa_lanes_oracle (per-lane singleton launches vs the grouped launches, N = 1..8 lanes, rows 1..8, cross-block-boundary and budget-saturating contexts, negative controls) PASSED on gfx1201 (126/126 cases, 3 controls detected, mgmtp/gdnbatch/runs/oracle-k1-qsa), and the EP2 mq4 / PP2 mq3 A/B text md5s are identical. The fused route (qsa_core_lanes.rs launch_fused, default off) rebuilds the pool's newest raw key from the index row and runs the incumbent select in the same workgroup, and rotates each attention head's output as mq_rotate_x does: `qsa_lanes_oracle --fuse` PASSED on gfx1201 (156/156 cases at 24 query heads, 15/15 at 12, 4 controls detected; mgmtp/hcqsa-runs/oracle3, oracle3h12)",
         reaches: &[],
     },
     Decision {
@@ -1463,7 +1463,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-flash-next-gfx1201-eager-fusions",
         predicates: &[IsRecording, CaptureMode],
-        condition: "Fn10k exact-gfx1201 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_MIN_ROWS), Gpu::qwen4_moe_front_fuse_applies (HIPFIRE_QWEN4_MOE_FRONT_FUSE, gemm.rs: symmetric IU4 descriptor present), Gpu::hc_row_fold_gfx1201_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs: hidden 2560, rows >= 16, 16-byte aligned streams/mixed), hc_up_v2_selected (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: low_rank 320, rows >= HC_UP_V2_MIN_ROWS) and its sole caller hyper_read_up_wmma_launch, which feeds the recorder/capture state into it for the Auto select (the Forced test route skips the gates)",
+        condition: "Fn10k exact-gfx1201 prefill fusions taken only with `!is_recording() && !capture_mode`: hc_down_fused_selected / Gpu::qwen4_hc_down_fused_applies (HIPFIRE_QWEN4_HC_DOWN_FUSED, gemm.rs: m 320, k 10240, route rows >= HC_DOWN_FUSED_MIN_ROWS), Gpu::qwen4_moe_front_fuse_applies (HIPFIRE_QWEN4_MOE_FRONT_FUSE, gemm.rs: symmetric IU4 descriptor present), Gpu::hc_row_fold_gfx1201_applies (HIPFIRE_QWEN4_HC_ROW_FOLD, hc_row_fold.rs: hidden 2560, rows >= 16, 16-byte aligned streams/mixed), hc_up_v2_selected (HIPFIRE_QWEN4_HC_UP_V2, tensor_ops.rs: low_rank 320, rows >= HC_UP_V2_MIN_ROWS) and its sole caller hyper_read_up_wmma_launch, which feeds the recorder/capture state into it for the Auto select (the Forced test route skips the gates); default-on byte-identical decode fusions (`=0` kills each) admitted with the same `!is_recording() && !capture_mode`: moe_route_scatter_top10_admitted (HIPFIRE_QWEN4_MOE_ROUTE_SCATTER, moe.rs: 1..=8 rows), the MoE shared-down combine epilogue `applies` (HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE, tensor_ops.rs: 1..=8 rows) and hyper_read_up_fused_rotate (HIPFIRE_QWEN4_HC_UP_ROT, tensor_ops.rs: 2..=8 rows, low_rank 320); recorded/captured: the unfused launches",
         effect: KernelSelection,
         switches: "eager: split-K HC-down GEMM + hc_activation_fused_f32 replaced by one fused launch; mq_rotate_x + convert_f32_to_f16 + mq_rotate_x_i4 replaced by the MoE front producer; HC write/norm/gate chains replaced by the row folds; the retiled _t128 HC up+mix replaced by the persistent _v2 entry; recorded/captured: the incumbent unfused launches (for HC up, the _t128 chain)",
         kernels: &[],
@@ -3820,6 +3820,24 @@ pub const SITES: &[Site] = &[
         function: "qsa_gathered_wmma_applies",
         occurrences: 2,
         decisions: &["qwen4-f16-wmma-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/moe.rs",
+        function: "moe_route_scatter_top10_admitted",
+        occurrences: 2,
+        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "applies",
+        occurrences: 2,
+        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
+    },
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "hyper_read_up_fused_rotate",
+        occurrences: 2,
+        decisions: &["qwen4-flash-next-gfx1201-eager-fusions"],
     },
     Site {
         file: "rdna-compute/src/tensor_ops.rs",

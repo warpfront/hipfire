@@ -345,6 +345,13 @@ pub(super) struct MoeStepState<'a> {
     /// `HIPFIRE_QWEN4_HC_ROW_FOLD`: the shared down ran the whole tail as the
     /// HC row fold, including the next HC read's norm.
     hc_row_folded: Cell<bool>,
+    /// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the combine stage deferred its launch to the shared
+    /// down stage's `moe_shared_down_combine_rows` (taken by that stage).
+    combine_deferred: Cell<bool>,
+    /// The call runs its whole lowered program through [`execute`] / [`execute_after_clear`]
+    /// (the only entries that run a `Combine` followed by its `SharedDown` in one state), so a
+    /// deferred combine is always consumed; direct stage entries leave it unset.
+    epilogue_fuse_allowed: Cell<bool>,
     /// Where this invocation is in the split transaction (never read when the
     /// call is not in the split mode).
     split_phase: Cell<SplitPhase>,
@@ -370,6 +377,13 @@ pub(super) struct MoeStepState<'a> {
     /// The normalize stage skipped the plain norm because the gate-side launch
     /// recomputes it ([`a3b_norm_fold_admitted`]).
     norm_fold_active: Cell<bool>,
+    /// `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`: the lowering placed `Scatter` immediately after `Route`
+    /// (no `OwnerAssign`, no CPU split / deferral), so the route stage may run the router and the
+    /// scatter as one launch.
+    route_scatter_allowed: Cell<bool>,
+    /// The route stage ran the fused router + scatter launch; the next `Scatter` stage launches
+    /// nothing (and clears this).
+    route_scatter_done: Cell<bool>,
 }
 
 /// A call abandoned between `Combine` (which queued the CP wait) and `JoinSplit`
@@ -444,6 +458,8 @@ impl<'a> MoeStepState<'a> {
             hc_write: RefCell::new(None),
             hc_folded: Cell::new(false),
             hc_row_folded: Cell::new(false),
+            combine_deferred: Cell::new(false),
+            epilogue_fuse_allowed: Cell::new(false),
             split_phase: Cell::new(SplitPhase::Idle),
             split_reference: Cell::new(false),
             expert_iu4: OnceCell::new(),
@@ -451,11 +467,49 @@ impl<'a> MoeStepState<'a> {
             front_allowed: Cell::new(false),
             front: RefCell::new(None),
             norm_fold_active: Cell::new(false),
+            route_scatter_allowed: Cell::new(false),
+            route_scatter_done: Cell::new(false),
         }
     }
 
     fn dispatch_ctx(&self) -> &DispatchCtx {
         self.call.dispatch_ctx()
+    }
+
+    /// `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: whether this call's combine rides its shared down
+    /// ([`super::qt44_qt53_prefill::epilogue_fuse_applies`]) -- only for the plain lowering
+    /// whose `Combine` is followed by the `SharedDown` that consumes the deferral: no CPU split
+    /// or deferred experts (their combine / splice order differs), no tile exchange, and no
+    /// HC write or absorbed target fill already offered to those stages.
+    fn epilogue_fuse_admitted(
+        &self,
+        gpu: &Gpu,
+        params: &MoePrefillParams<'_>,
+        selection: &MoePrefillSelection,
+    ) -> bool {
+        self.epilogue_fuse_allowed.get()
+            && !selection.cpu_split
+            && !selection.cpu_deferred_experts
+            && params.ep_tile_exchange.is_none()
+            && self.hc_write.borrow().is_none()
+            && !self.initial_zero.get()
+            && super::qt44_qt53_prefill::epilogue_fuse_applies(
+                gpu,
+                params,
+                selection.uses_grouped_rows(),
+            )
+    }
+
+    /// A deferred combine whose shared down never ran its launch would leave the target
+    /// uncombined: fail the call loudly.
+    fn require_epilogue_consumed(&self) -> Result<(), DispatchError> {
+        if self.combine_deferred.get() {
+            return Err(DispatchError::Hip(
+                "sealed moe: the combine was deferred to the shared down but its launch never ran"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     fn decode_parts(&self) -> Result<(&MoeParams<'_>, &MoeDecodeSelection), DispatchError> {
@@ -1278,13 +1332,31 @@ impl<'a> SealedMoeOp<'a> {
                         "sealed moe: route producer ran twice in one invocation".into(),
                     ));
                 }
-                let (params, _) = self.state.prefill_parts()?;
+                let (params, selection) = self.state.prefill_parts()?;
                 let scores = params.prelude.router_scores;
+                // The fused router + scatter launch: only when the lowering put `Scatter` right
+                // after this stage and the scatter stage would launch the plain grouped scatter.
+                let fuse = (self.state.route_scatter_allowed.get()
+                    && selection.uses_grouped_rows()
+                    && selection
+                        .route
+                        .is_some_and(MoeRouteCapability::is_sealed_grouped)
+                    && gpu.moe_route_scatter_top10_admitted(
+                        params.batch_size,
+                        params.n_exp,
+                        params.k_top,
+                    )
+                    && super::qt44_qt53_prefill::scatter_fusable(gpu, params))
+                .then(|| super::sealed_moe::RouteScatterFuse {
+                    grouped_rows: selection.path2_m_total,
+                    launched: &self.state.route_scatter_done,
+                });
                 let receipt = super::sealed_moe::produce_prefill_route(
                     self.state.call,
                     gpu,
                     scores,
                     params.prelude.norm_topk_prob,
+                    fuse,
                 )?;
                 self.state.call.validate_route_receipt(&receipt)?;
                 if let super::sealed_moe::PrefillRouteMode::ProduceRoot { slot } =
@@ -1507,6 +1579,15 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: this call's combine was deferred by the
+            // combine stage; the one launch does combine, shared-down rows and shared fold.
+            if self.state.combine_deferred.replace(false) {
+                return super::qt44_qt53_prefill::shared_down_combined(
+                    gpu,
+                    params,
+                    selection.uses_grouped_rows(),
+                );
+            }
             // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 3): the paired HC write rides the
             // shared down's GEMM epilogue when this call admits it.
             if let Some(hc) = self.state.hc_write.take() {
@@ -1550,6 +1631,10 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // The route stage already ran the scatter in its fused launch.
+            if self.state.route_scatter_done.replace(false) {
+                return Ok(());
+            }
             return super::qt44_qt53_prefill::scatter(gpu, params, selection.path2_m_total);
         }
         super::prefill_scatter_stage(gpu, params, selection.path2_m_total)
@@ -1823,6 +1908,17 @@ impl<'a> SealedMoeOp<'a> {
             .route
             .is_some_and(MoeRouteCapability::is_sealed_grouped)
         {
+            // `HIPFIRE_QWEN4_MOE_EPILOGUE_FUSE`: the shared down stage's one launch combines
+            // the ten expanded rows itself; only the scratch preflight is owed here.
+            if self.state.epilogue_fuse_admitted(gpu, params, selection) {
+                self.state.combine_deferred.set(true);
+                return super::qt44_qt53_prefill::combine_deferred(
+                    gpu,
+                    params,
+                    selection.uses_grouped_rows(),
+                    selection.path2_m_total,
+                );
+            }
             // The row fold combines inside its own kernel; only the rank order
             // is owed here, and the absorbed target fill is not (the shared
             // down's rows overwrite the target).
@@ -2645,12 +2741,21 @@ fn lower_prefill<'a>(
         append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
         // Balanced EP ownership: right after the route wrote the ids, before
         // the scatter and every routed-table reader.
-        if params
+        let owner_assign = params
             .ep_row_gather
-            .is_some_and(|gather| gather.assigns_owners(params.ep_layer_idx))
-        {
+            .is_some_and(|gather| gather.assigns_owners(params.ep_layer_idx));
+        if owner_assign {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::OwnerAssign))?;
         }
+        // `HIPFIRE_QWEN4_MOE_ROUTE_SCATTER`: only the lowering whose very next routed stage is
+        // `Scatter` (no owner assignment, no CPU split / deferral) lets the route stage launch
+        // the scatter with the router.
+        state.route_scatter_allowed.set(
+            !owner_assign
+                && !selection.cpu_split
+                && !selection.cpu_deferred_experts
+                && selection.uses_grouped_rows(),
+        );
         if selection.cpu_split {
             // Distinct eager CPU-cold/GPU-hot split. The original route feeds
             // the unchanged canonical combine and the shared expert; only the
@@ -2840,11 +2945,13 @@ pub(super) fn execute(gpu: &mut Gpu, call: &SealedMoeCall<'_>) -> Result<(), Dis
     // borrow only this invocation and are dropped before the call returns.
     let state = MoeStepState::new(call);
     state.front_allowed.set(true);
+    state.epilogue_fuse_allowed.set(true);
     let steps = match call.protocol() {
         MoeProtocol::IndexedDecode => lower_decode(&state)?,
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
-    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)
+    super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)?;
+    state.require_epilogue_consumed()
 }
 
 /// The stages of the S1 layer-major PREPARE half of a sealed grouped prefill, in
@@ -3114,6 +3221,7 @@ pub(super) fn execute_after_clear(
 ) -> Result<AfterClear, DispatchError> {
     let state = MoeStepState::new(call);
     state.front_allowed.set(true);
+    state.epilogue_fuse_allowed.set(true);
     let absorbed = state.absorbs_clear(gpu, clear);
     if !absorbed {
         super::layer_ops::execute_clear(gpu, clear)?;
@@ -3147,6 +3255,7 @@ pub(super) fn execute_after_clear(
         MoeProtocol::GroupedPrefill => lower_prefill(&state)?,
     };
     super::steps::execute_validated_steps(gpu, call.dispatch_ctx(), &steps)?;
+    state.require_epilogue_consumed()?;
     if state.initial_zero.get() {
         return Err(DispatchError::Hip(
             "sealed moe: the absorbed target clear was not consumed by the combine".into(),

@@ -107,6 +107,10 @@ name = "lane_q8_rows_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "ple_lanes_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "fn_prefill_g0"
 required-features = ["lab"]
 

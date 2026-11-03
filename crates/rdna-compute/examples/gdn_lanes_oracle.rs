@@ -46,8 +46,22 @@
 //! pointer mismatches, and the flag off; `Some` for admitted 2 and 8 lane
 //! sets).
 //!
+//! `--fuse` (`HIPFIRE_QWEN4_GDN_LANES_FUSE`): the candidate is `GdnCoreLanesPlan::launch_rotated`
+//! (`gated_delta_step_gate_norm128_q8_lanes_fuse`: the conv + gate-parameter launch as the
+//! step block's prologue, the output projection's `mq_rotate_x` as its epilogue, ONE launch per
+//! step). It is compared against the same per-lane singleton reference, and in addition: the
+//! rotated rows written into the batched rotation scratch (lane slot s = row s) must equal a real
+//! `rotate_x_mq_batched` of the lanes' gated outputs and (cases with the rotation arm) the
+//! singleton's decode rotation, the next matching `rotate_x_mq_batched` must skip (the armed
+//! `prerotated` claim: no launch), the arrival counters must be back to zero after every step,
+//! variant `same_pos` runs the prologue-only form (no rotation: rotated rows stay sentinel, no
+//! claim), and a flag-off probe asserts `launch_rotated` is the two incumbent launches and
+//! rotates nothing. `--bench ITERS` (implies `--fuse`; run it as a timing job): wall time per
+//! Core + rotation of the incumbent chain against the fused launch, then exit.
+//!
 //! `cargo run --release -p rdna-compute --features lab --example gdn_lanes_oracle --
-//!    [--out DIR] [--steps S] [--lanes 1,2,3,4,8] [--seed U64] [--skip-controls]`
+//!    [--out DIR] [--steps S] [--lanes 1,2,3,4,8] [--seed U64] [--skip-controls] [--fuse]
+//!    [--bench ITERS]`
 //!
 //! Prints one line per case / control / probe, a final `gdn_lanes_oracle:
 //! PASS|FAIL` line and a JSON summary (stdout, and `DIR/summary.json` with
@@ -601,6 +615,17 @@ impl Control {
     }
 }
 
+/// Which lanes launch the candidate takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fuse {
+    /// The two incumbent launches (`GdnCoreLanesPlan::launch`).
+    Off,
+    /// `launch_rotated` with a rotation scratch: one launch, rotated rows written, claim armed.
+    Rot,
+    /// `launch_rotated` without rotation: one launch (conv/params prologue only).
+    NoRot,
+}
+
 /// Candidate: ONE `gated_delta_core_lanes` launch pair over the table
 /// `order` (slot -> logical lane; slot s is row s). `control` corrupts one
 /// lane's arguments (the oracle must then report a mismatch).
@@ -612,6 +637,7 @@ fn run_lanes(
     order: &[usize],
     step: usize,
     control: Option<Control>,
+    fuse: Fuse,
 ) {
     let views: Vec<LaneViews> = order
         .iter()
@@ -646,7 +672,20 @@ fn run_lanes(
     let plan = gated_delta_core_lanes(gpu, &lanes, NV)
         .expect("admission")
         .expect("the lanes route refused an admitted lane set");
-    plan.launch(gpu).expect("lanes launch");
+    match fuse {
+        Fuse::Off => plan.launch(gpu).expect("lanes launch"),
+        Fuse::NoRot => {
+            let rotated = plan.launch_rotated(gpu, None).expect("fused lanes launch");
+            assert!(!rotated, "no rotation asked, none reported");
+        }
+        Fuse::Rot => {
+            let rot = arm.rot.view(0, arm.rows * VALUE);
+            let rotated = plan
+                .launch_rotated(gpu, Some(&rot))
+                .expect("fused lanes launch");
+            assert!(rotated, "the fused launch refused an admitted rotation");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -740,6 +779,7 @@ struct CaseSpec {
     steps: usize,
     control: Option<Control>,
     check_rotate: bool,
+    fuse: Fuse,
 }
 
 struct CaseResult {
@@ -755,6 +795,93 @@ struct CaseResult {
     detail: Value,
 }
 
+/// Number of bytes that differ between two equally long byte rows.
+fn byte_diff(a: &[u8], b: &[u8]) -> usize {
+    assert_eq!(a.len(), b.len(), "compared rows have one length");
+    a.iter().zip(b).filter(|(x, y)| x != y).count()
+}
+
+/// The fused arm's checks after one candidate step (`cand` has `table` rows): the arrival
+/// counters are back to zero, and
+/// * `Rot`: the next matching `rotate_x_mq_batched` skips (the claim), the rotated rows equal a
+///   real `rotate_x_mq_batched` of the lanes' gated outputs, and (when `rot_arm` ran the
+///   singleton with the decode rotation) the compared lanes' rows equal the singleton's;
+/// * `NoRot`: no rotated byte was written and no claim is armed.
+///
+/// Returns `(mismatching rotated bytes, other violations)`.
+fn check_fused(
+    gpu: &mut Gpu,
+    cand: &Arm,
+    truth: Option<&Guarded>,
+    rot_arm: Option<&Arm>,
+    fuse: Fuse,
+    cand_rows: &[(usize, usize)],
+) -> (u64, u64) {
+    let mut rot_bad = 0u64;
+    let mut other = 0u64;
+    let table = cand.rows;
+    match fuse {
+        Fuse::Off => {}
+        Fuse::Rot => {
+            let out_all = cand.out.view(0, table * VALUE);
+            let rot_all = cand.rot.view(0, table * VALUE);
+            let m0 = memory_effects::snapshot();
+            gpu.rotate_x_mq_batched(&out_all, &rot_all, VALUE, table)
+                .expect("rotate after fused launch");
+            if memory_effects::snapshot().since(m0).launches != 0 {
+                other += 1;
+            }
+            let truth = truth.expect("truth buffer");
+            let truth_all = truth.view(0, table * VALUE);
+            gpu.rotate_x_mq_batched(&out_all, &truth_all, VALUE, table)
+                .expect("truth rotation");
+            gpu.hip.device_synchronize().expect("sync");
+            let got = cand.rot.download(gpu);
+            let want = truth.download(gpu);
+            rot_bad += byte_diff(
+                cand.rot.rows(&got, 0, table * VALUE),
+                truth.rows(&want, 0, table * VALUE),
+            ) as u64;
+            if let Some(rot_arm) = rot_arm {
+                let singleton = rot_arm.rot.download(gpu);
+                for &(lane, slot) in cand_rows {
+                    if lane < rot_arm.rows {
+                        rot_bad += byte_diff(
+                            cand.rot.rows(&got, slot * VALUE, VALUE),
+                            rot_arm.rot.rows(&singleton, lane * VALUE, VALUE),
+                        ) as u64;
+                    }
+                }
+            }
+        }
+        Fuse::NoRot => {
+            gpu.hip.device_synchronize().expect("sync");
+            let got = cand.rot.download(gpu);
+            let pattern = sentinel_pattern(false);
+            let body = cand.rot.body(&got);
+            rot_bad += body
+                .iter()
+                .enumerate()
+                .filter(|(i, b)| **b != pattern[i % pattern.len()])
+                .count() as u64;
+            if gpu.scratch.prerotated.is_some() {
+                other += 1;
+            }
+        }
+    }
+    let counters = gpu
+        .scratch
+        .gdn_pair_counters
+        .as_ref()
+        .expect("the fused launch allocates its counters");
+    let mut raw = vec![0u8; counters.size()];
+    gpu.hip
+        .memcpy_dtoh(&mut raw, counters)
+        .expect("download counters");
+    other += raw.iter().filter(|b| **b != 0).count() as u64;
+    (rot_bad, other)
+}
+
 fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseResult {
     let host: Vec<LaneHost> = spec
         .positions
@@ -765,6 +892,7 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
     let ref_arm = Arm::new(gpu, spec.n, &host);
     let rot_arm = spec.check_rotate.then(|| Arm::new(gpu, spec.n, &host));
     let cand_arm = Arm::new(gpu, spec.table, &host);
+    let truth = (spec.fuse == Fuse::Rot).then(|| Guarded::new_f32(gpu, spec.table * VALUE, None));
     let ref_rows: Vec<(usize, usize)> = (0..spec.n).map(|l| (l, l)).collect();
     let cand_rows: Vec<(usize, usize)> = spec
         .order
@@ -779,6 +907,7 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
     let mut bad_items: Vec<String> = Vec::new();
     let mut guard_bad = 0u64;
     let mut rotate_bad = spec.check_rotate.then_some(0u64);
+    let (mut fuse_rot_bad, mut fuse_other) = (0u64, 0u64);
     let (mut ref_launches, mut lanes_launches) = (0u64, 0u64);
     for step in 0..spec.steps {
         ref_arm.stage(gpu, &host, step, &ref_rows);
@@ -787,9 +916,25 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
         ref_launches += memory_effects::snapshot().since(m0).launches;
         let want = snapshot(gpu, &ref_arm, &ref_rows);
 
+        // The singleton with the decode rotation: the fused arm's rotated rows' reference.
+        if let Some(rot) = &rot_arm {
+            rot.stage(gpu, &host, step, &ref_rows);
+            run_per_lane(gpu, w, rot, &host, &spec.ref_order, step, true);
+        }
+        let rotated = rot_arm.as_ref().map(|rot| snapshot(gpu, rot, &ref_rows));
+
         cand_arm.stage(gpu, &host, step, &cand_rows);
         let m0 = memory_effects::snapshot();
-        run_lanes(gpu, w, &cand_arm, &host, &spec.order, step, spec.control);
+        run_lanes(
+            gpu,
+            w,
+            &cand_arm,
+            &host,
+            &spec.order,
+            step,
+            spec.control,
+            spec.fuse,
+        );
         lanes_launches += memory_effects::snapshot().since(m0).launches;
         let got = snapshot(gpu, &cand_arm, &cand_compared);
 
@@ -802,12 +947,24 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
         for s in [&want, &got] {
             guard_bad += s.guard_bad.iter().map(|(_, n)| *n as u64).sum::<u64>();
         }
-        if let Some(rot) = &rot_arm {
-            rot.stage(gpu, &host, step, &ref_rows);
-            run_per_lane(gpu, w, rot, &host, &spec.ref_order, step, true);
-            let rotated = snapshot(gpu, rot, &ref_rows);
-            let n: usize = diff(&want, &rotated).iter().map(|(_, n)| *n).sum();
+        if let Some(rotated) = &rotated {
+            let n: usize = diff(&want, rotated).iter().map(|(_, n)| *n).sum();
             *rotate_bad.as_mut().unwrap() += n as u64;
+        }
+        if spec.fuse != Fuse::Off {
+            let (r, o) = check_fused(
+                gpu,
+                &cand_arm,
+                truth.as_ref(),
+                rot_arm.as_ref(),
+                spec.fuse,
+                &cand_compared,
+            );
+            fuse_rot_bad += r;
+            fuse_other += o;
+            if (r != 0 || o != 0) && bad_items.len() < 24 {
+                bad_items.push(format!("step{step}.fused_rot:{r}.other:{o}"));
+            }
         }
     }
     ref_arm.free(gpu);
@@ -815,12 +972,22 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
     if let Some(r) = rot_arm {
         r.free(gpu);
     }
+    if let Some(t) = truth {
+        gpu.free_tensor(t.t).expect("free truth");
+    }
     let want_ref = 2 * spec.n as u64 * spec.steps as u64;
-    let want_lanes = 2 * spec.steps as u64;
+    let want_lanes = if spec.fuse == Fuse::Off { 2 } else { 1 } * spec.steps as u64;
     let launches_ok = ref_launches == want_ref && lanes_launches == want_lanes;
     let detected = bad_bytes > 0;
     let pass = match spec.control {
-        None => bad_bytes == 0 && guard_bad == 0 && rotate_bad.unwrap_or(0) == 0 && launches_ok,
+        None => {
+            bad_bytes == 0
+                && guard_bad == 0
+                && rotate_bad.unwrap_or(0) == 0
+                && fuse_rot_bad == 0
+                && fuse_other == 0
+                && launches_ok
+        }
         Some(_) => detected && launches_ok,
     };
     let detail = json!({
@@ -828,6 +995,7 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
         "lanes": spec.n,
         "table_lanes": spec.table,
         "variant": spec.variant,
+        "fuse": format!("{:?}", spec.fuse),
         "steps": spec.steps,
         "slot_to_lane": spec.order,
         "ref_launch_order": spec.ref_order,
@@ -838,6 +1006,8 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
         "bad_items": bad_items,
         "guard_bytes_overwritten": guard_bad,
         "rotate_arm_bad_bytes": rotate_bad,
+        "fused_rotated_bad_bytes": fuse_rot_bad,
+        "fused_other_violations": fuse_other,
         "launches": {
             "per_lane_total": ref_launches,
             "per_lane_expected": want_ref,
@@ -850,7 +1020,7 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
     CaseResult {
         spec_name: spec.name.clone(),
         pass,
-        bad_bytes,
+        bad_bytes: bad_bytes + fuse_rot_bad + fuse_other,
         bad_items,
         guard_bad,
         rotate_bad,
@@ -1015,6 +1185,11 @@ struct Cli {
     lanes: Vec<usize>,
     seed: u64,
     controls: bool,
+    /// Run the candidate through `launch_rotated` with `HIPFIRE_QWEN4_GDN_LANES_FUSE`.
+    fuse: bool,
+    /// `--bench ITERS`: time the incumbent chain against the fused launch (implies `--fuse`),
+    /// then exit.
+    bench: Option<usize>,
 }
 
 fn parse_cli() -> Cli {
@@ -1024,6 +1199,8 @@ fn parse_cli() -> Cli {
         lanes: vec![1, 2, 3, 4, 8],
         seed: 0x6D6C_A9E5,
         controls: true,
+        fuse: false,
+        bench: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -1053,6 +1230,15 @@ fn parse_cli() -> Cli {
                 }
             }
             "--skip-controls" => cli.controls = false,
+            "--fuse" => cli.fuse = true,
+            "--bench" => {
+                cli.bench = Some(
+                    value("--bench")
+                        .parse()
+                        .unwrap_or_else(|_| usage("--bench")),
+                );
+                cli.fuse = true;
+            }
             "-h" | "--help" => usage(""),
             other => usage(&format!("unknown argument {other}")),
         }
@@ -1068,7 +1254,7 @@ fn usage(msg: &str) -> ! {
         eprintln!("gdn_lanes_oracle: {msg}");
     }
     eprintln!(
-        "usage: gdn_lanes_oracle [--out DIR] [--steps S=4] [--lanes 1,2,3,4,8] [--seed U64] [--skip-controls]"
+        "usage: gdn_lanes_oracle [--out DIR] [--steps S=4] [--lanes 1,2,3,4,8] [--seed U64] [--skip-controls] [--fuse]"
     );
     std::process::exit(if msg.is_empty() { 0 } else { 2 });
 }
@@ -1139,7 +1325,122 @@ fn build_spec(
         steps,
         control,
         check_rotate,
+        fuse: Fuse::Off,
     }
+}
+
+/// Flag off (the default): `launch_rotated` is the two incumbent launches, writes no rotated
+/// byte and arms no claim.
+fn fuse_flag_off_probe(gpu: &mut Gpu, w: &Weights, rng: &mut Rng) -> (bool, Value) {
+    let host: Vec<LaneHost> = (0..2).map(|l| make_lane_host(rng, l, 1)).collect();
+    let arm = Arm::new(gpu, 2, &host);
+    let rows = [(0usize, 0usize), (1, 1)];
+    arm.stage(gpu, &host, 0, &rows);
+    Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes_fuse = false;
+    gpu.scratch.prerotated = None;
+    let (rotated, launches) = {
+        let views: Vec<LaneViews> = (0..2).map(|l| LaneViews::new(&arm, l, l)).collect();
+        let lanes = lanes_of(&views, w, 2);
+        let rot = arm.rot.view(0, 2 * VALUE);
+        let m0 = memory_effects::snapshot();
+        let plan = gated_delta_core_lanes(gpu, &lanes, NV)
+            .expect("admission")
+            .expect("the lanes route refused an admitted lane set");
+        let rotated = plan
+            .launch_rotated(gpu, Some(&rot))
+            .expect("flag-off launch");
+        (rotated, memory_effects::snapshot().since(m0).launches)
+    };
+    gpu.hip.device_synchronize().expect("sync");
+    let all = arm.rot.download(gpu);
+    let pattern = sentinel_pattern(false);
+    let untouched = arm
+        .rot
+        .body(&all)
+        .iter()
+        .enumerate()
+        .all(|(i, b)| *b == pattern[i % pattern.len()]);
+    let claim = gpu.scratch.prerotated.is_some();
+    Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes_fuse = true;
+    arm.free(gpu);
+    let ok = !rotated && launches == 2 && untouched && !claim;
+    println!(
+        "probe   {:<40} {} (rotated={rotated}, launches={launches}, rot_untouched={untouched}, claim={claim})",
+        "fuse_flag_off_is_the_incumbent_pair",
+        if ok { "PASS" } else { "FAIL" },
+    );
+    (
+        ok,
+        json!({
+            "name": "fuse_flag_off_is_the_incumbent_pair", "pass": ok,
+            "rotated": rotated, "launches": launches, "rot_untouched": untouched, "claim": claim,
+        }),
+    )
+}
+
+/// Wall time per Core + output rotation, back to back on one stream (`iters` per sample, `reps`
+/// alternating A/B samples after one discarded): the incumbent chain (two lanes launches +
+/// `rotate_x_mq_batched`) against the fused launch (its claimed rotation skips the standalone one).
+fn bench_lanes(
+    gpu: &mut Gpu,
+    w: &Weights,
+    rng: &mut Rng,
+    n: usize,
+    iters: usize,
+    reps: usize,
+) -> Value {
+    let table = n.max(2);
+    let host: Vec<LaneHost> = (0..table).map(|l| make_lane_host(rng, l, 1)).collect();
+    let arm = Arm::new(gpu, table, &host);
+    let rows: Vec<(usize, usize)> = (0..table).map(|l| (l, l)).collect();
+    arm.stage(gpu, &host, 0, &rows);
+    let order: Vec<usize> = (0..table).collect();
+    let out_all = arm.out.view(0, table * VALUE);
+    let rot_all = arm.rot.view(0, table * VALUE);
+    let mut samples: [Vec<f64>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+    for rep in 0..=reps {
+        for k in 0..3 {
+            let mode = [Fuse::Off, Fuse::Rot, Fuse::NoRot][(rep + k) % 3];
+            gpu.hip.device_synchronize().expect("sync");
+            let t0 = std::time::Instant::now();
+            for _ in 0..iters {
+                run_lanes(gpu, w, &arm, &host, &order, 0, None, mode);
+                gpu.rotate_x_mq_batched(&out_all, &rot_all, VALUE, table)
+                    .expect("rotate");
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            let us = t0.elapsed().as_secs_f64() * 1e6 / iters as f64;
+            if rep > 0 {
+                samples[[Fuse::Off, Fuse::Rot, Fuse::NoRot]
+                    .iter()
+                    .position(|m| *m == mode)
+                    .unwrap()]
+                .push(us);
+            }
+        }
+    }
+    drop((out_all, rot_all));
+    arm.free(gpu);
+    let stat = |v: &mut Vec<f64>| {
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        (v[v.len() / 2], v[0])
+    };
+    let (off_med, off_min) = stat(&mut samples[0]);
+    let (on_med, on_min) = stat(&mut samples[1]);
+    let (nr_med, nr_min) = stat(&mut samples[2]);
+    println!(
+        "bench   lanes={table:<2} chain(3 launches) median={off_med:.2}us min={off_min:.2}us | fused+rotation(1 launch) median={on_med:.2}us min={on_min:.2}us | fused prologue only + rotate launch(2 launches) median={nr_med:.2}us min={nr_min:.2}us | saved median={:.2}us min-vs-min={:.2}us (prologue-only: {:.2}us)",
+        off_med - on_med,
+        off_min - on_min,
+        off_med - nr_med
+    );
+    json!({
+        "lanes": table,
+        "chain_median_us": off_med, "chain_min_us": off_min, "chain_samples_us": samples[0],
+        "fused_median_us": on_med, "fused_min_us": on_min, "fused_samples_us": samples[1],
+        "fused_norot_median_us": nr_med, "fused_norot_min_us": nr_min, "fused_norot_samples_us": samples[2],
+        "saved_median_us": off_med - on_med, "saved_min_us": off_min - on_min,
+    })
 }
 
 fn main() {
@@ -1154,6 +1455,18 @@ fn main() {
             gpu.arch
         );
         std::process::exit(2);
+    }
+    if cli.fuse {
+        Arc::make_mut(&mut gpu.flags).qwen4_gdn_lanes_fuse = true;
+        if !gpu.flags.qwen4_gdn_lanes_fuse_enabled() {
+            eprintln!(
+                "gdn_lanes_oracle: the fused lanes route is not available on {} (needs exact gfx1201)",
+                gpu.arch
+            );
+            std::process::exit(2);
+        }
+        // The fused launch's arrival counters are zeroed once, outside every counted launch.
+        rdna_compute::tensor_ops::ensure_gdn_pair_counters(&mut gpu).expect("counters");
     }
     println!(
         "arch={} lanes_default_enabled={} steps={} seed={:#x}",
@@ -1177,7 +1490,12 @@ fn main() {
             ("same_pos", "same"),
         ];
         for (vi, (variant, pool_kind)) in variants.into_iter().enumerate() {
-            let spec = build_spec(&mut rng, n, variant, pool_kind, cli.steps, None, vi == 0);
+            let mut spec = build_spec(&mut rng, n, variant, pool_kind, cli.steps, None, vi == 0);
+            spec.fuse = match (cli.fuse, variant) {
+                (false, _) => Fuse::Off,
+                (true, "same_pos") => Fuse::NoRot,
+                (true, _) => Fuse::Rot,
+            };
             let r = run_case(&mut gpu, &w, &mut rng, &spec);
             print_case(&r, false);
             counts.0 += 1;
@@ -1198,7 +1516,7 @@ fn main() {
             .collect();
         for n in control_lanes {
             for control in Control::ALL {
-                let spec = build_spec(
+                let mut spec = build_spec(
                     &mut rng,
                     n,
                     "shuffle",
@@ -1207,6 +1525,7 @@ fn main() {
                     Some(control),
                     false,
                 );
+                spec.fuse = if cli.fuse { Fuse::Rot } else { Fuse::Off };
                 let r = run_case(&mut gpu, &w, &mut rng, &spec);
                 print_case(&r, true);
                 counts.1 += 1;
@@ -1218,9 +1537,35 @@ fn main() {
         }
     }
 
-    let (probes_ok, probe_json) = admission_probes(&mut gpu, &w, &w2, &mut rng);
+    if let Some(iters) = cli.bench {
+        let mut results = Vec::new();
+        for &n in &cli.lanes {
+            results.push(bench_lanes(&mut gpu, &w, &mut rng, n, iters, 7));
+        }
+        let text = serde_json::to_string_pretty(&json!({
+            "tool": "gdn_lanes_oracle --bench", "arch": gpu.arch, "iters_per_sample": iters,
+            "samples": 7, "results": results,
+        }))
+        .expect("json");
+        if let Some(dir) = &cli.out {
+            std::fs::create_dir_all(dir).expect("create --out dir");
+            std::fs::write(dir.join("bench.json"), &text).expect("write bench.json");
+        }
+        println!("{text}");
+        w.free(&mut gpu);
+        w2.free(&mut gpu);
+        std::process::exit(0);
+    }
+    let (probes_ok, mut probe_json) = admission_probes(&mut gpu, &w, &w2, &mut rng);
     if !probes_ok {
         failures += 1;
+    }
+    if cli.fuse {
+        let (ok, js) = fuse_flag_off_probe(&mut gpu, &w, &mut rng);
+        if !ok {
+            failures += 1;
+        }
+        probe_json.push(js);
     }
     w.free(&mut gpu);
     w2.free(&mut gpu);
@@ -1243,7 +1588,8 @@ fn main() {
         "pass": pass,
         "launch_counts": {
             "per_lane_launches_per_step": "2 * N",
-            "lanes_launches_per_step": 2,
+            "lanes_launches_per_step": if cli.fuse { 1 } else { 2 },
+            "fused": cli.fuse,
         },
         "case_results": case_json,
         "control_results": control_json,

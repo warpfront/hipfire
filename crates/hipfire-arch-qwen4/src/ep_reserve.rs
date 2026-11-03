@@ -37,30 +37,31 @@ use std::fmt;
 /// load); unset or any other value is the default route.
 pub const EP_RESERVE_DECOUPLE_ENV: &str = "HIPFIRE_EP_RESERVE_DECOUPLE";
 
-/// Lab override (default OFF): let a native-MTP EP lane store (`--spec mtp`,
-/// the mixed store) load on the decoupled-reserve (route B) placement instead
-/// of the ordinary one. Without it the loader skips decoupling for a load that
-/// stages spec lanes and the EP lane staging
+/// Switch (default ON, exact `0` is the kill switch): a native-MTP EP lane
+/// store (`--spec mtp`, the mixed store) loads on the decoupled-reserve
+/// (route B) placement together with the AR lanes' placement. Off (`0`) the
+/// loader skips decoupling for a load that stages spec lanes (ordinary
+/// placement and reserve, the pre-share sizing) and the EP lane staging
 /// refuses a spec store on a reserve-sharing load (the daemon then stages AR
 /// lanes). Developer variable; read through the process configuration.
 pub const EP_MTP_RESERVE_SHARE_ENV: &str = "HIPFIRE_EP_MTP_RESERVE_SHARE";
 
-/// [`EP_MTP_RESERVE_SHARE_ENV`] (`1` on; unset or anything else off).
+/// [`EP_MTP_RESERVE_SHARE_ENV`] (unset or `1` on; exact `0` off).
 pub fn ep_mtp_reserve_share_enabled() -> bool {
-    hipfire_config::developer_bool(EP_MTP_RESERVE_SHARE_ENV, false)
+    hipfire_config::developer_bool(EP_MTP_RESERVE_SHARE_ENV, true)
 }
 
 /// Whether a spec lane store keeps the decoupled reserve off a load (the
 /// load-time half): `Some(reason)` when MTP lanes will be staged
-/// (`spec_k` set and at least one MTP slot of `lanes`) and the lab override
-/// is off.
+/// (`spec_k` set and at least one MTP slot of `lanes`) and the kill switch
+/// (`HIPFIRE_EP_MTP_RESERVE_SHARE=0`) turned the sharing off.
 pub fn spec_store_blocks_reserve(
     spec_k: Option<usize>,
     spec_slots: usize,
-    share_override: bool,
+    share_enabled: bool,
 ) -> Option<&'static str> {
-    (spec_k.is_some() && spec_slots > 0 && !share_override).then_some(
-        "native-MTP EP lanes are staged (`--spec mtp`): the decoupled reserve admits AR lanes only; pass no `--spec mtp` (or HIPFIRE_EP_MTP_LANES=0) for 32-layer AR lanes, or HIPFIRE_EP_MTP_RESERVE_SHARE=1 (lab) to run MTP lanes on it",
+    (spec_k.is_some() && spec_slots > 0 && !share_enabled).then_some(
+        "native-MTP EP lanes are staged (`--spec mtp`) and HIPFIRE_EP_MTP_RESERVE_SHARE=0 keeps them off the decoupled reserve (it admits AR lanes only then); pass no `--spec mtp` (or HIPFIRE_EP_MTP_LANES=0) for 32-layer AR lanes, or unset HIPFIRE_EP_MTP_RESERVE_SHARE to run MTP lanes on it",
     )
 }
 
@@ -71,19 +72,19 @@ pub fn spec_store_blocks_reserve(
 /// instead of at the first step.
 pub fn spec_store_reserve_verdict(
     reserve_active: bool,
-    share_override: bool,
+    share_enabled: bool,
     row_budget: usize,
     resident_rows: Option<usize>,
 ) -> Result<(), String> {
     if !reserve_active {
         return Ok(());
     }
-    if !share_override {
+    if !share_enabled {
         return Err(
-            "native-MTP lanes are refused on an EP reserve-sharing load: the mesh lane \
-             protocol's draft/verify windows and head fill are not proven on the borrowed \
-             reserve bank (AR lanes are admitted; load without `--spec mtp`, set \
-             HIPFIRE_EP_MTP_LANES=0, or HIPFIRE_EP_MTP_RESERVE_SHARE=1 for the lab route)"
+            "native-MTP lanes are refused on an EP reserve-sharing load while \
+             HIPFIRE_EP_MTP_RESERVE_SHARE=0 (AR lanes are admitted; load without \
+             `--spec mtp`, set HIPFIRE_EP_MTP_LANES=0, or unset \
+             HIPFIRE_EP_MTP_RESERVE_SHARE)"
                 .to_string(),
         );
     }
@@ -2153,25 +2154,26 @@ mod tests {
     }
 
     #[test]
-    fn a_spec_store_keeps_the_ordinary_reserve_unless_the_lab_override_is_on() {
+    fn a_spec_store_keeps_the_ordinary_reserve_only_under_the_kill_switch() {
         // AR store (no spec_k) and an MTP-less slot count never block.
         assert!(spec_store_blocks_reserve(None, 3, false).is_none());
         assert!(spec_store_blocks_reserve(Some(2), 0, false).is_none());
-        // A spec store blocks the decoupled reserve, naming the way out.
+        // The kill switch (`HIPFIRE_EP_MTP_RESERVE_SHARE=0`) blocks the decoupled
+        // reserve for a spec store, naming the way out.
         let why = spec_store_blocks_reserve(Some(2), 3, false).expect("blocked");
-        assert!(why.contains("--spec mtp") && why.contains("HIPFIRE_EP_MTP_RESERVE_SHARE=1"));
-        // The override lifts it.
+        assert!(why.contains("--spec mtp") && why.contains("HIPFIRE_EP_MTP_RESERVE_SHARE=0"));
+        // The default (sharing on) lets the spec store take the reserve.
         assert!(spec_store_blocks_reserve(Some(2), 3, true).is_none());
     }
 
     #[test]
-    fn the_stage_verdict_refuses_a_spec_store_on_a_reserve_load_unless_overridden() {
+    fn the_stage_verdict_refuses_a_spec_store_on_a_reserve_load_only_under_the_kill_switch() {
         // An ordinary load never reaches the reserve rules.
         assert_eq!(spec_store_reserve_verdict(false, false, 9999, None), Ok(()));
-        // A reserve load without the override: labeled refusal.
+        // A reserve load under the kill switch: labeled refusal.
         let refused = spec_store_reserve_verdict(true, false, 8, Some(512)).unwrap_err();
         assert!(refused.contains("refused on an EP reserve-sharing load"));
-        // With the override a step that fits the resident bank is admitted...
+        // By default a step that fits the resident bank is admitted...
         assert_eq!(spec_store_reserve_verdict(true, true, 8, Some(512)), Ok(()));
         assert_eq!(
             spec_store_reserve_verdict(true, true, 512, Some(512)),

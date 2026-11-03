@@ -2734,7 +2734,16 @@ fn upload_payload_bytes(
         .as_ref()
         .and_then(|arena| arena.span(&entry.name).map(|span| (arena, span)));
     let Some((arena, span)) = planned else {
-        return upload_resident_bytes(gpu, entry.residency, bytes, &entry.logical_shape)
+        let share = entry.residency == WeightResidency::HostMapped
+            && matches!(entry.policy, ShardPolicy::Replicate | ShardPolicy::Pin(_))
+            && hipfire_config::memory::ep_share_host();
+        let uploaded = if share {
+            // Replicated pinned payload: every rank of this process maps ONE pinned copy.
+            gpu.upload_raw_host_mapped_shared(&entry.name, bytes, &entry.logical_shape)
+        } else {
+            upload_resident_bytes(gpu, entry.residency, bytes, &entry.logical_shape)
+        };
+        return uploaded
             .map(|mut tensor| {
                 tensor.dtype = dtype;
                 tensor

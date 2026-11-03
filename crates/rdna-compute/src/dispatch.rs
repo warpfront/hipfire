@@ -18,6 +18,21 @@ use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
+/// One pinned host-mapped allocation shared by the ranks of this process
+/// ([`Gpu::upload_raw_host_mapped_shared`]). `owner` is weak: the allocation lives exactly as
+/// long as some rank's tensor (or lease) holds it.
+struct SharedHostEntry {
+    owner: std::sync::Weak<hip_bridge::HostAllocOwner>,
+    host_ptr: usize,
+    len: usize,
+    /// Caller identity digest ([`Gpu::host_mapped_shared_fill`]); `None` for a payload
+    /// proven by byte comparison.
+    identity: Option<[u8; 32]>,
+}
+
+static SHARED_HOST_MAPPED: std::sync::Mutex<Option<HashMap<String, SharedHostEntry>>> =
+    std::sync::Mutex::new(None);
+
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
 /// 16 B fp16 codebook (8 entries) + 96 B 3-bit packed indices = 112 B.
@@ -1715,6 +1730,10 @@ pub struct Gpu {
     /// `MQ4G128V2P`, DESIGN F1) instead of the shipped qt44/qt53 layout. Set
     /// once by the loader before any forward; every layer of the load shares one layout.
     pub(crate) mq4_experts_planar: bool,
+    /// `HIPFIRE_QWEN4_MOE32_GU` (unset/1 on = default, 0 off, 2 on without dead-slot zero stores;
+    /// [`Gpu::set_moe32_gu`] overrides): the wide-pass gate/up `g32` kernel family replaces `o4_r8_x4`
+    /// for more than 8 source rows on exact gfx1201 (shipped and planar layouts).
+    pub(crate) moe32_gu: u8,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -3088,6 +3107,11 @@ impl Gpu {
             device_id: id,
             moe_route_census: crate::gemm::MoeRouteLaunchCensus::default(),
             mq4_experts_planar: false,
+            moe32_gu: match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE32_GU").as_deref() {
+                Ok("0") => 0,
+                Ok("2") => 2,
+                _ => 1,
+            },
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
@@ -7234,6 +7258,150 @@ impl Gpu {
         })
     }
 
+    /// Map the already-pinned allocation `host_ptr` (kept alive by `owner`, shared with the
+    /// rank that allocated it) into THIS device as a host-mapped tensor of `bytes` bytes:
+    /// this device's own alias, recorded in the registry and the lease table so
+    /// [`Self::free_tensor`] drops this rank's share only. `Ok(None)`: this device already
+    /// holds the alias (the same device asked twice), so the caller must allocate privately.
+    fn adopt_shared_host_mapped(
+        &mut self,
+        owner: Arc<hip_bridge::HostAllocOwner>,
+        host_ptr: usize,
+        bytes: usize,
+        shape: &[usize],
+    ) -> HipResult<Option<GpuTensor>> {
+        let alias = resolve_host_mapped_alias(
+            host_ptr as *mut c_void,
+            |host| self.hip.host_get_device_pointer(host, 0),
+            |_| Ok(()),
+        )?;
+        let alias_key = alias as usize;
+        if self.host_mapped.contains_key(&alias_key)
+            || !self.host_leases.insert_shared(alias_key, owner)
+        {
+            return Ok(None);
+        }
+        self.host_mapped.insert(alias_key, host_ptr);
+        Ok(Some(GpuTensor {
+            // SAFETY: `alias` is this device's mapping of a live pinned allocation of at least
+            // `bytes` bytes, kept alive by the lease just recorded.
+            buf: unsafe { hip_bridge::DeviceBuffer::from_host_mapped(alias, bytes) },
+            shape: shape.to_vec(),
+            dtype: DType::Raw,
+        }))
+    }
+
+    /// [`Self::upload_raw_host_mapped`] for a payload that is byte-identical on every rank of
+    /// one process (the replicated EP embedding): the first caller allocates and fills the
+    /// pinned owner and leases it; later callers on other devices adopt the SAME pinned
+    /// allocation (their own device alias, a shared [`HostAllocLease`] owner: the last
+    /// holder frees it once) instead of pinning another copy. The adoption is proven, not
+    /// assumed: a live entry under `key` is used only when its length matches and its bytes
+    /// equal `data`; otherwise (and on the same device, whose alias would collide) this
+    /// falls back to a private allocation, so sharing can never change a byte a kernel
+    /// reads.
+    pub fn upload_raw_host_mapped_shared(
+        &mut self,
+        key: &str,
+        data: &[u8],
+        shape: &[usize],
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let mut registry = SHARED_HOST_MAPPED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = registry.get_or_insert_with(HashMap::new);
+        let live = map.get(key).and_then(|entry| {
+            (entry.len == data.len())
+                .then(|| entry.owner.upgrade().map(|owner| (owner, entry.host_ptr)))
+                .flatten()
+        });
+        if let Some((owner, host_ptr)) = live {
+            // SAFETY: `owner` keeps the allocation of `data.len() + HOST_TAIL_PAD_BYTES`
+            // bytes alive; nothing writes it after its first upload.
+            let existing = unsafe { std::slice::from_raw_parts(host_ptr as *const u8, data.len()) };
+            if existing == data {
+                if let Some(tensor) =
+                    self.adopt_shared_host_mapped(owner, host_ptr, data.len(), shape)?
+                {
+                    eprintln!(
+                        "  host-share: '{key}' ({:.2} GiB pinned) adopted from the live allocation of another device (one copy, this device's own alias)",
+                        data.len() as f64 / (1u64 << 30) as f64
+                    );
+                    return Ok(tensor);
+                }
+            }
+        }
+        let tensor = self.upload_raw_host_mapped(data, shape)?;
+        let lease = self.lease_host_owner(&tensor)?;
+        map.insert(
+            key.to_string(),
+            SharedHostEntry {
+                owner: Arc::downgrade(&lease.owner),
+                host_ptr: lease.host_ptr() as usize,
+                len: data.len(),
+                identity: None,
+            },
+        );
+        Ok(tensor)
+    }
+
+    /// Shared pinned allocation of `bytes` payload bytes keyed by `key`, proven by a caller
+    /// `identity` digest instead of a byte comparison (no source slice has to exist). The
+    /// first rank allocates the owner, runs `fill` on the payload in place (the tail pad is
+    /// zeroed afterwards), and leases it; a later rank on another device whose `key`,
+    /// `bytes` and `identity` match a live entry adopts the same pages through its own
+    /// alias and never runs `fill`. A mismatch (or the same device twice) allocates and
+    /// fills a private copy, so the bytes a kernel reads are always the ones `fill` wrote
+    /// for that identity. The registry lock is held across `fill`, so a second rank waits
+    /// for the first rank's fill instead of racing it. Free the tensor with
+    /// [`Self::free_tensor`]; the last holder frees the allocation once.
+    pub fn host_mapped_shared_fill(
+        &mut self,
+        key: &str,
+        identity: [u8; 32],
+        bytes: usize,
+        shape: &[usize],
+        fill: impl FnOnce(&mut [u8]) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
+        self.bind_thread()?;
+        let mut registry = SHARED_HOST_MAPPED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let map = registry.get_or_insert_with(HashMap::new);
+        let live = map.get(key).and_then(|entry| {
+            (entry.len == bytes && entry.identity == Some(identity))
+                .then(|| entry.owner.upgrade().map(|owner| (owner, entry.host_ptr)))
+                .flatten()
+        });
+        if let Some((owner, host_ptr)) = live {
+            if let Some(tensor) = self.adopt_shared_host_mapped(owner, host_ptr, bytes, shape)? {
+                return Ok(tensor);
+            }
+        }
+        let (tensor, host) = self.alloc_raw_host_mapped(bytes, shape)?;
+        // SAFETY: `alloc_raw_host_mapped` returned a live pinned allocation of
+        // `bytes + HOST_TAIL_PAD_BYTES` bytes that nothing else references yet.
+        let filled = fill(unsafe { std::slice::from_raw_parts_mut(host, bytes) });
+        if let Err(error) = filled {
+            let _ = self.free_tensor(tensor);
+            return Err(error);
+        }
+        // SAFETY: the pad lies inside the same allocation, past the payload.
+        unsafe { std::ptr::write_bytes(host.add(bytes), 0, HOST_TAIL_PAD_BYTES) };
+        let lease = self.lease_host_owner(&tensor)?;
+        map.insert(
+            key.to_string(),
+            SharedHostEntry {
+                owner: Arc::downgrade(&lease.owner),
+                host_ptr: lease.host_ptr() as usize,
+                len: bytes,
+                identity: Some(identity),
+            },
+        );
+        Ok(tensor)
+    }
+
     /// Allocate this GPU's bounded-wait error block (`crate::device_wait`)
     /// if it does not exist yet. Allocation (`hipDeviceGetAttribute`,
     /// `hipHostMalloc`, `hipHostGetDevicePointer`) is not capture-safe, so
@@ -10429,6 +10597,18 @@ impl<O> HostLeaseTable<O> {
         Ok(owner)
     }
 
+    /// Record `owner` as the shared owner of `key`, unless `key` is already recorded (then
+    /// `false` and the table is unchanged).
+    pub(crate) fn insert_shared(&mut self, key: usize, owner: std::sync::Arc<O>) -> bool {
+        match self.map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(_) => false,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(owner);
+                true
+            }
+        }
+    }
+
     /// Drop the registry's record of `key` and return its reference, if the allocation was
     /// ever leased.  `None` means NOT leased (or already released): the caller frees directly,
     /// exactly as before S1.  The returned reference is dropped by the caller; the physical
@@ -10512,6 +10692,30 @@ mod slowlink_host_lease_tests {
         assert_eq!(t.len(), 0);
         let _held = lease(&mut t, 0x2001);
         assert!(t.release(0x2000).is_none(), "another key is unaffected");
+    }
+
+    #[test]
+    fn host_lease_shared_owner_across_two_ranks_frees_once_after_both_release() {
+        // Two ranks (two tables, two device aliases) hold ONE owner of one pinned allocation.
+        // Keys are unique across this module: `FREED` is one process-wide counter.
+        let (rank0, rank1) = (0xA000, 0xA800);
+        let mut t0 = HostLeaseTable::new();
+        let mut t1 = HostLeaseTable::new();
+        let owner = lease(&mut t0, rank0);
+        assert!(t1.insert_shared(rank1, Arc::clone(&owner)));
+        assert!(
+            !t1.insert_shared(rank1, Arc::clone(&owner)),
+            "an alias is recorded once"
+        );
+        drop(owner);
+        drop(t0.release(rank0).expect("rank 0 leased"));
+        assert_eq!(freed(rank0), 0, "rank 1 still maps the pinned pages");
+        drop(t1.release(rank1).expect("rank 1 shares"));
+        assert_eq!(
+            freed(rank0),
+            1,
+            "the last rank frees the allocation exactly once"
+        );
     }
 
     #[test]
