@@ -160,6 +160,8 @@ pub enum OpKind {
     GatedFfn = 60,
     /// [`Step::BoundaryProject`] (#666 G18, Raon BF16-boundary projections).
     BoundaryProject = 61,
+    /// [`Step::Encoder`] (#666 G19, Qwen3.5 embedding encoder stages).
+    Encoder = 62,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -235,6 +237,8 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::GroupedMoe(..) => OpKind::GroupedMoe,
         Step::GatedFfn(..) => OpKind::GatedFfn,
         Step::BoundaryProject(..) => OpKind::BoundaryProject,
+        #[cfg(feature = "deltanet")]
+        Step::Encoder(..) => OpKind::Encoder,
     }
 }
 
@@ -711,6 +715,7 @@ mod tests {
             (OpKind::GroupedMoe, 59),
             (OpKind::GatedFfn, 60),
             (OpKind::BoundaryProject, 61),
+            (OpKind::Encoder, 62),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),

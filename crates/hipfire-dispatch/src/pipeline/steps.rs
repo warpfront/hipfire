@@ -215,6 +215,9 @@ pub enum Step<'a> {
     GatedFfn(crate::pipeline::moe_program::GatedFfnOp<'a>),
     /// Projections of one input plane with a BF16 output boundary and a tiered activation.
     BoundaryProject(crate::pipeline::boundary_project::BoundaryProjectOp<'a>),
+    /// One stage of a bidirectional hybrid encoder trunk over segmented rows.
+    #[cfg(feature = "deltanet")]
+    Encoder(crate::pipeline::encoder::EncoderOp<'a>),
 }
 
 /// Op-kind for fusion matching. Composite and opaque MoE operations are
@@ -285,7 +288,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         #[cfg(feature = "deltanet")]
         Step::DeltaNetMixer(_) | Step::GatedAttention(_) => None,
         #[cfg(feature = "deltanet")]
-        Step::Rda(_) => None,
+        Step::Rda(_) | Step::Encoder(_) => None,
     }
 }
 
@@ -954,6 +957,8 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::GroupedMoe(op) => op.validate_for_gpu(gpu)?,
             Step::GatedFfn(op) => op.validate_for_gpu(gpu)?,
             Step::BoundaryProject(op) => op.validate_for_gpu(gpu)?,
+            #[cfg(feature = "deltanet")]
+            Step::Encoder(op) => op.validate_for_gpu(gpu)?,
             // Rows-only DS4 operations have one route; a window holds rows.
             Step::EmbedStreams(crate::pipeline::mla::rows::EmbedStreamsOp { rows: 0, .. })
             | Step::SwaStage(crate::pipeline::mla::rows::SwaStageOp { rows: 0, .. })
@@ -2125,6 +2130,8 @@ pub(crate) fn launch_op_rows(
         Step::BoundaryProject(op) => {
             crate::pipeline::boundary_project::execute_boundary_project(gpu, op)
         }
+        #[cfg(feature = "deltanet")]
+        Step::Encoder(op) => crate::pipeline::encoder::execute_encoder(gpu, op),
     }
 }
 fn rmsnorm_out<'a>(step: &Step<'a>) -> &'a rdna_compute::GpuTensor {

@@ -15,10 +15,11 @@ default = ["deltanet"]
 lab = []
 # The GDN / partial-RoPE / mRoPE kernels in rdna-compute are deltanet-gated,
 # matching hipfire-arch-qwen35 and hipfire-arch-qwen35-vl.
-deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet", "hipfire-arch-qwen35-vl/deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "hipfire-dispatch/deltanet", "rdna-compute/deltanet", "hipfire-arch-qwen35-vl/deltanet"]
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hip-bridge = { path = "../hip-bridge" }
