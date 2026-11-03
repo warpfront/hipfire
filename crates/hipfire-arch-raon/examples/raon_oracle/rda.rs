@@ -27,11 +27,11 @@
 //! `gdn_S0`, `gdn_y`, `gdn_S_out`.
 //! Options: `case=<substring>` filters cases.
 
-use hipfire_arch_raon::rda::{
-    rda_forward_rows, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
-};
 use hipfire_dispatch::ops::delta_net::{
     execute_gated_delta, DecayAxis, GatedDeltaOp, GatedDeltaStrides,
+};
+use hipfire_dispatch::pipeline::rda::{
+    rda_forward_rows, RdaGeometry, RdaLayer, RdaLayerState, RdaProjected, RdaScratch,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -294,7 +294,7 @@ fn run_module_rows(
     }
     let scratch = keep_scratch.as_ref().unwrap();
 
-    let layer = RaonRdaLayer {
+    let layer = RdaLayer {
         conv_w_q: &cw[0],
         conv_w_k: &cw[1],
         conv_w_v: &cw[2],

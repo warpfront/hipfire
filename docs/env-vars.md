@@ -1079,8 +1079,8 @@ All developer-only, read once at load through the `[developer]` namespace (`hipf
 | `HIPFIRE_RAON_MHC_FUSED` | **`1`**; `0` | Raon mHC site chain (`crates/hipfire-dispatch/src/pipeline/stream_mix.rs`, `kernels/src/stream_mix_route_aggregate.hip`): fuses the Helmert route finalize and the stream aggregate+RMSNorm of one site into one pass over the old streams (`StreamMixStage::RouteAggregate`) for prefill batches of 64 rows or more and geometry 4 streams x 2560; the unfused chain reads the stream stack twice more before the branch (weightless RMS in `stream_mix_route_helmert`, aggregate). `pre`/`post`/`res`/branch input are bit-identical to the two-kernel chain (same per-thread accumulation order, same reduction trees; `res` keeps the runtime stream count so the compiler cannot re-fold the Helmert scales). `0` is the kill switch (also disables `HIPFIRE_RAON_MHC_BF16_STREAMS`). |
 | `HIPFIRE_RAON_MHC_BF16_STREAMS` | **`1`**; `0` (needs `HIPFIRE_RAON_MHC_FUSED` not `0`, BF16 selectors) | Stores the mHC stream ping-pong planes (`stream_a`/`stream_b`) as BF16 bits instead of F32 planes carrying BF16 values (every stream write is bf16-rounded, so values are identical, bytes halved). Selector GEMM (`gemm_bf16_xbf16_*`), fused route+aggregate, postmix (`stream_mix_postmix_bf16`), embedding broadcast and final mean read/write the BF16 planes at every row count including decode and verify; taps and the DFlash capture widen exactly. Read once when the scratch is allocated (`crates/hipfire-arch-raon/src/mhc.rs::bf16_streams_enabled`). `HIPFIRE_RAON_MHC_FUSED=0` kills both. |
 | `HIPFIRE_RAON_GFX1100_DOWN_PRODUCER` | **`1`**; `0` | Raon-1-mini-preview routed-expert down site on exact gfx1100 (7900 XTX): the grouped activation, FWHT rotation and A8 `block_i8_128` quantizer run as ONE launch (`ffn_situ_grouped_rotate_i8`, `kernels/src/ffn_grouped_activation_rotate_i8.gfx1201.hip`, one wave per (grouped row, 256-column group); the F32 activation and rotated planes are never written) instead of `ffn_situ_grouped_f32` + `mq_rotate_x` + `quantize_int8_mmq_ds128`. Output bit-identical to the three-launch chain (byte oracle), so KLD is unchanged. `0` restores the three-launch chain. gfx1201 keeps `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`; the shared/dense rows entry stays gfx1201-only. |
-| `HIPFIRE_RAON_RDA_FUSED_PREP` | **`1`**; `0` | Raon RDA layer producer and output norm on exact gfx1201 (the conv + prepare producer alone also on exact gfx1100; the gated norm stays gfx1201-only) for prefill batches of 64 rows or more (`crates/hipfire-arch-raon/src/rda.rs`, `kernels/src/raon_rda_conv_prepare.hip`, `kernels/src/gated_rmsnorm_sigmoid_rows_w128.hip`): the three depthwise convs (q/k/v, K=4, SiLU, BF16 round, in-place raw history) and `raon_rda_prepare` run as ONE launch with no materialized conv planes (one wave per (head, row tile), conv window in registers, the incumbent's fixed LDS L2 tree evaluated as a wave-shuffle tree), and the per-head gated RMSNorm runs as one wave per (row, head) with float4 accesses. Outputs, conv histories and the recurrent state are bit-identical to the incumbent launches (same expressions and reduction order, explicit `__fmul_rn`/`__fadd_rn` where a product feeds a sum). Decode, verify and rollback-replay rows (< 64 rows, or a taped verify) keep the incumbent launches. `0` is the kill switch. |
-| `HIPFIRE_RAON_RDA_SEGMENT` | **`1`**; `0` | With the chunked RDA core (`HIPFIRE_GATED_DELTA_VECTOR_CHUNKED`), an ordinary prefill chunk of more than 256 rows runs each RDA layer as consecutive 256-row segments (producer, chunked core, gated norm per segment, state and conv history chained through the in-place tensors) instead of three whole-chunk passes, so the planes the core consumes are still cache-resident and the core workspace stays small. Segments are whole C64 chunks, so every output and state is bit-identical to the single pass. `0` restores the single pass (`crates/hipfire-arch-raon/src/rda.rs`). |
+| `HIPFIRE_RAON_RDA_FUSED_PREP` | **`1`**; `0` | Raon RDA layer producer and output norm on exact gfx1201 (the conv + prepare producer alone also on exact gfx1100; the gated norm stays gfx1201-only) for prefill batches of 64 rows or more (`crates/hipfire-dispatch/src/pipeline/rda.rs`, `kernels/src/raon_rda_conv_prepare.hip`, `kernels/src/gated_rmsnorm_sigmoid_rows_w128.hip`): the three depthwise convs (q/k/v, K=4, SiLU, BF16 round, in-place raw history) and `raon_rda_prepare` run as ONE launch with no materialized conv planes (one wave per (head, row tile), conv window in registers, the incumbent's fixed LDS L2 tree evaluated as a wave-shuffle tree), and the per-head gated RMSNorm runs as one wave per (row, head) with float4 accesses. Outputs, conv histories and the recurrent state are bit-identical to the incumbent launches (same expressions and reduction order, explicit `__fmul_rn`/`__fadd_rn` where a product feeds a sum). Decode, verify and rollback-replay rows (< 64 rows, or a taped verify) keep the incumbent launches. `0` is the kill switch. |
+| `HIPFIRE_RAON_RDA_SEGMENT` | **`1`**; `0` | With the chunked RDA core (`HIPFIRE_GATED_DELTA_VECTOR_CHUNKED`), an ordinary prefill chunk of more than 256 rows runs each RDA layer as consecutive 256-row segments (producer, chunked core, gated norm per segment, state and conv history chained through the in-place tensors) instead of three whole-chunk passes, so the planes the core consumes are still cache-resident and the core workspace stays small. Segments are whole C64 chunks, so every output and state is bit-identical to the single pass. `0` restores the single pass (`crates/hipfire-dispatch/src/pipeline/rda.rs`). |
 | `HIPFIRE_RAON_SHARED_FFN` | **unset → `qt44`**; `q8f16`, `bf16` | Quantizer only (`crates/hipfire-quantize/src/raon.rs`): storage of the always-active FFN weights (shared-expert gate/up/down of every MoE layer and the dense layer-0 gate/up/down). `q8f16` stores them as Q8F16 (qt3, group 32), `bf16` as source-exact BF16 (qt16); neither carries an AWQ sidecar, and the shared `down_proj` keeps physical K 1280 (zero-padded columns) for both. Recorded as `hipfire_raon.shared_ffn` in the artifact metadata (`q8f16`/`bf16`, or `<storage>:shared` / `<storage>:shared-gateup` / `<storage>:dense` for a partial-scope swap). An unknown value is a conversion error. `hipfire-quantize --raon-shared-ffn <q8f16\|bf16> --input <shipped.hfq> --raon-source <checkpoint dir> --output <out.hfq>` builds the same variant from a shipped qt44 artifact without re-running calibration; `--raon-shared-ffn-scope <all\|shared\|shared-gateup\|dense>` (default `all`) restricts it to the MoE layers' shared experts (or only their gate/up weights) or to the dense layer-0 MLP, and `--raon-shared-ffn-verify` takes the same scope flag. |
 | `HIPFIRE_RAON_TOKENIZER` | unset → test skips | Test-only: HF `tokenizer.json` path (or its directory) for the `#[ignore]`d Raon tokenizer HF-parity check in `crates/hipfire-runtime/src/tokenizer.rs`; never read by runtime code. |
 
@@ -1222,7 +1222,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 2000
+**Count:** 1998
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1489,7 +1489,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_DEEPSEEK4_MOE` | crates/hipfire-arch-deepseek4/src/config_cache.rs, crates/hipfire-arch-deepseek4/src/forward.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_8W` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_CND` | crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs, crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
-| `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-dispatch/src/families/moe.rs | developer |
+| `HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-arch-maple/src/program.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_DOWN_BATCHED_K8ALL` | crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_GATE_UP_BATCHED_K4096_LDS` | crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
 | `HIPFIRE_DEEPSEEK4_MOE_GROUPED` | crates/hipfire-dispatch/src/pipeline/mod.rs | developer |
@@ -1867,7 +1867,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_G5_CAPTURE` | crates/rdna-compute/tests/ffn_grouped_i8_producer_oracle.rs | harness |
 | `HIPFIRE_G5_ONLY_CAPTURE` | crates/rdna-compute/tests/ffn_grouped_i8_producer_oracle.rs | harness |
 | `HIPFIRE_G942_TRUNK_GEMV` | crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
-| `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
+| `HIPFIRE_GATED_DELTA_VECTOR_CHUNKED` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-dispatch/src/ops/delta_net.rs | developer |
 | `HIPFIRE_GATED_DELTA_VECTOR_PM` | crates/rdna-compute/src/gated_delta_vector_pm.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_GATED_NORM_FP8_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATED_NORM_FP8_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
@@ -2374,7 +2374,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_MQ2G256V2_XBATCH` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ2G256V2_XBATCH_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_MQ2G256V2_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_MQ2_DOWN_ROWS` | crates/hipfire-arch-maple/src/forward.rs, crates/rdna-compute/src/gemv.rs | developer |
+| `HIPFIRE_MQ2_DOWN_ROWS` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_MQ3V25_A4` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_MQ3V25_A8` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/kernel_registry.rs | developer |
 | `HIPFIRE_MQ3_DOWN_ROWS` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
@@ -2906,14 +2906,14 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAILGUN_NEGATIVE_CONTROL` | crates/rdna-compute/src/railgun_check.rs, crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
 | `HIPFIRE_RAILGUN_SHADOW` | crates/hipfire-arch-qwen35/tests/pm4_staging_hold_hw.rs, crates/rdna-compute/src/railgun_check.rs | developer |
 | `HIPFIRE_RAILGUN_SHADOW_OUT` | crates/rdna-compute/src/replay/railgun_shadow.rs | developer |
-| `HIPFIRE_RAON_A8_FUSE_ROUND` | crates/hipfire-arch-raon/src/projection.rs | developer |
-| `HIPFIRE_RAON_A8_REUSE` | crates/hipfire-arch-raon/src/projection.rs | developer |
+| `HIPFIRE_RAON_A8_FUSE_ROUND` | crates/hipfire-dispatch/src/pipeline/boundary_project.rs | developer |
+| `HIPFIRE_RAON_A8_REUSE` | crates/hipfire-dispatch/src/pipeline/boundary_project.rs | developer |
 | `HIPFIRE_RAON_ATTN_TILED` | crates/hipfire-arch-raon/src/bundle.rs, crates/hipfire-arch-raon/src/mla.rs | developer |
 | `HIPFIRE_RAON_DFLASH_ROLLBACK` | crates/hipfire-arch-raon/src/rollback.rs | developer |
 | `HIPFIRE_RAON_GFX1100_DOWN_PRODUCER` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
 | `HIPFIRE_RAON_LM_HEAD` | crates/hipfire-quantize/src/raon.rs | developer |
 | `HIPFIRE_RAON_MHC_BF16_STREAMS` | crates/hipfire-arch-raon/src/forward.rs, crates/hipfire-arch-raon/src/mhc.rs | developer |
-| `HIPFIRE_RAON_MHC_FUSED` | crates/hipfire-arch-raon/src/forward.rs, crates/hipfire-arch-raon/src/mhc.rs | developer |
+| `HIPFIRE_RAON_MHC_FUSED` | crates/hipfire-arch-raon/src/mhc.rs, crates/hipfire-arch-raon/src/state.rs | developer |
 | `HIPFIRE_RAON_MIRROR_Q8` | crates/hipfire-arch-raon/src/bundle.rs, crates/hipfire-arch-raon/src/mla.rs | developer |
 | `HIPFIRE_RAON_MLA_ABSORB` | crates/hipfire-arch-raon/examples/raon_oracle/generate.rs, crates/hipfire-arch-raon/examples/raon_oracle/logits.rs | developer |
 | `HIPFIRE_RAON_PREFILL` | crates/hipfire-arch-raon/src/bundle.rs | developer |
@@ -2924,8 +2924,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_RAON_RAILGUN_CORPUS_GFX1100` | crates/hipfire-arch-raon/src/railgun_decode.rs | developer |
 | `HIPFIRE_RAON_RAILGUN_CORPUS_GFX1201` | crates/hipfire-arch-raon/src/railgun_decode.rs | developer |
 | `HIPFIRE_RAON_RAILGUN_LOCAL_CORPUS` | crates/hipfire-arch-raon/src/railgun_decode.rs, crates/hipfire-arch-raon/src/railgun_provision.rs | developer |
-| `HIPFIRE_RAON_RDA_FUSED_PREP` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
-| `HIPFIRE_RAON_RDA_SEGMENT` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-arch-raon/src/rda.rs | developer |
+| `HIPFIRE_RAON_RDA_FUSED_PREP` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-dispatch/src/pipeline/rda.rs | developer |
+| `HIPFIRE_RAON_RDA_SEGMENT` | crates/hipfire-arch-raon/examples/rda_layer_node.rs, crates/hipfire-dispatch/src/pipeline/rda.rs | developer |
 | `HIPFIRE_RAON_SHARED_FFN` | crates/hipfire-quantize/src/raon.rs | developer |
 | `HIPFIRE_RAON_TOKENIZER` | crates/hipfire-runtime/src/tokenizer.rs, scripts/check-env-docs.py | developer |
 | `HIPFIRE_RAON_VERIFY_ROWEXACT` | crates/hipfire-arch-raon/examples/raon_dflash_oracle.rs, crates/hipfire-arch-raon/src/projection.rs | developer |

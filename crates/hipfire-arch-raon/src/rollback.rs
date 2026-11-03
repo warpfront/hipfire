@@ -48,9 +48,11 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::bundle::RaonBundle;
 use crate::forward::{forward_rows_verify_tapped, RdaRing};
-use crate::rda::{rda_recurrence, RdaGeometry, RdaLayerState};
 use crate::spec_impl::RaonSpecState;
 use crate::state::RaonStateSnapshot;
+use hipfire_dispatch::pipeline::rda::{
+    execute_rda_recurrence, RdaGeometry, RdaLayerState, RdaRecurrenceOp,
+};
 
 /// Environment variable selecting the partial-accept rollback ([`RollbackMode`]).
 pub const ROLLBACK_ENV: &str = "HIPFIRE_RAON_DFLASH_ROLLBACK";
@@ -314,18 +316,20 @@ impl RaonBundle {
                 slot: 0,
                 state_slot_stride: geom.state_elems(),
             };
-            rda_recurrence(
+            execute_rda_recurrence(
                 gpu,
-                &geom,
-                &st,
-                &tape.q,
-                &tape.k,
-                &tape.vprime,
-                &tape.log_alpha,
-                &tape.beta,
-                discard,
-                keep,
-                None,
+                &RdaRecurrenceOp {
+                    geom: &geom,
+                    state: &st,
+                    q: &tape.q,
+                    k: &tape.k,
+                    vprime: &tape.vprime,
+                    log_alpha: &tape.log_alpha,
+                    beta: &tape.beta,
+                    output: discard,
+                    rows: keep,
+                    chunk: None,
+                },
             )
             .map_err(|e| format!("raon1_mini rollback L-rda{ri} recurrence: {e}"))?;
 

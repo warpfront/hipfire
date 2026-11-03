@@ -64,6 +64,7 @@ pub mod batched_attention;
 pub mod batched_deltanet;
 #[cfg(feature = "deltanet")]
 pub mod batched_moe;
+pub mod boundary_project;
 pub mod gated_mlp;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
@@ -71,6 +72,8 @@ pub mod latent_attention;
 pub(crate) mod layer_ops;
 pub mod mla;
 pub mod projection_split;
+#[cfg(feature = "deltanet")]
+pub mod rda;
 pub mod sandwich;
 pub mod step_graph;
 pub(crate) mod steps;

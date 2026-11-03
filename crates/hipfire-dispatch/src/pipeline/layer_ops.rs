@@ -6538,6 +6538,7 @@ enum EmbeddingPath {
     Mq4V2,
     Bf16,
     Q8,
+    F32,
     Hfq4G256,
     Hfq4G128,
 }
@@ -6547,6 +6548,7 @@ fn embedding_path(dtype: DType) -> Option<EmbeddingPath> {
         DType::MQ4G256V2 | DType::MQ4G128V2 => Some(EmbeddingPath::Mq4V2),
         DType::BF16 => Some(EmbeddingPath::Bf16),
         DType::Q8_0 => Some(EmbeddingPath::Q8),
+        DType::F32 => Some(EmbeddingPath::F32),
         DType::HFQ4G256 => Some(EmbeddingPath::Hfq4G256),
         DType::HFQ4G128 => Some(EmbeddingPath::Hfq4G128),
         _ => None,
@@ -6594,6 +6596,7 @@ pub fn execute_embedding(gpu: &mut Gpu, op: &EmbeddingOp<'_>) -> Result<(), Disp
             gpu.embedding_lookup_bf16_batched(table, output, ids, op.rows, op.dim)
         }
         EmbeddingPath::Q8 => gpu.embedding_lookup_q8_batched(table, output, ids, op.rows, op.dim),
+        EmbeddingPath::F32 => gpu.embedding_lookup_f32_batched(table, output, ids, op.rows, op.dim),
         EmbeddingPath::Hfq4G256 => {
             gpu.embedding_lookup_hfq4g256_batched(table, output, ids, op.rows, op.dim)
         }
@@ -7414,7 +7417,8 @@ mod tests {
 
     #[test]
     fn embedding_dispatch_rejects_unadmitted_dtype() {
-        assert!(embedding_path(DType::F32).is_none());
+        assert!(embedding_path(DType::F16).is_none());
+        assert_eq!(embedding_path(DType::F32), Some(EmbeddingPath::F32));
     }
 
     #[test]

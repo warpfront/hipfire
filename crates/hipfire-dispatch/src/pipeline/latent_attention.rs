@@ -246,6 +246,17 @@ pub enum LatentAttentionOp<'a> {
         out: &'a GpuTensor,
         elements: usize,
     },
+    /// `*pos += rows` on the device: the cache length advance after the last
+    /// stage of a call that read it (graph-recordable, no host write).
+    Advance { pos: &'a GpuTensor, rows: usize },
+    /// Pack a layer's expanded `kv_b` operator (`[latent, n_heads * (nope +
+    /// v_dim)]` F32: the projector applied to the identity) into the absorbed
+    /// route's BF16 weight. Load time.
+    PackAbsorbed {
+        geometry: LatentGeometry,
+        expanded: &'a GpuTensor,
+        packed: &'a GpuTensor,
+    },
 }
 
 fn refuse(msg: String) -> DispatchError {
@@ -317,6 +328,80 @@ fn resolve_range(
             }
             Ok((false, start, count))
         }
+    }
+}
+
+impl LatentAttentionOp<'_> {
+    /// The host checks [`execute_latent_attention`] runs before a stage
+    /// launches (geometry, cache bounds, mirror admission); launch-free.
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        match self {
+            LatentAttentionOp::NormRows { rows, width, .. } => {
+                if *rows == 0 || *width == 0 {
+                    return Err(refuse("norm rows with empty geometry".into()));
+                }
+            }
+            LatentAttentionOp::SplitKv {
+                geometry,
+                cache,
+                rows,
+                ..
+            }
+            | LatentAttentionOp::Attention {
+                geometry,
+                cache,
+                rows,
+                ..
+            } => {
+                check_geometry(geometry)?;
+                check_cache(cache, *rows)?;
+            }
+            LatentAttentionOp::GatherLatent {
+                geometry,
+                cache,
+                range,
+                ..
+            } => {
+                check_geometry(geometry)?;
+                resolve_range(cache, *range)?;
+            }
+            LatentAttentionOp::Decompress {
+                geometry,
+                cache,
+                mirror,
+                expansion,
+                range,
+            } => {
+                check_geometry(geometry)?;
+                let mirror_end = match range {
+                    RowRange::Absolute { start, count } => start.checked_add(*count),
+                    RowRange::NewRows { count } => cache.host_pos.map(|p| p + *count),
+                };
+                check_mirror(mirror, mirror_end)?;
+                resolve_range(cache, *range)?;
+                if mirror.q8 && matches!(expansion, KvExpansion::Dense { .. }) {
+                    return Err(refuse(
+                        "the dense expansion writes BF16 mirrors only; a Q8 mirror takes the \
+                         external expansion"
+                            .into(),
+                    ));
+                }
+            }
+            LatentAttentionOp::Gate { elements, .. } => {
+                if *elements == 0 {
+                    return Err(refuse("gate with no elements".into()));
+                }
+            }
+            LatentAttentionOp::Advance { pos, rows } => {
+                if *rows == 0 || pos.buf.size() < 4 {
+                    return Err(refuse(
+                        "position advance needs rows and an i32 counter".into(),
+                    ));
+                }
+            }
+            LatentAttentionOp::PackAbsorbed { geometry, .. } => check_geometry(geometry)?,
+        }
+        Ok(())
     }
 }
 
@@ -480,6 +565,23 @@ pub fn execute_latent_attention(
             out,
             elements,
         } => gpu.latent_attention_gate(y, g, out, *elements).map_err(hip),
+        LatentAttentionOp::Advance { pos, rows } => {
+            gpu.device_counter_add_i32(pos, *rows as i32).map_err(hip)
+        }
+        LatentAttentionOp::PackAbsorbed {
+            geometry,
+            expanded,
+            packed,
+        } => gpu
+            .latent_attention_absorb_pack(
+                expanded,
+                packed,
+                geometry.n_heads,
+                geometry.nope,
+                geometry.v_dim,
+                geometry.latent,
+            )
+            .map_err(hip),
     }
 }
 

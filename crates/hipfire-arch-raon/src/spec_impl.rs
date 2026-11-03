@@ -59,10 +59,10 @@ use crate::forward::{
     embed_lookup, forward_rows_tapped, readout_logits, require_whole_band, stage_decode_token,
     validate_extract_layers, DflashCapture, TapSite,
 };
-use crate::projection::{project_rows_batched, OutRound};
 use crate::rollback::{RdaRingBuf, RollbackMode};
 use crate::state::RaonStateSnapshot;
 use crate::verify_graph::VerifyGraphs;
+use hipfire_dispatch::pipeline::boundary_project::OutRound;
 use hipfire_dispatch::pipeline::PrefillActTier;
 
 // ───────────────────────── host planning ─────────────────────────
@@ -1002,15 +1002,19 @@ impl SpecTarget for RaonBundle {
         let head = self.spec.head.as_ref().expect("verify head just ensured");
         let mut logits = head.logits.sub_offset(0, n * vocab);
         // Draft rows are never decode rows: the batched head, row-exact or not.
-        project_rows_batched(
-            gpu,
+        let rows = hidden_rows.sub_offset(0, n * hidden);
+        let project = [crate::program::project_one(
             self.weights.lm_head_weight()?,
-            &hidden_rows.sub_offset(0, n * hidden),
+            &rows,
             &logits,
             n,
+            crate::program::batched_route(n),
             OutRound::Bf16,
             PrefillActTier::F16,
-        )?;
+        )];
+        let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+        crate::forward::run(gpu, &ctx, &project)?;
+        drop(project);
         logits.shape = vec![n, vocab];
         Ok(logits)
     }
