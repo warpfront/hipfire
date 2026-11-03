@@ -50,8 +50,24 @@ const BLOCK_I8_128_BYTES: usize = 136;
 /// Gate/up rows per CTA: 4 waves x 16 gate rows (the up rows ride along).
 const ROWS_PER_CTA: usize = 64;
 
+/// Developer override of the tile-run width (`1` or `2`; unset or anything else: [`ep_a8_select_nt`]).
+pub const QWEN4_MOE_EP_A8_NT_ENV: &str = "HIPFIRE_QWEN4_MOE_EP_A8_NT";
+
 static EP_A8: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_bool(QWEN4_MOE_EP_A8_FLAG, false));
+static EP_A8_NT: LazyLock<Option<usize>> = LazyLock::new(|| {
+    hipfire_config::developer_var(QWEN4_MOE_EP_A8_NT_ENV)
+        .ok()
+        .and_then(|v| ep_a8_parse_nt(&v))
+});
+
+/// Pure parse of [`QWEN4_MOE_EP_A8_NT_ENV`]: a built width, else `None`.
+fn ep_a8_parse_nt(raw: &str) -> Option<usize> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|nt| EP_A8_GATE_UP_NTS.contains(nt) && EP_A8_DOWN_NTS.contains(nt))
+}
 
 /// Tile-run widths built for gate/up (16-slot tiles per CTA).
 pub const EP_A8_GATE_UP_NTS: [usize; 2] = [1, 2];
@@ -347,7 +363,7 @@ impl Gpu {
             return Err(err(&format!("{what}: extent exceeds 32-bit slot indices")));
         }
         let planar = self.mq4_experts_planar;
-        let nt = ep_a8_select_nt(down, grouped_rows);
+        let nt = (*EP_A8_NT).unwrap_or_else(|| ep_a8_select_nt(down, grouped_rows));
         let func = if down {
             ep_a8_down_symbol(planar, nt)
         } else {
@@ -474,6 +490,16 @@ mod tests {
         assert!(!ep_a8_down_shape_ok(2560, 640, 0, 1));
         assert!(!ep_a8_down_shape_ok(2560, 600, 4096, 1));
         assert!(!ep_a8_down_shape_ok(2560, 640, 4096, 0));
+    }
+
+    #[test]
+    fn nt_override_accepts_only_built_widths() {
+        assert_eq!(ep_a8_parse_nt("1"), Some(1));
+        assert_eq!(ep_a8_parse_nt(" 2 "), Some(2));
+        for bad in ["0", "3", "4", "", "two", "-1"] {
+            assert_eq!(ep_a8_parse_nt(bad), None, "{bad:?}");
+        }
+        assert_eq!(QWEN4_MOE_EP_A8_NT_ENV, "HIPFIRE_QWEN4_MOE_EP_A8_NT");
     }
 
     #[test]
