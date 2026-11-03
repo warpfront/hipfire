@@ -821,13 +821,38 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
     }
     let mut cmp_words = 0u64;
     let mut mism = 0u64;
+    let mut t0_cpu_bad = 0u64;
+    let mut t1_cpu_bad = 0u64;
     for &(m, k) in &[(130usize, 256usize), (1000, 2560), (2560, 6144), (48, 2560)] {
         for n in 1..=8usize {
             let x = rand_activations(rng, k, n);
-            let (xq_ptr, _rot, _xq_host) = produce_real(gpu, &x, k, n);
+            let (xq_ptr, _rot, xq_host) = produce_real(gpu, &x, k, n);
+            let rows = pick_subset(m, 600, &[127, 128, 129, 255, 256, 1023, 1024], rng, 96);
+            let toks: Vec<usize> = (0..n).collect();
+            let rt = ref_tokens(&xq_host, k, n, &toks);
             for (wi, wk) in [WKind::Random, WKind::EdgeScales, WKind::Exhaustive].into_iter().enumerate() {
                 let w_host = gen_weights(m, k, wk, 0x7000_0000 + (m * 8 + n) as u64 + wi as u64);
                 let w_dev = upload_bytes(gpu, &w_host);
+                let yref = cpu_ref(&w_host, k, &rows, &rt);
+                let cpu_bad = |h: &[u8], bf16: bool| -> u64 {
+                    let elt = if bf16 { 2 } else { 4 };
+                    let mut bad = 0u64;
+                    for (ri, &r) in rows.iter().enumerate() {
+                        for t in 0..n {
+                            let want = yref[ri * n + t];
+                            let off = (t * m + r) * elt;
+                            let ok = if bf16 {
+                                u16::from_le_bytes([h[off], h[off + 1]]) == bf16_bits(want)
+                            } else {
+                                u32::from_le_bytes([h[off], h[off + 1], h[off + 2], h[off + 3]]) == want.to_bits()
+                            };
+                            if !ok {
+                                bad += 1;
+                            }
+                        }
+                    }
+                    bad
+                };
                 for bf16 in [false, true] {
                     let elt = if bf16 { 2 } else { 4 };
                     let bytes = m * n * elt;
@@ -846,6 +871,10 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
                         .unwrap_or_else(|err| panic!("launch {e}: {err}"));
                     gpu.hip.device_synchronize().expect("sync");
                     let hd = download_bytes(gpu, &yd, bytes + GUARD_TAIL);
+                    let t0_bad = cpu_bad(&hd, bf16);
+                    t0_cpu_bad += t0_bad;
+                    let mut t1_bad_case = 0u64;
+                    let mut par_bad_case = 0u64;
                     for tile in tiles_for(n, true) {
                         let ym = gpu.alloc_tensor(&[bytes + GUARD_TAIL], DType::Raw).expect("alloc ym");
                         gpu.hip.memset(&ym.buf, 0x5A, bytes + GUARD_TAIL).expect("memset");
@@ -853,18 +882,29 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
                         gpu.hip.device_synchronize().expect("sync");
                         let hm = download_bytes(gpu, &ym, bytes + GUARD_TAIL);
                         let d = hd[..bytes].iter().zip(&hm[..bytes]).filter(|(p, q)| p != q).count() as u64;
+                        par_bad_case += d;
                         mism += d;
                         cmp_words += (bytes / elt) as u64;
-                        if d != 0 {
-                            st.fails.push(format!("T0 parity {:?} m{m} k{k} n{n} {} {}: {d} bytes differ", wk, tile.label(), if bf16 { "bf16" } else { "f32" }));
-                        }
+                        let tb = cpu_bad(&hm, bf16);
+                        t1_bad_case += tb;
+                        t1_cpu_bad += tb;
+                    }
+                    js.line(&format!(
+                        "{{\"kind\":\"t0_dot4_parity_case\",\"m\":{m},\"k\":{k},\"n\":{n},\"w\":\"{:?}\",\"out\":\"{}\",\"t0_vs_cpu_bad_words\":{t0_bad},\"t1_tiles_vs_cpu_bad_words\":{t1_bad_case},\"t0_vs_t1_bad_bytes\":{par_bad_case}}}",
+                        wk, if bf16 { "bf16" } else { "f32" }
+                    ));
+                    if par_bad_case != 0 {
+                        st.fails.push(format!("T0 parity {:?} m{m} k{k} n{n} {}: T0 vs CPU {t0_bad} bad words, T1 tiles vs CPU {t1_bad_case}, T0 vs T1 {par_bad_case} bytes", wk, if bf16 { "bf16" } else { "f32" }));
                     }
                 }
             }
         }
     }
     st.mismatches += mism;
-    js.line(&format!("{{\"kind\":\"t0_dot4_parity\",\"words\":{cmp_words},\"byte_mismatches\":{mism},\"pass\":{}}}", mism == 0 && cmp_words > 0));
+    js.line(&format!(
+        "{{\"kind\":\"t0_dot4_parity\",\"words\":{cmp_words},\"byte_mismatches\":{mism},\"t0_vs_cpu_bad_words\":{t0_cpu_bad},\"t1_vs_cpu_bad_words\":{t1_cpu_bad},\"pass\":{}}}",
+        mism == 0 && cmp_words > 0
+    ));
     assert!(cmp_words > 0, "vacuous T0 parity");
 }
 
@@ -963,7 +1003,7 @@ fn mq6sym_i8_wmma_bytes_hw() {
         (1, 256),     // single row (clamped tail everywhere)
         (17, 512),
     ];
-    let narrow_n = [9usize, 16, 24, 32, 48];
+    let narrow_n = [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 16, 24, 32, 48];
     let mut case_no = 0u64;
     for &(m, k) in m_list {
         for &n in &narrow_n {
