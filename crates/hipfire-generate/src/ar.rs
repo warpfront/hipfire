@@ -3469,6 +3469,7 @@ pub fn generate(
                     top_p,
                     max_tokens,
                     max_think_tokens,
+                    enable_thinking,
                     tools,
                     messages_history,
                 );

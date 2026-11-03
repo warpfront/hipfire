@@ -46,6 +46,11 @@ pub fn generate_lfm3(
     top_p: f32,
     max_tokens: usize,
     max_think_tokens: usize,
+    // Engine-authoritative reasoning toggle (from `qwen_jinja_reasoning`).
+    // LFM3's template keys its think opener on this; without it LFM3 always
+    // thought, so `--thinking off` was a no-op and short caps were burned
+    // inside the chain-of-thought.
+    enable_thinking: bool,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -68,7 +73,7 @@ pub fn generate_lfm3(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking,
                 bos_token: None,
                 reasoning_strength: None,
                 reasoning_effort: None,
