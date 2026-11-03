@@ -27,13 +27,19 @@
 //   gemm_mq6sym_i8_set_gfx1201 / gemm_mq6sym_i8_set_bf16_gfx1201
 //       prefill 128x128 tile (any N, tails masked), grid [ceil(M/128),
 //       ceil(N/128)], block 256, dynamic LDS MQ6SYM_P128_LDS_BYTES (36864).
-//   gemm_mq6sym_i8_set_m{32,64,128}n{16,32,48}_gfx1201 and the `_bf16` twins
+//   gemm_mq6sym_i8_set_m{32|64}n{16|32|48}_gfx1201 (kept: m32n16, m32n32, m64n16, m64n32,
+//   m64n48) and gemm_mq6sym_i8_set_m64n16y_gfx1201, each with a `_bf16` twin:
 //       narrow verify tiles for N <= 16 / 32 / 48 (tokens >= N are masked): a
-//       CTA owns ROWS = 32/64/128 weight rows and EVERY token of the N tile,
+//       CTA owns ROWS = 32/64 weight rows and EVERY token of the N tile,
 //       one wave per 16 rows streaming its own weights straight from HBM into
 //       registers (decode once, no weight LDS), the activation block of the
 //       current K128 staged in LDS and shared by the CTA's waves; grid
-//       [ceil(M/ROWS), 1, 1], block ROWS/16*32, static LDS only.
+//       [ceil(M/ROWS), 1, 1], block ROWS/16*32, static LDS only. The `y` twin is
+//       token-split: grid [ceil(M/64), ceil(N/16), 1], each CTA a 16-token slice
+//       (small-M shapes, M ~ 2560, N 17..48).
+//   Measured launcher rule (card C, receipts parity/kernel-runs/t1/time-6): N<=16 m64n16
+//   (m32n16 for M<=2560), N 17..32 m64n32 (m32n32 for M 6144..12288), N 33..48 m64n48,
+//   M<=2560 and N>=24 m64n16y, lm_head-sized M m64n48 at every N.
 //
 // Narrow-tile operand roles: A = activations (WMMA row = token), B = weights
 // (WMMA column = weight row), so each lane's accumulators belong to ONE weight
@@ -336,15 +342,14 @@ static __device__ __forceinline__ void sym_narrow_body(
 
 SYM_ROW(32, 2, 16, 1, , false)
 SYM_ROW(32, 2, 32, 2, , false)
-SYM_ROW(32, 2, 48, 3, , false)
 SYM_ROW(64, 4, 16, 1, , false)
 SYM_ROW(64, 4, 32, 2, , false)
 SYM_ROW(64, 4, 48, 3, , false)
 // token-split twins of the 16-token tiles (grid [ceil(M/rows), ceil(N/16)])
-SYM_ROW(32, 2, 16, 1, y, true)
 SYM_ROW(64, 4, 16, 1, y, true)
-SYM_ROW(32, 2, 32, 2, y, true)
-SYM_ROW(64, 4, 32, 2, y, true)
+// KILLED on card C (receipts parity/kernel-runs/t1/time-6): m32n48, m32n16y, m32n32y, m64n32y, the
+// m{32,64,128}n*p{2,3} deeper-prefetch tiles, m128 tiles, an LDS-only-barrier prefill, a
+// 192-VGPR-capped prefill: each lost to the kept tiles in every cell.
 
 // ===================================================================
 // Prefill 128 x 128 tile (A = weights, B = activations), a fork of the affine
@@ -833,27 +838,4 @@ void gemm_mq6sym_i8_set_bf16_gfx1201(
 ) {
     gemm_mq6sym_p128_body<true>((const char*)W, Xq, Y, M, K, N);
 }
-
-// Twins capped at 192 VGPRs (two 256-thread CTAs per CU: 8 waves/SIMD); the uncapped kernels
-// allocate 199 (7 waves/SIMD).
-extern "C" __global__ __launch_bounds__(P_NTHREADS, 2) __attribute__((amdgpu_num_vgpr(192)))
-void gemm_mq6sym_i8_set_c192_gfx1201(
-    const unsigned char*  __restrict__ W,
-    const block_i8_128*   __restrict__ Xq,
-    void*                 __restrict__ Y,
-    int M, int K, int N
-) {
-    gemm_mq6sym_p128_body<false>((const char*)W, Xq, Y, M, K, N);
-}
-
-extern "C" __global__ __launch_bounds__(P_NTHREADS, 2) __attribute__((amdgpu_num_vgpr(192)))
-void gemm_mq6sym_i8_set_bf16_c192_gfx1201(
-    const unsigned char*  __restrict__ W,
-    const block_i8_128*   __restrict__ Xq,
-    void*                 __restrict__ Y,
-    int M, int K, int N
-) {
-    gemm_mq6sym_p128_body<true>((const char*)W, Xq, Y, M, K, N);
-}
-
 #endif  // gfx1200 / gfx1201
