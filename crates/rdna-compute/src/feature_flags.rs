@@ -132,8 +132,8 @@ pub struct FeatureFlags {
     /// on for exact gfx1201 (`=0` kills it), off elsewhere.
     pub qwen4_qsa_lanes: bool,
     /// Multi-lane fn-lanes GDN verify-rows core (`HIPFIRE_QWEN4_GDN_LANES_ROWS`),
-    /// default off on every arch (exact gfx1201 only, and only with
-    /// `HIPFIRE_QWEN4_GDN_LANES` on).
+    /// default on for exact gfx1201 only (`=0` kills it), and only with
+    /// `HIPFIRE_QWEN4_GDN_LANES` on.
     pub qwen4_gdn_lanes_rows: bool,
     /// Lane-batched PLE chain of an AR lane step (`HIPFIRE_QWEN4_LANE_PLE_BATCH`):
     /// the key / value projections once over the lanes' rows and one batched
@@ -144,7 +144,7 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`): HcRead / HcWrite / FinalHyper run one
     /// launch per kernel over every row instead of once per <= 8-row group
     /// (the single-launch `gemv_bf16_xf32_k4_rows_lane_t8` and the t1 HC up read
-    /// at 9..=64 rows). Default off on every arch (exact gfx1201 only).
+    /// at 9..=64 rows). Default on for exact gfx1201 only (`=0` kills it).
     pub qwen4_lane_hc_allrows: bool,
     /// Fused multi-lane fn-lanes GDN decode Core, conv/params prologue + output
     /// rotation epilogue in the step launch (`HIPFIRE_QWEN4_GDN_LANES_FUSE`),
@@ -1062,9 +1062,9 @@ impl FeatureFlags {
                 .unwrap_or(is_gfx1201),
             qwen4_gdn_lanes: parse_bool("HIPFIRE_QWEN4_GDN_LANES").unwrap_or(matches!(arch, "gfx1151" | "gfx1201")),
             qwen4_qsa_lanes: parse_bool("HIPFIRE_QWEN4_QSA_LANES").unwrap_or(arch == "gfx1201"),
-            qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(false),
+            qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(true),
             qwen4_lane_ple_batch: parse_bool("HIPFIRE_QWEN4_LANE_PLE_BATCH").unwrap_or(true),
-            qwen4_lane_hc_allrows: parse_bool("HIPFIRE_QWEN4_LANE_HC_ALLROWS").unwrap_or(false),
+            qwen4_lane_hc_allrows: parse_bool("HIPFIRE_QWEN4_LANE_HC_ALLROWS").unwrap_or(true),
             qwen4_gdn_lanes_fuse: parse_bool("HIPFIRE_QWEN4_GDN_LANES_FUSE").unwrap_or(true),
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
                 .unwrap_or(arch == "gfx1151" || is_gfx1201),
@@ -1741,7 +1741,7 @@ impl FeatureFlags {
     }
 
     /// Multi-lane fn-lanes GDN verify-rows core (`HIPFIRE_QWEN4_GDN_LANES_ROWS`).
-    /// Exact gfx1201 only, default off (`=1` enables) and it needs
+    /// Exact gfx1201 only, default on (`=0` kills it) and it needs
     /// [`Self::qwen4_gdn_lanes_enabled`] too (`HIPFIRE_QWEN4_GDN_LANES=0` kills both).
     pub fn qwen4_gdn_lanes_rows_enabled(&self) -> bool {
         self.qwen4_gdn_lanes_rows && self.qwen4_gdn_lanes_enabled() && self.arch == "gfx1201"
@@ -1754,7 +1754,7 @@ impl FeatureFlags {
     }
 
     /// All-rows HC stages of an AR lane step (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`). Exact
-    /// gfx1201 only, default off (`=1` enables).
+    /// gfx1201 only, default on (`=0` kills it).
     pub fn qwen4_lane_hc_allrows_enabled(&self) -> bool {
         self.qwen4_lane_hc_allrows && self.arch == "gfx1201"
     }
@@ -2990,9 +2990,9 @@ mod tests {
         }
     }
 
-    /// The all-rows lane HC stages are default off (`=1` enables) and reach exact gfx1201 only.
+    /// The all-rows lane HC stages are default on (`=0` kills them) and reach exact gfx1201 only.
     #[test]
-    fn qwen4_lane_hc_allrows_flag_is_default_off_and_exact_gfx1201() {
+    fn qwen4_lane_hc_allrows_flag_is_default_on_and_exact_gfx1201() {
         let with = |value: &'static str| {
             move |name: &str| -> std::result::Result<String, ()> {
                 if name == "HIPFIRE_QWEN4_LANE_HC_ALLROWS" {
@@ -3005,8 +3005,9 @@ mod tests {
         for arch in [
             "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
         ] {
-            assert!(
-                !FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_lane_hc_allrows_enabled(),
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_lane_hc_allrows_enabled(),
+                arch == "gfx1201",
                 "{arch}"
             );
             assert!(!FeatureFlags::from_lookup(arch, with("0")).qwen4_lane_hc_allrows_enabled());
@@ -4695,11 +4696,11 @@ mod tests {
         }
     }
 
-    /// `HIPFIRE_QWEN4_GDN_LANES_ROWS`: exact gfx1201 only, default off, `=1`
-    /// enables it, and it also needs `HIPFIRE_QWEN4_GDN_LANES` on (`=0` there
+    /// `HIPFIRE_QWEN4_GDN_LANES_ROWS`: exact gfx1201 only, default on, `=0`
+    /// kills it, and it also needs `HIPFIRE_QWEN4_GDN_LANES` on (`=0` there
     /// kills it too); no other arch ever enables it, whatever the values.
     #[test]
-    fn gdn_lanes_rows_is_opt_in_on_gfx1201_and_needs_the_lanes_flag() {
+    fn gdn_lanes_rows_is_default_on_gfx1201_and_needs_the_lanes_flag() {
         let flags = |arch: &str, rows: Option<&str>, lanes: Option<&str>| {
             FeatureFlags::from_lookup(arch, |name| match (name, rows, lanes) {
                 ("HIPFIRE_QWEN4_GDN_LANES_ROWS", Some(v), _) => Ok(v.to_owned()),
@@ -4709,8 +4710,9 @@ mod tests {
         };
         for arch in ["gfx1201", "gfx1151", "gfx1100", "gfx942", "gfx1201:xnack-"] {
             let exact = arch == "gfx1201";
-            assert!(
-                !flags(arch, None, None).qwen4_gdn_lanes_rows_enabled(),
+            assert_eq!(
+                flags(arch, None, None).qwen4_gdn_lanes_rows_enabled(),
+                exact,
                 "{arch}: unset"
             );
             for on in ["1", "true", "on"] {
@@ -4720,14 +4722,14 @@ mod tests {
                     "{arch}: {on}"
                 );
             }
-            for off in ["0", "false", "off", "2"] {
+            for off in ["0", "false", "off"] {
                 assert!(
                     !flags(arch, Some(off), None).qwen4_gdn_lanes_rows_enabled(),
                     "{arch}: {off}"
                 );
             }
-            // Both flags: the lanes kill switch also kills the rows route, and
-            // the AR route does not imply the rows route.
+            // Both flags: the lanes kill switch also kills the rows route; the
+            // rows route follows its own default when only the lanes flag is set.
             assert!(
                 !flags(arch, Some("1"), Some("0")).qwen4_gdn_lanes_rows_enabled(),
                 "{arch}: lanes off"
@@ -4737,7 +4739,10 @@ mod tests {
                 exact,
                 "{arch}: both on"
             );
-            assert!(!flags(arch, None, Some("1")).qwen4_gdn_lanes_rows_enabled());
+            assert_eq!(
+                flags(arch, None, Some("1")).qwen4_gdn_lanes_rows_enabled(),
+                exact
+            );
         }
     }
 

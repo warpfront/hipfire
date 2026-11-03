@@ -2888,7 +2888,7 @@ pub fn execute_gated_delta_net_uncovered(
 
 /// Whether `op` can join an [`execute_gated_delta_net_core_lanes`] group: a
 /// Core step that is either one AR row (no capture ring, the per-row branch) or
-/// a 2..=[`rdna_compute::tensor_ops::GDN_CORE_ROWS_MAX`]-row verify window under
+/// a 2..=[`rdna_compute::tensor_ops::GDN_CORE_LANE_ROWS`]-row verify window under
 /// its armed capture ring (the persistent-batch capture route), the latter only
 /// under `HIPFIRE_QWEN4_GDN_LANES_ROWS` ([`rdna_compute::feature_flags::FeatureFlags::qwen4_gdn_lanes_rows_enabled`]).
 pub fn gdn_core_lane_groupable(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
@@ -2897,7 +2897,7 @@ pub fn gdn_core_lane_groupable(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
             op.row_capture.is_none() && !gdn_persistent_batch(gpu, op, 1)
         } else {
             gpu.flags.qwen4_gdn_lanes_rows_enabled()
-                && (2..=rdna_compute::tensor_ops::GDN_CORE_ROWS_MAX).contains(&op.rows)
+                && (2..=rdna_compute::tensor_ops::GDN_CORE_LANE_ROWS).contains(&op.rows)
                 && op.row_capture.is_some()
                 && gdn_persistent_batch(gpu, op, op.rows)
         }

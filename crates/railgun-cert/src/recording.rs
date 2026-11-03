@@ -1369,7 +1369,7 @@ pub const DECISIONS: &[Decision] = &[
     Decision {
         id: "qwen4-gdn-core-lanes-rows",
         predicates: &[IsRecording],
-        condition: "gated_delta_core_lanes_rows (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive GDN Core steps that are 2..=GDN_CORE_ROWS_MAX-row verify windows under the armed capture ring (Q8 states, 128x128, no residual), HIPFIRE_QWEN4_GDN_LANES_ROWS (`qwen4_gdn_lanes_rows_enabled`: exact gfx1201 only, opt-in `=1` and default off, needs and is killed by HIPFIRE_QWEN4_GDN_LANES=0) and `!is_recording()`; never recorded: the per-lane cursor, Q8 frame and ring pointers are launch-time kernargs that no replay binding declares, so admission refuses under a recorder",
+        condition: "gated_delta_core_lanes_rows (tensor_ops.rs): 2..=GDN_CORE_LANES_MAX consecutive GDN Core steps that are 2..=GDN_CORE_LANE_ROWS-row verify windows under the armed capture ring (Q8 states, 128x128, no residual), HIPFIRE_QWEN4_GDN_LANES_ROWS (`qwen4_gdn_lanes_rows_enabled`: exact gfx1201 only, default on, `=0` kills it, also killed by HIPFIRE_QWEN4_GDN_LANES=0) and `!is_recording()`; never recorded: the per-lane cursor, Q8 frame and ring pointers are launch-time kernargs that no replay binding declares, so admission refuses under a recorder",
         effect: KernelSelection,
         switches: "eager verify lane step: gdn_lanes (gated_delta_conv_params_bf16_f32_rows_lanes, gated_delta_step_halves_state128_persistent256_capture_q8_lanes, gated_delta_gate_bf16_f32_rows_lanes), 3 launches per layer for every verify lane instead of 4 per lane; a set holding a one-row lane is never admitted (the AR lanes of a mixed group take qwen4-gdn-core-lanes, their fused one-launch kernel included, so every kernel of both sets launches once for the whole group; a class with a single lane runs per lane); flag off: gdn_core_lane_groupable refuses every verify window and the group is the one-row set exactly as before; recorded: the per-lane incumbent chain (copy_d2d, conv + params, capture step, gate)",
         kernels: &["gated_delta_conv_bf16_f32_batched_k4", "gated_delta_step_halves_state128_persistent256_capture_q8", "gated_delta_gate_bf16_f32_batched"],
@@ -1579,6 +1579,17 @@ pub const DECISIONS: &[Decision] = &[
         kernels: &[],
         verdict: Invariant,
         evidence: "same ids in lane order, same destination and stream order before the unchanged embedding launch; a ring slot is rewritten only after its own earlier copy's fence completes; PP2 mq2-xts hold j1574 (ids and every logits row byte-identical to the serialized PP singleton at K=1..8 under adaptive, 1 and 4 micro-batches and overlap off) ran with the ring",
+        reaches: &[],
+    },
+    Decision {
+        id: "qwen4-lane-hc-allrows-eager-only",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "hipfire-arch-qwen4 forward_lanes_scoped (gpu_forward_lanes.rs) via hc_all_rows_applies: an AR / verify lane step of more than LANE_MAX_ROWS rows runs its HC stages (layer reads, the writes no TP2 all-reduce carries, the final read) as ONE all-rows segment under HIPFIRE_QWEN4_LANE_HC_ALLROWS (exact gfx1201, default on, `=0` kills it) only while `!(gpu.replay.is_recording() || gpu.graphs.capture_mode)` and outside the prefill-invariant scope; a recorded or captured step keeps the per <= 8-row group emission",
+        effect: KernelSelection,
+        switches: "eager: gemv_bf16_xf32_k4_rows_lane_t8 (one launch over every row tile) and the t1 HC up read at 9..=64 rows; recorded/captured: the incumbent per-group HC launches",
+        kernels: &["gemv_bf16_xf32_k4_rows_lane_t8"],
+        verdict: Invariant,
+        evidence: "same per-row device arithmetic: hc_allrows_oracle (fabric j7403, card C) 16,822 cases over rows 1..=64, five lane partitions, real HC weights of layers 0/23/47, 0 mismatching bytes against both the per-group launches and the per-row singleton, 20/20 negative controls detected; model-level lane == singleton greedy ids at 8x2 and 8x4 verify rows (fabric j7394)",
         reaches: &[],
     },
     Decision {
@@ -2274,8 +2285,12 @@ pub const SITES: &[Site] = &[
     Site {
         file: "hipfire-arch-qwen4/src/gpu_forward_lanes.rs",
         function: "forward_lanes_scoped",
-        occurrences: 2,
-        decisions: &["qwen4-ple-async-upload", "qwen4-lane-token-ids-async"],
+        occurrences: 4,
+        decisions: &[
+            "qwen4-ple-async-upload",
+            "qwen4-lane-token-ids-async",
+            "qwen4-lane-hc-allrows-eager-only",
+        ],
     },
     Site {
         file: "hipfire-arch-qwen4/src/ple_stage.rs",

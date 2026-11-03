@@ -3780,7 +3780,7 @@ impl GdnCoreLanesPlan<'_, '_> {
 
 /// Most rows one lane of [`gated_delta_core_lanes_rows`] may carry (the
 /// capture ring's verify window).
-pub const GDN_CORE_ROWS_MAX: usize = 8;
+pub const GDN_CORE_LANE_ROWS: usize = 8;
 
 /// One verify lane's GDN Core under the armed capture ring: the arguments of
 /// its per-lane chain `copy_d2d(projection -> conv.input)`,
@@ -4027,13 +4027,13 @@ fn rows_step_kernargs(
 }
 
 /// Admission of the per-lane verify chains of 2..=[`GDN_CORE_LANES_MAX`] lanes
-/// with 2..=[`GDN_CORE_ROWS_MAX`] rows each as three launches (see
+/// with 2..=[`GDN_CORE_LANE_ROWS`] rows each as three launches (see
 /// [`GdnCoreRowsPlan::launch`]), under `HIPFIRE_QWEN4_GDN_LANES_ROWS`
 /// ([`crate::feature_flags::FeatureFlags::qwen4_gdn_lanes_rows_enabled`]: exact
 /// gfx1201, opt-in, killed by `HIPFIRE_QWEN4_GDN_LANES=0`). Lanes hold Q8 slots on the exact-gfx1201
 /// 128x128 route with their capture ring armed (`step.row_states`: the
 /// token-exact capture recurrence; the unarmed route requantizes once and is
-/// not this kernel; every lane has 2..=[`GDN_CORE_ROWS_MAX`] rows, so a set
+/// not this kernel; every lane has 2..=[`GDN_CORE_LANE_ROWS`] rows, so a set
 /// that holds a one-row lane is never admitted: one-row AR lanes take
 /// [`gated_delta_core_lanes`]) and share the weights and shapes. Every
 /// refusal happens
@@ -4069,7 +4069,7 @@ pub fn gated_delta_core_lanes_rows<'a, 'l>(
         let fits = s.format == GdnStateFormat::Q8
             && s.residual.is_none()
             && s.row_states.is_some()
-            && (2..=GDN_CORE_ROWS_MAX).contains(&s.rows)
+            && (2..=GDN_CORE_LANE_ROWS).contains(&s.rows)
             && c.rows == s.rows
             && p.rows == s.rows
             && g.rows == s.rows

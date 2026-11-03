@@ -83,7 +83,7 @@ use rdna_compute::tensor_ops::{
     gated_delta_step_batched, gated_delta_step_gated, GatedDeltaConv, GatedDeltaConvBatched,
     GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched,
     GatedDeltaStep, GatedDeltaStepBatched, GdnCoreLane, GdnCoreRowsLane, GdnStateFormat,
-    GDN_CORE_LANES_MAX, GDN_CORE_ROWS_MAX,
+    GDN_CORE_LANES_MAX, GDN_CORE_LANE_ROWS,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -99,7 +99,7 @@ const RING: usize = 3;
 const SLOT: usize = NV * HD * (HD + 4);
 /// Rows one capture ring half holds (one more than a verify may use, so the
 /// probes can form a 9-row lane).
-const RING_ROWS: usize = GDN_CORE_ROWS_MAX + 1;
+const RING_ROWS: usize = GDN_CORE_LANE_ROWS + 1;
 /// Guard elements around every F32 buffer (1 KiB), bytes around raw ones.
 const GUARD_F32: usize = 256;
 const GUARD_RAW: usize = 1024;
@@ -984,7 +984,8 @@ fn run_candidate(
         // output projection's rotation scratch only for a group of AR lanes alone.
         let rot_all = arm.rot.view(0, arm.cap * VALUE);
         let rotation = (rotate && verify_lanes.is_empty()).then_some(&rot_all);
-        plan.launch_rotated(gpu, rotation).map_err(|e| e.to_string())?;
+        plan.launch_rotated(gpu, rotation)
+            .map_err(|e| e.to_string())?;
         gpu.scratch.prerotated = None;
     } else {
         for (l, (_, v)) in ar_lanes.iter().zip(&ar) {
@@ -1013,7 +1014,15 @@ fn expected_counts(rows: &[usize], fuse: bool) -> ((u64, u64), (u64, u64)) {
     let per_lane = (2 * ar + 3 * verify, verify);
     // Two or more AR lanes: the fused one-launch kernel (HIPFIRE_QWEN4_GDN_LANES_FUSE,
     // beta's default) or the two incumbent lane launches.
-    let ar_launches = if ar >= 2 { if fuse { 1 } else { 2 } } else { 2 * ar };
+    let ar_launches = if ar >= 2 {
+        if fuse {
+            1
+        } else {
+            2
+        }
+    } else {
+        2 * ar
+    };
     let (verify_launches, verify_copies) = if verify >= 2 {
         (3, 0)
     } else {
@@ -1169,7 +1178,7 @@ fn run_case(gpu: &mut Gpu, w: &Weights, rng: &mut Rng, spec: &CaseSpec) -> CaseR
         .collect();
     // One row of slack: the rows control lays the candidate's segments out by
     // the claimed rows, so a lane's full view may end one row past the packed total.
-    let cap = spec.n * GDN_CORE_ROWS_MAX + 1;
+    let cap = spec.n * GDN_CORE_LANE_ROWS + 1;
     let ref_arm = Arm::new(gpu, cap, &host);
     let cand_arm = Arm::new(gpu, cap, &host);
     let carry0: Vec<Carry> = host
@@ -1664,7 +1673,7 @@ fn bench(
     let host: Vec<LaneHost> = (0..n)
         .map(|l| make_lane_host(rng, 3 + l, &[rows[l]]))
         .collect();
-    let arm = Arm::new(gpu, n * GDN_CORE_ROWS_MAX + 1, &host);
+    let arm = Arm::new(gpu, n * GDN_CORE_LANE_ROWS + 1, &host);
     let carry: Vec<Carry> = (0..n)
         .map(|l| Carry {
             pos: 3 + l,
@@ -1797,10 +1806,14 @@ fn parse_cli() -> Cli {
             "--reps" => cli.reps = value("--reps").parse().unwrap_or_else(|_| usage("--reps")),
             "--lanes" => cli.lanes = parse_list(&value("--lanes"), "--lanes", GDN_CORE_LANES_MAX),
             "--time-rows" => {
-                cli.time_rows = parse_list(&value("--time-rows"), "--time-rows", GDN_CORE_ROWS_MAX)
+                cli.time_rows = parse_list(&value("--time-rows"), "--time-rows", GDN_CORE_LANE_ROWS)
             }
             "--bench" => {
-                cli.bench = Some(value("--bench").parse().unwrap_or_else(|_| usage("--bench")));
+                cli.bench = Some(
+                    value("--bench")
+                        .parse()
+                        .unwrap_or_else(|_| usage("--bench")),
+                );
                 cli.time_rows = vec![1, 2, 4];
             }
             "--bench-runs" => {
@@ -1853,7 +1866,7 @@ fn pool(kind: &str, steps: usize) -> Vec<usize> {
             1_000_003,
             16_777_215,
             4_294_967_000,
-            u32::MAX as usize - (GDN_CORE_ROWS_MAX * steps - 1),
+            u32::MAX as usize - (GDN_CORE_LANE_ROWS * steps - 1),
         ],
         // Every lane at the same position: lanes differ only by data.
         "same" => vec![5; 8],
@@ -1878,19 +1891,19 @@ fn rows_for(pattern: &str, n: usize, steps: usize, rng: &mut Rng) -> Vec<Vec<usi
                     "all1" => 1,
                     "all2" => 2,
                     "all4" => 4,
-                    "all8" => GDN_CORE_ROWS_MAX,
+                    "all8" => GDN_CORE_LANE_ROWS,
                     // The reference mixed window of the step packet: AR and verify
                     // lanes interleaved, every row count 1..=8 present; the pattern
                     // rotates by one lane per step so every lane takes every role.
                     "task_mixed" => [1, 4, 1, 4, 2, 1, 3, 8][(l + s) % 8],
-                    "ragged" => 1 + rng.below(GDN_CORE_ROWS_MAX),
-                    "verify_ragged" => 2 + rng.below(GDN_CORE_ROWS_MAX - 1),
+                    "ragged" => 1 + rng.below(GDN_CORE_LANE_ROWS),
+                    "verify_ragged" => 2 + rng.below(GDN_CORE_LANE_ROWS - 1),
                     // AR lanes (one row) among verify lanes of 2..=8 rows.
                     "mixed" => {
                         if l % 2 == 0 {
                             1
                         } else {
-                            2 + (3 * l + s) % (GDN_CORE_ROWS_MAX - 1)
+                            2 + (3 * l + s) % (GDN_CORE_LANE_ROWS - 1)
                         }
                     }
                     _ => unreachable!(),
@@ -2081,8 +2094,11 @@ fn main() {
         // lanes: both classes grouped at once) at 4 and 8 lanes, as far as the
         // requested lane counts reach.
         let widest = cli.lanes.iter().copied().max().unwrap_or(0);
-        let control_sets: [(&'static str, [usize; 3]); 3] =
-            [("verify_ragged", [2, 3, 8]), ("mixed", [4, 8, 8]), ("task_mixed", [8, 8, 8])];
+        let control_sets: [(&'static str, [usize; 3]); 3] = [
+            ("verify_ragged", [2, 3, 8]),
+            ("mixed", [4, 8, 8]),
+            ("task_mixed", [8, 8, 8]),
+        ];
         for (pattern, lane_counts) in control_sets {
             let mut seen = Vec::new();
             for n in lane_counts {
@@ -2263,7 +2279,10 @@ mod tests {
         assert_eq!(expected_counts(&[1, 4], true), ((5, 1), (5, 1)));
         assert_eq!(expected_counts(&[1, 1, 4], true), ((7, 1), (4, 1)));
         assert_eq!(expected_counts(&[1, 4, 5], true), ((8, 2), (5, 0)));
-        assert_eq!(expected_counts(&[1, 4, 1, 4, 2, 1, 3, 8], true), ((21, 5), (4, 0)));
+        assert_eq!(
+            expected_counts(&[1, 4, 1, 4, 2, 1, 3, 8], true),
+            ((21, 5), (4, 0))
+        );
         assert_eq!(expected_counts(&[7], true), ((3, 1), (3, 1)));
     }
 
@@ -2315,7 +2334,7 @@ mod tests {
             assert_eq!(rows.len(), 8);
             for lane in &rows {
                 assert_eq!(lane.len(), 6);
-                assert!(lane.iter().all(|r| (1..=GDN_CORE_ROWS_MAX).contains(r)));
+                assert!(lane.iter().all(|r| (1..=GDN_CORE_LANE_ROWS).contains(r)));
                 if pattern == "verify_ragged" {
                     assert!(lane.iter().all(|&r| r >= 2));
                 }
@@ -2333,7 +2352,7 @@ mod tests {
                 assert_eq!(p.len(), 8, "{kind}");
                 for &base in &p {
                     assert!(
-                        base + GDN_CORE_ROWS_MAX * steps - 1 <= u32::MAX as usize,
+                        base + GDN_CORE_LANE_ROWS * steps - 1 <= u32::MAX as usize,
                         "{kind} {base}"
                     );
                 }

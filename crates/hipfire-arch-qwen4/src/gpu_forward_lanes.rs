@@ -14,11 +14,16 @@
 //! typed layer operations with one rule:
 //!
 //! - **Stateful stages** (PLE convolution, GDN conv/recurrence/gate, QSA
-//!   prologue/select/attend) always run per lane, on the lane's state, with
-//!   the lane's own row count.
+//!   prologue/select/attend) always run on each lane's own state with the
+//!   lane's own row count; the dispatch interpreter launches consecutive GDN
+//!   and QSA Core steps of several lanes (AR rows and ragged verify windows)
+//!   as one multi-lane launch per kernel (`HIPFIRE_QWEN4_GDN_LANES`,
+//!   `HIPFIRE_QWEN4_GDN_LANES_ROWS`, `HIPFIRE_QWEN4_QSA_LANES`).
 //! - **Row-local stages** run either per lane ([`StageShare::PerLane`], the
 //!   singleton's arm by construction) or once over every lane's rows
-//!   ([`StageShare::OnceAllRows`], in groups of at most [`LANE_MAX_ROWS`]).
+//!   ([`StageShare::OnceAllRows`], in groups of at most [`LANE_MAX_ROWS`];
+//!   under `HIPFIRE_QWEN4_LANE_HC_ALLROWS` the HC stages of a >8-row AR /
+//!   verify step take one all-rows segment instead).
 //!   A stage moves to `OnceAllRows` only on byte evidence from the G0 oracle
 //!   (`examples/fn_lane_oracle.rs --g0`): the S0 kill experiment found the
 //!   few-row forward NOT bitwise equal to single rows at every N ≥ 2, so
@@ -212,7 +217,8 @@ impl StageName {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StageShare {
     /// One launch over every lane's rows, in groups of at most
-    /// [`LANE_MAX_ROWS`] rows. Admitted only with G0 byte evidence.
+    /// [`LANE_MAX_ROWS`] rows (HC stages: one all-rows segment under
+    /// `HIPFIRE_QWEN4_LANE_HC_ALLROWS`). Admitted only with G0 byte evidence.
     OnceAllRows,
     /// One launch per lane class; executes as [`StageShare::PerLane`] with
     /// the existing kernels.

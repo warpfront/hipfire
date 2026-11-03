@@ -3007,7 +3007,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                     "gemv_bf16_xf32_x4_rows_otile_r8"
                 ]
             );
-            // `HIPFIRE_QWEN4_LANE_HC_ALLROWS` (default off): the lane step's all-rows HC k4 GEMV.
+            // `HIPFIRE_QWEN4_LANE_HC_ALLROWS` (default on, `=0` kills it): the lane step's all-rows HC k4 GEMV.
             add!(
                 "qwen4_gemv_bf16_xf32_lane_allrows",
                 kernels::QWEN4_GEMV_BF16_XF32_LANE_ALLROWS_SRC,
@@ -11774,7 +11774,7 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
-        // `HIPFIRE_QWEN4_LANE_HC_ALLROWS` (default off, exact gfx1201): the all-rows HC k4 GEMV.
+        // `HIPFIRE_QWEN4_LANE_HC_ALLROWS` (default on, exact gfx1201): the all-rows HC k4 GEMV.
         const LANE_HC_ALLROWS_ADDED_MODULES: [&str; 1] = ["qwen4_gemv_bf16_xf32_lane_allrows"];
         for module in LANE_HC_ALLROWS_ADDED_MODULES {
             assert!(
