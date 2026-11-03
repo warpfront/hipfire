@@ -80,7 +80,9 @@ use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
 use hipfire_arch_qwen4::lane::{LaneSampling, LaneSpecStats, LaneStatus};
-use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute, Qwen4LaneExecutor};
+use hipfire_arch_qwen4::lane_exec::{
+    LaneDraft, LaneRoute, Qwen4LaneExecutor, PROVISION_MAP_REFUSED,
+};
 use hipfire_engine::emit::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
@@ -440,6 +442,18 @@ fn adopt_promoted(
     });
 }
 
+/// The wire class and retryability of a failed lane step: a mapping refusal
+/// ([`PROVISION_MAP_REFUSED`], the lane could not commit the device pages its context needs) is a
+/// capacity condition, answered `overload` + retryable (HTTP 503, the request may be retried when
+/// other lanes finish); every other failure keeps the caller's class and is not retryable.
+fn lane_error_wire<'a>(message: &str, class: &'a str) -> (&'a str, bool) {
+    if message.contains(PROVISION_MAP_REFUSED) {
+        ("overload", true)
+    } else {
+        (class, false)
+    }
+}
+
 fn lane_error(
     sched: &mut ContinuousBatchScheduler,
     model: &mut LoadedModel,
@@ -456,13 +470,14 @@ fn lane_error(
     };
     let released = controls[idx].as_mut().map_or(Ok(()), |c| release(model, c));
     let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+    let (class, retryable) = lane_error_wire(message, class);
     emit_generation_error(
         ROUTE,
         stdout,
         Some(&key.id),
         message,
         class,
-        false,
+        retryable,
         released.is_ok(),
     );
     let _ = sched.abort_lane(idx, &key, admission);
@@ -1713,6 +1728,23 @@ fn attach_mtp_lane_stats(done: &mut serde_json::Value, stats: &LaneSpecStats) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_mapping_refusal_is_a_retryable_overload_and_other_failures_keep_their_class() {
+        let refused = format!(
+            "qwen4 lane step failed: {}16301 positions for RequestEpoch {{ request_tag: 40 }}: hipMemCreate out of memory",
+            hipfire_arch_qwen4::lane_exec::PROVISION_MAP_REFUSED
+        );
+        assert_eq!(super::lane_error_wire(&refused, "gpu"), ("overload", true));
+        assert_eq!(
+            super::lane_error_wire("qwen4 lane step failed: forward failed", "gpu"),
+            ("gpu", false)
+        );
+        assert_eq!(
+            super::lane_error_wire("qwen4 lane draft failed: x", "gpu"),
+            ("gpu", false)
+        );
+    }
+
     use super::{attach_mtp_lane_stats, forwarded_tokens, LaneCtl, LaneSpecStats};
     use hipfire_runtime::emit_text::ThinkBudget;
     use hipfire_runtime::external_rows::FetchActivity;

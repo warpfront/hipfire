@@ -2461,6 +2461,45 @@ fn run_lane_exec<T>(
     f(&mut executor)
 }
 
+/// The verdict of one `provision_step` fanned out to every rank, from each rank's own outcome in
+/// rank order: `Ok` when every rank mapped; otherwise the message to return and whether the mesh
+/// must be poisoned. Identical failures are an ordinary error (every rank agrees, nothing
+/// diverged). Ranks that disagree are poisoned (diverged tables) EXCEPT when every failure is a
+/// mapping refusal ([`crate::lane_exec::PROVISION_MAP_REFUSED`]: one rank's `hipMemCreate` ran
+/// out of headroom while another's did not): mapping only grows capacity, so no state diverged and
+/// the request is refused with the rank pool intact.
+pub(crate) fn ep_provision_verdict(outcomes: &[Result<(), String>]) -> Result<(), (String, bool)> {
+    let Some(first_error) = outcomes.iter().find_map(|outcome| outcome.as_ref().err()) else {
+        return Ok(());
+    };
+    let all_failed_alike = outcomes
+        .iter()
+        .all(|outcome| outcome.as_ref().err() == Some(first_error));
+    if all_failed_alike {
+        return Err((first_error.clone(), false));
+    }
+    let only_mapping_refusals = outcomes
+        .iter()
+        .filter_map(|outcome| outcome.as_ref().err())
+        .all(|error| error.starts_with(crate::lane_exec::PROVISION_MAP_REFUSED));
+    if only_mapping_refusals {
+        return Err((first_error.clone(), false));
+    }
+    let (first, rank, other) = outcomes
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find(|(_, outcome)| **outcome != outcomes[0])
+        .map(|(rank, other)| (&outcomes[0], rank, other))
+        .unwrap_or((&outcomes[0], 0, &outcomes[0]));
+    Err((
+        format!(
+            "rank pool: lane provision_step disagrees across ranks: rank 0 = {first:?}, rank {rank} = {other:?}"
+        ),
+        true,
+    ))
+}
+
 /// One rank's lane staging: the loader's budget check against this rank's own
 /// free memory, then the singleton `stage_lanes`. `Ok` means this call
 /// created the rank's store; `Err` means it created nothing.
@@ -2904,18 +2943,44 @@ impl Qwen4Bundle {
         )
     }
 
+    /// `provision_step` on every rank. Mapping a lane's QSA arenas can fail on ONE rank
+    /// (`hipMemCreate` OOM when that rank's headroom is the smaller one) while the other maps:
+    /// that is a capacity refusal, not diverged state (a rank that mapped keeps extra capacity,
+    /// which is monotonic and harmless; the caller's `abort_step` resets every rank's step and
+    /// poisons only the plan's lanes), so it comes back as an ordinary error and the mesh stays
+    /// usable ([`ep_provision_verdict`]). Any other disagreement still poisons the mesh.
     pub(crate) fn ep_lane_provision_step(
         &mut self,
         gpu: &mut Gpu,
         plan: &BatchStepPlan,
     ) -> Result<(), String> {
-        self.ep_lane_soft(
-            "lane provision_step",
-            |bundle| run_lane_exec(bundle, |exec| exec.provision_step(gpu, plan)),
-            &|bundle, peer_gpu, _| {
-                run_lane_exec(bundle, |exec| exec.provision_step(peer_gpu, plan))
-            },
-        )
+        let outcomes = self
+            .ep_run_ranks(
+                false,
+                |bundle| Ok(run_lane_exec(bundle, |exec| exec.provision_step(gpu, plan))),
+                &|bundle, peer_gpu, _| {
+                    Ok(run_lane_exec(bundle, |exec| {
+                        exec.provision_step(peer_gpu, plan)
+                    }))
+                },
+            )
+            .map_err(|message| {
+                if let Some(mesh) = self.ep.as_ref() {
+                    mesh.poison(&message);
+                }
+                message
+            })?;
+        match ep_provision_verdict(&outcomes) {
+            Ok(()) => Ok(()),
+            Err((message, poison)) => {
+                if poison {
+                    if let Some(mesh) = self.ep.as_ref() {
+                        mesh.poison(&message);
+                    }
+                }
+                Err(message)
+            }
+        }
     }
 
     /// Best effort and void, like the singleton entry: a mesh failure or
@@ -3151,6 +3216,45 @@ impl Qwen4EpPeer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_one_rank_mapping_refusal_does_not_poison_the_mesh() {
+        let refused = |bytes: usize| {
+            Err(format!(
+                "{}16301 positions for E: Qwen4 QSA context map of {bytes} bytes failed: HipError(2)",
+                crate::lane_exec::PROVISION_MAP_REFUSED
+            ))
+        };
+        // Every rank mapped.
+        assert_eq!(ep_provision_verdict(&[Ok(()), Ok(())]), Ok(()));
+        // Rank 0 ran out of headroom, rank 1 mapped: a refusal, the mesh stays usable.
+        let (message, poison) = ep_provision_verdict(&[refused(2_097_152), Ok(())]).unwrap_err();
+        assert!(!poison && message.contains("QSA context map of 2097152"));
+        let (_, poison) = ep_provision_verdict(&[Ok(()), refused(2_097_152)]).unwrap_err();
+        assert!(!poison);
+        // Both ranks refuse (different byte offsets): still a refusal.
+        let (_, poison) = ep_provision_verdict(&[refused(1), refused(2)]).unwrap_err();
+        assert!(!poison);
+        // The same failure everywhere is an ordinary error whatever it is.
+        let same = Err::<(), _>("provision_step: epoch vanished".to_string());
+        let (_, poison) = ep_provision_verdict(&[same.clone(), same]).unwrap_err();
+        assert!(!poison);
+    }
+
+    #[test]
+    fn any_other_disagreement_still_poisons_the_mesh() {
+        let other = Err::<(), _>("provision_step: epoch vanished".to_string());
+        let refused = Err::<(), _>(format!(
+            "{}9 positions for E: x",
+            crate::lane_exec::PROVISION_MAP_REFUSED
+        ));
+        // One rank failed for a reason that is not a capacity refusal.
+        let (message, poison) = ep_provision_verdict(&[Ok(()), other.clone()]).unwrap_err();
+        assert!(poison && message.contains("disagrees across ranks"));
+        // A capacity refusal on one rank and a different failure on the other.
+        let (_, poison) = ep_provision_verdict(&[refused, other]).unwrap_err();
+        assert!(poison);
+    }
 
     #[test]
     fn mirror_specs_compare_by_shape_and_dtype() {

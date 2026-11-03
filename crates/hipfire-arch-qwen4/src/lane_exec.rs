@@ -869,6 +869,12 @@ pub(crate) fn pick_at(host: &[u8], row: usize) -> u32 {
     u32::from_ne_bytes([b[0], b[1], b[2], b[3]])
 }
 
+/// Prefix of every `provision_step` error that is a mapping (VMM commit) refusal: the lane
+/// cannot get the device pages its context needs. It is a capacity condition, never diverged
+/// state: the EP mesh does not poison on it ([`crate::ep::ep_provision_verdict`]) and the serve
+/// loop answers it with a retryable overload (HTTP 503).
+pub const PROVISION_MAP_REFUSED: &str = "provision_step: map ";
+
 /// Map the lanes of a provisioned plan through the step's end (I4/I9) and
 /// check the plan against the step the draft phase sealed. An AR store has
 /// no draft phase of its own: its decode lanes are planned through the same
@@ -897,9 +903,12 @@ fn provision_inner(
         let lane = store
             .lane_mut(&r.epoch)
             .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
-        lane.state
-            .ensure_mapped_capacity(gpu, end)
-            .map_err(|e| format!("provision_step: map {end} positions for {:?}: {e}", r.epoch))?;
+        lane.state.ensure_mapped_capacity(gpu, end).map_err(|e| {
+            format!(
+                "{PROVISION_MAP_REFUSED}{end} positions for {:?}: {e}",
+                r.epoch
+            )
+        })?;
         if let Some(spec) = lane.spec.as_mut() {
             // A head-free (retired, no copy future) lane's head lags the
             // trunk and is never touched; a lagging head (copy future) is
@@ -908,7 +917,7 @@ fn provision_inner(
             if head_live {
                 spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
                     format!(
-                        "provision_step: map {end} head positions for {:?}: {e}",
+                        "{PROVISION_MAP_REFUSED}{end} head positions for {:?}: {e}",
                         r.epoch
                     )
                 })?;
