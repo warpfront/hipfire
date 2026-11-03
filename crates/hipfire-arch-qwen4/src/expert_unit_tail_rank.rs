@@ -40,7 +40,24 @@
 //!
 //! Any device error freezes the tail at its last uploaded table and logs once;
 //! it never fails a decode (every table state is valid: canonical, or a live
-//! slot with complete bytes).
+//! slot with complete bytes). The one exception is the pins lever's own fault (below).
+//!
+//! # Dynamic pins (`HIPFIRE_EP_UNIT_TAIL_PINS`)
+//!
+//! With the pins lever the tail runs on PINNED unit layers (D1.9) instead of static owners, and
+//! every retirement also steps the rank's [`PinProtocol`] (the protocol, its identity and
+//! visibility arguments and its failure path are the module docs of
+//! [`crate::expert_unit_tail::pins`]): the rank posts the publications / evictions its
+//! retirement made (an empty marker when it made none), applies every rank's posts with stamp
+//! `<= r - 2` to its pin planes and uploads the changed plane bytes on its active stream with
+//! its table uploads. The lever's step runs at EVERY cadence group end, on a frozen tail too
+//! (a freeze never resets the cadence under this lever, so the retirement clock stays the one
+//! every rank counts); a frozen tail posts markers only and keeps applying. The plane of a
+//! layer is read by `qwen4_ep_owner_assign_pinned` on this rank's stream, enqueued after the
+//! upload: a pin never changes between a window's first and last call. A pin FAULT (a missing
+//! post, a digest that differs, a failed plane upload: ranks whose planes may differ) is the
+//! one thing that does fail decodes: [`UnitTailRank::pins_fault`] makes the owner assignment
+//! refuse on every rank, because running a call over diverged planes is not exact.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -51,8 +68,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::expert_ep_units::EpUnitPlan;
 use crate::expert_unit_tail::{
-    EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, Retire, RetireCadence, TailPolicy,
-    UnitKey, WindowUse, QUARANTINE_WINDOWS,
+    EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, PinDelta, PinPlanes, PinProtocol,
+    Retire, RetireCadence, TailPolicy, UnitKey, WindowUse, QUARANTINE_WINDOWS,
 };
 
 /// Ids one window's log holds (`calls x slots`); a window past this stops
@@ -112,6 +129,23 @@ pub(crate) struct TailLayerInit {
     pub down_entries: Vec<usize>,
     /// The layer's full (chunk / prefill) table, when `HIPFIRE_EP_UNIT_TAIL_PREFILL` is on.
     pub full: Option<TailFullInit>,
+    /// A pinned unit layer's pin plane (`HIPFIRE_EP_UNIT_TAIL_PINS`): a non-owning alias of the
+    /// device `u8[512]` the balanced layer owns; the tail rewrites it at retirements. `None`
+    /// without the lever and for a layer without a pin plane.
+    pub pins: Option<GpuTensor>,
+}
+
+/// Whether the forward hands layer `ordinal`'s tables to the tail (`HIPFIRE_EP_UNIT_TAIL`): a
+/// static-owner layer over host experts as ever, and with the pins lever also every layer that
+/// has a pin plane (pinned unit layers keep the balanced owner kind, their full tables are what
+/// the per-call owner assignment reads). Without the lever this is exactly the static-owner rule.
+pub(crate) fn tail_layer_selected(
+    static_owners: bool,
+    host_mapped: bool,
+    with_pins: bool,
+    has_pin_plane: bool,
+) -> bool {
+    (static_owners && host_mapped) || (with_pins && has_pin_plane)
 }
 
 /// The layer's FULL (chunk / prefill) pointer tables: non-owning aliases and the host entries
@@ -416,6 +450,20 @@ struct Batch {
     fills: Vec<(usize, u64)>,
 }
 
+/// The pins lever on one rank: its protocol over the pinned host images of the planes (the
+/// protocol's [`PinPlanes`] order, ascending by label) and the non-owning device aliases the
+/// retirement uploads them to (the balanced layers own and free the planes).
+struct RankPins {
+    proto: PinProtocol<TableImage>,
+    /// `device[i]` is the device plane of `proto.planes()`'s plane `i`.
+    device: Vec<GpuTensor>,
+    /// Plane uploads (H2D calls) and bytes.
+    upload_calls: u64,
+    upload_bytes: u64,
+    /// The fault was logged.
+    reported: bool,
+}
+
 struct Inner {
     rank: usize,
     ranks: usize,
@@ -469,6 +517,8 @@ struct Inner {
     /// [`peer_shared`] does not admit, or an image already in that state).
     peer_applied: u64,
     peer_skipped: u64,
+    /// The pins lever's state, `None` without it.
+    pins: Option<RankPins>,
     released: bool,
 }
 
@@ -479,6 +529,23 @@ pub(crate) struct UnitTailRank {
 
 fn io(error: impl std::fmt::Display) -> String {
     error.to_string()
+}
+
+/// The pin deltas of one retirement: its publications (`on`, a completed fill the tables now
+/// name) in publish order, then its evictions (`off`, back to canonical), the order
+/// [`UnitTailRank::install`]'s warm start and the peer deltas use too.
+fn pin_deltas(retire: &Retire) -> Vec<PinDelta> {
+    retire
+        .publish
+        .iter()
+        .map(|&(unit, _)| PinDelta { unit, on: true })
+        .chain(
+            retire
+                .unpublish
+                .iter()
+                .map(|&unit| PinDelta { unit, on: false }),
+        )
+        .collect()
 }
 
 impl UnitTailRank {
@@ -498,6 +565,7 @@ impl UnitTailRank {
         log_enabled: bool,
         layers: Vec<TailLayerInit>,
         peer: Option<Arc<PeerBoard>>,
+        pin_board: Option<Arc<PeerBoard>>,
     ) -> Result<Self, String> {
         use crate::expert_ep_units::EpLayerState;
         let geometry = *plan.geometry();
@@ -536,13 +604,27 @@ impl UnitTailRank {
             })
             .map(|init| 2 + 2 * usize::from(init.full.is_some()))
             .sum();
-        let pool = if images == 0 {
+        // The pins lever's planes (`experts` bytes each) are carved from the same allocation,
+        // after the table images, so their u64 entries stay aligned.
+        let pin_count = if pin_board.is_some() {
+            layers
+                .iter()
+                .filter(|init| init.pins.is_some() && init.label < geometry.layers)
+                .count()
+        } else {
+            0
+        };
+        let pool = if images == 0 && pin_count == 0 {
             None
         } else {
             let mut buf = gpu
                 .hip
-                .host_buffer(images * experts * ENTRY_BYTES)
-                .map_err(|e| format!("the tail's pinned table images ({images} tables): {e}"))?;
+                .host_buffer(images * experts * ENTRY_BYTES + pin_count * experts)
+                .map_err(|e| {
+                    format!(
+                        "the tail's pinned table images ({images} tables, {pin_count} pin planes): {e}"
+                    )
+                })?;
             let ptr = buf.as_bytes_mut().as_mut_ptr();
             Some((Arc::new(PinnedPool { _buf: buf }), ptr))
         };
@@ -564,8 +646,14 @@ impl UnitTailRank {
             }
             image
         };
-        for init in layers {
+        let mut pin_inits: Vec<(usize, GpuTensor)> = Vec::new();
+        for mut init in layers {
             let label = init.label;
+            if pin_board.is_some() && label < geometry.layers {
+                if let Some(alias) = init.pins.take() {
+                    pin_inits.push((label, alias));
+                }
+            }
             if label >= geometry.layers
                 || !matches!(plan.layer_state(rank, label), EpLayerState::Mixed { .. })
             {
@@ -636,6 +724,50 @@ impl UnitTailRank {
         if managed.is_empty() {
             return Err("the unit plan has no mixed layer on this rank".into());
         }
+        // The pins lever: every layer with a pin plane (all pinned unit layers, whatever this
+        // rank holds of them) gets its plane's host image, carved after the table images.
+        let pin_state = match pin_board.as_ref() {
+            None => None,
+            Some(board) => {
+                if pin_inits.is_empty() {
+                    return Err("the pins lever found no pinned unit layer on this rank".into());
+                }
+                pin_inits.sort_by_key(|(label, _)| *label);
+                let (pool, base) = pool.as_ref().expect("pin planes have a pinned pool");
+                let mut planes = Vec::with_capacity(pin_inits.len());
+                for (label, alias) in &pin_inits {
+                    let statics = crate::expert_ep_units::ep_unit_pin_plane(plan, *label);
+                    rdna_compute::moe::qwen4_ep_owner_pins_check(&statics, ranks)
+                        .map_err(|why| format!("layer {label} pin plane: {why}"))?;
+                    if statics.len() != experts || alias.buf.size() < experts {
+                        return Err(format!(
+                            "layer {label}: the pin plane holds {} bytes on the device, the plan has {} experts",
+                            alias.buf.size(),
+                            statics.len()
+                        ));
+                    }
+                    let mut image = TableImage {
+                        // SAFETY: `pin_count * experts` bytes were allocated after the table
+                        // images for exactly these planes; the offsets are disjoint.
+                        ptr: unsafe { base.add(carved) },
+                        len: experts,
+                        dirty: DirtyRange::default(),
+                        _pool: pool.clone(),
+                    };
+                    carved += experts;
+                    image.copy_from_slice(&statics);
+                    planes.push((*label, statics, image));
+                }
+                let planes = PinPlanes::new(ranks, planes)?;
+                Some(RankPins {
+                    proto: PinProtocol::new(rank, board.clone(), planes),
+                    device: pin_inits.into_iter().map(|(_, alias)| alias).collect(),
+                    upload_calls: 0,
+                    upload_bytes: 0,
+                    reported: false,
+                })
+            }
+        };
 
         // Per-read kinds and the ranking priority of the units the tail may hold.
         let mut kinds = vec![Kind::Foreign; geometry.layers * experts];
@@ -712,6 +844,7 @@ impl UnitTailRank {
             peer,
             peer_applied: 0,
             peer_skipped: 0,
+            pins: pin_state,
             released: false,
         };
         let built = state.build_device(gpu, slots, &seeds);
@@ -730,9 +863,33 @@ impl UnitTailRank {
                 }
             }
         }
+        if let Some(pins) = state.pins.as_mut() {
+            // The same warm units, as the pin deltas of retirement 0: every rank applies them at
+            // its retirement 2 (the lag), so the planes agree whenever each rank's install ran.
+            let deltas: Vec<PinDelta> = seeds
+                .iter()
+                .map(|op| PinDelta {
+                    unit: op.unit,
+                    on: true,
+                })
+                .collect();
+            if let Err(error) = pins.proto.post_warm(deltas) {
+                state.release(gpu);
+                return Err(format!("tail install on rank {rank}: {error}"));
+            }
+        }
+        let owners_note = if state.pins.is_some() {
+            format!(
+                "on PINNED owners with dynamic pins ({} pinned unit layers; a unit published in its \
+                 holder's slot is pinned to its holder two retirements later)",
+                state.pins.as_ref().map_or(0, |pins| pins.device.len())
+            )
+        } else {
+            "on static owners (pinned owners are off while the tail is on)".to_string()
+        };
         eprintln!(
             "qwen4 EP rank {rank}: D2 tail on: {slots} evictable slots ({} MiB pool) over {} mixed layers \
-             on static owners (pinned owners are off while the tail is on), \
+             {owners_note}, \
              {} warm units published, F={} fills/window{}{}; retires every {} routed ids or {} windows",
             ((slots * (gub + dnb)) >> 20),
             state.layers.len(),
@@ -766,6 +923,16 @@ impl UnitTailRank {
                 QUARANTINE_WINDOWS * config.fill_per_step * crate::expert_unit_tail::FILL_GROUP_CAP
             );
         }
+        if let Some(pins) = state.pins.as_ref() {
+            eprintln!(
+                "qwen4 EP rank {rank}: D2 tail PINS on: {} pin planes follow the slot publications of every \
+                 rank (a unit published at retirement k is pinned to its holder from retirement k + {}, \
+                 an eviction frees it likewise); the planes are identical on every rank by construction, \
+                 a missing post or a digest mismatch fails the decode",
+                pins.device.len(),
+                crate::expert_unit_tail::PIN_LAG
+            );
+        }
         Ok(Self {
             inner: Mutex::new(state),
         })
@@ -780,6 +947,11 @@ impl UnitTailRank {
     /// End of a decode window (after its forward's D2H sync): retire it.
     pub(crate) fn step_end(&self, gpu: &mut Gpu) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.pins.is_some() && !inner.released {
+            // The pins lever: the retirement clock runs on a frozen tail too.
+            inner.step_end_pinned(gpu);
+            return;
+        }
         if inner.frozen.is_some() || inner.released {
             inner.calls.clear();
             inner.log_used = 0;
@@ -789,6 +961,14 @@ impl UnitTailRank {
         if let Err(error) = inner.step_end(gpu) {
             inner.freeze(&error);
         }
+    }
+
+    /// The pins lever's fault, if any rank recorded one: the pinned owner assignment must not
+    /// launch (a call over planes that may differ between ranks is not exact), the decode errors
+    /// out through the mesh's ordinary error path. `None` without the lever.
+    pub(crate) fn pins_fault(&self) -> Option<String> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.pins.as_ref().and_then(|pins| pins.proto.fault())
     }
 
     /// Free the pool, the log, the stream and the events (forward teardown).
@@ -1039,20 +1219,108 @@ impl Inner {
         self.cadence.clear();
     }
 
-    fn step_end(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+    /// The retirement cadence of one window end: `Some(n)` when this window completes a group of
+    /// `n` windows. A window that does not complete a group does nothing on the device (no stream
+    /// sync, no D2H); its ids stay in the log for the group's retirement. The decision reads the
+    /// routed-id sequence only, which is identical on every rank.
+    fn group_end(&mut self) -> Option<u32> {
         if !self.window_seen {
-            return Ok(());
+            return None;
         }
-        // The cadence: a window that does not complete a group returns at once (no stream sync,
-        // no D2H); its ids stay in the log for the group's retirement. The decision reads the
-        // routed-id sequence only, which is identical on every rank.
         let routed = std::mem::take(&mut self.window_routed);
         self.window_seen = false;
-        let Some(windows) = self.cadence.window_end(routed) else {
+        self.cadence.window_end(routed)
+    }
+
+    fn step_end(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        let Some(windows) = self.group_end() else {
             return Ok(());
         };
+        self.retire_group(gpu, windows).map(|_| ())
+    }
+
+    /// The pins lever's window end: the retirement clock of the mesh runs here, whatever the
+    /// state of this rank's tail. At a group end the stream is made idle, the tail retires
+    /// (unless frozen: a failure freezes it and its posts stop), and the pin step ALWAYS runs
+    /// with the deltas of a successful retirement (an empty marker otherwise).
+    fn step_end_pinned(&mut self, gpu: &mut Gpu) {
+        let Some(windows) = self.group_end() else {
+            return;
+        };
+        // The previous retirement's table and plane uploads read the pinned host images, which
+        // this retirement rewrites: the stream is idle before anything is touched.
+        let synced = match gpu.active_stream.as_ref() {
+            Some(stream) => gpu.hip.stream_synchronize(stream).map_err(io),
+            None => Ok(()),
+        };
+        let mut deltas = Vec::new();
+        match synced {
+            Err(error) => self.freeze(&error),
+            Ok(()) if self.frozen.is_some() => {
+                self.calls.clear();
+                self.log_used = 0;
+            }
+            Ok(()) => match self.retire_group(gpu, windows) {
+                Ok(posted) => deltas = posted,
+                Err(error) => self.freeze(&error),
+            },
+        }
+        self.pin_retire(gpu, deltas);
+    }
+
+    /// The pin step of one retirement ([`PinProtocol::retire`]) and the upload of the plane
+    /// bytes it changed, on the active stream (enqueued before any kernel of the next window,
+    /// like the table uploads). Any failure is the mesh's pin fault: logged once here, and the
+    /// pinned owner assignment refuses from then on ([`UnitTailRank::pins_fault`]).
+    fn pin_retire(&mut self, gpu: &mut Gpu, deltas: Vec<PinDelta>) {
+        let rank = self.rank;
+        let Some(pins) = self.pins.as_mut() else {
+            return;
+        };
+        let mut result = pins.proto.retire(deltas);
+        if result.is_ok() {
+            let compute = gpu.active_stream.as_ref();
+            for index in pins.proto.planes_mut().take_dirty() {
+                let label = pins.proto.planes().label(index);
+                let bytes = pins.proto.planes().bytes(index);
+                let sent = gpu.hip.memcpy_htod_async_on(
+                    &pins.device[index].buf.byte_view(0, bytes.len()),
+                    bytes,
+                    compute,
+                );
+                match sent {
+                    Ok(()) => {
+                        pins.upload_calls += 1;
+                        pins.upload_bytes += pins.proto.planes().bytes(index).len() as u64;
+                    }
+                    Err(error) => {
+                        result = Err(pins.proto.fail(&format!(
+                            "the plane of layer {label} could not be uploaded: {error}"
+                        )));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Err(why) = result {
+            if !pins.reported {
+                pins.reported = true;
+                eprintln!(
+                    "qwen4 EP rank {rank}: D2 tail PINS FAULT: {why}; the pinned owner assignment refuses \
+                     from now on on every rank (the decode fails rather than run over planes that may differ)"
+                );
+            }
+        }
+    }
+
+    /// One retirement of the tail: the log's D2H, the policy step, the table uploads, the peer
+    /// protocol and the fills. Returns the pin deltas of the retirement (its publications `on`,
+    /// its evictions `off`; empty without the pins lever and when nothing was retired): only a
+    /// retirement that completed all its table uploads returns them, so a pin never claims a
+    /// publication the tables did not take.
+    fn retire_group(&mut self, gpu: &mut Gpu, windows: u32) -> Result<Vec<PinDelta>, String> {
         if self.calls.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let t0 = Instant::now();
         // The window's forward ended with a D2H; make the stream idle for certain
@@ -1251,7 +1519,11 @@ impl Inner {
         if self.log_enabled && self.policy.stats().retirements % LOG_EVERY == 0 {
             self.print_line("window");
         }
-        Ok(())
+        Ok(if self.pins.is_some() {
+            pin_deltas(&retire)
+        } else {
+            Vec::new()
+        })
     }
 
     /// The deltas of this retirement's publications (a published fill names its slot, an evicted
@@ -1330,7 +1602,11 @@ impl Inner {
         }
         self.calls.clear();
         self.log_used = 0;
-        self.reset_group();
+        // The pins lever's retirement clock IS the cadence's: a freeze must never reset the
+        // accumulated group (the other ranks keep theirs), nor drop this window's routed count.
+        if self.pins.is_none() {
+            self.reset_group();
+        }
     }
 
     fn print_line(&self, tag: &str) {
@@ -1353,6 +1629,26 @@ impl Inner {
             )
         } else {
             String::new()
+        };
+        let peer_note = match self.pins.as_ref() {
+            None => peer_note,
+            Some(pins) => {
+                let stats = pins.proto.stats();
+                format!(
+                    "{peer_note} pins clock {} posted {} applied {} verified {} dynamic {} \
+                     plane-uploads {} ({} B){}",
+                    pins.proto.clock(),
+                    stats.posted,
+                    stats.applied,
+                    stats.verified,
+                    pins.proto.planes().dynamic_pins(),
+                    pins.upload_calls,
+                    pins.upload_bytes,
+                    pins.proto
+                        .fault()
+                        .map_or(String::new(), |why| format!(" PINS FAULT: {why}"))
+                )
+            }
         };
         eprintln!(
             "[unit-tail] rank {} {tag} windows {} retirements {} (group {:.2} windows, pending {}) reads/window {:.1}: core {:.2}% tail {:.2}% host {:.2}% \
@@ -1419,6 +1715,10 @@ impl Inner {
         if let Some(board) = self.peer.as_ref() {
             board.detach(self.rank);
         }
+        if let Some(pins) = self.pins.as_ref() {
+            // The mesh is going down: the other ranks' pin steps stop quietly.
+            pins.proto.close();
+        }
         // The table images are pinned: no table upload may still read them when the pool drops.
         if let Some(stream) = gpu.active_stream.as_ref() {
             let _ = gpu.hip.stream_synchronize(stream);
@@ -1454,11 +1754,12 @@ impl Inner {
 mod tests {
     use super::{
         apply_peer_delta, changed_entry_range, entry_span, full_shared, image_entry,
-        live_slot_units, peer_shared, DirtyRange, LiveSlot, ENTRY_BYTES,
+        live_slot_units, peer_shared, pin_deltas, tail_layer_selected, DirtyRange, LiveSlot,
+        ENTRY_BYTES,
     };
     use crate::expert_unit_tail::{
-        EpUnitTailConfig, PeerBoard, PeerDelta, RetireCadence, SlotPhase, TailPolicy, UnitKey,
-        WindowUse,
+        EpUnitTailConfig, PeerBoard, PeerDelta, PinDelta, Retire, RetireCadence, SlotPhase,
+        TailPolicy, UnitKey, WindowUse,
     };
     use std::collections::HashMap;
 
@@ -2129,6 +2430,62 @@ mod tests {
             totals.evictions > 0 && totals.quarantined_refills > 0,
             "{totals:?}"
         );
+    }
+
+    /// Without the pins lever the forward hands the tail exactly the static-owner host layers it
+    /// always did (whatever pin planes exist); with it, every layer that has a pin plane too.
+    #[test]
+    fn the_layer_selector_without_the_pins_lever_is_the_static_owner_rule() {
+        for static_owners in [false, true] {
+            for host_mapped in [false, true] {
+                for has_pin_plane in [false, true] {
+                    assert_eq!(
+                        tail_layer_selected(static_owners, host_mapped, false, has_pin_plane),
+                        static_owners && host_mapped,
+                        "so={static_owners} host={host_mapped} plane={has_pin_plane}"
+                    );
+                }
+            }
+        }
+        // With the lever a pinned unit layer is handed over whatever it holds on this rank (a
+        // rank whose layer is wholly resident still applies the pin deltas to its plane) ...
+        assert!(tail_layer_selected(false, false, true, true));
+        assert!(tail_layer_selected(false, true, true, true));
+        // ... a layer without a plane is not, and a static-owner layer is handed over as ever.
+        assert!(!tail_layer_selected(false, true, true, false));
+        assert!(tail_layer_selected(true, true, true, false));
+        assert!(!tail_layer_selected(true, false, true, false));
+    }
+
+    #[test]
+    fn a_retirement_posts_its_publications_then_its_evictions_as_pin_deltas() {
+        let retire = Retire {
+            publish: vec![((0, 4), 2), ((1, 6), 0)],
+            unpublish: vec![(0, 8), (2, 2)],
+            fills: Vec::new(),
+        };
+        assert_eq!(
+            pin_deltas(&retire),
+            [
+                PinDelta {
+                    unit: (0, 4),
+                    on: true
+                },
+                PinDelta {
+                    unit: (1, 6),
+                    on: true
+                },
+                PinDelta {
+                    unit: (0, 8),
+                    on: false
+                },
+                PinDelta {
+                    unit: (2, 2),
+                    on: false
+                },
+            ]
+        );
+        assert!(pin_deltas(&Retire::default()).is_empty());
     }
 
     /// The same safety property when the ranks retire GROUPS of windows: the groups come from

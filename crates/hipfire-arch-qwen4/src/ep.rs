@@ -687,9 +687,32 @@ impl Qwen4EpRowGatherHook {
     }
 }
 
+/// The mesh's one shared [`crate::expert_unit_tail::PeerBoard`], created by the first rank to
+/// install (`slot`); every rank of the mesh must agree on the rank count.
+fn shared_tail_board(
+    slot: &Mutex<Option<Arc<crate::expert_unit_tail::PeerBoard>>>,
+    ranks: usize,
+    what: &str,
+) -> Result<Arc<crate::expert_unit_tail::PeerBoard>, String> {
+    let mut slot = lock(slot);
+    match slot.as_ref() {
+        Some(board) if board.ranks() == ranks => Ok(board.clone()),
+        Some(board) => Err(format!(
+            "{what}: the shared peer board has {} ranks, the plan {ranks}",
+            board.ranks()
+        )),
+        None => {
+            let board = Arc::new(crate::expert_unit_tail::PeerBoard::new(ranks));
+            *slot = Some(board.clone());
+            Ok(board)
+        }
+    }
+}
+
 /// Install the rank's D2 tail when `HIPFIRE_EP_UNIT_TAIL` asks for it. The tail needs the
 /// per-expert unit plan (a plan-less load is a load error, never a silent no-op). With
-/// `HIPFIRE_EP_UNIT_TAIL_PEER=1` (and the prefill lever) every rank gets the mesh's one shared
+/// `HIPFIRE_EP_UNIT_TAIL_PEER=1` (and the prefill lever), and/or with `HIPFIRE_EP_UNIT_TAIL_PINS=1`
+/// where pinned owners are in effect, every rank gets the mesh's one shared
 /// [`crate::expert_unit_tail::PeerBoard`], created by the first rank to install (`peer_board`).
 fn install_unit_tail(
     hook: &Qwen4EpRowGatherHook,
@@ -736,22 +759,51 @@ fn install_unit_tail(
             tail::EP_UNIT_TAIL_PEER_ENV
         ));
     } else {
-        let mut slot = lock(peer_board);
-        match slot.as_ref() {
-            Some(board) if board.ranks() == ranks => Some(board.clone()),
-            Some(board) => {
-                return Err(format!(
-                    "{}: the shared peer board has {} ranks, the plan {ranks}",
-                    tail::EP_UNIT_TAIL_PEER_ENV,
-                    board.ranks()
-                ));
-            }
-            None => {
-                let board = Arc::new(tail::PeerBoard::new(ranks));
-                *slot = Some(board.clone());
-                Some(board)
-            }
-        }
+        Some(shared_tail_board(
+            peer_board,
+            ranks,
+            tail::EP_UNIT_TAIL_PEER_ENV,
+        )?)
+    };
+    // The pins lever: the tail keeps the pinned unit layers (D1.9) and their pin plane follows
+    // its publications. Effective only where those layers exist on this load (pinned owners
+    // admitted as without a tail); otherwise the tail runs exactly as it does without the lever.
+    let pins_flag = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_PINS_ENV, false);
+    let pins_requested = tail::ep_unit_tail_pins_requested();
+    if pins_flag && !pins_requested {
+        eprintln!(
+            "qwen4 EP rank {rank}: {}=1 is ignored: it needs {}=1",
+            tail::EP_UNIT_TAIL_PINS_ENV,
+            tail::EP_UNIT_TAIL_PREFILL_ENV
+        );
+    }
+    let layers = forward.tail_layers(prefill, pins_requested);
+    let pin_board = if !pins_requested {
+        None
+    } else if !layers.iter().any(|layer| layer.pins.is_some()) {
+        eprintln!(
+            "qwen4 EP rank {rank}: {}=1 is ignored: pinned owners are not in effect on this load \
+             (the tail runs on static owners, as without the lever)",
+            tail::EP_UNIT_TAIL_PINS_ENV
+        );
+        None
+    } else if ranks < 2 {
+        eprintln!(
+            "qwen4 EP rank {rank}: {}=1 is ignored: the mesh has no peer rank",
+            tail::EP_UNIT_TAIL_PINS_ENV
+        );
+        None
+    } else if rank >= ranks {
+        return Err(format!(
+            "{}: rank {rank} is outside the plan's {ranks} ranks",
+            tail::EP_UNIT_TAIL_PINS_ENV
+        ));
+    } else {
+        Some(shared_tail_board(
+            peer_board,
+            ranks,
+            tail::EP_UNIT_TAIL_PINS_ENV,
+        )?)
     };
     let installed = Arc::new(crate::expert_unit_tail_rank::UnitTailRank::install(
         gpu,
@@ -761,8 +813,9 @@ fn install_unit_tail(
         config,
         hipfire_config::developer_bool(tail::EP_UNIT_TAIL_FREEZE_ENV, false),
         log,
-        forward.tail_layers(prefill),
+        layers,
         peer,
+        pin_board,
     )?);
     hook.install_tail(installed.clone())?;
     if prefill {
@@ -903,6 +956,16 @@ impl MoeRowGather for Qwen4EpRowGatherHook {
             .and_then(Option::as_ref)
         {
             Some(pins) => {
+                // The pin planes of the tail (`HIPFIRE_EP_UNIT_TAIL_PINS`) are identical on every
+                // rank by construction; after a recorded fault they may not be, and a call over
+                // planes that differ is not exact: refuse before any launch of the pinned kernel.
+                if let Some(why) = self.tail.get().and_then(|tail| tail.pins_fault()) {
+                    return Err(format!(
+                        "qwen4 EP owner assignment layer {layer_idx} rank {}: the tail's pin planes \
+                         may differ between ranks: {why}",
+                        self.rank
+                    ));
+                }
                 let pins = lock(pins);
                 gpu.qwen4_ep_owner_assign_pinned(
                     topk_indices,

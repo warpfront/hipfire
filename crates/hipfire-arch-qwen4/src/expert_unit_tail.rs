@@ -101,6 +101,17 @@
 //! windows are out of step), or whose upload fails, freezes and records no ack, so the owner never
 //! refills a slot that rank may still name; a frozen tail leaves every table state valid
 //! (canonical, or a live slot with complete bytes).
+//!
+//! # Dynamic pins (`HIPFIRE_EP_UNIT_TAIL_PINS`)
+//!
+//! By default a configured tail runs on STATIC `e % ranks` owners (pinned owners off). With the
+//! pins lever the layers keep the D1.9 pinned owner assignment and the pin plane follows the
+//! tail's publications: a unit published in its holder's slot is pinned to its holder. The
+//! protocol, its plane-identity argument, its visibility argument and its failure path are in
+//! [`pins`].
+
+pub mod pins;
+pub use pins::{PinDelta, PinError, PinPlanes, PinPost, PinProtocol, PinStats, PIN_LAG};
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};
@@ -128,6 +139,14 @@ pub const EP_UNIT_TAIL_PREFILL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PREFILL";
 /// until every peer's table dropped it (module docs). Default off; ignored (with a note) without
 /// the prefill lever.
 pub const EP_UNIT_TAIL_PEER_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PEER";
+/// `1`: with the tail AND [`EP_UNIT_TAIL_PREFILL_ENV`], the tail no longer turns pinned owners
+/// (D1.9) off: the pinned unit layers keep the balanced pinned owner assignment and its pin plane
+/// follows the tail, a unit published in its holder's slot is pinned to its holder (module docs
+/// of [`pins`]: the retirement-lagged, rank-identical plane, its safety argument and failure
+/// path). Effective only where pinned owners are admitted as without a tail
+/// (`HIPFIRE_EP_UNIT_PINNED_OWNERS` not `0`, balanced ownership admitted); otherwise (with a note)
+/// the tail runs exactly as it does without this lever. Default off.
+pub const EP_UNIT_TAIL_PINS_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PINS";
 /// `1`: print a `[unit-tail]` counter line every 64 windows and at release.
 pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
 /// `G` (whole units, default [`EP_UNIT_TAIL_STAGE_GAP_DEFAULT`]): with the prefill lever, the
@@ -205,11 +224,12 @@ pub fn parse_ep_unit_tail(raw: Option<&str>) -> Result<Option<EpUnitTailConfig>,
     }))
 }
 
-/// Whether [`EP_UNIT_TAIL_ENV`] asks for a tail in this process. A configured tail runs on STATIC
-/// `e % ranks` owners: pinned owners (D1.9) deal the non-core experts of a call to either rank, so
-/// a rank's tail would have to follow a pin plane both ranks agree on every window (simulated
-/// replicated tails lose to D1.9 everywhere; see `SIM-PINNED.md`), and the unit layers' owner kind
-/// ([`crate::gpu_forward::ep_unit_layer_owner_kind`]) keeps D1's static rule instead.
+/// Whether [`EP_UNIT_TAIL_ENV`] asks for a tail in this process. Without
+/// [`EP_UNIT_TAIL_PINS_ENV`] a configured tail runs on STATIC `e % ranks` owners: pinned owners
+/// (D1.9) deal the non-core experts of a call to either rank, so a rank's tail would have to follow
+/// a pin plane both ranks agree on every window (the dynamic pins of [`pins`] are exactly that),
+/// and the unit layers' owner kind ([`crate::gpu_forward::ep_unit_layer_owner_kind`]) keeps D1's
+/// static rule instead.
 pub fn ep_unit_tail_configured() -> bool {
     parse_ep_unit_tail(
         hipfire_config::developer_var(EP_UNIT_TAIL_ENV)
@@ -224,6 +244,35 @@ pub fn ep_unit_tail_configured() -> bool {
 /// publications and the unit stage's slot-aware tables / copy runs.
 pub fn ep_unit_tail_prefill_requested() -> bool {
     ep_unit_tail_configured() && hipfire_config::developer_bool(EP_UNIT_TAIL_PREFILL_ENV, false)
+}
+
+/// The pure decision of [`ep_unit_tail_pins_requested`]: the lever is on only with the tail
+/// AND its prefill lever (the decode owner assignment reads the full tables, which follow the
+/// slot publications only with the prefill lever).
+pub fn tail_pins_requested(prefill_requested: bool, pins_flag: bool) -> bool {
+    prefill_requested && pins_flag
+}
+
+/// Whether [`EP_UNIT_TAIL_PINS_ENV`] is in effect: the tail is configured, its prefill lever is
+/// on and the pins flag is on. Admission of pinned owners on the load is still decided as ever
+/// (`qwen4_ep_unit_pins_admitted`); without it the lever changes nothing.
+pub fn ep_unit_tail_pins_requested() -> bool {
+    tail_pins_requested(
+        ep_unit_tail_prefill_requested(),
+        hipfire_config::developer_bool(EP_UNIT_TAIL_PINS_ENV, false),
+    )
+}
+
+/// The pure decision of [`ep_unit_tail_blocks_pins`].
+pub fn tail_blocks_pins(tail_configured: bool, pins_requested: bool) -> bool {
+    tail_configured && !pins_requested
+}
+
+/// Whether a configured tail turns pinned owners (D1.9) off on this load: any configured tail
+/// did, before the pins lever; with [`ep_unit_tail_pins_requested`] it does not. A load without
+/// a tail is never blocked.
+pub fn ep_unit_tail_blocks_pins() -> bool {
+    tail_blocks_pins(ep_unit_tail_configured(), ep_unit_tail_pins_requested())
 }
 
 /// Parse [`EP_UNIT_TAIL_STAGE_GAP_ENV`]: unset or empty = the default, else a non-negative integer.
@@ -953,12 +1002,15 @@ struct BoardState {
 }
 
 /// The cross-rank state of the PEER lever (module docs): what each owner posted, what each rank
-/// took, and the acknowledgements the owners release quarantined slots on. One board per process
-/// and EP mesh, shared by every rank thread; every call is a short critical section.
+/// took, and the acknowledgements the owners release quarantined slots on; plus the pin section
+/// of the PINS lever ([`pins`]: the retirement-stamped pin deltas every rank applies under the
+/// retirement lag), independent of the PEER lever. One board per process and EP mesh, shared by
+/// every rank thread; every call is a short critical section.
 #[derive(Debug)]
 pub struct PeerBoard {
     ranks: usize,
     state: Mutex<BoardState>,
+    pins: pins::PinSection,
 }
 
 impl PeerBoard {
@@ -974,6 +1026,7 @@ impl PeerBoard {
                     .collect(),
                 detached: vec![false; ranks],
             }),
+            pins: pins::PinSection::new(ranks),
         }
     }
 
@@ -1935,5 +1988,27 @@ mod tests {
         assert_eq!(board.released_through(0, 10), 5);
         // With no peer at all everything is released.
         assert_eq!(PeerBoard::new(1).released_through(0, 1), u64::MAX);
+    }
+
+    /// The pins lever is off by default and, off, a configured tail turns pinned owners off
+    /// exactly as before it existed (`ep_unit_tail_configured()`); on, only with the tail's
+    /// prefill lever, it does not.
+    #[test]
+    fn pins_flag_off_is_todays_static_owner_tail() {
+        // Requested only with the prefill lever AND the flag.
+        assert!(!tail_pins_requested(false, false));
+        assert!(!tail_pins_requested(true, false));
+        assert!(!tail_pins_requested(false, true));
+        assert!(tail_pins_requested(true, true));
+        // Flag off: the gate is exactly `tail configured` (the old `!ep_unit_tail_configured()`
+        // term of `qwen4_ep_unit_pins_admitted` / `pins_on`).
+        for configured in [false, true] {
+            assert_eq!(tail_blocks_pins(configured, false), configured);
+        }
+        // Flag on (which implies a configured tail): the tail no longer blocks pinned owners.
+        assert!(!tail_blocks_pins(true, true));
+        // The unit-test process has none of the levers set.
+        assert!(!ep_unit_tail_pins_requested());
+        assert!(!ep_unit_tail_blocks_pins());
     }
 }

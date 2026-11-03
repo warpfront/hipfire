@@ -3611,13 +3611,15 @@ pub(crate) fn qwen4_ep_balanced_owners_refusal(arch: &str, ranks: usize) -> Opti
 /// (D1.9): a unit plan's layer that is host on some rank but not on all becomes a balanced
 /// layer under the pinned owner-assign kernel. Needs `HIPFIRE_EP_UNIT_PINNED_OWNERS` not
 /// exactly `0` and balanced ownership itself on and admitted ([`qwen4_ep_balanced_owners_enabled`],
-/// [`qwen4_ep_balanced_owners_refusal`]); otherwise those layers run D1's static owners.
+/// [`qwen4_ep_balanced_owners_refusal`]); otherwise those layers run D1's static owners. A
+/// configured D2 tail turns them off too, except with `HIPFIRE_EP_UNIT_TAIL_PINS`
+/// ([`crate::expert_unit_tail::ep_unit_tail_blocks_pins`]), where the pin plane follows the tail.
 pub(crate) fn qwen4_ep_unit_pins_admitted(arch: &str, ranks: usize) -> bool {
     ep_unit_pinned_owners_on(
         hipfire_config::developer_var(EP_UNIT_PINNED_OWNERS_ENV)
             .ok()
             .as_deref(),
-    ) && !crate::expert_unit_tail::ep_unit_tail_configured()
+    ) && !crate::expert_unit_tail::ep_unit_tail_blocks_pins()
         && qwen4_ep_balanced_owners_enabled()
         && qwen4_ep_balanced_owners_refusal(arch, ranks).is_none()
 }
@@ -3901,7 +3903,9 @@ pub(crate) struct Qwen4BalancedLayer {
     tables: Qwen4EpOwnerTables,
     /// A pinned unit layer's pin plane (D1.9): a device `u8[512]`, one owner rank or `0xFF`
     /// per expert ([`ep_unit_pin_plane`], checked with [`qwen4_ep_owner_pins_check`]), uploaded
-    /// once at attach and read by every launch of the pinned owner assignment. `None` for an
+    /// once at attach and read by every launch of the pinned owner assignment. With the D2 tail's
+    /// pins lever (`HIPFIRE_EP_UNIT_TAIL_PINS`) the tail rewrites it at its retirements, through a
+    /// non-owning alias, on this rank's stream ([`Qwen4GpuForward::tail_layers`]). `None` for an
     /// unpinned balanced layer (the unpinned kernel). Freed with the layer.
     pins: Option<GpuTensor>,
 }
@@ -13044,18 +13048,38 @@ impl Qwen4GpuForward {
     /// qualify (the tail itself keeps just the plan's mixed ones); empty outside EP.
     /// `with_full` (`HIPFIRE_EP_UNIT_TAIL_PREFILL`) also hands over the layer's FULL (chunk /
     /// prefill) table of the same ordinal, so published slots serve the full-table prefill too.
+    /// `with_pins` (`HIPFIRE_EP_UNIT_TAIL_PINS`) also yields every pinned unit layer (a balanced
+    /// layer with a pin plane: its owner assignment derives the live tables from the full tables
+    /// the tail rewrites), with a non-owning alias of its pin plane, which the tail rewrites at
+    /// its retirements.
     pub(crate) fn tail_layers(
         &self,
         with_full: bool,
+        with_pins: bool,
     ) -> Vec<crate::expert_unit_tail_rank::TailLayerInit> {
         let Some(ep) = self.ep.as_ref() else {
             return Vec::new();
+        };
+        let pin_plane = |ordinal: usize, label: usize| -> Option<&GpuTensor> {
+            ep.balanced
+                .get(ordinal)?
+                .as_ref()
+                .filter(|layer| layer.label == label)?
+                .pins
+                .as_ref()
         };
         self.moe
             .iter()
             .flatten()
             .enumerate()
-            .filter(|(_, moe)| moe.static_owners && moe.host_mapped)
+            .filter(|(ordinal, moe)| {
+                crate::expert_unit_tail_rank::tail_layer_selected(
+                    moe.static_owners,
+                    moe.host_mapped,
+                    with_pins,
+                    pin_plane(*ordinal, moe.label).is_some(),
+                )
+            })
             .map(
                 |(ordinal, moe)| crate::expert_unit_tail_rank::TailLayerInit {
                     label: moe.label,
@@ -13093,6 +13117,17 @@ impl Qwen4GpuForward {
                             },
                             gate_up_entries: full.expert_gate_up_entries.clone(),
                             down_entries: full.expert_down_entries.clone(),
+                        }),
+                    // SAFETY: a `Borrowed` alias of the pin plane the balanced layer owns until
+                    // `Qwen4ForwardEp::free_gpu`, which releases the tail (its only other user)
+                    // first.
+                    pins: with_pins
+                        .then(|| pin_plane(ordinal, moe.label))
+                        .flatten()
+                        .map(|pins| GpuTensor {
+                            buf: unsafe { pins.buf.alias() },
+                            shape: pins.shape.clone(),
+                            dtype: pins.dtype,
                         }),
                 },
             )
@@ -13171,9 +13206,10 @@ impl Qwen4GpuForward {
         // Pinned unit layers (D1.9): a unit plan's layer that is host on some rank but not on
         // all balances under the pinned kernel (resident experts pinned to their holder). Off with
         // `HIPFIRE_EP_UNIT_PINNED_OWNERS=0` (D1: static owners there) or when balanced ownership
-        // itself is off or refused.
+        // itself is off or refused, and with a configured D2 tail unless `HIPFIRE_EP_UNIT_TAIL_PINS`
+        // (the tail's pin plane then follows its publications).
         let pins_on = balanced_on
-            && !crate::expert_unit_tail::ep_unit_tail_configured()
+            && !crate::expert_unit_tail::ep_unit_tail_blocks_pins()
             && ep_unit_pinned_owners_on(
                 hipfire_config::developer_var(EP_UNIT_PINNED_OWNERS_ENV)
                     .ok()
