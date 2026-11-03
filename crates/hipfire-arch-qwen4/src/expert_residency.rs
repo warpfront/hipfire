@@ -3173,6 +3173,68 @@ pub fn place_routed_experts_set(weights: &mut [WeightEntry], resident: &[usize])
     moved
 }
 
+/// The native MTP head's routed-expert entries: the `mtp.` layer's stacked
+/// gate/up and down tensors (or slab arena). [`place_routed_experts`] and
+/// [`place_routed_experts_set`] always host-map exactly these on a single card.
+fn is_mtp_head_routed(entry: &WeightEntry) -> bool {
+    entry.name.starts_with("mtp.")
+        && is_routed_expert(&entry.name)
+        && !crate::expert_ep_units::is_unit_arena_name(&entry.name)
+        && !matches!(entry.policy, ShardPolicy::Tied { .. })
+}
+
+/// What the native MTP head's routed experts weigh: entries, payload bytes (the
+/// device charge when they stay VRAM-resident) and pinned-host bytes including
+/// [`HOST_MAPPED_PAD_BYTES`] per entry (what [`hotset_host_mapped_bytes`]
+/// counts for them while they are host-mapped).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MtpHeadRoutedCensus {
+    pub entries: usize,
+    pub payload_bytes: u64,
+    pub host_charge_bytes: u64,
+}
+
+/// [`MtpHeadRoutedCensus`] of `weights`, whatever each entry's current
+/// placement. Sums are checked.
+pub fn mtp_head_routed_census(
+    weights: &[WeightEntry],
+    bytes_of: impl Fn(&WeightEntry) -> Option<u64>,
+) -> Result<MtpHeadRoutedCensus, String> {
+    let mut census = MtpHeadRoutedCensus::default();
+    for entry in weights.iter().filter(|entry| is_mtp_head_routed(entry)) {
+        let bytes =
+            bytes_of(entry).ok_or_else(|| format!("no payload size for '{}'", entry.name))?;
+        let overflow = || "MTP head routed-expert byte census overflows".to_string();
+        census.entries += 1;
+        census.payload_bytes = census
+            .payload_bytes
+            .checked_add(bytes)
+            .ok_or_else(overflow)?;
+        census.host_charge_bytes = bytes
+            .checked_add(HOST_MAPPED_PAD_BYTES)
+            .and_then(|charge| census.host_charge_bytes.checked_add(charge))
+            .ok_or_else(overflow)?;
+    }
+    Ok(census)
+}
+
+/// Keep the native MTP head's routed experts VRAM-resident
+/// (`HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`): undo, for exactly those entries, the
+/// host placement [`place_routed_experts`] / [`place_routed_experts_set`] gave
+/// them (they upload through the ordinary resident tensor path, no new
+/// format). The caller has already charged [`MtpHeadRoutedCensus::payload_bytes`]
+/// against the device budget. Returns the number of entries restored.
+pub fn keep_mtp_head_routed_resident(weights: &mut [WeightEntry]) -> usize {
+    let mut restored = 0;
+    for entry in weights.iter_mut() {
+        if entry.residency == WeightResidency::HostMapped && is_mtp_head_routed(entry) {
+            entry.residency = WeightResidency::Resident;
+            restored += 1;
+        }
+    }
+    restored
+}
+
 /// Mark the replicated token embedding table ([`crate::weights::QWEN4_EMBED`])
 /// [`WeightResidency::HostMapped`]: an expert-parallel rank pins its own copy in
 /// host RAM and the embedding kernels read the rows they gather (one row per
@@ -4469,6 +4531,40 @@ mod tests {
                 "mtp.layers.0.mlp.experts.down_proj"
             ]
         );
+    }
+
+    #[test]
+    fn mtp_head_routed_census_and_resident_restore_touch_only_the_head_experts() {
+        let mut weights = vec![
+            entry("model.language_model.layers.0.mlp.experts.gate_up_proj", 0),
+            entry("model.language_model.layers.2.mlp.experts.down_proj", 2),
+            entry("mtp.layers.0.mlp.experts.gate_up_proj", 0),
+            entry("mtp.layers.0.mlp.experts.down_proj", 0),
+            entry("mtp.layers.0.mlp.shared_expert.down_proj.weight", 0),
+        ];
+        let bytes =
+            |entry: &WeightEntry| Some(entry.logical_shape.iter().product::<usize>() as u64);
+        let census = mtp_head_routed_census(&weights, bytes).unwrap();
+        assert_eq!(census.entries, 2);
+        assert_eq!(census.payload_bytes, 2 * 4 * 4 * 256);
+        assert_eq!(
+            census.host_charge_bytes,
+            census.payload_bytes + 2 * HOST_MAPPED_PAD_BYTES
+        );
+        assert_eq!(
+            mtp_head_routed_census(&weights, |_| None),
+            Err("no payload size for 'mtp.layers.0.mlp.experts.gate_up_proj'".to_string())
+        );
+        // Placement host-maps the head; the restore undoes only the head.
+        place_routed_experts(&mut weights, 3);
+        assert_eq!(weights[1].residency, WeightResidency::Resident);
+        assert_eq!(weights[2].residency, WeightResidency::HostMapped);
+        assert_eq!(keep_mtp_head_routed_resident(&mut weights), 2);
+        assert!(weights
+            .iter()
+            .all(|entry| entry.residency == WeightResidency::Resident));
+        // Idempotent: nothing left to restore.
+        assert_eq!(keep_mtp_head_routed_resident(&mut weights), 0);
     }
 
     #[test]

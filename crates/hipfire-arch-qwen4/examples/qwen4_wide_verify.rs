@@ -46,6 +46,20 @@
 //! Every record carries the execution mode (`replay.is_recording()`,
 //! `graphs.capture_mode`) read just before its windows.
 //!
+//! # D2 wide-window sweep (`HIPFIRE_QWEN4_D2_WINDOW_ROWS=N`, 5..=8, default off)
+//!
+//! On a D2-armed load (the XTX measured default, or `HIPFIRE_QWEN4_D2_DEFAULT=1`)
+//! the knob builds the executors for N rows and qualifies every whole non-prefill
+//! window of up to N rows for the CPU arm, with no lab-wide override: the effective
+//! caps in the JSON (`spec_verify_rows_cap`, `row_exact_verify_rows`) read N.
+//! Bitwise gate (n <= 8 is fatal; the AR reference is the same CPU-arm decode):
+//! `HIPFIRE_QWEN4_D2_WINDOW_ROWS=8 qwen4_wide_verify --model M --prompt-files a.txt,b.txt
+//! --rows 2-8 --accepts all --out wide-d2.json`. Window cost per K (K = rows - 1, native
+//! MTP windows, acceptance included): `... --cost-curve --rows 1-8 --prod-windows 6
+//! --prod-ks 0-7 --commit on --deadline-secs 1700 --out cost-d2.json`
+//! (`actual_windows.json` carries the accepted prefixes). Same-input per-layer gates at
+//! 5..8 rows: `qwen4_cpu_split_parity --rows 5` ... `--rows 8`.
+//!
 //! A fixed `--hot-budget-mib` uses the same frozen expert-tier partition with
 //! `HIPFIRE_OFFLOAD_EXEC=cpu` (requires D2 armed) or `pcie` (requires D2 unarmed).
 //! Both receipts expose its actual `partition_digest`; `split_digest` remains

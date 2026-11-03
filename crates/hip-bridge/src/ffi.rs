@@ -4916,11 +4916,18 @@ impl Drop for PinnedTransferBuffer {
 /// Lifecycle phase of a [`MappedHostBuffer`].
 ///
 /// `Retired → CpuWriting → Published → GpuReading → Retired`. Host bytes are
-/// writable only in `CpuWriting`, which is reachable only from `Retired`.
+/// writable only in `CpuWriting`, which is reachable only from `Retired` or
+/// `Deferred` (a generation whose gated GPU reads were queued before the host
+/// write, [`MappedHostBuffer::enqueue_gated_uploads`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MappedPhase {
     /// No GPU consumer can be reading; the host may begin a write.
     Retired,
+    /// Gated host-to-device reads of this generation are queued on a stream
+    /// behind a wait the host has not released; the host write has not begun.
+    /// The reads cannot run before the host publishes and releases the gate,
+    /// so the host may begin its write exactly as from `Retired`.
+    Deferred,
     /// The host holds the unique [`MappedWrite`].
     CpuWriting,
     /// The host finished writing; the consumer has not been recorded yet.
@@ -4969,6 +4976,9 @@ struct MappedLedger {
     /// `GpuReading` entered without a recorded retirement event (the record
     /// call failed). Retirable only by device synchronization.
     unfenced: bool,
+    /// The current `CpuWriting` phase began from `Deferred`: an abandoned write
+    /// returns there (the queued gated reads are still pending), not to `Retired`.
+    from_deferred: bool,
 }
 
 impl MappedLedger {
@@ -4978,24 +4988,45 @@ impl MappedLedger {
             phase: MappedPhase::Retired,
             generation: 0,
             unfenced: false,
+            from_deferred: false,
         }
     }
 
-    fn begin_write(&mut self) -> Result<(), &'static str> {
+    /// Gated GPU reads of the next generation are about to be queued. Only
+    /// legal from `Retired`.
+    fn begin_deferred(&mut self) -> Result<(), &'static str> {
         if self.phase != MappedPhase::Retired {
+            return Err("mapped buffer is not retired; cannot queue gated reads");
+        }
+        if self.generation == u64::MAX {
+            return Err("mapped buffer generation counter exhausted");
+        }
+        self.phase = MappedPhase::Deferred;
+        Ok(())
+    }
+
+    fn begin_write(&mut self) -> Result<(), &'static str> {
+        if self.phase != MappedPhase::Retired && self.phase != MappedPhase::Deferred {
             return Err("mapped buffer is not retired; cannot begin a host write");
         }
         if self.generation == u64::MAX {
             return Err("mapped buffer generation counter exhausted");
         }
+        self.from_deferred = self.phase == MappedPhase::Deferred;
         self.phase = MappedPhase::CpuWriting;
         Ok(())
     }
 
-    /// An unpublished write returns to `Retired`; the generation is unchanged.
+    /// An unpublished write returns to where it began (`Retired`, or
+    /// `Deferred` for a deferred generation); the generation is unchanged.
     fn abandon_write(&mut self) {
         if self.phase == MappedPhase::CpuWriting {
-            self.phase = MappedPhase::Retired;
+            self.phase = if self.from_deferred {
+                MappedPhase::Deferred
+            } else {
+                MappedPhase::Retired
+            };
+            self.from_deferred = false;
         }
     }
 
@@ -5006,6 +5037,7 @@ impl MappedLedger {
         }
         self.generation += 1;
         self.phase = MappedPhase::Published;
+        self.from_deferred = false;
         Ok(MappedPublished {
             buffer: self.id,
             generation: self.generation,
@@ -5041,6 +5073,9 @@ impl MappedLedger {
             MappedPhase::Retired => Ok(MappedQuiesce::Done),
             MappedPhase::GpuReading if self.unfenced => Ok(MappedQuiesce::Device),
             MappedPhase::GpuReading => Ok(MappedQuiesce::Event),
+            // The gated reads cannot run before the host publishes and releases
+            // the gate, so a deferred generation has nothing to wait for yet.
+            MappedPhase::Deferred => Ok(MappedQuiesce::Done),
             MappedPhase::CpuWriting => Err("mapped buffer is being written; nothing to retire"),
             MappedPhase::Published => {
                 Err("mapped buffer was published but never marked GpuReading; refusing to retire")
@@ -5244,7 +5279,55 @@ impl MappedHostBuffer {
         unsafe { std::slice::from_raw_parts(self.host.cast::<u8>(), self.size) }
     }
 
-    /// Start a host write. Only legal from `Retired`.
+    /// Queue host-to-device copies of byte `ranges` of this buffer to the same
+    /// offsets of `dst` on `stream` (`None` = the default stream), BEFORE the
+    /// host has written them: the caller must already have queued a stream wait
+    /// (`hipStreamWaitValue32`) that the host releases only after it
+    /// [`publishes`](MappedWrite::publish) the generation, so the copies read
+    /// finished bytes. Only legal from `Retired`; the phase becomes `Deferred`
+    /// (even for no ranges, even when a copy fails part-way: the caller must
+    /// then abort the wait), and [`Self::begin_write`] continues from it.
+    /// Returns the number of copies queued. Each range must lie inside both
+    /// this buffer and `dst`.
+    pub fn enqueue_gated_uploads(
+        &mut self,
+        hip: &HipRuntime,
+        dst: &DeviceBuffer,
+        ranges: impl IntoIterator<Item = (usize, usize)>,
+        stream: Option<&Stream>,
+    ) -> HipResult<usize> {
+        self.ledger.begin_deferred().map_err(mapped_err)?;
+        let raw = stream.map_or(ptr::null_mut(), |s| s.0);
+        let mut queued = 0;
+        for (offset, len) in ranges {
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| mapped_err("gated upload range overflows"))?;
+            if len == 0 || end > self.size || end > dst.size() {
+                return Err(mapped_err("gated upload range outside the buffers"));
+            }
+            // SAFETY: the range is inside the live mapped allocation and the
+            // destination (checked above). The source bytes are written by the
+            // host strictly before the gate the stream waits on is released,
+            // and the host does not touch them again until the generation is
+            // retired (phase ledger), so the DMA read never races a host store.
+            let code = unsafe {
+                (hip.fn_memcpy_async)(
+                    dst.ptr.cast::<u8>().add(offset).cast(),
+                    self.host.cast::<u8>().add(offset).cast(),
+                    len,
+                    MemcpyKind::HostToDevice as c_uint,
+                    raw,
+                )
+            };
+            memory_effects::htod();
+            hip.check(code, "hipMemcpyAsync gated mapped H2D")?;
+            queued += 1;
+        }
+        Ok(queued)
+    }
+
+    /// Start a host write. Only legal from `Retired` or `Deferred`.
     pub fn begin_write(&mut self) -> HipResult<MappedWrite<'_>> {
         self.ledger.begin_write().map_err(mapped_err)?;
         Ok(MappedWrite {
@@ -5922,6 +6005,58 @@ mod mapped_ledger_tests {
         l.enter_gpu_reading(&t, true).unwrap();
         l.abandon_write();
         assert_eq!(l.phase, MappedPhase::GpuReading);
+    }
+
+    #[test]
+    fn deferred_generation_walks_deferred_then_the_normal_cycle() {
+        let mut l = MappedLedger::new();
+        l.begin_deferred().unwrap();
+        assert_eq!(l.phase, MappedPhase::Deferred);
+        // Nothing can read before the host publishes and releases the gate, so a
+        // retire is a no-op and a drop must still assume a queued consumer.
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Done));
+        assert_eq!(l.drop_plan(), MappedQuiesce::Device);
+        l.begin_write().unwrap();
+        assert_eq!(l.phase, MappedPhase::CpuWriting);
+        let t = l.publish().unwrap();
+        assert_eq!(t.generation(), 1);
+        assert_eq!(l.phase, MappedPhase::Published);
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert_eq!(l.retire_plan(), Ok(MappedQuiesce::Event));
+        l.complete_retirement();
+        assert_eq!(l.phase, MappedPhase::Retired);
+        assert_eq!(l.generation, 1);
+    }
+
+    #[test]
+    fn deferred_only_from_retired_and_an_abandoned_write_returns_to_deferred() {
+        let mut l = MappedLedger::new();
+        l.begin_write().unwrap();
+        assert!(l.begin_deferred().is_err(), "CpuWriting");
+        let t = l.publish().unwrap();
+        assert!(l.begin_deferred().is_err(), "Published");
+        l.enter_gpu_reading(&t, true).unwrap();
+        assert!(l.begin_deferred().is_err(), "GpuReading");
+        l.complete_retirement();
+        l.begin_deferred().unwrap();
+        assert!(l.begin_deferred().is_err(), "Deferred twice");
+        // A write that never publishes leaves the queued gated reads pending.
+        l.begin_write().unwrap();
+        l.abandon_write();
+        assert_eq!(l.phase, MappedPhase::Deferred);
+        assert_eq!(l.generation, 1);
+        l.begin_write().unwrap();
+        let t = l.publish().unwrap();
+        assert_eq!(t.generation(), 2);
+        l.enter_gpu_reading(&t, true).unwrap();
+        l.complete_retirement();
+        // An ordinary abandoned write still returns to Retired.
+        l.begin_write().unwrap();
+        l.abandon_write();
+        assert_eq!(l.phase, MappedPhase::Retired);
+        // A deferred generation is refused when the counter is exhausted.
+        l.generation = u64::MAX;
+        assert!(l.begin_deferred().is_err());
     }
 
     #[test]

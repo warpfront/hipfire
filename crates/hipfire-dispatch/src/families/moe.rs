@@ -2460,6 +2460,38 @@ impl CpuWideVerifyScope {
             capacity_rows
         }
     }
+
+    /// Qualified rows of the D2 CPU-cold/GPU-hot split for this call:
+    /// [`Self::qualified_max_rows`] inside an explicit lab-wide scope
+    /// (`min(capacity, STORAGE)`), otherwise the default
+    /// [`NARROW_VERIFY_MAX_ROWS`] widened to `d2_window_rows`
+    /// (`HIPFIRE_QWEN4_D2_WINDOW_ROWS`, `4..=8`) but never past the executor's
+    /// allocated `capacity_rows` and never below the default 4. Pure: the
+    /// caller passes the knob value (`hipfire_config::memory::qwen4_d2_window_rows`).
+    pub const fn d2_qualified_max_rows(
+        &self,
+        capacity_rows: usize,
+        d2_window_rows: usize,
+    ) -> usize {
+        if self.lab_armed {
+            return self.qualified_max_rows(capacity_rows);
+        }
+        let window = if d2_window_rows > CPU_SPLIT_STORAGE_MAX_ROWS {
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        } else {
+            d2_window_rows
+        };
+        let covered = if capacity_rows < window {
+            capacity_rows
+        } else {
+            window
+        };
+        if covered < NARROW_VERIFY_MAX_ROWS {
+            NARROW_VERIFY_MAX_ROWS
+        } else {
+            covered
+        }
+    }
 }
 
 /// Prewarmed D1 host-slot scratch rows visible to the routing slice (the
@@ -2541,14 +2573,36 @@ pub const fn cpu_d1_wide_window_qualified(
 /// state. `capacity_rows` is the executor's allocated
 /// [`crate::cpu_split::CpuSplitExecutor::capacity_rows`]; callers MUST pass
 /// the executor's own value, never a constant.
-pub const fn cpu_wide_window_qualified(
+pub fn cpu_wide_window_qualified(
     armed: bool,
     rows: usize,
     route_rows: usize,
     scope: CpuWideVerifyScope,
     capacity_rows: usize,
 ) -> bool {
-    let qualified = scope.qualified_max_rows(capacity_rows);
+    cpu_wide_window_qualified_with(
+        armed,
+        rows,
+        route_rows,
+        scope,
+        capacity_rows,
+        hipfire_config::memory::qwen4_d2_window_rows(),
+    )
+}
+
+/// [`cpu_wide_window_qualified`] with the D2 verify window passed explicitly
+/// (`HIPFIRE_QWEN4_D2_WINDOW_ROWS`, default 4): the pure body the unit tests
+/// drive. With `d2_window_rows == 4` this is exactly the legacy default-4 /
+/// lab-wide qualification.
+pub const fn cpu_wide_window_qualified_with(
+    armed: bool,
+    rows: usize,
+    route_rows: usize,
+    scope: CpuWideVerifyScope,
+    capacity_rows: usize,
+    d2_window_rows: usize,
+) -> bool {
+    let qualified = scope.d2_qualified_max_rows(capacity_rows, d2_window_rows);
     crate::cpu_split::cpu_splice_window_qualified(armed, rows, route_rows, qualified)
 }
 
@@ -3460,6 +3514,64 @@ mod tests {
         assert!(!cpu_wide_window_qualified(false, 4, 4, default, 64));
         // Storage gate: beyond-64 never resolves, even lab-wide.
         assert!(cpu_split_executor_wide_is_none_past_storage());
+    }
+
+    /// `HIPFIRE_QWEN4_D2_WINDOW_ROWS` wiring (pure, wiring only — not numeric
+    /// proof): the knob widens only the D2 qualified window of the default
+    /// (non-lab) scope, to at most the executor's allocated capacity; `4` is
+    /// exactly the legacy gate; tails, zero rows and unarmed layers never
+    /// qualify; D1 is untouched.
+    #[test]
+    fn d2_window_rows_knob_widens_only_the_default_scope_up_to_capacity() {
+        let default = CpuWideVerifyScope::default_scope();
+        let lab64 = CpuWideVerifyScope::from_lab_presence(true, 64);
+        for window in 4..=8usize {
+            for capacity in [0usize, 1, 4, 5, 6, 7, 8, 64] {
+                let expect = window.min(capacity).max(NARROW_VERIFY_MAX_ROWS);
+                assert_eq!(default.d2_qualified_max_rows(capacity, window), expect);
+                for rows in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+                    assert_eq!(
+                        cpu_wide_window_qualified_with(true, rows, rows, default, capacity, window),
+                        rows <= expect,
+                        "window={window} capacity={capacity} rows={rows}"
+                    );
+                    // Tails never qualify, unarmed layers never qualify.
+                    assert!(!cpu_wide_window_qualified_with(
+                        true,
+                        rows,
+                        rows + 1,
+                        default,
+                        capacity,
+                        window
+                    ));
+                    assert!(!cpu_wide_window_qualified_with(
+                        false, rows, rows, default, capacity, window
+                    ));
+                }
+                assert!(!cpu_wide_window_qualified_with(
+                    true, 0, 0, default, capacity, window
+                ));
+                // The lab-wide scope is untouched by the knob.
+                assert_eq!(
+                    lab64.d2_qualified_max_rows(capacity, window),
+                    lab64.qualified_max_rows(capacity)
+                );
+                // D1 never reads the knob.
+                assert_eq!(default.qualified_max_rows(capacity), NARROW_VERIFY_MAX_ROWS);
+            }
+        }
+        // The process default (no knob in the test snapshot) is the legacy gate.
+        for rows in 1..=CPU_SPLIT_STORAGE_MAX_ROWS {
+            assert_eq!(
+                cpu_wide_window_qualified(true, rows, rows, default, 64),
+                rows <= 4
+            );
+        }
+        // A knob beyond storage clamps to storage, never past it.
+        assert_eq!(
+            default.d2_qualified_max_rows(CPU_SPLIT_STORAGE_MAX_ROWS, 1000),
+            CPU_SPLIT_STORAGE_MAX_ROWS
+        );
     }
 
     #[test]

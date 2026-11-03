@@ -1191,6 +1191,9 @@ fn qwen4_placed_verify_rows(
         gpu_rows.min(
             bundle
                 .cpu_d1_storage_capacity_rows()
+                // D2 loads: the CPU window of the armed mode
+                // (`HIPFIRE_QWEN4_D2_WINDOW_ROWS`, default 4).
+                .max(bundle.native_mtp_cpu_window_rows().unwrap_or(0))
                 .max(hipfire_arch_qwen4::program::QWEN4_CPU_SPLICE_MAX_ROWS),
         )
     } else {
@@ -2797,6 +2800,57 @@ fn qwen4_shared_table_mirror(
         0
     };
     Ok((tables, mirror))
+}
+
+/// Verdict of `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT` for one hot-set placement
+/// attempt (the knob is on; with it off the attempt never builds a verdict).
+#[derive(Debug, PartialEq, Eq)]
+enum Qwen4MtpHeadResident {
+    /// Knob off (the default): nothing changes, nothing is logged.
+    Off,
+    /// Asked for but refused: the head keeps the host-mapped placement.
+    Refused(String),
+    /// The head's routed experts stay in VRAM: `device_bytes` of payload are
+    /// charged against the hot-set budget like non-expert weights, and the
+    /// `host_bytes` they would have pinned (padding included) are not.
+    Charged { device_bytes: u64, host_bytes: u64 },
+}
+
+/// Decide whether a load can afford the native MTP head's routed experts in
+/// VRAM. `head_kept`: the native MTP head attaches on this load. `free`,
+/// `non_expert` and `reserve` are the hot-set budget inputs
+/// ([`residency::expert_hotset_budget`]); the head is affordable when that
+/// budget, with its payload added to the non-expert bytes, still exists.
+fn qwen4_mtp_head_resident_verdict(
+    head_kept: bool,
+    census: hipfire_arch_qwen4::expert_residency::MtpHeadRoutedCensus,
+    free: u64,
+    non_expert: u64,
+    reserve: u64,
+) -> Qwen4MtpHeadResident {
+    const MIB: u64 = 1 << 20;
+    if !head_kept {
+        return Qwen4MtpHeadResident::Refused(
+            "the native MTP head is not attached on this load".to_string(),
+        );
+    }
+    if census.entries == 0 || census.payload_bytes == 0 {
+        return Qwen4MtpHeadResident::Refused(
+            "the model carries no MTP head routed experts".to_string(),
+        );
+    }
+    let charged = non_expert.saturating_add(census.payload_bytes);
+    match hipfire_arch_qwen4::expert_residency::expert_hotset_budget(free, charged, reserve) {
+        Ok(budget) if budget > 0 => Qwen4MtpHeadResident::Charged {
+            device_bytes: census.payload_bytes,
+            host_bytes: census.host_charge_bytes,
+        },
+        Ok(_) | Err(_) => Qwen4MtpHeadResident::Refused(format!(
+            "{} MiB of head experts leave no expert hot-set budget on {} MiB free VRAM",
+            census.payload_bytes / MIB,
+            free / MIB
+        )),
+    }
 }
 
 /// Apply whole-layer placement: trunk layers `>= vram_layers` and the MTP layer
@@ -4875,7 +4929,10 @@ pub fn qwen4_preload_resource_plan(
                         residency::expert_hotset_budget(
                             free_for_plan,
                             inputs.non_expert,
-                            inputs.reserve.bytes(),
+                            hipfire_arch_qwen4::expert_hotset::hotset_reserve_bytes(
+                                &gpu.arch,
+                                &inputs.reserve,
+                            ),
                         ),
                     )
                     .map_err(|skip| format!("qwen4 preload plan: hotset budget: {skip}"))?;
@@ -4917,7 +4974,10 @@ pub fn qwen4_preload_resource_plan(
                         residency::expert_hotset_budget(
                             latest_free as u64,
                             inputs.non_expert,
-                            inputs.reserve.bytes(),
+                            hipfire_arch_qwen4::expert_hotset::hotset_reserve_bytes(
+                                &gpu.arch,
+                                &inputs.reserve,
+                            ),
                         )
                         .and_then(|bytes| {
                             let extra_tables = qwen4_expert_table_bytes(
@@ -6714,6 +6774,10 @@ fn load_qwen4_rank_unscoped(
         qwen4_shared_charges(layer_experts, staged, slab_stage, 0)
             .map_err(|error| format!("qwen4: {error}"))
     };
+    // `HIPFIRE_QWEN4_D2_WINDOW_ROWS` (default off, `4..=8`): an invalid value
+    // refuses the load before any placement or allocation.
+    hipfire_config::memory::validate_qwen4_d2_window_rows()
+        .map_err(|error| format!("qwen4: {error}"))?;
     let mut settled_placement_charges = None;
     let explicit =
         residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
@@ -7020,6 +7084,9 @@ fn load_qwen4_rank_unscoped(
     // experts before and after, and the reserve actually used.
     let mut decode_share_growth: Option<(u64, usize, usize, residency::AutoReserve)> = None;
     let mut hotset_host_bytes = 0;
+    let mut hotset_head_logged = false;
+    // `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`: the verdict of the applied hot-set attempt.
+    let mut hotset_head_resident = false;
     let (hotset, hotset_plan) = if let Some(path) =
         hotset_path.as_deref().filter(|_| band.is_none())
     {
@@ -7049,8 +7116,59 @@ fn load_qwen4_rank_unscoped(
             } else {
                 plain_reserve
             };
-            let reserve_note = reserve_obj.describe();
-            let reserve = reserve_obj.bytes();
+            let mut reserve_note = reserve_obj.describe();
+            let reserve = hotsets::hotset_reserve_bytes(&ctx.gpu.arch, &reserve_obj);
+            if reserve != reserve_obj.bytes() {
+                reserve_note.push_str(&format!(
+                    "; {}=1 sizes the hot set from {} MiB (census + runtime budget) instead of the {} MiB default reserve",
+                    hotsets::HOTSET_CENSUS_RESERVE_ENV,
+                    reserve / MIB,
+                    reserve_obj.bytes() / MIB,
+                ));
+            }
+            // `HIPFIRE_QWEN4_S1_TIER=1`: the S1 profile admitted over this hot set (zero
+            // resident layers) charged the base census at its tile, the S1 census and the
+            // granule slack; the hot budget is the free memory less that reserve (the
+            // incumbent historical floor and 8192-row chunk do not apply to a load whose
+            // prefill is S1). The margin, tier tables and stage are charged below as before.
+            let tier_s1 = slowlink_profile.as_ref().filter(|profile| profile.tier);
+            let hold = tier_s1.map_or(0, |profile| profile.free_hold_bytes);
+            let (free, reserve) = match tier_s1 {
+                Some(profile) => {
+                    let tier_reserve = profile.tier_hot_reserve_bytes();
+                    reserve_note = format!(
+                        "S1 tier (HIPFIRE_QWEN4_S1_TIER=1): {} MiB = base census at the {}-row tile + S1 census + granule slack, with {} MiB held free; replaces the {} MiB incumbent reserve",
+                        tier_reserve / MIB,
+                        profile.tile_rows,
+                        hold / MIB,
+                        reserve / MIB,
+                    );
+                    (free.saturating_sub(hold), tier_reserve)
+                }
+                None => (free, reserve),
+            };
+            // `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT` (default off): keep the head's
+            // routed experts in VRAM, charged against this budget exactly like
+            // non-expert weights; a load that cannot afford them keeps them
+            // host-mapped (one log line, never an OOM).
+            let head = if hipfire_config::memory::qwen4_mtp_head_resident() == Some(true) {
+                qwen4_mtp_head_resident_verdict(
+                    placement_native_mtp && mtp_bytes.is_some(),
+                    residency::mtp_head_routed_census(&manifest.weights, bytes_of)?,
+                    free,
+                    non_expert,
+                    reserve,
+                )
+            } else {
+                Qwen4MtpHeadResident::Off
+            };
+            let (non_expert, head_host_bytes) = match &head {
+                Qwen4MtpHeadResident::Charged {
+                    device_bytes,
+                    host_bytes,
+                } => (non_expert + device_bytes, *host_bytes),
+                _ => (non_expert, 0),
+            };
             let total =
                 hotsets::require_budget(residency::expert_hotset_budget(free, non_expert, reserve))
                     .map_err(|skip| skip.to_string())?;
@@ -7121,6 +7239,7 @@ fn load_qwen4_rank_unscoped(
                     bytes_of,
                     config.num_hidden_layers,
                 )?)
+                .and_then(|bytes| bytes.checked_sub(head_host_bytes))
                 .ok_or("host byte accounting overflow")?;
             residency::check_host_ram(
                 host_bytes,
@@ -7136,16 +7255,19 @@ fn load_qwen4_rank_unscoped(
                 .device_mem_info()
                 .map_err(|error| format!("memory re-query before materialize: {error}"))?;
             let latest_budget = hotsets::require_budget(
-                residency::expert_hotset_budget(latest_free as u64, non_expert, reserve).and_then(
-                    |bytes| {
-                        bytes
-                            .checked_sub(stage)
-                            .and_then(|bytes| bytes.checked_sub(extra_tables))
-                            .ok_or_else(|| {
-                                "no budget after long-prefill stage/table owners".to_string()
-                            })
-                    },
-                ),
+                residency::expert_hotset_budget(
+                    (latest_free as u64).saturating_sub(hold),
+                    non_expert,
+                    reserve,
+                )
+                .and_then(|bytes| {
+                    bytes
+                        .checked_sub(stage)
+                        .and_then(|bytes| bytes.checked_sub(extra_tables))
+                        .ok_or_else(|| {
+                            "no budget after long-prefill stage/table owners".to_string()
+                        })
+                }),
             )
             .map_err(|skip| skip.to_string())?;
             // Check the entire requested ceiling, not just the rounded-down
@@ -7179,6 +7301,7 @@ fn load_qwen4_rank_unscoped(
                 host_bytes,
                 stage,
                 growth,
+                head,
             ))
         };
         // An `on` attempt that lowered the reserve is only kept if the plan
@@ -7200,8 +7323,25 @@ fn load_qwen4_rank_unscoped(
             other => other,
         };
         match attempt {
-            Ok((sidecar, plan, budget, host_bytes, stage, growth)) => {
+            Ok((sidecar, plan, budget, host_bytes, stage, growth, head)) => {
                 hotset_host_bytes = host_bytes;
+                match &head {
+                    Qwen4MtpHeadResident::Off => {}
+                    Qwen4MtpHeadResident::Refused(reason) => {
+                        hotset_head_logged = true;
+                        eprintln!(
+                            "  qwen4 MTP head resident: refused ({reason}); the head's routed experts stay host-mapped"
+                        );
+                    }
+                    Qwen4MtpHeadResident::Charged { device_bytes, .. } => {
+                        hotset_head_resident = true;
+                        hotset_head_logged = true;
+                        eprintln!(
+                            "  qwen4 MTP head resident: HIPFIRE_QWEN4_MTP_HEAD_RESIDENT=1: {} MiB of head routed experts kept in VRAM, charged against the expert hot-set budget (the head's D2 CPU split is off)",
+                            device_bytes / MIB
+                        );
+                    }
+                }
                 decode_share_growth = growth;
                 settled_placement_charges = Some(residency::PlacementCharges {
                     margin: residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES,
@@ -7227,6 +7367,11 @@ fn load_qwen4_rank_unscoped(
     } else {
         (None, None)
     };
+    if hipfire_config::memory::qwen4_mtp_head_resident() == Some(true) && !hotset_head_logged {
+        eprintln!(
+            "  qwen4 MTP head resident: refused (no ranked expert hot set was applied on this load; whole-layer placement keeps the head's routed experts host-mapped)"
+        );
+    }
     if !routed_experts {
         residency::refuse_host_expert_request(explicit, config.profile.id())
             .map_err(|error| format!("qwen4: {error}"))?;
@@ -7465,9 +7610,20 @@ fn load_qwen4_rank_unscoped(
         // count from the ONE post-initialization quote (`profile.placement`).
         // The placement never re-queries free memory or re-derives the joint
         // arithmetic from another epoch: it places exactly that count.
-        let admitted = slowlink_profile
-            .as_ref()
-            .map(|profile| profile.resident_layers);
+        // A tier profile (HIPFIRE_QWEN4_S1_TIER) admitted zero resident layers because the
+        // hot set takes the capacity; when no hot set applied after all, the load keeps the
+        // whole layers that same quote fits (below the layer count: S1 needs a host layer).
+        let admitted = slowlink_profile.as_ref().map(|profile| {
+            if profile.tier && hotset_plan.is_none() {
+                profile
+                    .placement
+                    .largest_fitting_layers()
+                    .unwrap_or(0)
+                    .min(config.num_hidden_layers.saturating_sub(1))
+            } else {
+                profile.resident_layers
+            }
+        });
         let vram_layers = match (policy, admitted) {
             (residency::ExpertVramLayers::Layers(layers), _) => {
                 let (_, layer_experts, ..) = placement_inputs
@@ -7743,8 +7899,15 @@ fn load_qwen4_rank_unscoped(
     if let Some((plan, _)) = &hotset_plan {
         // Trunk payloads are tier-owned; the unchanged MTP entries still use
         // their ordinary host-mapped WeightEntries.
-        let mtp_tensors =
+        let mut mtp_tensors =
             residency::place_routed_experts(&mut manifest.weights, config.num_hidden_layers);
+        if hotset_head_resident {
+            // The head's experts were charged against the hot-set budget: they
+            // upload through the ordinary resident tensor path.
+            mtp_tensors = mtp_tensors.saturating_sub(residency::keep_mtp_head_routed_resident(
+                &mut manifest.weights,
+            ));
+        }
         manifest = manifest
             .with_expert_tiers()
             .map_err(|error| error.to_string())?;
@@ -8173,6 +8336,9 @@ fn load_qwen4_rank_unscoped(
         lease
             .bind_hotset_sidecar_sha256(sidecar.sha256())
             .map_err(|error| format!("hotset numerical identity: {error}"))?;
+        lease
+            .bind_hotset_counts(sidecar.counts())
+            .map_err(|error| format!("hotset routing counts: {error}"))?;
         eprintln!(
             "  qwen4 expert hot set: {} sha256 {}, budget {} MiB, {} experts in VRAM ({} MiB), {} host-mapped ({} MiB), generation {}, digest {}, bound to base {} B, index sha256 {}",
             hotset_path.as_ref().expect("a hotset plan has a path").display(),
@@ -8590,9 +8756,10 @@ fn load_qwen4_rank_unscoped(
             String::new()
         };
         eprintln!(
-            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}{ready}{join}{provenance}): decode and <=4-row verify run their host-placed cold experts on the CPU; wider verify needs the qualified lab-wide CPU window (default 64 when admitted+prewarmed)",
+            "  qwen4 routed experts: CPU split (D2) armed on {} layers ({}; {source}{cold_return}{ready}{join}{provenance}): decode and <={}-row verify run their host-placed cold experts on the CPU (HIPFIRE_QWEN4_D2_WINDOW_ROWS, default 4); wider verify needs the qualified lab-wide CPU window (default 64 when admitted+prewarmed)",
             split_kinds.len(),
-            by_kind.join(", ")
+            by_kind.join(", "),
+            hipfire_config::memory::qwen4_d2_window_rows()
         );
     }
     let split_layers = split_kinds.len();
@@ -15597,6 +15764,82 @@ mod qwen4_ep_embed_host_tests {
             Ok(vec![pinned; 2])
         );
         assert_eq!(residency::host_mapped_bytes(&weights, bytes_of), Ok(pinned));
+    }
+}
+
+#[cfg(test)]
+mod qwen4_mtp_head_resident_tests {
+    use super::{qwen4_mtp_head_resident_verdict, Qwen4MtpHeadResident};
+    use hipfire_arch_qwen4::expert_residency::{
+        MtpHeadRoutedCensus, EXPERT_HOTSET_VRAM_MARGIN_BYTES, EXPERT_TIER_TABLE_BYTES,
+    };
+    const MIB: u64 = 1 << 20;
+
+    fn census() -> MtpHeadRoutedCensus {
+        MtpHeadRoutedCensus {
+            entries: 2,
+            payload_bytes: 1337 * MIB,
+            host_charge_bytes: 1337 * MIB + 2 * 4096,
+        }
+    }
+
+    #[test]
+    fn head_resident_is_charged_only_when_the_hot_set_budget_survives_it() {
+        let (non_expert, reserve) = (9 * 1024 * MIB, 3 * 1024 * MIB);
+        let floor =
+            non_expert + reserve + EXPERT_TIER_TABLE_BYTES + EXPERT_HOTSET_VRAM_MARGIN_BYTES;
+        let payload = census().payload_bytes;
+        // One byte of hot-set budget past the head: affordable, and the verdict
+        // carries the device charge and the host pin it replaces.
+        assert_eq!(
+            qwen4_mtp_head_resident_verdict(
+                true,
+                census(),
+                floor + payload + 1,
+                non_expert,
+                reserve
+            ),
+            Qwen4MtpHeadResident::Charged {
+                device_bytes: payload,
+                host_bytes: census().host_charge_bytes,
+            }
+        );
+        // The head eats the whole budget (0 bytes left) or more: refused with
+        // the sizes named, never an OOM at materialization.
+        for free in [floor + payload, floor + payload - 1, floor, 0] {
+            match qwen4_mtp_head_resident_verdict(true, census(), free, non_expert, reserve) {
+                Qwen4MtpHeadResident::Refused(reason) => {
+                    assert!(reason.contains("1337 MiB"), "{free}: {reason}");
+                    assert!(
+                        reason.contains("no expert hot-set budget"),
+                        "{free}: {reason}"
+                    );
+                }
+                other => panic!("free={free}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn head_resident_refuses_a_load_without_a_head_or_head_experts() {
+        let huge = 1 << 40;
+        assert!(matches!(
+            qwen4_mtp_head_resident_verdict(false, census(), huge, 0, 0),
+            Qwen4MtpHeadResident::Refused(reason) if reason.contains("not attached")
+        ));
+        for empty in [
+            MtpHeadRoutedCensus::default(),
+            MtpHeadRoutedCensus {
+                entries: 1,
+                payload_bytes: 0,
+                host_charge_bytes: 4096,
+            },
+        ] {
+            assert!(matches!(
+                qwen4_mtp_head_resident_verdict(true, empty, huge, 0, 0),
+                Qwen4MtpHeadResident::Refused(reason) if reason.contains("no MTP head routed experts")
+            ));
+        }
     }
 }
 

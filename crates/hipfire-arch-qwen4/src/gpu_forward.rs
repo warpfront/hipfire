@@ -1654,6 +1654,10 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     cpu_split: Option<hipfire_dispatch::cpu_split::CpuSplitExecutor>,
     /// Keeps the frozen payload owners and borrowed pointer tables alive.
     tier: Option<crate::expert_tier_owners::ExpertTierLease>,
+    /// S1 over a ranked hot set is enabled for this load's arch
+    /// ([`crate::slowlink_admission::s1_tier_enabled_on`], read once at build): a tier layer may
+    /// then be an S1 host layer. Meaningless (false) for a layer without a tier.
+    s1_tier_ok: bool,
     tier_identity: Option<hipfire_dispatch::families::moe::ExpertTierIdentity>,
     /// `Some` on a trunk layer of an expert-slab artifact: the layer's experts
     /// are views into its one slab arena with a codec each.
@@ -1705,8 +1709,14 @@ impl Qwen4MoeLayerRuntime {
         self.host_mapped
     }
 
+    /// Whether this layer is a hot-set tier layer (S1 over tiers, `HIPFIRE_QWEN4_S1_TIER`).
+    pub(crate) fn s1_is_tier(&self) -> bool {
+        self.tier.is_some()
+    }
+
     /// Whether this layer is the qualified S1 shape: uniform MQ4 experts with
-    /// no tier split, no stock FP8, no expert-keep
+    /// no tier split (unless S1 over a hot set is enabled for the load's arch,
+    /// `HIPFIRE_QWEN4_S1_TIER` / the gfx1100 tier package), no stock FP8, no expert-keep
     /// pruning mask and no non-MQ4 slab codec. `Err` names the first reason;
     /// the S1 selector turns it into a pre-mutation incumbent verdict.
     /// S1 never runs host arithmetic: D1 is switched off per S1 tile binding
@@ -1718,7 +1728,7 @@ impl Qwen4MoeLayerRuntime {
         if self.fp8 {
             return Err("stock FP8 experts");
         }
-        if self.tier.is_some() {
+        if self.tier.is_some() && !self.s1_tier_ok {
             return Err("expert tiers");
         }
         if !self.experts_all_gate_up_mq4 {
@@ -1779,6 +1789,83 @@ impl Qwen4MoeLayerRuntime {
         Some((expert.gate_up.dtype, expert.down.dtype))
     }
 
+    /// The transport sources of a hot-set TIER layer (S1 over tiers): each cold expert's
+    /// bytes sit in the tier's pinned host owner (CPU address = host base + owner-relative
+    /// offset, copied over the link as for a whole host layer); each hot expert's bytes sit in
+    /// the tier's device owner (device address = device base + offset) and are copied into the
+    /// page device-to-device. Both owners are the lease's, kept alive by its keepalive. Every
+    /// page then holds its whole group, so the panel kernels, tables and combine order are
+    /// exactly those of a whole host layer.
+    fn s1_tier_sources(
+        &self,
+        layer: usize,
+        lease: &crate::expert_tier_owners::ExpertTierLease,
+    ) -> Result<panel_stage::LayerExpertSources, Qwen4GpuForwardError> {
+        use crate::expert_tier_plan::Placement;
+        use panel_stage::{ExpertExtent, ExpertSource, LayerExpertSources, PanelCodec};
+        let view = lease
+            .layer(layer)
+            .ok_or_else(|| invalid(format!("slow-link layer {layer} is not a tier layer")))?;
+        let host = lease.host_cpu_range().ok_or_else(|| {
+            invalid(format!(
+                "slow-link layer {layer}: the tier plan has no pinned host owner"
+            ))
+        })?;
+        let device = lease.owner_range(Placement::Device).unwrap_or((0, 0));
+        let mut experts = Vec::with_capacity(self.experts.len());
+        let mut on_device = Vec::with_capacity(self.experts.len());
+        for id in 0..self.experts.len() {
+            let Some((gate_up_len, down_len)) = self.s1_expert_bytes(id) else {
+                experts.push(None);
+                on_device.push(false);
+                continue;
+            };
+            let entry = view.entry(id).ok_or_else(|| {
+                invalid(format!(
+                    "slow-link layer {layer}: expert {id} has no tier entry"
+                ))
+            })?;
+            if entry.gate_up_len != gate_up_len as u64 || entry.down_len != down_len as u64 {
+                return Err(invalid(format!(
+                    "slow-link layer {layer}: expert {id} tier spans {}+{} differ from the view's {gate_up_len}+{down_len}",
+                    entry.gate_up_len, entry.down_len
+                )));
+            }
+            let (base, device_resident) = match entry.tier {
+                Placement::Device => (device.0, true),
+                Placement::HostMapped => (host.0, false),
+            };
+            let at = |offset: u64| -> Result<usize, Qwen4GpuForwardError> {
+                usize::try_from(offset)
+                    .ok()
+                    .and_then(|offset| base.checked_add(offset))
+                    .ok_or_else(|| {
+                        invalid(format!(
+                            "slow-link layer {layer}: expert {id} tier offset overflows"
+                        ))
+                    })
+            };
+            experts.push(Some(ExpertSource {
+                codec: PanelCodec(0),
+                gate_up: ExpertExtent {
+                    addr: at(entry.gate_up_offset)?,
+                    len: gate_up_len,
+                },
+                down: ExpertExtent {
+                    addr: at(entry.down_offset)?,
+                    len: down_len,
+                },
+            }));
+            on_device.push(device_resident);
+        }
+        // SAFETY: the host range is the lease's pinned owner and the device range its device
+        // owner, both immutable and kept alive by the lease's keepalive (the sources' owner);
+        // every extent is bounds checked against the range of its own kind by the constructor.
+        unsafe {
+            LayerExpertSources::new_tier(layer, host, device, experts, on_device, lease.keepalive())
+        }
+    }
+
     /// The transport sources of this host layer's experts: pinned CPU
     /// addresses of the immutable weight payload, translated from the device
     /// alias addresses of the layer's pointer entries. A slab arena layer has
@@ -1804,6 +1891,9 @@ impl Qwen4MoeLayerRuntime {
             return Err(invalid(format!(
                 "slow-link layer {layer} has no host-mapped experts to stream"
             )));
+        }
+        if let Some(lease) = self.tier.as_ref() {
+            return self.s1_tier_sources(layer, lease);
         }
         let mut aliases: Vec<Option<AliasExpert>> = Vec::with_capacity(self.experts.len());
         for id in 0..self.experts.len() {
@@ -2110,6 +2200,16 @@ pub(crate) fn select_ep_lane_moe<'a, R>(
     static_moe: Option<&'a R>,
 ) -> Option<&'a R> {
     select_layer_moe(balanced_live, ep_full, false, false, static_moe)
+}
+
+/// Rows a trunk layer's D2 split executor is built for: the default
+/// [`hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS`] (4), or the wider
+/// `HIPFIRE_QWEN4_D2_WINDOW_ROWS` verify window (`5..=8`, default off) so the
+/// CPU arm's allocated capacity covers every window the qualification admits
+/// ([`d2_executor_admitted`] never admits a window past the capacity).
+fn d2_executor_rows() -> usize {
+    hipfire_config::memory::qwen4_d2_window_rows()
+        .max(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS)
 }
 
 /// Whether a gathered EP MoE call of `rows` rows binds a separate
@@ -4081,6 +4181,7 @@ impl Qwen4MoeLayerRuntime {
             None,
             true,
             d2_default,
+            crate::d2_default::PcieShare::Off,
             crate::expert_tier_owners::ExpertReadView::BorrowPrefill(class),
             false,
             None,
@@ -4095,6 +4196,7 @@ impl Qwen4MoeLayerRuntime {
         layer_label: usize,
         config: &Qwen4Config,
         d2_default: bool,
+        pcie_share: crate::d2_default::PcieShare,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::build(
             gpu,
@@ -4107,6 +4209,7 @@ impl Qwen4MoeLayerRuntime {
             None,
             true,
             d2_default,
+            pcie_share,
             crate::expert_tier_owners::ExpertReadView::Resident,
             false,
             None,
@@ -4133,6 +4236,7 @@ impl Qwen4MoeLayerRuntime {
             None,
             false,
             false,
+            crate::d2_default::PcieShare::Off,
             crate::expert_tier_owners::ExpertReadView::Resident,
             head_split,
             None,
@@ -4185,6 +4289,7 @@ impl Qwen4MoeLayerRuntime {
             Some(sealed),
             true,
             false,
+            crate::d2_default::PcieShare::Off,
             crate::expert_tier_owners::ExpertReadView::Resident,
             false,
             None,
@@ -4228,6 +4333,7 @@ impl Qwen4MoeLayerRuntime {
             Some(sealed),
             true,
             false,
+            crate::d2_default::PcieShare::Off,
             crate::expert_tier_owners::ExpertReadView::Resident,
             false,
             Some((gate_up, down)),
@@ -4284,6 +4390,7 @@ impl Qwen4MoeLayerRuntime {
             Some(sealed),
             true,
             false,
+            crate::d2_default::PcieShare::Off,
             crate::expert_tier_owners::ExpertReadView::Resident,
             false,
             None,
@@ -4307,6 +4414,7 @@ impl Qwen4MoeLayerRuntime {
         sealed: Option<(ExpertTable, ExpertBindingCache)>,
         allow_tiers: bool,
         d2_default: bool,
+        pcie_share: crate::d2_default::PcieShare,
         read_view: crate::expert_tier_owners::ExpertReadView,
         head_split: bool,
         source_override: Option<(&GpuTensor, &GpuTensor)>,
@@ -5163,7 +5271,7 @@ impl Qwen4MoeLayerRuntime {
                     gate_up_expert_bytes,
                     down_expert_bytes,
                 )
-                .map(cpu_splice::HostSpanOwner::Tier),
+                .map(|owners| cpu_splice::HostSpanOwner::Tier(owners.with_pcie_share(pcie_share))),
                 None => cpu_splice::CpuExpertOwners::new(
                     gpu,
                     gate_up_source,
@@ -5179,6 +5287,16 @@ impl Qwen4MoeLayerRuntime {
                 }),
             };
             match owners {
+                // A share that leaves the CPU arm no expert (every cold expert
+                // GPU-owned) is plain PCIe: no executor, no split protocol.
+                Ok(owners) if owners.share_counts().0 == 0 => {
+                    eprintln!(
+                        "  [moe-cpu-split] qwen4 layer {layer_label}: the PCIe share leaves the \
+                         CPU arm no cold expert; this layer falls back to the PCIe mapped-expert \
+                         read"
+                    );
+                    None
+                }
                 Ok(owners) => Some(owners),
                 Err(why) => {
                     eprintln!(
@@ -5216,6 +5334,8 @@ impl Qwen4MoeLayerRuntime {
             cpu_cold_owners,
             cpu_split: None,
             tier: tier_layer.as_ref().map(|view| view.lease()),
+            s1_tier_ok: tier_layer.is_some()
+                && crate::slowlink_admission::s1_tier_enabled_on(&gpu.arch),
             tier_identity,
             slab: None,
             label: layer_label,
@@ -5233,15 +5353,7 @@ impl Qwen4MoeLayerRuntime {
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last: nothing
         // after it can fail and strand it.
-        runtime.attach_cpu_split(
-            gpu,
-            config,
-            if head_split {
-                1
-            } else {
-                hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS
-            },
-        )
+        runtime.attach_cpu_split(gpu, config, if head_split { 1 } else { d2_executor_rows() })
     }
 
     /// Create the layer's D2 split executor from its cold-expert owner's
@@ -5278,7 +5390,7 @@ impl Qwen4MoeLayerRuntime {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
         })?;
         let (request, join) = (transport.ret, transport.join);
-        let ready = hipfire_config::memory::qwen4_d2_ready().map_err(|error| {
+        let ready = self.d2_ready(&gpu.arch).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 attach: {error}", self.label))
         })?;
         let built = self.new_split_executor(gpu, config, &placement, rows, request, ready, join);
@@ -5671,6 +5783,7 @@ impl Qwen4MoeLayerRuntime {
             cpu_cold_owners,
             cpu_split: None,
             tier: None,
+            s1_tier_ok: false,
             tier_identity: None,
             label: layer_label,
             retained_identities: Vec::new(),
@@ -5687,7 +5800,7 @@ impl Qwen4MoeLayerRuntime {
         }
         .seal_retained_identities()?;
         // The executor owns device storage, so it is created last.
-        runtime.attach_cpu_split(gpu, config, hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS)
+        runtime.attach_cpu_split(gpu, config, d2_executor_rows())
     }
 
     /// Load-only D2 prewarm/reserve: replace this layer's default-4 executor
@@ -5728,7 +5841,7 @@ impl Qwen4MoeLayerRuntime {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
         })?;
         let (request, join) = (transport.ret, transport.join);
-        let ready = hipfire_config::memory::qwen4_d2_ready().map_err(|error| {
+        let ready = self.d2_ready(&gpu.arch).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("layer {} D2 prewarm: {error}", self.label))
         })?;
         let placement = self
@@ -5752,6 +5865,17 @@ impl Qwen4MoeLayerRuntime {
         // Re-apply is inside new_split_executor; publish under the same log lines.
         self.cpu_split = Some(fresh);
         Ok(true)
+    }
+
+    /// The D2 input readiness of this layer's split: an explicit `HIPFIRE_QWEN4_D2_READY` wins;
+    /// unset is event readiness for a hot-set TIER split on a gfx1100 tier-package load
+    /// (`hipfire_config::memory::qwen4_d2_ready_for`), sync for every other layer and arch.
+    fn d2_ready(&self, arch: &str) -> Result<hipfire_config::memory::D2Ready, String> {
+        let tier_split = self
+            .cpu_cold_owners
+            .as_ref()
+            .is_some_and(|owners| owners.kind() == cpu_splice::SplitOwnerKind::Tier);
+        hipfire_config::memory::qwen4_d2_ready_for(arch, tier_split)
     }
 
     /// Shared executor construction behind [`Self::attach_cpu_split`] (initial
@@ -5786,7 +5910,52 @@ impl Qwen4MoeLayerRuntime {
                 .unwrap_or_default();
             format!("{error}{release}")
         };
-        if request == D2Return::Mapped {
+        if let Some(owners) = self.cpu_cold_owners.as_ref() {
+            // `HIPFIRE_QWEN4_TIER_COUNTERS=1`: a no-op unless the flag is set.
+            if let Err(error) = executor.enable_tier_counters(
+                self.label,
+                self.label >= config.num_hidden_layers,
+                &owners.host_mask(),
+                owners.cold_expert_bytes().unwrap_or(0),
+            ) {
+                return Err(release(executor, format!("{error:?}")));
+            }
+        }
+        if let Some(pcie) = self
+            .cpu_cold_owners
+            .as_ref()
+            .and_then(cpu_splice::HostSpanOwner::pcie_owned)
+        {
+            if let Err(error) = executor.set_pcie_owned(&pcie) {
+                return Err(release(executor, format!("{error:?}")));
+            }
+        }
+        // `HIPFIRE_QWEN4_D2_MIXED_CPWAIT=1` (developer, default off): a MIXED
+        // hot/cold layer of a load that requests `mapped` + `cpwait` takes the
+        // mapped staging + CP-wait join as one atomic selection; a refusal of
+        // either half restores the copy transport and the host join, logged.
+        let mixed_cpwait = hipfire_config::memory::qwen4_d2_mixed_cpwait(&gpu.arch)
+            && request == D2Return::Mapped
+            && join == D2Join::CpWait
+            && placement.contains(&0)
+            && placement.contains(&1);
+        if mixed_cpwait {
+            if let Err(error) = executor.enable_mixed_cpwait(gpu) {
+                return Err(release(executor, format!("{error:?}")));
+            }
+            if let Some(reason) = executor.return_refusal() {
+                eprintln!(
+                    "  qwen4 D2 return: layer {}: mixed mapped staging refused, copy kept: {reason}",
+                    self.label
+                );
+            }
+            if let Some(reason) = executor.join_refusal() {
+                eprintln!(
+                    "  qwen4 D2 join: layer {}: mixed cpwait refused, host kept: {reason}",
+                    self.label
+                );
+            }
+        } else if request == D2Return::Mapped {
             if let Err(error) = executor.enable_mapped_return(gpu) {
                 return Err(release(executor, format!("{error:?}")));
             }
@@ -5802,7 +5971,7 @@ impl Qwen4MoeLayerRuntime {
                 return Err(release(executor, format!("{error:?}")));
             }
         }
-        if join == D2Join::CpWait {
+        if !mixed_cpwait && join == D2Join::CpWait {
             if let Err(error) = executor.enable_cpwait_join(gpu) {
                 return Err(release(executor, format!("{error:?}")));
             }
@@ -10770,8 +10939,7 @@ impl Qwen4GpuForward {
         let d1 = self
             .cpu_deferred_experts
             .then_some(cpu_splice::NARROW_VERIFY_MAX_ROWS);
-        let d2 =
-            (self.cpu_split_layers > 0).then_some(hipfire_dispatch::cpu_split::CPU_SPLIT_MAX_ROWS);
+        let d2 = (self.cpu_split_layers > 0).then_some(d2_executor_rows());
         match (d1, d2) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -10858,6 +11026,21 @@ impl Qwen4GpuForward {
             })
             .collect()
     }
+    /// Cumulative routed slots of every armed D2 split layer by owner, as
+    /// `(layer label, [device_resident, pcie_cold, cpu_cold])` in layer order
+    /// ([`hipfire_dispatch::cpu_split::CpuSplitExecutor::route_slot_counters`]).
+    pub(crate) fn split_route_counters(&self) -> Vec<(usize, [u64; 3])> {
+        self.moe
+            .iter()
+            .flatten()
+            .filter_map(|layer| {
+                layer.cpu_split.as_ref().map(|executor| {
+                    let (hot, pcie, cpu) = executor.route_slot_counters();
+                    (layer.label, [hot, pcie, cpu])
+                })
+            })
+            .collect()
+    }
     /// Layers armed for the D2 split through one owner kind.
     fn split_layers_of(&self, kind: cpu_splice::SplitOwnerKind) -> Vec<usize> {
         self.moe
@@ -10927,6 +11110,22 @@ impl Qwen4GpuForward {
                     lease.hotset_sidecar_sha256().map(str::to_owned),
                 )
             });
+        // Layers whose executor leaves some cold experts to the GPU arm: their
+        // partition is part of the numerical identity (those experts run the
+        // GPU kernel, the rest the CPU arm's arithmetic).
+        let shared: Vec<(usize, &[u8])> = self
+            .moe
+            .iter()
+            .flatten()
+            .filter_map(|layer| {
+                layer
+                    .cpu_split
+                    .as_ref()
+                    .and_then(|executor| executor.pcie_owned())
+                    .map(|mask| (layer.label, mask))
+            })
+            .collect();
+        let pcie_share = cpu_splice::pcie_share_digest(&shared);
         cpu_splice::host_exec_identity(
             &cpu_all,
             &[
@@ -10936,6 +11135,7 @@ impl Qwen4GpuForward {
             ],
             tier.as_ref()
                 .map(|(digest, sidecar)| (digest, sidecar.as_deref())),
+            pcie_share.as_deref(),
         )
     }
     /// Configure the D2 parity/timing hooks of every armed layer (lab only).
@@ -11582,6 +11782,19 @@ impl Qwen4GpuForward {
                 } else {
                     d2_resolved
                 };
+            // The PCIe share of the armed tier split (developer knob, default
+            // off): decided once per load from the same measured CPU-arm and
+            // link rates, before any layer admission reads it.
+            let pcie_share = crate::d2_default::resolve_pcie_share(
+                gpu,
+                &bundle.weights,
+                &bundle.config,
+                single_scope,
+                d2_default
+                    || (hipfire_dispatch::cpu_exec::moe_cpu_experts_enabled()
+                        && !hipfire_dispatch::cpu_exec::passback_enabled()),
+            )
+            .map_err(invalid)?;
             match sym_iu4_kill_verdict(
                 hipfire_config::developer_typed_bool("HIPFIRE_QWEN4_MOE_SYM_IU4"),
                 gpu.qwen4_moe_sym_kernel().is_some(),
@@ -11692,6 +11905,7 @@ impl Qwen4GpuForward {
                         layer,
                         &bundle.config,
                         d2_default,
+                        pcie_share,
                     )
                 })?;
                 if bundle
@@ -11813,6 +12027,44 @@ impl Qwen4GpuForward {
                     slots - cold,
                     hipfire_dispatch::cpu_exec::splice_pool_threads()
                 );
+                if pcie_share != crate::d2_default::PcieShare::Off {
+                    let (mut cpu, mut pcie) = (0usize, 0usize);
+                    let mut ppms = Vec::new();
+                    let mut gains: Vec<f64> = Vec::new();
+                    for layer in moe
+                        .iter()
+                        .flatten()
+                        .filter(|layer| layer.cpu_split.is_some())
+                    {
+                        if let Some(owners) = layer
+                            .cpu_cold_owners
+                            .as_ref()
+                            .filter(|owners| owners.kind() == cpu_splice::SplitOwnerKind::Tier)
+                        {
+                            let (cpu_owned, pcie_owned, ppm) = owners.share_counts();
+                            cpu += cpu_owned;
+                            pcie += pcie_owned;
+                            ppms.push(ppm);
+                            if let Some(plan) = owners.share_plan().filter(|p| p.base_ns > 0.0) {
+                                gains.push(plan.best_gain_percent());
+                            }
+                        }
+                    }
+                    let gain = gains.iter().sum::<f64>() / gains.len().max(1) as f64;
+                    let (min, max) = (
+                        ppms.iter().copied().min().unwrap_or(0),
+                        ppms.iter().copied().max().unwrap_or(0),
+                    );
+                    let mean = ppms.iter().map(|&ppm| u64::from(ppm)).sum::<u64>() as f64
+                        / ppms.len().max(1) as f64;
+                    eprintln!(
+                        "  qwen4 D2 pcie share: {}; {tier_split_layers}/{tier_layers} hot-set layers armed (a layer whose share leaves the CPU arm nothing stays on PCIe); per-layer share min {:.4} mean {:.4} max {:.4} (mean predicted gain of the best grid share {gain:.1}%); cold experts CPU-owned {cpu}, PCIe-owned {pcie} (static, across armed layers); the routed-slot split per owner is reported by the executors (`split_route_counters`)",
+                        pcie_share.describe(),
+                        f64::from(min) / 1e6,
+                        mean / 1e6,
+                        f64::from(max) / 1e6,
+                    );
+                }
             }
             // Un-tiered owner kinds: every host-placed expert of an armed
             // layer is cold.

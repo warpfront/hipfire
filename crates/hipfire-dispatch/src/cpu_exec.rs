@@ -5098,6 +5098,22 @@ mod moe_splice_tests {
         }
     }
 
+    /// `HIPFIRE_QWEN4_D2_WINDOW_ROWS` widths: the default 4-row cover's
+    /// 1024-mask density, extended to windows of 5..=8 rows (the wide fixture
+    /// cycles the four proven rows; the join is checked byte-for-byte against
+    /// the one-row AR of every token), with and without identical tokens and
+    /// invalid slots.
+    #[test]
+    fn canonical_join_multirow_windows_5_to_8_match_one_row_ar_for_sampled_masks() {
+        for rows in 5..=8usize {
+            for identical in [false, true] {
+                for invalid in [false, true] {
+                    multirow_join_wide(rows, 1024, identical, invalid);
+                }
+            }
+        }
+    }
+
     /// Wide row builder behind [`multirow_join_wide`]: the same interleaved /
     /// repeated / sentinel / extreme-weight fixture, row `t` cycling the four
     /// proven narrow rows so every 1..64 width repeats established cover.

@@ -2626,6 +2626,10 @@ pub(crate) enum HeadD2Off {
     TrunkD2Off,
     /// Expert-parallel bundles never split the head.
     Ep,
+    /// `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT=1`: the head's routed experts are in
+    /// VRAM, so there is no host copy for a CPU arm to read (and the GPU
+    /// route needs no CPU help).
+    Resident,
 }
 
 impl HeadD2Off {
@@ -2634,6 +2638,9 @@ impl HeadD2Off {
             Self::KnobOff => "HIPFIRE_QWEN4_MTP_HEAD_D2=0",
             Self::TrunkD2Off => "trunk D2 split is not armed on this load (the head follows it)",
             Self::Ep => "expert-parallel bundle",
+            Self::Resident => {
+                "HIPFIRE_QWEN4_MTP_HEAD_RESIDENT: the head's routed experts are VRAM-resident"
+            }
         }
     }
 }
@@ -2645,13 +2652,25 @@ pub(crate) enum HeadD2Decision {
     Off(HeadD2Off),
 }
 
+/// Whether the bound head's routed experts sit in pinned host RAM (the layout
+/// its rows=1 D2 CPU split reads) rather than VRAM
+/// (`HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`). `None` when the head has no stacked
+/// expert tensor to inspect.
+pub(crate) fn head_experts_host_mapped(weights: &Qwen4Weights) -> Option<bool> {
+    let moe = weights.mtp.as_ref()?.ffn.moe()?;
+    let down = weights.resident(&moe.experts_down).ok()?;
+    Some(down.buf.is_host_mapped())
+}
+
 /// Pure decision behind `attach_mtp`: `Some(false)` never arms (the kill);
 /// otherwise (`Some(true)` or unset) the head follows the trunk: armed when the
-/// trunk's D2 split is armed on this load and the bundle is not EP.
+/// trunk's D2 split is armed on this load, the bundle is not EP and the head's
+/// experts are host-placed (`head_resident` = VRAM-resident, never split).
 pub(crate) fn head_d2_decision(
     knob: Option<bool>,
     trunk_split_layers_nonempty: bool,
     ep: bool,
+    head_resident: bool,
 ) -> HeadD2Decision {
     match knob {
         Some(false) => HeadD2Decision::Off(HeadD2Off::KnobOff),
@@ -2659,6 +2678,7 @@ pub(crate) fn head_d2_decision(
         Some(true) | None if !trunk_split_layers_nonempty => {
             HeadD2Decision::Off(HeadD2Off::TrunkD2Off)
         }
+        Some(true) | None if head_resident => HeadD2Decision::Off(HeadD2Off::Resident),
         Some(true) | None => HeadD2Decision::Armed,
     }
 }
@@ -4228,26 +4248,51 @@ mod tests {
     #[test]
     fn head_d2_decision_table() {
         use HeadD2Decision::{Armed, Off};
-        // Unset and `1` both follow the trunk's D2 verdict (non-EP only).
+        // Unset and `1` both follow the trunk's D2 verdict (non-EP only) for a
+        // host-placed head.
         for knob in [None, Some(true)] {
-            assert_eq!(head_d2_decision(knob, true, false), Armed);
+            assert_eq!(head_d2_decision(knob, true, false, false), Armed);
             assert_eq!(
-                head_d2_decision(knob, false, false),
+                head_d2_decision(knob, false, false, false),
                 Off(HeadD2Off::TrunkD2Off)
             );
-            assert_eq!(head_d2_decision(knob, true, true), Off(HeadD2Off::Ep));
-            assert_eq!(head_d2_decision(knob, false, true), Off(HeadD2Off::Ep));
+            assert_eq!(
+                head_d2_decision(knob, true, true, false),
+                Off(HeadD2Off::Ep)
+            );
+            assert_eq!(
+                head_d2_decision(knob, false, true, false),
+                Off(HeadD2Off::Ep)
+            );
+            // A VRAM-resident head (HIPFIRE_QWEN4_MTP_HEAD_RESIDENT) never
+            // splits: there is no host copy for the CPU arm.
+            assert_eq!(
+                head_d2_decision(knob, true, false, true),
+                Off(HeadD2Off::Resident)
+            );
+            assert_eq!(
+                head_d2_decision(knob, false, false, true),
+                Off(HeadD2Off::TrunkD2Off)
+            );
+            assert_eq!(head_d2_decision(knob, true, true, true), Off(HeadD2Off::Ep));
         }
-        // `0` is the kill for every trunk/EP combination.
+        // `0` is the kill for every trunk/EP/residency combination.
         for trunk in [true, false] {
             for ep in [true, false] {
-                assert_eq!(
-                    head_d2_decision(Some(false), trunk, ep),
-                    Off(HeadD2Off::KnobOff)
-                );
+                for resident in [true, false] {
+                    assert_eq!(
+                        head_d2_decision(Some(false), trunk, ep, resident),
+                        Off(HeadD2Off::KnobOff)
+                    );
+                }
             }
         }
-        for off in [HeadD2Off::KnobOff, HeadD2Off::TrunkD2Off, HeadD2Off::Ep] {
+        for off in [
+            HeadD2Off::KnobOff,
+            HeadD2Off::TrunkD2Off,
+            HeadD2Off::Ep,
+            HeadD2Off::Resident,
+        ] {
             assert!(!off.reason().is_empty());
         }
     }

@@ -2069,15 +2069,18 @@ impl<'a> SealedMoeOp<'a> {
     }
 
     /// CP-wait `Combine`: queue the wait behind the routed tail and hand the
-    /// canonical combine the mapped view. From here until `JoinSplit` the
+    /// canonical combine the mapped view (an all-cold layer) or the device
+    /// `expanded` rows the stream fills with the staged cold slots behind the
+    /// wait (a mixed layer, `HIPFIRE_QWEN4_D2_MIXED_CPWAIT`). From here until `JoinSplit` the
     /// stream is gated: no stage may synchronize it, and a call abandoned in
     /// the `Armed` phase aborts the wait (`MoeStepState`'s `Drop`).
     fn arm_cpwait_combine<'e>(
         &self,
         gpu: &Gpu,
         executor: &'e CpuSplitExecutor,
+        expanded: &'e GpuTensor,
     ) -> Result<&'e GpuTensor, DispatchError> {
-        let view = executor.cpwait_arm(gpu)?;
+        let view = executor.cpwait_arm(gpu, expanded)?;
         self.state.split_phase.set(SplitPhase::Armed);
         Ok(view)
     }
@@ -2110,7 +2113,7 @@ impl<'a> SealedMoeOp<'a> {
         let target = params.routed_out.unwrap_or(params.x_residual);
         let rows = params.batch_size;
         let combine_input = if cpwait {
-            self.arm_cpwait_combine(gpu, executor)?
+            self.arm_cpwait_combine(gpu, executor, params.down_expanded)?
         } else {
             executor.combine_outputs(params.down_expanded)?
         };
@@ -2158,7 +2161,7 @@ impl<'a> SealedMoeOp<'a> {
         let target = params.routed_out.unwrap_or(params.x_batch);
         let rows = params.batch_size;
         let combine_input = if cpwait {
-            self.arm_cpwait_combine(gpu, executor)?
+            self.arm_cpwait_combine(gpu, executor, params.down_expanded)?
         } else {
             executor.combine_outputs(params.down_expanded)?
         };
@@ -2578,9 +2581,10 @@ fn lower_prefill<'a>(
             params,
             selection.route,
             selection.cpu_deferred_experts,
-            // The executor-dependent shape check ran at seal and runs again in
-            // `validate_split_prefill`; lowering needs no device object.
-            None,
+            // The width check reads the executor's ALLOCATED capacity: with
+            // `None` a window wider than 4 rows (HIPFIRE_QWEN4_D2_WINDOW_ROWS,
+            // the lab-wide window) always refused here, whatever was built.
+            prefill_split_executor(params).ok(),
         ) {
             return Err(split_error(reason));
         }
@@ -3818,10 +3822,9 @@ fn cpu_split_executor_for_join(
     crate::families::moe::cpu_split_executor_wide(experts, rows)
 }
 
-/// Pure width truth of [`cpu_split_prefill_conflict`] for tests: the
-/// structural refusal for a `rows`-row window given an allocated `capacity`,
+/// Pure width truth of [`cpu_split_prefill_conflict`]: the structural refusal
+/// for a `rows`-row window given an allocated `capacity` (`0` = no executor),
 /// without params or an executor. Wiring only, not numeric proof.
-#[cfg(test)]
 pub(super) fn cpu_split_prefill_conflict_width(
     rows: usize,
     capacity: usize,
@@ -3865,17 +3868,8 @@ pub(super) fn cpu_split_prefill_conflict(
     let capacity = executor
         .map(|executor| executor.capacity_rows())
         .unwrap_or(0);
-    let structural =
-        NARROW_VERIFY_MAX_ROWS.max(capacity.min(crate::families::moe::CPU_SPLIT_STORAGE_MAX_ROWS));
-    if params.batch_size == 0 || params.batch_size > structural {
-        if params.batch_size > NARROW_VERIFY_MAX_ROWS {
-            return Some(
-                "the window exceeds the executor's allocated CPU window (wider windows are ordinary wide prefill)",
-            );
-        }
-        return Some(
-            "the window exceeds the four-row cap (wider windows are ordinary wide prefill)",
-        );
+    if let Some(reason) = cpu_split_prefill_conflict_width(params.batch_size, capacity) {
+        return Some(reason);
     }
     if cpu_deferred_experts || params.cpu_deferred_experts {
         return Some("CPU tier split and CPU-deferred routed experts are mutually exclusive");

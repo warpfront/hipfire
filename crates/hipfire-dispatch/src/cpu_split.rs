@@ -37,6 +37,7 @@ use hipfire_config::memory::{D2Join, D2Ready, D2Return};
 use hipfire_cpu::quant::CpuQuant;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -178,10 +179,20 @@ impl D2ReturnMode {
 
 /// Why a layer cannot use the mapped return, or `None`. The mapped view
 /// REPLACES the combine's expanded input, so it must hold every live slot:
-/// only a layer whose every expert is cold qualifies.
-fn mapped_return_refusal(placement: &[u8]) -> Option<&'static str> {
+/// only a layer whose every expert is cold qualifies. With `mixed_cpwait`
+/// (`HIPFIRE_QWEN4_D2_MIXED_CPWAIT`) a mixed hot/cold layer qualifies too: the
+/// mapped buffer then only stages the CPU-computed cold slots, which the stream
+/// copies into the device `expanded` rows behind the CP wait
+/// ([`CpuSplitExecutor::cpwait_arm`]); the layer needs at least one cold expert.
+fn mapped_return_refusal(placement: &[u8], mixed_cpwait: bool) -> Option<&'static str> {
     if placement.is_empty() {
         return Some("empty ownership plan");
+    }
+    if mixed_cpwait {
+        if !placement.iter().any(|&p| p == 1) {
+            return Some("no cold expert: nothing for the CPU arm to stage");
+        }
+        return None;
     }
     if !placement.iter().all(|&p| p == 1) {
         return Some(
@@ -202,12 +213,22 @@ pub struct ReturnDecision {
 /// plan: `Mapped` is honoured on all-cold plans only, every other request or
 /// plan keeps `Copy` and (for a refused `Mapped`) says why.
 pub fn select_return_mode(request: D2Return, placement: &[u8]) -> ReturnDecision {
+    select_return_mode_with(request, placement, false)
+}
+
+/// [`select_return_mode`] with the mixed-layer CP-wait staging admitted
+/// (`mixed_cpwait`, see [`mapped_return_refusal`]).
+pub fn select_return_mode_with(
+    request: D2Return,
+    placement: &[u8],
+    mixed_cpwait: bool,
+) -> ReturnDecision {
     match request {
         D2Return::Copy => ReturnDecision {
             mode: D2ReturnMode::Copy,
             refusal: None,
         },
-        D2Return::Mapped => match mapped_return_refusal(placement) {
+        D2Return::Mapped => match mapped_return_refusal(placement, mixed_cpwait) {
             None => ReturnDecision {
                 mode: D2ReturnMode::Mapped,
                 refusal: None,
@@ -237,6 +258,19 @@ pub fn select_join_mode(
     placement: &[u8],
     capable: bool,
 ) -> JoinDecision {
+    select_join_mode_with(request, return_mode, placement, capable, false)
+}
+
+/// [`select_join_mode`] with the mixed-layer CP-wait join admitted
+/// (`mixed_cpwait`): a mixed hot/cold plan with at least one cold expert may
+/// take the CP-wait join (its mapped return stages the cold slots only).
+pub fn select_join_mode_with(
+    request: D2Join,
+    return_mode: D2ReturnMode,
+    placement: &[u8],
+    capable: bool,
+    mixed_cpwait: bool,
+) -> JoinDecision {
     match request {
         D2Join::Host => JoinDecision {
             mode: D2Join::Host,
@@ -245,7 +279,9 @@ pub fn select_join_mode(
         D2Join::CpWait => {
             let refusal = if placement.is_empty() {
                 Some("empty ownership plan")
-            } else if !placement.iter().all(|&p| p == 1) {
+            } else if mixed_cpwait && !placement.iter().any(|&p| p == 1) {
+                Some("no cold expert: nothing for the CP-wait join to wait for (host join kept)")
+            } else if !mixed_cpwait && !placement.iter().all(|&p| p == 1) {
                 Some("mixed hot/cold placement: the CP-wait join needs the mapped return, which only an all-cold layer can use (host join kept)")
             } else if return_mode != D2ReturnMode::Mapped {
                 Some("the CP-wait join needs the mapped return (HIPFIRE_QWEN4_D2_RETURN=mapped); the copy transport is installed behind the GPU tail (host join kept)")
@@ -342,6 +378,28 @@ fn zero_unwritten_slots(out: &mut [f32], dim: usize, host_slots: &[u32]) {
         next = slot + 1;
     }
     out[next * dim..].fill(0.0);
+}
+
+/// The byte ranges `(offset, len)` of the slot rows of `host_slots` (strictly
+/// ascending slot indices) in an `[slots, dim]` F32 layout, adjacent slots
+/// merged into one range: the cold runs a mixed CP-wait layer copies from the
+/// mapped staging buffer into the device `expanded` rows (the same runs, at the
+/// same offsets, the copy transport installs).
+fn slot_runs(host_slots: &[u32], dim: usize) -> impl Iterator<Item = (usize, usize)> + '_ {
+    let row_bytes = dim * 4;
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        if i >= host_slots.len() {
+            return None;
+        }
+        let mut j = i + 1;
+        while j < host_slots.len() && host_slots[j] == host_slots[j - 1] + 1 {
+            j += 1;
+        }
+        let run = (host_slots[i] as usize * row_bytes, (j - i) * row_bytes);
+        i = j;
+        Some(run)
+    })
 }
 
 /// What the executor did for one recorded call (lab records only).
@@ -722,6 +780,255 @@ impl Drop for CpWait {
     }
 }
 
+/// `HIPFIRE_QWEN4_TIER_COUNTERS=1` (developer, default off): count, per D2 split
+/// layer call, the DISTINCT routed experts that are device-resident (hot), read
+/// by the CPU arm (cold, CPU) or read over PCIe zero-copy (cold, PCIe), and print
+/// one aggregate per request ([`TierCounterTotals::report_lines`]).
+/// Read once per executor construction; an executor built with it off carries
+/// `tally: None`, so the hot path pays one `Option` check and nothing else.
+///
+/// Counted where the route ids are already on the host: [`CpuSplitExecutor::prepare`]
+/// downloads every call's ids for the CPU arm, so the counters add no transfer, no
+/// synchronization and no kernel. A tier layer that is NOT D2 armed (default PCIe
+/// route, `HIPFIRE_QWEN4_D2=pcie`) has no host copy of its ids and is not counted;
+/// the counters exist only while D2 is armed.
+pub const TIER_COUNTERS_ENV: &str = "HIPFIRE_QWEN4_TIER_COUNTERS";
+
+fn tier_counters_enabled() -> bool {
+    hipfire_config::developer_bool(TIER_COUNTERS_ENV, false)
+}
+
+/// Distinct routed experts of one layer call by serving tier.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CallTally {
+    /// Device-resident experts (the GPU route reads them from VRAM).
+    pub hot: u32,
+    /// Host-resident experts the CPU arm computes (`placement == 1`).
+    pub cold_cpu: u32,
+    /// Host-resident experts the GPU route reads over PCIe (`placement == 0`).
+    pub cold_pcie: u32,
+}
+
+/// Count the distinct valid experts of `ids` (negative or out-of-range ids belong to
+/// no arm and are skipped) by tier: `host[e] == 0` is device-resident; a host-resident
+/// expert is CPU-served when `placement[e] == 1`, else PCIe-served. `seen` is the
+/// caller's bitset scratch, at least `placement.len().div_ceil(64)` words; it is
+/// cleared here. Pure.
+pub fn tally_call(ids: &[i32], placement: &[u8], host: &[u8], seen: &mut [u64]) -> CallTally {
+    debug_assert_eq!(placement.len(), host.len());
+    let words = placement.len().div_ceil(64);
+    seen[..words].fill(0);
+    let mut tally = CallTally::default();
+    for &id in ids {
+        if id < 0 || id as usize >= placement.len() {
+            continue;
+        }
+        let e = id as usize;
+        let (word, bit) = (e / 64, 1u64 << (e % 64));
+        if seen[word] & bit != 0 {
+            continue;
+        }
+        seen[word] |= bit;
+        if host[e] == 0 {
+            tally.hot += 1;
+        } else if placement[e] == 1 {
+            tally.cold_cpu += 1;
+        } else {
+            tally.cold_pcie += 1;
+        }
+    }
+    tally
+}
+
+/// Aggregate of every counted call since the last [`take_tier_counters`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TierCounterTotals {
+    /// Decode/verify steps: a trunk layer call whose layer label does not rise above the
+    /// previous trunk call's starts a new step.
+    pub steps: u64,
+    /// Rows of those steps (the first counted trunk call's rows of each step).
+    pub rows: u64,
+    /// Distinct experts summed over every trunk layer call.
+    pub hot: u64,
+    pub cold_cpu: u64,
+    pub cold_pcie: u64,
+    /// Bytes of the cold experts read over PCIe / by the CPU arm (zero for an owner
+    /// kind with no uniform expert size, i.e. a codec-mixed slab arena).
+    pub link_bytes: u64,
+    pub cpu_bytes: u64,
+    /// MTP head layer calls (a head layer is labelled past the trunk), counted apart
+    /// so draft rows never inflate the trunk step count.
+    pub head_calls: u64,
+    pub head_rows: u64,
+    pub head_hot: u64,
+    pub head_cold_cpu: u64,
+    pub head_cold_pcie: u64,
+}
+
+impl TierCounterTotals {
+    /// Distinct cold experts (CPU + PCIe) of the trunk calls.
+    pub fn cold(&self) -> u64 {
+        self.cold_cpu + self.cold_pcie
+    }
+
+    /// `hot / (hot + cold)` in percent, `0.0` for an empty total.
+    pub fn hit_pct(&self) -> f64 {
+        let all = self.hot + self.cold();
+        if all == 0 {
+            0.0
+        } else {
+            100.0 * self.hot as f64 / all as f64
+        }
+    }
+
+    /// The report: the aggregate line, a per-step line and, when MTP head calls ran, a
+    /// head line. `[]` when nothing was counted.
+    pub fn report_lines(&self) -> Vec<String> {
+        if self.steps == 0 && self.head_calls == 0 {
+            return Vec::new();
+        }
+        let steps = self.steps.max(1);
+        let per = |total: u64| total as f64 / steps as f64;
+        let mut lines = vec![
+            format!(
+                "[tier-counters] steps={} rows={} hot={} cold={} hit={:.1}% cold_cpu={} cold_pcie={} \
+                 link_bytes_per_step={:.0} cpu_bytes_per_step={:.0}",
+                self.steps,
+                self.rows,
+                self.hot,
+                self.cold(),
+                self.hit_pct(),
+                self.cold_cpu,
+                self.cold_pcie,
+                per(self.link_bytes),
+                per(self.cpu_bytes),
+            ),
+            format!(
+                "[tier-counters] per_step rows={:.2} distinct={:.1} hot={:.1} cold={:.1} cold_cpu={:.1} cold_pcie={:.1}",
+                per(self.rows),
+                per(self.hot + self.cold()),
+                per(self.hot),
+                per(self.cold()),
+                per(self.cold_cpu),
+                per(self.cold_pcie),
+            ),
+        ];
+        if self.head_calls > 0 {
+            lines.push(format!(
+                "[tier-counters] head calls={} rows={} hot={} cold_cpu={} cold_pcie={}",
+                self.head_calls,
+                self.head_rows,
+                self.head_hot,
+                self.head_cold_cpu,
+                self.head_cold_pcie,
+            ));
+        }
+        lines
+    }
+}
+
+/// Process-wide accumulator behind [`TierCounterTotals`] (relaxed atomics; counting
+/// is diagnostic and one CPU thread drives all D2 prepares).
+struct TierCounters {
+    steps: AtomicU64,
+    rows: AtomicU64,
+    hot: AtomicU64,
+    cold_cpu: AtomicU64,
+    cold_pcie: AtomicU64,
+    link_bytes: AtomicU64,
+    cpu_bytes: AtomicU64,
+    head_calls: AtomicU64,
+    head_rows: AtomicU64,
+    head_hot: AtomicU64,
+    head_cold_cpu: AtomicU64,
+    head_cold_pcie: AtomicU64,
+    /// Label of the previous trunk call; `usize::MAX` before the first.
+    last_label: AtomicUsize,
+}
+
+static TIER_COUNTERS: TierCounters = TierCounters {
+    steps: AtomicU64::new(0),
+    rows: AtomicU64::new(0),
+    hot: AtomicU64::new(0),
+    cold_cpu: AtomicU64::new(0),
+    cold_pcie: AtomicU64::new(0),
+    link_bytes: AtomicU64::new(0),
+    cpu_bytes: AtomicU64::new(0),
+    head_calls: AtomicU64::new(0),
+    head_rows: AtomicU64::new(0),
+    head_hot: AtomicU64::new(0),
+    head_cold_cpu: AtomicU64::new(0),
+    head_cold_pcie: AtomicU64::new(0),
+    last_label: AtomicUsize::new(usize::MAX),
+};
+
+/// Take (and zero) the process-wide tier counters. `Qwen4Bundle::reset` prints
+/// [`TierCounterTotals::report_lines`] at each cold prefill (the previous request),
+/// and the first split executor freed at unload prints the last request's.
+pub fn take_tier_counters() -> TierCounterTotals {
+    let c = &TIER_COUNTERS;
+    let t = |a: &AtomicU64| a.swap(0, Ordering::Relaxed);
+    c.last_label.store(usize::MAX, Ordering::Relaxed);
+    TierCounterTotals {
+        steps: t(&c.steps),
+        rows: t(&c.rows),
+        hot: t(&c.hot),
+        cold_cpu: t(&c.cold_cpu),
+        cold_pcie: t(&c.cold_pcie),
+        link_bytes: t(&c.link_bytes),
+        cpu_bytes: t(&c.cpu_bytes),
+        head_calls: t(&c.head_calls),
+        head_rows: t(&c.head_rows),
+        head_hot: t(&c.head_hot),
+        head_cold_cpu: t(&c.head_cold_cpu),
+        head_cold_pcie: t(&c.head_cold_pcie),
+    }
+}
+
+/// One executor's counting state; present only under [`TIER_COUNTERS_ENV`].
+struct TierTally {
+    /// The layer's label (`layer.layer`); `head` layers are labelled past the trunk.
+    label: usize,
+    head: bool,
+    /// `1` = the expert lives in host memory whichever arm serves it.
+    host: Box<[u8]>,
+    /// Bytes of one host-resident expert (gate/up + down); 0 when not uniform.
+    expert_bytes: u64,
+    seen: RefCell<Vec<u64>>,
+}
+
+impl TierTally {
+    fn record(&self, rows: usize, ids: &[i32], placement: &[u8]) {
+        let mut seen = self.seen.borrow_mut();
+        let tally = tally_call(ids, placement, &self.host, &mut seen);
+        let c = &TIER_COUNTERS;
+        let (hot, cpu, pcie) = (
+            u64::from(tally.hot),
+            u64::from(tally.cold_cpu),
+            u64::from(tally.cold_pcie),
+        );
+        if self.head {
+            c.head_calls.fetch_add(1, Ordering::Relaxed);
+            c.head_rows.fetch_add(rows as u64, Ordering::Relaxed);
+            c.head_hot.fetch_add(hot, Ordering::Relaxed);
+            c.head_cold_cpu.fetch_add(cpu, Ordering::Relaxed);
+            c.head_cold_pcie.fetch_add(pcie, Ordering::Relaxed);
+            return;
+        }
+        if c.last_label.swap(self.label, Ordering::Relaxed) >= self.label {
+            c.steps.fetch_add(1, Ordering::Relaxed);
+            c.rows.fetch_add(rows as u64, Ordering::Relaxed);
+        }
+        c.hot.fetch_add(hot, Ordering::Relaxed);
+        c.cold_cpu.fetch_add(cpu, Ordering::Relaxed);
+        c.cold_pcie.fetch_add(pcie, Ordering::Relaxed);
+        c.link_bytes
+            .fetch_add(pcie * self.expert_bytes, Ordering::Relaxed);
+        c.cpu_bytes
+            .fetch_add(cpu * self.expert_bytes, Ordering::Relaxed);
+    }
+}
+
 /// Preallocated per-layer transaction and immutable expert ownership plan.
 /// A runtime must release this with `free_gpu` while its device is bound, just
 /// like its other model-owned tensors. CPU work never outlives `join`.
@@ -736,6 +1043,14 @@ pub struct CpuSplitExecutor {
     max_rows: usize,
     device: i32,
     placement: Box<[u8]>,
+    /// Cold experts the GPU arm reads over PCIe (`1` per expert id), a subset
+    /// of the `0` entries of [`Self::placement`]. `None`: every `0` expert is
+    /// device-resident (today's executor). Diagnostic only: it never changes
+    /// ownership, which is `placement` alone.
+    pcie_owned: Option<Box<[u8]>>,
+    /// Routed slots of `Natural` calls by owner, ever: device-resident,
+    /// PCIe-read cold, CPU-computed cold.
+    route_slots: [Cell<u64>; 3],
     masked_indices: GpuTensor,
     state: RefCell<Transaction>,
     /// One-read gate for every diagnostic path; false == production.
@@ -748,6 +1063,10 @@ pub struct CpuSplitExecutor {
     parity: RefCell<ParityState>,
     /// Mapped cold-result return; `None` selects the copy transport.
     mapped: Option<MappedReturn>,
+    /// Mixed hot/cold CP-wait join requested ([`Self::enable_mixed_cpwait`]):
+    /// the mapped buffer stages only the CPU-computed cold slots and the
+    /// canonical combine keeps reading the device `expanded` rows.
+    mixed_cpwait: bool,
     /// Why a requested mapped return was refused (copy transport kept).
     return_refusal: Option<String>,
     /// Cold-slot H2D enqueues, ever.
@@ -770,6 +1089,9 @@ pub struct CpuSplitExecutor {
     /// cached. Independent of `diag_on`/parity: it never enables them and they
     /// never enable it. Disabled: no clock reads, records, or output.
     cpu_trace: bool,
+    /// `HIPFIRE_QWEN4_TIER_COUNTERS=1` counting state ([`TIER_COUNTERS_ENV`]);
+    /// `None` is production.
+    tally: Option<TierTally>,
 }
 
 /// The single env value that enables the CPU-arm trace; every other setting
@@ -856,6 +1178,8 @@ impl CpuSplitExecutor {
             top_k,
             max_rows,
             device: gpu.device_id,
+            pcie_owned: None,
+            route_slots: [Cell::new(0), Cell::new(0), Cell::new(0)],
             placement: placement.into(),
             masked_indices,
             state: RefCell::new(Transaction {
@@ -890,6 +1214,7 @@ impl CpuSplitExecutor {
                 open: None,
             }),
             mapped: None,
+            mixed_cpwait: false,
             return_refusal: None,
             output_copy_calls: Cell::new(0),
             mapped_publications: Cell::new(0),
@@ -900,7 +1225,38 @@ impl CpuSplitExecutor {
             ready_fallback_syncs: Cell::new(0),
             join_refusal: None,
             cpu_trace: cpu_split_trace_enabled(),
+            tally: None,
         })
+    }
+
+    /// Arm the tier counters for this executor when [`TIER_COUNTERS_ENV`] is `1` (a no-op
+    /// otherwise). `host[e] == 1` names every host-resident expert whichever arm serves it
+    /// (the tier plan's host-mapped entries); `placement` alone only says which of them the
+    /// CPU arm computes. `head` marks an MTP head layer, `expert_bytes` the bytes of one
+    /// host-resident expert (0 when not uniform).
+    pub fn enable_tier_counters(
+        &mut self,
+        label: usize,
+        head: bool,
+        host: &[u8],
+        expert_bytes: usize,
+    ) -> Result<(), DispatchError> {
+        if !tier_counters_enabled() {
+            return Ok(());
+        }
+        if host.len() != self.placement.len() || host.iter().any(|&v| v > 1) {
+            return Err(err(
+                "tier counters: host mask must be 0/1 over every expert",
+            ));
+        }
+        self.tally = Some(TierTally {
+            label,
+            head,
+            host: host.into(),
+            expert_bytes: expert_bytes as u64,
+            seen: RefCell::new(vec![0; host.len().div_ceil(64)]),
+        });
+        Ok(())
     }
 
     pub fn masked_indices(&self) -> &GpuTensor {
@@ -908,6 +1264,41 @@ impl CpuSplitExecutor {
     }
     pub fn placement(&self) -> &[u8] {
         &self.placement
+    }
+    /// Mark the cold experts the GPU arm reads over PCIe (see
+    /// [`Self::route_slot_counters`]). Call once at construction, before the
+    /// first `prepare`. The mask must cover exactly the experts of
+    /// [`Self::placement`], never overlap its CPU-owned (`1`) entries, and
+    /// holds only `0`/`1`; a refused mask leaves the executor untouched.
+    pub fn set_pcie_owned(&mut self, pcie_owned: &[u8]) -> Result<(), DispatchError> {
+        if pcie_owned.len() != self.placement.len()
+            || pcie_owned.iter().any(|&v| v > 1)
+            || pcie_owned
+                .iter()
+                .zip(self.placement.iter())
+                .any(|(&pcie, &cpu)| pcie == 1 && cpu == 1)
+        {
+            return Err(err("PCIe ownership mask disagrees with the ownership plan"));
+        }
+        self.pcie_owned = Some(pcie_owned.into());
+        Ok(())
+    }
+    /// Cold experts the GPU arm reads over PCIe, `None` when the placement
+    /// leaves every cold expert to the CPU arm.
+    pub fn pcie_owned(&self) -> Option<&[u8]> {
+        self.pcie_owned.as_deref()
+    }
+    /// `(device_resident, pcie_cold, cpu_cold)` routed slots of every prepared
+    /// `Natural` call, cumulative. `pcie_cold` is zero unless
+    /// [`Self::with_pcie_owned`] named the PCIe-read experts. Invalid router
+    /// slots (negative or out of range ids) belong to no arm and are not
+    /// counted; lab endpoint overrides are not counted either.
+    pub fn route_slot_counters(&self) -> (u64, u64, u64) {
+        (
+            self.route_slots[0].get(),
+            self.route_slots[1].get(),
+            self.route_slots[2].get(),
+        )
     }
     pub fn max_rows(&self) -> usize {
         self.max_rows
@@ -1032,7 +1423,13 @@ impl CpuSplitExecutor {
         if gpu.device_id != self.device {
             return Err(err("join selection on another device"));
         }
-        let precheck = select_join_mode(D2Join::CpWait, self.return_mode(), &self.placement, true);
+        let precheck = select_join_mode_with(
+            D2Join::CpWait,
+            self.return_mode(),
+            &self.placement,
+            true,
+            self.mixed_cpwait,
+        );
         if let Some(reason) = precheck.refusal {
             self.join_refusal = Some(reason.to_string());
             return Ok(D2Join::Host);
@@ -1051,8 +1448,13 @@ impl CpuSplitExecutor {
                 return Ok(D2Join::Host);
             }
         };
-        let decision =
-            select_join_mode(D2Join::CpWait, self.return_mode(), &self.placement, capable);
+        let decision = select_join_mode_with(
+            D2Join::CpWait,
+            self.return_mode(),
+            &self.placement,
+            capable,
+            self.mixed_cpwait,
+        );
         if let Some(reason) = decision.refusal {
             self.join_refusal = Some(reason.to_string());
             return Ok(D2Join::Host);
@@ -1092,6 +1494,59 @@ impl CpuSplitExecutor {
         Ok(D2Join::CpWait)
     }
 
+    /// Whether this call's transport stages only the CPU-computed cold slots of
+    /// a MIXED hot/cold layer in the mapped buffer (the combine then reads the
+    /// device `expanded` rows, into which the stream copies those slots behind
+    /// the CP wait). False for an all-cold layer, whose combine reads the mapped
+    /// view itself, and for every copy executor.
+    fn mixed_staging(&self) -> bool {
+        self.mixed_cpwait && self.mapped.is_some() && self.placement.iter().any(|&p| p == 0)
+    }
+
+    /// Switch a MIXED hot/cold layer to the mapped staging + CP-wait join
+    /// (`HIPFIRE_QWEN4_D2_MIXED_CPWAIT=1`), or keep the copy transport and the
+    /// host join and record why. Call once, at load, before the first `prepare`
+    /// and only when the operator asked for it and the load requests `mapped`
+    /// and `cpwait`. It is atomic: when the CP-wait join is refused (the
+    /// capability, a lab parity configuration, the watchdog or the signal word)
+    /// the mapped staging is dropped again and the executor is exactly the copy
+    /// + host one, with both refusals recorded.
+    ///
+    /// Numerics are untouched: the CPU arm computes the same cold slot bytes and
+    /// the canonical combine reads the same `expanded` rows; only who installs
+    /// the cold rows and who enqueues the combine changes.
+    pub fn enable_mixed_cpwait(&mut self, gpu: &Gpu) -> Result<D2Join, DispatchError> {
+        if self.mapped.is_some() || self.cpwait.is_some() || self.mixed_cpwait {
+            return Err(err("the mixed CP-wait join was already selected"));
+        }
+        self.mixed_cpwait = true;
+        let selected = (|| {
+            if self.enable_mapped_return(gpu)? != D2ReturnMode::Mapped {
+                return Ok(false);
+            }
+            Ok::<bool, DispatchError>(self.enable_cpwait_join(gpu)? == D2Join::CpWait)
+        })();
+        match selected {
+            Ok(true) => Ok(D2Join::CpWait),
+            Ok(false) => {
+                // Refused: restore the copy executor. A refused return left its
+                // reason; a refused join gets the transport restored and says so.
+                if self.mapped.take().is_some() && self.return_refusal.is_none() {
+                    self.return_refusal = Some(
+                        "the mixed CP-wait join was refused, so its mapped staging was dropped (copy transport kept)"
+                            .to_string(),
+                    );
+                }
+                self.mixed_cpwait = false;
+                Ok(D2Join::Host)
+            }
+            Err(error) => {
+                self.mixed_cpwait = false;
+                Err(error)
+            }
+        }
+    }
+
     /// Switch this executor's cold return to the mapped transport, or keep
     /// the copy transport and record why. Call once, at load, before the first
     /// `prepare`, and only when the operator asked for `mapped`. Capability
@@ -1114,7 +1569,8 @@ impl CpuSplitExecutor {
         if gpu.device_id != self.device {
             return Err(err("cold-result return selection on another device"));
         }
-        let decision = select_return_mode(D2Return::Mapped, &self.placement);
+        let decision =
+            select_return_mode_with(D2Return::Mapped, &self.placement, self.mixed_cpwait);
         if let Some(reason) = decision.refusal {
             self.return_refusal = Some(reason.to_string());
             return Ok(D2ReturnMode::Copy);
@@ -1273,7 +1729,11 @@ impl CpuSplitExecutor {
     /// does), so no code may synchronize the stream or device between this call
     /// and `join`. A failure aborts (ABORT stored before any drain) and
     /// poisons; the request must be discarded.
-    pub fn cpwait_arm<'a>(&'a self, gpu: &Gpu) -> Result<&'a GpuTensor, DispatchError> {
+    pub fn cpwait_arm<'a>(
+        &'a self,
+        gpu: &Gpu,
+        expanded: &'a GpuTensor,
+    ) -> Result<&'a GpuTensor, DispatchError> {
         let (Some(cp), Some(mapped)) = (self.cpwait.as_ref(), self.mapped.as_ref()) else {
             return Err(err("cpwait_arm on an executor without the CP-wait join"));
         };
@@ -1300,7 +1760,31 @@ impl CpuSplitExecutor {
             cp.arm.set(Some(cp.watchdog.arm(cp.target.clone())));
             gpu.hip
                 .stream_wait_signal_gte(gpu.active_stream.as_ref(), &cp.join_word, gen)
-                .map_err(err)
+                .map_err(err)?;
+            if self.mixed_staging() {
+                // Mixed layer: behind the wait (stream order) the cold slot rows
+                // are copied from the mapped staging buffer into the device
+                // `expanded` rows, after the masked GPU tail's zero stores and
+                // before the canonical combine (enqueued by the caller next).
+                // The copies read bytes the host has not written yet; they cannot
+                // run before `join` publishes and releases the wait, and any
+                // error from here aborts that wait (below).
+                let mut buf = mapped
+                    .buf
+                    .try_borrow_mut()
+                    .map_err(|_| err("mapped staging buffer is in use"))?;
+                let queued = buf
+                    .enqueue_gated_uploads(
+                        &gpu.hip,
+                        &expanded.buf,
+                        slot_runs(&st.host_slots[..st.host_count], self.dim),
+                        gpu.active_stream.as_ref(),
+                    )
+                    .map_err(err)?;
+                self.output_copy_calls
+                    .set(self.output_copy_calls.get() + queued as u64);
+            }
+            Ok(())
         })();
         if let Err(e) = result {
             st.failed = true;
@@ -1308,7 +1792,11 @@ impl CpuSplitExecutor {
             let _ = cp.fail(gpu);
             return Err(e);
         }
-        Ok(&mapped.view)
+        Ok(if self.mixed_staging() {
+            expanded
+        } else {
+            &mapped.view
+        })
     }
 
     /// Release a queued CP wait with the abort value and poison, without any
@@ -1767,6 +2255,23 @@ impl CpuSplitExecutor {
                 } else {
                     st.gpu_ids[s] = id;
                 }
+                if endpoint == SplitEndpoint::Natural {
+                    let arm = if cold {
+                        2
+                    } else if self
+                        .pcie_owned
+                        .as_deref()
+                        .is_some_and(|pcie| pcie[id as usize] == 1)
+                    {
+                        1
+                    } else {
+                        0
+                    };
+                    self.route_slots[arm].set(self.route_slots[arm].get() + 1);
+                }
+            }
+            if let Some(tally) = self.tally.as_ref() {
+                tally.record(rows, &st.ids[..slots_x], &self.placement);
             }
             self.validate_payloads(gpu, &st, rows, experts, shadow.as_deref())?;
             for s in 0..slots_x {
@@ -1930,6 +2435,7 @@ impl CpuSplitExecutor {
         // These are CPU clock enclosures; the retirement API's profiler
         // interval constrains clock translation, never an assumed offset.
         let trace_on = self.cpu_trace && self.cpwait.is_some();
+        let mixed = self.mixed_staging();
         let trace_entry = trace_on.then(Instant::now);
         self.gate(gpu, rows)?;
         let slots = rows
@@ -2058,7 +2564,9 @@ impl CpuSplitExecutor {
                 // Slots owned by neither arm hold zero in the copy transport's
                 // expanded rows (masked zero stores); match those bytes.
                 let t_zero = trace_on.then(Instant::now);
-                zero_unwritten_slots(rows_out, self.dim, &host_slots[..*host_count]);
+                if !mixed {
+                    zero_unwritten_slots(rows_out, self.dim, &host_slots[..*host_count]);
+                }
                 let (zero_ns, zero_slots) = match t_zero {
                     Some(t) => (ns(t, Instant::now()), (slots - *host_count) as u64),
                     None => (0, 0),
@@ -2341,6 +2849,13 @@ impl CpuSplitExecutor {
 
     pub fn free_gpu(self, gpu: &Gpu) -> Result<(), HipError> {
         gpu.bind_thread()?;
+        if self.tally.is_some() {
+            // Under HIPFIRE_QWEN4_TIER_COUNTERS the first freed executor prints the
+            // last request's aggregate; the rest find it already taken.
+            for line in take_tier_counters().report_lines() {
+                eprintln!("{line}");
+            }
+        }
         // A queued CP wait is released with the abort value BEFORE any drain: a
         // device synchronize with a pending wait never returns.
         self.abort_armed();
@@ -2826,5 +3341,265 @@ mod return_tests {
         assert_eq!(parse_d2_ready(Some("event")), Ok(D2Ready::Event));
         assert!(parse_d2_ready(Some("spin")).is_err());
         assert!(parse_d2_ready(Some("")).is_err());
+    }
+}
+
+#[cfg(test)]
+mod tier_counter_tests {
+    use super::*;
+
+    #[test]
+    fn tally_counts_distinct_experts_by_tier_and_skips_invalid_ids() {
+        // Experts 0..8: 0,1 device-resident; 2,3 host + CPU arm; 4,5 host + PCIe; 6,7 unused.
+        let host = [0u8, 0, 1, 1, 1, 1, 0, 0];
+        let placement = [0u8, 0, 1, 1, 0, 0, 0, 0];
+        let mut seen = vec![u64::MAX; 1];
+        // Two rows routing {0,2,4,0,9,-1}: duplicates, an out-of-range and a negative id.
+        let ids = [0, 2, 4, 0, 9, -1, 2, 5, 1, 3];
+        let tally = tally_call(&ids, &placement, &host, &mut seen);
+        assert_eq!(
+            tally,
+            CallTally {
+                hot: 2,       // 0, 1
+                cold_cpu: 2,  // 2, 3
+                cold_pcie: 2, // 4, 5
+            }
+        );
+        // Stale scratch never leaks into the next call.
+        assert_eq!(
+            tally_call(&[7], &placement, &host, &mut seen),
+            CallTally {
+                hot: 1,
+                cold_cpu: 0,
+                cold_pcie: 0
+            }
+        );
+        assert_eq!(
+            tally_call(&[], &placement, &host, &mut seen),
+            CallTally::default()
+        );
+    }
+
+    #[test]
+    fn tally_spans_bitset_words() {
+        let n = 512;
+        let host = vec![1u8; n];
+        let mut placement = vec![0u8; n];
+        placement[511] = 1;
+        let mut seen = vec![0u64; n / 64];
+        let tally = tally_call(&[0, 63, 64, 511, 511], &placement, &host, &mut seen);
+        assert_eq!(
+            tally,
+            CallTally {
+                hot: 0,
+                cold_cpu: 1,
+                cold_pcie: 3
+            }
+        );
+    }
+
+    /// The one test that drives the process-wide accumulator: steps start where a trunk
+    /// call's label does not rise, head calls are counted apart, bytes follow the tier.
+    #[test]
+    fn recording_aggregates_steps_trunk_calls_and_head_apart() {
+        let _ = take_tier_counters();
+        let host: Box<[u8]> = vec![0, 0, 1, 1, 1, 1, 1, 1].into();
+        let placement = [0u8, 0, 1, 1, 1, 1, 0, 0];
+        let mk = |label, head| TierTally {
+            label,
+            head,
+            host: host.clone(),
+            expert_bytes: 100,
+            seen: RefCell::new(vec![0; 1]),
+        };
+        let (l0, l1, head) = (mk(0, false), mk(1, false), mk(48, true));
+        // Step 1 (rows 4): layer 0 sees {0, 2, 6} (0 twice), layer 1 sees {1, 3}.
+        l0.record(4, &[0, 2, 6, 0], &placement);
+        l1.record(4, &[1, 3], &placement);
+        head.record(1, &[0, 2], &placement);
+        head.record(1, &[3], &placement);
+        // Step 2 (rows 1): layer 0 label does not rise above layer 1's -> a new step.
+        l0.record(1, &[2], &placement);
+        l1.record(1, &[0], &placement);
+        let totals = take_tier_counters();
+        assert_eq!(totals.steps, 2);
+        assert_eq!(totals.rows, 5);
+        // Expert 6 is host-resident with placement 0: PCIe-served.
+        assert_eq!(totals.hot, 1 + 1 + 1); // s1 l0: 0; s1 l1: 1; s2 l1: 0
+        assert_eq!(totals.cold_cpu, 1 + 1 + 1); // s1 l0: 2; s1 l1: 3; s2 l0: 2
+        assert_eq!(totals.cold_pcie, 1);
+        assert_eq!(totals.cpu_bytes, 300);
+        assert_eq!(totals.link_bytes, 100);
+        assert_eq!((totals.head_calls, totals.head_rows), (2, 2));
+        assert_eq!(
+            (totals.head_hot, totals.head_cold_cpu, totals.head_cold_pcie),
+            (1, 2, 0)
+        );
+        // Taking zeroed the accumulator and the step detector.
+        assert_eq!(take_tier_counters(), TierCounterTotals::default());
+        l0.record(1, &[0], &placement);
+        assert_eq!(take_tier_counters().steps, 1);
+    }
+
+    #[test]
+    fn report_has_the_documented_line_and_nothing_when_empty() {
+        assert!(TierCounterTotals::default().report_lines().is_empty());
+        let totals = TierCounterTotals {
+            steps: 10,
+            rows: 10,
+            hot: 150,
+            cold_cpu: 330,
+            cold_pcie: 0,
+            link_bytes: 0,
+            cpu_bytes: 861_696_000,
+            ..TierCounterTotals::default()
+        };
+        let lines = totals.report_lines();
+        assert_eq!(
+            lines[0],
+            "[tier-counters] steps=10 rows=10 hot=150 cold=330 hit=31.2% cold_cpu=330 cold_pcie=0 \
+             link_bytes_per_step=0 cpu_bytes_per_step=86169600"
+        );
+        assert_eq!(
+            lines[1],
+            "[tier-counters] per_step rows=1.00 distinct=48.0 hot=15.0 cold=33.0 cold_cpu=33.0 cold_pcie=0.0"
+        );
+        assert_eq!(lines.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod mixed_cpwait_tests {
+    use super::*;
+
+    /// The copy transport's run loop (`join`, copy branch), restated: adjacent slots are
+    /// one contiguous copy at `slot * dim * 4`.
+    fn copy_transport_runs(host_slots: &[u32], dim: usize) -> Vec<(usize, usize)> {
+        let mut runs = Vec::new();
+        let mut i = 0;
+        while i < host_slots.len() {
+            let mut j = i + 1;
+            while j < host_slots.len() && host_slots[j] == host_slots[j - 1] + 1 {
+                j += 1;
+            }
+            runs.push((host_slots[i] as usize * dim * 4, (j - i) * dim * 4));
+            i = j;
+        }
+        runs
+    }
+
+    #[test]
+    fn mixed_staging_is_admitted_only_with_the_knob_and_a_cold_expert() {
+        let mixed = [1u8, 0, 1, 0, 0];
+        // Knob off: today's refusals, byte for byte.
+        let off = select_return_mode_with(D2Return::Mapped, &mixed, false);
+        assert_eq!(off, select_return_mode(D2Return::Mapped, &mixed));
+        assert_eq!(off.mode, D2ReturnMode::Copy);
+        assert!(off.refusal.unwrap().contains("mixed hot/cold"));
+        // Knob on: the mixed layer stages through the mapped buffer.
+        let on = select_return_mode_with(D2Return::Mapped, &mixed, true);
+        assert_eq!(on.mode, D2ReturnMode::Mapped);
+        assert_eq!(on.refusal, None);
+        // Never for an all-hot or empty plan; a copy request stays copy.
+        for plan in [&[0u8, 0, 0][..], &[][..]] {
+            let refused = select_return_mode_with(D2Return::Mapped, plan, true);
+            assert_eq!(refused.mode, D2ReturnMode::Copy, "{plan:?}");
+            assert!(refused.refusal.is_some(), "{plan:?}");
+        }
+        assert_eq!(
+            select_return_mode_with(D2Return::Copy, &mixed, true).mode,
+            D2ReturnMode::Copy
+        );
+        // An all-cold plan is the same decision with the knob on or off.
+        for plan in [&[1u8; 8][..], &[1u8][..]] {
+            assert_eq!(
+                select_return_mode_with(D2Return::Mapped, plan, true),
+                select_return_mode_with(D2Return::Mapped, plan, false)
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_cpwait_join_needs_the_knob_the_mapped_return_and_the_capability() {
+        let mixed = [1u8, 0, 1];
+        let join = |ret, plan: &[u8], capable, knob| {
+            select_join_mode_with(D2Join::CpWait, ret, plan, capable, knob)
+        };
+        let off = join(D2ReturnMode::Mapped, &mixed, true, false);
+        assert_eq!(off.mode, D2Join::Host);
+        assert!(off.refusal.unwrap().contains("mixed hot/cold"));
+        assert_eq!(
+            off,
+            select_join_mode(D2Join::CpWait, D2ReturnMode::Mapped, &mixed, true)
+        );
+        let on = join(D2ReturnMode::Mapped, &mixed, true, true);
+        assert_eq!((on.mode, on.refusal), (D2Join::CpWait, None));
+        // Every other precondition still refuses, with its own reason.
+        assert!(join(D2ReturnMode::Copy, &mixed, true, true)
+            .refusal
+            .unwrap()
+            .contains("mapped return"));
+        assert!(join(D2ReturnMode::Mapped, &mixed, false, true)
+            .refusal
+            .unwrap()
+            .contains("StreamWaitValue"));
+        assert!(join(D2ReturnMode::Mapped, &[0, 0], true, true)
+            .refusal
+            .unwrap()
+            .contains("no cold expert"));
+        assert!(join(D2ReturnMode::Mapped, &[], true, true)
+            .refusal
+            .is_some());
+        // Host stays host, and an all-cold plan is knob-independent.
+        assert_eq!(
+            select_join_mode_with(D2Join::Host, D2ReturnMode::Mapped, &mixed, true, true).mode,
+            D2Join::Host
+        );
+        assert_eq!(
+            join(D2ReturnMode::Mapped, &[1; 4], true, true),
+            join(D2ReturnMode::Mapped, &[1; 4], true, false)
+        );
+    }
+
+    #[test]
+    fn slot_runs_are_the_copy_transports_runs_at_the_same_offsets() {
+        const DIM: usize = 2560;
+        assert_eq!(slot_runs(&[], DIM).count(), 0);
+        assert_eq!(
+            slot_runs(&[3], DIM).collect::<Vec<_>>(),
+            vec![(3 * DIM * 4, DIM * 4)]
+        );
+        assert_eq!(
+            slot_runs(&[0, 1, 2, 5, 6, 9], DIM).collect::<Vec<_>>(),
+            vec![
+                (0, 3 * DIM * 4),
+                (5 * DIM * 4, 2 * DIM * 4),
+                (9 * DIM * 4, DIM * 4)
+            ]
+        );
+        // Random ascending slot sets over a 4-row window (40 slots): identical to the
+        // copy transport's loop, runs never touch (a hot slot always separates two runs)
+        // and cover exactly the cold slots.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..500 {
+            let mut slots = Vec::new();
+            for slot in 0..40u32 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                if (seed >> 33) % 100 < 40 {
+                    slots.push(slot);
+                }
+            }
+            let runs: Vec<_> = slot_runs(&slots, DIM).collect();
+            assert_eq!(runs, copy_transport_runs(&slots, DIM), "{slots:?}");
+            assert_eq!(
+                runs.iter().map(|&(_, len)| len).sum::<usize>(),
+                slots.len() * DIM * 4
+            );
+            for pair in runs.windows(2) {
+                assert!(pair[0].0 + pair[0].1 < pair[1].0, "{slots:?}");
+            }
+        }
     }
 }

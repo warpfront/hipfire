@@ -1284,7 +1284,15 @@ impl Qwen4Bundle {
             lab_armed,
             crate::gpu_forward::qwen4_row_exact_verify_rows(gpu),
         );
-        scope.qualified_max_rows(self.cpu_storage_capacity_rows())
+        let storage = self.cpu_storage_capacity_rows();
+        // `HIPFIRE_QWEN4_D2_WINDOW_ROWS` (default off): a D2-armed load qualifies
+        // its widened window up to the actual executor capacity without the
+        // lab-wide presence; a D1 splice keeps its own 4 (the window of
+        // `native_mtp_cpu_window_rows` is the narrowest armed mode's).
+        let d2_window = self
+            .native_mtp_cpu_window_rows()
+            .map_or(0, |window| window.min(storage));
+        scope.qualified_max_rows(storage).max(d2_window)
     }
 
     /// Planned D1 storage need in rows: 0 unless carrying an admitted native capture
@@ -1460,6 +1468,18 @@ impl Qwen4Bundle {
         self.execution
             .as_ref()
             .map(Qwen4GpuForward::split_readiness_counters)
+            .unwrap_or_default()
+    }
+
+    /// Cumulative routed slots of every armed D2 split layer by owner, as
+    /// `(layer label, [device_resident, pcie_cold, cpu_cold])` in layer order.
+    /// `pcie_cold` is the cold experts the GPU arm read over PCIe
+    /// (`HIPFIRE_QWEN4_D2_PCIE_SHARE`), `cpu_cold` the ones the CPU arm
+    /// computed.
+    pub fn split_route_counters(&self) -> Vec<(usize, [u64; 3])> {
+        self.execution
+            .as_ref()
+            .map(Qwen4GpuForward::split_route_counters)
             .unwrap_or_default()
     }
 
@@ -1838,6 +1858,9 @@ impl Qwen4Bundle {
                 .as_ref()
                 .is_some_and(|forward| !forward.split_layers().is_empty()),
             ep_binding.is_some(),
+            // `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`: VRAM-resident head experts have
+            // no host copy for the CPU arm.
+            crate::mtp_gpu::head_experts_host_mapped(&self.weights) == Some(false),
         );
         let mtp = Qwen4MtpGpu::new_with_backend(
             gpu,
@@ -4100,6 +4123,12 @@ impl Qwen4Bundle {
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
         if self.pp.is_some() {
             return Err(pp_owner_required());
+        }
+        // `HIPFIRE_QWEN4_TIER_COUNTERS=1`: the previous request's tier counters, once per
+        // cold prefill (the last request's print at unload). Nothing is counted, so nothing
+        // prints, unless the flag armed a split executor.
+        for line in hipfire_dispatch::cpu_split::take_tier_counters().report_lines() {
+            eprintln!("{line}");
         }
         if self.ep.is_some() {
             return self.ep_reset(gpu);

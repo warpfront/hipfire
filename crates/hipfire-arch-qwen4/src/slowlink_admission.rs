@@ -124,6 +124,34 @@ pub const S1_PREFERRED_RESIDENT_LAYERS: usize = 10;
 /// exactly `N` distinct layer indices below the trunk layer count.
 pub const S1_RESIDENT_LAYERS_ENV: &str = "HIPFIRE_QWEN4_SLOWLINK_RESIDENT_LAYERS";
 
+/// S1 slow-link prefill over a load
+/// whose ranked expert hot set (tier plan) applies. Every trunk layer is then an S1 host layer:
+/// the panel ring fills each group's page with the layer's cold experts over the link and its
+/// hot experts by a device-to-device copy from the tier's device owner, so the kernels, pointer
+/// tables, ordered combine and census terms are a whole host layer's. No whole layer stays
+/// resident (a profile admitted this way has `resident_layers == 0` and [`SlowlinkProfile::tier`]
+/// set); the discretionary capacity at zero resident layers is the hot-expert budget
+/// ([`SlowlinkProfile::tier_hot_reserve_bytes`]). Default ON on exact gfx1100 as part of the
+/// gfx1100 tier package ([`hipfire_config::memory::QWEN4_GFX1100_TIER_PACKAGE_ENV`]); `=0` is the
+/// kill (a hot set then refuses S1 exactly as before) and `=1` forces it on any arch. Every other
+/// arch's default is unchanged: a hot set refuses S1.
+/// (`HIPFIRE_QWEN4_S1_TIER`, `developer.qwen4_s1_tier`.)
+pub const S1_TIER_ENV: &str = "HIPFIRE_QWEN4_S1_TIER";
+
+/// Whether S1 over a ranked hot set is enabled for a load on `arch`: [`S1_TIER_ENV`] when set
+/// (`1` / `0`), else the gfx1100 tier package default.
+pub fn s1_tier_enabled_on(arch: &str) -> bool {
+    hipfire_config::developer_bool(
+        S1_TIER_ENV,
+        hipfire_config::memory::qwen4_gfx1100_tier_package(arch),
+    )
+}
+
+/// A tier-admitted window may grow past the floor only while it keeps at least this share
+/// (numerator over [`S1_TIER_GROWTH_KEEP_DEN`]) of the hot-expert budget the floor window leaves.
+pub const S1_TIER_GROWTH_KEEP_NUM: u128 = 3;
+pub const S1_TIER_GROWTH_KEEP_DEN: u128 = 4;
+
 /// The `N` resident trunk layers of a `T`-layer model under
 /// [`S1_RESIDENT_LAYERS_ENV`], sorted ascending. `spread` puts the `k`-th of
 /// `N` at `floor(k*T/N) + floor(T/(2N)) + 1`, clamped to `T-1` (T=48, N=9 gives
@@ -476,7 +504,10 @@ pub fn preflight(mode: SlowlinkMode, shape: &LoadShape<'_>) -> Result<(), Slowli
             shape.explicit_vram_layers,
             "explicit expert VRAM layer count",
         ),
-        (shape.hotset_sidecar, "ranked expert hot set"),
+        (
+            shape.hotset_sidecar && !s1_tier_enabled_on(shape.arch),
+            "ranked expert hot set",
+        ),
         (shape.whole_first, "whole-first placement policy"),
         (shape.stage_opt_out, "HIPFIRE_QWEN4_EXPERT_STAGE=0 opt-out"),
         (shape.npu_trunk, "NPU trunk selected"),
@@ -1681,9 +1712,29 @@ pub struct SlowlinkProfile {
     /// The source-header verdict behind [`ModelGeometry::route`] (see
     /// [`AdmissionInputs::sym_iu4_source_symmetric`]).
     pub sym_iu4_source_symmetric: Option<bool>,
+    /// Admitted over a ranked hot set ([`S1_TIER_ENV`]): `resident_layers` is 0 because every
+    /// layer is a host layer, and the hot experts take the capacity whole resident layers
+    /// would have ([`Self::tier_hot_reserve_bytes`]).
+    pub tier: bool,
+    /// Device bytes the quote held back from the actual free memory (a grown window's
+    /// [`S1_GROWN_FREE_HOLD_BYTES`]; 0 otherwise).
+    pub free_hold_bytes: u64,
 }
 
 impl SlowlinkProfile {
+    /// The reserve a tier load's hot-expert budget subtracts from the actual free memory
+    /// (after the non-expert weights and `free_hold_bytes`): everything the quote charged
+    /// beside resident layers (base census at the tile, S1 census, granule slack) WITHOUT the
+    /// safety margin, which the hot budget charges itself
+    /// ([`crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES`]). With
+    /// `HIPFIRE_QWEN4_S1_TIER` the hot-set budget is `free - hold - non_expert - this - tables -
+    /// margin`, not the incumbent floor.
+    pub fn tier_hot_reserve_bytes(&self) -> u64 {
+        self.placement
+            .reserve_bytes
+            .saturating_sub(self.charges.margin)
+    }
+
     /// Device bytes one resident layer costs the placement: the loader's
     /// `layer_expert_bytes` plus the layer's own physical-granule slack
     /// ([`GranuleCharge::layer`]). The loader's resident-layer resolver MUST
@@ -1750,8 +1801,16 @@ impl SlowlinkProfile {
     /// resident layers and the remaining slack on `actual_free_bytes`, the free
     /// hold included. The S1 load line.
     pub fn describe_against(&self, actual_free_bytes: u64) -> String {
+        // Only a tier admission names itself: every other load logs byte for byte as before.
+        let tier = if self.tier {
+            format!(
+                "; {S1_TIER_ENV}=1: every layer streams, the ranked hot set takes the remaining slack as its budget (S1 tier)"
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "{}; window {} rows = {} tiles, {} resident layers, {} B slack remaining of {} B actual free ({} B free hold included)",
+            "{}; window {} rows = {} tiles, {} resident layers, {} B slack remaining of {} B actual free ({} B free hold included){tier}",
             self.describe(),
             self.window_rows,
             self.window_rows / self.tile_rows,
@@ -1888,6 +1947,19 @@ impl PlacementProjection {
             });
         }
         Ok(layers)
+    }
+}
+
+impl PlacementProjection {
+    /// The verdict of a load that applies a ranked hot set ([`S1_TIER_ENV`]): every trunk layer
+    /// is a host layer, so zero whole layers are resident and no "nothing to stream" refusal
+    /// applies; the base budget (zero layers) must fit, else the exact [`Deficit`] as
+    /// [`Self::verdict`].
+    pub fn tier_verdict(&self) -> Result<usize, SlowlinkDecline> {
+        match self.verdict() {
+            Err(SlowlinkDecline::NoHostLayers { .. }) | Ok(_) => Ok(0),
+            Err(other) => Err(other),
+        }
     }
 }
 
@@ -2102,6 +2174,61 @@ pub fn admit_grown(
     Ok(best.unwrap_or(base))
 }
 
+/// [`admit_grown`] for a load that applies a ranked hot set ([`S1_TIER_ENV`]): zero resident
+/// layers, so the capacity a grown window takes comes out of the hot-expert budget. The window
+/// grows only to the covering window of a context within [`S1_GROWN_WINDOW_MAX_TILES`] (one
+/// sweep per request) and only while the held quote keeps at least
+/// [`S1_TIER_GROWTH_KEEP_NUM`]/[`S1_TIER_GROWTH_KEEP_DEN`] of the hot budget the floor window
+/// leaves on the same held quote; a longer context keeps the floor window. Every grown
+/// candidate leaves [`S1_GROWN_FREE_HOLD_BYTES`] free as [`admit_grown`]'s do
+/// (`free_hold_bytes`).
+pub fn admit_tier_grown(
+    inputs: &AdmissionInputs,
+    max_seq: usize,
+) -> Result<SlowlinkProfile, SlowlinkDecline> {
+    let tile = purpose_tile_rows(inputs.purpose);
+    let base = admit_at_tile_as(inputs, tile, true)?;
+    let ceiling_rows = max_seq.div_ceil(tile).saturating_mul(tile);
+    let (floor_tiles, covering) = (base.window_rows / tile, ceiling_rows / tile);
+    if base.window_rows % tile != 0
+        || covering <= floor_tiles
+        || covering > S1_GROWN_WINDOW_MAX_TILES
+    {
+        return Ok(base);
+    }
+    let held = |tiles: usize| AdmissionInputs {
+        window_rows: tiles * tile,
+        memory: AdmissionMemory {
+            pre_init_free_bytes: inputs
+                .memory
+                .pre_init_free_bytes
+                .map(|free| free.saturating_sub(S1_GROWN_FREE_HOLD_BYTES)),
+            free_bytes: inputs
+                .memory
+                .free_bytes
+                .saturating_sub(S1_GROWN_FREE_HOLD_BYTES),
+        },
+        ..*inputs
+    };
+    let slack = |profile: &SlowlinkProfile| profile.placement.slack_bytes_at(0).max(0) as u128;
+    let floor_slack = match admit_at_tile_as(&held(floor_tiles), tile, true) {
+        Ok(profile) => slack(&profile),
+        Err(_) => return Ok(base),
+    };
+    let candidate = admit_at_tile_as(&held(covering), tile, true)
+        .ok()
+        .filter(|profile| {
+            slack(profile) * S1_TIER_GROWTH_KEEP_DEN >= floor_slack * S1_TIER_GROWTH_KEEP_NUM
+        });
+    Ok(match candidate {
+        Some(mut profile) => {
+            profile.free_hold_bytes = S1_GROWN_FREE_HOLD_BYTES;
+            profile
+        }
+        None => base,
+    })
+}
+
 /// [`admit`] at an explicit legal tile ([`legal_tile_rungs`]) through the same
 /// [`project_at_tile`] quote and verdict: the shared helper tests use to
 /// build a real computed profile at any rung (the historical 1,536-row
@@ -2112,8 +2239,23 @@ pub(crate) fn admit_at_tile(
     inputs: &AdmissionInputs,
     tile_rows: usize,
 ) -> Result<SlowlinkProfile, SlowlinkDecline> {
+    admit_at_tile_as(inputs, tile_rows, false)
+}
+
+/// [`admit_at_tile`] for a load that applies a ranked hot set ([`S1_TIER_ENV`]): the verdict
+/// is [`PlacementProjection::tier_verdict`] (zero resident layers whenever the base budget
+/// fits), the profile is marked `tier`.
+fn admit_at_tile_as(
+    inputs: &AdmissionInputs,
+    tile_rows: usize,
+    tier: bool,
+) -> Result<SlowlinkProfile, SlowlinkDecline> {
     let projection = project_at_tile(inputs, tile_rows)?;
-    let resident_layers = projection.verdict()?;
+    let resident_layers = if tier {
+        projection.tier_verdict()?
+    } else {
+        projection.verdict()?
+    };
     // Everything the placement keeps beside the joint reserve (safety margin
     // included): what is left of the actual free is discretionary capacity.
     let device_snapshot_budget_bytes =
@@ -2139,6 +2281,8 @@ pub(crate) fn admit_at_tile(
         link_gbps: inputs.link_gbps,
         sym_iu4_source_symmetric: inputs.sym_iu4_source_symmetric,
         purpose: inputs.purpose,
+        tier,
+        free_hold_bytes: 0,
     })
 }
 
@@ -2476,8 +2620,12 @@ pub fn select_profile(
         Ok(()) => match link_verdict(link())
             .and_then(inputs)
             .and_then(|inputs| {
-                admit_grown(&inputs, shape.max_seq)
-                    .map(|profile| (profile, inputs.memory.free_bytes))
+                if shape.hotset_sidecar && s1_tier_enabled_on(shape.arch) {
+                    admit_tier_grown(&inputs, shape.max_seq)
+                } else {
+                    admit_grown(&inputs, shape.max_seq)
+                }
+                .map(|profile| (profile, inputs.memory.free_bytes))
             })
             .and_then(
                 |(profile, free)| match explicit_chunk_rows(shape.chunk_rows_env) {
@@ -3249,8 +3397,11 @@ mod tests {
                 },
             ),
             (
+                // A ranked hot set declines S1 on every arch but exact gfx1100 (whose tier
+                // package admits it, see the gfx1100 tier default test).
                 "hotset",
                 LoadShape {
+                    arch: "gfx1151",
                     hotset_sidecar: true,
                     ..shape()
                 },
@@ -8323,5 +8474,158 @@ mod tests {
                 &req(3072, 5, CaptureKind::None)
             )
         );
+    }
+
+    // ── S1 over a ranked hot set (HIPFIRE_QWEN4_S1_TIER) ─────────────────────────────────
+
+    /// The XTX-class tier admission at `max_seq`: inputs at the product tile with the census
+    /// reserve of that context, a window sized as the loader sizes it.
+    fn tier_inputs(free: u64, max_seq: usize) -> AdmissionInputs {
+        let mut inputs = j1778_inputs(
+            WindowRoute::AggregateSymIu4,
+            AdmissionPurpose::Product,
+            free,
+        );
+        inputs.base_reserve =
+            j1778_reserve_for(purpose_tile_rows(inputs.purpose), max_seq).placement_bytes(true);
+        inputs.window_rows = S1_WINDOW_ROWS.min(max_seq);
+        inputs
+    }
+
+    /// Hot experts the loader's tier budget places on `free` actual bytes: the profile's reserve
+    /// without the margin, less the hold, the non-expert weights, the tier tables and the margin
+    /// (`expert_hotset_budget`), in whole mq4 experts of 2,611,200 B.
+    fn tier_hot_experts(profile: &SlowlinkProfile, free: u64) -> (u64, u64) {
+        let budget = crate::expert_residency::expert_hotset_budget(
+            free.saturating_sub(profile.free_hold_bytes),
+            profile.placement.non_expert_bytes,
+            profile.tier_hot_reserve_bytes(),
+        )
+        .unwrap();
+        (budget, budget / 2_611_200)
+    }
+
+    #[test]
+    fn slowlink_tier_verdict_admits_zero_resident_layers_and_marks_the_profile() {
+        let free = 24_376u64 << 20;
+        let inputs = tier_inputs(free, 32_768);
+        let whole = admit(&inputs).unwrap();
+        assert!(!whole.tier && whole.free_hold_bytes == 0);
+        assert!(
+            whole.resident_layers > 0,
+            "the whole-layer profile keeps layers"
+        );
+        let tier = admit_at_tile_as(&inputs, purpose_tile_rows(inputs.purpose), true).unwrap();
+        assert!(tier.tier);
+        assert_eq!(tier.resident_layers, 0);
+        // The same quote: identical charges, only the layer verdict differs.
+        assert_eq!(tier.placement, whole.placement);
+        assert_eq!(tier.census, whole.census);
+        assert_eq!(tier.charges, whole.charges);
+        // The slack at zero layers IS the discretionary capacity the hot set takes.
+        assert_eq!(
+            tier.device_snapshot_budget_bytes as i128,
+            tier.placement.slack_bytes_at(0)
+        );
+        assert_eq!(
+            tier.tier_hot_reserve_bytes() + tier.charges.margin,
+            tier.placement.reserve_bytes
+        );
+        // A base budget that does not fit is still the exact deficit.
+        let tiny = tier_inputs(8u64 << 30, 32_768);
+        assert!(matches!(
+            admit_at_tile_as(&tiny, purpose_tile_rows(tiny.purpose), true),
+            Err(SlowlinkDecline::Deficit(_))
+        ));
+        // A tier admission never takes the "every layer resident" refusal.
+        let huge = tier_inputs(200u64 << 30, 32_768);
+        assert!(admit(&huge).is_err());
+        assert_eq!(
+            admit_at_tile_as(&huge, purpose_tile_rows(huge.purpose), true)
+                .unwrap()
+                .resident_layers,
+            0
+        );
+    }
+
+    #[test]
+    fn slowlink_tier_window_grows_only_to_the_covering_window_and_keeps_most_of_the_budget() {
+        let free = 24_376u64 << 20;
+        // 32K context: the covering window (43 tiles) fits within the keep share.
+        let inputs = tier_inputs(free, 32_768);
+        let floor = admit_at_tile_as(&inputs, purpose_tile_rows(inputs.purpose), true).unwrap();
+        let grown = admit_tier_grown(&inputs, 32_768).unwrap();
+        assert!(grown.tier && grown.resident_layers == 0);
+        if grown.window_rows > floor.window_rows {
+            assert_eq!(grown.window_rows, 32_768usize.div_ceil(768) * 768);
+            assert_eq!(grown.free_hold_bytes, S1_GROWN_FREE_HOLD_BYTES);
+        }
+        // A context past the cap keeps the floor window and no hold.
+        let long = tier_inputs(free, 262_144);
+        let kept = admit_tier_grown(&long, 262_144).unwrap();
+        assert_eq!(kept.window_rows, long.window_rows);
+        assert_eq!(kept.free_hold_bytes, 0);
+        // Whatever the window, the hot budget stays above the incumbent floor's (13,219 MiB
+        // reserve at 32K with MTP: 2,220 experts; 15,806 MiB at 262,144: 1,181).
+        let (_, experts_32k) = tier_hot_experts(&grown, free);
+        let (_, experts_256k) = tier_hot_experts(&kept, free);
+        println!("S1 tier hot experts at {free} B free: 32768 -> {experts_32k} (window {} rows, hold {} MiB), 262144 -> {experts_256k} (window {} rows)",
+            grown.window_rows, grown.free_hold_bytes >> 20, kept.window_rows);
+        assert!(experts_32k > 2_220, "{experts_32k}");
+        assert!(experts_256k > 1_181, "{experts_256k}");
+    }
+
+    #[test]
+    fn slowlink_tier_hot_reserve_is_what_the_hot_budget_subtracts_beside_the_margin() {
+        let free = 24_376u64 << 20;
+        let inputs = tier_inputs(free, 32_768);
+        let profile = admit_at_tile_as(&inputs, purpose_tile_rows(inputs.purpose), true).unwrap();
+        let (budget, _) = tier_hot_experts(&profile, free);
+        // free - non_expert - (reserve incl. margin) - tier tables == the hot budget.
+        let expected = i128::from(free)
+            - i128::from(inputs.non_expert)
+            - i128::from(profile.placement.reserve_bytes)
+            - i128::from(crate::expert_residency::EXPERT_TIER_TABLE_BYTES);
+        assert_eq!(i128::from(budget), expected);
+        // The 512 MiB margin is inside both sides: never charged twice, never dropped.
+        assert_eq!(
+            profile.charges.margin,
+            crate::expert_residency::EXPERT_HOTSET_VRAM_MARGIN_BYTES
+        );
+    }
+
+    #[test]
+    fn slowlink_tier_default_is_on_for_exact_gfx1100_and_a_hot_set_refuses_s1_elsewhere() {
+        // Shipped defaults (a unit test's process snapshot sets none of the variables).
+        assert!(s1_tier_enabled_on("gfx1100"));
+        for arch in ["gfx1201", "gfx1200", "gfx1151", "gfx1101", "gfx942", ""] {
+            assert!(!s1_tier_enabled_on(arch), "{arch}");
+        }
+        let with_hotset = |arch| LoadShape {
+            arch,
+            hotset_sidecar: true,
+            ..shape()
+        };
+        // A ranked hot set no longer declines S1 on gfx1100 ...
+        assert_eq!(
+            preflight(SlowlinkMode::Force, &with_hotset("gfx1100")),
+            Ok(())
+        );
+        // ... and declines it exactly as before everywhere else.
+        for arch in ["gfx1201", "gfx1151", "gfx1101", "gfx942"] {
+            assert_eq!(
+                preflight(SlowlinkMode::Force, &with_hotset(arch)),
+                Err(SlowlinkDecline::Unsupported("ranked expert hot set")),
+                "{arch}"
+            );
+        }
+        // No hot set: no behavior change on any arch.
+        for arch in ["gfx1100", "gfx1201", "gfx1151"] {
+            assert_eq!(
+                preflight(SlowlinkMode::Force, &LoadShape { arch, ..shape() }),
+                Ok(()),
+                "{arch}"
+            );
+        }
     }
 }

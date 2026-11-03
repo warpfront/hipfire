@@ -8973,6 +8973,36 @@ mod tests {
         }
     }
 
+    /// `HIPFIRE_QWEN4_D2_WINDOW_ROWS=N`: the executor is built for N rows
+    /// (capacity N). The seal's qualification and the lowering's structural
+    /// width check must agree for every window against that capacity: a window
+    /// the seal qualifies (`cpu_wide_window_qualified_with`) must lower, and
+    /// lowering must read the allocated capacity (`0` = no executor still
+    /// refuses everything above the legacy 4). Regression: lowering once
+    /// checked against "no executor" and refused every 5..8-row window on the
+    /// first MTP verify step of a card run (wiring only, not numeric proof).
+    #[test]
+    fn d2_window_n_lowers_exactly_the_windows_the_seal_qualifies() {
+        use crate::families::moe::{cpu_wide_window_qualified_with, CpuWideVerifyScope};
+        let default = CpuWideVerifyScope::default_scope();
+        for window in 4..=8usize {
+            for rows in 1..=12usize {
+                let qualified =
+                    cpu_wide_window_qualified_with(true, rows, rows, default, window, window);
+                let lowers = moe_program::cpu_split_prefill_conflict_width(rows, window).is_none();
+                assert_eq!(qualified, lowers, "window={window} rows={rows}");
+                assert_eq!(qualified, rows <= window, "window={window} rows={rows}");
+            }
+            // No executor (capacity 0): only the legacy 4 rows lower.
+            for rows in 1..=8usize {
+                assert_eq!(
+                    moe_program::cpu_split_prefill_conflict_width(rows, 0).is_none(),
+                    rows <= 4
+                );
+            }
+        }
+    }
+
     #[test]
     fn split_cap_matches_the_narrow_verify_window_and_wide_prefill_is_ordinary() {
         assert_eq!(crate::cpu_split::CPU_SPLIT_MAX_ROWS, 4);

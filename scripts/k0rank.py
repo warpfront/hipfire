@@ -34,6 +34,8 @@ Usage
   k0rank.py write    --route-hist route_hist.pooled.cal.json --capture-label gfx942-derived ... --out F
                      (MiHeat route_hist.v1: per_layer counts[48][512] flatten to global ids; the sibling
                       .counts.npz must equal them; reads total = tokens x top_k x layers is checked)
+  k0rank.py rebind   --ranking R.expert-hotset --bind-from TARGET_BASE.expert-hotset --out F
+                     (same rank/counts, base binding of another artifact: single-card sidecar from any ranking)
   k0rank.py validate F [--manifest M.tsv --split held | --route-hist H.json]   (+ coverage curve)
   k0rank.py compare  --ranking A --ranking B --held manifest=M.tsv --held route_hist=H.json
                      (top-50% / top-68.75% coverage, static hit at --per-rank-units 8448 per rank by
@@ -463,6 +465,20 @@ def cmd_pool(args):
               pool_scale=POOL_SCALE, inputs=files))
 
 
+def cmd_rebind(args):
+    """Re-bind an existing ranking (same rank order and counts) to another base artifact's binding."""
+    with open(args.ranking) as fh:
+        doc = json.load(fh)
+    validate_doc(doc)
+    bind = load_bind(args)
+    src_bind = {k: doc[k] for k in BIND_KEYS}
+    emit(args, bind, doc["layers"], doc["top_k"], doc["counts"], doc["capture_tokens"], doc["corpus"],
+         doc["ranking_rule"],
+         dict(source_kind="rebind", source_ranking=os.path.abspath(args.ranking),
+              source_ranking_sha256=sha256_file(args.ranking), source_binding=src_bind,
+              source_provenance=read_sidecar(args.ranking), split=None))
+
+
 def read_sidecar(path):
     side = path + ".provenance.json"
     if not os.path.exists(side):
@@ -594,6 +610,18 @@ def main(argv=None):
     w.add_argument("--drop-class", action="append", default=[], choices=CLASSES)
     w.add_argument("--capture-tokens", type=int, default=0)
     w.add_argument("--corpus")
+    r = sub.add_parser("rebind", help="same ranking, another base artifact's binding (copy it with --bind-from)")
+    r.add_argument("--ranking", required=True)
+    r.add_argument("--out", required=True)
+    r.add_argument("--bind-from", help="existing .expert-hotset of the TARGET base to copy the binding from")
+    r.add_argument("--model-sha256")
+    r.add_argument("--base-size", type=int)
+    r.add_argument("--base-index-sha256")
+    r.add_argument("--format-map")
+    r.add_argument("--format-map-sha256")
+    r.add_argument("--layers", type=int)
+    r.add_argument("--experts-per-layer", type=int)
+    r.add_argument("--top-k", type=int)
     v = sub.add_parser("validate")
     v.add_argument("file")
     v.add_argument("--manifest")
@@ -615,7 +643,7 @@ def main(argv=None):
     p.add_argument("--label", default="")
     args = ap.parse_args(argv)
     {"write": cmd_write, "validate": cmd_validate, "compare": cmd_compare,
-     "pool": cmd_pool}[args.cmd](args)
+     "pool": cmd_pool, "rebind": cmd_rebind}[args.cmd](args)
 
 
 if __name__ == "__main__":

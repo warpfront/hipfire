@@ -33,7 +33,7 @@ use hipfire_dispatch::cpu_exec::{
     cpu_quant_for, moe_cpu_grouped_rows_bf16, CpuMoeExpert, SpCpuExpert, SpCpuScratch, SpCpuStats,
 };
 use hipfire_dispatch::pipeline::sp_layer::{
-    exact_counts, plan_sp_layer, touched_binding_ranges, touched_experts, touched_groups,
+    exact_counts, plan_sp_layer_pinned, touched_binding_ranges, touched_experts, touched_groups,
     SpLayerPlan, SpLimits,
 };
 use hipfire_dispatch::sp_plan::SplitCost;
@@ -102,7 +102,7 @@ pub(crate) fn lab_trace() -> bool {
 /// * `All`: no CPU slot is feasible, so the only feasible `k` is `U`;
 /// * `Cpu`: a streamed expert costs more than any CPU time, so `k = 0` wins
 ///   (a layer whose CPU slots exceed the staging cap is then refused by
-///   [`plan_sp_layer`], a lab-only outcome).
+///   `plan_sp_layer`, a lab-only outcome).
 pub(crate) fn sp_layer_cost(
     rows: usize,
     hidden: usize,
@@ -1260,7 +1260,20 @@ impl Run<'_, '_> {
             cpu_slot_cap: sp.profile.s_cap,
             ..SpLimits::S1_XTX
         };
-        let plan = plan_sp_layer(&route_plan, sorted, rows, &cost, limits)
+        // A tier layer's hot experts have no host bytes: they never take a CPU slot and stream
+        // (device-to-device, no link bytes) like any streamed expert.
+        let pinned: Vec<bool> = match self.rt.schedule.sources_of(layer) {
+            Some(sources) => (0..sources.num_experts())
+                .map(|id| sources.is_device(id))
+                .collect(),
+            None => Vec::new(),
+        };
+        let pinned = if pinned.iter().any(|&p| p) {
+            pinned
+        } else {
+            Vec::new()
+        };
+        let plan = plan_sp_layer_pinned(&route_plan, sorted, rows, &cost, limits, &pinned)
             .map_err(dsp_err("SP layer plan"))?;
         sp.protocol
             .plan(
@@ -1469,6 +1482,11 @@ impl Run<'_, '_> {
                         "SP layer {layer} expert {expert} has no host source"
                     ))
                 })?;
+                if sources.is_device(*expert) {
+                    return Err(invalid(format!(
+                        "SP layer {layer} expert {expert} is device-resident and has no host bytes"
+                    )));
+                }
                 // SAFETY: the extents lie inside the layer's pinned host
                 // ranges (checked by `LayerExpertSources`) and stay valid and
                 // unmodified while the sources' owner lease lives; the
@@ -1837,6 +1855,7 @@ mod tests {
     use super::*;
     use crate::slowlink_admission::RequestVerdict;
     use crate::slowlink_sp::{SpBypass, SP_MIN_ROWS};
+    use hipfire_dispatch::pipeline::sp_layer::plan_sp_layer;
     use hipfire_dispatch::sp_plan::{plan_layer_split, NUM_EXPERTS};
 
     const AGG: dsp::WindowRoute = dsp::WindowRoute::Aggregate;

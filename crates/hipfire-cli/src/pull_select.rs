@@ -547,7 +547,11 @@ fn ask_draft(prompt: &mut dyn Prompt, entry: &ModelEntry) -> Result<bool> {
 /// Per-sidecar yes/no for the expert hot set, default on. The size is fixed
 /// text because the summary's GB rounding would print it as 0.00 GB.
 fn ask_expert_hotset(prompt: &mut dyn Prompt) -> Result<bool> {
-    match confirm(prompt, "Fetch Expert hot set (R9700 decode, 213 KB)", true)? {
+    match confirm(
+        prompt,
+        "Fetch Expert hot set (R9700 and 7900 XTX decode, 213 KB)",
+        true,
+    )? {
         Some(answer) => Ok(answer),
         None => bail!("pull cancelled: no answer for the expert hot set (end of input)"),
     }
@@ -1314,7 +1318,7 @@ mod tests {
             ("qwen3.8:flash-next", true, true)
         );
         for expected in [
-            "Fetch Expert hot set (R9700 decode, 213 KB)? [Y/n]",
+            "Fetch Expert hot set (R9700 and 7900 XTX decode, 213 KB)? [Y/n]",
             LOCAL_HOTSET_FILE,
             "Total download: 125.70 GB",
         ] {
@@ -1381,6 +1385,60 @@ mod tests {
         assert!(declined
             .iter()
             .all(|item| item.label != "EP expert hot set"));
+    }
+
+    #[test]
+    fn the_expert_hotset_is_planned_on_every_host_so_a_gfx1100_pull_fetches_it() {
+        // The pin is keyed by the base artifact identity, never by GPU architecture: a 7900 XTX
+        // (gfx1100) host plans the same single 217,675-byte sidecar as an R9700 (gfx1201), and a
+        // host with no detected GPU or another arch plans exactly that one file as well (no
+        // additional download on any arch).
+        let registry = registry();
+        let (tag, entry) = registry.model("qwen3.8:flash-next").unwrap();
+        let mut planned: Vec<Vec<(String, Option<u64>)>> = Vec::new();
+        for arches in [
+            vec!["gfx1100".to_owned()],
+            vec!["gfx1201".to_owned()],
+            vec!["gfx1151".to_owned()],
+            vec!["gfx1100".to_owned(), "gfx1151".to_owned()],
+            Vec::new(),
+        ] {
+            let host = HostFacts {
+                gpu_arches: arches.clone(),
+                ..host()
+            };
+            let ctx = PullContext {
+                registry: &registry,
+                host: &host,
+                overlay_pins: &[],
+                grandfather_pins: &[],
+                hotset_pins: HOTSET_PINS,
+                present: &absent,
+            };
+            let choice = PullChoice {
+                tag,
+                entry,
+                ple: PleSelection::Skip,
+                draft: false,
+                expert_hotset: true,
+            };
+            let items = plan_items(&ctx, &choice, false);
+            let hot: Vec<_> = items
+                .iter()
+                .filter(|item| item.label.contains("hot set"))
+                .map(|item| (item.file.clone(), item.size))
+                .collect();
+            assert_eq!(
+                hot,
+                vec![(LOCAL_HOTSET_FILE.to_owned(), Some(HOTSET_SIZE))],
+                "{arches:?}"
+            );
+            planned.push(items.iter().map(|i| (i.file.clone(), i.size)).collect());
+        }
+        assert!(
+            planned.windows(2).all(|pair| pair[0] == pair[1]),
+            "plan differs by host arch"
+        );
     }
 
     #[test]

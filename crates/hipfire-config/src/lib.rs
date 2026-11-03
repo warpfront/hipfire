@@ -4076,6 +4076,7 @@ const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_sym_iu4",
     "developer.qwen4_d2_default",
     "developer.qwen4_mtp_head_d2",
+    "developer.qwen4_mtp_head_resident",
     "developer.qwen4_sp",
     "developer.qwen4_sp_touched",
     "developer.moe_sym_iu4",
@@ -7114,6 +7115,43 @@ mod tests {
                 "{raw}"
             );
         }
+    }
+
+    #[test]
+    fn qwen4_mtp_head_resident_is_a_typed_bool_developer_key_default_off() {
+        const KEY: &str = "developer.qwen4_mtp_head_resident";
+        const ENV: &str = "HIPFIRE_QWEN4_MTP_HEAD_RESIDENT";
+        assert!(is_developer_key(KEY));
+        assert!(is_typed_bool_developer_key(KEY));
+        assert_eq!(developer_key_for_env(ENV).as_deref(), Some(KEY));
+        assert_eq!(typed_developer_bool_value(ENV, None), None);
+        for (raw, want) in [("1", true), ("true", true), ("0", false), ("false", false)] {
+            assert_eq!(
+                typed_developer_bool_value(ENV, Some(raw)),
+                Some(want),
+                "{raw}"
+            );
+        }
+        assert_eq!(memory::qwen4_mtp_head_resident(), None);
+    }
+
+    #[test]
+    fn qwen4_d2_window_rows_parses_four_to_eight_and_refuses_everything_else() {
+        use memory::parse_d2_window_rows as parse;
+        assert_eq!(parse(None), Ok(4));
+        for rows in 4..=8usize {
+            assert_eq!(parse(Some(&rows.to_string())), Ok(rows));
+        }
+        for bad in ["", "0", "1", "3", "9", "64", "-5", "5.0", "eight", " 6"] {
+            let error = parse(Some(bad)).unwrap_err();
+            assert!(
+                error.contains("HIPFIRE_QWEN4_D2_WINDOW_ROWS"),
+                "{bad}: {error}"
+            );
+        }
+        // The process snapshot of a test binary carries no knob.
+        assert_eq!(memory::qwen4_d2_window_rows(), 4);
+        assert_eq!(memory::validate_qwen4_d2_window_rows(), Ok(()));
     }
 
     #[test]
@@ -10595,6 +10633,70 @@ pub mod memory {
         super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_D2")
     }
 
+    /// `developer.qwen4_mtp_head_resident` (env `HIPFIRE_QWEN4_MTP_HEAD_RESIDENT`),
+    /// a typed boolean read once per single-card load (default off, unset ==
+    /// `0`): `Some(true)` asks the loader to keep the native MTP head's routed
+    /// experts (the `mtp.` gate/up and down tensors, all of them) in VRAM
+    /// instead of pinned host RAM, charging their bytes against the expert hot
+    /// set's budget; a load that cannot afford them refuses the request with
+    /// one log line and keeps the host-mapped head. A resident head never runs
+    /// the head's rows=1 D2 CPU split (`qwen4_mtp_head_d2`): there is no host
+    /// copy to read.
+    pub fn qwen4_mtp_head_resident() -> Option<bool> {
+        super::developer_typed_bool("HIPFIRE_QWEN4_MTP_HEAD_RESIDENT")
+    }
+
+    /// Env name of the D2 verify-window knob ([`qwen4_d2_window_rows`]).
+    pub const QWEN4_D2_WINDOW_ROWS_ENV: &str = "HIPFIRE_QWEN4_D2_WINDOW_ROWS";
+    /// Rows the D2 CPU split qualifies by default (`CPU_SPLIT_MAX_ROWS`).
+    pub const QWEN4_D2_WINDOW_ROWS_DEFAULT: usize = 4;
+    /// Most rows [`qwen4_d2_window_rows`] may raise the window to: the GPU
+    /// few-row route's proven width on every arch the D2 split runs on.
+    pub const QWEN4_D2_WINDOW_ROWS_CEILING: usize = 8;
+
+    /// Pure body of [`qwen4_d2_window_rows`]: unset is the default 4; an
+    /// integer in `4..=8` selects that window; every other spelling (empty,
+    /// non-numeric, below 4, above 8) is an error that names the accepted
+    /// values.
+    pub fn parse_d2_window_rows(raw: Option<&str>) -> std::result::Result<usize, String> {
+        let Some(raw) = raw else {
+            return Ok(QWEN4_D2_WINDOW_ROWS_DEFAULT);
+        };
+        match raw.parse::<usize>() {
+            Ok(rows)
+                if (QWEN4_D2_WINDOW_ROWS_DEFAULT..=QWEN4_D2_WINDOW_ROWS_CEILING).contains(&rows) =>
+            {
+                Ok(rows)
+            }
+            _ => Err(format!(
+                "{QWEN4_D2_WINDOW_ROWS_ENV}={raw:?} is not a D2 verify window: expected an integer \
+                 from {QWEN4_D2_WINDOW_ROWS_DEFAULT} (the default) to {QWEN4_D2_WINDOW_ROWS_CEILING}"
+            )),
+        }
+    }
+
+    /// Validate `developer.qwen4_d2_window_rows` for the load: an invalid value
+    /// is an `Err` the loader must propagate (the per-call reader below would
+    /// otherwise silently keep the default).
+    pub fn validate_qwen4_d2_window_rows() -> std::result::Result<(), String> {
+        parse_d2_window_rows(process_value(QWEN4_D2_WINDOW_ROWS_ENV).as_deref()).map(|_| ())
+    }
+
+    /// `developer.qwen4_d2_window_rows` (env `HIPFIRE_QWEN4_D2_WINDOW_ROWS`,
+    /// default `4`, range `4..=8`): the widest whole-window verify the D2
+    /// CPU-cold/GPU-hot split qualifies without the lab-wide oracle override.
+    /// Snapshot-read once per process (cached): the per-call D2 gates and the
+    /// native-MTP `auto` K cap read it on hot paths. An invalid value reads as
+    /// the default here and is refused at load by
+    /// [`validate_qwen4_d2_window_rows`].
+    pub fn qwen4_d2_window_rows() -> usize {
+        static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *ROWS.get_or_init(|| {
+            parse_d2_window_rows(process_value(QWEN4_D2_WINDOW_ROWS_ENV).as_deref())
+                .unwrap_or(QWEN4_D2_WINDOW_ROWS_DEFAULT)
+        })
+    }
+
     /// `developer.qwen4_sp` (env `HIPFIRE_QWEN4_SP`), a typed boolean read once
     /// per Qwen4 load by the S1 short-prompt prefill hook (SP: stream the
     /// top-k* experts, run the rest on the CPU, one canonical combine). `None`
@@ -10797,6 +10899,67 @@ pub mod memory {
         }
     }
 
+    /// The Qwen4 gfx1100 (7900 XTX) single-card tier package, default ON on exact `gfx1100`
+    /// and inert everywhere else: the default sibling expert hot set sidecar
+    /// (`HIPFIRE_QWEN4_EXPERT_HOTSET`), S1 slow-link prefill over its tier plan
+    /// (`HIPFIRE_QWEN4_S1_TIER`), the census hot-set reserve
+    /// (`HIPFIRE_QWEN4_EXPERT_HOTSET_CENSUS_RESERVE`), event input readiness for tier D2 splits
+    /// (`HIPFIRE_QWEN4_D2_READY`) and the mixed-layer CP-wait join
+    /// (`HIPFIRE_QWEN4_D2_MIXED_CPWAIT`). The one switch is
+    /// `HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100` (`developer.qwen4_expert_hotset_gfx1100`): `0`
+    /// turns the whole package off (every member returns to its previous default: no default
+    /// sidecar on gfx1100, S1 declines a hot set, the incumbent reserve, sync readiness, the copy
+    /// transport on mixed layers); any other value, including unset, leaves it on. Each member
+    /// keeps its own variable, which always wins over the package for that member (`=1` / `=0`).
+    pub const QWEN4_GFX1100_TIER_PACKAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_HOTSET_GFX1100";
+
+    /// Pure body of [`qwen4_gfx1100_tier_package`]: `arch` is exact `gfx1100` and the switch
+    /// (`package_switch`, the process value; `None` unset) is not `0`.
+    pub fn gfx1100_tier_package_for(arch: &str, package_switch: Option<bool>) -> bool {
+        arch == "gfx1100" && package_switch.unwrap_or(true)
+    }
+
+    /// Whether the gfx1100 tier package defaults apply to a load on `arch` (see
+    /// [`QWEN4_GFX1100_TIER_PACKAGE_ENV`]). Read from the process snapshot.
+    pub fn qwen4_gfx1100_tier_package(arch: &str) -> bool {
+        gfx1100_tier_package_for(
+            arch,
+            match process_value(QWEN4_GFX1100_TIER_PACKAGE_ENV).as_deref() {
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                _ => None,
+            },
+        )
+    }
+
+    /// Pure body of [`qwen4_d2_ready_for`]: an explicit value (`sync` / `event`) always wins; unset
+    /// is `Event` for a tier split on a load where the gfx1100 tier package applies
+    /// (`package`), `Sync` for every other split and arch. An invalid spelling is an error.
+    pub fn resolve_d2_ready(
+        package: bool,
+        tier_split: bool,
+        raw: Option<&str>,
+    ) -> std::result::Result<D2Ready, String> {
+        match raw {
+            None if package && tier_split => Ok(D2Ready::Event),
+            other => parse_d2_ready(other),
+        }
+    }
+
+    /// [`qwen4_d2_ready`] with the per-arch default: event readiness for the D2 tier split
+    /// (`tier_split`: the layer's cold experts live in a hot-set tier owner) of a gfx1100
+    /// tier-package load. `HIPFIRE_QWEN4_D2_READY=sync` is the kill value for it.
+    pub fn qwen4_d2_ready_for(
+        arch: &str,
+        tier_split: bool,
+    ) -> std::result::Result<D2Ready, String> {
+        resolve_d2_ready(
+            qwen4_gfx1100_tier_package(arch),
+            tier_split,
+            process_value("HIPFIRE_QWEN4_D2_READY").as_deref(),
+        )
+    }
+
     /// Pure body of [`qwen4_d2_ready`]: unset is `Sync`; `sync` and `event`
     /// (exact, lower-case) select a mode; every other spelling, including the
     /// empty string, is an error that names the accepted values.
@@ -10866,6 +11029,122 @@ pub mod memory {
     /// unset is `Host`. The arch default lives in [`default_d2_transport`].
     pub fn parse_d2_join(raw: Option<&str>) -> std::result::Result<D2Join, String> {
         parse_d2_join_explicit(raw).map(Option::unwrap_or_default)
+    }
+
+    /// Parts-per-million denominator of a [`D2PcieShare`] fraction.
+    pub const D2_PCIE_SHARE_PPM_ONE: u32 = 1_000_000;
+
+    /// Which fraction of a D2 tier layer's host-mapped (cold) experts, by
+    /// routing mass, the GPU arm reads over PCIe instead of the CPU arm
+    /// computing them (`developer.qwen4_d2_pcie_share`, env
+    /// `HIPFIRE_QWEN4_D2_PCIE_SHARE`). Only reads on a hot-set tier layer whose
+    /// D2 split is armed; every other load and layer ignores it.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub enum D2PcieShare {
+        /// Unset, `off` or `0`: every cold expert is CPU-owned (today's D2).
+        #[default]
+        Off,
+        /// The fraction is sized per layer at load from the measured CPU-arm
+        /// rate, the measured zero-copy link rate and the hot-arm GPU time.
+        Auto,
+        /// A fixed fraction in parts per million, `1..=1_000_000`.
+        Fixed(u32),
+    }
+
+    /// Pure body of [`qwen4_d2_pcie_share`]: unset is `Off`; `off`, `auto` and a
+    /// decimal fraction in `[0, 1]` (exact, no sign, no whitespace) select a
+    /// mode; `0` and `off` are the same mode. Every other spelling, including
+    /// the empty string, NaN and an out-of-range number, is an error that names
+    /// the accepted values: a mistyped share must refuse the load, never run
+    /// a different split.
+    pub fn parse_d2_pcie_share(raw: Option<&str>) -> std::result::Result<D2PcieShare, String> {
+        let bad = |value: &str| {
+            format!(
+                "HIPFIRE_QWEN4_D2_PCIE_SHARE={value:?} is not a D2 PCIe share: expected `off`, `auto` or a fraction in [0, 1]"
+            )
+        };
+        match raw {
+            None | Some("off") => Ok(D2PcieShare::Off),
+            Some("auto") => Ok(D2PcieShare::Auto),
+            Some(value) => {
+                if value.is_empty()
+                    || !value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+                {
+                    return Err(bad(value));
+                }
+                let fraction: f64 = value.parse().map_err(|_| bad(value))?;
+                if !(0.0..=1.0).contains(&fraction) {
+                    return Err(bad(value));
+                }
+                let ppm = (fraction * f64::from(D2_PCIE_SHARE_PPM_ONE)).round() as u32;
+                Ok(if ppm == 0 {
+                    D2PcieShare::Off
+                } else {
+                    D2PcieShare::Fixed(ppm)
+                })
+            }
+        }
+    }
+
+    /// `developer.qwen4_d2_pcie_share` (env `HIPFIRE_QWEN4_D2_PCIE_SHARE`) from
+    /// the process snapshot. Resolve it once per load; an invalid value is an
+    /// `Err` the loader must propagate.
+    pub fn qwen4_d2_pcie_share() -> std::result::Result<D2PcieShare, String> {
+        parse_d2_pcie_share(process_value("HIPFIRE_QWEN4_D2_PCIE_SHARE").as_deref())
+    }
+
+    /// `developer.qwen4_d2_mixed_cpwait` (env `HIPFIRE_QWEN4_D2_MIXED_CPWAIT`), a
+    /// boolean read once per load (default ON on exact gfx1100 as part of the tier package,
+    /// [`QWEN4_GFX1100_TIER_PACKAGE_ENV`]; off on every other arch; `=0` is the kill, `=1` forces
+    /// it anywhere the load requests `mapped` + `cpwait`): a MIXED hot/cold D2 tier layer
+    /// takes the mapped staging + CP-wait join instead of the copy transport +
+    /// host join, whenever the load requests `mapped` and `cpwait` (the gfx1100
+    /// default, or an explicit `HIPFIRE_QWEN4_D2_RETURN=mapped
+    /// HIPFIRE_QWEN4_D2_JOIN=cpwait`). The CPU arm computes the same bytes and the
+    /// canonical combine reads the same device rows; only the cold-row install
+    /// and the combine's enqueue move behind a command-processor wait. Off keeps
+    /// every layer's transport exactly as before.
+    pub fn qwen4_d2_mixed_cpwait(arch: &str) -> bool {
+        super::developer_bool(
+            "HIPFIRE_QWEN4_D2_MIXED_CPWAIT",
+            qwen4_gfx1100_tier_package(arch),
+        )
+    }
+
+    /// Pure body of [`qwen4_d2_pcie_contention`]: unset is `1.0` (no
+    /// contention); otherwise a plain decimal in `[1, 8]` (digits and one dot,
+    /// no sign or exponent). Anything else, including the empty string, is an
+    /// error naming the accepted range.
+    pub fn parse_d2_pcie_contention(raw: Option<&str>) -> std::result::Result<f64, String> {
+        let Some(value) = raw else { return Ok(1.0) };
+        let bad = || {
+            format!(
+                "HIPFIRE_QWEN4_D2_PCIE_CONTENTION={value:?} is not a contention factor: expected a decimal in [1, 8]"
+            )
+        };
+        if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+        {
+            return Err(bad());
+        }
+        match value.parse::<f64>() {
+            Ok(factor) if (1.0..=8.0).contains(&factor) => Ok(factor),
+            _ => Err(bad()),
+        }
+    }
+
+    /// `developer.qwen4_d2_pcie_contention` (env
+    /// `HIPFIRE_QWEN4_D2_PCIE_CONTENTION`, lab): the factor `>= 1` by which the
+    /// `auto` PCIe share sizing slows BOTH cold arms while they overlap, for a
+    /// host whose CPU GEMV and PCIe DMA read share one DRAM (a unified-memory
+    /// APU host). Default `1.0`. Resolve it once per load; an invalid value is
+    /// an `Err` the loader must propagate.
+    pub fn qwen4_d2_pcie_contention() -> std::result::Result<f64, String> {
+        parse_d2_pcie_contention(process_value("HIPFIRE_QWEN4_D2_PCIE_CONTENTION").as_deref())
     }
 
     /// How much of a split step the GPU takes (`memory.offload_passback_share`).
@@ -10966,6 +11245,131 @@ pub mod memory {
             }
             for mode in [D2Ready::Sync, D2Ready::Event] {
                 assert_eq!(parse_d2_ready(Some(mode.as_str())), Ok(mode));
+            }
+        }
+
+        #[test]
+        fn gfx1100_tier_package_is_on_for_exact_gfx1100_only_and_one_switch_turns_it_off() {
+            // (arch, switch, package)
+            for (arch, switch, want) in [
+                ("gfx1100", None, true),
+                ("gfx1100", Some(true), true),
+                ("gfx1100", Some(false), false),
+                ("gfx1101", None, false),
+                ("gfx1102", None, false),
+                ("gfx1151", None, false),
+                ("gfx1201", None, false),
+                ("gfx1201", Some(true), false),
+                ("gfx942", None, false),
+                ("", None, false),
+            ] {
+                assert_eq!(
+                    gfx1100_tier_package_for(arch, switch),
+                    want,
+                    "{arch} {switch:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn gfx1100_tier_package_members_default_on_for_gfx1100_and_off_elsewhere() {
+            // The process snapshot of a unit test carries none of the package variables, so
+            // these are the shipped defaults.
+            for arch in ["gfx1100"] {
+                assert!(qwen4_gfx1100_tier_package(arch));
+                assert!(qwen4_d2_mixed_cpwait(arch), "{arch}");
+                assert_eq!(qwen4_d2_ready_for(arch, true), Ok(D2Ready::Event));
+                assert_eq!(qwen4_d2_ready_for(arch, false), Ok(D2Ready::Sync));
+            }
+            // gfx1201, gfx1151 and everything else: byte-unchanged defaults.
+            for arch in [
+                "gfx1201", "gfx1200", "gfx1151", "gfx1101", "gfx942", "gfx90a", "",
+            ] {
+                assert!(!qwen4_gfx1100_tier_package(arch), "{arch}");
+                assert!(!qwen4_d2_mixed_cpwait(arch), "{arch}");
+                for tier in [true, false] {
+                    assert_eq!(qwen4_d2_ready_for(arch, tier), Ok(D2Ready::Sync), "{arch}");
+                }
+            }
+        }
+
+        #[test]
+        fn d2_ready_defaults_to_event_only_for_a_tier_split_of_the_gfx1100_package() {
+            // (package, tier_split, raw) -> mode
+            for (package, tier, raw, want) in [
+                (true, true, None, D2Ready::Event),
+                (true, false, None, D2Ready::Sync),
+                (false, true, None, D2Ready::Sync),
+                (false, false, None, D2Ready::Sync),
+                // An explicit value always wins, either way.
+                (true, true, Some("sync"), D2Ready::Sync),
+                (true, true, Some("event"), D2Ready::Event),
+                (false, false, Some("event"), D2Ready::Event),
+                (false, true, Some("sync"), D2Ready::Sync),
+            ] {
+                assert_eq!(
+                    resolve_d2_ready(package, tier, raw),
+                    Ok(want),
+                    "package {package} tier {tier} raw {raw:?}"
+                );
+            }
+            // A bad spelling is still an error under the package default.
+            assert!(resolve_d2_ready(true, true, Some("spin")).is_err());
+            assert!(resolve_d2_ready(true, true, Some("")).is_err());
+        }
+
+        #[test]
+        fn d2_pcie_share_parses_off_auto_fraction_and_refuses_everything_else() {
+            assert_eq!(parse_d2_pcie_share(None), Ok(D2PcieShare::Off));
+            assert_eq!(D2PcieShare::default(), D2PcieShare::Off);
+            assert_eq!(parse_d2_pcie_share(Some("off")), Ok(D2PcieShare::Off));
+            assert_eq!(parse_d2_pcie_share(Some("auto")), Ok(D2PcieShare::Auto));
+            // `0` is the same mode as `off`: the placement stays exactly today's.
+            assert_eq!(parse_d2_pcie_share(Some("0")), Ok(D2PcieShare::Off));
+            assert_eq!(parse_d2_pcie_share(Some("0.0")), Ok(D2PcieShare::Off));
+            assert_eq!(parse_d2_pcie_share(Some("0.0000001")), Ok(D2PcieShare::Off));
+            assert_eq!(
+                parse_d2_pcie_share(Some("0.25")),
+                Ok(D2PcieShare::Fixed(250_000))
+            );
+            assert_eq!(
+                parse_d2_pcie_share(Some("1")),
+                Ok(D2PcieShare::Fixed(D2_PCIE_SHARE_PPM_ONE))
+            );
+            assert_eq!(
+                parse_d2_pcie_share(Some(".5")),
+                Ok(D2PcieShare::Fixed(500_000))
+            );
+            for bad in [
+                "", "Auto", "OFF", " auto", "auto ", "-0.1", "+0.5", "1.0001", "2", "nan", "inf",
+                "1e-1", "0.5.5", ".", "true", "on",
+            ] {
+                let error = parse_d2_pcie_share(Some(bad)).unwrap_err();
+                assert!(
+                    error.contains("HIPFIRE_QWEN4_D2_PCIE_SHARE"),
+                    "{bad:?}: {error}"
+                );
+                assert!(
+                    error.contains("`off`, `auto` or a fraction"),
+                    "{bad:?}: {error}"
+                );
+            }
+        }
+
+        #[test]
+        fn d2_pcie_contention_parses_a_factor_of_one_to_eight() {
+            assert_eq!(parse_d2_pcie_contention(None), Ok(1.0));
+            assert_eq!(parse_d2_pcie_contention(Some("1")), Ok(1.0));
+            assert_eq!(parse_d2_pcie_contention(Some("1.5")), Ok(1.5));
+            assert_eq!(parse_d2_pcie_contention(Some("8")), Ok(8.0));
+            for bad in [
+                "", "0.9", "0", "8.01", "-1", "+2", "1e0", "nan", "inf", "x", "1.2.3",
+            ] {
+                let error = parse_d2_pcie_contention(Some(bad)).unwrap_err();
+                assert!(
+                    error.contains("HIPFIRE_QWEN4_D2_PCIE_CONTENTION"),
+                    "{bad:?}: {error}"
+                );
             }
         }
 

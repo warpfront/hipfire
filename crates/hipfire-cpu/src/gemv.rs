@@ -1209,7 +1209,8 @@ mod test {
         }
     }
 
-    /// D2 admits verify windows of 2..4 rows. A routed expert selected by `w`
+    /// D2 admits verify windows of 2..4 rows by default and 5..8 rows under
+    /// `HIPFIRE_QWEN4_D2_WINDOW_ROWS`. A routed expert selected by `w`
     /// window rows is ONE grouped job of `n = w` activation rows; each row's
     /// bytes must equal a one-row (`n = 1`) job and independent `gemv` at every
     /// token position, with the Σx cache seeing aliased pointers (identical
@@ -1242,8 +1243,8 @@ mod test {
         }
         let (m, k) = (37usize, 1024usize);
         let base = x_of(k);
-        let copies: Vec<Vec<f32>> = (0..4).map(|_| base.clone()).collect();
-        let distinct: Vec<Vec<f32>> = (0..4)
+        let copies: Vec<Vec<f32>> = (0..8).map(|_| base.clone()).collect();
+        let distinct: Vec<Vec<f32>> = (0..8)
             .map(|t| {
                 base.iter()
                     .map(|v| v * (1.0 + 0.37 * t as f32) - 0.01 * t as f32)
@@ -1281,7 +1282,7 @@ mod test {
                     );
                     y
                 };
-                for width in 2..=4usize {
+                for width in 2..=8usize {
                     // Rows alias one buffer / copy one token / differ.
                     let aliased: Vec<&[f32]> = vec![&copies[0][..]; width];
                     let copied: Vec<&[f32]> = copies[..width].iter().map(|v| &v[..]).collect();
