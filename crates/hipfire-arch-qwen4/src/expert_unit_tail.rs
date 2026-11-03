@@ -38,10 +38,13 @@ pub const EP_UNIT_TAIL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL";
 /// `1`: build the tail (pool, seed, usage log) but never admit or evict: the
 /// A/B arm that prices the tail's bookkeeping without any fill traffic.
 pub const EP_UNIT_TAIL_FREEZE_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_FREEZE";
-/// `1`: the rank's FULL (chunk / prefill) pointer tables follow the tail's slot publications for
-/// the owned units whose canonical entries they share with the decode tables, so a full-table
-/// prefill forward reads a live slot from VRAM instead of the pinned host arena (the decode
-/// tables alone see slots without it). Needs the tail; default off.
+/// `1`: the pool is visible to prefill routes. The rank's FULL (chunk / prefill) pointer tables
+/// follow the tail's slot publications for the owned units whose canonical entries they share
+/// with the decode tables, so a full-table prefill forward reads a live slot from VRAM instead of
+/// the pinned host arena; and the long-prefill UNIT STAGE (the owner-routed tile route's staged
+/// forwards) names a slot-live owned unit's slot in its pointer table and skips that unit's bytes
+/// in the per-layer H2D copy (the decode tables alone see slots without it). Needs the tail;
+/// default off.
 pub const EP_UNIT_TAIL_PREFILL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PREFILL";
 /// `1`: print a `[unit-tail]` counter line every 64 windows and at release.
 pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
@@ -112,6 +115,13 @@ pub fn ep_unit_tail_configured() -> bool {
             .as_deref(),
     )
     .is_ok_and(|config| config.is_some())
+}
+
+/// Whether the D2 tail's pool is visible to prefill routes: the tail is configured AND
+/// [`EP_UNIT_TAIL_PREFILL_ENV`] is on. Gates both the full chunk tables following the slot
+/// publications and the unit stage's slot-aware tables / copy runs.
+pub fn ep_unit_tail_prefill_requested() -> bool {
+    ep_unit_tail_configured() && hipfire_config::developer_bool(EP_UNIT_TAIL_PREFILL_ENV, false)
 }
 
 /// VRAM one rank's tail pool takes: `T` units plus the two block tail pads

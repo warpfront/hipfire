@@ -530,7 +530,7 @@ pub(crate) struct Qwen4EpRowGatherHook {
     unit_plan: OnceLock<Arc<crate::expert_ep_units::EpUnitPlan>>,
     /// The rank's D2 expert tail (`HIPFIRE_EP_UNIT_TAIL`), installed once after the forward
     /// attached; never set when the tail is off.
-    tail: OnceLock<crate::expert_unit_tail_rank::UnitTailRank>,
+    tail: OnceLock<Arc<crate::expert_unit_tail_rank::UnitTailRank>>,
 }
 
 /// What the hook knows of the rank's balanced trunk layers.
@@ -620,7 +620,10 @@ impl Qwen4EpRowGatherHook {
     }
 
     /// Install the rank's D2 tail (once, after `attach_ep`).
-    fn install_tail(&self, tail: crate::expert_unit_tail_rank::UnitTailRank) -> Result<(), String> {
+    fn install_tail(
+        &self,
+        tail: Arc<crate::expert_unit_tail_rank::UnitTailRank>,
+    ) -> Result<(), String> {
         self.tail.set(tail).map_err(|_| {
             format!(
                 "qwen4 EP rank {}: the D2 tail is already installed",
@@ -706,20 +709,25 @@ fn install_unit_tail(
             crate::expert_ep_units::EP_EXPERT_HOTSET_ENV
         )
     })?;
-    let installed = crate::expert_unit_tail_rank::UnitTailRank::install(
+    let log = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_LOG_ENV, false);
+    let prefill = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_PREFILL_ENV, false);
+    let installed = Arc::new(crate::expert_unit_tail_rank::UnitTailRank::install(
         gpu,
         rank,
         trunk_layers,
         plan,
         config,
         hipfire_config::developer_bool(tail::EP_UNIT_TAIL_FREEZE_ENV, false),
-        hipfire_config::developer_bool(tail::EP_UNIT_TAIL_LOG_ENV, false),
-        forward.tail_layers(hipfire_config::developer_bool(
-            tail::EP_UNIT_TAIL_PREFILL_ENV,
-            false,
-        )),
-    )?;
-    hook.install_tail(installed)
+        log,
+        forward.tail_layers(prefill),
+    )?);
+    hook.install_tail(installed.clone())?;
+    if prefill {
+        // The pool is visible to prefill routes: the unit stage (when this rank built one) names
+        // live slots in its tables and skips their bytes in the H2D copy.
+        forward.link_unit_tail_stage(installed, log)?;
+    }
+    Ok(())
 }
 
 /// Record `buffer` as the rank's current invocation in `last`; `Err` when the

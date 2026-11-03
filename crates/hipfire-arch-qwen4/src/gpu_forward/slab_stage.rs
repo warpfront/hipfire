@@ -119,6 +119,7 @@ pub(super) struct SlabStageMeta {
 }
 
 /// One host-to-stage copy of a tier layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StageCopy {
     /// CPU address of the pinned host owner's bytes.
     src: usize,
@@ -142,6 +143,10 @@ struct TierStageMeta {
     /// tail pad follows, as far as the buffer reaches); `0` for a buffer the
     /// slot does not use. A dedicated stage uses buffer 0 only.
     used: Vec<[usize; 2]>,
+    /// The D2 tail's visibility to this unit stage (the tail's prefill flag on and the stage
+    /// holds mixed layers): per-forward slot-aware tables and copy runs ([`UnitSlotStage`]).
+    /// `None` for every other stage, whose tables and copies are the static ones above.
+    unit_slots: Option<UnitSlotStage>,
     /// Keeps both model-level owners alive while the stage exists (tier
     /// stage). The unit stage reads the bundle's pinned arenas, which every
     /// forward holds the bundle for; it keeps a unit `()`.
@@ -467,6 +472,250 @@ pub(super) fn unit_stage_table_bufs(
         table.extend_from_slice(&value.to_ne_bytes());
     }
     Ok((table, rebased))
+}
+
+/// The static sources of one mixed unit-stage layer, as [`Qwen4ExpertStage::new_units`] laid it
+/// out: its compact pointer-table entries, its host regions with their CPU addresses and stage
+/// placement, and the device addresses of the stage buffers.
+struct UnitLayerSources<'a> {
+    /// `[gate_up, down]` compact table entries (device-visible addresses).
+    entries: [&'a [usize]; 2],
+    regions: &'a [UnitStageRegion],
+    /// CPU address of each region's first byte (the pinned host arena the copy reads).
+    cpu: &'a [usize],
+    /// Stage offset and buffer of each region.
+    dst: &'a [usize],
+    buf: &'a [usize],
+    /// Device address of stage buffer 0 / 1 of this layer's parity.
+    bases: [usize; 2],
+}
+
+/// One mixed layer's stage tables and H2D runs for ONE forward, with the D2 tail's live slots
+/// taken into account ([`unit_stage_forward_plan`]).
+#[derive(Debug, PartialEq, Eq)]
+struct UnitForwardPlan {
+    /// Little-endian `[gate_up, down]` pointer tables: a slot-served unit names its slot, every
+    /// other entry inside a host region is rebased onto the stage exactly as the static table
+    /// does, any other entry is unchanged.
+    tables: [Vec<u8>; 2],
+    /// The runs to copy H2D: each region's bytes minus the slot-served units' pieces, in region
+    /// order and ascending inside a region. With no slot-served unit this is one copy per region,
+    /// exactly the static copies.
+    copies: Vec<StageCopy>,
+    /// Units served from a slot (both pieces).
+    served: usize,
+    /// Live slots this stage could not honour (the tail's canonical entries are not this
+    /// stage's, or a piece is not wholly inside a host region): their units stage as usual.
+    rejected: usize,
+}
+
+/// The stage tables and copy runs of one mixed unit-stage layer when the tail's `live` slots hold
+/// byte copies of some of its host units.
+///
+/// A live unit names its slot (VRAM) in BOTH tables and its two pieces (`piece_bytes`: gate/up,
+/// down) are cut out of the region copies; every other unit stages as in the static layout (same
+/// stage offsets, so a skipped piece leaves its stage bytes untouched and unread). The copy runs
+/// are the complement of the skipped pieces inside each region: a unit is cut out whole or not at
+/// all, so no expert is split between a run and a slot. A live slot is honoured only if the
+/// tail's canonical entries equal this stage's entries and both pieces lie wholly inside a host
+/// region; otherwise the unit stages as usual (counted in `rejected`). `live` empty gives exactly
+/// the static tables and copies.
+fn unit_stage_forward_plan(
+    src: &UnitLayerSources<'_>,
+    piece_bytes: [usize; 2],
+    live: &[crate::expert_unit_tail_rank::LiveSlot],
+) -> Result<UnitForwardPlan, String> {
+    if src.regions.len() != src.cpu.len() {
+        return Err(format!(
+            "{} host regions but {} CPU addresses",
+            src.regions.len(),
+            src.cpu.len()
+        ));
+    }
+    let experts = src.entries[0].len();
+    if src.entries[1].len() != experts {
+        return Err("the gate/up and down tables differ in length".to_string());
+    }
+    let mut tables = [Vec::new(), Vec::new()];
+    for kind in 0..2 {
+        tables[kind] =
+            unit_stage_table_bufs(src.entries[kind], src.regions, src.dst, src.buf, src.bases)?.0;
+    }
+    // `(start, end)` of the skipped pieces, per region.
+    let mut holes: Vec<Vec<(usize, usize)>> = vec![Vec::new(); src.regions.len()];
+    let place = |kind: usize, entry: usize| -> Option<(usize, usize)> {
+        let region = src
+            .regions
+            .iter()
+            .position(|region| entry >= region.base && entry - region.base < region.len)?;
+        let start = entry - src.regions[region].base;
+        (start + piece_bytes[kind] <= src.regions[region].len).then_some((region, start))
+    };
+    let mut seen = vec![false; experts];
+    let (mut served, mut rejected) = (0usize, 0usize);
+    for unit in live {
+        let expert = unit.expert;
+        if expert >= experts {
+            return Err(format!("live slot names expert {expert} of {experts}"));
+        }
+        if std::mem::replace(&mut seen[expert], true) {
+            return Err(format!("expert {expert} is live in two slots"));
+        }
+        let canon = [src.entries[0][expert], src.entries[1][expert]];
+        let places = [place(0, canon[0]), place(1, canon[1])];
+        match places {
+            [Some(gate_up), Some(down)]
+                if unit.canon == canon && unit.slot.iter().all(|&slot| slot != 0) =>
+            {
+                for (kind, (region, start)) in [gate_up, down].into_iter().enumerate() {
+                    holes[region].push((start, start + piece_bytes[kind]));
+                    tables[kind][expert * 8..expert * 8 + 8]
+                        .copy_from_slice(&unit.slot[kind].to_ne_bytes());
+                }
+                served += 1;
+            }
+            _ => rejected += 1,
+        }
+    }
+    let mut copies = Vec::with_capacity(src.regions.len() + served);
+    for (index, region) in src.regions.iter().enumerate() {
+        let run = |from: usize, to: usize| StageCopy {
+            src: src.cpu[index] + from,
+            dst: src.dst[index] + from,
+            len: to - from,
+            buf: src.buf[index],
+        };
+        holes[index].sort_unstable();
+        let mut cursor = 0usize;
+        for &(start, end) in &holes[index] {
+            if start < cursor {
+                return Err(format!(
+                    "slot-served pieces overlap in host region {index} at offset {start}"
+                ));
+            }
+            if start > cursor {
+                copies.push(run(cursor, start));
+            }
+            cursor = end;
+        }
+        if cursor < region.len {
+            copies.push(run(cursor, region.len));
+        }
+    }
+    Ok(UnitForwardPlan {
+        tables,
+        copies,
+        served,
+        rejected,
+    })
+}
+
+/// One mixed layer the tail may serve, with the static sources [`unit_stage_forward_plan`] needs.
+struct UnitSlotLayer {
+    /// The layer's slot in the stage's `copies` / `tables`.
+    slot: usize,
+    /// Trunk layer index (the tail's layer label).
+    layer: usize,
+    entries: [Vec<usize>; 2],
+    regions: Vec<UnitStageRegion>,
+    cpu: Vec<usize>,
+    dst: Vec<usize>,
+    buf: Vec<usize>,
+    bases: [usize; 2],
+}
+
+impl UnitSlotLayer {
+    fn sources(&self) -> UnitLayerSources<'_> {
+        UnitLayerSources {
+            entries: [&self.entries[0], &self.entries[1]],
+            regions: &self.regions,
+            cpu: &self.cpu,
+            dst: &self.dst,
+            buf: &self.buf,
+            bases: self.bases,
+        }
+    }
+}
+
+/// Per-forward mutable state of [`UnitSlotStage`]; one rank thread drives it (the stage is not
+/// `Sync`).
+struct UnitSlotState {
+    /// Per stage slot: this forward's copy runs, `None` = the static copies.
+    copies: Vec<Option<Vec<StageCopy>>>,
+    /// Per `UnitSlotStage::layers` index: the `[gate_up, down]` table bytes the device holds
+    /// (initially the static tables), which are also the host bytes an enqueued upload reads.
+    tables: Vec<[Vec<u8>; 2]>,
+    /// A table upload from `tables` was enqueued on the compute stream and the stream has not
+    /// been drained since: the host bytes may not change yet.
+    upload_pending: bool,
+    forwards: u64,
+}
+
+/// The D2 tail's pool made visible to the unit stage (the tail's prefill flag; see
+/// [`crate::expert_unit_tail::EP_UNIT_TAIL_PREFILL_ENV`]).
+///
+/// At the start of every staged forward ([`Qwen4ExpertStage::slab_prime`]) the stage asks the
+/// rank's tail which owned units of each mixed layer a slot serves as of the last retirement
+/// ([`crate::expert_unit_tail_rank::UnitTailRank::live_slots`]) and plans the layer
+/// ([`unit_stage_forward_plan`]): the layer's two pointer tables name the slots of those units
+/// and the per-layer H2D copy skips their bytes. Until [`Qwen4GpuForward::link_unit_tail_stage`]
+/// runs (and always with the tail or its prefill flag off) the stage is byte-for-byte the static
+/// one: this value is not even built.
+///
+/// # Why a named slot cannot be overwritten during the forward
+///
+/// * A slot is overwritten only by a fill that the tail issues in `step_end` (a decode window's
+///   retirement, on the rank thread, between forwards) on its copy stream, AFTER an event
+///   recorded on the COMPUTE stream behind that retirement's table upload (the window protocol
+///   of `expert_unit_tail_rank`). The compute stream is the stream this stage's table uploads
+///   and the forward's kernels run on, so every kernel of a forward that was enqueued before
+///   that retirement completes before the fill's first byte lands.
+/// * A staged forward runs entirely on the rank thread between two retirements: no retirement
+///   (and so no fill, eviction or new publication) happens between the snapshot at its start and
+///   the end of its enqueueing, and a retirement after it enqueues its event behind all of the
+///   forward's kernels. The snapshot can only name slots whose fill had COMPLETED on the host
+///   (published at a retirement), so the bytes are whole when the stage tables are uploaded.
+/// * This stage never writes a slot: its own copies read the pinned host arena and write the
+///   stage buffers, and slots are only read by the forward's kernels.
+struct UnitSlotStage {
+    layers: Vec<UnitSlotLayer>,
+    /// `[gate_up, down]` bytes of one unit.
+    piece_bytes: [usize; 2],
+    /// The rank's tail and whether to print the per-forward counter line; set once.
+    link: std::sync::OnceLock<(
+        std::sync::Arc<crate::expert_unit_tail_rank::UnitTailRank>,
+        bool,
+    )>,
+    state: std::cell::RefCell<UnitSlotState>,
+}
+
+impl UnitSlotStage {
+    /// `stage_slots`: the stage's slot count (length of its `copies`).
+    fn new(
+        layers: Vec<UnitSlotLayer>,
+        stage_slots: usize,
+        piece_bytes: [usize; 2],
+    ) -> Result<Self, String> {
+        // The static tables: what `new_units` uploaded (no live slot).
+        let tables = layers
+            .iter()
+            .map(|layer| {
+                let plan = unit_stage_forward_plan(&layer.sources(), piece_bytes, &[])?;
+                Ok(plan.tables)
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(Self {
+            layers,
+            piece_bytes,
+            link: std::sync::OnceLock::new(),
+            state: std::cell::RefCell::new(UnitSlotState {
+                copies: vec![None; stage_slots],
+                tables,
+                upload_pending: false,
+                forwards: 0,
+            }),
+        })
+    }
 }
 
 /// Bytes of zeroed tail pad a stage buffer of `size` bytes can hold behind a payload ending at
@@ -1428,6 +1677,7 @@ impl Qwen4ExpertStage {
                     slots,
                     copies,
                     used,
+                    unit_slots: None,
                     _keepalive: lease.keepalive(),
                 }),
                 borrowed: false,
@@ -1603,6 +1853,9 @@ impl Qwen4ExpertStage {
             }
         }
         let slots = unit_stage_slots(plan, rank, moe.len(), donors);
+        // The layers whose host region is a mixed unit layer's host arena (the units the D2 tail
+        // may hold in a slot), as opposed to a host layer's aggregates or a scratch donor.
+        let mut mixed_layers: Vec<usize> = Vec::new();
         // (layer, regions, CPU addresses of the regions, layout, expected rebased entries)
         let mut layouts: Vec<(
             usize,
@@ -1661,6 +1914,7 @@ impl Qwen4ExpertStage {
                     owned
                 }
                 (false, Some(unit)) => {
+                    mixed_layers.push(layer);
                     let bytes = unit.map.arena_entry_bytes(UnitTier::Host);
                     let Some(host) = gpu.host_bytes(unit.host) else {
                         return off("a mixed layer's host arena has no pinned host bytes");
@@ -1905,6 +2159,7 @@ impl Qwen4ExpertStage {
                     slots,
                     copies,
                     used,
+                    unit_slots: None,
                     _keepalive: std::sync::Arc::new(()),
                 }),
                 borrowed: borrow.is_some(),
@@ -1973,6 +2228,67 @@ impl Qwen4ExpertStage {
         if let Err(error) = result {
             let _ = stage.free_gpu(gpu);
             return Err(error);
+        }
+        // The D2 tail's prefill visibility (its prefill flag on): keep each mixed layer's static
+        // sources so a staged forward can name live tail slots ([`UnitSlotStage`]). Built only
+        // then; every other load keeps exactly the static stage.
+        if crate::expert_unit_tail::ep_unit_tail_prefill_requested() {
+            let mut slot_layers = Vec::new();
+            for (layer, regions, cpu, layout, _) in &layouts {
+                if !mixed_layers.contains(layer) {
+                    continue;
+                }
+                let runtime = moe[*layer].as_ref().expect("checked above");
+                let base = |buf: usize| {
+                    if borrow.is_some() {
+                        stage.donor_views[2 * (layer % 2) + buf].buf.as_ptr() as usize
+                    } else {
+                        stage.mirrors[layer % 2].buf.as_ptr() as usize
+                    }
+                };
+                let slot = stage
+                    .slab
+                    .as_ref()
+                    .and_then(|meta| meta.tier.as_ref())
+                    .and_then(|tier| tier.slots[*layer])
+                    .expect("a mixed unit layer has a stage slot");
+                slot_layers.push(UnitSlotLayer {
+                    slot,
+                    layer: *layer,
+                    entries: [
+                        runtime.expert_gate_up_entries.clone(),
+                        runtime.expert_down_entries.clone(),
+                    ],
+                    regions: regions.clone(),
+                    cpu: cpu.clone(),
+                    dst: layout.dst.clone(),
+                    buf: layout.buf.clone(),
+                    bases: [base(0), if borrow.is_some() { base(1) } else { 0 }],
+                });
+            }
+            if !slot_layers.is_empty() {
+                match UnitSlotStage::new(
+                    slot_layers,
+                    layouts.len(),
+                    [
+                        geometry.gate_up_bytes as usize,
+                        geometry.down_bytes as usize,
+                    ],
+                ) {
+                    Ok(unit_slots) => {
+                        stage
+                            .slab
+                            .as_mut()
+                            .and_then(|meta| meta.tier.as_mut())
+                            .expect("a unit stage has tier meta")
+                            .unit_slots = Some(unit_slots);
+                    }
+                    Err(reason) => {
+                        let _ = stage.free_gpu(gpu);
+                        return Err(invalid(format!("unit stage: tail slot plan: {reason}")));
+                    }
+                }
+            }
         }
         let host_experts = layouts
             .iter()
@@ -2121,6 +2437,124 @@ impl Qwen4ExpertStage {
         }
     }
 
+    /// Start of a staged forward under the D2 tail ([`UnitSlotStage`]): ask the rank's tail
+    /// which owned units of each mixed layer a slot serves as of the last retirement, upload the
+    /// layers' slot-naming pointer tables when they changed and plan the per-layer H2D runs that
+    /// skip those units ([`unit_stage_forward_plan`]). A no-op until the tail is linked, so with
+    /// the tail or its prefill flag off the stage keeps its static tables and copies.
+    ///
+    /// The table uploads are host-asynchronous on the compute stream, ahead of every kernel of
+    /// this forward and behind every kernel of the previous one, so no running kernel sees a
+    /// table change. Their host bytes live in the stage state and are rewritten only after the
+    /// compute stream was drained, which an earlier upload makes necessary at most once per
+    /// forward that changed a table (a prefill's later chunks find the tables unchanged).
+    fn unit_slots_refresh(
+        &self,
+        gpu: &Gpu,
+        tier: &TierStageMeta,
+        layers: usize,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let Some(slots) = tier.unit_slots.as_ref() else {
+            return Ok(());
+        };
+        let Some((tail, log)) = slots.link.get() else {
+            return Ok(());
+        };
+        let mut state = slots.state.borrow_mut();
+        let state = &mut *state;
+        let mut plans = Vec::with_capacity(slots.layers.len());
+        let (mut served, mut rejected, mut served_layers) = (0usize, 0usize, 0usize);
+        for (index, layer) in slots.layers.iter().enumerate() {
+            if layer.layer >= layers {
+                continue;
+            }
+            let live = tail.live_slots(layer.layer);
+            let plan = unit_stage_forward_plan(&layer.sources(), slots.piece_bytes, &live)
+                .map_err(|reason| {
+                    invalid(format!(
+                        "unit stage: layer {} slot-aware plan: {reason}",
+                        layer.layer
+                    ))
+                })?;
+            served += plan.served;
+            rejected += plan.rejected;
+            served_layers += usize::from(plan.served > 0);
+            plans.push((index, plan));
+        }
+        let changed = plans
+            .iter()
+            .any(|(index, plan)| state.tables[*index] != plan.tables);
+        let compute = if changed {
+            let compute = gpu
+                .active_stream
+                .as_ref()
+                .ok_or_else(|| invalid("G2 compute stream missing"))?;
+            if state.upload_pending {
+                gpu.hip.stream_synchronize(compute)?;
+                state.upload_pending = false;
+            }
+            Some(compute)
+        } else {
+            None
+        };
+        for (index, plan) in plans {
+            let layer = &slots.layers[index];
+            let UnitForwardPlan {
+                tables,
+                copies,
+                served: layer_served,
+                ..
+            } = plan;
+            if state.tables[index] != tables {
+                let compute = compute.expect("a changed table was planned with the compute stream");
+                state.tables[index] = tables;
+                for kind in 0..2 {
+                    let bytes = &state.tables[index][kind];
+                    let target = &self.tables[2 * layer.slot + kind];
+                    if let Err(error) = gpu.hip.memcpy_htod_async(
+                        &target.buf.byte_view(0, bytes.len()),
+                        bytes,
+                        compute,
+                    ) {
+                        // The device table is unknown from here: drain what was enqueued, then
+                        // force the next forward to upload this layer again.
+                        let _ = gpu.hip.stream_synchronize(compute);
+                        state.upload_pending = false;
+                        state.tables[index] = [Vec::new(), Vec::new()];
+                        return Err(error.into());
+                    }
+                }
+                state.upload_pending = true;
+            }
+            state.copies[layer.slot] = (layer_served > 0).then_some(copies);
+        }
+        state.forwards += 1;
+        if *log {
+            let (mut tail_off, mut staged, mut tail_off_runs, mut runs) = (0usize, 0usize, 0, 0);
+            for slot in tier.slots.iter().take(layers).flatten() {
+                let base = &tier.copies[*slot];
+                let used = state.copies[*slot].as_deref().unwrap_or(base);
+                tail_off += base.iter().map(|copy| copy.len).sum::<usize>();
+                staged += used.iter().map(|copy| copy.len).sum::<usize>();
+                tail_off_runs += base.len();
+                runs += used.len();
+            }
+            let mib = |bytes: usize| bytes as f64 / (1u64 << 20) as f64;
+            eprintln!(
+                "[unit-tail] rank {} stage forward {}: staged {:.1} MiB H2D in {runs} copy runs \
+                 (tail-off stage: {:.1} MiB in {tail_off_runs}), {served} units served from tail \
+                 slots over {served_layers} layers ({:.1} MiB not copied, {rejected} live slots \
+                 refused)",
+                self.placement.map_or(0, |placement| placement.rank),
+                state.forwards,
+                mib(staged),
+                mib(tail_off),
+                mib(tail_off - staged),
+            );
+        }
+        Ok(())
+    }
+
     /// Start of a staged forward: the first two host layers (one per parity)
     /// copy while the resident layers compute. A tier stage primes the first
     /// staged layer of each parity. A borrowed stage primes nothing: each
@@ -2130,6 +2564,11 @@ impl Qwen4ExpertStage {
         let Some(meta) = self.slab.as_ref() else {
             return Ok(());
         };
+        // Slot-aware tables and copy runs first (a borrowed stage returns below, but its tables
+        // still name this forward's slots).
+        if let Some(tier) = meta.tier.as_ref() {
+            self.unit_slots_refresh(gpu, tier, layers)?;
+        }
         if meta.borrowed {
             return Ok(());
         }
@@ -2177,7 +2616,14 @@ impl Qwen4ExpertStage {
                 // From the first byte issued, the lent layer no longer holds its experts.
                 self.set_state(parity, DonorState::Overwritten);
             }
-            for copy in &tier.copies[slot] {
+            // The static copies, or this forward's runs minus the units the D2 tail serves from
+            // a live slot ([`UnitSlotStage`]; planned by `unit_slots_refresh` in `slab_prime`).
+            let slot_state = tier.unit_slots.as_ref().map(|slots| slots.state.borrow());
+            let copies: &[StageCopy] = slot_state
+                .as_ref()
+                .and_then(|state| state.copies[slot].as_deref())
+                .unwrap_or(&tier.copies[slot]);
+            for copy in copies {
                 let buffer = &self.unit_buffer(parity, copy.buf).buf;
                 // SAFETY: `copy.src` lies inside a pinned host owner (the lease's
                 // for a tier stage, the bundle's host arena or aggregate for a
@@ -2409,6 +2855,43 @@ impl Qwen4ExpertStage {
             self.set_state(parity, DonorState::Resident);
         }
         Ok(())
+    }
+}
+
+impl Qwen4GpuForward {
+    /// Make the rank's D2 `tail` visible to this forward's unit stage ([`UnitSlotStage`]): from
+    /// the next staged forward on, a mixed layer's pointer tables name the slot of each owned
+    /// unit the tail serves, and the per-layer H2D copy skips that unit's bytes. `log` prints a
+    /// counter line per staged forward (bytes staged H2D against units served from slots).
+    /// `Ok(false)`: this forward has no slot-capable unit stage (no stage admitted, or the
+    /// tail's prefill flag was off when it was built), so there is nothing to link.
+    pub(crate) fn link_unit_tail_stage(
+        &self,
+        tail: std::sync::Arc<crate::expert_unit_tail_rank::UnitTailRank>,
+        log: bool,
+    ) -> Result<bool, String> {
+        let Some(stage) = self.expert_stage.as_ref() else {
+            return Ok(false);
+        };
+        let Some(slots) = stage
+            .slab
+            .as_ref()
+            .and_then(|meta| meta.tier.as_ref())
+            .and_then(|tier| tier.unit_slots.as_ref())
+        else {
+            return Ok(false);
+        };
+        slots
+            .link
+            .set((tail, log))
+            .map_err(|_| "the unit stage is already linked to a D2 tail".to_string())?;
+        eprintln!(
+            "qwen4 EP rank {}: D2 tail prefill stage on: {} mixed staged layers name live tail \
+             slots in their stage tables and skip those units' H2D bytes",
+            stage.placement.map_or(0, |placement| placement.rank),
+            slots.layers.len()
+        );
+        Ok(true)
     }
 }
 
@@ -3226,6 +3709,281 @@ mod tests {
             // The down aggregate sits after the gate/up block in the stage.
             assert_eq!(out[e], stage + owned * UNIT_GU + (e / 2) * UNIT_DN);
         }
+    }
+
+    // ---- D2 tail slots visible to the unit stage (`unit_stage_forward_plan`) ----
+
+    use crate::expert_unit_tail_rank::LiveSlot;
+
+    const SLOT_VRAM: usize = 0x7000_0000;
+    const SLOT_HOST: usize = 0x9000_0000;
+    const SLOT_DUMMY: usize = 0x5000_0000;
+    const SLOT_CPU: usize = 0x7f00_0000_0000;
+    const SLOT_POOL_GU: usize = 0x4_0000_0000;
+    const SLOT_POOL_DN: usize = 0x5_0000_0000;
+
+    /// A mixed layer of rank 0 of 2 (owns the even experts): experts 0, 2, 4 in the VRAM arena,
+    /// the next `n_host` even experts in the host arena (gate/up block, then down block), odd
+    /// experts the dummy. `split`: the host arena is two regions in two stage buffers (a
+    /// borrowed stage), else one region in one buffer.
+    struct MixedFixture {
+        gate_up: Vec<usize>,
+        down: Vec<usize>,
+        regions: Vec<UnitStageRegion>,
+        cpu: Vec<usize>,
+        dst: Vec<usize>,
+        buf: Vec<usize>,
+        bases: [usize; 2],
+        n_host: usize,
+    }
+
+    impl MixedFixture {
+        fn new(n_host: usize, split: bool) -> Self {
+            let experts = 2 * (3 + n_host);
+            let gate_up = (0..experts)
+                .map(|e| match e {
+                    e if e % 2 == 1 => SLOT_DUMMY,
+                    e if e / 2 < 3 => SLOT_VRAM + (e / 2) * UNIT_GU,
+                    e => SLOT_HOST + (e / 2 - 3) * UNIT_GU,
+                })
+                .collect();
+            let down = (0..experts)
+                .map(|e| match e {
+                    e if e % 2 == 1 => SLOT_DUMMY,
+                    e if e / 2 < 3 => SLOT_VRAM + 3 * UNIT_GU + (e / 2) * UNIT_DN,
+                    e => SLOT_HOST + n_host * UNIT_GU + (e / 2 - 3) * UNIT_DN,
+                })
+                .collect();
+            let (regions, cpu, dst, buf) = if split {
+                let regions = split_mixed_host_arena(SLOT_HOST, n_host, UNIT_GU, UNIT_DN);
+                let layout =
+                    unit_stage_layout_bufs(&regions, [n_host * UNIT_GU, n_host * UNIT_DN]).unwrap();
+                (
+                    regions.to_vec(),
+                    vec![SLOT_CPU, SLOT_CPU + n_host * UNIT_GU],
+                    layout.dst,
+                    layout.buf,
+                )
+            } else {
+                let regions = vec![UnitStageRegion {
+                    base: SLOT_HOST,
+                    len: n_host * (UNIT_GU + UNIT_DN),
+                }];
+                let layout = unit_stage_layout(&regions).unwrap();
+                (regions, vec![SLOT_CPU], layout.dst, vec![0])
+            };
+            Self {
+                gate_up,
+                down,
+                regions,
+                cpu,
+                dst,
+                buf,
+                bases: [0x2_0000_0000, 0x3_0000_0000],
+                n_host,
+            }
+        }
+
+        fn sources(&self) -> UnitLayerSources<'_> {
+            UnitLayerSources {
+                entries: [&self.gate_up, &self.down],
+                regions: &self.regions,
+                cpu: &self.cpu,
+                dst: &self.dst,
+                buf: &self.buf,
+                bases: self.bases,
+            }
+        }
+
+        /// The `index`th host expert (`e = 2 * (3 + index)`) live in pool slot `slot`.
+        fn live(&self, index: usize, slot: usize) -> LiveSlot {
+            let expert = 2 * (3 + index);
+            LiveSlot {
+                expert,
+                canon: [self.gate_up[expert], self.down[expert]],
+                slot: [SLOT_POOL_GU + slot * UNIT_GU, SLOT_POOL_DN + slot * UNIT_DN],
+            }
+        }
+
+        /// The static tables `new_units` uploads (no slot): the flag-off result.
+        fn static_tables(&self) -> [Vec<u8>; 2] {
+            [&self.gate_up, &self.down].map(|entries| {
+                unit_stage_table_bufs(entries, &self.regions, &self.dst, &self.buf, self.bases)
+                    .unwrap()
+                    .0
+            })
+        }
+
+        /// The static copies `new_units` builds: one whole copy per region.
+        fn static_copies(&self) -> Vec<StageCopy> {
+            self.regions
+                .iter()
+                .enumerate()
+                .map(|(i, region)| StageCopy {
+                    src: self.cpu[i],
+                    dst: self.dst[i],
+                    len: region.len,
+                    buf: self.buf[i],
+                })
+                .collect()
+        }
+    }
+
+    const SLOT_PIECES: [usize; 2] = [UNIT_GU, UNIT_DN];
+
+    #[test]
+    fn slot_plan_without_live_slots_is_the_static_stage() {
+        for split in [false, true] {
+            let f = MixedFixture::new(4, split);
+            let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[]).unwrap();
+            assert_eq!(plan.tables, f.static_tables(), "split {split}");
+            assert_eq!(plan.copies, f.static_copies(), "split {split}");
+            assert_eq!((plan.served, plan.rejected), (0, 0));
+        }
+    }
+
+    #[test]
+    fn slot_plan_names_the_slot_and_cuts_exactly_the_live_units_out_of_the_copy() {
+        let f = MixedFixture::new(4, false);
+        // Host experts 1 and 3 (e = 8, 12) are live in pool slots 5 and 0.
+        let live = [f.live(1, 5), f.live(3, 0)];
+        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live).unwrap();
+        assert_eq!((plan.served, plan.rejected), (2, 0));
+        let (static_gu, static_dn) = {
+            let [gu, dn] = f.static_tables();
+            (decode(&gu), decode(&dn))
+        };
+        let (gu, dn) = (decode(&plan.tables[0]), decode(&plan.tables[1]));
+        for e in 0..f.gate_up.len() {
+            match e {
+                8 => assert_eq!(
+                    (gu[e], dn[e]),
+                    (SLOT_POOL_GU + 5 * UNIT_GU, SLOT_POOL_DN + 5 * UNIT_DN)
+                ),
+                12 => assert_eq!((gu[e], dn[e]), (SLOT_POOL_GU, SLOT_POOL_DN)),
+                // Every other entry (VRAM arena, dummy, staged host units) is the static one.
+                e => assert_eq!((gu[e], dn[e]), (static_gu[e], static_dn[e]), "expert {e}"),
+            }
+        }
+        // Region = [4 gate/up | 4 down]; the live pieces are gate/up 1 and 3, down 1 and 3.
+        let down_block = 4 * UNIT_GU;
+        let run = |from: usize, to: usize| StageCopy {
+            src: SLOT_CPU + from,
+            dst: from,
+            len: to - from,
+            buf: 0,
+        };
+        assert_eq!(
+            plan.copies,
+            [
+                run(0, UNIT_GU),
+                run(2 * UNIT_GU, 3 * UNIT_GU),
+                run(down_block, down_block + UNIT_DN),
+                run(down_block + 2 * UNIT_DN, down_block + 3 * UNIT_DN),
+            ]
+        );
+        let bytes: usize = plan.copies.iter().map(|copy| copy.len).sum();
+        assert_eq!(bytes, 4 * (UNIT_GU + UNIT_DN) - 2 * (UNIT_GU + UNIT_DN));
+        // Never split an expert: each staged (non-live) host unit's two pieces sit whole inside
+        // one run, and each live unit's pieces are in none.
+        for index in 0..f.n_host {
+            let pieces = [
+                (index * UNIT_GU, UNIT_GU),
+                (down_block + index * UNIT_DN, UNIT_DN),
+            ];
+            for (from, len) in pieces {
+                let covered: usize = plan
+                    .copies
+                    .iter()
+                    .map(|copy| {
+                        let (lo, hi) = (copy.dst.max(from), (copy.dst + copy.len).min(from + len));
+                        hi.saturating_sub(lo)
+                    })
+                    .sum();
+                let live = index == 1 || index == 3;
+                assert_eq!(
+                    covered,
+                    if live { 0 } else { len },
+                    "host unit {index} at {from}"
+                );
+                if !live {
+                    assert!(
+                        plan.copies
+                            .iter()
+                            .any(|copy| copy.dst <= from && from + len <= copy.dst + copy.len),
+                        "host unit {index} piece at {from} is split across runs"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn slot_plan_merges_adjacent_live_units_and_drops_an_empty_region() {
+        let f = MixedFixture::new(3, true);
+        // Borrowed stage, two regions: live host experts 0 and 1 are adjacent in both blocks.
+        let live = [f.live(0, 2), f.live(1, 3)];
+        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live).unwrap();
+        let run = |region: usize, from: usize, to: usize| StageCopy {
+            src: f.cpu[region] + from,
+            dst: f.dst[region] + from,
+            len: to - from,
+            buf: f.buf[region],
+        };
+        assert_eq!(
+            plan.copies,
+            [
+                run(0, 2 * UNIT_GU, 3 * UNIT_GU),
+                run(1, 2 * UNIT_DN, 3 * UNIT_DN)
+            ]
+        );
+        // Every unit live: nothing left to copy.
+        let all: Vec<LiveSlot> = (0..3).map(|i| f.live(i, i)).collect();
+        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &all).unwrap();
+        assert_eq!((plan.served, plan.copies.len()), (3, 0));
+        // The live units' table entries name their slots, in the gate/up and the down table.
+        let (gu, dn) = (decode(&plan.tables[0]), decode(&plan.tables[1]));
+        for index in 0..3 {
+            let e = 2 * (3 + index);
+            assert_eq!(gu[e], SLOT_POOL_GU + index * UNIT_GU);
+            assert_eq!(dn[e], SLOT_POOL_DN + index * UNIT_DN);
+        }
+    }
+
+    #[test]
+    fn slot_plan_refuses_slots_it_cannot_honour_and_stages_those_units() {
+        let f = MixedFixture::new(3, false);
+        let mut moved = f.live(0, 0);
+        // The tail's canonical entry is not this stage's.
+        moved.canon[0] += 256;
+        let mut null_slot = f.live(1, 1);
+        null_slot.slot[1] = 0;
+        // A "live" unit whose canonical entries are VRAM-arena addresses (not in a host region).
+        let core = LiveSlot {
+            expert: 2,
+            canon: [f.gate_up[2], f.down[2]],
+            slot: [SLOT_POOL_GU, SLOT_POOL_DN],
+        };
+        let plan =
+            unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[moved, null_slot, core]).unwrap();
+        assert_eq!((plan.served, plan.rejected), (0, 3));
+        assert_eq!(plan.tables, f.static_tables());
+        assert_eq!(plan.copies, f.static_copies());
+    }
+
+    #[test]
+    fn slot_plan_refuses_malformed_live_lists() {
+        let f = MixedFixture::new(3, false);
+        let twice = [f.live(0, 0), f.live(0, 1)];
+        assert!(unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &twice).is_err());
+        let mut outside = f.live(0, 0);
+        outside.expert = f.gate_up.len();
+        assert!(unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[outside]).is_err());
+        // Two units whose pieces would overlap (a piece longer than the unit stride).
+        let overlapping = [f.live(0, 0), f.live(1, 1)];
+        assert!(
+            unit_stage_forward_plan(&f.sources(), [UNIT_GU + 4096, UNIT_DN], &overlapping).is_err()
+        );
     }
 
     #[test]

@@ -9,8 +9,13 @@
 //! DECODE pointer tables' byte images. Only those tables are ever rewritten: an
 //! entry is the unit's canonical pointer (pinned host arena or the static core's
 //! VRAM arena, exactly what D1 uploaded) or the address of a completed tail slot
-//! holding a byte copy of the same unit. Host-side views, the sealed binding,
-//! the chunk (prefill) tables and the unit stage never see a slot.
+//! holding a byte copy of the same unit. Host-side views and the sealed binding never see a
+//! slot. With the prefill flag the chunk (prefill) tables follow the publications of the
+//! shared owned units, and the long-prefill unit stage reads the live slots at each staged
+//! forward's start ([`UnitTailRank::live_slots`]; `gpu_forward::slab_stage::UnitSlotStage`
+//! names them in its stage tables and skips their bytes in its H2D copy). It only ever reads
+//! the published map: a slot is overwritten only by a fill issued after a retirement's table
+//! upload, which no staged forward straddles.
 //!
 //! # Window protocol (rank thread; no cross-rank state)
 //!
@@ -42,6 +47,43 @@ use crate::expert_unit_tail::{EpUnitTailConfig, FillOp, TailPolicy, UnitKey, Win
 const LOG_IDS: usize = 1 << 18;
 /// Print a counter line every this many retired windows under the log env.
 const LOG_EVERY: u64 = 64;
+
+/// One owned unit of a managed layer that a tail slot holds at the last retirement: its
+/// canonical decode-table entries (the pinned host arena addresses D1 uploaded) and the two slot
+/// addresses that the decode table names instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LiveSlot {
+    pub expert: usize,
+    /// Canonical `[gate_up, down]` device-visible addresses.
+    pub canon: [usize; 2],
+    /// Slot `[gate_up, down]` addresses (byte copies of the canonical unit).
+    pub slot: [usize; 2],
+}
+
+/// The units of one layer whose table `image` (u64 LE per expert, as last uploaded) differs from
+/// its canonical entries, restricted to the experts `tail_owned` names (the units the tail may
+/// hold): exactly the units a slot serves at the last retirement. Ascending by expert.
+fn live_slot_units(
+    tail_owned: impl Fn(usize) -> bool,
+    canon: (&[u64], &[u64]),
+    image: (&[u8], &[u8]),
+) -> Vec<LiveSlot> {
+    let entry = |bytes: &[u8], expert: usize| -> u64 {
+        let at = expert * 8;
+        u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8-byte table entry"))
+    };
+    (0..canon.0.len())
+        .filter(|&expert| tail_owned(expert))
+        .filter_map(|expert| {
+            let slot = [entry(image.0, expert), entry(image.1, expert)];
+            (slot != [canon.0[expert], canon.1[expert]]).then_some(LiveSlot {
+                expert,
+                canon: [canon.0[expert] as usize, canon.1[expert] as usize],
+                slot: slot.map(|address| address as usize),
+            })
+        })
+        .collect()
+}
 
 /// What the tail needs of one decode MoE layer runtime (from the forward).
 pub(crate) struct TailLayerInit {
@@ -433,7 +475,36 @@ impl UnitTailRank {
     }
 }
 
+impl UnitTailRank {
+    /// The units of trunk layer `label` that a tail slot serves as of the LAST RETIREMENT (the
+    /// decode table's state: every unit published after its fill completed and not yet evicted),
+    /// ascending by expert. Empty for an unmanaged layer or a released tail. The unit stage of a
+    /// long prefill forward ([`crate::gpu_forward::slab_stage`]) reads this at the forward's
+    /// start; retirements run on the rank thread only after a decode window's forward, never
+    /// inside a prefill forward, so the answer holds for the whole forward (the slot lifetime
+    /// argument is in `slab_stage`'s `UnitSlotStage` docs).
+    pub(crate) fn live_slots(&self, label: usize) -> Vec<LiveSlot> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.live_slots(label)
+    }
+}
+
 impl Inner {
+    fn live_slots(&self, label: usize) -> Vec<LiveSlot> {
+        if self.released {
+            return Vec::new();
+        }
+        let Some(index) = self.layer_of.get(label).copied().flatten() else {
+            return Vec::new();
+        };
+        let layer = &self.layers[index];
+        live_slot_units(
+            |expert| self.kind(label, expert) == Kind::Tail,
+            (&layer.canon_gate_up, &layer.canon_down),
+            (&layer.image_gate_up, &layer.image_down),
+        )
+    }
+
     fn kind(&self, layer: usize, expert: usize) -> Kind {
         if layer >= self.trunk_layers || expert >= self.experts {
             return Kind::Foreign;
@@ -872,7 +943,50 @@ impl Inner {
 
 #[cfg(test)]
 mod tests {
-    use super::full_shared;
+    use super::{full_shared, live_slot_units, LiveSlot};
+
+    fn image(entries: &[u64]) -> Vec<u8> {
+        entries.iter().flat_map(|e| e.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn live_slots_are_the_tail_owned_units_whose_image_leaves_canonical() {
+        let canon_gu = [100u64, 200, 300, 400];
+        let canon_dn = [10u64, 20, 30, 40];
+        // Expert 1: published (both entries name a slot). Expert 2: evicted back to canonical.
+        // Expert 3: a slot, but not a tail unit (core / foreign): never reported.
+        let mut img_gu = canon_gu;
+        let mut img_dn = canon_dn;
+        img_gu[1] = 7000;
+        img_dn[1] = 8000;
+        img_gu[3] = 7100;
+        img_dn[3] = 8100;
+        let live = live_slot_units(
+            |expert| expert != 3,
+            (&canon_gu, &canon_dn),
+            (&image(&img_gu), &image(&img_dn)),
+        );
+        assert_eq!(
+            live,
+            [LiveSlot {
+                expert: 1,
+                canon: [200, 20],
+                slot: [7000, 8000],
+            }]
+        );
+    }
+
+    #[test]
+    fn no_publication_means_no_live_slot() {
+        let canon_gu = [1u64, 2];
+        let canon_dn = [3u64, 4];
+        let live = live_slot_units(
+            |_| true,
+            (&canon_gu, &canon_dn),
+            (&image(&canon_gu), &image(&canon_dn)),
+        );
+        assert!(live.is_empty());
+    }
 
     #[test]
     fn full_table_shares_only_owned_experts_with_equal_canonical_entries() {
