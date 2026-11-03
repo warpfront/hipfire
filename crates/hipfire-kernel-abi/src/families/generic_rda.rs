@@ -314,7 +314,7 @@ const CFG_HEADS: BindSource = BindSource::Config(&[
 const CFG_RDA_HEAD_DIM: BindSource =
     BindSource::Config(&["rda_config.head_dim", "linear_value_head_dim", "head_dim"]);
 
-/// Rows of one RDA launch: `crates/hipfire-arch-raon/src/rda.rs::RDA_SEGMENT_ROWS` (the layer runs as 256-row
+/// Rows of one RDA launch: `crates/hipfire-dispatch/src/pipeline/rda.rs::RDA_SEGMENT_ROWS` (the layer runs as 256-row
 /// segments whenever the chunked core is on and the chunk has more rows).
 const SEGMENT_ROWS: BindSource = BindSource::Derived(Expr::Const(256));
 
@@ -329,7 +329,7 @@ const CHUNK_ADMIT: RowDomainV1 = RowDomainV1 {
 const WAVE_ADMIT: RowDomainV1 = RowDomainV1 {
     min_rows: 64,
     max_rows: None,
-    predicate: "crates/hipfire-arch-raon/src/rda.rs::RDA_WAVE_MIN_ROWS",
+    predicate: "crates/hipfire-dispatch/src/pipeline/rda.rs::RDA_WAVE_MIN_ROWS",
     kill_env: Some("HIPFIRE_RAON_RDA_FUSED_PREP"),
 };
 
@@ -1355,7 +1355,7 @@ mod tests {
             assert_eq!(w.work.admit.min_rows, 64);
             assert_eq!(
                 w.work.admit.predicate,
-                "crates/hipfire-arch-raon/src/rda.rs::RDA_WAVE_MIN_ROWS"
+                "crates/hipfire-dispatch/src/pipeline/rda.rs::RDA_WAVE_MIN_ROWS"
             );
             assert_eq!(w.work.admit.kill_env, Some("HIPFIRE_RAON_RDA_FUSED_PREP"));
         }
