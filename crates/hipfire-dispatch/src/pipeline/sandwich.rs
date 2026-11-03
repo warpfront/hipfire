@@ -672,6 +672,9 @@ pub enum RopeKind {
     /// Rotate-half over the first `rot_dim` channels of each head (pair
     /// `(i, i + rot_dim / 2)`); channels `rot_dim..` pass through.
     PrefixHalfSplit { rot_dim: usize },
+    /// GPT-J pairing `(2i, 2i + 1)` over the first `rot_dim` channels of each
+    /// head; channels `rot_dim..` pass through (Cohere2).
+    Interleaved { rot_dim: usize },
     /// No rotation (NoPE layers).
     NoPe,
 }
@@ -689,7 +692,7 @@ impl Rope {
         match self.kind {
             RopeKind::RotateHalf => Some(head_dim / 2),
             RopeKind::PartialHalved { rot_pairs } => Some(rot_pairs),
-            RopeKind::PrefixHalfSplit { .. } => None,
+            RopeKind::PrefixHalfSplit { .. } | RopeKind::Interleaved { .. } => None,
             RopeKind::NoPe => Some(0),
         }
     }
@@ -741,6 +744,11 @@ impl Rope {
                     });
                 }
             }
+            #[cfg(feature = "deltanet")]
+            RopeKind::Interleaved { rot_dim } => gpu
+                .rope_interleaved_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_dim, theta),
+            #[cfg(not(feature = "deltanet"))]
+            RopeKind::Interleaved { .. } => return Err(interleaved_needs_deltanet()),
         }
         .map_err(hip)
     }
@@ -772,9 +780,25 @@ impl Rope {
                     "prefix half-split RoPE is single-row only".into(),
                 ))
             }
+            #[cfg(feature = "deltanet")]
+            RopeKind::Interleaved { rot_dim } => gpu.rope_interleaved_f32_batched(
+                q, k, positions, n_heads, n_kv_heads, head_dim, rot_dim, theta, rows,
+            ),
+            #[cfg(not(feature = "deltanet"))]
+            RopeKind::Interleaved { .. } => return Err(interleaved_needs_deltanet()),
             RopeKind::NoPe => return Ok(()),
         }
         .map_err(hip)
+    }
+}
+
+#[cfg(not(feature = "deltanet"))]
+fn interleaved_needs_deltanet() -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "rope",
+        variant: "interleaved-requires-deltanet",
+        arch: "",
+        quant: "",
     }
 }
 
