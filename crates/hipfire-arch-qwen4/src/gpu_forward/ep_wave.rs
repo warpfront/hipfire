@@ -56,15 +56,15 @@ pub const QWEN4_EP_WAVE_ROW_CAP: usize = 2048;
 /// serial tile until the card says otherwise.
 pub const EXACT_WAVE_MIN_LANE_ROWS: usize = 49;
 
-/// Sub-switch of the TILE-route wave (default OFF until its card identity receipt; the master
-/// switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills both routes): exact `1` lets a burst whose
-/// lanes all take the owner-routed tile route run as ONE tile-route wave. Unset, a burst on the
-/// tile route is refused (`ep wave refused:`) and runs as serial tile-route tiles.
+/// Sub-switch of the TILE-route wave (default ON after its card identity receipt, j7460; the master
+/// switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills every route): a burst whose lanes all take
+/// the owner-routed tile route runs as ONE tile-route wave. Exact `0` refuses it
+/// (`ep wave refused:`): the burst runs as serial tile-route tiles.
 pub const QWEN4_EP_WAVE_TILE_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_TILE";
 
-/// [`QWEN4_EP_WAVE_TILE_ENV`] parsed: exact `1` is on, anything else is off.
+/// [`QWEN4_EP_WAVE_TILE_ENV`] parsed: on unless exact `0`.
 pub(crate) fn ep_wave_tile_enabled_from(value: Option<&str>) -> bool {
-    value.map(str::trim) == Some("1")
+    value.map(str::trim) != Some("0")
 }
 
 static EP_WAVE_TILE_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -232,7 +232,7 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
         Ok(EpWaveRoute::Tile) => {
             if !facts.tile_wave_enabled {
                 return refuse(format!(
-                    "the tile-route wave is not enabled ({QWEN4_EP_WAVE_TILE_ENV}=1; off until its card identity receipt)"
+                    "the tile-route wave is switched off ({QWEN4_EP_WAVE_TILE_ENV}=0)"
                 ));
             }
             if let Some(lane) = facts.lane_a8.iter().position(|a8| !*a8) {
@@ -735,19 +735,19 @@ mod tests {
     /// refused by name and the burst runs serial tile-route tiles; the full-table wave is not
     /// gated by it.
     #[test]
-    fn the_tile_wave_needs_its_own_sub_switch_and_the_full_table_wave_does_not() {
-        for off in [
+    fn the_tile_wave_has_its_own_kill_switch_and_the_full_table_wave_does_not() {
+        for on in [
             None,
             Some(""),
-            Some("0"),
+            Some("1"),
+            Some(" 1 "),
             Some("true"),
-            Some("on"),
             Some("2"),
         ] {
-            assert!(!ep_wave_tile_enabled_from(off), "{off:?}");
+            assert!(ep_wave_tile_enabled_from(on), "{on:?}");
         }
-        assert!(ep_wave_tile_enabled_from(Some("1")));
-        assert!(ep_wave_tile_enabled_from(Some(" 1 ")));
+        assert!(!ep_wave_tile_enabled_from(Some("0")));
+        assert!(!ep_wave_tile_enabled_from(Some(" 0\n")));
         assert_eq!(QWEN4_EP_WAVE_TILE_ENV, "HIPFIRE_EP_LANE_PREFILL_WAVE_TILE");
         let mut tile = facts(&[149; 8]);
         tile.lane_tile = vec![true; 8];
