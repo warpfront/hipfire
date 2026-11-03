@@ -1568,7 +1568,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EP_SHARE_HOST` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_EP_SKIP_ALLREDUCE` | crates/hipfire-arch-qwen35/src/qwen35/ep_batch.rs | developer |
 | `HIPFIRE_EP_TRUNK_SPLIT` | crates/hipfire-arch-qwen4/src/ep.rs, crates/hipfire-arch-qwen4/src/ep_trunk_split.rs | developer |
-| `HIPFIRE_EP_UNIT_BUDGET_DELTA_MIB` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs | developer |
+| `HIPFIRE_EP_UNIT_BUDGET_DELTA_MIB` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/expert_unit_tail.rs | developer |
 | `HIPFIRE_EP_UNIT_DONORS` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_UNIT_LANE_GROWTH` | crates/hipfire-loader/src/carriers.rs | developer |
 | `HIPFIRE_EP_UNIT_PINNED_OWNERS` | crates/hipfire-arch-qwen4/src/expert_ep_units.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
