@@ -137,6 +137,58 @@ pub(crate) fn in_splice_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     hipfire_cpu::splice_pool::install(splice_pool_config(), f)
 }
 
+/// Whether [`pool_spin_default`] is on when `HIPFIRE_CPU_POOL_SPIN` is unset. Flip to `true` only
+/// with the paired decode A/B receipts of the spin (the CHANGELOG entry names them).
+const POOL_SPIN_DEFAULT: bool = false;
+
+/// Default spin budget (both the workers' and the caller's), `HIPFIRE_CPU_POOL_SPIN_US`.
+const POOL_SPIN_DEFAULT_US: u64 = 2000;
+
+/// `HIPFIRE_CPU_POOL_SPIN` / `HIPFIRE_CPU_POOL_SPIN_US` (developer, read once): the spin budget of
+/// the CPU arm's pool wake and completion wait, or `None` when the spin is off.
+fn pool_spin() -> Option<std::time::Duration> {
+    static SPIN: LazyLock<Option<std::time::Duration>> = LazyLock::new(|| {
+        if !hipfire_config::developer_bool("HIPFIRE_CPU_POOL_SPIN", POOL_SPIN_DEFAULT) {
+            return None;
+        }
+        let us = hipfire_config::developer_var("HIPFIRE_CPU_POOL_SPIN_US")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(POOL_SPIN_DEFAULT_US);
+        (us > 0).then(|| std::time::Duration::from_micros(us))
+    });
+    *SPIN
+}
+
+/// Whether the CPU arm's pool spin is on (the trace line reports it).
+pub(crate) fn pool_spin_on() -> bool {
+    pool_spin().is_some()
+}
+
+/// [`in_splice_pool`] for the routed-expert CPU arms: with the pool spin on, the caller polls for
+/// the arm's completion instead of blocking on a Condvar (and consumes a pending
+/// [`warm_splice_pool`] handshake of this thread).
+pub(crate) fn in_splice_pool_arm<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    match pool_spin() {
+        Some(spin) => {
+            let cfg = splice_pool_config();
+            hipfire_cpu::splice_pool::install_spin(
+                hipfire_cpu::splice_pool::splice_pool(cfg),
+                spin,
+                f,
+            )
+        }
+        None => in_splice_pool(f),
+    }
+}
+
+/// Wake the splice pool's workers and hold them spinning until the returned guard is dropped (or
+/// the spin budget runs out): called at the start of a D2 layer's `prepare`, so the wake overlaps
+/// the input-readiness wait instead of delaying the arm. `None` when the pool spin is off.
+pub(crate) fn warm_splice_pool() -> Option<hipfire_cpu::splice_pool::PoolWarm> {
+    pool_spin().map(|spin| hipfire_cpu::splice_pool::PoolWarm::start(splice_pool_config(), spin))
+}
+
 /// Streaming-read bandwidth of host RAM measured on the splice pool: the
 /// pinned pool (one worker per physical core) the routed-expert splice runs
 /// on, so the figure is what that splice can actually pull from system
@@ -1122,7 +1174,7 @@ pub fn moe_cpu_experts<'a>(
             // The whole CPU side of the splice (gate_up, the SwiGLU/rotate
             // middle, down, combine) runs on the pinned physical-core pool.
             let scratch_ref: &mut MoeScratch = &mut scratch;
-            in_splice_pool(|| {
+            in_splice_pool_arm(|| {
                 moe_cpu_experts_host(
                     dim,
                     mi,
@@ -1945,7 +1997,7 @@ pub fn moe_cpu_host_slot_outputs(
     MOE_SCRATCH.with(|cell| {
         let mut guard = cell.borrow_mut();
         let scratch: &mut MoeScratch = &mut guard;
-        in_splice_pool(|| {
+        in_splice_pool_arm(|| {
             host_slot_outputs_core(
                 dim, mi, top_k, ids, host_slots, experts, x_rot, scratch, out, None,
             )
@@ -2008,7 +2060,7 @@ pub(crate) fn moe_cpu_host_slot_outputs_traced(
         // Owned fixed-size record across the Rayon install: the pool body
         // timer runs INSIDE the install closure, so dispatch/return overhead
         // stays in `pool_install_ns`, not `pool_body_ns`.
-        in_splice_pool(|| {
+        in_splice_pool_arm(|| {
             let t_body = Instant::now();
             let result = host_slot_outputs_core(
                 dim,
@@ -5506,6 +5558,61 @@ mod moe_splice_tests {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// The pool spin (`HIPFIRE_CPU_POOL_SPIN`) changes only when the workers are awake: the arm
+    /// run through `install_spin`, with and without a warm pool and its handshake, over every
+    /// host-slot subset of a 4-row window, is byte-equal to the plain splice-pool run.
+    #[test]
+    fn host_slot_bytes_identical_under_pool_spin_and_warm() {
+        use hipfire_cpu::splice_pool::{install_spin, splice_pool, PoolWarm};
+        use std::time::Duration;
+        let (rows, top_k, n_exp) = (4usize, 3usize, 5usize);
+        let fx = host_fixture(n_exp);
+        let ids: Vec<i32> = vec![4, 1, 3, 1, 1, 0, 3, 2, 4, 0, 2, 1];
+        let x = x_of(rows * HS_DIM);
+        let cfg = splice_pool_config();
+        let pool = splice_pool(cfg);
+        let subsets: [Vec<u32>; 4] = [
+            (0..12).collect(),
+            (0..12).rev().collect(),
+            (0..12).filter(|s| s % 3 != 1).collect(),
+            vec![7],
+        ];
+        for host in &subsets {
+            let experts = fx.spans(&ids, host);
+            let mut plain = stale(12 * HS_DIM);
+            moe_cpu_host_slot_outputs(
+                HS_DIM, HS_MI, rows, top_k, n_exp, &ids, None, host, &experts, &x, false,
+                &mut plain,
+            )
+            .unwrap();
+            for warm_on in [false, true] {
+                let warm = warm_on.then(|| PoolWarm::start(cfg, Duration::from_millis(5)));
+                if let Some(w) = &warm {
+                    w.arm_next_install();
+                }
+                let mut scratch = MoeScratch::default();
+                let mut out = stale(12 * HS_DIM);
+                install_spin(pool, Duration::from_micros(500), || {
+                    host_slot_outputs_core(
+                        HS_DIM,
+                        HS_MI,
+                        top_k,
+                        &ids,
+                        host,
+                        &experts,
+                        &x,
+                        &mut scratch,
+                        &mut out,
+                        None,
+                    )
+                })
+                .unwrap();
+                drop(warm);
+                assert_eq!(bits(&out), bits(&plain), "warm={warm_on} host={host:?}");
             }
         }
     }

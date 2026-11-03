@@ -676,6 +676,35 @@ struct Transaction {
     waits_base: u64,
     /// Generation of this call's join word (CP-wait executors).
     cp_gen: u32,
+    /// Splice-pool workers held awake from `prepare` until the CPU arm has run
+    /// (`HIPFIRE_CPU_POOL_SPIN`); `None` when the spin is off or no cold slot needs the arm.
+    warm: Option<hipfire_cpu::splice_pool::PoolWarm>,
+    /// `HIPFIRE_CPU_SPLIT_TRACE` host timeline of this call's `prepare` (cpwait executors only).
+    prep_trace: Option<PrepTrace>,
+}
+
+/// Host-side timeline of one `prepare`, recorded only under `HIPFIRE_CPU_SPLIT_TRACE` on a
+/// CP-wait executor and printed by the join's `QWEN4_CPU_ARM` line.
+#[derive(Clone, Copy, Debug)]
+struct PrepTrace {
+    /// `prepare` entry and exit.
+    start: Instant,
+    end: Instant,
+    /// The input-readiness wait alone (event spin or stream synchronization).
+    ready_wait_ns: u64,
+    /// Previous traced join's end to this `prepare`'s entry (the host enqueue of the layer's
+    /// trunk kernels in between); `None` for the first traced call of the process.
+    since_prev_join_ns: Option<u64>,
+}
+
+/// Process-wide clock origin and the last traced join's end (ns from it; 0 = none yet), so the
+/// trace can time the host gap between consecutive layers across executors.
+static TRACE_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+static TRACE_LAST_JOIN_END_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn trace_now_ns() -> u64 {
+    // +1 keeps 0 reserved for "no join yet".
+    ns(*TRACE_EPOCH.get_or_init(Instant::now), Instant::now()) + 1
 }
 
 /// The mapped cold-result return: one owning mapped host allocation and its
@@ -1199,6 +1228,8 @@ impl CpuSplitExecutor {
                 mapped_call: false,
                 waits_base: 0,
                 cp_gen: 0,
+                warm: None,
+                prep_trace: None,
             }),
             diag_on: Cell::new(false),
             recording: Cell::new(false),
@@ -2128,6 +2159,15 @@ impl CpuSplitExecutor {
     ) -> Result<(), DispatchError> {
         let diag = self.diag_on.get();
         let t0 = diag.then(Instant::now);
+        let trace_prep = (self.cpu_trace && self.cpwait.is_some()).then(|| {
+            let start = Instant::now();
+            let now_ns = trace_now_ns();
+            let prev = TRACE_LAST_JOIN_END_NS.load(Ordering::Relaxed);
+            (start, (prev != 0).then(|| now_ns.saturating_sub(prev)))
+        });
+        // Wake the splice pool now: the wake then overlaps the readiness wait below instead of
+        // delaying the arm (`HIPFIRE_CPU_POOL_SPIN`; `None` when off).
+        let warm = cpu_exec::warm_splice_pool();
         self.gate(gpu, rows)?;
         let rows_x = rows
             .checked_mul(self.dim)
@@ -2170,6 +2210,7 @@ impl CpuSplitExecutor {
         if st.failed || st.ready {
             return Err(err("failed or unfinished transaction"));
         }
+        let mut ready_wait_ns = 0u64;
         let result = (|| {
             if let Some(cp) = self.cpwait.as_ref() {
                 if cp.target.is_poisoned() {
@@ -2211,7 +2252,9 @@ impl CpuSplitExecutor {
                     gpu.active_stream.as_ref(),
                 )
                 .map_err(err)?;
+            let t_ready = trace_prep.map(|_| Instant::now());
             self.await_inputs(gpu, &mut st)?;
+            ready_wait_ns = t_ready.map_or(0, |t| ns(t, Instant::now()));
             if retire_first {
                 // The input proof (a synchronization, or the event that
                 // follows the previous layer's work on this stream) puts the
@@ -2290,9 +2333,19 @@ impl CpuSplitExecutor {
             st.mapped_call = self.mapped.is_some() && endpoint != SplitEndpoint::AllHot;
             st.rows = rows;
             st.ready = true;
+            // No cold slot, no CPU arm: do not hold the pool awake for nothing.
+            st.warm = if st.host_count > 0 { warm } else { None };
+            st.prep_trace = trace_prep.map(|(start, since_prev_join_ns)| PrepTrace {
+                start,
+                end: Instant::now(),
+                ready_wait_ns,
+                since_prev_join_ns,
+            });
             Ok(())
         })();
         if result.is_err() {
+            st.warm = None;
+            st.prep_trace = None;
             st.failed = true;
             // Keep this transaction poisoned even after a successful drain:
             // a partially advanced model request must never silently retry.
@@ -2455,6 +2508,9 @@ impl CpuSplitExecutor {
         let tj0 = diag.then(Instant::now);
         let serial = diag && self.parity.borrow().serial;
         let shadow = st.cold_shadow.clone();
+        // Held across the arm; dropped (workers released) right after it, error or not.
+        let warm = st.warm.take();
+        let prep_trace = st.prep_trace.take();
         let copies0 = self.output_copy_calls.get();
         let publications0 = self.mapped_publications.get();
         let result = (|| {
@@ -2528,6 +2584,9 @@ impl CpuSplitExecutor {
                 let all = write.f32_mut().map_err(err)?;
                 let rows_out = &mut all[..out_values];
                 let t_cpu = (diag || trace_on).then(Instant::now);
+                if let Some(w) = warm.as_ref() {
+                    w.arm_next_install();
+                }
                 let arm = if trace_on {
                     Some(cpu_exec::moe_cpu_host_slot_outputs_traced(
                         self.dim,
@@ -2634,6 +2693,9 @@ impl CpuSplitExecutor {
                 )
             };
             let t_cpu = diag.then(Instant::now);
+            if let Some(w) = warm.as_ref() {
+                w.arm_next_install();
+            }
             cpu_exec::moe_cpu_host_slot_outputs(
                 self.dim,
                 self.mi,
@@ -2675,6 +2737,10 @@ impl CpuSplitExecutor {
             }
             Ok((cpu_ns, None))
         })();
+        if warm.is_some() {
+            hipfire_cpu::splice_pool::clear_next_install();
+        }
+        drop(warm);
         st.ready = false;
         match result {
             Ok((cpu_ns, arm)) => {
@@ -2711,7 +2777,7 @@ impl CpuSplitExecutor {
                     if self.cpwait.is_some() {
                         let t = &j.trace;
                         eprintln!(
-                            "QWEN4_CPU_ARM {{\"rows\":{rows},\"dim\":{},\"top_k\":{},\"host_count\":{},\"unique_experts\":{},\"executor\":{},\"cpwait\":1,\"cp_gen\":{},\"cp_joins\":{},\"resolve_ns\":{},\"prove_ns\":{},\"cpu_total_ns\":{},\"validate_ns\":{},\"pool_install_ns\":{},\"pool_body_ns\":{},\"group_ns\":{},\"gu_ns\":{},\"gu_prep_ns\":{},\"gu_exec_ns\":{},\"middle_ns\":{},\"gather_ns\":{},\"silu_ns\":{},\"fwht_ns\":{},\"dn_ns\":{},\"dn_prep_ns\":{},\"dn_exec_ns\":{},\"scatter_ns\":{},\"zero_ns\":{},\"zero_slots\":{},\"publish_ns\":{},\"mark_ns\":{},\"release_ns\":{},\"join_total_ns\":{},\"middle_start_ns\":{},\"middle_end_ns\":{},\"scatter_start_ns\":{},\"scatter_end_ns\":{},\"retirement_start_ns\":{},\"retirement_end_ns\":{},\"release_start_ns\":{},\"release_end_ns\":{},\"join_word_device\":{}}}",
+                            "QWEN4_CPU_ARM {{\"rows\":{rows},\"dim\":{},\"top_k\":{},\"host_count\":{},\"unique_experts\":{},\"executor\":{},\"cpwait\":1,\"cp_gen\":{},\"cp_joins\":{},\"resolve_ns\":{},\"prove_ns\":{},\"cpu_total_ns\":{},\"validate_ns\":{},\"pool_install_ns\":{},\"pool_body_ns\":{},\"group_ns\":{},\"gu_ns\":{},\"gu_prep_ns\":{},\"gu_exec_ns\":{},\"middle_ns\":{},\"gather_ns\":{},\"silu_ns\":{},\"fwht_ns\":{},\"dn_ns\":{},\"dn_prep_ns\":{},\"dn_exec_ns\":{},\"scatter_ns\":{},\"zero_ns\":{},\"zero_slots\":{},\"publish_ns\":{},\"mark_ns\":{},\"release_ns\":{},\"join_total_ns\":{},\"middle_start_ns\":{},\"middle_end_ns\":{},\"scatter_start_ns\":{},\"scatter_end_ns\":{},\"retirement_start_ns\":{},\"retirement_end_ns\":{},\"release_start_ns\":{},\"release_end_ns\":{},\"join_word_device\":{},\"prepare_ns\":{},\"ready_wait_ns\":{},\"tail_enqueue_ns\":{},\"since_prev_join_ns\":{},\"pool_spin\":{}}}",
                             self.dim,
                             self.top_k,
                             st.host_count,
@@ -2752,7 +2818,13 @@ impl CpuSplitExecutor {
                             TraceNs(j.release_start_ns),
                             TraceNs(j.release_end_ns),
                             j.join_word_device,
+                            TraceNs(prep_trace.map(|p| ns(p.start, p.end))),
+                            TraceNs(prep_trace.map(|p| p.ready_wait_ns)),
+                            TraceNs(prep_trace.zip(trace_entry).map(|(p, e)| ns(p.end, e))),
+                            TraceNs(prep_trace.and_then(|p| p.since_prev_join_ns)),
+                            u8::from(cpu_exec::pool_spin_on()),
                         );
+                        TRACE_LAST_JOIN_END_NS.store(trace_now_ns(), Ordering::Relaxed);
                     }
                 }
                 Ok(())
