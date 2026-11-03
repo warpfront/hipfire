@@ -24,7 +24,7 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 
 /// Automatic retained-Redline admission for a loaded model.
 ///
-/// MQ4R keeps its existing cross-model policy with two carve-outs. Muse
+/// MQ4R keeps its existing cross-model policy with three carve-outs. Muse
 /// Glimmer (arch 14) IS an MQ4R Redline SKU, but it is not lowered to
 /// Redline PM4 yet, so automatic admission is withheld until that lowering
 /// lands — the extension-only policy would otherwise route Glimmer onto a
@@ -50,6 +50,11 @@ pub fn mq4r_redline_default(gpu_arch: &str, model_path: &str, pp: usize, tp: usi
 /// retained tape does not record. Expert parallelism (`ep` > 1, Flash-Next EP)
 /// runs one program per rank with a cross-device row gather between kernels,
 /// which a single-device retained tape cannot record, so it is never admitted.
+///
+/// Qwen4 (Flash-Next) on gfx1100/gfx1151 is never admitted automatically,
+/// `.mq4r` included (HIPF-254): recording closes the eager-only QSA split-KV
+/// decode attention, so the replay differs from the HIP route and measured
+/// slower on gfx1151.
 pub fn retained_redline_default(
     gpu_arch: &str,
     model_arch: &str,
@@ -64,6 +69,12 @@ pub fn retained_redline_default(
     }
     if model_arch.eq_ignore_ascii_case("muse_glimmer") || model_arch.eq_ignore_ascii_case("gemma4")
     {
+        return false;
+    }
+    // HIPF-254: recording a Qwen4 body closes the eager-only QSA split-KV decode
+    // attention (gfx1100/gfx1151), so the replay differs from default HIP and
+    // measured ~5-8% slower on gfx1151. Lift only with a perf A/B that wins.
+    if model_arch.eq_ignore_ascii_case("qwen4") && matches!(gpu_arch, "gfx1100" | "gfx1151") {
         return false;
     }
     if is_qwen35_family(model_arch) && cpu_offload_configured() {
@@ -743,6 +754,25 @@ mod tests {
                 gpu_arch, "qwen4", fn_xts, 1, 1, false
             ));
         }
+        // HIPF-254: a Flash-Next `.mq4r` stays on HIP on gfx1100/gfx1151; the
+        // extension route still admits it on gfx1201 and admits other archs.
+        let fn_mq4r = "/models/qwen3.8-flash-next.mq4r";
+        for gpu_arch in ["gfx1100", "gfx1151"] {
+            assert!(!retained_redline_default(
+                gpu_arch, "qwen4", fn_mq4r, 1, 1, false
+            ));
+            assert!(retained_redline_default(
+                gpu_arch,
+                "qwen3_5",
+                "/models/m.mq4r",
+                1,
+                1,
+                false
+            ));
+        }
+        assert!(retained_redline_default(
+            "gfx1201", "qwen4", fn_mq4r, 1, 1, false
+        ));
     }
 
     #[test]
