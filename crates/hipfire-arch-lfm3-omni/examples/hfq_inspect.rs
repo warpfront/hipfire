@@ -16,7 +16,10 @@ fn main() {
                 continue;
             }
         }
-        println!("qt={:2} sz={:>9} {} {:?}", t.quant_type, t.data_size, t.name, t.shape);
+        println!(
+            "qt={:2} sz={:>9} {} {:?}",
+            t.quant_type, t.data_size, t.name, t.shape
+        );
         shown += 1;
     }
     if let Some(f) = &filter {

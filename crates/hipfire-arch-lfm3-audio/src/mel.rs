@@ -227,7 +227,8 @@ pub fn log_mel_spectrogram(waveform: &[f32], cfg: &MelConfig) -> Vec<f32> {
             if v < cfg.log_floor as f64 {
                 v = cfg.log_floor as f64;
             }
-            out[m * num_frames + f] = ((v + cfg.norm_offset as f64) / cfg.norm_divisor as f64) as f32;
+            out[m * num_frames + f] =
+                ((v + cfg.norm_offset as f64) / cfg.norm_divisor as f64) as f32;
         }
     }
     out

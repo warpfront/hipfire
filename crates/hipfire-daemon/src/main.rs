@@ -3601,10 +3601,8 @@ fn main() {
                                 .and_then(|v| v.as_str())
                                 .filter(|s| *s == "audio" || *s == "interleaved")
                                 .unwrap_or("audio");
-                            let stream = msg
-                                .get("stream")
-                                .and_then(|v| v.as_bool())
-                                .unwrap_or(false);
+                            let stream =
+                                msg.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
                             let max_steps = msg
                                 .get("max_steps")
                                 .and_then(|v| v.as_u64())

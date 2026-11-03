@@ -28,13 +28,15 @@
 //! presence). The text decoder is owned by `hipfire-arch-lfm3::Lfm3`.
 
 use crate::mel::MelConfig;
+use hip_bridge::{HipError, HipResult};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, Step};
 use hipfire_runtime::hfq::HfqFile;
-use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, weight_gemv, KvCache, KvCacheExt, WeightTensor};
-use hip_bridge::{HipError, HipResult};
+use hipfire_runtime::llama::{
+    f16_to_f32, f32_to_f16, weight_gemv, KvCache, KvCacheExt, WeightTensor,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -92,7 +94,10 @@ impl EncoderConfig {
         self.layer_types.iter().filter(|t| t.is_attention()).count()
     }
     pub fn num_conv_layers(&self) -> usize {
-        self.layer_types.iter().filter(|t| !t.is_attention()).count()
+        self.layer_types
+            .iter()
+            .filter(|t| !t.is_attention())
+            .count()
     }
 }
 
@@ -132,12 +137,7 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
     let config = meta.get("config").or(Some(&meta))?;
     let (pre, enc_cfg, lfm_cfg, text_cfg) = if let Some(ae) = config.get("audio_encoder_config") {
         // Omni shape.
-        (
-            ae,
-            ae,
-            ae.get("text_config")?,
-            config.get("text_config")?,
-        )
+        (ae, ae, ae.get("text_config")?, config.get("text_config")?)
     } else {
         // Audio-standalone shape.
         (
@@ -151,13 +151,25 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
     // Mel front-end (config.preprocessor).
     let mel = MelConfig {
         n_fft: pre.get("n_fft").and_then(|v| v.as_u64()).unwrap_or(400) as usize,
-        hop_length: pre.get("hop_length").and_then(|v| v.as_u64()).unwrap_or(160) as usize,
-        win_length: pre.get("win_length").and_then(|v| v.as_u64()).unwrap_or(400) as usize,
+        hop_length: pre
+            .get("hop_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(160) as usize,
+        win_length: pre
+            .get("win_length")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(400) as usize,
         n_mels: pre.get("n_mels").and_then(|v| v.as_u64()).unwrap_or(128) as usize,
-        sample_rate: pre.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(16000) as u32,
+        sample_rate: pre
+            .get("sample_rate")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(16000) as u32,
         f_max: pre.get("f_max").and_then(|v| v.as_f64()).unwrap_or(8000.0) as f32,
         f_min: pre.get("f_min").and_then(|v| v.as_f64()).unwrap_or(0.0) as f32,
-        log_floor: pre.get("logmel_floor").and_then(|v| v.as_f64()).unwrap_or(-12.0) as f32,
+        log_floor: pre
+            .get("logmel_floor")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(-12.0) as f32,
         norm_offset: pre
             .get("normalization")
             .and_then(|n| n.get("offset"))
@@ -183,19 +195,31 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or_else(|| {
-                enc_cfg.get("conv_channels").and_then(|v| v.as_u64()).unwrap_or(256) as usize
+                enc_cfg
+                    .get("conv_channels")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(256) as usize
             }),
         dim_out: enc_cfg
             .get("dim_out")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
             .unwrap_or_else(|| {
-                enc_cfg.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(768) as usize
+                enc_cfg
+                    .get("hidden_size")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(768) as usize
             }),
     };
 
-    let hidden = lfm_cfg.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(768) as usize;
-    let n_heads = lfm_cfg.get("num_attention_heads").and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+    let hidden = lfm_cfg
+        .get("hidden_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(768) as usize;
+    let n_heads = lfm_cfg
+        .get("num_attention_heads")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(8) as usize;
     let n_kv = lfm_cfg
         .get("num_key_value_heads")
         .and_then(|v| v.as_u64())
@@ -204,8 +228,14 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
         .get("head_dim")
         .and_then(|v| v.as_u64())
         .unwrap_or((hidden / n_heads) as u64) as usize;
-    let num_layers = lfm_cfg.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(17) as usize;
-    let conv_k = lfm_cfg.get("conv_L_cache").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+    let num_layers = lfm_cfg
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(17) as usize;
+    let conv_k = lfm_cfg
+        .get("conv_L_cache")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(3) as usize;
     let sliding_window = enc_cfg
         .get("sliding_window")
         .and_then(|v| v.as_u64())
@@ -215,7 +245,10 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
         .and_then(|r| r.get("rope_theta"))
         .and_then(|v| v.as_f64())
         .unwrap_or(1_000_000.0) as f32;
-    let norm_eps = lfm_cfg.get("norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
+    let norm_eps = lfm_cfg
+        .get("norm_eps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-5) as f32;
 
     let layer_types: Vec<EncLayerKind> = lfm_cfg
         .get("layer_types")
@@ -228,7 +261,17 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
                 })
                 .collect()
         })
-        .unwrap_or_else(|| (0..num_layers).map(|i| if i % 3 == 2 { EncLayerKind::Attention } else { EncLayerKind::Conv }).collect());
+        .unwrap_or_else(|| {
+            (0..num_layers)
+                .map(|i| {
+                    if i % 3 == 2 {
+                        EncLayerKind::Attention
+                    } else {
+                        EncLayerKind::Conv
+                    }
+                })
+                .collect()
+        });
 
     // Intermediate size: derive from the actual w1 tensor shape (config value
     // is pre-`block_auto_adjust_ff_dim` and unreliable — 2560 vs real 1792).
@@ -239,12 +282,18 @@ pub fn audio_config_from_hfq(hfq: &HfqFile) -> Option<AudioConfig> {
         .and_then(|i| i.shape.first().copied())
         .map(|s| s as usize)
         .unwrap_or_else(|| {
-            lfm_cfg.get("intermediate_size").and_then(|v| v.as_u64()).unwrap_or(1792) as usize
+            lfm_cfg
+                .get("intermediate_size")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1792) as usize
         });
 
     let proj = ProjectorConfig {
         in_features: down.dim_out,
-        out_features: text_cfg.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(2048) as usize,
+        out_features: text_cfg
+            .get("hidden_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2048) as usize,
         // HF `nn.LayerNorm(in_features)` default (modeling_lfm3_audio.py projector).
         norm_eps: 1e-5,
     };
@@ -281,17 +330,17 @@ struct HostW {
 
 /// Downsampler weights, host-side F32 (the downsampler runs on CPU).
 pub struct DownsamplerWeights {
-    conv_in_w: HostW,   // [256,1,3,3]
+    conv_in_w: HostW,    // [256,1,3,3]
     conv_in_b: Vec<f32>, // [256]
-    conv_mid_w: HostW,  // [256,1,3,3] (depthwise)
+    conv_mid_w: HostW,   // [256,1,3,3] (depthwise)
     conv_mid_b: Vec<f32>,
-    lin_mid_w: HostW,   // [256,256,1,1]
+    lin_mid_w: HostW, // [256,256,1,1]
     lin_mid_b: Vec<f32>,
-    conv_end_w: HostW,  // [256,1,3,3] (depthwise)
+    conv_end_w: HostW, // [256,1,3,3] (depthwise)
     conv_end_b: Vec<f32>,
-    lin_end_w: HostW,   // [256,256,1,1]
+    lin_end_w: HostW, // [256,256,1,1]
     lin_end_b: Vec<f32>,
-    lin_out_w: HostW,   // [768,4096,1]
+    lin_out_w: HostW,    // [768,4096,1]
     lin_out_b: Vec<f32>, // [768]
 }
 
@@ -340,7 +389,8 @@ fn conv2d_k3s2p1(x: &[f32], cin: usize, h: usize, w: usize, w_w: &HostW, bias: &
                             if iw < 0 || iw >= w as isize {
                                 continue;
                             }
-                            acc += x[xbase + ih as usize * w + iw as usize] * w_w.data[wci + kh * 3 + kw];
+                            acc += x[xbase + ih as usize * w + iw as usize]
+                                * w_w.data[wci + kh * 3 + kw];
                         }
                     }
                 }
@@ -352,7 +402,14 @@ fn conv2d_k3s2p1(x: &[f32], cin: usize, h: usize, w: usize, w_w: &HostW, bias: &
 }
 
 /// Depthwise Conv2d (k=3, s=2, p=1, groups=C). `x`: [C, H, W]. `w`: [C, 1, 3, 3].
-fn conv2d_dw_k3s2p1(x: &[f32], c: usize, h: usize, w: usize, w_w: &HostW, bias: &[f32]) -> Vec<f32> {
+fn conv2d_dw_k3s2p1(
+    x: &[f32],
+    c: usize,
+    h: usize,
+    w: usize,
+    w_w: &HostW,
+    bias: &[f32],
+) -> Vec<f32> {
     let ho = conv_out_dim(h);
     let wo = conv_out_dim(w);
     let mut out = vec![0.0f32; c * ho * wo];
@@ -375,7 +432,8 @@ fn conv2d_dw_k3s2p1(x: &[f32], c: usize, h: usize, w: usize, w_w: &HostW, bias: 
                         if iw < 0 || iw >= w as isize {
                             continue;
                         }
-                        acc += x[xbase + ih as usize * w + iw as usize] * w_w.data[wci + kh * 3 + kw];
+                        acc +=
+                            x[xbase + ih as usize * w + iw as usize] * w_w.data[wci + kh * 3 + kw];
                     }
                 }
                 out[ci * ho * wo + hoi * wo + woi] = acc;
@@ -408,7 +466,12 @@ fn conv2d_1x1(x: &[f32], cin: usize, h: usize, w: usize, w_w: &HostW, bias: &[f3
 ///
 /// `mel`: `[n_mels, num_frames]` row-major F32. Returns `[n_tokens, dim_out]`
 /// row-major F32 — one 768-dim vector per 8 mel frames, ready for the encoder.
-pub fn downsampler_forward(mel: &[f32], n_mels: usize, num_frames: usize, dw: &DownsamplerWeights) -> Vec<f32> {
+pub fn downsampler_forward(
+    mel: &[f32],
+    n_mels: usize,
+    num_frames: usize,
+    dw: &DownsamplerWeights,
+) -> Vec<f32> {
     let c = dw.conv_in_w.shape[0]; // 256
 
     // h = silu(conv_in(mel))  — mel is [1, n_mels, num_frames] (Cin=1).
@@ -493,19 +556,41 @@ fn dequant_q8_0(data: &[u8]) -> Vec<f32> {
 }
 
 /// Load a 1D/raw F16/F32/Q8 vector → F32 GpuTensor (norms, conv filter).
-fn load_f32(hfq: &HfqFile, gpu: &mut Gpu, name: &str, shape: &[usize]) -> Result<GpuTensor, String> {
+fn load_f32(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    shape: &[usize],
+) -> Result<GpuTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     let f32_data: Vec<f32> = match qt {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         3 => dequant_q8_0(&data),
-        other => return Err(format!("lfm3-audio: expected F16/F32/Q8 for {name}, got qt={other}")),
+        other => {
+            return Err(format!(
+                "lfm3-audio: expected F16/F32/Q8 for {name}, got qt={other}"
+            ))
+        }
     };
-    gpu.upload_f32(&f32_data, shape).map_err(|e| format!("lfm3-audio: upload {name}: {e:?}"))
+    gpu.upload_f32(&f32_data, shape)
+        .map_err(|e| format!("lfm3-audio: upload {name}: {e:?}"))
 }
 
 /// Load a 2D weight as a WeightTensor (Q8/F16/MQ-family) for `weight_gemv`.
-fn load_wt(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> Result<WeightTensor, String> {
+fn load_wt(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Result<WeightTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
     let dtype = match qt {
         3 => DType::Q8_0,
@@ -515,22 +600,54 @@ fn load_wt(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> Resu
         15 => DType::MQ6G256,
         17 => DType::MQ3G256,
         1 => DType::F16,
-        other => return Err(format!("lfm3-audio: unsupported quant_type {other} for {name}")),
+        other => {
+            return Err(format!(
+                "lfm3-audio: unsupported quant_type {other} for {name}"
+            ))
+        }
     };
-    let buf = gpu.upload_raw(&data, &[data.len()]).map_err(|e| format!("upload_raw: {e:?}"))?;
-    Ok(WeightTensor { buf, gpu_dtype: dtype, m, k, row_stride: 0, paro: None, awq_scale: None, lloyd_lut_e4m3: None, lloyd_lut_f16: None, lloyd_lut_c16: None })
+    let buf = gpu
+        .upload_raw(&data, &[data.len()])
+        .map_err(|e| format!("upload_raw: {e:?}"))?;
+    Ok(WeightTensor {
+        buf,
+        gpu_dtype: dtype,
+        m,
+        k,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
+    })
 }
 
 /// Load a downsampler weight (F16/F32/Q8) → host F32 Vec + shape.
 fn load_host_w(hfq: &HfqFile, name: &str) -> Result<HostW, String> {
-    let (info, data) = hfq.tensor_data_vec(name).ok_or_else(|| format!("lfm3-audio: {name} not found"))?;
+    let (info, data) = hfq
+        .tensor_data_vec(name)
+        .ok_or_else(|| format!("lfm3-audio: {name} not found"))?;
     let f32_data: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         3 => dequant_q8_0(&data),
-        other => return Err(format!("lfm3-audio: downsampler {name}: unsupported qt={other}")),
+        other => {
+            return Err(format!(
+                "lfm3-audio: downsampler {name}: unsupported qt={other}"
+            ))
+        }
     };
-    Ok(HostW { data: f32_data, shape: info.shape.iter().map(|&s| s as usize).collect() })
+    Ok(HostW {
+        data: f32_data,
+        shape: info.shape.iter().map(|&s| s as usize).collect(),
+    })
 }
 
 fn load_host_vec(hfq: &HfqFile, name: &str) -> Result<Vec<f32>, String> {
@@ -541,9 +658,9 @@ fn load_host_vec(hfq: &HfqFile, name: &str) -> Result<Vec<f32>, String> {
 
 /// LFM2 conv mixer weights (K=3 for the audio encoder).
 pub struct EncConvWeights {
-    pub in_proj: WeightTensor,   // [3*hidden, hidden]
-    pub conv_weight: GpuTensor,  // [hidden, K] F32
-    pub out_proj: WeightTensor,  // [hidden, hidden]
+    pub in_proj: WeightTensor,  // [3*hidden, hidden]
+    pub conv_weight: GpuTensor, // [hidden, K] F32
+    pub out_proj: WeightTensor, // [hidden, hidden]
     pub conv_state_idx: usize,
 }
 
@@ -702,7 +819,11 @@ fn load_downsampler(hfq: &HfqFile) -> Result<DownsamplerWeights, String> {
     })
 }
 
-fn load_encoder(hfq: &HfqFile, cfg: &EncoderConfig, gpu: &mut Gpu) -> Result<EncoderWeights, String> {
+fn load_encoder(
+    hfq: &HfqFile,
+    cfg: &EncoderConfig,
+    gpu: &mut Gpu,
+) -> Result<EncoderWeights, String> {
     let h = cfg.hidden_size;
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
@@ -733,23 +854,53 @@ fn load_encoder(hfq: &HfqFile, cfg: &EncoderConfig, gpu: &mut Gpu) -> Result<Enc
         let mixer = match cfg.layer_types[l] {
             EncLayerKind::Conv => {
                 let in_proj = load_wt(hfq, gpu, &format!("{p}.conv.in_proj.weight"), 3 * h, h)?;
-                let conv_weight = load_f32(hfq, gpu, &format!("{p}.conv.conv.weight"), &[h * k_conv])?;
+                let conv_weight =
+                    load_f32(hfq, gpu, &format!("{p}.conv.conv.weight"), &[h * k_conv])?;
                 let out_proj = load_wt(hfq, gpu, &format!("{p}.conv.out_proj.weight"), h, h)?;
                 let conv_state_idx = conv_count;
                 conv_count += 1;
-                EncMixer::Conv(EncConvWeights { in_proj, conv_weight, out_proj, conv_state_idx })
+                EncMixer::Conv(EncConvWeights {
+                    in_proj,
+                    conv_weight,
+                    out_proj,
+                    conv_state_idx,
+                })
             }
             EncLayerKind::Attention => {
                 let wq = load_wt(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_dim, h)?;
                 let wk = load_wt(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, h)?;
                 let wv = load_wt(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, h)?;
-                let wo = load_wt(hfq, gpu, &format!("{p}.self_attn.out_proj.weight"), h, q_dim)?;
+                let wo = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.self_attn.out_proj.weight"),
+                    h,
+                    q_dim,
+                )?;
                 // LFM2 names these q_layernorm / k_layernorm.
-                let q_norm = load_f32(hfq, gpu, &format!("{p}.self_attn.q_layernorm.weight"), &[head_dim])?;
-                let k_norm = load_f32(hfq, gpu, &format!("{p}.self_attn.k_layernorm.weight"), &[head_dim])?;
+                let q_norm = load_f32(
+                    hfq,
+                    gpu,
+                    &format!("{p}.self_attn.q_layernorm.weight"),
+                    &[head_dim],
+                )?;
+                let k_norm = load_f32(
+                    hfq,
+                    gpu,
+                    &format!("{p}.self_attn.k_layernorm.weight"),
+                    &[head_dim],
+                )?;
                 let kv_idx = kv_count;
                 kv_count += 1;
-                EncMixer::Attention(EncAttnWeights { wq, wk, wv, wo, q_norm, k_norm, kv_idx })
+                EncMixer::Attention(EncAttnWeights {
+                    wq,
+                    wk,
+                    wv,
+                    wo,
+                    q_norm,
+                    k_norm,
+                    kv_idx,
+                })
             }
         };
 
@@ -758,25 +909,52 @@ fn load_encoder(hfq: &HfqFile, cfg: &EncoderConfig, gpu: &mut Gpu) -> Result<Enc
         let w2 = load_wt(hfq, gpu, &format!("{p}.feed_forward.w2.weight"), h, inter)?;
         let ffn = DenseFfn { w1, w3, w2 };
 
-        layers.push(EncLayerWeights { operator_norm, ffn_norm, mixer, ffn });
+        layers.push(EncLayerWeights {
+            operator_norm,
+            ffn_norm,
+            mixer,
+            ffn,
+        });
     }
     let _ = (conv_count, kv_count);
-    Ok(EncoderWeights { embedding_norm, layers })
+    Ok(EncoderWeights {
+        embedding_norm,
+        layers,
+    })
 }
 
-fn load_projector(hfq: &HfqFile, cfg: &ProjectorConfig, gpu: &mut Gpu) -> Result<ProjectorWeights, String> {
+fn load_projector(
+    hfq: &HfqFile,
+    cfg: &ProjectorConfig,
+    gpu: &mut Gpu,
+) -> Result<ProjectorWeights, String> {
     // AUDIO-NAME-1: two projector namings. Audio-2B raw names it `mlp.model.*`
     // with numeric indices 0=LayerNorm, 1=linear_1, 3=linear_2 (GELU at 2).
     // Omni-2B names it `model.audio_projector.{layer_norm,linear_1,linear_2}`.
-    if hfq.find_tensor_info("model.audio_projector.linear_1.weight").is_some() {
+    if hfq
+        .find_tensor_info("model.audio_projector.linear_1.weight")
+        .is_some()
+    {
         let p = "model.audio_projector.";
-        let layer_norm_w = load_f32(hfq, gpu, &format!("{p}layer_norm.weight"), &[cfg.in_features])?;
+        let layer_norm_w = load_f32(
+            hfq,
+            gpu,
+            &format!("{p}layer_norm.weight"),
+            &[cfg.in_features],
+        )?;
         let layer_norm_b = load_f32(hfq, gpu, &format!("{p}layer_norm.bias"), &[cfg.in_features])?;
         let linear_1_w = load_f16_gpu_host(hfq, gpu, &format!("{p}linear_1.weight"))?;
         let linear_1_b = load_f32(hfq, gpu, &format!("{p}linear_1.bias"), &[cfg.out_features])?;
         let linear_2_w = load_f16_gpu_host(hfq, gpu, &format!("{p}linear_2.weight"))?;
         let linear_2_b = load_f32(hfq, gpu, &format!("{p}linear_2.bias"), &[cfg.out_features])?;
-        return Ok(ProjectorWeights { layer_norm_w, layer_norm_b, linear_1_w, linear_1_b, linear_2_w, linear_2_b });
+        return Ok(ProjectorWeights {
+            layer_norm_w,
+            layer_norm_b,
+            linear_1_w,
+            linear_1_b,
+            linear_2_w,
+            linear_2_b,
+        });
     }
     let p = "mlp.model.";
     let layer_norm_w = load_f32(hfq, gpu, &format!("{p}0.weight"), &[cfg.in_features])?;
@@ -785,32 +963,57 @@ fn load_projector(hfq: &HfqFile, cfg: &ProjectorConfig, gpu: &mut Gpu) -> Result
     let linear_1_b = load_f32(hfq, gpu, &format!("{p}1.bias"), &[cfg.out_features])?;
     let linear_2_w = load_f16_gpu_host(hfq, gpu, &format!("{p}3.weight"))?;
     let linear_2_b = load_f32(hfq, gpu, &format!("{p}3.bias"), &[cfg.out_features])?;
-    Ok(ProjectorWeights { layer_norm_w, layer_norm_b, linear_1_w, linear_1_b, linear_2_w, linear_2_b })
+    Ok(ProjectorWeights {
+        layer_norm_w,
+        layer_norm_b,
+        linear_1_w,
+        linear_1_b,
+        linear_2_w,
+        linear_2_b,
+    })
 }
 
 /// Load an F16 (or dequant Q8→F16) weight as a raw GPU tensor for `gemm_f16`.
 fn load_f16_gpu_host(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<GpuTensor, String> {
-    let (info, data) = hfq.tensor_data_vec(name).ok_or_else(|| format!("lfm3-audio: {name} not found"))?;
+    let (info, data) = hfq
+        .tensor_data_vec(name)
+        .ok_or_else(|| format!("lfm3-audio: {name} not found"))?;
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match info.quant_type {
-        1 => gpu.upload_raw(&data, &[n]).map_err(|e| format!("lfm3-audio: upload {name}: {e:?}")),
+        1 => gpu
+            .upload_raw(&data, &[n])
+            .map_err(|e| format!("lfm3-audio: upload {name}: {e:?}")),
         3 => {
             let f32_data = dequant_q8_0(&data);
-            let f16_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| f32_to_f16(v).to_le_bytes()).collect();
-            gpu.upload_raw(&f16_bytes, &[n]).map_err(|e| format!("lfm3-audio: upload {name}: {e:?}"))
+            let f16_bytes: Vec<u8> = f32_data
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect();
+            gpu.upload_raw(&f16_bytes, &[n])
+                .map_err(|e| format!("lfm3-audio: upload {name}: {e:?}"))
         }
-        other => Err(format!("lfm3-audio: {name}: unsupported qt={other} (expected F16=1 or Q8=3)")),
+        other => Err(format!(
+            "lfm3-audio: {name}: unsupported qt={other} (expected F16=1 or Q8=3)"
+        )),
     }
 }
 
-pub fn load_audio_weights(hfq: &HfqFile, cfg: &AudioConfig, gpu: &mut Gpu) -> HipResult<AudioWeights> {
+pub fn load_audio_weights(
+    hfq: &HfqFile,
+    cfg: &AudioConfig,
+    gpu: &mut Gpu,
+) -> HipResult<AudioWeights> {
     eprintln!("  loading LFM3-Audio downsampler weights (CPU)...");
     let downsampler = load_downsampler(hfq).map_err(|e| HipError::new(999, &e))?;
     eprintln!("  loading LFM3-Audio encoder weights (GPU)...");
     let encoder = load_encoder(hfq, &cfg.enc, gpu).map_err(|e| HipError::new(999, &e))?;
     eprintln!("  loading LFM3-Audio projector weights (GPU)...");
     let projector = load_projector(hfq, &cfg.proj, gpu).map_err(|e| HipError::new(999, &e))?;
-    Ok(AudioWeights { downsampler, encoder, projector })
+    Ok(AudioWeights {
+        downsampler,
+        encoder,
+        projector,
+    })
 }
 
 // ─── Encoder state (GPU scratch + KV cache + conv state) ─────────────────────
@@ -853,7 +1056,8 @@ impl AudioEncoderState {
         let k_conv = cfg.conv_kernel_size;
         let head_dim = cfg.head_dim;
 
-        gpu.ensure_mq_signs().map_err(|e| format!("lfm3-audio: ensure_mq_signs: {e:?}"))?;
+        gpu.ensure_mq_signs()
+            .map_err(|e| format!("lfm3-audio: ensure_mq_signs: {e:?}"))?;
 
         let n_attn = cfg.num_attention_layers().max(1);
         let dims = hipfire_runtime::llama::KvDims {
@@ -864,7 +1068,8 @@ impl AudioEncoderState {
             physical_cap: None,
         };
         let kv = KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY).mode,
+            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY)
+                .mode,
             gpu,
             &dims,
         )
@@ -874,14 +1079,22 @@ impl AudioEncoderState {
         let zeros = vec![0u8; conv_hist * 4];
         let mut conv_states = Vec::with_capacity(cfg.num_conv_layers());
         for _ in 0..cfg.num_conv_layers() {
-            let cs = gpu.alloc_tensor(&[conv_hist], DType::F32).map_err(|e| format!("lfm3-audio: alloc conv_state: {e:?}"))?;
-            gpu.hip.memcpy_htod(&cs.buf, &zeros).map_err(|e| format!("lfm3-audio: zero conv_state: {e:?}"))?;
+            let cs = gpu
+                .alloc_tensor(&[conv_hist], DType::F32)
+                .map_err(|e| format!("lfm3-audio: alloc conv_state: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&cs.buf, &zeros)
+                .map_err(|e| format!("lfm3-audio: zero conv_state: {e:?}"))?;
             conv_states.push(cs);
         }
 
-        let pos_buf = gpu.hip.malloc(4).map_err(|e| format!("lfm3-audio: pos_buf: {e:?}"))?;
+        let pos_buf = gpu
+            .hip
+            .malloc(4)
+            .map_err(|e| format!("lfm3-audio: pos_buf: {e:?}"))?;
         let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
-            g.alloc_tensor(&[n], DType::F32).map_err(|e| format!("lfm3-audio: alloc {label}: {e:?}"))
+            g.alloc_tensor(&[n], DType::F32)
+                .map_err(|e| format!("lfm3-audio: alloc {label}: {e:?}"))
         };
 
         Ok(AudioEncoderState {
@@ -914,7 +1127,9 @@ impl AudioEncoderState {
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         for cs in &self.conv_states {
             let zeros = vec![0u8; cs.numel() * 4];
-            gpu.hip.memcpy_htod(&cs.buf, &zeros).map_err(|e| format!("lfm3-audio: reset conv_state: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&cs.buf, &zeros)
+                .map_err(|e| format!("lfm3-audio: reset conv_state: {e:?}"))?;
         }
         Ok(())
     }
@@ -925,9 +1140,21 @@ impl AudioEncoderState {
             let _ = gpu.free_tensor(t);
         }
         for t in [
-            self.h, self.tmp, self.fa_q, self.fa_k, self.fa_v, self.fa_attn_out, self.flash_partials,
-            self.conv_bcx, self.conv_y, self.ffn_tmp, self.dense_gate, self.dense_up, self.dense_act,
-            self.proj_out, self.final_norm_buf,
+            self.h,
+            self.tmp,
+            self.fa_q,
+            self.fa_k,
+            self.fa_v,
+            self.fa_attn_out,
+            self.flash_partials,
+            self.conv_bcx,
+            self.conv_y,
+            self.ffn_tmp,
+            self.dense_gate,
+            self.dense_up,
+            self.dense_act,
+            self.proj_out,
+            self.final_norm_buf,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -945,29 +1172,48 @@ impl AudioEncoderState {
 // embedding_norm'd hidden state per token (last_hidden_state).
 
 fn enc_conv_mixer(
-    gpu: &mut Gpu, cfg: &EncoderConfig, c: &EncConvWeights, st: &AudioEncoderState, l: usize,
+    gpu: &mut Gpu,
+    cfg: &EncoderConfig,
+    c: &EncConvWeights,
+    st: &AudioEncoderState,
+    l: usize,
 ) -> Result<(), String> {
     let hidden = cfg.hidden_size;
     weight_gemv(gpu, &c.in_proj, &st.tmp, &st.conv_bcx)
         .map_err(|e| format!("lfm3-audio L{l}: conv in_proj: {e}"))?;
-    gpu.conv1d_gated_decode_f32(&st.conv_bcx, &st.conv_states[c.conv_state_idx], &c.conv_weight, &st.conv_y, 1, hidden, cfg.conv_kernel_size)
-        .map_err(|e| format!("lfm3-audio L{l}: conv gated decode: {e:?}"))?;
+    gpu.conv1d_gated_decode_f32(
+        &st.conv_bcx,
+        &st.conv_states[c.conv_state_idx],
+        &c.conv_weight,
+        &st.conv_y,
+        1,
+        hidden,
+        cfg.conv_kernel_size,
+    )
+    .map_err(|e| format!("lfm3-audio L{l}: conv gated decode: {e:?}"))?;
     weight_gemv(gpu, &c.out_proj, &st.conv_y, &st.proj_out)
         .map_err(|e| format!("lfm3-audio L{l}: conv out_proj: {e}"))
 }
 
 fn enc_attn_mixer(
-    gpu: &mut Gpu, cfg: &EncoderConfig, a: &EncAttnWeights, st: &mut AudioEncoderState,
-    l: usize, seq_len: usize,
+    gpu: &mut Gpu,
+    cfg: &EncoderConfig,
+    a: &EncAttnWeights,
+    st: &mut AudioEncoderState,
+    l: usize,
+    seq_len: usize,
 ) -> Result<(), String> {
     let n_heads = cfg.num_attention_heads;
     let n_kv = cfg.num_key_value_heads;
     let head_dim = cfg.head_dim;
     let eps = cfg.norm_eps;
 
-    weight_gemv(gpu, &a.wq, &st.tmp, &st.fa_q).map_err(|e| format!("lfm3-audio L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &a.wk, &st.tmp, &st.fa_k).map_err(|e| format!("lfm3-audio L{l}: k_proj: {e}"))?;
-    weight_gemv(gpu, &a.wv, &st.tmp, &st.fa_v).map_err(|e| format!("lfm3-audio L{l}: v_proj: {e}"))?;
+    weight_gemv(gpu, &a.wq, &st.tmp, &st.fa_q)
+        .map_err(|e| format!("lfm3-audio L{l}: q_proj: {e}"))?;
+    weight_gemv(gpu, &a.wk, &st.tmp, &st.fa_k)
+        .map_err(|e| format!("lfm3-audio L{l}: k_proj: {e}"))?;
+    weight_gemv(gpu, &a.wv, &st.tmp, &st.fa_v)
+        .map_err(|e| format!("lfm3-audio L{l}: v_proj: {e}"))?;
 
     // Per-head QK-norm (LFM2 q_layernorm / k_layernorm).
     gpu.rmsnorm_batched(&st.fa_q, &a.q_norm, &st.fa_q, n_heads, head_dim, eps)
@@ -976,8 +1222,17 @@ fn enc_attn_mixer(
         .map_err(|e| format!("lfm3-audio L{l}: k_norm: {e:?}"))?;
 
     // Full-rotary RoPE (n_rot = head_dim, θ = rope_theta).
-    gpu.rope_partial_interleaved_f32(&st.fa_q, &st.fa_k, &st.pos_buf, n_heads, n_kv, head_dim, head_dim, cfg.rope_theta)
-        .map_err(|e| format!("lfm3-audio L{l}: rope: {e:?}"))?;
+    gpu.rope_partial_interleaved_f32(
+        &st.fa_q,
+        &st.fa_k,
+        &st.pos_buf,
+        n_heads,
+        n_kv,
+        head_dim,
+        head_dim,
+        cfg.rope_theta,
+    )
+    .map_err(|e| format!("lfm3-audio L{l}: rope: {e:?}"))?;
 
     // KV cache write (Q8).
     let kv_idx = a.kv_idx;
@@ -1052,13 +1307,16 @@ pub fn encoder_forward(
     for i in 0..n_tokens as u32 {
         let pos = base as u32 + i;
         let seq_len = pos as usize + 1;
-        gpu.hip.memcpy_htod(&st.pos_buf, &(pos as i32).to_ne_bytes())
+        gpu.hip
+            .memcpy_htod(&st.pos_buf, &(pos as i32).to_ne_bytes())
             .map_err(|e| format!("lfm3-audio: htod pos: {e:?}"))?;
 
         // Input = downsampler token embedding (not a token-id lookup).
         let embed = &tokens[i as usize * hidden..(i as usize + 1) * hidden];
         let bytes: Vec<u8> = embed.iter().flat_map(|&f| f.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&st.h.buf, &bytes).map_err(|e| format!("lfm3-audio: htod embed: {e:?}"))?;
+        gpu.hip
+            .memcpy_htod(&st.h.buf, &bytes)
+            .map_err(|e| format!("lfm3-audio: htod embed: {e:?}"))?;
 
         for (l, layer) in weights.layers.iter().enumerate() {
             // operator_norm → tmp
@@ -1070,7 +1328,8 @@ pub fn encoder_forward(
             }
 
             // Residual (no sandwich norm in the audio encoder).
-            gpu.add_f32(&st.proj_out, &st.h, &st.h).map_err(|e| format!("lfm3-audio L{l}: operator residual: {e:?}"))?;
+            gpu.add_f32(&st.proj_out, &st.h, &st.h)
+                .map_err(|e| format!("lfm3-audio L{l}: operator residual: {e:?}"))?;
 
             // AUDIO-DBG: per-layer hidden hash — the first layer whose hash
             // diverges across identical runs pins the nondeterministic op.
@@ -1079,17 +1338,24 @@ pub fn encoder_forward(
             gpu.rmsnorm_f32(&st.h, &layer.ffn_norm, &st.ffn_tmp, eps)
                 .map_err(|e| format!("lfm3-audio L{l}: ffn rmsnorm: {e:?}"))?;
             let d = &layer.ffn;
-            weight_gemv(gpu, &d.w1, &st.ffn_tmp, &st.dense_gate).map_err(|e| format!("lfm3-audio L{l}: w1: {e}"))?;
-            weight_gemv(gpu, &d.w3, &st.ffn_tmp, &st.dense_up).map_err(|e| format!("lfm3-audio L{l}: w3: {e}"))?;
-            gpu.silu_mul_f32(&st.dense_gate, &st.dense_up, &st.dense_act).map_err(|e| format!("lfm3-audio L{l}: silu_mul: {e:?}"))?;
-            weight_gemv(gpu, &d.w2, &st.dense_act, &st.proj_out).map_err(|e| format!("lfm3-audio L{l}: w2: {e}"))?;
-            gpu.add_f32(&st.proj_out, &st.h, &st.h).map_err(|e| format!("lfm3-audio L{l}: ffn residual: {e:?}"))?;
+            weight_gemv(gpu, &d.w1, &st.ffn_tmp, &st.dense_gate)
+                .map_err(|e| format!("lfm3-audio L{l}: w1: {e}"))?;
+            weight_gemv(gpu, &d.w3, &st.ffn_tmp, &st.dense_up)
+                .map_err(|e| format!("lfm3-audio L{l}: w3: {e}"))?;
+            gpu.silu_mul_f32(&st.dense_gate, &st.dense_up, &st.dense_act)
+                .map_err(|e| format!("lfm3-audio L{l}: silu_mul: {e:?}"))?;
+            weight_gemv(gpu, &d.w2, &st.dense_act, &st.proj_out)
+                .map_err(|e| format!("lfm3-audio L{l}: w2: {e}"))?;
+            gpu.add_f32(&st.proj_out, &st.h, &st.h)
+                .map_err(|e| format!("lfm3-audio L{l}: ffn residual: {e:?}"))?;
         }
 
         // Final embedding_norm → last_hidden_state for this token.
         gpu.rmsnorm_f32(&st.h, &weights.embedding_norm, &st.final_norm_buf, eps)
             .map_err(|e| format!("lfm3-audio: final rmsnorm: {e:?}"))?;
-        let h = gpu.download_f32(&st.final_norm_buf).map_err(|e| format!("lfm3-audio: download hidden: {e:?}"))?;
+        let h = gpu
+            .download_f32(&st.final_norm_buf)
+            .map_err(|e| format!("lfm3-audio: download hidden: {e:?}"))?;
         out[i as usize * hidden..(i as usize + 1) * hidden].copy_from_slice(&h);
     }
 
@@ -1102,40 +1368,89 @@ pub fn encoder_forward(
 // Reuses the lfm3-vl linear helpers (gemm_f16 + transpose + bias_add).
 
 fn linear_f16_bias(
-    gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, bias: &GpuTensor, out_dim: usize, in_dim: usize, n: usize,
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    bias: &GpuTensor,
+    out_dim: usize,
+    in_dim: usize,
+    n: usize,
 ) -> Result<GpuTensor, String> {
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32).map_err(|e| format!("alloc yt: {e:?}"))?;
-    gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n).map_err(|e| format!("gemm_f16: {e:?}"))?;
-    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32).map_err(|e| format!("alloc y: {e:?}"))?;
-    gpu.transpose_f32(&yt, &y, out_dim, n).map_err(|e| format!("transpose: {e:?}"))?;
+    let yt = gpu
+        .alloc_tensor(&[out_dim * n], DType::F32)
+        .map_err(|e| format!("alloc yt: {e:?}"))?;
+    gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)
+        .map_err(|e| format!("gemm_f16: {e:?}"))?;
+    let y = gpu
+        .alloc_tensor(&[n * out_dim], DType::F32)
+        .map_err(|e| format!("alloc y: {e:?}"))?;
+    gpu.transpose_f32(&yt, &y, out_dim, n)
+        .map_err(|e| format!("transpose: {e:?}"))?;
     gpu.free_tensor(yt).map_err(|e| format!("free yt: {e:?}"))?;
-    gpu.bias_add_f32(&y, bias, n, out_dim).map_err(|e| format!("bias_add: {e:?}"))?;
+    gpu.bias_add_f32(&y, bias, n, out_dim)
+        .map_err(|e| format!("bias_add: {e:?}"))?;
     Ok(y)
 }
 
 pub fn projector_forward(
-    gpu: &mut Gpu, w: &ProjectorWeights, cfg: &ProjectorConfig, enc_out: &[f32], n_tokens: usize,
+    gpu: &mut Gpu,
+    w: &ProjectorWeights,
+    cfg: &ProjectorConfig,
+    enc_out: &[f32],
+    n_tokens: usize,
 ) -> Result<Vec<f32>, String> {
     let in_f = cfg.in_features;
     let out_f = cfg.out_features;
-    let x = gpu.upload_f32(enc_out, &[n_tokens * in_f]).map_err(|e| format!("upload enc: {e:?}"))?;
+    let x = gpu
+        .upload_f32(enc_out, &[n_tokens * in_f])
+        .map_err(|e| format!("upload enc: {e:?}"))?;
 
     // LayerNorm(768) with weight + bias.
-    let normed = gpu.alloc_tensor(&[n_tokens * in_f], DType::F32).map_err(|e| format!("alloc normed: {e:?}"))?;
-    gpu.layernorm_batched(&x, &w.layer_norm_w, &w.layer_norm_b, &normed, n_tokens, in_f, cfg.norm_eps)
-        .map_err(|e| format!("projector layernorm: {e:?}"))?;
+    let normed = gpu
+        .alloc_tensor(&[n_tokens * in_f], DType::F32)
+        .map_err(|e| format!("alloc normed: {e:?}"))?;
+    gpu.layernorm_batched(
+        &x,
+        &w.layer_norm_w,
+        &w.layer_norm_b,
+        &normed,
+        n_tokens,
+        in_f,
+        cfg.norm_eps,
+    )
+    .map_err(|e| format!("projector layernorm: {e:?}"))?;
     gpu.free_tensor(x).map_err(|e| format!("free x: {e:?}"))?;
 
     // linear_1 (768→2048) + bias → GELU(erf).
-    let m1 = linear_f16_bias(gpu, &w.linear_1_w, &normed, &w.linear_1_b, out_f, in_f, n_tokens)?;
-    gpu.free_tensor(normed).map_err(|e| format!("free normed: {e:?}"))?;
-    gpu.gelu_erf_f32(&m1, &m1, n_tokens * out_f).map_err(|e| format!("gelu_erf: {e:?}"))?;
+    let m1 = linear_f16_bias(
+        gpu,
+        &w.linear_1_w,
+        &normed,
+        &w.linear_1_b,
+        out_f,
+        in_f,
+        n_tokens,
+    )?;
+    gpu.free_tensor(normed)
+        .map_err(|e| format!("free normed: {e:?}"))?;
+    gpu.gelu_erf_f32(&m1, &m1, n_tokens * out_f)
+        .map_err(|e| format!("gelu_erf: {e:?}"))?;
 
     // linear_2 (2048→2048) + bias.
-    let m2 = linear_f16_bias(gpu, &w.linear_2_w, &m1, &w.linear_2_b, out_f, out_f, n_tokens)?;
+    let m2 = linear_f16_bias(
+        gpu,
+        &w.linear_2_w,
+        &m1,
+        &w.linear_2_b,
+        out_f,
+        out_f,
+        n_tokens,
+    )?;
     gpu.free_tensor(m1).map_err(|e| format!("free m1: {e:?}"))?;
 
-    let result = gpu.download_f32(&m2).map_err(|e| format!("download proj: {e:?}"))?;
+    let result = gpu
+        .download_f32(&m2)
+        .map_err(|e| format!("download proj: {e:?}"))?;
     gpu.free_tensor(m2).map_err(|e| format!("free m2: {e:?}"))?;
     Ok(result)
 }
@@ -1205,7 +1520,10 @@ pub fn audio_forward(
         eprintln!("[lfm3-audio][dbg] projector hash {:016x}", fnv1a(&b));
     }
 
-    eprintln!("  LFM3-Audio forward done: {n_tokens} audio tokens x {} dims", cfg.proj.out_features);
+    eprintln!(
+        "  LFM3-Audio forward done: {n_tokens} audio tokens x {} dims",
+        cfg.proj.out_features
+    );
     Ok(proj)
 }
 
@@ -1335,12 +1653,18 @@ pub fn audio_forward_streaming(
     // can no longer affect any output. (Bound: n_fft − hop + a sub-hop
     // remainder between chunks.)
     let drop_samples = new_frames * hop;
-    cache.accum_samples.drain(..drop_samples.min(cache.accum_samples.len()));
+    cache
+        .accum_samples
+        .drain(..drop_samples.min(cache.accum_samples.len()));
 
     // 2. Token accounting (HF `stream()`): a token needs its full 8-frame
     //    group, except on the final flush where the partial group emits one
     //    last token.
-    let num_tokens = if is_final { (num_frames + 7) / 8 } else { num_frames / 8 };
+    let num_tokens = if is_final {
+        (num_frames + 7) / 8
+    } else {
+        num_frames / 8
+    };
     let start_token = cache.num_tokens_emitted;
     let new_tokens = num_tokens.saturating_sub(start_token);
     if new_tokens == 0 {
@@ -1406,9 +1730,15 @@ pub fn audio_forward_streaming(
     let slice = &tokens_win[first_idx * cfg.enc.hidden_size..end_idx * cfg.enc.hidden_size];
 
     // 4. GPU encoder forward (persistent state — position carries).
-    let enc_out =
-        encoder_forward(gpu, &weights.encoder, &cfg.enc, &mut cache.state, slice, new_tokens)
-            .map_err(|e| HipError::new(999, &e))?;
+    let enc_out = encoder_forward(
+        gpu,
+        &weights.encoder,
+        &cfg.enc,
+        &mut cache.state,
+        slice,
+        new_tokens,
+    )
+    .map_err(|e| HipError::new(999, &e))?;
 
     // 5. GPU projector.
     let proj = projector_forward(gpu, &weights.projector, &cfg.proj, &enc_out, new_tokens)
@@ -1432,8 +1762,10 @@ mod tests {
     }
 
     fn host_w(name: &str, dir: &str) -> HostW {
-        let idx: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&format!("{dir}/downsample_weights_idx.json")).unwrap()).unwrap();
+        let idx: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(&format!("{dir}/downsample_weights_idx.json")).unwrap(),
+        )
+        .unwrap();
         let entry = idx.get(name).unwrap();
         let shape: Vec<usize> = entry["shape"]
             .as_array()
@@ -1550,7 +1882,11 @@ mod tests {
         let dm = parse_meta(&format!("{dir}/downsample_meta.txt"));
         let hidden = dm["hidden"];
         let n_tokens = full.len() / hidden;
-        assert_eq!(n_tokens * hidden, full.len(), "fixture token grid must be exact");
+        assert_eq!(
+            n_tokens * hidden,
+            full.len(),
+            "fixture token grid must be exact"
+        );
         assert!(n_tokens >= 2, "fixture too short to exercise windows");
 
         // Window helper: materialize frames [ws, hi) of the mel fixture in
@@ -1585,7 +1921,11 @@ mod tests {
         let trunc = num_frames - 3;
         let trunc_mel = window(&mel, num_frames, 0, trunc);
         let full_trunc = downsampler_forward(&trunc_mel, n_mels, trunc, &dw);
-        assert_eq!(full_trunc.len() / hidden, (trunc + 7) / 8, "flush token must exist");
+        assert_eq!(
+            full_trunc.len() / hidden,
+            (trunc + 7) / 8,
+            "flush token must exist"
+        );
         let t = (trunc + 7) / 8 - 1;
         let ws = 8 * t.saturating_sub(1);
         let win = window(&mel, num_frames, ws, trunc);
@@ -1593,6 +1933,9 @@ mod tests {
         let j = t - ws / 8;
         let got = &win_tokens[j * hidden..(j + 1) * hidden];
         let want = &full_trunc[t * hidden..(t + 1) * hidden];
-        assert_eq!(got, want, "flush token t={t}: window diverged from full stream");
+        assert_eq!(
+            got, want,
+            "flush token t={t}: window diverged from full stream"
+        );
     }
 }

@@ -78,7 +78,18 @@ fn main() {
         let v = gpu.upload_raw(&kv, &[kv.len()]).expect("v");
         let out = gpu.zeros(&[NH * HD], DType::F32).expect("out");
         gpu.attention_flash_q8_0_windowed(
-            &q, &k, &v, &out, &positions.buf, S, NH, NKV, HD, S, &partials, W as i32,
+            &q,
+            &k,
+            &v,
+            &out,
+            &positions.buf,
+            S,
+            NH,
+            NKV,
+            HD,
+            S,
+            &partials,
+            W as i32,
         )
         .expect("windowed attn launch");
         gpu.download_f32(&out).expect("download")
@@ -139,8 +150,12 @@ fn main() {
     let mut max_run_diff = 0.0f32;
     for _ in 0..4 {
         let o = run(&mut gpu);
-        max_run_diff = max_run_diff
-            .max(o.iter().zip(&out0).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max));
+        max_run_diff = max_run_diff.max(
+            o.iter()
+                .zip(&out0)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max),
+        );
     }
 
     println!("head_dim={HD} (audio-encoder shape) seq={S} window={W} tile={tile}");

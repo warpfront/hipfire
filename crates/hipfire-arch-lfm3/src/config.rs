@@ -224,7 +224,9 @@ impl Lfm3Config {
             });
 
         // A config with sliding_attention layers MUST declare a window.
-        if layer_types.iter().any(|t| *t == MixerKind::SlidingAttention)
+        if layer_types
+            .iter()
+            .any(|t| *t == MixerKind::SlidingAttention)
             && raw.sliding_window == 0
         {
             return Err(

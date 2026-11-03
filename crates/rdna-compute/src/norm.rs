@@ -1528,7 +1528,11 @@ impl Gpu {
         freq_base: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rope_zero_tail", kernels::ROPE_ZERO_TAIL_SRC, "rope_zero_tail_f32")?;
+        self.ensure_kernel(
+            "rope_zero_tail",
+            kernels::ROPE_ZERO_TAIL_SRC,
+            "rope_zero_tail_f32",
+        )?;
         let qp = q.buf.as_ptr();
         let kp = k.buf.as_ptr();
         let pp = pos_buf.as_ptr();
@@ -1552,18 +1556,25 @@ impl Gpu {
             &ra as *const _ as *mut c_void,
             &fb as *const _ as *mut c_void,
         ];
-        let result = self.launch_maybe_blob("rope_zero_tail_f32", grid, [block, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(qp);
-            b.push_ptr(kp);
-            b.push_ptr(pp);
-            b.push_i32(nhq);
-            b.push_i32(nhk);
-            b.push_i32(hd);
-            b.push_i32(ra);
-            b.push_f32(fb);
-            b
-        });
+        let result = self.launch_maybe_blob(
+            "rope_zero_tail_f32",
+            grid,
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(pp);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_i32(ra);
+                b.push_f32(fb);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6909,13 +6920,20 @@ impl Gpu {
             &op as *const _ as *mut c_void,
             &ni as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob("gelu_erf_f32", [blocks, 1, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(xp);
-            b.push_ptr(op);
-            b.push_i32(ni);
-            b
-        })
+        self.launch_maybe_blob(
+            "gelu_erf_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b
+            },
+        )
     }
 
     /// LFM3-VL vision conv layer: double-gated depthwise 2D convolution.
@@ -6935,7 +6953,11 @@ impl Gpu {
         sms: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("conv2d_gated_f32", kernels::CONV2D_GATED_SRC, "conv2d_gated_f32")?;
+        self.ensure_kernel(
+            "conv2d_gated_f32",
+            kernels::CONV2D_GATED_SRC,
+            "conv2d_gated_f32",
+        )?;
         // GRAPH-1: launches via `launch_maybe_blob` — the raw `launch_kernel`
         // path dangles its stack kernargs under hipGraph capture.
         let bp = bcx.buf.as_ptr();
@@ -6961,18 +6983,25 @@ impl Gpu {
         let by = 16u32;
         let gx = ((n as u32) + bx - 1) / bx;
         let gy = ((hidden as u32) + by - 1) / by;
-        self.launch_maybe_blob("conv2d_gated_f32", [gx, gy, 1], [bx, by, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(bp);
-            b.push_ptr(wp);
-            b.push_ptr(op);
-            b.push_i32(ni);
-            b.push_i32(hi);
-            b.push_i32(gh);
-            b.push_i32(gw);
-            b.push_i32(sm);
-            b
-        })
+        self.launch_maybe_blob(
+            "conv2d_gated_f32",
+            [gx, gy, 1],
+            [bx, by, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(wp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b.push_i32(hi);
+                b.push_i32(gh);
+                b.push_i32(gw);
+                b.push_i32(sm);
+                b
+            },
+        )
     }
 
     /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)

@@ -18,4 +18,3 @@
 // `hipfire-arch-lfm3-{vl,audio,omni}` crates that this crate must not depend
 // on. A future `SpecTarget` impl for LFM3 still belongs here, next to the
 // forward it drives (orphan rule).
-

@@ -173,6 +173,7 @@ pub use trunk_mask::{
     TRUNK_QSA_BITS,
 };
 
+pub use attention::q8_flash_tile_size;
 pub use compiler::KernelCompiler;
 #[cfg(feature = "lab")]
 pub use dispatch::LabKernelFaultReceipt;
@@ -196,7 +197,6 @@ pub use dispatch::{
 #[cfg(feature = "lab")]
 pub use dispatch::{LabLaunchWitness, LabProjectionLaunch};
 pub use feature_flags::FeatureFlags;
-pub use attention::q8_flash_tile_size;
 pub use hip_bridge::{HipError, HipResult};
 use hipfire_config::developer_bool;
 pub use plan_sink::{PlanSink, PlannedKernel, PlannedOp};

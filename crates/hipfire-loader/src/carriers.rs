@@ -17395,7 +17395,9 @@ impl Carrier for Lfm3Carrier {
                     .tensor_data("model.vision_tower.patchifier.weight")
                     .is_some()
                 {
-                    eprintln!("lfm3: LFM3-VL vision tower detected — loading vision + projector weights");
+                    eprintln!(
+                        "lfm3: LFM3-VL vision tower detected — loading vision + projector weights"
+                    );
                     let vc = lfm3_vl::vision_config_from_hfq(&hfq).ok_or_else(|| {
                         "lfm3-vl: vision_config not found in HFQ metadata".to_string()
                     })?;
@@ -17407,7 +17409,9 @@ impl Carrier for Lfm3Carrier {
                 // LFM3-Audio speech encoder by tensor presence.
                 // AUDIO-NAME-1: Audio-2B names it `encoder.downsample.*`;
                 // Omni-2B names it `model.audio_encoder.downsample.*`.
-                if hfq.tensor_data("encoder.downsample.conv_in.weight").is_some()
+                if hfq
+                    .tensor_data("encoder.downsample.conv_in.weight")
+                    .is_some()
                     || hfq
                         .tensor_data("model.audio_encoder.downsample.conv_in.weight")
                         .is_some()

@@ -16,7 +16,8 @@ use rdna_compute::Gpu;
 
 fn build_prompt(model: &hipfire_loader::LoadedModel, prompt: &str) -> Vec<u32> {
     let tok = model.tokenizer.as_ref().unwrap();
-    let chatml = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>");
+    let chatml =
+        format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>");
     let mut t = tok.encode(&chatml);
     t.insert(0, 124_894);
     t.push(MIXED_START_TOKEN);
@@ -36,8 +37,19 @@ fn main() {
 
     // ── Batch run 1 ──
     eprintln!("== batch run 1 ==");
-    let mut model = load_model(&path, 2048, None, None, None, None, &CaskConfig::default(), 1, SpecLoadCfg::default(), &mut gpu)
-        .expect("load_model");
+    let mut model = load_model(
+        &path,
+        2048,
+        None,
+        None,
+        None,
+        None,
+        &CaskConfig::default(),
+        1,
+        SpecLoadCfg::default(),
+        &mut gpu,
+    )
+    .expect("load_model");
     let prompt_tokens = build_prompt(&model, &prompt);
     let depth_cfg = model.lfm3_depth_config().unwrap().clone();
     let (text_ids_b, audio_codes_b, text_n_b) = {
@@ -50,19 +62,45 @@ fn main() {
         let dw = bundle.depth_weights.as_ref().unwrap();
         let mut rng = DepthRng::new(seed);
         let out = omni_generate(
-            &bundle.config, &bundle.weights, &mut bundle.state,
-            &depth_cfg, dw, &mut gpu, &prompt_tokens, 40, &mut rng,
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            &depth_cfg,
+            dw,
+            &mut gpu,
+            &prompt_tokens,
+            40,
+            &mut rng,
         )
         .expect("batch omni_generate");
-        (out.text_tokens.clone(), out.audio_codes.clone(), out.text_tokens.len())
+        (
+            out.text_tokens.clone(),
+            out.audio_codes.clone(),
+            out.text_tokens.len(),
+        )
     };
-    eprintln!("  batch: {text_n_b} text tokens {text_ids_b:?} + {} audio frames ({} codes)", audio_codes_b.len()/12, audio_codes_b.len());
+    eprintln!(
+        "  batch: {text_n_b} text tokens {text_ids_b:?} + {} audio frames ({} codes)",
+        audio_codes_b.len() / 12,
+        audio_codes_b.len()
+    );
 
     // ── Batch run 2 (determinism check: fresh state, same seed) ──
     eprintln!("== batch run 2 ==");
     drop(model);
-    let mut model2 = load_model(&path, 2048, None, None, None, None, &CaskConfig::default(), 1, SpecLoadCfg::default(), &mut gpu)
-        .expect("load_model (batch2)");
+    let mut model2 = load_model(
+        &path,
+        2048,
+        None,
+        None,
+        None,
+        None,
+        &CaskConfig::default(),
+        1,
+        SpecLoadCfg::default(),
+        &mut gpu,
+    )
+    .expect("load_model (batch2)");
     let (text_ids_b2, audio_codes_b2) = {
         let bundle = match model2.state.as_mut() {
             Some(s) => (s.as_mut() as &mut dyn std::any::Any)
@@ -73,8 +111,15 @@ fn main() {
         let dw = bundle.depth_weights.as_ref().unwrap();
         let mut rng = DepthRng::new(seed);
         let out = omni_generate(
-            &bundle.config, &bundle.weights, &mut bundle.state,
-            &depth_cfg, dw, &mut gpu, &prompt_tokens, 40, &mut rng,
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            &depth_cfg,
+            dw,
+            &mut gpu,
+            &prompt_tokens,
+            40,
+            &mut rng,
         )
         .expect("batch omni_generate run2");
         (out.text_tokens.clone(), out.audio_codes.clone())
@@ -82,14 +127,22 @@ fn main() {
     let frames_b2 = audio_codes_b2.len() / 12;
     let mut b12_div = None;
     for i in 0..text_ids_b.len().min(text_ids_b2.len()) {
-        if text_ids_b[i] != text_ids_b2[i] { b12_div = Some(i); break; }
+        if text_ids_b[i] != text_ids_b2[i] {
+            b12_div = Some(i);
+            break;
+        }
     }
     let mut b12_code_div = None;
-    for f in 0..(audio_codes_b.len()/12).min(frames_b2) {
-        if audio_codes_b[f*12..(f+1)*12] != audio_codes_b2[f*12..(f+1)*12] { b12_code_div = Some(f); break; }
+    for f in 0..(audio_codes_b.len() / 12).min(frames_b2) {
+        if audio_codes_b[f * 12..(f + 1) * 12] != audio_codes_b2[f * 12..(f + 1) * 12] {
+            b12_code_div = Some(f);
+            break;
+        }
     }
     match (b12_div, b12_code_div) {
-        (None, None) if text_ids_b.len() == text_ids_b2.len() && audio_codes_b.len()/12 == frames_b2 => {
+        (None, None)
+            if text_ids_b.len() == text_ids_b2.len() && audio_codes_b.len() / 12 == frames_b2 =>
+        {
             println!("  batch-vs-batch: IDENTICAL (deterministic)");
         }
         _ => {
@@ -102,11 +155,25 @@ fn main() {
 
     // ── Fresh model for streaming (fresh Lfm3State) ──
     eprintln!("== streaming ==");
-    let mut model = load_model(&path, 2048, None, None, None, None, &CaskConfig::default(), 1, SpecLoadCfg::default(), &mut gpu)
-        .expect("load_model (streaming)");
+    let mut model = load_model(
+        &path,
+        2048,
+        None,
+        None,
+        None,
+        None,
+        &CaskConfig::default(),
+        1,
+        SpecLoadCfg::default(),
+        &mut gpu,
+    )
+    .expect("load_model (streaming)");
     let prompt_tokens_s = build_prompt(&model, &prompt);
     let depth_cfg = model.lfm3_depth_config().unwrap().clone();
-    assert_eq!(prompt_tokens, prompt_tokens_s, "prompt construction differs");
+    assert_eq!(
+        prompt_tokens, prompt_tokens_s,
+        "prompt construction differs"
+    );
 
     let mut text_ids_s: Vec<u32> = Vec::new();
     let mut audio_codes_s: Vec<u32> = Vec::new();
@@ -120,15 +187,26 @@ fn main() {
         let dw = bundle.depth_weights.as_ref().unwrap();
         let mut rng = DepthRng::new(seed);
         let mut stream = omni_stream_prefill(
-            &bundle.config, &bundle.weights, &mut bundle.state, &mut gpu, &prompt_tokens_s,
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            &mut gpu,
+            &prompt_tokens_s,
         )
         .expect("stream prefill");
         eprintln!("  prefill done (position={})", stream.position);
         let mut step = 0usize;
         while !stream.finished && step < 40 {
             let out = omni_stream_step(
-                &bundle.config, &bundle.weights, &mut bundle.state,
-                &depth_cfg, dw, &mut gpu, &mut stream, 12, &mut rng,
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                &depth_cfg,
+                dw,
+                &mut gpu,
+                &mut stream,
+                12,
+                &mut rng,
             )
             .expect("stream step");
             text_ids_s.extend_from_slice(&out.text_tokens);
@@ -142,7 +220,12 @@ fn main() {
             step += 1;
         }
     }
-    eprintln!("  streaming: {} text tokens {text_ids_s:?} + {} audio frames ({} codes)", text_ids_s.len(), audio_codes_s.len()/12, audio_codes_s.len());
+    eprintln!(
+        "  streaming: {} text tokens {text_ids_s:?} + {} audio frames ({} codes)",
+        text_ids_s.len(),
+        audio_codes_s.len() / 12,
+        audio_codes_s.len()
+    );
 
     // TEST-1: bound the generated frame/text counts by the step budget
     // (STREAM-1's max_steps cap + EOS-1's post-eos TEXT continuation must
@@ -174,7 +257,7 @@ fn main() {
     let n_frames_s = audio_codes_s.len() / 12;
     let mut code_div = None;
     for f in 0..n_frames_b.min(n_frames_s) {
-        if audio_codes_b[f*12..(f+1)*12] != audio_codes_s[f*12..(f+1)*12] {
+        if audio_codes_b[f * 12..(f + 1) * 12] != audio_codes_s[f * 12..(f + 1) * 12] {
             code_div = Some(f);
             break;
         }
@@ -185,12 +268,15 @@ fn main() {
         Some(f) => {
             println!(
                 "RESULT: AUDIO CODES DIVERGED at frame {f}: batch={:?} stream={:?}",
-                &audio_codes_b[f*12..(f+1)*12],
-                &audio_codes_s[f*12..(f+1)*12],
+                &audio_codes_b[f * 12..(f + 1) * 12],
+                &audio_codes_s[f * 12..(f + 1) * 12],
             );
             std::process::exit(1);
         }
-        None => println!("  audio codes IDENTICAL for {} frames", frames_b.min(frames_s)),
+        None => println!(
+            "  audio codes IDENTICAL for {} frames",
+            frames_b.min(frames_s)
+        ),
     }
 
     let div_txt = match div {
@@ -200,11 +286,11 @@ fn main() {
         ),
         None => "text prefix identical".to_string(),
     };
-    if div.is_none()
-        && text_ids_b.len() == text_ids_s.len()
-        && frames_b == frames_s
-    {
-        println!("RESULT: IDENTICAL ({} text tokens, {frames_b} audio frames) — {div_txt}", text_ids_b.len());
+    if div.is_none() && text_ids_b.len() == text_ids_s.len() && frames_b == frames_s {
+        println!(
+            "RESULT: IDENTICAL ({} text tokens, {frames_b} audio frames) — {div_txt}",
+            text_ids_b.len()
+        );
     } else {
         println!(
             "RESULT: {} (batch: {} text/{frames_b} audio; stream: {} text/{frames_s} audio)",

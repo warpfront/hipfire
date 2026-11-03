@@ -18511,19 +18511,26 @@ impl Gpu {
         let block_size: u32 = 256; // power of two; ≥ head_dim for the VL shape
         let shared_mem = ((VIT_ATTN_TILE + block_size as usize) * 4) as u32;
         let grid_x = (n_heads * n) as u32;
-        self.launch_maybe_blob("vit_attention_gqa_f32", [grid_x, 1, 1], [block_size, 1, 1], shared_mem, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(qp);
-            b.push_ptr(kp);
-            b.push_ptr(vp);
-            b.push_ptr(op);
-            b.push_i32(ni);
-            b.push_i32(nh);
-            b.push_i32(nk);
-            b.push_i32(hd);
-            b.push_f32(sc);
-            b
-        })
+        self.launch_maybe_blob(
+            "vit_attention_gqa_f32",
+            [grid_x, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b.push_i32(nh);
+                b.push_i32(nk);
+                b.push_i32(hd);
+                b.push_f32(sc);
+                b
+            },
+        )
     }
 
     /// Apply 2D rotary positional embedding to the Q and K halves of a packed

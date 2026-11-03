@@ -314,7 +314,8 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         adaptive: false,
         host_position_and_conversation: true,
         eligibility: RetryResetEligibility::Ineligible {
-            reason: "lfm3 is AR-only (hybrid conv + attention) — not a serve-hardening retry candidate",
+            reason:
+                "lfm3 is AR-only (hybrid conv + attention) — not a serve-hardening retry candidate",
         },
     };
     &[

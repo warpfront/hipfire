@@ -1506,9 +1506,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "rmsnorm_f32" | "rmsnorm_f32_warp_reduce" | "rmsnorm_f32_rowsplit" => {
             Some(vec![read(0), read(8), write(16)])
         }
-        "rope_partial_halfsplit_f32" | "rope_partial_halfsplit_f32_headgrid" | "rope_zero_tail_f32" => {
-            Some(vec![write(0), write(8), read(16)])
-        }
+        "rope_partial_halfsplit_f32"
+        | "rope_partial_halfsplit_f32_headgrid"
+        | "rope_zero_tail_f32" => Some(vec![write(0), write(8), read(16)]),
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
         }

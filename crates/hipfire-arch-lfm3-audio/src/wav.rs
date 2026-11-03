@@ -40,7 +40,10 @@ impl std::fmt::Display for WavError {
             WavError::BadHeader(s) => write!(f, "bad WAV header: {s}"),
             WavError::UnsupportedFormat(s) => write!(f, "unsupported WAV format: {s}"),
             WavError::SampleRateMismatch { got, expected } => {
-                write!(f, "sample rate {got} Hz != expected {expected} Hz (resample first)")
+                write!(
+                    f,
+                    "sample rate {got} Hz != expected {expected} Hz (resample first)"
+                )
             }
             WavError::NoData => write!(f, "WAV has no data chunk"),
         }
@@ -51,7 +54,10 @@ impl std::fmt::Display for WavError {
 pub fn decode_wav(bytes: &[u8], expected_sr: u32) -> Result<Waveform, WavError> {
     let w = decode_wav_any(bytes)?;
     if w.sample_rate != expected_sr {
-        return Err(WavError::SampleRateMismatch { got: w.sample_rate, expected: expected_sr });
+        return Err(WavError::SampleRateMismatch {
+            got: w.sample_rate,
+            expected: expected_sr,
+        });
     }
     Ok(w)
 }
@@ -71,7 +77,12 @@ pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
     let mut data: &[u8] = &[];
     while pos + 8 <= bytes.len() {
         let chunk_id = &bytes[pos..pos + 4];
-        let chunk_size = u32::from_le_bytes([bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7]]) as usize;
+        let chunk_size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
         let body_start = pos + 8;
         let body_end = (body_start + chunk_size).min(bytes.len());
         match chunk_id {
@@ -119,7 +130,12 @@ pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
             .map(|frame| {
                 let mut acc = 0.0f32;
                 for c in 0..channels {
-                    acc += f32::from_le_bytes([frame[4 * c], frame[4 * c + 1], frame[4 * c + 2], frame[4 * c + 3]]);
+                    acc += f32::from_le_bytes([
+                        frame[4 * c],
+                        frame[4 * c + 1],
+                        frame[4 * c + 2],
+                        frame[4 * c + 3],
+                    ]);
                 }
                 acc / channels as f32
             })
@@ -129,7 +145,12 @@ pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
             .map(|frame| {
                 let mut acc = 0.0f32;
                 for c in 0..channels {
-                    let s = i32::from_le_bytes([frame[4 * c], frame[4 * c + 1], frame[4 * c + 2], frame[4 * c + 3]]) as f32;
+                    let s = i32::from_le_bytes([
+                        frame[4 * c],
+                        frame[4 * c + 1],
+                        frame[4 * c + 2],
+                        frame[4 * c + 3],
+                    ]) as f32;
                     acc += s / 2147483648.0;
                 }
                 acc / channels as f32
@@ -142,7 +163,8 @@ pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
                 for c in 0..channels {
                     let b = &frame[3 * c..3 * c + 3];
                     // 24-bit signed little-endian → i32
-                    let s = ((b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16)) << 8 >> 8;
+                    let s =
+                        ((b[0] as i32) | ((b[1] as i32) << 8) | ((b[2] as i32) << 16)) << 8 >> 8;
                     acc += s as f32 / 8388608.0;
                 }
                 acc / channels as f32
@@ -156,7 +178,10 @@ pub fn decode_wav_any(bytes: &[u8]) -> Result<Waveform, WavError> {
         }
     };
 
-    Ok(Waveform { samples, sample_rate: fmt_sample_rate })
+    Ok(Waveform {
+        samples,
+        sample_rate: fmt_sample_rate,
+    })
 }
 
 #[cfg(test)]

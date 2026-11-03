@@ -42,6 +42,6 @@ pub mod lfm3_audio;
 pub use arch::Lfm3Audio;
 #[cfg(feature = "deltanet")]
 pub use lfm3_audio::{
-    audio_config_from_hfq, audio_forward, audio_forward_streaming, load_audio_weights,
-    AudioConfig, AudioEncoderStreamingCache, AudioWeights,
+    audio_config_from_hfq, audio_forward, audio_forward_streaming, load_audio_weights, AudioConfig,
+    AudioEncoderStreamingCache, AudioWeights,
 };

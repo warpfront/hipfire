@@ -72,10 +72,18 @@ fn main() {
     eprintln!("  prompt {prompt:?} → {} tokens", tokens.len());
     let hidden: Vec<f32> = {
         for (i, &t) in tokens.iter().enumerate() {
-            decode_step(&bundle.config, &bundle.weights, &mut bundle.state, &mut gpu, t, i as u32)
-                .unwrap_or_else(|e| panic!("decode_step @ {i}: {e}"));
+            decode_step(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                &mut gpu,
+                t,
+                i as u32,
+            )
+            .unwrap_or_else(|e| panic!("decode_step @ {i}: {e}"));
         }
-        gpu.download_f32(&bundle.state.final_norm_buf).expect("download hidden")
+        gpu.download_f32(&bundle.state.final_norm_buf)
+            .expect("download hidden")
     };
     eprintln!("  hidden finite={}", hidden.iter().all(|v| v.is_finite()));
 
@@ -85,9 +93,15 @@ fn main() {
     let mut all_codes: Vec<u32> = Vec::with_capacity(n_frames * depth_cfg.num_codebooks);
     let mut history: Vec<Vec<u32>> = Vec::new();
     for f in 0..n_frames {
-        let codes =
-            sample_audio_frame(depth_cfg, depth_weights, &mut gpu, &hidden, &history, &mut rng)
-                .unwrap_or_else(|e| panic!("sample_audio_frame @ {f}: {e}"));
+        let codes = sample_audio_frame(
+            depth_cfg,
+            depth_weights,
+            &mut gpu,
+            &hidden,
+            &history,
+            &mut rng,
+        )
+        .unwrap_or_else(|e| panic!("sample_audio_frame @ {f}: {e}"));
         history.push(codes.clone());
         all_codes.extend_from_slice(&codes);
     }
@@ -152,8 +166,8 @@ fn main() {
         .and_then(|s| s.parse().ok())
         .unwrap_or(n_frames); // default: single chunk (isolates tail handling)
     let n_q = codec_cfg.n_q;
-    let mut str_cache = CodecStreamingCache::new(&mut gpu, &codec_cfg, n_frames)
-        .expect("CodecStreamingCache::new");
+    let mut str_cache =
+        CodecStreamingCache::new(&mut gpu, &codec_cfg, n_frames).expect("CodecStreamingCache::new");
     let mut str_waveform: Vec<f32> = Vec::new();
     let n_chunks = n_frames.div_ceil(chunk_frames);
     for c in 0..n_chunks {
@@ -185,7 +199,10 @@ fn main() {
 
     // ── Verify + write WAV ──
     write_wav(std::path::Path::new(&out_wav), &waveform, sr).expect("write_wav");
-    println!("wav: {out_wav}  ({n_frames} frames, {} samples)", waveform.len());
+    println!(
+        "wav: {out_wav}  ({n_frames} frames, {} samples)",
+        waveform.len()
+    );
 
     // The codec decoder uses a Q8 KV cache with stochastic rounding (non-
     // deterministic), so batch-vs-batch itself differs by ~0.09 — bit-exact
@@ -193,7 +210,11 @@ fn main() {
     // for byte-parity). Validate the streaming produces the same LENGTH +
     // finite/non-silent audio (the values match within the Q8 noise band).
     let str_match = str_waveform.len() == waveform.len();
-    let pass = finite && finite2 && non_silent && waveform.len() == n_frames * codec_cfg.frame_samples() && str_match;
+    let pass = finite
+        && finite2
+        && non_silent
+        && waveform.len() == n_frames * codec_cfg.frame_samples()
+        && str_match;
     println!("RESULT: {}", if pass { "PASS" } else { "FAIL" });
     if !pass {
         std::process::exit(1);
