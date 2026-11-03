@@ -89,7 +89,8 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::ep_wave::{
-    ep_wave_expected_moe_calls, ep_wave_layer_moe, ep_wave_policy, ep_wave_refusal,
+    ep_wave_expected_moe_calls, ep_wave_layer_moe, ep_wave_policy, ep_wave_refusal, ep_wave_route,
+    ep_wave_scope_rows, ep_wave_tile_exchange, EpWaveRoute,
 };
 use crate::gpu_forward::{
     bind_ep_lane_gather, ep_lane, ep_lane_buffer, ep_lane_check_invocations, ep_lane_moe_rows,
@@ -1767,12 +1768,16 @@ fn forward_wave_ep(
     if let Some(why) = ep_wave_refusal(&facts) {
         return Err(invalid(why));
     }
+    // Admitted: the route every lane's own tile takes (decided by the refusal's own rule).
+    let route = ep_wave_route(&facts).map_err(invalid)?;
     // `Qwen4Bundle::with_lane` clamps a lane state's F16 arenas to its committed
     // lengths before its tile; the wave's lanes enter the same way.
     for lane in lanes.iter_mut() {
         lane.state.clamp_f16_valid();
     }
-    fwd.ep_wave_run(gpu, total, |fwd, gpu| {
+    // The routing scopes are the lanes' own (the widest lane's rows), never the total's.
+    let scope_rows = ep_wave_scope_rows(&lane_rows);
+    fwd.ep_wave_run(gpu, total, scope_rows, route, |fwd, gpu| {
         forward_lanes_scoped(gpu, fwd, bundle, lanes, out, &policy)
     })
 }
@@ -1794,15 +1799,18 @@ fn forward_lanes_scoped(
     // exact joint full-table prefill instead (`forward_wave_ep`).
     let ep_lane_step = ep_lane(fwd.ep.as_ref(), &fwd.scratch)?.is_some();
     let ep_wave = ep_lane_step && out.prefill();
+    // The route of the wave in flight (set by `ep_wave_run`); `None` outside a wave.
+    let wave_route = fwd.wave_route;
     if ep_wave {
         // `forward_wave_ep` entered the wave's scopes, reserve bank and routing-row cap; a
         // direct caller would run a wide MoE on the gather route (refused below by row cap).
         if !(fwd.lane_scope
             && fwd.prefill_scope
+            && wave_route.is_some()
             && gpu.qwen4_route_rows_cap == QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP)
         {
             return Err(invalid(
-                "an EP prefill wave runs only inside forward_wave_ep (lane and prefill scope, routing-row cap, reserve bank)",
+                "an EP prefill wave runs only inside forward_wave_ep (lane and prefill scope, wave route, routing-row cap, reserve bank)",
             ));
         }
         if policy.share(StageName::Moe) != StageShare::OnceAllRows {
@@ -2292,6 +2300,7 @@ fn forward_lanes_scoped(
             for layer_index in band_scope.band.clone() {
                 let layer_moe = if wave_set {
                     ep_wave_layer_moe(
+                        wave_route.unwrap_or(EpWaveRoute::FullTable),
                         fwd.ep.as_ref(),
                         &fwd.moe,
                         &fwd.moe_borrow,
@@ -2313,7 +2322,14 @@ fn forward_lanes_scoped(
                     &fwd.decode_q8,
                     rows,
                     gpu.few_row_limit(),
-                    rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+                    // The wave's MoE segment declares what the lanes' own singleton tiles do at
+                    // the floor in scope (Tile route: the lowered floor, symmetric capability;
+                    // full-table route: pinned 512); every lane step keeps the default.
+                    if wave_set {
+                        gpu.qwen4_moe_sym_iu4_floor
+                    } else {
+                        rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS
+                    },
                     None,
                 )?);
             }
@@ -2867,11 +2883,14 @@ fn forward_lanes_scoped(
                             // The runtime this invocation selected (the static
                             // runtime outside EP; under EP the singleton's
                             // gathered-forward selection, see `lane_layer_moe`; an
-                            // EP prefill wave's FULL-TABLE runtime of the bank in use,
-                            // exactly the singleton chunk's emission for a
-                            // sub-512-row tile: no gather, no tile exchange).
+                            // EP prefill wave's runtime of the bank in use, exactly the
+                            // singleton chunk's emission for a sub-512-row tile of the wave's
+                            // route: FULL-TABLE (no gather, no tile exchange) or TILE (the
+                            // compact runtime plus the owner-routed tile exchange).
                             if ep_wave {
+                                let route = wave_route.unwrap_or(EpWaveRoute::FullTable);
                                 if let Some(runtime) = ep_wave_layer_moe(
+                                    route,
                                     fwd.ep.as_ref(),
                                     &fwd.moe,
                                     &fwd.moe_borrow,
@@ -2881,6 +2900,15 @@ fn forward_lanes_scoped(
                                 ) {
                                     moe.routed_experts =
                                         runtime.routed_view(false, r, rr, false, 8);
+                                }
+                                if route == EpWaveRoute::Tile {
+                                    moe.tile_exchange = Some(
+                                        ep_wave_tile_exchange(fwd.ep.as_ref()).ok_or_else(|| {
+                                            invalid(
+                                                "a tile-route EP wave needs the installed tile exchange",
+                                            )
+                                        })?,
+                                    );
                                 }
                                 wave_moe_calls += 1;
                             } else if let Some(runtime) =
@@ -5108,6 +5136,26 @@ mod tests {
             per_lane(&items),
             per_lane(&group_major_items(&program, &policy, lanes, groups))
         );
+    }
+
+    /// The exact EP prefill wave keeps every HC stage PER LANE (each lane's HC read / write are
+    /// its singleton tile's launches at the lane's own rows and stream kind; under the trunk
+    /// shard each write is its own all-reduce at the lane's row count): the all-rows HC
+    /// placement of an AR / verify step never reaches it, by the step kind AND by the policy.
+    #[test]
+    fn the_exact_wave_never_takes_the_all_rows_hc_placement() {
+        use crate::gpu_forward::ep_wave::ep_wave_policy;
+        let wave = ep_wave_policy();
+        assert_eq!(wave.share(StageName::HcRead), StageShare::PerLane);
+        assert_eq!(wave.share(StageName::HcWrite), StageShare::PerLane);
+        // Whatever the step kind, flag and row shapes, the wave policy is never admitted ...
+        for ar_step in [false, true] {
+            for groups in [&[8usize, 8][..], &[8, 8, 8, 8], &[5, 5]] {
+                assert!(!hc_all_rows_applies(
+                    true, ar_step, true, false, groups, &wave
+                ));
+            }
+        }
     }
 
     #[test]

@@ -10378,6 +10378,10 @@ pub struct Qwen4GpuForward {
     /// The route the most recent EP lane prefill tile took (`lane_scope` forwards under EP
     /// only): diagnostic for the `HIPFIRE_CB_PHASES` per-tile line, never read by a decision.
     pub(crate) lane_tile_note: Option<ep_reserve_forward::LaneTileNote>,
+    /// The route of the exact EP prefill wave in flight ([`ep_wave::EpWaveRoute`]; set and
+    /// restored by `ep_wave_run`, `None` outside a wave): the lane program binds the wave's MoE
+    /// to the full-table runtime or to the tile runtime plus the exchange accordingly.
+    pub(crate) wave_route: Option<ep_wave::EpWaveRoute>,
     /// Set only by the bundle's prefill entries (`forward_chunk*`,
     /// `spec_prefill_rows*`, `lane_prefill_tile`) around their forward call:
     /// the batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`])
@@ -12712,6 +12716,7 @@ impl Qwen4GpuForward {
             layer_capture: None,
             lane_scope: false,
             lane_tile_note: None,
+            wave_route: None,
             prefill_scope: false,
             #[cfg(feature = "lab")]
             last_verify_reference: None,

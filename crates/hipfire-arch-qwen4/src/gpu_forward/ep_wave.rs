@@ -30,6 +30,18 @@
 //! ([`EpWaveFacts`]); every rank refuses or admits together before any launch, and a refused
 //! wave leaves the caller to run serial lane tiles (today's route).
 
+//! # The tile route
+//!
+//! With the lowered owner-routed floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`, default 9 while the
+//! A8 chain is active) a sub-512-row lane tile runs the owner-routed TILE route on the A8 chain:
+//! each rank computes only the experts it owns, BF16 grouped rows cross the tile exchange once
+//! per layer. A wave of such lanes ([`EpWaveRoute::Tile`]) runs the MoE once per layer over all
+//! rows on that route: the compact runtime, the exchange of the singleton tile chunk, the same
+//! routing-row cap and the lanes' own tile scopes ([`ep_wave_scope_rows`]). Per-slot
+//! independence of the chain (exact int32 K128 epochs in a fixed order, per-row quantization
+//! blocks, tiles owned per EXPERT, per-token combine) is documented in
+//! `qwen4_moe_ep_a8.gfx12.hip`; the dense half is the one the full-table wave proved.
+//!
 use super::ep_reserve_scratch::EpBankRoute;
 use super::*;
 use crate::gpu_forward_lanes::{LaneStagePolicy, StageName, StageShare};
@@ -43,6 +55,30 @@ pub const QWEN4_EP_WAVE_ROW_CAP: usize = 2048;
 /// the `o4_r8_x4` arm the wave runs, but no wave receipt covers it, so those lanes keep their
 /// serial tile until the card says otherwise.
 pub const EXACT_WAVE_MIN_LANE_ROWS: usize = 49;
+
+/// Sub-switch of the TILE-route wave (default OFF until its card identity receipt; the master
+/// switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills both routes): exact `1` lets a burst whose
+/// lanes all take the owner-routed tile route run as ONE tile-route wave. Unset, a burst on the
+/// tile route is refused (`ep wave refused:`) and runs as serial tile-route tiles.
+pub const QWEN4_EP_WAVE_TILE_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_TILE";
+
+/// [`QWEN4_EP_WAVE_TILE_ENV`] parsed: exact `1` is on, anything else is off.
+pub(crate) fn ep_wave_tile_enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+static EP_WAVE_TILE_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    ep_wave_tile_enabled_from(
+        hipfire_config::developer_var(QWEN4_EP_WAVE_TILE_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Whether the tile-route wave is switched on in this process (every rank thread agrees).
+pub(crate) fn ep_wave_tile_enabled() -> bool {
+    *EP_WAVE_TILE_KNOB
+}
 
 /// Lab knob (default unset: [`EXACT_WAVE_MIN_LANE_ROWS`], byte-identical): lowers the fewest
 /// rows of a lane the exact wave takes, to 9 at the lowest (a lane of at most 8 rows runs the
@@ -84,18 +120,32 @@ pub(crate) fn ep_wave_policy() -> LaneStagePolicy {
         .expect("the MoE is not a stateful stage")
 }
 
+/// The route a wave reproduces: the one every lane's own singleton tile takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EpWaveRoute {
+    /// The EP FULL-TABLE MoE (every rank computes every expert; no exchange): sub-512 tiles on a
+    /// load whose owner-routed floor is 512 (A8 killed, knob 512, no tile transport).
+    FullTable,
+    /// The owner-routed TILE route (each rank its owned experts, BF16 grouped rows exchanged per
+    /// layer) on the A8 chain: sub-512 tiles under the lowered floor (default 9).
+    Tile,
+}
+
 /// Host facts of one wave, identical on every rank. All of them are decided from replicated
 /// state (lane rows, config, flags), never from device contents.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EpWaveFacts {
     /// Rows of every lane, in lane order.
     pub lane_rows: Vec<usize>,
-    /// Per lane: the lane's own rows take the owner-routed tile route (its singleton is then
-    /// not the full-table tile the wave reproduces).
+    /// Per lane: the lane's own rows take the owner-routed tile route (see [`ep_wave_route`]).
     pub lane_tile: Vec<bool>,
+    /// Per lane: the A8 chain is the lane's active owner-routed chain (`Gpu::qwen4_moe_ep_a8_requested`
+    /// under the lane's own tile scopes).
+    pub lane_a8: Vec<bool>,
     /// The EP full tables are built (`attach_ep` ran).
     pub moe_full_ready: bool,
-    /// Trunk-shard partial FFN route: its chunks bind the compact table, not the full one.
+    /// Trunk-shard partial FFN route: its chunks bind the compact table with the all-reduce of
+    /// the FFN HC write, a route neither wave reproduces.
     pub ffn_partial: bool,
     /// A non-EP decode-share bank swap or borrowed runtime view is configured.
     pub decode_share: bool,
@@ -104,13 +154,21 @@ pub(crate) struct EpWaveFacts {
     pub scoped_route: bool,
     /// Fewest rows of a lane the wave takes ([`exact_wave_min_lane_rows`]).
     pub min_lane_rows: usize,
-    /// Rows the selected scratch holds for the F32 grouped chain: the forward's `max_chunk` in
-    /// Full scratch mode, `QWEN4_COMPACT_FALLBACK_ROWS` in compact mode; on an EP reserve load
-    /// the resident bank's call limit.
+    /// FullTable route: rows the selected scratch holds for the F32 grouped chain: the forward's
+    /// `max_chunk` in Full scratch mode, `QWEN4_COMPACT_FALLBACK_ROWS` in compact mode; on an EP
+    /// reserve load the resident bank's call limit.
     pub capacity_rows: usize,
+    /// Tile route: rows its chain holds: the forward's `max_chunk` (the BF16 grouped chain has no
+    /// compact-mode limit: a wide singleton chunk runs it in either scratch mode); on an EP
+    /// reserve load the resident bank's call limit (a wider wave would take the borrowed bank,
+    /// which no wave receipt covers).
+    pub tile_capacity_rows: usize,
     /// An EP reserve load refuses the wave's full-table call (`EpEpoch::plan_call` with the
     /// full-table route): its reason.
     pub reserve_refusal: Option<String>,
+    /// The tile-route wave is switched on ([`ep_wave_tile_enabled`]); the full-table wave needs
+    /// no sub-switch (the master switch decides).
+    pub tile_wave_enabled: bool,
 }
 
 impl EpWaveFacts {
@@ -129,7 +187,7 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
     for (lane, &rows) in facts.lane_rows.iter().enumerate() {
         if !(facts.min_lane_rows..=EXACT_WAVE_MAX_LANE_ROWS).contains(&rows) {
             return refuse(format!(
-                "lane {lane} has {rows} rows, outside {}..={EXACT_WAVE_MAX_LANE_ROWS} (its serial tile is not the sub-512 full-table route the wave reproduces)",
+                "lane {lane} has {rows} rows, outside {}..={EXACT_WAVE_MAX_LANE_ROWS} (its serial tile is not a sub-512-row tile of the route the wave reproduces)",
                 facts.min_lane_rows
             ));
         }
@@ -145,7 +203,7 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
     }
     if facts.ffn_partial {
         return refuse(
-            "the trunk-shard partial FFN route binds the compact table, not the full one"
+            "the trunk-shard partial FFN route binds the compact table with its own reduction, not either route a wave reproduces"
                 .to_string(),
         );
     }
@@ -155,30 +213,72 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
     if facts.scoped_route {
         return refuse("a routing scope (invariant / append route) is active".to_string());
     }
-    if let Some(lane) = facts.lane_tile.iter().position(|tile| *tile) {
-        return refuse(format!(
-            "lane {lane} ({} rows) takes the owner-routed tile route on its own",
-            facts.lane_rows[lane]
-        ));
+    match ep_wave_route(facts) {
+        Err(why) => refuse(why),
+        Ok(EpWaveRoute::FullTable) => {
+            if total > facts.capacity_rows {
+                return refuse(format!(
+                    "{total} rows exceed the {} rows the selected scratch holds for the F32 grouped chain",
+                    facts.capacity_rows
+                ));
+            }
+            if let Some(why) = facts.reserve_refusal.as_ref() {
+                return refuse(format!(
+                    "the EP reserve refuses the full-table call ({why})"
+                ));
+            }
+            None
+        }
+        Ok(EpWaveRoute::Tile) => {
+            if !facts.tile_wave_enabled {
+                return refuse(format!(
+                    "the tile-route wave is not enabled ({QWEN4_EP_WAVE_TILE_ENV}=1; off until its card identity receipt)"
+                ));
+            }
+            if let Some(lane) = facts.lane_a8.iter().position(|a8| !*a8) {
+                return refuse(format!(
+                    "lane {lane} ({} rows) is on the tile route without the A8 chain; only the A8 tile chain is proven per-slot independent",
+                    facts.lane_rows[lane]
+                ));
+            }
+            if total > facts.tile_capacity_rows {
+                return refuse(format!(
+                    "{total} rows exceed the {} rows the tile route's scratch / resident bank holds",
+                    facts.tile_capacity_rows
+                ));
+            }
+            None
+        }
     }
-    if total > facts.capacity_rows {
-        return refuse(format!(
-            "{total} rows exceed the {} rows the selected scratch holds for the F32 grouped chain",
-            facts.capacity_rows
-        ));
+}
+
+/// The route a wave takes, decided from its lanes' own routes: every lane's singleton tile on
+/// the FULL-TABLE route -> [`EpWaveRoute::FullTable`], every lane's on the owner-routed TILE
+/// route -> [`EpWaveRoute::Tile`]; lanes of both kinds (a floor between their rows) have no
+/// single route to reproduce.
+pub(crate) fn ep_wave_route(facts: &EpWaveFacts) -> Result<EpWaveRoute, String> {
+    let tiles = facts.lane_tile.iter().filter(|tile| **tile).count();
+    if tiles == 0 {
+        Ok(EpWaveRoute::FullTable)
+    } else if tiles == facts.lane_tile.len() {
+        Ok(EpWaveRoute::Tile)
+    } else {
+        let first_tile = facts.lane_tile.iter().position(|tile| *tile).unwrap_or(0);
+        let first_full = facts.lane_tile.iter().position(|tile| !*tile).unwrap_or(0);
+        Err(format!(
+            "the lanes' own routes differ: lane {first_tile} ({} rows) takes the owner-routed tile route, lane {first_full} ({} rows) the full-table route",
+            facts.lane_rows[first_tile], facts.lane_rows[first_full]
+        ))
     }
-    if let Some(why) = facts.reserve_refusal.as_ref() {
-        return refuse(format!(
-            "the EP reserve refuses the full-table call ({why})"
-        ));
-    }
-    None
 }
 
 /// The runtime a wave's MoE invocation of `layer` binds: exactly the singleton chunk's
-/// full-table selection (`select_layer_moe` with `full_chunk` and no tile route: the layer's EP
-/// full runtime of the bank in use, never the balanced live or the decode table).
+/// selection for a sub-512-row tile of the wave's route (`select_layer_moe` with `full_chunk`):
+/// [`EpWaveRoute::FullTable`] the layer's EP full runtime of the bank in use (never the balanced
+/// live or the decode table), [`EpWaveRoute::Tile`] the compact (owned-experts) runtime the
+/// owner-routed tile exchange reads.
 pub(crate) fn ep_wave_layer_moe<'a>(
+    route: EpWaveRoute,
     ep: Option<&'a Qwen4ForwardEp>,
     moe: &'a [Option<Qwen4MoeLayerRuntime>],
     moe_borrow: &'a [Vec<Option<Qwen4MoeLayerRuntime>>],
@@ -191,14 +291,45 @@ pub(crate) fn ep_wave_layer_moe<'a>(
         None,
         ep.map(|ep| ep.moe_full.get(layer)),
         true,
-        false,
+        route == EpWaveRoute::Tile,
         tile_moe.get(layer).and_then(Option::as_ref),
     )
+}
+
+/// The owner-routed tile exchange a Tile-route wave binds to every MoE invocation: the
+/// installed transport and this rank's masked tile ids, exactly the singleton tile chunk's
+/// `MoeTileExchangeParams`. `None` without an installed transport.
+pub(crate) fn ep_wave_tile_exchange(
+    ep: Option<&Qwen4ForwardEp>,
+) -> Option<hipfire_dispatch::families::moe::MoeTileExchangeParams<'_>> {
+    let route = ep?.tile.as_ref()?;
+    Some(hipfire_dispatch::families::moe::MoeTileExchangeParams {
+        exchange: route.hook.as_deref()?,
+        tile_ids_owned: &route.tile_ids_owned,
+    })
+}
+
+/// Rows of the routing scopes ([`Qwen4GpuForward::enter_tile_scopes`]) a wave runs under: the
+/// widest LANE, never the wave total. The scopes a tile enters key on its rows (the A8 chain is
+/// the default only below 512 rows, the sub-512 floor follows it), and the wave must run under
+/// exactly the scopes every lane's own singleton tile enters; the total (up to 2048 rows) would
+/// select the >= 512-row A4 chain and the 512 floor.
+pub(crate) fn ep_wave_scope_rows(lane_rows: &[usize]) -> usize {
+    lane_rows.iter().copied().max().unwrap_or(0)
 }
 
 /// The wave program's MoE invocation count: one per MoE layer of the band, never one per lane.
 pub(crate) fn ep_wave_expected_moe_calls(moe_layers: usize) -> usize {
     moe_layers
+}
+
+/// Rows the Tile route's chain holds (see [`EpWaveFacts::tile_capacity_rows`]): the forward's
+/// `max_chunk` whatever the scratch mode, on an EP reserve load at most the resident bank.
+pub(crate) fn ep_wave_tile_rows(
+    max_chunk: usize,
+    reserve_resident_call_limit: Option<usize>,
+) -> usize {
+    reserve_resident_call_limit.map_or(max_chunk, |limit| max_chunk.min(limit))
 }
 
 /// Rows the F32 grouped chain's scratch holds (see [`EpWaveFacts::capacity_rows`]).
@@ -230,27 +361,32 @@ impl Qwen4GpuForward {
         let prior_prefill = std::mem::replace(&mut self.prefill_scope, true);
         // (tile route, any scope entered) of `rows` rows under the routing scopes a prefill tile
         // of those rows enters.
-        let probe = |this: &Self, gpu: &mut Gpu, rows: usize| -> (bool, bool) {
+        let probe = |this: &Self, gpu: &mut Gpu, rows: usize| -> (bool, bool, bool) {
             let (pm_invariant, append) = Self::route_scopes(this.prefill_scope, gpu, rows);
             let (saved, _) = this.enter_tile_scopes(gpu, rows);
             let route_rows = gpu.route_rows(rows);
             let tile =
                 ep_reserve_forward::ep_tile_active(this.ep.as_ref(), gpu, config, rows, route_rows);
+            let a8 = gpu.qwen4_moe_ep_a8_requested();
             Self::leave_tile_scopes(gpu, saved);
-            (tile, pm_invariant || append)
+            (tile, pm_invariant || append, a8)
         };
         let mut scoped_route = probe(self, gpu, total).1;
         let mut lane_tile = Vec::with_capacity(lane_rows.len());
+        let mut lane_a8 = Vec::with_capacity(lane_rows.len());
         for &rows in lane_rows {
-            let (tile, scoped) = probe(self, gpu, rows);
+            let (tile, scoped, a8) = probe(self, gpu, rows);
             lane_tile.push(tile);
+            lane_a8.push(a8);
             scoped_route |= scoped;
         }
         self.prefill_scope = prior_prefill;
         let reserve = self.ep_reserve.as_ref();
+        let resident_limit = reserve.map(|reserve| reserve.banks.resident_call_limit());
         EpWaveFacts {
             lane_rows: lane_rows.to_vec(),
             lane_tile,
+            lane_a8,
             moe_full_ready: self
                 .ep
                 .as_ref()
@@ -263,8 +399,9 @@ impl Qwen4GpuForward {
             capacity_rows: ep_wave_scratch_rows(
                 self.scratch.mode,
                 self.scratch.max_chunk,
-                reserve.map(|reserve| reserve.banks.resident_call_limit()),
+                resident_limit,
             ),
+            tile_capacity_rows: ep_wave_tile_rows(self.scratch.max_chunk, resident_limit),
             reserve_refusal: reserve.and_then(|reserve| {
                 reserve
                     .epoch
@@ -276,6 +413,7 @@ impl Qwen4GpuForward {
                     )
                     .err()
             }),
+            tile_wave_enabled: ep_wave_tile_enabled(),
         }
     }
 
@@ -306,42 +444,58 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
-    /// Run a wave's forward `run` over `n` total rows as a lane prefill tile of the full-table
-    /// route: lane and prefill scope set, the whole-prompt entry bracketed (nest-safe: the
-    /// caller's own bracket makes this one inner), the routing scopes of a prefill tile entered,
-    /// the singleton's full-table prelude, the EP reserve bank switch (restore of a dirty epoch,
-    /// resident bank) taken exactly as a singleton tile takes it, the routing-row cap set for
-    /// the call, and everything put back on every return path.
+    /// Run a wave's forward `run` over `n` total rows as a lane prefill tile of `route`: lane and
+    /// prefill scope set, the whole-prompt entry bracketed (nest-safe: the caller's own bracket
+    /// makes this one inner), the routing scopes of a prefill tile entered for `scope_rows` (the
+    /// widest LANE, [`ep_wave_scope_rows`]), on the full-table route the singleton's prelude, the
+    /// EP reserve bank switch (restore of a dirty epoch, resident bank) taken exactly as a
+    /// singleton tile of that route takes it, the routing-row cap set for the call, and
+    /// everything put back on every return path.
     pub(crate) fn ep_wave_run(
         &mut self,
         gpu: &mut Gpu,
         n: usize,
+        scope_rows: usize,
+        route: EpWaveRoute,
         run: impl FnOnce(&mut Self, &mut Gpu) -> Result<(), Qwen4GpuForwardError>,
     ) -> Result<(), Qwen4GpuForwardError> {
         self.share_check()?;
         let prior_prefill = std::mem::replace(&mut self.prefill_scope, true);
         let prior_lane = std::mem::replace(&mut self.lane_scope, true);
+        let prior_route = self.wave_route.replace(route);
         self.share_prompt_begin();
         self.ep_ordinary_note_call(n);
-        let (scopes, _) = self.enter_tile_scopes(gpu, n);
-        // The wave's wide MoE call is a full-table call: the sub-512 floor of the owner-routed
-        // tile route (`ep_prefill_tile_sym_floor`) never reaches it. An admitted wave has no lane
-        // on the tile route, but a floor between the lanes' rows and the cap (knob 100, lanes of
-        // 60 rows) would still let the routing cap's 511 rows select the symmetric arm that no
-        // lane's own singleton takes; `leave_tile_scopes` restores the floor.
-        gpu.qwen4_moe_sym_iu4_floor = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS;
+        let (scopes, _) = self.enter_tile_scopes(gpu, scope_rows);
+        if route == EpWaveRoute::FullTable {
+            // The wave's wide MoE call is a full-table call: the sub-512 floor of the owner-routed
+            // tile route (`ep_prefill_tile_sym_floor`) never reaches it. An admitted full-table
+            // wave has no lane on the tile route, but a floor between the lanes' rows and the cap
+            // (knob 100, lanes of 60 rows) would still let the routing cap's 511 rows select the
+            // symmetric arm that no lane's own singleton takes; `leave_tile_scopes` restores it.
+            // The Tile route keeps the floor of the lanes' own scopes (every lane is at or above
+            // it, so is the cap).
+            gpu.qwen4_moe_sym_iu4_floor = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS;
+        }
         let prior_cap = std::mem::replace(
             &mut gpu.qwen4_route_rows_cap,
             QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP,
         );
+        let bank_route = match route {
+            EpWaveRoute::FullTable => EpBankRoute::FullTable,
+            EpWaveRoute::Tile => EpBankRoute::TileExchange,
+        };
         let result = (|| {
             if self.ep_reserve.is_some() {
-                self.ep_reserve_call(gpu, n, EpBankRoute::FullTable, false, |this, gpu| {
-                    this.ep_wave_prelude(gpu)?;
+                self.ep_reserve_call(gpu, n, bank_route, false, |this, gpu| {
+                    if route == EpWaveRoute::FullTable {
+                        this.ep_wave_prelude(gpu)?;
+                    }
                     run(this, gpu)
                 })
             } else {
-                self.ep_wave_prelude(gpu)?;
+                if route == EpWaveRoute::FullTable {
+                    self.ep_wave_prelude(gpu)?;
+                }
                 run(self, gpu)
             }
         })();
@@ -350,6 +504,7 @@ impl Qwen4GpuForward {
         let ended = self.share_prompt_end(gpu, result.is_ok());
         self.prefill_scope = prior_prefill;
         self.lane_scope = prior_lane;
+        self.wave_route = prior_route;
         merge_share_result(result, ended)
     }
 
@@ -358,7 +513,7 @@ impl Qwen4GpuForward {
     pub(crate) fn ep_wave_note(&mut self, rows: usize) {
         self.lane_tile_note = Some(ep_reserve_forward::LaneTileNote {
             rows,
-            tile_exchange: false,
+            tile_exchange: self.wave_route == Some(EpWaveRoute::Tile),
             staged: false,
             stage_min_rows: None,
         });
@@ -373,13 +528,16 @@ mod tests {
         EpWaveFacts {
             lane_rows: lane_rows.to_vec(),
             lane_tile: vec![false; lane_rows.len()],
+            lane_a8: vec![true; lane_rows.len()],
             moe_full_ready: true,
             ffn_partial: false,
             decode_share: false,
             scoped_route: false,
             min_lane_rows: EXACT_WAVE_MIN_LANE_ROWS,
             capacity_rows: 4096,
+            tile_capacity_rows: 4096,
             reserve_refusal: None,
+            tile_wave_enabled: true,
         }
     }
 
@@ -475,6 +633,19 @@ mod tests {
         cases.push(f);
         let mut f = facts(&[200, 200]);
         f.lane_tile = vec![false, true];
+        f.lane_a8 = vec![true, true];
+        cases.push(f);
+        let mut f = facts(&[200, 200]);
+        f.lane_tile = vec![true, true];
+        f.lane_a8 = vec![true, false];
+        cases.push(f);
+        let mut f = facts(&[200, 200]);
+        f.lane_tile = vec![true, true];
+        f.tile_capacity_rows = 399;
+        cases.push(f);
+        let mut f = facts(&[200, 200]);
+        f.lane_tile = vec![true, true];
+        f.tile_wave_enabled = false;
         cases.push(f);
         let mut f = facts(&[200, 200]);
         f.capacity_rows = 399;
@@ -496,12 +667,12 @@ mod tests {
     }
 
     /// The sub-512 owner-routed floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`, default 9 on the A8
-    /// chain) sends a lane tile of at least the floor to the tile route, which the full-table
-    /// wave cannot reproduce: such a burst is refused (serial tiles on the tile route). The
-    /// lane's route is the pure admission `rows >= max(floor, few-row limit + 1)` that
-    /// `Gpu::qwen4_moe_sym_iu4_applies` evaluates with the floor in scope.
+    /// chain) decides each lane's own route: `rows >= max(floor, few-row limit + 1)` on a load with
+    /// the tile hook (the pure admission `Gpu::qwen4_moe_sym_iu4_applies` evaluates with the
+    /// floor in scope). Lanes all on the tile route are the Tile wave, none the FullTable wave,
+    /// a mix has no route and the wave is refused.
     #[test]
-    fn a_lowered_floor_refuses_the_wave_for_lanes_on_the_tile_route() {
+    fn the_floor_decides_the_wave_route_and_a_mix_refuses() {
         use super::ep_reserve_forward::ep_prefill_tile_sym_floor;
         let few = rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
         let facts_under = |knob: Option<usize>, hook: bool, a8: bool, lanes: &[usize]| {
@@ -511,9 +682,11 @@ mod tests {
                 .iter()
                 .map(|&rows| hook && rows >= floor.max(few + 1))
                 .collect();
+            f.lane_a8 = vec![a8; lanes.len()];
             f
         };
-        // Default (unset knob) on the A8 chain: every 49..=511-row lane is on the tile route.
+        // Default (unset knob) on the A8 chain: every 49..=511-row lane is on the tile route and
+        // the wave is the Tile wave.
         for lanes in [
             &[149usize; 8][..],
             &[60; 8],
@@ -521,37 +694,118 @@ mod tests {
             &[60, 60, 149, 256],
         ] {
             let f = facts_under(None, true, true, lanes);
-            assert!(
-                refused(&f).contains("takes the owner-routed tile route"),
-                "{lanes:?}: {}",
-                refused(&f)
-            );
+            assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::Tile), "{lanes:?}");
+            assert_eq!(ep_wave_refusal(&f), None, "{lanes:?}");
         }
-        // A8 killed, floor kill switch (512), no tile hook: today's full-table lanes, wave admitted.
-        assert_eq!(
-            ep_wave_refusal(&facts_under(None, true, false, &[149; 8])),
-            None
-        );
-        assert_eq!(
-            ep_wave_refusal(&facts_under(None, true, true, &[149; 8])).is_some(),
-            true
-        );
-        assert_eq!(
-            ep_wave_refusal(&facts_under(Some(512), true, true, &[149; 8])),
-            None
-        );
-        assert_eq!(
-            ep_wave_refusal(&facts_under(None, false, true, &[149; 8])),
-            None
-        );
-        // A lab floor above every lane keeps them on the full table (wave admitted); one lane at
-        // the floor refuses the whole wave, naming that lane.
-        assert_eq!(
-            ep_wave_refusal(&facts_under(Some(300), true, true, &[60, 149, 256])),
-            None
-        );
+        // A8 killed (floor 512), the floor kill switch, no tile hook, not a prefill forward:
+        // today's full-table lanes, the FullTable wave.
+        for f in [
+            facts_under(None, true, false, &[149; 8]),
+            facts_under(Some(512), true, true, &[149; 8]),
+            facts_under(None, false, true, &[149; 8]),
+        ] {
+            assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::FullTable));
+            assert_eq!(ep_wave_refusal(&f), None);
+        }
+        // A lab floor above every lane keeps them all on the full table; a floor in the middle
+        // of the burst splits it into two routes: refused, naming one lane of each route.
+        let f = facts_under(Some(300), true, true, &[60, 149, 256]);
+        assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::FullTable));
+        assert_eq!(ep_wave_refusal(&f), None);
         let f = facts_under(Some(150), true, true, &[60, 149, 150]);
-        assert!(refused(&f).contains("lane 2 (150 rows)"), "{}", refused(&f));
+        let why = refused(&f);
+        assert!(
+            why.contains("differ")
+                && why.contains("lane 2 (150 rows) takes the owner-routed tile route")
+                && why.contains("lane 0 (60 rows) the full-table route"),
+            "{why}"
+        );
+        // A lab floor of 100 on the A4 chain puts the lanes at or above it on the tile route
+        // without A8: refused (only the A8 tile chain is proven per-slot independent).
+        let f = facts_under(Some(100), true, false, &[149, 256]);
+        assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::Tile));
+        assert!(
+            refused(&f).contains("without the A8 chain"),
+            "{}",
+            refused(&f)
+        );
+    }
+
+    /// The tile-route wave is off until its card receipt: unset (and anything but exact `1`) it is
+    /// refused by name and the burst runs serial tile-route tiles; the full-table wave is not
+    /// gated by it.
+    #[test]
+    fn the_tile_wave_needs_its_own_sub_switch_and_the_full_table_wave_does_not() {
+        for off in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("true"),
+            Some("on"),
+            Some("2"),
+        ] {
+            assert!(!ep_wave_tile_enabled_from(off), "{off:?}");
+        }
+        assert!(ep_wave_tile_enabled_from(Some("1")));
+        assert!(ep_wave_tile_enabled_from(Some(" 1 ")));
+        assert_eq!(QWEN4_EP_WAVE_TILE_ENV, "HIPFIRE_EP_LANE_PREFILL_WAVE_TILE");
+        let mut tile = facts(&[149; 8]);
+        tile.lane_tile = vec![true; 8];
+        assert_eq!(ep_wave_refusal(&tile), None);
+        tile.tile_wave_enabled = false;
+        assert!(
+            refused(&tile).contains(QWEN4_EP_WAVE_TILE_ENV),
+            "{}",
+            refused(&tile)
+        );
+        let mut full = facts(&[149; 8]);
+        full.tile_wave_enabled = false;
+        assert_eq!(ep_wave_refusal(&full), None);
+    }
+
+    #[test]
+    fn the_tile_wave_has_its_own_capacity_and_ignores_the_full_table_ones() {
+        let mut f = facts(&[300, 300]);
+        f.lane_tile = vec![true; 2];
+        // The F32 grouped chain's capacity (compact scratch: 512 rows) and the full-table
+        // reserve refusal are the FullTable wave's, not the Tile wave's.
+        f.capacity_rows = 512;
+        f.reserve_refusal = Some("full peer tables".to_string());
+        assert_eq!(ep_wave_refusal(&f), None);
+        f.tile_capacity_rows = 599;
+        assert!(
+            refused(&f).contains("tile route's scratch"),
+            "{}",
+            refused(&f)
+        );
+        f.tile_capacity_rows = 600;
+        assert_eq!(ep_wave_refusal(&f), None);
+        assert_eq!(ep_wave_tile_rows(4096, None), 4096);
+        assert_eq!(ep_wave_tile_rows(4096, Some(512)), 512);
+        assert_eq!(ep_wave_tile_rows(256, Some(512)), 256);
+        // Trunk shard and the other route-independent refusals hold on the Tile route too.
+        let mut g = facts(&[300, 300]);
+        g.lane_tile = vec![true; 2];
+        g.ffn_partial = true;
+        assert!(refused(&g).contains("trunk-shard"), "{}", refused(&g));
+    }
+
+    /// The Tile wave runs under the scopes of its lanes' own tiles: `enter_tile_scopes` is entered
+    /// with the widest lane's rows, never the total (a total of 512+ rows would select the A4
+    /// chain and the 512 floor, the chain no lane's singleton takes).
+    #[test]
+    fn the_wave_enters_the_tile_scopes_with_the_widest_lane_not_the_total() {
+        assert_eq!(ep_wave_scope_rows(&[149; 8]), 149);
+        assert_eq!(ep_wave_scope_rows(&[60, 60, 149, 256, 511]), 511);
+        assert!(ep_wave_scope_rows(&[511; 4]) < rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS);
+        assert_eq!(ep_wave_scope_rows(&[]), 0);
+        let src = include_str!("ep_wave.rs");
+        let body = &src[..src.find("#[cfg(test)]").unwrap()];
+        assert!(body.contains("self.enter_tile_scopes(gpu, scope_rows)"));
+        assert!(!body.contains("self.enter_tile_scopes(gpu, n)"));
+        let lanes = include_str!("../gpu_forward_lanes.rs");
+        assert!(lanes.contains("ep_wave_scope_rows(&lane_rows)"));
+        assert!(lanes.contains("fwd.ep_wave_run(gpu, total, scope_rows, route,"));
     }
 
     #[test]
@@ -605,31 +859,44 @@ mod tests {
         assert_eq!(ep_wave_expected_moe_calls(48), 48);
     }
 
-    /// Pins that bind the wave to the singleton's full-table emission: the sealed call binds no
-    /// gather and no tile exchange, picks the full runtime, runs the singleton's prelude once
-    /// inside the reserve bracket, and sets and restores the routing-row cap.
+    /// Pins that bind each wave route to its singleton's emission: the FullTable wave binds no
+    /// gather and no tile exchange, picks the full runtime and runs the singleton's prelude
+    /// once inside the reserve bracket with its floor pinned to 512; the Tile wave binds the
+    /// compact runtime plus the installed exchange, the TileExchange bank route, no prelude, and
+    /// keeps the floor of the lanes' own scopes; both set and restore the routing-row cap.
     #[test]
-    fn the_wave_is_the_full_table_emission_by_construction() {
+    fn each_wave_route_is_its_singletons_emission_by_construction() {
         let src = include_str!("ep_wave.rs");
         let body = &src[..src.find("#[cfg(test)]").unwrap()];
-        assert!(
-            !body.contains("tile_exchange ="),
-            "no tile exchange is bound"
-        );
         assert!(!body.contains("row_gather"), "no gather is bound");
         assert!(body.contains("select_layer_moe("));
-        assert!(body.contains("EpBankRoute::FullTable"));
-        assert!(!body.contains("EpBankRoute::TileExchange"));
+        // Full-table: the full runtime (`compact_chunk` false), the full-table bank route, the
+        // singleton prelude exactly on that route, the floor pin.
+        assert!(
+            body.contains("route == EpWaveRoute::Tile,\n"),
+            "compact runtime only on Tile"
+        );
+        assert!(body.contains("EpWaveRoute::FullTable => EpBankRoute::FullTable"));
         assert_eq!(body.matches("ep_wave_prelude(gpu)?").count(), 2);
-        assert_eq!(body.matches("gpu.qwen4_route_rows_cap").count(), 2);
+        assert_eq!(
+            body.matches("if route == EpWaveRoute::FullTable {").count(),
+            3
+        );
         assert!(body.contains("before_down(gpu)"));
-        // The wave's wide call is a full-table call whatever sub-512 floor the tile scope set.
+        assert!(body.contains("HOST_STAGE_QUIESCE"));
         assert!(
             body.contains(
                 "gpu.qwen4_moe_sym_iu4_floor = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS"
             ),
-            "the wave pins the symmetric-IU4 floor to 512"
+            "the full-table wave pins the symmetric-IU4 floor to 512"
         );
-        assert!(body.contains("HOST_STAGE_QUIESCE"));
+        // Tile: the tile bank route and the exchange of the installed transport.
+        assert!(body.contains("EpWaveRoute::Tile => EpBankRoute::TileExchange"));
+        assert!(body.contains("exchange: route.hook.as_deref()?"));
+        assert!(body.contains("tile_ids_owned: &route.tile_ids_owned"));
+        // Both routes run under the routing-row cap, set and restored once.
+        assert_eq!(body.matches("gpu.qwen4_route_rows_cap").count(), 2);
+        assert_eq!(body.matches("self.wave_route.replace(route)").count(), 1);
+        assert_eq!(body.matches("self.wave_route = prior_route").count(), 1);
     }
 }
