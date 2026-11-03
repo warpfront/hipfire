@@ -787,7 +787,14 @@ async fn serve_connection(
     builder
         .timer(TokioTimer::new())
         .header_read_timeout(HEADER_READ_TIMEOUT);
-    let conn = builder.serve_connection(TokioIo::new(io), service);
+    // with_upgrades: hyper 1.x only wires `hyper::upgrade::on(request)` when
+    // the connection carries the upgrade intent — the plain `serve_connection`
+    // drops it and the realtime WebSocket handshake dies with "upgrade
+    // expected but low level API in use" (session.created never reached the
+    // client). The UpgradeableConnection future keeps graceful_shutdown.
+    let conn = builder
+        .serve_connection(TokioIo::new(io), service)
+        .with_upgrades();
     tokio::pin!(conn);
     let mut draining = false;
     let result = loop {

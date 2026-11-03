@@ -953,8 +953,12 @@ impl GenerationRoute {
     /// `Qwen35Emit`). Each matches only the answer channel, holds a possible
     /// stop prefix back, and never emits the stop text. `RaonAr` rides the
     /// same `generate_ar_with_forward` producer as Qwen4 AR, and `RaonSpec`
-    /// the `Qwen35Emit` matcher like `Qwen4Spec`. Every other route
-    /// would ignore `stop` or leak it, so `generate` refuses it.
+    /// the `Qwen35Emit` matcher like `Qwen4Spec`. `LfmAr` (LFM3 arch 24 and
+    /// LFM2.5-MoE arch 11) honours stop through the runtime `StopMatcher` fed
+    /// in its host-side decode loop — same hold-back semantics: the stop text
+    /// itself is never emitted, and a held partial tail is flushed as a final
+    /// token event on a natural stop. Every other route would ignore `stop`
+    /// or leak it, so `generate` refuses it.
     pub const fn supports_stop(self) -> bool {
         matches!(
             self,
@@ -964,6 +968,7 @@ impl GenerationRoute {
                 | Self::QwenDflash
                 | Self::RaonAr
                 | Self::RaonSpec
+                | Self::LfmAr
         )
     }
 
@@ -3309,6 +3314,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                stop,
             );
             return;
         }
@@ -3328,6 +3334,7 @@ pub fn generate(
                     enable_thinking,
                     tools,
                     messages_history,
+                    stop,
                 );
                 return;
             }
@@ -3353,6 +3360,7 @@ pub fn generate(
                 max_think_tokens,
                 tools,
                 messages_history,
+                stop,
             );
             return;
         }

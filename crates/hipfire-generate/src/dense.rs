@@ -6133,6 +6133,11 @@ pub fn generate_lfm2moe(
     max_think_tokens: usize,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    // [OI] `stop` sequences (LfmAr declares supports_stop): matched on the
+    // client-visible answer text only (tool-span text never passes through),
+    // the stop text itself is never emitted, held partial tails flush at the
+    // natural stop.
+    stop: &[String],
 ) {
     if m.tokenizer.is_none() {
         emit_active_attempt_error(
@@ -6444,6 +6449,7 @@ pub fn generate_lfm2moe(
     let mut tool_span_tokens: Vec<u32> = Vec::new();
     let mut tool_body_tokens: Vec<u32> = Vec::new();
     let mut tool_calls: Vec<hipfire_runtime::prompt_frame::ToolCall> = Vec::new();
+    let mut stop_matcher = hipfire_runtime::stop_sequence::StopMatcher::new(stop);
     let mut hit_eos = false;
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
@@ -6560,7 +6566,20 @@ pub fn generate_lfm2moe(
             continue;
         }
 
-        emit_dense_token_text(stdout, id, &text_stream.push(tokenizer, next_tok));
+        // [OI] stop matching on the visible answer: emit only what is now
+        // safe (a possible stop prefix is held back), and end the turn when a
+        // stop sequence matches — the stop text itself is never emitted.
+        {
+            let piece = text_stream.push(tokenizer, next_tok);
+            let visible = stop_matcher.push(&piece);
+            if !visible.is_empty() {
+                emit_dense_token_text(stdout, id, visible.as_ref());
+            }
+        }
+        if stop_matcher.matched() {
+            hit_eos = true;
+            break;
+        }
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -6600,7 +6619,21 @@ pub fn generate_lfm2moe(
             return;
         }
     }
-    emit_dense_token_text(stdout, id, &text_stream.flush());
+    // Loop ended without a stop match: the text_stream tail + any held
+    // stop-prefix tail are legitimate output — release them.
+    {
+        let tail = text_stream.flush();
+        let visible = stop_matcher.push(&tail);
+        if !visible.is_empty() {
+            emit_dense_token_text(stdout, id, visible.as_ref());
+        }
+        if !stop_matcher.matched() {
+            let held = stop_matcher.finish();
+            if !held.is_empty() {
+                emit_dense_token_text(stdout, id, &held);
+            }
+        }
+    }
 
     // Unclosed tool span (EOS or max_tokens landed mid-call): never
     // fabricate a call from a truncated body — re-emit the buffered span

@@ -55,6 +55,11 @@ pub fn generate_lfm3(
     enable_thinking: bool,
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    // [OI] `stop` sequences (LfmAr declares supports_stop). Matched on the
+    // client-visible answer text via the runtime StopMatcher: the stop text
+    // itself is never emitted, a held partial tail is flushed as a final
+    // token event on a natural stop.
+    stop: &[String],
 ) {
     // THINK-1: derive started_in_think from the frame actually rendered, not
     // from `max_think_tokens != 1`. That flag is correct for the Jinja path
@@ -281,6 +286,7 @@ pub fn generate_lfm3(
     let mut rng = sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
+    let mut stop_matcher = hipfire_runtime::stop_sequence::StopMatcher::new(stop);
     let decode_t0 = Instant::now();
     loop {
         if generated_count >= max_tokens {
@@ -306,14 +312,23 @@ pub fn generate_lfm3(
         if matches!(frag.as_str(), "" | "</s>" | "<|im_end|>") {
             break;
         }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
+        // [OI] stop matching on the visible answer: emit only what is now
+        // safe (a possible stop prefix is held back), and end the turn when a
+        // stop sequence matches — the stop text itself is never emitted.
+        let visible = stop_matcher.push(&frag);
+        if !visible.is_empty() {
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": visible.as_ref(),
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+        if stop_matcher.matched() {
+            break;
+        }
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
@@ -336,6 +351,23 @@ pub fn generate_lfm3(
 
     m.seq_pos = m.lfm3().unwrap().state.n_tokens;
 
+    // Stop-matcher tail: text held back as a possible stop prefix when the
+    // loop ended WITHOUT a match (cap / EOS) is legitimate output — release
+    // it as one final token event.
+    if !stop_matcher.matched() {
+        let tail = stop_matcher.finish();
+        if !tail.is_empty() {
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": tail,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    }
+
     let decode_ms = decode_t0.elapsed().as_millis().max(1);
     let total_ms = t0.elapsed().as_millis().max(1);
     let tok_s = if generated_count > 0 {
@@ -343,10 +375,11 @@ pub fn generate_lfm3(
     } else {
         0.0
     };
-    // The loop's only breaks are the max_tokens cap, stop_toks, and the
-    // string-level EOS guard (all "stop"), so reaching the cap is the sole
-    // non-stop cause. The CLI defaults a missing finish_reason to "stop",
-    // which mislabeled token-cap truncation as a natural stop.
+    // The loop's only breaks are the max_tokens cap, stop_toks, the
+    // string-level EOS guard, and a [OI] stop-sequence match (all "stop"), so
+    // reaching the cap is the sole non-stop cause. The CLI defaults a missing
+    // finish_reason to "stop", which mislabeled token-cap truncation as a
+    // natural stop.
     let finish_reason = if generated_count >= max_tokens {
         "length"
     } else {
