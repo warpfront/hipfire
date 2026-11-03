@@ -507,6 +507,66 @@ struct UnitForwardPlan {
     /// Live slots this stage could not honour (the tail's canonical entries are not this
     /// stage's, or a piece is not wholly inside a host region): their units stage as usual.
     rejected: usize,
+    /// Slot-live pieces that are copied anyway because they sat in a gap shorter than the merge
+    /// gap between two runs ([`unit_stage_forward_plan`]'s `gap_units`): their bytes (a whole
+    /// number of pieces) and count. Their table entries still name the slot.
+    bridged_bytes: usize,
+    bridged_pieces: usize,
+}
+
+/// The slot-live pieces of one host region, as `(start, end)` byte ranges inside it, minus the
+/// interior gaps the copy bridges (module doc of [`unit_stage_forward_plan`]): the ranges the
+/// region's copy runs skip. `holes` is the region's raw piece list (any order). Returns the kept
+/// holes, ascending, with touching same-size pieces coalesced, and the `(bytes, pieces)` of the
+/// pieces bridged.
+///
+/// A maximal cluster of touching same-size pieces (one kind: gate/up or down) is bridged, i.e.
+/// copied after all, only when it has a copy run on BOTH sides inside the region and is shorter
+/// than `gap_units` whole pieces: bridging then merges two runs into one (and never creates a
+/// run). `gap_units == 0` keeps every hole. An expert is never split: a bridged cluster is a
+/// whole number of whole pieces, and every kept hole is the exact set of its live pieces.
+fn bridge_holes(
+    holes: &mut [(usize, usize)],
+    region_len: usize,
+    gap_units: usize,
+) -> Result<(Vec<(usize, usize)>, (usize, usize)), String> {
+    holes.sort_unstable();
+    // Maximal clusters: `(start, end, piece)`, `piece` = the size of one piece in the cluster.
+    let mut clusters: Vec<(usize, usize, usize)> = Vec::new();
+    let mut cursor = 0usize;
+    for &(start, end) in holes.iter() {
+        if start < cursor {
+            return Err(format!(
+                "slot-served pieces overlap in a host region at offset {start}"
+            ));
+        }
+        cursor = end;
+        let piece = end - start;
+        match clusters.last_mut() {
+            Some(last) if last.1 == start && last.2 == piece => last.1 = end,
+            _ => clusters.push((start, end, piece)),
+        }
+    }
+    let mut kept: Vec<(usize, usize)> = Vec::with_capacity(clusters.len());
+    let (mut bridged_bytes, mut bridged_pieces) = (0usize, 0usize);
+    // End of the last KEPT hole: everything between it and a cluster is copied.
+    let mut copied_from = 0usize;
+    for (i, &(start, end, piece)) in clusters.iter().enumerate() {
+        let run_before = start > copied_from;
+        let run_after = match clusters.get(i + 1) {
+            Some(next) => next.0 > end,
+            None => end < region_len,
+        };
+        let short = piece > 0 && (end - start) / piece < gap_units;
+        if gap_units > 0 && run_before && run_after && short {
+            bridged_bytes += end - start;
+            bridged_pieces += (end - start) / piece;
+            continue;
+        }
+        kept.push((start, end));
+        copied_from = end;
+    }
+    Ok((kept, (bridged_bytes, bridged_pieces)))
 }
 
 /// The stage tables and copy runs of one mixed unit-stage layer when the tail's `live` slots hold
@@ -520,10 +580,18 @@ struct UnitForwardPlan {
 /// tail's canonical entries equal this stage's entries and both pieces lie wholly inside a host
 /// region; otherwise the unit stages as usual (counted in `rejected`). `live` empty gives exactly
 /// the static tables and copies.
+///
+/// `gap_units` (`HIPFIRE_EP_UNIT_TAIL_STAGE_GAP`): a long prefill with a large tail cuts a copy
+/// run per scattered live unit; a maximal cluster of touching live pieces shorter than
+/// `gap_units` pieces with a copy run on both sides is copied after all ([`bridge_holes`]), so
+/// the two runs merge. Those units stay slot-named in the tables (the copy writes stage bytes
+/// nothing reads) and are counted in `bridged_bytes` / `bridged_pieces`; `served` is unchanged.
+/// `gap_units == 0` is exactly the complement above.
 fn unit_stage_forward_plan(
     src: &UnitLayerSources<'_>,
     piece_bytes: [usize; 2],
     live: &[crate::expert_unit_tail_rank::LiveSlot],
+    gap_units: usize,
 ) -> Result<UnitForwardPlan, String> {
     if src.regions.len() != src.cpu.len() {
         return Err(format!(
@@ -578,6 +646,7 @@ fn unit_stage_forward_plan(
         }
     }
     let mut copies = Vec::with_capacity(src.regions.len() + served);
+    let (mut bridged_bytes, mut bridged_pieces) = (0usize, 0usize);
     for (index, region) in src.regions.iter().enumerate() {
         let run = |from: usize, to: usize| StageCopy {
             src: src.cpu[index] + from,
@@ -585,14 +654,12 @@ fn unit_stage_forward_plan(
             len: to - from,
             buf: src.buf[index],
         };
-        holes[index].sort_unstable();
+        let (kept, (bytes, pieces)) = bridge_holes(&mut holes[index], region.len, gap_units)
+            .map_err(|reason| format!("host region {index}: {reason}"))?;
+        bridged_bytes += bytes;
+        bridged_pieces += pieces;
         let mut cursor = 0usize;
-        for &(start, end) in &holes[index] {
-            if start < cursor {
-                return Err(format!(
-                    "slot-served pieces overlap in host region {index} at offset {start}"
-                ));
-            }
+        for (start, end) in kept {
             if start > cursor {
                 copies.push(run(cursor, start));
             }
@@ -607,6 +674,8 @@ fn unit_stage_forward_plan(
         copies,
         served,
         rejected,
+        bridged_bytes,
+        bridged_pieces,
     })
 }
 
@@ -681,6 +750,8 @@ struct UnitSlotStage {
     layers: Vec<UnitSlotLayer>,
     /// `[gate_up, down]` bytes of one unit.
     piece_bytes: [usize; 2],
+    /// Copy-run merge gap in whole units (`HIPFIRE_EP_UNIT_TAIL_STAGE_GAP`; [`bridge_holes`]).
+    gap_units: usize,
     /// The rank's tail and whether to print the per-forward counter line; set once.
     link: std::sync::OnceLock<(
         std::sync::Arc<crate::expert_unit_tail_rank::UnitTailRank>,
@@ -700,13 +771,15 @@ impl UnitSlotStage {
         let tables = layers
             .iter()
             .map(|layer| {
-                let plan = unit_stage_forward_plan(&layer.sources(), piece_bytes, &[])?;
+                let plan = unit_stage_forward_plan(&layer.sources(), piece_bytes, &[], 0)?;
                 Ok(plan.tables)
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let gap_units = crate::expert_unit_tail::ep_unit_tail_stage_gap()?;
         Ok(Self {
             layers,
             piece_bytes,
+            gap_units,
             link: std::sync::OnceLock::new(),
             state: std::cell::RefCell::new(UnitSlotState {
                 copies: vec![None; stage_slots],
@@ -2464,20 +2537,28 @@ impl Qwen4ExpertStage {
         let state = &mut *state;
         let mut plans = Vec::with_capacity(slots.layers.len());
         let (mut served, mut rejected, mut served_layers) = (0usize, 0usize, 0usize);
+        let (mut bridged_bytes, mut bridged_pieces) = (0usize, 0usize);
         for (index, layer) in slots.layers.iter().enumerate() {
             if layer.layer >= layers {
                 continue;
             }
             let live = tail.live_slots(layer.layer);
-            let plan = unit_stage_forward_plan(&layer.sources(), slots.piece_bytes, &live)
-                .map_err(|reason| {
-                    invalid(format!(
-                        "unit stage: layer {} slot-aware plan: {reason}",
-                        layer.layer
-                    ))
-                })?;
+            let plan = unit_stage_forward_plan(
+                &layer.sources(),
+                slots.piece_bytes,
+                &live,
+                slots.gap_units,
+            )
+            .map_err(|reason| {
+                invalid(format!(
+                    "unit stage: layer {} slot-aware plan: {reason}",
+                    layer.layer
+                ))
+            })?;
             served += plan.served;
             rejected += plan.rejected;
+            bridged_bytes += plan.bridged_bytes;
+            bridged_pieces += plan.bridged_pieces;
             served_layers += usize::from(plan.served > 0);
             plans.push((index, plan));
         }
@@ -2544,12 +2625,15 @@ impl Qwen4ExpertStage {
                 "[unit-tail] rank {} stage forward {}: staged {:.1} MiB H2D in {runs} copy runs \
                  (tail-off stage: {:.1} MiB in {tail_off_runs}), {served} units served from tail \
                  slots over {served_layers} layers ({:.1} MiB not copied, {rejected} live slots \
-                 refused)",
+                 refused); merge gap {} units: {bridged_pieces} slot-live pieces ({:.1} MiB) \
+                 copied anyway inside the staged bytes",
                 self.placement.map_or(0, |placement| placement.rank),
                 state.forwards,
                 mib(staged),
                 mib(tail_off),
                 mib(tail_off - staged),
+                slots.gap_units,
+                mib(bridged_bytes),
             );
         }
         Ok(())
@@ -2887,9 +2971,11 @@ impl Qwen4GpuForward {
             .map_err(|_| "the unit stage is already linked to a D2 tail".to_string())?;
         eprintln!(
             "qwen4 EP rank {}: D2 tail prefill stage on: {} mixed staged layers name live tail \
-             slots in their stage tables and skip those units' H2D bytes",
+             slots in their stage tables and skip those units' H2D bytes (copy runs merge across \
+             slot-live gaps shorter than {} units)",
             stage.placement.map_or(0, |placement| placement.rank),
-            slots.layers.len()
+            slots.layers.len(),
+            slots.gap_units
         );
         Ok(true)
     }
@@ -3835,7 +3921,7 @@ mod tests {
     fn slot_plan_without_live_slots_is_the_static_stage() {
         for split in [false, true] {
             let f = MixedFixture::new(4, split);
-            let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[]).unwrap();
+            let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[], 0).unwrap();
             assert_eq!(plan.tables, f.static_tables(), "split {split}");
             assert_eq!(plan.copies, f.static_copies(), "split {split}");
             assert_eq!((plan.served, plan.rejected), (0, 0));
@@ -3847,7 +3933,7 @@ mod tests {
         let f = MixedFixture::new(4, false);
         // Host experts 1 and 3 (e = 8, 12) are live in pool slots 5 and 0.
         let live = [f.live(1, 5), f.live(3, 0)];
-        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live).unwrap();
+        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live, 0).unwrap();
         assert_eq!((plan.served, plan.rejected), (2, 0));
         let (static_gu, static_dn) = {
             let [gu, dn] = f.static_tables();
@@ -3923,7 +4009,7 @@ mod tests {
         let f = MixedFixture::new(3, true);
         // Borrowed stage, two regions: live host experts 0 and 1 are adjacent in both blocks.
         let live = [f.live(0, 2), f.live(1, 3)];
-        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live).unwrap();
+        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live, 0).unwrap();
         let run = |region: usize, from: usize, to: usize| StageCopy {
             src: f.cpu[region] + from,
             dst: f.dst[region] + from,
@@ -3939,7 +4025,7 @@ mod tests {
         );
         // Every unit live: nothing left to copy.
         let all: Vec<LiveSlot> = (0..3).map(|i| f.live(i, i)).collect();
-        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &all).unwrap();
+        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &all, 0).unwrap();
         assert_eq!((plan.served, plan.copies.len()), (3, 0));
         // The live units' table entries name their slots, in the gate/up and the down table.
         let (gu, dn) = (decode(&plan.tables[0]), decode(&plan.tables[1]));
@@ -3964,8 +4050,8 @@ mod tests {
             canon: [f.gate_up[2], f.down[2]],
             slot: [SLOT_POOL_GU, SLOT_POOL_DN],
         };
-        let plan =
-            unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[moved, null_slot, core]).unwrap();
+        let plan = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[moved, null_slot, core], 0)
+            .unwrap();
         assert_eq!((plan.served, plan.rejected), (0, 3));
         assert_eq!(plan.tables, f.static_tables());
         assert_eq!(plan.copies, f.static_copies());
@@ -3975,15 +4061,201 @@ mod tests {
     fn slot_plan_refuses_malformed_live_lists() {
         let f = MixedFixture::new(3, false);
         let twice = [f.live(0, 0), f.live(0, 1)];
-        assert!(unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &twice).is_err());
+        assert!(unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &twice, 0).is_err());
         let mut outside = f.live(0, 0);
         outside.expert = f.gate_up.len();
-        assert!(unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[outside]).is_err());
+        assert!(unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &[outside], 0).is_err());
         // Two units whose pieces would overlap (a piece longer than the unit stride).
         let overlapping = [f.live(0, 0), f.live(1, 1)];
         assert!(
-            unit_stage_forward_plan(&f.sources(), [UNIT_GU + 4096, UNIT_DN], &overlapping).is_err()
+            unit_stage_forward_plan(&f.sources(), [UNIT_GU + 4096, UNIT_DN], &overlapping, 0)
+                .is_err()
         );
+    }
+
+    /// Per piece kind, every byte of host unit `index` (`0..n_host`) as `(offset, len)` in a
+    /// fixture region: the unsplit fixture is one region `[gate/up block | down block]`.
+    fn unit_pieces(f: &MixedFixture, index: usize) -> Vec<(usize, usize, usize)> {
+        if f.regions.len() == 1 {
+            vec![
+                (0, index * UNIT_GU, UNIT_GU),
+                (0, f.n_host * UNIT_GU + index * UNIT_DN, UNIT_DN),
+            ]
+        } else {
+            vec![(0, index * UNIT_GU, UNIT_GU), (1, index * UNIT_DN, UNIT_DN)]
+        }
+    }
+
+    /// Bytes of region `region` in `[from, from + len)` that `copies` cover (stage offsets
+    /// are region-relative plus `dst`).
+    fn covered(
+        f: &MixedFixture,
+        copies: &[StageCopy],
+        region: usize,
+        from: usize,
+        len: usize,
+    ) -> usize {
+        copies
+            .iter()
+            .filter(|copy| {
+                copy.src >= f.cpu[region] && copy.src < f.cpu[region] + f.regions[region].len
+            })
+            .map(|copy| {
+                let start = copy.src - f.cpu[region];
+                let (lo, hi) = (start.max(from), (start + copy.len).min(from + len));
+                hi.saturating_sub(lo)
+            })
+            .sum()
+    }
+
+    #[test]
+    fn bridge_holes_merges_only_short_interior_clusters() {
+        let u = 100usize;
+        let len = 20 * u;
+        // Pieces of one kind at units 0, 3..=4, 8, 12 and 19 (the last touches the region end).
+        let mut holes: Vec<(usize, usize)> = [0, 3, 4, 8, 12, 19]
+            .iter()
+            .map(|&i| (i * u, (i + 1) * u))
+            .collect();
+        // G = 0: every cluster stays (touching units 3, 4 coalesce).
+        let (kept, bridged) = bridge_holes(&mut holes.clone(), len, 0).unwrap();
+        assert_eq!(
+            kept,
+            [
+                (0, u),
+                (3 * u, 5 * u),
+                (8 * u, 9 * u),
+                (12 * u, 13 * u),
+                (19 * u, 20 * u)
+            ]
+        );
+        assert_eq!(bridged, (0, 0));
+        // G = 2: the one-unit interior clusters (8, 12) are bridged; the two-unit cluster and
+        // both edge clusters (no run on one side) stay.
+        let (kept, bridged) = bridge_holes(&mut holes.clone(), len, 2).unwrap();
+        assert_eq!(kept, [(0, u), (3 * u, 5 * u), (19 * u, 20 * u)]);
+        assert_eq!(bridged, (2 * u, 2));
+        // G = 3: the two-unit cluster is short too.
+        let (kept, bridged) = bridge_holes(&mut holes, len, 3).unwrap();
+        assert_eq!(kept, [(0, u), (19 * u, 20 * u)]);
+        assert_eq!(bridged, (4 * u, 4));
+        // A different-size piece touching a cluster is a different kind: never coalesced.
+        let mut mixed = vec![(3 * u, 4 * u), (4 * u, 4 * u + 50), (9 * u, 10 * u)];
+        let (kept, _) = bridge_holes(&mut mixed, len, 0).unwrap();
+        assert_eq!(kept, [(3 * u, 4 * u), (4 * u, 4 * u + 50), (9 * u, 10 * u)]);
+        // Overlapping pieces are an error whatever the gap.
+        assert!(bridge_holes(&mut [(0, 150), (100, 250)], len, 4).is_err());
+    }
+
+    #[test]
+    fn stage_gap_zero_is_todays_complement_and_a_gap_only_adds_whole_unreferenced_units() {
+        let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for split in [false, true] {
+            let f = MixedFixture::new(24, split);
+            for trial in 0..64 {
+                // A random live subset of the 24 host units.
+                let density = 1 + trial % 6;
+                let live_units: Vec<usize> = (0..f.n_host)
+                    .filter(|_| (next() % 8) < density as u64)
+                    .collect();
+                let live: Vec<LiveSlot> = live_units
+                    .iter()
+                    .enumerate()
+                    .map(|(slot, &i)| f.live(i, slot))
+                    .collect();
+                let base = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live, 0).unwrap();
+                // G = 0: exactly the complement of the live pieces (today's plan).
+                let mut expect = 0usize;
+                for index in 0..f.n_host {
+                    let is_live = live_units.contains(&index);
+                    for (region, from, len) in unit_pieces(&f, index) {
+                        assert_eq!(
+                            covered(&f, &base.copies, region, from, len),
+                            if is_live { 0 } else { len },
+                            "split {split} trial {trial} unit {index}"
+                        );
+                        expect += if is_live { 0 } else { len };
+                    }
+                }
+                let base_bytes: usize = base.copies.iter().map(|copy| copy.len).sum();
+                assert_eq!(base_bytes, expect);
+                assert_eq!((base.bridged_bytes, base.bridged_pieces), (0, 0));
+                let mut previous_runs = base.copies.len();
+                for gap in [1usize, 2, 3, 8, 64] {
+                    let plan =
+                        unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live, gap).unwrap();
+                    // Slot entries (both tables) and the served count never change.
+                    assert_eq!(plan.tables, base.tables, "split {split} gap {gap}");
+                    assert_eq!((plan.served, plan.rejected), (base.served, base.rejected));
+                    // Every non-slot unit is wholly inside a run; a live unit is copied whole or
+                    // not at all (never split), and only the bridged ones are copied.
+                    let mut bridged_pieces = 0usize;
+                    let mut bridged_bytes = 0usize;
+                    for index in 0..f.n_host {
+                        let is_live = live_units.contains(&index);
+                        for (region, from, len) in unit_pieces(&f, index) {
+                            let got = covered(&f, &plan.copies, region, from, len);
+                            if is_live {
+                                assert!(got == 0 || got == len, "split unit {index} {got}/{len}");
+                                if got == len {
+                                    bridged_pieces += 1;
+                                    bridged_bytes += len;
+                                }
+                            } else {
+                                assert_eq!(got, len, "non-slot unit {index} gap {gap}");
+                            }
+                        }
+                    }
+                    assert_eq!(plan.bridged_pieces, bridged_pieces, "gap {gap}");
+                    assert_eq!(plan.bridged_bytes, bridged_bytes, "gap {gap}");
+                    let bytes: usize = plan.copies.iter().map(|copy| copy.len).sum();
+                    assert_eq!(bytes, base_bytes + plan.bridged_bytes);
+                    // Bridging only merges runs: the run count never grows with the gap, runs
+                    // stay ascending and disjoint inside a region.
+                    assert!(plan.copies.len() <= previous_runs, "gap {gap} added runs");
+                    previous_runs = plan.copies.len();
+                    for pair in plan.copies.windows(2) {
+                        if pair[0].buf == pair[1].buf && pair[0].dst < pair[1].dst {
+                            assert!(pair[0].dst + pair[0].len <= pair[1].dst);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn stage_gap_merges_the_scattered_live_units_into_few_runs() {
+        // Live units 1, 4, 5, 9 of 12 in one gate/up block and one down block (unsplit region).
+        let f = MixedFixture::new(12, false);
+        let live: Vec<LiveSlot> = [1usize, 4, 5, 9]
+            .iter()
+            .enumerate()
+            .map(|(slot, &i)| f.live(i, slot))
+            .collect();
+        let base = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live, 0).unwrap();
+        // gate/up: runs [0], [2,3], [6..=8], [10..=11]; down: [0], [2,3], [6..=8], [10,11]; the
+        // last gate/up run touches the first down run (units 10, 11 | down 0): one region run
+        // each side of every cut, 4 + 4 minus the join of gate/up's tail and down's head.
+        assert_eq!(base.copies.len(), 7);
+        // G = 2 bridges the one-unit live holes (1, 9): two fewer runs per kind, one lost join.
+        let two = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live, 2).unwrap();
+        assert_eq!(two.bridged_pieces, 4);
+        assert_eq!(two.bridged_bytes, 2 * (UNIT_GU + UNIT_DN));
+        assert!(two.copies.len() < base.copies.len());
+        // G = 3 bridges the two-unit hole (4, 5) as well.
+        let three = unit_stage_forward_plan(&f.sources(), SLOT_PIECES, &live, 3).unwrap();
+        assert_eq!(three.bridged_pieces, 8);
+        let bytes: usize = three.copies.iter().map(|copy| copy.len).sum();
+        assert_eq!(bytes, 12 * (UNIT_GU + UNIT_DN));
+        assert_eq!(three.copies.len(), 1);
+        assert_eq!(three.tables, base.tables);
     }
 
     #[test]

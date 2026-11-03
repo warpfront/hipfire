@@ -114,6 +114,13 @@ pub const EP_UNIT_TAIL_PREFILL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PREFILL";
 pub const EP_UNIT_TAIL_PEER_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PEER";
 /// `1`: print a `[unit-tail]` counter line every 64 windows and at release.
 pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
+/// `G` (whole units, default [`EP_UNIT_TAIL_STAGE_GAP_DEFAULT`]): with the prefill lever, the
+/// slot-aware unit stage merges two H2D copy runs across a slot-live gap shorter than `G` units
+/// (the gap units are copied too and simply not referenced: their stage-table entries still name
+/// the slot). `0` = exactly the complement of the slot-live units.
+pub const EP_UNIT_TAIL_STAGE_GAP_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_STAGE_GAP";
+/// Default of [`EP_UNIT_TAIL_STAGE_GAP_ENV`].
+pub const EP_UNIT_TAIL_STAGE_GAP_DEFAULT: usize = 8;
 
 /// One MiB.
 const MIB: u64 = 1 << 20;
@@ -188,6 +195,25 @@ pub fn ep_unit_tail_configured() -> bool {
 /// publications and the unit stage's slot-aware tables / copy runs.
 pub fn ep_unit_tail_prefill_requested() -> bool {
     ep_unit_tail_configured() && hipfire_config::developer_bool(EP_UNIT_TAIL_PREFILL_ENV, false)
+}
+
+/// Parse [`EP_UNIT_TAIL_STAGE_GAP_ENV`]: unset or empty = the default, else a non-negative integer.
+pub fn parse_stage_gap(raw: Option<&str>) -> Result<usize, String> {
+    match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        None => Ok(EP_UNIT_TAIL_STAGE_GAP_DEFAULT),
+        Some(raw) => raw.parse::<usize>().map_err(|_| {
+            format!("{EP_UNIT_TAIL_STAGE_GAP_ENV}={raw}: expected a non-negative integer (units)")
+        }),
+    }
+}
+
+/// The unit stage's copy-run merge gap ([`EP_UNIT_TAIL_STAGE_GAP_ENV`]) of this process.
+pub fn ep_unit_tail_stage_gap() -> Result<usize, String> {
+    parse_stage_gap(
+        hipfire_config::developer_var(EP_UNIT_TAIL_STAGE_GAP_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// VRAM one rank's tail pool takes: `T` units plus the two block tail pads
@@ -909,6 +935,16 @@ impl PeerBoard {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn stage_gap_parses_a_unit_count_and_defaults_to_eight() {
+        assert_eq!(parse_stage_gap(None), Ok(8));
+        assert_eq!(parse_stage_gap(Some("")), Ok(8));
+        assert_eq!(parse_stage_gap(Some(" 0 ")), Ok(0));
+        assert_eq!(parse_stage_gap(Some("32")), Ok(32));
+        assert!(parse_stage_gap(Some("-1")).is_err());
+        assert!(parse_stage_gap(Some("eight")).is_err());
+    }
 
     fn cfg(t: usize, f: usize, b: u32) -> EpUnitTailConfig {
         EpUnitTailConfig {
