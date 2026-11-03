@@ -219,6 +219,23 @@ __device__ __forceinline__ void ep8_body(const ep8_wrow (&wrow)[DOWN ? 1 : 2], c
     for (int i = 0; i < NT; ++i) {
         if (!FULL && i >= ntv) break;
         const int pos = (tile + i) * 16 + lr;
+#ifdef EP8_RAW_F32
+        // Test build only (`#define EP8_RAW_F32 1` before this source): the raw F32 fold sums, no SwiGLU, no BF16
+        // rounding. Y is F32 `[m_total, M]`; gate/up stores the gate sums at columns `rbase + 8 hi + j` and the
+        // up sums at `M/2 + rbase + 8 hi + j`; padding slots store their (zero) sums.
+        {
+            float* Yf = (float*)Y + (size_t)pos * M + rbase + 8 * hi;
+            *(float4*)(Yf) = make_float4(sum[0][i][0], sum[0][i][1], sum[0][i][2], sum[0][i][3]);
+            *(float4*)(Yf + 4) = make_float4(sum[0][i][4], sum[0][i][5], sum[0][i][6], sum[0][i][7]);
+            if (!DOWN) {
+                *(float4*)(Yf + (M >> 1)) =
+                    make_float4(sum[NF - 1][i][0], sum[NF - 1][i][1], sum[NF - 1][i][2], sum[NF - 1][i][3]);
+                *(float4*)(Yf + (M >> 1) + 4) =
+                    make_float4(sum[NF - 1][i][4], sum[NF - 1][i][5], sum[NF - 1][i][6], sum[NF - 1][i][7]);
+            }
+            continue;
+        }
+#endif
         unsigned short o[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
