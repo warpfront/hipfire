@@ -42,9 +42,15 @@ use std::sync::LazyLock;
 /// GB/s in-situ (rocprof, EP2 C1 MTP window: 4.85 ms/step), so the A8 route can only add its
 /// quantize launches there (+1.4 ms/step measured); the symmetric artifact runs those rows on the
 /// affine kernels (`z = -32 s` is exact in the affine container). From 9 rows (wide verify /
-/// prefill chunks of any size) the integer tiles replace the WMMA / FP8 / affine-I8 routes.
+/// prefill chunks up to [`QWEN4_TRUNK_A8_MAX_ROWS`]) the integer tiles replace the WMMA / FP8 / affine-I8 routes.
 pub const QWEN4_TRUNK_A8_MIN_ROWS: usize = crate::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1;
 
+/// Largest `route_rows` the trunk route serves. EP2 R9700 pair A/B (A8 vs `HIPFIRE_QWEN4_TRUNK_A8=0`
+/// on the same bins and symmetric model, ABBA, host load <= 10): prefill 194 tokens +5.6 %, the 8-lane
+/// burst (151-token lane prefills) TTFT -6 %, but 613 / 1145 / 2086 / 3030 / 8172 tokens
+/// -1.9 / -2.7 / -1.7 / -4.5 / -5.0 %: the 128x128 tile loses to the served FP8 / affine-I8 routes
+/// from a few hundred rows. The crossover lies between 194 and 613 rows (unmeasured in between).
+pub const QWEN4_TRUNK_A8_MAX_ROWS: usize = 256;
 /// qt47 group bytes (8 B headers + 192 B 6-bit payload).
 const MQ6_GROUP_BYTES: usize = 200;
 /// A8 `block_i8_128` bytes (`float d; int s; signed char qs[128]`).
@@ -106,7 +112,7 @@ fn trunk_a8_admits(g: TrunkA8Gate) -> bool {
         && g.k % 256 == 0
         && g.m > 0
         && g.route_rows > g.few_row_limit
-        && g.route_rows >= QWEN4_TRUNK_A8_MIN_ROWS
+        && (QWEN4_TRUNK_A8_MIN_ROWS..=QWEN4_TRUNK_A8_MAX_ROWS).contains(&g.route_rows)
 }
 
 /// One launchable tile of the symmetric A8 route.
@@ -256,7 +262,7 @@ impl Gpu {
     /// Whether one projection of `m` rows x `k` with `rows` tokens takes the trunk A8 route:
     /// requested, verified symmetric, inside the Qwen4 forward, eager (no replay recording / graph
     /// capture), outside the prefill-invariant scope, `k % 256 == 0`, and
-    /// `route_rows >= QWEN4_TRUNK_A8_MIN_ROWS` (9, and above the scope's few-row limit: an admitted wide verify keeps its row-exact twins).
+    /// `QWEN4_TRUNK_A8_MIN_ROWS <= route_rows <= QWEN4_TRUNK_A8_MAX_ROWS` (9..=256, and above the scope's few-row limit: an admitted wide verify keeps its row-exact twins).
     pub fn qwen4_trunk_a8_applies(&self, m: usize, k: usize, rows: usize) -> bool {
         trunk_a8_admits(TrunkA8Gate {
             requested: self.qwen4_trunk_a8_requested(),
@@ -801,12 +807,21 @@ mod tests {
                 "rows {r}"
             );
         }
-        for r in [64usize, 65, 512, 4096] {
-            assert!(
+        for (r, want) in [
+            (64usize, true),
+            (65, true),
+            (194, true),
+            (256, true),
+            (257, false),
+            (512, false),
+            (4096, false),
+        ] {
+            assert_eq!(
                 trunk_a8_admits(TrunkA8Gate {
                     route_rows: r,
                     ..ok
                 }),
+                want,
                 "rows {r}"
             );
         }
