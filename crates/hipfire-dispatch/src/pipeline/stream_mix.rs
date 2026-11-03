@@ -201,6 +201,28 @@ impl StreamMixOp<'_> {
                 StreamChart::HelmertBounded { .. } => {}
             }
         }
+        if let StreamMixStage::Capture {
+            dst,
+            dst_row_stride,
+            dst_col,
+            ..
+        } = &self.stage
+        {
+            let row = self.streams * self.width;
+            let need = (self.rows - 1)
+                .checked_mul(*dst_row_stride)
+                .and_then(|n| n.checked_add(*dst_col + row))
+                .ok_or_else(|| geometry("capture extent overflows"))?;
+            if dst.dtype != DType::F32 || *dst_row_stride < row || dst.numel() < need {
+                return Err(geometry(format!(
+                    "capture of {} rows x {row} needs an F32 destination of {need} elements at \
+                     row stride >= {row} (got {:?} x {}, stride {dst_row_stride})",
+                    self.rows,
+                    dst.dtype,
+                    dst.numel()
+                )));
+            }
+        }
         Ok(())
     }
 

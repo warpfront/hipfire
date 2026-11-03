@@ -34,7 +34,9 @@ use hipfire_dispatch::pipeline::boundary_project::{
 use hipfire_dispatch::pipeline::latent_attention::{
     ExpandedMirror, KvExpansion, LatentAttentionOp, LatentCache, LatentGeometry, RowRange,
 };
-use hipfire_dispatch::pipeline::rda::{RdaLayer, RdaLayerState, RdaOp, RdaProjected, RdaTape};
+use hipfire_dispatch::pipeline::rda::{
+    RdaLayer, RdaLayerState, RdaOp, RdaProjected, RdaStage, RdaTape,
+};
 use hipfire_dispatch::pipeline::stream_mix::{
     StreamChart, StreamMixOp, StreamMixStage, StreamNorm, StreamRounding,
 };
@@ -73,6 +75,17 @@ pub(crate) fn batched_route(rows: usize) -> RowsRoute {
         RowsRoute::Decode
     } else {
         RowsRoute::Prefill
+    }
+}
+
+/// How the FFN of a call on `route` runs: the MoE core, whether the dense MLP
+/// runs row-exactly, and which weight copy (by row count) the dense and shared
+/// projections read. A verify block runs every row as the decode step does.
+pub(crate) fn ffn_plan(route: RowsRoute, rows: usize) -> (GroupedMoeProtocol, bool, usize) {
+    match route {
+        RowsRoute::Decode => (GroupedMoeProtocol::Indexed, false, rows),
+        RowsRoute::Prefill => (GroupedMoeProtocol::Grouped, false, rows),
+        RowsRoute::Verify => (GroupedMoeProtocol::RowsExact, true, 1),
     }
 }
 
@@ -365,7 +378,7 @@ pub(crate) fn rda_steps<'a>(
             b,
             f16,
         ),
-        Step::Rda(RdaOp {
+        Step::Rda(RdaStage::Layer(RdaOp {
             geom: work.rda_geom,
             layer: RdaLayer {
                 conv_w_q: &w.q_conv,
@@ -396,7 +409,7 @@ pub(crate) fn rda_steps<'a>(
             gated: &scratch.rda_gated,
             rows,
             tape,
-        }),
+        })),
         project_one(
             &w.o_proj,
             &scratch.rda_gated,
@@ -632,8 +645,7 @@ pub(crate) fn ffn_step<'a>(
     rows: usize,
     route: RowsRoute,
 ) -> Result<Step<'a>, String> {
-    let exact = route == RowsRoute::Verify;
-    let weight_rows = if exact { 1 } else { rows };
+    let (protocol, exact, weight_rows) = ffn_plan(route, rows);
     let (x, y) = (&scratch.branch_in, &scratch.ffn_out);
     match &layer.ffn {
         RaonFfn::Dense(d) => {
@@ -671,11 +683,6 @@ pub(crate) fn ffn_step<'a>(
                 m.expert_down_awq_ptrs.as_ref(),
             )
             .with_iu4_symmetric(m.iu4_symmetric, m.shared.iu4_symmetric);
-            let protocol = match route {
-                RowsRoute::Decode => GroupedMoeProtocol::Indexed,
-                RowsRoute::Prefill => GroupedMoeProtocol::Grouped,
-                RowsRoute::Verify => GroupedMoeProtocol::RowsExact,
-            };
             Ok(Step::GroupedMoe(raon_moe_op(
                 ctx,
                 &work.moe_dims,
@@ -688,5 +695,62 @@ pub(crate) fn ffn_step<'a>(
                 None,
             )))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The default row-exact widths (`HIPFIRE_RAON_VERIFY_ROWEXACT` unset): gfx1201 up
+    /// to 4 rows, gfx1100 up to 9, every other arch none. Every op of one call takes
+    /// the route this resolves, so a wrong edge silently changes verify kernels.
+    #[test]
+    fn rows_route_follows_the_row_exact_width() {
+        use RowsRoute::{Decode, Prefill, Verify};
+        for (arch, want) in [
+            (
+                "gfx1151",
+                [
+                    Decode, Prefill, Prefill, Prefill, Prefill, Prefill, Prefill, Prefill,
+                ],
+            ),
+            (
+                "gfx1201",
+                [
+                    Decode, Verify, Verify, Prefill, Prefill, Prefill, Prefill, Prefill,
+                ],
+            ),
+            (
+                "gfx1100",
+                [
+                    Decode, Verify, Verify, Verify, Verify, Prefill, Prefill, Prefill,
+                ],
+            ),
+        ] {
+            for (rows, want) in [1, 2, 4, 5, 9, 10, 16, 17].into_iter().zip(want) {
+                assert_eq!(rows_route(arch, rows), want, "{arch} rows {rows}");
+            }
+        }
+        for rows in [2, 4, 9, 16] {
+            assert_eq!(batched_route(rows), Prefill);
+        }
+        assert_eq!(batched_route(1), Decode);
+    }
+
+    #[test]
+    fn verify_ffn_runs_every_row_as_a_decode_row() {
+        assert_eq!(
+            ffn_plan(RowsRoute::Verify, 4),
+            (GroupedMoeProtocol::RowsExact, true, 1)
+        );
+        assert_eq!(
+            ffn_plan(RowsRoute::Prefill, 64),
+            (GroupedMoeProtocol::Grouped, false, 64)
+        );
+        assert_eq!(
+            ffn_plan(RowsRoute::Decode, 1),
+            (GroupedMoeProtocol::Indexed, false, 1)
+        );
     }
 }

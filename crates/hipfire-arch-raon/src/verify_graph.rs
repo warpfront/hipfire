@@ -44,8 +44,8 @@
 //!
 //! # Capture eligibility
 //!
-//! Every op of the verify forward is capture-safe except `project()` over a
-//! `MQ4G256V2` weight with `rows > 1`: `llama::weight_gemm` allocates and frees
+//! Every op of the verify forward is capture-safe except a `Step::BoundaryProject`
+//! over a `MQ4G256V2` weight on the batched route: its qt44 GEMM allocates and frees
 //! its rotated-activation scratch per call. Raon's shipped recipe keeps every
 //! attention projection and `lm_head` on Q8F16/F32 (qt44 only in the dense and
 //! shared-FFN/MoE paths, which use the dispatch crate's allocation-free
@@ -101,7 +101,7 @@ fn graph_key(rows: usize, with_features: bool) -> usize {
     (rows << 1) | with_features as usize
 }
 
-/// Name of the first projection weight (`project()` over `rows > 1`) whose dtype
+/// Name of the first projection weight (a batched `Step::BoundaryProject`) whose dtype
 /// allocates inside the batched GEMM, `None` when every one is capture-safe.
 fn projections_capturable(w: &RaonWeights) -> Option<&'static str> {
     let qt44 = |t: &hipfire_runtime::llama::WeightTensor| t.gpu_dtype == DType::MQ4G256V2;
