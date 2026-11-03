@@ -552,7 +552,15 @@ impl StreamParser {
             let _: String = self.buf.drain(..TOOL_CALLS_CLOSE.len()).collect();
             self.state = State::Normal;
             let calls = parse_tool_calls_body(&body);
-            events.push(StreamEvent::ToolCalls(calls));
+            // A closed block with no parseable invoke (e.g. a misspelled
+            // `</｜DSML｜invinoke>` close) is a failed call, not a plain stop.
+            if calls.is_empty() {
+                events.push(StreamEvent::Malformed {
+                    detail: "DSML tool_calls block without a parseable invoke".to_string(),
+                });
+            } else {
+                events.push(StreamEvent::ToolCalls(calls));
+            }
             return true;
         }
         // No close yet: don't emit anything (tool calls are atomic; we
@@ -992,6 +1000,28 @@ mod tests {
         assert!(
             detail.is_some_and(|d| d.contains("unclosed") && d.contains("tool_calls")),
             "expected Malformed detail, events={events:?}"
+        );
+    }
+
+    #[test]
+    fn closed_tool_calls_without_parseable_invoke_is_malformed() {
+        // HIPF-262: DS4 DSpark emitted this exact block; it parsed to zero
+        // calls and the turn ended as a plain stop.
+        let mut p = StreamParser::new();
+        let mut events = p.feed(
+            "Sure.\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">\n\
+<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n\
+</｜DSML｜invinoke>\n</｜DSML｜tool_calls>",
+        );
+        events.extend(p.finish());
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, StreamEvent::ToolCalls(_))));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, StreamEvent::Malformed { .. })),
+            "events={events:?}"
         );
     }
 
