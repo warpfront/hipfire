@@ -1968,6 +1968,17 @@ pub struct Gpu {
     /// [`Gpu::qwen4_mq6_sym_check`] (set by the loader through
     /// [`Gpu::set_qwen4_trunk_a8_verified`]); gates [`Gpu::qwen4_trunk_a8_applies`].
     pub(crate) qwen4_trunk_a8_verified: bool,
+    /// True once every routed MoE layer this device serves has symmetric qt53 down experts
+    /// (set by the loader through [`Gpu::set_qwen4_moe_down_a8_verified`]); gates
+    /// [`Gpu::qwen4_moe_down_a8_applies`].
+    pub(crate) qwen4_moe_down_a8_verified: bool,
+    /// True while the MTP head's MoE layer verdict is still owed (the route declines until the
+    /// head settles it through [`Gpu::set_qwen4_moe_down_a8_head_pending`]).
+    pub(crate) qwen4_moe_down_a8_head_pending: bool,
+    /// A8 `block_i8_128` sidecar of the routed-down route (`rows * 680` B), grown eagerly by
+    /// [`Gpu::reserve_qwen4_moe_down_a8`].
+    pub(crate) qwen4_moe_down_a8_scratch: Option<DeviceBuffer>,
+    pub(crate) qwen4_moe_down_a8_scratch_bytes: usize,
     /// True while the Flash-Next lane step, a Qwen4 speculative verify forward
     /// or the DFlash2 draft head runs (set by their drivers):
     /// together with the `fn_lane_pm_rows` flag it routes the four incumbent
@@ -3331,6 +3342,10 @@ impl Gpu {
             hessian_capture: None,
             qwen4_scope: false,
             qwen4_trunk_a8_verified: false,
+            qwen4_moe_down_a8_verified: false,
+            qwen4_moe_down_a8_head_pending: false,
+            qwen4_moe_down_a8_scratch: None,
+            qwen4_moe_down_a8_scratch_bytes: 0,
             lane_rows_scope: false,
             prefill_invariant_scope: false,
             wide_verify_rows: 0,

@@ -3901,6 +3901,18 @@ pub const SITES: &[Site] = &[
         decisions: &["eager-only-refusals"],
     },
     Site {
+        file: "rdna-compute/src/qwen4_moe_down_a8.rs",
+        function: "qwen4_moe_down_a8_applies",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/qwen4_moe_down_a8.rs",
+        function: "reserve_qwen4_moe_down_a8",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
         file: "rdna-compute/src/tensor_ops.rs",
         function: "qsa_filter_production",
         occurrences: 2,

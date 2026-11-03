@@ -3247,6 +3247,26 @@ impl Gpu {
             &[batch_size, k_top, 4],
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded indices",
         )?;
+        // Exact gfx1201 symmetric experts, 1..=48 tokens: the int8 A8 routed down (one fold for
+        // every row count, bytewise equal to the grouped A8 entry); see qwen4_moe_down_a8.rs.
+        if self.qwen4_moe_down_a8_applies_indexed(m, k, batch_size, k_top) {
+            require_span(
+                expert_ptrs,
+                &[n_exp, 8],
+                "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded A8 pointer table",
+            )?;
+            return self.qwen4_moe_down_a8_indexed(
+                expert_ptrs,
+                topk_indices,
+                hidden_batch,
+                expert_outputs,
+                m,
+                k,
+                batch_size,
+                n_exp,
+                k_top,
+            );
+        }
         // K = 640 on exact gfx1151, eager: four weight rows per wave reuse the
         // pick's x (bitwise the one-row kernel).
         let r4 = k == 640
@@ -3511,6 +3531,34 @@ impl Gpu {
         x_src_rows: usize,
         n_exp: usize,
     ) -> HipResult<()> {
+        // Exact gfx1201 symmetric experts, one X row per pick, 1..=48 tokens: the int8 A8
+        // grouped down with the incumbent Y contract; see qwen4_moe_down_a8.rs.
+        if self.qwen4_moe_down_a8_applies_grouped(m, k, x_row_div, x_src_rows) {
+            self.bind_thread()?;
+            require_span(
+                y_grouped,
+                &[grouped_rows, m, 4],
+                "gemm_mq4g128v2_moe_grouped_top10 A8 grouped rows",
+            )?;
+            require_span(
+                x_src,
+                &[x_src_rows, k, 4],
+                "gemm_mq4g128v2_moe_grouped_top10 A8 activations",
+            )?;
+            return self.qwen4_moe_down_a8_grouped(
+                expert_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                grouped_rows,
+                x_src_rows,
+                n_exp,
+            );
+        }
         // gfx1151, >= 512 tokens (x_row_div == 1: one X row per top-10 slot):
         // F16 WMMA grouped down, 8.6 -> 5.4 ms at 1131 tokens.  Not
         // bit-exact (F16 dequant/inputs); gated by KLD against the BF16

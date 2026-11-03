@@ -2067,6 +2067,7 @@ pub(crate) use cpu_splice::{ColdLayerRefs, ColdLayerSource};
 mod cpu_slab_owner;
 mod cpu_splice;
 pub(crate) mod ep_reserve_forward;
+pub(crate) mod moe_down_a8;
 pub use ep_reserve_forward::ep_reserve_receipt_scope;
 pub(crate) mod ep_reserve_loan;
 pub(crate) mod ep_reserve_scratch;
@@ -12573,6 +12574,29 @@ impl Qwen4GpuForward {
             // capture; one failing tensor keeps the affine route for the whole device. Under EP
             // the trunk weights are these same resident tensors (`attach_ep` adds none).
             crate::trunk_a8::verify_trunk_a8(gpu, &bundle.weights)?;
+            // Int8 routed-down route (`HIPFIRE_QWEN4_MOE_DOWN_A8`, gfx1201): one verdict per
+            // device from the per-layer symmetric flags just taken (gate/up AND down verified, host-
+            // mapped layers included). Under EP the verdict is taken on the full tables in `attach_ep`.
+            if ep.is_none() {
+                let sym_checked = !stock_fp8
+                    && moe_count > 0
+                    && !s1_f16_profile
+                    && gpu.qwen4_moe_sym_iu4_requested();
+                moe_down_a8::settle_trunk(
+                    gpu,
+                    sym_checked,
+                    moe.iter().flatten().filter(|layer| layer.symmetric).count(),
+                    moe_count,
+                    bundle
+                        .weights
+                        .mtp
+                        .as_ref()
+                        .is_some_and(|mtp| mtp.ffn.moe().is_some()),
+                );
+            } else {
+                gpu.set_qwen4_moe_down_a8_verified(false);
+                gpu.set_qwen4_moe_down_a8_head_pending(false);
+            }
             // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above does not run
             // there when `HIPFIRE_QWEN4_MOE_SYM_IU4=0` (or no layer passed the header check), yet
             // the slab K2 prefill reuses its grouping scratch, down sidecar and shared gate/up
@@ -13434,6 +13458,19 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
+            // Int8 routed-down route (`HIPFIRE_QWEN4_MOE_DOWN_A8`, gfx1201): the rank's verdict
+            // over every routed layer of the full tables (host-mapped aliases included).
+            moe_down_a8::settle_trunk(
+                gpu,
+                !full.is_empty() && gpu.qwen4_moe_sym_iu4_requested(),
+                full.iter().filter(|layer| layer.symmetric).count(),
+                full.len(),
+                bundle
+                    .weights
+                    .mtp
+                    .as_ref()
+                    .is_some_and(|mtp| mtp.ffn.moe().is_some()),
+            );
             // Balanced ownership (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0` disables): every
             // balanced trunk layer gets a live runtime of the same full
             // addressing, whose tables the per-call owner assignment

@@ -4075,6 +4075,8 @@ pub fn is_developer_key(key: &str) -> bool {
 const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_sym_iu4",
     "developer.qwen4_trunk_a8",
+    "developer.qwen4_moe_down_a8",
+    "developer.qwen4_moe_down_a8_indexed",
     "developer.qwen4_d2_default",
     "developer.qwen4_mtp_head_d2",
     "developer.qwen4_mtp_head_resident",

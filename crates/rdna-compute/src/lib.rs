@@ -128,6 +128,7 @@ pub mod profile_rocprof;
 pub mod profiler;
 pub mod qsa_pooled_mirror;
 pub mod qwen35_fa_batch;
+pub mod qwen4_moe_down_a8;
 pub mod railgun_check;
 pub mod railgun_window;
 pub mod rdna;

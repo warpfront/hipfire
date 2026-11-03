@@ -1862,7 +1862,7 @@ impl Qwen4Bundle {
             // no host copy for the CPU arm.
             crate::mtp_gpu::head_experts_host_mapped(&self.weights) == Some(false),
         );
-        let mtp = Qwen4MtpGpu::new_with_backend(
+        let mut mtp = Qwen4MtpGpu::new_with_backend(
             gpu,
             &self.weights,
             &self.config,
@@ -1872,6 +1872,12 @@ impl Qwen4Bundle {
             // and the rank's dummy expert) builds the head's EP decode table.
             ep_binding,
             decision == crate::mtp_gpu::HeadD2Decision::Armed,
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))?;
+        crate::gpu_forward::moe_down_a8::settle_mtp_head(
+            gpu,
+            self.config.mtp_geometry(),
+            mtp.moe.as_mut(),
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         match (decision, mtp.head_d2_modes(), mtp.head_d2_host_bytes()) {
