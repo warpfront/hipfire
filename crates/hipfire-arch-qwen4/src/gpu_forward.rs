@@ -3577,8 +3577,18 @@ pub(crate) struct MtpEpGather<'a> {
 /// builds nothing (no tables, no buffer, no stage, no kernel load).
 pub const QWEN4_EP_BALANCED_OWNERS_ENV: &str = "HIPFIRE_EP_BALANCED_OWNERS";
 
+///
+/// Never under the trunk shard ([`crate::weights::trunk_shard::trunk_shard_requested`]): its FFN is
+/// the rank's PARTIAL (owned routed slots + its K-half of the shared expert) folded by the fused
+/// all-reduce, so which routed experts a rank sums changes the bf16 partials. Balanced ownership
+/// (`idx_free(e) % ranks` over the routed set of the CALL) depends on the other rows of the call,
+/// so a lane's decode row differed from its singleton (lane == singleton failed on every
+/// multi-lane burst, card job j7451: production 0/8 lanes equal, `HIPFIRE_EP_BALANCED_OWNERS=0`
+/// 8/8). The static `e % ranks` split is batch-invariant, and resident experts were already
+/// pinned to their holder `e % ranks`, so it only gives up balancing the host-resident tail.
 fn qwen4_ep_balanced_owners_enabled() -> bool {
     hipfire_config::developer_var(QWEN4_EP_BALANCED_OWNERS_ENV).as_deref() != Ok("0")
+        && !crate::weights::trunk_shard::trunk_shard_requested()
 }
 
 /// Why an EP rank does not run balanced ownership, or `None` when it does. The
