@@ -104,9 +104,10 @@ use crate::program::{
 use crate::state::Qwen4State;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::{
-    execute_embedding, execute_validated_steps, validate_steps, ClearOp, EmbeddingOp,
-    GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode,
-    IndexedAttentionOp, IndexedAttentionState, MixerPhase, Step,
+    execute_embedding, execute_validated_steps, execute_validated_steps_with_moe_hooks,
+    validate_steps, ClearOp, EmbeddingOp, GatedDeltaNetOp, GroupedDepthwiseOp, HyperReadOp,
+    HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState, MixerPhase,
+    MoeStepHooks, Step,
 };
 use hipfire_runtime::external_rows::RowFetch;
 use rdna_compute::prefill_invariant::QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
@@ -1092,6 +1093,135 @@ pub(crate) fn row_group_count(rows: &[usize]) -> usize {
     group_segments(rows, LANE_MAX_ROWS).len()
 }
 
+/// Widest all-rows HC op: the wide-verify row bound every HC kernel arm admits
+/// ([`rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS`]).
+const HC_ALL_ROWS_MAX: usize = rdna_compute::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
+
+/// Whether an AR / verify lane step of `group_rows` (the once-over-all-rows
+/// groups of at most [`LANE_MAX_ROWS`] rows each) runs its HC stages once over
+/// every row (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`) instead of once per group.
+/// `flag` is the exact-gfx1201 flag, `ar_step` an AR / verify step (never a
+/// prefill wave or a band edge), `eager` no replay recording and no graph
+/// capture (the wide few-row limit the HC kernels' all-rows arms run under
+/// exists only eagerly), `cpu_splice` a layer with CPU routed experts (its
+/// groups are CPU-window sized). The HC read needs `HcRead` and `HcWrite`
+/// both [`StageShare::OnceAllRows`].
+fn hc_all_rows_applies(
+    flag: bool,
+    ar_step: bool,
+    eager: bool,
+    cpu_splice: bool,
+    group_rows: &[usize],
+    policy: &LaneStagePolicy,
+) -> bool {
+    let n: usize = group_rows.iter().sum();
+    flag && ar_step
+        && eager
+        && !cpu_splice
+        && group_rows.len() > 1
+        && group_rows
+            .iter()
+            .all(|&rows| (1..=LANE_MAX_ROWS).contains(&rows))
+        && (LANE_MAX_ROWS + 1..=HC_ALL_ROWS_MAX).contains(&n)
+        && policy.share(StageName::HcRead) == StageShare::OnceAllRows
+        && policy.share(StageName::HcWrite) == StageShare::OnceAllRows
+}
+
+/// Where a piece of a once-over-all-rows run is emitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    /// Once per [`LANE_MAX_ROWS`]-row group, segment-major (today's emission).
+    Groups,
+    /// One segment over every row of the step (rows `[0, n)`): the HC stages
+    /// of an all-rows step.
+    AllRows,
+}
+
+/// Split one run of consecutive once-over-all-rows operations into pieces of
+/// consecutive operations with the same [`Placement`]. `hc_all`: `None` keeps
+/// the whole run in groups (today's emission); `Some(writes)` places every HC
+/// read, and the HC write of the attention (`writes[0]`) / MLP (`writes[1]`)
+/// stage when `writes` says so, over all rows. Operations keep their order.
+fn run_pieces(
+    run: &[(LaneOp, StageName)],
+    hc_all: Option<[bool; 2]>,
+) -> Vec<(std::ops::Range<usize>, Placement)> {
+    let place = |op: LaneOp| match (op, hc_all) {
+        (LaneOp::HcRead { .. }, Some(_)) => Placement::AllRows,
+        (LaneOp::HcWrite { mlp, .. }, Some(writes)) if writes[usize::from(mlp)] => {
+            Placement::AllRows
+        }
+        _ => Placement::Groups,
+    };
+    let mut pieces: Vec<(std::ops::Range<usize>, Placement)> = Vec::new();
+    for (i, &(op, _)) in run.iter().enumerate() {
+        let placement = place(op);
+        match pieces.last_mut() {
+            Some((range, last)) if *last == placement => range.end = i + 1,
+            _ => pieces.push((i..i + 1, placement)),
+        }
+    }
+    pieces
+}
+
+/// The `(segment, ops)` items of one same-share run, in emission order: `run`
+/// starts at program index `start`, `segs` are the segments its share places
+/// it over (every group, or every lane), `hc_all` is `Some((all-rows segment,
+/// HC writes taken all-rows))` for a once-over-all-rows run of an all-rows
+/// step. Every piece is emitted segment-major over its own segments, pieces
+/// in order; without `hc_all` that is the whole run over `segs` (today's
+/// emission).
+fn run_items(
+    start: usize,
+    run: &[(LaneOp, StageName)],
+    segs: std::ops::Range<usize>,
+    hc_all: Option<(usize, [bool; 2])>,
+) -> Vec<(usize, std::ops::Range<usize>)> {
+    let mut items = Vec::new();
+    for (piece, placement) in run_pieces(run, hc_all.map(|(_, writes)| writes)) {
+        let ops = start + piece.start..start + piece.end;
+        match (placement, hc_all) {
+            (Placement::AllRows, Some((hc, _))) => items.push((hc, ops)),
+            _ => items.extend(segs.clone().map(|i| (i, ops.clone()))),
+        }
+    }
+    items
+}
+
+/// Opens the wide few-row scope (`Gpu::wide_verify_rows`, so `few_row_limit`
+/// admits `rows`) around exactly the all-rows HC steps of a lane program: the
+/// interpreter announces every step before dispatching it
+/// ([`MoeStepHooks::before_step`]), and the scope is `rows` for an HC read /
+/// write of `rows` rows and the step's prior value for every other step, so
+/// every other stage keeps the routes of its own (at most
+/// [`LANE_MAX_ROWS`]-row) groups.
+struct HcAllRowsScope {
+    rows: usize,
+    prior: usize,
+}
+
+impl MoeStepHooks for HcAllRowsScope {
+    fn before_moe(&mut self, _gpu: &mut Gpu) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Ok(())
+    }
+    fn after_moe(&mut self, _gpu: &mut Gpu) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        Ok(())
+    }
+    fn before_step(
+        &mut self,
+        gpu: &mut Gpu,
+        step: &Step<'_>,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let all_rows = match step {
+            Step::HyperRead(op) => op.rows == self.rows,
+            Step::HyperWrite(op) => op.rows == self.rows,
+            _ => false,
+        };
+        gpu.set_wide_verify_rows(if all_rows { self.rows } else { self.prior });
+        Ok(())
+    }
+}
+
 /// The row views one segment's operations bind: every row-indexed scratch
 /// tensor offset to the segment's first row, extending to the end of its
 /// allocation (exactly what a singleton forward of these rows sees from row
@@ -1952,7 +2082,30 @@ fn forward_lanes_scoped(
             lane_segs.len()..lane_segs.len() + group_segs.len()
         }
     };
-    let all_segs: Vec<Segment> = lane_segs.iter().chain(&group_segs).copied().collect();
+    let mut all_segs: Vec<Segment> = lane_segs.iter().chain(&group_segs).copied().collect();
+    // `HIPFIRE_QWEN4_LANE_HC_ALLROWS` (exact gfx1201): an AR / verify step of more than
+    // LANE_MAX_ROWS rows (several groups) runs every HC stage -- each layer's reads, the
+    // writes the all-reduce does not carry, the final read -- as ONE segment over all `n`
+    // rows; every other once-over-all-rows stage keeps its groups. The segment is appended
+    // after the groups (`hc_seg`); a prefill wave, a band edge, a recorded or captured
+    // step and a CPU splice never take it.
+    let group_rows: Vec<usize> = group_segs.iter().map(|seg| seg.rows).collect();
+    let hc_all = hc_all_rows_applies(
+        gpu.flags.qwen4_lane_hc_allrows_enabled(),
+        matches!(out, StepOutputs::Ar(_)),
+        !(gpu.replay.is_recording() || gpu.graphs.capture_mode) && !gpu.prefill_invariant_scope,
+        cpu_splice,
+        &group_rows,
+        policy,
+    );
+    // The writes a TP2 all-reduce carries (`HyperWriteOp::ar`) stay per group.
+    let hc_writes = [
+        crate::trunk_route::attn_writer().is_none(),
+        crate::trunk_route::ffn_writer().is_none(),
+    ];
+    let hc_final = hc_all
+        && band_scope.output
+        && policy.share(StageName::FinalHyper) == StageShare::OnceAllRows;
     // The head stages (final hyper, LM head, top-1) run on the output band only.
     // A prefill wave's head runs per lane after the trunk (its own views), so
     // the policy's Head / Argmax segments exist only for AR steps.
@@ -1977,7 +2130,7 @@ fn forward_lanes_scoped(
     // route capability and the few-row limit as the singleton at those rows),
     // so each segment's set is built at its own routing rows, which must be
     // within the gather cap and equal its real rows (refused before any launch).
-    let seg_desc_rows: Vec<usize> = if ep_lane_step && !ep_wave {
+    let mut seg_desc_rows: Vec<usize> = if ep_lane_step && !ep_wave {
         for i in segs_for(policy.share(StageName::Moe)) {
             let seg = &all_segs[i];
             let rr = if prefill {
@@ -1996,6 +2149,16 @@ fn forward_lanes_scoped(
     } else {
         vec![widest; all_segs.len()]
     };
+    // The all-rows HC segment binds the descriptions (and decode copies) of the groups.
+    let hc_seg: Option<usize> = hc_all.then_some(all_segs.len());
+    if hc_all {
+        all_segs.push(Segment {
+            begin: 0,
+            rows: n,
+            first_lane: 0,
+        });
+        seg_desc_rows.push(seg_desc_rows[lane_segs.len()]);
+    }
 
     // Token ids: one upload for every row, in lane order (the input band
     // embeds them; every other band runs from received HC streams). Outside a
@@ -2213,7 +2376,11 @@ fn forward_lanes_scoped(
         let states: Vec<&Qwen4State> = lanes.iter().map(|lane| &*lane.state).collect();
 
         // Preflight the head of every segment before any launch.
-        for i in head_segs(policy.share(StageName::FinalHyper)) {
+        let final_preflight: Vec<usize> = match hc_seg {
+            Some(hc) if hc_final => vec![hc],
+            _ => head_segs(policy.share(StageName::FinalHyper)).collect(),
+        };
+        for i in final_preflight {
             let (seg, v) = (&all_segs[i], &views[i]);
             let (final_hyper, _) = head_ref()?;
             validate_final_hyper(
@@ -2366,12 +2533,30 @@ fn forward_lanes_scoped(
             } else {
                 StageShare::OnceAllRows
             };
-            for i in segs_for(share) {
+            // The run's pieces: with the all-rows HC arm the HC ops of a once-over-all-rows run
+            // form their own all-rows pieces (the run's other ops keep their groups); each
+            // piece is emitted segment-major over its own segments, pieces in order.
+            let items = run_items(
+                start,
+                &program[start..end],
+                segs_for(share),
+                hc_seg
+                    .filter(|_| share == StageShare::OnceAllRows)
+                    .map(|hc| (hc, hc_writes)),
+            );
+            for (i, ops) in items {
                 let (seg, v) = (&all_segs[i], &views[i]);
                 let r = seg.rows;
-                let rr = if prefill { gpu.route_rows(r) } else { r };
+                // The all-rows HC segment binds the decode copies its groups bind.
+                let rr = if prefill {
+                    gpu.route_rows(r)
+                } else if Some(i) == hc_seg {
+                    widest
+                } else {
+                    r
+                };
                 let descs = &desc_sets[seg_desc_set[i]];
-                for &(op, _) in &program[start..end] {
+                for &(op, _) in &program[ops] {
                     match op {
                         LaneOp::HcRead { layer, mlp } => {
                             let read = if mlp {
@@ -2715,10 +2900,26 @@ fn forward_lanes_scoped(
                                 .map_err(|error| {
                                 Qwen4GpuForwardError::Dispatch(format!("seal lane MoE: {error:?}"))
                             })?;
-                            steps.push(Step::Clear(ClearOp {
-                                tensor: &v.ffn_output,
-                                elements: r * config.hidden_size,
-                            }));
+                            match hc_seg {
+                                // All-rows HC: ONE zero fill of every row's FFN output ahead of
+                                // the first group's call (the all-rows HC write+read launch
+                                // before it absorbs it), so every group's call starts from the
+                                // zeros its own fill would have left.
+                                Some(hc)
+                                    if policy.share(StageName::Moe) == StageShare::OnceAllRows =>
+                                {
+                                    if i == lane_segs.len() {
+                                        steps.push(Step::Clear(ClearOp {
+                                            tensor: &views[hc].ffn_output,
+                                            elements: n * config.hidden_size,
+                                        }));
+                                    }
+                                }
+                                _ => steps.push(Step::Clear(ClearOp {
+                                    tensor: &v.ffn_output,
+                                    elements: r * config.hidden_size,
+                                })),
+                            }
                             steps.push(Step::Moe(sealed));
                         }
                     }
@@ -2798,8 +2999,22 @@ fn forward_lanes_scoped(
             }
         }
 
+        // The all-rows HC steps run under the wide few-row scope (`HcAllRowsScope`); every other
+        // step keeps the step's own.
+        let prior_wide = gpu.wide_verify_rows;
         let execute = |gpu: &mut Gpu, steps: &[Step<'_>]| {
-            execute_validated_steps(gpu, &ctx, steps).map_err(|error| {
+            let result = if hc_seg.is_some() {
+                let mut scope = HcAllRowsScope {
+                    rows: n,
+                    prior: prior_wide,
+                };
+                let result = execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut scope);
+                gpu.set_wide_verify_rows(prior_wide);
+                result
+            } else {
+                execute_validated_steps(gpu, &ctx, steps)
+            };
+            result.map_err(|error| {
                 Qwen4GpuForwardError::Dispatch(format!("execute lane program: {error:?}"))
             })
         };
@@ -2894,10 +3109,19 @@ fn forward_lanes_scoped(
 
         // Final HC read, LM head, greedy top-1.
         let final_share = policy.share(StageName::FinalHyper);
-        for i in head_segs(final_share) {
+        let final_segs: Vec<usize> = match hc_seg {
+            Some(hc) if hc_final => vec![hc],
+            _ => head_segs(final_share).collect(),
+        };
+        for i in final_segs {
             let (seg, v) = (&all_segs[i], &views[i]);
             let (final_hyper, _) = head_ref()?;
-            execute_final_hyper(
+            // The all-rows final read runs under the wide few-row scope, like the layers' HC.
+            let all_rows = Some(i) == hc_seg;
+            if all_rows {
+                gpu.set_wide_verify_rows(seg.rows);
+            }
+            let result = execute_final_hyper(
                 gpu,
                 dims,
                 &final_hyper,
@@ -2905,8 +3129,11 @@ fn forward_lanes_scoped(
                 &seg_scratch[i],
                 seg.rows,
                 bf16_state,
-            )
-            .map_err(|error| {
+            );
+            if all_rows {
+                gpu.set_wide_verify_rows(prior_wide);
+            }
+            result.map_err(|error| {
                 Qwen4GpuForwardError::Dispatch(format!("execute lane final hyper: {error:?}"))
             })?;
         }
@@ -4680,5 +4907,263 @@ mod tests {
         assert_eq!(packed_bf16_offset(1, 3, f32_bytes, numel), None);
         assert_eq!(packed_bf16_offset(usize::MAX, 2, f32_bytes, numel), None);
         assert_eq!(packed_bf16_offset(1, wide, 0, numel), None);
+    }
+
+    /// `(segment, op)` of a whole program as `forward_lanes_scoped` walks it:
+    /// `lanes` lane segments then `groups` group segments, the all-rows HC
+    /// segment (when `hc_all` is `Some`) appended after them.
+    fn program_items(
+        program: &[(LaneOp, StageName)],
+        policy: &LaneStagePolicy,
+        lanes: usize,
+        groups: usize,
+        hc_all: Option<[bool; 2]>,
+    ) -> Vec<(usize, LaneOp)> {
+        let mut emitted = Vec::new();
+        let mut start = 0;
+        while start < program.len() {
+            let per_lane = policy.share(program[start].1).per_lane();
+            let mut end = start + 1;
+            while end < program.len() && policy.share(program[end].1).per_lane() == per_lane {
+                end += 1;
+            }
+            let segs = if per_lane {
+                0..lanes
+            } else {
+                lanes..lanes + groups
+            };
+            let hc = hc_all
+                .filter(|_| !per_lane)
+                .map(|writes| (lanes + groups, writes));
+            for (seg, ops) in run_items(start, &program[start..end], segs, hc) {
+                emitted.extend(program[ops].iter().map(|&(op, _)| (seg, op)));
+            }
+            start = end;
+        }
+        emitted
+    }
+
+    /// Today's emission, written out independently of `run_pieces`: every run
+    /// segment-major over its share's segments.
+    fn group_major_items(
+        program: &[(LaneOp, StageName)],
+        policy: &LaneStagePolicy,
+        lanes: usize,
+        groups: usize,
+    ) -> Vec<(usize, LaneOp)> {
+        let mut emitted = Vec::new();
+        let mut start = 0;
+        while start < program.len() {
+            let per_lane = policy.share(program[start].1).per_lane();
+            let mut end = start + 1;
+            while end < program.len() && policy.share(program[end].1).per_lane() == per_lane {
+                end += 1;
+            }
+            let segs = if per_lane {
+                0..lanes
+            } else {
+                lanes..lanes + groups
+            };
+            for seg in segs {
+                emitted.extend(program[start..end].iter().map(|&(op, _)| (seg, op)));
+            }
+            start = end;
+        }
+        emitted
+    }
+
+    fn is_hc(op: LaneOp) -> bool {
+        matches!(op, LaneOp::HcRead { .. } | LaneOp::HcWrite { .. })
+    }
+
+    #[test]
+    fn hc_all_rows_flag_off_emits_todays_group_major_program() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        for policy in test_policies() {
+            let program = lane_program(
+                band_kinds(&config, single.band.clone()),
+                &policy,
+                Some(ple_layer),
+            );
+            for (lanes, groups) in [(1, 1), (8, 1), (8, 2), (8, 4), (16, 8)] {
+                assert_eq!(
+                    program_items(&program, &policy, lanes, groups, None),
+                    group_major_items(&program, &policy, lanes, groups),
+                    "{} lanes {lanes} groups {groups}",
+                    policy.describe()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn hc_all_rows_places_each_hc_stage_once_and_keeps_every_other_stage_in_groups() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        let layers = config.num_hidden_layers;
+        let policy = LaneStagePolicy::production();
+        let program = lane_program(
+            band_kinds(&config, single.band.clone()),
+            &policy,
+            Some(ple_layer),
+        );
+        for (lanes, groups) in [(8, 2), (8, 3), (8, 4), (16, 8)] {
+            let hc_seg = lanes + groups;
+            let today = group_major_items(&program, &policy, lanes, groups);
+            let all = program_items(&program, &policy, lanes, groups, Some([true, true]));
+            // Today: every HC op runs once per group.
+            assert_eq!(
+                today.iter().filter(|(_, op)| is_hc(*op)).count(),
+                layers * 4 * groups
+            );
+            // All-rows: every HC op once, on the all-rows segment alone.
+            let hc_items: Vec<_> = all.iter().filter(|(_, op)| is_hc(*op)).collect();
+            assert_eq!(hc_items.len(), layers * 4);
+            assert!(hc_items.iter().all(|(seg, _)| *seg == hc_seg));
+            // Every other op: the very (segment, op) multiset of today's emission.
+            let rest = |items: &[(usize, LaneOp)]| {
+                let mut rest: Vec<_> = items
+                    .iter()
+                    .filter(|(_, op)| !is_hc(*op))
+                    .map(|&(seg, op)| (seg, format!("{op:?}")))
+                    .collect();
+                rest.sort();
+                rest
+            };
+            assert_eq!(rest(&all), rest(&today), "lanes {lanes} groups {groups}");
+            // Each segment still sees its non-HC ops in today's relative order.
+            for seg in 0..hc_seg {
+                let seq = |items: &[(usize, LaneOp)]| -> Vec<LaneOp> {
+                    items
+                        .iter()
+                        .filter(|(s, op)| *s == seg && !is_hc(*op))
+                        .map(|&(_, op)| op)
+                        .collect()
+                };
+                assert_eq!(seq(&all), seq(&today), "segment {seg}");
+            }
+            // The all-rows HC ops keep the program's order: per layer read(attn),
+            // write(attn), read(mlp), write(mlp).
+            let hc_ops: Vec<LaneOp> = hc_items.iter().map(|&&(_, op)| op).collect();
+            let expected: Vec<LaneOp> = program
+                .iter()
+                .map(|&(op, _)| op)
+                .filter(|op| is_hc(*op))
+                .collect();
+            assert_eq!(hc_ops, expected);
+        }
+    }
+
+    #[test]
+    fn hc_all_rows_leaves_all_reduce_writes_and_per_lane_runs_in_place() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        let layers = config.num_hidden_layers;
+        let policy = LaneStagePolicy::production();
+        let program = lane_program(
+            band_kinds(&config, single.band.clone()),
+            &policy,
+            Some(ple_layer),
+        );
+        let (lanes, groups) = (8, 4);
+        let hc_seg = lanes + groups;
+        // The FFN write carried by the all-reduce stays per group; reads and the
+        // mixer writes go all-rows.
+        let items = program_items(&program, &policy, lanes, groups, Some([true, false]));
+        for (seg, op) in &items {
+            match op {
+                LaneOp::HcRead { .. } | LaneOp::HcWrite { mlp: false, .. } => {
+                    assert_eq!(*seg, hc_seg, "{op:?}")
+                }
+                LaneOp::HcWrite { mlp: true, .. } => assert!(*seg >= lanes && *seg < hc_seg),
+                _ => assert_ne!(*seg, hc_seg, "{op:?}"),
+            }
+        }
+        assert_eq!(
+            items
+                .iter()
+                .filter(|(_, op)| matches!(op, LaneOp::HcWrite { mlp: true, .. }))
+                .count(),
+            layers * groups
+        );
+        // Per-lane stages are emitted exactly as today, with and without the arm.
+        let per_lane = |items: &[(usize, LaneOp)]| -> Vec<(usize, LaneOp)> {
+            items
+                .iter()
+                .copied()
+                .filter(|(seg, _)| *seg < lanes)
+                .collect()
+        };
+        assert_eq!(
+            per_lane(&items),
+            per_lane(&group_major_items(&program, &policy, lanes, groups))
+        );
+    }
+
+    #[test]
+    fn hc_all_rows_applies_only_to_eager_multi_group_ar_steps() {
+        let production = LaneStagePolicy::production();
+        let eight_by_two = [8usize, 8];
+        let applies = |flag, ar, eager, cpu, groups: &[usize], policy: &LaneStagePolicy| {
+            hc_all_rows_applies(flag, ar, eager, cpu, groups, policy)
+        };
+        assert!(applies(true, true, true, false, &eight_by_two, &production));
+        // Flag off, a prefill wave / band edge (not an AR step), a recorded or
+        // captured step, a CPU splice: never.
+        assert!(!applies(
+            false,
+            true,
+            true,
+            false,
+            &eight_by_two,
+            &production
+        ));
+        assert!(!applies(
+            true,
+            false,
+            true,
+            false,
+            &eight_by_two,
+            &production
+        ));
+        assert!(!applies(
+            true,
+            true,
+            false,
+            false,
+            &eight_by_two,
+            &production
+        ));
+        assert!(!applies(true, true, true, true, &eight_by_two, &production));
+        // One group (<= 8 rows) has nothing to share; an over-wide group, an empty one and
+        // more than the 64 wide-verify rows are refused.
+        assert!(!applies(true, true, true, false, &[8], &production));
+        assert!(!applies(true, true, true, false, &[3, 4], &production));
+        assert!(!applies(true, true, true, false, &[9, 8], &production));
+        assert!(!applies(true, true, true, false, &[8, 0], &production));
+        assert!(applies(true, true, true, false, &[8; 8], &production));
+        assert!(!applies(true, true, true, false, &[8; 9], &production));
+        // 24 and 32 rows (three / four groups of 8, or six / eight of 4).
+        assert!(applies(true, true, true, false, &[8, 8, 8], &production));
+        assert!(applies(true, true, true, false, &[4; 8], &production));
+        // The HC read and write must both be once-over-all-rows.
+        for stage in [StageName::HcRead, StageName::HcWrite] {
+            let per_lane = LaneStagePolicy::production()
+                .with(stage, StageShare::PerLane)
+                .unwrap();
+            assert!(!applies(true, true, true, false, &eight_by_two, &per_lane));
+        }
+        assert!(!applies(
+            true,
+            true,
+            true,
+            false,
+            &eight_by_two,
+            &LaneStagePolicy::all_per_lane()
+        ));
     }
 }

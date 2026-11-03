@@ -2808,6 +2808,17 @@ pub fn hyper_read_up_fused(gpu: &mut Gpu, p: &HyperReadUpFused<'_>) -> HipResult
         gpu.arch_caps.is_gfx1201(),
         p.rows,
     );
+    // `HIPFIRE_QWEN4_LANE_HC_ALLROWS`: the lane step's all-rows HC read tail (9..=64 rows) is the
+    // t1 entry, whose grid `[hidden / 8, ceil(rows / 8)]` runs each eight-token tile with the
+    // very device body the <= 8-row group launches run (one token per wave, no state shared
+    // across `blockIdx.y`), in one launch, instead of the incumbent's 128-token row grid.
+    if entry == HyperReadUpFusedEntry::Incumbent
+        && *QWEN4_HC_UP_TWIN
+        && *QWEN4_HC_UP_T1
+        && gpu.lane_hc_allrows_applies(p.rows)
+    {
+        entry = HyperReadUpFusedEntry::TwinT1;
+    }
     if entry == HyperReadUpFusedEntry::TwinT1 && *QWEN4_HC_UP_T1_K320 && p.low_rank == 320 {
         entry = HyperReadUpFusedEntry::TwinT1K320;
     }

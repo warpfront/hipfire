@@ -21574,6 +21574,17 @@ impl Gpu {
                 "gemv_bf16_xf32_k4_rows needs K % 32 == 0 and 1..=64 rows",
             ));
         }
+        if rows > FEW_ROW_ROUTE_ROWS && self.lane_hc_allrows_applies(rows) {
+            return self.gemv_bf16_xf32_k4_rows_lane_allrows(
+                weight,
+                x,
+                y,
+                m,
+                k,
+                hc_act_scale,
+                rows,
+            );
+        }
         if rows > FEW_ROW_ROUTE_ROWS && self.row_tile_twin_enabled(WideTwinFamily::Bf16, rows) {
             return self.lab_gemv_bf16_xf32_k4_rows_t8(weight, x, y, m, k, hc_act_scale, rows);
         }
@@ -21786,6 +21797,94 @@ impl Gpu {
                 b.push_i32(k_val);
                 b.push_f32(scale);
                 b.push_i32(hc_act);
+                b
+            },
+        )
+    }
+
+    /// Whether the lane step's all-rows HC stages (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`, exact
+    /// gfx1201) take their one-launch arms for a `rows`-row HC op: the flag, more than
+    /// [`FEW_ROW_ROUTE_ROWS`] and at most [`WIDE_VERIFY_MAX_ROWS`] rows, and
+    /// [`Gpu::few_row_limit`] already admitting them (the lane forward opens that scope for
+    /// its all-rows HC steps only: eager, never recording or capturing, never the
+    /// prefill-invariant profile). Pure.
+    pub fn lane_hc_allrows_applies(&self, rows: usize) -> bool {
+        self.flags.qwen4_lane_hc_allrows_enabled()
+            && rows > FEW_ROW_ROUTE_ROWS
+            && rows <= WIDE_VERIFY_MAX_ROWS
+            && !self.prefill_invariant_scope
+            && self.few_row_limit() >= rows
+    }
+
+    /// [`Gpu::gemv_bf16_xf32_k4_rows`] of `rows` (9..=[`WIDE_VERIFY_MAX_ROWS`]) activation rows
+    /// (x row stride K, y row stride M) in ONE `gemv_bf16_xf32_k4_rows_lane_t8` launch, grid
+    /// `[m, ceil(rows / 8)]`: full tiles of eight rows and the partial last tile run the
+    /// incumbent `_k4_rows_r<R>` device body, so each row is bitwise the one the <= 8-row
+    /// group launches (`_otile_r<R>` / `_k4_rows_r<R>`) and the single-row kernel give it.
+    /// Needs `k % 32 == 0`; no row past `rows` is read or written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_xf32_k4_rows_lane_allrows(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        const FUNC: &str = "gemv_bf16_xf32_k4_rows_lane_t8";
+        if !k.is_multiple_of(32)
+            || m == 0
+            || m > u32::MAX as usize
+            || !(FEW_ROW_ROUTE_ROWS + 1..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+            || !self.flags.qwen4_lane_hc_allrows_enabled()
+        {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gemv_bf16_xf32_k4_rows_lane_allrows needs K % 32 == 0, 9..=64 rows and HIPFIRE_QWEN4_LANE_HC_ALLROWS on gfx1201",
+            ));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32_lane_allrows",
+            kernels::QWEN4_GEMV_BF16_XF32_LANE_ALLROWS_SRC,
+            FUNC,
+        )?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let scale = hc_act_scale.unwrap_or(1.0);
+        let hc_act = i32::from(hc_act_scale.is_some());
+        let rows_val = rows as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+            &hc_act as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            FUNC,
+            [m as u32, rows.div_ceil(FEW_ROW_ROUTE_ROWS) as u32, 1],
+            [128, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_f32(scale);
+                b.push_i32(hc_act);
+                b.push_i32(rows_val);
                 b
             },
         )

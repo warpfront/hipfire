@@ -8038,6 +8038,13 @@ pub const QWEN4_DECODE_HEAD_FUSE_SRC: &str =
 /// outputs). Standalone source.
 pub const QWEN4_GEMV_BF16_XF32_OTILE_SRC: &str =
     include_str!("../../../kernels/src/qwen4_gemv_bf16_xf32_otile.hip");
+/// Module `qwen4_gemv_bf16_xf32_lane_allrows` (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`, default
+/// off, exact gfx1201): `gemv_bf16_xf32_k4_rows_lane_t8`, the HC k4 rows GEMV of 9..=64
+/// rows (the lane step's all-rows HC read down / write gates) in ONE launch, grid
+/// `[m, ceil(rows / 8)]`, the partial last tile included. Standalone source holding the
+/// incumbent `gemv_bf16_xf32_row_multi` / `_k4_rows_body` device arithmetic verbatim.
+pub const QWEN4_GEMV_BF16_XF32_LANE_ALLROWS_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_gemv_bf16_xf32_lane_allrows.gfx1201.hip");
 /// Module `qsa_pooled_bf16_mirror` (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, exact
 /// gfx1151): `qsa_pooled_f32_to_bf16_mirror`, the lossless high-half copy of
 /// the BF16-rounded F32 pooled index keys, and the lab exactness probe
