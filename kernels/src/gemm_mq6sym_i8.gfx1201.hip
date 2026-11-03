@@ -185,7 +185,7 @@ static __device__ __forceinline__ void sym_narrow_body(
         #pragma unroll
         for (int rg = 0; rg < RG; rg++) {
             const auto h2 = __builtin_amdgcn_raw_buffer_load_b64(w_rsrc, hoff[rg], goff, 0);
-            r.hdr[rg] = sym_hdr2(h2.x, h2.y);
+            r.hdr[rg] = sym_hdr2(h2[0], h2[1]);
             #pragma unroll
             for (int hv = 0; hv < 2; hv++) {
                 #pragma unroll
