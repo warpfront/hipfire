@@ -1430,24 +1430,31 @@ fn mq6sym_i8_wmma_timing_hw() {
                         .is_ok();
                 }
                 if ok {
-                    let x8 = rand_activations(&mut rng, k, 8);
-                    let x8t = upload_f32(&mut gpu, &x8);
-                    let res8 = gpu.reserve_int8_mmq(k, 8).expect("reserve8");
-                    let prep8 = gpu.rotate_x_mq_i8_batched(&x8t, None, res8, k, 8).expect("producer8");
-                    let p8 = gpu.int8_mmq_prepared_ptr(&prep8, k, 8).expect("ptr8");
-                    let nb8 = (k / 128) * 8 * BLK;
-                    let xq8 = gpu.alloc_tensor(&[nb8], DType::Raw).expect("alloc xq8");
-                    unsafe {
-                        gpu.hip.memcpy_dtod_raw(xq8.buf.as_ptr(), p8 as *const c_void, nb8).expect("dtod xq8");
-                    }
-                    let res = gpu.reserve_int8_mmq(k, n).expect("reserve");
-                    let prep = gpu.rotate_x_mq_i8_batched(&xt, None, res, k, n).expect("producer");
-                    let again = gpu.int8_mmq_prepared_ptr(&prep, k, n).expect("xq ptr");
-                    assert_eq!(again, xq, "scratch pointer moved");
-                    gpu.hip.device_synchronize().unwrap();
+                    // N <= 8: the N-token scratch is the sidecar (one launch). N > 8: own persistent
+                    // 8-token sidecar (same producer), then the N-token scratch is rebuilt.
+                    let xq8p = if n <= 8 {
+                        xq
+                    } else {
+                        let x8 = rand_activations(&mut rng, k, 8);
+                        let x8t = upload_f32(&mut gpu, &x8);
+                        let res8 = gpu.reserve_int8_mmq(k, 8).expect("reserve8");
+                        let prep8 = gpu.rotate_x_mq_i8_batched(&x8t, None, res8, k, 8).expect("producer8");
+                        let p8 = gpu.int8_mmq_prepared_ptr(&prep8, k, 8).expect("ptr8");
+                        let nb8 = (k / 128) * 8 * BLK;
+                        let xq8 = gpu.alloc_tensor(&[nb8], DType::Raw).expect("alloc xq8");
+                        unsafe {
+                            gpu.hip.memcpy_dtod_raw(xq8.buf.as_ptr(), p8 as *const c_void, nb8).expect("dtod xq8");
+                        }
+                        let res = gpu.reserve_int8_mmq(k, n).expect("reserve");
+                        let prep = gpu.rotate_x_mq_i8_batched(&xt, None, res, k, n).expect("producer");
+                        let again = gpu.int8_mmq_prepared_ptr(&prep, k, n).expect("xq ptr");
+                        assert_eq!(again, xq, "scratch pointer moved");
+                        gpu.hip.device_synchronize().unwrap();
+                        let p = xq8.buf.as_ptr();
+                        keep_alive.push(xq8);
+                        p
+                    };
                     let wp = wp.clone();
-                    let xq8p = if n <= 8 { xq } else { xq8.buf.as_ptr() };
-                    keep_alive.push(xq8);
                     let passes = n.div_ceil(8);
                     arms.push(Arm {
                         name: format!("dot4_same_format_x{passes}pass_f32"),
