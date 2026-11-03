@@ -676,6 +676,10 @@ pub enum RopeKind {
     /// GPT-J pairing `(2i, 2i + 1)` over the first `rot_dim` channels of each
     /// head; channels `rot_dim..` pass through (Cohere2).
     Interleaved { rot_dim: usize },
+    /// Interleaved (t, h, w) multimodal RoPE, rotate-half over the first
+    /// `rot_dim` channels of each head with the frequency bands split by
+    /// `section`; positions are `[rows][3]` I32 (Qwen3.5). Batched rows only.
+    Mrope { rot_dim: usize, section: [usize; 3] },
     /// No rotation (NoPE layers).
     NoPe,
 }
@@ -695,6 +699,8 @@ impl Rope {
             RopeKind::RotateHalf | RopeKind::RotateHalfLlama3(_) | RopeKind::NoPe => {
                 return Ok(());
             }
+            // Batched rows only; `validate_rows` checks its `rot_dim` and `section`.
+            RopeKind::Mrope { .. } => return Ok(()),
             RopeKind::PartialHalved { rot_pairs } if 2 * rot_pairs <= head_dim => return Ok(()),
             RopeKind::PartialHalved { rot_pairs } => 2 * rot_pairs,
             RopeKind::PrefixHalfSplit { rot_dim } | RopeKind::Interleaved { rot_dim } => rot_dim,
@@ -714,8 +720,18 @@ impl Rope {
         match self.kind {
             RopeKind::RotateHalf | RopeKind::RotateHalfLlama3(_) => Some(head_dim / 2),
             RopeKind::PartialHalved { rot_pairs } => Some(rot_pairs),
-            RopeKind::PrefixHalfSplit { .. } | RopeKind::Interleaved { .. } => None,
+            RopeKind::PrefixHalfSplit { .. }
+            | RopeKind::Interleaved { .. }
+            | RopeKind::Mrope { .. } => None,
             RopeKind::NoPe => Some(0),
+        }
+    }
+
+    /// Position entries per row: 3 for [`RopeKind::Mrope`], else 1.
+    pub(crate) fn positions_per_row(&self) -> usize {
+        match self.kind {
+            RopeKind::Mrope { .. } => 3,
+            _ => 1,
         }
     }
 
@@ -735,6 +751,11 @@ impl Rope {
         let theta = self.theta;
         match self.kind {
             RopeKind::NoPe => Ok(()),
+            RopeKind::Mrope { .. } => {
+                return Err(DispatchError::Hip(
+                    "mRoPE has no single-row route; pass per-row positions".into(),
+                ))
+            }
             RopeKind::RotateHalf => {
                 gpu.rope_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, theta)
             }
@@ -833,6 +854,22 @@ impl Rope {
             ),
             #[cfg(not(feature = "deltanet"))]
             RopeKind::Interleaved { .. } => return Err(interleaved_needs_deltanet()),
+            #[cfg(feature = "deltanet")]
+            RopeKind::Mrope { rot_dim, section } => gpu.rope_mrope_halfsplit_f32_batched(
+                q,
+                k,
+                &positions.buf,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                rot_dim,
+                theta,
+                rows,
+                0,
+                section,
+            ),
+            #[cfg(not(feature = "deltanet"))]
+            RopeKind::Mrope { .. } => return Err(interleaved_needs_deltanet()),
             RopeKind::NoPe => return Ok(()),
         }
         .map_err(hip)

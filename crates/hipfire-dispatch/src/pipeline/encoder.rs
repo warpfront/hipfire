@@ -4,20 +4,22 @@
 
 //! `EncoderOp` / `execute_encoder`: the stages of a bidirectional hybrid
 //! encoder trunk over a row block of independent, back-to-back sequences
-//! (Qwen3.5 multi-vector embedding, #666 G19). F16 weights, F32 activations.
+//! (Qwen3.5 multi-vector embedding, #666 G19). F32 activations.
 //!
 //! ```text
-//! full attn  [RmsnormAutomatic] -> Project(q, gate, k, v) -> QkNorm(q, k) -> Mrope
-//!            -> Attention (bidirectional, per segment) -> SigmoidGate -> Project(o, +residual)
-//! GDN        [RmsnormAutomatic] -> Project(qkv, z, a, b) -> AlphaGate -> ConvSplit (per segment)
-//!            -> QkL2 -> Scan (per segment) -> GatedNorm -> Project(out, +residual)
+//! full attn  [RmsnormAutomatic] -> [Project(q, gate, k, v)] -> [QkNorm(q, k)] -> [Rope(Mrope)]
+//!            -> Attention (bidirectional, per segment) -> SigmoidGate -> [Project(o, +residual)]
+//! GDN        [RmsnormAutomatic] -> [Project(qkv, z, a, b)] -> AlphaGate -> ConvSplit (per segment)
+//!            -> QkL2 -> Scan (per segment) -> GatedNorm -> [Project(out, +residual)]
 //! ```
 //!
-//! Row-independent stages run once over the whole block. The two stateful
-//! ones run per [`EncoderSegment`] with their state zeroed at each segment's
-//! start, and attention never reads keys outside its own segment, so a block
-//! of sequences is equivalent to encoding each alone. Stages borrow every
-//! operand; the only allocations are each stage's own transient scratch.
+//! Bracketed steps are the shared ones (projections on
+//! `ProjectLadder::EncoderF16`). Row-independent stages run once over the
+//! whole block. The two stateful ones run per [`EncoderSegment`] with their
+//! state zeroed at each segment's start, and attention never reads keys
+//! outside its own segment, so a block of sequences is equivalent to encoding
+//! each alone. Stages borrow every operand; the only allocations are the eager
+//! attention route's per-call transients.
 
 use rdna_compute::gemm::{LdsTile, LdsTileSplitK};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -26,6 +28,24 @@ use crate::types::DispatchError;
 
 fn hip(e: impl std::fmt::Debug) -> DispatchError {
     DispatchError::Hip(format!("{e:?}"))
+}
+
+/// Rows a sequence of `n` tokens occupies, after padding it up to a multiple
+/// of 64 so the eager attention's PV GEMM meets its `k % 64 == 0` contract
+/// (the eager route needs `rows % 64 == 0 && rows >= 256`, see [`EncoderOp::Attention`]).
+///
+/// Padding is at the END, which the architecture tolerates: GDN is causal, so
+/// the padded rows cannot influence a real row's state, and the full-attention
+/// layers mask the padded keys in the softmax. The padded rows' own outputs are
+/// garbage and are dropped by the caller. Below 256 tokens no padding is taken
+/// and the Q-tiled kernel runs instead — its cost is O(n^2), so it is cheap
+/// there and it needs no mask.
+pub fn padded_rows(n: usize) -> usize {
+    if n < 256 {
+        n
+    } else {
+        n.div_ceil(64) * 64
+    }
 }
 
 /// One sequence's row block inside the concatenated batch.
@@ -57,29 +77,6 @@ impl EncoderHeads {
 }
 
 pub enum EncoderOp<'a> {
-    /// `out[rows, out_dim] = x[rows, k] · w_f16[out_dim, k]ᵀ`, then
-    /// `residual += out` when given. No bias.
-    Project {
-        w: &'a GpuTensor,
-        x: &'a GpuTensor,
-        out: &'a GpuTensor,
-        residual: Option<&'a GpuTensor>,
-        rows: usize,
-        out_dim: usize,
-        k: usize,
-    },
-    /// Interleaved (t, h, w) mRoPE, rotate-half over the first `n_rot`
-    /// channels of each head; `positions` is `[rows][3]` i32.
-    Mrope {
-        q: &'a GpuTensor,
-        k: &'a GpuTensor,
-        positions: &'a GpuTensor,
-        heads: EncoderHeads,
-        n_rot: usize,
-        theta: f32,
-        section: [usize; 3],
-        rows: usize,
-    },
     /// Bidirectional attention within each segment. Scales `q` in place on
     /// the eager-GEMM route.
     Attention {
@@ -171,43 +168,6 @@ impl EncoderOp<'_> {
     /// Geometry and operand sizes; launch-free.
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
         match self {
-            EncoderOp::Project {
-                w,
-                x,
-                out,
-                residual,
-                rows,
-                out_dim,
-                k,
-            } => {
-                if *k == 0 || k % 16 != 0 {
-                    return Err(DispatchError::Hip(format!(
-                        "encoder: GEMM k={k} is not a multiple of 16"
-                    )));
-                }
-                fits(w, out_dim * k, "projection weight")?;
-                fits(x, rows * k, "projection input")?;
-                fits(out, rows * out_dim, "projection output")?;
-                if let Some(r) = residual {
-                    fits(r, rows * out_dim, "projection residual")?;
-                }
-            }
-            EncoderOp::Mrope {
-                q,
-                k,
-                positions,
-                heads,
-                n_rot,
-                rows,
-                ..
-            } => {
-                if *n_rot > heads.head_dim {
-                    return Err(DispatchError::Hip("encoder: mrope n_rot > head_dim".into()));
-                }
-                fits(q, rows * heads.q_dim(), "mrope q")?;
-                fits(k, rows * heads.kv_dim(), "mrope k")?;
-                fits(positions, rows * 3, "mrope positions")?;
-            }
             EncoderOp::Attention {
                 q,
                 k,
@@ -244,17 +204,27 @@ impl EncoderOp<'_> {
             }
             EncoderOp::ConvSplit {
                 qkv,
+                weight,
+                ring,
                 q,
                 k,
                 v,
                 key_dim,
                 value_dim,
                 segments,
-                ..
             } => {
                 check_segments(segments)?;
                 let n = segments_rows(segments);
-                fits(qkv, n * (2 * key_dim + value_dim), "conv input")?;
+                let ch = 2 * key_dim + value_dim;
+                // The kernel is a width-4 causal conv over a 3-row ring.
+                if weight.numel() != ch * 4 || ring.numel() != ch * 3 {
+                    return Err(DispatchError::Hip(format!(
+                        "encoder: conv takes a [{ch}, 4] weight and a [{ch}, 3] ring, got {} and {}",
+                        weight.numel(),
+                        ring.numel()
+                    )));
+                }
+                fits(qkv, n * ch, "conv input")?;
                 fits(q, n * key_dim, "conv q")?;
                 fits(k, n * key_dim, "conv k")?;
                 fits(v, n * value_dim, "conv v")?;
@@ -283,6 +253,12 @@ impl EncoderOp<'_> {
                 head_dim,
                 segments,
             } => {
+                // Key heads equal value heads: the kernel reads Q/K as heads x head_dim.
+                if *key_dim != heads * head_dim {
+                    return Err(DispatchError::Hip(format!(
+                        "encoder: scan key_dim {key_dim} != {heads} heads x {head_dim}"
+                    )));
+                }
                 check_segments(segments)?;
                 let n = segments_rows(segments);
                 fits(q, n * key_dim, "scan q")?;
@@ -330,45 +306,6 @@ fn check_segments(segments: &[EncoderSegment]) -> Result<(), DispatchError> {
 
 pub fn execute_encoder(gpu: &mut Gpu, op: &EncoderOp<'_>) -> Result<(), DispatchError> {
     match op {
-        EncoderOp::Project {
-            w,
-            x,
-            out,
-            residual,
-            rows,
-            out_dim,
-            k,
-        } => {
-            project(gpu, w, x, out, *out_dim, *k, *rows)?;
-            if let Some(r) = residual {
-                gpu.add_inplace_f32(r, out).map_err(hip)?;
-            }
-            Ok(())
-        }
-        EncoderOp::Mrope {
-            q,
-            k,
-            positions,
-            heads,
-            n_rot,
-            theta,
-            section,
-            rows,
-        } => gpu
-            .rope_mrope_halfsplit_f32_batched(
-                q,
-                k,
-                &positions.buf,
-                heads.n_heads,
-                heads.n_kv_heads,
-                heads.head_dim,
-                *n_rot,
-                *theta,
-                *rows,
-                0,
-                *section,
-            )
-            .map_err(hip),
         EncoderOp::Attention {
             q,
             k,
@@ -512,64 +449,10 @@ pub fn execute_encoder(gpu: &mut Gpu, op: &EncoderOp<'_>) -> Result<(), Dispatch
     }
 }
 
-// ── projection ladder ───────────────────────────────────────────────────
-
-fn projection_gfx1201_tile(m: usize) -> LdsTileSplitK {
-    match m {
-        0..512 => LdsTileSplitK::new(64, 128, 32, 64, true, 1),
-        512..1024 => LdsTileSplitK::new(128, 128, 32, 64, false, 1),
-        _ => LdsTileSplitK::new(128, 256, 32, 64, false, 1),
-    }
-}
-
 fn cast_f16(gpu: &mut Gpu, x: &GpuTensor, n: usize) -> Result<GpuTensor, DispatchError> {
     let dst = gpu.alloc_tensor(&[n], DType::F16).map_err(hip)?;
     gpu.cast_f32_to_f16(x, &dst).map_err(hip)?;
     Ok(dst)
-}
-
-/// `y[n, out] = x[n, k] · w_f16[out, k]ᵀ`, F32 `x` and `y`.
-///
-/// Large shapes take the LDS-tiled macro-tile kernel; small ones keep
-/// `gemm_f16_wmma_mb8`. Measured on gfx1101 at n=4096: mb8 runs the trunk's
-/// GEMMs at ~1.6 TFLOP/s (2% of the f16 peak) because it is a register-blocked
-/// 32-thread block with no LDS staging. The tiled kernel's X operand is f16,
-/// so activations narrow (~1e-3 relative against the f32 reference, two
-/// orders below what 4-bit weights cost). `HIPFIRE_EMBED_GEMM=f32` forces mb8.
-fn project(
-    gpu: &mut Gpu,
-    w: &GpuTensor,
-    x: &GpuTensor,
-    y: &GpuTensor,
-    out: usize,
-    k: usize,
-    n: usize,
-) -> Result<(), DispatchError> {
-    let wmma = gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12();
-    if !wmma {
-        let yt = gpu.alloc_tensor(&[out * n], DType::F32).map_err(hip)?;
-        let r = gpu
-            .gemm_f16(w, x, &yt, out, k, n)
-            .and_then(|_| gpu.transpose_f32(&yt, y, out, n));
-        gpu.free_tensor(yt).map_err(hip)?;
-        return r.map_err(hip);
-    }
-    let use_tiled = k % 64 == 0
-        && out >= 256
-        && !embed_gemm_f32()
-        && (gpu.arch_caps.has_wmma_w32() || gpu.arch == "gfx1201");
-    if use_tiled {
-        let x16 = cast_f16(gpu, x, n * k)?;
-        let r = if gpu.arch == "gfx1201" {
-            gpu.gemm_f16_x_f16_wmma_lds_splitk(w, &x16, y, out, k, n, projection_gfx1201_tile(out))
-        } else {
-            gpu.gemm_f16_x_f16_wmma_lds_auto(w, &x16, y, None, out, k, n)
-        };
-        gpu.free_tensor(x16).map_err(hip)?;
-        r.map_err(hip)
-    } else {
-        gpu.gemm_f16_wmma_mb8(w, x, y, out, k, n).map_err(hip)
-    }
 }
 
 // ── attention ───────────────────────────────────────────────────────────
@@ -818,18 +701,12 @@ fn knob(name: &str, values: &[&str]) -> bool {
 
 use std::sync::LazyLock;
 
-/// `HIPFIRE_EMBED_GEMM=f32|mb8`: every projection on `gemm_f16_wmma_mb8`.
-static EMBED_GEMM_F32: LazyLock<bool> =
-    LazyLock::new(|| knob("HIPFIRE_EMBED_GEMM", &["f32", "mb8"]));
 /// `HIPFIRE_EMBED_ATTN=no-gemm|tiled`: keep the tiled kernel where eager applies.
 static EMBED_ATTN_NO_GEMM: LazyLock<bool> =
     LazyLock::new(|| knob("HIPFIRE_EMBED_ATTN", &["no-gemm", "tiled"]));
 /// `HIPFIRE_EMBED_ATTN=naive`: the per-(query, head) reference kernel.
 static EMBED_ATTN_NAIVE: LazyLock<bool> = LazyLock::new(|| knob("HIPFIRE_EMBED_ATTN", &["naive"]));
 
-fn embed_gemm_f32() -> bool {
-    *EMBED_GEMM_F32
-}
 fn embed_attn_no_gemm() -> bool {
     *EMBED_ATTN_NO_GEMM
 }
@@ -840,26 +717,8 @@ fn embed_attn_naive() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        attention_route, check_segments, projection_gfx1201_tile, AttentionRoute, EncoderSegment,
-        LdsTile, LdsTileSplitK,
+        attention_route, check_segments, AttentionRoute, EncoderSegment, LdsTile, LdsTileSplitK,
     };
-
-    #[test]
-    fn gfx1201_projection_tiles_are_supported_unsplit_entries() {
-        for (m, entry) in [
-            (256, "qwen4_wmma_lds_64_128_32_64_k64_p"),
-            (511, "qwen4_wmma_lds_64_128_32_64_k64_p"),
-            (512, "qwen4_wmma_lds_128_128_32_64_k64"),
-            (1023, "qwen4_wmma_lds_128_128_32_64_k64"),
-            (1024, "qwen4_wmma_lds_128_256_32_64_k64"),
-            (4096, "qwen4_wmma_lds_128_256_32_64_k64"),
-        ] {
-            let tile = projection_gfx1201_tile(m);
-            assert_eq!(tile.split, 1);
-            assert_eq!(tile.ks, 64);
-            assert_eq!(tile.entry(), entry);
-        }
-    }
 
     #[test]
     fn gfx1201_attention_tiles_are_supported_unsplit_entries() {
