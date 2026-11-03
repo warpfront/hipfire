@@ -210,10 +210,14 @@ DFlash drafter) and requests run on the shared fixed-lane driver
 (`hipfire_generate::lanes`, #666 G12). The Glimmer adapter renders the prompt
 with the singleton's `glimmer_prompt_ids`, seeds a lane by the singleton
 prefill plus `import`, routes tokens through the singleton's Harmony router and
-stop set, and samples on the host from the lane logits (greedy rows take the
-device picks). Seeding goes through `GlimmerState`, so a batch drops the
-sequential session cache. Not batched: tools, multi-turn history, stop strings,
-a loaded drafter; those take the singleton route.
+stop set, and samples each lane on the host from its logits with its own
+config (greedy rows take the device picks), so mixed sampling configs share a
+batch. Seeding goes through `GlimmerState`, so a batch drops the sequential
+session cache. Not batched: tools, multi-turn history, stop strings, a loaded
+drafter, and a request whose `prompt + max_tokens` exceeds the lane capacity;
+those take the singleton route. Lane logits are close to the singleton's but
+not bitwise (a lone lane runs the 1-row path), so greedy text can flip at
+near-ties.
 
 ## Single-only refusal
 

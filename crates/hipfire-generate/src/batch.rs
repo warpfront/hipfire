@@ -205,7 +205,7 @@ fn request_sets_min_tokens(msg: &serde_json::Value) -> bool {
 /// The batching serve modes that cannot hold EOS and stops inactive below
 /// `min_tokens`: Flash-Next fn-lanes (single card and EP) can, everything else
 /// that batches (Qwen3.5 fixed-lane / VMM / EP continuous batch, dense LFM,
-/// pipeline-parallel Qwen4 lanes) cannot. Rerouting such a request to the
+/// Muse Glimmer lanes, pipeline-parallel Qwen4 lanes) cannot. Rerouting such a request to the
 /// singleton would silently serialize a batched serve, so it is refused.
 ///
 /// `batching`: the server runs a continuous-batch scheduler (batch size above

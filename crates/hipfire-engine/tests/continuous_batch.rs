@@ -569,6 +569,31 @@ fn deadline_30s_is_set_and_poll_returns_abort_after_expiry() {
     assert!(sched.lanes[ticket.lane].is_empty());
 }
 
+/// A per-lane-sampling family (Glimmer) runs differently sampled requests
+/// side by side: no cohort is installed and no head blocks a free lane.
+#[test]
+fn per_lane_sampling_admits_mixed_cohorts_together() {
+    let _l = begin();
+    let mut sched = ContinuousBatchScheduler::new(3, 4096);
+    sched.per_lane_sampling = true;
+    let keys: Vec<AttemptKey> = (1..=3)
+        .map(|i| AttemptKey::new(&format!("m{i}"), i))
+        .collect();
+    for (k, s) in keys
+        .iter()
+        .zip([sampling(0.0, 1.0), sampling(0.7, 1.0), sampling(0.0, 1.0)])
+    {
+        batch_announce_terminal(&k.id, k.attempt_id);
+        sched.enqueue(req(k.clone(), s));
+    }
+    let lanes: Vec<usize> = (0..3)
+        .map(|_| sched.try_assign_one().unwrap().1.lane)
+        .collect();
+    assert_eq!(lanes, vec![0, 1, 2]);
+    assert!(sched.cohort_key.is_none());
+    assert!(sched.inbox.is_empty());
+}
+
 #[test]
 fn fifo_cohort_incompatible_head_blocks_later_compatible() {
     let _l = begin();
