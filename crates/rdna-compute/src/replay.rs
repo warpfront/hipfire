@@ -78,8 +78,9 @@ enum Pm4Architecture {
 pub struct RetainedTapeNeeds {
     /// Kernargs derived from the decode position (rebinding needs PM4).
     pub position_kernargs: bool,
-    /// Kernels with a private (scratch) segment.
-    pub scratch_kernels: bool,
+    /// Not validated on GFX10/GFX11 PM4 (scratch kernels, or decode parity vs HIP
+    /// not yet shown).
+    pub gfx10_11_pm4_unvalidated: bool,
 }
 
 /// Per-stream producer/consumer visibility for legacy (gfx10/gfx11) PM4 IBs.
@@ -8355,17 +8356,21 @@ impl ReplayController {
             ReplayTransport::AqlPackets if needs.position_kernargs => Some(
                 "linear AQL cannot rebind the position-derived kernargs of this tape (it needs PM4)",
             ),
-            // ponytail: lift when GFX10/GFX11 PM4 scratch lands (HIPF-253).
-            ReplayTransport::Pm4Ib
-                if needs.scratch_kernels
-                    && matches!(
-                        Pm4Architecture::from_name(arch),
-                        Ok(Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11)
-                    ) =>
-            {
-                Some("GFX10/GFX11 PM4 dispatch does not support the scratch kernels of this tape")
-            }
-            _ => None,
+            ReplayTransport::AqlPackets => None,
+            ReplayTransport::Pm4Ib => match Pm4Architecture::from_name(arch) {
+                Err(_) => Some("retained PM4 has no register map for this arch"),
+                // ponytail: lift Gfx11 with HIPF-254 (after HIPF-253 gfx11 scratch);
+                // Gfx10 stays until gfx10 PM4 scratch exists.
+                Ok(Pm4Architecture::Gfx10 | Pm4Architecture::Gfx11)
+                    if needs.gfx10_11_pm4_unvalidated =>
+                {
+                    Some(
+                        "GFX10/GFX11 PM4 replay of this tape is unvalidated (scratch dispatch: \
+                         HIPF-253; decode parity vs HIP: HIPF-254)",
+                    )
+                }
+                Ok(_) => None,
+            },
         }
     }
 
@@ -9049,11 +9054,11 @@ mod tests {
     fn transport_refusal_is_known_before_recording() {
         let qwen4 = RetainedTapeNeeds {
             position_kernargs: true,
-            scratch_kernels: true,
+            gfx10_11_pm4_unvalidated: true,
         };
         let plain = RetainedTapeNeeds {
             position_kernargs: false,
-            scratch_kernels: false,
+            gfx10_11_pm4_unvalidated: false,
         };
         let mut c = ReplayController::new(ReplayBackendRequest::Auto);
         c.transport = ReplayTransport::AqlPackets;
@@ -9065,6 +9070,8 @@ mod tests {
             assert!(c.transport_refusal(arch, plain).is_none(), "{arch}");
         }
         assert!(c.transport_refusal("gfx1201", qwen4).is_none());
+        // No PM4 register map: prepare would fail after recording.
+        assert!(c.transport_refusal("gfx942", plain).is_some());
     }
 
     #[test]
