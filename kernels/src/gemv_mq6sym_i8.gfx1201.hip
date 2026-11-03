@@ -4,13 +4,13 @@
 
 // MQ6SymG256 x A8 decode GEMV for gfx1201 (RDNA4), N = 1..8 tokens, signed dot4.
 //
-// Format MQ6SymG256 (KERNEL-PLAN §1.4, symtrunk/RESULT.md §0; NOT qt47):
-// row-major [M, K], K % 256 == 0, group (256 weights) = 196 B:
-//   +0  fp16 s0 (weights 0..127)      +2  fp16 s1 (weights 128..255)
-//   +4  192 B little-endian 6-bit bitstream, code c = bits [6c, 6c+6) (4 codes
+// Format: the EXISTING qt47 MQ6G256V2 group, symmetric trunk (z_h == -32 s_h exactly; z is IGNORED here):
+// row-major [M, K], K % 256 == 0, group (256 weights) = 200 B:
+//   +0  u32 {fp16 s0 | fp16 z0 << 16} (weights 0..127)   +4  u32 {fp16 s1 | fp16 z1 << 16} (128..255)
+//   +8  192 B little-endian 6-bit bitstream, code c = bits [6c, 6c+6) (4 codes
 //       per 3 bytes: q0 | q1 << 6 | q2 << 12 | q3 << 18), stored q in 0..63,
 //       decoded signed int8 value q - 32 in -32..31 (NOT two's complement).
-// Row stride (K / 256) * 196 B (4-byte aligned only: every load is dword-aligned).
+// Row stride (K / 256) * 200 B (4-byte aligned only: every load is dword-aligned).
 // w = f32(s_h) * (q - 32): no zero point, no correction term.
 //
 // Activation: `block_i8_128` (136 B {f32 d; i32 s; i8 qs[128]}), layout
@@ -79,7 +79,12 @@
 #ifndef S6_PF
 #define S6_PF 1
 #endif
-#define S6_GROUP_BYTES 196u
+#define S6_GROUP_BYTES 200u
+// {s0 | s1 << 16} from the two qt47 header dwords (z halves ignored).
+static __device__ __forceinline__ unsigned s6_hdr(const unsigned char* gp) {
+    const unsigned long long d = *reinterpret_cast<const unsigned long long*>(gp);
+    return ((unsigned)d & 0xFFFFu) | (((unsigned)(d >> 32)) << 16);
+}
 
 typedef unsigned __attribute__((ext_vector_type(4), aligned(4))) s6_u32x4_t;
 
@@ -130,14 +135,14 @@ static __device__ __forceinline__ s6_wgroup s6_load(const unsigned char* __restr
     const unsigned char* gp = row + (size_t)g * S6_GROUP_BYTES;
     s6_wgroup w;
 #if S6_NT
-    w.hdr = __builtin_nontemporal_load(reinterpret_cast<const unsigned*>(gp));
-    const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 4 + 48 * q);
+    w.hdr = s6_hdr(gp);
+    const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 8 + 48 * q);
     w.a = __builtin_nontemporal_load(cp + 0);
     w.b = __builtin_nontemporal_load(cp + 1);
     w.c = __builtin_nontemporal_load(cp + 2);
 #else
-    w.hdr = *reinterpret_cast<const unsigned*>(gp);
-    const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 4 + 48 * q);
+    w.hdr = s6_hdr(gp);
+    const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 8 + 48 * q);
     w.a = cp[0];
     w.b = cp[1];
     w.c = cp[2];
@@ -435,8 +440,8 @@ struct s6_wgroup2 {
 static __device__ __forceinline__ s6_wgroup2 s6_load2(const unsigned char* __restrict__ row, int g, int kh) {
     const unsigned char* gp = row + (size_t)g * S6_GROUP_BYTES;
     s6_wgroup2 w;
-    w.hdr = *reinterpret_cast<const unsigned*>(gp);
-    const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 4 + 96 * kh);
+    w.hdr = s6_hdr(gp);
+    const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 8 + 96 * kh);
     #pragma unroll
     for (int i = 0; i < 6; ++i) w.v[i] = cp[i];
     return w;

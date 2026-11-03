@@ -27,7 +27,7 @@
 //! rows 1/2/4/8: the symmetric kernel alone, producer alone, producer + kernel, a same-job b128
 //! streaming roofline over the same bytes, and the OLD product route (affine MQ6G256V2 F32 rotate
 //! + `gemv_mq6g256v2` / `gemm_mq6g256v2_f32_rows`) as separate arms. Weights-only GB/s counts the
-//! 196-B (new) / 200-B (old) bytes actually read.
+//! 200-B (qt47 MQ6G256V2, both routes) bytes actually read.
 //!
 //! `#[ignore]`d: needs an exact gfx1201 device.
 //!   cargo test -p rdna-compute --release --features lab --test mq6sym_i8_decode_hw -- --ignored --nocapture --test-threads=1 <name>
@@ -45,7 +45,7 @@ const KERNEL_SRC: &str = concat!(
 );
 const MODULE: &str = "mq6sym_i8_t0";
 const MODULE_DBG: &str = "mq6sym_i8_t0_dbg";
-const GROUP_BYTES: usize = 196;
+const GROUP_BYTES: usize = 200;
 const BLOCK_BYTES: usize = 136;
 const CHUNK_GROUPS: usize = 12;
 
@@ -194,13 +194,13 @@ fn scale_bits(mode: SMode, rng: &mut Rng) -> u16 {
         }
         SMode::Zero => 0,
         SMode::Subnormal => [0x0001u16, 0x0003, 0x01FF, 0x03FF, 0x8001, 0x83FF][rng.below(6) as usize],
-        SMode::Large => [0x7BFFu16, 0xFBFF, 0x7800, 0x7A00][rng.below(4) as usize],
+        SMode::Large => [0x6FFFu16, 0xEFFF, 0x6C00, 0x6E00][rng.below(4) as usize],
         SMode::Mixed => match rng.below(6) {
             0 => 0,
             1 => [0x0001u16, 0x03FF, 0x8001][rng.below(3) as usize],
             2 => scale_bits(SMode::Normal, rng),
             3 => scale_bits(SMode::Normal, rng) | 0x8000,
-            4 => [0x7BFFu16, 0xFBFF][rng.below(2) as usize],
+            4 => [0x6FFFu16, 0xEFFF][rng.below(2) as usize],
             _ => 0x3C00,
         },
     }
@@ -208,22 +208,26 @@ fn scale_bits(mode: SMode, rng: &mut Rng) -> u16 {
 
 /// Triple-pack encoder: 4 codes per 3 bytes `q0 | q1 << 6 | q2 << 12 | q3 << 18`, LE.
 fn encode_group(hdr: [u16; 2], codes: &[u8; 256], out: &mut [u8]) {
+    // qt47 header: {s0 | z0 << 16}, {s1 | z1 << 16}, z_h = f16(-32 s_h) (exact; the kernels ignore z).
+    let z = |s: u16| half::f16::from_f32(-32.0 * f16_to_f32(s)).to_bits();
     out[0..2].copy_from_slice(&hdr[0].to_le_bytes());
-    out[2..4].copy_from_slice(&hdr[1].to_le_bytes());
+    out[2..4].copy_from_slice(&z(hdr[0]).to_le_bytes());
+    out[4..6].copy_from_slice(&hdr[1].to_le_bytes());
+    out[6..8].copy_from_slice(&z(hdr[1]).to_le_bytes());
     for t in 0..64 {
         let v = (codes[4 * t] as u32)
             | ((codes[4 * t + 1] as u32) << 6)
             | ((codes[4 * t + 2] as u32) << 12)
             | ((codes[4 * t + 3] as u32) << 18);
-        out[4 + 3 * t] = v as u8;
-        out[4 + 3 * t + 1] = (v >> 8) as u8;
-        out[4 + 3 * t + 2] = (v >> 16) as u8;
+        out[8 + 3 * t] = v as u8;
+        out[8 + 3 * t + 1] = (v >> 8) as u8;
+        out[8 + 3 * t + 2] = (v >> 16) as u8;
     }
 }
 
 /// Independent bit-level decoder: code c = bits [6c, 6c + 6) of the 192-byte LE stream.
 fn decode_codes(group: &[u8]) -> [u8; 256] {
-    let payload = &group[4..196];
+    let payload = &group[8..200];
     let mut out = [0u8; 256];
     for (c, o) in out.iter_mut().enumerate() {
         let bo = 6 * c;
@@ -441,7 +445,7 @@ fn cpu_ref(w: &[u8], m: usize, k: usize, n: usize, blocks: &[u8]) -> Ref {
                     wq[g * 256 + p] = codes[p] as i32 - 32;
                 }
                 hs[2 * g] = f16_to_f32(u16::from_le_bytes([grp[0], grp[1]]));
-                hs[2 * g + 1] = f16_to_f32(u16::from_le_bytes([grp[2], grp[3]]));
+                hs[2 * g + 1] = f16_to_f32(u16::from_le_bytes([grp[4], grp[5]]));
             }
             let out = &mut chunk[r * per..(r + 1) * per];
             for t in 0..n {
@@ -491,7 +495,7 @@ fn quality_diag(w: &[u8], m: usize, k: usize, n: usize, xrot: &[f32], y: &[f32])
             let grp = &rb[g * GROUP_BYTES..(g + 1) * GROUP_BYTES];
             let codes = decode_codes(grp);
             let s0 = f16_to_f32(u16::from_le_bytes([grp[0], grp[1]])) as f64;
-            let s1 = f16_to_f32(u16::from_le_bytes([grp[2], grp[3]])) as f64;
+            let s1 = f16_to_f32(u16::from_le_bytes([grp[4], grp[5]])) as f64;
             for p in 0..256 {
                 wf[g * 256 + p] = if p < 128 { s0 } else { s1 } * (codes[p] as f64 - 32.0);
             }
@@ -788,7 +792,7 @@ fn run_weights(
 fn bit_level_decoder_matches_triple_pack() {
     // Pure CPU: the independent bit-level decoder inverts the 4-codes-per-3-bytes encoder.
     let mut rng = Rng(7);
-    let mut g = [0u8; 196];
+    let mut g = [0u8; 200];
     for _ in 0..64 {
         let mut codes = [0u8; 256];
         codes.iter_mut().for_each(|c| *c = rng.below(64) as u8);
@@ -803,6 +807,56 @@ fn bit_level_decoder_matches_triple_pack() {
     for i in 0..128 {
         assert_eq!(back[i] as i32, q[i]);
     }
+}
+
+#[test]
+#[ignore = "needs an exact gfx1201 GPU"]
+fn mq6sym_i8_decode_ignores_z_hw() {
+    // Robustness: random garbage in the qt47 z halves must give byte-identical outputs to z = -32 s.
+    let Some(mut gpu) = gpu_gate() else { return };
+    let ksrc = kernel_src();
+    let mut cases = 0usize;
+    let mut bad_words = 0u64;
+    let mut words = 0u64;
+    for n in 1..=8 {
+        for bf in [false, true] {
+            gpu.ensure_kernel_public(MODULE, &ksrc, &entry(n, bf)).expect("load kernel");
+        }
+    }
+    for &(m, k) in &[(48usize, 512usize), (640, 2560), (2560, 6144)] {
+        let w = gen_weights(m, k, CMode::Random, SMode::Normal, 0x2_0000 ^ m as u64);
+        let mut wg = w.clone();
+        let mut rng = Rng(0x6A2B_A6E0 ^ k as u64);
+        for g in wg.chunks_mut(GROUP_BYTES) {
+            for i in [2usize, 3, 6, 7] {
+                g[i] = rng.next() as u8;
+            }
+        }
+        assert_ne!(w, wg);
+        let (wd, wgd) = (upload_u8(&mut gpu, &w), upload_u8(&mut gpu, &wg));
+        for n in 1..=8usize {
+            let x = gen_act(k, n, AMode::Gauss, 0xAC70 ^ n as u64);
+            let (xq, _, _) = produce(&mut gpu, &x, k, n);
+            for bf in [false, true] {
+                let ybytes = n * m * if bf { 2 } else { 4 };
+                let mut outs: Vec<Vec<u8>> = Vec::new();
+                for wt in [&wd, &wgd] {
+                    let yb = gpu.alloc_tensor(&[ybytes.div_ceil(4)], DType::F32).expect("y");
+                    gpu.hip.memcpy_htod(&yb.buf, &vec![0xA5u8; yb.byte_size()]).expect("poison");
+                    let mut b = blob(wt.buf.as_ptr(), xq, yb.buf.as_ptr(), m, k, n);
+                    launch_sym(&gpu, &entry(n, bf), &mut b, m, k, n);
+                    outs.push(download(&gpu, yb.buf.as_ptr(), ybytes));
+                }
+                let nz = outs[0].iter().filter(|&&v| v != 0 && v != 0xA5).count();
+                assert!(nz > 0, "all-zero/poison output m={m} k={k} n={n}");
+                bad_words += outs[0].iter().zip(&outs[1]).filter(|(a, b)| a != b).count() as u64;
+                words += ybytes as u64;
+                cases += 1;
+            }
+        }
+    }
+    println!("Z_GARBAGE cases={cases} bytes={words} mismatching_bytes={bad_words}");
+    assert_eq!(bad_words, 0, "kernel output depends on z bytes");
 }
 
 #[test]

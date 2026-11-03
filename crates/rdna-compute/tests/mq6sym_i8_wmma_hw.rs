@@ -54,7 +54,9 @@ extern "C" __global__ void t1_stream_read(const uint4* __restrict__ p, unsigned 
 }
 "#;
 
-const GROUP: usize = 196;
+/// qt47 MQ6G256V2 group: {s0 | z0 << 16}, {s1 | z1 << 16}, 192 B code stream. The symmetric kernels
+/// read the SAME bytes as the affine ones and ignore z (z_h == -32 s_h exactly in a symmetric artifact).
+const GROUP: usize = 200;
 const AFFINE_GROUP: usize = 200;
 const BLK: usize = 136;
 const KERNARG_BYTES: usize = 36;
@@ -117,16 +119,19 @@ fn bf16_bits(y: f32) -> u16 {
 // ---------------------------------------------------------------- format
 
 fn pack_group(s0: u16, s1: u16, codes: &[u8; 256], out: &mut [u8]) {
+    let z = |s: u16| half::f16::from_f32(-32.0 * f16_to_f32(s)).to_bits();
     out[0..2].copy_from_slice(&s0.to_le_bytes());
-    out[2..4].copy_from_slice(&s1.to_le_bytes());
+    out[2..4].copy_from_slice(&z(s0).to_le_bytes());
+    out[4..6].copy_from_slice(&s1.to_le_bytes());
+    out[6..8].copy_from_slice(&z(s1).to_le_bytes());
     for i in 0..64 {
         let t = (codes[4 * i] as u32 & 63)
             | ((codes[4 * i + 1] as u32 & 63) << 6)
             | ((codes[4 * i + 2] as u32 & 63) << 12)
             | ((codes[4 * i + 3] as u32 & 63) << 18);
-        out[4 + 3 * i] = (t & 255) as u8;
-        out[4 + 3 * i + 1] = ((t >> 8) & 255) as u8;
-        out[4 + 3 * i + 2] = ((t >> 16) & 255) as u8;
+        out[8 + 3 * i] = (t & 255) as u8;
+        out[8 + 3 * i + 1] = ((t >> 8) & 255) as u8;
+        out[8 + 3 * i + 2] = ((t >> 16) & 255) as u8;
     }
 }
 
@@ -135,11 +140,11 @@ fn decode_row(row: &[u8], k: usize, codes: &mut [i8], scales: &mut [f32]) {
     for g in 0..k / 256 {
         let gb = &row[g * GROUP..(g + 1) * GROUP];
         scales[2 * g] = f16_to_f32(u16::from_le_bytes([gb[0], gb[1]]));
-        scales[2 * g + 1] = f16_to_f32(u16::from_le_bytes([gb[2], gb[3]]));
+        scales[2 * g + 1] = f16_to_f32(u16::from_le_bytes([gb[4], gb[5]]));
         for i in 0..64 {
-            let t = gb[4 + 3 * i] as u32
-                | ((gb[4 + 3 * i + 1] as u32) << 8)
-                | ((gb[4 + 3 * i + 2] as u32) << 16);
+            let t = gb[8 + 3 * i] as u32
+                | ((gb[8 + 3 * i + 1] as u32) << 8)
+                | ((gb[8 + 3 * i + 2] as u32) << 16);
             for c in 0..4 {
                 codes[g * 256 + 4 * i + c] = ((t >> (6 * c)) & 63) as i32 as i8 - 32;
             }
@@ -226,7 +231,7 @@ enum WKind {
 }
 
 const EDGE_SCALES: [u16; 14] = [
-    0x0000, 0x8000, 0x0001, 0x0002, 0x03FF, 0x8155, 0x0400, 0x3C00, 0xBC00, 0x3800, 0x7BFF,
+    0x0000, 0x8000, 0x0001, 0x0002, 0x03FF, 0x8155, 0x0400, 0x3C00, 0xBC00, 0x3800, 0x6FFF,
     0x2E66, 0x5640, 0x0155,
 ];
 
@@ -1101,9 +1106,9 @@ fn mq6sym_i8_wmma_bytes_hw() {
             let mut xq_bad = xq_host.clone();
             match what {
                 // one 6-bit code of row 0, group 1 (block 2): flip a payload bit
-                "code" => w_bad[GROUP + 4 + 50] ^= 0x04,
+                "code" => w_bad[GROUP + 8 + 50] ^= 0x04,
                 // the s1 scale of row 0 group 0 (block 1)
-                "scale" => w_bad[2] ^= 0x08,
+                "scale" => w_bad[4] ^= 0x08,
                 // one activation byte of (block 1, token 0)
                 _ => xq_bad[(n) * BLK + 8 + 10] ^= 0x10,
             }
@@ -1120,6 +1125,47 @@ fn mq6sym_i8_wmma_bytes_hw() {
             }
         }
         js.line(&format!("{{\"kind\":\"negative_summary\",\"controls\":6,\"undetected\":{undetected}}}"));
+    }
+
+    // ---- G. z-ignored robustness: garbage z halves must leave every output byte unchanged ----
+    {
+        let mut z_bad_bytes = 0u64;
+        let mut z_cases = 0u64;
+        for &(m, k, n) in &[(130usize, 2560usize, 24usize), (1000, 512, 48), (48, 6144, 5), (257, 256, 200)] {
+            let x = rand_activations(&mut rng, k, n);
+            let (_p, _rot, xq_host) = produce_real(&mut gpu, &x, k, n);
+            let xq_dev = upload_bytes(&mut gpu, &xq_host);
+            let w_host = gen_weights(m, k, WKind::Random, 0x2_BAD0 + m as u64);
+            let mut w_garb = w_host.clone();
+            for g in w_garb.chunks_mut(GROUP) {
+                for i in [2usize, 3, 6, 7] {
+                    g[i] = rng.next_u32() as u8;
+                }
+            }
+            assert_ne!(w_host, w_garb);
+            let (wa, wb) = (upload_bytes(&mut gpu, &w_host), upload_bytes(&mut gpu, &w_garb));
+            for tile in tiles_for(n, true) {
+                for bf16 in [false, true] {
+                    let ybytes = m * n * if bf16 { 2 } else { 4 };
+                    let mut outs = Vec::new();
+                    for wt in [&wa, &wb] {
+                        let y = gpu.alloc_tensor(&[ybytes], DType::Raw).expect("alloc y");
+                        gpu.hip.memset(&y.buf, 0xA5, ybytes).expect("memset");
+                        launch_sym(&gpu, tile, bf16, wt.buf.as_ptr(), xq_dev.buf.as_ptr(), y.buf.as_ptr(), m, k, n);
+                        gpu.hip.device_synchronize().expect("sync");
+                        outs.push(download_bytes(&gpu, &y, ybytes));
+                    }
+                    assert!(outs[0].iter().any(|&b| b != 0 && b != 0xA5), "vacuous z case");
+                    z_bad_bytes += outs[0].iter().zip(&outs[1]).filter(|(p, q)| p != q).count() as u64;
+                    z_cases += 1;
+                }
+            }
+        }
+        js.line(&format!("{{\"kind\":\"z_garbage\",\"cases\":{z_cases},\"mismatching_bytes\":{z_bad_bytes}}}"));
+        if z_bad_bytes != 0 {
+            st.fails.push(format!("z-garbage: {z_bad_bytes} output bytes depend on z"));
+        }
+        st.mismatches += z_bad_bytes;
     }
 
     let verdict = st.mismatches == 0 && st.fails.is_empty();
@@ -1146,17 +1192,10 @@ fn rand_bytes(rng: &mut Lcg, len: usize) -> Vec<u8> {
     v
 }
 
-/// Random sym weights with valid normal f16 scales (timing content).
+/// Random qt47-layout weights for the symmetric kernels (same 200-B bytes as the affine arm;
+/// z is ignored by the kernels).
 fn timing_sym_weights(rng: &mut Lcg, m: usize, k: usize) -> Vec<u8> {
-    let mut w = rand_bytes(rng, m * (k / 256) * GROUP);
-    for g in w.chunks_mut(GROUP) {
-        for h in 0..2 {
-            let e = 8 + (g[1 + 2 * h] % 10) as u16;
-            let v = (e << 10) | (g[2 * h] as u16) | ((g[2 * h + 1] as u16 & 3) << 8);
-            g[2 * h..2 * h + 2].copy_from_slice(&v.to_le_bytes());
-        }
-    }
-    w
+    timing_affine_weights(rng, m, k)
 }
 
 /// Random affine MQ6G256V2 weights (200-B groups: s0 z0 s1 z1 f16 + 192 B).
@@ -1240,10 +1279,11 @@ fn mq6sym_i8_wmma_timing_hw() {
         ("out_2560x6144", 2560, 6144),
         ("qproj_12288x2560", 12288, 2560),
     ];
-    if big {
+    if big || std::env::var("T1_LM").is_ok() {
         shapes.push(("lm_head_248320x2560", 248320, 2560));
     }
-    let narrow_ns = [9usize, 16, 24, 32, 48];
+    let skip_prefill = std::env::var("T1_SKIP_PREFILL").is_ok();
+    let narrow_ns = [1usize, 2, 4, 8, 9, 16, 24, 32, 48];
     let dev_pre_n = [512usize, 2048, 4096];
 
     for &(name, m, k) in &shapes {
@@ -1405,7 +1445,7 @@ fn mq6sym_i8_wmma_timing_hw() {
                     assert_eq!(again, xq, "scratch pointer moved");
                     gpu.hip.device_synchronize().unwrap();
                     let wp = wp.clone();
-                    let xq8p = xq8.buf.as_ptr();
+                    let xq8p = if n <= 8 { xq } else { xq8.buf.as_ptr() };
                     keep_alive.push(xq8);
                     let passes = n.div_ceil(8);
                     arms.push(Arm {
@@ -1524,16 +1564,16 @@ fn mq6sym_i8_wmma_timing_hw() {
                 let wgbs = arm.wbytes as f64 / med / 1e3;
                 let traffic = (arm.wbytes + (k / 128) * n * BLK + n * m * if arm.name.contains("bf16") { 2 } else { 4 }) as f64;
                 js.line(&format!(
-                    "{{\"kind\":\"skinny\",\"cell\":\"{cell}\",\"arm\":\"{}\",\"m\":{m},\"k\":{k},\"n\":{n},\"sets\":{sets},\"us_median\":{med:.2},\"us_min\":{mn:.2},\"weights_GBps\":{wgbs:.1},\"total_traffic_GBps\":{:.1},\"weight_bytes\":{},\"producer_us\":{prod_us:.2}}}",
-                    arm.name, traffic / med / 1e3, arm.wbytes
+                    "{{\"kind\":\"skinny\",\"cell\":\"{cell}\",\"arm\":\"{}\",\"m\":{m},\"k\":{k},\"n\":{n},\"sets\":{sets},\"us_median\":{med:.2},\"us_min\":{mn:.2},\"weights_GBps\":{wgbs:.1},\"incl_producer_us\":{:.2},\"incl_producer_weights_GBps\":{:.1},\"total_traffic_GBps\":{:.1},\"weight_bytes\":{},\"producer_us\":{prod_us:.2}}}",
+                    arm.name, med + prod_us, arm.wbytes as f64 / (med + prod_us) / 1e3, traffic / med / 1e3, arm.wbytes
                 ));
             }
         }
 
         // ------- prefill cells (compute-bound; two weight sets) -------
         // the lm_head is only ever evaluated for a handful of sampled rows: no prefill cells for it
-        let mut pre: Vec<usize> = if m > 100_000 { Vec::new() } else { dev_pre_n.to_vec() };
-        if big && m <= 100_000 {
+        let mut pre: Vec<usize> = if m > 100_000 || skip_prefill { Vec::new() } else { dev_pre_n.to_vec() };
+        if big && m <= 100_000 && !skip_prefill {
             pre.push(16384);
         }
         for &n in &pre {

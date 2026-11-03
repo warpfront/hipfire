@@ -6,8 +6,9 @@
 // activations x SYMMETRIC 6-bit weight codes on the SIGNED iu8 WMMA
 // (`__builtin_amdgcn_wmma_i32_16x16x16_iu8_w32_gfx12`, signed A and signed B).
 // KERNEL-PLAN §1.4 / symtrunk RESULT §0 format:
-//   weights [M, K] row-major, K % 256 == 0, 196-B groups per 256 K:
-//     +0 fp16 s0 (weights 0..127), +2 fp16 s1 (weights 128..255), +4 192 B of
+//   weights [M, K] row-major, K % 256 == 0, the EXISTING qt47 MQ6G256V2 200-B group per 256 K
+//   (symmetric trunk: z_h == -32 s_h exactly; z is IGNORED, w = s_h (q - 32)):
+//     +0 u32 {fp16 s0 | fp16 z0 << 16} (weights 0..127), +4 u32 {fp16 s1 | fp16 z1 << 16}, +8 192 B of
 //     little-endian 6-bit fields (4 codes / 3 bytes: q0 | q1<<6 | q2<<12 |
 //     q3<<18), stored q in 0..63, decoded signed int8 value q - 32 (-32..31).
 //   activations: block_i8_128 (136 B {f32 d; i32 s; i8 qs[128]}), layout
@@ -57,7 +58,12 @@
 
 // block_i8_128 comes from the host JIT prelude (block_i8_128_quant.hip).
 
-#define SYM_GROUP_BYTES 196u
+#define SYM_GROUP_BYTES 200u
+
+// {s0 | s1 << 16} from the two qt47 header dwords {s | z << 16} (z ignored).
+static __device__ __forceinline__ unsigned sym_hdr2(unsigned d0, unsigned d1) {
+    return (d0 & 0xFFFFu) | (d1 << 16);
+}
 
 typedef int32_t __attribute__((ext_vector_type(2)))  int32x2_t;
 typedef int32_t __attribute__((ext_vector_type(8)))  int32x8_t;
@@ -178,13 +184,14 @@ static __device__ __forceinline__ void sym_narrow_body(
         const unsigned goff = (unsigned)g * SYM_GROUP_BYTES;
         #pragma unroll
         for (int rg = 0; rg < RG; rg++) {
-            r.hdr[rg] = __builtin_amdgcn_raw_buffer_load_b32(w_rsrc, hoff[rg], goff, 0);
+            const auto h2 = __builtin_amdgcn_raw_buffer_load_b64(w_rsrc, hoff[rg], goff, 0);
+            r.hdr[rg] = sym_hdr2(h2.x, h2.y);
             #pragma unroll
             for (int hv = 0; hv < 2; hv++) {
                 #pragma unroll
                 for (int t = 0; t < 3; t++) {
                     r.v[rg][hv * 3 + t] = __builtin_amdgcn_raw_buffer_load_b128(
-                        w_rsrc, woff[rg], goff + 4u + (unsigned)(hv * 96 + t * 16), 0);
+                        w_rsrc, woff[rg], goff + 8u + (unsigned)(hv * 96 + t * 16), 0);
                 }
             }
         }
@@ -355,8 +362,8 @@ SYM_ROW(64, 4, 16, 1, y, true)
 // Prefill 128 x 128 tile (A = weights, B = activations), a fork of the affine
 // `gemm_mq6g256v2_mmq_i8.gfx12.hip` K1 lean-issue design: 8 waves, 32-row x
 // 64-token wave tile, K64 slabs in a two-slot LDS ring with 2 barriers per K128,
-// banded CTA raster, wide b128 epilogue. Differences: 196-B groups (payload at
-// +4), the codes are decoded to SIGNED bytes at staging (q - 32) and enter the
+// banded CTA raster, wide b128 epilogue. Differences: qt47 200-B groups (payload at
+// +8, z ignored), the codes are decoded to SIGNED bytes at staging (q - 32) and enter the
 // WMMA signed, the WMMA chains start from 0 (no zero-point seed, no z' fold):
 //   acc = fmaf(RN(s_h * d), (float)C, acc)
 // Operand pairing / fragment swizzle / LDS map: see the affine kernel header.
@@ -448,7 +455,7 @@ static __device__ __forceinline__ float p_sz_value(unsigned hw, int h, int w) {
 
 template <bool BF16>
 static __device__ __forceinline__ void gemm_mq6sym_p128_body(
-    const char*           __restrict__ A,   // [M x groups_per_row x 196]
+    const char*           __restrict__ A,   // [M x groups_per_row x 200]
     const block_i8_128*   __restrict__ Xq,  // [K/128 x N]
     void*                 __restrict__ Yv,  // [N x M] F32 or BF16 bits
     int M, int K, int N
@@ -555,7 +562,8 @@ static __device__ __forceinline__ void gemm_mq6sym_p128_body(
         const int w = i & 1;
         const int grow = rs + row_idx;
         const int src_row = (grow < M) ? grow : (M - 1);
-        const unsigned hw = *(const unsigned*)(A + (long long)src_row * groups_per_row * SYM_GROUP_BYTES);
+        const unsigned* hp = (const unsigned*)(A + (long long)src_row * groups_per_row * SYM_GROUP_BYTES);
+        const unsigned hw = sym_hdr2(hp[0], hp[1]);
         ((float*)(LDS + P_SZ0_OFF + row_idx * 8))[w] = (grow < M) ? p_sz_value(hw, 0, w) : 0.0f;
     }
     {
@@ -591,7 +599,7 @@ static __device__ __forceinline__ void gemm_mq6sym_p128_body(
                 for (int r = 0; r < 2; r++) {
                     A_pf[r] = __builtin_amdgcn_raw_buffer_load_b64(a_rsrc, st_avoff[r], 72u, 0);
                     p_load_w3(w_rsrc, st_wvoff[r],
-                        (unsigned)g * SYM_GROUP_BYTES + 4u + (unsigned)h * 96u + 48u, W_pf[r]);
+                        (unsigned)g * SYM_GROUP_BYTES + 8u + (unsigned)h * 96u + 48u, W_pf[r]);
                 }
                 p_bundle<0, true>(LDS + P_SLOT0_OFF, a_lane, w_lane, cacc);
                 #pragma unroll
@@ -628,15 +636,16 @@ static __device__ __forceinline__ void gemm_mq6sym_p128_body(
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         p_load_w3(w_rsrc, st_wvoff[r],
-                            (unsigned)g_nx * SYM_GROUP_BYTES + 4u + (unsigned)h_nx * 96u, W_pf[r]);
+                            (unsigned)g_nx * SYM_GROUP_BYTES + 8u + (unsigned)h_nx * 96u, W_pf[r]);
                     }
                     const int tok_ds = bs + (tid >> 1);
                     const int tok_dsc = (tok_ds < N) ? tok_ds : (N - 1);
                     ds_nx = ((const unsigned*)(Xq + (long long)kb_nx * N + tok_dsc))[tid & 1];
                     const int row_sz = rs + (tid >> 1);
                     const int src_sz = (row_sz < M) ? row_sz : (M - 1);
-                    sz_nx = *(const unsigned*)(A + (long long)src_sz * groups_per_row * SYM_GROUP_BYTES
+                    const unsigned* hp = (const unsigned*)(A + (long long)src_sz * groups_per_row * SYM_GROUP_BYTES
                         + (unsigned)g_nx * SYM_GROUP_BYTES);
+                    sz_nx = sym_hdr2(hp[0], hp[1]);
                 }
             }
             // --- Slot 1 compute, fold, next slab 0 -> slot 0. ---
