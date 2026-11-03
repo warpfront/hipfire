@@ -45,8 +45,9 @@ use crate::expert_unit_tail::{EpUnitTailConfig, FillOp, TailPolicy, UnitKey, Win
 /// Ids one window's log holds (`calls x slots`); a window past this stops
 /// logging (counted, never fatal: it only thins the next admission).
 const LOG_IDS: usize = 1 << 18;
-/// Print a counter line every this many retired windows under the log env.
-const LOG_EVERY: u64 = 64;
+/// Print a counter line every this many retired windows under the log env (fine enough to
+/// attribute the cumulative raw counters to one loadgen cell by their `unix_ms` stamps).
+const LOG_EVERY: u64 = 16;
 
 /// One owned unit of a managed layer that a tail slot holds at the last retirement: its
 /// canonical decode-table entries (the pinned host arena addresses D1 uploaded) and the two slot
@@ -882,11 +883,16 @@ impl Inner {
         let s = self.policy.stats();
         let w = s.windows.max(1) as f64;
         let total = (s.core_reads + s.tail_reads + s.host_reads).max(1) as f64;
+        let unit_mb = (self.gate_up_bytes + self.down_bytes) as f64 / 1e6;
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
         eprintln!(
             "[unit-tail] rank {} {tag} windows {} reads/window {:.1}: core {:.2}% tail {:.2}% host {:.2}% \
              (slot hit {:.2}%, distinct hit {:.2}%) host distinct/window {:.2} ({:.3} MB) \
              fills {} published {} evictions {} skipped {} stale {} live {}/{} late-in-flight {} \
-             host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} ({} table uploads){}",
+             host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} ({} table uploads){} \
+             | raw unix_ms={unix_ms} unit_bytes={} core_reads={} tail_reads={} host_reads={} core_distinct={} tail_distinct={} host_distinct={} fills_issued={}",
             self.rank,
             s.windows,
             total / w,
@@ -896,7 +902,7 @@ impl Inner {
             100.0 * s.slot_hit(),
             100.0 * s.distinct_hit(),
             s.host_distinct as f64 / w,
-            s.host_distinct as f64 / w * 2.6112,
+            s.host_distinct as f64 / w * unit_mb,
             s.fills_issued,
             s.fills_published,
             s.evictions,
@@ -915,6 +921,14 @@ impl Inner {
             self.frozen
                 .as_ref()
                 .map_or(String::new(), |why| format!(" FROZEN: {why}")),
+            self.gate_up_bytes + self.down_bytes,
+            s.core_reads,
+            s.tail_reads,
+            s.host_reads,
+            s.core_distinct,
+            s.tail_distinct,
+            s.host_distinct,
+            s.fills_issued,
         );
     }
 
