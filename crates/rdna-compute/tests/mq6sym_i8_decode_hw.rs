@@ -95,8 +95,12 @@ fn chunk_groups() -> usize {
         .unwrap_or(CHUNK_GROUPS)
 }
 
-fn lds_bytes(k: usize, n: usize) -> u32 {
-    ((k / 256).min(chunk_groups()) * 2 * n * 132) as u32
+/// Dynamic LDS of the two-slot A8 ring: the token-split layout (S6Ts<R>::SLOT = 2 (R + B) 144 B
+/// cells + 8 R B of d, B = 2 at R = 7 else 1) is the larger of the two layouts at every R.
+fn lds_bytes(_k: usize, n: usize) -> u32 {
+    let b = if n == 7 { 2 } else { 1 };
+    let slot = 2 * (n + b) * 144 + 8 * n;
+    (2 * slot).max(528 * n) as u32
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -992,6 +996,9 @@ fn isolated<F: FnMut(&mut Gpu, usize)>(gpu: &mut Gpu, samples: usize, mut f: F) 
 }
 
 fn median(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return f64::NAN;
+    }
     let mut s = v.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap());
     s[s.len() / 2]
@@ -1058,6 +1065,38 @@ fn mq6sym_i8_decode_timing_hw() {
     for n in 1..=8 {
         gpu.ensure_kernel_public(MODULE, &kernel_src(), &entry(n, false)).expect("load kernel");
     }
+    // A/B variants: MQ6SYM_VARIANTS="name=KEY:VAL+KEY:VAL;name2=..." (extra arms on the same
+    // buffers, alternated with the baseline inside every rep).
+    let variants: Vec<(String, usize)> = std::env::var("MQ6SYM_VARIANTS")
+        .ok()
+        .map(|v| {
+            v.split(';')
+                .filter(|s| !s.is_empty())
+                .map(|spec| {
+                    let (name, defs) = spec.split_once('=').unwrap_or((spec, ""));
+                    let mut src = String::new();
+                    let mut chunk = chunk_groups();
+                    for (k, val) in kernel_defs() {
+                        writeln!(src, "#define {k} {val}").ok();
+                    }
+                    for kv in defs.split('+').filter(|s| !s.is_empty()) {
+                        let (k, val) = kv.split_once(':').unwrap_or((kv, "1"));
+                        writeln!(src, "#define {k} {val}").ok();
+                        if k == "S6_CHUNK_GROUPS" {
+                            chunk = val.parse().unwrap();
+                        }
+                    }
+                    writeln!(src, "#define S6_SUF _{name}").ok();
+                    src.push_str(KERNEL_SRC);
+                    for n in 1..=8 {
+                        gpu.ensure_kernel_public(&format!("{MODULE}_{name}"), &src, &format!("gemv_mq6sym_i8_rows_r{n}_{name}_gfx1201"))
+                            .expect("load variant");
+                    }
+                    (name.to_string(), chunk)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     gpu.ensure_kernel_public(ROOF_MODULE, ROOF_SRC, ROOF).expect("load roof");
     let reps: usize = std::env::var("MQ6SYM_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let skip_lm = std::env::var("MQ6SYM_SKIP_LM").is_ok();
@@ -1078,6 +1117,11 @@ fn mq6sym_i8_decode_timing_hw() {
         cells.push((248320, 2560, true));
     }
     cells.extend([(48usize, 2560usize, false), (512, 2560, false), (640, 2560, false)]);
+    if let Ok(filter) = std::env::var("MQ6SYM_CELLS") {
+        let keep: Vec<String> = filter.split(',').map(|s| s.to_string()).collect();
+        cells.retain(|&(m, k, _)| keep.contains(&format!("{m}x{k}")));
+    }
+    let sym_only = std::env::var("MQ6SYM_SYMONLY").is_ok();
 
     let mut out_rows: Vec<Row> = Vec::new();
     println!("arch={} device={}", gpu.arch, gpu.device_id);
@@ -1113,6 +1157,18 @@ fn mq6sym_i8_decode_timing_hw() {
             let prepared = gpu.rotate_x_mq_i8_batched(&x, None, res, k, r).expect("producer");
             let xq = gpu.int8_mmq_prepared_ptr(&prepared, k, r).expect("xq ptr");
             let name = entry(r, false);
+            let mut var_blobs: Vec<Vec<KernargBlob>> = variants
+                .iter()
+                .map(|_| {
+                    (0..sets)
+                        .map(|s| {
+                            let w = unsafe { (sym_buf.buf.as_ptr() as *mut u8).add(s * sym_stride) as *mut c_void };
+                            blob(w, xq, ysym.buf.as_ptr(), m, k, r)
+                        })
+                        .collect()
+                })
+                .collect();
+            let mut var_us: Vec<Vec<f64>> = variants.iter().map(|_| Vec::new()).collect();
             let mut sym_blobs: Vec<KernargBlob> = (0..sets)
                 .map(|s| {
                     let w = unsafe { (sym_buf.buf.as_ptr() as *mut u8).add(s * sym_stride) as *mut c_void };
@@ -1147,12 +1203,24 @@ fn mq6sym_i8_decode_timing_hw() {
                 // Alternate candidate / baseline / roofline inside each rep.
                 let us = bench(&mut gpu, sets, |g, i| launch_sym(g, &name, &mut sym_blobs[i % sets], m, k, r));
                 row.sym_us.push(us);
+                for (vi, (vname, vchunk)) in variants.iter().enumerate() {
+                    let vn = format!("gemv_mq6sym_i8_rows_r{r}_{vname}_gfx1201");
+                    let lds = lds_bytes(k, r) + (*vchunk as u32) * 0;
+                    let us = bench(&mut gpu, sets, |g, i| {
+                        g.launch_kernel_blob(&vn, [m.div_ceil(32) as u32, 1, 1], [128, 1, 1], lds, var_blobs[vi][i % sets].as_mut_slice())
+                            .expect("variant launch")
+                    });
+                    var_us[vi].push(us);
+                }
+                if !sym_only {
                 let us = bench(&mut gpu, sets, |g, i| old_kernel(g, i, &xrot, &yold));
                 row.old_k_us.push(us);
+                }
                 let us = bench(&mut gpu, sets, |g, i| {
                     g.launch_kernel_blob(ROOF, [roof_grid, 1, 1], [256, 1, 1], 0, roof_blobs[i % sets].as_mut_slice()).expect("roof")
                 });
                 row.roof_us.push(us);
+                if !sym_only {
                 let us = bench(&mut gpu, 64, |g, _| {
                     let res = g.reserve_int8_mmq(k, r).expect("reserve");
                     g.rotate_x_mq_i8_batched(&x, None, res, k, r).expect("producer");
@@ -1171,6 +1239,7 @@ fn mq6sym_i8_decode_timing_hw() {
                     old_kernel(g, i, &xrot, &yold);
                 });
                 row.old_tot_us.push(us);
+                }
             }
             if tiny {
                 row.iso_sym_us = Some(isolated(&mut gpu, 200, |g, i| launch_sym(g, &name, &mut sym_blobs[i % sets], m, k, r)));
@@ -1192,6 +1261,14 @@ fn mq6sym_i8_decode_timing_hw() {
                 "  reps sym_us={:?} roof_us={:?} prod_us={:?} symprod_us={:?} old_k_us={:?} old_rot_us={:?} old_tot_us={:?}",
                 row.sym_us, row.roof_us, row.prod_us, row.symprod_us, row.old_k_us, row.old_rot_us, row.old_tot_us
             );
+            for (vi, (vname, _)) in variants.iter().enumerate() {
+                let v = median(&var_us[vi]);
+                println!(
+                    "  VARIANT {vname} {m}x{k} rows={r}: {v:8.2} us {:6.1} GB/s (reps {:?})",
+                    gbps(sym_bytes, v),
+                    var_us[vi]
+                );
+            }
             out_rows.push(row);
             drop(ysym);
         }

@@ -42,20 +42,28 @@
 // N must equal the entry's row count (the entry returns without writing
 // otherwise; the host picks the entry from N). K % 256 == 0, M >= 1.
 // Grid [ceil(M / 32), 1, 1], block 128 (four waves, eight output rows per wave),
-// dynamic LDS = mq6sym_x_lds_bytes(K, N) = min(K/256, S6_CHUNK_GROUPS) * 2 * N * 132 B.
+// dynamic LDS = mq6sym_x_lds_bytes(N) = 2 * (2 * (N + B) * 144 + 8 * N) bytes, B = 2 if N == 7
+// else 1 (the larger of the two body layouts, >= 528 * N, so one formula serves every entry;
+// 1168 B at N = 1, 5312 B at N = 8).
 // Y is [N][M] row-major, overwritten. Rows >= M are never stored (weight loads
 // clamp to row M - 1).
 //
-// Lane map (wave32): row = lane >> 2 (8 rows per wave), quarter q = lane & 3.
-// Per 256-K group lane q owns codes [64 q, 64 q + 64): half h = q >> 1 (block
-// 2g + h), codes 64 (q & 1) .. +63 inside that block = 12 payload dwords = three
-// dword-aligned b128 loads. All N tokens' activations come from LDS (the CTA
-// stages the A8 chunk once; the eight rows of a wave broadcast). Per block the
-// four partial integer sums of a quad are reduce-scattered with DPP: pair
-// exchange (xor 1) adds the two halves of a block and splits the tokens, the
-// cross-pair exchange (xor 2) hands every lane both blocks' C for its own
-// tokens (2 tokens/lane at N = 8, 1 at N = 4, replicated below), and each lane
-// runs the ordered f32 fold (block 2g, then 2g + 1) only for its tokens.
+// Two bodies, picked per entry by S6_TS_MIN (default 3):
+//   N = 1, 2  K-split ("ks"): row = lane >> 2, quarter q = lane & 3. Per 256-K group lane q
+//     owns codes [64 q, 64 q + 64): block half h = q >> 1 (block 2g + h), codes 64 (q & 1) ..
+//     +63 of that block = 12 payload dwords = three dword-aligned b128 loads, all N tokens.
+//     The four partial integer sums of a quad are reduce-scattered with DPP (xor 1 adds the two
+//     halves of a block, xor 2 hands every lane both blocks' C for its tokens).
+//   N >= 3    token-split ("ts"): lane (row, q = 2 tp + kh) owns the 128 codes of block kh of every
+//     group (six b128 loads) for the tokens of token half tp ([tp * T0, tp * T0 + MT),
+//     T0 = MT = ceil(N / 2)). A block's C never crosses lanes; only the two lanes of a (row,
+//     tp) pair exchange C (DPP xor 1), each folding half of the pair's tokens.
+// Both read every token's activations from LDS: a two-slot ring refilled one K256 group
+// ahead (one b128 per thread, a barrier that drains only LDS so the weight loads in flight
+// stay in flight); the eight rows of a wave broadcast. The ts layout pads every 128-B
+// (block, token) cell to 144 B (and R = 7 by one more cell per block) so the four lanes of a
+// row read distinct LDS bank groups. Each lane then runs the ordered f32 fold (block 2g, then
+// 2g + 1) for its own tokens only.
 //
 // Test-only: compiling with -DS6_DEBUG_C also stores the per-block integer C
 // ([K/128][N][M] i32 after Y's N*M words); never defined in production.
@@ -66,19 +74,26 @@
 
 #if defined(__gfx1201__)
 
-#ifndef S6_CHUNK_GROUPS
-#define S6_CHUNK_GROUPS 12
-#endif
-// Weight-load lookahead in 256-K groups (1 or 2).
+
+// Weight-load lookahead in 256-K groups (1 or 2); 1 measured faster at every cell.
 #ifndef S6_PF
-#define S6_PF 2
+#define S6_PF 1
 #endif
 #define S6_GROUP_BYTES 196u
 
 typedef unsigned __attribute__((ext_vector_type(4), aligned(4))) s6_u32x4_t;
 
+// Timing-ablation bits (test only; 0 in production): 1 dot4 -> xor3, 2 no LDS x reads, 4 no DPP
+// exchange, 8 no A8 staging/barriers, 16 no decode. Results are meaningless numerically.
+#ifndef S6_ABL
+#define S6_ABL 0
+#endif
 static __device__ __forceinline__ int s6_dot4(unsigned w, unsigned x, int acc) {
+#if S6_ABL & 1
+    return (int)(w ^ x ^ (unsigned)acc);
+#else
     return __builtin_amdgcn_sudot4(true, (int)w, true, (int)x, acc, false);
+#endif
 }
 
 static __device__ __forceinline__ int s6_dpp_x1(int v) {
@@ -106,14 +121,27 @@ struct s6_wgroup {
     unsigned hdr;
 };
 
+// Streaming (non-temporal) weight loads: off by default (S6_NT=1 selects them).
+#ifndef S6_NT
+#define S6_NT 0
+#endif
+
 static __device__ __forceinline__ s6_wgroup s6_load(const unsigned char* __restrict__ row, int g, int q) {
     const unsigned char* gp = row + (size_t)g * S6_GROUP_BYTES;
     s6_wgroup w;
+#if S6_NT
+    w.hdr = __builtin_nontemporal_load(reinterpret_cast<const unsigned*>(gp));
+    const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 4 + 48 * q);
+    w.a = __builtin_nontemporal_load(cp + 0);
+    w.b = __builtin_nontemporal_load(cp + 1);
+    w.c = __builtin_nontemporal_load(cp + 2);
+#else
     w.hdr = *reinterpret_cast<const unsigned*>(gp);
     const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 4 + 48 * q);
     w.a = cp[0];
     w.b = cp[1];
     w.c = cp[2];
+#endif
     return w;
 }
 
@@ -142,8 +170,45 @@ static __device__ __forceinline__ void s6_decode16(unsigned w0, unsigned w1, uns
 
 template <int R> struct S6Np { static constexpr int v = R <= 1 ? 1 : (R <= 2 ? 2 : (R <= 4 ? 4 : 8)); };
 
+// One thread's share of a group's A8 sidecar: group g = blocks 2g, 2g + 1 x R tokens = 2R (block,
+// token) cells, contiguous in Xq ([K/128][N]). Threads 0 .. 16 R - 1 each move one 16-byte slice
+// of a cell's qs (8 per cell; the qs array sits at +8, so loads are 8-byte aligned only); threads
+// 0 .. 2 R - 1 also move one cell's f32 d.
+struct s6_xreg {
+    s6_u32x4_t v;
+    float d;
+};
+
+template <int R>
+static __device__ __forceinline__ s6_xreg s6_loadx(const block_i8_128* Xq, int N, int g, int tid) {
+    s6_xreg r;
+    r.v = (s6_u32x4_t){0u, 0u, 0u, 0u};
+    r.d = 0.0f;
+    const block_i8_128* cell0 = Xq + (size_t)(2 * g) * N;
+    if (tid < 16 * R) {
+        const unsigned char* p = reinterpret_cast<const unsigned char*>(cell0 + (tid >> 3)) + 8 + 16 * (tid & 7);
+        r.v = *reinterpret_cast<const s6_u32x4_t*>(p);
+    }
+    if (tid < 2 * R) r.d = cell0[tid].d;
+    return r;
+}
+
+// LDS slot: qs [2][R][128 B] then d [2][R] f32.
+template <int R>
+static __device__ __forceinline__ void s6_storex(unsigned char* slot, const s6_xreg& r, int tid) {
+    if (tid < 16 * R) {
+        *reinterpret_cast<uint4*>(slot + (tid >> 3) * 128 + 16 * (tid & 7)) = make_uint4(r.v.x, r.v.y, r.v.z, r.v.w);
+    }
+    if (tid < 2 * R) reinterpret_cast<float*>(slot + 256 * R)[tid] = r.d;
+}
+
+// Workgroup barrier that only drains LDS (the weight loads in flight stay in flight).
+static __device__ __forceinline__ void s6_sync_lds() {
+    asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+}
+
 template <int R, bool BF16>
-static __device__ __forceinline__ void s6_body(
+static __device__ __forceinline__ void s6_body_ks(
     const unsigned char* __restrict__ W,
     const block_i8_128* __restrict__ Xq,
     void* __restrict__ Yv,
@@ -178,47 +243,52 @@ static __device__ __forceinline__ void s6_body(
     #pragma unroll
     for (int j = 0; j < KT; ++j) acc[j] = 0.0f;
 
+    constexpr int XS = 264 * R;   // bytes per LDS slot: qs [2][R][128] + d [2][R] f32
     s6_wgroup cur = s6_load(wrow, 0, q);
     s6_wgroup nx1 = cur;
     if (S6_PF >= 2) nx1 = (G > 1) ? s6_load(wrow, 1, q) : cur;
+    // A8 ring: group g's two blocks x R tokens live in LDS slot g & 1; the b128 for group g + 1
+    // is already in flight (xr1), the one for g + 2 is issued at the top of iteration g.
+#if !(S6_ABL & 8)
+    s6_xreg xr1 = s6_loadx<R>(Xq, N, 0, tid);
+    s6_storex<R>(s6_lds, xr1, tid);
+    if (G > 1) xr1 = s6_loadx<R>(Xq, N, 1, tid);
+    s6_sync_lds();
+#else
+    s6_xreg xr1 = s6_loadx<R>(Xq, N, 0, tid);
+#endif
 
-    for (int c0 = 0; c0 < G; c0 += S6_CHUNK_GROUPS) {
-        const int cg = (G - c0) < S6_CHUNK_GROUPS ? (G - c0) : S6_CHUNK_GROUPS;
-        const int nbk = 2 * cg * R;                 // (block, token) cells of the chunk
-        unsigned char* qs_lds = s6_lds;              // [nbk][128 B]
-        float* d_lds = reinterpret_cast<float*>(s6_lds + (size_t)nbk * 128);  // [nbk]
-        // Stage the A8 chunk: blocks 2*c0 .. 2*(c0+cg), all N tokens (contiguous in Xq).
+    for (int g = 0; g < G; ++g) {
         {
-            const block_i8_128* src = Xq + (size_t)(2 * c0) * N;
-            const int units = nbk * 16;
-            #pragma unroll 4
-            for (int u = tid; u < units; u += 128) {
-                const int j = u >> 4, c = u & 15;
-                const uint2 v = *reinterpret_cast<const uint2*>(
-                    reinterpret_cast<const unsigned char*>(src + j) + 8 + 8 * c);
-                *reinterpret_cast<uint2*>(qs_lds + (size_t)j * 128 + 8 * c) = v;
-            }
-            for (int j = tid; j < nbk; j += 128) d_lds[j] = src[j].d;
-        }
-        __syncthreads();
-
-        for (int gg = 0; gg < cg; ++gg) {
-            const int g = c0 + gg;
+            s6_xreg xn = xr1;
+#if !(S6_ABL & 8)
+            if (g + 2 < G) xn = s6_loadx<R>(Xq, N, g + 2, tid);
+#endif
             s6_wgroup nx2 = nx1;
             if (S6_PF >= 2) {
                 if (g + 2 < G) nx2 = s6_load(wrow, g + 2, q);
             } else {
                 if (g + 1 < G) nx2 = s6_load(wrow, g + 1, q);
             }
+            unsigned char* slot = s6_lds + (g & 1) * XS;
+            const float* d_lds = reinterpret_cast<const float*>(slot + 256 * R);
 
             // Decode the lane's 64 codes -> 16 dwords of 4 (q - 32) bytes (4 triples x 4).
             unsigned e[16];
+#if S6_ABL & 16
+            // ablation: no decode (wrong values, timing only)
+            e[0] = cur.a.x; e[1] = cur.a.y; e[2] = cur.a.z; e[3] = cur.a.w;
+            e[4] = cur.b.x; e[5] = cur.b.y; e[6] = cur.b.z; e[7] = cur.b.w;
+            e[8] = cur.c.x; e[9] = cur.c.y; e[10] = cur.c.z; e[11] = cur.c.w;
+            e[12] = cur.a.x ^ cur.c.w; e[13] = cur.a.y ^ cur.c.z; e[14] = cur.a.z ^ cur.c.y; e[15] = cur.a.w ^ cur.c.x;
+#else
             s6_decode16(cur.a.x, cur.a.y, cur.a.z, e + 0);
             s6_decode16(cur.a.w, cur.b.x, cur.b.y, e + 4);
             s6_decode16(cur.b.z, cur.b.w, cur.c.x, e + 8);
             s6_decode16(cur.c.y, cur.c.z, cur.c.w, e + 12);
+#endif
 
-            const unsigned char* xb = qs_lds + (size_t)((2 * gg + h) * R) * 128 + 64 * (q & 1);
+            const unsigned char* xb = slot + (size_t)(h * R) * 128 + 64 * (q & 1);
             int c[NP];
             #pragma unroll
             for (int n = 0; n < NP; ++n) {
@@ -227,7 +297,12 @@ static __device__ __forceinline__ void s6_body(
                     const uint4* xp = reinterpret_cast<const uint4*>(xb + n * 128);
                     #pragma unroll
                     for (int t = 0; t < 4; ++t) {
+#if S6_ABL & 2
+                        // ablation: no LDS x reads (wrong values, timing only)
+                        const uint4 xv = make_uint4(e[4 * t] + n, e[4 * t + 1] + n, e[4 * t + 2] + n, e[4 * t + 3] + n);
+#else
                         const uint4 xv = xp[t];
+#endif
                         c[n] = s6_dot4(e[4 * t + 0], xv.x, c[n]);
                         c[n] = s6_dot4(e[4 * t + 1], xv.y, c[n]);
                         c[n] = s6_dot4(e[4 * t + 2], xv.z, c[n]);
@@ -273,6 +348,14 @@ static __device__ __forceinline__ void s6_body(
                     oth[j] = s6_dpp_x2(h ? p[j] : p[2 + j]);
                 }
             }
+#if S6_ABL & 4
+            // ablation: no DPP exchange (wrong values, timing only)
+            #pragma unroll
+            for (int j = 0; j < KT; ++j) {
+                own[j] = c[j];
+                oth[j] = c[NP - 1 - j];
+            }
+#endif
 
             const float s0f = s6_f16_lo(cur.hdr);
             const float s1f = s6_f16_hi(cur.hdr);
@@ -290,8 +373,8 @@ static __device__ __forceinline__ void s6_body(
                     dbg[((size_t)(2 * g + 1) * R + tok) * M + row] = C1;
                 }
 #endif
-                const float d0 = d_lds[(2 * gg) * R + tr];
-                const float d1 = d_lds[(2 * gg + 1) * R + tr];
+                const float d0 = d_lds[tr];
+                const float d1 = d_lds[R + tr];
                 acc[j] = __builtin_fmaf(__fmul_rn(s0f, d0), (float)C0, acc[j]);
                 acc[j] = __builtin_fmaf(__fmul_rn(s1f, d1), (float)C1, acc[j]);
             }
@@ -301,8 +384,16 @@ static __device__ __forceinline__ void s6_body(
             } else {
                 cur = nx2;
             }
+            // Publish group g + 1's A8 into the other slot (its last readers passed the previous
+            // barrier), then release it to every wave.
+#if !(S6_ABL & 8)
+            if (g + 1 < G) s6_storex<R>(s6_lds + ((g + 1) & 1) * XS, xr1, tid);
+#endif
+            xr1 = xn;
         }
-        if (c0 + S6_CHUNK_GROUPS < G) __syncthreads();
+#if !(S6_ABL & 8)
+        if (g + 1 < G) s6_sync_lds();
+#endif
     }
 
     if (row < M && writer) {
@@ -320,6 +411,208 @@ static __device__ __forceinline__ void s6_body(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Token-split body (R >= S6_TS_MIN): lane (row, q = 2 tp + kh) owns the 128 codes of block kh of
+// every group (so a block's integer C never crosses lanes) and the tokens of token-half tp
+// (tokens [tp * T0, tp * T0 + MT)). Only the two lanes of a (row, tp) pair (xor 1) exchange C:
+// each lane folds half of the pair's tokens and receives the other block's C for them.
+// ---------------------------------------------------------------------------------------------
+template <int R> struct S6Ts {
+    static constexpr int T0 = (R + 1) / 2;       // tokens of half 0 (max per half)
+    static constexpr int MT = T0;
+    static constexpr int HJ = (MT + 1) / 2;      // owned tokens per lane (max)
+    static constexpr int B = (R == 7) ? 2 : 1;   // padding cells per block: bank rotation of the
+                                                 // four lanes' cells (stride 144 B = 9 chunks)
+    static constexpr int CELLS = 2 * (R + B);
+    static constexpr int SLOT = CELLS * 144 + 8 * R;  // qs cells, then d [2][R] f32
+};
+
+struct s6_wgroup2 {
+    s6_u32x4_t v[6];
+    unsigned hdr;
+};
+
+static __device__ __forceinline__ s6_wgroup2 s6_load2(const unsigned char* __restrict__ row, int g, int kh) {
+    const unsigned char* gp = row + (size_t)g * S6_GROUP_BYTES;
+    s6_wgroup2 w;
+    w.hdr = *reinterpret_cast<const unsigned*>(gp);
+    const s6_u32x4_t* cp = reinterpret_cast<const s6_u32x4_t*>(gp + 4 + 96 * kh);
+    #pragma unroll
+    for (int i = 0; i < 6; ++i) w.v[i] = cp[i];
+    return w;
+}
+
+template <int R>
+static __device__ __forceinline__ void s6_storex_ts(unsigned char* slot, const s6_xreg& r, int tid) {
+    constexpr int B = S6Ts<R>::B;
+    if (tid < 16 * R) {
+        const int cc = tid >> 3;
+        const int hh = cc / R;
+        const int n = cc - hh * R;
+        *reinterpret_cast<uint4*>(slot + (hh * (R + B) + n) * 144 + 16 * (tid & 7)) = make_uint4(r.v.x, r.v.y, r.v.z, r.v.w);
+    }
+    if (tid < 2 * R) reinterpret_cast<float*>(slot + S6Ts<R>::CELLS * 144)[tid] = r.d;
+}
+
+template <int R, bool BF16>
+static __device__ __forceinline__ void s6_body_ts(
+    const unsigned char* __restrict__ W,
+    const block_i8_128* __restrict__ Xq,
+    void* __restrict__ Yv,
+    int M, int K, int N
+) {
+    extern __shared__ __align__(16) unsigned char s6_lds[];
+    if (N != R) return;
+    using TS = S6Ts<R>;
+    constexpr int T0 = TS::T0, MT = TS::MT, HJ = TS::HJ, B = TS::B, SLOT = TS::SLOT;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int q = lane & 3;
+    const int kh = q & 1;                   // block half owned by this lane
+    const int tp = q >> 1;                  // token half
+    const int row = (int)blockIdx.x * 32 + wave * 8 + (lane >> 2);
+    const int rowc = row < M ? row : M - 1;
+    const int G = K >> 8;
+    const size_t row_stride = (size_t)G * S6_GROUP_BYTES;
+    const unsigned char* wrow = W + (size_t)rowc * row_stride;
+    const int tbase = tp * T0;
+
+    float acc[HJ];
+    #pragma unroll
+    for (int i = 0; i < HJ; ++i) acc[i] = 0.0f;
+
+    s6_wgroup2 cur = s6_load2(wrow, 0, kh);
+    s6_wgroup2 nx1 = cur;
+    if (S6_PF >= 2) nx1 = (G > 1) ? s6_load2(wrow, 1, kh) : cur;
+    s6_xreg xr1 = s6_loadx<R>(Xq, N, 0, tid);
+    s6_storex_ts<R>(s6_lds, xr1, tid);
+    if (G > 1) xr1 = s6_loadx<R>(Xq, N, 1, tid);
+    s6_sync_lds();
+
+    for (int g = 0; g < G; ++g) {
+        {
+            s6_xreg xn = xr1;
+#if !(S6_ABL & 8)
+            if (g + 2 < G) xn = s6_loadx<R>(Xq, N, g + 2, tid);
+#endif
+            s6_wgroup2 nx2 = nx1;
+            if (S6_PF >= 2) {
+                if (g + 2 < G) nx2 = s6_load2(wrow, g + 2, kh);
+            } else {
+                if (g + 1 < G) nx2 = s6_load2(wrow, g + 1, kh);
+            }
+            unsigned char* slot = s6_lds + (g & 1) * SLOT;
+            const float* d_lds = reinterpret_cast<const float*>(slot + TS::CELLS * 144);
+            const unsigned char* xb = slot + (size_t)(kh * (R + B) + tbase) * 144;
+
+            int c[MT];
+            #pragma unroll
+            for (int j = 0; j < MT; ++j) c[j] = 0;
+            #pragma unroll
+            for (int h2 = 0; h2 < 2; ++h2) {
+                unsigned e[16];
+                const s6_u32x4_t va = cur.v[3 * h2], vb = cur.v[3 * h2 + 1], vc = cur.v[3 * h2 + 2];
+#if S6_ABL & 16
+                for (int u = 0; u < 12; ++u) e[u] = cur.v[3 * h2 + u / 4][u & 3];
+                e[12] = va.x ^ vc.w; e[13] = va.y ^ vc.z; e[14] = va.z ^ vc.y; e[15] = va.w ^ vc.x;
+#else
+                s6_decode16(va.x, va.y, va.z, e + 0);
+                s6_decode16(va.w, vb.x, vb.y, e + 4);
+                s6_decode16(vb.z, vb.w, vc.x, e + 8);
+                s6_decode16(vc.y, vc.z, vc.w, e + 12);
+#endif
+                #pragma unroll
+                for (int j = 0; j < MT; ++j) {
+                    const uint4* xp = reinterpret_cast<const uint4*>(xb + j * 144 + 64 * h2);
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t) {
+#if S6_ABL & 2
+                        const uint4 xv = make_uint4(e[4 * t] + j, e[4 * t + 1] + j, e[4 * t + 2] + j, e[4 * t + 3] + j);
+#else
+                        const uint4 xv = xp[t];
+#endif
+                        c[j] = s6_dot4(e[4 * t + 0], xv.x, c[j]);
+                        c[j] = s6_dot4(e[4 * t + 1], xv.y, c[j]);
+                        c[j] = s6_dot4(e[4 * t + 2], xv.z, c[j]);
+                        c[j] = s6_dot4(e[4 * t + 3], xv.w, c[j]);
+                    }
+                }
+            }
+
+            // Pair exchange: lane kh owns slots j = kh * HJ + i; it sends the partner's slots.
+            const float s0f = s6_f16_lo(cur.hdr);
+            const float s1f = s6_f16_hi(cur.hdr);
+            #pragma unroll
+            for (int i = 0; i < HJ; ++i) {
+                constexpr int ZERO = 0;
+                const int hi = (HJ + i < MT) ? c[(HJ + i < MT) ? HJ + i : 0] : ZERO;
+                const int own = kh ? hi : c[i];
+                const int snd = kh ? c[i] : hi;
+#if S6_ABL & 4
+                const int rcv = snd;   // ablation: no DPP exchange
+#else
+                const int rcv = s6_dpp_x1(snd);
+#endif
+                const int C0 = (kh ? rcv : own) >> 2;
+                const int C1 = (kh ? own : rcv) >> 2;
+                const int tok = tbase + kh * HJ + i;
+                const int tr = tok < R ? tok : R - 1;
+#ifdef S6_DEBUG_C
+                if (kh * HJ + i < MT && tok < R && row < M) {
+                    int* dbg = reinterpret_cast<int*>(Yv) + (size_t)N * M;
+                    dbg[((size_t)(2 * g) * R + tok) * M + row] = C0;
+                    dbg[((size_t)(2 * g + 1) * R + tok) * M + row] = C1;
+                }
+#endif
+                const float d0 = d_lds[tr];
+                const float d1 = d_lds[R + tr];
+                acc[i] = __builtin_fmaf(__fmul_rn(s0f, d0), (float)C0, acc[i]);
+                acc[i] = __builtin_fmaf(__fmul_rn(s1f, d1), (float)C1, acc[i]);
+            }
+            if (S6_PF >= 2) {
+                cur = nx1;
+                nx1 = nx2;
+            } else {
+                cur = nx2;
+            }
+#if !(S6_ABL & 8)
+            if (g + 1 < G) s6_storex_ts<R>(s6_lds + ((g + 1) & 1) * SLOT, xr1, tid);
+#endif
+            xr1 = xn;
+        }
+#if !(S6_ABL & 8)
+        if (g + 1 < G) s6_sync_lds();
+#endif
+    }
+
+    if (row < M) {
+        #pragma unroll
+        for (int i = 0; i < HJ; ++i) {
+            const int j = kh * HJ + i;
+            const int tok = tbase + j;
+            if (j < MT && tok < R) {
+                if (BF16) {
+                    reinterpret_cast<unsigned short*>(Yv)[(size_t)tok * M + row] = s6_bf16_bits(acc[i]);
+                } else {
+                    reinterpret_cast<float*>(Yv)[(size_t)tok * M + row] = acc[i];
+                }
+            }
+        }
+    }
+}
+
+// Token-split from this row count up (the K-split body below 3 rows).
+#ifndef S6_TS_MIN
+#define S6_TS_MIN 3
+#endif
+template <int R, bool BF16>
+static __device__ __forceinline__ void s6_body(
+    const unsigned char* __restrict__ W, const block_i8_128* __restrict__ Xq,
+    void* __restrict__ Yv, int M, int K, int N) {
+    if constexpr (R >= S6_TS_MIN) s6_body_ts<R, BF16>(W, Xq, Yv, M, K, N);
+    else s6_body_ks<R, BF16>(W, Xq, Yv, M, K, N);
+}
 #ifdef S6_DEBUG_C
 // Test-only build: F32 entries only, distinct symbol names (`_dbgc_`).
 #define S6_ENTRY(R)                                                                              \
@@ -329,13 +622,20 @@ extern "C" __global__ __launch_bounds__(128) void gemv_mq6sym_i8_rows_r##R##_dbg
     s6_body<R, false>(W, Xq, Y, M, K, N);                                                       \
 }
 #else
+// Test-only hook: -DS6_SUF=_name appends a suffix to every entry symbol (A/B variants in one
+// process); empty in production.
+#ifndef S6_SUF
+#define S6_SUF
+#endif
+#define S6_CAT4_(a, b, c, d) a##b##c##d
+#define S6_CAT4(a, b, c, d) S6_CAT4_(a, b, c, d)
 #define S6_ENTRY(R)                                                                              \
-extern "C" __global__ __launch_bounds__(128) void gemv_mq6sym_i8_rows_r##R##_gfx1201(          \
+extern "C" __global__ __launch_bounds__(128) void S6_CAT4(gemv_mq6sym_i8_rows_r, R, S6_SUF, _gfx1201)( \
     const unsigned char* __restrict__ W, const block_i8_128* __restrict__ Xq,                   \
     float* __restrict__ Y, int M, int K, int N) {                                               \
     s6_body<R, false>(W, Xq, Y, M, K, N);                                                       \
 }                                                                                               \
-extern "C" __global__ __launch_bounds__(128) void gemv_mq6sym_i8_rows_r##R##_bf16_gfx1201(     \
+extern "C" __global__ __launch_bounds__(128) void S6_CAT4(gemv_mq6sym_i8_rows_r, R, S6_SUF, _bf16_gfx1201)( \
     const unsigned char* __restrict__ W, const block_i8_128* __restrict__ Xq,                   \
     float* __restrict__ Y, int M, int K, int N) {                                               \
     s6_body<R, true>(W, Xq, Y, M, K, N);                                                        \
