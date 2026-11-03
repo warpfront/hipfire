@@ -1083,7 +1083,13 @@ mod exact {
                 SimdTier::Scalar,
                 "{q:?}: forced off"
             );
-            let want = if matches!(q, CpuQuant::Mq4G256V2 | CpuQuant::Mq4G128V2) {
+            let want = if matches!(
+                q,
+                CpuQuant::Mq4G256V2
+                    | CpuQuant::Mq4G128V2
+                    | CpuQuant::Mq3I4G128R256
+                    | CpuQuant::Mq3I4G128R128
+            ) {
                 SimdTier::Avx512
             } else {
                 SimdTier::Avx2
@@ -1096,7 +1102,12 @@ mod exact {
             );
         }
         // The detected tier is consistent with the detected features.
-        for q in [CpuQuant::Mq4G256V2, CpuQuant::Mq4G128V2] {
+        for q in [
+            CpuQuant::Mq4G256V2,
+            CpuQuant::Mq4G128V2,
+            CpuQuant::Mq3I4G128R256,
+            CpuQuant::Mq3I4G128R128,
+        ] {
             let want = match (row_dot_enabled(q, None), avx512_available()) {
                 (false, _) => SimdTier::Scalar,
                 (true, true) => SimdTier::Avx512,
@@ -1775,6 +1786,223 @@ mod exact {
                     );
                 }
             }
+        }
+    }
+}
+
+// ── Planar W3: the AVX-512 / VBMI row dot and the decode-once multi-token dot ───
+//
+// The AVX2 kernel ([`x86::w3_row_dot`]) is the W3 law (two 8-lane chains per 128-group, the
+// `a0 + a1` join, one FMA per group by `2·f32(d)`, `hsum256`). The AVX-512 kernels must
+// reproduce it to the bit, row by row and token by token, and the whole GEMV path must keep
+// the digest the pre-change kernel produced on the Flash-Next expert shapes.
+
+#[cfg(target_arch = "x86_64")]
+mod w3_exact {
+    use super::*;
+
+    const W3: [CpuQuant; 2] = [CpuQuant::Mq3I4G128R256, CpuQuant::Mq3I4G128R128];
+
+    /// `(k, shape comment)`: the real gate/up and down widths, the single-group row (the masked
+    /// tail load is the only load), two groups and an odd group count.
+    const KS: [usize; 7] = [128, 256, 384, 640, 2560, 1152, 4096];
+
+    /// Activations at mixed magnitudes and signs: a reassociated sum would round differently.
+    fn awkward(k: usize, salt: usize) -> Vec<f32> {
+        planar_x(k, salt)
+            .into_iter()
+            .enumerate()
+            .map(|(i, v)| match (i + salt) % 7 {
+                0 => v * 4096.0,
+                1 => v / 4096.0,
+                2 => -v,
+                3 => 0.0,
+                _ => v,
+            })
+            .collect()
+    }
+
+    /// One job: the whole tensor against `xs.len()` activation rows, through the shared-GEMV
+    /// path the D2 expert arm runs (`out[r * n + t]`).
+    struct OneJob<'a> {
+        q: CpuQuant,
+        packed: &'a [u8],
+        xs: &'a [Vec<f32>],
+    }
+    impl SharedJobSource for OneJob<'_> {
+        fn jobs(&self) -> usize {
+            1
+        }
+        fn n(&self, _j: usize) -> usize {
+            self.xs.len()
+        }
+        fn quant(&self, _j: usize) -> CpuQuant {
+            self.q
+        }
+        fn packed(&self, _j: usize) -> &[u8] {
+            self.packed
+        }
+        fn xs_row(&self, _j: usize, t: usize) -> &[f32] {
+            &self.xs[t]
+        }
+    }
+
+    fn fnv(h: &mut u64, v: &[f32]) {
+        for x in v {
+            for b in x.to_bits().to_le_bytes() {
+                *h = (*h ^ b as u64).wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+
+    /// The AVX-512 row dot, the dispatching `row_dot_avx2` and the AVX2 kernel agree to the bit.
+    #[test]
+    fn w3_avx512_row_dot_is_bit_identical_to_avx2() {
+        if !avx512_available() {
+            eprintln!("skip: AVX-512 VBMI absent on this runner");
+            return;
+        }
+        for q in W3 {
+            for k in KS {
+                if k % q.k_multiple() != 0 {
+                    continue;
+                }
+                let m = 24;
+                let packed = testfix::planar_tensor(q, m, k, 0x3300 + k as u64);
+                for salt in 0..3 {
+                    let x = if salt == 0 {
+                        planar_x(k, 0)
+                    } else {
+                        awkward(k, salt)
+                    };
+                    for r in 0..m {
+                        let (row, srow) = planar_row(q, &packed, m, k, r);
+                        let a2 = row_dot_tier(SimdTier::Avx2, q, row, srow, k, &x);
+                        let a5 = row_dot_tier(SimdTier::Avx512, q, row, srow, k, &x);
+                        let disp = row_dot_avx2(q, row, srow, k, &x);
+                        let what = format!("{q:?} k={k} salt={salt} row={r}");
+                        assert_eq!(a5.to_bits(), a2.to_bits(), "avx512 vs avx2 {what}");
+                        assert_eq!(disp.to_bits(), a2.to_bits(), "dispatch {what}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The multi-token dot (any token count, so groups of 8 and a short tail) equals the
+    /// single-token AVX2 kernel per token, and the shared GEMV through it equals the per-token dots.
+    #[test]
+    fn w3_multi_token_is_bit_identical_to_per_token() {
+        if !avx512_available() {
+            eprintln!("skip: AVX-512 VBMI absent on this runner");
+            return;
+        }
+        for q in W3 {
+            assert!(has_planar_multi_kernel(q), "{q:?}");
+            for k in [128usize, 640, 2560] {
+                if k % q.k_multiple() != 0 {
+                    continue;
+                }
+                let m = 9;
+                let packed = testfix::planar_tensor(q, m, k, 0x7700 + k as u64);
+                for n in 1..=11usize {
+                    let xs: Vec<Vec<f32>> = (0..n).map(|t| awkward(k, t + 1)).collect();
+                    let refs: Vec<&[f32]> = xs.iter().map(|x| x.as_slice()).collect();
+                    for r in 0..m {
+                        let (row, srow) = planar_row(q, &packed, m, k, r);
+                        let mut got = vec![0.0f32; n];
+                        row_dot_multi_planar(q, row, srow, k, &refs, &mut got);
+                        for t in 0..n {
+                            let want = row_dot_tier(SimdTier::Avx2, q, row, srow, k, &xs[t]);
+                            assert_eq!(
+                                got[t].to_bits(),
+                                want.to_bits(),
+                                "{q:?} k={k} n={n} row={r} token={t}"
+                            );
+                        }
+                    }
+                    // The shared GEMV (`out[r * n + t]`).
+                    let mut out = vec![0.0f32; m * n];
+                    gemv_shared_sourced(
+                        m,
+                        k,
+                        &mut out,
+                        &OneJob {
+                            q,
+                            packed: &packed,
+                            xs: &xs,
+                        },
+                        Some(true),
+                    );
+                    for t in 0..n {
+                        let mut one = vec![0.0f32; m];
+                        gemv_with_simd(q, &packed, m, k, &xs[t], &mut one, Some(true));
+                        for r in 0..m {
+                            assert_eq!(
+                                out[r * n + t].to_bits(),
+                                one[r].to_bits(),
+                                "{q:?} k={k} shared n={n} row={r} token={t}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Golden digests of the PRE-CHANGE kernel (the AVX2 `w3_row_dot`, untouched by the AVX-512
+    /// work) over the Flash-Next expert shapes: gate/up `[1280, 2560]` and down `[2560, 640]`, 4
+    /// awkward tokens each. The AVX-512 tier, the dispatch and the multi-token GEMM must all land
+    /// on exactly these bits — the same proof the MQ4 V2 kernel change used.
+    #[test]
+    fn w3_flash_next_shapes_keep_the_pre_change_digest() {
+        const GOLDEN_GATE_UP: u64 = 0xbd672e582ddbc2ed;
+        const GOLDEN_DOWN: u64 = 0x16c8dcab57b9ff98;
+        for (q, m, k, golden, name) in [
+            (
+                CpuQuant::Mq3I4G128R256,
+                1280usize,
+                2560usize,
+                GOLDEN_GATE_UP,
+                "gate_up",
+            ),
+            (CpuQuant::Mq3I4G128R128, 2560, 640, GOLDEN_DOWN, "down"),
+        ] {
+            let packed = testfix::planar_tensor(q, m, k, 0xF1A5_0000 + (m * k) as u64);
+            let xs: Vec<Vec<f32>> = (0..4).map(|t| awkward(k, 10 + t)).collect();
+            let digest_of = |tier: SimdTier| {
+                let mut h = 0xcbf29ce484222325u64;
+                for r in 0..m {
+                    let (row, srow) = planar_row(q, &packed, m, k, r);
+                    for x in &xs {
+                        fnv(&mut h, &[row_dot_tier(tier, q, row, srow, k, x)]);
+                    }
+                }
+                h
+            };
+            let avx2 = digest_of(SimdTier::Avx2);
+            eprintln!("w3 {name} avx2 digest {avx2:#018x}");
+            assert_eq!(avx2, golden, "{name}: the AVX2 W3 law moved");
+            if avx512_available() {
+                assert_eq!(digest_of(SimdTier::Avx512), golden, "{name}: avx512");
+            }
+            // The shared GEMV (the multi-token path on AVX-512 CPUs), `out[r * 4 + t]`: the same
+            // row-then-token order the digest above hashes in.
+            let mut out = vec![0.0f32; m * 4];
+            gemv_shared_sourced(
+                m,
+                k,
+                &mut out,
+                &OneJob {
+                    q,
+                    packed: &packed,
+                    xs: &xs,
+                },
+                Some(true),
+            );
+            let mut h = 0xcbf29ce484222325u64;
+            fnv(&mut h, &out);
+            assert_eq!(h, golden, "{name}: shared GEMV path");
         }
     }
 }

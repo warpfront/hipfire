@@ -692,6 +692,30 @@ fn run_shared_jobs<S: SharedJobSource + Sync>(
                 for (within_block, chunk) in rows.chunks_mut(n).enumerate() {
                     let r = first_row + within_block;
                     let (row, srow) = row_slices(q, src.packed(j), m, k, r);
+                    #[cfg(target_arch = "x86_64")]
+                    if n > 1 && use_simd && simd::has_planar_multi_kernel(q) {
+                        // Planar W3: each weight group is decoded once for all `n` rows
+                        // instead of once per row; every output is the per-row dot's bits.
+                        let mut xs: [&[f32]; simd::PLANAR_MULTI_MAX] =
+                            [&[]; simd::PLANAR_MULTI_MAX];
+                        let mut t0 = 0;
+                        while t0 < n {
+                            let g = (n - t0).min(simd::PLANAR_MULTI_MAX);
+                            for i in 0..g {
+                                xs[i] = &src.xs_row(j, t0 + i)[..k];
+                            }
+                            simd::row_dot_multi_planar(
+                                q,
+                                row,
+                                srow,
+                                k,
+                                &xs[..g],
+                                &mut chunk[t0..t0 + g],
+                            );
+                            t0 += g;
+                        }
+                        continue;
+                    }
                     for (t, v) in chunk.iter_mut().enumerate() {
                         *v = dot_row_simd(q, row, srow, k, &src.xs_row(j, t)[..k], use_simd);
                     }
