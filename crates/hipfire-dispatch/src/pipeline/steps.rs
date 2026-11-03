@@ -206,9 +206,10 @@ pub enum Step<'a> {
     StreamMix(crate::pipeline::stream_mix::StreamMixOp<'a>),
     /// One latent (NoPE MLA) attention stage over the latent cache / expanded mirror.
     LatentAttention(crate::pipeline::latent_attention::LatentAttentionOp<'a>),
-    /// Raon RDA core: vector-decay gated delta over projected rows.
+    /// Raon RDA layer stage: the vector-decay gated delta core over projected
+    /// rows, or the partial-accept rollback (recurrence + conv-history rebuild).
     #[cfg(feature = "deltanet")]
-    Rda(crate::pipeline::rda::RdaOp<'a>),
+    Rda(crate::pipeline::rda::RdaStage<'a>),
     /// Sigmoid top-k grouped MoE with a shared expert and SiTU activation.
     GroupedMoe(crate::pipeline::moe_program::GroupedMoeOp<'a>),
     /// Dense gated FFN on the grouped-MoE arithmetic (one slot, no router).
@@ -2119,7 +2120,7 @@ pub(crate) fn launch_op_rows(
             crate::pipeline::latent_attention::execute_latent_attention(gpu, op)
         }
         #[cfg(feature = "deltanet")]
-        Step::Rda(op) => crate::pipeline::rda::execute_rda(gpu, op),
+        Step::Rda(stage) => crate::pipeline::rda::execute_rda_stage(gpu, stage),
         Step::GroupedMoe(op) => crate::pipeline::moe_program::execute_grouped_moe(gpu, op),
         Step::GatedFfn(op) => crate::pipeline::moe_program::execute_gated_ffn(gpu, op),
         Step::BoundaryProject(op) => {
