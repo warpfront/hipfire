@@ -1950,6 +1950,10 @@ pub struct Gpu {
     /// on prefill chunks of >= 512 rows).  An explicit value of those
     /// variables applies everywhere, as before.
     pub qwen4_scope: bool,
+    /// True once every qt47 trunk tensor of the loaded Qwen4 model passed
+    /// [`Gpu::qwen4_mq6_sym_check`] (set by the loader through
+    /// [`Gpu::set_qwen4_trunk_a8_verified`]); gates [`Gpu::qwen4_trunk_a8_applies`].
+    pub(crate) qwen4_trunk_a8_verified: bool,
     /// True while the Flash-Next lane step, a Qwen4 speculative verify forward
     /// or the DFlash2 draft head runs (set by their drivers):
     /// together with the `fn_lane_pm_rows` flag it routes the four incumbent
@@ -3306,6 +3310,7 @@ impl Gpu {
             capture_names: HashMap::new(),
             hessian_capture: None,
             qwen4_scope: false,
+            qwen4_trunk_a8_verified: false,
             lane_rows_scope: false,
             prefill_invariant_scope: false,
             wide_verify_rows: 0,

@@ -17,6 +17,7 @@ pub mod ggml_convert;
 pub mod ggml_mmvq;
 pub mod ggml_mmvq_fused;
 pub mod mq6_i8;
+pub mod mq6sym_i8;
 pub mod qwen4_moe_sym;
 
 use crate::work::WorkSpecV1;
@@ -27,6 +28,7 @@ use crate::{Arch, ExportV1, KernelAbiV1};
 pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
     mq6_i8::ABIS
         .iter()
+        .chain(mq6sym_i8::ABIS.iter())
         .chain(qwen4_moe_sym::ABIS.iter())
         .chain(ggml_mmvq::ABIS.iter())
         .chain(ggml_mmvq_fused::ABIS.iter())

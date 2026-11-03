@@ -5835,6 +5835,25 @@ pub const GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i8_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq6g256v2_mmq_i8.gfx12.hip")
 );
+/// gfx1201 symmetric-MQ6 x A8 decode/verify GEMV (`gemv_mq6sym_i8_rows_r{1..8}{,_bf16}_gfx1201`, N = 1..8;
+/// dynamic LDS per entry in `gemm_mq6sym_i8.rs`): the `block_i8_128` prelude without its standalone
+/// quantizer, then the kernel.
+pub const GEMV_MQ6SYM_I8_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemv_mq6sym_i8.gfx1201.hip")
+);
+/// gfx1201 symmetric-MQ6 x A8 signed-iu8 WMMA GEMM: narrow verify tiles
+/// (`gemm_mq6sym_i8_set{,_bf16}_m{32,64}n{16,32,48}{,y}_gfx1201`) and the 128x128 prefill tile
+/// (`gemm_mq6sym_i8_set{,_bf16}_gfx1201`, dynamic LDS 36864); same prelude as the GEMV.
+pub const GEMM_MQ6SYM_I8_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i8_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq6sym_i8.gfx1201.hip")
+);
+/// gfx1201 qt47 (MQ6G256V2) symmetric-grid header checker (`Gpu::qwen4_mq6_sym_check`).
+pub const QWEN4_MQ6_SYM_CHECK_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_mq6_sym_check.gfx1201.hip");
 /// gfx1201 Qwen4 shared-expert INT8 x INT8 prefill GEMM (`qwen4_shared_i8_down_set_f32`,
 /// `qwen4_shared_i8_gate_up_silu_bf16`; dynamic LDS `QWEN4_SHARED_I8_LDS_BYTES` = 36864): the
 /// `block_i8_128` prelude without its standalone quantizer, then the kernel

@@ -4074,6 +4074,7 @@ pub fn is_developer_key(key: &str) -> bool {
 /// developer key keeps its free-form legacy spelling.
 const TYPED_BOOL_DEVELOPER_KEYS: &[&str] = &[
     "developer.qwen4_moe_sym_iu4",
+    "developer.qwen4_trunk_a8",
     "developer.qwen4_d2_default",
     "developer.qwen4_mtp_head_d2",
     "developer.qwen4_mtp_head_resident",

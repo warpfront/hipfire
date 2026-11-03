@@ -53,6 +53,7 @@ pub mod gemm;
 mod gemm_fp8_verify;
 mod gemm_mq6_fp8;
 mod gemm_mq6_i8;
+pub mod gemm_mq6sym_i8;
 mod gemm_mq8g256;
 mod gemm_q8_a8;
 mod gemm_q8_fp8;

@@ -416,6 +416,36 @@ const EXPECTED_HIPCC_EXPORTS: &[(&str, &str)] = &[
     ("gfx1201", "stream_mix_postmix_bf16"),
     ("gfx1201", "stream_mix_route_aggregate_n4_k10_bf16"),
     ("gfx1201", "stream_mix_route_helmert"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m32n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m32n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n16y_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_bf16_m64n48_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m32n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m32n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n16y_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n32_gfx1201"),
+    ("gfx1201", "gemm_mq6sym_i8_set_m64n48_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r1_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r1_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r2_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r2_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r3_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r3_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r4_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r4_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r5_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r5_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r6_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r6_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r7_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r7_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r8_bf16_gfx1201"),
+    ("gfx1201", "gemv_mq6sym_i8_rows_r8_gfx1201"),
 ];
 
 // ---- shared helpers ------------------------------------------------------------------
@@ -1353,6 +1383,10 @@ fn runtime_source(module: &str, source: &str) -> Result<String, String> {
         ),
         "gemm_mq6g256v2_mmq_i8_gfx11_t256" => format!(
             "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n#define I8_TILE 256\n{}{body}",
+            read("kernels/src/block_i8_128_quant.hip")?
+        ),
+        "gemv_mq6sym_i8_gfx1201" | "gemm_mq6sym_i8_gfx1201" => format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{}{body}",
             read("kernels/src/block_i8_128_quant.hip")?
         ),
         "ffn_grouped_activation_rotate_i8_gfx1201" => format!(
