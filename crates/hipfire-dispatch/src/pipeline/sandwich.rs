@@ -711,6 +711,43 @@ impl Rope {
         }
     }
 
+    /// Launch-free checks of a batched RoPE: whole rows of positions, Q/K
+    /// holding those rows, and an mRoPE `rot_dim`/`section` the kernel reads.
+    pub(crate) fn validate_rows(
+        &self,
+        positions: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), DispatchError> {
+        let per_row = self.positions_per_row();
+        let rows = positions.numel() / per_row;
+        if positions.numel() % per_row != 0
+            || q.numel() < rows * n_heads * head_dim
+            || (n_kv_heads > 0 && k.numel() < rows * n_kv_heads * head_dim)
+        {
+            return Err(DispatchError::Hip(format!(
+                "rope: {} positions ({per_row}/row), q {} / k {} elements for {n_heads}/{n_kv_heads} heads of {head_dim}",
+                positions.numel(),
+                q.numel(),
+                k.numel()
+            )));
+        }
+        if let RopeKind::Mrope { rot_dim, section } = self.kind {
+            if rot_dim > head_dim
+                || rot_dim % 2 != 0
+                || section.iter().sum::<usize>() != rot_dim / 2
+            {
+                return Err(DispatchError::Hip(format!(
+                    "rope: mRoPE rot_dim {rot_dim} / section {section:?} invalid for head_dim {head_dim}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// RoPE of one row at the position in `pos_buf`; `n_kv_heads == 0` leaves
     /// K untouched.
     #[allow(clippy::too_many_arguments)]
@@ -1072,6 +1109,9 @@ impl SandwichAttentionOp<'_> {
         if self.kv_proj.is_some() {
             need(self.k, kv_len, L, "k")?;
             need(self.v, kv_len, L, "v")?;
+        }
+        if matches!(self.rope.kind, RopeKind::Mrope { .. }) {
+            return Err(invalid(format!("{L}: mRoPE is an encoder-only RoPE")));
         }
         if s.batched() {
             let positions = self

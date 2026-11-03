@@ -5582,6 +5582,7 @@ impl ProjectOp<'_> {
         }
         if self.ladder == ProjectLadder::EncoderF16
             && (self.weight.dtype != DType::F16
+                || self.weight.buf.dtype != DType::F16
                 || self.weight.buf.numel() < checked_mul(m, k, "F16 weight")?
                 || k == 0
                 || k % 16 != 0)
