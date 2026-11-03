@@ -1130,8 +1130,15 @@ struct Report {
     cases_n: u64,
     bytes: u64,
     failed_controls: Vec<String>,
+    nz_words: u64,
+    total_words: u64,
 }
 impl Report {
+    /// Non-vacuity statistic: how many expected fold sums are non-zero.
+    fn note_sums(&mut self, sums: &[f32]) {
+        self.total_words += sums.len() as u64;
+        self.nz_words += sums.iter().filter(|v| **v != 0.0).count() as u64;
+    }
     fn new(section: &str) -> Report {
         Report {
             section: section.to_string(),
@@ -1142,6 +1149,8 @@ impl Report {
             cases_n: 0,
             bytes: 0,
             failed_controls: vec![],
+            nz_words: 0,
+            total_words: 0,
         }
     }
     /// `coord` = (element bytes, columns) to turn the first mismatching byte into (row, col).
@@ -1201,6 +1210,7 @@ impl Report {
             "cases": self.cases_n,
             "bytes_compared": self.bytes,
             "failed_controls": self.failed_controls,
+            "expected_fold_sum_words": {"total": self.total_words, "nonzero": self.nz_words},
             "controls": self.controls,
             "extra": Value::Object(self.extra),
             "case_list": self.cases,
@@ -1515,6 +1525,7 @@ fn compare_all(
     xsrc: usize,
     exp: &Expect,
 ) {
+    rep.note_sums(&exp.sums);
     let cols_bf = if sh.down { sh.m } else { sh.m / 2 };
     for planar in [false, true] {
         ctx.g.set_mq4_experts_planar(planar);
@@ -2540,6 +2551,7 @@ fn chain_case(
     let sh1 = Shape { down: false, m: 1280, k: hid, div: 10 };
     let sh2 = Shape { down: true, m: hid, k: mi, div: 1 };
     let e1 = expect_case(ctx, sh1, &lay, &rl.gate_w, &gx, Fold::Asc);
+    rep.note_sums(&e1.sums);
     let tag0 = format!("S2 layer{layer} {label} rows={rows} G={}", lay.g);
     let xt = ctx.g.upload_f32(&x, &[rows * hid]).unwrap();
     let nk1 = hid / 128;
@@ -2586,6 +2598,7 @@ fn chain_case(
             let sums = ref_raw(&lay, &rl.down_w, &xs, 1, hid, Fold::Asc);
             let raw = exp_raw_bytes(&lay, &sums, hid, n_sel);
             let bf16 = exp_bf16_down(&lay, &sums, hid, n_sel);
+            rep.note_sums(&sums);
             down_cache = Some(DownRef { y1: y1_bytes.clone(), xs, present, raw, bf16 });
         }
         let dr = down_cache.as_ref().unwrap();
