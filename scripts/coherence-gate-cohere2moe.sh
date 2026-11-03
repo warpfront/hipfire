@@ -67,6 +67,7 @@ if [ ! -x "$EXE" ]; then
 else
     for src in crates/hipfire-arch-cohere2moe/src/cohere2moe.rs \
                crates/hipfire-arch-cohere2moe/src/forward.rs \
+               crates/hipfire-arch-cohere2moe/src/program.rs \
                crates/hipfire-arch-cohere2moe/src/config.rs \
                crates/hipfire-runtime/src/prompt_frame.rs \
                crates/hipfire-runtime/src/llama.rs \

@@ -672,6 +672,9 @@ pub enum RopeKind {
     /// Rotate-half over the first `rot_dim` channels of each head (pair
     /// `(i, i + rot_dim / 2)`); channels `rot_dim..` pass through.
     PrefixHalfSplit { rot_dim: usize },
+    /// GPT-J pairing `(2i, 2i + 1)` over the first `rot_dim` channels of each
+    /// head; channels `rot_dim..` pass through (Cohere2).
+    Interleaved { rot_dim: usize },
     /// No rotation (NoPE layers).
     NoPe,
 }
@@ -689,7 +692,7 @@ impl Rope {
         match self.kind {
             RopeKind::RotateHalf => Some(head_dim / 2),
             RopeKind::PartialHalved { rot_pairs } => Some(rot_pairs),
-            RopeKind::PrefixHalfSplit { .. } => None,
+            RopeKind::PrefixHalfSplit { .. } | RopeKind::Interleaved { .. } => None,
             RopeKind::NoPe => Some(0),
         }
     }
@@ -741,6 +744,11 @@ impl Rope {
                     });
                 }
             }
+            #[cfg(feature = "deltanet")]
+            RopeKind::Interleaved { rot_dim } => gpu
+                .rope_interleaved_f32(q, k, pos_buf, n_heads, n_kv_heads, head_dim, rot_dim, theta),
+            #[cfg(not(feature = "deltanet"))]
+            RopeKind::Interleaved { .. } => return Err(interleaved_needs_deltanet()),
         }
         .map_err(hip)
     }
@@ -767,14 +775,49 @@ impl Rope {
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
                 q, k, positions, n_heads, n_kv_heads, head_dim, rot_pairs, theta, rows,
             ),
-            RopeKind::PrefixHalfSplit { .. } => {
-                return Err(DispatchError::Hip(
-                    "prefix half-split RoPE is single-row only".into(),
-                ))
+            RopeKind::PrefixHalfSplit { rot_dim } => {
+                if gpu.flags.rope_interleaved_legacy {
+                    return Err(DispatchError::Hip(
+                        "prefix half-split RoPE refuses HIPFIRE_ROPE_INTERLEAVED_LEGACY".into(),
+                    ));
+                }
+                // Positions are absolute, so no compacted-KV phase offset.
+                #[cfg(feature = "deltanet")]
+                {
+                    gpu.rope_partial_interleaved_f32_batched(
+                        q, k, positions, n_heads, n_kv_heads, head_dim, rot_dim, theta, rows, 0,
+                    )
+                }
+                #[cfg(not(feature = "deltanet"))]
+                {
+                    let _ = rot_dim;
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "rope",
+                        variant: "prefix-half-split-requires-deltanet",
+                        arch: "",
+                        quant: "",
+                    });
+                }
             }
+            #[cfg(feature = "deltanet")]
+            RopeKind::Interleaved { rot_dim } => gpu.rope_interleaved_f32_batched(
+                q, k, positions, n_heads, n_kv_heads, head_dim, rot_dim, theta, rows,
+            ),
+            #[cfg(not(feature = "deltanet"))]
+            RopeKind::Interleaved { .. } => return Err(interleaved_needs_deltanet()),
             RopeKind::NoPe => return Ok(()),
         }
         .map_err(hip)
+    }
+}
+
+#[cfg(not(feature = "deltanet"))]
+fn interleaved_needs_deltanet() -> DispatchError {
+    DispatchError::UnsupportedVariant {
+        family: "rope",
+        variant: "interleaved-requires-deltanet",
+        arch: "",
+        quant: "",
     }
 }
 

@@ -82,10 +82,11 @@ pub use layer_ops::{
     execute_indexed_attention_uncovered, execute_lm_head, execute_project, gdn_qkv_projection_bf16,
     grouped_depthwise_lanes_admitted, project_weight, project_weights,
     qsa_projection_hook_installed, reset_qsa_projection_slot, set_qsa_projection_hook,
-    validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp, GatedDeltaNetOp,
-    GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp, HyperNormOp, HyperReadOp,
-    HyperWriteAr, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
-    LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp, QsaProjectionHook, QsaTrunkArenas,
+    validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, DenseGroupedTables, EmbeddingOp,
+    GatedDeltaNetOp, GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp,
+    HyperNormOp, HyperReadOp, HyperWriteAr, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
+    IndexedAttentionState, LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp,
+    QsaProjectionHook, QsaTrunkArenas,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,
@@ -6234,9 +6235,20 @@ fn decode_activation_stage(
         // dtype exists to avoid, and it would not crash or even look
         // wrong until the model generated text.
         //
-        // silu_mul is elementwise, so one launch over the whole
-        // [k_top * mi] buffer covers every selected expert.
-        hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
+        // Elementwise, so one launch over the whole [k_top * mi] buffer covers
+        // every selected expert. A declared Lloyd route (Maple) clamps:
+        // silu(min(gate, L)) * clamp(up, -L, L).
+        match p.mq2_lloyd.as_ref() {
+            Some(lloyd) => hip!(gpu.deepseek4_silu_mul_clamp_f32_batched(
+                p.gate_batch,
+                p.up_batch,
+                p.rot_batch,
+                p.mi,
+                p.k,
+                lloyd.swiglu_limit,
+            ))?,
+            None => hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?,
+        }
     } else if let (_, Some(awq)) = no_shared_routed_awq(p) {
         hip!(gpu.fused_silu_mul_rotate_mq_awq_batched(
             p.gate_batch,
@@ -7300,6 +7312,20 @@ fn prefill_gate_up_unscatter_stage(
     path2_m_total: usize,
 ) -> Result<(), DispatchError> {
     reject_fp8_moe(&p.dtypes)?;
+    if let Some(lloyd) = p.mq2_lloyd.as_ref() {
+        // Declared MQ2-Lloyd (Maple qt51): unscatter + clamped SwiGLU in one
+        // launch into `gate_batch`; `up_batch` is not written.
+        hip!(gpu.moe_unscatter_silu_clamp_k8(
+            p.y_gate_up_grouped,
+            p.sorted_slot_index,
+            p.gate_batch,
+            p.mi,
+            p.k_top,
+            path2_m_total,
+            lloyd.swiglu_limit,
+        ))?;
+        return Ok(());
+    }
     hip!(gpu.moe_gate_up_unscatter_k8(
         p.y_gate_up_grouped,
         p.sorted_slot_index,
@@ -7321,6 +7347,17 @@ fn prefill_activation_stage(
     reject_fp8_moe(&p.dtypes)?;
     check_qt53_prefill_fallback(p)?;
     let mi = p.mi;
+    if p.mq2_lloyd.is_some() {
+        // Declared unrotated MQ2-Lloyd: the unscatter already applied the
+        // clamped SwiGLU; the grouped down reads its own F16 copy (an F32 X
+        // would hit the grouped entry's pointer-keyed FP16 conversion cache,
+        // which serves a stale layer when one buffer is reused per layer).
+        let live = total_slots
+            .checked_mul(mi)
+            .ok_or_else(|| DispatchError::Hip("MoE activation extent overflows".into()))?;
+        hip!(gpu.deepseek4_convert_f32_to_f16(p.gate_batch, p.rot_batch, live as i64))?;
+        return Ok(());
+    }
     // ── SwiGLU + rotate over [N*K_TOP × mi] ────────────────────────────
     if p.dtypes.routed_down == DType::MQ4G128V2 {
         // qwen35 qt53 routed-down typed fallback: F32 silu_mul then an in-place
