@@ -1494,6 +1494,17 @@ pub const DECISIONS: &[Decision] = &[
         reaches: &[],
     },
     Decision {
+        id: "qwen4-moe-ep-a8-prefill",
+        predicates: &[IsRecording, CaptureMode],
+        condition: "Gpu::qwen4_moe_ep_a8_requested (HIPFIRE_QWEN4_MOE_EP_A8, qwen4_moe_ep_a8.rs): exact gfx1201, the switch on (default: an EP prefill forward below 512 rows), and `!capture_mode && !is_recording()`",
+        effect: KernelSelection,
+        switches: "eager: the EP owner-routed symmetric MoE chain runs its int8-per-128 (A8) producers and signed-IU8 gate/up + down GEMMs; recorded/captured: the A4 chain (the A8 int8 scratch is lazily grown, which would invalidate a capture)",
+        kernels: &[],
+        verdict: NotEquivalent,
+        evidence: "different numerics (int8 per 128 vs 4-bit per 32 activations); byte-checked against an independent CPU integer reference on card (0 mismatching bytes, 14/14 negative controls, tests/qwen4_moe_ep_a8_hw.rs); paired prefill KLD of the lowered-floor route A8 vs off: WT2 -0.0020, code24 -0.0010 (j7418)",
+        reaches: &[],
+    },
+    Decision {
         id: "qwen4-g2-expert-stage",
         predicates: &[GraphSlotCapturing],
         condition: "G2 long-prefill expert staging in hipfire-arch-qwen4 forward_chunk_scoped (gpu_forward.rs): a chunk of >= HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS rows stages host-mapped expert layers into borrowed VRAM only when the active stream is not capturing (`stream_is_capturing`)",
@@ -4051,6 +4062,12 @@ pub const SITES: &[Site] = &[
         function: "qwen4_shared_i8_applies",
         occurrences: 2,
         decisions: &["qwen4-shared-int8-prefill"],
+    },
+    Site {
+        file: "rdna-compute/src/qwen4_moe_ep_a8.rs",
+        function: "qwen4_moe_ep_a8_requested",
+        occurrences: 2,
+        decisions: &["qwen4-moe-ep-a8-prefill"],
     },
     Site {
         file: "rdna-compute/src/gemm.rs",

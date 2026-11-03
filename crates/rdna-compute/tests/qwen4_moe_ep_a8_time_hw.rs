@@ -16,7 +16,8 @@ use std::{
     time::Instant,
 };
 
-const DEFAULT_MODEL: &str = "/home/kaden/qcal/release-0.4.3/mgfn/model/qwen3.8-flash-next-base.mq4-xts";
+const DEFAULT_MODEL: &str =
+    "/home/kaden/qcal/release-0.4.3/mgfn/model/qwen3.8-flash-next-base.mq4-xts";
 const E: usize = 512;
 const H: usize = 2560;
 const I: usize = 640;
@@ -153,7 +154,9 @@ fn median(v: &mut [f64]) -> f64 {
 fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
     let model = std::env::var("EP_A8_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.into());
     let out_dir = std::env::var("EP_A8_OUT").unwrap_or_else(|_| ".".into());
-    let planar = std::env::var("EP_A8_PLANAR").map(|v| v == "1").unwrap_or(false);
+    let planar = std::env::var("EP_A8_PLANAR")
+        .map(|v| v == "1")
+        .unwrap_or(false);
     let rows_list = env_list("EP_A8_ROWS", &[9, 64, 256, 512, 2048]);
     let layers = env_list("EP_A8_LAYERS", &[0, 17, 47]);
     let reps = env_list("EP_A8_REPS", &[5])[0];
@@ -186,8 +189,18 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
             let mut gp = Vec::with_capacity(E * gu_stride);
             let mut dp = Vec::with_capacity(E * dn_stride);
             for e in 0..E {
-                gp.extend(repack_expert(&gu_b[e * GU_BYTES..(e + 1) * GU_BYTES], 2 * I, H, true));
-                dp.extend(repack_expert(&dn_b[e * DN_BYTES..(e + 1) * DN_BYTES], H, I, false));
+                gp.extend(repack_expert(
+                    &gu_b[e * GU_BYTES..(e + 1) * GU_BYTES],
+                    2 * I,
+                    H,
+                    true,
+                ));
+                dp.extend(repack_expert(
+                    &dn_b[e * DN_BYTES..(e + 1) * DN_BYTES],
+                    H,
+                    I,
+                    false,
+                ));
             }
             (gp, dp)
         } else {
@@ -203,7 +216,13 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
         };
         let gu_ptrs = g.upload_raw(&table(&gu, gu_stride), &[E * 8])?;
         let dn_ptrs = g.upload_raw(&table(&dn, dn_stride), &[E * 8])?;
-        sets.push(WeightSet { layer, gu, dn, gu_ptrs, dn_ptrs });
+        sets.push(WeightSet {
+            layer,
+            gu,
+            dn,
+            gu_ptrs,
+            dn_ptrs,
+        });
         eprintln!("loaded layer {layer} (planar={planar})");
     }
     let per_expert = gu_stride + dn_stride;
@@ -236,7 +255,11 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
             .map(|i| {
                 let v = ((i as u64).wrapping_mul(2654435761) >> 7) as u32 % 4001;
                 let base = (v as f32 - 2000.0) / 1000.0;
-                if i % H % 97 == 0 { base * 8.0 } else { base }
+                if i % H % 97 == 0 {
+                    base * 8.0
+                } else {
+                    base
+                }
             })
             .collect();
         let x = g.upload_f32(&xs, &[n * H])?;
@@ -245,7 +268,9 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
         let sorted = raw(&mut g, p * 4)?;
         let tiles = raw(&mut g, p / 16 * 4)?;
         let inverse = raw(&mut g, slots * 4)?;
-        g.moe_scatter_stable_top10(&top, &counts, &offsets, &sorted, &tiles, &inverse, slots, E, p)?;
+        g.moe_scatter_stable_top10(
+            &top, &counts, &offsets, &sorted, &tiles, &inverse, slots, E, p,
+        )?;
         let owner = g.upload_raw(&ints((0..E).map(|e| (e % 2) as i32)), &[E])?;
         let owned = raw(&mut g, p / 16 * 4)?;
         g.ep_tile_mask(&tiles, &owned, &owner, p / 16, E, 0)?;
@@ -276,7 +301,17 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
                 if stage != 2 {
                     let a = g.qwen4_moe_rotate256_i4(&x, H, n)?;
                     g.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-                        &w.gu_ptrs, &owned, &sorted, &a, &ygu, 2 * I, H, TOPK, p, n, false,
+                        &w.gu_ptrs,
+                        &owned,
+                        &sorted,
+                        &a,
+                        &ygu,
+                        2 * I,
+                        H,
+                        TOPK,
+                        p,
+                        n,
+                        false,
                     )?;
                 }
                 if stage != 1 {
@@ -289,7 +324,16 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
                 if stage != 2 {
                     let a = g.qwen4_moe_rotate256_i8(&x, H, n)?;
                     g.gemm_qwen4_moe_gate_up_silu_a8_sym(
-                        &w.gu_ptrs, &owned, &sorted, &a, &ygu, 2 * I, H, TOPK, p, n,
+                        &w.gu_ptrs,
+                        &owned,
+                        &sorted,
+                        &a,
+                        &ygu,
+                        2 * I,
+                        H,
+                        TOPK,
+                        p,
+                        n,
                     )?;
                 }
                 if stage != 1 {
@@ -313,7 +357,11 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
         g.hip.device_synchronize()?;
         for rep in 0..reps {
             for stage in 0..3 {
-                let order: [usize; 2] = if (rep + stage) % 2 == 0 { [0, 1] } else { [1, 0] };
+                let order: [usize; 2] = if (rep + stage) % 2 == 0 {
+                    [0, 1]
+                } else {
+                    [1, 0]
+                };
                 for arm in order {
                     g.hip.device_synchronize()?;
                     let t0 = Instant::now();
@@ -346,7 +394,9 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
         row.push('}');
         println!("EP_A8_TIMING {row}");
         results.push(row);
-        for t in [top, x, counts, offsets, sorted, tiles, inverse, owner, owned, ygu, ydn] {
+        for t in [
+            top, x, counts, offsets, sorted, tiles, inverse, owner, owned, ygu, ydn,
+        ] {
             g.free_tensor(t)?;
         }
     }
@@ -355,14 +405,24 @@ fn qwen4_moe_ep_a8_chain_timing() -> Result<()> {
         "{{\"schema\":\"qwen4-moe-ep-a8-time-v1\",\"model\":\"{model}\",\"planar\":{planar},\"layers\":{layers:?},\"nt\":\"{nt}\",\"reps\":{reps},\"routing\":\"uniform top-10 over 512 experts, EP2 rank-0 owner mask e%2\",\"activations\":\"synthetic F32 with outlier channels\",\"rows\":[{}]}}",
         results.join(",")
     );
-    let path = format!("{out_dir}/ep_a8_timing_planar{}_nt{nt}_pid{}.json", planar as u8, std::process::id());
+    let path = format!(
+        "{out_dir}/ep_a8_timing_planar{}_nt{nt}_pid{}.json",
+        planar as u8,
+        std::process::id()
+    );
     std::fs::write(&path, &json)?;
     println!("EP_A8_TIMING_JSON {path}");
     let _ = sets.iter().map(|s| (s.layer, &s.gu, &s.dn)).count();
     Ok(())
 }
 
-fn serde_like(n: usize, p: usize, owned_tiles: usize, active: usize, weights_bytes: usize) -> String {
+fn serde_like(
+    n: usize,
+    p: usize,
+    owned_tiles: usize,
+    active: usize,
+    weights_bytes: usize,
+) -> String {
     format!(
         "{{\"rows\":{n},\"grouped_rows\":{p},\"owned_tiles\":{owned_tiles},\"active_owned_experts\":{active},\"weights_bytes\":{weights_bytes}"
     )

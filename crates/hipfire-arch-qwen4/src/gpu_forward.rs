@@ -9118,6 +9118,7 @@ pub(crate) struct TileScopes {
     invariant: bool,
     f16_moe: bool,
     ragged: bool,
+    ep_a8: bool,
 }
 
 /// How a prefill chunk's staged PLE rows reach the device.
@@ -13108,6 +13109,14 @@ impl Qwen4GpuForward {
                         config.hidden_size,
                         config.moe_intermediate_size,
                     )?;
+                    // The A8 owner-routed chain's int8 scratch, load-bound like the A4 one (no
+                    // lazy growth inside a forward); a no-op when the switch is off.
+                    gpu.reserve_qwen4_moe_ep_a8(
+                        max_chunk,
+                        config.num_experts_per_tok,
+                        config.hidden_size,
+                        config.moe_intermediate_size,
+                    )?;
                 }
             }
             // Balanced ownership (default on under EP; `HIPFIRE_EP_BALANCED_OWNERS=0` disables): every
@@ -15019,12 +15028,21 @@ impl Qwen4GpuForward {
             self.scratch.mode,
         );
         let ragged = std::mem::replace(&mut gpu.qwen4_trunk_iu4_prefill_scope, ragged_scope);
+        // The A8 chain is the default only for an EP forward BELOW the owner-routed floor (the
+        // sub-512-row lane/singleton prompts that take the lowered-floor tile route): card gates
+        // measured it +4.4% pp4096 prefill time with no measurable quality gain on >= 512-row
+        // prompts (j7430, j7431), so every >= 512-row forward keeps the A4 chain.
+        let ep_a8 = std::mem::replace(
+            &mut gpu.qwen4_ep_a8_scope,
+            self.ep.is_some() && rows < rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
+        );
         (
             TileScopes {
                 scope,
                 invariant,
                 f16_moe,
                 ragged,
+                ep_a8,
             },
             append,
         )
@@ -15036,6 +15054,7 @@ impl Qwen4GpuForward {
         gpu.prefill_invariant_scope = saved.invariant;
         gpu.qwen4_append_f16_moe_scope = saved.f16_moe;
         gpu.qwen4_trunk_iu4_prefill_scope = saved.ragged;
+        gpu.qwen4_ep_a8_scope = saved.ep_a8;
     }
 
     /// Bank and runtime selection, the only place decode-share state changes.

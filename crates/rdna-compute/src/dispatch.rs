@@ -1981,6 +1981,9 @@ pub struct Gpu {
     /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
     pub qwen4_append_f16_moe_scope: bool,
+    /// Set while an expert-parallel prefill forward of fewer than 512 rows runs: the default scope of the A8 owner-routed
+    /// MoE chain (`HIPFIRE_QWEN4_MOE_EP_A8` unset, [`Gpu::qwen4_moe_ep_a8_requested`]).
+    pub qwen4_ep_a8_scope: bool,
     /// Routing-row cap (`0` = none, every forward but the exact EP prefill wave): while set,
     /// [`Gpu::route_rows`] reports `min(rows, cap)`, so every row-keyed ROUTING decision
     /// (never a launch extent) of a forward wider than `cap` rows is taken as if it carried
@@ -3303,6 +3306,7 @@ impl Gpu {
             qwen4_verify_reference: None,
             emu,
             qwen4_append_f16_moe_scope: false,
+            qwen4_ep_a8_scope: false,
             qwen4_route_rows_cap: 0,
         })
         .and_then(|mut gpu| {

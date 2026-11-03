@@ -24,7 +24,7 @@
 //! `acc = fmaf(RN(f32(sc_h) * d_h), (float)C_h, acc)` from +0. Both weight layouts are served: the shipped
 //! qt44 / qt53 groups and the F1 drop-zero planar `MQ4G256V2P` / `MQ4G128V2P` ([`Gpu::mq4_experts_planar`]).
 //!
-//! Developer env `HIPFIRE_QWEN4_MOE_EP_A8` (default off, `=1` on; exact gfx1201 only): when the chain runs,
+//! Developer env `HIPFIRE_QWEN4_MOE_EP_A8` (default on only for EP prefill forwards below 512 rows, `=0` off, `=1` on everywhere; exact gfx1201 only): when the chain runs,
 //! [`Gpu::qwen4_moe_ep_a8_requested`] routes it through these kernels, any row count the chain serves.
 
 use crate::dispatch::{DType, Gpu, GpuTensor};
@@ -36,7 +36,12 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
 
-/// Developer switch of the A8 EP chain (default off; `=1` on).
+/// Developer switch of the A8 EP chain. Unset: ON only inside an expert-parallel prefill forward
+/// BELOW the owner-routed floor ([`Gpu::qwen4_ep_a8_scope`]: the sub-512-row prompts on the
+/// lowered-floor tile route, where it is quality-neutral vs the exact route); every >= 512-row
+/// forward and the single-card chain keep A4 (A8 measured +4.4% pp4096 prefill time there with no
+/// measurable KLD gain). Exact `1`: on in every forward the chain serves; exact `0`: the kill
+/// switch (the A4 chain everywhere).
 pub const QWEN4_MOE_EP_A8_FLAG: &str = "HIPFIRE_QWEN4_MOE_EP_A8";
 
 /// Module of the gate/up and down GEMM entries.
@@ -53,8 +58,16 @@ const ROWS_PER_CTA: usize = 64;
 /// Developer override of the tile-run width (`1` or `2`; unset or anything else: [`ep_a8_select_nt`]).
 pub const QWEN4_MOE_EP_A8_NT_ENV: &str = "HIPFIRE_QWEN4_MOE_EP_A8_NT";
 
-static EP_A8: LazyLock<bool> =
-    LazyLock::new(|| hipfire_config::developer_bool(QWEN4_MOE_EP_A8_FLAG, false));
+static EP_A8: LazyLock<Option<bool>> = LazyLock::new(|| {
+    match hipfire_config::developer_var(QWEN4_MOE_EP_A8_FLAG)
+        .as_deref()
+        .map(str::trim)
+    {
+        Ok("1") => Some(true),
+        Ok("0") => Some(false),
+        _ => None,
+    }
+});
 static EP_A8_NT: LazyLock<Option<usize>> = LazyLock::new(|| {
     hipfire_config::developer_var(QWEN4_MOE_EP_A8_NT_ENV)
         .ok()
@@ -137,8 +150,25 @@ pub fn ep_a8_down_shape_ok(m: usize, k: usize, grouped_rows: usize, x_row_div: u
 }
 
 /// Pure form of [`Gpu::qwen4_moe_ep_a8_requested`].
-fn ep_a8_requested(arch: &str, flag: bool) -> bool {
-    arch == "gfx1201" && flag
+fn ep_a8_requested(arch: &str, flag: Option<bool>, ep_scope: bool) -> bool {
+    arch == "gfx1201" && flag.unwrap_or(ep_scope)
+}
+
+/// `(k, n)` int8-scratch reservations of a chain of up to `max_rows` tokens: the gate sidecar and the down
+/// sidecar ([`ep_a8_down_reserve_k`] rounding), `n` saturating at `usize::MAX`.
+pub fn ep_a8_reserve_shapes(
+    max_rows: usize,
+    k_top: usize,
+    hidden: usize,
+    intermediate: usize,
+) -> [(usize, usize); 2] {
+    [
+        (hidden, max_rows),
+        (
+            ep_a8_down_reserve_k(intermediate),
+            max_rows.saturating_mul(k_top),
+        ),
+    ]
 }
 
 fn err(what: &str) -> HipError {
@@ -154,16 +184,41 @@ fn first_launch_receipt(stage: usize, line: impl FnOnce() -> String) {
 
 impl Gpu {
     /// Whether the EP owner-routed symmetric MoE prefill chain runs its A8 kernels
-    /// (`HIPFIRE_QWEN4_MOE_EP_A8=1`, exact gfx1201, eager: never while a graph is captured or a replay
+    /// (default on, `HIPFIRE_QWEN4_MOE_EP_A8=0` kills it; exact gfx1201, eager: never while a graph is captured or a replay
     /// recorded, where a lazy int8-scratch growth would invalidate the capture and the A4 chain's
     /// pre-reserved scratch is the one in force). Flag read once per process.
     pub fn qwen4_moe_ep_a8_requested(&self) -> bool {
-        ep_a8_requested(&self.arch, *EP_A8) && !self.graphs.capture_mode && !self.replay.is_recording()
+        ep_a8_requested(&self.arch, *EP_A8, self.qwen4_ep_a8_scope)
+            && !self.graphs.capture_mode
+            && !self.replay.is_recording()
     }
 
     fn qwen4_moe_ep_a8_require(&self, what: &str) -> HipResult<()> {
         if self.arch != "gfx1201" {
-            return Err(err(&format!("{what}: the EP A8 chain is exact-gfx1201 only")));
+            return Err(err(&format!(
+                "{what}: the EP A8 chain is exact-gfx1201 only"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Grow the shared int8 scratch for A8 chains of up to `max_rows` tokens (`k_top` routed slots each) before
+    /// any graph capture, alongside [`Gpu::reserve_qwen4_moe_sym`]'s A4 scratch: the gate sidecar `[hidden / 128,
+    /// max_rows]` and the down sidecar `[intermediate / 128, slots]` (the larger one wins). A no-op unless the
+    /// switch is on for this device ([`Gpu::qwen4_moe_ep_a8_requested`]'s flag and arch, capture state aside).
+    pub fn reserve_qwen4_moe_ep_a8(
+        &mut self,
+        max_rows: usize,
+        k_top: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> HipResult<()> {
+        // Load-time (no forward scope yet): the caller is the EP load, so the unset flag counts as on.
+        if !ep_a8_requested(&self.arch, *EP_A8, true) {
+            return Ok(());
+        }
+        for (k, n) in ep_a8_reserve_shapes(max_rows, k_top, hidden, intermediate) {
+            self.reserve_int8_mmq(k, n)?;
         }
         Ok(())
     }
@@ -303,7 +358,15 @@ impl Gpu {
         )?;
         let (generation, live) = self.scratch.int8_mmq_live();
         let xp = xq.checked_ptr(generation, live, k, x_src_rows)?;
-        self.qwen4_moe_ep_a8_gemm(false, ptrs, tiles, sorted, xp, y, [m, k, x_row_div, grouped_rows, x_src_rows])
+        self.qwen4_moe_ep_a8_gemm(
+            false,
+            ptrs,
+            tiles,
+            sorted,
+            xp,
+            y,
+            [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
     }
 
     /// Grouped A8 down: `y` `[grouped_rows, m]` BF16 bits of `rt(sum)` per grouped row (no residual, no
@@ -336,7 +399,15 @@ impl Gpu {
         )?;
         let (generation, live) = self.scratch.int8_mmq_live();
         let xp = xq.checked_ptr(generation, live, ep_a8_down_reserve_k(k), x_src_rows)?;
-        self.qwen4_moe_ep_a8_gemm(true, ptrs, tiles, sorted, xp, y, [m, k, x_row_div, grouped_rows, x_src_rows])
+        self.qwen4_moe_ep_a8_gemm(
+            true,
+            ptrs,
+            tiles,
+            sorted,
+            xp,
+            y,
+            [m, k, x_row_div, grouped_rows, x_src_rows],
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -454,7 +525,11 @@ mod tests {
         for down in [false, true] {
             for rows in [16, 32, 48, 64, 4096, 20480] {
                 let nt = ep_a8_select_nt(down, rows);
-                let built = if down { EP_A8_DOWN_NTS } else { EP_A8_GATE_UP_NTS };
+                let built = if down {
+                    EP_A8_DOWN_NTS
+                } else {
+                    EP_A8_GATE_UP_NTS
+                };
                 assert!(built.contains(&nt), "{down} {rows}");
             }
         }
@@ -503,11 +578,31 @@ mod tests {
     }
 
     #[test]
+    fn reserve_shapes_cover_both_sidecars_in_whole_k256_reservations() {
+        // Flash-Next EP: hidden 2560, intermediate 640, top-10, 2048-row chain.
+        let [(gk, gn), (dk, dn)] = ep_a8_reserve_shapes(2048, 10, 2560, 640);
+        assert_eq!((gk, gn), (2560, 2048));
+        assert_eq!((dk, dn), (768, 20480));
+        for (k, _) in [(gk, gn), (dk, dn)] {
+            assert_eq!(k % 256, 0);
+        }
+        // the down sidecar (5 K128 epochs x 20480 slots) fits its reservation
+        assert!(640 / 128 * 20480 * BLOCK_I8_128_BYTES <= dk / 128 * dn * BLOCK_I8_128_BYTES);
+        assert_eq!(
+            ep_a8_reserve_shapes(usize::MAX, 10, 2560, 640)[1].1,
+            usize::MAX
+        );
+    }
+
+    #[test]
     fn requested_needs_exact_gfx1201_and_the_flag() {
-        assert!(ep_a8_requested("gfx1201", true));
-        assert!(!ep_a8_requested("gfx1201", false));
+        // Unset follows the EP scope; exact 1 / 0 override it.
+        assert!(ep_a8_requested("gfx1201", None, true));
+        assert!(!ep_a8_requested("gfx1201", None, false));
+        assert!(ep_a8_requested("gfx1201", Some(true), false));
+        assert!(!ep_a8_requested("gfx1201", Some(false), true));
         for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", ""] {
-            assert!(!ep_a8_requested(arch, true), "{arch}");
+            assert!(!ep_a8_requested(arch, Some(true), true), "{arch}");
         }
         assert_eq!(QWEN4_MOE_EP_A8_FLAG, "HIPFIRE_QWEN4_MOE_EP_A8");
     }
