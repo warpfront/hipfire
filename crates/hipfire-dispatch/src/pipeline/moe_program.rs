@@ -1162,7 +1162,17 @@ impl<'a> SealedMoeOp<'a> {
                 return Ok(());
             }
         }
-        if let Some(weight) = input_weight {
+        if params.mq2_lloyd.is_some() {
+            // Declared unrotated MQ2-Lloyd (Maple qt51): the basis is the
+            // natural-basis norm in F16, read by the F16 router and the
+            // grouped gate/up (see `MoePrefillParams::mq2_lloyd`).
+            let n = params
+                .batch_size
+                .checked_mul(params.gate_up_k)
+                .ok_or_else(|| DispatchError::Hip("sealed moe: input basis overflows".into()))?;
+            gpu.deepseek4_convert_f32_to_f16(params.x_norm_batch, params.x_rot_batch, n as i64)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        } else if let Some(weight) = input_weight {
             if let Some(awq) = weight.awq_scale {
                 gpu.rotate_x_mq_awq_batched(
                     params.x_norm_batch,
@@ -1303,6 +1313,17 @@ impl<'a> SealedMoeOp<'a> {
                 };
                 let result = match prelude.q8_router_policy {
                     _ if carry => self.router_projection_carrying_shared_iu4(gpu, params),
+                    // F16 router mirror over the F16 input basis (Maple).
+                    _ if prelude.router.dtype == rdna_compute::DType::F16 => gpu
+                        .gemm_f16_x_f16_wmma(
+                            prelude.router.buf,
+                            params.x_rot_batch,
+                            prelude.router_logits,
+                            prelude.router.m,
+                            prelude.router.k,
+                            params.batch_size,
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string())),
                     MoeQ8RouterPolicy::FreshFp16Wmma { scratch }
                         if prelude.router.dtype == rdna_compute::DType::Q8_0 =>
                     {
@@ -1574,6 +1595,19 @@ impl<'a> SealedMoeOp<'a> {
                             arch: "",
                             quant: "",
                         });
+                    } else if params.recipe == MoeRecipe::SoftmaxRoutedNoShared {
+                        // Softmax over the one row's logits in place, then the
+                        // k8 renorm top-k (no shared gate side).
+                        gpu.softmax_f32(params.router_logits)
+                            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+                        gpu.moe_topk_renorm_k8(
+                            params.router_logits,
+                            params.topk_indices,
+                            params.topk_weights,
+                            params.n_exp,
+                            params.norm_topk_prob,
+                        )
+                        .map_err(|e| DispatchError::Hip(e.to_string()))?;
                     } else {
                         let (shared_gate, shared_up) = self.state.shared_views()?;
                         super::decode_route_gpu_stage(
@@ -2747,7 +2781,7 @@ fn lower_decode<'a>(
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::SharedDown))?;
             }
         }
-        MoeRecipe::SigmoidRoutedNoShared => {
+        MoeRecipe::SigmoidRoutedNoShared | MoeRecipe::SoftmaxRoutedNoShared => {
             if !adopted {
                 // Precomputed scores arrive activated: no router projection.
                 if !params.router_scores_precomputed() {
@@ -3104,6 +3138,18 @@ fn lower_prefill<'a>(
                 append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
             }
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+        }
+        MoeRecipe::SoftmaxRoutedNoShared => {
+            // The router reads the input basis (Maple: the F16 copy of the
+            // natural-basis norm), so it is produced first.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+            if !adopted {
+                append_step(
+                    &mut steps,
+                    Step::MoeStage(op(state), MoeStage::RouterProjection),
+                )?;
+                append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Route))?;
+            }
         }
     }
     if !selection.cpu_deferred_experts {
@@ -3544,13 +3590,13 @@ pub(super) fn select_decode(
     // Qt55 decode uses the grouped protocol even for one row. An indexed
     // descriptor cannot supply its stable permutation and must fail closed.
     super::reject_fp8_moe(&params.dtypes)?;
-    if params.recipe == MoeRecipe::SigmoidRoutedNoShared
+    if params.recipe.routed_only()
         && (!super::sealed_moe::sigmoid_decode_width_ok(params)
             || params.ep_mode != crate::families::moe::MoeEpMode::None
             || params.defer_routed_combine)
     {
         return Err(DispatchError::Hip(
-            "sigmoid MoE decode requires k=8 (k<=8 with a selection bias), no EP, and no deferred combine"
+            "routed-only MoE decode requires k=8 (k<=8 with a selection bias), no EP, and no deferred combine"
                 .into(),
         ));
     }
@@ -3600,13 +3646,16 @@ pub(super) fn select_decode(
         resolution.use_gpu_topk = true;
         resolution.needs_x_rot_local = true;
     }
-    if params.mq2_lloyd.is_some() {
-        // A declared MQ2-Lloyd route runs only the uniform MQ2G256Lloyd kernels.
-        use rdna_compute::DType::MQ2G256Lloyd;
-        let uniform = matches!(
-            (params.dtypes.routed_gate_up, params.dtypes.routed_down),
-            (MQ2G256Lloyd, MQ2G256Lloyd)
-        ) && !params.dtypes.routed_has_mixed_experts
+    if let Some(lloyd) = params.mq2_lloyd.as_ref() {
+        // A declared MQ2-Lloyd route runs only the uniform MQ2-Lloyd kernels:
+        // rotated qt19 (DeepSeek-V4), or unrotated qt51 (Maple) on the
+        // portable kernels (the native backends rotate).
+        use rdna_compute::DType::{MQ2G256Lloyd, MQ2G256LloydU};
+        let uniform = match (params.dtypes.routed_gate_up, params.dtypes.routed_down) {
+            (MQ2G256Lloyd, MQ2G256Lloyd) => true,
+            (MQ2G256LloydU, MQ2G256LloydU) => lloyd.native.is_none(),
+            _ => false,
+        } && !params.dtypes.routed_has_mixed_experts
             && params.expert_dtype_tags.is_none()
             && params.expert_down_awq_ptrs.is_none();
         if !uniform {
@@ -4704,6 +4753,32 @@ pub(super) fn select_prefill(
             }
         }
     };
+    if let Some(lloyd) = params.mq2_lloyd.as_ref() {
+        // The declared prefill route is the unrotated qt51 (Maple) grouped
+        // path with F16 input basis and down activation; nothing else lowers it.
+        use rdna_compute::DType::{MQ2G256LloydU, F16};
+        let admitted = (params.dtypes.routed_gate_up, params.dtypes.routed_down)
+            == (MQ2G256LloydU, MQ2G256LloydU)
+            && !params.dtypes.routed_has_mixed_experts
+            && params.expert_dtype_tags.is_none()
+            && params.expert_down_awq_ptrs.is_none()
+            && params.down_awq_scale.is_none()
+            && lloyd.native.is_none()
+            && route.is_none()
+            && resolution.use_path2
+            && !cpu_split
+            && !params.cpu_deferred_experts
+            && params.x_rot_batch.dtype == F16
+            && params.rot_batch.dtype == F16;
+        if !admitted {
+            return Err(DispatchError::UnsupportedVariant {
+                family: "moe",
+                variant: "mq2-lloyd-prefill-needs-grouped-uniform-mq2g256-lloyd-u-f16",
+                arch: "",
+                quant: "",
+            });
+        }
+    }
     let _total_slots = params
         .batch_size
         .checked_mul(params.k_top)

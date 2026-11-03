@@ -3840,6 +3840,7 @@ fn forward_lanes_scoped(
                                     rotation: Some(&scratch.rotation),
                                     ladder: ProjectLadder::TrunkRowExact,
                                     residual: None,
+                                    grouped: None,
                                 }));
                             }
                         }
