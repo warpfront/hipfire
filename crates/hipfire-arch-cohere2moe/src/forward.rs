@@ -29,28 +29,23 @@
 //! (`attention_flash_q8_0_windowed`) that applies the sliding-window mask so
 //! context beyond the 4096 window attends correctly. At ≤4096, sliding == full
 //! causal, so the window is a no-op there.
+//!
+//! The layers are the typed step program of [`crate::program`]; this module
+//! owns the scratch and runs it.
 
 use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
-use crate::config::{AttnKind, Cohere2MoeConfig};
+use crate::config::Cohere2MoeConfig;
+use crate::program::{head_steps, lm_head_ref, Bufs, LayerRefs, MoeRow, MoeRows, Route};
 use hipfire_dispatch::context::DispatchCtx;
-use hipfire_dispatch::families::gemv::GivensRef;
-use hipfire_dispatch::families::moe::{
-    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoePrefillPrelude,
-    MoeQ8RouterPolicy, MoeRecipe, MOE_GROUPED_BLOCK_M,
-};
-use hipfire_dispatch::pipeline::sealed_moe::{
-    checked_grouped_m_total_bound, seal_decode, seal_prefill, BoundMoeExperts, PrefillRouteMode,
-};
-use hipfire_dispatch::pipeline::{execute_steps, Step};
-use hipfire_runtime::llama::{weight_gemv, weight_gemv_residual, KvCacheExt};
+use hipfire_dispatch::families::moe::MOE_GROUPED_BLOCK_M;
+use hipfire_dispatch::pipeline::sealed_moe::checked_grouped_m_total_bound;
+use hipfire_dispatch::pipeline::{execute_steps, ProjectLadder};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// Batched Q8_0 projection GEMM for prefill (`Y[b,m] = X[b,k] @ W_q8[m,k]^T`).
-/// On WMMA archs (gfx11+/RDNA3.5/RDNA4) with K%32==0 it routes to the
-/// matrix-core `gemm_q8_0_wmma` (activation widened to F16 internally) — no
-/// MAX_BATCH cap and far faster than the scalar 1-wave-per-row kernel at large
-/// batch (mirrors the deepseek4 gfx11 Q8 prefill path). Falls back to the
-/// scalar-sub-batched chunked driver on CDNA or when K%32≠0.
+/// Prefill Q8_0 projection ladder: `ProjectLadder::GemmQ8Fp16` (on WMMA archs
+/// with K%32==0 the matrix-core `gemm_q8_0_wmma` over a fresh F16 activation —
+/// no MAX_BATCH cap and far faster than the scalar 1-wave-per-row kernel at
+/// large batch; the scalar chunked driver on CDNA or when K%32≠0).
 /// Opt out of the WMMA Q8 prefill projections (force the scalar sub-batched
 /// chunked driver) via `HIPFIRE_COHERE2MOE_Q8_SCALAR=1` — a debugging /
 /// precision fallback. WMMA is the default: bit-identical to scalar on the
@@ -60,30 +55,6 @@ fn q8_wmma_enabled() -> bool {
     *EN.get_or_init(|| {
         hipfire_config::developer_var("HIPFIRE_COHERE2MOE_Q8_SCALAR").as_deref() != Ok("1")
     })
-}
-
-#[inline]
-fn q8_proj_raw(
-    gpu: &mut Gpu,
-    w: &GpuTensor,
-    x: &GpuTensor,
-    y: &GpuTensor,
-    m: usize,
-    k: usize,
-    b: usize,
-    x_f16: &GpuTensor,
-) -> hip_bridge::HipResult<()> {
-    hipfire_dispatch::families::gemm::run_q8_projection_fresh(
-        gpu,
-        w,
-        x,
-        y,
-        m,
-        k,
-        b,
-        x_f16,
-        q8_wmma_enabled(),
-    )
 }
 
 /// Decode one token; returns the full logits vector.
@@ -147,236 +118,78 @@ fn decode_step_body(
     gpu: &mut Gpu,
     position: u32,
 ) -> Result<(), String> {
-    let hidden = cfg.hidden_size;
-    let head_dim = cfg.head_dim;
-    let n_heads = cfg.num_attention_heads;
-    let n_kv = cfg.num_key_value_heads;
-    let moe_inter = cfg.moe_intermediate_size;
-    let n_exp = cfg.num_experts;
-    let k_top = cfg.num_experts_per_tok;
-    let eps = cfg.rms_norm_eps;
-    let seq_len = position as usize + 1;
-
-    for (l, layer) in weights.layers.iter().enumerate() {
-        // ── Parallel block: ONE RMSNorm → `normed`, fed to BOTH the attention
-        //    and the FFN branch. cohere2_moe uses plain RMSNorm (LlamaRMSNorm,
-        //    rms_norm_eps), NOT base Cohere2's mean-centered LayerNorm. ────────
-        gpu.rmsnorm_batched(&state.h, &layer.input_norm, &state.normed, 1, hidden, eps)
-            .map_err(|e| format!("cohere2moe L{l}: input rmsnorm: {e:?}"))?;
-
-        // ── Attention branch (reads `normed`) ──────────────────────────────
-        weight_gemv(gpu, &layer.wq, &state.normed, &state.fa_q)
-            .map_err(|e| format!("cohere2moe L{l}: q_proj: {e}"))?;
-        weight_gemv(gpu, &layer.wk, &state.normed, &state.fa_k)
-            .map_err(|e| format!("cohere2moe L{l}: k_proj: {e}"))?;
-        weight_gemv(gpu, &layer.wv, &state.normed, &state.fa_v)
-            .map_err(|e| format!("cohere2moe L{l}: v_proj: {e}"))?;
-
-        // NoPE: only `sliding_attention` layers apply RoPE. `full_attention`
-        // (global) layers use NO positional embedding (Cohere2 sets
-        // sliding_window=None there, gating off rotary).
-        //
-        // Cohere2 uses the **interleaved (GPT-J)** rotary convention — pairs
-        // adjacent dims (2i, 2i+1) — NOT Llama's half-split. The HF
-        // `rotate_half` is explicitly commented "different from e.g. Llama":
-        // `x1=x[..., ::2]; x2=x[..., 1::2]; rot=stack([-x2,x1]).flatten`. So we
-        // MUST use `rope_partial_interleaved_f32` (pairs 2i/2i+1), NOT
-        // `rope_f32` (pairs i / i+head_dim/2). Rotary covers the FULL head_dim
-        // (no partial_rotary_factor in the config) → n_rot = head_dim.
-        // RoPE on sliding layers AND the dense prefix layers (force_rope:
-        // l < first_k_dense_replace && prefix_dense_sliding_window_pattern == 1).
-        // North layer 0 is full_attention but STILL rotated; the other global
-        // full_attention layers are NoPE. (Matches Cohere2MoeAttention.)
-        if layer.attn_kind == AttnKind::Sliding
-            || (l < cfg.first_k_dense_replace && cfg.prefix_dense_sliding_window_pattern == 1)
-        {
-            gpu.rope_interleaved_f32(
-                &state.fa_q,
-                &state.fa_k,
-                &state.pos_buf,
-                n_heads,
-                n_kv,
-                head_dim,
-                head_dim, // n_rot = full head_dim (no partial_rotary_factor)
-                cfg.rope_theta,
-            )
-            .map_err(|e| format!("cohere2moe L{l}: rope: {e:?}"))?;
-        }
-
-        // KV write (Q8) + sliding-window flash attention via the shared KV-usage
-        // abstraction. `sliding_attention` layers clip to the last
-        // `sliding_window` keys (window>0); `full_attention` layers are full
-        // causal (window=0). cohere routes through AttnFlashQ8_0Windowed
-        // UNCONDITIONALLY (q8_windowed) — NOT the q8_attend_key flash/non-flash
-        // heuristic, whose non-windowed AttnQ8_0Kv would drop the window and
-        // attend the full context at ctx>window. (Tiled, O(1)-LDS, online-softmax
-        // — no seq-bound shared-memory ceiling.)
-        let window = if layer.attn_kind == AttnKind::Sliding {
-            cfg.sliding_window as i32
-        } else {
-            0
-        };
-        let ctx = DispatchCtx::new(gpu);
-        let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
-            hipfire_dispatch::families::kv_tier::KvTierInputs {
-                pos: seq_len - 1,
-                q8_windowed: true,
-                window,
-                ..state.kv.tier_inputs()
+    let b = Bufs {
+        h: &state.h,
+        normed: &state.normed,
+        fa_q: &state.fa_q,
+        fa_k: &state.fa_k,
+        fa_v: &state.fa_v,
+        attn_out: &state.fa_attn_out,
+        proj_out: &state.fa_attn_out,
+        dense_gate: &state.dense_gate,
+        dense_up: &state.dense_up,
+        dense_act: &state.dense_act,
+        pos_buf: &state.pos_buf,
+        kv: &state.kv,
+        flash_partials: &state.flash_partials,
+        route: Route::Decode {
+            position: position as usize,
+            moe: MoeRow {
+                router_logits: &state.router_logits,
+                topk_indices: &state.topk_indices,
+                topk_weights: &state.topk_weights,
+                x_rot: &state.ffn_x_rot,
+                gate_up: &state.expert_gate_up,
+                act: &state.expert_act,
+                down: &state.expert_down,
+                gate_batch: &state.gate_batch,
+                up_batch: &state.up_batch,
+                rot_batch: &state.rot_batch,
+                down_expanded: &state.down_expanded,
             },
-        )
-        .map_err(|e| format!("cohere2moe L{l}: kv tier: {e}"))?;
-        let io = hipfire_dispatch::families::attention::AttnParams {
-            q: &state.fa_q,
-            k: &state.fa_k,
-            v: &state.fa_v,
-            k_cache: &state.kv.k_gpu[l],
-            v_cache: &state.kv.v_gpu[l],
-            k_scales: None,
-            v_scales: None,
-            pos_buf: &state.pos_buf,
-            pos: seq_len - 1,
-            positions: None,
-            n_heads,
-            n_kv_heads: n_kv,
-            head_dim,
-            physical_cap: state.kv.physical_cap,
-            batch_size: 1,
-            max_ctx_len: 0,
-            flash_partials: Some(&state.flash_partials),
-            givens_cos: None,
-            givens_sin: None,
-            tree_bias: None,
-            block_start: 0,
-            block_cols: 0,
-            output_gate: None,
-            output_awq_scale: None,
-            output: &state.fa_attn_out,
-        };
-        hipfire_dispatch::pipeline::execute_steps(
-            gpu,
-            &ctx,
-            &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
-        )
-        .map_err(|e| format!("cohere2moe L{l}: attention: {e:?}"))?;
+        },
+    };
+    run_layers(cfg, weights, gpu, &b, |_, _, _| {})?;
+    let ctx = DispatchCtx::new(gpu);
+    let lm_head = lm_head_ref(weights);
+    let head = head_steps(
+        cfg,
+        weights,
+        &lm_head,
+        &state.h,
+        &state.final_norm_buf,
+        &state.logits,
+    );
+    execute_steps(gpu, &ctx, &head).map_err(|e| format!("cohere2moe: head: {e:?}"))?;
+    state.n_tokens = position as usize + 1;
+    Ok(())
+}
 
-        // h += o_proj · attn_out  (attention into the residual).
-        weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
-            .map_err(|e| format!("cohere2moe L{l}: o_proj: {e}"))?;
-
-        // ── FFN branch (reads the SAME `normed`, NOT post-attention `h`) ─────
-        match &layer.ffn {
-            Ffn::Dense(d) => {
-                weight_gemv(gpu, &d.gate, &state.normed, &state.dense_gate)
-                    .map_err(|e| format!("cohere2moe L{l}: dense gate_proj: {e}"))?;
-                weight_gemv(gpu, &d.up, &state.normed, &state.dense_up)
-                    .map_err(|e| format!("cohere2moe L{l}: dense up_proj: {e}"))?;
-                gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
-                    .map_err(|e| format!("cohere2moe L{l}: dense silu_mul: {e:?}"))?;
-                weight_gemv_residual(gpu, &d.down, &state.dense_act, &state.h)
-                    .map_err(|e| format!("cohere2moe L{l}: dense down_proj: {e}"))?;
-            }
-            Ffn::Moe(m) => {
-                let gate_up_dtypes = m.sealed.gate_up_dtypes.as_ref();
-                let down_dtypes = m.sealed.down_dtypes.as_ref();
-                let tier_varies = |tiers: &[DType]| {
-                    tiers
-                        .first()
-                        .is_some_and(|&first| tiers.iter().skip(1).any(|&dtype| dtype != first))
-                };
-                let gate_up_mixed = tier_varies(gate_up_dtypes);
-                let down_mixed = tier_varies(down_dtypes);
-                let routed_gate_up = gate_up_dtypes
-                    .first()
-                    .copied()
-                    .ok_or_else(|| format!("cohere2moe L{l}: no gate/up expert dtype"))?;
-                let routed_down = down_dtypes
-                    .first()
-                    .copied()
-                    .ok_or_else(|| format!("cohere2moe L{l}: no down expert dtype"))?;
-                let params_gate_paro = m.experts[0].gate_up.paro.as_ref().map(|paro| GivensRef {
-                    pairs: &paro.pairs,
-                    theta: &paro.theta,
-                    scales: &paro.channel_scales,
-                    krot: paro.krot as usize,
-                });
-                let params_down_paro = m.experts[0].down.paro.as_ref().map(|paro| GivensRef {
-                    pairs: &paro.pairs,
-                    theta: &paro.theta,
-                    scales: &paro.channel_scales,
-                    krot: paro.krot as usize,
-                });
-                let params = MoeParams {
-                    dtypes: MoeDtypes {
-                        router: m.router.gpu_dtype,
-                        shared: None,
-                        experts_all_gate_up_mq4: gate_up_dtypes
-                            .iter()
-                            .all(|&dtype| dtype == DType::MQ4G256),
-                        routed_gate_up,
-                        routed_down,
-                        routed_has_mixed_experts: gate_up_mixed || down_mixed,
-                        has_paro_shared: m.paro_shared.is_some(),
-                        per_expert_gate_up: gate_up_mixed.then_some(gate_up_dtypes),
-                        per_expert_down: down_mixed.then_some(down_dtypes),
-                    },
-                    mq2_lloyd: None,
-                    recipe: MoeRecipe::SigmoidRoutedNoShared,
-                    route_policy: None,
-                    normalization: MoeNormalization::Provided,
-                    batch_size: 1,
-                    hidden,
-                    mi: moe_inter,
-                    k: k_top,
-                    n_exp,
-                    norm_topk_prob: cfg.norm_topk_prob,
-                    selection_bias: None,
-                    x_rot_prerotated: false,
-                    defer_routed_combine: false,
-                    cpu_deferred_experts: false,
-                    ep_mode: MoeEpMode::None,
-                    layer_idx: l as u16,
-                    x_norm: &state.normed,
-                    x_residual: &state.h,
-                    routed_out: None,
-                    skip_shared: false,
-                    router: m.router.dispatch_ref(),
-                    shared: None,
-                    expert_gate_up_ptrs: &m.expert_gate_up_ptrs,
-                    expert_down_ptrs: &m.expert_down_ptrs,
-                    expert_ptrs_host: None,
-                    expert_down_awq_ptrs: None,
-                    expert_dtype_tags: None,
-                    routed_gate_up_k: m.experts[0].gate_up.k,
-                    routed_down_m: m.experts[0].down.m,
-                    routed_down_k: m.experts[0].down.k,
-                    routed_experts: m,
-                    routed_gate_up_paro: params_gate_paro,
-                    routed_down_paro: params_down_paro,
-                    router_logits: &state.router_logits,
-                    x_rot_local: &state.ffn_x_rot,
-                    gate_up_buf: &state.expert_gate_up,
-                    ffn_hidden: &state.expert_act,
-                    ffn_out: &state.expert_down,
-                    gate_batch: &state.gate_batch,
-                    up_batch: &state.up_batch,
-                    rot_batch: &state.rot_batch,
-                    topk_indices: &state.topk_indices,
-                    topk_weights: &state.topk_weights,
-                    down_expanded: &state.down_expanded,
-                    ep_row_gather: None,
-                };
-                let ctx = DispatchCtx::new(gpu);
-                let bound = BoundMoeExperts::from_cache(&m.sealed.table, &m.sealed.cache)
-                    .map_err(|e| format!("cohere2moe L{l} bind experts: {e:?}"))?;
-                let call = seal_decode(bound, &ctx, params)
-                    .map_err(|e| format!("cohere2moe L{l} seal decode: {e:?}"))?;
-                execute_steps(gpu, &ctx, &[Step::Moe(call)])
-                    .map_err(|e| format!("cohere2moe L{l} sealed decode: {e:?}"))?;
-            }
-        }
+/// Run every layer's program over `b`; `probe(gpu, layer, tag)` observes the
+/// residual after each branch.
+fn run_layers(
+    cfg: &Cohere2MoeConfig,
+    weights: &Cohere2MoeWeights,
+    gpu: &mut Gpu,
+    b: &Bufs<'_>,
+    mut probe: impl FnMut(&mut Gpu, usize, &str),
+) -> Result<(), String> {
+    for (l, layer) in weights.layers.iter().enumerate() {
+        let refs = LayerRefs::new(layer);
+        let ctx = DispatchCtx::new(gpu);
+        let attn = refs
+            .attention_steps(cfg, b, l)
+            .map_err(|e| format!("cohere2moe L{l}: attention: {e}"))?;
+        execute_steps(gpu, &ctx, &attn)
+            .map_err(|e| format!("cohere2moe L{l}: attention: {e:?}"))?;
+        probe(gpu, l, "post_attn");
+        let ffn = refs
+            .ffn_steps(cfg, &ctx, b, l)
+            .map_err(|e| format!("cohere2moe L{l}: ffn: {e}"))?;
+        execute_steps(gpu, &ctx, &ffn).map_err(|e| format!("cohere2moe L{l}: ffn: {e:?}"))?;
+        probe(gpu, l, "post_ffn");
         if hipfire_config::developer_var_os("HIPFIRE_COHERE_DEBUG").is_some() {
-            if let Ok(hv) = gpu.download_f32(&state.h) {
+            if let Ok(hv) = gpu.download_f32(b.h) {
                 let l2 = hv.iter().map(|v| v * v).sum::<f32>().sqrt();
                 let mx = hv.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let nan = hv.iter().filter(|v| v.is_nan()).count();
@@ -387,20 +200,6 @@ fn decode_step_body(
             }
         }
     }
-    state.n_tokens = seq_len;
-
-    // Final RMSNorm + lm_head (tied embed).
-    gpu.rmsnorm_batched(
-        &state.h,
-        &weights.final_norm,
-        &state.final_norm_buf,
-        1,
-        hidden,
-        eps,
-    )
-    .map_err(|e| format!("cohere2moe: final rmsnorm: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("cohere2moe: lm_head: {e}"))?;
     Ok(())
 }
 
@@ -505,16 +304,11 @@ pub fn forward_batch(
     let hidden = cfg.hidden_size;
     let q_dim = cfg.q_dim();
     let kv_dim = cfg.kv_dim();
-    let head_dim = cfg.head_dim;
-    let n_heads = cfg.num_attention_heads;
-    let n_kv = cfg.num_key_value_heads;
     let moe_inter = cfg.moe_intermediate_size;
     let dense_inter = cfg.dense_intermediate_size;
     let n_exp = cfg.num_experts;
     let k_top = cfg.num_experts_per_tok;
-    let eps = cfg.rms_norm_eps;
     let max_ctx = start_pos + b;
-    let max_seq = state.kv.physical_cap;
 
     let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
         g.alloc_tensor(&[n], DType::F32)
@@ -591,277 +385,72 @@ pub fn forward_batch(
     let normdump = c2m_normdump_step().map_or(false, |step| {
         step > 0 && (start_pos / step != max_ctx / step)
     });
-    for (l, layer) in weights.layers.iter().enumerate() {
-        // Parallel block: normed = RMSNorm(x), fed to BOTH branches.
-        gpu.rmsnorm_batched(&x, &layer.input_norm, &normed, b, hidden, eps)
-            .map_err(|e| format!("cohere2moe L{l} batch ln: {e:?}"))?;
-        // Attention from `normed` (Q8 projections).
-        q8_proj_raw(gpu, &layer.wq.buf, &normed, &fq, q_dim, hidden, b, &x_f16)
-            .map_err(|e| format!("cohere2moe L{l} batch q: {e:?}"))?;
-        q8_proj_raw(gpu, &layer.wk.buf, &normed, &fk, kv_dim, hidden, b, &x_f16)
-            .map_err(|e| format!("cohere2moe L{l} batch k: {e:?}"))?;
-        q8_proj_raw(gpu, &layer.wv.buf, &normed, &fv, kv_dim, hidden, b, &x_f16)
-            .map_err(|e| format!("cohere2moe L{l} batch v: {e:?}"))?;
-        // NoPE on full layers; interleaved RoPE on sliding layers.
-        // RoPE on sliding layers AND the dense prefix layers (force_rope) — see
-        // the decode path. North layer 0 (dense, full_attention) is rotated.
-        if layer.attn_kind == AttnKind::Sliding
-            || (l < cfg.first_k_dense_replace && cfg.prefix_dense_sliding_window_pattern == 1)
-        {
-            gpu.rope_interleaved_f32_batched(
-                &fq,
-                &fk,
-                &pos_array,
-                n_heads,
-                n_kv,
-                head_dim,
-                head_dim,
-                cfg.rope_theta,
-                b,
-            )
-            .map_err(|e| format!("cohere2moe L{l} batch rope: {e:?}"))?;
-        }
-        // Batched KV write (Q8) + sliding-window flash attention via the shared
-        // KV-usage abstraction (causal: tree_bias=None). q8_windowed selects
-        // AttnQ8_0KvBatchedMaskedWindowed unconditionally (window>0 clips
-        // `sliding_attention` layers to the last `sliding_window` keys; window=0
-        // is full causal for `full_attention`/NoPE layers) — NOT the LDS-bound
-        // non-windowed batched key, which would drop the window.
-        let window = if layer.attn_kind == AttnKind::Sliding {
-            cfg.sliding_window as i32
-        } else {
-            0
-        };
-        let ctx = DispatchCtx::new(gpu);
-        let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
-            hipfire_dispatch::families::kv_tier::KvTierInputs {
-                q8_windowed: true,
-                window,
-                batch_size: b,
-                ..state.kv.tier_inputs()
+    let ladder = if q8_wmma_enabled() {
+        ProjectLadder::GemmQ8Fp16
+    } else {
+        ProjectLadder::Gemm
+    };
+    let bufs = Bufs {
+        h: &x,
+        normed: &normed,
+        fa_q: &fq,
+        fa_k: &fk,
+        fa_v: &fv,
+        attn_out: &attn_out,
+        proj_out: &o,
+        dense_gate: &dense_gate,
+        dense_up: &dense_up,
+        dense_act: &dense_act,
+        pos_buf: &state.pos_buf,
+        kv: &state.kv,
+        flash_partials: &state.flash_partials,
+        route: Route::Prefill {
+            rows: b,
+            positions: &pos_array,
+            max_ctx,
+            ladder,
+            scratch: &x_f16,
+            moe: MoeRows {
+                router_logits: &router_logits,
+                topk_indices: &topk_idx,
+                topk_weights: &topk_w,
+                x_rot: &ffn_x_rot,
+                gate: &gate,
+                up: &up,
+                rot: &rot,
+                down_expanded: &down_exp,
+                expert_token_counts: &expert_token_counts,
+                expert_offsets: &expert_offsets,
+                sorted_slot_index: &sorted_slot_index,
+                expert_tile_ids: &expert_tile_ids,
+                inverse_perm: &inverse_perm,
+                y_gate_up_grouped: &y_gate_up_grouped,
+                y_down_grouped: &y_down_grouped,
+                m_total_max,
             },
-        )
-        .map_err(|e| format!("cohere2moe L{l} batch kv tier: {e}"))?;
-        let io = hipfire_dispatch::families::attention::AttnParams {
-            q: &fq,
-            k: &fk,
-            v: &fv,
-            k_cache: &state.kv.k_gpu[l],
-            v_cache: &state.kv.v_gpu[l],
-            k_scales: None,
-            v_scales: None,
-            pos_buf: &state.pos_buf,
-            pos: 0,
-            positions: Some(&pos_array),
-            n_heads,
-            n_kv_heads: n_kv,
-            head_dim,
-            physical_cap: max_seq,
-            batch_size: b,
-            max_ctx_len: max_ctx,
-            flash_partials: Some(&state.flash_partials),
-            givens_cos: None,
-            givens_sin: None,
-            tree_bias: None,
-            block_start: 0,
-            block_cols: 0,
-            output_gate: None,
-            output_awq_scale: None,
-            output: &attn_out,
-        };
-        hipfire_dispatch::pipeline::execute_steps(
-            gpu,
-            &ctx,
-            &[hipfire_dispatch::pipeline::Step::Attend { plan, io }],
-        )
-        .map_err(|e| format!("cohere2moe L{l} batch attn: {e:?}"))?;
-        q8_proj_raw(gpu, &layer.wo.buf, &attn_out, &o, hidden, q_dim, b, &x_f16)
-            .map_err(|e| format!("cohere2moe L{l} batch o: {e:?}"))?;
-        gpu.add_inplace_f32(&x, &o)
-            .map_err(|e| format!("cohere2moe L{l} batch o-resid: {e:?}"))?;
+        },
+    };
+    run_layers(cfg, weights, gpu, &bufs, |gpu, l, tag| {
         if normdump {
-            dbg_row_stats(gpu, &x, b, hidden, l, max_ctx, "post_attn");
+            dbg_row_stats(gpu, &x, b, hidden, l, max_ctx, tag);
         }
-
-        // FFN from the SAME `normed` (parallel block).
-        match &layer.ffn {
-            Ffn::Dense(d) => {
-                q8_proj_raw(
-                    gpu,
-                    &d.gate.buf,
-                    &normed,
-                    &dense_gate,
-                    dense_inter,
-                    hidden,
-                    b,
-                    &x_f16,
-                )
-                .map_err(|e| format!("cohere2moe L{l} batch dgate: {e:?}"))?;
-                q8_proj_raw(
-                    gpu,
-                    &d.up.buf,
-                    &normed,
-                    &dense_up,
-                    dense_inter,
-                    hidden,
-                    b,
-                    &x_f16,
-                )
-                .map_err(|e| format!("cohere2moe L{l} batch dup: {e:?}"))?;
-                gpu.silu_mul_f32(&dense_gate, &dense_up, &dense_act)
-                    .map_err(|e| format!("cohere2moe L{l} batch dsilu: {e:?}"))?;
-                q8_proj_raw(
-                    gpu,
-                    &d.down.buf,
-                    &dense_act,
-                    &o,
-                    hidden,
-                    dense_inter,
-                    b,
-                    &x_f16,
-                )
-                .map_err(|e| format!("cohere2moe L{l} batch ddown: {e:?}"))?;
-                gpu.add_inplace_f32(&x, &o)
-                    .map_err(|e| format!("cohere2moe L{l} batch ddown-resid: {e:?}"))?;
-            }
-            Ffn::Moe(m) => {
-                // The sealed recipe owns router projection, sigmoid/top-eight,
-                // activation-basis preparation, and the indexed/grouped
-                // routed tail. Cohere has no shared expert.
-                let ctx = DispatchCtx::new(gpu);
-                let bound = BoundMoeExperts::from_cache(&m.sealed.table, &m.sealed.cache)
-                    .map_err(|e| format!("cohere2moe L{l} bind experts: {e:?}"))?;
-                let gate_up_dtypes = m.sealed.gate_up_dtypes.as_ref();
-                let down_dtypes = m.sealed.down_dtypes.as_ref();
-                let tier_varies = |tiers: &[DType]| {
-                    tiers
-                        .first()
-                        .is_some_and(|&first| tiers.iter().skip(1).any(|&dtype| dtype != first))
-                };
-                let gate_up_mixed = tier_varies(gate_up_dtypes);
-                let down_mixed = tier_varies(down_dtypes);
-                let routed_gate_up = gate_up_dtypes
-                    .first()
-                    .copied()
-                    .ok_or_else(|| format!("cohere2moe L{l}: no gate/up expert dtype"))?;
-                let routed_down = down_dtypes
-                    .first()
-                    .copied()
-                    .ok_or_else(|| format!("cohere2moe L{l}: no down expert dtype"))?;
-                let params_gate_paro = m.experts[0].gate_up.paro.as_ref().map(|paro| GivensRef {
-                    pairs: &paro.pairs,
-                    theta: &paro.theta,
-                    scales: &paro.channel_scales,
-                    krot: paro.krot as usize,
-                });
-                let params_down_paro = m.experts[0].down.paro.as_ref().map(|paro| GivensRef {
-                    pairs: &paro.pairs,
-                    theta: &paro.theta,
-                    scales: &paro.channel_scales,
-                    krot: paro.krot as usize,
-                });
-                let params = MoePrefillParams {
-                    dtypes: MoeDtypes {
-                        router: m.router.gpu_dtype,
-                        shared: None,
-                        experts_all_gate_up_mq4: gate_up_dtypes
-                            .iter()
-                            .all(|&dtype| dtype == DType::MQ4G256),
-                        routed_gate_up,
-                        routed_down,
-                        routed_has_mixed_experts: gate_up_mixed || down_mixed,
-                        has_paro_shared: m.paro_shared.is_some(),
-                        per_expert_gate_up: gate_up_mixed.then_some(gate_up_dtypes),
-                        per_expert_down: down_mixed.then_some(down_dtypes),
-                    },
-                    recipe: MoeRecipe::SigmoidRoutedNoShared,
-                    route_policy: None,
-                    prelude: MoePrefillPrelude {
-                        normalization: MoeNormalization::Provided,
-                        router: m.router.dispatch_ref(),
-                        router_logits: &router_logits,
-                        // The preallocated 2-D score view is the exact
-                        // router-logits allocation, not a reshaped copy.
-                        router_scores: &router_logits,
-                        norm_topk_prob: cfg.norm_topk_prob,
-                        route: PrefillRouteMode::Replicated,
-                        shared: None,
-                        q8_router_policy: MoeQ8RouterPolicy::FreshFp16Wmma {
-                            enabled: q8_wmma_enabled(),
-                            scratch: &x_f16,
-                        },
-                    },
-                    batch_size: b,
-                    mi: moe_inter,
-                    down_m: hidden,
-                    down_k: moe_inter,
-                    gate_up_k: hidden,
-                    k_top,
-                    n_exp,
-                    m_total_max,
-                    force_mq4_grouped_fp16: false,
-                    cpu_deferred_experts: false,
-                    topk_indices: &topk_idx,
-                    topk_weights: &topk_w,
-                    x_batch: &x,
-                    x_norm_batch: &normed,
-                    x_rot_batch: &ffn_x_rot,
-                    expert_gate_up_ptrs: &m.expert_gate_up_ptrs,
-                    expert_down_ptrs: &m.expert_down_ptrs,
-                    expert_stage_ptrs: None,
-                    routed_experts: m,
-                    expert_down_awq_ptrs: None,
-                    expert_dtype_tags: None,
-                    gate_batch: &gate,
-                    up_batch: &up,
-                    rot_batch: &rot,
-                    down_expanded: &down_exp,
-                    expert_token_counts: &expert_token_counts,
-                    expert_offsets: &expert_offsets,
-                    sorted_slot_index: &sorted_slot_index,
-                    expert_tile_ids: &expert_tile_ids,
-                    inverse_perm: &inverse_perm,
-                    y_gate_up_grouped: &y_gate_up_grouped,
-                    y_down_grouped: &y_down_grouped,
-                    paro_gate_up: params_gate_paro,
-                    paro_down: params_down_paro,
-                    down_awq_scale: None,
-                    routed_out: None,
-                    ep_row_gather: None,
-                    shared_down_out: None,
-                    ep_layer_idx: 0,
-                    ep_tile_exchange: None,
-                    expert_iu4: None,
-                };
-                let call = seal_prefill(bound, &ctx, params)
-                    .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;
-                execute_steps(gpu, &ctx, &[Step::Moe(call)])
-                    .map_err(|e| format!("cohere2moe L{l} sealed prefill: {e:?}"))?;
-            }
-        }
-        if normdump {
-            dbg_row_stats(gpu, &x, b, hidden, l, max_ctx, "post_ffn");
-        }
-    }
+    })?;
     state.n_tokens = start_pos + b;
 
-    // Final RMSNorm + lm_head on the LAST row only (prefill needs the
-    // last position's logits to seed decode).
-    let x_last = alloc(gpu, hidden, "x_last")?;
-    gpu.hip
-        .memcpy_dtod_at(&x_last.buf, 0, &x.buf, (b - 1) * hidden * 4, hidden * 4)
-        .map_err(|e| format!("forward_batch last copy: {e:?}"))?;
-    gpu.rmsnorm_batched(
+    // Final norm + LM head on the LAST row only (prefill needs the last
+    // position's logits to seed decode).
+    let x_last = x.sub_offset((b - 1) * hidden, hidden);
+    let ctx = DispatchCtx::new(gpu);
+    let lm_head = lm_head_ref(weights);
+    let head = head_steps(
+        cfg,
+        weights,
+        &lm_head,
         &x_last,
-        &weights.final_norm,
         &state.final_norm_buf,
-        1,
-        hidden,
-        eps,
-    )
-    .map_err(|e| format!("forward_batch final ln: {e:?}"))?;
-    weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
-        .map_err(|e| format!("forward_batch lm_head: {e}"))?;
+        &state.logits,
+    );
+    execute_steps(gpu, &ctx, &head).map_err(|e| format!("forward_batch head: {e:?}"))?;
     let logits = gpu
         .download_f32(&state.logits)
         .map_err(|e| format!("forward_batch download logits: {e:?}"))?;
@@ -886,7 +475,6 @@ pub fn forward_batch(
         dense_up,
         dense_act,
         pos_array,
-        x_last,
         expert_token_counts,
         expert_offsets,
         sorted_slot_index,
@@ -899,17 +487,4 @@ pub fn forward_batch(
         gpu.free_tensor(t).ok();
     }
     Ok(logits)
-}
-
-#[cfg(test)]
-mod expert_iu4_binding_tests {
-    /// Cohere never binds the Qwen35 expert IU4 capability.
-    #[test]
-    fn moe_prefill_constructor_binds_no_expert_iu4() {
-        let src = include_str!("forward.rs");
-        let production = src.split(concat!("#[cfg", "(test)]")).next().unwrap();
-        assert_eq!(production.matches("MoePrefillParams {").count(), 1);
-        assert_eq!(production.matches("expert_iu4:").count(), 1);
-        assert_eq!(production.matches("expert_iu4: None,").count(), 1);
-    }
 }

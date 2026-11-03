@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Changed (internal, byte-identical): Cohere2-MoE (North-Mini-Code, arch 12) decode and batched prefill run as typed `Step` programs (#666 G16, HIPF-268).** `hipfire-arch-cohere2moe/src/program.rs` declares the parallel block (shared RMS norm, QKV, RoPE, windowed Q8 attention, residual o-projection; dense SwiGLU prefix or sealed sigmoid MoE) for both routes; `forward.rs` only owns scratch. Dispatch gains `RopeKind::Interleaved { rot_dim }` (GPT-J pairing, single and batched rows) and `ProjectLadder::GemmQ8Fp16` (fresh F16 activation + `gemm_q8_0_wmma`, the incumbent Cohere prefill projection). gfx1151, `north-mini-code-1.0.mq4.hfq` (sha256 `bf73ee8e…6028`): logits at every prefill chunk and decode step, greedy ids and the full KV cache are bitwise equal to beta `2b69c5814` for 300-token and 5000-token (past the 4096 window) prefills, per-token decode prefill, and `HIPFIRE_COHERE2MOE_Q8_SCALAR=1`; prefill and decode tok/s unchanged (within ±1%).
+
 ## v0.4.5 — 2026-11-11 (re-cut)
 
 The v0.4.5 tag first pointed at `b30b46c1e2` (2026-10-30); that GitHub release was never published. v0.4.5 was re-cut at `7f7cf7f50f` and now includes everything below. If you fetched the October tag, run `git fetch --tags --force`.
