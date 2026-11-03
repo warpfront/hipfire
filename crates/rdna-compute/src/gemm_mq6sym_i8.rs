@@ -793,10 +793,22 @@ mod tests {
             ..ok
         }));
         for r in 0..=8 {
-            assert!(!trunk_a8_admits(TrunkA8Gate { route_rows: r, ..ok }), "rows {r}");
+            assert!(
+                !trunk_a8_admits(TrunkA8Gate {
+                    route_rows: r,
+                    ..ok
+                }),
+                "rows {r}"
+            );
         }
         for r in [64usize, 65, 512, 4096] {
-            assert!(trunk_a8_admits(TrunkA8Gate { route_rows: r, ..ok }), "rows {r}");
+            assert!(
+                trunk_a8_admits(TrunkA8Gate {
+                    route_rows: r,
+                    ..ok
+                }),
+                "rows {r}"
+            );
         }
         assert!(!trunk_a8_admits(TrunkA8Gate {
             route_rows: 0,
