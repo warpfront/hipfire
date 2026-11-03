@@ -115,7 +115,15 @@ struct SymWRegs {
     u32x4_t v[RG][6];   // [rg][h*3 + t]: 48 bytes of half h, lane half kg
 };
 
-template <int NW, int RG, int TG, bool BF16>
+// LDS-only CTA barrier: wait for this wave's LDS traffic (not for in-flight global loads, which
+// __syncthreads would drain through its release fence), then rendezvous. Weight prefetch loads stay
+// in flight across it.
+static __device__ __forceinline__ void sym_bar() {
+    asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
+}
+
+// PD = weight groups prefetched ahead of the group being computed (PD + 1 register sets).
+template <int NW, int RG, int TG, int PD, bool BF16>
 static __device__ __forceinline__ void sym_narrow_body(
     const unsigned char*  __restrict__ W,
     const block_i8_128*   __restrict__ Xq,
@@ -169,24 +177,26 @@ static __device__ __forceinline__ void sym_narrow_body(
         }
     };
 
-    u32x2_t xr[NPF];
+    // Staged activation blocks in flight: slot 0 = block of the current group's second half,
+    // slot 1 = first block of the next group (issued together, ahead of the weight prefetch).
+    u32x2_t xr[2][NPF];
     // Activation block kb of N tokens is N*136 contiguous bytes; reads past the
     // descriptor's N*136 bytes return zero (tokens >= N stage as zero).
-    auto load_x = [&](int kb) {
+    auto load_x = [&](int kb, int slot) {
         const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
             (void*)(Xq + (long long)kb * N), 0, x_bytes, 0x31004000u);
         #pragma unroll
         for (int i = 0; i < NPF; i++) {
-            xr[i] = __builtin_amdgcn_raw_buffer_load_b64(
+            xr[slot][i] = __builtin_amdgcn_raw_buffer_load_b64(
                 x_rsrc, (unsigned)(tid + i * NT) * 8u, 0u, 0);
         }
     };
-    auto store_x = [&](int buf) {
+    auto store_x = [&](int buf, int slot) {
         #pragma unroll
         for (int i = 0; i < NPF; i++) {
             const int idx = tid + i * NT;
             if (idx < XQ) {
-                *(u32x2_t*)(LDS + buf * XB + idx * 8) = xr[i];
+                *(u32x2_t*)(LDS + buf * XB + idx * 8) = xr[slot][i];
             }
         }
     };
@@ -200,11 +210,16 @@ static __device__ __forceinline__ void sym_narrow_body(
         }
     }
 
-    SymWRegs<RG> wa, wb;
-    load_group(wa, 0);
-    load_x(0);
-    store_x(0);
-    __syncthreads();
+    SymWRegs<RG> wr[PD + 1];
+    #pragma unroll
+    for (int p = 0; p < PD; p++) {
+        if (p < gpr) {
+            load_group(wr[p], p);
+        }
+    }
+    load_x(0, 0);
+    store_x(0, 0);
+    sym_bar();
 
     // One K128 block (half HH of the group in `cur`), activations staged in LDS
     // buffer HH (kb parity == half index).
@@ -258,34 +273,35 @@ static __device__ __forceinline__ void sym_narrow_body(
         }
     };
 
-    // Issue order matters for the in-order vmcnt: the staged X block of the NEXT K128 is
-    // requested before the next group's weights, so publishing it waits only for itself.
+    // Issue order (the vmcnt is in-order): both activation blocks of the group first, then the
+    // weight prefetch PD groups ahead; publishing an activation block therefore never waits for the
+    // prefetch, which is only waited for at its own group's first use.
     auto process_group = [&](int g, SymWRegs<RG>& cur, SymWRegs<RG>& nxt) {
         const bool more_g = (g + 1 < gpr);
         const int kb0 = 2 * g;
-        // half 0 (X buffer 0); the block of half 1 always exists.
-        load_x(kb0 + 1);
+        load_x(kb0 + 1, 0);
         if (more_g) {
-            load_group(nxt, g + 1);
+            load_x(kb0 + 2, 1);
+        }
+        if (g + PD < gpr) {
+            load_group(nxt, g + PD);
         }
         compute_half(cur, std::integral_constant<int, 0>());
-        store_x(1);
-        __syncthreads();
-        // half 1 (X buffer 1)
-        if (more_g) {
-            load_x(kb0 + 2);
-        }
+        store_x(1, 0);
+        sym_bar();
         compute_half(cur, std::integral_constant<int, 1>());
         if (more_g) {
-            store_x(0);
-            __syncthreads();
+            store_x(0, 1);
+            sym_bar();
         }
     };
 
-    for (int g = 0; g < gpr; g += 2) {
-        process_group(g, wa, wb);
-        if (g + 1 < gpr) {
-            process_group(g + 1, wb, wa);
+    for (int g0 = 0; g0 < gpr; g0 += PD + 1) {
+        #pragma unroll
+        for (int u = 0; u <= PD; u++) {
+            if (g0 + u < gpr) {
+                process_group(g0 + u, wr[u], wr[(u + PD) % (PD + 1)]);
+            }
         }
     }
 
@@ -312,31 +328,40 @@ static __device__ __forceinline__ void sym_narrow_body(
     }
 }
 
-#define SYM_NARROW_ENTRY(NAME, NW, RG, TG, BF)                                           \
+#define SYM_NARROW_ENTRY(NAME, NW, RG, TG, PD, BF)                                       \
     extern "C" __global__ __launch_bounds__((NW) * 32) void NAME(                        \
         const unsigned char* __restrict__ W, const block_i8_128* __restrict__ Xq,        \
         void* __restrict__ Y, int M, int K, int N) {                                     \
-        sym_narrow_body<NW, RG, TG, BF>(W, Xq, Y, M, K, N);                              \
+        sym_narrow_body<NW, RG, TG, PD, BF>(W, Xq, Y, M, K, N);                          \
     }
+#define SYM_ROW(R, NW, TGN, TG, P)                                                       \
+    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m##R##n##TGN##p##P##_gfx1201, NW, 1, TG, P, false) \
+    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m##R##n##TGN##p##P##_gfx1201, NW, 1, TG, P, true)
 
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m32n16_gfx1201, 2, 1, 1, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m32n32_gfx1201, 2, 1, 2, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m32n48_gfx1201, 2, 1, 3, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m64n16_gfx1201, 4, 1, 1, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m64n32_gfx1201, 4, 1, 2, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m64n48_gfx1201, 4, 1, 3, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m128n16_gfx1201, 8, 1, 1, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m128n32_gfx1201, 8, 1, 2, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m128n48_gfx1201, 8, 1, 3, false)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m32n16_gfx1201, 2, 1, 1, true)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m32n32_gfx1201, 2, 1, 2, true)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m32n48_gfx1201, 2, 1, 3, true)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m64n16_gfx1201, 4, 1, 1, true)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m64n32_gfx1201, 4, 1, 2, true)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m64n48_gfx1201, 4, 1, 3, true)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m128n16_gfx1201, 8, 1, 1, true)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m128n32_gfx1201, 8, 1, 2, true)
-SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m128n48_gfx1201, 8, 1, 3, true)
+SYM_ROW(32, 2, 16, 1, 1)
+SYM_ROW(32, 2, 16, 1, 2)
+SYM_ROW(32, 2, 16, 1, 3)
+SYM_ROW(32, 2, 32, 2, 1)
+SYM_ROW(32, 2, 32, 2, 2)
+SYM_ROW(32, 2, 32, 2, 3)
+SYM_ROW(32, 2, 48, 3, 1)
+SYM_ROW(32, 2, 48, 3, 2)
+SYM_ROW(64, 4, 16, 1, 1)
+SYM_ROW(64, 4, 16, 1, 2)
+SYM_ROW(64, 4, 16, 1, 3)
+SYM_ROW(64, 4, 32, 2, 1)
+SYM_ROW(64, 4, 32, 2, 2)
+SYM_ROW(64, 4, 32, 2, 3)
+SYM_ROW(64, 4, 48, 3, 1)
+SYM_ROW(64, 4, 48, 3, 2)
+SYM_ROW(128, 8, 16, 1, 1)
+SYM_ROW(128, 8, 16, 1, 2)
+SYM_ROW(128, 8, 16, 1, 3)
+SYM_ROW(128, 8, 32, 2, 1)
+SYM_ROW(128, 8, 32, 2, 2)
+SYM_ROW(128, 8, 32, 2, 3)
+SYM_ROW(128, 8, 48, 3, 1)
+SYM_ROW(128, 8, 48, 3, 2)
 
 // ===================================================================
 // Prefill 128 x 128 tile (A = weights, B = activations), a fork of the affine
