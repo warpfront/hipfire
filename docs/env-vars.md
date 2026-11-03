@@ -1662,7 +1662,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_EMBED_BATCH_WINDOW_US` | crates/hipfire-arch-embeddinggemma2/src/slot_engine.rs, crates/hipfire-arch-qwen35-embed/src/slot_engine.rs | developer |
 | `HIPFIRE_EMBED_DEBUG` | crates/hipfire-arch-embeddinggemma2/src/carrier.rs, crates/hipfire-arch-embeddinggemma2/src/forward.rs | developer |
 | `HIPFIRE_EMBED_ENGINE_TRACE` | crates/hipfire-arch-embeddinggemma2/src/slot_engine.rs, crates/hipfire-arch-qwen35-embed/src/slot_engine.rs | developer |
-| `HIPFIRE_EMBED_GEMM` | crates/hipfire-arch-embeddinggemma2/src/forward.rs, crates/hipfire-dispatch/src/pipeline/encoder.rs | developer |
+| `HIPFIRE_EMBED_GEMM` | crates/hipfire-arch-embeddinggemma2/src/forward.rs, crates/hipfire-dispatch/src/pipeline/layer_ops.rs | developer |
 | `HIPFIRE_EMBED_PHASE` | crates/hipfire-arch-qwen35-embed/examples/batch_parity.rs, crates/hipfire-generate/src/embed.rs | developer |
 | `HIPFIRE_EMBED_VISION_OFFLOAD` | crates/hipfire-arch-qwen35-embed/src/lib.rs, crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
 | `HIPFIRE_EMIT_TOKEN_IDS` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-cohere2moe/src/spec_emit.rs | developer |

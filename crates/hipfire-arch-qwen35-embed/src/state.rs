@@ -8,9 +8,9 @@
 //! This is the `DeltaNetState` layout from `hipfire-arch-qwen35` (FP32
 //! quant, fresh sequence) without the Q8/Q4/lane machinery an encoder never
 //! uses: `s_matrices[l]` is `[n_v_heads × k_dim × v_dim]` f32 and
-//! `conv_states[l]` is `[conv_dim × (kernel − 1)]` f32, both zeroed. Every
-//! encode starts from zero state — an embedding model has no cross-request
-//! recurrence — so [`GdnEncodeState::reset`] runs before each forward.
+//! `conv_states[l]` is `[conv_dim × (kernel − 1)]` f32. Every encode starts
+//! from zero state (an embedding model has no cross-request recurrence): the
+//! dispatch conv and scan stages zero their state at each segment's start.
 
 use crate::config::EmbedConfig;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -52,40 +52,6 @@ impl GdnEncodeState {
             conv_states,
             n_linear_layers: n_linear,
         })
-    }
-
-    /// Zero every S matrix and conv ring. Runs before each encode.
-    pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
-        for i in 0..self.n_linear_layers {
-            self.reset_layer(gpu, i)?;
-        }
-        Ok(())
-    }
-
-    /// Zero one layer's S matrix and conv ring.
-    pub fn reset_layer(&mut self, gpu: &mut Gpu, i: usize) -> Result<(), String> {
-        self.reset_conv(gpu, i)?;
-        self.reset_s(gpu, i)
-    }
-
-    /// Zero one layer's causal-conv ring.
-    ///
-    /// Split from [`Self::reset_s`] because the two are consumed in different
-    /// passes: a batched encode runs every segment's conv, then a row-independent
-    /// L2 norm over the whole row block, then every segment's delta-rule scan.
-    /// Each pass must zero the state *it* reads at each segment's start — the
-    /// scan zeroes S immediately before its own segment, not back when that
-    /// segment's conv ran, or segment k would start from segment k-1's state.
-    /// A single sequence needs neither: [`Self::reset`] once on entry is enough.
-    pub fn reset_conv(&mut self, gpu: &mut Gpu, i: usize) -> Result<(), String> {
-        gpu.zero_f32(&self.conv_states[i])
-            .map_err(|e| format!("gdn reset: {e:?}"))
-    }
-
-    /// Zero one layer's delta-rule S matrix. See [`Self::reset_conv`].
-    pub fn reset_s(&mut self, gpu: &mut Gpu, i: usize) -> Result<(), String> {
-        gpu.zero_f32(&self.s_matrices[i])
-            .map_err(|e| format!("gdn reset: {e:?}"))
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
