@@ -43,7 +43,7 @@
 //!   heads), a state/forward rebuilt on it, and the mixer's HC write carrying the fused
 //!   all-reduce (`ArHcExchange`, installed through the forward's own `HyperWriteOp.ar` hook),
 //!   mailbox qualified at start. It does not read `HIPFIRE_QWEN4_EP_TRUNK_SHARD` and does
-//!   not depend on `TRUNK_SHARD_ROUTE_READY`.
+//!   not depend on the switch.
 //! * **checks** per block (`evaluate_block`, CPU-side and unit-tested; `compare` re-runs
 //!   them from the dumps on any box):
 //!   C0 identical block input on both ranks and on the reference;

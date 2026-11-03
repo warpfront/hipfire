@@ -2,8 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! TP2 trunk shard of the Flash-Next EP2 forward (`HIPFIRE_QWEN4_EP_TRUNK_SHARD=1`, default
-//! off; Gate 0b F-R shape, `mgmtp/trunkshard/DESIGN.md`).
+//! TP2 trunk shard of the Flash-Next EP2 forward (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`: default on for
+//! an EP2 load over two gfx1201 cards, `0` is the kill switch; Gate 0b F-R shape,
+//! `mgmtp/trunkshard/DESIGN.md`).
 //!
 //! Each rank keeps half of the replicated trunk projections, cut as byte ranges from the
 //! resident (replicated, unchanged-artifact) tensors, exactly like
@@ -48,77 +49,104 @@ pub const SHARD_LM_HEAD: bool = false;
 /// Shared-expert intermediate granule: the prefill kernels admit `intermediate % 128`.
 pub const SHARED_UNIT: usize = 128;
 
-/// Whether the forward route consuming the sharded weights is complete (kernel, mailbox,
-/// FFN partial route, GDN/QSA head shapes, lm_head exchange). Until it is, the switch is
-/// INERT: a half-wired shard would run garbage, so [`trunk_shard_requested`] stays false
-/// whatever the environment says. Flipped by the slice that completes the route.
-pub const TRUNK_SHARD_ROUTE_READY: bool = false;
+/// What the raw `HIPFIRE_QWEN4_EP_TRUNK_SHARD` value asks for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShardSwitch {
+    /// Unset (or empty): the shipped default, on for an EP2 load over two gfx1201 cards.
+    Default,
+    /// `0` / `off` / `false`: the kill switch, EP2 as before the shard.
+    Off,
+    /// `1` / `true` / `on`: the shard even where the default would not apply (a load that is
+    /// not two-rank EP refuses, loudly, in [`Qwen4Bundle::apply_trunk_shard`]).
+    On,
+}
 
-/// Whether the developer switch asks for the shard (`1`/`true`/`on`) and the route exists.
+/// Parse the raw switch. An unrecognised value is OFF (fail safe to the pre-shard route).
+pub fn parse_switch(raw: Option<&str>) -> ShardSwitch {
+    match raw.map(str::trim) {
+        None | Some("") => ShardSwitch::Default,
+        Some("1" | "true" | "on") => ShardSwitch::On,
+        Some(_) => ShardSwitch::Off,
+    }
+}
+
+/// The raw environment switch ([`parse_switch`] of `HIPFIRE_QWEN4_EP_TRUNK_SHARD`).
+pub fn trunk_shard_switch() -> ShardSwitch {
+    parse_switch(
+        hipfire_config::developer_var(TRUNK_SHARD_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Whether the shipped default applies: expert parallelism of exactly two ranks over exactly two
+/// visible gfx1201 cards (the only shape the fused all-reduce kernel and the measurements cover).
+pub fn default_applies_given(ep: usize, archs: &[&str]) -> bool {
+    ep == 2 && archs.len() == 2 && archs.iter().all(|arch| *arch == "gfx1201")
+}
+
+/// [`default_applies_given`] for this process: the Qwen4 expert-parallel degree
+/// (`topology.ep`, `HIPFIRE_QWEN4_EP=0` forces 1) and the visible GPUs. A process that cannot
+/// name its GPUs (no readable KFD topology) gets no default.
+pub fn default_applies() -> bool {
+    use std::sync::OnceLock;
+    static ARCHS: OnceLock<Option<Vec<String>>> = OnceLock::new();
+    let archs = ARCHS.get_or_init(|| {
+        hipfire_config::devices::startup_devices()
+            .map(|devices| devices.iter().map(|d| d.arch.clone()).collect())
+    });
+    let Some(archs) = archs else {
+        return false;
+    };
+    let archs: Vec<&str> = archs.iter().map(String::as_str).collect();
+    default_applies_given(hipfire_config::topology::qwen4_ep().unwrap_or(1), &archs)
+}
+
+/// [`trunk_shard_requested`] with both inputs passed in (the CPU tests of the load path drive
+/// every `*_for(requested)` helper below with explicit values instead of the process environment).
+pub const fn requested_for(switch: ShardSwitch, default_applies: bool) -> bool {
+    match switch {
+        ShardSwitch::Off => false,
+        ShardSwitch::On => true,
+        ShardSwitch::Default => default_applies,
+    }
+}
+
+/// Whether this load shards the trunk: the kill switch, the explicit `1`, or the default.
 pub fn trunk_shard_requested() -> bool {
-    requested_given(TRUNK_SHARD_ROUTE_READY, trunk_shard_env_set()) || trunk_shard_lab_set()
+    match trunk_shard_switch() {
+        ShardSwitch::Off => false,
+        ShardSwitch::On => true,
+        ShardSwitch::Default => default_applies(),
+    }
 }
 
-/// `HIPFIRE_QWEN4_EP_TRUNK_SHARD=lab`: the lab value that runs the route on the cards BEFORE
-/// `TRUNK_SHARD_ROUTE_READY` is flipped (identity/KLD/timing checkpoints). Not a user switch:
-/// a user value of `1` stays inert until the const flips.
-pub fn trunk_shard_lab_set() -> bool {
-    matches!(
-        hipfire_config::developer_var(TRUNK_SHARD_ENV)
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("lab")
-    )
-}
-
-/// [`trunk_shard_requested`] with both inputs passed in: the route's readiness and the raw
-/// switch. The CPU tests of the load path drive every `*_for(requested)` helper below with
-/// `requested_given(true, true)` instead of flipping the inert const or the process
-/// environment.
-pub const fn requested_given(route_ready: bool, env_set: bool) -> bool {
-    route_ready && env_set
-}
-
-/// The raw environment switch (what a user asked for, regardless of route readiness).
-pub fn trunk_shard_env_set() -> bool {
-    matches!(
-        hipfire_config::developer_var(TRUNK_SHARD_ENV)
-            .ok()
-            .as_deref()
-            .map(str::trim),
-        Some("1" | "true" | "on")
-    )
-}
-
-/// `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP=1`: with `HIPFIRE_QWEN4_EP_TRUNK_SHARD=lab`, keep the
-/// native MTP head loaded (replicated) under the shard instead of dropping it. Lab only, default
-/// off; ignored without the lab value of the shard switch.
+/// `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP=0` (developer): drop the native MTP head under the shard
+/// (AR-only load: the head's weights and expert units go back to the trunk). Unset keeps the
+/// head, replicated on every rank.
 pub const TRUNK_SHARD_MTP_ENV: &str = "HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP";
 
-/// The raw `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP` switch.
-pub fn trunk_shard_mtp_env_set() -> bool {
-    hipfire_config::developer_bool(TRUNK_SHARD_MTP_ENV, false)
+/// The raw `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP` switch (default on: keep the head).
+pub fn trunk_shard_mtp_env_on() -> bool {
+    hipfire_config::developer_bool(TRUNK_SHARD_MTP_ENV, true)
 }
 
-/// [`trunk_shard_keeps_mtp`] with both inputs passed in: the lab value of the shard switch
-/// and the MTP switch. Both are required: a user `1` (or the const flipping) never keeps a
-/// head the checkpoints have not cleared.
-pub const fn keeps_mtp_given(lab: bool, mtp_env: bool) -> bool {
-    lab && mtp_env
+/// [`trunk_shard_keeps_mtp`] with both inputs passed in: whether the shard is requested and the
+/// MTP switch. Both are required: without the shard the head policy is not the shard's.
+pub const fn keeps_mtp_given(requested: bool, mtp_env: bool) -> bool {
+    requested && mtp_env
 }
 
 /// Whether the native MTP head stays loaded under the shard: replicated on every rank (its
 /// weights are not cut) and run on the GLOBAL geometry ([`Qwen4Config::mtp_geometry`]: 24 q
 /// heads, shared expert 640) while the 48-layer trunk runs sharded on the rank-local config.
-/// Lab only: `HIPFIRE_QWEN4_EP_TRUNK_SHARD=lab` AND `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP=1`,
-/// default off (the shard is then AR-only and the load drops the head). THE one decision for
-/// it: artifact admission ([`crate::artifact`]) keeps the profile / `mtp` config / `mtp.*`
-/// manifest or drops them ([`Qwen4Config::into_headless`]) from it, and
+/// Default on whenever the shard is; `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP=0` drops it. THE one
+/// decision for it: artifact admission ([`crate::artifact`]) keeps the profile / `mtp` config /
+/// `mtp.*` manifest or drops them ([`Qwen4Config::into_headless`]) from it, and
 /// [`load_local_config`] refuses a config that disagrees; every spec/lane gate follows from
 /// the admitted config.
 pub fn trunk_shard_keeps_mtp() -> bool {
-    keeps_mtp_given(trunk_shard_lab_set(), trunk_shard_mtp_env_set())
+    keeps_mtp_given(trunk_shard_requested(), trunk_shard_mtp_env_on())
 }
 
 /// Whether a load drops the native MTP head because the shard asks for it.
@@ -182,7 +210,7 @@ pub fn load_local_config_for(
     if config.mtp.is_some() && !keeps {
         return Err(format!(
             "{TRUNK_SHARD_ENV}: the config carries the native MTP head but the shard drops it \
-             (set {TRUNK_SHARD_ENV}=lab and {TRUNK_SHARD_MTP_ENV}=1 to keep it replicated); \
+             (unset {TRUNK_SHARD_MTP_ENV}, or set it to 1, to keep it replicated); \
              artifact admission should have admitted the artifact headless"
         ));
     }
@@ -1304,23 +1332,26 @@ mod tests {
         assert_eq!(sharded - trunk_sharded, head_plain);
     }
 
-    /// THE head policy: kept only under the lab value of the shard switch AND the MTP switch,
-    /// never by the shard alone, never by the MTP switch alone; default off.
+    /// THE head policy: kept when the shard is requested AND the MTP switch is on (its default),
+    /// dropped by `HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP=0`; no shard, no head policy.
     #[test]
-    fn the_head_is_kept_only_under_the_lab_shard_and_the_mtp_switch() {
-        for lab in [false, true] {
+    fn the_head_is_kept_under_the_shard_unless_the_mtp_switch_drops_it() {
+        for requested in [false, true] {
             for env in [false, true] {
-                assert_eq!(keeps_mtp_given(lab, env), lab && env, "lab={lab} env={env}");
-                // an off shard drops nothing; an on shard drops unless the head is kept
-                assert!(!drops_head_for(false, keeps_mtp_given(lab, env)));
                 assert_eq!(
-                    drops_head_for(true, keeps_mtp_given(lab, env)),
-                    !(lab && env)
+                    keeps_mtp_given(requested, env),
+                    requested && env,
+                    "requested={requested} env={env}"
+                );
+                // an off shard drops nothing; an on shard drops unless the head is kept
+                assert!(!drops_head_for(false, keeps_mtp_given(requested, env)));
+                assert_eq!(
+                    drops_head_for(true, keeps_mtp_given(requested, env)),
+                    !(requested && env)
                 );
             }
         }
-        // nothing in this process sets either switch: default off, and the inert user value
-        // of the shard switch never keeps the head
+        // this process requests no shard (no EP2 topology, no switch): no head policy at all
         assert!(!trunk_shard_keeps_mtp());
         assert!(!trunk_shard_drops_mtp_head());
         assert_eq!(TRUNK_SHARD_MTP_ENV, "HIPFIRE_QWEN4_EP_TRUNK_SHARD_MTP");
@@ -1390,9 +1421,26 @@ mod tests {
     }
 
     #[test]
-    fn switch_is_inert_until_the_route_is_ready() {
-        assert!(!TRUNK_SHARD_ROUTE_READY);
-        assert!(!trunk_shard_requested());
+    fn switch_parse_and_default_context() {
+        assert_eq!(parse_switch(None), ShardSwitch::Default);
+        assert_eq!(parse_switch(Some("  ")), ShardSwitch::Default);
+        for on in ["1", "true", "on", " 1 "] {
+            assert_eq!(parse_switch(Some(on)), ShardSwitch::On, "{on}");
+        }
+        // the kill switch and anything unrecognised (including the retired lab value) is OFF
+        for off in ["0", "off", "false", "lab", "yes", "2"] {
+            assert_eq!(parse_switch(Some(off)), ShardSwitch::Off, "{off}");
+        }
+        // explicit values beat the context; the default needs two-rank EP over two gfx1201
+        assert!(requested_for(ShardSwitch::On, false));
+        assert!(!requested_for(ShardSwitch::Off, true));
+        assert!(requested_for(ShardSwitch::Default, true));
+        assert!(!requested_for(ShardSwitch::Default, false));
+        assert!(default_applies_given(2, &["gfx1201", "gfx1201"]));
+        assert!(!default_applies_given(1, &["gfx1201", "gfx1201"]));
+        assert!(!default_applies_given(2, &["gfx1201"]));
+        assert!(!default_applies_given(2, &["gfx1201", "gfx1100"]));
+        assert!(!default_applies_given(4, &["gfx1201"; 4]));
     }
 
     #[test]
