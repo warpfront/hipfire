@@ -1124,8 +1124,9 @@ impl Gpu {
     /// Mirrors the host `softmax_temp_into` (apply temp to each logit, max over
     /// scaled logits, exp(scaled - max), normalize). The GPU reduction order
     /// (tree) differs from the host sequential sum, so the result is
-    /// DISTRIBUTION-parity, NOT byte-identical — used only behind the
-    /// HIPFIRE_DFLASH_FAST_SAMPLE opt-in in the DFlash sampled path.
+    /// DISTRIBUTION-parity with the host, NOT byte-identical. Users: the
+    /// HIPFIRE_DFLASH_FAST_SAMPLE DFlash sampled path, and the routed-only
+    /// softmax MoE prefill route (temp 1).
     pub fn softmax_temp_batched_into_f32(
         &mut self,
         logits: &GpuTensor,
