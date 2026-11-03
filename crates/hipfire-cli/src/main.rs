@@ -6802,12 +6802,6 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
     }
     if let Some(spec) = args.concurrency.clone() {
-        if args.json {
-            bail!(
-                "--json is not supported with --concurrency; omit --json for the concurrency table, \
-                 or run without --concurrency for standard bench JSON (including kv_backend fields)"
-            );
-        }
         return bench_concurrency_command(paths, &args, &spec);
     }
     for (name, values) in [
@@ -7029,8 +7023,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
 /// when `--concurrency` is given; the single-stream path above is untouched.
 fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
     use crate::bench_concurrency::{
-        betterbench_workload, parse_concurrency, render_table, steady_workload, sweep_backend,
-        BackendSel, BenchShape, Driver, Point, WorkloadSel, STEADY_DEFAULT_MAX_TOKENS,
+        betterbench_workload, failed_overlap_cells, parse_concurrency, render_json, render_table,
+        steady_workload, sweep_backend, BackendSel, BenchShape, Driver, Point, WorkloadSel,
+        STEADY_DEFAULT_MAX_TOKENS,
     };
 
     let points = parse_concurrency(spec)?;
@@ -7188,7 +7183,20 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         }
     }
 
-    println!("{}", render_table(&out, shape));
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&render_json(&out, shape))?);
+    } else {
+        println!("{}", render_table(&out, shape));
+    }
+    // A K>1 cell whose every sample was serialized is not a concurrency
+    // result: the run fails.
+    let failed = failed_overlap_cells(&out);
+    if !failed.is_empty() {
+        bail!(
+            "overlap check failed (streams did not decode simultaneously, FAIL (serialized)): {}",
+            failed.join(", ")
+        );
+    }
     Ok(())
 }
 
