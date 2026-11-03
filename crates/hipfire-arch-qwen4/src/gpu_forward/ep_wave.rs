@@ -80,16 +80,15 @@ pub(crate) fn ep_wave_tile_enabled() -> bool {
     *EP_WAVE_TILE_KNOB
 }
 
-/// Sub-switch of the trunk-shard PARTIAL-route wave (default OFF until its card identity
-/// receipt; the master switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills every route): exact
-/// `1` lets a burst of 49..=511-row lanes on a trunk-shard load run as ONE wave on the shard's
-/// partial chunk route. Unset, such a burst is refused (`ep wave refused:`) and runs as serial
-/// partial-chunk tiles.
+/// Sub-switch of the trunk-shard PARTIAL-route wave (default ON after its card identity receipt,
+/// j7464; the master switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills every route): a burst of
+/// 49..=511-row lanes on a trunk-shard load runs as ONE wave on the shard's partial chunk route.
+/// Exact `0` refuses it (`ep wave refused:`): the burst runs as serial partial-chunk tiles.
 pub const QWEN4_EP_WAVE_SHARD_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD";
 
-/// [`QWEN4_EP_WAVE_SHARD_ENV`] parsed: exact `1` is on, anything else is off.
+/// [`QWEN4_EP_WAVE_SHARD_ENV`] parsed: on unless exact `0`.
 pub(crate) fn ep_wave_shard_enabled_from(value: Option<&str>) -> bool {
-    value.map(str::trim) == Some("1")
+    value.map(str::trim) != Some("0")
 }
 
 static EP_WAVE_SHARD_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
@@ -282,7 +281,7 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
         Ok(EpWaveRoute::Partial) => {
             if !facts.shard_wave_enabled {
                 return refuse(format!(
-                    "the trunk-shard partial-route wave is not enabled ({QWEN4_EP_WAVE_SHARD_ENV}=1; off until its card identity receipt)"
+                    "the trunk-shard partial-route wave is switched off ({QWEN4_EP_WAVE_SHARD_ENV}=0)"
                 ));
             }
             // The singleton partial chunk runs the symmetric chain (floor / A8 scope) or the F32
@@ -866,10 +865,10 @@ mod tests {
     /// one chain for all lanes, with that chain's capacity, behind its own sub-switch.
     #[test]
     fn the_shard_wave_is_the_partial_route_and_follows_the_lanes_own_chain() {
-        for off in [None, Some(""), Some("0"), Some("true"), Some("2")] {
-            assert!(!ep_wave_shard_enabled_from(off), "{off:?}");
+        for on in [None, Some(""), Some("1"), Some("true"), Some("2")] {
+            assert!(ep_wave_shard_enabled_from(on), "{on:?}");
         }
-        assert!(ep_wave_shard_enabled_from(Some("1")));
+        assert!(!ep_wave_shard_enabled_from(Some("0")));
         assert_eq!(
             QWEN4_EP_WAVE_SHARD_ENV,
             "HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD"
@@ -900,7 +899,7 @@ mod tests {
             "{}",
             refused(&f)
         );
-        // Off by default; the master switch / planner rules still hold.
+        // On by default (kill switch =0); the master switch / planner rules still hold.
         f.lane_sym = vec![false; 8];
         f.capacity_rows = 4096;
         f.shard_wave_enabled = false;
