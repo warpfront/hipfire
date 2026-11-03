@@ -80,6 +80,32 @@ pub(crate) fn ep_wave_tile_enabled() -> bool {
     *EP_WAVE_TILE_KNOB
 }
 
+/// Sub-switch of the trunk-shard PARTIAL-route wave (default OFF until its card identity
+/// receipt; the master switch `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=0` kills every route): exact
+/// `1` lets a burst of 49..=511-row lanes on a trunk-shard load run as ONE wave on the shard's
+/// partial chunk route. Unset, such a burst is refused (`ep wave refused:`) and runs as serial
+/// partial-chunk tiles.
+pub const QWEN4_EP_WAVE_SHARD_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD";
+
+/// [`QWEN4_EP_WAVE_SHARD_ENV`] parsed: exact `1` is on, anything else is off.
+pub(crate) fn ep_wave_shard_enabled_from(value: Option<&str>) -> bool {
+    value.map(str::trim) == Some("1")
+}
+
+static EP_WAVE_SHARD_KNOB: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    ep_wave_shard_enabled_from(
+        hipfire_config::developer_var(QWEN4_EP_WAVE_SHARD_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+/// Whether the trunk-shard partial-route wave is switched on in this process (every rank
+/// thread agrees).
+pub(crate) fn ep_wave_shard_enabled() -> bool {
+    *EP_WAVE_SHARD_KNOB
+}
+
 /// Lab knob (default unset: [`EXACT_WAVE_MIN_LANE_ROWS`], byte-identical): lowers the fewest
 /// rows of a lane the exact wave takes, to 9 at the lowest (a lane of at most 8 rows runs the
 /// few-row routes and is never a wave lane). A measurement switch for the g32 family: a wave
@@ -129,6 +155,10 @@ pub(crate) enum EpWaveRoute {
     /// The owner-routed TILE route (each rank its owned experts, BF16 grouped rows exchanged per
     /// layer) on the A8 chain: sub-512 tiles under the lowered floor (default 9).
     Tile,
+    /// The trunk shard's PARTIAL chunk route (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`): the compact table
+    /// (non-owned experts the zero dummy, static `e % ranks` owners), no exchange, no gather; the
+    /// rank's FFN is its partial, reduced by the all-reduce of each lane's FFN HC write.
+    Partial,
 }
 
 /// Host facts of one wave, identical on every rank. All of them are decided from replicated
@@ -144,8 +174,8 @@ pub(crate) struct EpWaveFacts {
     pub lane_a8: Vec<bool>,
     /// The EP full tables are built (`attach_ep` ran).
     pub moe_full_ready: bool,
-    /// Trunk-shard partial FFN route: its chunks bind the compact table with the all-reduce of
-    /// the FFN HC write, a route neither wave reproduces.
+    /// Trunk-shard partial FFN route active: every chunk of 9+ rows binds the rank's compact
+    /// table and the all-reduce of its HC writes completes the FFN ([`EpWaveRoute::Partial`]).
     pub ffn_partial: bool,
     /// A non-EP decode-share bank swap or borrowed runtime view is configured.
     pub decode_share: bool,
@@ -169,6 +199,12 @@ pub(crate) struct EpWaveFacts {
     /// The tile-route wave is switched on ([`ep_wave_tile_enabled`]); the full-table wave needs
     /// no sub-switch (the master switch decides).
     pub tile_wave_enabled: bool,
+    /// The trunk-shard partial-route wave is switched on ([`ep_wave_shard_enabled`]).
+    pub shard_wave_enabled: bool,
+    /// Per lane: the lane's own partial chunk runs the SYMMETRIC grouped chain
+    /// (`Gpu::qwen4_moe_sym_iu4_applies` under the lane's tile scopes), else the F32 grouped
+    /// chain. Only read on the Partial route.
+    pub lane_sym: Vec<bool>,
 }
 
 impl EpWaveFacts {
@@ -200,12 +236,6 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
     }
     if !facts.moe_full_ready {
         return refuse("the EP full tables are not built (attach_ep has not run)".to_string());
-    }
-    if facts.ffn_partial {
-        return refuse(
-            "the trunk-shard partial FFN route binds the compact table with its own reduction, not either route a wave reproduces"
-                .to_string(),
-        );
     }
     if facts.decode_share {
         return refuse("a decode-share bank swap is configured on this EP load".to_string());
@@ -249,6 +279,44 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
             }
             None
         }
+        Ok(EpWaveRoute::Partial) => {
+            if !facts.shard_wave_enabled {
+                return refuse(format!(
+                    "the trunk-shard partial-route wave is not enabled ({QWEN4_EP_WAVE_SHARD_ENV}=1; off until its card identity receipt)"
+                ));
+            }
+            // The singleton partial chunk runs the symmetric chain (floor / A8 scope) or the F32
+            // grouped chain by the lane's rows against the floor in scope: one chain for all
+            // lanes, else the wide call has no lane's route to reproduce.
+            let sym = facts.lane_sym.iter().filter(|sym| **sym).count();
+            if sym != 0 && sym != facts.lane_sym.len() {
+                let first_sym = facts.lane_sym.iter().position(|s| *s).unwrap_or(0);
+                let first_f32 = facts.lane_sym.iter().position(|s| !*s).unwrap_or(0);
+                return refuse(format!(
+                    "the lanes' own partial chunks run different chains: lane {first_sym} ({} rows) the symmetric chain, lane {first_f32} ({} rows) the F32 grouped chain",
+                    facts.lane_rows[first_sym], facts.lane_rows[first_f32]
+                ));
+            }
+            if sym != 0 {
+                if let Some(lane) = facts.lane_a8.iter().position(|a8| !*a8) {
+                    return refuse(format!(
+                        "lane {lane} ({} rows) runs the symmetric chain on its partial chunk without the A8 chain; only the A8 chain is proven per-slot independent",
+                        facts.lane_rows[lane]
+                    ));
+                }
+            }
+            let capacity = if sym != 0 {
+                facts.tile_capacity_rows
+            } else {
+                facts.capacity_rows
+            };
+            if total > capacity {
+                return refuse(format!(
+                    "{total} rows exceed the {capacity} rows the partial route's chain scratch / resident bank holds"
+                ));
+            }
+            None
+        }
     }
 }
 
@@ -257,6 +325,13 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
 /// route -> [`EpWaveRoute::Tile`]; lanes of both kinds (a floor between their rows) have no
 /// single route to reproduce.
 pub(crate) fn ep_wave_route(facts: &EpWaveFacts) -> Result<EpWaveRoute, String> {
+    // Under the trunk shard every chunk of 9+ rows is the PARTIAL chunk route
+    // (`ep_trunk_partial_chunk`): it takes precedence over the tile route, whose exchange the
+    // shard refuses (it would complete the routed FFN on both ranks), so the lanes' own tile
+    // flags are not their route.
+    if facts.ffn_partial {
+        return Ok(EpWaveRoute::Partial);
+    }
     let tiles = facts.lane_tile.iter().filter(|tile| **tile).count();
     if tiles == 0 {
         Ok(EpWaveRoute::FullTable)
@@ -275,8 +350,9 @@ pub(crate) fn ep_wave_route(facts: &EpWaveFacts) -> Result<EpWaveRoute, String> 
 /// The runtime a wave's MoE invocation of `layer` binds: exactly the singleton chunk's
 /// selection for a sub-512-row tile of the wave's route (`select_layer_moe` with `full_chunk`):
 /// [`EpWaveRoute::FullTable`] the layer's EP full runtime of the bank in use (never the balanced
-/// live or the decode table), [`EpWaveRoute::Tile`] the compact (owned-experts) runtime the
-/// owner-routed tile exchange reads.
+/// live or the decode table), [`EpWaveRoute::Tile`] and [`EpWaveRoute::Partial`] the compact
+/// (owned-experts, non-owned = zero dummy) runtime the owner-routed tile exchange / the trunk
+/// shard's partial chunk reads.
 pub(crate) fn ep_wave_layer_moe<'a>(
     route: EpWaveRoute,
     ep: Option<&'a Qwen4ForwardEp>,
@@ -291,7 +367,7 @@ pub(crate) fn ep_wave_layer_moe<'a>(
         None,
         ep.map(|ep| ep.moe_full.get(layer)),
         true,
-        route == EpWaveRoute::Tile,
+        route != EpWaveRoute::FullTable,
         tile_moe.get(layer).and_then(Option::as_ref),
     )
 }
@@ -359,25 +435,28 @@ impl Qwen4GpuForward {
     ) -> EpWaveFacts {
         let total: usize = lane_rows.iter().sum();
         let prior_prefill = std::mem::replace(&mut self.prefill_scope, true);
-        // (tile route, any scope entered) of `rows` rows under the routing scopes a prefill tile
-        // of those rows enters.
-        let probe = |this: &Self, gpu: &mut Gpu, rows: usize| -> (bool, bool, bool) {
+        // (tile route, any scope entered, A8 chain, symmetric chain) of `rows` rows under the
+        // routing scopes a prefill tile of those rows enters.
+        let probe = |this: &Self, gpu: &mut Gpu, rows: usize| -> (bool, bool, bool, bool) {
             let (pm_invariant, append) = Self::route_scopes(this.prefill_scope, gpu, rows);
             let (saved, _) = this.enter_tile_scopes(gpu, rows);
             let route_rows = gpu.route_rows(rows);
             let tile =
                 ep_reserve_forward::ep_tile_active(this.ep.as_ref(), gpu, config, rows, route_rows);
             let a8 = gpu.qwen4_moe_ep_a8_requested();
+            let sym = gpu.qwen4_moe_sym_iu4_applies(rows);
             Self::leave_tile_scopes(gpu, saved);
-            (tile, pm_invariant || append, a8)
+            (tile, pm_invariant || append, a8, sym)
         };
         let mut scoped_route = probe(self, gpu, total).1;
         let mut lane_tile = Vec::with_capacity(lane_rows.len());
         let mut lane_a8 = Vec::with_capacity(lane_rows.len());
+        let mut lane_sym = Vec::with_capacity(lane_rows.len());
         for &rows in lane_rows {
-            let (tile, scoped, a8) = probe(self, gpu, rows);
+            let (tile, scoped, a8, sym) = probe(self, gpu, rows);
             lane_tile.push(tile);
             lane_a8.push(a8);
+            lane_sym.push(sym);
             scoped_route |= scoped;
         }
         self.prefill_scope = prior_prefill;
@@ -414,6 +493,8 @@ impl Qwen4GpuForward {
                     .err()
             }),
             tile_wave_enabled: ep_wave_tile_enabled(),
+            shard_wave_enabled: ep_wave_shard_enabled(),
+            lane_sym,
         }
     }
 
@@ -482,7 +563,7 @@ impl Qwen4GpuForward {
         );
         let bank_route = match route {
             EpWaveRoute::FullTable => EpBankRoute::FullTable,
-            EpWaveRoute::Tile => EpBankRoute::TileExchange,
+            EpWaveRoute::Tile | EpWaveRoute::Partial => EpBankRoute::TileExchange,
         };
         let result = (|| {
             if self.ep_reserve.is_some() {
@@ -538,6 +619,8 @@ mod tests {
             tile_capacity_rows: 4096,
             reserve_refusal: None,
             tile_wave_enabled: true,
+            shard_wave_enabled: true,
+            lane_sym: vec![false; lane_rows.len()],
         }
     }
 
@@ -624,6 +707,20 @@ mod tests {
         cases.push(f);
         let mut f = facts(&[200, 200]);
         f.ffn_partial = true;
+        f.shard_wave_enabled = false;
+        cases.push(f);
+        let mut f = facts(&[200, 200]);
+        f.ffn_partial = true;
+        f.lane_sym = vec![true, false];
+        cases.push(f);
+        let mut f = facts(&[200, 200]);
+        f.ffn_partial = true;
+        f.lane_sym = vec![true, true];
+        f.lane_a8 = vec![true, false];
+        cases.push(f);
+        let mut f = facts(&[200, 200]);
+        f.ffn_partial = true;
+        f.capacity_rows = 399;
         cases.push(f);
         let mut f = facts(&[200, 200]);
         f.decode_share = true;
@@ -763,6 +860,56 @@ mod tests {
         assert_eq!(ep_wave_refusal(&full), None);
     }
 
+    /// Under the trunk shard every 9+-row chunk is the partial route whatever the tile flags say
+    /// (a reserve-sharing shard load installs the tile transport only as a rendezvous carrier):
+    /// the wave is the Partial wave, its chain is the lanes' own (symmetric A8 or F32 grouped),
+    /// one chain for all lanes, with that chain's capacity, behind its own sub-switch.
+    #[test]
+    fn the_shard_wave_is_the_partial_route_and_follows_the_lanes_own_chain() {
+        for off in [None, Some(""), Some("0"), Some("true"), Some("2")] {
+            assert!(!ep_wave_shard_enabled_from(off), "{off:?}");
+        }
+        assert!(ep_wave_shard_enabled_from(Some("1")));
+        assert_eq!(
+            QWEN4_EP_WAVE_SHARD_ENV,
+            "HIPFIRE_EP_LANE_PREFILL_WAVE_SHARD"
+        );
+        let mut f = facts(&[149; 8]);
+        f.ffn_partial = true;
+        // The carrier tile hook may flag the lanes as tile lanes: the route is still Partial.
+        f.lane_tile = vec![true; 8];
+        assert_eq!(ep_wave_route(&f), Ok(EpWaveRoute::Partial));
+        // F32 grouped chain (D1 load: floor 512): the compact-mode capacity binds.
+        assert_eq!(ep_wave_refusal(&f), None);
+        f.capacity_rows = 512;
+        assert!(
+            refused(&f).contains("partial route's chain scratch"),
+            "{}",
+            refused(&f)
+        );
+        // Symmetric A8 chain on the partial chunk (reserve-sharing shard load, floor 9): the
+        // tile chain's capacity applies, A8 is required of every lane, a mix is refused.
+        f.lane_sym = vec![true; 8];
+        assert_eq!(ep_wave_refusal(&f), None);
+        f.lane_a8[3] = false;
+        assert!(refused(&f).contains("lane 3"), "{}", refused(&f));
+        f.lane_a8 = vec![true; 8];
+        f.lane_sym[5] = false;
+        assert!(
+            refused(&f).contains("different chains") && refused(&f).contains("lane 0"),
+            "{}",
+            refused(&f)
+        );
+        // Off by default; the master switch / planner rules still hold.
+        f.lane_sym = vec![false; 8];
+        f.capacity_rows = 4096;
+        f.shard_wave_enabled = false;
+        assert!(refused(&f).contains(QWEN4_EP_WAVE_SHARD_ENV));
+        f.shard_wave_enabled = true;
+        f.lane_rows[2] = 512;
+        assert!(refused(&f).contains("lane 2"), "{}", refused(&f));
+    }
+
     #[test]
     fn the_tile_wave_has_its_own_capacity_and_ignores_the_full_table_ones() {
         let mut f = facts(&[300, 300]);
@@ -783,11 +930,17 @@ mod tests {
         assert_eq!(ep_wave_tile_rows(4096, None), 4096);
         assert_eq!(ep_wave_tile_rows(4096, Some(512)), 512);
         assert_eq!(ep_wave_tile_rows(256, Some(512)), 256);
-        // Trunk shard and the other route-independent refusals hold on the Tile route too.
+        // Trunk shard is the Partial route, not a refusal: it needs its own sub-switch.
         let mut g = facts(&[300, 300]);
-        g.lane_tile = vec![true; 2];
         g.ffn_partial = true;
-        assert!(refused(&g).contains("trunk-shard"), "{}", refused(&g));
+        assert_eq!(ep_wave_route(&g), Ok(EpWaveRoute::Partial));
+        assert_eq!(ep_wave_refusal(&g), None);
+        g.shard_wave_enabled = false;
+        assert!(
+            refused(&g).contains(QWEN4_EP_WAVE_SHARD_ENV),
+            "{}",
+            refused(&g)
+        );
     }
 
     /// The Tile wave runs under the scopes of its lanes' own tiles: `enter_tile_scopes` is entered
@@ -873,8 +1026,8 @@ mod tests {
         // Full-table: the full runtime (`compact_chunk` false), the full-table bank route, the
         // singleton prelude exactly on that route, the floor pin.
         assert!(
-            body.contains("route == EpWaveRoute::Tile,\n"),
-            "compact runtime only on Tile"
+            body.contains("route != EpWaveRoute::FullTable,\n"),
+            "compact runtime on every route but the full-table one"
         );
         assert!(body.contains("EpWaveRoute::FullTable => EpBankRoute::FullTable"));
         assert_eq!(body.matches("ep_wave_prelude(gpu)?").count(), 2);
@@ -890,10 +1043,23 @@ mod tests {
             ),
             "the full-table wave pins the symmetric-IU4 floor to 512"
         );
-        // Tile: the tile bank route and the exchange of the installed transport.
-        assert!(body.contains("EpWaveRoute::Tile => EpBankRoute::TileExchange"));
+        // Tile / Partial: the tile bank route (the partial chunk's wide route is the same class,
+        // `ep_wide_bank_route(false, true)`), and for Tile alone the exchange of the installed
+        // transport.
+        assert!(
+            body.contains("EpWaveRoute::Tile | EpWaveRoute::Partial => EpBankRoute::TileExchange")
+        );
         assert!(body.contains("exchange: route.hook.as_deref()?"));
         assert!(body.contains("tile_ids_owned: &route.tile_ids_owned"));
+        // The lane program binds the exchange on the Tile route only: the Partial wave has no
+        // cross-rank traffic in its MoE call (its ARs are the per-lane HC writes).
+        let lanes = include_str!("../gpu_forward_lanes.rs");
+        let arm = &lanes[lanes
+            .find("let route = wave_route.unwrap_or(EpWaveRoute::FullTable);")
+            .unwrap()..];
+        let arm = &arm[..arm.find("wave_moe_calls += 1;").unwrap()];
+        assert_eq!(arm.matches("moe.tile_exchange =").count(), 1, "{arm}");
+        assert!(arm.contains("if route == EpWaveRoute::Tile {"), "{arm}");
         // Both routes run under the routing-row cap, set and restored once.
         assert_eq!(body.matches("gpu.qwen4_route_rows_cap").count(), 2);
         assert_eq!(body.matches("self.wave_route.replace(route)").count(), 1);
