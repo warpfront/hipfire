@@ -790,7 +790,8 @@ fn reject_mq4g128v2(dtype: DType) -> HipResult<()> {
 
 /// Dispatch GEMV for a weight tensor (quantized or F32).
 /// y = W * x where W is the weight tensor, x is F32 input, y is F32 output.
-
+/// `hipfire_dispatch::pipeline::boundary_project` copies the non-rotated and
+/// qt44 arms (and `weight_gemv_rows_exact`); keep the two in step.
 pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor) -> HipResult<()> {
     reject_mq4g128v2(w.gpu_dtype)?;
     // Calibration tap: PRE-rotation input x (n=1, k=w.k). No-op when unarmed.
@@ -1744,6 +1745,7 @@ pub fn weight_gemv_swiglu_residual(
 
 /// Batched weight GEMM: y[b] = W * x[b] for all batch elements.
 /// x: [batch_size × K], y: [batch_size × M]. Falls back to repeated GEMV for unsupported formats.
+/// The qt44 (`MQ4G256V2`) arm is copied in `hipfire_dispatch::pipeline::boundary_project`.
 pub fn weight_gemm(
     gpu: &mut Gpu,
     w: &WeightTensor,

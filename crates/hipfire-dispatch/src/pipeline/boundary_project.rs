@@ -262,9 +262,14 @@ pub fn execute_boundary_project(
 }
 
 // ───────────────────────── decode / batched GEMV and GEMM ─────────────────────────
+//
+// Copies of the arms of `hipfire_runtime::llama::{weight_gemv, weight_gemv_rows_exact,
+// weight_gemm}` Raon reaches (dispatch cannot call hipfire-runtime): a change to those
+// launch sequences must land here too, or Raon's projections drift from the shared ones.
 
 /// The decode GEMV `y[m] = W x[k]` of one row (no rounding). Safe inside graph
 /// capture: device-resident operands, the Gpu-owned rotation scratch.
+/// Mirrors `hipfire_runtime::llama::weight_gemv` (non-rotated and qt44 arms).
 fn weight_gemv(
     gpu: &mut Gpu,
     w: &WeightRef<'_>,
