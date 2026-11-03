@@ -46,24 +46,32 @@ fn main() {
         &mut gpu,
     )
     .expect("load_model");
-    eprintln!("  arch_id={}  depth_decoder={}", model.arch_id, model.lfm3_depth_weights().is_some());
+    eprintln!(
+        "  arch_id={}  depth_decoder={}",
+        model.arch_id,
+        model.lfm3_depth_weights().is_some()
+    );
 
     // Tokenize the prompt. The omni model was trained on ChatML + BOS
     // (<|startoftext|> = 124894); a bare prompt produces repetition collapse.
-    let chatml = format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>");
-    let mut tokens = model
-        .tokenizer
-        .as_ref()
-        .expect("tokenizer")
-        .encode(&chatml);
+    let chatml =
+        format!("<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n<think></think>");
+    let mut tokens = model.tokenizer.as_ref().expect("tokenizer").encode(&chatml);
     tokens.insert(0, 124_894); // BOS <|startoftext|>
     eprintln!("  prompt (ChatML+BOS): {chatml:?}");
-    eprintln!("  tokens ({}): {:?}…", tokens.len(), &tokens[..tokens.len().min(12)]);
+    eprintln!(
+        "  tokens ({}): {:?}…",
+        tokens.len(),
+        &tokens[..tokens.len().min(12)]
+    );
 
     // Phase 1: run the text backbone (sequential prefill = decode_step per
     // token). After the last token, state.final_norm_buf holds the LM's
     // last_hidden_state — the depth decoder's input.
-    eprintln!("depth_smoke: prefilling text backbone ({} tokens)...", tokens.len());
+    eprintln!(
+        "depth_smoke: prefilling text backbone ({} tokens)...",
+        tokens.len()
+    );
     let hidden: Vec<f32> = {
         let bundle = match model.state.as_mut() {
             Some(s) => (s.as_mut() as &mut dyn std::any::Any)
@@ -74,8 +82,15 @@ fn main() {
         let mut last_logits: Option<Vec<f32>> = None;
         for (i, &tok_id) in tokens.iter().enumerate() {
             last_logits = Some(
-                decode_step(&bundle.config, &bundle.weights, &mut bundle.state, &mut gpu, tok_id, i as u32)
-                    .unwrap_or_else(|e| panic!("decode_step @ {i}: {e}")),
+                decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    &mut gpu,
+                    tok_id,
+                    i as u32,
+                )
+                .unwrap_or_else(|e| panic!("decode_step @ {i}: {e}")),
             );
         }
         // Greedy text decode (coherence check — rules out a Q8 text-backbone
@@ -94,8 +109,15 @@ fn main() {
             gen.push(next);
             pos += 1;
             last_logits = Some(
-                decode_step(&bundle.config, &bundle.weights, &mut bundle.state, &mut gpu, next, pos)
-                    .unwrap_or_else(|e| panic!("greedy decode_step: {e}")),
+                decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    &mut gpu,
+                    next,
+                    pos,
+                )
+                .unwrap_or_else(|e| panic!("greedy decode_step: {e}")),
             );
         }
         let gen_text = model.tokenizer.as_ref().unwrap().decode(&gen);
@@ -156,7 +178,10 @@ fn main() {
         &embed[..4.min(embed.len())]
     );
 
-    let pass = all_in_range && !all_same && !all_eos && n_distinct >= 2
+    let pass = all_in_range
+        && !all_same
+        && !all_eos
+        && n_distinct >= 2
         && hidden.iter().all(|v| v.is_finite())
         && embed.iter().all(|v| v.is_finite());
     println!("RESULT: {}", if pass { "PASS" } else { "FAIL" });

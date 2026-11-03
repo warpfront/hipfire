@@ -55,21 +55,21 @@ pub struct CodecConfig {
     pub quantizer_dim: usize, // 256
     pub encoder_dim: usize,   // 512
     // STFT
-    pub stft_n_fft: usize,    // 1280
-    pub stft_hop: usize,      // 320
-    pub stft_win: usize,      // 1280
+    pub stft_n_fft: usize,       // 1280
+    pub stft_hop: usize,         // 320
+    pub stft_win: usize,         // 1280
     pub stft_frame_stack: usize, // 6
     // LFM3 decoder
-    pub hidden_size: usize,       // 512
-    pub num_hidden_layers: usize, // 8
+    pub hidden_size: usize,         // 512
+    pub num_hidden_layers: usize,   // 8
     pub num_attention_heads: usize, // 8
     pub num_key_value_heads: usize, // 2
-    pub head_dim: usize,          // 64
-    pub conv_kernel_size: usize,  // 7
-    pub intermediate_size: usize, // 2304
-    pub sliding_window: usize,    // 30
-    pub rope_theta: f32,          // 1e6
-    pub norm_eps: f32,            // 1e-5
+    pub head_dim: usize,            // 64
+    pub conv_kernel_size: usize,    // 7
+    pub intermediate_size: usize,   // 2304
+    pub sliding_window: usize,      // 30
+    pub rope_theta: f32,            // 1e6
+    pub norm_eps: f32,              // 1e-5
     /// Per-layer kind: layers 2,4,6 = sliding_attention; 0,1,3,5,7 = conv.
     pub layer_is_attn: Vec<bool>,
 }
@@ -99,30 +99,77 @@ impl CodecConfig {
         let fsq_levels = c
             .get("fsq_levels")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_u64().map(|x| x as u32)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64().map(|x| x as u32))
+                    .collect()
+            })
             .unwrap_or_else(|| vec![8, 7, 6, 6]);
-        let n_layers = c.get("model").and_then(|m| m.get("decoder_lfm_config")).and_then(|v| v.get("num_hidden_layers")).and_then(|v| v.as_u64()).unwrap_or(8) as usize;
+        let n_layers = c
+            .get("model")
+            .and_then(|m| m.get("decoder_lfm_config"))
+            .and_then(|v| v.get("num_hidden_layers"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8) as usize;
         // The released codec config nests the LFM3 dims under `model` (dropped by
         // LiquidCodecConfig.__post_init__). Fall back to the omni defaults.
         let dec = c.get("model").unwrap_or(c);
-        let hidden = dec.get("encoder_dim").and_then(|v| v.as_u64()).unwrap_or(512) as usize;
-        let n_heads = dec.get("decoder_lfm_config").and_then(|v| v.get("num_attention_heads")).and_then(|v| v.as_u64()).unwrap_or(8) as usize;
-        let n_kv = dec.get("decoder_lfm_config").and_then(|v| v.get("num_key_value_heads")).and_then(|v| v.as_u64()).unwrap_or(2) as usize;
-        let head_dim = dec.get("decoder_lfm_config").and_then(|v| v.get("head_dim")).and_then(|v| v.as_u64()).unwrap_or(64) as usize;
-        let inter = dec.get("decoder_lfm_config").and_then(|v| v.get("intermediate_size")).and_then(|v| v.as_u64()).unwrap_or(2304) as usize;
-        let conv_k = dec.get("decoder_lfm_config").and_then(|v| v.get("conv_L_cache")).and_then(|v| v.as_u64()).unwrap_or(7) as usize;
-        let sliding = c.get("decoder_window").and_then(|v| v.as_u64()).unwrap_or(30) as usize;
+        let hidden = dec
+            .get("encoder_dim")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(512) as usize;
+        let n_heads = dec
+            .get("decoder_lfm_config")
+            .and_then(|v| v.get("num_attention_heads"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(8) as usize;
+        let n_kv = dec
+            .get("decoder_lfm_config")
+            .and_then(|v| v.get("num_key_value_heads"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as usize;
+        let head_dim = dec
+            .get("decoder_lfm_config")
+            .and_then(|v| v.get("head_dim"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(64) as usize;
+        let inter = dec
+            .get("decoder_lfm_config")
+            .and_then(|v| v.get("intermediate_size"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2304) as usize;
+        let conv_k = dec
+            .get("decoder_lfm_config")
+            .and_then(|v| v.get("conv_L_cache"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(7) as usize;
+        let sliding = c
+            .get("decoder_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(30) as usize;
         // layer_types: attention at indices 2,4,6; conv elsewhere (lfm_config).
         let layer_is_attn = (0..n_layers).map(|i| i == 2 || i == 4 || i == 6).collect();
         Self {
             fsq_levels,
             n_q: c.get("n_q").and_then(|v| v.as_u64()).unwrap_or(12) as usize,
-            quantizer_dim: c.get("quantizer_dim").and_then(|v| v.as_u64()).unwrap_or(256) as usize,
+            quantizer_dim: c
+                .get("quantizer_dim")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(256) as usize,
             encoder_dim: hidden,
             stft_n_fft: c.get("stft_n_fft").and_then(|v| v.as_u64()).unwrap_or(1280) as usize,
-            stft_hop: c.get("stft_hop_length").and_then(|v| v.as_u64()).unwrap_or(320) as usize,
-            stft_win: c.get("stft_win_length").and_then(|v| v.as_u64()).unwrap_or(1280) as usize,
-            stft_frame_stack: c.get("stft_frame_stack").and_then(|v| v.as_u64()).unwrap_or(6) as usize,
+            stft_hop: c
+                .get("stft_hop_length")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(320) as usize,
+            stft_win: c
+                .get("stft_win_length")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1280) as usize,
+            stft_frame_stack: c
+                .get("stft_frame_stack")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(6) as usize,
             hidden_size: hidden,
             num_hidden_layers: n_layers,
             num_attention_heads: n_heads,
@@ -141,19 +188,19 @@ impl CodecConfig {
 // ─── Weights ─────────────────────────────────────────────────────────────────
 
 pub struct CodecConvWeights {
-    pub in_proj: GpuTensor,    // [3*hidden, hidden] F16
+    pub in_proj: GpuTensor,     // [3*hidden, hidden] F16
     pub conv_weight: GpuTensor, // [hidden, K] F32 (depthwise causal conv filter)
-    pub out_proj: GpuTensor,   // [hidden, hidden] F16
+    pub out_proj: GpuTensor,    // [hidden, hidden] F16
     pub conv_state_idx: usize,
 }
 
 pub struct CodecAttnWeights {
-    pub wq: GpuTensor, // [q_dim, hidden] F16
-    pub wk: GpuTensor, // [kv_dim, hidden] F16
-    pub wv: GpuTensor, // [kv_dim, hidden] F16
-    pub wo: GpuTensor, // [q_dim, q_dim] F16
-    pub q_norm: GpuTensor, // [head_dim] F32
-    pub k_norm: GpuTensor, // [head_dim] F32
+    pub wq: GpuTensor,        // [q_dim, hidden] F16
+    pub wk: GpuTensor,        // [kv_dim, hidden] F16
+    pub wv: GpuTensor,        // [kv_dim, hidden] F16
+    pub wo: GpuTensor,        // [q_dim, q_dim] F16
+    pub q_norm: GpuTensor,    // [head_dim] F32
+    pub k_norm: GpuTensor,    // [head_dim] F32
     pub gate_proj: GpuTensor, // [n_heads, hidden] F16
     pub kv_idx: usize,
 }
@@ -164,8 +211,8 @@ pub enum CodecMixer {
 }
 
 pub struct CodecLayer {
-    pub operator_norm: GpuTensor, // [hidden] F32
-    pub ffn_norm: GpuTensor,      // [hidden] F32
+    pub operator_norm: GpuTensor,      // [hidden] F32
+    pub ffn_norm: GpuTensor,           // [hidden] F32
     pub post_operator_norm: GpuTensor, // [hidden] F32 (sandwich)
     pub post_ffn_norm: GpuTensor,      // [hidden] F32 (sandwich)
     pub mixer: CodecMixer,
@@ -184,8 +231,8 @@ pub struct CodecWeights {
     pub layers: Vec<CodecLayer>,
     pub embedding_norm: GpuTensor, // [hidden] F32
     // lin + istft
-    pub lin_w: GpuTensor, // [2*(n_fft//2+1), hidden] F16
-    pub lin_b: GpuTensor, // [2*(n_fft//2+1)] F32
+    pub lin_w: GpuTensor,       // [2*(n_fft//2+1), hidden] F16
+    pub lin_b: GpuTensor,       // [2*(n_fft//2+1)] F32
     pub istft_window: Vec<f32>, // [win] F32 (host — the synthesis Hann window)
 }
 
@@ -201,7 +248,11 @@ fn src_bytes<'a>(
     Ok((&info.dtype, data, info.shape.clone()))
 }
 
-fn load_f16_source(source: &dyn ModelSource, gpu: &mut Gpu, name: &str) -> Result<GpuTensor, String> {
+fn load_f16_source(
+    source: &dyn ModelSource,
+    gpu: &mut Gpu,
+    name: &str,
+) -> Result<GpuTensor, String> {
     let (dtype, data, shape) = src_bytes(source, name)?;
     let n: usize = shape.iter().product();
     // DTYPE-1: delegate to the shared converter — it passes genuine F16
@@ -209,10 +260,15 @@ fn load_f16_source(source: &dyn ModelSource, gpu: &mut Gpu, name: &str) -> Resul
     // arm decoded every F16 tensor as if it were BF16 (garbled weights on any
     // F16-stored codec artifact).
     let f16_bytes = hipfire_runtime::safetensors_source::source_bytes_to_f16_stream(dtype, data);
-    gpu.upload_raw(&f16_bytes, &[n]).map_err(|e| format!("codec: upload {name}: {e:?}"))
+    gpu.upload_raw(&f16_bytes, &[n])
+        .map_err(|e| format!("codec: upload {name}: {e:?}"))
 }
 
-fn load_f32_source_host(source: &dyn ModelSource, name: &str, n: usize) -> Result<Vec<f32>, String> {
+fn load_f32_source_host(
+    source: &dyn ModelSource,
+    name: &str,
+    n: usize,
+) -> Result<Vec<f32>, String> {
     let (dtype, data, _) = src_bytes(source, name)?;
     // DTYPE-1: shared converter (F16 decoded as F16, BF16 as BF16 — the old
     // arm treated both as BF16).
@@ -245,9 +301,11 @@ pub fn load_codec_weights(
 
     eprintln!("  loading Liquid Codec weights (F16)...");
     let project_out_w = load_f16_source(source, gpu, "quantizer.project_out.weight")?;
-    let project_out_b = load_f32_source_gpu(source, gpu, "quantizer.project_out.bias", cfg.quantizer_dim)?;
+    let project_out_b =
+        load_f32_source_gpu(source, gpu, "quantizer.project_out.bias", cfg.quantizer_dim)?;
     let from_quantizer_w = load_f16_source(source, gpu, "from_quantizer.weight")?;
-    let from_quantizer_b = load_f32_source_gpu(source, gpu, "from_quantizer.bias", cfg.encoder_dim)?;
+    let from_quantizer_b =
+        load_f32_source_gpu(source, gpu, "from_quantizer.bias", cfg.encoder_dim)?;
 
     let embedding_norm = load_f32_source_gpu(source, gpu, "decoder.lfm.embedding_norm.weight", h)?;
 
@@ -256,7 +314,8 @@ pub fn load_codec_weights(
     let mut kv_count = 0usize;
     for l in 0..cfg.num_hidden_layers {
         let p = format!("decoder.lfm.layers.{l}");
-        let operator_norm = load_f32_source_gpu(source, gpu, &format!("{p}.operator_norm.weight"), h)?;
+        let operator_norm =
+            load_f32_source_gpu(source, gpu, &format!("{p}.operator_norm.weight"), h)?;
         let ffn_norm = load_f32_source_gpu(source, gpu, &format!("{p}.ffn_norm.weight"), h)?;
         let post_operator_norm =
             load_f32_source_gpu(source, gpu, &format!("{p}.post_operator_norm.weight"), h)?;
@@ -274,9 +333,23 @@ pub fn load_codec_weights(
                 wk: load_f16_source(source, gpu, &format!("{p}.self_attn.k_proj.weight"))?,
                 wv: load_f16_source(source, gpu, &format!("{p}.self_attn.v_proj.weight"))?,
                 wo: load_f16_source(source, gpu, &format!("{p}.self_attn.o_proj.weight"))?,
-                q_norm: load_f32_source_gpu(source, gpu, &format!("{p}.self_attn.q_norm.weight"), cfg.head_dim)?,
-                k_norm: load_f32_source_gpu(source, gpu, &format!("{p}.self_attn.k_norm.weight"), cfg.head_dim)?,
-                gate_proj: load_f16_source(source, gpu, &format!("{p}.self_attn.gate_proj.weight"))?,
+                q_norm: load_f32_source_gpu(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.q_norm.weight"),
+                    cfg.head_dim,
+                )?,
+                k_norm: load_f32_source_gpu(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.k_norm.weight"),
+                    cfg.head_dim,
+                )?,
+                gate_proj: load_f16_source(
+                    source,
+                    gpu,
+                    &format!("{p}.self_attn.gate_proj.weight"),
+                )?,
                 kv_idx,
             })
         } else {
@@ -339,7 +412,12 @@ impl CodecWeights {
         for t in [self.project_out_w, self.from_quantizer_w, self.lin_w] {
             let _ = gpu.free_tensor(t);
         }
-        for t in [self.project_out_b, self.from_quantizer_b, self.embedding_norm, self.lin_b] {
+        for t in [
+            self.project_out_b,
+            self.from_quantizer_b,
+            self.embedding_norm,
+            self.lin_b,
+        ] {
             let _ = gpu.free_tensor(t);
         }
         for l in self.layers {
@@ -405,7 +483,8 @@ impl CodecState {
         let head_dim = cfg.head_dim;
         let k_conv = cfg.conv_kernel_size;
 
-        gpu.ensure_mq_signs().map_err(|e| format!("codec: ensure_mq_signs: {e:?}"))?;
+        gpu.ensure_mq_signs()
+            .map_err(|e| format!("codec: ensure_mq_signs: {e:?}"))?;
 
         let n_attn = cfg.num_attn_layers().max(1);
         let dims = hipfire_runtime::llama::KvDims {
@@ -416,7 +495,8 @@ impl CodecState {
             physical_cap: None,
         };
         let kv = KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY).mode,
+            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY)
+                .mode,
             gpu,
             &dims,
         )
@@ -426,14 +506,22 @@ impl CodecState {
         let zeros = vec![0u8; conv_hist * 4];
         let mut conv_states = Vec::with_capacity(cfg.num_conv_layers());
         for _ in 0..cfg.num_conv_layers() {
-            let cs = gpu.alloc_tensor(&[conv_hist], DType::F32).map_err(|e| format!("codec: alloc conv_state: {e:?}"))?;
-            gpu.hip.memcpy_htod(&cs.buf, &zeros).map_err(|e| format!("codec: zero conv_state: {e:?}"))?;
+            let cs = gpu
+                .alloc_tensor(&[conv_hist], DType::F32)
+                .map_err(|e| format!("codec: alloc conv_state: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&cs.buf, &zeros)
+                .map_err(|e| format!("codec: zero conv_state: {e:?}"))?;
             conv_states.push(cs);
         }
 
-        let pos_buf = gpu.hip.malloc(4).map_err(|e| format!("codec: pos_buf: {e:?}"))?;
+        let pos_buf = gpu
+            .hip
+            .malloc(4)
+            .map_err(|e| format!("codec: pos_buf: {e:?}"))?;
         let alloc = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
-            g.alloc_tensor(&[n], DType::F32).map_err(|e| format!("codec: alloc {label}: {e:?}"))
+            g.alloc_tensor(&[n], DType::F32)
+                .map_err(|e| format!("codec: alloc {label}: {e:?}"))
         };
         const SUB: usize = 2;
         Ok(CodecState {
@@ -468,7 +556,9 @@ impl CodecState {
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         for cs in &self.conv_states {
             let zeros = vec![0u8; cs.numel() * 4];
-            gpu.hip.memcpy_htod(&cs.buf, &zeros).map_err(|e| format!("codec: reset conv_state: {e:?}"))?;
+            gpu.hip
+                .memcpy_htod(&cs.buf, &zeros)
+                .map_err(|e| format!("codec: reset conv_state: {e:?}"))?;
         }
         Ok(())
     }
@@ -479,9 +569,23 @@ impl CodecState {
             let _ = gpu.free_tensor(t);
         }
         for t in [
-            self.h, self.tmp, self.fa_q, self.fa_k, self.fa_v, self.fa_attn_out, self.fa_gate,
-            self.flash_partials, self.conv_bcx, self.conv_y, self.ffn_tmp, self.dense_gate,
-            self.dense_up, self.dense_act, self.proj_out, self.sandwich_buf, self.final_norm_buf,
+            self.h,
+            self.tmp,
+            self.fa_q,
+            self.fa_k,
+            self.fa_v,
+            self.fa_attn_out,
+            self.fa_gate,
+            self.flash_partials,
+            self.conv_bcx,
+            self.conv_y,
+            self.ffn_tmp,
+            self.dense_gate,
+            self.dense_up,
+            self.dense_act,
+            self.proj_out,
+            self.sandwich_buf,
+            self.final_norm_buf,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -495,37 +599,77 @@ impl CodecState {
 /// gemv: y[out_dim] = W_f16[out_dim, in_dim] @ x_f32[in_dim] (n=1, no transpose
 /// needed — gemm_f16 writes [out_dim, 1] == [out_dim] for N=1). Writes into the
 /// pre-allocated `out` buffer (no per-call alloc).
-fn gemv_f16(gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, out: &GpuTensor, out_dim: usize, in_dim: usize) -> Result<(), String> {
-    gpu.gemm_f16(w, x, out, out_dim, in_dim, 1).map_err(|e| format!("gemv_f16: {e:?}"))
+fn gemv_f16(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    out: &GpuTensor,
+    out_dim: usize,
+    in_dim: usize,
+) -> Result<(), String> {
+    gpu.gemm_f16(w, x, out, out_dim, in_dim, 1)
+        .map_err(|e| format!("gemv_f16: {e:?}"))
 }
 
 /// Batched linear with bias: y[n, out_dim] = W[out_dim,in_dim] @ x[n,in_dim]^T + b.
 fn linear_f16_bias_batched(
-    gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, bias: &GpuTensor, out_dim: usize, in_dim: usize, n: usize,
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    bias: &GpuTensor,
+    out_dim: usize,
+    in_dim: usize,
+    n: usize,
 ) -> Result<GpuTensor, String> {
-    let yt = gpu.alloc_tensor(&[out_dim * n], DType::F32).map_err(|e| format!("alloc yt: {e:?}"))?;
-    gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n).map_err(|e| format!("gemm_f16: {e:?}"))?;
-    let y = gpu.alloc_tensor(&[n * out_dim], DType::F32).map_err(|e| format!("alloc y: {e:?}"))?;
-    gpu.transpose_f32(&yt, &y, out_dim, n).map_err(|e| format!("transpose: {e:?}"))?;
+    let yt = gpu
+        .alloc_tensor(&[out_dim * n], DType::F32)
+        .map_err(|e| format!("alloc yt: {e:?}"))?;
+    gpu.gemm_f16(w, x, &yt, out_dim, in_dim, n)
+        .map_err(|e| format!("gemm_f16: {e:?}"))?;
+    let y = gpu
+        .alloc_tensor(&[n * out_dim], DType::F32)
+        .map_err(|e| format!("alloc y: {e:?}"))?;
+    gpu.transpose_f32(&yt, &y, out_dim, n)
+        .map_err(|e| format!("transpose: {e:?}"))?;
     gpu.free_tensor(yt).map_err(|e| format!("free yt: {e:?}"))?;
-    gpu.bias_add_f32(&y, bias, n, out_dim).map_err(|e| format!("bias_add: {e:?}"))?;
+    gpu.bias_add_f32(&y, bias, n, out_dim)
+        .map_err(|e| format!("bias_add: {e:?}"))?;
     Ok(y)
 }
 
 // ─── Decoder forward (sequential prefill) ────────────────────────────────────
 
 fn codec_conv_mixer(
-    gpu: &mut Gpu, cfg: &CodecConfig, c: &CodecConvWeights, st: &CodecState, l: usize,
+    gpu: &mut Gpu,
+    cfg: &CodecConfig,
+    c: &CodecConvWeights,
+    st: &CodecState,
+    l: usize,
 ) -> Result<(), String> {
     let h = cfg.hidden_size;
-    gemv_f16(gpu, &c.in_proj, &st.tmp, &st.conv_bcx, 3 * h, h).map_err(|e| format!("codec L{l}: conv in_proj: {e}"))?;
-    gpu.conv1d_gated_decode_f32(&st.conv_bcx, &st.conv_states[c.conv_state_idx], &c.conv_weight, &st.conv_y, 1, h, cfg.conv_kernel_size)
-        .map_err(|e| format!("codec L{l}: conv gated decode: {e:?}"))?;
-    gemv_f16(gpu, &c.out_proj, &st.conv_y, &st.proj_out, h, h).map_err(|e| format!("codec L{l}: conv out_proj: {e}"))
+    gemv_f16(gpu, &c.in_proj, &st.tmp, &st.conv_bcx, 3 * h, h)
+        .map_err(|e| format!("codec L{l}: conv in_proj: {e}"))?;
+    gpu.conv1d_gated_decode_f32(
+        &st.conv_bcx,
+        &st.conv_states[c.conv_state_idx],
+        &c.conv_weight,
+        &st.conv_y,
+        1,
+        h,
+        cfg.conv_kernel_size,
+    )
+    .map_err(|e| format!("codec L{l}: conv gated decode: {e:?}"))?;
+    gemv_f16(gpu, &c.out_proj, &st.conv_y, &st.proj_out, h, h)
+        .map_err(|e| format!("codec L{l}: conv out_proj: {e}"))
 }
 
 fn codec_attn_mixer(
-    gpu: &mut Gpu, cfg: &CodecConfig, a: &CodecAttnWeights, st: &CodecState, l: usize, seq_len: usize,
+    gpu: &mut Gpu,
+    cfg: &CodecConfig,
+    a: &CodecAttnWeights,
+    st: &CodecState,
+    l: usize,
+    seq_len: usize,
 ) -> Result<(), String> {
     let n_heads = cfg.num_attention_heads;
     let n_kv = cfg.num_key_value_heads;
@@ -533,16 +677,30 @@ fn codec_attn_mixer(
     let eps = cfg.norm_eps;
     let q_dim = cfg.q_dim();
 
-    gemv_f16(gpu, &a.wq, &st.tmp, &st.fa_q, q_dim, cfg.hidden_size).map_err(|e| format!("codec L{l}: q_proj: {e}"))?;
-    gemv_f16(gpu, &a.wk, &st.tmp, &st.fa_k, cfg.kv_dim(), cfg.hidden_size).map_err(|e| format!("codec L{l}: k_proj: {e}"))?;
-    gemv_f16(gpu, &a.wv, &st.tmp, &st.fa_v, cfg.kv_dim(), cfg.hidden_size).map_err(|e| format!("codec L{l}: v_proj: {e}"))?;
+    gemv_f16(gpu, &a.wq, &st.tmp, &st.fa_q, q_dim, cfg.hidden_size)
+        .map_err(|e| format!("codec L{l}: q_proj: {e}"))?;
+    gemv_f16(gpu, &a.wk, &st.tmp, &st.fa_k, cfg.kv_dim(), cfg.hidden_size)
+        .map_err(|e| format!("codec L{l}: k_proj: {e}"))?;
+    gemv_f16(gpu, &a.wv, &st.tmp, &st.fa_v, cfg.kv_dim(), cfg.hidden_size)
+        .map_err(|e| format!("codec L{l}: v_proj: {e}"))?;
 
-    gpu.rmsnorm_batched(&st.fa_q, &a.q_norm, &st.fa_q, n_heads, head_dim, eps).map_err(|e| format!("codec L{l}: q_norm: {e:?}"))?;
-    gpu.rmsnorm_batched(&st.fa_k, &a.k_norm, &st.fa_k, n_kv, head_dim, eps).map_err(|e| format!("codec L{l}: k_norm: {e:?}"))?;
+    gpu.rmsnorm_batched(&st.fa_q, &a.q_norm, &st.fa_q, n_heads, head_dim, eps)
+        .map_err(|e| format!("codec L{l}: q_norm: {e:?}"))?;
+    gpu.rmsnorm_batched(&st.fa_k, &a.k_norm, &st.fa_k, n_kv, head_dim, eps)
+        .map_err(|e| format!("codec L{l}: k_norm: {e:?}"))?;
 
     // Full-rotary RoPE (n_rot = head_dim, θ = 1e6).
-    gpu.rope_partial_interleaved_f32(&st.fa_q, &st.fa_k, &st.pos_buf, n_heads, n_kv, head_dim, head_dim, cfg.rope_theta)
-        .map_err(|e| format!("codec L{l}: rope: {e:?}"))?;
+    gpu.rope_partial_interleaved_f32(
+        &st.fa_q,
+        &st.fa_k,
+        &st.pos_buf,
+        n_heads,
+        n_kv,
+        head_dim,
+        head_dim,
+        cfg.rope_theta,
+    )
+    .map_err(|e| format!("codec L{l}: rope: {e:?}"))?;
 
     let kv_idx = a.kv_idx;
     gpu.kv_cache_write_q8_0(&st.kv.k_gpu[kv_idx], &st.fa_k, &st.pos_buf, n_kv, head_dim)
@@ -586,16 +744,25 @@ fn codec_attn_mixer(
         output_awq_scale: None,
         output: &st.fa_attn_out,
     };
-    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }]).map_err(|e| format!("codec L{l}: attention: {e:?}"))?;
+    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+        .map_err(|e| format!("codec L{l}: attention: {e:?}"))?;
 
     // Sigmoid output gate: gate_proj(tmp) → [n_heads]; attn_out *= sigmoid(gate).
-    gemv_f16(gpu, &a.gate_proj, &st.tmp, &st.fa_gate, n_heads, cfg.hidden_size)
-        .map_err(|e| format!("codec L{l}: gate_proj: {e}"))?;
+    gemv_f16(
+        gpu,
+        &a.gate_proj,
+        &st.tmp,
+        &st.fa_gate,
+        n_heads,
+        cfg.hidden_size,
+    )
+    .map_err(|e| format!("codec L{l}: gate_proj: {e}"))?;
     gpu.sigmoid_head_gate_mul_f32(&st.fa_attn_out, &st.fa_gate, head_dim)
         .map_err(|e| format!("codec L{l}: sigmoid gate: {e:?}"))?;
 
     // o_proj → proj_out.
-    gemv_f16(gpu, &a.wo, &st.fa_attn_out, &st.proj_out, q_dim, q_dim).map_err(|e| format!("codec L{l}: o_proj: {e}"))
+    gemv_f16(gpu, &a.wo, &st.fa_attn_out, &st.proj_out, q_dim, q_dim)
+        .map_err(|e| format!("codec L{l}: o_proj: {e}"))
 }
 
 /// Run the 8-layer decoder over `inputs` (`[n_tokens, hidden]` host F32),
@@ -614,11 +781,11 @@ fn codec_decoder_forward(
     let h = cfg.hidden_size;
     let eps = cfg.norm_eps;
     let base = st.n_tokens; // absolute position offset (carries across chunks)
-    // STREAM-1 (defense in depth): the KV cache is sized for `physical_cap`
-    // tokens (= max_frames * stft_frame_stack from `CodecStreamingCache::new`);
-    // a caller that feeds more frames than the cache was sized for used to
-    // write out of range silently (the same class the daemon's step budget
-    // closes). Refuse instead of corrupting GPU memory.
+                            // STREAM-1 (defense in depth): the KV cache is sized for `physical_cap`
+                            // tokens (= max_frames * stft_frame_stack from `CodecStreamingCache::new`);
+                            // a caller that feeds more frames than the cache was sized for used to
+                            // write out of range silently (the same class the daemon's step budget
+                            // closes). Refuse instead of corrupting GPU memory.
     let cap = st.kv.physical_cap;
     if base + n_tokens > cap {
         return Err(format!(
@@ -630,14 +797,19 @@ fn codec_decoder_forward(
     for i in 0..n_tokens as u32 {
         let pos = base as u32 + i; // absolute position (RoPE + KV write)
         let seq_len = pos as usize + 1;
-        gpu.hip.memcpy_htod(&st.pos_buf, &(pos as i32).to_ne_bytes()).map_err(|e| format!("codec: htod pos: {e:?}"))?;
+        gpu.hip
+            .memcpy_htod(&st.pos_buf, &(pos as i32).to_ne_bytes())
+            .map_err(|e| format!("codec: htod pos: {e:?}"))?;
 
         let embed = &inputs[i as usize * h..(i as usize + 1) * h];
         let bytes: Vec<u8> = embed.iter().flat_map(|&f| f.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&st.h.buf, &bytes).map_err(|e| format!("codec: htod embed: {e:?}"))?;
+        gpu.hip
+            .memcpy_htod(&st.h.buf, &bytes)
+            .map_err(|e| format!("codec: htod embed: {e:?}"))?;
 
         for layer in &weights.layers {
-            gpu.rmsnorm_f32(&st.h, &layer.operator_norm, &st.tmp, eps).map_err(|e| format!("codec: operator rmsnorm: {e:?}"))?;
+            gpu.rmsnorm_f32(&st.h, &layer.operator_norm, &st.tmp, eps)
+                .map_err(|e| format!("codec: operator rmsnorm: {e:?}"))?;
 
             match &layer.mixer {
                 CodecMixer::Conv(c) => codec_conv_mixer(gpu, cfg, c, st, 0)?,
@@ -645,24 +817,62 @@ fn codec_decoder_forward(
             }
 
             // Sandwich norm (post_operator) + residual.
-            gpu.rmsnorm_f32(&st.proj_out, &layer.post_operator_norm, &st.sandwich_buf, eps).map_err(|e| format!("codec: post_op norm: {e:?}"))?;
-            gpu.add_f32(&st.sandwich_buf, &st.h, &st.h).map_err(|e| format!("codec: op residual: {e:?}"))?;
+            gpu.rmsnorm_f32(
+                &st.proj_out,
+                &layer.post_operator_norm,
+                &st.sandwich_buf,
+                eps,
+            )
+            .map_err(|e| format!("codec: post_op norm: {e:?}"))?;
+            gpu.add_f32(&st.sandwich_buf, &st.h, &st.h)
+                .map_err(|e| format!("codec: op residual: {e:?}"))?;
 
             // FFN: ffn_norm → SwiGLU.
-            gpu.rmsnorm_f32(&st.h, &layer.ffn_norm, &st.ffn_tmp, eps).map_err(|e| format!("codec: ffn rmsnorm: {e:?}"))?;
-            gemv_f16(gpu, &layer.w1, &st.ffn_tmp, &st.dense_gate, cfg.intermediate_size, h).map_err(|e| format!("codec: w1: {e}"))?;
-            gemv_f16(gpu, &layer.w3, &st.ffn_tmp, &st.dense_up, cfg.intermediate_size, h).map_err(|e| format!("codec: w3: {e}"))?;
-            gpu.silu_mul_f32(&st.dense_gate, &st.dense_up, &st.dense_act).map_err(|e| format!("codec: silu_mul: {e:?}"))?;
-            gemv_f16(gpu, &layer.w2, &st.dense_act, &st.proj_out, h, cfg.intermediate_size).map_err(|e| format!("codec: w2: {e}"))?;
+            gpu.rmsnorm_f32(&st.h, &layer.ffn_norm, &st.ffn_tmp, eps)
+                .map_err(|e| format!("codec: ffn rmsnorm: {e:?}"))?;
+            gemv_f16(
+                gpu,
+                &layer.w1,
+                &st.ffn_tmp,
+                &st.dense_gate,
+                cfg.intermediate_size,
+                h,
+            )
+            .map_err(|e| format!("codec: w1: {e}"))?;
+            gemv_f16(
+                gpu,
+                &layer.w3,
+                &st.ffn_tmp,
+                &st.dense_up,
+                cfg.intermediate_size,
+                h,
+            )
+            .map_err(|e| format!("codec: w3: {e}"))?;
+            gpu.silu_mul_f32(&st.dense_gate, &st.dense_up, &st.dense_act)
+                .map_err(|e| format!("codec: silu_mul: {e:?}"))?;
+            gemv_f16(
+                gpu,
+                &layer.w2,
+                &st.dense_act,
+                &st.proj_out,
+                h,
+                cfg.intermediate_size,
+            )
+            .map_err(|e| format!("codec: w2: {e}"))?;
 
             // Sandwich norm (post_ffn) + residual.
-            gpu.rmsnorm_f32(&st.proj_out, &layer.post_ffn_norm, &st.sandwich_buf, eps).map_err(|e| format!("codec: post_ffn norm: {e:?}"))?;
-            gpu.add_f32(&st.sandwich_buf, &st.h, &st.h).map_err(|e| format!("codec: ffn residual: {e:?}"))?;
+            gpu.rmsnorm_f32(&st.proj_out, &layer.post_ffn_norm, &st.sandwich_buf, eps)
+                .map_err(|e| format!("codec: post_ffn norm: {e:?}"))?;
+            gpu.add_f32(&st.sandwich_buf, &st.h, &st.h)
+                .map_err(|e| format!("codec: ffn residual: {e:?}"))?;
         }
 
         // Final embedding_norm → last_hidden_state for this token.
-        gpu.rmsnorm_f32(&st.h, &weights.embedding_norm, &st.final_norm_buf, eps).map_err(|e| format!("codec: final norm: {e:?}"))?;
-        let hidden = gpu.download_f32(&st.final_norm_buf).map_err(|e| format!("codec: download hidden: {e:?}"))?;
+        gpu.rmsnorm_f32(&st.h, &weights.embedding_norm, &st.final_norm_buf, eps)
+            .map_err(|e| format!("codec: final norm: {e:?}"))?;
+        let hidden = gpu
+            .download_f32(&st.final_norm_buf)
+            .map_err(|e| format!("codec: download hidden: {e:?}"))?;
         out[i as usize * h..(i as usize + 1) * h].copy_from_slice(&hidden);
     }
     st.n_tokens = base + n_tokens; // advance the absolute position
@@ -739,7 +949,11 @@ fn irfft_with(tw: &IrfftTwiddles, re: &[f32], im: &[f32]) -> Vec<f32> {
     let inv_n = 1.0 / n as f32;
     let mut out = vec![0.0f32; n];
     for k in 0..=half {
-        let scale = if k == 0 || k == half { inv_n } else { 2.0 * inv_n };
+        let scale = if k == 0 || k == half {
+            inv_n
+        } else {
+            2.0 * inv_n
+        };
         let c = tw.cos_t[k * n..k * n + n].as_ptr();
         let s = tw.sin_t[k * n..k * n + n].as_ptr();
         let rk = re[k];
@@ -794,7 +1008,11 @@ fn istft_overlap_add_raw(
         let re: Vec<f32> = (0..n_bins)
             .map(|k| {
                 let lg = log_mag[t * n_bins + k];
-                let mag = if lg.is_nan() { 0.0 } else { lg.clamp(-120.0, 80.0).exp() };
+                let mag = if lg.is_nan() {
+                    0.0
+                } else {
+                    lg.clamp(-120.0, 80.0).exp()
+                };
                 let a = angle[t * n_bins + k];
                 let ca = if a.is_nan() { 1.0 } else { a.cos() };
                 mag * ca
@@ -803,7 +1021,11 @@ fn istft_overlap_add_raw(
         let im: Vec<f32> = (0..n_bins)
             .map(|k| {
                 let lg = log_mag[t * n_bins + k];
-                let mag = if lg.is_nan() { 0.0 } else { lg.clamp(-120.0, 80.0).exp() };
+                let mag = if lg.is_nan() {
+                    0.0
+                } else {
+                    lg.clamp(-120.0, 80.0).exp()
+                };
                 let a = angle[t * n_bins + k];
                 let sa = if a.is_nan() { 0.0 } else { a.sin() };
                 mag * sa
@@ -866,7 +1088,10 @@ pub fn codec_decode(
     let fs = cfg.stft_frame_stack; // 6
     let n_bins = cfg.stft_n_fft / 2 + 1; // 641
 
-    eprintln!("codec_decode: {num_frames} frames ({:.1}s @ 12.5 fps)", num_frames as f32 / 12.5);
+    eprintln!(
+        "codec_decode: {num_frames} frames ({:.1}s @ 12.5 fps)",
+        num_frames as f32 / 12.5
+    );
 
     // 1. FSQ decode (CPU): codes → [num_frames, n_q*cb_dim=48] FSQ latents.
     let cb_dim = cfg.fsq_levels.len();
@@ -874,13 +1099,36 @@ pub fn codec_decode(
     let latents = fsq_decode(cfg, codes)?;
 
     // 2. project_out Linear(48→256) + from_quantizer Linear(256→512) (batched, GPU).
-    let lat_gpu = gpu.upload_f32(&latents, &[num_frames * fsq_in]).map_err(|e| format!("codec: upload latents: {e:?}"))?;
-    let proj = linear_f16_bias_batched(gpu, &weights.project_out_w, &lat_gpu, &weights.project_out_b, cfg.quantizer_dim, fsq_in, num_frames)?;
-    gpu.free_tensor(lat_gpu).map_err(|e| format!("codec: free lat: {e:?}"))?;
-    let emb = linear_f16_bias_batched(gpu, &weights.from_quantizer_w, &proj, &weights.from_quantizer_b, h, cfg.quantizer_dim, num_frames)?;
-    gpu.free_tensor(proj).map_err(|e| format!("codec: free proj: {e:?}"))?;
-    let emb_host = gpu.download_f32(&emb).map_err(|e| format!("codec: dl emb: {e:?}"))?;
-    gpu.free_tensor(emb).map_err(|e| format!("codec: free emb: {e:?}"))?;
+    let lat_gpu = gpu
+        .upload_f32(&latents, &[num_frames * fsq_in])
+        .map_err(|e| format!("codec: upload latents: {e:?}"))?;
+    let proj = linear_f16_bias_batched(
+        gpu,
+        &weights.project_out_w,
+        &lat_gpu,
+        &weights.project_out_b,
+        cfg.quantizer_dim,
+        fsq_in,
+        num_frames,
+    )?;
+    gpu.free_tensor(lat_gpu)
+        .map_err(|e| format!("codec: free lat: {e:?}"))?;
+    let emb = linear_f16_bias_batched(
+        gpu,
+        &weights.from_quantizer_w,
+        &proj,
+        &weights.from_quantizer_b,
+        h,
+        cfg.quantizer_dim,
+        num_frames,
+    )?;
+    gpu.free_tensor(proj)
+        .map_err(|e| format!("codec: free proj: {e:?}"))?;
+    let emb_host = gpu
+        .download_f32(&emb)
+        .map_err(|e| format!("codec: dl emb: {e:?}"))?;
+    gpu.free_tensor(emb)
+        .map_err(|e| format!("codec: free emb: {e:?}"))?;
     // emb_host: [num_frames, 512]
 
     // 3. Upsample ×6 (nearest): each frame repeated 6× → [num_frames*6, 512].
@@ -904,11 +1152,25 @@ pub fn codec_decode(
     };
 
     // 5. lin Linear(512→2*n_bins) (batched) → (log_mag, angle).
-    let hidden_gpu = gpu.upload_f32(&hidden, &[n_up * h]).map_err(|e| format!("codec: upload hidden: {e:?}"))?;
-    let lin_out = linear_f16_bias_batched(gpu, &weights.lin_w, &hidden_gpu, &weights.lin_b, 2 * n_bins, h, n_up)?;
-    gpu.free_tensor(hidden_gpu).map_err(|e| format!("codec: free hidden_gpu: {e:?}"))?;
-    let lin_host = gpu.download_f32(&lin_out).map_err(|e| format!("codec: dl lin: {e:?}"))?;
-    gpu.free_tensor(lin_out).map_err(|e| format!("codec: free lin: {e:?}"))?;
+    let hidden_gpu = gpu
+        .upload_f32(&hidden, &[n_up * h])
+        .map_err(|e| format!("codec: upload hidden: {e:?}"))?;
+    let lin_out = linear_f16_bias_batched(
+        gpu,
+        &weights.lin_w,
+        &hidden_gpu,
+        &weights.lin_b,
+        2 * n_bins,
+        h,
+        n_up,
+    )?;
+    gpu.free_tensor(hidden_gpu)
+        .map_err(|e| format!("codec: free hidden_gpu: {e:?}"))?;
+    let lin_host = gpu
+        .download_f32(&lin_out)
+        .map_err(|e| format!("codec: dl lin: {e:?}"))?;
+    gpu.free_tensor(lin_out)
+        .map_err(|e| format!("codec: free lin: {e:?}"))?;
     // lin_host: [n_up, 2*n_bins] — first n_bins = log_mag, next n_bins = angle.
 
     // 6. iSTFT overlap-add → waveform.
@@ -997,13 +1259,36 @@ pub fn codec_decode_streaming(
         let cb_dim = cfg.fsq_levels.len();
         let fsq_in = n_q * cb_dim;
         let latents = fsq_decode(cfg, codes_chunk)?;
-        let lat_gpu = gpu.upload_f32(&latents, &[n_chunk * fsq_in]).map_err(|e| format!("codec-str: upload lat: {e:?}"))?;
-        let proj = linear_f16_bias_batched(gpu, &weights.project_out_w, &lat_gpu, &weights.project_out_b, cfg.quantizer_dim, fsq_in, n_chunk)?;
-        gpu.free_tensor(lat_gpu).map_err(|e| format!("codec-str: free lat: {e:?}"))?;
-        let emb = linear_f16_bias_batched(gpu, &weights.from_quantizer_w, &proj, &weights.from_quantizer_b, h, cfg.quantizer_dim, n_chunk)?;
-        gpu.free_tensor(proj).map_err(|e| format!("codec-str: free proj: {e:?}"))?;
-        let emb_host = gpu.download_f32(&emb).map_err(|e| format!("codec-str: dl emb: {e:?}"))?;
-        gpu.free_tensor(emb).map_err(|e| format!("codec-str: free emb: {e:?}"))?;
+        let lat_gpu = gpu
+            .upload_f32(&latents, &[n_chunk * fsq_in])
+            .map_err(|e| format!("codec-str: upload lat: {e:?}"))?;
+        let proj = linear_f16_bias_batched(
+            gpu,
+            &weights.project_out_w,
+            &lat_gpu,
+            &weights.project_out_b,
+            cfg.quantizer_dim,
+            fsq_in,
+            n_chunk,
+        )?;
+        gpu.free_tensor(lat_gpu)
+            .map_err(|e| format!("codec-str: free lat: {e:?}"))?;
+        let emb = linear_f16_bias_batched(
+            gpu,
+            &weights.from_quantizer_w,
+            &proj,
+            &weights.from_quantizer_b,
+            h,
+            cfg.quantizer_dim,
+            n_chunk,
+        )?;
+        gpu.free_tensor(proj)
+            .map_err(|e| format!("codec-str: free proj: {e:?}"))?;
+        let emb_host = gpu
+            .download_f32(&emb)
+            .map_err(|e| format!("codec-str: dl emb: {e:?}"))?;
+        gpu.free_tensor(emb)
+            .map_err(|e| format!("codec-str: free emb: {e:?}"))?;
         let n_up = n_chunk * fs;
         let mut upsampled = vec![0.0f32; n_up * h];
         for f in 0..n_chunk {
@@ -1015,11 +1300,25 @@ pub fn codec_decode_streaming(
         }
         // Decoder forward (persistent state) + lin.
         let hidden = codec_decoder_forward(gpu, weights, cfg, &mut cache.state, &upsampled, n_up)?;
-        let hidden_gpu = gpu.upload_f32(&hidden, &[n_up * h]).map_err(|e| format!("codec-str: upload hidden: {e:?}"))?;
-        let lin_out = linear_f16_bias_batched(gpu, &weights.lin_w, &hidden_gpu, &weights.lin_b, 2 * n_bins, h, n_up)?;
-        gpu.free_tensor(hidden_gpu).map_err(|e| format!("codec-str: free hidden: {e:?}"))?;
-        let lin_host = gpu.download_f32(&lin_out).map_err(|e| format!("codec-str: dl lin: {e:?}"))?;
-        gpu.free_tensor(lin_out).map_err(|e| format!("codec-str: free lin: {e:?}"))?;
+        let hidden_gpu = gpu
+            .upload_f32(&hidden, &[n_up * h])
+            .map_err(|e| format!("codec-str: upload hidden: {e:?}"))?;
+        let lin_out = linear_f16_bias_batched(
+            gpu,
+            &weights.lin_w,
+            &hidden_gpu,
+            &weights.lin_b,
+            2 * n_bins,
+            h,
+            n_up,
+        )?;
+        gpu.free_tensor(hidden_gpu)
+            .map_err(|e| format!("codec-str: free hidden: {e:?}"))?;
+        let lin_host = gpu
+            .download_f32(&lin_out)
+            .map_err(|e| format!("codec-str: dl lin: {e:?}"))?;
+        gpu.free_tensor(lin_out)
+            .map_err(|e| format!("codec-str: free lin: {e:?}"))?;
         let mut log_mag = vec![0.0f32; n_up * n_bins];
         let mut angle = vec![0.0f32; n_up * n_bins];
         for t in 0..n_up {
@@ -1071,7 +1370,11 @@ pub fn codec_decode_streaming(
     let hi = audio.len().saturating_sub(trail_trim);
     let mut out = Vec::with_capacity(hi.saturating_sub(lo));
     for i in lo..hi {
-        out.push(if envelope[i] > 1e-8 { audio[i] / envelope[i] } else { 0.0 });
+        out.push(if envelope[i] > 1e-8 {
+            audio[i] / envelope[i]
+        } else {
+            0.0
+        });
     }
     Ok(out)
 }

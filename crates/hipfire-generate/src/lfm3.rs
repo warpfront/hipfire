@@ -10,18 +10,20 @@
 use std::io::Write;
 use std::time::Instant;
 
+use crate::vision::{GenerateVLParams, ImageSource};
 use hipfire_arch_deepseek4::sampling;
-use hipfire_engine::emit::{emit_error_with_id, emit_gen_start, render_tail_opens_think, write_error};
+use hipfire_arch_lfm3_audio::{lfm3_audio, mel as lfm3_mel, wav as lfm3_wav};
+use hipfire_arch_lfm3_vl::lfm3_vl;
+use hipfire_arch_qwen35_vl::image;
+use hipfire_engine::emit::{
+    emit_error_with_id, emit_gen_start, render_tail_opens_think, write_error,
+};
 use hipfire_engine::terminal::{
     active_attempt_id, await_client_terminal_commit, emit_staged_terminal_done,
     ClientTerminalDecision,
 };
 use hipfire_loader::LoadedModel;
 use std::path::Path;
-use crate::vision::{GenerateVLParams, ImageSource};
-use hipfire_arch_qwen35_vl::image;
-use hipfire_arch_lfm3_vl::lfm3_vl;
-use hipfire_arch_lfm3_audio::{lfm3_audio, mel as lfm3_mel, wav as lfm3_wav};
 
 /// Emit an active-attempt error (thin alias to the dense-route helper).
 fn emit_active_attempt_error(
@@ -368,7 +370,9 @@ pub fn generate_lfm3(
         // correlated cancellation transcript so the CLI serve's
         // abort_and_drain terminates instead of waiting forever while holding
         // the serve admission slot (queue-wide stall).
-        ClientTerminalDecision::Abort => crate::ar::emit_active_route_cancel(stdout, id, generated_count),
+        ClientTerminalDecision::Abort => {
+            crate::ar::emit_active_route_cancel(stdout, id, generated_count)
+        }
     }
 }
 
@@ -683,7 +687,9 @@ pub fn generate_lfm3_vl(
             let res = if tok == image_pad_id && visual_idx < n_visual_tokens {
                 let emb = &visual_tokens[visual_idx * text_hidden..(visual_idx + 1) * text_hidden];
                 visual_idx += 1;
-                hipfire_arch_lfm3::forward::decode_step_with_embed(cfg, weights, state, gpu, emb, position)
+                hipfire_arch_lfm3::forward::decode_step_with_embed(
+                    cfg, weights, state, gpu, emb, position,
+                )
             } else {
                 hipfire_arch_lfm3::forward::decode_step(cfg, weights, state, gpu, tok, position)
             };
@@ -786,8 +792,12 @@ pub fn generate_lfm3_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => { let _ = emit_staged_terminal_done(stdout, &pending_done); }
-        ClientTerminalDecision::Abort => crate::ar::emit_active_route_cancel(stdout, id, generated_count),
+        ClientTerminalDecision::Commit => {
+            let _ = emit_staged_terminal_done(stdout, &pending_done);
+        }
+        ClientTerminalDecision::Abort => {
+            crate::ar::emit_active_route_cancel(stdout, id, generated_count)
+        }
     }
 }
 
@@ -894,7 +904,10 @@ pub fn generate_lfm3_audio(
                 out.len(),
                 sr
             );
-            lfm3_wav::Waveform { samples: out, sample_rate: sr }
+            lfm3_wav::Waveform {
+                samples: out,
+                sample_rate: sr,
+            }
         }
         Err(e) => {
             write_error(stdout, id, &format!("lfm3-audio: WAV decode failed: {e}"));
@@ -1168,7 +1181,9 @@ pub fn generate_lfm3_audio(
             let res = if tok == audio_pad_id && audio_idx < n_audio_tokens {
                 let emb = &audio_tokens[audio_idx * text_hidden..(audio_idx + 1) * text_hidden];
                 audio_idx += 1;
-                hipfire_arch_lfm3::forward::decode_step_with_embed(cfg, weights, state, gpu, emb, position)
+                hipfire_arch_lfm3::forward::decode_step_with_embed(
+                    cfg, weights, state, gpu, emb, position,
+                )
             } else {
                 hipfire_arch_lfm3::forward::decode_step(cfg, weights, state, gpu, tok, position)
             };
@@ -1267,8 +1282,12 @@ pub fn generate_lfm3_audio(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => { let _ = emit_staged_terminal_done(stdout, &pending_done); }
-        ClientTerminalDecision::Abort => crate::ar::emit_active_route_cancel(stdout, id, generated_count),
+        ClientTerminalDecision::Commit => {
+            let _ = emit_staged_terminal_done(stdout, &pending_done);
+        }
+        ClientTerminalDecision::Abort => {
+            crate::ar::emit_active_route_cancel(stdout, id, generated_count)
+        }
     }
 }
 /// LFM3-Omni TTS (audio output) path — Phase 4c. Generates audio OUTPUT: a
@@ -1443,7 +1462,9 @@ pub fn generate_lfm3_omni(
         // Prefill once.
         let mut stream_state = {
             let bundle = match m.state.as_mut() {
-                Some(s) => (s.as_mut() as &mut dyn std::any::Any).downcast_mut::<hipfire_loader::Lfm3Bundle>().expect("not lfm3"),
+                Some(s) => (s.as_mut() as &mut dyn std::any::Any)
+                    .downcast_mut::<hipfire_loader::Lfm3Bundle>()
+                    .expect("not lfm3"),
                 _ => {
                     write_error(stdout, id, "lfm3-omni: not an lfm3 model");
                     return;
@@ -1525,7 +1546,9 @@ pub fn generate_lfm3_omni(
             steps_left -= this_chunk;
             let step_out = {
                 let bundle = match m.state.as_mut() {
-                    Some(s) => (s.as_mut() as &mut dyn std::any::Any).downcast_mut::<hipfire_loader::Lfm3Bundle>().expect("not lfm3"),
+                    Some(s) => (s.as_mut() as &mut dyn std::any::Any)
+                        .downcast_mut::<hipfire_loader::Lfm3Bundle>()
+                        .expect("not lfm3"),
                     _ => {
                         // LEAK-1: free the codec GPU buffers on the error path.
                         codec_cache.free_gpu(gpu);
@@ -1662,7 +1685,9 @@ pub fn generate_lfm3_omni(
     let t0 = std::time::Instant::now();
     let out = {
         let bundle = match m.state.as_mut() {
-            Some(s) => (s.as_mut() as &mut dyn std::any::Any).downcast_mut::<hipfire_loader::Lfm3Bundle>().expect("not lfm3"),
+            Some(s) => (s.as_mut() as &mut dyn std::any::Any)
+                .downcast_mut::<hipfire_loader::Lfm3Bundle>()
+                .expect("not lfm3"),
             _ => {
                 write_error(stdout, id, "lfm3-omni: not an lfm3 model");
                 return;
@@ -1803,4 +1828,3 @@ pub fn generate_lfm3_omni(
     );
     let _ = stdout.flush();
 }
-

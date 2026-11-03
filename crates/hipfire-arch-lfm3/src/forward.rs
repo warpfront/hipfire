@@ -77,7 +77,16 @@ pub fn decode_step_capture(
     position: u32,
     capture: &mut [Vec<f32>],
 ) -> Result<(), String> {
-    decode_step_inner(cfg, weights, state, gpu, token_id, position, None, Some(capture))
+    decode_step_inner(
+        cfg,
+        weights,
+        state,
+        gpu,
+        token_id,
+        position,
+        None,
+        Some(capture),
+    )
 }
 
 fn decode_step_inner(
@@ -195,8 +204,13 @@ fn decode_step_inner(
     state.n_tokens = seq_len;
 
     // Final RMSNorm + lm_head (tied to embed_tokens).
-    gpu.rmsnorm_f32(&state.h, &weights.embedding_norm, &state.final_norm_buf, eps)
-        .map_err(|e| format!("lfm3: final rmsnorm: {e:?}"))?;
+    gpu.rmsnorm_f32(
+        &state.h,
+        &weights.embedding_norm,
+        &state.final_norm_buf,
+        eps,
+    )
+    .map_err(|e| format!("lfm3: final rmsnorm: {e:?}"))?;
     weight_gemv(gpu, &weights.lm_head, &state.final_norm_buf, &state.logits)
         .map_err(|e| format!("lfm3: lm_head: {e}"))?;
     Ok(())
@@ -305,10 +319,22 @@ fn attn_mixer(
 
     // KV cache write (Q8).
     let kv_idx = a.kv_idx;
-    gpu.kv_cache_write_q8_0(&state.kv.k_gpu[kv_idx], &state.fa_k, &state.pos_buf, n_kv, head_dim)
-        .map_err(|e| format!("lfm3 L{l}: kv write k: {e:?}"))?;
-    gpu.kv_cache_write_q8_0(&state.kv.v_gpu[kv_idx], &state.fa_v, &state.pos_buf, n_kv, head_dim)
-        .map_err(|e| format!("lfm3 L{l}: kv write v: {e:?}"))?;
+    gpu.kv_cache_write_q8_0(
+        &state.kv.k_gpu[kv_idx],
+        &state.fa_k,
+        &state.pos_buf,
+        n_kv,
+        head_dim,
+    )
+    .map_err(|e| format!("lfm3 L{l}: kv write k: {e:?}"))?;
+    gpu.kv_cache_write_q8_0(
+        &state.kv.v_gpu[kv_idx],
+        &state.fa_v,
+        &state.pos_buf,
+        n_kv,
+        head_dim,
+    )
+    .map_err(|e| format!("lfm3 L{l}: kv write v: {e:?}"))?;
 
     // Attention: sliding layers clip to the last `sliding_window` keys
     // (window>0); full layers are full causal (window=0). Routes through
@@ -475,7 +501,11 @@ mod rope_zero_tail_tests {
             let half = head_dim / 2;
             let mut out = vec![0.0f32; head_dim];
             for d in 0..head_dim {
-                let rot = if d < half { -x[base + d + half] } else { x[base + d - half] };
+                let rot = if d < half {
+                    -x[base + d + half]
+                } else {
+                    x[base + d - half]
+                };
                 out[d] = x[base + d] * cos[d] + rot * sin[d];
             }
             x[base..base + head_dim].copy_from_slice(&out);
@@ -494,7 +524,10 @@ mod rope_zero_tail_tests {
         let partial = 0.5f32;
         let theta = 1_000_000.0f32;
         let rope_angles = ((partial * head_dim as f32) as usize) / 2;
-        assert_eq!(rope_angles, 32, "LFM3 full-attn partial 0.5 on head_dim=128 → 32 pairs");
+        assert_eq!(
+            rope_angles, 32,
+            "LFM3 full-attn partial 0.5 on head_dim=128 → 32 pairs"
+        );
 
         for pos in [0u32, 1, 7, 1234] {
             let mut a = sample_input(n_heads, head_dim);

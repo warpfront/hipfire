@@ -338,12 +338,12 @@ fn run_turn(
         Ok(reply) => reply,
         Err(error) => {
             if cancel_flag.load(Ordering::Relaxed) {
-                emit(
-                    serde_json::json!({"type":"response.done","response":{"status":"cancelled"}}),
-                );
+                emit(serde_json::json!({"type":"response.done","response":{"status":"cancelled"}}));
             } else {
                 eprintln!("[realtime] text stage failed: {error:#}");
-                emit(serde_json::json!({"type":"error","error":{"message":format!("reply generation failed: {error:#}")}}));
+                emit(
+                    serde_json::json!({"type":"error","error":{"message":format!("reply generation failed: {error:#}")}}),
+                );
             }
             return;
         }

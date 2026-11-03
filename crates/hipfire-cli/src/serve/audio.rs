@@ -175,7 +175,9 @@ pub(crate) fn tts_generate(
         Ok(())
     };
     match cancel {
-        Some(flag) => runtime.engine.generate_cancellable(&generate, flag, &mut fold)?,
+        Some(flag) => runtime
+            .engine
+            .generate_cancellable(&generate, flag, &mut fold)?,
         None => runtime.engine.generate(&generate, &mut fold)?,
     };
 

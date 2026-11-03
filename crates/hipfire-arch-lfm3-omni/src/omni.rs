@@ -117,7 +117,15 @@ pub fn omni_generate(
     let last = *prompt_tokens.last().unwrap_or(&0);
     if last == AUDIO_START_TOKEN {
         let (codes, n, eos) = omni_generate_audio(
-            cfg, weights, state, depth_cfg, depth_weights, gpu, prompt_tokens, max_steps, rng,
+            cfg,
+            weights,
+            state,
+            depth_cfg,
+            depth_weights,
+            gpu,
+            prompt_tokens,
+            max_steps,
+            rng,
         )?;
         Ok(OmniOutput {
             text_tokens: vec![AUDIO_OUT_TOKEN; n],
@@ -128,7 +136,15 @@ pub fn omni_generate(
         })
     } else if last == MIXED_START_TOKEN {
         omni_generate_interleaved(
-            cfg, weights, state, depth_cfg, depth_weights, gpu, prompt_tokens, max_steps, rng,
+            cfg,
+            weights,
+            state,
+            depth_cfg,
+            depth_weights,
+            gpu,
+            prompt_tokens,
+            max_steps,
+            rng,
         )
     } else {
         Err(format!(
@@ -253,9 +269,8 @@ fn omni_generate_interleaved(
     for step in 0..max_steps {
         if speaking {
             // Audio slot: MaskGIT-sample one frame.
-            let codes =
-                sample_audio_frame(depth_cfg, depth_weights, gpu, &hidden, &history, rng)
-                    .map_err(|e| format!("omni: sample @ {step}: {e}"))?;
+            let codes = sample_audio_frame(depth_cfg, depth_weights, gpu, &hidden, &history, rng)
+                .map_err(|e| format!("omni: sample @ {step}: {e}"))?;
             let is_eos = codes.iter().any(|&c| c == eos_code);
             if is_eos {
                 hit_eos = true;
@@ -482,8 +497,15 @@ pub fn omni_stream_step(
         }
         match stream.mode {
             OmniMode::Audio => {
-                let codes = sample_audio_frame(depth_cfg, depth_weights, gpu, &stream.hidden, &stream.history, rng)
-                    .map_err(|e| format!("omni stream: sample: {e}"))?;
+                let codes = sample_audio_frame(
+                    depth_cfg,
+                    depth_weights,
+                    gpu,
+                    &stream.hidden,
+                    &stream.history,
+                    rng,
+                )
+                .map_err(|e| format!("omni stream: sample: {e}"))?;
                 let is_eos = codes.iter().any(|&c| c == eos_code);
                 if is_eos {
                     stream.hit_eos = true;
@@ -502,15 +524,25 @@ pub fn omni_stream_step(
                 text_tokens.push(AUDIO_OUT_TOKEN);
                 let next_embed = get_audio_out_embeds(depth_cfg, depth_weights, &codes);
                 stream.position += 1;
-                stream.prev_logits = Some(decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
-                    .map_err(|e| format!("omni stream: audio step: {e}"))?);
-                stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                stream.prev_logits = Some(
+                    decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
+                        .map_err(|e| format!("omni stream: audio step: {e}"))?,
+                );
+                stream.hidden = gpu
+                    .download_f32(&state.final_norm_buf)
                     .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
             }
             OmniMode::Interleaved => {
                 if stream.speaking {
-                    let codes = sample_audio_frame(depth_cfg, depth_weights, gpu, &stream.hidden, &stream.history, rng)
-                        .map_err(|e| format!("omni stream: sample: {e}"))?;
+                    let codes = sample_audio_frame(
+                        depth_cfg,
+                        depth_weights,
+                        gpu,
+                        &stream.hidden,
+                        &stream.history,
+                        rng,
+                    )
+                    .map_err(|e| format!("omni stream: sample: {e}"))?;
                     let is_eos = codes.iter().any(|&c| c == eos_code);
                     if is_eos {
                         stream.hit_eos = true;
@@ -520,9 +552,19 @@ pub fn omni_stream_step(
                         let eos_frame = vec![eos_code; codes.len()];
                         let next_embed = get_audio_out_embeds(depth_cfg, depth_weights, &eos_frame);
                         stream.position += 1;
-                        stream.prev_logits = Some(decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
-                            .map_err(|e| format!("omni stream: audio eos step: {e}"))?);
-                        stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                        stream.prev_logits = Some(
+                            decode_step_with_embed(
+                                cfg,
+                                weights,
+                                state,
+                                gpu,
+                                &next_embed,
+                                stream.position,
+                            )
+                            .map_err(|e| format!("omni stream: audio eos step: {e}"))?,
+                        );
+                        stream.hidden = gpu
+                            .download_f32(&state.final_norm_buf)
                             .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
                         stream.left_interleave = true;
                         stream.text_done = true;
@@ -535,9 +577,19 @@ pub fn omni_stream_step(
                     text_tokens.push(AUDIO_OUT_TOKEN);
                     let next_embed = get_audio_out_embeds(depth_cfg, depth_weights, &codes);
                     stream.position += 1;
-                    stream.prev_logits = Some(decode_step_with_embed(cfg, weights, state, gpu, &next_embed, stream.position)
-                        .map_err(|e| format!("omni stream: audio step: {e}"))?);
-                    stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                    stream.prev_logits = Some(
+                        decode_step_with_embed(
+                            cfg,
+                            weights,
+                            state,
+                            gpu,
+                            &next_embed,
+                            stream.position,
+                        )
+                        .map_err(|e| format!("omni stream: audio step: {e}"))?,
+                    );
+                    stream.hidden = gpu
+                        .download_f32(&state.final_norm_buf)
                         .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
                     if !stream.text_done {
                         stream.slots_left -= 1;
@@ -547,7 +599,9 @@ pub fn omni_stream_step(
                         }
                     }
                 } else {
-                    let logits = stream.prev_logits.as_ref()
+                    let logits = stream
+                        .prev_logits
+                        .as_ref()
                         .ok_or_else(|| "omni stream: no prev logits".to_string())?;
                     // Same suppression as the batch loop (see `argmax_text_token`).
                     let token = argmax_text_token(logits);
@@ -559,9 +613,12 @@ pub fn omni_stream_step(
                             stream.speaking = true;
                             stream.slots_left = INTERLEAVED_N_AUDIO;
                             stream.position += 1;
-                            stream.prev_logits = Some(decode_step(cfg, weights, state, gpu, token, stream.position)
-                                .map_err(|e| format!("omni stream: text_end step: {e}"))?);
-                            stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                            stream.prev_logits = Some(
+                                decode_step(cfg, weights, state, gpu, token, stream.position)
+                                    .map_err(|e| format!("omni stream: text_end step: {e}"))?,
+                            );
+                            stream.hidden = gpu
+                                .download_f32(&state.final_norm_buf)
                                 .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
                             continue;
                         }
@@ -575,9 +632,12 @@ pub fn omni_stream_step(
                         break;
                     }
                     stream.position += 1;
-                    stream.prev_logits = Some(decode_step(cfg, weights, state, gpu, token, stream.position)
-                        .map_err(|e| format!("omni stream: text step: {e}"))?);
-                    stream.hidden = gpu.download_f32(&state.final_norm_buf)
+                    stream.prev_logits = Some(
+                        decode_step(cfg, weights, state, gpu, token, stream.position)
+                            .map_err(|e| format!("omni stream: text step: {e}"))?,
+                    );
+                    stream.hidden = gpu
+                        .download_f32(&state.final_norm_buf)
                         .map_err(|e| format!("omni stream: dl hidden: {e:?}"))?;
                     // Block alternation only while still interleaving and
                     // before the audio tail (HF `interleaving and not

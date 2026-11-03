@@ -58,13 +58,13 @@ fn main() {
     let waveform: Vec<f32> = (0..n_samples)
         .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / sr as f32).sin() * 0.5)
         .collect();
-    eprintln!("  synthetic audio: {n_samples} samples ({:.2}s @ {sr}Hz)", n_samples as f32 / sr as f32);
+    eprintln!(
+        "  synthetic audio: {n_samples} samples ({:.2}s @ {sr}Hz)",
+        n_samples as f32 / sr as f32
+    );
 
     // ── Batch: mel (padded) + audio_forward over the full audio ──
-    let mel = hipfire_arch_lfm3_audio::mel::log_mel_from_waveform(
-        &waveform,
-        &audio_cfg.mel,
-    );
+    let mel = hipfire_arch_lfm3_audio::mel::log_mel_from_waveform(&waveform, &audio_cfg.mel);
     let num_frames = mel.len() / audio_cfg.mel.n_mels;
     eprintln!("  batch: {num_frames} mel frames...");
     let batch_tokens = hipfire_arch_lfm3_audio::lfm3_audio::audio_forward(
@@ -112,7 +112,10 @@ fn main() {
     // `(num_frames + 7) // 8`); before the fix that tail was dropped and a
     // clip shorter than one group yielded 0 tokens. Assert the flush actually
     // closed the stream.
-    assert!(cache.finished, "is_final chunk must finalize the stream cache");
+    assert!(
+        cache.finished,
+        "is_final chunk must finalize the stream cache"
+    );
     cache.free_gpu(&mut gpu);
     let stream_n = stream_tokens.len() / audio_cfg.proj.out_features;
     let stream_finite = stream_tokens.iter().all(|v| v.is_finite());
@@ -140,7 +143,10 @@ fn main() {
     // token count exactly — both go through the same full-stream mel +
     // downsampler; the batch path pads the waveform (pad_length) which can
     // add one trailing frame, so allow ±1 token but require >0 and finite.
-    let pass = batch_n > 0 && stream_n > 0 && batch_finite && stream_finite
+    let pass = batch_n > 0
+        && stream_n > 0
+        && batch_finite
+        && stream_finite
         && batch_tokens.len() == batch_n * audio_cfg.proj.out_features
         && stream_tokens.len() == stream_n * audio_cfg.proj.out_features
         && (batch_n as i64 - stream_n as i64).abs() <= 1;

@@ -42,10 +42,10 @@
 //! run on CPU, avoiding GPU sub-tensor slicing for the per-codebook norm. The
 //! trunk (the only GPU-heavy part) runs entirely on GPU.
 
+use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::f16_to_f32;
 use hipfire_runtime::safetensors_source::bf16_to_f32;
-use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -54,23 +54,23 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// speech fields). Defaults match `LiquidAI/LFM3-Omni-2B`.
 #[derive(Clone, Debug)]
 pub struct DepthConfig {
-    pub text_hidden_size: usize, // 2048 (LM hidden — depth_linear input)
-    pub hidden_size: usize,      // 1024 (depth decoder hidden)
-    pub num_codebooks: usize,    // 12
-    pub codebook_size: usize,    // 2017 (codec codes + eos)
-    pub num_hidden_layers: usize,    // 3
-    pub num_attention_heads: usize,  // 32
-    pub num_key_value_heads: usize,  // 8
-    pub head_dim: usize,         // 32
-    pub intermediate_size: usize, // 2816
-    pub rope_theta: f32,         // 1e6
-    pub norm_eps: f32,           // 1e-5
+    pub text_hidden_size: usize,      // 2048 (LM hidden — depth_linear input)
+    pub hidden_size: usize,           // 1024 (depth decoder hidden)
+    pub num_codebooks: usize,         // 12
+    pub codebook_size: usize,         // 2017 (codec codes + eos)
+    pub num_hidden_layers: usize,     // 3
+    pub num_attention_heads: usize,   // 32
+    pub num_key_value_heads: usize,   // 8
+    pub head_dim: usize,              // 32
+    pub intermediate_size: usize,     // 2816
+    pub rope_theta: f32,              // 1e6
+    pub norm_eps: f32,                // 1e-5
     pub maskgit_schedule: Vec<usize>, // [4,4,4]
-    pub audio_eos_code: u32,     // 2016
+    pub audio_eos_code: u32,          // 2016
     // Sampling (HF generation_config).
-    pub audio_temperature: f32,          // 0.4
-    pub audio_repetition_penalty: f32,   // 1.2
-    pub audio_repetition_window: usize,  // 64
+    pub audio_temperature: f32,         // 0.4
+    pub audio_repetition_penalty: f32,  // 1.2
+    pub audio_repetition_window: usize, // 64
 }
 
 impl DepthConfig {
@@ -263,11 +263,22 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
 /// Decode HFQ tensor bytes → F32 vec, handling F16(1)/F32(2)/BF16(16)/HFQ4(6,7).
 fn bytes_to_f32(qt: u8, data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
     match qt {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
-        16 => data.chunks_exact(2).map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
         6 | 7 => dequant_hfq4(data, n, group_size),
-        other => panic!("depth: unsupported quant_type={other} (expected F16=1/F32=2/BF16=16/HFQ4=6,7)"),
+        other => {
+            panic!("depth: unsupported quant_type={other} (expected F16=1/F32=2/BF16=16/HFQ4=6,7)")
+        }
     }
 }
 
@@ -275,7 +286,10 @@ fn bytes_to_f32(qt: u8, data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
 fn bytes_to_f16(qt: u8, data: &[u8]) -> Vec<u16> {
     use hipfire_runtime::llama::f32_to_f16;
     match qt {
-        1 => data.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect(),
         // DTYPE-1: BF16 bits are not F16 bits — the old pass-through copied
         // BF16 patterns into an F16 buffer (noise). Route through F32.
         16 => data
@@ -292,9 +306,9 @@ fn bytes_to_f16(qt: u8, data: &[u8]) -> Vec<u16> {
 
 /// Upload an F16 weight tensor to the GPU (from F16/BF16/F32/HFQ4 source).
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data(name).ok_or_else(|| {
-        hip_bridge::HipError::new(0, &format!("depth: tensor not found: {name}"))
-    })?;
+    let (info, data) = hfq
+        .tensor_data(name)
+        .ok_or_else(|| hip_bridge::HipError::new(0, &format!("depth: tensor not found: {name}")))?;
     let qt = info.quant_type;
     // DTYPE-1: element count comes from the tensor shape. The old
     // data.len()/2 derivation is wrong for HFQ4 (8-byte scale/zero header +
@@ -352,7 +366,11 @@ pub fn load_depth_weights(
 
     let depth_linear_w = load_f16_gpu(hfq, gpu, &format!("{pfx}.depth_linear.weight"))?;
     let depth_linear_b = {
-        let vals = load_f32_host(hfq, &format!("{pfx}.depth_linear.bias"), cfg.num_codebooks * h);
+        let vals = load_f32_host(
+            hfq,
+            &format!("{pfx}.depth_linear.bias"),
+            cfg.num_codebooks * h,
+        );
         gpu.upload_f32(&vals, &[cfg.num_codebooks * h])?
     };
     let embedding_norm = {
@@ -414,16 +432,22 @@ pub fn load_depth_weights(
             cb * h,
         );
         host_codebook_embeddings.push(emb);
-        let nm = load_f32_host(hfq, &format!("{pfx}.depth_embeddings.{i}.embedding_norm.weight"), h);
+        let nm = load_f32_host(
+            hfq,
+            &format!("{pfx}.depth_embeddings.{i}.embedding_norm.weight"),
+            h,
+        );
         host_codebook_norms.push(nm);
     }
     let host_mask_embedding = load_f32_host(hfq, &format!("{pfx}.mask_embedding"), h);
 
     // Shared codebook embedding (model.codebook_embedding) — host F16.
     let host_shared_codebook_embedding = {
-        let (info, data) = hfq.tensor_data("model.codebook_embedding.weight").ok_or_else(|| {
-            hip_bridge::HipError::new(0, "depth: model.codebook_embedding.weight not found")
-        })?;
+        let (info, data) = hfq
+            .tensor_data("model.codebook_embedding.weight")
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "depth: model.codebook_embedding.weight not found")
+            })?;
         bytes_to_f16(info.quant_type, data)
     };
 
@@ -507,11 +531,13 @@ pub fn depth_forward(
         .map_err(|e| format!("depth: depth_linear: {e:?}"))?;
     gpu.bias_add_f32(&dl, &weights.depth_linear_b, 1, ncb * h)
         .map_err(|e| format!("depth: depth_linear bias: {e:?}"))?;
-    gpu.free_tensor(hidden_gpu).map_err(|e| format!("depth: free: {e:?}"))?;
+    gpu.free_tensor(hidden_gpu)
+        .map_err(|e| format!("depth: free: {e:?}"))?;
     let dl_host = gpu
         .download_f32(&dl)
         .map_err(|e| format!("depth: download depth_linear: {e:?}"))?;
-    gpu.free_tensor(dl).map_err(|e| format!("depth: free: {e:?}"))?;
+    gpu.free_tensor(dl)
+        .map_err(|e| format!("depth: free: {e:?}"))?;
 
     // ── 2. CPU: depth_in[slot] = depth_linear[slot] + (masked ? mask : code_emb) ──
     let mut depth_in = vec![0.0f32; seq * h];
@@ -567,7 +593,16 @@ pub fn depth_forward(
 
         // full-rotary RoPE (n_rot = head_dim), positions 0..seq-1
         gpu.rope_partial_interleaved_f32_batched(
-            &q, &k, &positions, n_heads, n_kv, hd, hd, cfg.rope_theta, seq, 0,
+            &q,
+            &k,
+            &positions,
+            n_heads,
+            n_kv,
+            hd,
+            hd,
+            cfg.rope_theta,
+            seq,
+            0,
         )
         .map_err(|e| format!("depth: rope: {e:?}"))?;
 
@@ -577,27 +612,41 @@ pub fn depth_forward(
             .map_err(|e| format!("depth: alloc attn_out: {e:?}"))?;
         gpu.vit_attention_gqa_f32(&q, &k, &v, &attn_out, seq, n_heads, n_kv, hd)
             .map_err(|e| format!("depth: attention: {e:?}"))?;
-        gpu.free_tensor(q).map_err(|e| format!("depth: free: {e:?}"))?;
-        gpu.free_tensor(k).map_err(|e| format!("depth: free: {e:?}"))?;
-        gpu.free_tensor(v).map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(q)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(k)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(v)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
 
         // sigmoid output gate: gate_proj(tmp) → [seq, n_heads]; attn_out *= sigmoid(gate)
         let gate = linear_f16_no_bias(gpu, &layer.gate_proj, &tmp, n_heads, h, seq)
             .map_err(|e| format!("depth: gate_proj: {e:?}"))?;
         gpu.sigmoid_head_gate_mul_f32(&attn_out, &gate, hd)
             .map_err(|e| format!("depth: sigmoid gate: {e:?}"))?;
-        gpu.free_tensor(gate).map_err(|e| format!("depth: free: {e:?}"))?;
-        gpu.free_tensor(tmp).map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(gate)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(tmp)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
 
         // o_proj → proj_out [seq, h]
-        let proj_out = linear_f16_no_bias(gpu, &layer.o_proj, &attn_out, n_heads * hd, n_heads * hd, seq)
-            .map_err(|e| format!("depth: o_proj: {e:?}"))?;
-        gpu.free_tensor(attn_out).map_err(|e| format!("depth: free: {e:?}"))?;
+        let proj_out = linear_f16_no_bias(
+            gpu,
+            &layer.o_proj,
+            &attn_out,
+            n_heads * hd,
+            n_heads * hd,
+            seq,
+        )
+        .map_err(|e| format!("depth: o_proj: {e:?}"))?;
+        gpu.free_tensor(attn_out)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
 
         // residual (no sandwich norm)
         gpu.add_inplace_f32(&x, &proj_out)
             .map_err(|e| format!("depth: attn residual: {e:?}"))?;
-        gpu.free_tensor(proj_out).map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(proj_out)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
 
         // FFN: ffn_norm → SwiGLU
         let ffn_tmp = gpu
@@ -609,20 +658,25 @@ pub fn depth_forward(
             .map_err(|e| format!("depth: w1: {e:?}"))?;
         let u = linear_f16_no_bias(gpu, &layer.w3, &ffn_tmp, cfg.intermediate_size, h, seq)
             .map_err(|e| format!("depth: w3: {e:?}"))?;
-        gpu.free_tensor(ffn_tmp).map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(ffn_tmp)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
         let act = gpu
             .alloc_tensor(&[seq * cfg.intermediate_size], DType::F32)
             .map_err(|e| format!("depth: alloc act: {e:?}"))?;
         gpu.silu_mul_f32(&g, &u, &act)
             .map_err(|e| format!("depth: silu_mul: {e:?}"))?;
-        gpu.free_tensor(g).map_err(|e| format!("depth: free: {e:?}"))?;
-        gpu.free_tensor(u).map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(g)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(u)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
         let ffn_out = linear_f16_no_bias(gpu, &layer.w2, &act, h, cfg.intermediate_size, seq)
             .map_err(|e| format!("depth: w2: {e:?}"))?;
-        gpu.free_tensor(act).map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(act)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
         gpu.add_inplace_f32(&x, &ffn_out)
             .map_err(|e| format!("depth: ffn residual: {e:?}"))?;
-        gpu.free_tensor(ffn_out).map_err(|e| format!("depth: free: {e:?}"))?;
+        gpu.free_tensor(ffn_out)
+            .map_err(|e| format!("depth: free: {e:?}"))?;
     }
 
     // ── 5. final embedding_norm → depth_out [seq, h] ──
@@ -631,13 +685,16 @@ pub fn depth_forward(
         .map_err(|e| format!("depth: alloc depth_out: {e:?}"))?;
     gpu.rmsnorm_batched(&x, &weights.embedding_norm, &depth_out, seq, h, eps)
         .map_err(|e| format!("depth: final norm: {e:?}"))?;
-    gpu.free_tensor(x).map_err(|e| format!("depth: free: {e:?}"))?;
-    gpu.free_tensor(positions).map_err(|e| format!("depth: free: {e:?}"))?;
+    gpu.free_tensor(x)
+        .map_err(|e| format!("depth: free: {e:?}"))?;
+    gpu.free_tensor(positions)
+        .map_err(|e| format!("depth: free: {e:?}"))?;
 
     let depth_out_host = gpu
         .download_f32(&depth_out)
         .map_err(|e| format!("depth: download depth_out: {e:?}"))?;
-    gpu.free_tensor(depth_out).map_err(|e| format!("depth: free: {e:?}"))?;
+    gpu.free_tensor(depth_out)
+        .map_err(|e| format!("depth: free: {e:?}"))?;
 
     // ── 6. CPU: per-codebook logits = embedding_norm[slot](depth_out[slot]) @ emb[slot] ──
     let mut logits = vec![0.0f32; ncb * cb];
@@ -681,7 +738,11 @@ pub struct DepthRng {
 impl DepthRng {
     pub fn new(seed: u64) -> Self {
         Self {
-            state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
+            state: if seed == 0 {
+                0x9E37_79B9_7F4A_7C15
+            } else {
+                seed
+            },
         }
     }
     pub fn next_u64(&mut self) -> u64 {
@@ -833,10 +894,7 @@ pub fn sample_audio_frame(
         let logits = depth_forward(cfg, weights, gpu, hidden, &codes, &masked)?;
         for &slot in pick {
             let row = &logits[slot * cb..slot * cb + cb];
-            let hist: Vec<u32> = history[hist_start..]
-                .iter()
-                .map(|f| f[slot])
-                .collect();
+            let hist: Vec<u32> = history[hist_start..].iter().map(|f| f[slot]).collect();
             codes[slot] = sample_code(
                 row,
                 cfg.audio_temperature,
@@ -858,11 +916,7 @@ pub fn sample_audio_frame(
 ///
 /// Returns `[text_hidden_size]` F32 — the embedding spliced into the LM context
 /// at the `audio_out_token_id` position via `decode_step_with_embed`.
-pub fn get_audio_out_embeds(
-    cfg: &DepthConfig,
-    weights: &DepthWeights,
-    codes: &[u32],
-) -> Vec<f32> {
+pub fn get_audio_out_embeds(cfg: &DepthConfig, weights: &DepthWeights, codes: &[u32]) -> Vec<f32> {
     let th = cfg.text_hidden_size;
     let cb = cfg.codebook_size;
     let mut out = vec![0.0f32; th];

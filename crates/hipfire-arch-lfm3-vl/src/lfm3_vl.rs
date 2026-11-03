@@ -30,9 +30,9 @@
 //! `layernorm_batched` (projector LayerNorm), `gelu_erf_f32` (NEW erf GELU),
 //! `silu_mul_f32` (SwiGLU), `add_inplace_f32` (residuals).
 
+use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
-use hip_bridge::{HipError, HipResult};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -47,27 +47,27 @@ pub enum VisionLayerKind {
 /// Multi-modal projector config (top-level `Lfm3VlConfig` fields).
 #[derive(Clone, Debug)]
 pub struct ProjectorConfig {
-    pub hidden_size: usize,        // projector_hidden_size (4096)
-    pub hidden_act: String,        // "gelu" (erf)
-    pub layer_norm_eps: f32,       // 1e-6
-    pub downsample_factor: usize,  // == vision spatial_merge_size (2)
-    pub text_hidden_size: usize,   // text_config.hidden_size (2048) — projector output
+    pub hidden_size: usize,       // projector_hidden_size (4096)
+    pub hidden_act: String,       // "gelu" (erf)
+    pub layer_norm_eps: f32,      // 1e-6
+    pub downsample_factor: usize, // == vision spatial_merge_size (2)
+    pub text_hidden_size: usize,  // text_config.hidden_size (2048) — projector output
 }
 
 #[derive(Clone, Debug)]
 pub struct VisionConfig {
-    pub hidden_size: usize,        // 1024
-    pub intermediate_size: usize,  // 2560
-    pub num_hidden_layers: usize,  // 14
-    pub num_attention_heads: usize,// 16
-    pub num_key_value_heads: usize,// 8
-    pub head_dim: usize,           // 64
-    pub patch_size: usize,         // 16
-    pub temporal_patch_size: usize,// 2
-    pub in_channels: usize,        // 3
-    pub spatial_merge_size: usize, // 2
-    pub norm_eps: f32,             // 1e-5
-    pub rope_theta: f32,           // 1e6 (axial)
+    pub hidden_size: usize,         // 1024
+    pub intermediate_size: usize,   // 2560
+    pub num_hidden_layers: usize,   // 14
+    pub num_attention_heads: usize, // 16
+    pub num_key_value_heads: usize, // 8
+    pub head_dim: usize,            // 64
+    pub patch_size: usize,          // 16
+    pub temporal_patch_size: usize, // 2
+    pub in_channels: usize,         // 3
+    pub spatial_merge_size: usize,  // 2
+    pub norm_eps: f32,              // 1e-5
+    pub rope_theta: f32,            // 1e6 (axial)
     pub layer_types: Vec<VisionLayerKind>,
     pub projector: ProjectorConfig,
     // Special-token ids (top-level Lfm3VlConfig fields) for prompt building.
@@ -169,16 +169,31 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
         num_key_value_heads,
         head_dim,
         patch_size: vc.get("patch_size").and_then(|v| v.as_u64()).unwrap_or(16) as usize,
-        temporal_patch_size: vc.get("temporal_patch_size").and_then(|v| v.as_u64()).unwrap_or(2) as usize,
+        temporal_patch_size: vc
+            .get("temporal_patch_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as usize,
         in_channels: vc.get("in_channels").and_then(|v| v.as_u64()).unwrap_or(3) as usize,
-        spatial_merge_size: vc.get("spatial_merge_size").and_then(|v| v.as_u64()).unwrap_or(2) as usize,
+        spatial_merge_size: vc
+            .get("spatial_merge_size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(2) as usize,
         norm_eps: vc.get("norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32,
         rope_theta,
         layer_types,
         projector,
-        image_token_id: config.get("image_token_id").and_then(|v| v.as_u64()).unwrap_or(125_030) as u32,
-        vision_start_token_id: config.get("vision_start_token_id").and_then(|v| v.as_u64()).unwrap_or(125_009) as u32,
-        vision_end_token_id: config.get("vision_end_token_id").and_then(|v| v.as_u64()).unwrap_or(125_010) as u32,
+        image_token_id: config
+            .get("image_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(125_030) as u32,
+        vision_start_token_id: config
+            .get("vision_start_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(125_009) as u32,
+        vision_end_token_id: config
+            .get("vision_end_token_id")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(125_010) as u32,
     })
 }
 
@@ -188,22 +203,22 @@ pub fn vision_config_from_hfq(hfq: &HfqFile) -> Option<VisionConfig> {
 /// attention layers carry the GQA projections + QK RMSNorm. Both share the
 /// operator/ffn RMSNorm + dense SwiGLU FFN.
 pub struct VisionLayerWeights {
-    pub operator_norm: GpuTensor, // [hidden] F32 RMSNorm
-    pub ffn_norm: GpuTensor,      // [hidden] F32 RMSNorm
+    pub operator_norm: GpuTensor,   // [hidden] F32 RMSNorm
+    pub ffn_norm: GpuTensor,        // [hidden] F32 RMSNorm
     pub feed_forward_w1: GpuTensor, // [intermediate, hidden] F16
     pub feed_forward_w2: GpuTensor, // [hidden, intermediate] F16
     pub feed_forward_w3: GpuTensor, // [intermediate, hidden] F16
     // Conv-only:
-    pub conv_in_proj: Option<GpuTensor>,    // [3*hidden, hidden] F16
-    pub conv_out_proj: Option<GpuTensor>,   // [hidden, hidden] F16
-    pub conv_spatial: Option<GpuTensor>,    // [hidden*9] F32 (3x3 depthwise, flattened)
+    pub conv_in_proj: Option<GpuTensor>, // [3*hidden, hidden] F16
+    pub conv_out_proj: Option<GpuTensor>, // [hidden, hidden] F16
+    pub conv_spatial: Option<GpuTensor>, // [hidden*9] F32 (3x3 depthwise, flattened)
     // Attention-only:
-    pub q_proj: Option<GpuTensor>,          // [n_heads*head_dim, hidden] F16
-    pub k_proj: Option<GpuTensor>,          // [n_kv*head_dim, hidden] F16
-    pub v_proj: Option<GpuTensor>,          // [n_kv*head_dim, hidden] F16
-    pub out_proj: Option<GpuTensor>,        // [hidden, hidden] F16
-    pub q_layernorm: Option<GpuTensor>,     // [head_dim] F32 RMSNorm
-    pub k_layernorm: Option<GpuTensor>,     // [head_dim] F32 RMSNorm
+    pub q_proj: Option<GpuTensor>,   // [n_heads*head_dim, hidden] F16
+    pub k_proj: Option<GpuTensor>,   // [n_kv*head_dim, hidden] F16
+    pub v_proj: Option<GpuTensor>,   // [n_kv*head_dim, hidden] F16
+    pub out_proj: Option<GpuTensor>, // [hidden, hidden] F16
+    pub q_layernorm: Option<GpuTensor>, // [head_dim] F32 RMSNorm
+    pub k_layernorm: Option<GpuTensor>, // [head_dim] F32 RMSNorm
 }
 
 pub struct ProjectorWeights {
@@ -216,8 +231,8 @@ pub struct ProjectorWeights {
 }
 
 pub struct VisionWeights {
-    pub patchifier: GpuTensor,    // [hidden, patch_dim] F16 (no bias)
-    pub embedding_norm: GpuTensor,// [hidden] F32 RMSNorm
+    pub patchifier: GpuTensor,     // [hidden, patch_dim] F16 (no bias)
+    pub embedding_norm: GpuTensor, // [hidden] F32 RMSNorm
     pub layers: Vec<VisionLayerWeights>,
     pub projector: ProjectorWeights,
 }
@@ -232,9 +247,20 @@ impl VisionWeights {
             let _ = gpu.free_tensor(l.feed_forward_w1);
             let _ = gpu.free_tensor(l.feed_forward_w2);
             let _ = gpu.free_tensor(l.feed_forward_w3);
-            for t in [l.conv_in_proj, l.conv_out_proj, l.conv_spatial,
-                      l.q_proj, l.k_proj, l.v_proj, l.out_proj,
-                      l.q_layernorm, l.k_layernorm].into_iter().flatten() {
+            for t in [
+                l.conv_in_proj,
+                l.conv_out_proj,
+                l.conv_spatial,
+                l.q_proj,
+                l.k_proj,
+                l.v_proj,
+                l.out_proj,
+                l.q_layernorm,
+                l.k_layernorm,
+            ]
+            .into_iter()
+            .flatten()
+            {
                 let _ = gpu.free_tensor(t);
             }
         }
@@ -261,8 +287,14 @@ fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Result<Vec<f32>, String>
         .tensor_data(name)
         .ok_or_else(|| format!("lfm3-vl: vision tensor not found: {name}"))?;
     let mut vals: Vec<f32> = match info.quant_type {
-        1 => data.chunks_exact(2).map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]]))).collect(),
-        2 => data.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
         6 | 7 => dequant_hfq4(data, n, info.group_size as usize),
         other => {
             return Err(format!(
@@ -280,9 +312,9 @@ fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
 }
 
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
-    let (info, data) = hfq.tensor_data(name).ok_or_else(|| {
-        HipError::new(999, &format!("lfm3-vl: vision tensor not found: {name}"))
-    })?;
+    let (info, data) = hfq
+        .tensor_data(name)
+        .ok_or_else(|| HipError::new(999, &format!("lfm3-vl: vision tensor not found: {name}")))?;
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match info.quant_type {
         1 => gpu.upload_raw(data, &[n]),
@@ -296,7 +328,9 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
         }
         other => Err(HipError::new(
             999,
-            &format!("lfm3-vl: {name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"),
+            &format!(
+                "lfm3-vl: {name}: unsupported vision quant_type={other} (expected F16=1, HFQ4=6/7)"
+            ),
         )),
     }
 }
@@ -321,7 +355,11 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
             if byte_idx >= nibbles.len() {
                 break;
             }
-            let nibble = if i % 2 == 0 { nibbles[byte_idx] & 0xF } else { nibbles[byte_idx] >> 4 };
+            let nibble = if i % 2 == 0 {
+                nibbles[byte_idx] & 0xF
+            } else {
+                nibbles[byte_idx] >> 4
+            };
             out.push(scale * nibble as f32 + zero);
         }
     }
@@ -329,7 +367,11 @@ fn dequant_hfq4(data: &[u8], n: usize, group_size: usize) -> Vec<f32> {
     out
 }
 
-pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) -> HipResult<VisionWeights> {
+pub fn load_vision_weights(
+    hfq: &HfqFile,
+    config: &VisionConfig,
+    gpu: &mut Gpu,
+) -> HipResult<VisionWeights> {
     let h = config.hidden_size;
     let pfx = "model.vision_tower";
 
@@ -349,17 +391,54 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
         let feed_forward_w2 = load_f16_gpu(hfq, gpu, &format!("{lp}.feed_forward.w2.weight"))?;
         let feed_forward_w3 = load_f16_gpu(hfq, gpu, &format!("{lp}.feed_forward.w3.weight"))?;
 
-        let (conv_in_proj, conv_out_proj, conv_spatial, q_proj, k_proj, v_proj, out_proj,
-             q_layernorm, k_layernorm) = if config.is_attention(i) {
+        let (
+            conv_in_proj,
+            conv_out_proj,
+            conv_spatial,
+            q_proj,
+            k_proj,
+            v_proj,
+            out_proj,
+            q_layernorm,
+            k_layernorm,
+        ) = if config.is_attention(i) {
             // Attention layer: q/k/v/out_proj + QK RMSNorm.
             (
-                None, None, None,
-                Some(load_f16_gpu(hfq, gpu, &format!("{lp}.self_attn.q_proj.weight"))?),
-                Some(load_f16_gpu(hfq, gpu, &format!("{lp}.self_attn.k_proj.weight"))?),
-                Some(load_f16_gpu(hfq, gpu, &format!("{lp}.self_attn.v_proj.weight"))?),
-                Some(load_f16_gpu(hfq, gpu, &format!("{lp}.self_attn.out_proj.weight"))?),
-                Some(load_f32_gpu(hfq, gpu, &format!("{lp}.self_attn.q_layernorm.weight"), config.head_dim)?),
-                Some(load_f32_gpu(hfq, gpu, &format!("{lp}.self_attn.k_layernorm.weight"), config.head_dim)?),
+                None,
+                None,
+                None,
+                Some(load_f16_gpu(
+                    hfq,
+                    gpu,
+                    &format!("{lp}.self_attn.q_proj.weight"),
+                )?),
+                Some(load_f16_gpu(
+                    hfq,
+                    gpu,
+                    &format!("{lp}.self_attn.k_proj.weight"),
+                )?),
+                Some(load_f16_gpu(
+                    hfq,
+                    gpu,
+                    &format!("{lp}.self_attn.v_proj.weight"),
+                )?),
+                Some(load_f16_gpu(
+                    hfq,
+                    gpu,
+                    &format!("{lp}.self_attn.out_proj.weight"),
+                )?),
+                Some(load_f32_gpu(
+                    hfq,
+                    gpu,
+                    &format!("{lp}.self_attn.q_layernorm.weight"),
+                    config.head_dim,
+                )?),
+                Some(load_f32_gpu(
+                    hfq,
+                    gpu,
+                    &format!("{lp}.self_attn.k_layernorm.weight"),
+                    config.head_dim,
+                )?),
             )
         } else {
             // Conv layer: in_proj / out_proj / spatial_conv (3x3 depthwise).
@@ -370,10 +449,23 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
                 gpu.upload_f32(&vals, &[h * 9])?
             };
             (
-                Some(load_f16_gpu(hfq, gpu, &format!("{lp}.conv.in_proj.weight"))?),
-                Some(load_f16_gpu(hfq, gpu, &format!("{lp}.conv.out_proj.weight"))?),
+                Some(load_f16_gpu(
+                    hfq,
+                    gpu,
+                    &format!("{lp}.conv.in_proj.weight"),
+                )?),
+                Some(load_f16_gpu(
+                    hfq,
+                    gpu,
+                    &format!("{lp}.conv.out_proj.weight"),
+                )?),
                 Some(conv_spatial),
-                None, None, None, None, None, None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
             )
         };
 
@@ -402,9 +494,19 @@ pub fn load_vision_weights(hfq: &HfqFile, config: &VisionConfig, gpu: &mut Gpu) 
         layer_norm_w: load_f32_gpu(hfq, gpu, "model.multi_modal_projector.layer_norm.weight", h)?,
         layer_norm_b: load_f32_gpu(hfq, gpu, "model.multi_modal_projector.layer_norm.bias", h)?,
         linear_1_w: load_f16_gpu(hfq, gpu, "model.multi_modal_projector.linear_1.weight")?,
-        linear_1_b: load_f32_gpu(hfq, gpu, "model.multi_modal_projector.linear_1.bias", proj.hidden_size)?,
+        linear_1_b: load_f32_gpu(
+            hfq,
+            gpu,
+            "model.multi_modal_projector.linear_1.bias",
+            proj.hidden_size,
+        )?,
         linear_2_w: load_f16_gpu(hfq, gpu, "model.multi_modal_projector.linear_2.weight")?,
-        linear_2_b: load_f32_gpu(hfq, gpu, "model.multi_modal_projector.linear_2.bias", proj.text_hidden_size)?,
+        linear_2_b: load_f32_gpu(
+            hfq,
+            gpu,
+            "model.multi_modal_projector.linear_2.bias",
+            proj.text_hidden_size,
+        )?,
     };
     let _ = merge_dim; // asserted by linear_1_w shape at gemm time
 
@@ -429,7 +531,11 @@ pub fn build_axial_rope_tables(
     spatial_merge_size: usize,
     theta: f32,
 ) -> (Vec<f32>, Vec<f32>) {
-    assert_eq!(head_dim % 4, 0, "lfm3-vl: axial RoPE needs head_dim % 4 == 0 (got {head_dim})");
+    assert_eq!(
+        head_dim % 4,
+        0,
+        "lfm3-vl: axial RoPE needs head_dim % 4 == 0 (got {head_dim})"
+    );
     assert_eq!(grid_h % spatial_merge_size, 0);
     assert_eq!(grid_w % spatial_merge_size, 0);
 
@@ -564,14 +670,43 @@ pub fn vision_forward(
 
         let proj_out = if config.is_attention(li) {
             // q/k/v proj (no bias).
-            let q = linear_f16_no_bias(gpu, lw.q_proj.as_ref().unwrap(), &tmp, config.q_dim(), h, n)?;
-            let k = linear_f16_no_bias(gpu, lw.k_proj.as_ref().unwrap(), &tmp, config.kv_dim(), h, n)?;
-            let v = linear_f16_no_bias(gpu, lw.v_proj.as_ref().unwrap(), &tmp, config.kv_dim(), h, n)?;
+            let q =
+                linear_f16_no_bias(gpu, lw.q_proj.as_ref().unwrap(), &tmp, config.q_dim(), h, n)?;
+            let k = linear_f16_no_bias(
+                gpu,
+                lw.k_proj.as_ref().unwrap(),
+                &tmp,
+                config.kv_dim(),
+                h,
+                n,
+            )?;
+            let v = linear_f16_no_bias(
+                gpu,
+                lw.v_proj.as_ref().unwrap(),
+                &tmp,
+                config.kv_dim(),
+                h,
+                n,
+            )?;
             gpu.free_tensor(tmp)?;
 
             // Per-head QK RMSNorm (head_dim slices).
-            gpu.rmsnorm_batched(&q, lw.q_layernorm.as_ref().unwrap(), &q, n * n_heads, head_dim, eps)?;
-            gpu.rmsnorm_batched(&k, lw.k_layernorm.as_ref().unwrap(), &k, n * n_kv, head_dim, eps)?;
+            gpu.rmsnorm_batched(
+                &q,
+                lw.q_layernorm.as_ref().unwrap(),
+                &q,
+                n * n_heads,
+                head_dim,
+                eps,
+            )?;
+            gpu.rmsnorm_batched(
+                &k,
+                lw.k_layernorm.as_ref().unwrap(),
+                &k,
+                n * n_kv,
+                head_dim,
+                eps,
+            )?;
 
             // Axial 2D RoPE on q/k (separate GQA buffers).
             gpu.rope_2d_halfsplit_f32(&q, &k, &cos_gpu, &sin_gpu, n, n_heads, n_kv, head_dim)?;
@@ -589,17 +724,25 @@ pub fn vision_forward(
             po
         } else {
             // in_proj → bcx [n, 3h] (B|C|x).
-            let bcx = linear_f16_no_bias(gpu, lw.conv_in_proj.as_ref().unwrap(), &tmp, 3 * h, h, n)?;
+            let bcx =
+                linear_f16_no_bias(gpu, lw.conv_in_proj.as_ref().unwrap(), &tmp, 3 * h, h, n)?;
             gpu.free_tensor(tmp)?;
             // Gated depthwise 2D conv → proj_in [n, h].
             let proj_in = gpu.alloc_tensor(&[n * h], DType::F32)?;
             gpu.conv2d_gated_f32(
-                &bcx, lw.conv_spatial.as_ref().unwrap(), &proj_in,
-                n, h, grid_h, grid_w, sms,
+                &bcx,
+                lw.conv_spatial.as_ref().unwrap(),
+                &proj_in,
+                n,
+                h,
+                grid_h,
+                grid_w,
+                sms,
             )?;
             gpu.free_tensor(bcx)?;
             // out_proj (no bias).
-            let po = linear_f16_no_bias(gpu, lw.conv_out_proj.as_ref().unwrap(), &proj_in, h, h, n)?;
+            let po =
+                linear_f16_no_bias(gpu, lw.conv_out_proj.as_ref().unwrap(), &proj_in, h, h, n)?;
             gpu.free_tensor(proj_in)?;
             po
         };
@@ -611,14 +754,35 @@ pub fn vision_forward(
         // FFN: ffn_norm → SwiGLU (w1 gate, w3 up, silu_mul, w2 down).
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
         gpu.rmsnorm_batched(&x, &lw.ffn_norm, &tmp, n, h, eps)?;
-        let gate = linear_f16_no_bias(gpu, &lw.feed_forward_w1, &tmp, config.intermediate_size, h, n)?;
-        let up = linear_f16_no_bias(gpu, &lw.feed_forward_w3, &tmp, config.intermediate_size, h, n)?;
+        let gate = linear_f16_no_bias(
+            gpu,
+            &lw.feed_forward_w1,
+            &tmp,
+            config.intermediate_size,
+            h,
+            n,
+        )?;
+        let up = linear_f16_no_bias(
+            gpu,
+            &lw.feed_forward_w3,
+            &tmp,
+            config.intermediate_size,
+            h,
+            n,
+        )?;
         gpu.free_tensor(tmp)?;
         let act = gpu.alloc_tensor(&[n * config.intermediate_size], DType::F32)?;
         gpu.silu_mul_f32(&gate, &up, &act)?;
         gpu.free_tensor(gate)?;
         gpu.free_tensor(up)?;
-        let po = linear_f16_no_bias(gpu, &lw.feed_forward_w2, &act, h, config.intermediate_size, n)?;
+        let po = linear_f16_no_bias(
+            gpu,
+            &lw.feed_forward_w2,
+            &act,
+            h,
+            config.intermediate_size,
+            n,
+        )?;
         gpu.free_tensor(act)?;
 
         gpu.add_inplace_f32(&x, &po)?;
@@ -628,7 +792,10 @@ pub fn vision_forward(
     gpu.hip.device_synchronize()?;
     gpu.free_tensor(cos_gpu)?;
     gpu.free_tensor(sin_gpu)?;
-    eprintln!("  LFM3-VL vision tower complete ({:.2}s)", t0.elapsed().as_secs_f32());
+    eprintln!(
+        "  LFM3-VL vision tower complete ({:.2}s)",
+        t0.elapsed().as_secs_f32()
+    );
 
     // ── Projector: LayerNorm → 2x2 merge rearrange → GELU MLP ──
     let pcfg = &config.projector;
@@ -640,7 +807,15 @@ pub fn vision_forward(
 
     // LayerNorm all patches (with mean + bias).
     let normed = gpu.alloc_tensor(&[n * h], DType::F32)?;
-    gpu.layernorm_batched(&x, &pw.layer_norm_w, &pw.layer_norm_b, &normed, n, h, pcfg.layer_norm_eps)?;
+    gpu.layernorm_batched(
+        &x,
+        &pw.layer_norm_w,
+        &pw.layer_norm_b,
+        &normed,
+        n,
+        h,
+        pcfg.layer_norm_eps,
+    )?;
     gpu.free_tensor(x)?;
 
     // 2x2 merge: patches arrive in (gy, gx, sy, sx) merge-grouped order (see
@@ -652,11 +827,27 @@ pub fn vision_forward(
     // gemm directly.
     debug_assert_eq!(n, n_merged * sms * sms);
     debug_assert_eq!(merge_dim, h * sms * sms);
-    let m1 = linear_f16_bias(gpu, &pw.linear_1_w, &normed, &pw.linear_1_b, pcfg.hidden_size, merge_dim, n_merged)?;
+    let m1 = linear_f16_bias(
+        gpu,
+        &pw.linear_1_w,
+        &normed,
+        &pw.linear_1_b,
+        pcfg.hidden_size,
+        merge_dim,
+        n_merged,
+    )?;
     gpu.free_tensor(normed)?;
     gpu.gelu_erf_f32(&m1, &m1, n_merged * pcfg.hidden_size)?;
 
-    let m2 = linear_f16_bias(gpu, &pw.linear_2_w, &m1, &pw.linear_2_b, pcfg.text_hidden_size, pcfg.hidden_size, n_merged)?;
+    let m2 = linear_f16_bias(
+        gpu,
+        &pw.linear_2_w,
+        &m1,
+        &pw.linear_2_b,
+        pcfg.text_hidden_size,
+        pcfg.hidden_size,
+        n_merged,
+    )?;
     gpu.free_tensor(m1)?;
 
     let result = gpu.download_f32(&m2)?;

@@ -78,9 +78,7 @@ fn load_f32(
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
         3 => dequant_q8_0(&data),
-        _ => {
-            return Err(format!("lfm3: expected F16/F32/Q8 for {name}, got qt={qt}"))
-        }
+        _ => return Err(format!("lfm3: expected F16/F32/Q8 for {name}, got qt={qt}")),
     };
     gpu.upload_f32(&f32_data, shape)
         .map_err(|e| format!("lfm3: upload {name}: {e:?}"))
@@ -210,7 +208,7 @@ pub struct Lfm3Weights {
     /// F16/BF16 bytes as Q8 blocks and emit word salad). Mirrors lfm2moe.
     pub embed_format: EmbeddingFormat,
     pub embedding_norm: GpuTensor, // model.embedding_norm.weight (final norm)
-    pub lm_head: WeightTensor, // tied = embed_tokens (loaded as a weight tensor)
+    pub lm_head: WeightTensor,     // tied = embed_tokens (loaded as a weight tensor)
     pub layers: Vec<Lfm3LayerWeights>,
 }
 
@@ -335,7 +333,13 @@ impl Lfm3Weights {
             }
         };
         let embedding_norm = load_f32(hfq, gpu, "model.embedding_norm.weight", &[hidden])?;
-        let lm_head = load_wt(hfq, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
+        let lm_head = load_wt(
+            hfq,
+            gpu,
+            "model.embed_tokens.weight",
+            cfg.vocab_size,
+            hidden,
+        )?;
 
         let mut conv_state_count = 0usize;
         let mut kv_count = 0usize;
@@ -343,7 +347,8 @@ impl Lfm3Weights {
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for l in 0..cfg.num_hidden_layers {
             let p = format!("model.layers.{l}");
-            let operator_norm = load_f32(hfq, gpu, &format!("{p}.operator_norm.weight"), &[hidden])?;
+            let operator_norm =
+                load_f32(hfq, gpu, &format!("{p}.operator_norm.weight"), &[hidden])?;
             let ffn_norm = load_f32(hfq, gpu, &format!("{p}.ffn_norm.weight"), &[hidden])?;
             let post_operator_norm = if sandwich {
                 Some(load_f32(
@@ -369,13 +374,27 @@ impl Lfm3Weights {
             // ── Mixer: conv vs attention (full/sliding share weights) ──────
             let mixer = match cfg.mixer(l) {
                 MixerKind::Conv => {
-                    let in_proj =
-                        load_wt(hfq, gpu, &format!("{p}.conv.in_proj.weight"), 3 * hidden, hidden)?;
+                    let in_proj = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.conv.in_proj.weight"),
+                        3 * hidden,
+                        hidden,
+                    )?;
                     // conv.conv.weight ships [hidden,1,K] → loaded flat [hidden,K] f32.
-                    let conv_weight =
-                        load_f32(hfq, gpu, &format!("{p}.conv.conv.weight"), &[hidden * k_conv])?;
-                    let out_proj =
-                        load_wt(hfq, gpu, &format!("{p}.conv.out_proj.weight"), hidden, hidden)?;
+                    let conv_weight = load_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.conv.conv.weight"),
+                        &[hidden * k_conv],
+                    )?;
+                    let out_proj = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.conv.out_proj.weight"),
+                        hidden,
+                        hidden,
+                    )?;
                     let conv_state_idx = conv_state_count;
                     conv_state_count += 1;
                     Mixer::Conv(ConvWeights {
@@ -386,13 +405,47 @@ impl Lfm3Weights {
                     })
                 }
                 MixerKind::FullAttention | MixerKind::SlidingAttention => {
-                    let wq = load_wt(hfq, gpu, &format!("{p}.self_attn.q_proj.weight"), q_dim, hidden)?;
-                    let wk = load_wt(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden)?;
-                    let wv = load_wt(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden)?;
-                    let wo = load_wt(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), hidden, q_dim)?;
+                    let wq = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_proj.weight"),
+                        q_dim,
+                        hidden,
+                    )?;
+                    let wk = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_proj.weight"),
+                        kv_dim,
+                        hidden,
+                    )?;
+                    let wv = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.v_proj.weight"),
+                        kv_dim,
+                        hidden,
+                    )?;
+                    let wo = load_wt(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.o_proj.weight"),
+                        hidden,
+                        q_dim,
+                    )?;
                     // LFM3 names these q_norm / k_norm (NOT LFM2's q_layernorm).
-                    let q_norm = load_f32(hfq, gpu, &format!("{p}.self_attn.q_norm.weight"), &[head_dim])?;
-                    let k_norm = load_f32(hfq, gpu, &format!("{p}.self_attn.k_norm.weight"), &[head_dim])?;
+                    let q_norm = load_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                        &[head_dim],
+                    )?;
+                    let k_norm = load_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                        &[head_dim],
+                    )?;
                     // Sigmoid output gate: [n_heads, hidden].
                     let gate_proj = load_wt(
                         hfq,
@@ -417,9 +470,27 @@ impl Lfm3Weights {
             };
 
             // ── FFN: dense SwiGLU (no MoE in the LFM3 text backbone) ───────
-            let w1 = load_wt(hfq, gpu, &format!("{p}.feed_forward.w1.weight"), inter, hidden)?;
-            let w3 = load_wt(hfq, gpu, &format!("{p}.feed_forward.w3.weight"), inter, hidden)?;
-            let w2 = load_wt(hfq, gpu, &format!("{p}.feed_forward.w2.weight"), hidden, inter)?;
+            let w1 = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.feed_forward.w1.weight"),
+                inter,
+                hidden,
+            )?;
+            let w3 = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.feed_forward.w3.weight"),
+                inter,
+                hidden,
+            )?;
+            let w2 = load_wt(
+                hfq,
+                gpu,
+                &format!("{p}.feed_forward.w2.weight"),
+                hidden,
+                inter,
+            )?;
             let ffn = DenseFfn { w1, w3, w2 };
 
             layers.push(Lfm3LayerWeights {
@@ -461,10 +532,7 @@ fn classify_tensor_bytes(bytes: &[u8], numel: usize) -> (bool, bool) {
     (is_f16, is_q8_0)
 }
 
-fn effective_quant_type(
-    info: &hipfire_runtime::model_source::TensorInfo,
-    data: &[u8],
-) -> u8 {
+fn effective_quant_type(info: &hipfire_runtime::model_source::TensorInfo, data: &[u8]) -> u8 {
     if info.quant_type != 0xFF {
         return info.quant_type;
     }
@@ -518,9 +586,7 @@ fn load_f32_from_source(
     let f32_data: Vec<f32> = match qt {
         1 | 2 => source_bytes_to_f32_vec(dtype, data),
         3 => dequant_q8_0(data),
-        _ => {
-            return Err(format!("lfm3: expected F16/F32/Q8 for {name}, got qt={qt}"))
-        }
+        _ => return Err(format!("lfm3: expected F16/F32/Q8 for {name}, got qt={qt}")),
     };
     gpu.upload_f32(&f32_data, shape)
         .map_err(|e| format!("lfm3: upload {name}: {e:?}"))
@@ -643,7 +709,13 @@ pub fn load_weights_from_source(
     };
     let embedding_norm =
         load_f32_from_source(source, gpu, "model.embedding_norm.weight", &[hidden])?;
-    let lm_head = load_wt_from_source(source, gpu, "model.embed_tokens.weight", cfg.vocab_size, hidden)?;
+    let lm_head = load_wt_from_source(
+        source,
+        gpu,
+        "model.embed_tokens.weight",
+        cfg.vocab_size,
+        hidden,
+    )?;
 
     let mut conv_state_count = 0usize;
     let mut kv_count = 0usize;
@@ -854,7 +926,7 @@ pub struct Lfm3State {
     // mixer/ffn output + sandwich-norm scratch (the post-operator/post-ffn
     // norm is applied to the projection output BEFORE the residual add, so the
     // fused `weight_gemv_residual` cannot be used when sandwich norm is on).
-    pub proj_out: GpuTensor,    // [hidden] out_proj / o_proj / w2 output
+    pub proj_out: GpuTensor,     // [hidden] out_proj / o_proj / w2 output
     pub sandwich_buf: GpuTensor, // [hidden] post_*_norm output (sandwich only)
 
     // head
@@ -894,7 +966,8 @@ impl Lfm3State {
             physical_cap: None,
         };
         let kv = KvCache::from_mode(
-            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY).mode,
+            hipfire_runtime::kv_mode::resolve("", &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY)
+                .mode,
             gpu,
             &dims,
         )
