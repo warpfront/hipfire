@@ -65,6 +65,8 @@ pub mod batched_deltanet;
 #[cfg(feature = "deltanet")]
 pub mod batched_moe;
 pub mod boundary_project;
+#[cfg(feature = "deltanet")]
+pub mod encoder;
 pub mod gated_mlp;
 #[cfg(feature = "deltanet")]
 pub mod hybrid;
