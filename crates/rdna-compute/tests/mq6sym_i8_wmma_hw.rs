@@ -425,16 +425,14 @@ struct Tile {
     rows: usize,
     /// token capacity of the tile (16/32/48; 0 = prefill, any N)
     ntok: usize,
-    /// weight groups prefetched ahead (narrow tiles)
-    pd: usize,
 }
 
 impl Tile {
-    fn narrow(rows: usize, ntok: usize, pd: usize) -> Tile {
-        Tile { rows, ntok, pd }
+    fn narrow(rows: usize, ntok: usize) -> Tile {
+        Tile { rows, ntok }
     }
     fn p128() -> Tile {
-        Tile { rows: 128, ntok: 0, pd: 0 }
+        Tile { rows: 128, ntok: 0 }
     }
     fn is_prefill(&self) -> bool {
         self.ntok == 0
@@ -444,14 +442,14 @@ impl Tile {
         if self.is_prefill() {
             format!("gemm_mq6sym_i8_set{b}_gfx1201")
         } else {
-            format!("gemm_mq6sym_i8_set{b}_m{}n{}p{}_gfx1201", self.rows, self.ntok, self.pd)
+            format!("gemm_mq6sym_i8_set{b}_m{}n{}_gfx1201", self.rows, self.ntok)
         }
     }
     fn label(&self) -> String {
         if self.is_prefill() {
             "p128".to_string()
         } else {
-            format!("m{}n{}p{}", self.rows, self.ntok, self.pd)
+            format!("m{}n{}", self.rows, self.ntok)
         }
     }
     fn grid(&self, m: usize, n: usize) -> [u32; 3] {
@@ -482,14 +480,9 @@ impl Tile {
 
 fn narrow_tiles() -> Vec<Tile> {
     let mut v = Vec::new();
-    for rows in [32usize, 64, 128] {
+    for rows in [32usize, 64] {
         for ntok in [16usize, 32, 48] {
-            for pd in [1usize, 2, 3] {
-                if ntok == 48 && pd == 3 {
-                    continue;
-                }
-                v.push(Tile::narrow(rows, ntok, pd));
-            }
+            v.push(Tile::narrow(rows, ntok));
         }
     }
     v
@@ -978,7 +971,7 @@ fn mq6sym_i8_wmma_bytes_hw() {
         let (xq_ptr, _rot, xq_host) = produce_real(&mut gpu, &x, k, n);
         let w_host = gen_weights(m, k, WKind::Random, 0xBAD_C0DE);
         let mut undetected = 0usize;
-        for (what, tile) in [("code", Tile::narrow(64, 32, 2)), ("scale", Tile::narrow(32, 32, 1)), ("act", Tile::narrow(128, 32, 3)), ("code", Tile::p128()), ("scale", Tile::p128()), ("act", Tile::p128())] {
+        for (what, tile) in [("code", Tile::narrow(64, 32)), ("scale", Tile::narrow(32, 32)), ("act", Tile::narrow(64, 48)), ("code", Tile::p128()), ("scale", Tile::p128()), ("act", Tile::p128())] {
             let mut w_bad = w_host.clone();
             let mut xq_bad = xq_host.clone();
             match what {

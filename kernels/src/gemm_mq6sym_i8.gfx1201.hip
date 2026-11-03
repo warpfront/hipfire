@@ -63,18 +63,19 @@ static __device__ __forceinline__ int32x8_t sym_zero8() {
     return (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
 }
 
-// Spread the four 6-bit codes of a 24-bit field into the four bytes of a dword.
-static __device__ __forceinline__ unsigned sym_sp4(unsigned t) {
-    return ((t & 0x3Fu) | ((t << 2) & 0x3F00u) | ((t << 4) & 0x3F0000u)
-        | ((t << 6) & 0x3F000000u)) & 0x3F3F3F3Fu;
+// Four 6-bit fields f0..f3 (values 0..63) -> the four signed bytes q - 32 of one dword: the bytes
+// are assembled as q + 0x60 (<= 0x9F, no carry between bytes) and bit 7 flipped, which is exactly
+// the two's-complement byte of q - 32 (q = 0 -> 0xE0 = -32, q = 63 -> 0x1F = 31).
+static __device__ __forceinline__ unsigned sym_pack(unsigned f0, unsigned f1, unsigned f2, unsigned f3) {
+    return (((f3 << 24) | (f2 << 16) | (f1 << 8) | f0) + 0x60606060u) ^ 0x80808080u;
 }
 
-// Bytes q in 0..63 -> signed int8 q - 32: u = q ^ 0x20 is q - 32 in 6-bit two's
-// complement, sign-extend by replicating bit 5 into bits 6 and 7 of each byte.
-static __device__ __forceinline__ unsigned sym_signed(unsigned q) {
-    const unsigned u = q ^ 0x20202020u;
-    const unsigned m = u & 0x20202020u;
-    return u | (m << 1) | (m << 2);
+// Two 24-bit fields (codes 0..3 in `ta`, codes 4..7 in `tb`, code i of a field at bits 6i) of an
+// 8-code group -> {c0,c2,c4,c6} and {c1,c3,c5,c7} as signed bytes: the byte order of
+// block_i8_128.qs, so the iu8 WMMA pairs every code with its own activation without a shuffle.
+static __device__ __forceinline__ void sym_group8(unsigned ta, unsigned tb, unsigned& ev, unsigned& od) {
+    ev = sym_pack(ta & 63u, (ta >> 12) & 63u, tb & 63u, (tb >> 12) & 63u);
+    od = sym_pack((ta >> 6) & 63u, (ta >> 18) & 63u, (tb >> 6) & 63u, (tb >> 18) & 63u);
 }
 
 // 16 codes in w0 | w1<<32 | w2<<64 (code i = bits [6i, 6i+6)) -> the two iu8
@@ -82,15 +83,13 @@ static __device__ __forceinline__ unsigned sym_signed(unsigned q) {
 // e1 = codes 8..15 likewise, signed bytes q - 32.
 static __device__ __forceinline__ void sym_expand16(
     unsigned w0, unsigned w1, unsigned w2, u32x2_t& e0, u32x2_t& e1) {
-    const unsigned b0 = sym_signed(sym_sp4(w0));                      // c0 c1 c2 c3
-    const unsigned b1 = sym_signed(sym_sp4((w0 >> 24) | (w1 << 8)));  // c4 c5 c6 c7
-    const unsigned b2 = sym_signed(sym_sp4((w1 >> 16) | (w2 << 16))); // c8 c9 c10 c11
-    const unsigned b3 = sym_signed(sym_sp4(w2 >> 8));                 // c12 .. c15
-    // v_perm_b32(S0, S1, sel): result byte i = {S1 bytes 0-3, S0 bytes 4-7}[sel_i].
-    e0[0] = __builtin_amdgcn_perm(b1, b0, 0x06040200u);
-    e0[1] = __builtin_amdgcn_perm(b1, b0, 0x07050301u);
-    e1[0] = __builtin_amdgcn_perm(b3, b2, 0x06040200u);
-    e1[1] = __builtin_amdgcn_perm(b3, b2, 0x07050301u);
+    unsigned a, b;
+    sym_group8(w0, __builtin_amdgcn_alignbit(w1, w0, 24), a, b);
+    e0[0] = a;
+    e0[1] = b;
+    sym_group8(__builtin_amdgcn_alignbit(w2, w1, 16), w2 >> 8, a, b);
+    e1[0] = a;
+    e1[1] = b;
 }
 
 // f32 scale of half h (0/1) from the group's header dword {s0 | s1 << 16}.
@@ -122,8 +121,9 @@ static __device__ __forceinline__ void sym_bar() {
     asm volatile("s_wait_dscnt 0x0\n\ts_barrier_signal -1\n\ts_barrier_wait -1" ::: "memory");
 }
 
-// PD = weight groups prefetched ahead of the group being computed (PD + 1 register sets).
-template <int NW, int RG, int TG, int PD, bool BF16>
+// Weights: the next group's registers are fetched while the current group computes (two register
+// sets; deeper prefetch measured slower on card C, see the T1 receipts).
+template <int NW, int RG, int TG, bool BF16>
 static __device__ __forceinline__ void sym_narrow_body(
     const unsigned char*  __restrict__ W,
     const block_i8_128*   __restrict__ Xq,
@@ -132,9 +132,11 @@ static __device__ __forceinline__ void sym_narrow_body(
 ) {
     constexpr int NT = NW * 32;
     constexpr int TOK = TG * 16;
-    constexpr int XB = TOK * 136;            // one staged K128 activation block
+    // One staged K128 activation block: TOK tokens x 136 B, in a buffer rounded up to whole
+    // per-thread b64 words so every thread stores every word (words past the descriptor read as 0).
     constexpr int XQ = TOK * 17;             // b64 words of one staged block
     constexpr int NPF = (XQ + NT - 1) / NT;  // staged b64 words per thread
+    constexpr int XB = NPF * NT * 8;         // bytes of one LDS buffer
     __shared__ __attribute__((aligned(16))) char LDS[2 * XB];
 
     const int tid = threadIdx.x;
@@ -195,9 +197,7 @@ static __device__ __forceinline__ void sym_narrow_body(
         #pragma unroll
         for (int i = 0; i < NPF; i++) {
             const int idx = tid + i * NT;
-            if (idx < XQ) {
-                *(u32x2_t*)(LDS + buf * XB + idx * 8) = xr[slot][i];
-            }
+            *(u32x2_t*)(LDS + buf * XB + idx * 8) = xr[slot][i];
         }
     };
 
@@ -210,13 +210,8 @@ static __device__ __forceinline__ void sym_narrow_body(
         }
     }
 
-    SymWRegs<RG> wr[PD + 1];
-    #pragma unroll
-    for (int p = 0; p < PD; p++) {
-        if (p < gpr) {
-            load_group(wr[p], p);
-        }
-    }
+    SymWRegs<RG> wa, wb;
+    load_group(wa, 0);
     load_x(0, 0);
     store_x(0, 0);
     sym_bar();
@@ -274,7 +269,7 @@ static __device__ __forceinline__ void sym_narrow_body(
     };
 
     // Issue order (the vmcnt is in-order): both activation blocks of the group first, then the
-    // weight prefetch PD groups ahead; publishing an activation block therefore never waits for the
+    // next group's weights; publishing an activation block therefore never waits for the
     // prefetch, which is only waited for at its own group's first use.
     auto process_group = [&](int g, SymWRegs<RG>& cur, SymWRegs<RG>& nxt) {
         const bool more_g = (g + 1 < gpr);
@@ -282,9 +277,7 @@ static __device__ __forceinline__ void sym_narrow_body(
         load_x(kb0 + 1, 0);
         if (more_g) {
             load_x(kb0 + 2, 1);
-        }
-        if (g + PD < gpr) {
-            load_group(nxt, g + PD);
+            load_group(nxt, g + 1);
         }
         compute_half(cur, std::integral_constant<int, 0>());
         store_x(1, 0);
@@ -296,12 +289,10 @@ static __device__ __forceinline__ void sym_narrow_body(
         }
     };
 
-    for (int g0 = 0; g0 < gpr; g0 += PD + 1) {
-        #pragma unroll
-        for (int u = 0; u <= PD; u++) {
-            if (g0 + u < gpr) {
-                process_group(g0 + u, wr[u], wr[(u + PD) % (PD + 1)]);
-            }
+    for (int g = 0; g < gpr; g += 2) {
+        process_group(g, wa, wb);
+        if (g + 1 < gpr) {
+            process_group(g + 1, wb, wa);
         }
     }
 
@@ -328,40 +319,22 @@ static __device__ __forceinline__ void sym_narrow_body(
     }
 }
 
-#define SYM_NARROW_ENTRY(NAME, NW, RG, TG, PD, BF)                                       \
+#define SYM_NARROW_ENTRY(NAME, NW, RG, TG, BF)                                           \
     extern "C" __global__ __launch_bounds__((NW) * 32) void NAME(                        \
         const unsigned char* __restrict__ W, const block_i8_128* __restrict__ Xq,        \
         void* __restrict__ Y, int M, int K, int N) {                                     \
-        sym_narrow_body<NW, RG, TG, PD, BF>(W, Xq, Y, M, K, N);                          \
+        sym_narrow_body<NW, RG, TG, BF>(W, Xq, Y, M, K, N);                              \
     }
-#define SYM_ROW(R, NW, TGN, TG, P)                                                       \
-    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m##R##n##TGN##p##P##_gfx1201, NW, 1, TG, P, false) \
-    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m##R##n##TGN##p##P##_gfx1201, NW, 1, TG, P, true)
+#define SYM_ROW(R, NW, TGN, TG)                                                          \
+    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m##R##n##TGN##_gfx1201, NW, 1, TG, false)        \
+    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m##R##n##TGN##_gfx1201, NW, 1, TG, true)
 
-SYM_ROW(32, 2, 16, 1, 1)
-SYM_ROW(32, 2, 16, 1, 2)
-SYM_ROW(32, 2, 16, 1, 3)
-SYM_ROW(32, 2, 32, 2, 1)
-SYM_ROW(32, 2, 32, 2, 2)
-SYM_ROW(32, 2, 32, 2, 3)
-SYM_ROW(32, 2, 48, 3, 1)
-SYM_ROW(32, 2, 48, 3, 2)
-SYM_ROW(64, 4, 16, 1, 1)
-SYM_ROW(64, 4, 16, 1, 2)
-SYM_ROW(64, 4, 16, 1, 3)
-SYM_ROW(64, 4, 32, 2, 1)
-SYM_ROW(64, 4, 32, 2, 2)
-SYM_ROW(64, 4, 32, 2, 3)
-SYM_ROW(64, 4, 48, 3, 1)
-SYM_ROW(64, 4, 48, 3, 2)
-SYM_ROW(128, 8, 16, 1, 1)
-SYM_ROW(128, 8, 16, 1, 2)
-SYM_ROW(128, 8, 16, 1, 3)
-SYM_ROW(128, 8, 32, 2, 1)
-SYM_ROW(128, 8, 32, 2, 2)
-SYM_ROW(128, 8, 32, 2, 3)
-SYM_ROW(128, 8, 48, 3, 1)
-SYM_ROW(128, 8, 48, 3, 2)
+SYM_ROW(32, 2, 16, 1)
+SYM_ROW(32, 2, 32, 2)
+SYM_ROW(32, 2, 48, 3)
+SYM_ROW(64, 4, 16, 1)
+SYM_ROW(64, 4, 32, 2)
+SYM_ROW(64, 4, 48, 3)
 
 // ===================================================================
 // Prefill 128 x 128 tile (A = weights, B = activations), a fork of the affine
