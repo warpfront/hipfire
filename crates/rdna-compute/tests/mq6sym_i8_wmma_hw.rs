@@ -427,17 +427,22 @@ struct Tile {
     ntok: usize,
     /// token-split grid ([ceil(M/rows), ceil(N/ntok)]): any N, the slices re-stream the weights
     ys: bool,
+    /// prefill only: LDS-only main-loop barrier (`_fb` entry)
+    fb: bool,
 }
 
 impl Tile {
     fn narrow(rows: usize, ntok: usize) -> Tile {
-        Tile { rows, ntok, ys: false }
+        Tile { rows, ntok, ys: false, fb: false }
     }
     fn split(rows: usize, ntok: usize) -> Tile {
-        Tile { rows, ntok, ys: true }
+        Tile { rows, ntok, ys: true, fb: false }
     }
     fn p128() -> Tile {
-        Tile { rows: 128, ntok: 0, ys: false }
+        Tile { rows: 128, ntok: 0, ys: false, fb: false }
+    }
+    fn p128fb() -> Tile {
+        Tile { rows: 128, ntok: 0, ys: false, fb: true }
     }
     fn is_prefill(&self) -> bool {
         self.ntok == 0
@@ -445,7 +450,7 @@ impl Tile {
     fn entry(&self, bf16: bool) -> String {
         let b = if bf16 { "_bf16" } else { "" };
         if self.is_prefill() {
-            format!("gemm_mq6sym_i8_set{b}_gfx1201")
+            format!("gemm_mq6sym_i8_set{b}{}_gfx1201", if self.fb { "_fb" } else { "" })
         } else {
             let y = if self.ys { "y" } else { "" };
             format!("gemm_mq6sym_i8_set{b}_m{}n{}{y}_gfx1201", self.rows, self.ntok)
@@ -453,7 +458,7 @@ impl Tile {
     }
     fn label(&self) -> String {
         if self.is_prefill() {
-            "p128".to_string()
+            (if self.fb { "p128fb" } else { "p128" }).to_string()
         } else {
             format!("m{}n{}{}", self.rows, self.ntok, if self.ys { "y" } else { "" })
         }
@@ -502,6 +507,7 @@ fn narrow_tiles() -> Vec<Tile> {
 fn load_entries(gpu: &mut Gpu) {
     let mut tiles = narrow_tiles();
     tiles.push(Tile::p128());
+    tiles.push(Tile::p128fb());
     for t in tiles {
         for bf16 in [false, true] {
             let e = t.entry(bf16);
@@ -789,6 +795,7 @@ fn tiles_for(n: usize, prefill_ok: bool) -> Vec<Tile> {
     let mut v: Vec<Tile> = narrow_tiles().into_iter().filter(|t| t.admits(n)).collect();
     if prefill_ok {
         v.push(Tile::p128());
+        v.push(Tile::p128fb());
     }
     v
 }
@@ -967,10 +974,12 @@ fn mq6sym_i8_wmma_bytes_hw() {
             let w_host = gen_weights(m, k, WKind::Random, 0xF00D + n as u64 + m as u64);
             let w_dev = upload_bytes(&mut gpu, &w_host);
             for bf16 in [false, true] {
-                run_case(
-                    &mut gpu, &mut st, &mut js, "prefill/real-act/Random", Tile::p128(), bf16,
-                    &w_host, &w_dev, xq_ptr, &xq_host, m, k, n, &mut rng, false, false,
-                );
+                for tile in [Tile::p128(), Tile::p128fb()] {
+                    run_case(
+                        &mut gpu, &mut st, &mut js, "prefill/real-act/Random", tile, bf16,
+                        &w_host, &w_dev, xq_ptr, &xq_host, m, k, n, &mut rng, false, false,
+                    );
+                }
             }
         }
     }
@@ -1448,6 +1457,14 @@ fn mq6sym_i8_wmma_timing_hw() {
                 });
             }
             {
+                let wp = wp.clone();
+                arms.push(Arm {
+                    name: "sym_p128fb_f32".into(),
+                    wbytes: sym_bytes,
+                    run: Box::new(move |g, i| launch_sym(g, Tile::p128fb(), false, wp[i], xq, yp, m, k, n)),
+                });
+            }
+            {
                 let ap = ap.clone();
                 arms.push(Arm {
                     name: "affine_i8_hipcc_f32".into(),
@@ -1467,9 +1484,9 @@ fn mq6sym_i8_wmma_timing_hw() {
             let mut samples: Vec<Vec<f64>> = vec![Vec::new(); arms.len() + 1];
             let iters = if n >= 4096 { 6 } else { 12 };
             for r in 0..rounds {
-                let order: Vec<usize> = if r % 2 == 0 { vec![0, 1, 2] } else { vec![2, 1, 0] };
+                let order: Vec<usize> = if r % 2 == 0 { vec![0, 1, 2, 3] } else { vec![3, 2, 1, 0] };
                 for &ai in &order {
-                    let us = if ai < 2 {
+                    let us = if ai < 3 {
                         let arm = &mut arms[ai];
                         (arm.run)(&gpu, 0);
                         gpu.hip.device_synchronize().unwrap();
@@ -1494,7 +1511,7 @@ fn mq6sym_i8_wmma_timing_hw() {
                     samples[ai].push(us);
                 }
             }
-            let names = ["sym_p128_f32".to_string(), "affine_i8_hipcc_f32".to_string(), format!("affine_i8_production({prod_entry})")];
+            let names = ["sym_p128_f32".to_string(), "sym_p128fb_f32".to_string(), "affine_i8_hipcc_f32".to_string(), format!("affine_i8_production({prod_entry})")];
             for (ai, nm) in names.iter().enumerate() {
                 let mut v = samples[ai].clone();
                 let med = median(&mut v);
