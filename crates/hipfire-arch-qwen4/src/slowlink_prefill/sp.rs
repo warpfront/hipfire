@@ -344,7 +344,10 @@ pub(crate) fn sp_load_decision(
         pinned_budget_bytes: 0,
         prefix_cache: false,
         slab_sp: route == dsp::WindowRoute::SlabIu4
-            && hipfire_config::developer_bool(crate::slowlink_sp::SP_SLAB_ENV, false),
+            && hipfire_config::developer_bool(
+                crate::slowlink_sp::SP_SLAB_ENV,
+                crate::slowlink_sp::SP_SLAB_DEFAULT,
+            ),
     };
     let mut dtypes = None;
     if mode == Some(SpMode::Hybrid) {
