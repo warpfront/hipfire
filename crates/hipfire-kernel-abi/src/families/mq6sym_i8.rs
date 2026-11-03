@@ -60,11 +60,6 @@ const CONSTS_R32: &[(&str, u64)] = &[("tile_rows", 32)];
 const CONSTS_R64: &[(&str, u64)] = &[("tile_rows", 64)];
 const CONSTS_128X128: &[(&str, u64)] = &[("tile_rows", 128), ("tile_tokens", 128)];
 
-/// Static LDS (`group_segment_fixed_size`) of the narrow tiles by token width.
-const SG_N16: u32 = 0;
-const SG_N32: u32 = 0;
-const SG_N48: u32 = 0;
-
 macro_rules! export {
     ($sym:literal, $obj:expr, $block:expr, $lds:expr, $fixed:expr, $grid:expr, $consts:expr) => {
         ExportV1 {
@@ -80,8 +75,9 @@ macro_rules! export {
     };
 }
 
-/// Every F32 entry (T0 N = 1..8, narrow tiles, prefill).
-const EXPORTS_SYM_F32: &[ExportV1] = &[
+/// F32 T0 (N = 1..8) and narrow-tile entries: no hidden kernargs (kernarg segment = the 36
+/// explicit bytes), static LDS per tile.
+const EXPORTS_SYM_NARROW_F32: &[ExportV1] = &[
     export!(
         "gemv_mq6sym_i8_rows_r1_gfx1201",
         GEMV_OBJECT,
@@ -159,7 +155,7 @@ const EXPORTS_SYM_F32: &[ExportV1] = &[
         GEMM_OBJECT,
         64,
         0,
-        SG_N16,
+        5120,
         GRID_R32,
         CONSTS_R32
     ),
@@ -168,7 +164,7 @@ const EXPORTS_SYM_F32: &[ExportV1] = &[
         GEMM_OBJECT,
         64,
         0,
-        SG_N32,
+        9216,
         GRID_R32,
         CONSTS_R32
     ),
@@ -177,7 +173,7 @@ const EXPORTS_SYM_F32: &[ExportV1] = &[
         GEMM_OBJECT,
         128,
         0,
-        SG_N16,
+        6144,
         GRID_R64,
         CONSTS_R64
     ),
@@ -186,7 +182,7 @@ const EXPORTS_SYM_F32: &[ExportV1] = &[
         GEMM_OBJECT,
         128,
         0,
-        SG_N32,
+        10240,
         GRID_R64,
         CONSTS_R64
     ),
@@ -195,7 +191,7 @@ const EXPORTS_SYM_F32: &[ExportV1] = &[
         GEMM_OBJECT,
         128,
         0,
-        SG_N48,
+        14336,
         GRID_R64,
         CONSTS_R64
     ),
@@ -204,22 +200,24 @@ const EXPORTS_SYM_F32: &[ExportV1] = &[
         GEMM_OBJECT,
         128,
         0,
-        SG_N16,
+        6144,
         GRID_R64_Y,
         CONSTS_R64
     ),
-    export!(
-        "gemm_mq6sym_i8_set_gfx1201",
-        GEMM_OBJECT,
-        256,
-        36864,
-        0,
-        GRID_128X128,
-        CONSTS_128X128
-    ),
 ];
 
-/// Symmetric A8 route, F32 `Y`: `W Xq Y M K N` through kernelParams (36 explicit bytes).
+/// F32 128x128 prefill entry: the runtime hidden block (kernarg segment 296), dynamic LDS only.
+const EXPORTS_SYM_PREFILL_F32: &[ExportV1] = &[export!(
+    "gemm_mq6sym_i8_set_gfx1201",
+    GEMM_OBJECT,
+    256,
+    36864,
+    0,
+    GRID_128X128,
+    CONSTS_128X128
+)];
+
+/// Symmetric A8 route, 128x128 prefill entry, F32 `Y`: `W Xq Y M K N` through kernelParams (36 explicit bytes).
 pub static MQ6SYM_I8_SET_F32: KernelAbiV1 = KernelAbiV1 {
     id: "mq6sym_i8.hipcc.gfx12.set_f32",
     version: 1,
@@ -233,11 +231,29 @@ pub static MQ6SYM_I8_SET_F32: KernelAbiV1 = KernelAbiV1 {
     segment_bytes: 296,
     segment_align: 8,
     domain: DOMAIN_HIPCC,
-    exports: EXPORTS_SYM_F32,
+    exports: EXPORTS_SYM_PREFILL_F32,
 };
 
-/// Every BF16 entry (T0 N = 1..8, narrow tiles, prefill).
-const EXPORTS_SYM_BF16: &[ExportV1] = &[
+/// Symmetric A8 route, T0 GEMV and narrow tiles, F32 `Y`: `W Xq Y M K N` through kernelParams (36 explicit bytes).
+pub static MQ6SYM_I8_NARROW_F32: KernelAbiV1 = KernelAbiV1 {
+    id: "mq6sym_i8.hipcc.gfx12.narrow_f32",
+    version: 1,
+    wave: 32,
+    numeric: NUMERIC_SYM_SET_F32,
+    params: PARAMS_MKN,
+    operands: OPERANDS_HIPCC_F32,
+    fields: FIELDS_HIPCC,
+    hidden: &[],
+    explicit_bytes: 36,
+    segment_bytes: 36,
+    segment_align: 8,
+    domain: DOMAIN_HIPCC,
+    exports: EXPORTS_SYM_NARROW_F32,
+};
+
+/// BF16 T0 (N = 1..8) and narrow-tile entries: no hidden kernargs (kernarg segment = the 36
+/// explicit bytes), static LDS per tile.
+const EXPORTS_SYM_NARROW_BF16: &[ExportV1] = &[
     export!(
         "gemv_mq6sym_i8_rows_r1_bf16_gfx1201",
         GEMV_OBJECT,
@@ -315,7 +331,7 @@ const EXPORTS_SYM_BF16: &[ExportV1] = &[
         GEMM_OBJECT,
         64,
         0,
-        SG_N16,
+        5120,
         GRID_R32,
         CONSTS_R32
     ),
@@ -324,7 +340,7 @@ const EXPORTS_SYM_BF16: &[ExportV1] = &[
         GEMM_OBJECT,
         64,
         0,
-        SG_N32,
+        9216,
         GRID_R32,
         CONSTS_R32
     ),
@@ -333,7 +349,7 @@ const EXPORTS_SYM_BF16: &[ExportV1] = &[
         GEMM_OBJECT,
         128,
         0,
-        SG_N16,
+        6144,
         GRID_R64,
         CONSTS_R64
     ),
@@ -342,7 +358,7 @@ const EXPORTS_SYM_BF16: &[ExportV1] = &[
         GEMM_OBJECT,
         128,
         0,
-        SG_N32,
+        10240,
         GRID_R64,
         CONSTS_R64
     ),
@@ -351,7 +367,7 @@ const EXPORTS_SYM_BF16: &[ExportV1] = &[
         GEMM_OBJECT,
         128,
         0,
-        SG_N48,
+        14336,
         GRID_R64,
         CONSTS_R64
     ),
@@ -360,22 +376,24 @@ const EXPORTS_SYM_BF16: &[ExportV1] = &[
         GEMM_OBJECT,
         128,
         0,
-        SG_N16,
+        6144,
         GRID_R64_Y,
         CONSTS_R64
     ),
-    export!(
-        "gemm_mq6sym_i8_set_bf16_gfx1201",
-        GEMM_OBJECT,
-        256,
-        36864,
-        0,
-        GRID_128X128,
-        CONSTS_128X128
-    ),
 ];
 
-/// Symmetric A8 route, BF16 `Y`: `W Xq Y M K N` through kernelParams (36 explicit bytes).
+/// BF16 128x128 prefill entry: the runtime hidden block (kernarg segment 296), dynamic LDS only.
+const EXPORTS_SYM_PREFILL_BF16: &[ExportV1] = &[export!(
+    "gemm_mq6sym_i8_set_bf16_gfx1201",
+    GEMM_OBJECT,
+    256,
+    36864,
+    0,
+    GRID_128X128,
+    CONSTS_128X128
+)];
+
+/// Symmetric A8 route, 128x128 prefill entry, BF16 `Y`: `W Xq Y M K N` through kernelParams (36 explicit bytes).
 pub static MQ6SYM_I8_SET_BF16: KernelAbiV1 = KernelAbiV1 {
     id: "mq6sym_i8.hipcc.gfx12.set_bf16",
     version: 1,
@@ -389,8 +407,30 @@ pub static MQ6SYM_I8_SET_BF16: KernelAbiV1 = KernelAbiV1 {
     segment_bytes: 296,
     segment_align: 8,
     domain: DOMAIN_HIPCC,
-    exports: EXPORTS_SYM_BF16,
+    exports: EXPORTS_SYM_PREFILL_BF16,
+};
+
+/// Symmetric A8 route, T0 GEMV and narrow tiles, BF16 `Y`: `W Xq Y M K N` through kernelParams (36 explicit bytes).
+pub static MQ6SYM_I8_NARROW_BF16: KernelAbiV1 = KernelAbiV1 {
+    id: "mq6sym_i8.hipcc.gfx12.narrow_bf16",
+    version: 1,
+    wave: 32,
+    numeric: NUMERIC_SYM_SET_BF16_RNE,
+    params: PARAMS_MKN,
+    operands: OPERANDS_HIPCC_BF16,
+    fields: FIELDS_HIPCC,
+    hidden: &[],
+    explicit_bytes: 36,
+    segment_bytes: 36,
+    segment_align: 8,
+    domain: DOMAIN_HIPCC,
+    exports: EXPORTS_SYM_NARROW_BF16,
 };
 
 /// Every contract of this family.
-pub static ABIS: &[&KernelAbiV1] = &[&MQ6SYM_I8_SET_F32, &MQ6SYM_I8_SET_BF16];
+pub static ABIS: &[&KernelAbiV1] = &[
+    &MQ6SYM_I8_SET_F32,
+    &MQ6SYM_I8_SET_BF16,
+    &MQ6SYM_I8_NARROW_F32,
+    &MQ6SYM_I8_NARROW_BF16,
+];
