@@ -149,6 +149,7 @@ impl<'a> Bufs<'a> {
                 rotation: Some(scratch),
                 ladder,
                 residual: None,
+                grouped: None,
             }),
         }
     }
@@ -176,6 +177,7 @@ impl<'a> Bufs<'a> {
                 rotation: Some(scratch),
                 ladder,
                 residual: Some(self.h),
+                grouped: None,
             }),
         }
     }
@@ -471,6 +473,7 @@ impl<'a> LayerRefs<'a> {
                     ep_layer_idx: 0,
                     ep_tile_exchange: None,
                     expert_iu4: None,
+                    mq2_lloyd: None,
                 },
             )
             .map_err(|e| format!("seal prefill: {e:?}"))?,

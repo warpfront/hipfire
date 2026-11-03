@@ -235,6 +235,11 @@ pub enum MoeRecipe {
         shared_after_combine: bool,
     },
     SigmoidRoutedNoShared,
+    /// Softmax over every expert, top-k, renormalized over the selection; no
+    /// shared expert (Maple). Decode runs `softmax_f32` + `moe_topk_renorm_k8`,
+    /// prefill `softmax_temp_batched_into_f32` (logits into the score view) +
+    /// `moe_topk_renorm_k8_batched`.
+    SoftmaxRoutedNoShared,
 }
 
 impl MoeRecipe {
@@ -255,6 +260,14 @@ impl MoeRecipe {
                 shared_after_combine: true,
                 ..
             }
+        )
+    }
+
+    /// Recipes whose routed experts are the whole FFN (no shared expert).
+    pub(crate) fn routed_only(self) -> bool {
+        matches!(
+            self,
+            Self::SigmoidRoutedNoShared | Self::SoftmaxRoutedNoShared
         )
     }
 }
@@ -1453,7 +1466,7 @@ impl MoeParams<'_> {
     /// MQ2-Lloyd expert follows the model's down-combine policy.
     pub fn down_writes_expanded(&self) -> bool {
         match (&self.mq2_lloyd, self.dtypes.routed_down) {
-            (Some(lloyd), DType::MQ2G256Lloyd) => lloyd.deterministic_down(),
+            (Some(lloyd), DType::MQ2G256Lloyd | DType::MQ2G256LloydU) => lloyd.deterministic_down(),
             _ => {
                 moe_down_writes_expanded(self.dtypes.routed_down, self.expert_dtype_tags.is_some())
             }
@@ -1758,13 +1771,13 @@ pub struct MoeParams<'a> {
     /// `None` (every single-device caller) lowers exactly the historical
     /// stage sequence.
     pub ep_row_gather: Option<&'a dyn MoeRowGather>,
-    /// DeepSeek-V4 MQ2-Lloyd routed experts (k in 1..=8). `None` lowers the
-    /// generic sealed sequence unchanged.
+    /// MQ2-Lloyd routed experts declared by the model (DeepSeek-V4 qt19, Maple
+    /// qt51; k in 1..=8). `None` lowers the generic sealed sequence unchanged.
     pub mq2_lloyd: Option<MoeMq2Lloyd<'a>>,
 }
 
-/// Model-owned MQ2-Lloyd routed-expert declaration (DeepSeek-V4): sealed decode
-/// runs these experts with the model's SwiGLU clamp and down-combine policy.
+/// Model-owned MQ2-Lloyd routed-expert declaration (DeepSeek-V4, Maple): sealed
+/// MoE runs these experts with the model's SwiGLU clamp and down-combine policy.
 #[derive(Clone, Copy)]
 pub struct MoeMq2Lloyd<'a> {
     /// SwiGLU clamp passed to `deepseek4_silu_mul_clamp_f32_batched`.
@@ -2085,6 +2098,11 @@ pub struct MoePrefillParams<'a> {
     /// `None` (every non-Qwen35 constructor, and Qwen35 with the flag off) means
     /// the route does not exist for this call and changes nothing.
     pub expert_iu4: Option<(crate::families::moe_expert_iu4::ExpertIu4Spec, bool)>,
+    /// Declared MQ2-Lloyd routed experts (see [`MoeParams::mq2_lloyd`]). For the
+    /// unrotated qt51 (Maple) grouped route the input basis, the SwiGLU rows
+    /// and the down activation are F16 (`x_rot_batch`, `rot_batch`) and the
+    /// unscatter applies the clamp. `None` changes nothing.
+    pub mq2_lloyd: Option<MoeMq2Lloyd<'a>>,
 }
 /// Dtype-only admission snapshot for grouped MoE prefill.
 ///

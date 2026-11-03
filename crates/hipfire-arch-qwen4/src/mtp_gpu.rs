@@ -2334,6 +2334,7 @@ fn push_head_rows_front<'a>(
         rotation: Some(t.rotation),
         ladder: ProjectLadder::Trunk,
         residual: None,
+        grouped: None,
     }));
     steps.push(Step::HyperNorm(HyperNormOp {
         input: backbone_hidden,
@@ -2353,6 +2354,7 @@ fn push_head_rows_front<'a>(
             rotation: Some(t.rotation),
             ladder: ProjectLadder::Trunk,
             residual: None,
+            grouped: None,
         }));
         steps.push(Step::BroadcastAdd(BroadcastAddOp {
             rows_input: t.projected_hidden,
@@ -2371,6 +2373,7 @@ fn push_head_rows_front<'a>(
                 rotation: Some(t.rotation),
                 ladder: ProjectLadder::Trunk,
                 residual: None,
+                grouped: None,
             }));
         }
         for (rows_input, row, output) in &views.broadcast {
