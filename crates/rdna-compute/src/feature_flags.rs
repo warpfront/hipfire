@@ -146,6 +146,13 @@ pub struct FeatureFlags {
     /// (the single-launch `gemv_bf16_xf32_k4_rows_lane_t8` and the t1 HC up read
     /// at 9..=64 rows). Default on for exact gfx1201 only (`=0` kills it).
     pub qwen4_lane_hc_allrows: bool,
+    /// Every non-MoE row-local stage of an AR / verify lane step with more than 8 rows
+    /// (`HIPFIRE_QWEN4_LANE_ALLROWS`): Embed, PleRows, the GDN / QSA input and output
+    /// projections, the HC stages, FinalHyper, Head and Argmax run one launch over every
+    /// row on the all-rows segment (the wide 9..=64-row routes) instead of once per <= 8-row
+    /// group; the routed MoE keeps its groups. Refines `qwen4_lane_hc_allrows` (needs it).
+    /// Default on for exact gfx1201 only (`=0` kills it).
+    pub qwen4_lane_allrows: bool,
     /// Fused multi-lane fn-lanes GDN decode Core, conv/params prologue + output
     /// rotation epilogue in the step launch (`HIPFIRE_QWEN4_GDN_LANES_FUSE`),
     /// default off on every arch (exact gfx1201 only, and only with
@@ -1074,6 +1081,7 @@ impl FeatureFlags {
             qwen4_gdn_lanes_rows: parse_bool("HIPFIRE_QWEN4_GDN_LANES_ROWS").unwrap_or(true),
             qwen4_lane_ple_batch: parse_bool("HIPFIRE_QWEN4_LANE_PLE_BATCH").unwrap_or(true),
             qwen4_lane_hc_allrows: parse_bool("HIPFIRE_QWEN4_LANE_HC_ALLROWS").unwrap_or(true),
+            qwen4_lane_allrows: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS").unwrap_or(true),
             qwen4_gdn_lanes_fuse: parse_bool("HIPFIRE_QWEN4_GDN_LANES_FUSE").unwrap_or(true),
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
                 .unwrap_or(arch == "gfx1151" || is_gfx1201),
@@ -1770,6 +1778,13 @@ impl FeatureFlags {
         self.qwen4_lane_hc_allrows && self.arch == "gfx1201"
     }
 
+    /// All-rows non-MoE stages of an AR / verify lane step (`HIPFIRE_QWEN4_LANE_ALLROWS`).
+    /// Exact gfx1201 only, default on (`=0` kills it); it only refines the all-rows HC
+    /// segment, so it is inert while `HIPFIRE_QWEN4_LANE_HC_ALLROWS` is off.
+    pub fn qwen4_lane_allrows_enabled(&self) -> bool {
+        self.qwen4_lane_allrows && self.arch == "gfx1201"
+    }
+
     /// Fused multi-lane fn-lanes GDN decode Core (`HIPFIRE_QWEN4_GDN_LANES_FUSE`): the
     /// conv + gate-parameter launch is the step kernel's prologue and the output
     /// projection's rotation its epilogue. Exact gfx1201 only, default off (`=1`
@@ -1984,6 +1999,7 @@ impl FeatureFlags {
             qwen4_gdn_lanes_rows: false,
             qwen4_lane_ple_batch: false,
             qwen4_lane_hc_allrows: false,
+            qwen4_lane_allrows: false,
             qwen4_gdn_lanes_fuse: false,
             qwen4_moe_down_r4: false,
             qwen4_shared_down_fuse: false,
@@ -3043,6 +3059,36 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_hc_allrows_enabled());
+    }
+
+    /// The all-rows non-MoE lane stages are default on (`=0` kills them) and reach exact gfx1201 only.
+    #[test]
+    fn qwen4_lane_allrows_flag_is_default_on_and_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_LANE_ALLROWS" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_lane_allrows_enabled(),
+                arch == "gfx1201",
+                "{arch}"
+            );
+            assert!(!FeatureFlags::from_lookup(arch, with("0")).qwen4_lane_allrows_enabled());
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, with("1")).qwen4_lane_allrows_enabled(),
+                arch == "gfx1201",
+                "{arch}"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_allrows_enabled());
     }
 
     /// The wave-per-token router defaults on for exact gfx1151 / gfx1201; `0` turns it off.

@@ -23,7 +23,9 @@
 //!   singleton's arm by construction) or once over every lane's rows
 //!   ([`StageShare::OnceAllRows`], in groups of at most [`LANE_MAX_ROWS`];
 //!   under `HIPFIRE_QWEN4_LANE_HC_ALLROWS` the HC stages of a >8-row AR /
-//!   verify step take one all-rows segment instead).
+//!   verify step take one all-rows segment instead, and under
+//!   `HIPFIRE_QWEN4_LANE_ALLROWS` so does every other non-MoE once-over-all-rows
+//!   stage: only the routed MoE keeps its groups).
 //!   A stage moves to `OnceAllRows` only on byte evidence from the G0 oracle
 //!   (`examples/fn_lane_oracle.rs --g0`): the S0 kill experiment found the
 //!   few-row forward NOT bitwise equal to single rows at every N ≥ 2, so
@@ -221,7 +223,8 @@ impl StageName {
 pub enum StageShare {
     /// One launch over every lane's rows, in groups of at most
     /// [`LANE_MAX_ROWS`] rows (HC stages: one all-rows segment under
-    /// `HIPFIRE_QWEN4_LANE_HC_ALLROWS`). Admitted only with G0 byte evidence.
+    /// `HIPFIRE_QWEN4_LANE_HC_ALLROWS`; every non-MoE stage under
+    /// `HIPFIRE_QWEN4_LANE_ALLROWS`). Admitted only with G0 byte evidence.
     OnceAllRows,
     /// One launch per lane class; executes as [`StageShare::PerLane`] with
     /// the existing kernels.
@@ -1191,35 +1194,73 @@ fn hc_all_rows_applies(
         && policy.share(StageName::HcWrite) == StageShare::OnceAllRows
 }
 
+/// Whether an AR / verify lane step also runs every non-MoE row-local stage once over all
+/// rows (`HIPFIRE_QWEN4_LANE_ALLROWS`), on top of the all-rows HC segment
+/// ([`hc_all_rows_applies`], which it refines: it is only asked for a step that segment
+/// admitted). Refused (`false`) for anything the wide 9..=64-row routes of the projections
+/// cannot serve exactly as their G x 8 groups' arms do:
+///
+/// - `wide_scope_rows != 0`: a wide-verify scope is in force, so the projections would take
+///   its row-exact twins instead of the wide arms (the lane step runs with no scope);
+/// - `gdn_qkv_bf16`: `HIPFIRE_QWEN4_GDN_QKV_BF16` makes the GDN input projection store its
+///   qkv rows as BF16 by a row-keyed decision (`mq6_i8_route`) the per-lane GDN core, which
+///   routes at the lane's own rows, would not repeat;
+/// - `streams_agree` false: the HC stream storage the step's `n` rows route to differs from
+///   the singleton's one-row storage the lanes' own stateful stages run on.
+fn all_rows_stages_apply(
+    flag: bool,
+    segment_applies: bool,
+    wide_scope_rows: usize,
+    gdn_qkv_bf16: bool,
+    streams_agree: bool,
+) -> bool {
+    flag && segment_applies && wide_scope_rows == 0 && !gdn_qkv_bf16 && streams_agree
+}
+
+/// What the all-rows segment of an AR / verify lane step takes: the HC stages
+/// (`HIPFIRE_QWEN4_LANE_HC_ALLROWS`) and, with `stages`, every other non-MoE
+/// once-over-all-rows stage (`HIPFIRE_QWEN4_LANE_ALLROWS`). The routed MoE always keeps
+/// its <= 8-row groups.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AllRowsPlan {
+    /// Whether the attention (`[0]`) / MLP (`[1]`) HC write runs all-rows; a write a TP2
+    /// all-reduce carries stays per group.
+    hc_writes: [bool; 2],
+    /// Every other non-MoE once-over-all-rows operation runs all-rows too.
+    stages: bool,
+}
+
 /// Where a piece of a once-over-all-rows run is emitted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Placement {
     /// Once per [`LANE_MAX_ROWS`]-row group, segment-major (today's emission).
     Groups,
-    /// One segment over every row of the step (rows `[0, n)`): the HC stages
-    /// of an all-rows step.
+    /// One segment over every row of the step (rows `[0, n)`): the all-rows segment.
     AllRows,
 }
 
 /// Split one run of consecutive once-over-all-rows operations into pieces of
-/// consecutive operations with the same [`Placement`]. `hc_all`: `None` keeps
-/// the whole run in groups (today's emission); `Some(writes)` places every HC
-/// read, and the HC write of the attention (`writes[0]`) / MLP (`writes[1]`)
-/// stage when `writes` says so, over all rows. Operations keep their order.
+/// consecutive operations with the same [`Placement`]. `all_rows`: `None` keeps the whole
+/// run in groups (today's emission); `Some(plan)` places every HC read, the HC write the
+/// plan says, and (`plan.stages`) every operation of a stage other than the routed MoE
+/// over all rows. Operations keep their order.
 fn run_pieces(
     run: &[(LaneOp, StageName)],
-    hc_all: Option<[bool; 2]>,
+    all_rows: Option<AllRowsPlan>,
 ) -> Vec<(std::ops::Range<usize>, Placement)> {
-    let place = |op: LaneOp| match (op, hc_all) {
+    let place = |op: LaneOp, stage: StageName| match (op, all_rows) {
+        (_, None) => Placement::Groups,
         (LaneOp::HcRead { .. }, Some(_)) => Placement::AllRows,
-        (LaneOp::HcWrite { mlp, .. }, Some(writes)) if writes[usize::from(mlp)] => {
+        (LaneOp::HcWrite { mlp, .. }, Some(plan)) if plan.hc_writes[usize::from(mlp)] => {
             Placement::AllRows
         }
+        (LaneOp::HcWrite { .. }, Some(_)) => Placement::Groups,
+        (_, Some(plan)) if plan.stages && stage != StageName::Moe => Placement::AllRows,
         _ => Placement::Groups,
     };
     let mut pieces: Vec<(std::ops::Range<usize>, Placement)> = Vec::new();
-    for (i, &(op, _)) in run.iter().enumerate() {
-        let placement = place(op);
+    for (i, &(op, stage)) in run.iter().enumerate() {
+        let placement = place(op, stage);
         match pieces.last_mut() {
             Some((range, last)) if *last == placement => range.end = i + 1,
             _ => pieces.push((i..i + 1, placement)),
@@ -1230,22 +1271,21 @@ fn run_pieces(
 
 /// The `(segment, ops)` items of one same-share run, in emission order: `run`
 /// starts at program index `start`, `segs` are the segments its share places
-/// it over (every group, or every lane), `hc_all` is `Some((all-rows segment,
-/// HC writes taken all-rows))` for a once-over-all-rows run of an all-rows
-/// step. Every piece is emitted segment-major over its own segments, pieces
-/// in order; without `hc_all` that is the whole run over `segs` (today's
-/// emission).
+/// it over (every group, or every lane), `all_rows` is `Some((all-rows segment,
+/// plan))` for a once-over-all-rows run of an all-rows step. Every piece is emitted
+/// segment-major over its own segments, pieces in order; without `all_rows` that is the
+/// whole run over `segs` (today's emission).
 fn run_items(
     start: usize,
     run: &[(LaneOp, StageName)],
     segs: std::ops::Range<usize>,
-    hc_all: Option<(usize, [bool; 2])>,
+    all_rows: Option<(usize, AllRowsPlan)>,
 ) -> Vec<(usize, std::ops::Range<usize>)> {
     let mut items = Vec::new();
-    for (piece, placement) in run_pieces(run, hc_all.map(|(_, writes)| writes)) {
+    for (piece, placement) in run_pieces(run, all_rows.map(|(_, plan)| plan)) {
         let ops = start + piece.start..start + piece.end;
-        match (placement, hc_all) {
-            (Placement::AllRows, Some((hc, _))) => items.push((hc, ops)),
+        match (placement, all_rows) {
+            (Placement::AllRows, Some((seg, _))) => items.push((seg, ops)),
             _ => items.extend(segs.clone().map(|i| (i, ops.clone()))),
         }
     }
@@ -2163,12 +2203,14 @@ fn forward_lanes_scoped(
         }
     };
     let mut all_segs: Vec<Segment> = lane_segs.iter().chain(&group_segs).copied().collect();
-    // `HIPFIRE_QWEN4_LANE_HC_ALLROWS` (exact gfx1201): an AR / verify step of more than
-    // LANE_MAX_ROWS rows (several groups) runs every HC stage -- each layer's reads, the
-    // writes the all-reduce does not carry, the final read -- as ONE segment over all `n`
-    // rows; every other once-over-all-rows stage keeps its groups. The segment is appended
-    // after the groups (`hc_seg`); a prefill wave, a band edge, a recorded or captured
-    // step and a CPU splice never take it.
+    // The all-rows segment (exact gfx1201). `HIPFIRE_QWEN4_LANE_HC_ALLROWS`: an AR / verify
+    // step of more than LANE_MAX_ROWS rows (several groups) runs every HC stage -- each
+    // layer's reads, the writes the all-reduce does not carry, the final read -- as ONE
+    // segment over all `n` rows. `HIPFIRE_QWEN4_LANE_ALLROWS` (`all_stages`, a refinement of
+    // the same step) puts every other non-MoE once-over-all-rows stage on that segment too:
+    // Embed, PleRows, the GDN / QSA input and output projections, Head and Argmax; only the
+    // routed MoE keeps its groups. The segment is appended after the groups (`hc_seg`); a
+    // prefill wave, a band edge, a recorded or captured step and a CPU splice never take it.
     let group_rows: Vec<usize> = group_segs.iter().map(|seg| seg.rows).collect();
     let hc_all = hc_all_rows_applies(
         gpu.flags.qwen4_lane_hc_allrows_enabled(),
@@ -2178,11 +2220,35 @@ fn forward_lanes_scoped(
         &group_rows,
         policy,
     );
+    let all_stages = all_rows_stages_apply(
+        gpu.flags.qwen4_lane_allrows_enabled(),
+        hc_all,
+        gpu.wide_verify_rows,
+        gpu.flags.qwen4_gdn_qkv_bf16_enabled(),
+        gpu.qwen4_bf16_streams(n) == bf16_state,
+    );
+    let hc_seg: Option<usize> = hc_all.then_some(all_segs.len());
+    // The segments a stage of share `share` runs over: its groups / lanes, or the all-rows
+    // segment for a once-over-all-rows stage other than the routed MoE (whose groups are
+    // always `segs_for`).
+    let stage_segs = |share: StageShare| match hc_seg {
+        Some(all) if all_stages && !share.per_lane() => all..all + 1,
+        _ => segs_for(share),
+    };
     // The writes a TP2 all-reduce carries (`HyperWriteOp::ar`) stay per group.
     let hc_writes = [
         crate::trunk_route::attn_writer().is_none(),
         crate::trunk_route::ffn_writer().is_none(),
     ];
+    let all_rows_plan = hc_seg.map(|seg| {
+        (
+            seg,
+            AllRowsPlan {
+                hc_writes,
+                stages: all_stages,
+            },
+        )
+    });
     let hc_final = hc_all
         && band_scope.output
         && policy.share(StageName::FinalHyper) == StageShare::OnceAllRows;
@@ -2191,7 +2257,7 @@ fn forward_lanes_scoped(
     // the policy's Head / Argmax segments exist only for AR steps.
     let head_segs = |share: StageShare| {
         if band_scope.output {
-            segs_for(share)
+            stage_segs(share)
         } else {
             0..0
         }
@@ -2229,8 +2295,7 @@ fn forward_lanes_scoped(
     } else {
         vec![widest; all_segs.len()]
     };
-    // The all-rows HC segment binds the descriptions (and decode copies) of the groups.
-    let hc_seg: Option<usize> = hc_all.then_some(all_segs.len());
+    // The all-rows segment binds the descriptions (and decode copies) of the groups.
     if hc_all {
         all_segs.push(Segment {
             begin: 0,
@@ -2644,16 +2709,15 @@ fn forward_lanes_scoped(
             } else {
                 StageShare::OnceAllRows
             };
-            // The run's pieces: with the all-rows HC arm the HC ops of a once-over-all-rows run
-            // form their own all-rows pieces (the run's other ops keep their groups); each
+            // The run's pieces: with the all-rows segment the HC ops (and, under
+            // `HIPFIRE_QWEN4_LANE_ALLROWS`, every other non-MoE op) of a once-over-all-rows
+            // run form their own all-rows pieces (the routed MoE keeps its groups); each
             // piece is emitted segment-major over its own segments, pieces in order.
             let items = run_items(
                 start,
                 &program[start..end],
                 segs_for(share),
-                hc_seg
-                    .filter(|_| share == StageShare::OnceAllRows)
-                    .map(|hc| (hc, hc_writes)),
+                all_rows_plan.filter(|_| share == StageShare::OnceAllRows),
             );
             for (i, ops) in items {
                 let (seg, v) = (&all_segs[i], &views[i]);
@@ -3090,7 +3154,7 @@ fn forward_lanes_scoped(
             }
             let embedding = bundle.weights.resident(&bundle.weights.root.embedding)?;
             let embed_share = policy.share(StageName::Embed);
-            for i in segs_for(embed_share) {
+            for i in stage_segs(embed_share) {
                 let (seg, v) = (&all_segs[i], &views[i]);
                 execute_embedding(
                     gpu,
@@ -3107,7 +3171,7 @@ fn forward_lanes_scoped(
                     Qwen4GpuForwardError::Dispatch(format!("lane embedding: {error:?}"))
                 })?;
             }
-            for i in segs_for(embed_share) {
+            for i in stage_segs(embed_share) {
                 let (seg, v) = (&all_segs[i], &views[i]);
                 let streams = view(&v.streams, 0, seg.rows * dims.wide());
                 if bf16_state {
@@ -3192,7 +3256,7 @@ fn forward_lanes_scoped(
             let ple_rows_segs = if ple_rows_f16 {
                 0..lane_segs.len()
             } else {
-                segs_for(rows_share)
+                stage_segs(rows_share)
             };
             for i in ple_rows_segs {
                 let (seg, v) = (&all_segs[i], &views[i]);
@@ -5293,7 +5357,7 @@ mod tests {
         policy: &LaneStagePolicy,
         lanes: usize,
         groups: usize,
-        hc_all: Option<[bool; 2]>,
+        all_rows: Option<AllRowsPlan>,
     ) -> Vec<(usize, LaneOp)> {
         let mut emitted = Vec::new();
         let mut start = 0;
@@ -5308,9 +5372,9 @@ mod tests {
             } else {
                 lanes..lanes + groups
             };
-            let hc = hc_all
+            let hc = all_rows
                 .filter(|_| !per_lane)
-                .map(|writes| (lanes + groups, writes));
+                .map(|plan| (lanes + groups, plan));
             for (seg, ops) in run_items(start, &program[start..end], segs, hc) {
                 emitted.extend(program[ops].iter().map(|&(op, _)| (seg, op)));
             }
@@ -5389,7 +5453,7 @@ mod tests {
         for (lanes, groups) in [(8, 2), (8, 3), (8, 4), (16, 8)] {
             let hc_seg = lanes + groups;
             let today = group_major_items(&program, &policy, lanes, groups);
-            let all = program_items(&program, &policy, lanes, groups, Some([true, true]));
+            let all = program_items(&program, &policy, lanes, groups, plan([true, true], false));
             // Today: every HC op runs once per group.
             assert_eq!(
                 today.iter().filter(|(_, op)| is_hc(*op)).count(),
@@ -5449,7 +5513,7 @@ mod tests {
         let hc_seg = lanes + groups;
         // The FFN write carried by the all-reduce stays per group; reads and the
         // mixer writes go all-rows.
-        let items = program_items(&program, &policy, lanes, groups, Some([true, false]));
+        let items = program_items(&program, &policy, lanes, groups, plan([true, false], false));
         for (seg, op) in &items {
             match op {
                 LaneOp::HcRead { .. } | LaneOp::HcWrite { mlp: false, .. } => {
@@ -5561,5 +5625,196 @@ mod tests {
             &eight_by_two,
             &LaneStagePolicy::all_per_lane()
         ));
+    }
+
+    fn plan(hc_writes: [bool; 2], stages: bool) -> Option<AllRowsPlan> {
+        Some(AllRowsPlan { hc_writes, stages })
+    }
+
+    fn stage_of(program: &[(LaneOp, StageName)], op: LaneOp) -> StageName {
+        program
+            .iter()
+            .find(|(candidate, _)| *candidate == op)
+            .map(|&(_, stage)| stage)
+            .expect("every emitted op is in the program")
+    }
+
+    /// Without `stages` the all-rows segment carries the HC ops and nothing else (H0's
+    /// placement), whatever the policy.
+    #[test]
+    fn all_rows_without_stages_is_the_hc_only_placement() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        for policy in test_policies() {
+            let program = lane_program(
+                band_kinds(&config, single.band.clone()),
+                &policy,
+                Some(ple_layer),
+            );
+            for (lanes, groups) in [(8, 2), (16, 8)] {
+                let all_seg = lanes + groups;
+                for (seg, op) in
+                    program_items(&program, &policy, lanes, groups, plan([true, true], false))
+                {
+                    let on_all = seg == all_seg;
+                    let hc_once = is_hc(op) && !policy.share(stage_of(&program, op)).per_lane();
+                    assert_eq!(on_all, hc_once, "{op:?} {}", policy.describe());
+                }
+            }
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_LANE_ALLROWS`: every non-MoE once-over-all-rows op appears ONCE on the
+    /// all-rows segment (one launch per op per layer), the routed MoE stays on its groups
+    /// between the all-rows HC read and write of its block, and per-lane stages are emitted
+    /// exactly as today.
+    #[test]
+    fn all_rows_stages_place_every_non_moe_once_op_once_and_keep_the_moe_in_groups() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        let layers = config.num_hidden_layers;
+        for policy in test_policies() {
+            let program = lane_program(
+                band_kinds(&config, single.band.clone()),
+                &policy,
+                Some(ple_layer),
+            );
+            let moe_once = !policy.share(StageName::Moe).per_lane();
+            for (lanes, groups) in [(8, 2), (8, 3), (8, 4), (16, 8)] {
+                let all_seg = lanes + groups;
+                let today = group_major_items(&program, &policy, lanes, groups);
+                let items =
+                    program_items(&program, &policy, lanes, groups, plan([true, true], true));
+                let label = format!("{} lanes {lanes} groups {groups}", policy.describe());
+                for &(seg, op) in &items {
+                    let stage = stage_of(&program, op);
+                    if policy.share(stage).per_lane() {
+                        assert!(seg < lanes, "{op:?} {label}");
+                    } else if stage == StageName::Moe {
+                        assert!((lanes..all_seg).contains(&seg), "{op:?} {label}");
+                    } else {
+                        assert_eq!(seg, all_seg, "{op:?} {label}");
+                    }
+                }
+                // Each non-MoE once op: exactly once, in program order.
+                let on_all: Vec<LaneOp> = items
+                    .iter()
+                    .filter(|(seg, _)| *seg == all_seg)
+                    .map(|&(_, op)| op)
+                    .collect();
+                let expected: Vec<LaneOp> = program
+                    .iter()
+                    .filter(|&&(_, stage)| {
+                        !policy.share(stage).per_lane() && stage != StageName::Moe
+                    })
+                    .map(|&(op, _)| op)
+                    .collect();
+                assert_eq!(on_all, expected, "{label}");
+                // The MoE: once per layer per group (or lane), never on the all-rows segment.
+                let moe_items = items
+                    .iter()
+                    .filter(|(_, op)| matches!(op, LaneOp::Moe { .. }))
+                    .count();
+                assert_eq!(
+                    moe_items,
+                    layers * if moe_once { groups } else { lanes },
+                    "{label}"
+                );
+                // Per-lane segments see exactly today's emission.
+                let per_lane = |items: &[(usize, LaneOp)]| -> Vec<(usize, LaneOp)> {
+                    items
+                        .iter()
+                        .copied()
+                        .filter(|(seg, _)| *seg < lanes)
+                        .collect()
+                };
+                assert_eq!(per_lane(&items), per_lane(&today), "{label}");
+                // Each group's MoE calls run between the all-rows HC read and write of
+                // their own block.
+                if moe_once && policy.share(StageName::HcRead) == StageShare::OnceAllRows {
+                    let at = |wanted: LaneOp, nth: usize| {
+                        items
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, (_, op))| *op == wanted)
+                            .nth(nth)
+                            .map(|(index, _)| index)
+                    };
+                    for layer in 0..layers {
+                        let read = at(LaneOp::HcRead { layer, mlp: true }, 0).unwrap();
+                        let write = at(LaneOp::HcWrite { layer, mlp: true }, 0).unwrap();
+                        for nth in 0..groups {
+                            let moe = at(LaneOp::Moe { layer }, nth).unwrap();
+                            assert!(read < moe && moe < write, "layer {layer} {label}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A write a TP2 all-reduce carries stays per group even with every other non-MoE op
+    /// all-rows.
+    #[test]
+    fn all_rows_stages_keep_all_reduce_writes_in_groups() {
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let ple_layer = ple_layer_of(&config);
+        let layers = config.num_hidden_layers;
+        let policy = LaneStagePolicy::production();
+        let program = lane_program(
+            band_kinds(&config, single.band.clone()),
+            &policy,
+            Some(ple_layer),
+        );
+        let (lanes, groups) = (8, 4);
+        let all_seg = lanes + groups;
+        let items = program_items(&program, &policy, lanes, groups, plan([true, false], true));
+        for &(seg, op) in &items {
+            match op {
+                LaneOp::HcWrite { mlp: true, .. } | LaneOp::Moe { .. } => {
+                    assert!((lanes..all_seg).contains(&seg), "{op:?}")
+                }
+                _ if policy.share(stage_of(&program, op)).per_lane() => assert!(seg < lanes),
+                _ => assert_eq!(seg, all_seg, "{op:?}"),
+            }
+        }
+        assert_eq!(
+            items
+                .iter()
+                .filter(|(_, op)| matches!(op, LaneOp::HcWrite { mlp: true, .. }))
+                .count(),
+            layers * groups
+        );
+    }
+
+    /// The refinement applies only to a step the all-rows segment admitted (so never a
+    /// prefill wave, band edge, recorded / captured step, CPU splice, prefill-invariant scope
+    /// or a step of at most 8 rows), with the flag, no wide-verify scope in force, no
+    /// row-keyed GDN qkv BF16 store and one HC stream storage.
+    #[test]
+    fn all_rows_stages_apply_only_where_the_segment_applies() {
+        assert!(all_rows_stages_apply(true, true, 0, false, true));
+        assert!(!all_rows_stages_apply(false, true, 0, false, true));
+        assert!(!all_rows_stages_apply(true, false, 0, false, true));
+        assert!(!all_rows_stages_apply(true, true, 8, false, true));
+        assert!(!all_rows_stages_apply(true, true, 0, true, true));
+        assert!(!all_rows_stages_apply(true, true, 0, false, false));
+        let production = LaneStagePolicy::production();
+        let segment = |ar, eager, cpu, groups: &[usize]| {
+            hc_all_rows_applies(true, ar, eager, cpu, groups, &production)
+        };
+        let stages = |segment_applies| all_rows_stages_apply(true, segment_applies, 0, false, true);
+        assert!(stages(segment(true, true, false, &[8, 8])));
+        // Prefill wave / band edge, recorded or captured (or invariant) step, CPU splice.
+        assert!(!stages(segment(false, true, false, &[8, 8])));
+        assert!(!stages(segment(true, false, false, &[8, 8])));
+        assert!(!stages(segment(true, true, true, &[8, 8])));
+        // n <= 8: one group, nothing to share.
+        for groups in [&[1usize][..], &[8], &[4]] {
+            assert!(!stages(segment(true, true, false, groups)));
+        }
     }
 }

@@ -45,6 +45,13 @@
 //!    stop the sweep, and an execution error stops it only when the lane
 //!    store is no longer usable.
 //!
+//! `--logits-dump DIR` (implies `--logits`; DIR must not exist, AR arm only) also writes every
+//! compared logits row as raw little-endian f32 (`vocab` values per row, `tokens + 1` rows per
+//! file, the order the shas are taken in): `DIR/ref/prompt{P}.f32` for the singleton and
+//! `DIR/lane/{policy}/{K=..|burst=..}/lane{L}-prompt{P}.f32` per lane run. Per-row KL between two
+//! dumps (singleton vs lane, or lane vs lane across an env flag) is a script's job
+//! (`kl_rows.py`); the oracle only emits the rows.
+//!
 //! Exit 0: every compared K/prompt equal. 1: mismatch. 2: refusal or error.
 //!
 //! The lane driver runs behind [`LaneBackend`]; [`LocalLanes`] is the Single/EP
@@ -60,7 +67,7 @@
 //! ```text
 //! fn_mesh_lane_oracle --model M.mq4 --prompt-file a.txt [--prompt-file b.ids ...] \
 //!     --max-seq 4096 --tokens 64 --ks 1,2,4,8 --out DIR \
-//!     [--pp 1] [--row-budget R] [--skip-model-hash] [--logits]
+//!     [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] [--logits-dump DIR]
 //!     [--policies 'g0' | 'per-lane;per-lane:moe=once;production'] [--tokens-sweep N]
 //!     [--burst I,J,...]   (repeatable; see "Bursts" below)
 //! ```
@@ -233,6 +240,8 @@ struct Args {
     row_budget: Option<usize>,
     skip_model_hash: bool,
     logits: bool,
+    /// `--logits-dump DIR`: write every compared logits row as raw f32 (needs `--logits`).
+    logits_dump: Option<PathBuf>,
     /// Policies to sweep, in order (never empty); default is the store's
     /// construction policy only.
     policies: Vec<PolicyEntry>,
@@ -521,6 +530,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut row_budget = None;
     let mut skip_model_hash = false;
     let mut logits = false;
+    let mut logits_dump: Option<PathBuf> = None;
     let mut policies = None;
     let mut tokens_sweep = None;
     let mut reserve_lanes = None;
@@ -547,6 +557,10 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             }
             "--skip-model-hash" => skip_model_hash = true,
             "--logits" => logits = true,
+            "--logits-dump" => {
+                logits_dump = Some(PathBuf::from(value("--logits-dump")?));
+                logits = true;
+            }
             "--policies" => policies = Some(parse_policies(&value("--policies")?)?),
             "--tokens-sweep" => {
                 tokens_sweep = Some(value("--tokens-sweep")?.parse::<usize>().map_err(e)?)
@@ -652,6 +666,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         row_budget,
         skip_model_hash,
         logits,
+        logits_dump,
         policies: policies.unwrap_or_else(|| {
             vec![PolicyEntry {
                 spec: DEFAULT_POLICY_SPEC.to_string(),
@@ -671,7 +686,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
 }
 
 const HELP: &str = "fn_mesh_lane_oracle --model M.mq4 --prompt-file P [--prompt-file P ...] \
---max-seq N --tokens T --ks 1,2,4,8 --out DIR [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] \
+--max-seq N --tokens T --ks 1,2,4,8 --out DIR [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] [--logits-dump DIR] \
 [--burst I,J,...] [--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N] \
 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--soak-seconds S [--soak-seed N]] \
 [--fault-point before-draft|head-round|target-edge|repair|before-publish]\n\
@@ -734,6 +749,42 @@ fn load_prompt(path: &str, tokenizer: &hipfire_runtime::tokenizer::Tokenizer) ->
 fn tensor_bytes(gpu: &Gpu, tensor: &GpuTensor) -> R<Vec<u8>> {
     gpu.hip.device_synchronize().map_err(e)?;
     gpu.download_raw_bytes(tensor).map_err(e)
+}
+
+/// `--logits-dump`: append one raw f32 logits row to `path`.
+fn dump_row(path: &Path, bytes: &[u8]) -> R<()> {
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(bytes))
+        .map_err(|x| format!("dump logits row to {}: {x}", path.display()))
+}
+
+/// `--logits-dump`: the per-lane row files of one policy's run set (the directory is created):
+/// `root/lane/{policy}/{label}/lane{L}-prompt{P}.f32`, path-unsafe characters of the policy
+/// spec and run label replaced by `_`.
+fn lane_dump_paths(root: &Path, spec: &str, label: &str, members: &[usize]) -> R<Vec<PathBuf>> {
+    let safe = |text: &str| -> String {
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '-' | '=' | '+' | '.') {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect()
+    };
+    let dir = root.join("lane").join(safe(spec)).join(safe(label));
+    std::fs::create_dir_all(&dir)
+        .map_err(|x| format!("create logits dump dir {}: {x}", dir.display()))?;
+    Ok(members
+        .iter()
+        .enumerate()
+        .map(|(lane, prompt)| dir.join(format!("lane{lane}-prompt{prompt}.f32")))
+        .collect())
 }
 
 fn device_info(gpu: &Gpu) -> Value {
@@ -1343,6 +1394,9 @@ struct DriveCfg<'a> {
     max_lanes: usize,
     row_budget: usize,
     want_logits: bool,
+    /// Per lane (in lane order): the file every logits row of the lane is appended to as raw f32
+    /// (`--logits-dump`); `None` writes nothing.
+    dump: Option<&'a [PathBuf]>,
 }
 
 struct LaneRun {
@@ -1615,6 +1669,18 @@ fn drive_inner(
                     .find(|(epoch, _)| *epoch == request.epoch)
                     .map(|(_, bytes)| bytes.to_vec())
             };
+            // `--logits-dump`: the lane's raw f32 row, appended to its file.
+            let row_dump = || -> R<()> {
+                let Some(paths) = cfg.dump else {
+                    return Ok(());
+                };
+                let (_, bytes) = result
+                    .logits
+                    .iter()
+                    .find(|(epoch, _)| *epoch == request.epoch)
+                    .ok_or_else(|| format!("lane {idx}: the step returned no logits row"))?;
+                dump_row(&paths[idx], bytes)
+            };
             let lane = &mut lanes[idx];
             match request.kind {
                 RequestStepKind::Prefill => {
@@ -1637,6 +1703,7 @@ fn drive_inner(
                     lane.committed.push(*id);
                     lane.logits_sha.extend(row_sha()?);
                     lane.logits_raw.extend(row_raw());
+                    row_dump()?;
                 }
                 RequestStepKind::Ar => {
                     lane.progress.ar_steps += 1;
@@ -1656,6 +1723,7 @@ fn drive_inner(
                     lane.committed.push(*id);
                     lane.logits_sha.extend(row_sha()?);
                     lane.logits_raw.extend(row_raw());
+                    row_dump()?;
                     if decode_only {
                         lane.decode_only_rows += 1;
                     }
@@ -1791,6 +1859,7 @@ fn reference_run(
     prompt: &[u32],
     tokens: usize,
     want_logits: bool,
+    dump: Option<&Path>,
 ) -> R<Reference> {
     // The singleton's cold prefill of this prompt, timed (the final-logits read after it drains
     // the device), to set beside the lane prefill tile of the same rows (`prefill` in
@@ -1812,6 +1881,9 @@ fn reference_run(
     if want_logits {
         let bytes = single.logits_bytes()?;
         reference.logits_sha.push(sha256_hex(&bytes));
+        if let Some(path) = dump {
+            dump_row(path, &bytes)?;
+        }
         reference.logits_raw.push(bytes);
     }
     for step in 1..=tokens {
@@ -1822,6 +1894,9 @@ fn reference_run(
         if want_logits {
             let bytes = single.logits_bytes()?;
             reference.logits_sha.push(sha256_hex(&bytes));
+            if let Some(path) = dump {
+                dump_row(path, &bytes)?;
+            }
             reference.logits_raw.push(bytes);
         }
     }
@@ -1909,12 +1984,25 @@ fn run_policy(
                     "[{TOOL}] policy {spec}: {label}: {k} concurrent lanes ({tokens} tokens)"
                 );
                 let selected: Vec<&[u32]> = set.members.iter().map(|&i| prompts[i]).collect();
+                let dump_paths = match args
+                    .logits_dump
+                    .as_deref()
+                    .map(|root| lane_dump_paths(root, spec, &label, &set.members))
+                    .transpose()
+                {
+                    Ok(paths) => paths,
+                    Err(x) => {
+                        status = PolicyStatus::Error(format!("{label}: {x}"));
+                        break;
+                    }
+                };
                 let cfg = DriveCfg {
                     prompts: &selected,
                     tokens,
                     max_lanes,
                     row_budget,
                     want_logits: args.logits,
+                    dump: dump_paths.as_deref(),
                 };
                 let run = match drive_k(backend, &cfg, k, next_tag) {
                     Ok(run) => run,
@@ -2666,6 +2754,7 @@ fn drive_mtp_ep(
             max_lanes,
             row_budget,
             want_logits: false,
+            dump: None,
         };
         let out = match drive_mtp_k(
             bundle,
@@ -2915,6 +3004,10 @@ fn expanded_argv(args: &Args, cwd: &Path) -> Vec<String> {
     }
     if args.logits {
         argv.push("--logits".to_string());
+    }
+    if let Some(dir) = &args.logits_dump {
+        argv.push("--logits-dump".to_string());
+        argv.push(absolute_path(&dir.display().to_string(), cwd));
     }
     argv
 }
@@ -3347,6 +3440,11 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
         }))
         .collect::<Vec<_>>());
 
+    if let Some(root) = &args.logits_dump {
+        std::fs::create_dir(root)
+            .and_then(|()| std::fs::create_dir(root.join("ref")))
+            .map_err(|x| format!("create logits dump dir {}: {x}", root.display()))?;
+    }
     // Reference: the serialized singleton run of every prompt.
     let mut references = Vec::with_capacity(prompts.len());
     for (index, prompt) in prompts.iter().enumerate() {
@@ -3355,6 +3453,10 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
             prompt.path,
             prompt.ids.len()
         );
+        let dump = args
+            .logits_dump
+            .as_ref()
+            .map(|root| root.join("ref").join(format!("prompt{index}.f32")));
         let reference = match pp_gpus.as_deref_mut() {
             Some(gpus) => reference_run(
                 &mut PpSingle {
@@ -3366,6 +3468,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
                 &prompt.ids,
                 args.tokens,
                 args.logits,
+                dump.as_deref(),
             ),
             None => reference_run(
                 &mut LocalSingle {
@@ -3376,6 +3479,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
                 &prompt.ids,
                 args.tokens,
                 args.logits,
+                dump.as_deref(),
             ),
         }?;
         ids_lines.push(json!({"kind": "reference", "prompt": index, "ids": reference.ids}));
@@ -3616,12 +3720,12 @@ mod tests {
             position: 0,
             prefills: 0,
         };
-        let got = reference_run(&mut single, &prompt, 5, true).unwrap();
+        let got = reference_run(&mut single, &prompt, 5, true, None).unwrap();
         let want = reference(&prompt, 5);
         assert_eq!(got.ids, want.ids);
         assert_eq!(got.logits_sha, want.logits_sha);
         assert_eq!(single.prefills, 1);
-        let plain = reference_run(&mut single, &prompt, 5, false).unwrap();
+        let plain = reference_run(&mut single, &prompt, 5, false, None).unwrap();
         assert!(plain.logits_sha.is_empty());
         assert_eq!(plain.ids, want.ids);
     }
@@ -4013,6 +4117,40 @@ mod tests {
             .collect()
     }
 
+    /// `--logits-dump`: the flag parses (and implies `--logits`), and every lane row lands in the
+    /// lane's file as the raw bytes the backend returned, in the order the shas are taken.
+    #[test]
+    fn logits_dump_writes_every_lane_row_as_raw_bytes() {
+        let line = format!("{BASE} --ks 1 --logits-dump out/dump{}", files(1));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert!(args.logits);
+        assert_eq!(args.logits_dump, Some(PathBuf::from("out/dump")));
+
+        let prompts = prompts();
+        let slices: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        let root = std::env::temp_dir().join(format!("{TOOL}-logits-dump-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = lane_dump_paths(&root, "per-lane:moe=once", "K=2", &[0, 1]).unwrap();
+        assert!(paths[1].ends_with("lane/per-lane_moe=once/K=2/lane1-prompt1.f32"));
+        let mut backend = FakeLanes::new(4, 3);
+        let cfg = DriveCfg {
+            prompts: &slices,
+            tokens: 4,
+            max_lanes: 4,
+            row_budget: 4,
+            want_logits: true,
+            dump: Some(&paths),
+        };
+        drive_k(&mut backend, &cfg, 2, &mut 0).unwrap();
+        for (lane, path) in paths.iter().enumerate() {
+            let want: Vec<u8> = (0..=4)
+                .flat_map(|s| pick_bytes(&prompts[lane], prompts[lane].len() - 1 + s))
+                .collect();
+            assert_eq!(std::fs::read(path).unwrap(), want, "lane {lane}");
+        }
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn mixed_lanes_commit_the_singleton_ids_and_release() {
         let prompts = prompts();
@@ -4027,6 +4165,7 @@ mod tests {
                     max_lanes: 4,
                     row_budget: 4,
                     want_logits,
+                    dump: None,
                 };
                 backend.steps.clear();
                 backend.released.clear();
@@ -4078,6 +4217,7 @@ mod tests {
             max_lanes: 4,
             row_budget: 2,
             want_logits: true,
+            dump: None,
         };
         let run = drive_k(&mut backend, &cfg, 4, &mut 0).unwrap();
         assert!(backend.steps.iter().all(|s| s.1 <= 2));
@@ -4127,6 +4267,7 @@ mod tests {
             max_lanes: 4,
             row_budget: 4,
             want_logits: false,
+            dump: None,
         };
         let error = drive_k(&mut backend, &cfg, 3, &mut 0).unwrap_err();
         assert!(error.contains("injected"), "{error}");
@@ -4144,6 +4285,7 @@ mod tests {
             max_lanes: 2,
             row_budget: 2,
             want_logits: false,
+            dump: None,
         };
         assert!(drive_k(&mut backend, &cfg, 3, &mut 0).is_err());
         assert!(backend.lanes.is_empty());
@@ -4454,6 +4596,7 @@ mod tests {
             max_lanes: 4,
             row_budget: 4,
             want_logits: false,
+            dump: None,
         };
         let run = drive_k(&mut backend, &cfg, 2, &mut 0).unwrap();
         let references: Vec<Reference> = prompts.iter().map(|p| reference(p, 3)).collect();
