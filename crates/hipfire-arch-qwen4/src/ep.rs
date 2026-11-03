@@ -725,33 +725,45 @@ fn install_unit_tail(
 ) -> Result<(), String> {
     use crate::expert_unit_tail as tail;
     let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
-    let Some(config) = tail::parse_ep_unit_tail(raw.as_deref())? else {
+    let Some(config) = tail::resolve_ep_unit_tail(raw.as_deref())? else {
         return Ok(());
     };
-    let plan = bundle.weights.ep_unit_plan().ok_or_else(|| {
-        format!(
-            "{} needs a per-expert unit plan ({})",
-            tail::EP_UNIT_TAIL_ENV,
-            crate::expert_ep_units::EP_EXPERT_HOTSET_ENV
-        )
-    })?;
+    let Some(plan) = bundle.weights.ep_unit_plan() else {
+        // The shipped default tail only exists over a per-expert unit plan; an explicit one
+        // without a plan is a load error, never a silent no-op.
+        if tail::ep_unit_tail_explicit() {
+            return Err(format!(
+                "{} needs a per-expert unit plan ({})",
+                tail::EP_UNIT_TAIL_ENV,
+                crate::expert_ep_units::EP_EXPERT_HOTSET_ENV
+            ));
+        }
+        return Ok(());
+    };
     let log = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_LOG_ENV, false);
-    let prefill = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_PREFILL_ENV, false);
+    let prefill = tail::tail_lever(tail::EP_UNIT_TAIL_PREFILL_ENV);
     let ranks = plan.geometry().ranks;
-    let peer = if !hipfire_config::developer_bool(tail::EP_UNIT_TAIL_PEER_ENV, false) {
+    // Notes about an ignored lever print only when the operator set that lever.
+    let peer_set = tail::tail_lever_explicit(tail::EP_UNIT_TAIL_PEER_ENV);
+    let pins_set = tail::tail_lever_explicit(tail::EP_UNIT_TAIL_PINS_ENV);
+    let peer = if !tail::tail_lever(tail::EP_UNIT_TAIL_PEER_ENV) {
         None
     } else if !prefill {
-        eprintln!(
-            "qwen4 EP rank {rank}: {}=1 is ignored: it needs {}=1",
-            tail::EP_UNIT_TAIL_PEER_ENV,
-            tail::EP_UNIT_TAIL_PREFILL_ENV
-        );
+        if peer_set {
+            eprintln!(
+                "qwen4 EP rank {rank}: {}=1 is ignored: it needs {}=1",
+                tail::EP_UNIT_TAIL_PEER_ENV,
+                tail::EP_UNIT_TAIL_PREFILL_ENV
+            );
+        }
         None
     } else if ranks < 2 {
-        eprintln!(
-            "qwen4 EP rank {rank}: {}=1 is ignored: the mesh has no peer rank",
-            tail::EP_UNIT_TAIL_PEER_ENV
-        );
+        if peer_set {
+            eprintln!(
+                "qwen4 EP rank {rank}: {}=1 is ignored: the mesh has no peer rank",
+                tail::EP_UNIT_TAIL_PEER_ENV
+            );
+        }
         None
     } else if rank >= ranks {
         return Err(format!(
@@ -768,9 +780,9 @@ fn install_unit_tail(
     // The pins lever: the tail keeps the pinned unit layers (D1.9) and their pin plane follows
     // its publications. Effective only where those layers exist on this load (pinned owners
     // admitted as without a tail); otherwise the tail runs exactly as it does without the lever.
-    let pins_flag = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_PINS_ENV, false);
+    let pins_flag = tail::tail_lever(tail::EP_UNIT_TAIL_PINS_ENV);
     let pins_requested = tail::ep_unit_tail_pins_requested();
-    if pins_flag && !pins_requested {
+    if pins_set && pins_flag && !pins_requested {
         eprintln!(
             "qwen4 EP rank {rank}: {}=1 is ignored: it needs {}=1",
             tail::EP_UNIT_TAIL_PINS_ENV,
@@ -781,17 +793,21 @@ fn install_unit_tail(
     let pin_board = if !pins_requested {
         None
     } else if !layers.iter().any(|layer| layer.pins.is_some()) {
-        eprintln!(
-            "qwen4 EP rank {rank}: {}=1 is ignored: pinned owners are not in effect on this load \
-             (the tail runs on static owners, as without the lever)",
-            tail::EP_UNIT_TAIL_PINS_ENV
-        );
+        if pins_set {
+            eprintln!(
+                "qwen4 EP rank {rank}: {}=1 is ignored: pinned owners are not in effect on this load \
+                 (the tail runs on static owners, as without the lever)",
+                tail::EP_UNIT_TAIL_PINS_ENV
+            );
+        }
         None
     } else if ranks < 2 {
-        eprintln!(
-            "qwen4 EP rank {rank}: {}=1 is ignored: the mesh has no peer rank",
-            tail::EP_UNIT_TAIL_PINS_ENV
-        );
+        if pins_set {
+            eprintln!(
+                "qwen4 EP rank {rank}: {}=1 is ignored: the mesh has no peer rank",
+                tail::EP_UNIT_TAIL_PINS_ENV
+            );
+        }
         None
     } else if rank >= ranks {
         return Err(format!(

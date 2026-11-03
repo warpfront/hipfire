@@ -117,8 +117,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 
 /// `T,F[,b=N]`: tail slots per rank, fills per rank per window, optional
-/// boundary mode (admit only every `N` windows). Unset, empty, `0` or `off`
-/// leaves the tail off.
+/// boundary mode (admit only every `N` windows). Unset = the shipped default
+/// ([`EP_UNIT_TAIL_DEFAULT_SLOTS`],[`EP_UNIT_TAIL_DEFAULT_FILLS`]) on a load with a per-expert
+/// unit plan; empty, `0` or `off` leaves the tail off.
 pub const EP_UNIT_TAIL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL";
 /// `1`: build the tail (pool, seed, usage log) but never admit or evict: the
 /// A/B arm that prices the tail's bookkeeping without any fill traffic.
@@ -129,14 +130,14 @@ pub const EP_UNIT_TAIL_FREEZE_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_FREEZE";
 /// the pinned host arena; and the long-prefill UNIT STAGE (the owner-routed tile route's staged
 /// forwards) names a slot-live owned unit's slot in its pointer table and skips that unit's bytes
 /// in the per-layer H2D copy (the decode tables alone see slots without it). Needs the tail;
-/// default off.
+/// default on; `=0` is the kill switch.
 pub const EP_UNIT_TAIL_PREFILL_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PREFILL";
 /// `1`: with the tail AND [`EP_UNIT_TAIL_PREFILL_ENV`], every rank's FULL (chunk / prefill)
 /// pointer tables also follow the PEER ranks' slot publications for the peer-owned units whose
 /// full-table entries equal the owner's canonical ones, so a full-table prefill forward (every
 /// rank computes every expert) reads a unit the owner holds in a tail slot from the owner's VRAM
 /// over P2P instead of from the owner's pinned host arena. An owner quarantines an evicted slot
-/// until every peer's table dropped it (module docs). Default off; ignored (with a note) without
+/// until every peer's table dropped it (module docs). Default on (`=0` kills it); ignored (with a note) without
 /// the prefill lever.
 pub const EP_UNIT_TAIL_PEER_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PEER";
 /// `1`: with the tail AND [`EP_UNIT_TAIL_PREFILL_ENV`], the tail no longer turns pinned owners
@@ -145,7 +146,7 @@ pub const EP_UNIT_TAIL_PEER_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PEER";
 /// of [`pins`]: the retirement-lagged, rank-identical plane, its safety argument and failure
 /// path). Effective only where pinned owners are admitted as without a tail
 /// (`HIPFIRE_EP_UNIT_PINNED_OWNERS` not `0`, balanced ownership admitted); otherwise (with a note)
-/// the tail runs exactly as it does without this lever. Default off.
+/// the tail runs exactly as it does without this lever. Default on (`=0` kills it).
 pub const EP_UNIT_TAIL_PINS_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PINS";
 /// `1`: print a `[unit-tail]` counter line every 64 windows and at release.
 pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
@@ -224,6 +225,41 @@ pub fn parse_ep_unit_tail(raw: Option<&str>) -> Result<Option<EpUnitTailConfig>,
     }))
 }
 
+/// Default tail when [`EP_UNIT_TAIL_ENV`] is unset: `T` slots per rank.
+pub const EP_UNIT_TAIL_DEFAULT_SLOTS: usize = 1536;
+/// Default tail when [`EP_UNIT_TAIL_ENV`] is unset: `F` fills per rank per window.
+pub const EP_UNIT_TAIL_DEFAULT_FILLS: usize = 16;
+
+/// [`parse_ep_unit_tail`] with the shipped default: unset = the default `T,F` (a tail exists only
+/// over a per-expert unit plan, see [`ep_unit_tail_explicit`]); empty / `0` / `off` = off.
+pub fn resolve_ep_unit_tail(raw: Option<&str>) -> Result<Option<EpUnitTailConfig>, String> {
+    match raw {
+        None => Ok(Some(EpUnitTailConfig {
+            tail_units: EP_UNIT_TAIL_DEFAULT_SLOTS,
+            fill_per_step: EP_UNIT_TAIL_DEFAULT_FILLS,
+            boundary_every: 1,
+        })),
+        raw => parse_ep_unit_tail(raw),
+    }
+}
+
+/// Whether [`EP_UNIT_TAIL_ENV`] was set to a tail (not unset, not off): an explicit tail on a load
+/// without a unit plan is a load error; the shipped default silently stays off there.
+pub fn ep_unit_tail_explicit() -> bool {
+    let raw = hipfire_config::developer_var(EP_UNIT_TAIL_ENV).ok();
+    raw.is_some() && parse_ep_unit_tail(raw.as_deref()).is_ok_and(|config| config.is_some())
+}
+
+/// A tail lever flag (`PREFILL` / `PEER` / `PINS`): default on, `=0` is the kill switch.
+pub fn tail_lever(env: &str) -> bool {
+    hipfire_config::developer_bool(env, true)
+}
+
+/// Whether the lever env var was set by the operator (notes about an ignored lever print only then).
+pub fn tail_lever_explicit(env: &str) -> bool {
+    hipfire_config::developer_var(env).is_ok()
+}
+
 /// Whether [`EP_UNIT_TAIL_ENV`] asks for a tail in this process. Without
 /// [`EP_UNIT_TAIL_PINS_ENV`] a configured tail runs on STATIC `e % ranks` owners: pinned owners
 /// (D1.9) deal the non-core experts of a call to either rank, so a rank's tail would have to follow
@@ -231,7 +267,7 @@ pub fn parse_ep_unit_tail(raw: Option<&str>) -> Result<Option<EpUnitTailConfig>,
 /// and the unit layers' owner kind ([`crate::gpu_forward::ep_unit_layer_owner_kind`]) keeps D1's
 /// static rule instead.
 pub fn ep_unit_tail_configured() -> bool {
-    parse_ep_unit_tail(
+    resolve_ep_unit_tail(
         hipfire_config::developer_var(EP_UNIT_TAIL_ENV)
             .ok()
             .as_deref(),
@@ -243,7 +279,7 @@ pub fn ep_unit_tail_configured() -> bool {
 /// [`EP_UNIT_TAIL_PREFILL_ENV`] is on. Gates both the full chunk tables following the slot
 /// publications and the unit stage's slot-aware tables / copy runs.
 pub fn ep_unit_tail_prefill_requested() -> bool {
-    ep_unit_tail_configured() && hipfire_config::developer_bool(EP_UNIT_TAIL_PREFILL_ENV, false)
+    ep_unit_tail_configured() && tail_lever(EP_UNIT_TAIL_PREFILL_ENV)
 }
 
 /// The pure decision of [`ep_unit_tail_pins_requested`]: the lever is on only with the tail
@@ -259,7 +295,7 @@ pub fn tail_pins_requested(prefill_requested: bool, pins_flag: bool) -> bool {
 pub fn ep_unit_tail_pins_requested() -> bool {
     tail_pins_requested(
         ep_unit_tail_prefill_requested(),
-        hipfire_config::developer_bool(EP_UNIT_TAIL_PINS_ENV, false),
+        tail_lever(EP_UNIT_TAIL_PINS_ENV),
     )
 }
 
@@ -1363,6 +1399,22 @@ mod tests {
     }
 
     #[test]
+    fn resolve_defaults_when_unset() {
+        let default = resolve_ep_unit_tail(None).unwrap().unwrap();
+        assert_eq!(default.tail_units, EP_UNIT_TAIL_DEFAULT_SLOTS);
+        assert_eq!(default.fill_per_step, EP_UNIT_TAIL_DEFAULT_FILLS);
+        assert_eq!(default.boundary_every, 1);
+        assert_eq!(resolve_ep_unit_tail(Some("")), Ok(None));
+        assert_eq!(resolve_ep_unit_tail(Some("0")), Ok(None));
+        assert_eq!(resolve_ep_unit_tail(Some("off")), Ok(None));
+        assert_eq!(
+            resolve_ep_unit_tail(Some("512,8")).unwrap().unwrap().tail_units,
+            512
+        );
+        assert!(resolve_ep_unit_tail(Some("x")).is_err());
+    }
+
+    #[test]
     fn parse_forms() {
         assert_eq!(parse_ep_unit_tail(None), Ok(None));
         assert_eq!(parse_ep_unit_tail(Some("")), Ok(None));
@@ -1990,9 +2042,9 @@ mod tests {
         assert_eq!(PeerBoard::new(1).released_through(0, 1), u64::MAX);
     }
 
-    /// The pins lever is off by default and, off, a configured tail turns pinned owners off
-    /// exactly as before it existed (`ep_unit_tail_configured()`); on, only with the tail's
-    /// prefill lever, it does not.
+    /// The pins lever is on by default (with the default tail and prefill lever); off (`=0`), a
+    /// configured tail turns pinned owners off exactly as before it existed
+    /// (`ep_unit_tail_configured()`); on, only with the tail's prefill lever, it does not.
     #[test]
     fn pins_flag_off_is_todays_static_owner_tail() {
         // Requested only with the prefill lever AND the flag.
@@ -2007,8 +2059,8 @@ mod tests {
         }
         // Flag on (which implies a configured tail): the tail no longer blocks pinned owners.
         assert!(!tail_blocks_pins(true, true));
-        // The unit-test process has none of the levers set.
-        assert!(!ep_unit_tail_pins_requested());
+        // The unit-test process has none of the levers set: the shipped defaults are all on.
+        assert!(ep_unit_tail_pins_requested());
         assert!(!ep_unit_tail_blocks_pins());
     }
 }

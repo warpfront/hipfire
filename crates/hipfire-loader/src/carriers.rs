@@ -3000,9 +3000,10 @@ pub fn qwen4_ep_vram_layers(
         // The D2 tail only exists over a per-expert unit plan: refuse before any load work.
         use hipfire_arch_qwen4::expert_unit_tail as tail;
         let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
-        if tail::parse_ep_unit_tail(raw.as_deref())
-            .map_err(|error| format!("qwen4: {error}"))?
-            .is_some()
+        if raw.is_some()
+            && tail::parse_ep_unit_tail(raw.as_deref())
+                .map_err(|error| format!("qwen4: {error}"))?
+                .is_some()
         {
             return Err(format!(
                 "qwen4: {} needs a per-expert unit plan ({})",
@@ -3648,7 +3649,7 @@ fn qwen4_ep_unit_tail_delta_mib(unit_bytes: u64) -> Result<i64, String> {
     use hipfire_arch_qwen4::expert_unit_tail as tail;
     let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
     let config =
-        tail::parse_ep_unit_tail(raw.as_deref()).map_err(|error| format!("qwen4: {error}"))?;
+        tail::resolve_ep_unit_tail(raw.as_deref()).map_err(|error| format!("qwen4: {error}"))?;
     Ok(config.map_or(0, |config| {
         tail::ep_unit_tail_budget_delta_mib(&config, unit_bytes)
     }))
