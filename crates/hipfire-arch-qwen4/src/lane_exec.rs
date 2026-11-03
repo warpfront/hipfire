@@ -129,18 +129,18 @@ static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(||
     hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
 });
 
-/// The lab knob that turns a step's sub-512-row lane prefill tiles into EXACT joint prefill
-/// waves (EP lane forwards only; see [`plan_prefill_parts`]). Unset: every tile is its own
-/// serial singleton chunk forward, byte-identical to before.
+/// The knob of the EXACT joint prefill wave of a step's sub-512-row lane prefill tiles (EP lane
+/// forwards only; see [`plan_prefill_parts`]). Default ON; `0` is the kill switch: every tile is
+/// its own serial singleton chunk forward, byte-identical to the wave's output anyway.
 pub const EP_LANE_PREFILL_WAVE_EXACT_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT";
 
 /// Most rows one prefill wave carries (the plan of record's 2048-row pass).
-pub(crate) const EP_WAVE_MAX_ROWS: usize = crate::gpu_forward::ep_wave::QWEN4_EP_WAVE_MAX_ROWS;
+pub(crate) const EP_WAVE_MAX_ROWS: usize = crate::gpu_forward::ep_wave::QWEN4_EP_WAVE_ROW_CAP;
 
-/// [`EP_LANE_PREFILL_WAVE_EXACT_ENV`] parsed: only the value `1` arms the wave (unset, empty,
-/// `0` and anything else: today's serial tiles).
+/// [`EP_LANE_PREFILL_WAVE_EXACT_ENV`] parsed: the wave is ON by default (it is byte-identical to
+/// the serial tiles it replaces); exactly `0` is the kill switch (today's serial tiles).
 pub(crate) fn ep_lane_prefill_wave_from(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.trim() == "1")
+    value.is_none_or(|v| v.trim() != "0")
 }
 
 /// The wave knob, read once per process (every rank thread agrees).
@@ -2388,10 +2388,18 @@ mod wave_tests {
     }
 
     #[test]
-    fn the_knob_is_armed_only_by_one() {
-        assert!(ep_lane_prefill_wave_from(Some("1")));
-        assert!(ep_lane_prefill_wave_from(Some(" 1\n")));
-        for off in [None, Some(""), Some("0"), Some("2"), Some("true")] {
+    fn the_wave_is_on_by_default_and_only_exact_zero_kills_it() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some(" 1\n"),
+            Some("2"),
+            Some("true"),
+        ] {
+            assert!(ep_lane_prefill_wave_from(on), "{on:?}");
+        }
+        for off in [Some("0"), Some(" 0\n")] {
             assert!(!ep_lane_prefill_wave_from(off), "{off:?}");
         }
     }

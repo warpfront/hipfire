@@ -36,7 +36,7 @@ use crate::gpu_forward_lanes::{LaneStagePolicy, StageName, StageShare};
 use rdna_compute::prefill_invariant::QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
 
 /// Most rows one wave carries (the plan of record's 2048-row pass).
-pub const QWEN4_EP_WAVE_MAX_ROWS: usize = 2048;
+pub const QWEN4_EP_WAVE_ROW_CAP: usize = 2048;
 
 /// Fewest rows of a lane the exact wave takes. A lane of at most 8 rows runs the few-row routes
 /// and 9..=48 rows the g32 gate/up family in its singleton; g32 is documented bit-identical to
@@ -135,9 +135,9 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
         }
     }
     let total = facts.total();
-    if total > QWEN4_EP_WAVE_MAX_ROWS {
+    if total > QWEN4_EP_WAVE_ROW_CAP {
         return refuse(format!(
-            "{total} rows exceed the {QWEN4_EP_WAVE_MAX_ROWS}-row wave cap"
+            "{total} rows exceed the {QWEN4_EP_WAVE_ROW_CAP}-row wave cap"
         ));
     }
     if !facts.moe_full_ready {
