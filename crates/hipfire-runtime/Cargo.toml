@@ -885,6 +885,11 @@ required-features = ["lab"]
 name = "ep2_boundary_micro"
 required-features = ["lab"]
 
+# Dead grouped-row store skip (HIPFIRE_QWEN4_MOE_DEAD_STORES) byte oracle + A/B on real expert tensors: production o8_r16 down, zero stores vs skip.
+[[example]]
+name = "moe_dead_rows_oracle"
+required-features = ["lab"]
+
 [[example]]
 name = "moe_nan_guard_regress"
 required-features = ["lab"]
