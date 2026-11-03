@@ -434,15 +434,19 @@ pub enum ContinuousBatchRoute {
     /// Flash-Next (qwen4, arch 16) exact AR lanes. Staged only through the
     /// VMM branch (`serve.vmm_batch`); there is no fixed-lane qwen4 body.
     Qwen4,
+    /// Muse Glimmer (arch 14) lanes: `MuseGlimmerBundle::lanes`, driven by
+    /// the shared lane driver (`hipfire_generate::lanes`).
+    MuseGlimmer,
 }
-/// Exact arch_id -> continuous-batch route. qwen35 5|6 and qwen4 16 admit:
-/// LFM2 (11) has no servable batch path (see the lfm2moe carrier caps), so
-/// the route refuses it and no batch state is ever allocated. No carrier
-/// probing — pure id match. `ContinuousBatchRoute::Lfm2Moe` stays for the
-/// staging body, which is now unreachable.
+/// Exact arch_id -> continuous-batch route. qwen35 5|6, glimmer 14 and qwen4
+/// 16 admit: LFM2 (11) has no servable batch path (see the lfm2moe carrier
+/// caps), so the route refuses it and no batch state is ever allocated. No
+/// carrier probing — pure id match. `ContinuousBatchRoute::Lfm2Moe` stays for
+/// the staging body, which is now unreachable.
 pub fn continuous_batch_route(arch_id: u32) -> Option<ContinuousBatchRoute> {
     match arch_id {
         5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+        14 => Some(ContinuousBatchRoute::MuseGlimmer),
         16 => Some(ContinuousBatchRoute::Qwen4),
         _ => None,
     }
@@ -956,6 +960,9 @@ impl hipfire_runtime::arch_model::ArchModel for MuseGlimmerBundle {
             drafter.scratch.free_gpu(gpu);
             drafter.weights.free_gpu(gpu);
         }
+        if let Some(lanes) = b.lanes {
+            lanes.free_gpu(gpu);
+        }
         b.state.free_gpu(gpu);
         b.weights.free_gpu(gpu);
     }
@@ -1045,6 +1052,8 @@ pub struct MuseGlimmerBundle {
     /// is retained solely as an exact host fallback (session rewind must not
     /// mutate it in device mode).
     pub target_hidden_host: Vec<f32>,
+    /// Continuous-batch lanes, staged at load under `continuous_batch_size > 1`.
+    pub lanes: Option<glimmer::lanes::GlimmerLanes>,
 }
 
 impl MuseGlimmerBundle {
@@ -7806,16 +7815,18 @@ mod registry_tests {
             ArchCaps {
                 reasoning_contract: ReasoningContract::MuseGlimmer,
                 semantic_contract_version: Some(2),
+                supports_continuous_batch: true,
                 ..text_only
             }
         );
 
-        // ── continuous_batch_route: 5|6 -> Qwen35, 16 -> Qwen4 (11/LFM2 refuses) ──
+        // ── continuous_batch_route: 5|6 -> Qwen35, 14 -> MuseGlimmer, 16 -> Qwen4 (11/LFM2 refuses) ──
         // The Some/None half duplicates caps().supports_continuous_batch; the
         // variant picks between distinct staging bodies in batch_staging.
         for id in 0u32..=22 {
             let want = match id {
                 5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+                14 => Some(ContinuousBatchRoute::MuseGlimmer),
                 16 => Some(ContinuousBatchRoute::Qwen4),
                 _ => None,
             };

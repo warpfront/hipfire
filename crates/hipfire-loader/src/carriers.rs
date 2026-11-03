@@ -13951,7 +13951,7 @@ impl Carrier for MuseGlimmerCarrier {
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
-            supports_continuous_batch: false,
+            supports_continuous_batch: true,
             supports_ep_batch: false,
             dflash: None,
             supports_mtp: false,
@@ -14304,6 +14304,7 @@ impl Carrier for MuseGlimmerCarrier {
                         eos_tok,
                         drafter,
                         target_hidden_host: Vec::new(),
+                        lanes: None,
                     })),
                     speculator,
                     ..LoadedModel::skeleton(
