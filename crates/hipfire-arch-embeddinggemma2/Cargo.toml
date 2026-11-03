@@ -8,6 +8,8 @@ description = "EmbeddingGemma 2 single-vector embedding architecture (bidirectio
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-config = { path = "../hipfire-config" }
+# `Step::Encoder` (the encoder-trunk stages) is deltanet-gated.
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["deltanet"] }
 rdna-compute = { path = "../rdna-compute" }
 # The audio tower JITs three elementwise kernels of its own (clip clamp, GLU,
 # causal depthwise conv) through `Gpu::ensure_kernel_public` +
