@@ -804,6 +804,13 @@ pub(crate) struct BenchArgs {
     /// Pair this with `--max-tokens` large enough for the span to close.
     #[arg(long = "reasoning-on")]
     reasoning_on: bool,
+    /// Hold EOS and stop sequences inactive until this many tokens were
+    /// generated (the daemon's vLLM-compatible `min_tokens`), so every measured
+    /// run decodes a fixed length even on a prompt the model would end early.
+    /// Clamped to each request's own `max_tokens`. Absent leaves the request
+    /// unchanged.
+    #[arg(long = "min-tokens")]
+    min_tokens: Option<usize>,
     /// Sweep closed-loop concurrency levels, e.g. `1,2,4,8`: at each level K,
     /// K client lanes drain the shape's N requests. Absent leaves bench on
     /// its single-stream path, unchanged.
@@ -6801,6 +6808,10 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && args.reasoning_on {
         bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
     }
+    BENCH_MIN_TOKENS.store(
+        args.min_tokens.map_or(0, |tokens| tokens as u64),
+        std::sync::atomic::Ordering::Relaxed,
+    );
     if let Some(spec) = args.concurrency.clone() {
         return bench_concurrency_command(paths, &args, &spec);
     }
@@ -7705,6 +7716,16 @@ fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
     bench_generate_request_reasoning(prompt, max_tokens, false)
 }
 
+/// `--min-tokens` of the running bench (0 = unset), read by every bench generate request.
+static BENCH_MIN_TOKENS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The `min_tokens` a bench request carries: the flag clamped to the request's own
+/// `max_tokens` (the daemon rejects a larger value), none when unset or for a one-token
+/// request (the TTFT probe), where holding EOS inactive has no meaning.
+fn bench_min_tokens_field(flag: u64, max_tokens: u64) -> Option<u64> {
+    (flag > 0 && max_tokens > 1).then(|| flag.min(max_tokens))
+}
+
 fn bench_generate_request_reasoning(
     prompt: &str,
     max_tokens: u64,
@@ -7723,6 +7744,12 @@ fn bench_generate_request_reasoning(
         "max_tokens": max_tokens,
         "attempt_id": 1,
     });
+    if let Some(min_tokens) = bench_min_tokens_field(
+        BENCH_MIN_TOKENS.load(std::sync::atomic::Ordering::Relaxed),
+        max_tokens,
+    ) {
+        request["min_tokens"] = serde_json::json!(min_tokens);
+    }
     if !reasoning_on {
         request["max_think_tokens"] = serde_json::json!(1);
         request["assistant_prefix"] = serde_json::json!("closed_think");
@@ -8350,6 +8377,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             redline: false,
             speculation: None,
             reasoning_on: false,
+            min_tokens: None,
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
@@ -19734,6 +19762,7 @@ effort = "high"
             redline: false,
             speculation: None,
             reasoning_on: false,
+            min_tokens: None,
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
@@ -19764,6 +19793,21 @@ effort = "high"
         })
         .unwrap();
         (ran, requests)
+    }
+
+    #[test]
+    fn bench_min_tokens_flag_parses_and_clamps_to_the_request_budget() {
+        assert_eq!(parse_bench_args(&[]).min_tokens, None);
+        assert_eq!(
+            parse_bench_args(&["--min-tokens", "256"]).min_tokens,
+            Some(256)
+        );
+        assert_eq!(bench_min_tokens_field(0, 256), None);
+        assert_eq!(bench_min_tokens_field(256, 256), Some(256));
+        assert_eq!(bench_min_tokens_field(512, 256), Some(256));
+        assert_eq!(bench_min_tokens_field(256, 1), None);
+        // Unset: the standard request carries no `min_tokens` key at all.
+        assert!(bench_generate_request("p", 128).get("min_tokens").is_none());
     }
 
     #[test]
