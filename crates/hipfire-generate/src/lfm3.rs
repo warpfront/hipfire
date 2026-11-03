@@ -395,6 +395,11 @@ pub fn generate_lfm3_vl(
         ..
     } = *params;
 
+    // Reasoning toggle. The engine lowers "thinking off" to a closed-think
+    // assistant prefix; every other prefix (open_think / plain) keeps LFM3's
+    // default-on reasoning. `max_think_tokens` stays an independent cap.
+    let enable_thinking = !matches!(params.assistant_prefix, AssistantPrefix::ClosedThink);
+
     // Contract opener (see generate_lfm3): gen_start must precede every other
     // event or the CLI serve's StreamContractGate rejects the stream. The VL
     // Jinja frame below renders with enable_thinking: true, so the stream
@@ -402,7 +407,7 @@ pub fn generate_lfm3_vl(
     emit_gen_start(
         stdout,
         id,
-        true,
+        enable_thinking,
         crate::common::gen_start_contract_version_for_arch(m.arch_id),
     );
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_vision_weights().is_none() {
@@ -550,7 +555,7 @@ pub fn generate_lfm3_vl(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: true,
+            enable_thinking,
             bos_token: None,
             reasoning_strength: None,
             reasoning_effort: None,
@@ -831,6 +836,11 @@ pub fn generate_lfm3_audio(
     temp: f32,
     top_p: f32,
     max_tokens: usize,
+    // Reasoning toggle for ASR. LFM3-Audio supports thinking, but the ASR
+    // transcript must land in `content` (not `reasoning_content`), so the
+    // dispatch keeps the historical default OFF and only an explicit
+    // open-think request turns it on.
+    enable_thinking: bool,
     audio_bytes: &[u8],
 ) {
     use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame};
@@ -842,7 +852,7 @@ pub fn generate_lfm3_audio(
     emit_gen_start(
         stdout,
         id,
-        false,
+        enable_thinking,
         crate::common::gen_start_contract_version_for_arch(m.arch_id),
     );
     if m.tokenizer.is_none() || m.lfm3().is_none() || m.lfm3_audio_weights().is_none() {
@@ -1017,7 +1027,7 @@ pub fn generate_lfm3_audio(
             template,
             system: system_prompt,
             user: prompt,
-            enable_thinking: false,
+            enable_thinking,
             bos_token: None,
             reasoning_strength: None,
             reasoning_effort: None,

@@ -3680,6 +3680,14 @@ fn main() {
                             temp,
                             top_p,
                             max_tokens,
+                            // ASR keeps its closed-think default: transcripts
+                            // belong in `content`, not `reasoning_content`, so
+                            // only an explicit open-think request enables
+                            // reasoning for LFM3-Audio.
+                            matches!(
+                                assistant_prefix,
+                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                            ),
                             &audio_bytes,
                         );
                         continue;
