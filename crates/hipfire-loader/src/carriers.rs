@@ -17359,7 +17359,15 @@ impl Carrier for Lfm3Carrier {
             // text checkpoints still refuse media via the bundle checks
             // (`has_vision_encoder()` / `has_audio_encoder()`).
             supports_images: true,
-            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+            // LFM3's vendor chat template keys a real `enable_thinking`
+            // boolean (`{% if enable_thinking %} thinking {% else %}
+            //  thinking`), so it honors the engine's reasoning toggle like
+            // the other Jinja-thinking families. Reporting `Unsupported` made
+            // the CLI drop `thinking`/`reasoning_effort`/`max_think_tokens`
+            // ("[WARN: INVALID CONFIG] ... dropped for unsupported contract"),
+            // leaving LFM3 always thinking and burning short caps inside its
+            // chain-of-thought.
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
         }
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
