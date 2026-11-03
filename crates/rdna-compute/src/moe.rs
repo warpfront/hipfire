@@ -3758,6 +3758,12 @@ impl Gpu {
             } else {
                 kernel
             };
+        // HIPFIRE_QWEN4_MOE_DEAD_STORES (default: skip): the exact gfx1201 O8R16 arms (shipped and F1 planar) leave dead
+        // rows (sentinel tiles, pad slots) unwritten; live rows are bitwise the production words.
+        let nodz = !self.moe_dead_stores
+            && self.arch_caps.is_gfx1201()
+            && matches!(kernel, MoeDownKernel::O8R16 | MoeDownKernel::PlanarO8R16);
+        self.moe_dead_poison_fill(y_grouped, grouped_rows.saturating_mul(m))?;
         let (func, module, source, grid_x, grid_z, block_x) = match kernel {
             MoeDownKernel::PlanarO8R16 => (
                 "gemm_mq4g128v2p_moe_grouped_top10_o8_r16_gfx1201",
@@ -3792,6 +3798,16 @@ impl Gpu {
                 32u32,
             ),
         };
+        let timer_name: &'static str = func;
+        let (module_nodz, source_nodz, func_nodz);
+        let (module, source, func): (&str, &str, &str) = if nodz {
+            module_nodz = format!("{module}_nodz");
+            func_nodz = format!("{func}_nodz");
+            source_nodz = format!("#define HF_NODZ 1\n#define {func} {func_nodz}\n{source}");
+            (&module_nodz, &source_nodz, &func_nodz)
+        } else {
+            (module, source, func)
+        };
         self.ensure_kernel(module, source, func)?;
         let ep = expert_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
@@ -3819,7 +3835,7 @@ impl Gpu {
         ];
         let bytes =
             grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", func, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", timer_name, bytes);
         let result = self.launch_maybe_blob(
             func,
             [grid_x as u32, grouped_rows.div_ceil(16) as u32, grid_z],

@@ -1738,6 +1738,16 @@ pub struct Gpu {
     /// gfx1201 per-pick K = 640 down (<= 8 rows, eager) runs the `dni` kernel instead of `k640_r4`
     /// (bitwise equal output).
     pub(crate) moe_down_dni: bool,
+    /// `HIPFIRE_QWEN4_MOE_DEAD_STORES` (default off = dead rows are NOT stored; `1` restores the zero stores;
+    /// [`Gpu::set_moe_dead_stores`] overrides): the exact gfx1201 grouped routed down (`o8_r16`) and the grouped gate/up
+    /// (`o4_r8_x4`) skip the +0.0 stores of sentinel tiles and pad slots. Live rows are bitwise unchanged; the
+    /// consumers (combine / unscatter) address Y through inverse_perm / sorted_slots only.
+    pub(crate) moe_dead_stores: bool,
+    /// `HIPFIRE_QWEN4_MOE_DEAD_POISON=<u32 seed>` (lab/developer only, never set in product): every grouped GU / down
+    /// launcher first fills its whole Y span with a word derived from the seed and an invocation counter, so dead words
+    /// differ per run and per call. [`Gpu::set_moe_dead_poison`] overrides.
+    pub(crate) moe_dead_poison: Option<u32>,
+    pub(crate) moe_dead_poison_ctr: u32,
     pub(crate) compiler: KernelCompiler,
     pub(crate) modules: HashMap<String, hip_bridge::Module>,
     pub(crate) functions: HashMap<String, hip_bridge::Function>,
@@ -3137,6 +3147,11 @@ impl Gpu {
                 _ => 1,
             },
             moe_down_dni: hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DOWN_DNI", true),
+            moe_dead_stores: hipfire_config::developer_bool("HIPFIRE_QWEN4_MOE_DEAD_STORES", false),
+            moe_dead_poison: hipfire_config::developer_var("HIPFIRE_QWEN4_MOE_DEAD_POISON")
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok()),
+            moe_dead_poison_ctr: 0,
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),

@@ -50587,6 +50587,7 @@ impl Gpu {
             &[grouped_rows, m, 4],
             "gemm_mq4g256v2_moe_grouped_top10 grouped rows",
         )?;
+        self.moe_dead_poison_fill(y_grouped, grouped_rows.saturating_mul(m))?;
         // gfx1151, >= 512 tokens: the F16 WMMA grouped GEMM (60 VGPRs, 16
         // waves/SIMD) beats the F32 O4×R8 kernel (9.6 vs 14.7 ms at 1131
         // tokens; slower below ~450).  Not bit-exact — F16 dequant/inputs —
@@ -50720,6 +50721,19 @@ impl Gpu {
         } else {
             (module, 8)
         };
+        // HIPFIRE_QWEN4_MOE_DEAD_STORES (default: skip), exact gfx1201, the many-row R8 arm: pad slots of live tiles are
+        // not stored (sentinel tiles never were). The few-row R2 arm keeps its entry.
+        let timer_name: &'static str = module;
+        let (nodz_module, nodz_src, nodz_func);
+        let (module, src, func): (&str, &str, &str) =
+            if !few && !self.moe_dead_stores && self.arch_caps.is_gfx1201() {
+                nodz_module = format!("{module}_nodz");
+                nodz_func = format!("{func}_nodz");
+                nodz_src = format!("#define HF_NODZ 1\n#define {func} {nodz_func}\n{src}");
+                (&nodz_module, &nodz_src, &nodz_func)
+            } else {
+                (module, src, func)
+            };
         self.ensure_kernel(module, src, func)?;
         let ep = expert_weight_ptrs.buf.as_ptr();
         let tp = expert_tile_ids.buf.as_ptr();
@@ -50745,7 +50759,7 @@ impl Gpu {
         ];
         let bytes =
             grouped_rows.saturating_mul(m.saturating_mul(4).saturating_add(k.saturating_mul(4)));
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", module, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", timer_name, bytes);
         let result = self.launch_maybe_blob(
             func,
             [
@@ -52682,6 +52696,42 @@ impl Gpu {
     /// ([`MoeRouteLaunchCensus`]); window it with [`MoeRouteLaunchCensus::since`].
     pub fn moe_route_launch_census(&self) -> MoeRouteLaunchCensus {
         self.moe_route_census
+    }
+
+    /// Override `HIPFIRE_QWEN4_MOE_DEAD_STORES` for this device: `true` restores the +0.0 stores of dead grouped rows
+    /// (sentinel tiles, pad slots) in the grouped routed down / gate/up kernels; `false` (default) skips them.
+    pub fn set_moe_dead_stores(&mut self, stores: bool) {
+        self.moe_dead_stores = stores;
+    }
+
+    /// Whether the grouped routed down / gate/up kernels still store dead grouped rows.
+    pub fn moe_dead_stores(&self) -> bool {
+        self.moe_dead_stores
+    }
+
+    /// Override `HIPFIRE_QWEN4_MOE_DEAD_POISON` for this device (lab only): `Some(seed)` poisons every grouped GU / down
+    /// output span before each launch; resets the invocation counter.
+    pub fn set_moe_dead_poison(&mut self, seed: Option<u32>) {
+        self.moe_dead_poison = seed;
+        self.moe_dead_poison_ctr = 0;
+    }
+
+    /// `HIPFIRE_QWEN4_MOE_DEAD_POISON` developer hook: fill the first `words` 32-bit words of `y` with a pattern derived
+    /// from the seed and the invocation counter (stream-ordered, no host sync). A no-op unless the seed is set.
+    pub(crate) fn moe_dead_poison_fill(&mut self, y: &GpuTensor, words: usize) -> HipResult<()> {
+        let Some(seed) = self.moe_dead_poison else {
+            return Ok(());
+        };
+        self.moe_dead_poison_ctr = self.moe_dead_poison_ctr.wrapping_add(1);
+        let mut z = (seed as u64) << 32 | self.moe_dead_poison_ctr as u64;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        // a quiet NaN with a seed/call-derived payload: any live read of a dead row turns the consumer's output into NaN
+        let word = 0x7fc0_0000 | ((z as u32) & 0x003f_ffff);
+        let n = words.min(y.buf.size() / 4);
+        self.hip
+            .memset_d32_async(&y.buf, word as i32, n, self.active_stream.as_ref())
     }
 
     /// Declare that the routed-expert tensors this device's Qwen4 MQ4 MoE launchers read
