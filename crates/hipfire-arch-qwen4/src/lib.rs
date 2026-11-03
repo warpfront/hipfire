@@ -117,6 +117,7 @@ pub mod state_parity;
 pub mod sym_verdict_cache;
 pub mod trunk_overlay;
 pub(crate) mod trunk_route;
+pub(crate) mod trunk_a8;
 pub mod weights;
 #[cfg(feature = "reference-parity")]
 pub mod wide_verify_oracle;

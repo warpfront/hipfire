@@ -235,7 +235,40 @@ fn mq6_fp8_route(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
 fn mq6_i8_route(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
     weight.dtype == DType::MQ6G256V2
         && gpu.route_rows(rows) > gpu.few_row_limit()
+        && !gpu.qwen4_trunk_a8_applies(weight.m, weight.k, rows)
         && gpu.gemm_mq6g256v2_i8_applies(weight.m, weight.k, rows)
+}
+
+/// Whether `weight` projects through the symmetric-MQ6 x int8-activation trunk
+/// route ([`Gpu::qwen4_trunk_a8_applies`]): decode, few-row verify and short
+/// prefill (1..=`QWEN4_TRUNK_A8_MAX_ROWS` route rows) of a load-verified
+/// symmetric qt47 model. It reads an F32 activation, so producers keep it F32,
+/// and it never fuses an epilogue, so the exact-INT8 route, its fused QSA
+/// norm+RoPE and the HC-write / shared-F16 routes all decline where it applies.
+fn mq6_a8_route(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
+    weight.dtype == DType::MQ6G256V2 && gpu.qwen4_trunk_a8_applies(weight.m, weight.k, rows)
+}
+
+/// One-time-per-process receipt of the A8 trunk route per row class (1,
+/// 2..=8, 9..=64): proof in served-job logs that the route actually ran.
+fn a8_first_launch_receipt(gpu: &Gpu, m: usize, k: usize, rows: usize, bf16: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SEEN: [AtomicBool; 3] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
+    let class = match gpu.route_rows(rows) {
+        0 | 1 => 0,
+        2..=8 => 1,
+        _ => 2,
+    };
+    if !SEEN[class].swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[INFO] qwen4 trunk A8: first launch rows={rows} m={m} k={k} entry={}",
+            gpu.gemm_mq6sym_i8_kernel_name(m, rows, bf16)
+        );
+    }
 }
 
 /// Only an admitted eager verify may extend the singleton routes past eight.
@@ -282,7 +315,9 @@ fn project_weights_inner(
     let shared = |w: &WeightRef<'_>, gpu: &Gpu| {
         !wide_exact
             && match w.dtype {
-                DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, rows),
+                DType::MQ6G256V2 => {
+                    !mq6_a8_route(gpu, w, rows) && gpu.gemm_mq6g256v2_xf16_applies(w.k, rows)
+                }
                 // gfx1151, more than 8 rows (N >= 96): PM or exact bt4 on the shared F16 rotation.
                 DType::MQ4G256V2 => gpu.gemm_mq4g256v2_xf16_applies(w.k, rows),
                 _ => false,
@@ -299,7 +334,31 @@ fn project_weights_inner(
     // (`route <= few_row_limit`, incl. the row-exact wide verify) never take
     // it; MQ4 members left in the group keep the shared F16 rotation below.
     if input.dtype == DType::F32 {
-        // The exact-INT8 route (gfx1201 / gfx1151) goes first: one FWHT + A8
+        // gfx1201 symmetric qt47 trunk (`HIPFIRE_QWEN4_TRUNK_A8`, load-verified
+        // z == -32*s): one FWHT + A8 block quantization per K feeds every MQ6
+        // member (F32 or BF16 output), decode through 64-row verify / prefill.
+        // Never fuses an epilogue (`NormRopeEpi::fused` stays false: the caller
+        // runs the separate norm / RoPE). All members of a K launch before the
+        // next producer call, which would overwrite the shared quantized scratch.
+        for i in 0..projections.len() {
+            let (weight, _) = projections[i];
+            let take = |gpu: &Gpu, w: &WeightRef<'_>, out: &GpuTensor| {
+                matches!(out.dtype, DType::F32 | DType::BF16) && mq6_a8_route(gpu, w, rows)
+            };
+            if done[i] || !take(gpu, weight, projections[i].1) {
+                continue;
+            }
+            let xq = hip(gpu.mq6_i8_prepare_x(input, weight.k, rows))?;
+            for j in i..projections.len() {
+                let (w, out) = projections[j];
+                if !done[j] && w.k == weight.k && take(gpu, w, out) {
+                    a8_first_launch_receipt(gpu, w.m, w.k, rows, out.dtype == DType::BF16);
+                    hip(gpu.gemm_mq6sym_i8_prequant(w.buf, xq, out, w.m, w.k, rows))?;
+                    done[j] = true;
+                }
+            }
+        }
+        // The exact-INT8 route (gfx1201 / gfx1151) goes next: one FWHT + A8
         // block quantization per K feeds every MQ6 member, output BF16 or F32.
         for i in 0..projections.len() {
             let (weight, _) = projections[i];
@@ -1851,7 +1910,10 @@ fn project_output_into_hyper_write(
     // MQ4G256V2 (gfx1151 PM module only) is declined where the unfused route
     // would run the IU4 trunk projection (`a4`: its trunk bit) instead.
     let covered = match weight.dtype {
-        DType::MQ6G256V2 => gpu.gemm_mq6g256v2_hcw_applies(weight.m, weight.k, rows),
+        DType::MQ6G256V2 => {
+            !mq6_a8_route(gpu, weight, rows)
+                && gpu.gemm_mq6g256v2_hcw_applies(weight.m, weight.k, rows)
+        }
         DType::MQ4G256V2 => {
             gpu.gemm_mq4g256v2_hcw_applies(weight.m, weight.k, rows)
                 && !(a4 && gpu.qwen4_trunk_iu4_applies(rows))
@@ -2487,7 +2549,10 @@ pub fn gdn_qkv_projection_bf16(gpu: &Gpu, op: &GatedDeltaNetOp<'_>) -> bool {
         && persistent_batch
         && gated_delta_chunk_route(gpu, &dims)
         && match op.qkv.dtype {
-            DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(op.qkv.k, op.rows),
+            DType::MQ6G256V2 => {
+                !mq6_a8_route(gpu, &op.qkv, op.rows)
+                    && gpu.gemm_mq6g256v2_xf16_applies(op.qkv.k, op.rows)
+            }
             DType::MQ4G256V2 => {
                 gpu.gemm_mq4g256v2_pm_applies(op.qkv.k, op.rows)
                     && !(op.trunk_a4 & TrunkFamily::GdnQkv.bit() != 0
@@ -3293,7 +3358,9 @@ fn execute_gated_delta_net_hc_impl(
         !wide_exact_rows(gpu, op.rows)
             && chunked
             && match w.dtype {
-                DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, op.rows),
+                DType::MQ6G256V2 => {
+                    !mq6_a8_route(gpu, w, op.rows) && gpu.gemm_mq6g256v2_xf16_applies(w.k, op.rows)
+                }
                 DType::MQ4G256V2 => {
                     gpu.gemm_mq4g256v2_pm_applies(w.k, op.rows)
                         && !(op.trunk_a4 & a4 != 0 && gpu.qwen4_trunk_iu4_applies(op.rows))

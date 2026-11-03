@@ -12401,6 +12401,11 @@ impl Qwen4GpuForward {
                     )?;
                 }
             }
+            // Symmetric-MQ6 x int8-activation trunk route (`HIPFIRE_QWEN4_TRUNK_A8`, gfx1201):
+            // verify every qt47 projection this device reads (z == -32*s) once, before any
+            // capture; one failing tensor keeps the affine route for the whole device. Under EP
+            // the trunk weights are these same resident tensors (`attach_ep` adds none).
+            crate::trunk_a8::verify_trunk_a8(gpu, &bundle.weights)?;
             // Sealed expert-slab layers on gfx1100: the symmetric IU4 block above does not run
             // there when `HIPFIRE_QWEN4_MOE_SYM_IU4=0` (or no layer passed the header check), yet
             // the slab K2 prefill reuses its grouping scratch, down sidecar and shared gate/up
