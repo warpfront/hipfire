@@ -577,7 +577,7 @@ static __device__ __forceinline__ void gemm_mq6sym_p128_body(
                 *(u32x2_t*)(LDS + P_SLOT0_OFF + st_alds[r] + sb * 512) = av;
             }
             unsigned wd[3];
-            p_load_w3(w_rsrc, st_wvoff[r], 4u, wd);
+            p_load_w3(w_rsrc, st_wvoff[r], 8u, wd);
             p_publish_w(LDS + P_SLOT0_OFF + P_A_BYTES, st_wlds[r], wd);
         }
     }
