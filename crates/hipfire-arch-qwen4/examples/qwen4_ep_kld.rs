@@ -47,6 +47,79 @@ const USAGE: &str =
 [--max-chunks N] [--max-seq N] [--prefix chunk-final|prefill-final] [--no-rank-check] \
 [--kv-mode M] [--state-quant Q]";
 
+/// Process-wide host counters read before/after a token (lab diagnosis of rank-asymmetric host stalls).
+#[derive(Clone, Copy, Default)]
+struct HostProbe {
+    majflt: u64,
+    read_bytes: u64,
+    psi_mem_us: u64,
+    psi_io_us: u64,
+    vol_ctx: u64,
+    invol_ctx: u64,
+}
+
+impl HostProbe {
+    fn read() -> Self {
+        let mut p = Self::default();
+        if let Ok(stat) = std::fs::read_to_string("/proc/self/stat") {
+            // Field 12 (majflt) counts from after the ")" closing the command name.
+            if let Some(rest) = stat.rsplit(')').next() {
+                p.majflt = rest
+                    .split_whitespace()
+                    .nth(9)
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0);
+            }
+        }
+        if let Ok(io) = std::fs::read_to_string("/proc/self/io") {
+            for l in io.lines() {
+                if let Some(v) = l.strip_prefix("read_bytes: ") {
+                    p.read_bytes = v.trim().parse().unwrap_or(0);
+                }
+            }
+        }
+        let psi = |path: &str| -> u64 {
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| {
+                    t.lines().find(|l| l.starts_with("some")).and_then(|l| {
+                        l.split_whitespace()
+                            .find_map(|w| w.strip_prefix("total=")?.parse().ok())
+                    })
+                })
+                .unwrap_or(0)
+        };
+        p.psi_mem_us = psi("/proc/pressure/memory");
+        p.psi_io_us = psi("/proc/pressure/io");
+        // All threads of the process (every rank's host thread): sum the per-task context switches.
+        if let Ok(dir) = std::fs::read_dir("/proc/self/task") {
+            for t in dir.flatten() {
+                if let Ok(st) = std::fs::read_to_string(t.path().join("status")) {
+                    for l in st.lines() {
+                        if let Some(v) = l.strip_prefix("voluntary_ctxt_switches:") {
+                            p.vol_ctx += v.trim().parse().unwrap_or(0u64);
+                        } else if let Some(v) = l.strip_prefix("nonvoluntary_ctxt_switches:") {
+                            p.invol_ctx += v.trim().parse().unwrap_or(0u64);
+                        }
+                    }
+                }
+            }
+        }
+        p
+    }
+
+    fn since(&self, before: &Self) -> Self {
+        Self {
+            majflt: self.majflt.saturating_sub(before.majflt),
+            read_bytes: self.read_bytes.saturating_sub(before.read_bytes),
+            psi_mem_us: self.psi_mem_us.saturating_sub(before.psi_mem_us),
+            psi_io_us: self.psi_io_us.saturating_sub(before.psi_io_us),
+            vol_ctx: self.vol_ctx.saturating_sub(before.vol_ctx),
+            invol_ctx: self.invol_ctx.saturating_sub(before.invol_ctx),
+        }
+    }
+}
+
 fn e<E: std::fmt::Display>(error: E) -> String {
     error.to_string()
 }
@@ -234,10 +307,32 @@ fn score_one(
         let mut klds = Vec::with_capacity(window.scored_per_chunk());
         let mut chunk_nll = 0.0f64;
         for (i, pos) in (from..to).enumerate() {
+            let t_tok = Instant::now();
+            let probe0 = HostProbe::read();
             bundle
                 .forward_token(gpu, chunk[pos], &row_t, None)
                 .map_err(e)?;
+            let t_enq = t_tok.elapsed();
             gpu.hip.device_synchronize().map_err(e)?;
+            let t_tot = t_tok.elapsed();
+            if t_tot.as_millis() > 120 {
+                let d = HostProbe::read().since(&probe0);
+                eprintln!(
+                    "{TOOL} {name}: SLOW TOKEN t_end={} chunk {c} pos {pos}: forward_token returned after {} ms, device sync after {} ms; \
+                     during it: major faults {}, disk read {} KiB, memory-PSI some {} ms, io-PSI some {} ms, ctx switches (vol/invol) {}/{}",
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |t| t.as_millis()),
+                    t_enq.as_millis(),
+                    t_tot.as_millis(),
+                    d.majflt,
+                    d.read_bytes / 1024,
+                    d.psi_mem_us / 1000,
+                    d.psi_io_us / 1000,
+                    d.vol_ctx,
+                    d.invol_ctx
+                );
+            }
             let rank0_bytes = gpu.download_raw_bytes(&row_t).map_err(e)?;
             if args.rank_check && ranks > 1 {
                 for rank in 1..ranks {
@@ -363,6 +458,11 @@ fn run(args: &Args) -> R<()> {
         .map(|(k, v)| (k, serde_json::Value::String(v)))
         .collect();
     eprintln!("{TOOL}: loading {}", args.model);
+    // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call. Without it
+    // KFD userptr invalidations evict every queue of the process for seconds under host memory pressure
+    // (ROCm/rocm-systems#12528: GPUs idle, HIP's signal wait spins a core) and the fused AR's 500 ms
+    // bounded wait trips (the EP2 route just stalls).
+    hipfire_loader::prepare_host_memory_for(Path::new(&args.model));
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let mut model = hipfire_loader::load_model(

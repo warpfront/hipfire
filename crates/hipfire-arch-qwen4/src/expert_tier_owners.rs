@@ -1274,6 +1274,7 @@ impl ExpertTierOwners {
             return Ok(());
         }
         let bytes = usize::try_from(bytes).map_err(|_| ExpertTierOwnerError::Overflow)?;
+        hip_bridge::declare_qwen4_host_mapping("Qwen4 expert-tier host payload");
         let alloc_started = std::time::Instant::now();
         let _alloc_phase = AllocPhase(alloc_started, bytes as u64);
         let cpu = self

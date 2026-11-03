@@ -3321,6 +3321,8 @@ fn load(
 ) -> R<(HfqModelSource, World, Tokenizer)> {
     let mut hfq = HfqFile::open(path).map_err(e)?;
     let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(e)?;
+    // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
+    hipfire_loader::prepare_host_memory_for(path);
     let mut gpu = Gpu::init().map_err(e)?;
     // The PLE rows source (`memory.ple_format` / `HIPFIRE_PLE_FORMAT`), bound
     // while the base is open and before admission, exactly as `qwen4_kld`,

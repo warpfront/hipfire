@@ -935,6 +935,8 @@ impl Model {
             .map_err(|e| format!("tokenizer: {e}"))?;
         // The GPU arch drives `memory.ple_format = auto`; initialising it
         // allocates no model memory, so admission still precedes every upload.
+        // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
+        hipfire_loader::prepare_host_memory_for(path);
         let mut gpu = Gpu::init().map_err(es)?;
         let choice = resolve_and_attach_ple_rows(
             &mut hfq,

@@ -363,6 +363,8 @@ impl Model {
         // declined, fast/unified/unmeasured link, a pinned
         // `HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS`) it returns before any allocation
         // and the loader below runs, placement and all, exactly as before.
+        // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
+        hipfire_loader::prepare_host_memory_for(path);
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         if hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::from_env()
             != hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Off

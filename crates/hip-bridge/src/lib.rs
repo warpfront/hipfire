@@ -35,7 +35,7 @@ pub use ffi::weight_slab::{
     device_alloc_charge, SlabMode, SlabScopeSummary, SlabStats, ALLOC_GRANULE, DEFAULT_SLAB_MODE,
     SLAB_ALIGN,
 };
-pub use ffi::{arm_hip_fault, keep_host_memory_out_of_reclaim};
+pub use ffi::{arm_hip_fault, declare_qwen4_host_mapping, keep_host_memory_out_of_reclaim};
 pub use ffi::{launch_counters, memory_effects};
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,

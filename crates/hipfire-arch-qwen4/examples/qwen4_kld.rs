@@ -519,6 +519,8 @@ impl Model {
         // The GPU arch drives `memory.ple_format = auto` and the S1 selector;
         // initialising it allocates no model memory, so admission still
         // precedes every upload.
+        // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
+        hipfire_loader::prepare_host_memory_for(path);
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
         if s1_mode != hipfire_arch_qwen4::slowlink_admission::SlowlinkMode::Off
             && !hot_flags

@@ -1018,6 +1018,93 @@ fn keep_pageable_copies_out_of_reclaim() {
     }
 }
 
+/// What [`HipRuntime::load`] found when the HIP runtime was first loaded in this process:
+/// libhsakmt and clr read `HSA_USERPTR_FOR_PAGED_MEM` once, at that moment.
+const RECLAIM_NOT_LOADED: u8 = 0;
+/// The runtime loaded with `HSA_USERPTR_FOR_PAGED_MEM=0` (host-mapped pages are GTT, outside reclaim).
+const RECLAIM_ARMED: u8 = 1;
+/// The runtime loaded with `HSA_USERPTR_FOR_PAGED_MEM` set by the operator to something other than `0`.
+const RECLAIM_OPERATOR_CHOICE: u8 = 2;
+/// The runtime loaded with the switch unset: host-mapped pages are KFD userptr BOs.
+const RECLAIM_UNARMED: u8 = 3;
+static RECLAIM_AT_RUNTIME_LOAD: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(RECLAIM_NOT_LOADED);
+static QWEN4_HOST_MAPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Smallest `hipHostMalloc` the guard checks: the host-mapped routed experts, embedding table
+/// and unit tiers are hundreds of MiB to tens of GiB; small stage and mailbox buffers are not.
+const HOST_MAP_GUARD_MIN_BYTES: usize = 64 << 20;
+
+fn classify_reclaim_switch(value: Option<&str>) -> u8 {
+    match value {
+        Some(v) if v.trim() == "0" => RECLAIM_ARMED,
+        Some(_) => RECLAIM_OPERATOR_CHOICE,
+        None => RECLAIM_UNARMED,
+    }
+}
+
+/// Whether the guard refuses a host-mapped allocation of `size` bytes.
+fn host_map_guard_refuses(state: u8, declared: bool, size: usize) -> bool {
+    size >= HOST_MAP_GUARD_MIN_BYTES && declared && state == RECLAIM_UNARMED
+}
+
+fn record_runtime_load_reclaim_state() {
+    let state = classify_reclaim_switch(std::env::var("HSA_USERPTR_FOR_PAGED_MEM").ok().as_deref());
+    // The first load is the one the HSA runtime read; later loads in the same process see the same env.
+    let _ = RECLAIM_AT_RUNTIME_LOAD.compare_exchange(
+        RECLAIM_NOT_LOADED,
+        state,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+}
+
+/// A Qwen4 model in this process pins host pages the GPU reads (routed experts, embedding table,
+/// expert-unit tiers). Call it where that placement is decided; `what` names the caller.
+///
+/// KFD registers such pages as userptr BOs unless `HSA_USERPTR_FOR_PAGED_MEM=0`, and host reclaim
+/// or compaction then evicts every queue of the process on every GPU until KFD's restore worker
+/// catches up: seconds of idle GPUs with no error (ROCm/rocm-systems#12528), which also trips the
+/// bounded waits of the TP kernels. libhsakmt reads the switch once, when the runtime loads, so:
+///
+/// * HIP runtime not loaded yet: arm the switches now ([`keep_host_memory_out_of_reclaim`]). The
+///   shared Qwen4 load path therefore protects every binary that places before its first
+///   `Gpu::init`, with no per-binary call.
+/// * Runtime already loaded armed (or by the operator's explicit choice): nothing to do.
+/// * Runtime already loaded WITHOUT the switch: it cannot be armed any more. The next
+///   `hipHostMalloc` of the pages fails loudly ([`HipRuntime::host_malloc`]) with the fix, instead
+///   of the process running into seconds-long stalls.
+pub fn declare_qwen4_host_mapping(what: &str) {
+    QWEN4_HOST_MAPS.store(true, Ordering::Release);
+    if RECLAIM_AT_RUNTIME_LOAD.load(Ordering::Acquire) == RECLAIM_NOT_LOADED {
+        keep_host_memory_out_of_reclaim(what);
+    }
+}
+
+/// `Err` when this process declared Qwen4 host mapping and its HIP runtime loaded without
+/// `HSA_USERPTR_FOR_PAGED_MEM=0`.
+fn check_qwen4_host_map_reclaim(size: usize) -> HipResult<()> {
+    if !host_map_guard_refuses(
+        RECLAIM_AT_RUNTIME_LOAD.load(Ordering::Acquire),
+        QWEN4_HOST_MAPS.load(Ordering::Acquire),
+        size,
+    ) {
+        return Ok(());
+    }
+    Err(HipError::new(
+        0,
+        &format!(
+            "refusing a {size}-byte hipHostMalloc for Qwen4 host-mapped pages: the HIP runtime loaded \
+             without HSA_USERPTR_FOR_PAGED_MEM=0, so KFD registers them as userptr BOs and host reclaim \
+             evicts every queue of this process for seconds (ROCm/rocm-systems#12528: idle GPUs, a \
+             spinning HIP wait, bounded TP waits timing out). The switch is read once at runtime load: \
+             call hipfire_loader::prepare_host_memory_for(model) (or hip_bridge::keep_host_memory_out_of_reclaim) \
+             before the first Gpu::init, or run with HSA_USERPTR_FOR_PAGED_MEM=0 GPU_PINNED_MIN_XFER_SIZE=100000 \
+             (the daemon does this itself)"
+        ),
+    ))
+}
+
 /// Places the routed experts of Qwen4 trunk layers at or past `N` in pinned,
 /// device-mapped host RAM (`hipfire_arch_qwen4::expert_residency`). It is
 /// named here because it decides [`keep_host_memory_out_of_reclaim`] before
@@ -1064,6 +1151,7 @@ impl HipRuntime {
         if host_maps_qwen4_experts() {
             keep_host_memory_out_of_reclaim(&format!("{QWEN4_EXPERT_VRAM_LAYERS_ENV} set"));
         }
+        record_runtime_load_reclaim_state();
         // Windows and Unix share one candidate policy in hipfire_config::rocm so a
         // selected/configured root never falls through to another install's DLL
         // (user cache or bare PATH names). HIP_RUNTIME_LIBRARIES already encodes
@@ -2281,6 +2369,7 @@ impl HipRuntime {
     /// address to hand a kernel.
     pub fn host_malloc(&self, size: usize, flags: u32) -> HipResult<*mut c_void> {
         self.plan_deny("hipHostMalloc")?;
+        check_qwen4_host_map_reclaim(size)?;
         let Some(budget) = crate::emu_budget::active() else {
             return self.host_malloc_raw(size, flags);
         };
@@ -6618,5 +6707,30 @@ mod host_alloc_owner_tests {
         release_keyed::<crate::emu_budget::Process>(&HOST_TOKENS, FAILING_CHARGED, || Ok(()))
             .expect("a second release is a no-op");
         assert_eq!(committed_host_bytes(id), base, "no double release");
+    }
+}
+
+#[cfg(test)]
+mod host_map_reclaim_guard_tests {
+    use super::*;
+
+    #[test]
+    fn switch_classification() {
+        assert_eq!(classify_reclaim_switch(Some("0")), RECLAIM_ARMED);
+        assert_eq!(classify_reclaim_switch(Some(" 0 ")), RECLAIM_ARMED);
+        assert_eq!(classify_reclaim_switch(Some("1")), RECLAIM_OPERATOR_CHOICE);
+        assert_eq!(classify_reclaim_switch(None), RECLAIM_UNARMED);
+    }
+
+    #[test]
+    fn guard_refuses_only_declared_large_unarmed() {
+        let big = HOST_MAP_GUARD_MIN_BYTES;
+        assert!(host_map_guard_refuses(RECLAIM_UNARMED, true, big));
+        // Not a Qwen4 host mapping, small stage buffer, armed, operator's explicit choice, runtime not loaded.
+        assert!(!host_map_guard_refuses(RECLAIM_UNARMED, false, big));
+        assert!(!host_map_guard_refuses(RECLAIM_UNARMED, true, big - 1));
+        assert!(!host_map_guard_refuses(RECLAIM_ARMED, true, big));
+        assert!(!host_map_guard_refuses(RECLAIM_OPERATOR_CHOICE, true, big));
+        assert!(!host_map_guard_refuses(RECLAIM_NOT_LOADED, true, big));
     }
 }

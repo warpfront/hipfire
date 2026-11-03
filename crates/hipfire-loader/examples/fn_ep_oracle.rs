@@ -904,6 +904,8 @@ fn run() -> R<()> {
     }
 
     eprintln!("[fn_ep_oracle] loading {}", args.model);
+    // Daemon parity: keep host-mapped expert memory out of reclaim before the first HIP call (KFD userptr eviction stalls, ROCm/rocm-systems#12528).
+    hipfire_loader::prepare_host_memory_for(Path::new(&args.model));
     let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let mut spec_cfg = hipfire_runtime::loader_api::SpecLoadCfg::default();

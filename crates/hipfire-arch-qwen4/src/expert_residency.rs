@@ -3144,6 +3144,9 @@ pub fn place_routed_experts(weights: &mut [WeightEntry], vram_layers: usize) -> 
             moved += 1;
         }
     }
+    if moved > 0 {
+        hip_bridge::declare_qwen4_host_mapping("Qwen4 host-mapped weights (place_routed_experts)");
+    }
     moved
 }
 
@@ -3169,6 +3172,11 @@ pub fn place_routed_experts_set(weights: &mut [WeightEntry], resident: &[usize])
             entry.residency = WeightResidency::HostMapped;
             moved += 1;
         }
+    }
+    if moved > 0 {
+        hip_bridge::declare_qwen4_host_mapping(
+            "Qwen4 host-mapped weights (place_routed_experts_set)",
+        );
     }
     moved
 }
@@ -3254,6 +3262,9 @@ pub fn place_embedding_host(weights: &mut [WeightEntry]) -> usize {
         }
         entry.residency = WeightResidency::HostMapped;
         moved += 1;
+    }
+    if moved > 0 {
+        hip_bridge::declare_qwen4_host_mapping("Qwen4 host-mapped weights (place_embedding_host)");
     }
     moved
 }
