@@ -45,12 +45,15 @@ use std::sync::LazyLock;
 /// prefill chunks up to [`QWEN4_TRUNK_A8_MAX_ROWS`]) the integer tiles replace the WMMA / FP8 / affine-I8 routes.
 pub const QWEN4_TRUNK_A8_MIN_ROWS: usize = crate::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1;
 
-/// Largest `route_rows` the trunk route serves. EP2 R9700 pair A/B (A8 vs `HIPFIRE_QWEN4_TRUNK_A8=0`
-/// on the same bins and symmetric model, ABBA, host load <= 10): prefill 194 tokens +5.6 %, the 8-lane
-/// burst (151-token lane prefills) TTFT -6 %, but 613 / 1145 / 2086 / 3030 / 8172 tokens
-/// -1.9 / -2.7 / -1.7 / -4.5 / -5.0 %: the 128x128 tile loses to the served FP8 / affine-I8 routes
-/// from a few hundred rows. The crossover lies between 194 and 613 rows (unmeasured in between).
-pub const QWEN4_TRUNK_A8_MAX_ROWS: usize = 256;
+/// Largest `route_rows` the trunk route serves: the exact EP joint prefill wave's routing cap (511).
+/// A lane's prefill inside a wave routes as `route_rows = 511`, its singleton tile routes as its own
+/// rows, and the two must pick the same kernels, so the route must be constant over 9..=511; above it
+/// (>= 512-row tiles, never waved) the served FP8 / affine-I8 routes keep prefill: EP2 R9700 pair A/B
+/// (A8 vs `HIPFIRE_QWEN4_TRUNK_A8=0`, ABBA): prefill 194 tokens +5.9 %, 8-lane burst TTFT 6.8 % faster,
+/// 613..8172 tokens -1.9..-5.0 % (A8 uncapped; the 128x128 tile loses to FP8 from a few hundred rows;
+/// 194..613 rows were not swept).
+pub const QWEN4_TRUNK_A8_MAX_ROWS: usize =
+    crate::prefill_invariant::QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
 /// qt47 group bytes (8 B headers + 192 B 6-bit payload).
 const MQ6_GROUP_BYTES: usize = 200;
 /// A8 `block_i8_128` bytes (`float d; int s; signed char qs[128]`).
@@ -262,7 +265,7 @@ impl Gpu {
     /// Whether one projection of `m` rows x `k` with `rows` tokens takes the trunk A8 route:
     /// requested, verified symmetric, inside the Qwen4 forward, eager (no replay recording / graph
     /// capture), outside the prefill-invariant scope, `k % 256 == 0`, and
-    /// `QWEN4_TRUNK_A8_MIN_ROWS <= route_rows <= QWEN4_TRUNK_A8_MAX_ROWS` (9..=256, and above the scope's few-row limit: an admitted wide verify keeps its row-exact twins).
+    /// `QWEN4_TRUNK_A8_MIN_ROWS <= route_rows <= QWEN4_TRUNK_A8_MAX_ROWS` (9..=511, and above the scope's few-row limit: an admitted wide verify keeps its row-exact twins).
     pub fn qwen4_trunk_a8_applies(&self, m: usize, k: usize, rows: usize) -> bool {
         trunk_a8_admits(TrunkA8Gate {
             requested: self.qwen4_trunk_a8_requested(),
@@ -812,7 +815,7 @@ mod tests {
             (65, true),
             (194, true),
             (256, true),
-            (257, false),
+            (511, true),
             (512, false),
             (4096, false),
         ] {

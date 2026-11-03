@@ -79,4 +79,3 @@ crates/rdna-compute/src/tensor_ops.rs QSA_ATTENTION_HG4_MIN_ROWS
 crates/rdna-compute/src/tensor_ops.rs QSA_SELECT_PM_MIN_ROWS
 crates/rdna-compute/src/tensor_ops.rs QWEN4_HC_UP_TWIN_MIN_ROWS
 crates/saddle-core/src/spec.rs MTP_MAX_N
-crates/rdna-compute/src/gemm_mq6sym_i8.rs QWEN4_TRUNK_A8_MAX_ROWS
