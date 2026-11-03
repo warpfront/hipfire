@@ -394,6 +394,35 @@ pub(crate) fn qwen4_ar_launch(
     Qwen4ArLaunch::Recorded
 }
 
+/// Admission of the Qwen4 retained body on this controller and arch: `admission`
+/// unless the transport is known not to prepare the tape, which refuses before
+/// anything records. The measurement-only diagnostic capture never prepares, so
+/// it is not refused. One answer for the boundary and `ar_launch_reference`.
+pub(crate) fn qwen4_retained_admission(
+    replay: &rdna_compute::replay::ReplayController,
+    arch: &str,
+    admission: SpecializedRouteAdmission,
+) -> SpecializedRouteAdmission {
+    // The GDN conv carries a position kernarg; the gfx1151 MQ6 LM-head GEMV
+    // (gemv_mq6g256v2_k2560_u2) uses scratch, and gfx11 PM4 decode parity is HIPF-254.
+    const NEEDS: rdna_compute::replay::RetainedTapeNeeds =
+        rdna_compute::replay::RetainedTapeNeeds {
+            position_kernargs: true,
+            gfx10_11_pm4_unvalidated: true,
+        };
+    match (admission, replay.transport_refusal(arch, NEEDS)) {
+        (SpecializedRouteAdmission::Admitted, Some(reason)) => {
+            SpecializedRouteAdmission::Refused { reason }
+        }
+        (admission, _) => admission,
+    }
+}
+
+/// Appended to every Qwen4 fallback after a recording forward.
+const RECORDED_FORWARD_NOTE: &str = "the forward that recorded the tape ran on the recorded \
+     route, so its output (and the state it wrote) may not be byte-identical to plain HIP; \
+     later forwards are plain HIP";
+
 pub(crate) fn qwen4_spec_logit_rows(max_chunk: usize) -> usize {
     QWEN4_SPEC_VERIFY_ROWS.min(max_chunk)
 }
@@ -15715,7 +15744,16 @@ impl Qwen4GpuForward {
             && self.qsa_tap.is_none()
             && self.mesh_route_rows.is_none()
             && self.cut_layers.is_none()
-            && !hipfire_dispatch::pipeline::qsa_projection_hook_installed();
+            && !hipfire_dispatch::pipeline::qsa_projection_hook_installed()
+            // A transport the boundary refuses never records.
+            && !matches!(
+                qwen4_retained_admission(
+                    &gpu.replay,
+                    &gpu.arch,
+                    specialized_sealed_moe_retained_admission(),
+                ),
+                SpecializedRouteAdmission::Refused { .. }
+            );
         qwen4_ar_launch(
             retained_candidate,
             gpu.replay.request(),
@@ -17605,16 +17643,11 @@ impl Qwen4GpuForward {
                 None
             };
             if shadow_route.is_none() {
-                // The GDN conv carries a position kernarg and the MQ6 decode
-                // GEMVs (gemv_mq6g256v2_*) use scratch.
-                let needs = rdna_compute::replay::RetainedTapeNeeds {
-                    position_kernargs: true,
-                    scratch_kernels: true,
-                };
-                let admission = match gpu.replay.transport_refusal(&gpu.arch, needs) {
-                    Some(reason) => SpecializedRouteAdmission::Refused { reason },
-                    None => specialized_sealed_moe_retained_admission(),
-                };
+                let admission = qwen4_retained_admission(
+                    &gpu.replay,
+                    &gpu.arch,
+                    specialized_sealed_moe_retained_admission(),
+                );
                 match retained_body_action(eligible, gpu.replay.state(), admission) {
                     RetainedBodyAction::Ineligible => {}
                     RetainedBodyAction::Refuse { reason } => {
@@ -18189,12 +18222,18 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
     if let Err(reason) = gpu.hip.device_synchronize() {
         let reason = format!("qwen4 capture sync failed: {reason:?}");
         gpu.replay.poison(reason.clone());
-        eprintln!("[redline] qwen4 capture could not be closed or prepared: {reason}");
+        eprintln!(
+            "[redline] qwen4 capture could not be closed or prepared: {reason}; \
+             {RECORDED_FORWARD_NOTE}"
+        );
         return;
     }
     if let Err(reason) = gpu.replay.finish_capture() {
-        gpu.replay.poison(reason);
-        eprintln!("[redline] qwen4 capture could not be closed or prepared: {reason}");
+        gpu.replay.poison(reason.clone());
+        eprintln!(
+            "[redline] qwen4 capture could not be closed or prepared: {reason}; \
+             {RECORDED_FORWARD_NOTE}"
+        );
         return;
     }
     let launches = gpu.replay.recorded_launches().len();
@@ -18215,19 +18254,41 @@ fn finish_qwen4_capture(gpu: &mut Gpu, diagnostic_capture: bool) {
         Err(reason) => {
             let reason = format!("Redline prepare after warmup failed: {reason}");
             gpu.replay.poison(reason.clone());
-            eprintln!(
-                "[redline] falling back to HIP: {reason}; the forward that recorded the tape ran \
-                 on the recorded route, so its output (and the state it wrote) is not \
-                 byte-identical to plain HIP; later forwards are plain HIP"
-            );
+            eprintln!("[redline] falling back to HIP: {reason}; {RECORDED_FORWARD_NOTE}");
         }
     }
 }
 
 #[cfg(test)]
 mod wide_verify_guard_tests {
-    use super::{qwen4_ar_launch, qwen4_spec_logit_rows, Qwen4ArLaunch};
-    use rdna_compute::replay::{ReplayBackendRequest as Request, ReplayState as State};
+    use super::{qwen4_ar_launch, qwen4_retained_admission, qwen4_spec_logit_rows, Qwen4ArLaunch};
+    use hipfire_dispatch::pipeline::sealed_moe::SpecializedRouteAdmission as Admission;
+    use rdna_compute::replay::{
+        ReplayBackendRequest as Request, ReplayController, ReplayState as State,
+    };
+
+    /// HIPF-225: the transports that cannot prepare the Qwen4 tape are refused
+    /// before recording; the diagnostic census still records.
+    #[test]
+    fn retained_admission_refuses_unpreparable_transports() {
+        let refused = |c: &ReplayController, arch| {
+            matches!(
+                qwen4_retained_admission(c, arch, Admission::Admitted),
+                Admission::Refused { .. }
+            )
+        };
+        let (aql, pm4) = (
+            ReplayController::new_manual_aql(),
+            ReplayController::new_manual_pm4(),
+        );
+        assert!(refused(&aql, "gfx1151") && refused(&aql, "gfx1201"));
+        assert!(refused(&pm4, "gfx1151") && refused(&pm4, "gfx1100"));
+        assert!(!refused(&pm4, "gfx1201"));
+        assert_eq!(
+            qwen4_retained_admission(&aql, "gfx1151", Admission::DiagnosticCapture),
+            Admission::DiagnosticCapture
+        );
+    }
 
     #[test]
     fn ar_launch_truth_table() {
