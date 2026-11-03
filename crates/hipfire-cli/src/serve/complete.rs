@@ -2282,6 +2282,7 @@ pub(crate) fn complete_request_attempt(
         .ok_or_else(|| invalid_request!("model is required"))?
         .to_owned();
     let images_base64 = request_images_base64(body.get("messages"))?;
+    let audio_base64 = request_audio_base64(body.get("messages"))?;
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
@@ -2377,6 +2378,21 @@ pub(crate) fn complete_request_attempt(
             }
         } else if !images_base64.is_empty() {
             generate["images_base64"] = serde_json::json!(images_base64);
+        }
+        if let Some(audio) = audio_base64 {
+            // LFM3-Audio ASR path (Phase 5b): the daemon's generate_lfm3_audio
+            // route consumes `prompt` + `system` only (NOT `messages`), so the
+            // audio payload and the leading system message must be forwarded
+            // explicitly — "Perform ASR in English." never reaches the route
+            // otherwise. Scoped to the audio path: text routes render the
+            // system turn through `messages` already, and double-forwarding
+            // would duplicate it there. (Dropped in the lfm3-port merge — the
+            // re-homed CLI lost the audio pass-through and every
+            // input_audio request degraded to a text-only chat.)
+            generate["audio_base64"] = serde_json::Value::String(audio);
+            if let Some(system) = leading_system_message(&normalized_messages) {
+                generate["system"] = serde_json::Value::String(system);
+            }
         }
         for (key, config_key) in [
             ("temperature", "generation.temperature"),
@@ -3161,6 +3177,66 @@ pub(crate) fn openai_content_text(content: Option<&serde_json::Value>) -> String
             .collect(),
         Some(other) => other.to_string(),
     }
+}
+
+/// Extract the (single) `input_audio` content part from [OI]-shaped chat
+/// messages as base64 (bare or data-URI-wrapped WAV). Mirrors
+/// [`request_images_base64`]; feeds the daemon's `audio_base64` field
+/// (generate_lfm3_audio — the LFM3-Omni ASR route; Phase 5b).
+pub(crate) fn request_audio_base64(messages: Option<&serde_json::Value>) -> Result<Option<String>> {
+    let Some(messages) = messages.and_then(serde_json::Value::as_array) else {
+        return Ok(None);
+    };
+    let mut audio = None;
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(serde_json::Value::as_str) != Some("input_audio") {
+                continue;
+            }
+            let payload = part
+                .pointer("/input_audio/data")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| invalid_request!("input_audio content part requires input_audio.data"))?;
+            match part
+                .pointer("/input_audio/format")
+                .and_then(serde_json::Value::as_str)
+            {
+                None | Some("wav") => {}
+                Some(other) => {
+                    bail_invalid!("unsupported input_audio format '{other}': only wav is supported")
+                }
+            }
+            // Tolerate a data-URI wrapper (the daemon strips it too).
+            let payload = payload
+                .strip_prefix("data:")
+                .and_then(|rest| rest.split_once(',').map(|(_, tail)| tail))
+                .unwrap_or(payload);
+            if payload.is_empty() {
+                bail_invalid!("input_audio part has an empty base64 payload");
+            }
+            if audio.replace(payload.to_owned()).is_some() {
+                bail_invalid!("at most one input_audio part is supported per request");
+            }
+        }
+    }
+    Ok(audio)
+}
+
+/// First non-empty system message, for routes that consume the daemon's
+/// `system` field directly (the LFM3-Audio ASR path; Phase 5b).
+pub(crate) fn leading_system_message(messages: &serde_json::Value) -> Option<String> {
+    messages
+        .as_array()?
+        .iter()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+        .and_then(|message| message.get("content"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
 }
 
 /// The chat role a raw OpenAI message normalizes to; `None` for a role the
