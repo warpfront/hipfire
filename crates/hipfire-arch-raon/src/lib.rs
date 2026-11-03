@@ -17,10 +17,10 @@ pub mod mla;
 pub mod moe;
 pub mod precision;
 pub mod prefill;
+mod program;
 pub mod projection;
 pub mod railgun_decode;
 pub mod railgun_provision;
-pub mod rda;
 pub mod rollback;
 pub mod session;
 pub mod spec_impl;
@@ -45,7 +45,6 @@ pub use mesh::{
     raon_edge_capacity_bytes, raon_manifest, raon_rank_op_ids, raon_step_graph, RaonMeshBindings,
     RaonMeshModel, RaonMeshOutput, RaonMeshProgram, RAON_STREAMS_RESOURCE,
 };
-pub use projection::{project, project_row, project_rows, round_bf16_rows, OutRound};
 pub use rollback::{RollbackMode, ROLLBACK_ENV};
 pub use spec_impl::RaonSpecScratch;
 pub use weights::{

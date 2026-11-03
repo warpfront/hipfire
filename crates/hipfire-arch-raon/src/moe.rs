@@ -24,7 +24,7 @@ use crate::precision::{RaonPrecisionSite, RaonSiteTiers};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::moe::{GroupedMoeGeometry, MOE_GROUPED_MAX_TOP_K};
 use hipfire_dispatch::pipeline::{
-    execute_gated_ffn, execute_grouped_moe, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
+    execute_gated_ffn, CastPolicy, CombineOrder, FfnActivation, GatedFfnOp,
     GroupedMoeGroupedScratch, GroupedMoeIndexedScratch, GroupedMoeOp, GroupedMoePolicy,
     GroupedMoeProtocol, GroupedMoeRouted, GroupedMoeRouter, GroupedMoeScratch,
     GroupedMoeScratchPlan, GroupedMoeShared, GroupedMoeSharedScratch, GroupedMoeSiteTiers,
@@ -535,74 +535,6 @@ pub fn raon_moe_op<'a>(
         out,
         routed_out,
     }
-}
-
-/// Run one MoE layer: decode (`rows == 1`) on the indexed qt44 core, wider
-/// batches on the grouped WMMA core (`GroupedMoeProtocol::Auto`).
-#[allow(clippy::too_many_arguments)]
-pub fn forward_moe(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    dims: &RaonMoeDims,
-    layer: &RaonMoeLayerRefs<'_>,
-    rows: usize,
-    x: &GpuTensor,
-    scratch: &RaonMoeScratch,
-    out: &GpuTensor,
-) -> Result<(), String> {
-    if rows > scratch.max_rows {
-        return Err(format!(
-            "raon moe: {rows} rows exceed the scratch capacity {}",
-            scratch.max_rows
-        ));
-    }
-    let op = raon_moe_op(
-        ctx,
-        dims,
-        layer,
-        GroupedMoeProtocol::Auto,
-        rows,
-        x,
-        scratch,
-        out,
-        None,
-    );
-    execute_grouped_moe(gpu, &op).map_err(|e| e.to_string())
-}
-
-/// Run one MoE layer with every row bit-identical to the same row run alone as
-/// a `rows == 1` decode call ([`GroupedMoeProtocol::RowsExact`]): the routed
-/// experts on the indexed core, the shared expert per row. For speculative
-/// verify blocks of up to 16 rows; slower than [`forward_moe`] at wide batches.
-#[allow(clippy::too_many_arguments)]
-pub fn forward_moe_rows_exact(
-    gpu: &mut Gpu,
-    ctx: &DispatchCtx,
-    dims: &RaonMoeDims,
-    layer: &RaonMoeLayerRefs<'_>,
-    rows: usize,
-    x: &GpuTensor,
-    scratch: &RaonMoeScratch,
-    out: &GpuTensor,
-) -> Result<(), String> {
-    if rows > scratch.max_rows {
-        return Err(format!(
-            "raon moe: {rows} rows exceed the scratch capacity {}",
-            scratch.max_rows
-        ));
-    }
-    let op = raon_moe_op(
-        ctx,
-        dims,
-        layer,
-        GroupedMoeProtocol::RowsExact,
-        rows,
-        x,
-        scratch,
-        out,
-        None,
-    );
-    execute_grouped_moe(gpu, &op).map_err(|e| e.to_string())
 }
 
 /// Build the [`GatedFfnOp`] of the dense layer-0 MLP (SiTU, down K 12032).

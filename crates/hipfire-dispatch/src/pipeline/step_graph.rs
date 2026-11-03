@@ -150,6 +150,18 @@ pub enum OpKind {
     LaneAttention = 55,
     /// [`Step::RowGather`] (Flash-Next EP2 sequence-parallel prefill row all-gather).
     RowGather = 56,
+    /// [`Step::StreamMix`] (#666 G18, Raon mHC stream mixing).
+    StreamMix = 57,
+    /// [`Step::LatentAttention`] (#666 G18, Raon NoPE MLA).
+    LatentAttention = 58,
+    /// [`Step::Rda`] (#666 G18, Raon vector-decay gated delta core).
+    Rda = 59,
+    /// [`Step::GroupedMoe`] (#666 G18, Raon SiTU sigmoid top-k MoE).
+    GroupedMoe = 60,
+    /// [`Step::GatedFfn`] (#666 G18, Raon dense SiTU FFN).
+    GatedFfn = 61,
+    /// [`Step::BoundaryProject`] (#666 G18, Raon BF16-boundary projections).
+    BoundaryProject = 62,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,
     /// [`Step::SiluMul`]; also the hand-route SiLU-mul.
@@ -219,6 +231,13 @@ pub fn op_kind_of(step: &Step<'_>) -> OpKind {
         Step::LaneAttention(..) => OpKind::LaneAttention,
         Step::RowGather(..) => OpKind::RowGather,
         Step::CompressorProject(..) => OpKind::CompressorProject,
+        Step::StreamMix(..) => OpKind::StreamMix,
+        Step::LatentAttention(..) => OpKind::LatentAttention,
+        #[cfg(feature = "deltanet")]
+        Step::Rda(..) => OpKind::Rda,
+        Step::GroupedMoe(..) => OpKind::GroupedMoe,
+        Step::GatedFfn(..) => OpKind::GatedFfn,
+        Step::BoundaryProject(..) => OpKind::BoundaryProject,
     }
 }
 
@@ -690,6 +709,12 @@ mod tests {
             (OpKind::SwaStage, 54),
             (OpKind::LaneAttention, 55),
             (OpKind::RowGather, 56),
+            (OpKind::StreamMix, 57),
+            (OpKind::LatentAttention, 58),
+            (OpKind::Rda, 59),
+            (OpKind::GroupedMoe, 60),
+            (OpKind::GatedFfn, 61),
+            (OpKind::BoundaryProject, 62),
             (OpKind::ResidualAdd, 1000),
             (OpKind::SiluMul, 1001),
             (OpKind::Argmax, 1002),
