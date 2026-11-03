@@ -11,10 +11,11 @@
 //! `C` and folds `acc = fmaf(RN(s_h * d), (float)C, acc)`; output `[N][M]` F32 or BF16 (RNE),
 //! overwrite.
 //!
-//! Entry selection by [`mq6sym_i8_select`]`(m, n)`:
-//! * `n <= 8`: the T0 dot4 GEMV `gemv_mq6sym_i8_rows_r{n}` (grid `[ceil(M/32)]`, block 128,
-//!   dynamic LDS `2 * (2 * (n + B) * 144 + 8 * n)`, `B = 2` iff `n == 7`); [`N_LE8_USE_T1`]
-//!   switches individual row counts to the T1 narrow tiles.
+//! Entry selection by [`mq6sym_i8_select`]`(m, k, n)`:
+//! * `n <= 8`: the T1 narrow tile where it measured at least even with the T0 dot4 GEMV
+//!   ([`le8_uses_t1`]: `K <= 2560`, `6144 <= M < 100000`, `n` in 1 and 4..=8), else the T0 dot4
+//!   GEMV `gemv_mq6sym_i8_rows_r{n}` (grid `[ceil(M/32)]`, block 128, dynamic LDS
+//!   `2 * (2 * (n + B) * 144 + 8 * n)`, `B = 2` iff `n == 7`).
 //! * `9..=48`: the T1 narrow tile of the measured launcher rule (receipts: `gemm_mq6sym_i8.gfx1201.hip`
 //!   header): `M >= 100000` (lm_head) `m64n48`; `M <= 2560 && n >= 24` `m64n16y`; `n <= 16`
 //!   `m64n16` (`m32n16` for `M <= 2560`); `n 17..=32` `m64n32` (`m32n32` for `6144 <= M <= 12288`);
@@ -53,9 +54,15 @@ const GEMM_MODULE: &str = "gemm_mq6sym_i8_gfx1201";
 const CHECK_MODULE: &str = "qwen4_mq6_sym_check_gfx1201";
 const CHECK_SYMBOL: &str = "qwen4_mq6_sym_check_gfx1201";
 
-/// Per row count `n` (index; 0 unused): run the T1 narrow tiles instead of the T0 dot4 GEMV.
-/// All false: T0 is the measured winner for `n <= 8` so far.
-const N_LE8_USE_T1: [bool; 9] = [false; 9];
+/// Whether `m x k` at `n <= 8` tokens takes the T1 narrow tile (`m64n16`) instead of the T0 dot4
+/// GEMV. Card C, 3 processes, kernel-only medians (`release-0.4.5/parity/kernel-runs/a8/
+/// wmma-time-2`, RESULT.md): T1 is even at n=1 (+-0.4 %) and n=4 (+-1 %) and wins n=8 by 5-9 % on
+/// the K=2560 projections M 6144/10240/12288; T0 wins n=2 by 2-7 % everywhere, and every n on
+/// out_proj/o_proj (K=6144) and lm_head (M=248320). n=3 follows n=2; unmeasured tiny M
+/// (48/512/640) keeps T0.
+fn le8_uses_t1(m: usize, k: usize, n: usize) -> bool {
+    !matches!(n, 2 | 3) && k <= 2560 && (6144..LM_HEAD_MIN_ROWS).contains(&m)
+}
 
 /// `HIPFIRE_QWEN4_TRUNK_A8` (`developer.qwen4_trunk_a8`, typed boolean). Read once.
 static QWEN4_TRUNK_A8: LazyLock<Option<bool>> =
@@ -188,17 +195,17 @@ fn narrow_tile(m: usize, n: usize) -> Tile {
 }
 
 /// Tile choice for `m` weight rows x `n` tokens.
-fn mq6sym_i8_tile(m: usize, n: usize) -> Tile {
+fn mq6sym_i8_tile(m: usize, k: usize, n: usize) -> Tile {
     match n {
-        1..=8 if !N_LE8_USE_T1[n] => Tile::Gemv(n),
+        1..=8 if !le8_uses_t1(m, k, n) => Tile::Gemv(n),
         0..=48 => narrow_tile(m, n),
         _ => Tile::P128,
     }
 }
 
-/// Entry, module and launch geometry of one launch of `m` rows x `n` tokens.
-fn mq6sym_i8_select(m: usize, n: usize) -> Select {
-    let tile = mq6sym_i8_tile(m, n);
+/// Entry, module and launch geometry of one launch of `m` rows x `k` x `n` tokens.
+fn mq6sym_i8_select(m: usize, k: usize, n: usize) -> Select {
+    let tile = mq6sym_i8_tile(m, k, n);
     let rows = |r: usize| m.div_ceil(r) as u32;
     let (module, source) = match tile {
         Tile::Gemv(_) => (GEMV_MODULE, kernels::GEMV_MQ6SYM_I8_GFX1201_SRC),
@@ -256,9 +263,9 @@ impl Gpu {
         })
     }
 
-    /// Name of the kernel [`Gpu::gemm_mq6sym_i8_prequant`] launches for `m` rows x `n` tokens.
-    pub fn gemm_mq6sym_i8_kernel_name(&self, m: usize, n: usize, bf16: bool) -> &'static str {
-        tile_entry(mq6sym_i8_tile(m, n), bf16)
+    /// Name of the kernel [`Gpu::gemm_mq6sym_i8_prequant`] launches for `m` x `k` x `n` tokens.
+    pub fn gemm_mq6sym_i8_kernel_name(&self, m: usize, k: usize, n: usize, bf16: bool) -> &'static str {
+        tile_entry(mq6sym_i8_tile(m, k, n), bf16)
     }
 
     /// True when every half-group header of the `m x (k/256)` qt47 groups of `w` is finite and
@@ -374,7 +381,7 @@ impl Gpu {
                 "gemm_mq6sym_i8: undersized weight or output tensor",
             ));
         }
-        let sel = mq6sym_i8_select(m, n);
+        let sel = mq6sym_i8_select(m, k, n);
         let kernel = tile_entry(sel.tile, bf16);
         // One typed contract per kernel (hipfire-kernel-abi): operand formats/extents, launch
         // geometry and the kernarg image are validated and encoded once, before the module loads.
@@ -430,11 +437,16 @@ mod tests {
 
     #[test]
     fn selection_table() {
-        let t = mq6sym_i8_tile;
-        // n <= 8: T0 at every M.
+        let t = |m, n| mq6sym_i8_tile(m, 2560, n);
+        // n <= 8: T1 m64n16 on the K=2560 6144..100000-row projections at n 1 and 4..=8, T0 else.
         for n in 1..=8 {
-            for m in [64usize, 2560, 10240, 248_320] {
+            for m in [64usize, 2560, 248_320] {
                 assert_eq!(t(m, n), Tile::Gemv(n), "m={m} n={n}");
+            }
+            for m in [6144usize, 10240, 12288] {
+                let want = if matches!(n, 2 | 3) { Tile::Gemv(n) } else { Tile::M64N16 };
+                assert_eq!(t(m, n), want, "m={m} n={n}");
+                assert_eq!(mq6sym_i8_tile(m, 6144, n), Tile::Gemv(n), "k=6144 m={m} n={n}");
             }
         }
         // 9..=16.
@@ -472,19 +484,21 @@ mod tests {
 
     #[test]
     fn launch_geometry() {
-        let s = mq6sym_i8_select(10240, 1);
+        let s = mq6sym_i8_select(10240, 6144, 1);
         assert_eq!((s.grid, s.block, s.lds), ([320, 1, 1], 128, 1168));
         assert_eq!(s.module, GEMV_MODULE);
         assert_eq!(gemv_lds_bytes(8), 5312);
-        let s = mq6sym_i8_select(10241, 4);
+        let s = mq6sym_i8_select(10241, 6144, 4);
         assert_eq!(s.grid, [321, 1, 1]);
-        let s = mq6sym_i8_select(2048, 12);
+        let s = mq6sym_i8_select(10240, 2560, 4);
+        assert_eq!((s.grid, s.block, s.lds), ([160, 1, 1], 128, 0));
+        let s = mq6sym_i8_select(2048, 2560, 12);
         assert_eq!((s.grid, s.block, s.lds), ([64, 1, 1], 64, 0));
-        let s = mq6sym_i8_select(2560, 40);
+        let s = mq6sym_i8_select(2560, 6144, 40);
         assert_eq!((s.grid, s.block, s.lds), ([40, 3, 1], 128, 0));
-        let s = mq6sym_i8_select(248_320, 40);
+        let s = mq6sym_i8_select(248_320, 2560, 40);
         assert_eq!((s.grid, s.block), ([3880, 1, 1], 128));
-        let s = mq6sym_i8_select(4097, 129);
+        let s = mq6sym_i8_select(4097, 2560, 129);
         assert_eq!(
             (s.grid, s.block, s.lds),
             ([33, 2, 1], 256, MQ6SYM_P128_LDS_BYTES)
@@ -621,15 +635,15 @@ mod tests {
         for &m in &ms {
             for n in 1..=130usize {
                 for bf16 in [false, true] {
-                    let sel = mq6sym_i8_select(m, n);
+                    let sel = mq6sym_i8_select(m, 256, n);
                     let entry = tile_entry(sel.tile, bf16);
                     assert_export_matches(Arch::Gfx1201, entry, &sel, &[m as u64, 256, n as u64]);
                     seen.insert(entry);
                 }
             }
         }
-        // Every tile the table can select (T0 is reached at n <= 8; flipping N_LE8_USE_T1 only
-        // re-routes to narrow tiles already in the set).
+        // Every tile the table can select (T0 is reached at n <= 8 for every M at K=256;
+        // the T1 n <= 8 crossover only re-routes to narrow tiles already in the set).
         assert_eq!(seen.len(), ALL_TILES.len() * 2, "{seen:?}");
         // The family holds exactly those exports.
         let exported: usize = families::all()
@@ -640,12 +654,15 @@ mod tests {
     }
 
     #[test]
-    fn t1_switch_table_routes_narrow_tiles() {
-        // The switch is a pure table; with a row count flipped the narrow rule applies at n <= 8.
+    fn le8_crossover_routes_narrow_tiles() {
+        // The narrow rule itself at n <= 8 (where `le8_uses_t1` selects it).
         assert_eq!(narrow_tile(2048, 3), Tile::M32N16);
         assert_eq!(narrow_tile(10240, 8), Tile::M64N16);
-        assert_eq!(N_LE8_USE_T1.len(), 9);
-        assert!(N_LE8_USE_T1.iter().all(|&on| !on));
+        assert!(le8_uses_t1(10240, 2560, 1));
+        assert!(!le8_uses_t1(10240, 2560, 2));
+        assert!(!le8_uses_t1(2560, 6144, 8));
+        assert!(!le8_uses_t1(248_320, 2560, 8));
+        assert!(!le8_uses_t1(640, 2560, 8));
     }
 
     /// The kernarg image of every entry is the 36 explicit bytes `W Xq Y M K N`.

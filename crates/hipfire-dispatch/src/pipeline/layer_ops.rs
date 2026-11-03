@@ -266,7 +266,7 @@ fn a8_first_launch_receipt(gpu: &Gpu, m: usize, k: usize, rows: usize, bf16: boo
     if !SEEN[class].swap(true, Ordering::Relaxed) {
         eprintln!(
             "[INFO] qwen4 trunk A8: first launch rows={rows} m={m} k={k} entry={}",
-            gpu.gemm_mq6sym_i8_kernel_name(m, rows, bf16)
+            gpu.gemm_mq6sym_i8_kernel_name(m, k, rows, bf16)
         );
     }
 }
