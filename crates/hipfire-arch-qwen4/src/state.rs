@@ -7181,6 +7181,13 @@ mod tests {
                 advance_history(&mut gpu, &mut reference, row);
                 expected.push(capture_semantic_digest(&reference, &mut gpu));
             }
+            // The ring layout this allocation took (`HIPFIRE_QWEN4_CAPTURE_RING_COMPACT`, default
+            // on: `rows + 1` slots, logical slots mapped by `capture_ring_slot`; `=0` is the
+            // double ring where logical == physical). Run the test under both settings.
+            let compact = candidate.row_capture_compact;
+            let ring_slot = |state: &Qwen4State, logical: usize| {
+                capture_ring_slot(state.row_capture_compact, rows, logical)
+            };
             for base in [0, rows] {
                 for keep in 0..=rows {
                     candidate.set_gdn_live(if base == 0 { 2 * rows - 1 } else { rows - 1 });
@@ -7190,34 +7197,74 @@ mod tests {
                     let old_bytes = gpu
                         .download_raw_bytes(&candidate.gdn[0].recurrent)
                         .expect("old live bytes");
-                    let destination = candidate.row_capture[0]
-                        .0
-                        .sub_offset(base * state_units, rows * state_units);
-                    gpu.hip
-                        .memset(&destination.buf, 0xa5, destination.byte_size())
-                        .expect("poison free half");
+                    if compact {
+                        // Poison every physical slot but the old live one (the old state must
+                        // survive the capture), the compact ring's equivalent of the free half.
+                        for physical in 0..=rows {
+                            if physical == ring_slot(&candidate, old_live) {
+                                continue;
+                            }
+                            let slot = candidate.row_capture[0]
+                                .0
+                                .sub_offset(physical * state_units, state_units);
+                            gpu.hip
+                                .memset(&slot.buf, 0xa5, slot.byte_size())
+                                .expect("poison free slot");
+                        }
+                    } else {
+                        let destination = candidate.row_capture[0]
+                            .0
+                            .sub_offset(base * state_units, rows * state_units);
+                        gpu.hip
+                            .memset(&destination.buf, 0xa5, destination.byte_size())
+                            .expect("poison free half");
+                    }
                     candidate.row_capture_armed = true;
                     let ticket = candidate.snapshot(&mut gpu).expect("armed snapshot");
                     capture(&mut gpu, &mut candidate, 0, rows);
                     assert_eq!(candidate.gdn_live, base + rows - 1);
                     let old_slot = candidate.row_capture[0]
                         .0
-                        .sub_offset(old_live * state_units, state_units);
+                        .sub_offset(ring_slot(&candidate, old_live) * state_units, state_units);
                     assert_eq!(
                         gpu.download_raw_bytes(&old_slot).expect("old slot"),
                         old_bytes
                     );
-                    for slot in [base, base + rows - 2] {
-                        let intermediate = candidate.row_capture[0]
-                            .0
-                            .sub_offset(slot * state_units, state_units);
-                        assert!(
-                            gpu.download_raw_bytes(&intermediate)
-                                .expect("uncaptured slot")
-                                .iter()
-                                .all(|byte| *byte == 0xa5),
-                            "intermediate state was materialized"
-                        );
+                    if compact {
+                        // Compact ring: only the captured slot and the old live slot hold
+                        // state; every other physical slot is still the poison byte.
+                        let written = [
+                            ring_slot(&candidate, candidate.gdn_live),
+                            ring_slot(&candidate, old_live),
+                        ];
+                        for physical in 0..=rows {
+                            if written.contains(&physical) {
+                                continue;
+                            }
+                            let slot = candidate.row_capture[0]
+                                .0
+                                .sub_offset(physical * state_units, state_units);
+                            assert!(
+                                gpu.download_raw_bytes(&slot)
+                                    .expect("uncaptured slot")
+                                    .iter()
+                                    .all(|byte| *byte == 0xa5),
+                                "intermediate state was materialized (physical slot {physical})"
+                            );
+                        }
+                    } else {
+                        for slot in [base, base + rows - 2] {
+                            let intermediate = candidate.row_capture[0]
+                                .0
+                                .sub_offset(slot * state_units, state_units);
+                            assert!(
+                                gpu.download_raw_bytes(&intermediate)
+                                    .expect("uncaptured slot")
+                                    .iter()
+                                    .all(|byte| *byte == 0xa5),
+                                "intermediate state was materialized"
+                            );
+                        }
                     }
                     candidate.row_capture_armed = false;
                     if keep == 0 {
