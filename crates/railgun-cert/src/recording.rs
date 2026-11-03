@@ -4225,6 +4225,18 @@ pub const SITES: &[Site] = &[
         decisions: &["eager-only-refusals"],
     },
     Site {
+        file: "rdna-compute/src/gemm_mq6sym_i8.rs",
+        function: "gemm_mq6sym_i8_prequant",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
+        file: "rdna-compute/src/gemm_mq6sym_i8.rs",
+        function: "qwen4_trunk_a8_applies",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
+    Site {
         file: "rdna-compute/src/gemm_mq8g256.rs",
         function: "mq8_quantize_x",
         occurrences: 2,
