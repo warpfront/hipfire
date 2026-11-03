@@ -425,14 +425,19 @@ struct Tile {
     rows: usize,
     /// token capacity of the tile (16/32/48; 0 = prefill, any N)
     ntok: usize,
+    /// token-split grid ([ceil(M/rows), ceil(N/ntok)]): any N, the slices re-stream the weights
+    ys: bool,
 }
 
 impl Tile {
     fn narrow(rows: usize, ntok: usize) -> Tile {
-        Tile { rows, ntok }
+        Tile { rows, ntok, ys: false }
+    }
+    fn split(rows: usize, ntok: usize) -> Tile {
+        Tile { rows, ntok, ys: true }
     }
     fn p128() -> Tile {
-        Tile { rows: 128, ntok: 0 }
+        Tile { rows: 128, ntok: 0, ys: false }
     }
     fn is_prefill(&self) -> bool {
         self.ntok == 0
@@ -442,19 +447,22 @@ impl Tile {
         if self.is_prefill() {
             format!("gemm_mq6sym_i8_set{b}_gfx1201")
         } else {
-            format!("gemm_mq6sym_i8_set{b}_m{}n{}_gfx1201", self.rows, self.ntok)
+            let y = if self.ys { "y" } else { "" };
+            format!("gemm_mq6sym_i8_set{b}_m{}n{}{y}_gfx1201", self.rows, self.ntok)
         }
     }
     fn label(&self) -> String {
         if self.is_prefill() {
             "p128".to_string()
         } else {
-            format!("m{}n{}", self.rows, self.ntok)
+            format!("m{}n{}{}", self.rows, self.ntok, if self.ys { "y" } else { "" })
         }
     }
     fn grid(&self, m: usize, n: usize) -> [u32; 3] {
         if self.is_prefill() {
             [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1]
+        } else if self.ys {
+            [m.div_ceil(self.rows) as u32, n.div_ceil(self.ntok) as u32, 1]
         } else {
             [m.div_ceil(self.rows) as u32, 1, 1]
         }
@@ -474,7 +482,7 @@ impl Tile {
         }
     }
     fn admits(&self, n: usize) -> bool {
-        self.is_prefill() || n <= self.ntok
+        self.is_prefill() || self.ys || n <= self.ntok
     }
 }
 
@@ -483,6 +491,9 @@ fn narrow_tiles() -> Vec<Tile> {
     for rows in [32usize, 64] {
         for ntok in [16usize, 32, 48] {
             v.push(Tile::narrow(rows, ntok));
+        }
+        for ntok in [16usize, 32] {
+            v.push(Tile::split(rows, ntok));
         }
     }
     v
@@ -1200,6 +1211,9 @@ fn mq6sym_i8_wmma_timing_hw() {
 
             let mut arms: Vec<Arm> = Vec::new();
             for tile in tiles_for(n, false) {
+                if tile.ys && n <= tile.ntok {
+                    continue; // identical to the plain tile
+                }
                 let outs: Vec<(bool, *mut c_void)> = if std::env::var("T1_BF16").is_ok() {
                     vec![(false, yp), (true, ybp)]
                 } else {

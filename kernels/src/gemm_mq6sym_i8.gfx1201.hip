@@ -123,7 +123,9 @@ static __device__ __forceinline__ void sym_bar() {
 
 // Weights: the next group's registers are fetched while the current group computes (two register
 // sets; deeper prefetch measured slower on card C, see the T1 receipts).
-template <int NW, int RG, int TG, bool BF16>
+// YS: token-split grid: blockIdx.y selects a TG*16-token slice of the N tokens (each CTA streams the
+// weights of its rows again; the slices share them through L2), for small-M shapes with few waves.
+template <int NW, int RG, int TG, bool YS, bool BF16>
 static __device__ __forceinline__ void sym_narrow_body(
     const unsigned char*  __restrict__ W,
     const block_i8_128*   __restrict__ Xq,
@@ -148,7 +150,10 @@ static __device__ __forceinline__ void sym_narrow_body(
     const int gpr = K / 256;
     const int nkb = K / 128;
     const unsigned row_stride = (unsigned)gpr * SYM_GROUP_BYTES;
-    const unsigned x_bytes = (unsigned)N * (unsigned)sizeof(block_i8_128);
+    constexpr int TOKN = TG * 16;
+    const int tok0 = YS ? (int)blockIdx.y * TOKN : 0;     // first token of this CTA
+    const int nloc = YS ? min(TOKN, N - tok0) : N;        // tokens this CTA stages and stores
+    const unsigned x_bytes = (unsigned)nloc * (unsigned)sizeof(block_i8_128);
 
     unsigned hoff[RG];
     unsigned woff[RG];
@@ -186,7 +191,7 @@ static __device__ __forceinline__ void sym_narrow_body(
     // descriptor's N*136 bytes return zero (tokens >= N stage as zero).
     auto load_x = [&](int kb, int slot) {
         const auto x_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-            (void*)(Xq + (long long)kb * N), 0, x_bytes, 0x31004000u);
+            (void*)(Xq + (long long)kb * N + tok0), 0, x_bytes, 0x31004000u);
         #pragma unroll
         for (int i = 0; i < NPF; i++) {
             xr[slot][i] = __builtin_amdgcn_raw_buffer_load_b64(
@@ -306,12 +311,12 @@ static __device__ __forceinline__ void sym_narrow_body(
             #pragma unroll
             for (int j = 0; j < 8; j++) {
                 const int tok = tg * 16 + 8 * kg + j;
-                if (tok < N) {
+                if (tok < nloc) {
                     const float v = facc[rg][tg][j];
                     if constexpr (BF16) {
-                        ((unsigned short*)Yv)[(long long)tok * M + row] = sym_bf16_bits(v);
+                        ((unsigned short*)Yv)[(long long)(tok0 + tok) * M + row] = sym_bf16_bits(v);
                     } else {
-                        ((float*)Yv)[(long long)tok * M + row] = v;
+                        ((float*)Yv)[(long long)(tok0 + tok) * M + row] = v;
                     }
                 }
             }
@@ -319,22 +324,27 @@ static __device__ __forceinline__ void sym_narrow_body(
     }
 }
 
-#define SYM_NARROW_ENTRY(NAME, NW, RG, TG, BF)                                           \
+#define SYM_NARROW_ENTRY(NAME, NW, RG, TG, YS, BF)                                       \
     extern "C" __global__ __launch_bounds__((NW) * 32) void NAME(                        \
         const unsigned char* __restrict__ W, const block_i8_128* __restrict__ Xq,        \
         void* __restrict__ Y, int M, int K, int N) {                                     \
-        sym_narrow_body<NW, RG, TG, BF>(W, Xq, Y, M, K, N);                              \
+        sym_narrow_body<NW, RG, TG, YS, BF>(W, Xq, Y, M, K, N);                          \
     }
-#define SYM_ROW(R, NW, TGN, TG)                                                          \
-    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m##R##n##TGN##_gfx1201, NW, 1, TG, false)        \
-    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m##R##n##TGN##_gfx1201, NW, 1, TG, true)
+#define SYM_ROW(R, NW, TGN, TG, SUF, YS)                                                 \
+    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_m##R##n##TGN##SUF##_gfx1201, NW, 1, TG, YS, false)   \
+    SYM_NARROW_ENTRY(gemm_mq6sym_i8_set_bf16_m##R##n##TGN##SUF##_gfx1201, NW, 1, TG, YS, true)
 
-SYM_ROW(32, 2, 16, 1)
-SYM_ROW(32, 2, 32, 2)
-SYM_ROW(32, 2, 48, 3)
-SYM_ROW(64, 4, 16, 1)
-SYM_ROW(64, 4, 32, 2)
-SYM_ROW(64, 4, 48, 3)
+SYM_ROW(32, 2, 16, 1, , false)
+SYM_ROW(32, 2, 32, 2, , false)
+SYM_ROW(32, 2, 48, 3, , false)
+SYM_ROW(64, 4, 16, 1, , false)
+SYM_ROW(64, 4, 32, 2, , false)
+SYM_ROW(64, 4, 48, 3, , false)
+// token-split twins of the 16-token tiles (grid [ceil(M/rows), ceil(N/16)])
+SYM_ROW(32, 2, 16, 1, y, true)
+SYM_ROW(64, 4, 16, 1, y, true)
+SYM_ROW(32, 2, 32, 2, y, true)
+SYM_ROW(64, 4, 32, 2, y, true)
 
 // ===================================================================
 // Prefill 128 x 128 tile (A = weights, B = activations), a fork of the affine
