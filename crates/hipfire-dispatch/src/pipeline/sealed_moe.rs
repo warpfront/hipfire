@@ -2497,13 +2497,9 @@ pub(super) fn produce_prefill_route<'a>(
     match call.router {
         MoeRouterInput::SoftmaxTopK if params.recipe == MoeRecipe::SoftmaxRoutedNoShared => {
             // Exact per-row softmax (temperature 1) from the logits into the
-            // distinct score view, then the k8 renorm top-k over the scores.
+            // distinct score view (`validate_prefill` refuses an alias), then
+            // the k8 renorm top-k over the scores.
             let logits = params.prelude.router_logits;
-            if logits.buf.as_ptr() == scores.buf.as_ptr() {
-                return Err(invalid(
-                    "routed-only softmax prefill needs router scores distinct from the logits",
-                ));
-            }
             gpu.softmax_temp_batched_into_f32(logits, scores, params.n_exp, params.batch_size, 1.0)
                 .map_err(|e| DispatchError::Hip(e.to_string()))?;
             gpu.moe_topk_renorm_k8_batched(
@@ -3975,6 +3971,13 @@ fn validate_prefill(
             "prefill router scores shape {:?} must be [{}, {}]",
             params.prelude.router_scores.shape, params.batch_size, params.n_exp
         )));
+    }
+    if params.recipe == MoeRecipe::SoftmaxRoutedNoShared
+        && params.prelude.router_scores.buf.as_ptr() == params.prelude.router_logits.buf.as_ptr()
+    {
+        return Err(invalid(
+            "routed-only softmax prefill needs router scores distinct from the logits",
+        ));
     }
     require_elements(
         params.prelude.router_scores,
@@ -7682,6 +7685,238 @@ mod tests {
             format!("{error:?}").contains("cannot bind shared"),
             "{error:?}"
         );
+    }
+
+    /// k_top=8/n_exp=8 grouped-prefill scratch over fake pointers (HIPF-274).
+    /// `f16` picks the dtype of `x_rot_batch` and `rot_batch`.
+    fn lloyd_prefill_scratch(base: usize, f16: bool) -> PrefillScratch {
+        let (n, k, hidden, mi) = (2usize, 8usize, 4usize, 4usize);
+        let slots = n * k;
+        let m_total_max = checked_grouped_m_total_bound(slots, 8, GROUPED_BLOCK_M).unwrap();
+        let basis = |ptr: usize, elems: usize| {
+            if f16 {
+                live_tensor(ptr, elems * 2, &[elems], DType::F16)
+            } else {
+                f32_elems(ptr, elems)
+            }
+        };
+        PrefillScratch {
+            router_logits: f32_matrix(base + 0x1100, n, 8),
+            router_scores: f32_matrix(base + 0x1200, n, 8),
+            shared_scalar: f32_elems(base + 0x1300, n),
+            shared_gate: f32_elems(base + 0x1400, n * mi),
+            shared_up: f32_elems(base + 0x1500, n * mi),
+            shared_rotated: f32_elems(base + 0x1600, n * mi),
+            route_slot: std::cell::Cell::new(None),
+            topk_indices: f32_elems(base, slots),
+            topk_weights: f32_elems(base + 0x100, slots),
+            x_batch: f32_elems(base + 0x200, n * hidden),
+            x_norm_batch: f32_elems(base + 0x300, n * hidden),
+            x_rot_batch: basis(base + 0x400, n * hidden),
+            gate_batch: f32_elems(base + 0x2000, slots * mi),
+            up_batch: f32_elems(base + 0x2000, slots * mi),
+            rot_batch: basis(base + 0x3000, slots * mi),
+            down_expanded: f32_elems(base + 0x4000, slots * hidden),
+            expert_token_counts: f32_elems(base + 0x900, 8),
+            expert_offsets: f32_elems(base + 0xA00, 9),
+            sorted_slot_index: f32_elems(base + 0x5000, m_total_max),
+            expert_tile_ids: f32_elems(base + 0x6000, m_total_max / GROUPED_BLOCK_M * 4),
+            inverse_perm: f32_elems(base + 0xD00, slots),
+            y_gate_up_grouped: f32_elems(base + 0x10000, m_total_max * 8),
+            y_down_grouped: f32_elems(base + 0x20000, m_total_max * 4),
+            partial: f32_elems(base + 0x1000, n * hidden),
+            m_total_max,
+        }
+    }
+
+    /// Maple-shaped prefill (SoftmaxRoutedNoShared, F16 router, declared Lloyd).
+    fn lloyd_prefill_params<'a>(
+        s: &'a PrefillScratch,
+        routed: &'a dyn RoutedExpertWeights,
+        gate_up_ptrs: &'a GpuTensor,
+        down_ptrs: &'a GpuTensor,
+        expert: DType,
+        lloyd: bool,
+    ) -> MoePrefillParams<'a> {
+        use crate::families::moe::{MoeDtypes, MoeMq2Lloyd, MoeNormalization, MoePrefillPrelude};
+        let base = ep_prefill_params(s, routed, gate_up_ptrs, down_ptrs, None);
+        MoePrefillParams {
+            dtypes: MoeDtypes {
+                router: DType::F16,
+                shared: None,
+                experts_all_gate_up_mq4: expert == DType::MQ4G256,
+                routed_gate_up: expert,
+                routed_down: expert,
+                routed_has_mixed_experts: false,
+                has_paro_shared: false,
+                per_expert_gate_up: None,
+                per_expert_down: None,
+            },
+            recipe: MoeRecipe::SoftmaxRoutedNoShared,
+            prelude: MoePrefillPrelude {
+                normalization: MoeNormalization::Provided,
+                router: shaped_weight(&s.y_gate_up_grouped, DType::F16, 8, 4),
+                router_logits: &s.router_logits,
+                router_scores: &s.router_scores,
+                norm_topk_prob: true,
+                route: PrefillRouteMode::Replicated,
+                shared: None,
+                q8_router_policy: crate::families::moe::MoeQ8RouterPolicy::DispatcherEntry,
+            },
+            k_top: 8,
+            n_exp: 8,
+            m_total_max: s.m_total_max,
+            mq2_lloyd: lloyd.then_some(MoeMq2Lloyd {
+                swiglu_limit: 7.0,
+                uses_atomic_down: false,
+                native: None,
+                nonowned_gate_up_dummy: None,
+            }),
+            ..base
+        }
+    }
+
+    /// The declared MQ2-Lloyd prefill admits only the uniform qt51 grouped route
+    /// with F16 basis and activation, and lowers the input basis before the
+    /// router that reads it.
+    #[test]
+    fn declared_lloyd_prefill_admits_only_the_f16_grouped_route() {
+        let table_u = table(8, DType::MQ2G256LloydU);
+        let mut cache_u = table_u.prepare_binding(0, 1, 0).unwrap();
+        let fixture_u = live_fixture(&table_u, 0xA1_0000);
+        bind_fixture(&table_u, &mut cache_u, &fixture_u);
+        let experts_u = BoundMoeExperts::from_cache(&table_u, &cache_u).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let f16 = lloyd_prefill_scratch(0xA2_0000, true);
+        let f32s = lloyd_prefill_scratch(0xA4_0000, false);
+        let params = |s| {
+            lloyd_prefill_params(
+                s,
+                &fixture_u.routed,
+                &fixture_u.gate_up_ptrs,
+                &fixture_u.down_ptrs,
+                DType::MQ2G256LloydU,
+                true,
+            )
+        };
+        let call = seal_prefill(experts_u, &ctx, params(&f16)).expect("the Maple shape seals");
+        assert_eq!(call.router_input(), MoeRouterInput::SoftmaxTopK);
+        let stages = moe_program::lowered_stages(&call).unwrap();
+        let at = |stage: MoeStage| stages.iter().position(|s| *s == stage).unwrap();
+        assert!(
+            at(MoeStage::InputBasis) < at(MoeStage::RouterProjection),
+            "{stages:?}"
+        );
+        assert!(at(MoeStage::Route) < at(MoeStage::Scatter), "{stages:?}");
+        assert!(stages.contains(&MoeStage::Combine), "{stages:?}");
+
+        let refused = |p: MoePrefillParams<'_>, experts, ctx: &DispatchCtx, why: &str| {
+            let err = seal_prefill(experts, ctx, p).err();
+            assert!(err.is_some(), "{why} must be refused");
+        };
+        // F32 basis or activation: the grouped entry would take its pointer-keyed cache.
+        refused(
+            params(&f32s),
+            experts_u,
+            &ctx,
+            "an F32 x_rot_batch/rot_batch",
+        );
+        let mut x32 = lloyd_prefill_scratch(0xB2_0000, true);
+        x32.x_rot_batch = f32_elems(0xB2_0400, 8);
+        refused(params(&x32), experts_u, &ctx, "an F32 x_rot_batch");
+        let mut r32 = lloyd_prefill_scratch(0xB4_0000, true);
+        r32.rot_batch = f32_elems(0xB4_3000, 64);
+        refused(params(&r32), experts_u, &ctx, "an F32 rot_batch");
+        // No WMMA: no path 2, so nothing lowers the declared route.
+        refused(
+            params(&f16),
+            experts_u,
+            &DispatchCtx::for_test("gfx942"),
+            "a non-WMMA arch",
+        );
+        refused(
+            MoePrefillParams {
+                cpu_deferred_experts: true,
+                ..params(&f16)
+            },
+            experts_u,
+            &ctx,
+            "CPU-deferred experts",
+        );
+        // Rotated qt19 experts are not the unrotated grouped route.
+        let table_r = table(8, DType::MQ2G256Lloyd);
+        let mut cache_r = table_r.prepare_binding(0, 1, 0).unwrap();
+        let fixture_r = live_fixture(&table_r, 0xA6_0000);
+        bind_fixture(&table_r, &mut cache_r, &fixture_r);
+        let experts_r = BoundMoeExperts::from_cache(&table_r, &cache_r).unwrap();
+        refused(
+            lloyd_prefill_params(
+                &f16,
+                &fixture_r.routed,
+                &fixture_r.gate_up_ptrs,
+                &fixture_r.down_ptrs,
+                DType::MQ2G256Lloyd,
+                true,
+            ),
+            experts_r,
+            &ctx,
+            "rotated qt19 experts",
+        );
+        // A routed-only recipe is k=8 only.
+        refused(
+            MoePrefillParams {
+                k_top: 4,
+                ..params(&f16)
+            },
+            experts_u,
+            &ctx,
+            "k_top=4",
+        );
+        // The softmax writes the scores out of place, before anything launches.
+        let p = params(&f16);
+        refused(
+            MoePrefillParams {
+                prelude: crate::families::moe::MoePrefillPrelude {
+                    router_scores: p.prelude.router_logits,
+                    ..p.prelude
+                },
+                ..p
+            },
+            experts_u,
+            &ctx,
+            "router scores aliasing the logits",
+        );
+    }
+
+    /// The F16 router arm reads `x_rot_batch` as F16, which only the declared
+    /// Lloyd input basis produces. Undeclared, the input basis is the experts'
+    /// (F32, rotated) basis, so an F16 router must be refused rather than
+    /// lowered (HIPF-274 B1).
+    #[test]
+    fn f16_prefill_router_needs_the_declared_f16_basis() {
+        let table = table(8, DType::MQ4G256);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0xA8_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let s = lloyd_prefill_scratch(0xA9_0000, false);
+        let params = lloyd_prefill_params(
+            &s,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            DType::MQ4G256,
+            false,
+        );
+        assert_eq!(params.x_rot_batch.dtype, DType::F32);
+        match seal_prefill(experts, &ctx, params) {
+            Err(_) => {}
+            Ok(call) => panic!(
+                "sealed an F16 router over an F32 x_rot_batch; stages {:?}",
+                moe_program::lowered_stages(&call)
+            ),
+        }
     }
     #[cfg(not(feature = "deltanet"))]
     #[test]

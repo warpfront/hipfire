@@ -320,6 +320,15 @@ impl MapleMoeFfn {
             .first()
             .ok_or_else(|| format!("maple L{layer}: MoE layer has no experts"))?;
         let (gate_up_dtype, down_dtype) = (first.gate_up.gpu_dtype, first.down.gpu_dtype);
+        // Maple's experts are natively ternary and run only the unrotated
+        // qt51 route; a rotated or other format would take a different sealed
+        // route (e.g. the rotated DS4 MQ2-Lloyd one) the program does not declare.
+        if (gate_up_dtype, down_dtype) != (DType::MQ2G256LloydU, DType::MQ2G256LloydU) {
+            return Err(format!(
+                "maple L{layer}: expert dtype {gate_up_dtype:?}/{down_dtype:?} unsupported — \
+                 Maple's experts must be carried as MQ2G256LloydU (qt=51)"
+            ));
+        }
         let mut metadata = Vec::with_capacity(experts.len());
         for (e, expert) in experts.iter().enumerate() {
             if expert.gate_up.gpu_dtype != gate_up_dtype || expert.down.gpu_dtype != down_dtype {

@@ -1452,12 +1452,15 @@ impl<'a> SealedMoeOp<'a> {
                             quant: "",
                         });
                     } else if params.recipe == MoeRecipe::SoftmaxRoutedNoShared {
-                        // Softmax over the one row's logits in place, then the
-                        // k8 renorm top-k (no shared gate side).
-                        gpu.softmax_f32(params.router_logits)
+                        // Softmax over the one row's `n_exp` logits in place
+                        // (`softmax_f32` normalizes the whole tensor it is
+                        // handed), then the k8 renorm top-k; no shared gate side.
+                        let logits =
+                            super::slice_moe_f32_view(params.router_logits, 0, params.n_exp);
+                        gpu.softmax_f32(&logits)
                             .map_err(|e| DispatchError::Hip(e.to_string()))?;
                         gpu.moe_topk_renorm_k8(
-                            params.router_logits,
+                            &logits,
                             params.topk_indices,
                             params.topk_weights,
                             params.n_exp,
@@ -4587,6 +4590,19 @@ pub(super) fn select_prefill(
                 quant: "",
             });
         }
+    }
+    // The F16 router arm of `router_projection` reads `x_rot_batch` as F16,
+    // which only the declared Lloyd input basis (admitted above) writes.
+    if params.prelude.router.dtype == rdna_compute::DType::F16
+        && params.mq2_lloyd.is_none()
+        && !route.is_some_and(MoeRouteCapability::is_sealed_grouped)
+    {
+        return Err(DispatchError::UnsupportedVariant {
+            family: "moe",
+            variant: "f16-prefill-router-needs-declared-f16-basis",
+            arch: "",
+            quant: "",
+        });
     }
     let _total_slots = params
         .batch_size
