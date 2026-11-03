@@ -2032,7 +2032,7 @@ pub(crate) fn launch_op_rows(
                 *n_heads,
                 *n_kv_heads,
                 *head_dim,
-                positions.numel(),
+                positions.numel() / rope.positions_per_row(),
             ),
             None => rope.apply_row(gpu, q, k, pos_buf, *n_heads, *n_kv_heads, *head_dim),
         },

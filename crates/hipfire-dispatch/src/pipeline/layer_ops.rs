@@ -5531,6 +5531,12 @@ pub enum ProjectLadder {
     /// `rotation` scratch (`rows * k` F16), then the grouped MoE WMMA GEMM runs
     /// the weight as one dense expert over [`ProjectOp::grouped`]. Maple prefill.
     GroupedLloydF16,
+    /// F16 weight, F32 activation and output (the Qwen3.5 embedding encoder). On
+    /// wave32 WMMA with `k % 64 == 0 && m >= 256` (unless `HIPFIRE_EMBED_GEMM=f32`)
+    /// the activation is converted to F16 into the op's `rotation` scratch
+    /// (`rows * k` F16) for the LDS-tiled GEMM (gfx1201: split-K 1); other shapes
+    /// run `gemm_f16_wmma_mb8`, non-WMMA archs naive `gemm_f16` + a transpose.
+    EncoderF16,
 }
 
 /// One projection over `rows` row-major input rows on its [`ProjectLadder`],
@@ -5574,6 +5580,17 @@ impl ProjectOp<'_> {
         if self.ladder == ProjectLadder::Trunk {
             require_weight(&self.weight, m, k, "projection")?;
         }
+        if self.ladder == ProjectLadder::EncoderF16
+            && (self.weight.dtype != DType::F16
+                || self.weight.buf.numel() < checked_mul(m, k, "F16 weight")?
+                || k == 0
+                || k % 16 != 0)
+        {
+            return Err(DispatchError::Hip(format!(
+                "EncoderF16 projection takes an F16 [{m}, {k}] weight with k % 16 == 0, got {:?}",
+                self.weight.dtype
+            )));
+        }
         if self.ladder == ProjectLadder::GemmQ8Fp16 && self.weight.dtype != DType::Q8_0 {
             return Err(DispatchError::Hip(format!(
                 "GemmQ8Fp16 projection refuses a {:?} weight",
@@ -5600,9 +5617,9 @@ impl ProjectOp<'_> {
         }
         let rotated = match self.ladder {
             ProjectLadder::Trunk => !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0),
-            ProjectLadder::GemmQ8Fp16 => {
+            ProjectLadder::GemmQ8Fp16 | ProjectLadder::EncoderF16 => {
                 let scratch = self.rotation.ok_or_else(|| {
-                    DispatchError::Hip("GemmQ8Fp16 projection needs F16 scratch".into())
+                    DispatchError::Hip(format!("{:?} projection needs F16 scratch", self.ladder))
                 })?;
                 require_tensor(scratch, input, DType::F16, "projection F16 scratch")?;
                 false
@@ -5648,6 +5665,7 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
             project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)?
         }
         ProjectLadder::Gemm | ProjectLadder::GemmLmHead => project_gemm(gpu, op)?,
+        ProjectLadder::EncoderF16 => project_f16(gpu, op)?,
         ProjectLadder::GemmQ8Fp16 => {
             let w = &op.weight;
             let scratch = op.rotation.ok_or_else(|| {
@@ -5747,6 +5765,60 @@ fn project_gemm(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> 
         _ => unreachable!("gemm_ladder_rotation admits only the arms above"),
     })
 }
+
+/// The [`ProjectLadder::EncoderF16`] arm of [`execute_project`].
+///
+/// The LDS-tiled macro-tile kernel takes the large shapes; mb8 is a
+/// register-blocked 32-thread block with no LDS staging (measured on gfx1101
+/// at n=4096: ~1.6 TFLOP/s, 2% of the f16 peak), right for small ones.
+fn project_f16(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), DispatchError> {
+    let (w, rows, y) = (&op.weight, op.rows, op.output);
+    let (m, k) = (w.m, w.k);
+    let wmma = gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12();
+    if !wmma {
+        let yt = hip(gpu.alloc_tensor(&[m * rows], DType::F32))?;
+        let r = gpu
+            .gemm_f16(w.buf, op.input, &yt, m, k, rows)
+            .and_then(|_| gpu.transpose_f32(&yt, y, m, rows));
+        hip(gpu.free_tensor(yt))?;
+        return hip(r);
+    }
+    let tiled = k % 64 == 0
+        && m >= 256
+        && !*EMBED_GEMM_F32
+        && (gpu.arch_caps.has_wmma_w32() || gpu.arch == "gfx1201");
+    if !tiled {
+        return hip(gpu.gemm_f16_wmma_mb8(w.buf, op.input, y, m, k, rows));
+    }
+    let n = checked_mul(rows, k, "F16 activation")?;
+    let scratch = op
+        .rotation
+        .ok_or_else(|| DispatchError::Hip("EncoderF16 projection needs F16 scratch".into()))?;
+    let x16 = view(scratch, 0, n);
+    hip(gpu.cast_f32_to_f16(&view(op.input, 0, n), &x16))?;
+    hip(if gpu.arch == "gfx1201" {
+        gpu.gemm_f16_x_f16_wmma_lds_splitk(w.buf, &x16, y, m, k, rows, encoder_gfx1201_tile(m))
+    } else {
+        gpu.gemm_f16_x_f16_wmma_lds_auto(w.buf, &x16, y, None, m, k, rows)
+    })
+}
+
+fn encoder_gfx1201_tile(m: usize) -> rdna_compute::gemm::LdsTileSplitK {
+    use rdna_compute::gemm::LdsTileSplitK;
+    match m {
+        0..512 => LdsTileSplitK::new(64, 128, 32, 64, true, 1),
+        512..1024 => LdsTileSplitK::new(128, 128, 32, 64, false, 1),
+        _ => LdsTileSplitK::new(128, 256, 32, 64, false, 1),
+    }
+}
+
+/// `HIPFIRE_EMBED_GEMM=f32|mb8`: every [`ProjectLadder::EncoderF16`] projection on
+/// `gemm_f16_wmma_mb8`.
+static EMBED_GEMM_F32: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_EMBED_GEMM")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "f32" | "mb8"))
+});
 
 /// Largest causal window the gated short-convolution kernel holds per thread.
 pub const GATED_SHORT_CONV_MAX_KERNEL: usize = 8;
@@ -6037,6 +6109,23 @@ pub fn execute_argmax(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn encoder_gfx1201_projection_tiles_are_supported_unsplit_entries() {
+        for (m, entry) in [
+            (256, "qwen4_wmma_lds_64_128_32_64_k64_p"),
+            (511, "qwen4_wmma_lds_64_128_32_64_k64_p"),
+            (512, "qwen4_wmma_lds_128_128_32_64_k64"),
+            (1023, "qwen4_wmma_lds_128_128_32_64_k64"),
+            (1024, "qwen4_wmma_lds_128_256_32_64_k64"),
+            (4096, "qwen4_wmma_lds_128_256_32_64_k64"),
+        ] {
+            let tile = encoder_gfx1201_tile(m);
+            assert_eq!(tile.split, 1);
+            assert_eq!(tile.ks, 64);
+            assert_eq!(tile.entry(), entry);
+        }
+    }
 
     #[test]
     fn exact_route_uses_the_admitted_eager_limit_not_storage_capacity() {

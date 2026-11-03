@@ -66,9 +66,8 @@ fn trace(
     Ok(())
 }
 
-fn run(gpu: &mut Gpu, steps: &[Step<'_>]) -> Result<(), String> {
-    let ctx = DispatchCtx::new(gpu);
-    execute_steps(gpu, &ctx, steps).map_err(|e| format!("qwen35-embed: {e}"))
+fn run(gpu: &mut Gpu, ctx: &DispatchCtx, steps: &[Step<'_>]) -> Result<(), String> {
+    execute_steps(gpu, ctx, steps).map_err(|e| format!("qwen35-embed: {e}"))
 }
 
 /// `HIPFIRE_EMBED_DEBUG=1`, read once (the trace calls are on the hot path;
@@ -136,12 +135,10 @@ pub fn encode_embeddings_batch(
     }
     let segs = segment_layout(inputs)?;
     let t_rows: usize = segs.iter().map(|s| s.rows).sum();
-    state.reset(gpu)?;
-
     let s = encode_hidden_segments(gpu, w, state, cfg, inputs, &segs, t_rows)?;
     // Dense head: row-independent, so it runs over the whole row block at once.
     let dense_out = cfg.dense_out_features;
-    let head = run(gpu, &head_steps(cfg, w, &s));
+    let head = run(gpu, &DispatchCtx::new(gpu), &head_steps(cfg, w, &s));
     let all = head.and_then(|_| {
         gpu.download_f32(&s.dense)
             .map_err(|e| format!("qwen35-embed: download: {e:?}"))
@@ -164,8 +161,8 @@ pub fn encode_embeddings_batch(
 /// `[n, hidden]` as a device tensor (freed by the caller). Split out so a
 /// future pooled/mean variant can reuse everything above the Dense head.
 ///
-/// Unpadded and without a state reset — this is the debug/inspection entry
-/// point, not the serving one; use [`encode_embeddings`] for correctness.
+/// Unpadded (one segment of `ids.len()` rows) — this is the debug/inspection
+/// entry point, not the serving one; use [`encode_embeddings`] for correctness.
 pub fn encode_hidden(
     gpu: &mut Gpu,
     w: &EmbedWeights,
@@ -216,22 +213,7 @@ fn segment_layout(inputs: &[EncodeInput<'_>]) -> Result<Vec<EncodeSegment>, Stri
     Ok(segs)
 }
 
-/// Rows the encoder actually runs, after padding the sequence up to a multiple
-/// of 64 so the eager attention's PV GEMM meets its `k % 64 == 0` contract.
-///
-/// Padding is at the END, which the architecture tolerates: GDN is causal, so
-/// the padded rows cannot influence a real row's state, and the full-attention
-/// layers mask the padded keys in the softmax. The padded rows' own outputs are
-/// garbage and are dropped by the caller. Below 256 tokens no padding is taken
-/// and the Q-tiled kernel runs instead — its cost is O(n^2), so it is cheap
-/// there and it needs no mask.
-pub(crate) fn padded_rows(n: usize) -> usize {
-    if n < 256 {
-        n
-    } else {
-        n.div_ceil(64) * 64
-    }
-}
+pub(crate) use hipfire_dispatch::pipeline::encoder::padded_rows;
 
 #[allow(clippy::too_many_arguments)]
 fn encode_hidden_segments(
@@ -296,17 +278,21 @@ fn run_layers(
     segs: &[EncodeSegment],
     s: &EncodeScratch,
 ) -> Result<(), String> {
+    let ctx = DispatchCtx::new(gpu);
     let len = s.hidden.numel();
     trace(gpu, || "embed".into(), &s.hidden, len)?;
     let mut delta = 0usize;
     for (li, layer) in w.layers.iter().enumerate() {
-        run(gpu, &mixer_steps(cfg, layer, delta, state, s, segs))
+        run(gpu, &ctx, &mixer_steps(cfg, layer, delta, state, s, segs))
             .map_err(|e| format!("{e} (layer {li})"))?;
         if matches!(layer.mixer, crate::weights::MixerWeights::Gdn { .. }) {
             delta += 1;
+            for (label, t) in s.gdn_trace_planes() {
+                trace(gpu, || format!("L{li} gdn: {label}"), t, t.numel())?;
+            }
         }
         trace(gpu, || format!("layer {li} post-mixer"), &s.hidden, len)?;
-        run(gpu, &mlp_steps(cfg, layer, s)).map_err(|e| format!("{e} (layer {li} mlp)"))?;
+        run(gpu, &ctx, &mlp_steps(cfg, layer, s)).map_err(|e| format!("{e} (layer {li} mlp)"))?;
     }
     Ok(())
 }
