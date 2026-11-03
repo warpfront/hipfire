@@ -5519,6 +5519,11 @@ pub enum ProjectLadder {
     /// HFQ6 / HFQ3 payloads and their MQ rotations). Q8, F32 and BF16 keep
     /// the `Gemm` arms. No calibration tap, except the BF16 MFMA arm's.
     GemmLmHead,
+    /// Q8_0 only: on WMMA archs with `k % 32 == 0` the activation is converted
+    /// to F16 into the op's `rotation` scratch (`rows * k` F16), then
+    /// `gemm_q8_0_wmma`; otherwise the [`Self::Gemm`] Q8 arm. No calibration
+    /// tap (`run_q8_projection_fresh`). Cohere2-MoE prefill.
+    GemmQ8Fp16,
 }
 
 /// One projection over `rows` row-major input rows on its [`ProjectLadder`],
@@ -5529,7 +5534,8 @@ pub struct ProjectOp<'a> {
     pub input: &'a GpuTensor,
     pub output: &'a GpuTensor,
     pub rows: usize,
-    /// FWHT basis scratch (`rows * k`), required by the rotated payloads.
+    /// Ladder scratch of `rows * k`: the F32 FWHT basis of the rotated
+    /// payloads, or the F16 activation copy of [`ProjectLadder::GemmQ8Fp16`].
     pub rotation: Option<&'a GpuTensor>,
     pub ladder: ProjectLadder,
     /// F32 `[rows, m]`, distinct from `output`.
@@ -5546,6 +5552,12 @@ impl ProjectOp<'_> {
         if self.ladder == ProjectLadder::Trunk {
             require_weight(&self.weight, m, k, "projection")?;
         }
+        if self.ladder == ProjectLadder::GemmQ8Fp16 && self.weight.dtype != DType::Q8_0 {
+            return Err(DispatchError::Hip(format!(
+                "GemmQ8Fp16 projection refuses a {:?} weight",
+                self.weight.dtype
+            )));
+        }
         let input = checked_mul(self.rows, k, "projection input")?;
         require_tensor(self.input, input, DType::F32, "projection input")?;
         let output = checked_mul(self.rows, m, "projection output")?;
@@ -5555,6 +5567,13 @@ impl ProjectOp<'_> {
         }
         let rotated = match self.ladder {
             ProjectLadder::Trunk => !matches!(self.weight.dtype, DType::BF16 | DType::Q8_0),
+            ProjectLadder::GemmQ8Fp16 => {
+                let scratch = self.rotation.ok_or_else(|| {
+                    DispatchError::Hip("GemmQ8Fp16 projection needs F16 scratch".into())
+                })?;
+                require_tensor(scratch, input, DType::F16, "projection F16 scratch")?;
+                false
+            }
             ladder => gemm_ladder_rotation(self.weight.dtype, ladder == ProjectLadder::GemmLmHead)?,
         };
         if rotated {
@@ -5573,6 +5592,15 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
             project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)?
         }
         ProjectLadder::Gemm | ProjectLadder::GemmLmHead => project_gemm(gpu, op)?,
+        ProjectLadder::GemmQ8Fp16 => {
+            let w = &op.weight;
+            let scratch = op.rotation.ok_or_else(|| {
+                DispatchError::Hip("GemmQ8Fp16 projection needs F16 scratch".into())
+            })?;
+            hip(crate::families::gemm::run_q8_projection_fresh(
+                gpu, w.buf, op.input, op.output, w.m, w.k, op.rows, scratch, true,
+            ))?
+        }
     }
     match op.residual {
         Some(residual) => hip(gpu.add_inplace_f32(residual, op.output)),
