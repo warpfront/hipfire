@@ -36,6 +36,10 @@ use crate::weights::{EmbedWeights, LayerWeights, MixerWeights};
 /// Carve offsets round up to 64 floats (256 B), so odd row counts keep every
 /// role's base vector-aligned.
 const CARVE_ALIGN: usize = 64;
+/// Gap after every carve: 4 KiB + 256 B. Padded row counts are multiples of
+/// 64, so without it every role base shares its low address bits with the
+/// others (1-2% slower at 1-2K tokens on gfx1151; power-of-two gaps do not help).
+const CARVE_STAGGER: usize = 1088;
 
 /// One encode's activations, sized for its `rows`; reused by every layer.
 ///
@@ -75,7 +79,7 @@ fn carve<const N: usize>(arena: &GpuTensor, rows: usize, widths: [usize; N]) -> 
     let mut off = 0;
     widths.map(|w| {
         let t = arena.sub_offset(off, w * rows);
-        off += (w * rows).next_multiple_of(CARVE_ALIGN);
+        off += (w * rows).next_multiple_of(CARVE_ALIGN) + CARVE_STAGGER;
         t
     })
 }
@@ -83,7 +87,7 @@ fn carve<const N: usize>(arena: &GpuTensor, rows: usize, widths: [usize; N]) -> 
 fn carved_len(rows: usize, widths: &[usize]) -> usize {
     widths
         .iter()
-        .map(|w| (w * rows).next_multiple_of(CARVE_ALIGN))
+        .map(|w| (w * rows).next_multiple_of(CARVE_ALIGN) + CARVE_STAGGER)
         .sum()
 }
 
@@ -212,12 +216,15 @@ impl EncodeScratch {
     }
 }
 
+/// Free every tensor; the first failure is reported after the rest are freed.
 fn free_all<const N: usize>(gpu: &mut Gpu, tensors: [GpuTensor; N]) -> Result<(), String> {
+    let mut first = Ok(());
     for t in tensors {
-        gpu.free_tensor(t)
-            .map_err(|e| format!("qwen35-embed: free: {e:?}"))?;
+        if let (Err(e), Ok(())) = (gpu.free_tensor(t), &first) {
+            first = Err(format!("qwen35-embed: free: {e:?}"));
+        }
     }
-    Ok(())
+    first
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -234,7 +241,7 @@ fn project<'a>(
     Step::Project(ProjectOp {
         weight: WeightRef {
             buf: w,
-            dtype: DType::F16,
+            dtype: w.dtype,
             m: out_dim,
             k,
             row_stride: 0,
