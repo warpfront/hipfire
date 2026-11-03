@@ -30,7 +30,9 @@
 //!    over the picks, ring rollback, head commit), runs the head append of
 //!    every `ArSynced` lane, then each prefill tile through the singleton
 //!    chunk program on the lane's own state (an MTP lane's tile also fills
-//!    its head). A pure-decode step's wall clock (draft start to the final
+//!    its head; under `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward the
+//!    49..=511-row lane tiles of a burst are forwarded together as exact prefill
+//!    waves, [`plan_prefill_parts`]). A pure-decode step's wall clock (draft start to the final
 //!    sync) feeds the store's cost model, then every MTP lane's window
 //!    policy observes its window.
 //! 3. [`Qwen4LaneExecutor::commit_step`] applies the lane bookkeeping. The
@@ -103,7 +105,7 @@
 //!   refuses ends past `state.max_seq_len`.
 
 use crate::bundle::Qwen4Bundle;
-use crate::gpu_forward_lanes::LANE_MAX_ROWS;
+use crate::gpu_forward_lanes::{WaveHead, WaveLane, LANE_MAX_ROWS};
 use crate::lane::{
     download_lane_rows, lane_sample_step, LaneHost, LaneStatus, Qwen4LaneState, Qwen4LaneStore,
     StepParts,
@@ -112,13 +114,174 @@ use crate::lane_rank::{plan_and_draft, DecodeAdmission, LaneProto, LocalLaneRank
 use crate::mesh_lane_protocol::{
     ConfirmOutcome, ControllerInterval, GreedyRule, LaneMeshExecutor, ProposalSource,
 };
-use crate::mtp_lanes::prefill_tile;
+use crate::mtp_lanes::{fill_head_after_wave, prefill_tile};
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, StepOutput,
 };
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{Gpu, GpuTensor};
 use std::time::Instant;
+
+/// `HIPFIRE_CB_PHASES=1` (developer diagnostic, read once; the serve step line of the same name
+/// lives in `hipfire-generate`): one `[fn-lane-tile]` stderr line per lane prefill tile, with the
+/// tile's synchronized wall and the route it took (`run_prefill_tiles`).
+static LANE_TILE_PHASES: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
+});
+
+/// The lab knob that turns a step's sub-512-row lane prefill tiles into EXACT joint prefill
+/// waves (EP lane forwards only; see [`plan_prefill_parts`]). Unset: every tile is its own
+/// serial singleton chunk forward, byte-identical to before.
+pub const EP_LANE_PREFILL_WAVE_EXACT_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT";
+
+/// Most rows one prefill wave carries (the plan of record's 2048-row pass).
+pub(crate) const EP_WAVE_MAX_ROWS: usize = crate::gpu_forward::ep_wave::QWEN4_EP_WAVE_MAX_ROWS;
+
+/// [`EP_LANE_PREFILL_WAVE_EXACT_ENV`] parsed: only the value `1` arms the wave (unset, empty,
+/// `0` and anything else: today's serial tiles).
+pub(crate) fn ep_lane_prefill_wave_from(value: Option<&str>) -> bool {
+    value.is_some_and(|v| v.trim() == "1")
+}
+
+/// The wave knob, read once per process (every rank thread agrees).
+static EP_LANE_PREFILL_WAVE: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+    ep_lane_prefill_wave_from(
+        hipfire_config::developer_var(EP_LANE_PREFILL_WAVE_EXACT_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+pub(crate) fn ep_lane_prefill_wave_enabled() -> bool {
+    *EP_LANE_PREFILL_WAVE
+}
+
+/// Whether a lane's tile of `rows` rows joins an exact wave at all: only a tile in
+/// `EXACT_WAVE_MIN_LANE_ROWS..=EXACT_WAVE_MAX_LANE_ROWS` runs, alone, the sub-512 full-table
+/// route the wave reproduces; a larger tile takes the owner-routed route alone (and keeps its
+/// serial tile and today's bytes), a smaller one the few-row / g32 routes.
+pub(crate) fn ep_wave_lane_joins(rows: usize) -> bool {
+    (crate::gpu_forward::ep_wave::exact_wave_min_lane_rows()
+        ..=crate::gpu_forward::ep_wave::EXACT_WAVE_MAX_LANE_ROWS)
+        .contains(&rows)
+}
+
+/// Whether the lanes of one candidate wave (`per_lane_rows`, plan order) run as one wave: at
+/// least two lanes (one lane is its own tile), every lane joining ([`ep_wave_lane_joins`]),
+/// `total_rows` the sum of the lanes' rows, and `total_rows <= max_rows` (above the cap it must
+/// split). There is no row floor: the wave runs the full-table route every lane runs alone.
+pub(crate) fn ep_wave_prefill_admits(
+    total_rows: usize,
+    per_lane_rows: &[usize],
+    max_rows: usize,
+) -> bool {
+    per_lane_rows.len() >= 2
+        && per_lane_rows.iter().all(|&rows| ep_wave_lane_joins(rows))
+        && per_lane_rows.iter().sum::<usize>() == total_rows
+        && total_rows <= max_rows
+}
+
+/// One piece of a step's prefill: a lane's own tile, or a joint wave over consecutive prefill
+/// ordinals (`start..end` of the plan's Prefill requests).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillPart {
+    Serial(usize),
+    Wave(std::ops::Range<usize>),
+}
+
+/// Partition a step's prefill tiles (`tile_rows[i]` rows of the i-th Prefill request, plan
+/// order; `eligible[i]`: the lane may be forwarded by a wave) into serial tiles and waves.
+/// Runs of consecutive eligible joining lanes are packed into waves of at most `max_rows` rows,
+/// balanced when the run needs more than one (a single-lane tail is merged into the wave before
+/// it when that fits); a run with a single lane stays serial. A candidate wave must also pass
+/// `host_admits(lane rows)`, the forward's own admission (`Qwen4Bundle::ep_wave_admission`:
+/// scratch / reserve capacity, routing scopes); a refused candidate stays serial. Parts come
+/// back in plan order and cover every ordinal exactly once. With `wave` off every tile is
+/// `Serial` in plan order, today's schedule.
+pub(crate) fn plan_prefill_parts(
+    wave: bool,
+    tile_rows: &[usize],
+    eligible: &[bool],
+    max_rows: usize,
+    host_admits: &dyn Fn(&[usize]) -> bool,
+) -> Vec<PrefillPart> {
+    debug_assert_eq!(tile_rows.len(), eligible.len());
+    let n = tile_rows.len();
+    let mut parts = Vec::with_capacity(n);
+    let mut i = 0;
+    while i < n {
+        let joins = |k: usize| wave && eligible[k] && ep_wave_lane_joins(tile_rows[k]);
+        if !joins(i) {
+            parts.push(PrefillPart::Serial(i));
+            i += 1;
+            continue;
+        }
+        let run_start = i;
+        while i < n && joins(i) {
+            i += 1;
+        }
+        let run = run_start..i;
+        let total: usize = tile_rows[run.clone()].iter().sum();
+        // Balanced cut: `k` waves of about `target` rows each.
+        let waves_needed = total.div_ceil(max_rows.max(1)).max(1);
+        let target = total.div_ceil(waves_needed);
+        let mut groups: Vec<std::ops::Range<usize>> = Vec::new();
+        let (mut start, mut rows) = (run.start, 0usize);
+        for lane in run.clone() {
+            if rows > 0 && (rows + tile_rows[lane] > max_rows || rows >= target) {
+                groups.push(start..lane);
+                start = lane;
+                rows = 0;
+            }
+            rows += tile_rows[lane];
+        }
+        groups.push(start..run.end);
+        let admitted = |g: &std::ops::Range<usize>| {
+            ep_wave_prefill_admits(
+                tile_rows[g.clone()].iter().sum(),
+                &tile_rows[g.clone()],
+                max_rows,
+            ) && host_admits(&tile_rows[g.clone()])
+        };
+        // A single-lane tail (not a wave) joins the wave before it when the cap allows.
+        if groups.len() >= 2 {
+            let last = groups[groups.len() - 1].clone();
+            if !admitted(&last) {
+                let prev = groups[groups.len() - 2].clone();
+                let merged = prev.start..last.end;
+                if admitted(&merged) {
+                    groups.truncate(groups.len() - 2);
+                    groups.push(merged);
+                }
+            }
+        }
+        for g in groups {
+            if admitted(&g) {
+                parts.push(PrefillPart::Wave(g));
+            } else {
+                parts.extend(g.map(PrefillPart::Serial));
+            }
+        }
+    }
+    parts
+}
+
+/// Where a wave over prefill ordinals `first..first + lanes` writes its head, as `(first logits
+/// row, top-1 byte offset, top-1 byte length)` of the step buffers: lane `j` of the wave lands
+/// exactly on the slot (`rows_cap + first + j`) the serial tile of that ordinal uses, so every
+/// later reader (sampled draws, the top-1 download, `pick_at`) is unchanged.
+pub(crate) fn wave_head_slots(
+    rows_cap: usize,
+    first: usize,
+    lanes: usize,
+) -> (usize, usize, usize) {
+    let row0 = rows_cap + first;
+    (
+        row0,
+        row0 * std::mem::size_of::<i32>(),
+        lanes * std::mem::size_of::<i32>(),
+    )
+}
 
 /// How a lane's next window runs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1076,8 +1239,12 @@ fn forward_with_proto(
 }
 
 /// Each prefill tile of the plan through the singleton chunk program on the
-/// lane's own state (an MTP lane's tile also fills its head); the
-/// prompt-completing tile's pick lands in `picks`.
+/// lane's own state (an MTP lane's tile also fills its head), or, under
+/// `HIPFIRE_EP_LANE_PREFILL_WAVE_EXACT=1` on an EP forward, the step's 49..=511-row
+/// lane tiles as EXACT joint prefill waves ([`plan_prefill_parts`]: one
+/// [`Qwen4Bundle::prefill_wave`] per wave, every lane's rows forwarded together
+/// with the MoE once over all rows); the prompt-completing tile's pick lands in
+/// `picks`.
 fn run_prefill_tiles(
     bundle: &mut Qwen4Bundle,
     gpu: &mut Gpu,
@@ -1107,6 +1274,7 @@ fn run_prefill_tiles(
         rows_cap,
         sample_host,
         spec,
+        policy,
         ..
     } = store.step_parts(&epochs)?;
     let mut append = spec.map(|spec| &mut spec.append_scratch);
@@ -1125,12 +1293,158 @@ fn run_prefill_tiles(
     } else {
         bundle.share_prompt_begin();
     }
+    // The step's parts: with the wave knob off (or off the EP forward) every tile is its own
+    // part in plan order, exactly the serial schedule.
+    let ep_forward = bundle
+        .execution
+        .as_ref()
+        .is_some_and(|forward| forward.ep.is_some());
+    let wave_on = ep_lane_prefill_wave_enabled() && ep_forward;
+    let tile_rows: Vec<usize> = tiles.iter().map(|r| r.rows.len).collect();
+    // MTP lanes join a wave when the bundle's resident spec hidden buffer can take the wave's
+    // wide-hidden capture (the head fill reads it); a wave holding one is capped by that buffer.
+    let wide_width = bundle.config.hc_count * bundle.config.hidden_size;
+    let wide_rows = bundle
+        .spec_hidden
+        .as_ref()
+        .map_or(0, |hidden| hidden.numel() / wide_width.max(1));
+    let eligible: Vec<bool> = lanes
+        .iter()
+        .map(|lane| lane.spec.is_none() || wide_rows > 0)
+        .collect();
+    let wave_cap = if lanes.iter().any(|lane| lane.spec.is_some()) {
+        EP_WAVE_MAX_ROWS.min(wide_rows)
+    } else {
+        EP_WAVE_MAX_ROWS
+    };
+    let refused = std::cell::Cell::new(None::<String>);
+    let parts = {
+        let admit_cell = std::cell::RefCell::new((&mut *bundle, &mut *gpu));
+        let host_admits = |rows: &[usize]| match {
+            let (bundle_mut, gpu_mut) = &mut *admit_cell.borrow_mut();
+            bundle_mut.ep_wave_admission(gpu_mut, rows)
+        } {
+            Ok(()) => true,
+            Err(reason) => {
+                refused.set(Some(reason));
+                false
+            }
+        };
+        plan_prefill_parts(wave_on, &tile_rows, &eligible, wave_cap, &host_admits)
+    };
+    if let Some(reason) = refused.take() {
+        // Once per process: the refusal is a configuration fact, not a per-step event.
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!("  qwen4 EP lane prefill wave: serial tiles for refused waves ({reason})");
+        }
+    }
     let tiles_ran: Result<(), String> = (|| {
-        for (i, (r, lane)) in tiles.iter().zip(lanes.iter_mut()).enumerate() {
+        for part in parts {
+            let i = match part {
+                PrefillPart::Serial(i) => i,
+                PrefillPart::Wave(range) => {
+                    let wave_clock = (*LANE_TILE_PHASES).then(Instant::now);
+                    let (first, count) = (range.start, range.len());
+                    let total_rows: usize = tile_rows[range.clone()].iter().sum();
+                    let (row0, top1_off, top1_len) = wave_head_slots(rows_cap, first, count);
+                    let logits_view = logits.sub_offset(row0 * vocab, count * vocab);
+                    let top1_view = top1.sub_offset(top1_off, top1_len);
+                    // The wave's wide-hidden capture (MTP lanes' head fill reads it): the first
+                    // `total_rows` rows of the resident spec hidden buffer, lanes concatenated.
+                    let has_mtp = lanes[range.clone()].iter().any(|lane| lane.spec.is_some());
+                    let wide = match bundle.spec_hidden.as_ref().filter(|_| has_mtp) {
+                        Some(hidden) => Some(hidden.sub_offset(0, total_rows * wide_width)),
+                        None if has_mtp => {
+                            return Err("prefill wave: MTP lane without a spec hidden buffer".into())
+                        }
+                        None => None,
+                    };
+                    {
+                        let mut wave: Vec<WaveLane<'_>> = lanes[range.clone()]
+                            .iter_mut()
+                            .zip(&tiles[range.clone()])
+                            .map(|(lane, r)| WaveLane {
+                                state: &mut lane.state,
+                                tokens: &plan.batch.tokens[r.rows.begin..r.rows.end()],
+                            })
+                            .collect();
+                        let waved = match wide.as_ref() {
+                            None => bundle.prefill_wave(
+                                gpu,
+                                &mut wave,
+                                WaveHead::Final,
+                                &logits_view,
+                                Some(&top1_view),
+                                &policy,
+                            ),
+                            Some(wide) => bundle.prefill_wave_wide(
+                                gpu,
+                                &mut wave,
+                                WaveHead::Final,
+                                &logits_view,
+                                Some(&top1_view),
+                                &policy,
+                                Some(wide),
+                            ),
+                        };
+                        waved.map_err(|e| e.to_string())?;
+                    }
+                    // Each MTP lane's head fill, in plan order, from its own rows of the capture
+                    // (the same head append, pairing and pending hidden as its serial tile).
+                    let mut capture_row = 0;
+                    for (ordinal, r) in range.clone().zip(&tiles[range.clone()]) {
+                        if lanes[ordinal].spec.is_some() {
+                            let scratch = append.as_deref_mut().and_then(Option::as_mut);
+                            fill_head_after_wave(
+                                bundle,
+                                gpu,
+                                &mut *lanes[ordinal],
+                                &plan.batch.tokens[r.rows.begin..r.rows.end()],
+                                capture_row,
+                                scratch,
+                            )?;
+                        }
+                        capture_row += r.rows.len;
+                    }
+                    for (ordinal, r) in range.clone().zip(&tiles[range.clone()]) {
+                        if wants_pick(&lanes[ordinal].host, r) {
+                            final_tiles.push((ordinal, r.rows.end() - 1));
+                        }
+                    }
+                    if let Some(clock) = wave_clock {
+                        gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+                        let route = match bundle
+                            .lane_tile_note()
+                            .filter(|note| note.rows == total_rows)
+                        {
+                            Some(note) => format!(
+                                "{} stage_min_rows={}",
+                                note.label(),
+                                note.stage_min_rows
+                                    .map_or_else(|| "none".to_string(), |rows| rows.to_string())
+                            ),
+                            None => "n/a".to_string(),
+                        };
+                        eprintln!(
+                            "[fn-lane-wave] dev={} lanes={first}..{} rows={total_rows} ms={:.1} route={route}",
+                            gpu.device_id,
+                            range.end,
+                            clock.elapsed().as_secs_f64() * 1e3,
+                        );
+                    }
+                    continue;
+                }
+            };
+            let (r, lane) = (&tiles[i], &mut lanes[i]);
             let tokens = &plan.batch.tokens[r.rows.begin..r.rows.end()];
+            let tile_clock = (*LANE_TILE_PHASES).then(Instant::now);
             let completes = wants_pick(&lane.host, r);
             if lane.spec.is_some() {
                 let scratch = append.as_deref_mut().and_then(Option::as_mut);
+                if tile_clock.is_some() {
+                    crate::mtp_spec::lane_fill_split_arm();
+                }
                 let pick = prefill_tile(bundle, gpu, &mut **lane, tokens, scratch, sample_host)?;
                 if completes {
                     picks[r.rows.end() - 1] = pick
@@ -1161,6 +1475,38 @@ fn run_prefill_tiles(
                     .lane_prefill_tile(gpu, &mut lane.state, tokens, None)
                     .map_err(|e| e.to_string())?;
             }
+            if let Some(clock) = tile_clock {
+                // Synchronized wall of this one tile (`HIPFIRE_CB_PHASES=1` only: the device
+                // wait ends the overlap between consecutive tiles, so a timed run measures each
+                // tile alone), with the route the tile took.
+                gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
+                let route = match bundle
+                    .lane_tile_note()
+                    .filter(|note| note.rows == tokens.len())
+                {
+                    Some(note) => format!(
+                        "{} stage_min_rows={}",
+                        note.label(),
+                        note.stage_min_rows
+                            .map_or_else(|| "none".to_string(), |rows| rows.to_string())
+                    ),
+                    None => "n/a".to_string(),
+                };
+                // An MTP lane's tile: the trunk forward and the head fill apart.
+                let split = match crate::mtp_spec::lane_fill_split_take() {
+                    Some((trunk_ms, head_ms)) => {
+                        format!(" trunk_ms={trunk_ms:.1} head_ms={head_ms:.1}")
+                    }
+                    None => String::new(),
+                };
+                eprintln!(
+                    "[fn-lane-tile] dev={} tile={i}/{n_prefill} rows={} ms={:.1} mtp={}{split} route={route}",
+                    gpu.device_id,
+                    tokens.len(),
+                    clock.elapsed().as_secs_f64() * 1e3,
+                    lane.spec.is_some(),
+                );
+            }
         }
         Ok(())
     })();
@@ -1185,11 +1531,13 @@ fn run_prefill_tiles(
                 let gpu_ref: &Gpu = gpu;
                 let logits_ref: &GpuTensor = logits;
                 let mut one = [picks[row]];
+                // An MTP lane's first draw takes eos 0 exactly as its serial `prefill_tile` does.
+                let eos = if lane.spec.is_some() { 0 } else { lane_eos };
                 lane_sample_step(
                     &mut lane.host,
                     None,
                     &mut one,
-                    lane_eos,
+                    eos,
                     vocab,
                     sample_host,
                     |scratch| {
@@ -2015,5 +2363,295 @@ mod commit_window_tests {
             clear < mirror,
             "the window is cleared with the published mirror"
         );
+    }
+}
+
+#[cfg(test)]
+mod wave_tests {
+    use super::*;
+    use std::ops::Range;
+
+    const MAX: usize = EP_WAVE_MAX_ROWS;
+
+    fn plan(rows: &[usize]) -> Vec<PrefillPart> {
+        plan_prefill_parts(true, rows, &vec![true; rows.len()], MAX, &|_| true)
+    }
+
+    fn waves(parts: &[PrefillPart]) -> Vec<Range<usize>> {
+        parts
+            .iter()
+            .filter_map(|p| match p {
+                PrefillPart::Wave(r) => Some(r.clone()),
+                PrefillPart::Serial(_) => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_knob_is_armed_only_by_one() {
+        assert!(ep_lane_prefill_wave_from(Some("1")));
+        assert!(ep_lane_prefill_wave_from(Some(" 1\n")));
+        for off in [None, Some(""), Some("0"), Some("2"), Some("true")] {
+            assert!(!ep_lane_prefill_wave_from(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn the_exact_window_is_the_sub_512_full_table_lanes() {
+        assert_eq!(crate::gpu_forward::ep_wave::EXACT_WAVE_MIN_LANE_ROWS, 49);
+        assert_eq!(
+            crate::gpu_forward::ep_wave::EXACT_WAVE_MAX_LANE_ROWS,
+            rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS - 1
+        );
+        for rows in [0usize, 1, 8, 9, 48, 512, 513, 2048] {
+            assert!(!ep_wave_lane_joins(rows), "{rows}");
+        }
+        for rows in [49usize, 60, 149, 256, 511] {
+            assert!(ep_wave_lane_joins(rows), "{rows}");
+        }
+    }
+
+    #[test]
+    fn admission_table() {
+        // (total, per-lane rows, admitted)
+        let cases: &[(usize, &[usize], bool)] = &[
+            // The burst: 8 code prompts of 149 rows.
+            (1192, &[149; 8], true),
+            // The story burst below every 512 floor.
+            (480, &[60; 8], true),
+            // One lane is its own tile.
+            (300, &[300], false),
+            (0, &[], false),
+            // The cap: 2048 fits, 2049 must split.
+            (2048, &[511, 511, 511, 300, 215], true),
+            (2049, &[511, 511, 511, 300, 216], false),
+            // A lane at 512 keeps its serial tile (owner-routed on its own).
+            (1024, &[512, 512], false),
+            (700, &[100, 600], false),
+            // A lane under 49 rows or a zero-row lane is not an exact-wave tile.
+            (97, &[48, 49], false),
+            (300, &[0, 300], false),
+            // The total must be the lanes' sum.
+            (1000, &[300, 300], false),
+        ];
+        for (total, rows, want) in cases {
+            assert_eq!(
+                ep_wave_prefill_admits(*total, rows, MAX),
+                *want,
+                "total {total} lanes {rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn knob_off_is_the_serial_schedule() {
+        let rows = [149; 8];
+        let parts = plan_prefill_parts(false, &rows, &[true; 8], MAX, &|_| true);
+        assert_eq!(parts, (0..8).map(PrefillPart::Serial).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_burst_of_eight_code_prompts_is_one_wave() {
+        assert_eq!(plan(&[149; 8]), vec![PrefillPart::Wave(0..8)]);
+    }
+
+    #[test]
+    fn a_single_lane_run_stays_serial() {
+        for rows in [&[149usize][..], &[300], &[511]] {
+            let parts = plan(rows);
+            assert_eq!(
+                parts,
+                (0..rows.len()).map(PrefillPart::Serial).collect::<Vec<_>>(),
+                "{rows:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn there_is_no_row_floor_on_the_total() {
+        // The story C8 burst (8 x 60 = 480 rows, below every 512 floor) is one wave, and so
+        // is the smallest legal pair.
+        assert_eq!(plan(&[60; 8]), vec![PrefillPart::Wave(0..8)]);
+        assert_eq!(plan(&[49, 49]), vec![PrefillPart::Wave(0..2)]);
+        // Three 149-row lanes: 447 rows.
+        assert_eq!(plan(&[149; 3]), vec![PrefillPart::Wave(0..3)]);
+        assert_eq!(plan(&[200, 200]), vec![PrefillPart::Wave(0..2)]);
+    }
+
+    #[test]
+    fn a_floor_tile_and_an_mtp_lane_split_the_runs() {
+        // A 600-row tile (owner-routed on its own) keeps its serial tile; the lanes around it
+        // wave separately (contiguous ordinals only, since a wave writes one contiguous head
+        // block). A lane below 49 rows keeps its serial tile the same way.
+        let parts = plan(&[149, 149, 600, 149, 149, 149, 149]);
+        assert_eq!(
+            parts,
+            vec![
+                PrefillPart::Wave(0..2),
+                PrefillPart::Serial(2),
+                PrefillPart::Wave(3..7),
+            ]
+        );
+        let parts = plan(&[149, 48, 149, 149]);
+        assert_eq!(
+            parts,
+            vec![
+                PrefillPart::Serial(0),
+                PrefillPart::Serial(1),
+                PrefillPart::Wave(2..4),
+            ]
+        );
+        // An ineligible (MTP) lane in the middle ends the run the same way.
+        let eligible = [true, true, true, true, false, true, true, true, true];
+        let rows = [149; 9];
+        let parts = plan_prefill_parts(true, &rows, &eligible, MAX, &|_| true);
+        assert_eq!(
+            parts,
+            vec![
+                PrefillPart::Wave(0..4),
+                PrefillPart::Serial(4),
+                PrefillPart::Wave(5..9),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_big_burst_splits_into_balanced_waves_under_the_cap() {
+        let parts = plan(&[149; 20]); // 2980 rows
+        assert_eq!(
+            parts,
+            vec![PrefillPart::Wave(0..10), PrefillPart::Wave(10..20)]
+        );
+        for w in waves(&parts) {
+            let rows: usize = w.len() * 149;
+            assert!((2..=MAX).contains(&rows));
+        }
+    }
+
+    #[test]
+    fn a_single_lane_tail_merges_into_the_wave_before_it() {
+        // Nine 200-row lanes (1800 rows) fit one wave; a tenth lane (2000) still fits; four
+        // 511-row lanes plus a 49-row one overflow the cap (2093) and split into two balanced
+        // waves rather than leaving a one-lane serial tail.
+        assert_eq!(plan(&[200; 10]), vec![PrefillPart::Wave(0..10)]);
+        let mut rows = vec![511; 4];
+        rows.push(49);
+        assert_eq!(
+            plan(&rows),
+            vec![PrefillPart::Wave(0..3), PrefillPart::Wave(3..5)]
+        );
+        let mut rows = vec![300; 6];
+        rows.push(49);
+        assert_eq!(plan(&rows), vec![PrefillPart::Wave(0..7)]);
+    }
+
+    #[test]
+    fn parts_cover_every_ordinal_once_in_plan_order_within_the_cap() {
+        // Deterministic sweep over run shapes.
+        let mut x = 0x2545_f491_u32;
+        let mut next = |m: u32| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x % m) as usize
+        };
+        for _ in 0..500 {
+            let n = 1 + next(24);
+            let rows: Vec<usize> = (0..n).map(|_| 1 + next(700)).collect();
+            let eligible: Vec<bool> = (0..n).map(|_| next(8) != 0).collect();
+            let parts = plan_prefill_parts(true, &rows, &eligible, MAX, &|_| true);
+            let mut seen = Vec::new();
+            for part in &parts {
+                match part {
+                    PrefillPart::Serial(i) => seen.push(*i),
+                    PrefillPart::Wave(r) => {
+                        let lanes = &rows[r.clone()];
+                        assert!(
+                            ep_wave_prefill_admits(lanes.iter().sum(), lanes, MAX),
+                            "{rows:?} {r:?}"
+                        );
+                        assert!(eligible[r.clone()].iter().all(|&e| e));
+                        seen.extend(r.clone());
+                    }
+                }
+            }
+            assert_eq!(seen, (0..n).collect::<Vec<_>>(), "{rows:?} {eligible:?}");
+        }
+    }
+
+    #[test]
+    fn wave_head_slots_land_on_the_serial_tiles_slots() {
+        let word = std::mem::size_of::<i32>();
+        for (rows_cap, first, lanes) in [(8, 0, 8), (64, 3, 5), (8, 7, 1)] {
+            let (row0, top1_off, top1_len) = wave_head_slots(rows_cap, first, lanes);
+            for j in 0..lanes {
+                let ordinal = first + j;
+                // The serial tile of `ordinal` writes logits row `rows_cap + ordinal` and top-1
+                // byte `(rows_cap + ordinal) * 4`.
+                assert_eq!(row0 + j, rows_cap + ordinal);
+                assert_eq!(top1_off + j * word, (rows_cap + ordinal) * word);
+            }
+            assert_eq!(top1_len, lanes * word);
+        }
+    }
+
+    #[test]
+    fn a_host_refused_wave_stays_serial_and_is_asked_with_the_lane_rows() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let refuse = |rows: &[usize]| {
+            asked.borrow_mut().push(rows.to_vec());
+            false
+        };
+        let parts = plan_prefill_parts(true, &[149; 8], &[true; 8], MAX, &refuse);
+        assert_eq!(parts, (0..8).map(PrefillPart::Serial).collect::<Vec<_>>());
+        assert_eq!(asked.into_inner(), vec![vec![149; 8]]);
+        // Off the wave knob the host is never asked.
+        let never = |_: &[usize]| -> bool { panic!("asked with the knob off") };
+        let _ = plan_prefill_parts(false, &[149; 8], &[true; 8], MAX, &never);
+    }
+
+    /// The executor's ordering contract, pinned on the source (a device is needed to run it):
+    /// the borrowed-bank epoch opens once before the parts and closes once after them, the
+    /// wave arm sits inside it, runs each MTP lane's head fill after the wave and before the
+    /// prompt-completing ordinals are recorded for the shared pick/sampling tail, and the serial
+    /// tile body is the only place a lane tile runs.
+    #[test]
+    fn the_executor_orders_epoch_parts_and_picks() {
+        let src = include_str!("lane_exec.rs");
+        let start = src
+            .find("fn run_prefill_tiles(")
+            .expect("run_prefill_tiles");
+        let rest = &src[start..];
+        let body = &rest[..rest.find("\n}\n").expect("fn end")];
+        let count = |needle: &str| body.matches(needle).count();
+        assert_eq!(count("bundle.share_prompt_begin_mtp_fill()"), 1);
+        assert_eq!(count("bundle.share_prompt_begin()"), 1);
+        assert_eq!(count(".share_prompt_end(gpu"), 1);
+        assert_eq!(count(".prefill_wave("), 1);
+        assert_eq!(count(".prefill_wave_wide("), 1);
+        assert_eq!(count("fill_head_after_wave("), 1);
+        assert_eq!(count(".lane_prefill_tile("), 2, "completing + silent tiles");
+        let begin = body.find("bundle.share_prompt_begin()").unwrap();
+        let wave = body.find(".prefill_wave(").unwrap();
+        let wide = body.find(".prefill_wave_wide(").unwrap();
+        let fill = body.find("fill_head_after_wave(").unwrap();
+        let finals = body.find("final_tiles.push((ordinal").unwrap();
+        let tile = body.find(".lane_prefill_tile(").unwrap();
+        let end = body.find(".share_prompt_end(gpu").unwrap();
+        assert!(begin < wave && wave < wide && wide < fill && fill < finals);
+        assert!(finals < tile && tile < end);
+        // The wave arm feeds the shared tail (top-1 download, sampled draws).
+        let wave_arm = &body[wave..tile];
+        assert!(wave_arm.contains("wants_pick(&lanes[ordinal].host, r)"));
+        assert!(wave_arm.contains("final_tiles.push((ordinal, r.rows.end() - 1))"));
+        assert!(body.contains("WaveHead::Final"));
+        // The host's admission gates every candidate wave; the knob and the EP forward gate the
+        // whole plan.
+        assert!(body.contains("ep_wave_admission(gpu_mut, rows)"));
+        assert!(body.contains("ep_lane_prefill_wave_enabled() && ep_forward"));
+        // A wave carrying an MTP lane captures the wave's wide hidden into the resident spec
+        // hidden buffer and caps its rows by that buffer.
+        assert!(body.contains("EP_WAVE_MAX_ROWS.min(wide_rows)"));
+        assert!(body.contains("hidden.sub_offset(0, total_rows * wide_width)"));
     }
 }

@@ -286,16 +286,35 @@ pub(crate) fn few_row_groups(rows: usize) -> impl Iterator<Item = (usize, usize)
         .map(move |start| (start, FEW_ROW_ROUTE_ROWS.min(rows - start)))
 }
 
+/// [`Gpu::qwen4_route_rows_cap`] of the exact EP joint prefill wave: one row under the 512-row
+/// floor of every row-keyed route (F16 WMMA, symmetric IU4, INT8 shared expert, fused front,
+/// BF16 streams), so a wide wave's MoE call takes the routes a sub-512-row lane's singleton takes.
+pub const QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP: usize = crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS - 1;
+
+/// The routing rows of a forward of `rows` rows ([`Gpu::route_rows`], pure): the canonical chunk
+/// under the invariant profile, else `rows` clamped to `cap` when a routing-row cap is set
+/// (`cap != 0`, [`Gpu::qwen4_route_rows_cap`]).
+pub(crate) fn route_rows_of(invariant: bool, cap: usize, rows: usize) -> usize {
+    if invariant {
+        QWEN4_PREFILL_CANON_ROWS
+    } else if cap != 0 {
+        rows.min(cap)
+    } else {
+        rows
+    }
+}
+
 impl Gpu {
     /// Row count to feed ROUTING predicates (never launch extents): the
-    /// canonical prefill chunk under the invariant profile, else `rows`.
+    /// canonical prefill chunk under the invariant profile, else `rows`
+    /// (clamped to [`Gpu::qwen4_route_rows_cap`] while the exact EP wave sets it).
     #[inline]
     pub fn route_rows(&self, rows: usize) -> usize {
-        if self.prefill_invariant_scope {
-            QWEN4_PREFILL_CANON_ROWS
-        } else {
-            rows
-        }
+        route_rows_of(
+            self.prefill_invariant_scope,
+            self.qwen4_route_rows_cap,
+            rows,
+        )
     }
 
     /// Largest `route_rows` a few-row (decode-exact) route serves right now:
@@ -393,6 +412,49 @@ mod tests {
         assert!(QWEN4_PREFILL_CANON_ROWS >= 2048);
         assert!(QWEN4_PREFILL_CANON_ROWS > 8);
         assert_eq!(QWEN4_PREFILL_CANON_ROWS % 128, 0);
+    }
+
+    /// The routing-row cap of the exact EP wave: one row under every 512-row route floor, and
+    /// above the few-row routes (so a capped call is a PREFILL-class call, never decode / verify).
+    #[test]
+    fn exact_wave_cap_is_the_last_sub_512_row_count() {
+        assert_eq!(
+            QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP,
+            QWEN4_F16_WMMA_MIN_TOKENS - 1
+        );
+        assert!(QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP < QWEN4_MOE_SYM_IU4_MIN_ROWS);
+        assert!(QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP > WIDE_VERIFY_MAX_ROWS);
+    }
+
+    /// Cap off is the identity at every row count (and the invariant canon still wins over a cap);
+    /// cap on leaves every row count below it alone and clamps the wider ones.
+    #[test]
+    fn route_rows_cap_semantics() {
+        for rows in [
+            0usize, 1, 8, 9, 60, 149, 511, 512, 513, 1192, 2048, 4096, 100_000,
+        ] {
+            assert_eq!(route_rows_of(false, 0, rows), rows, "cap off, rows {rows}");
+            assert_eq!(
+                route_rows_of(true, 0, rows),
+                QWEN4_PREFILL_CANON_ROWS,
+                "invariant, rows {rows}"
+            );
+            assert_eq!(
+                route_rows_of(true, QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP, rows),
+                QWEN4_PREFILL_CANON_ROWS,
+                "invariant beats the cap, rows {rows}"
+            );
+            let capped = route_rows_of(false, QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP, rows);
+            assert_eq!(capped, rows.min(511), "cap 511, rows {rows}");
+            if rows < 512 {
+                assert_eq!(capped, rows, "a sub-512 lane is unchanged by the cap");
+            } else {
+                assert!(
+                    capped < QWEN4_F16_WMMA_MIN_TOKENS,
+                    "a wide wave routes sub-512"
+                );
+            }
+        }
     }
 
     #[test]

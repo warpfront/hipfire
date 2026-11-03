@@ -1981,6 +1981,13 @@ pub struct Gpu {
     /// is suppressed so the MoE takes the F16 WMMA grouped arm, exactly as
     /// `HIPFIRE_QWEN4_MOE_SYM_IU4=0` does, for that tile only.
     pub qwen4_append_f16_moe_scope: bool,
+    /// Routing-row cap (`0` = none, every forward but the exact EP prefill wave): while set,
+    /// [`Gpu::route_rows`] reports `min(rows, cap)`, so every row-keyed ROUTING decision
+    /// (never a launch extent) of a forward wider than `cap` rows is taken as if it carried
+    /// `cap` rows. The exact EP joint prefill wave runs its one wide MoE call under a cap of 511
+    /// so the wave's route / shared-expert / grouped-expert kernels are the sub-512 ones every
+    /// lane's own singleton takes.
+    pub qwen4_route_rows_cap: usize,
 }
 
 /// See [`Gpu::kv_fit_floor`]: plain data, no behaviour.
@@ -3296,6 +3303,7 @@ impl Gpu {
             qwen4_verify_reference: None,
             emu,
             qwen4_append_f16_moe_scope: false,
+            qwen4_route_rows_cap: 0,
         })
         .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {

@@ -62,7 +62,19 @@
 //!     --max-seq 4096 --tokens 64 --ks 1,2,4,8 --out DIR \
 //!     [--pp 1] [--row-budget R] [--skip-model-hash] [--logits]
 //!     [--policies 'g0' | 'per-lane;per-lane:moe=once;production'] [--tokens-sweep N]
+//!     [--burst I,J,...]   (repeatable; see "Bursts" below)
 //! ```
+//!
+//! Bursts (`--burst I,J,...`, repeatable): after the `--ks` runs (the first K prompts), each
+//! `--burst` is one more concurrent run of exactly the listed prompt-file indices in that lane
+//! order, so one process covers uniform and mixed-length bursts of 1..max lanes against ONE
+//! reference pass per prompt. Per prompt the report gives `prompt_len`, `lane` and
+//! `first_divergence` ({row, position, phase, via}: row 0 is the prompt-completing row, row r
+//! the r-th AR row; position is the absolute sequence position). Per run `prefill` has the
+//! burst's wall, rows, ms/row and one record per prefill pass (tiles, rows, AR rows sharing the
+//! step), `prompt_lens`, `rows_total` and `singleton_prefill_ms_sum` (the reference prefills of
+//! the same prompts) beside `burst_vs_singleton_sum`. stderr carries one `[oracle-burst]` line
+//! per run (read by `d1/scripts/wave-table.py`).
 //!
 //! Speculative-lane schema (CLI contract; execution is an explicit boundary):
 //! ```text
@@ -212,6 +224,9 @@ struct Args {
     tokens: usize,
     /// Ascending, unique lane counts.
     ks: Vec<usize>,
+    /// `--burst I,J,...` (repeatable): extra concurrent runs of the listed prompt-file indices
+    /// (0-based, in lane order, unique within a burst, any lengths) after the `--ks` runs.
+    bursts: Vec<Vec<usize>>,
     out: PathBuf,
     /// Pipeline-parallel degree handed to `load_model`; > 1 runs the PP arm.
     pp: usize,
@@ -241,6 +256,78 @@ struct Args {
     /// `--copy` (`--spec mtp` only): stage the lanes with the copy lane armed
     /// (default-copy budget: widened rings/rows, head-lag storage).
     copy: bool,
+}
+
+/// `--burst I,J,K`: prompt-file indices of one concurrent run, in lane (admission) order.
+fn parse_burst(value: &str) -> R<Vec<usize>> {
+    let members = value
+        .split(',')
+        .filter(|part| !part.trim().is_empty())
+        .map(|part| {
+            part.trim()
+                .parse::<usize>()
+                .map_err(|x| format!("--burst {value:?}: bad prompt index {part:?}: {x}"))
+        })
+        .collect::<R<Vec<usize>>>()?;
+    if members.is_empty() {
+        return Err("--burst needs at least one prompt index".into());
+    }
+    let unique: BTreeSet<usize> = members.iter().copied().collect();
+    if unique.len() != members.len() {
+        return Err(format!(
+            "--burst {value:?}: a prompt index appears twice (one lane per prompt)"
+        ));
+    }
+    Ok(members)
+}
+
+/// One concurrent lane run: the prompt-file indices of its lanes, in lane order. A `--ks` run
+/// is the first K prompts; a `--burst` run is any list (mixed lengths).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RunSet {
+    members: Vec<usize>,
+    burst: bool,
+}
+
+impl RunSet {
+    /// `K=4` for a `--ks` run, `burst=3+1+0` for a `--burst` run.
+    fn label(&self) -> String {
+        if self.burst {
+            format!(
+                "burst={}",
+                self.members
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            )
+        } else {
+            format!("K={}", self.members.len())
+        }
+    }
+}
+
+/// Every run of a policy, in order: the `--ks` runs, then the `--burst` runs.
+fn run_sets(args: &Args) -> Vec<RunSet> {
+    args.ks
+        .iter()
+        .map(|&k| RunSet {
+            members: (0..k).collect(),
+            burst: false,
+        })
+        .chain(args.bursts.iter().map(|members| RunSet {
+            members: members.clone(),
+            burst: true,
+        }))
+        .collect()
+}
+
+impl Args {
+    /// Lanes to stage: the largest `--ks` entry or `--burst` length.
+    fn max_lanes(&self) -> usize {
+        let bursts = self.bursts.iter().map(Vec::len).max().unwrap_or(0);
+        self.ks.last().copied().unwrap_or(0).max(bursts)
+    }
 }
 
 fn parse_ks(value: &str) -> R<Vec<usize>> {
@@ -428,6 +515,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut max_seq = None;
     let mut tokens = None;
     let mut ks = None;
+    let mut bursts: Vec<Vec<usize>> = Vec::new();
     let mut out = None;
     let mut pp = 1usize;
     let mut row_budget = None;
@@ -451,6 +539,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             "--max-seq" => max_seq = Some(value("--max-seq")?.parse::<usize>().map_err(e)?),
             "--tokens" => tokens = Some(value("--tokens")?.parse::<usize>().map_err(e)?),
             "--ks" => ks = Some(parse_ks(&value("--ks")?)?),
+            "--burst" => bursts.push(parse_burst(&value("--burst")?)?),
             "--out" => out = Some(PathBuf::from(value("--out")?)),
             "--pp" => pp = value("--pp")?.parse::<usize>().map_err(e)?,
             "--row-budget" => {
@@ -492,6 +581,15 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         if sweep == 0 || sweep > tokens {
             return Err(format!(
                 "--tokens-sweep must be in 1..=--tokens ({tokens}), got {sweep}"
+            ));
+        }
+    }
+    for burst in &bursts {
+        if let Some(&bad) = burst.iter().find(|&&i| i >= prompt_files.len()) {
+            return Err(format!(
+                "--burst index {bad} needs at least {} --prompt-file arguments, got {}",
+                bad + 1,
+                prompt_files.len()
             ));
         }
     }
@@ -548,6 +646,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         max_seq: max_seq.ok_or("--max-seq is required")?,
         tokens,
         ks,
+        bursts,
         out: out.ok_or("--out is required")?,
         pp,
         row_budget,
@@ -573,7 +672,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
 
 const HELP: &str = "fn_mesh_lane_oracle --model M.mq4 --prompt-file P [--prompt-file P ...] \
 --max-seq N --tokens T --ks 1,2,4,8 --out DIR [--pp 1] [--row-budget R] [--skip-model-hash] [--logits] \
-[--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N] \
+[--burst I,J,...] [--policies SPEC[;SPEC...]] [--tokens-sweep N] [--reserve-lanes N] \
 [--spec ar|mtp] [--k K] [--routes floor|cycle|batched] [--soak-seconds S [--soak-seed N]] \
 [--fault-point before-draft|head-round|target-edge|repair|before-publish]\n\
 EP comes from topology.ep / the S1 env var as in fn_ep_oracle; --pp N>1 runs the PP lanes arm. \
@@ -679,8 +778,16 @@ struct Comparison {
     first_mismatch: Option<usize>,
     ref_md5: String,
     lane_md5: String,
+    /// Digest of every compared logits row's sha (`--logits` only).
+    ref_logits_sha: Option<String>,
+    lane_logits_sha: Option<String>,
     /// `Some(first differing logits index)` per `--logits`; inner `None` = equal.
     logits_first_mismatch: Option<Option<usize>>,
+}
+
+/// One digest of a run's per-row logits shas (rows joined by newlines).
+fn rows_digest(rows: &[String]) -> String {
+    sha256_hex(rows.join("\n").as_bytes())
 }
 
 fn compare(
@@ -695,6 +802,8 @@ fn compare(
         first_mismatch: ids_mismatch,
         ref_md5: ids_md5(reference_ids),
         lane_md5: ids_md5(lane_ids),
+        ref_logits_sha: logits.map(|(reference, _)| rows_digest(reference)),
+        lane_logits_sha: logits.map(|(_, lane)| rows_digest(lane)),
         logits_first_mismatch,
     }
 }
@@ -711,8 +820,108 @@ fn comparison_json(prompt: usize, c: &Comparison) -> Value {
     if let Some(mismatch) = c.logits_first_mismatch {
         record["logits_equal"] = json!(mismatch.is_none());
         record["first_logits_mismatch"] = json!(mismatch);
+        // One digest over every compared logits row's sha: the cross-arm identity key
+        // (`wave-table.py`: an exact wave's lane == the serial tile's lane of the same prompt).
+        record["ref_logits_sha"] = json!(c.ref_logits_sha);
+        record["lane_logits_sha"] = json!(c.lane_logits_sha);
     }
     record
+}
+
+/// Where a lane first differs from its singleton: the first differing ids index or logits row
+/// (row 0 is the prompt-completing row, row r >= 1 the r-th AR row), the absolute sequence
+/// position of the token that row's logits follow (`prompt_len - 1 + row`) and which compare
+/// saw it. `None` when ids (and logits, when compared) are all equal.
+fn first_divergence(prompt_len: usize, c: &Comparison) -> Option<Value> {
+    let ids = c.first_mismatch;
+    let logits = c.logits_first_mismatch.flatten();
+    let row = match (ids, logits) {
+        (None, None) => return None,
+        (Some(a), None) | (None, Some(a)) => a,
+        (Some(a), Some(b)) => a.min(b),
+    };
+    let via = match (ids == Some(row), logits == Some(row)) {
+        (true, true) => "ids+logits",
+        (true, false) => "ids",
+        _ => "logits",
+    };
+    Some(json!({
+        "row": row,
+        "position": (prompt_len + row).saturating_sub(1),
+        "phase": if row == 0 { "prefill-final" } else { "decode" },
+        "via": via,
+    }))
+}
+
+/// [`comparison_json`] plus the lane's place in its run, its prompt length and the first
+/// divergence (`null` when equal).
+fn compared_json(prompt: usize, prompt_len: usize, lane: usize, c: &Comparison) -> Value {
+    let mut record = comparison_json(prompt, c);
+    record["lane"] = json!(lane);
+    record["prompt_len"] = json!(prompt_len);
+    record["first_divergence"] = json!(first_divergence(prompt_len, c));
+    record
+}
+
+/// The run-level fields of a lane run: its set, lengths, total rows, and the serialized
+/// singleton prefills of the same prompts summed (`burst_vs_singleton_sum` = singleton sum /
+/// the run's prefill wall: > 1 means the joint prefill beat prefilling the prompts one by one).
+fn burst_extras(set: &RunSet, run: &KRun, prompts: &[&[u32]], references: &[Reference]) -> Value {
+    let lens: Vec<usize> = set.members.iter().map(|&i| prompts[i].len()).collect();
+    let single_ms: f64 = set.members.iter().map(|&i| references[i].prefill_ms).sum();
+    json!({
+        "set": set.label(),
+        "burst": set.burst,
+        "members": set.members,
+        "prompt_lens": lens,
+        "rows_total": lens.iter().sum::<usize>(),
+        "singleton_prefill_ms_sum": single_ms,
+        "burst_vs_singleton_sum": (run.prefill.wall > 0.0 && single_ms > 0.0)
+            .then(|| single_ms / (run.prefill.wall * 1e3)),
+    })
+}
+
+/// Merge the fields of the object `extra` into the object `record`.
+fn with_extras(mut record: Value, extra: Value) -> Value {
+    if let (Some(into), Value::Object(from)) = (record.as_object_mut(), extra) {
+        into.extend(from);
+    }
+    record
+}
+
+/// The one stderr line per lane run the table scripts read (`wave-table.py`).
+fn burst_line(spec: &str, set: &RunSet, run: &KRun, compared: &[Value], extras: &Value) -> String {
+    let lens: Vec<u64> = compared
+        .iter()
+        .filter_map(|c| c["prompt_len"].as_u64())
+        .collect();
+    let divergences: Vec<(u64, u64, u64)> = compared
+        .iter()
+        .filter_map(|c| {
+            let d = c.get("first_divergence")?;
+            Some((
+                c["prompt"].as_u64()?,
+                d["row"].as_u64()?,
+                d["position"].as_u64()?,
+            ))
+        })
+        .collect();
+    format!(
+        "[oracle-burst] policy={spec} set={} lens={lens:?} prompts_equal={}/{} passes={} rows={} burst_prefill_ms={:.1} admit_ms={:.1} ms_per_row={:.3} singleton_sum_ms={:.1} first_divergence(prompt,row,pos)={divergences:?}",
+        set.label(),
+        compared.iter().filter(|c| c["equal"] == json!(true)).count(),
+        compared.len(),
+        run.prefill.steps,
+        run.prefill.rows,
+        run.prefill.wall * 1e3,
+        run.prefill.admit_wall * 1e3,
+        if run.prefill.rows > 0 {
+            run.prefill.wall * 1e3 / run.prefill.rows as f64
+        } else {
+            f64::NAN
+        },
+        extras["singleton_prefill_ms_sum"].as_f64().unwrap_or(f64::NAN),
+    )
 }
 
 // ------------------------------------------------------------- lane plans
@@ -1106,6 +1315,62 @@ struct LaneRun {
     admitted: bool,
 }
 
+/// The steps of a K run that carried at least one prefill tile: how many, the prompt rows their
+/// tiles forwarded, and their summed wall seconds (an AR row of an earlier lane may share the
+/// step; a K-lane run with equal prompts has one such step). `rows` over `wall` is the lane
+/// prefill's cost per prompt row, the number a serve step's `[fn-lane-step] pf_rows`/`fwd` pair
+/// reports.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PrefillTiming {
+    steps: usize,
+    rows: usize,
+    wall: f64,
+    /// Host time spent admitting finished prompts into the mesh decode (MTP arm), seconds;
+    /// `wall + admit_wall` is the time to every first token of the burst.
+    admit_wall: f64,
+    /// One record per prefill step (a pass): how the burst was split across steps.
+    passes: Vec<PrefillPass>,
+}
+
+/// One step that carried prefill tiles.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct PrefillPass {
+    /// Prefill tiles (lanes) in the pass.
+    tiles: usize,
+    /// Prompt rows those tiles forwarded.
+    rows: usize,
+    /// AR rows of earlier-finished lanes that shared the step.
+    ar_rows: usize,
+    wall: f64,
+}
+
+impl PrefillTiming {
+    fn record(&mut self, pass: PrefillPass) {
+        self.steps += 1;
+        self.rows += pass.rows;
+        self.wall += pass.wall;
+        self.passes.push(pass);
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "steps": self.steps,
+            "rows": self.rows,
+            "wall_s": self.wall,
+            "ms_per_row": (self.rows > 0).then(|| self.wall * 1e3 / self.rows as f64),
+            "admit_wall_s": self.admit_wall,
+            "burst_wall_s": self.wall + self.admit_wall,
+            "passes": self.passes.iter().map(|p| json!({
+                "tiles": p.tiles,
+                "rows": p.rows,
+                "ar_rows": p.ar_rows,
+                "wall_s": p.wall,
+                "ms_per_row": (p.rows > 0).then(|| p.wall * 1e3 / p.rows as f64),
+            })).collect::<Vec<_>>(),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct KRun {
     k: usize,
@@ -1119,6 +1384,7 @@ struct KRun {
     /// Wall seconds of every step / of the decode-only steps.
     steps_wall: f64,
     decode_wall: f64,
+    prefill: PrefillTiming,
     lane_decode_rows: Vec<usize>,
 }
 
@@ -1198,6 +1464,7 @@ fn drive_inner(
 
     let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
     let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
+    let mut prefill_timing = PrefillTiming::default();
     loop {
         let progress: Vec<Progress> = lanes.iter().map(|lane| lane.progress).collect();
         let (prefill, ar) = schedule(&progress, cfg.tokens, cfg.row_budget);
@@ -1245,6 +1512,19 @@ fn drive_inner(
         let wall = started.elapsed().as_secs_f64();
         steps += 1;
         steps_wall += wall;
+        if !decode_only {
+            prefill_timing.record(PrefillPass {
+                tiles: prefill.len(),
+                rows: plan
+                    .requests
+                    .iter()
+                    .filter(|r| r.kind == RequestStepKind::Prefill)
+                    .map(|r| r.rows.len)
+                    .sum::<usize>(),
+                ar_rows: ar.len(),
+                wall,
+            });
+        }
         if decode_only {
             decode_steps += 1;
             decode_wall += wall;
@@ -1359,6 +1639,7 @@ fn drive_inner(
         decode_tokens,
         steps_wall,
         decode_wall,
+        prefill: prefill_timing,
         lane_decode_rows: lanes.iter().map(|lane| lane.decode_only_rows).collect(),
     })
 }
@@ -1370,6 +1651,9 @@ struct Reference {
     /// SHA-256 of the logits row after the prefill, then after every forward
     /// (`tokens + 1` rows with `--logits`, else empty).
     logits_sha: Vec<String>,
+    /// Wall milliseconds of the cold prefill (final-logits read included): the singleton the
+    /// lane prefill of the same prompt is compared with.
+    prefill_ms: f64,
 }
 
 /// The serialized singleton run of one topology (`fn_ep_oracle`'s AR loop).
@@ -1445,10 +1729,21 @@ fn reference_run(
     tokens: usize,
     want_logits: bool,
 ) -> R<Reference> {
+    // The singleton's cold prefill of this prompt, timed (the final-logits read after it drains
+    // the device), to set beside the lane prefill tile of the same rows (`prefill` in
+    // report.json, `[fn-lane-tile]` with `HIPFIRE_CB_PHASES=1`): one tile IS this program.
+    let clock = Instant::now();
     single.prefill(prompt)?;
+    single.logits_bytes()?;
+    let prefill_ms = clock.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "[oracle-ref-prefill] rows={} ms={prefill_ms:.1}",
+        prompt.len(),
+    );
     let mut reference = Reference {
         ids: Vec::with_capacity(tokens),
         logits_sha: Vec::new(),
+        prefill_ms,
     };
     if want_logits {
         reference
@@ -1543,64 +1838,96 @@ fn run_policy(
     match backend.set_policy(policy) {
         Err(x) => status = PolicyStatus::Error(format!("set lane stage policy: {x}")),
         Ok(()) => {
-            let cfg = DriveCfg {
-                prompts,
-                tokens,
-                max_lanes,
-                row_budget,
-                want_logits: args.logits,
-            };
-            for &k in &args.ks {
-                eprintln!("[{TOOL}] policy {spec}: K={k}: {k} concurrent lanes ({tokens} tokens)");
+            for set in run_sets(args) {
+                let label = set.label();
+                let k = set.members.len();
+                eprintln!(
+                    "[{TOOL}] policy {spec}: {label}: {k} concurrent lanes ({tokens} tokens)"
+                );
+                let selected: Vec<&[u32]> = set.members.iter().map(|&i| prompts[i]).collect();
+                let cfg = DriveCfg {
+                    prompts: &selected,
+                    tokens,
+                    max_lanes,
+                    row_budget,
+                    want_logits: args.logits,
+                };
                 let run = match drive_k(backend, &cfg, k, next_tag) {
                     Ok(run) => run,
                     Err(x) => {
-                        status = PolicyStatus::Error(format!("K={k}: {x}"));
+                        status = PolicyStatus::Error(format!("{label}: {x}"));
                         break;
                     }
                 };
                 let mut compared = Vec::with_capacity(k);
-                for index in 0..k {
+                for (lane, &index) in set.members.iter().enumerate() {
                     ids_lines.push(json!({
-                        "kind": "lane", "policy": spec, "k": k, "prompt": index,
-                        "ids": run.ids[index],
+                        "kind": "lane", "policy": spec, "k": k, "prompt": index, "lane": lane,
+                        "set": label, "ids": run.ids[lane],
                     }));
                     let (reference_ids, reference_logits) =
                         reference_prefix(&references[index], tokens, args.logits);
                     let comparison = compare(
                         reference_ids,
-                        &run.ids[index],
+                        &run.ids[lane],
                         args.logits
-                            .then(|| (reference_logits, run.logits_sha[index].as_slice())),
+                            .then(|| (reference_logits, run.logits_sha[lane].as_slice())),
                     );
                     if !comparison.equal {
                         if status == PolicyStatus::Pass {
                             status = PolicyStatus::Fail;
                         }
-                        failures.push(format!("K={k} prompt {index}"));
+                        failures.push(format!("{label} prompt {index}"));
                     }
-                    compared.push(comparison_json(index, &comparison));
+                    compared.push(compared_json(
+                        index,
+                        prompts[index].len(),
+                        lane,
+                        &comparison,
+                    ));
                 }
+                // One stderr line per K run: lane == singleton, with the first divergence of
+                // the ids / logits rows of every prompt that differs (the report carries them).
+                let first = |key: &str| {
+                    compared
+                        .iter()
+                        .filter_map(|c| Some((c["prompt"].as_u64()?, c.get(key)?.as_u64()?)))
+                        .collect::<Vec<_>>()
+                };
+                eprintln!(
+                    "[oracle-lane-vs-singleton] policy={spec} k={} prompts_equal={}/{} ids_first_mismatch(prompt,index)={:?} logits_first_mismatch(prompt,row)={:?}",
+                    run.k,
+                    compared.iter().filter(|c| c["equal"] == json!(true)).count(),
+                    compared.len(),
+                    first("first_mismatch"),
+                    first("first_logits_mismatch"),
+                );
                 let equal = compared.iter().all(|c| c["equal"] == json!(true));
+                let extras = burst_extras(&set, &run, prompts, references);
+                eprintln!("{}", burst_line(spec, &set, &run, &compared, &extras));
                 per_k.push(json!({
                     "k": run.k,
                     "equal": equal,
                     "decode_wall_s": run.decode_wall,
                     "aggregate_tok_s": run.aggregate_tok_s(),
                 }));
-                runs.push(json!({
-                    "k": run.k,
-                    "equal": equal,
-                    "prompts": compared,
-                    "steps": run.steps,
-                    "decode_steps": run.decode_steps,
-                    "decode_tokens": run.decode_tokens,
-                    "decode_wall_s": run.decode_wall,
-                    "steps_wall_s": run.steps_wall,
-                    "aggregate_tok_s": run.aggregate_tok_s(),
-                    "per_lane_tok_s": run.per_lane_tok_s(),
-                    "timing_includes_logits_read": args.logits,
-                }));
+                runs.push(with_extras(
+                    json!({
+                        "k": run.k,
+                        "equal": equal,
+                        "prompts": compared,
+                        "steps": run.steps,
+                        "decode_steps": run.decode_steps,
+                        "decode_tokens": run.decode_tokens,
+                        "decode_wall_s": run.decode_wall,
+                        "steps_wall_s": run.steps_wall,
+                        "prefill": run.prefill.json(),
+                        "aggregate_tok_s": run.aggregate_tok_s(),
+                        "per_lane_tok_s": run.per_lane_tok_s(),
+                        "timing_includes_logits_read": args.logits,
+                    }),
+                    extras,
+                ));
             }
         }
     }
@@ -1935,6 +2262,7 @@ fn drive_mtp_inner(
     let budgets: WindowBudgets = mesh.window_budgets(bundle, lab_routes(routes))?;
     let (mut steps, mut decode_steps, mut decode_tokens) = (0usize, 0usize, 0usize);
     let (mut steps_wall, mut decode_wall) = (0f64, 0f64);
+    let mut prefill_timing = PrefillTiming::default();
     let (mut ev_wall, mut ev_crit, mut ev_ex, mut ev_head, mut ev_bytes, mut ev_priced) = (
         Vec::new(),
         Vec::new(),
@@ -1983,7 +2311,14 @@ fn drive_mtp_inner(
             }
             .step(&plan, false)?;
             steps += 1;
-            steps_wall += started.elapsed().as_secs_f64();
+            let wall = started.elapsed().as_secs_f64();
+            steps_wall += wall;
+            prefill_timing.record(PrefillPass {
+                tiles: plan.requests.len(),
+                rows: plan.total_rows(),
+                ar_rows: 0,
+                wall,
+            });
             prefill_ran = true;
             mesh.note_prefill();
             for (request, advance) in plan.requests.iter().zip(&result.advances) {
@@ -2004,6 +2339,7 @@ fn drive_mtp_inner(
                 lanes[idx].committed.push(*id);
                 // No EOS handling: the AR reference loop ignores EOS, and the
                 // oracle compares exact id streams.
+                let admit_clock = Instant::now();
                 mesh.admit_lane(
                     bundle,
                     gpu,
@@ -2017,6 +2353,7 @@ fn drive_mtp_inner(
                         spec_k: Some(depth),
                     },
                 )?;
+                prefill_timing.admit_wall += admit_clock.elapsed().as_secs_f64();
                 lanes[idx].in_mesh = true;
             }
         }
@@ -2152,6 +2489,7 @@ fn drive_mtp_inner(
             decode_tokens,
             steps_wall,
             decode_wall,
+            prefill: prefill_timing,
             lane_decode_rows: lanes
                 .iter()
                 .map(|l| l.committed.len().saturating_sub(1))
@@ -2221,23 +2559,26 @@ fn drive_mtp_ep(
         after >> 20
     );
     let mut mesh = EpMeshLanes::new(bundle, 1, routes == RoutesArg::Floor)?;
-    let cfg = DriveCfg {
-        prompts,
-        tokens: args.tokens,
-        max_lanes,
-        row_budget,
-        want_logits: false,
-    };
     let mut next_tag = 0u64;
     let mut runs = Vec::new();
     let mut per_k = Vec::new();
     let mut failures = Vec::new();
     let mut status = PolicyStatus::Pass;
-    for &k in &args.ks {
+    for set in run_sets(args) {
+        let label_set = set.label();
+        let k = set.members.len();
         eprintln!(
-            "[{TOOL}] {label}: K={k}: {k} concurrent MTP lanes ({} tokens)",
+            "[{TOOL}] {label}: {label_set}: {k} concurrent MTP lanes ({} tokens)",
             args.tokens
         );
+        let selected: Vec<&[u32]> = set.members.iter().map(|&i| prompts[i]).collect();
+        let cfg = DriveCfg {
+            prompts: &selected,
+            tokens: args.tokens,
+            max_lanes,
+            row_budget,
+            want_logits: false,
+        };
         let out = match drive_mtp_k(
             bundle,
             gpu,
@@ -2252,48 +2593,60 @@ fn drive_mtp_ep(
         ) {
             Ok(out) => out,
             Err(x) => {
-                status = PolicyStatus::Error(format!("K={k}: {x}"));
+                status = PolicyStatus::Error(format!("{label_set}: {x}"));
                 break;
             }
         };
         let run = &out.run;
         let mut compared = Vec::with_capacity(k);
-        for index in 0..k {
+        for (lane, &index) in set.members.iter().enumerate() {
             ids_lines.push(json!({
-                "kind": "lane", "policy": label, "k": k, "prompt": index, "ids": run.ids[index],
+                "kind": "lane", "policy": label, "k": k, "prompt": index, "lane": lane,
+                "set": label_set, "ids": run.ids[lane],
             }));
-            let comparison = compare(&references[index].ids[..args.tokens], &run.ids[index], None);
+            let comparison = compare(&references[index].ids[..args.tokens], &run.ids[lane], None);
             if !comparison.equal {
                 if status == PolicyStatus::Pass {
                     status = PolicyStatus::Fail;
                 }
-                failures.push(format!("K={k} prompt {index}"));
+                failures.push(format!("{label_set} prompt {index}"));
             }
-            compared.push(comparison_json(index, &comparison));
+            compared.push(compared_json(
+                index,
+                prompts[index].len(),
+                lane,
+                &comparison,
+            ));
         }
         for w in &out.windows {
             ids_lines.push(json!({"kind": "window", "policy": label, "window": w}));
         }
         let equal = compared.iter().all(|c| c["equal"] == json!(true));
+        let extras = burst_extras(&set, run, prompts, references);
+        eprintln!("{}", burst_line(&label, &set, run, &compared, &extras));
         per_k.push(json!({
             "k": run.k, "equal": equal,
             "decode_wall_s": run.decode_wall,
             "aggregate_tok_s": run.aggregate_tok_s(),
         }));
-        runs.push(json!({
-            "k": run.k,
-            "equal": equal,
-            "prompts": compared,
-            "steps": run.steps,
-            "decode_steps": run.decode_steps,
-            "decode_tokens": run.decode_tokens,
-            "decode_wall_s": run.decode_wall,
-            "steps_wall_s": run.steps_wall,
-            "aggregate_tok_s": run.aggregate_tok_s(),
-            "mtp": out.summary,
-            "rank_stats": out.rank_stats,
-            "timing_includes_logits_read": false,
-        }));
+        runs.push(with_extras(
+            json!({
+                "k": run.k,
+                "equal": equal,
+                "prompts": compared,
+                "steps": run.steps,
+                "decode_steps": run.decode_steps,
+                "decode_tokens": run.decode_tokens,
+                "decode_wall_s": run.decode_wall,
+                "steps_wall_s": run.steps_wall,
+                "prefill": run.prefill.json(),
+                "aggregate_tok_s": run.aggregate_tok_s(),
+                "mtp": out.summary,
+                "rank_stats": out.rank_stats,
+                "timing_includes_logits_read": false,
+            }),
+            extras,
+        ));
     }
     let mut record = json!({
         "spec": label,
@@ -2418,6 +2771,16 @@ fn expanded_argv(args: &Args, cwd: &Path) -> Vec<String> {
             .collect::<Vec<_>>()
             .join(","),
     );
+    for burst in &args.bursts {
+        push(
+            "--burst",
+            burst
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
     push("--out", absolute_path(&args.out.display().to_string(), cwd));
     push("--pp", args.pp.to_string());
     if let Some(budget) = args.row_budget {
@@ -2545,6 +2908,7 @@ fn build_manifest(
         "prompts": fixtures,
         "distinct_prompts": distinct.len(),
         "ks": args.ks,
+        "bursts": args.bursts,
         "pp": args.pp,
         "max_seq": args.max_seq,
         "tokens": args.tokens,
@@ -2710,9 +3074,7 @@ fn load_with_lane_reservation(
     admission.batch_request = BatchLoadRequest {
         vmm_batch: true,
         continuous_batch_size: lanes,
-        row_budget: args
-            .row_budget
-            .unwrap_or_else(|| *args.ks.last().expect("ks is non-empty")),
+        row_budget: args.row_budget.unwrap_or_else(|| args.max_lanes()),
         // `--spec mtp` stages spec lanes: the EP plan charges that store.
         spec_k: (args.spec == SpecMode::Mtp).then(|| args.k.unwrap_or(DEFAULT_K)),
         spec_copy: args.spec == SpecMode::Mtp && args.copy,
@@ -2854,7 +3216,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     };
     let exe = std::fs::read("/proc/self/exe").map_err(e)?;
     let env = recorded_env();
-    let max_lanes_requested = *args.ks.last().expect("ks is non-empty");
+    let max_lanes_requested = args.max_lanes();
     let row_budget = args.row_budget.unwrap_or(max_lanes_requested);
     report["binary"] = json!(std::fs::read_link("/proc/self/exe")
         .map(|p| p.display().to_string())
@@ -2873,6 +3235,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     report["tokens"] = json!(args.tokens);
     report["vocab"] = json!(vocab);
     report["ks"] = json!(args.ks);
+    report["bursts"] = json!(args.bursts);
     report["max_lanes"] = json!(max_lanes_requested);
     report["row_budget"] = json!(row_budget);
     report["logits_compared"] = json!(args.logits);
@@ -2933,7 +3296,12 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     report["reference"] = json!(references
         .iter()
         .enumerate()
-        .map(|(index, r)| json!({"prompt": index, "ids_md5": ids_md5(&r.ids)}))
+        .map(|(index, r)| json!({
+            "prompt": index,
+            "ids_md5": ids_md5(&r.ids),
+            "prompt_len": prompts[index].ids.len(),
+            "prefill_ms": r.prefill_ms,
+        }))
         .collect::<Vec<_>>());
 
     // Lanes: staged once, then every policy's whole K matrix.
@@ -3016,7 +3384,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
     let shape = format!(
         "ks={:?} prompts={} tokens={} pp={} ranks={ranks} ep={ep} logits={}",
         args.ks,
-        args.ks.last().copied().unwrap_or(0),
+        args.max_lanes(),
         args.tokens,
         args.pp,
         args.logits
@@ -3540,7 +3908,11 @@ mod tests {
         let logits_sha = (0..=tokens)
             .map(|s| sha256_hex(&pick_bytes(prompt, prompt.len() - 1 + s)))
             .collect();
-        Reference { ids, logits_sha }
+        Reference {
+            ids,
+            logits_sha,
+            prefill_ms: prompt.len() as f64,
+        }
     }
 
     fn prompts() -> Vec<Vec<u32>> {
@@ -3807,6 +4179,216 @@ mod tests {
     fn sweep_args(extra: &str, ks: &str) -> Args {
         let line = format!("{BASE} --ks {ks} --tokens 6 --logits {extra}{}", files(4));
         parse_args_from(argv(&line)).unwrap()
+    }
+
+    #[test]
+    fn first_divergence_names_the_first_differing_row_and_position() {
+        let equal = compare(&[1, 2, 3], &[1, 2, 3], None);
+        assert_eq!(first_divergence(10, &equal), None);
+        // ids differ at index 2: row 2 follows the token at position 10 - 1 + 2.
+        let ids = compare(&[1, 2, 3], &[1, 2, 9], None);
+        assert_eq!(
+            first_divergence(10, &ids),
+            Some(json!({"row": 2, "position": 11, "phase": "decode", "via": "ids"}))
+        );
+        let reference = vec!["a".to_string(), "b".into()];
+        // Logits differ at the prompt-completing row, ids only later: the logits win.
+        let early = vec!["x".to_string(), "b".into()];
+        let c = compare(&[1, 2], &[1, 3], Some((&reference, &early)));
+        assert_eq!(
+            first_divergence(60, &c),
+            Some(json!({"row": 0, "position": 59, "phase": "prefill-final", "via": "logits"}))
+        );
+        // Both at the same row.
+        let late = vec!["a".to_string(), "z".into()];
+        let c = compare(&[1, 2], &[1, 3], Some((&reference, &late)));
+        assert_eq!(
+            first_divergence(60, &c),
+            Some(json!({"row": 1, "position": 60, "phase": "decode", "via": "ids+logits"}))
+        );
+        let record = compared_json(7, 60, 2, &c);
+        assert_eq!(
+            (
+                record["prompt"].clone(),
+                record["lane"].clone(),
+                record["prompt_len"].clone()
+            ),
+            (json!(7), json!(2), json!(60))
+        );
+        assert_eq!(record["first_divergence"]["row"], json!(1));
+        assert_eq!(
+            compared_json(7, 60, 2, &equal)["first_divergence"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn burst_args_parse_validate_and_drive_the_run_sets() {
+        let line = format!("{BASE} --ks 1 --burst 3,1,0 --burst 2{}", files(4));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert_eq!(args.bursts, vec![vec![3, 1, 0], vec![2]]);
+        assert_eq!(args.max_lanes(), 3);
+        let sets = run_sets(&args);
+        assert_eq!(
+            sets.iter().map(RunSet::label).collect::<Vec<_>>(),
+            ["K=1", "burst=3+1+0", "burst=2"]
+        );
+        assert_eq!(sets[0].members, vec![0]);
+        assert_eq!(sets[1].members, vec![3, 1, 0]);
+        assert!(!sets[0].burst && sets[1].burst);
+        // The manifest command reproduces the bursts.
+        let argv_out = expanded_argv(&args, Path::new("/w"));
+        let at = argv_out.iter().position(|a| a == "--burst").unwrap();
+        assert_eq!(argv_out[at + 1], "3,1,0");
+        assert_eq!(argv_out.iter().filter(|a| *a == "--burst").count(), 2);
+        // Without bursts nothing changes, and --ks still sets the lanes.
+        let line = format!("{BASE} --ks 1,2{}", files(2));
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert!(args.bursts.is_empty());
+        assert_eq!(args.max_lanes(), 2);
+        assert_eq!(run_sets(&args).len(), 2);
+        // A burst longer than --ks raises the staged lanes.
+        let line = format!("{BASE} --ks 1 --burst 0,1,2,3{}", files(4));
+        assert_eq!(parse_args_from(argv(&line)).unwrap().max_lanes(), 4);
+        for bad in ["--burst 0,0", "--burst x", "--burst ,", "--burst 4"] {
+            let line = format!("{BASE} --ks 1 {bad}{}", files(4));
+            assert!(parse_args_from(argv(&line)).is_err(), "accepted {bad}");
+        }
+        let line = format!("{BASE} --ks 1{} --burst", files(4));
+        assert_eq!(
+            parse_args_from(argv(&line)).unwrap_err(),
+            "--burst needs a value"
+        );
+    }
+
+    #[test]
+    fn burst_runs_record_members_lengths_prefill_passes_and_singleton_sums() {
+        let args = sweep_args("--burst 3,1,0", "1");
+        let mut backend = FakeLanes::new(4, 3);
+        let (outcomes, ids_lines) = sweep(&mut backend, &args);
+        assert_eq!(outcomes[0].status, PolicyStatus::Pass);
+        let runs = outcomes[0].record["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2, "the K=1 run, then the burst");
+        assert_eq!(runs[0]["set"], json!("K=1"));
+        assert_eq!(runs[0]["burst"], json!(false));
+        let burst = &runs[1];
+        assert_eq!(burst["set"], json!("burst=3+1+0"));
+        assert_eq!(burst["burst"], json!(true));
+        assert_eq!(burst["k"], json!(3));
+        assert_eq!(burst["members"], json!([3, 1, 0]));
+        assert_eq!(burst["prompt_lens"], json!([13, 2, 9]));
+        assert_eq!(burst["rows_total"], json!(24));
+        // reference() sets prefill_ms = prompt length.
+        assert_eq!(burst["singleton_prefill_ms_sum"], json!(24.0));
+        let prompts = burst["prompts"].as_array().unwrap();
+        let at = |key: &str| prompts.iter().map(|p| p[key].clone()).collect::<Vec<_>>();
+        assert_eq!(at("prompt"), [json!(3), json!(1), json!(0)]);
+        assert_eq!(at("lane"), [json!(0), json!(1), json!(2)]);
+        assert_eq!(at("prompt_len"), [json!(13), json!(2), json!(9)]);
+        assert!(prompts.iter().all(|p| p["first_divergence"].is_null()));
+        // Tile 3, lanes of 13 / 2 / 9 rows: five passes; the short lane's AR rows share the
+        // later passes.
+        let prefill = &burst["prefill"];
+        assert_eq!(
+            (prefill["steps"].clone(), prefill["rows"].clone()),
+            (json!(5), json!(24))
+        );
+        let passes = prefill["passes"].as_array().unwrap();
+        let shape = passes
+            .iter()
+            .map(|p| {
+                (
+                    p["tiles"].as_u64(),
+                    p["rows"].as_u64(),
+                    p["ar_rows"].as_u64(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            shape,
+            [
+                (Some(3), Some(8), Some(0)),
+                (Some(2), Some(6), Some(1)),
+                (Some(2), Some(6), Some(1)),
+                (Some(1), Some(3), Some(2)),
+                (Some(1), Some(1), Some(2)),
+            ]
+        );
+        assert!(prefill["burst_wall_s"].as_f64().unwrap() >= prefill["wall_s"].as_f64().unwrap());
+        // ids.jsonl names each lane's prompt index and set.
+        let burst_lines: Vec<_> = ids_lines
+            .iter()
+            .filter(|l| l["set"] == json!("burst=3+1+0"))
+            .collect();
+        assert_eq!(
+            burst_lines
+                .iter()
+                .map(|l| l["prompt"].clone())
+                .collect::<Vec<_>>(),
+            [json!(3), json!(1), json!(0)]
+        );
+    }
+
+    #[test]
+    fn a_diverging_burst_lane_reports_its_row_position_and_labels() {
+        let args = sweep_args("--policies per-lane:moe=once --burst 3,1", "1");
+        let mut backend = FakeLanes::new(4, 3);
+        backend.corrupt = Some(policy_of("per-lane:moe=once"));
+        let (outcomes, _) = sweep(&mut backend, &args);
+        assert_eq!(outcomes[0].status, PolicyStatus::Fail);
+        assert_eq!(
+            outcomes[0].failures,
+            ["K=1 prompt 0", "burst=3+1 prompt 3", "burst=3+1 prompt 1"]
+        );
+        let burst = &outcomes[0].record["runs"][1];
+        assert_eq!(burst["equal"], json!(false));
+        // The prompt-completing pick is right; the first AR pick (row 1) is wrong.
+        let d = &burst["prompts"][0]["first_divergence"];
+        assert_eq!(d["row"], json!(1));
+        assert_eq!(d["position"], json!(13));
+        assert_eq!(d["phase"], json!("decode"));
+        assert_eq!(d["via"], json!("ids"));
+        assert_eq!(
+            burst["prompts"][1]["first_divergence"]["position"],
+            json!(2)
+        );
+    }
+
+    #[test]
+    fn the_burst_stderr_line_carries_lengths_passes_and_the_singleton_sum() {
+        let prompts = prompts();
+        let slices: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
+        let mut backend = FakeLanes::new(4, 3);
+        let cfg = DriveCfg {
+            prompts: &slices[..2],
+            tokens: 3,
+            max_lanes: 4,
+            row_budget: 4,
+            want_logits: false,
+        };
+        let run = drive_k(&mut backend, &cfg, 2, &mut 0).unwrap();
+        let references: Vec<Reference> = prompts.iter().map(|p| reference(p, 3)).collect();
+        let set = RunSet {
+            members: vec![0, 1],
+            burst: true,
+        };
+        let extras = burst_extras(&set, &run, &slices, &references);
+        let compared: Vec<Value> = (0..2)
+            .map(|i| {
+                let ids = &references[i].ids;
+                compared_json(i, prompts[i].len(), i, &compare(ids, ids, None))
+            })
+            .collect();
+        let line = burst_line("p", &set, &run, &compared, &extras);
+        assert!(
+            line.starts_with("[oracle-burst] policy=p set=burst=0+1 lens=[9, 2] prompts_equal=2/2 passes=3 rows=11 "),
+            "{line}"
+        );
+        assert!(line.contains("singleton_sum_ms=11.0"), "{line}");
+        assert!(
+            line.ends_with("first_divergence(prompt,row,pos)=[]"),
+            "{line}"
+        );
     }
 
     fn sweep(backend: &mut dyn LaneBackend, args: &Args) -> (Vec<PolicyOutcome>, Vec<Value>) {

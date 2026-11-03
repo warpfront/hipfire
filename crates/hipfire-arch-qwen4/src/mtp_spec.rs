@@ -7663,6 +7663,24 @@ fn mark_phase(timers: &mut Option<&mut MtpPhaseTimers>, gpu: &Gpu, label: &'stat
     }
 }
 
+thread_local! {
+    /// `Some(None)`: armed by [`lane_fill_split_arm`] for one MTP lane prefill tile;
+    /// `Some(Some((trunk_ms, head_ms)))`: that tile's split, filled by [`mtp_prefill_chunk`].
+    static LANE_FILL_SPLIT: std::cell::Cell<Option<Option<(f64, f64)>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Arm the trunk/head split for the next [`mtp_prefill_chunk`] on this thread (the
+/// `HIPFIRE_CB_PHASES` per-tile line of `lane_exec::run_prefill_tiles`).
+pub(crate) fn lane_fill_split_arm() {
+    LANE_FILL_SPLIT.with(|split| split.set(Some(None)));
+}
+
+/// Disarm and return the split `(trunk_ms, head_ms)` the armed tile recorded, if any.
+pub(crate) fn lane_fill_split_take() -> Option<(f64, f64)> {
+    LANE_FILL_SPLIT.with(|split| split.replace(None)).flatten()
+}
+
 /// The body of `mtp_prefill`'s chunk loop for the chunk `chunk` at `pos`:
 /// the trunk tile with wide-hidden capture (`spec_prefill_rows` when
 /// `needs_pick`, else `spec_prefill_rows_silent`), then the head append of
@@ -7705,7 +7723,26 @@ pub(crate) fn mtp_prefill_chunk(
     } else {
         None
     };
+    // Lane-tile diagnostic (`lane_fill_split_arm`): the trunk forward and the head fill timed
+    // apart, each ending on a device wait. Unarmed (every singleton prefill, every serve step
+    // without `HIPFIRE_CB_PHASES`), this adds nothing.
+    let trunk_clock = LANE_FILL_SPLIT
+        .with(|split| split.get().is_some())
+        .then(std::time::Instant::now);
     let pick = bundle.ops_prefill_rows(ops, chunk, needs_pick)?;
+    let head_clock = match trunk_clock {
+        Some(clock) => {
+            ops.gpu()?
+                .hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            Some((
+                clock.elapsed().as_secs_f64() * 1e3,
+                std::time::Instant::now(),
+            ))
+        }
+        None => None,
+    };
     if let Some(shape) = &shape {
         // The target captured both banks together, but head append boundaries,
         // prompt-id uploads and pending rows remain those of the sequential run.
@@ -7756,11 +7793,19 @@ pub(crate) fn mtp_prefill_chunk(
     {
         return Ok(ControlFlow::Break(()));
     }
+    if let Some((trunk_ms, clock)) = head_clock {
+        ops.gpu()?
+            .hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        let head_ms = clock.elapsed().as_secs_f64() * 1e3;
+        LANE_FILL_SPLIT.with(|split| split.set(Some(Some((trunk_ms, head_ms)))));
+    }
     Ok(ControlFlow::Continue(pick))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn mtp_append_prefill_chunk(
+pub(crate) fn mtp_append_prefill_chunk(
     bundle: &mut Qwen4Bundle,
     ops: &mut Qwen4Ops<'_>,
     chunk: &[u32],

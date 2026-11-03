@@ -53,6 +53,20 @@
 //! [`WaveHead::All`] writes every row of every lane. The share policy's
 //! `Head` / `Argmax` entries are not consulted by a wave.
 //!
+//! ## Prefill wave under expert parallelism
+//!
+//! On an EP rank ([`forward_wave_ep`]; design in [`crate::gpu_forward::ep_wave`])
+//! the wave is the EXACT joint prefill of the lanes' serial tiles: the MoE runs ONCE
+//! per layer over every lane's rows on the singleton's own FULL-TABLE route (the
+//! sub-512-row kernels, selected by capping the routing rows of the call at 511, with
+//! real launch extents), so the layer's expert weights are read once instead of once
+//! per lane tile; every other stage runs per lane on the lane's own rows and state
+//! (its launches are the lane tile's by construction). The caller's policy is replaced
+//! by the EP wave policy ([`crate::gpu_forward::ep_wave::ep_wave_policy`]). A lane's
+//! committed state and head are byte-equal to its serial tile because every kernel of
+//! the wave's MoE call (router, shared expert, grouped expert GEMMs, combine) computes
+//! each row independently of the other rows of its launch; the card oracle proves it.
+//!
 //! # Pipeline-parallel bands
 //!
 //! Under `topology.pp` each band runs the same step over ITS trunk layers
@@ -69,6 +83,9 @@
 
 use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
+use crate::gpu_forward::ep_wave::{
+    ep_wave_expected_moe_calls, ep_wave_layer_moe, ep_wave_policy, ep_wave_refusal,
+};
 use crate::gpu_forward::{
     bind_ep_lane_gather, ep_lane, ep_lane_buffer, ep_lane_check_invocations, ep_lane_moe_rows,
     lane_layer_moe,
@@ -92,6 +109,7 @@ use hipfire_dispatch::pipeline::{
     IndexedAttentionOp, IndexedAttentionState, MixerPhase, Step,
 };
 use hipfire_runtime::external_rows::RowFetch;
+use rdna_compute::prefill_invariant::QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP;
 use rdna_compute::tensor_ops::{argmax_f32, ArgmaxF32};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -977,12 +995,15 @@ pub struct WaveLane<'a> {
 }
 
 /// A prefill wave's outputs: F32 `lanes * vocab` ([`WaveHead::Final`]) or
-/// `total_rows * vocab` ([`WaveHead::All`]) logits, and a Raw i32 per output
-/// row for the optional top-1.
+/// `total_rows * vocab` ([`WaveHead::All`]) logits, a Raw i32 per output
+/// row for the optional top-1, and the optional wide-hidden capture of every
+/// row (F32, `total_rows * hc_count * hidden`, lanes concatenated: what the
+/// singleton's `wide_hidden_capture` writes, the native-MTP fill's input).
 pub(crate) struct WaveOutputs<'a> {
     head: WaveHead,
     logits: &'a GpuTensor,
     top1: Option<&'a GpuTensor>,
+    wide_hidden: Option<&'a GpuTensor>,
 }
 
 /// Outputs of a lane step: one logits row and top-1 per AR row, a prefill
@@ -999,12 +1020,13 @@ pub(crate) enum StepOutputs<'a> {
 }
 
 impl<'a> StepOutputs<'a> {
-    /// The lane step's wide-hidden capture (verify lanes); a prefill wave and
-    /// a non-output band have none.
+    /// The lane step's wide-hidden capture (verify lanes, a prefill wave's
+    /// optional capture); a non-output band has none.
     fn wide_hidden(&self) -> Option<&'a GpuTensor> {
         match self {
             Self::Ar(out) => out.wide_hidden,
-            Self::Wave(_) | Self::Edge { .. } => None,
+            Self::Wave(wave) => wave.wide_hidden,
+            Self::Edge { .. } => None,
         }
     }
 
@@ -1521,6 +1543,12 @@ fn forward_lanes_with(
 /// state is published exactly as the singleton forward publishes it; on
 /// failure nothing host-side is published and the caller must treat the
 /// lanes' device state as untrusted.
+///
+/// `wide_hidden`: the optional capture of every row's final HC streams (F32,
+/// `total_rows * hc_count * hidden`, lanes concatenated), output band only.
+///
+/// On an EP rank the wave is the joint EP prefill ([`forward_wave_ep`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_wave(
     gpu: &mut Gpu,
     bundle: &mut Qwen4Bundle,
@@ -1528,11 +1556,21 @@ pub(crate) fn forward_wave(
     head: WaveHead,
     logits: &GpuTensor,
     top1: Option<&GpuTensor>,
+    wide_hidden: Option<&GpuTensor>,
     policy: &LaneStagePolicy,
 ) -> Result<(), Qwen4GpuForwardError> {
     // Only the output band has a head (see `forward_lanes`).
     let outputs = if bundle.weights.band_scope().output {
-        StepOutputs::Wave(WaveOutputs { head, logits, top1 })
+        StepOutputs::Wave(WaveOutputs {
+            head,
+            logits,
+            top1,
+            wide_hidden,
+        })
+    } else if wide_hidden.is_some() {
+        return Err(invalid(
+            "only the output band captures the wave wide hidden",
+        ));
     } else {
         StepOutputs::Edge { prefill: true }
     };
@@ -1562,11 +1600,45 @@ fn forward_wave_with(
     let invariant =
         rdna_compute::prefill_invariant::prefill_pm_invariant_enabled() && gpu.arch == "gfx1151";
     let invariant = std::mem::replace(&mut gpu.prefill_invariant_scope, invariant);
-    let result = forward_lanes_scoped(gpu, &mut forward, bundle, &mut rows, out, policy);
+    let result = if forward.ep.is_some() {
+        forward_wave_ep(gpu, &mut forward, bundle, &mut rows, out)
+    } else {
+        forward_lanes_scoped(gpu, &mut forward, bundle, &mut rows, out, policy)
+    };
     gpu.prefill_invariant_scope = invariant;
     gpu.qwen4_scope = scope;
     bundle.execution = Some(forward);
     result
+}
+
+/// The exact EP prefill wave ([`crate::gpu_forward::ep_wave`] has the design): the lane
+/// step over prefill lanes with the MoE ONCE per layer over every lane's rows on the
+/// singleton's FULL-TABLE route (sub-512 routing kernels), and every other stage per lane
+/// (the caller's `policy` is replaced by [`ep_wave_policy`]). Admission is decided from host
+/// facts before any launch, on every rank identically; a refusal is an `ep wave refused:`
+/// error and nothing ran.
+fn forward_wave_ep(
+    gpu: &mut Gpu,
+    fwd: &mut Qwen4GpuForward,
+    bundle: &Qwen4Bundle,
+    lanes: &mut [LaneRows<'_>],
+    out: &StepOutputs<'_>,
+) -> Result<(), Qwen4GpuForwardError> {
+    let policy = ep_wave_policy();
+    let lane_rows: Vec<usize> = lanes.iter().map(|lane| lane.tokens.len()).collect();
+    let total: usize = lane_rows.iter().sum();
+    let facts = fwd.ep_wave_facts(gpu, &bundle.config, &lane_rows);
+    if let Some(why) = ep_wave_refusal(&facts) {
+        return Err(invalid(why));
+    }
+    // `Qwen4Bundle::with_lane` clamps a lane state's F16 arenas to its committed
+    // lengths before its tile; the wave's lanes enter the same way.
+    for lane in lanes.iter_mut() {
+        lane.state.clamp_f16_valid();
+    }
+    fwd.ep_wave_run(gpu, total, |fwd, gpu| {
+        forward_lanes_scoped(gpu, fwd, bundle, lanes, out, &policy)
+    })
 }
 
 fn forward_lanes_scoped(
@@ -1580,10 +1652,29 @@ fn forward_lanes_scoped(
     // A decode-share load runs lane steps on the resident bank only (no prefill
     // bank is ever swapped in across a call boundary).
     fwd.share_require_resident(gpu)?;
-    // Expert parallelism: every MoE invocation runs the singleton's gathered
+    // Expert parallelism: an AR / verify lane step runs the singleton's gathered
     // forward over the rank's replicated trunk (the row gather must already be
-    // installed; checked before any launch).
+    // installed; checked before any launch). A PREFILL wave under EP is the
+    // exact joint full-table prefill instead (`forward_wave_ep`).
     let ep_lane_step = ep_lane(fwd.ep.as_ref(), &fwd.scratch)?.is_some();
+    let ep_wave = ep_lane_step && out.prefill();
+    if ep_wave {
+        // `forward_wave_ep` entered the wave's scopes, reserve bank and routing-row cap; a
+        // direct caller would run a wide MoE on the gather route (refused below by row cap).
+        if !(fwd.lane_scope
+            && fwd.prefill_scope
+            && gpu.qwen4_route_rows_cap == QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP)
+        {
+            return Err(invalid(
+                "an EP prefill wave runs only inside forward_wave_ep (lane and prefill scope, routing-row cap, reserve bank)",
+            ));
+        }
+        if policy.share(StageName::Moe) != StageShare::OnceAllRows {
+            return Err(invalid(
+                "an EP prefill wave runs its MoE once over all rows",
+            ));
+        }
+    }
     let band_scope = bundle.weights.band_scope();
     if fwd.band_scope() != band_scope {
         return Err(invalid(
@@ -1728,8 +1819,11 @@ fn forward_lanes_scoped(
     }
     // An EP reserve-sharing load: a dirty borrow epoch (a lane prefill tile on
     // the borrowed bank) is restored and the resident bank checked before any
-    // launch; a no-op on every other load.
-    fwd.ep_reserve_lane_step_enter(gpu, n)?;
+    // launch; a no-op on every other load. An EP prefill wave took its bank
+    // (restore, acquire, borrowed view) in `ep_wave_run` like a singleton tile.
+    if !ep_wave {
+        fwd.ep_reserve_lane_step_enter(gpu, n)?;
+    }
     fwd.scratch.note_forward_rows(n);
     match out {
         StepOutputs::Ar(out) => {
@@ -1883,7 +1977,7 @@ fn forward_lanes_scoped(
     // route capability and the few-row limit as the singleton at those rows),
     // so each segment's set is built at its own routing rows, which must be
     // within the gather cap and equal its real rows (refused before any launch).
-    let seg_desc_rows: Vec<usize> = if ep_lane_step {
+    let seg_desc_rows: Vec<usize> = if ep_lane_step && !ep_wave {
         for i in segs_for(policy.share(StageName::Moe)) {
             let seg = &all_segs[i];
             let rr = if prefill {
@@ -1987,8 +2081,13 @@ fn forward_lanes_scoped(
             .collect();
         // Under EP: the row gather, the two trunk gather buffers and, per
         // segment, the scratch description whose expanded-row scratch is each
-        // buffer (validated before any launch).
-        let ep_lane = ep_lane(fwd.ep.as_ref(), scratch)?;
+        // buffer (validated before any launch). A prefill wave runs no gather:
+        // its MoE is the singleton's full-table chunk MoE.
+        let ep_lane = if ep_wave {
+            None
+        } else {
+            ep_lane(fwd.ep.as_ref(), scratch)?
+        };
         let ep_seg_scratch: Option<Vec<[Qwen4LayerScratch<'_>; 2]>> = ep_lane.as_ref().map(|ep| {
             seg_scratch
                 .iter()
@@ -2000,6 +2099,11 @@ fn forward_lanes_scoped(
                 })
                 .collect()
         });
+        // The wave's wide MoE segment routes as `route_rows(n)` = the cap (511) rows: its layer
+        // description (declared route capability, decode copies) is the sub-512 one every lane's
+        // singleton sees, over each layer's FULL-TABLE runtime (the singleton chunk's
+        // `select_layer_moe` for a sub-512-row tile).
+        let wave_group_rows = gpu.route_rows(n);
 
         // Per-layer weight descriptions, one set per distinct row count in
         // `seg_desc_rows` (AR: one set; decode copies bind for every
@@ -2013,16 +2117,29 @@ fn forward_lanes_scoped(
         let mut desc_sets: Vec<Vec<Qwen4LayerDescription<'_>>> =
             Vec::with_capacity(desc_rows.len());
         for &rows in &desc_rows {
+            let wave_set = ep_wave && rows == wave_group_rows;
             let mut descs: Vec<Qwen4LayerDescription<'_>> =
                 Vec::with_capacity(config.num_hidden_layers);
             for layer_index in band_scope.band.clone() {
+                let layer_moe = if wave_set {
+                    ep_wave_layer_moe(
+                        fwd.ep.as_ref(),
+                        &fwd.moe,
+                        &fwd.moe_borrow,
+                        fwd.borrow_runtimes_active,
+                        fwd.borrow_view,
+                        layer_index,
+                    )
+                } else {
+                    lane_layer_moe(fwd.ep.as_ref(), &fwd.moe, layer_index)
+                };
                 descs.push(layer_desc(
                     &bundle.weights,
                     bundle
                         .weights
                         .layer(layer_index)
                         .ok_or_else(|| invalid(format!("lane layer {layer_index} is not owned")))?,
-                    lane_layer_moe(fwd.ep.as_ref(), &fwd.moe, layer_index),
+                    layer_moe,
                     config,
                     &fwd.decode_q8,
                     rows,
@@ -2160,7 +2277,14 @@ fn forward_lanes_scoped(
             )?;
         }
 
-        let ctx = DispatchCtx::new(gpu);
+        // The singleton threads the call's canonical routing rows through the
+        // dispatch context (the sealed MoE's CPU-split and verify gates read it); an
+        // EP wave seals as the chunk of its total routing rows.
+        let ctx = if ep_wave {
+            DispatchCtx::new(gpu).with_batch_size(wave_group_rows)
+        } else {
+            DispatchCtx::new(gpu)
+        };
         let band_first = band_scope.band.start;
         let program = layer_program(bundle, policy, band_scope.input.then_some(ple_layer))?;
         // `HIPFIRE_QWEN4_LANE_PLE_BATCH` (exact gfx1201, default off): AR lane
@@ -2221,6 +2345,8 @@ fn forward_lanes_scoped(
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(program.len() * lanes.len() * 2);
         let mut qsa_commits: Vec<QsaCommit> = Vec::new();
         let mut ple_split: Option<usize> = None;
+        // MoE invocations an EP prefill wave emitted (one exchange each).
+        let mut wave_moe_calls = 0usize;
         // MoE invocations emitted so far under EP, in emission (= execution)
         // order over the whole step: the gather buffer alternates per
         // invocation, whatever the lane/layer interleaving.
@@ -2548,9 +2674,25 @@ fn forward_lanes_scoped(
                             let mut moe = moe;
                             // The runtime this invocation selected (the static
                             // runtime outside EP; under EP the singleton's
-                            // gathered-forward selection, see
-                            // `lane_layer_moe`).
-                            if let Some(runtime) = lane_layer_moe(fwd.ep.as_ref(), &fwd.moe, layer)
+                            // gathered-forward selection, see `lane_layer_moe`; an
+                            // EP prefill wave's FULL-TABLE runtime of the bank in use,
+                            // exactly the singleton chunk's emission for a
+                            // sub-512-row tile: no gather, no tile exchange).
+                            if ep_wave {
+                                if let Some(runtime) = ep_wave_layer_moe(
+                                    fwd.ep.as_ref(),
+                                    &fwd.moe,
+                                    &fwd.moe_borrow,
+                                    fwd.borrow_runtimes_active,
+                                    fwd.borrow_view,
+                                    layer,
+                                ) {
+                                    moe.routed_experts =
+                                        runtime.routed_view(false, r, rr, false, 8);
+                                }
+                                wave_moe_calls += 1;
+                            } else if let Some(runtime) =
+                                lane_layer_moe(fwd.ep.as_ref(), &fwd.moe, layer)
                             {
                                 moe.routed_experts = runtime.routed_view(!prefill, r, rr, false, 8);
                             }
@@ -2585,6 +2727,13 @@ fn forward_lanes_scoped(
         }
         if ep_lane.is_some() {
             ep_lane_check_invocations(ep_invocations)?;
+        }
+        if ep_wave && wave_moe_calls != ep_wave_expected_moe_calls(band_scope.band.len()) {
+            return Err(invalid(format!(
+                "an EP prefill wave emitted {wave_moe_calls} MoE invocations for {} layers; every \
+                 rank must run exactly one exchange per layer",
+                band_scope.band.len()
+            )));
         }
         validate_steps(gpu, &steps).map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("preflight lane program: {error:?}"))
@@ -2829,6 +2978,9 @@ fn forward_lanes_scoped(
 
     match attempt {
         Ok(qsa_commits) => {
+            if ep_wave {
+                fwd.ep_wave_note(n);
+            }
             if let Some(ple) = ple.as_mut() {
                 ple.complete();
             }
@@ -2858,6 +3010,7 @@ fn forward_lanes_scoped(
             Ok(())
         }
         Err(error) => {
+            // The full-table route stages nothing (no donor is overwritten): nothing to restore.
             for lane in lanes.iter() {
                 lane.state.invalidate_f16_arenas();
             }
@@ -4363,6 +4516,41 @@ mod tests {
             Some(ple_layer),
         );
         assert_eq!(production.len(), config.num_hidden_layers * 8 + 1);
+    }
+
+    /// The EP prefill wave's program: every stage per lane (each mixer stays the
+    /// singleton's whole op on the lane's own rows) except the MoE, which is the
+    /// only op placed once over all rows, one per layer.
+    #[test]
+    fn ep_wave_program_places_only_the_moe_once() {
+        use crate::gpu_forward::ep_wave::ep_wave_policy;
+        let config = crate::config::compact_test_config();
+        let ple_layer = ple_layer_of(&config);
+        let single = Qwen4BandScope::single(&config);
+        let policy = ep_wave_policy();
+        let program = lane_program(
+            band_kinds(&config, single.band.clone()),
+            &policy,
+            Some(ple_layer),
+        );
+        let mut once = 0usize;
+        for (op, stage) in &program {
+            let share = policy.share(*stage);
+            if matches!(op, LaneOp::Moe { .. }) {
+                assert_eq!(share, StageShare::OnceAllRows);
+                once += 1;
+            } else {
+                assert!(share.per_lane(), "{op:?} runs per lane");
+            }
+            // No mixer splits: a per-lane projection pair is the whole singleton op.
+            if let LaneOp::Gdn { phase, .. } | LaneOp::Qsa { phase, .. } = op {
+                assert_eq!(*phase, MixerPhase::Whole);
+            }
+        }
+        // One exchange per layer, whatever the lane count.
+        assert_eq!(once, config.num_hidden_layers);
+        // Six ops per layer (the mixers stay whole) plus the PLE conv.
+        assert_eq!(program.len(), config.num_hidden_layers * 6 + 1);
     }
 
     fn band_scopes(config: &crate::config::Qwen4Config, counts: &[usize]) -> Vec<Qwen4BandScope> {

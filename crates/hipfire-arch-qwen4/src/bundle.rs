@@ -5475,6 +5475,17 @@ impl Qwen4Bundle {
         })?
     }
 
+    /// The route the most recent EP lane prefill tile took on this forward
+    /// ([`crate::gpu_forward::ep_reserve_forward::LaneTileNote`]), `None` before one ran and
+    /// outside EP. Diagnostic only (the `HIPFIRE_CB_PHASES` per-tile line).
+    pub(crate) fn lane_tile_note(
+        &self,
+    ) -> Option<crate::gpu_forward::ep_reserve_forward::LaneTileNote> {
+        self.execution
+            .as_ref()
+            .and_then(|forward| forward.lane_tile_note)
+    }
+
     /// A fresh prefill-wave lane state: the same constructor as a lane
     /// store's states (the resident state's formats, QSA backend and context
     /// bound), snapshot-capable like the resident state.
@@ -5493,6 +5504,16 @@ impl Qwen4Bundle {
     /// never touches the resident `state`, the MTP head, the session cache
     /// or the retained tape (eager HIP); `execution` is back in place on
     /// every return path.
+    ///
+    /// Under expert parallelism (called on every rank's own bundle inside the
+    /// replicated rank closure, same lanes and tokens in the same order) the wave
+    /// is the EXACT joint prefill ([`crate::gpu_forward::ep_wave`]): the MoE once
+    /// per layer over every lane's rows on the singleton's full-table route, every
+    /// other stage per lane, and `policy` is replaced by the EP wave policy; each
+    /// lane is byte-equal to its serial tile. A wave the route cannot take is
+    /// refused before any launch with an `ep wave refused:` error
+    /// ([`Self::ep_wave_admission`] is the same decision, host only), and the
+    /// caller runs serial lane tiles instead.
     pub fn prefill_wave(
         &mut self,
         gpu: &mut Gpu,
@@ -5502,6 +5523,27 @@ impl Qwen4Bundle {
         top1: Option<&GpuTensor>,
         policy: &crate::gpu_forward_lanes::LaneStagePolicy,
     ) -> Result<(), BundleError> {
+        self.prefill_wave_wide(gpu, lanes, head, logits, top1, policy, None)
+    }
+
+    /// [`Self::prefill_wave`] that also captures every row's final HC streams
+    /// into `wide_hidden` (F32, `total_rows * hc_count * hidden` elements, the
+    /// lanes' rows concatenated in lane order: the layout of
+    /// [`crate::gpu_forward_lanes::LaneOutputs::wide_hidden`] and of the
+    /// singleton's `wide_hidden_capture`), the native-MTP head fill's input.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prefill_wave_wide(
+        &mut self,
+        gpu: &mut Gpu,
+        lanes: &mut [crate::gpu_forward_lanes::WaveLane<'_>],
+        head: crate::gpu_forward_lanes::WaveHead,
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        policy: &crate::gpu_forward_lanes::LaneStagePolicy,
+        wide_hidden: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
+        // A mesh-attached root bundle must not run one rank's half of a replicated
+        // forward; the rank closures (which hold a detached bundle) take the EP wave.
         self.ep_refuse("continuous-batch wave prefill")?;
         for lane in lanes.iter_mut() {
             let end = lane
@@ -5525,8 +5567,39 @@ impl Qwen4Bundle {
                     ))
                 })?;
         }
-        crate::gpu_forward_lanes::forward_wave(gpu, self, lanes, head, logits, top1, policy)
-            .map_err(|error| BundleError::Forward(error.to_string()))
+        crate::gpu_forward_lanes::forward_wave(
+            gpu,
+            self,
+            lanes,
+            head,
+            logits,
+            top1,
+            wide_hidden,
+            policy,
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Whether a prefill wave of lanes with `lane_rows` rows each can run as one exact joint
+    /// EP pass on this rank, and why not: the exact admission [`Self::prefill_wave`] applies
+    /// under expert parallelism (two or more lanes of 49..=511 rows, total within the wave cap
+    /// and the scratch / reserve capacity, no owner-routed lane, no trunk-shard partial FFN),
+    /// from host facts only, no device work. `Ok` on a load without EP (the single-device wave
+    /// has no extra admission). `Err` starts with `ep wave refused:`; the caller then runs
+    /// serial lane tiles.
+    pub fn ep_wave_admission(&mut self, gpu: &mut Gpu, lane_rows: &[usize]) -> Result<(), String> {
+        let Some(forward) = self
+            .execution
+            .as_mut()
+            .filter(|forward| forward.ep.is_some())
+        else {
+            return Ok(());
+        };
+        let facts = forward.ep_wave_facts(gpu, &self.config, lane_rows);
+        match crate::gpu_forward::ep_wave::ep_wave_refusal(&facts) {
+            Some(why) => Err(why),
+            None => Ok(()),
+        }
     }
 
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {

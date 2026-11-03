@@ -778,6 +778,19 @@ pub const QWEN4_EXPERT_STAGE_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE";
 /// smaller ones, decode and verify keep the mapped reads.
 pub const QWEN4_EXPERT_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS";
 
+/// Lab knob (default unset: no effect, every forward keeps today's threshold): the
+/// expert-stage row threshold of an EP lane PREFILL tile. A lane's prompt runs as one
+/// singleton chunk forward per lane (`Qwen4Bundle::lane_prefill_tile`), so this threshold
+/// compares with that lane's own rows, never with the rows of the whole serve step. A
+/// tile of at least this many rows stages the host experts like any
+/// [`QWEN4_EXPERT_STAGE_MIN_ROWS_ENV`]-long forward; other forwards (singleton prefill,
+/// decode, verify) keep the stage's own threshold. The value is clamped up to
+/// [`ep_lane_stage_floor`]: the stage is only ever used by a forward on the owner-routed
+/// compact route (`>= 512` routing rows), and on a decoupled-reserve load strictly above the
+/// resident bank's call limit (`ep_reserve_stage_refusal`: a borrowed-only stage never
+/// serves the resident bank). Integer >= 2, anything else is ignored.
+pub const QWEN4_EP_LANE_PREFILL_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_STAGE_MIN_ROWS";
+
 /// Whether a long forward that captures wide hidden rows (the native-MTP
 /// prompt fill's trunk tiles) stages like any other long forward. `0` keeps
 /// those tiles on the mapped reads; unset or `1` stages them. The capture
@@ -2011,6 +2024,7 @@ pub(crate) mod ep_reserve_forward;
 pub use ep_reserve_forward::ep_reserve_receipt_scope;
 pub(crate) mod ep_reserve_loan;
 pub(crate) mod ep_reserve_scratch;
+pub(crate) mod ep_wave;
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     fn len(&self) -> usize {
@@ -10265,7 +10279,7 @@ pub struct Qwen4GpuForward {
     /// `Some(rows)` when a slab layer holds a codec without K2 prefill kernels on this device
     /// ([`slab_decode_only_rows`]): the widest prompt tile (and forward) the load runs.
     slab_decode_only_rows: Option<usize>,
-    expert_stage: Option<Qwen4ExpertStage>,
+    pub(crate) expert_stage: Option<Qwen4ExpertStage>,
     /// Expert-parallel state (`Some` iff the bundle's weights carry an EP
     /// placement): the zero dummy expert, the full per-layer tables for chunk
     /// forwards, the row-gather buffers and the installed gather. Under EP
@@ -10303,6 +10317,9 @@ pub struct Qwen4GpuForward {
     /// then never a retained-body candidate, so it neither records nor
     /// replays the singleton's tape (whose pointers name the resident state).
     pub(crate) lane_scope: bool,
+    /// The route the most recent EP lane prefill tile took (`lane_scope` forwards under EP
+    /// only): diagnostic for the `HIPFIRE_CB_PHASES` per-tile line, never read by a decision.
+    pub(crate) lane_tile_note: Option<ep_reserve_forward::LaneTileNote>,
     /// Set only by the bundle's prefill entries (`forward_chunk*`,
     /// `spec_prefill_rows*`, `lane_prefill_tile`) around their forward call:
     /// the batch-invariant prefill profile ([`Gpu::prefill_invariant_scope`])
@@ -10344,21 +10361,21 @@ pub struct Qwen4GpuForward {
     /// same layer order; empty unless the tier lease carries a decode-share
     /// binding and the mode uses it). Class `c` reads the donors its scratch
     /// can overwrite at their pinned mirror and every other donor in VRAM.
-    moe_borrow: Vec<Vec<Option<Qwen4MoeLayerRuntime>>>,
+    pub(crate) moe_borrow: Vec<Vec<Option<Qwen4MoeLayerRuntime>>>,
     /// Row capacity of each class ([`qwen4_decode_share_classes`]) the
     /// BorrowPrefill views were built for (empty without them).
     borrow_class_rows: Vec<usize>,
     /// Set only by the decode-share path ([`Self::forward_chunk_inner`]) for
     /// the duration of one prompt tile: [`Self::tile_moe`] then reads
     /// `moe_borrow[borrow_view]`.
-    borrow_runtimes_active: bool,
+    pub(crate) borrow_runtimes_active: bool,
     /// The class view of the running prompt tile.
-    borrow_view: usize,
+    pub(crate) borrow_view: usize,
     /// `Some` on an `HIPFIRE_EP_RESERVE_DECOUPLE=1` load: the 4096-row prompt plan,
     /// the resident / borrowed scratch banks, the donor loan and the epoch proof
     /// ([`ep_reserve_forward`]). `scratch` is the resident bank at every call
     /// boundary; the borrowed runtime view is `moe_borrow[0]`.
-    ep_reserve: Option<ep_reserve_forward::EpReserveForward>,
+    pub(crate) ep_reserve: Option<ep_reserve_forward::EpReserveForward>,
     /// `Some` on an ORDINARY EP load under `HIPFIRE_EP_RESERVE_RECEIPT=1` (no
     /// reserve): the host-only prompt-record state of the gate's off arm.
     ep_ordinary_receipt: Option<ep_reserve_forward::EpOrdinaryReceipt>,
@@ -12631,6 +12648,7 @@ impl Qwen4GpuForward {
             qsa_tap: None,
             layer_capture: None,
             lane_scope: false,
+            lane_tile_note: None,
             prefill_scope: false,
             #[cfg(feature = "lab")]
             last_verify_reference: None,
@@ -15596,6 +15614,24 @@ impl Qwen4GpuForward {
         // stream and its failure recovery synchronizes the device. The trunk-shard partial
         // chunk binds the compact table on EVERY layer (no full table, no peer donor read), the
         // condition [`Qwen4ExpertStage::begin_forward`] stages on.
+        // An EP lane prefill tile (`lane_scope`) compares its rows with the lab lane threshold
+        // (`HIPFIRE_EP_LANE_PREFILL_STAGE_MIN_ROWS`, clamped to the owner-routed route and the
+        // reserve's resident bank) when that knob is set; unset, every forward compares with
+        // `stage.min_rows` exactly as before.
+        let ep_lane_tile = self.ep.is_some() && self.lane_scope;
+        let lane_knob = ep_reserve_forward::ep_lane_stage_knob().filter(|_| ep_lane_tile);
+        let resident_call_limit = self
+            .ep_reserve
+            .as_ref()
+            .map(|reserve| reserve.banks.resident_call_limit());
+        let stage_threshold = |stage_min_rows: usize| {
+            ep_reserve_forward::ep_lane_stage_min_rows(
+                stage_min_rows,
+                lane_knob,
+                ep_lane_tile,
+                resident_call_limit,
+            )
+        };
         let expert_stage = match self
             .expert_stage
             .as_ref()
@@ -15603,7 +15639,7 @@ impl Qwen4GpuForward {
             .filter(|_| self.ep_reserve.is_none() || self.borrow_runtimes_active)
         {
             Some(stage)
-                if n >= stage.min_rows
+                if n >= stage_threshold(stage.min_rows)
                     && (stage.capture
                         || (wide_hidden_capture.is_none() && self.layer_capture.is_none()))
                     && self.qsa_tap.is_none() =>
@@ -15616,6 +15652,30 @@ impl Qwen4GpuForward {
             }
             _ => None,
         };
+        if ep_lane_tile {
+            self.lane_tile_note = Some(ep_reserve_forward::LaneTileNote {
+                rows: n,
+                tile_exchange: tile_active,
+                staged: expert_stage.is_some(),
+                stage_min_rows: self
+                    .expert_stage
+                    .as_ref()
+                    .map(|stage| stage_threshold(stage.min_rows)),
+            });
+            if let Some(rows) = lane_knob.filter(|_| self.expert_stage.is_some()) {
+                static LOGGED: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "  qwen4 EP lane prefill expert staging ({}={rows}): lane prefill tiles of >= {} rows on the owner-routed route stage the host experts (floor {}; the stage's own threshold stays {} rows for every other forward)",
+                        QWEN4_EP_LANE_PREFILL_STAGE_MIN_ROWS_ENV,
+                        stage_threshold(0),
+                        ep_reserve_forward::ep_lane_stage_floor(resident_call_limit),
+                        self.expert_stage.as_ref().map_or(0, |stage| stage.min_rows),
+                    );
+                }
+            }
+        }
         if let Some(stage) = expert_stage {
             // Slab stage: the first two host layers copy while the resident
             // layers compute (the legacy donors refill from their own MoE).

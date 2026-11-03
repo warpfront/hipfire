@@ -39,10 +39,10 @@ use crate::mesh_lane_protocol::ProposalSource;
 use crate::mesh_rank_copy::{verify_capable, PreparedRankLane, ProbeOutcome};
 use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
-    accept_native_greedy, floor_with_call_log, mtp_prefill_chunk, mtp_prefill_chunk_needs_pick,
-    mtp_reuse_prefill_ids_enabled, mtp_skip_intermediate_pick_enabled, prepare_native_window,
-    publish_native_window, HeadTicket, NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops,
-    TargetTicket, MTP_WINDOW_COST,
+    accept_native_greedy, floor_with_call_log, mtp_append_prefill_chunk, mtp_prefill_chunk,
+    mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
+    mtp_skip_intermediate_pick_enabled, prepare_native_window, publish_native_window, HeadTicket,
+    NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket, MTP_WINDOW_COST,
 };
 
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
@@ -1020,6 +1020,67 @@ pub(crate) fn prefill_tile(
     Ok(pick)
 }
 
+/// The head half of [`prefill_tile`] for an MTP lane whose trunk rows a prefill wave already
+/// forwarded (`Qwen4Bundle::prefill_wave_wide`): the lane's `tokens` are rows
+/// `hidden_row0..hidden_row0 + tokens.len()` of the wave's wide-hidden capture, which the caller
+/// took into the bundle's resident spec hidden buffer, the buffer
+/// [`mtp_prefill_chunk`]'s head append reads. The head append is `mtp_prefill_chunk`'s own
+/// (`mtp_append_prefill_chunk`, with the chunk's first row taking `pending` and the capture row
+/// offset `hidden_row0`), on the lane's own head state, in the same `with_lane` scope, so the head
+/// bytes are the serial tile's: token `p` pairs with the target hidden of `p - 1`, `pending`
+/// ends on the chunk's last row. The trunk already advanced `state.position` to the tile's end
+/// (as the serial tile's forward has by the time its head fill runs); the head must still be at
+/// the tile's start. The trunk ids are not reused (`reuse_trunk_ids = false`: the wave's token
+/// ids are the whole burst's, the head uploads the chunk's own, the same bytes).
+pub(crate) fn fill_head_after_wave(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    lane: &mut Qwen4LaneState,
+    tokens: &[u32],
+    hidden_row0: usize,
+    append_scratch: Option<&mut MtpAppendScratch>,
+) -> Result<(), String> {
+    let Qwen4LaneState { host, state, spec } = lane;
+    let spec = spec
+        .as_mut()
+        .ok_or_else(|| "fill_head_after_wave: lane has no MTP state".to_string())?;
+    let LaneSpec {
+        head,
+        draft,
+        pending_hidden,
+        ..
+    } = spec;
+    let start = host.prefilled;
+    let end = start + tokens.len();
+    if state.position != end || head.position() != start {
+        return Err(format!(
+            "fill_head_after_wave: I1: trunk position {} (want {end}), head position {} (want {start})",
+            state.position,
+            head.position()
+        ));
+    }
+    lane_call(bundle.with_lane(state, Some((head, draft)), |b| {
+        b.poll_npu_trunk(gpu)?;
+        match mtp_append_prefill_chunk(
+            b,
+            &mut Qwen4Ops::Single(&mut *gpu),
+            tokens,
+            start,
+            hidden_row0,
+            pending_hidden,
+            append_scratch,
+            false,
+            &|| false,
+        )
+        .map_err(BundleError::Forward)?
+        {
+            std::ops::ControlFlow::Continue(()) => Ok(()),
+            std::ops::ControlFlow::Break(()) => unreachable!("a never-abort fill cannot break"),
+        }
+    }))
+    .map_err(|e| format!("fill_head_after_wave: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     // The finish split's ordering guarantee. `Qwen4Bundle`/`Gpu` cannot be built
@@ -1085,6 +1146,37 @@ mod tests {
         let rest = &src[start..];
         let end = rest.find("\n}\n").expect("fn end");
         &rest[..end]
+    }
+
+    /// The wave's head fill is the serial tile's own head append (same function, same scope,
+    /// same pairing) over the captured rows: it never runs a trunk forward, checks I1 with the
+    /// trunk already at the tile's end, takes the lane's own row offset in the capture, and
+    /// embeds from its own ids (the trunk forward's ids are the whole burst's).
+    #[test]
+    fn wave_head_fill_is_the_serial_tiles_head_append() {
+        let body = fn_body(LANES_SRC, "fill_head_after_wave");
+        assert!(body.contains("mtp_append_prefill_chunk("));
+        assert!(body.contains("bundle.with_lane(state, Some((head, draft))"));
+        assert!(body.contains("state.position != end || head.position() != start"));
+        assert!(body.contains("start,\n            hidden_row0,"));
+        assert!(
+            body.contains("false,\n            &|| false,"),
+            "no trunk-id reuse, never aborts"
+        );
+        for trunk in [
+            "mtp_prefill_chunk(",
+            "ops_prefill_rows",
+            "spec_prefill_rows",
+            "forward_chunk",
+        ] {
+            assert!(
+                !body.contains(trunk),
+                "the head fill must not run the trunk: {trunk}"
+            );
+        }
+        // The serial tile pairs with the same append (through `mtp_prefill_chunk`).
+        assert!(fn_body(LANES_SRC, "prefill_tile").contains("mtp_prefill_chunk("));
+        assert!(SPEC_SRC.contains("pub(crate) fn mtp_append_prefill_chunk("));
     }
 
     #[test]

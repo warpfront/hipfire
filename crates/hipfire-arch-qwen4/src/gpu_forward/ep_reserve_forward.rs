@@ -336,6 +336,86 @@ pub(super) fn ep_wide_bank_route(tile_active: bool, trunk_partial_chunk: bool) -
 }
 
 // ---------------------------------------------------------------------------
+// Lane prefill tiles and the expert stage
+// ---------------------------------------------------------------------------
+
+/// [`QWEN4_EP_LANE_PREFILL_STAGE_MIN_ROWS_ENV`] parsed: an integer of at least 2, else `None`
+/// (unset, empty, not a number, `0`, `1`: no lane threshold, the stage keeps its own).
+pub(crate) fn ep_lane_stage_knob_from(value: Option<&str>) -> Option<usize> {
+    value
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|&rows| rows >= 2)
+}
+
+/// The lane stage threshold knob, read once per process (every rank thread agrees).
+static EP_LANE_STAGE_KNOB: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+    ep_lane_stage_knob_from(
+        hipfire_config::developer_var(QWEN4_EP_LANE_PREFILL_STAGE_MIN_ROWS_ENV)
+            .ok()
+            .as_deref(),
+    )
+});
+
+pub(super) fn ep_lane_stage_knob() -> Option<usize> {
+    *EP_LANE_STAGE_KNOB
+}
+
+/// The fewest rows at which a lane prefill tile may stage whatever the knob says. The stage is
+/// only ever used by a forward on the owner-routed compact route (`ep_tile_active`: at least
+/// [`rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`] routing rows), and on a decoupled-reserve
+/// load (`resident_call_limit` = the resident bank's call limit) strictly above that limit: a
+/// call of at most the limit runs on the resident bank, which a borrowed-only stage must never
+/// serve (`ep_reserve_stage_refusal`). Lowering the knob below this floor is inert, never unsafe.
+pub(crate) fn ep_lane_stage_floor(resident_call_limit: Option<usize>) -> usize {
+    resident_call_limit
+        .map_or(0, |limit| limit.saturating_add(1))
+        .max(rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS)
+}
+
+/// The row threshold a forward of the expert stage compares its rows with. `stage_min_rows` is
+/// the stage's own (`HIPFIRE_QWEN4_EXPERT_STAGE_MIN_ROWS`, else the arch default: 2048 on
+/// gfx1201). Only an EP lane prefill tile (`ep_lane_tile`) with the knob set takes
+/// `max(knob, floor)`; every other forward, and every forward with the knob unset, keeps
+/// `stage_min_rows` exactly.
+pub(crate) fn ep_lane_stage_min_rows(
+    stage_min_rows: usize,
+    knob: Option<usize>,
+    ep_lane_tile: bool,
+    resident_call_limit: Option<usize>,
+) -> usize {
+    match knob {
+        Some(rows) if ep_lane_tile => rows.max(ep_lane_stage_floor(resident_call_limit)),
+        _ => stage_min_rows,
+    }
+}
+
+/// The route one EP lane prefill tile took on this rank, kept for the `HIPFIRE_CB_PHASES`
+/// per-tile line (`[fn-lane-tile]`); it never feeds a decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaneTileNote {
+    /// Rows of the tile.
+    pub(crate) rows: usize,
+    /// The tile ran the owner-routed compact route (tile exchange); `false`: the EP full table
+    /// (every expert of both ranks read through this rank's links).
+    pub(crate) tile_exchange: bool,
+    /// The tile staged the host experts through the expert stage.
+    pub(crate) staged: bool,
+    /// The row threshold the tile compared with (`None`: this load has no expert stage).
+    pub(crate) stage_min_rows: Option<usize>,
+}
+
+impl LaneTileNote {
+    /// Short route label of the per-tile line.
+    pub(crate) fn label(&self) -> &'static str {
+        match (self.tile_exchange, self.staged) {
+            (_, true) => "tile+stage",
+            (true, false) => "tile",
+            (false, false) => "full-table",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Plan geometry (pure)
 // ---------------------------------------------------------------------------
 
@@ -1411,13 +1491,10 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         let n = tokens.len();
-        let (resident_rows, prompt_rows) = {
+        let resident_rows = {
             let reserve = self.ep_reserve.as_ref().expect("an EP reserve forward");
             reserve.check()?;
-            (
-                reserve.banks.resident_call_limit(),
-                reserve.banks.prompt_rows(),
-            )
+            reserve.banks.resident_call_limit()
         };
         let route = if n > resident_rows {
             // The same decision `forward_chunk_scoped` takes, under the same scopes.
@@ -1435,6 +1512,50 @@ impl Qwen4GpuForward {
         } else {
             EpBankRoute::TileExchange
         };
+        // A lane PREFILL tile is the singleton chunk program on a lane state
+        // (`with_lane`, `lane_scope`), so it borrows exactly as a singleton
+        // prompt tile does; only a device-argmax decode or a mesh segment is
+        // refused. Lane DECODE steps never reach here (`forward_lanes` enters
+        // through [`Self::ep_reserve_lane_step_enter`]).
+        let no_borrow = argmax_of.is_some() || self.mesh_route_rows.is_some();
+        self.ep_reserve_call(gpu, n, route, no_borrow, |this, gpu| {
+            this.forward_chunk_tile(
+                bundle,
+                gpu,
+                tokens,
+                argmax_of,
+                logits,
+                top1,
+                wide_hidden_capture,
+                output_policy,
+            )
+        })
+    }
+
+    /// The EP reserve bank switch around one forward call of `n` rows whose sealed
+    /// route is `route` (the body [`Self::ep_reserve_forward_chunk`] runs for a
+    /// singleton chunk, and `forward_wave` for a prefill wave): plan the call
+    /// against the epoch (a wide Full-table call is refused before anything is
+    /// written), restore globally first when the plan says so, acquire the borrowed
+    /// epoch, select and swap the bank and the borrowed runtime view, run `run`,
+    /// and swap everything back on every return path. `no_borrow`: the call may
+    /// not run on the borrowed bank (a device-argmax or mesh forward).
+    pub(crate) fn ep_reserve_call(
+        &mut self,
+        gpu: &mut Gpu,
+        n: usize,
+        route: EpBankRoute,
+        no_borrow: bool,
+        run: impl FnOnce(&mut Self, &mut Gpu) -> Result<(), Qwen4GpuForwardError>,
+    ) -> Result<(), Qwen4GpuForwardError> {
+        let (resident_rows, prompt_rows) = {
+            let reserve = self.ep_reserve.as_ref().expect("an EP reserve forward");
+            reserve.check()?;
+            (
+                reserve.banks.resident_call_limit(),
+                reserve.banks.prompt_rows(),
+            )
+        };
         let plan = self
             .ep_reserve
             .as_ref()
@@ -1442,14 +1563,7 @@ impl Qwen4GpuForward {
             .epoch
             .plan_call(n, resident_rows, prompt_rows, route)
             .map_err(invalid)?;
-        // A lane PREFILL tile is the singleton chunk program on a lane state
-        // (`with_lane`, `lane_scope`), so it borrows exactly as a singleton
-        // prompt tile does; only a device-argmax decode or a mesh segment is
-        // refused. Lane DECODE steps never reach here (`forward_lanes` enters
-        // through [`Self::ep_reserve_lane_step_enter`]).
-        if plan.bank == EpBankKind::Borrowed
-            && (argmax_of.is_some() || self.mesh_route_rows.is_some())
-        {
+        if plan.bank == EpBankKind::Borrowed && no_borrow {
             return Err(invalid(
                 "an argmax or mesh forward cannot run on the borrowed EP reserve bank",
             ));
@@ -1466,16 +1580,7 @@ impl Qwen4GpuForward {
                 reserve.poison(error.to_string());
                 return Err(error);
             }
-            let result = self.forward_chunk_tile(
-                bundle,
-                gpu,
-                tokens,
-                argmax_of,
-                logits,
-                top1,
-                wide_hidden_capture,
-                output_policy,
-            );
+            let result = run(self, gpu);
             self.ep_reserve_note_result(&result);
             return result;
         }
@@ -1492,16 +1597,7 @@ impl Qwen4GpuForward {
         }
         self.borrow_runtimes_active = true;
         self.borrow_view = 0;
-        let result = self.forward_chunk_tile(
-            bundle,
-            gpu,
-            tokens,
-            argmax_of,
-            logits,
-            top1,
-            wide_hidden_capture,
-            output_policy,
-        );
+        let result = run(self, gpu);
         self.borrow_runtimes_active = false;
         let reserve = self.ep_reserve.as_mut().expect("an EP reserve forward");
         let swapped = reserve.banks.swap_out(&mut self.scratch).map(|_| ());
@@ -2625,5 +2721,167 @@ mod tests {
         // a wide launch whose routing rows are a few-row count is not a verify window (its
         // routing rows differ from its launch rows): it takes the chunk route
         assert!(ep_trunk_partial_chunk(true, 4096, 8, true));
+    }
+
+    #[test]
+    fn lane_stage_knob_is_an_integer_of_at_least_two() {
+        for value in [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("-5"),
+            Some("0"),
+            Some("1"),
+            Some("5.5"),
+        ] {
+            assert_eq!(ep_lane_stage_knob_from(value), None, "{value:?}");
+        }
+        assert_eq!(ep_lane_stage_knob_from(Some("2")), Some(2));
+        assert_eq!(ep_lane_stage_knob_from(Some(" 513 ")), Some(513));
+        assert_eq!(ep_lane_stage_knob_from(Some("2048")), Some(2048));
+    }
+
+    #[test]
+    fn lane_stage_floor_is_the_owner_routed_route_and_the_resident_bank() {
+        // No reserve: only the owner-routed route's 512 routing rows bound it.
+        assert_eq!(ep_lane_stage_floor(None), 512);
+        // A reserve load: strictly above the resident bank's call limit.
+        assert_eq!(ep_lane_stage_floor(Some(RESIDENT)), 513);
+        // A call limit lowered below the route floor never lowers the floor under it.
+        assert_eq!(ep_lane_stage_floor(Some(RESIDENT - 1)), 512);
+        assert_eq!(ep_lane_stage_floor(Some(0)), 512);
+        // A larger resident bank raises it; the sum saturates.
+        assert_eq!(ep_lane_stage_floor(Some(2048)), 2049);
+        assert_eq!(ep_lane_stage_floor(Some(usize::MAX)), usize::MAX);
+    }
+
+    #[test]
+    fn lane_stage_threshold_is_exactly_the_stage_s_without_the_knob_or_off_a_lane_tile() {
+        for stage_min_rows in [2, 511, 512, 513, 768, 1536, 2048, 4096] {
+            for resident in [None, Some(0), Some(RESIDENT), Some(4096)] {
+                // Knob unset: today's threshold, lane tile or not.
+                for lane in [false, true] {
+                    assert_eq!(
+                        ep_lane_stage_min_rows(stage_min_rows, None, lane, resident),
+                        stage_min_rows
+                    );
+                }
+                // Knob set, not a lane tile (singleton prefill, decode, verify): unchanged.
+                for knob in [2, 256, 513, 1024, 4096] {
+                    assert_eq!(
+                        ep_lane_stage_min_rows(stage_min_rows, Some(knob), false, resident),
+                        stage_min_rows
+                    );
+                }
+            }
+        }
+    }
+
+    /// Whether a tile of `rows` stages on the rows axis (the call site's `n >= threshold`).
+    fn stages(rows: usize, stage_min: usize, knob: Option<usize>, resident: Option<usize>) -> bool {
+        rows >= ep_lane_stage_min_rows(stage_min, knob, true, resident)
+    }
+
+    #[test]
+    fn lane_stage_decision_table_rows_axis() {
+        const STAGE_MIN: usize = 2048;
+        // (resident call limit: none = ordinary / slab load, Some = decoupled reserve)
+        // Knob unset: a lane tile stages from the stage's 2048 rows, exactly as a singleton.
+        for resident in [None, Some(RESIDENT)] {
+            assert!(!stages(2047, STAGE_MIN, None, resident));
+            assert!(stages(2048, STAGE_MIN, None, resident));
+            assert!(stages(4096, STAGE_MIN, None, resident));
+        }
+        // Ordinary / slab load, knob 256 (below the route floor): the floor is 512.
+        assert!(!stages(149, STAGE_MIN, Some(256), None));
+        assert!(!stages(511, STAGE_MIN, Some(256), None));
+        assert!(stages(512, STAGE_MIN, Some(256), None));
+        assert!(stages(2047, STAGE_MIN, Some(256), None));
+        // Decoupled reserve (unit stage or S2 donors), knob 256: the floor is the bank limit + 1.
+        assert!(!stages(512, STAGE_MIN, Some(256), Some(RESIDENT)));
+        assert!(stages(513, STAGE_MIN, Some(256), Some(RESIDENT)));
+        // Knob above the floor is authoritative, below and above the stage's own threshold.
+        for resident in [None, Some(RESIDENT)] {
+            assert!(!stages(1023, STAGE_MIN, Some(1024), resident));
+            assert!(stages(1024, STAGE_MIN, Some(1024), resident));
+            assert!(!stages(2048, STAGE_MIN, Some(4096), resident));
+            assert!(stages(4096, STAGE_MIN, Some(4096), resident));
+        }
+        // Decode, verify and every serve-shaped lane prompt (60..150 rows, the C8 story / code
+        // cells) are below every floor: the knob never reaches them.
+        for rows in [1, 2, 8, 9, 60, 149, 256, 511] {
+            for knob in [2, 64, 256, 512] {
+                for resident in [None, Some(RESIDENT)] {
+                    assert!(
+                        !stages(rows, STAGE_MIN, Some(knob), resident),
+                        "{rows} {knob}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lane_stage_threshold_never_serves_the_resident_bank_on_any_reserve_plan_kind() {
+        // The two reserve plan kinds `ep_reserve_stage_refusal` admits: a suffix plan with the S2
+        // donors (the release default) and an explicit-donor plan served by the unit stage (D1).
+        let suffix = plan();
+        let explicit = explicit_plan();
+        assert!(!suffix.explicit_donors && explicit.explicit_donors);
+        // The stage facts each plan kind's built stage reports.
+        let facts = |plan: &EpReservePlan, min_rows| {
+            if plan.explicit_donors {
+                EpReserveStageFacts {
+                    first_host: 0,
+                    donors: [usize::MAX; 2],
+                    min_rows,
+                    serves_donor_layers: true,
+                }
+            } else {
+                EpReserveStageFacts {
+                    first_host: 26,
+                    donors: [24, 25],
+                    min_rows,
+                    serves_donor_layers: false,
+                }
+            }
+        };
+        for (name, plan) in [("S2 donors", &suffix), ("unit stage", &explicit)] {
+            // The stage's own threshold is admitted as built.
+            assert_eq!(
+                ep_reserve_stage_refusal(plan, RESIDENT, &facts(plan, 2048)),
+                None,
+                "{name}"
+            );
+            for knob in [2, 64, 256, 511, 512, 513, 1024, 2047, 2048, 4096, 1 << 20] {
+                let threshold = ep_lane_stage_min_rows(2048, Some(knob), true, Some(RESIDENT));
+                // A lane tile of at most the resident bank's rows never stages ...
+                assert!(threshold > RESIDENT, "{name} knob {knob}: {threshold}");
+                assert!(
+                    !stages(RESIDENT, 2048, Some(knob), Some(RESIDENT)),
+                    "{name} {knob}"
+                );
+                // ... so the stage the lane threshold produces is the borrowed-only stage the
+                // reserve admission requires.
+                assert_eq!(
+                    ep_reserve_stage_refusal(plan, RESIDENT, &facts(plan, threshold)),
+                    None,
+                    "{name} knob {knob}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lane_tile_note_labels_the_three_routes() {
+        let note = |tile_exchange, staged| LaneTileNote {
+            rows: 149,
+            tile_exchange,
+            staged,
+            stage_min_rows: Some(2048),
+        };
+        assert_eq!(note(false, false).label(), "full-table");
+        assert_eq!(note(true, false).label(), "tile");
+        assert_eq!(note(true, true).label(), "tile+stage");
     }
 }
