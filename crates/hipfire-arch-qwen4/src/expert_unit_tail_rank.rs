@@ -21,7 +21,10 @@
 //!
 //! * [`UnitTailRank::note_call`] (the row-gather hook, once per MoE layer
 //!   call): a stream-ordered D2D of the call's routed ids into the log.
-//! * [`UnitTailRank::step_end`] (after the window's forward and its D2H sync):
+//! * [`UnitTailRank::step_end`] (after the window's forward and its D2H sync): the retirement
+//!   cadence ([`crate::expert_unit_tail::RetireCadence`]) decides from the window's routed-id
+//!   count (rank-independent) whether this window ends a group; if not it returns at once (no
+//!   sync, no D2H) and the next window keeps appending to the log. At a group end:
 //!   one D2H of the log, the window's distinct units against the slots live at
 //!   its START, then [`crate::expert_unit_tail::TailPolicy::retire`], the touched
 //!   tables' upload on the compute stream, and only then the new fills on the
@@ -48,8 +51,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::expert_ep_units::EpUnitPlan;
 use crate::expert_unit_tail::{
-    EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, Retire, TailPolicy, UnitKey,
-    WindowUse, QUARANTINE_WINDOWS,
+    EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, Retire, RetireCadence, TailPolicy,
+    UnitKey, WindowUse, QUARANTINE_WINDOWS,
 };
 
 /// Ids one window's log holds (`calls x slots`); a window past this stops
@@ -435,6 +438,13 @@ struct Inner {
     log_host: Vec<u8>,
     log_used: usize,
     calls: Vec<(u16, u32, u32)>,
+    /// Which windows retire ([`RetireCadence`]); fed only by `window_routed`, never by anything
+    /// this rank logged.
+    cadence: RetireCadence,
+    /// Routed ids (`slots`, summed) of the trunk gather calls since the last `step_end`, counted
+    /// before any rank-local filter, and whether the window made any such call.
+    window_routed: u64,
+    window_seen: bool,
     /// Scratch of one retirement: slot reads per `layer * experts + expert` and the indices
     /// touched (so the per-window pass never hashes or clears the whole array).
     reads: Vec<u32>,
@@ -493,6 +503,7 @@ impl UnitTailRank {
         let geometry = *plan.geometry();
         let experts = geometry.experts_per_layer;
         let ranks = geometry.ranks;
+        let retire_ids = crate::expert_unit_tail::ep_unit_tail_retire_ids()?;
         let ranking = plan
             .ranking_order()
             .ok_or("the unit plan carries no ranking (a whole-layers plan has no tail)")?;
@@ -681,6 +692,9 @@ impl UnitTailRank {
             log_host: vec![0u8; LOG_IDS * 4],
             log_used: 0,
             calls: Vec::new(),
+            cadence: RetireCadence::new(retire_ids, LOG_IDS as u64),
+            window_routed: 0,
+            window_seen: false,
             reads: vec![0u32; geometry.layers * experts],
             touched: Vec::new(),
             overflowed: 0,
@@ -719,7 +733,7 @@ impl UnitTailRank {
         eprintln!(
             "qwen4 EP rank {rank}: D2 tail on: {slots} evictable slots ({} MiB pool) over {} mixed layers \
              on static owners (pinned owners are off while the tail is on), \
-             {} warm units published, F={} fills/window{}{}",
+             {} warm units published, F={} fills/window{}{}; retires every {} routed ids or {} windows",
             ((slots * (gub + dnb)) >> 20),
             state.layers.len(),
             seeds.len(),
@@ -729,7 +743,9 @@ impl UnitTailRank {
             } else {
                 String::new()
             },
-            if freeze { ", FROZEN (no admission)" } else { "" }
+            if freeze { ", FROZEN (no admission)" } else { "" },
+            retire_ids,
+            crate::expert_unit_tail::RETIRE_MAX_WINDOWS
         );
         if full_layers > 0 {
             eprintln!(
@@ -743,9 +759,11 @@ impl UnitTailRank {
                 "qwen4 EP rank {rank}: D2 tail PEER slots on: the full (chunk) tables also follow the slot \
                  publications of the {} peer rank(s) for the peer-owned entries equal to the owner's canonical \
                  ones (a full-table prefill reads a peer's live slot over P2P, not the peer's pinned host arena); \
-                 an evicted slot is quarantined until every peer's table dropped it (at most {} slots)",
+                 an evicted slot is quarantined until every peer's table dropped it (at most {} slots, {} \
+                 after a full group of windows)",
                 ranks - 1,
-                QUARANTINE_WINDOWS * config.fill_per_step
+                QUARANTINE_WINDOWS * config.fill_per_step,
+                QUARANTINE_WINDOWS * config.fill_per_step * crate::expert_unit_tail::FILL_GROUP_CAP
             );
         }
         Ok(Self {
@@ -765,6 +783,7 @@ impl UnitTailRank {
         if inner.frozen.is_some() || inner.released {
             inner.calls.clear();
             inner.log_used = 0;
+            inner.reset_group();
             return;
         }
         if let Err(error) = inner.step_end(gpu) {
@@ -972,6 +991,13 @@ impl Inner {
 
     fn note_call(&mut self, gpu: &mut Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
         let layer = layer_idx as usize;
+        // The cadence's input: every rank enters this call with the same `slots` (the extent of
+        // the cross-rank row exchange), so this count is counted before any rank-local early
+        // return below.
+        if layer < self.trunk_layers && slots > 0 {
+            self.window_routed += slots as u64;
+            self.window_seen = true;
+        }
         if self.frozen.is_some()
             || self.released
             || layer >= self.trunk_layers
@@ -1006,7 +1032,25 @@ impl Inner {
         }
     }
 
+    /// Forget the accumulated group (the tail froze or was released).
+    fn reset_group(&mut self) {
+        self.window_routed = 0;
+        self.window_seen = false;
+        self.cadence.clear();
+    }
+
     fn step_end(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if !self.window_seen {
+            return Ok(());
+        }
+        // The cadence: a window that does not complete a group returns at once (no stream sync,
+        // no D2H); its ids stay in the log for the group's retirement. The decision reads the
+        // routed-id sequence only, which is identical on every rank.
+        let routed = std::mem::take(&mut self.window_routed);
+        self.window_seen = false;
+        let Some(windows) = self.cadence.window_end(routed) else {
+            return Ok(());
+        };
         if self.calls.is_empty() {
             return Ok(());
         }
@@ -1084,17 +1128,24 @@ impl Inner {
         let retire = match self.peer.clone() {
             Some(board) => {
                 let owner = self.rank;
-                self.policy
-                    .retire_peer((core_distinct, core_reads), &window, &completed, |m| {
-                        board.released_through(owner, m)
-                    })
+                self.policy.retire_peer_windows(
+                    (core_distinct, core_reads),
+                    &window,
+                    &completed,
+                    windows,
+                    |m| board.released_through(owner, m),
+                )
             }
-            None => self
-                .policy
-                .retire((core_distinct, core_reads), &window, &completed),
+            None => self.policy.retire_windows(
+                (core_distinct, core_reads),
+                &window,
+                &completed,
+                windows,
+            ),
         };
-        // This retirement's index (the retirement counters of all ranks are one clock).
-        let j = self.policy.stats().windows;
+        // This retirement's index (the retirement counters of all ranks are one clock: the
+        // ranks retire the same groups of windows).
+        let j = self.policy.stats().retirements;
         let t_retire = Instant::now();
 
         // Tables first (publish -> slot, evict -> canonical), then the copies.
@@ -1197,7 +1248,7 @@ impl Inner {
         self.retire_ns += (t_retire - t_log).as_nanos() as u64;
         self.upload_ns += (t_upload - t_retire).as_nanos() as u64;
         self.fill_ns += (t_end - t_upload).as_nanos() as u64;
-        if self.log_enabled && self.policy.stats().windows % LOG_EVERY == 0 {
+        if self.log_enabled && self.policy.stats().retirements % LOG_EVERY == 0 {
             self.print_line("window");
         }
         Ok(())
@@ -1279,11 +1330,13 @@ impl Inner {
         }
         self.calls.clear();
         self.log_used = 0;
+        self.reset_group();
     }
 
     fn print_line(&self, tag: &str) {
         let s = self.policy.stats();
         let w = s.windows.max(1) as f64;
+        let r = s.retirements.max(1) as f64;
         let total = (s.core_reads + s.tail_reads + s.host_reads).max(1) as f64;
         let unit_mb = (self.gate_up_bytes + self.down_bytes) as f64 / 1e6;
         let unix_ms = std::time::SystemTime::now()
@@ -1302,13 +1355,16 @@ impl Inner {
             String::new()
         };
         eprintln!(
-            "[unit-tail] rank {} {tag} windows {} reads/window {:.1}: core {:.2}% tail {:.2}% host {:.2}% \
-             (slot hit {:.2}%, distinct hit {:.2}%) host distinct/window {:.2} ({:.3} MB) \
+            "[unit-tail] rank {} {tag} windows {} retirements {} (group {:.2} windows, pending {}) reads/window {:.1}: core {:.2}% tail {:.2}% host {:.2}% \
+             (slot hit {:.2}%, distinct hit {:.2}%) host distinct/window {:.2} ({:.3} MB) /retirement {:.2} \
              fills {} published {} evictions {}{} skipped {} stale {} live {}/{} late-in-flight {} \
-             host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} ({} layer uploads: {} H2D calls, {} B){} \
-             | raw unix_ms={unix_ms} unit_bytes={} core_reads={} tail_reads={} host_reads={} core_distinct={} tail_distinct={} host_distinct={} fills_issued={}",
+             host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} (us/retirement: {:.0} {:.0} {:.0} {:.0}) ({} layer uploads: {} H2D calls, {} B){} \
+             | raw unix_ms={unix_ms} retirements={} unit_bytes={} core_reads={} tail_reads={} host_reads={} core_distinct={} tail_distinct={} host_distinct={} fills_issued={}",
             self.rank,
             s.windows,
+            s.retirements,
+            w / r,
+            self.cadence.pending(),
             total / w,
             100.0 * s.core_reads as f64 / total,
             100.0 * s.tail_reads as f64 / total,
@@ -1317,6 +1373,7 @@ impl Inner {
             100.0 * s.distinct_hit(),
             s.host_distinct as f64 / w,
             s.host_distinct as f64 / w * unit_mb,
+            s.host_distinct as f64 / r,
             s.fills_issued,
             s.fills_published,
             s.evictions,
@@ -1332,12 +1389,17 @@ impl Inner {
             self.retire_ns as f64 / w / 1e3,
             self.upload_ns as f64 / w / 1e3,
             self.fill_ns as f64 / w / 1e3,
+            self.log_ns as f64 / r / 1e3,
+            self.retire_ns as f64 / r / 1e3,
+            self.upload_ns as f64 / r / 1e3,
+            self.fill_ns as f64 / r / 1e3,
             self.uploads,
             self.upload_calls,
             self.upload_bytes,
             self.frozen
                 .as_ref()
                 .map_or(String::new(), |why| format!(" FROZEN: {why}")),
+            s.retirements,
             self.gate_up_bytes + self.down_bytes,
             s.core_reads,
             s.tail_reads,
@@ -1395,7 +1457,8 @@ mod tests {
         live_slot_units, peer_shared, DirtyRange, LiveSlot, ENTRY_BYTES,
     };
     use crate::expert_unit_tail::{
-        EpUnitTailConfig, PeerBoard, PeerDelta, SlotPhase, TailPolicy, UnitKey, WindowUse,
+        EpUnitTailConfig, PeerBoard, PeerDelta, RetireCadence, SlotPhase, TailPolicy, UnitKey,
+        WindowUse,
     };
     use std::collections::HashMap;
 
@@ -1781,7 +1844,7 @@ mod tests {
 
         /// One rank's retirement of window `w`, in the production order: its policy step, its
         /// post, its fills, then the take / apply / upload / ack of the peers' deltas.
-        fn retire(&mut self, r: usize, w: u64) -> Result<(), String> {
+        fn retire(&mut self, r: usize, w: u64, windows: u32) -> Result<(), String> {
             let Sim {
                 ranks,
                 board,
@@ -1793,7 +1856,7 @@ mod tests {
             // The window's reads of this rank's own units, skewed to a drifting hot set.
             let owned = SIM_EXPERTS as usize / SIM_RANKS;
             let mut uses: Vec<WindowUse> = Vec::new();
-            for _ in 0..8 {
+            for _ in 0..8 * windows {
                 let layer = (rand(rng) % SIM_LAYERS as u64) as u16;
                 let idx = if rand(rng) % 3 != 0 {
                     (rand(rng) as usize % 4 + (w / 40) as usize) % owned
@@ -1824,11 +1887,15 @@ mod tests {
             let retire = if *quarantine {
                 ranks[r]
                     .policy
-                    .retire_peer((0, 0), &uses, &completed, |m| board.released_through(r, m))
+                    .retire_peer_windows((0, 0), &uses, &completed, windows, |m| {
+                        board.released_through(r, m)
+                    })
             } else {
-                ranks[r].policy.retire((0, 0), &uses, &completed)
+                ranks[r]
+                    .policy
+                    .retire_windows((0, 0), &uses, &completed, windows)
             };
-            let j = ranks[r].policy.stats().windows;
+            let j = ranks[r].policy.stats().retirements;
             if j != w {
                 return Err(format!("rank {r}: retirement {j} at window {w}"));
             }
@@ -1960,6 +2027,31 @@ mod tests {
         }
     }
 
+    /// The retirement schedule of `windows` decode windows under the cadence: both ranks run
+    /// their own [`RetireCadence`] over the same routed-id sequence (the windows' `slots` sums;
+    /// NOT what either rank logged) and must retire the same groups.
+    fn cadence_schedule(seed: u64, windows: u64, retire_ids: u64) -> Result<Vec<u32>, String> {
+        let mut state = seed | 1;
+        let mut cadences = [
+            RetireCadence::new(retire_ids, 1 << 18),
+            RetireCadence::new(retire_ids, 1 << 18),
+        ];
+        let mut groups = Vec::new();
+        for window in 1..=windows {
+            // 64 ids (a C1 AR step) .. 3000 (a C8 verify window).
+            let routed = 64 + rand(&mut state) % 2900;
+            let decided = [
+                cadences[0].window_end(routed),
+                cadences[1].window_end(routed),
+            ];
+            if decided[0] != decided[1] {
+                return Err(format!("window {window}: ranks decided {decided:?}"));
+            }
+            groups.extend(decided[0]);
+        }
+        Ok(groups)
+    }
+
     fn run_sim(
         t: usize,
         f: usize,
@@ -1968,9 +2060,22 @@ mod tests {
         seed: u64,
         windows: u64,
     ) -> Result<SimTotals, String> {
+        run_sim_groups(t, f, b, quarantine, seed, &vec![1; windows as usize])
+    }
+
+    /// `groups[k]`: the windows of the `k`th retirement (both ranks retire the same groups).
+    fn run_sim_groups(
+        t: usize,
+        f: usize,
+        b: u32,
+        quarantine: bool,
+        seed: u64,
+        groups: &[u32],
+    ) -> Result<SimTotals, String> {
         let mut sim = Sim::new(t, f, b, quarantine, seed);
         sim.check()?;
-        for w in 1..=windows {
+        for (k, &windows) in groups.iter().enumerate() {
+            let w = k as u64 + 1;
             // Both ranks retire every window; which one goes first is arbitrary.
             let order = if rand(&mut sim.rng) & 1 == 0 {
                 [0, 1]
@@ -1978,7 +2083,7 @@ mod tests {
                 [1, 0]
             };
             for r in order {
-                sim.retire(r, w)?;
+                sim.retire(r, w, windows)?;
                 sim.check()?;
             }
         }
@@ -2016,6 +2121,52 @@ mod tests {
         }
         // The runs exercised the protocol: units got published, peers' images followed them,
         // slots were evicted into quarantine and refilled after the acks.
+        assert!(
+            totals.published > 0 && totals.image_changes > 0,
+            "{totals:?}"
+        );
+        assert!(
+            totals.evictions > 0 && totals.quarantined_refills > 0,
+            "{totals:?}"
+        );
+    }
+
+    /// The same safety property when the ranks retire GROUPS of windows: the groups come from
+    /// two cadences fed the same routed-id sequence (they must agree), each retirement judges a
+    /// group of up to 8 windows with a fill budget of up to 4F, and the quarantine bound scales
+    /// with that budget.
+    #[test]
+    fn grouped_retirements_keep_the_peer_quarantine_safe() {
+        let mut totals = SimTotals::default();
+        let mut grouped = 0usize;
+        for (t, f, b) in [
+            (4usize, 2usize, 1u32),
+            (6, 3, 1),
+            (3, 1, 1),
+            (5, 2, 2),
+            (10, 4, 1),
+            (8, 8, 1),
+        ] {
+            for seed in [
+                0x9e37_79b9_7f4a_7c15u64,
+                0x2545_f491_4f6c_dd1d,
+                0x1234_5678_9abc_def1,
+            ] {
+                for retire_ids in [4096u64, 12_000, 40_000] {
+                    let groups = cadence_schedule(seed, 600, retire_ids).unwrap();
+                    grouped += groups.iter().filter(|&&n| n > 1).count();
+                    let run =
+                        run_sim_groups(t, f, b, true, seed, &groups).unwrap_or_else(|error| {
+                            panic!("T={t} F={f} b={b} ids={retire_ids} seed={seed:#x}: {error}")
+                        });
+                    totals.evictions += run.evictions;
+                    totals.quarantined_refills += run.quarantined_refills;
+                    totals.image_changes += run.image_changes;
+                    totals.published += run.published;
+                }
+            }
+        }
+        assert!(grouped > 0, "no retirement covered more than one window");
         assert!(
             totals.published > 0 && totals.image_changes > 0,
             "{totals:?}"

@@ -23,9 +23,13 @@
 //!
 //! One *window* is one trunk forward over every lane's sealed rows (an AR step
 //! or a verify window of any row-group count). Hits are judged against the
-//! slots published at the START of the window; the policy runs only at the
-//! window's retirement ([`TailPolicy::retire`]), so a window sees ONE table
-//! state. A slot is overwritten only after its previous unit was repointed to
+//! slots published at the START of the window; the policy runs only at a
+//! retirement ([`TailPolicy::retire`]), so a window sees ONE table
+//! state. A retirement normally covers one window; with the retirement cadence
+//! ([`RetireCadence`]) it covers a group of consecutive windows (up to
+//! [`RETIRE_MAX_WINDOWS`]) that all saw the one table state of the group's start, judged
+//! together ([`TailPolicy::retire_windows`]: a unit any window of the group read is never a
+//! victim; the fill budget is `F x windows`, at most `F x `[`FILL_GROUP_CAP`]). A slot is overwritten only after its previous unit was repointed to
 //! canonical by the table upload that precedes the copy, and a fill is
 //! published only after its copy completed ([`TailPolicy::retire`]'s
 //! `completed`); a stale (older generation) completion is ignored.
@@ -55,8 +59,20 @@
 //!   candidate that triggered the eviction waits for a released slot). It becomes free at an owner
 //!   retirement `m` only when, for EVERY peer `r`, some ack of `r` has `applied >= k` and `m >=
 //!   j + 1` for the `j` it was recorded at ([`PeerBoard::released_through`]). At most
-//!   [`QUARANTINE_WINDOWS`]` x F` slots are quarantined at once, so a peer that never acknowledges
+//!   [`QUARANTINE_WINDOWS`]` x ` (this retirement's fill budget, `F` per window of its group) slots
+//!   are quarantined at once, so a peer that never acknowledges
 //!   (frozen, released) cannot drain the pool; candidates that find no victim are `skipped`.
+//!
+//! Cadence. With the retirement cadence ([`RetireCadence`]) a retirement ends a GROUP of windows
+//! and "window `j + 1`" below means the first window after the group retired at `j`; the
+//! argument is otherwise word for word the same, because it only uses (a) that every rank
+//! retires the same groups in the same order (the retirement counters are one clock) and (b)
+//! that retirement `j` of `r` precedes `r`'s next window's forward and retirement `m` of the owner
+//! follows a forward of a LATER window. (a) holds because the decision to retire at a window end
+//! is a function of the routed-id sequence of the windows (the sum of the cross-rank exchange's
+//! `slots`, [`RetireCadence`]'s rank-independent rule), which every rank sees identically; it
+//! never reads a rank-local count (logged ids differ per rank). A window that does not complete
+//! a group does nothing on the device, so no table or slot changes inside a group.
 //!
 //! Why a refill never changes bytes a peer can still read as another unit. A peer image entry
 //! names slot `S` for unit `U` only from the peer's apply of the publication of `(U, S)` until its
@@ -121,6 +137,19 @@ pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
 pub const EP_UNIT_TAIL_STAGE_GAP_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_STAGE_GAP";
 /// Default of [`EP_UNIT_TAIL_STAGE_GAP_ENV`].
 pub const EP_UNIT_TAIL_STAGE_GAP_DEFAULT: usize = 8;
+
+/// `N` routed ids (default [`EP_UNIT_TAIL_RETIRE_IDS_DEFAULT`]): `step_end` retires the tail's
+/// window log only once the windows since the last retirement carry at least `N` routed ids
+/// (rows x top-k x MoE calls, see [`RetireCadence`]) or [`RETIRE_MAX_WINDOWS`] windows have
+/// accumulated; a window that does not complete a group returns at once (no stream sync, no D2H)
+/// and the next one keeps appending to the log. `0` = retire every window.
+pub const EP_UNIT_TAIL_RETIRE_IDS_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_RETIRE_IDS";
+/// Default of [`EP_UNIT_TAIL_RETIRE_IDS_ENV`].
+pub const EP_UNIT_TAIL_RETIRE_IDS_DEFAULT: u64 = 4096;
+/// A group never accumulates more windows than this.
+pub const RETIRE_MAX_WINDOWS: u32 = 8;
+/// A retirement of `n` windows may start `F x min(n, FILL_GROUP_CAP)` fills.
+pub const FILL_GROUP_CAP: usize = 4;
 
 /// One MiB.
 const MIB: u64 = 1 << 20;
@@ -204,6 +233,98 @@ pub fn parse_stage_gap(raw: Option<&str>) -> Result<usize, String> {
         Some(raw) => raw.parse::<usize>().map_err(|_| {
             format!("{EP_UNIT_TAIL_STAGE_GAP_ENV}={raw}: expected a non-negative integer (units)")
         }),
+    }
+}
+
+/// Parse [`EP_UNIT_TAIL_RETIRE_IDS_ENV`]: unset or empty = the default, else a non-negative
+/// integer.
+pub fn parse_retire_ids(raw: Option<&str>) -> Result<u64, String> {
+    match raw.map(str::trim).filter(|raw| !raw.is_empty()) {
+        None => Ok(EP_UNIT_TAIL_RETIRE_IDS_DEFAULT),
+        Some(raw) => raw.parse::<u64>().map_err(|_| {
+            format!(
+                "{EP_UNIT_TAIL_RETIRE_IDS_ENV}={raw}: expected a non-negative integer (routed ids)"
+            )
+        }),
+    }
+}
+
+/// The retirement cadence threshold ([`EP_UNIT_TAIL_RETIRE_IDS_ENV`]) of this process.
+pub fn ep_unit_tail_retire_ids() -> Result<u64, String> {
+    parse_retire_ids(
+        hipfire_config::developer_var(EP_UNIT_TAIL_RETIRE_IDS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The retirement cadence: which window ends retire the tail's accumulated log.
+///
+/// # The rule (rank-independent)
+///
+/// Every window reports `routed`, the sum of the `slots` argument (routed rows x top-k) of its
+/// trunk MoE gather calls, counted in the row-gather hook BEFORE anything rank-local (a frozen
+/// tail, a short top-k buffer, a log overflow, the experts a rank holds) can change what the
+/// rank logs. `slots` is the extent of the cross-rank row exchange of that call, which every
+/// rank enters with the same value, so every rank feeds [`Self::window_end`] the same sequence
+/// and decides identically. The group retires at the window end when, after adding the window,
+///
+/// * its routed ids reach `retire_ids`, or
+/// * it holds [`RETIRE_MAX_WINDOWS`] windows, or
+/// * the next window could overflow the log: routed ids so far plus the LARGEST window seen
+///   exceed `log_ids` (the log holds one id per routed id, so the routed total bounds the logged
+///   total from above and the check is conservative on every rank).
+///
+/// Only retirements move the tail's tables, so every retirement counter of the peer-visibility
+/// protocol (module docs) stays one clock across ranks.
+#[derive(Clone, Debug)]
+pub struct RetireCadence {
+    retire_ids: u64,
+    log_ids: u64,
+    windows: u32,
+    routed: u64,
+    largest: u64,
+}
+
+impl RetireCadence {
+    /// `retire_ids`: the threshold of [`EP_UNIT_TAIL_RETIRE_IDS_ENV`]; `log_ids`: the capacity
+    /// of one rank's usage log in ids.
+    pub fn new(retire_ids: u64, log_ids: u64) -> Self {
+        Self {
+            retire_ids,
+            log_ids,
+            windows: 0,
+            routed: 0,
+            largest: 0,
+        }
+    }
+
+    /// One window ended with `routed` routed ids. `Some(n)`: retire now, the group is `n`
+    /// windows (and the group is empty again); `None`: keep accumulating.
+    pub fn window_end(&mut self, routed: u64) -> Option<u32> {
+        self.windows += 1;
+        self.routed += routed;
+        self.largest = self.largest.max(routed);
+        let retire = self.routed >= self.retire_ids
+            || self.windows >= RETIRE_MAX_WINDOWS
+            || self.routed + self.largest > self.log_ids;
+        retire.then(|| {
+            let windows = self.windows;
+            self.windows = 0;
+            self.routed = 0;
+            windows
+        })
+    }
+
+    /// Windows accumulated since the last retirement.
+    pub fn pending(&self) -> u32 {
+        self.windows
+    }
+
+    /// Drop the accumulated group (the tail froze or was released).
+    pub fn clear(&mut self) {
+        self.windows = 0;
+        self.routed = 0;
     }
 }
 
@@ -293,7 +414,10 @@ pub struct WindowUse {
 /// Counters of the tail (cumulative).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TailStats {
+    /// Decode windows judged (a retirement judges every window of its group).
     pub windows: u64,
+    /// Retirements: the policy steps the tables, fills and the peer protocol count in.
+    pub retirements: u64,
     /// Slot reads / distinct units served by the static core.
     pub core_reads: u64,
     pub core_distinct: u64,
@@ -497,11 +621,26 @@ impl TailPolicy {
         window: &[WindowUse],
         completed: &[(usize, u64)],
     ) -> Retire {
+        self.retire_windows(core, window, completed, 1)
+    }
+
+    /// [`Self::retire`] of a GROUP of `windows` consecutive decode windows (the retirement
+    /// cadence, [`RetireCadence`]): `window` holds the distinct non-core units any window of
+    /// the group read (reads summed), judged against the slots live when the group started. A
+    /// unit read anywhere in the group is never a victim. The fill budget is `F x windows`
+    /// capped at `F x`[`FILL_GROUP_CAP`]; `windows == 1` is exactly [`Self::retire`].
+    pub fn retire_windows(
+        &mut self,
+        core: (u64, u64),
+        window: &[WindowUse],
+        completed: &[(usize, u64)],
+        windows: u32,
+    ) -> Retire {
         assert!(
             !self.peer,
             "a policy with peer quarantine retires through `retire_peer`"
         );
-        self.retire_inner(core, window, completed, 0)
+        self.retire_inner(core, window, completed, 0, windows)
     }
 
     /// [`Self::retire`] of a policy with peer quarantine. `released_through(m)` is asked once,
@@ -516,12 +655,30 @@ impl TailPolicy {
         completed: &[(usize, u64)],
         released_through: impl FnOnce(u64) -> u64,
     ) -> Retire {
+        self.retire_peer_windows(core, window, completed, 1, released_through)
+    }
+
+    /// [`Self::retire_peer`] of a group of `windows` windows ([`Self::retire_windows`]). The
+    /// retirement index `m` counts retirements, not windows: the ranks retire the same groups.
+    pub fn retire_peer_windows(
+        &mut self,
+        core: (u64, u64),
+        window: &[WindowUse],
+        completed: &[(usize, u64)],
+        windows: u32,
+        released_through: impl FnOnce(u64) -> u64,
+    ) -> Retire {
         assert!(
             self.peer,
             "`retire_peer` needs a policy with peer quarantine"
         );
         let through = released_through(self.window + 1);
-        self.retire_inner(core, window, completed, through)
+        self.retire_inner(core, window, completed, through, windows)
+    }
+
+    /// Fills one retirement of `windows` windows may have in flight in total.
+    fn fill_budget(&self, windows: u32) -> usize {
+        self.config.fill_per_step * (windows as usize).clamp(1, FILL_GROUP_CAP)
     }
 
     fn retire_inner(
@@ -530,10 +687,14 @@ impl TailPolicy {
         window: &[WindowUse],
         completed: &[(usize, u64)],
         released_through: u64,
+        windows: u32,
     ) -> Retire {
+        let windows = windows.max(1);
         self.window += 1;
         let now = self.window;
-        self.stats.windows += 1;
+        let windows_before = self.stats.windows;
+        self.stats.windows += windows as u64;
+        self.stats.retirements += 1;
         self.stats.core_distinct += core.0;
         self.stats.core_reads += core.1;
         let mut out = Retire::default();
@@ -591,13 +752,14 @@ impl TailPolicy {
             return out;
         }
         let boundary = self.config.boundary_every > 1;
-        if boundary && now % self.config.boundary_every as u64 != 0 {
+        // Boundary mode admits when the group crossed a multiple of N WINDOWS (with one window
+        // per retirement: every Nth window, as before).
+        let every = self.config.boundary_every as u64;
+        if boundary && (self.stats.windows / every) == (windows_before / every) {
             return out;
         }
-        let budget = self
-            .config
-            .fill_per_step
-            .saturating_sub(self.fills_in_flight());
+        let total_budget = self.fill_budget(windows);
+        let budget = total_budget.saturating_sub(self.fills_in_flight());
         if budget == 0 {
             return out;
         }
@@ -637,7 +799,7 @@ impl TailPolicy {
             let (slot, evicted) = if let Some(slot) = free.pop() {
                 (slot, None)
             } else {
-                if self.peer && quarantined >= QUARANTINE_WINDOWS * self.config.fill_per_step {
+                if self.peer && quarantined >= QUARANTINE_WINDOWS * total_budget {
                     self.stats.skipped_full += 1;
                     continue;
                 }
@@ -935,6 +1097,181 @@ impl PeerBoard {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn retire_ids_parses_a_count_and_defaults_to_4096() {
+        assert_eq!(parse_retire_ids(None), Ok(4096));
+        assert_eq!(parse_retire_ids(Some(" ")), Ok(4096));
+        assert_eq!(parse_retire_ids(Some("0")), Ok(0));
+        assert_eq!(parse_retire_ids(Some("12000")), Ok(12000));
+        assert!(parse_retire_ids(Some("-5")).is_err());
+        assert!(parse_retire_ids(Some("4k")).is_err());
+    }
+
+    /// Feed a routed-id sequence to a cadence; the window indices (1-based) it retires at and
+    /// the group sizes.
+    fn cadence_run(cadence: &mut RetireCadence, routed: &[u64]) -> Vec<(usize, u32)> {
+        routed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &ids)| cadence.window_end(ids).map(|n| (i + 1, n)))
+            .collect()
+    }
+
+    #[test]
+    fn cadence_retires_on_routed_ids_or_eight_windows_or_log_headroom() {
+        let log = 1 << 18;
+        // 4096 routed ids: 1280 per window (C1 MTP-sized) retires at the 4th window.
+        let mut c = RetireCadence::new(4096, log);
+        assert_eq!(cadence_run(&mut c, &[1280; 9]), [(4, 4), (8, 4)]);
+        assert_eq!(c.pending(), 1);
+        // Tiny windows: the 8-window cap.
+        let mut c = RetireCadence::new(4096, log);
+        assert_eq!(cadence_run(&mut c, &[320; 17]), [(8, 8), (16, 8)]);
+        // Big windows retire at once (a prefill or a C8 window of 2560 ids x 2).
+        let mut c = RetireCadence::new(4096, log);
+        assert_eq!(cadence_run(&mut c, &[5000, 5000]), [(1, 1), (2, 1)]);
+        let mut c = RetireCadence::new(4096, log);
+        assert_eq!(cadence_run(&mut c, &[2560; 4]), [(2, 2), (4, 2)]);
+        // 0 = every window.
+        let mut c = RetireCadence::new(0, log);
+        assert_eq!(cadence_run(&mut c, &[1, 1, 1]), [(1, 1), (2, 1), (3, 1)]);
+        // Log headroom (capacity 450 ids): retire when routed + the largest window seen would
+        // pass the capacity: after 4 windows of 100 (400 + 100 > 450).
+        let mut c = RetireCadence::new(1_000_000, 450);
+        assert_eq!(cadence_run(&mut c, &[100, 100, 100, 100]), [(4, 4)]);
+        // The largest window seen bounds the headroom of every later group: after the 150 window
+        // a group of 110s retires at 330 + 150 > 450 (it would not with a largest of 110).
+        let mut c = RetireCadence::new(1_000_000, 450);
+        assert_eq!(
+            cadence_run(&mut c, &[150, 100, 100, 110, 110, 110]),
+            [(3, 3), (6, 3)]
+        );
+    }
+
+    #[test]
+    fn cadence_decisions_depend_on_the_routed_sequence_only() {
+        // Two ranks log different numbers of ids (a frozen / overflowed / foreign-expert rank
+        // logs fewer), but the cadence never sees a logged count: both decide identically for
+        // every routed sequence.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for retire_ids in [0u64, 1, 700, 4096, 20_000] {
+            for log in [300u64, 4096, 1 << 18] {
+                let (mut a, mut b) = (
+                    RetireCadence::new(retire_ids, log),
+                    RetireCadence::new(retire_ids, log),
+                );
+                for _ in 0..500 {
+                    let routed = next() % 3000;
+                    assert_eq!(a.window_end(routed), b.window_end(routed));
+                    assert_eq!(a.pending(), b.pending());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_group_never_exceeds_eight_windows_nor_the_log() {
+        let log = 5_000u64;
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut c = RetireCadence::new(1 << 40, log);
+        let (mut total, mut windows, mut largest) = (0u64, 0u32, 0u64);
+        for _ in 0..2000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let routed = state % 900;
+            total += routed;
+            windows += 1;
+            largest = largest.max(routed);
+            match c.window_end(routed) {
+                Some(n) => {
+                    assert_eq!(n, windows);
+                    assert!(n <= RETIRE_MAX_WINDOWS);
+                    total = 0;
+                    windows = 0;
+                }
+                // The window just kept pending could be followed by the largest window seen
+                // without passing the log capacity.
+                None => assert!(total + largest <= log, "{total} + {largest}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_group_retirement_never_evicts_a_unit_any_window_of_the_group_used() {
+        for windows in [1u32, 2, 4, 8] {
+            let mut p = policy(4, 2, 1);
+            p.seed(&[(0, 1), (0, 2), (0, 3), (0, 4)]);
+            // The merged window of the group: slots (0,1) and (0,2) hit, five misses.
+            let uses = [
+                use1(0, 1, 2),
+                use1(0, 2, 1),
+                use1(1, 9, 7),
+                use1(1, 8, 6),
+                use1(1, 7, 5),
+                use1(1, 6, 4),
+                use1(1, 5, 3),
+            ];
+            let r = p.retire_windows((0, 0), &uses, &[], windows);
+            assert!(
+                !r.unpublish.contains(&(0, 1)) && !r.unpublish.contains(&(0, 2)),
+                "windows {windows}: {:?}",
+                r.unpublish
+            );
+            assert_eq!(p.live_slot((0, 1)), Some(0));
+            assert_eq!(p.live_slot((0, 2)), Some(1));
+            // Only the two unused slots can be victims: at most 2 fills, whatever the budget.
+            assert_eq!(
+                r.fills.len(),
+                2.min(2 * (windows as usize).min(4)),
+                "windows {windows}"
+            );
+            let s = p.stats();
+            assert_eq!((s.windows, s.retirements), (windows as u64, 1));
+        }
+    }
+
+    #[test]
+    fn the_fill_budget_is_f_per_window_capped_at_four_f() {
+        for (windows, expect) in [(1u32, 2usize), (2, 4), (3, 6), (4, 8), (5, 8), (8, 8)] {
+            let mut p = policy(64, 2, 1);
+            let uses: Vec<WindowUse> = (0..40u16).map(|e| use1(0, e, 1)).collect();
+            let r = p.retire_windows((0, 0), &uses, &[], windows);
+            assert_eq!(r.fills.len(), expect, "windows {windows}");
+        }
+        // In-flight fills count against the group's budget.
+        let mut p = policy(64, 2, 1);
+        let first: Vec<WindowUse> = (0..40u16).map(|e| use1(0, e, 1)).collect();
+        assert_eq!(p.retire_windows((0, 0), &first, &[], 4).fills.len(), 8);
+        let second: Vec<WindowUse> = (40..64u16).map(|e| use1(0, e, 1)).collect();
+        assert_eq!(p.retire_windows((0, 0), &second, &[], 4).fills.len(), 0);
+    }
+
+    #[test]
+    fn boundary_mode_admits_when_a_group_crosses_a_multiple_of_n_windows() {
+        // b=4: windows 1..=3 admit nothing, the group that reaches window 4..7 admits.
+        let mut p = policy(8, 4, 4);
+        let uses = [use1(0, 5, 3)];
+        assert!(p.retire_windows((0, 0), &uses, &[], 3).fills.is_empty()); // windows 0 -> 3
+        assert_eq!(p.retire_windows((0, 0), &uses, &[], 2).fills.len(), 1); // 3 -> 5 crosses 4
+        assert!(p.retire_windows((0, 0), &uses, &[], 2).fills.is_empty()); // 5 -> 7
+                                                                           // One window per retirement is the old rule: only every 4th window admits.
+        let mut q = policy(8, 4, 4);
+        let admitted: Vec<bool> = (0..8)
+            .map(|_| !q.retire((0, 0), &[use1(0, 5, 3)], &[]).fills.is_empty())
+            .collect();
+        assert_eq!(
+            admitted,
+            [false, false, false, true, false, false, false, false]
+        );
+    }
 
     #[test]
     fn stage_gap_parses_a_unit_count_and_defaults_to_eight() {
