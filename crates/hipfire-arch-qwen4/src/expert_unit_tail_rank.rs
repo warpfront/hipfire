@@ -58,9 +58,9 @@ use crate::expert_unit_tail::{
 /// Ids one window's log holds (`calls x slots`); a window past this stops
 /// logging (counted, never fatal: it only thins the next admission).
 const LOG_IDS: usize = 1 << 18;
-/// Print a counter line every this many retired windows under the log env (fine enough to
+/// Print a counter line every this many retirements under the log env (fine enough to
 /// attribute the cumulative raw counters to one loadgen cell by their `unix_ms` stamps).
-const LOG_EVERY: u64 = 16;
+const LOG_EVERY: u64 = 4;
 
 /// One owned unit of a managed layer that a tail slot holds at the last retirement: its
 /// canonical decode-table entries (the pinned host arena addresses D1 uploaded) and the two slot
