@@ -1123,7 +1123,9 @@ impl DType {
             DType::FP8E4M3PT => Some(k),
             DType::HFQ6G256 | DType::MQ6G256 | DType::MQ6G256V2 => grouped(256, 200),
             DType::MQ3G256 => grouped(256, 104),
-            DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ2G256V2 => grouped(256, 72),
+            DType::MQ2G256 | DType::MQ2G256Lloyd | DType::MQ2G256V2 | DType::MQ2G256LloydU => {
+                grouped(256, 72)
+            }
             DType::MQ3G256Lloyd => grouped(256, 112),
             DType::MQ4G256Lloyd => grouped(256, 160),
             // HFQ4-G128 layout, see the variant.

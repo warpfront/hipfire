@@ -6675,6 +6675,10 @@ pub enum ProjectLadder {
     /// `gemm_q8_0_wmma`; otherwise the [`Self::Gemm`] Q8 arm. No calibration
     /// tap (`run_q8_projection_fresh`). Cohere2-MoE prefill.
     GemmQ8Fp16,
+    /// MQ2G256LloydU only: the activation is converted to F16 into the op's
+    /// `rotation` scratch (`rows * k` F16), then the grouped MoE WMMA GEMM runs
+    /// the weight as one dense expert over [`ProjectOp::grouped`]. Maple prefill.
+    GroupedLloydF16,
 }
 
 /// One projection over `rows` row-major input rows on its [`ProjectLadder`],
@@ -6686,11 +6690,26 @@ pub struct ProjectOp<'a> {
     pub output: &'a GpuTensor,
     pub rows: usize,
     /// Ladder scratch of `rows * k`: the F32 FWHT basis of the rotated
-    /// payloads, or the F16 activation copy of [`ProjectLadder::GemmQ8Fp16`].
+    /// payloads, or the F16 activation copy of [`ProjectLadder::GemmQ8Fp16`]
+    /// and [`ProjectLadder::GroupedLloydF16`].
     pub rotation: Option<&'a GpuTensor>,
     pub ladder: ProjectLadder,
     /// F32 `[rows, m]`, distinct from `output`.
     pub residual: Option<&'a GpuTensor>,
+    /// The one-expert grouped tables of [`ProjectLadder::GroupedLloydF16`];
+    /// `None` on every other ladder.
+    pub grouped: Option<DenseGroupedTables<'a>>,
+}
+
+/// A dense projection driven through the grouped MoE GEMM as a single expert.
+#[derive(Clone, Copy)]
+pub struct DenseGroupedTables<'a> {
+    /// `[2]` F32 holding the weight's device pointer (a one-entry table).
+    pub expert_ptrs: &'a GpuTensor,
+    /// I32 expert id per 16-row tile, all zero, for `align16(rows)` rows.
+    pub tile_ids: &'a GpuTensor,
+    /// I32 slot per padded row: the row index for live rows, -1 on the tail.
+    pub slot_index: &'a GpuTensor,
 }
 
 impl ProjectOp<'_> {
@@ -6712,6 +6731,17 @@ impl ProjectOp<'_> {
                 self.weight.dtype
             )));
         }
+        // The grouped tables belong to exactly the grouped ladder, which
+        // decodes only the unrotated MQ2-Lloyd payload.
+        let grouped_ladder = self.ladder == ProjectLadder::GroupedLloydF16;
+        if grouped_ladder != self.grouped.is_some()
+            || (grouped_ladder && self.weight.dtype != DType::MQ2G256LloydU)
+        {
+            return Err(DispatchError::Hip(format!(
+                "GroupedLloydF16 projection takes exactly an MQ2G256LloydU weight with grouped tables ({:?} {:?})",
+                self.ladder, self.weight.dtype
+            )));
+        }
         let input = checked_mul(self.rows, k, "projection input")?;
         require_tensor(self.input, input, DType::F32, "projection input")?;
         let output = checked_mul(self.rows, m, "projection output")?;
@@ -6728,6 +6758,29 @@ impl ProjectOp<'_> {
                     DispatchError::Hip("GemmQ8Fp16 projection needs F16 scratch".into())
                 })?;
                 require_tensor(scratch, input, DType::F16, "projection F16 scratch")?;
+                false
+            }
+            ProjectLadder::GroupedLloydF16 => {
+                let scratch = self.rotation.ok_or_else(|| {
+                    DispatchError::Hip("GroupedLloydF16 projection needs F16 scratch".into())
+                })?;
+                require_tensor(scratch, input, DType::F16, "projection F16 scratch")?;
+                let tables = self.grouped.as_ref().expect("checked above");
+                let padded = self.rows.div_ceil(16) * 16;
+                require_tensor(
+                    self.output,
+                    padded * m,
+                    DType::F32,
+                    "grouped projection output",
+                )?;
+                require_tensor(tables.expert_ptrs, 2, DType::F32, "grouped expert pointer")?;
+                if tables.tile_ids.buf.size() < padded / 16 * 4
+                    || tables.slot_index.buf.size() < padded * 4
+                {
+                    return Err(DispatchError::Hip(format!(
+                        "grouped projection tables are below {padded} padded rows"
+                    )));
+                }
                 false
             }
             ladder => gemm_ladder_rotation(self.weight.dtype, ladder == ProjectLadder::GemmLmHead)?,
@@ -6776,6 +6829,30 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
             })?;
             hip(crate::families::gemm::run_q8_projection_fresh(
                 gpu, w.buf, op.input, op.output, w.m, w.k, op.rows, scratch, true,
+            ))?
+        }
+        ProjectLadder::GroupedLloydF16 => {
+            let (w, rows) = (&op.weight, op.rows);
+            let tables = op.grouped.as_ref().ok_or_else(|| {
+                DispatchError::Hip("GroupedLloydF16 projection needs grouped tables".into())
+            })?;
+            let scratch = op.rotation.ok_or_else(|| {
+                DispatchError::Hip("GroupedLloydF16 projection needs F16 scratch".into())
+            })?;
+            // An F32 X would take the grouped entry's pointer-keyed FP16 cache,
+            // which serves a stale layer when one buffer is reused per layer.
+            hip(gpu.deepseek4_convert_f32_to_f16(op.input, scratch, (rows * w.k) as i64))?;
+            hip(gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
+                tables.expert_ptrs,
+                tables.tile_ids,
+                tables.slot_index,
+                scratch,
+                op.output,
+                w.m,
+                w.k,
+                1,
+                rows.div_ceil(16) * 16,
+                rows,
             ))?
         }
     }
