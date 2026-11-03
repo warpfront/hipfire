@@ -51,11 +51,11 @@ use hipfire_generate::ar::{
     QwenArRouteFinish, QwenArSemanticProducer, QwenArTerminalCause,
 };
 use hipfire_generate::batch::{
-    attach_qwen_ep_batch_receipt_evidence, drive_lfm_continuous_batch,
-    drive_qwen35_ep_continuous_batch, drive_qwen_continuous_batch, emit_uncorrelated_error,
-    is_batch_request_eligible, is_qwen_ep_batch_request_eligible,
-    lfm_prefill_cancellable_or_fallback,
+    attach_qwen_ep_batch_receipt_evidence, drive_qwen35_ep_continuous_batch,
+    drive_qwen_continuous_batch, emit_uncorrelated_error, is_batch_request_eligible,
+    is_qwen_ep_batch_request_eligible,
 };
+use hipfire_generate::lanes::drive_lane_continuous_batch;
 use hipfire_generate::redline::{
     handle_railgun_g0_dflash_cycle, handle_redline_dflash_verify_shadow_pm4,
     handle_redline_dispatch_profile, handle_redline_dspark_shadow_pm4, handle_redline_greedy_trace,
@@ -4096,6 +4096,12 @@ fn main() {
                     let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
                         == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
                     let qwen4_lanes = qwen4_batch && vmm_route;
+                    // Fixed-lane families on the shared lane driver.
+                    let (lane_family, lane_route) =
+                        match hipfire_generate::lanes::lane_family_route(m) {
+                            Some(route) => (true, route),
+                            None => (false, hipfire_generate::ar::GenerationRoute::QwenAr),
+                        };
                     let batch_eligible = if !singleton_handoff
                         && batch_scheduler.is_some()
                         && (!qwen4_batch || qwen4_lanes)
@@ -4125,6 +4131,8 @@ fn main() {
                             hipfire_generate::ar::emit_generation_start(
                                 if qwen4_lanes {
                                     hipfire_generate::ar::GenerationRoute::Qwen4Ar
+                                } else if lane_family {
+                                    lane_route
                                 } else {
                                     hipfire_generate::ar::GenerationRoute::QwenAr
                                 },
@@ -4145,6 +4153,8 @@ fn main() {
                         // prompt tokens and skips Qwen3.5 length/think validation.
                         let render = if qwen4_lanes {
                             Ok((Vec::new(), false))
+                        } else if lane_family {
+                            hipfire_generate::lanes::render_lane_prompt(m, &msg)
                         } else {
                             batch_render_prompt_tokens(
                                 &prompt_owned,
@@ -4243,7 +4253,7 @@ fn main() {
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {
                                 let arch = m.arch_id;
-                                if arch == 11 {
+                                if lane_family {
                                     let enq_ok = sched.enqueue(pending);
                                     if !enq_ok {
                                         eprintln!(
@@ -4259,13 +4269,13 @@ fn main() {
                                             admission,
                                         );
                                         hipfire_generate::ar::emit_generation_start(
-                                            hipfire_generate::ar::GenerationRoute::LfmAr,
+                                            lane_route,
                                             &mut stdout,
                                             id,
                                             false,
                                         );
                                     }
-                                    let drive_res = drive_lfm_continuous_batch(
+                                    let drive_res = drive_lane_continuous_batch(
                                         sched,
                                         &mut gpu,
                                         m,
@@ -5168,7 +5178,7 @@ mod tests {
             "activate_terminal_control(id, gen_attempt_id)",
             "batch_request_eligible_for_route(",
             "drive_staged_continuous_batch(",
-            "drive_lfm_continuous_batch(",
+            "drive_lane_continuous_batch(",
             "hipfire_generate::batch::drive_promoted(",
             "                    generate(\n",
         ] {

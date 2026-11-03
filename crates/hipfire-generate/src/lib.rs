@@ -79,6 +79,9 @@ pub mod batch;
 /// Flash-Next exact autoregressive request lanes.
 pub mod fn_batch;
 
+/// The shared fixed-lane continuous-batch driver and its family adapters.
+pub mod lanes;
+
 /// VMM batch route: per-request singleton semantics on batch lanes —
 /// conversation continuity (prefix pool) and think control.
 pub mod vmm_conv;

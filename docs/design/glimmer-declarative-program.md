@@ -3,8 +3,8 @@
 Status: every Glimmer forward route runs typed dispatch steps: single-lane
 decode (AR and the DFlash hidden-capture decode, slice 1), batched prefill,
 batched DFlash verify, the shared draft/verify LM head, the DFlash drafter
-(slice 2) and the continuous-batch lane decode (HIPF-248; no serve caller
-yet). Glimmer is refused for every parallel axis until the G13 dense axes.
+(slice 2) and the continuous-batch lane decode (HIPF-248, served by the shared
+lane driver). Glimmer is refused for every parallel axis until the G13 dense axes.
 
 ## Semantic checkpoint
 
@@ -204,6 +204,16 @@ head is `glimmer_lm_head_picks`. A lane is seeded by the singleton prefill and
 attention sizes its LDS by the lane capacity, so `GlimmerLanes::new` refuses
 lanes past `Gpu::attention_q8_0_kv_independent_max_lane_capacity` (about 16K
 rows on gfx1151).
+
+Serve: arch 14 stages `GlimmerLanes` at load (`continuous_batch_size > 1`, no
+DFlash drafter) and requests run on the shared fixed-lane driver
+(`hipfire_generate::lanes`, #666 G12). The Glimmer adapter renders the prompt
+with the singleton's `glimmer_prompt_ids`, seeds a lane by the singleton
+prefill plus `import`, routes tokens through the singleton's Harmony router and
+stop set, and samples on the host from the lane logits (greedy rows take the
+device picks). Seeding goes through `GlimmerState`, so a batch drops the
+sequential session cache. Not batched: tools, multi-turn history, stop strings,
+a loaded drafter; those take the singleton route.
 
 ## Single-only refusal
 

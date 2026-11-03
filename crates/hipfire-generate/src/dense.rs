@@ -4342,6 +4342,223 @@ pub fn glimmer_profit_guard_status_label(g: &GlimmerSpecProfitGuard) -> &'static
     }
 }
 
+/// Glimmer's static stop set: the config and bundle EOS plus every
+/// tokenizer-resolved end-of-turn token. Shared with the batch lanes.
+pub fn glimmer_stop_set(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    cfg_eos_tok: u32,
+    bundle_eos_tok: u32,
+) -> Vec<u32> {
+    let mut s = vec![cfg_eos_tok];
+    // Bundle eos_tok may be same as cfg_eos_tok; dedup below.
+    if !s.contains(&bundle_eos_tok) {
+        s.push(bundle_eos_tok);
+    }
+    // Candidate end-of-turn / chat-boundary tokens. Use special_token_id
+    // (covers vocab-registered specials) plus a single-id encode probe
+    // for tokenizers that expose the string via encode.
+    for candidate in [
+        // Muse Glimmer turn boundaries: `<|end_of_text|>` (200001) and `<|eot|>` (200008)
+        // always stop. `<|eom|>` does NOT always stop — it ends the CURRENT CHANNEL
+        // (self->keep decoding into answer, user->stop), so it is handled by the
+        // Harmony router, not the static stop set.
+        "<|eot|>",
+        "<|end_of_text|>",
+        "<end_of_turn>",
+        "<|end_of_turn|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "</s>",
+        "<eos>",
+    ] {
+        if let Some(tid) = tokenizer.special_token_id(candidate) {
+            if !s.contains(&tid) {
+                s.push(tid);
+            }
+        } else {
+            let ids = tokenizer.encode(candidate);
+            if ids.len() == 1 && !s.contains(&ids[0]) {
+                // Only accept single-id encodings to avoid polluting stop
+                // set with subword fragments.
+                // For <|endoftext|> this will typically be multi-token and
+                // thus ignored; special_token_id above is the reliable path
+                // for that token.
+                s.push(ids[0]);
+            }
+        }
+    }
+    s.dedup();
+    s
+}
+
+/// Glimmer prompt ids: the jinja/onyx render (history replay from
+/// `asst_turn_cache`), raw-encode fallbacks, and a leading BOS. Shared by
+/// the singleton route and the batch lanes (`crate::lanes`).
+#[allow(clippy::too_many_arguments)]
+pub fn glimmer_prompt_ids(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    chat_template: Option<&String>,
+    asst_turn_cache: &mut AsstTurnCache,
+    bos_tok: u32,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    reasoning_effort: Option<&str>,
+    max_think_tokens: usize,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    glimmer_replay_hits: &std::cell::Cell<usize>,
+    glimmer_replay_lookups: &std::cell::Cell<usize>,
+) -> Result<Vec<u32>, String> {
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
+    let try_jinja = jinja_enabled && chat_template.is_some();
+    let mut ids: Vec<u32> = if try_jinja {
+        let template = chat_template.unwrap();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking: true,
+            bos_token: Some("<bos>"),
+            reasoning_strength: Some(glimmer_reasoning_strength(
+                reasoning_effort,
+                max_think_tokens,
+            )),
+            reasoning_effort: None,
+        };
+        if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let raw_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) => h,
+                None => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            let prepared = match prepare_glimmer_onyx_history(raw_slice) {
+                Ok(p) => p,
+                Err(e) => {
+                    return Err(format!("glimmer history prep failed: {e}"));
+                }
+            };
+            let mut prepared_owned = prepared;
+            {
+                let mut ordinal = 0usize;
+                for msg in &mut prepared_owned {
+                    if msg.role == hipfire_runtime::prompt_frame::Role::Assistant {
+                        let has_client_reasoning = msg
+                            .reasoning_content
+                            .as_ref()
+                            .map(|s| !s.trim().is_empty())
+                            .unwrap_or(false);
+                        if !has_client_reasoning {
+                            let fp_raw = asst_turn_fingerprint(
+                                &normalize_asst_turn_for_fingerprint(&msg.content),
+                                &msg.tool_calls,
+                            );
+                            let fp = glimmer_turn_key(fp_raw, ordinal);
+                            if let Some(cached) = asst_turn_cache.get(&fp) {
+                                if let Some(reasoning) = &cached.reasoning {
+                                    msg.reasoning_content = Some(reasoning.text.clone());
+                                }
+                            }
+                        }
+                        ordinal += 1;
+                    }
+                }
+            }
+            if messages_history.is_some() {
+                let mut lookup_ordinal = 0usize;
+                let mut cache_lookup = |msg: &hipfire_runtime::prompt_frame::Message| -> Option<
+                    hipfire_runtime::prompt_frame::CachedAssistantTurn,
+                > {
+                    if msg.role != hipfire_runtime::prompt_frame::Role::Assistant {
+                        return None;
+                    }
+                    let fp_raw = asst_turn_fingerprint(
+                        &normalize_asst_turn_for_fingerprint(&msg.content),
+                        &msg.tool_calls,
+                    );
+                    let fp = glimmer_turn_key(fp_raw, lookup_ordinal);
+                    lookup_ordinal += 1;
+                    glimmer_replay_lookups.set(glimmer_replay_lookups.get() + 1);
+                    let hit = asst_turn_cache.get(&fp).cloned();
+                    if hit.is_some() {
+                        glimmer_replay_hits.set(glimmer_replay_hits.get() + 1);
+                    }
+                    hit
+                };
+                match hipfire_runtime::prompt_frame::build_cached_history_jinja(
+                    &frame,
+                    &prepared_owned,
+                    tools,
+                    &mut cache_lookup,
+                ) {
+                    Ok(cached_ids) => cached_ids,
+                    Err(e) => {
+                        eprintln!("[daemon] glimmer build_cached_history_jinja failed ({e}) — falling back to plain render");
+                        match frame.render_messages(&prepared_owned, tools, None) {
+                            Ok(rendered) => tokenizer.encode(&rendered),
+                            Err(e2) => {
+                                eprintln!("[daemon] jinja render failed in muse_glimmer path ({e2}) — falling back to BOS + raw prompt");
+                                tokenizer.encode(prompt)
+                            }
+                        }
+                    }
+                }
+            } else {
+                match frame.render_messages(&prepared_owned, tools, None) {
+                    Ok(rendered) => tokenizer.encode(&rendered),
+                    Err(e) => {
+                        eprintln!("[daemon] jinja render failed in muse_glimmer path ({e}) — falling back to BOS + raw prompt");
+                        tokenizer.encode(prompt)
+                    }
+                }
+            }
+        } else {
+            match frame.render() {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    eprintln!("[daemon] jinja render failed in muse_glimmer path ({e}) — falling back to BOS + raw prompt");
+                    tokenizer.encode(prompt)
+                }
+            }
+        }
+    } else {
+        tokenizer.encode(prompt)
+    };
+    if ids.first() != Some(&bos_tok) {
+        ids.insert(0, bos_tok);
+    }
+    Ok(ids)
+}
+
 pub fn generate_muse_glimmer(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -4412,157 +4629,25 @@ pub fn generate_muse_glimmer(
     let glimmer_replay_lookups = std::cell::Cell::new(0usize);
 
     // ── Prompt build (same two-path branch as the gemma4 AR path) ──
-    let prompt_ids: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
-        let try_jinja = jinja_enabled && m.chat_template.is_some();
-        let mut ids: Vec<u32> = if try_jinja {
-            let template = m.chat_template.as_ref().unwrap();
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking: true,
-                bos_token: Some("<bos>"),
-                reasoning_strength: Some(glimmer_reasoning_strength(
-                    reasoning_effort,
-                    max_think_tokens,
-                )),
-                reasoning_effort: None,
-            };
-            if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let raw_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
-                    Some(h) => h,
-                    None => {
-                        let mut v = Vec::new();
-                        if let Some(sys) = system_prompt {
-                            v.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::System,
-                                content: sys.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                        }
-                        v.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::User,
-                            content: prompt.to_string(),
-                            reasoning_content: None,
-                            name: None,
-                            rendered_name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                        synthesized = v;
-                        &synthesized
-                    }
-                };
-                let prepared = match prepare_glimmer_onyx_history(raw_slice) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        emit_error_with_id(stdout, id, format!("glimmer history prep failed: {e}"));
-                        return;
-                    }
-                };
-                let mut prepared_owned = prepared;
-                {
-                    let mut ordinal = 0usize;
-                    for msg in &mut prepared_owned {
-                        if msg.role == hipfire_runtime::prompt_frame::Role::Assistant {
-                            let has_client_reasoning = msg
-                                .reasoning_content
-                                .as_ref()
-                                .map(|s| !s.trim().is_empty())
-                                .unwrap_or(false);
-                            if !has_client_reasoning {
-                                let fp_raw = asst_turn_fingerprint(
-                                    &normalize_asst_turn_for_fingerprint(&msg.content),
-                                    &msg.tool_calls,
-                                );
-                                let fp = glimmer_turn_key(fp_raw, ordinal);
-                                if let Some(cached) = m.asst_turn_cache.get(&fp) {
-                                    if let Some(reasoning) = &cached.reasoning {
-                                        msg.reasoning_content = Some(reasoning.text.clone());
-                                    }
-                                }
-                            }
-                            ordinal += 1;
-                        }
-                    }
-                }
-                if messages_history.is_some() {
-                    let mut lookup_ordinal = 0usize;
-                    let mut cache_lookup = |msg: &hipfire_runtime::prompt_frame::Message| -> Option<
-                        hipfire_runtime::prompt_frame::CachedAssistantTurn,
-                    > {
-                        if msg.role != hipfire_runtime::prompt_frame::Role::Assistant {
-                            return None;
-                        }
-                        let fp_raw = asst_turn_fingerprint(
-                            &normalize_asst_turn_for_fingerprint(&msg.content),
-                            &msg.tool_calls,
-                        );
-                        let fp = glimmer_turn_key(fp_raw, lookup_ordinal);
-                        lookup_ordinal += 1;
-                        glimmer_replay_lookups.set(glimmer_replay_lookups.get() + 1);
-                        let hit = m.asst_turn_cache.get(&fp).cloned();
-                        if hit.is_some() {
-                            glimmer_replay_hits.set(glimmer_replay_hits.get() + 1);
-                        }
-                        hit
-                    };
-                    match hipfire_runtime::prompt_frame::build_cached_history_jinja(
-                        &frame,
-                        &prepared_owned,
-                        tools,
-                        &mut cache_lookup,
-                    ) {
-                        Ok(cached_ids) => cached_ids,
-                        Err(e) => {
-                            eprintln!("[daemon] glimmer build_cached_history_jinja failed ({e}) — falling back to plain render");
-                            match frame.render_messages(&prepared_owned, tools, None) {
-                                Ok(rendered) => tokenizer.encode(&rendered),
-                                Err(e2) => {
-                                    eprintln!("[daemon] jinja render failed in muse_glimmer path ({e2}) — falling back to BOS + raw prompt");
-                                    tokenizer.encode(prompt)
-                                }
-                            }
-                        }
-                    }
-                } else {
-                    match frame.render_messages(&prepared_owned, tools, None) {
-                        Ok(rendered) => tokenizer.encode(&rendered),
-                        Err(e) => {
-                            eprintln!("[daemon] jinja render failed in muse_glimmer path ({e}) — falling back to BOS + raw prompt");
-                            tokenizer.encode(prompt)
-                        }
-                    }
-                }
-            } else {
-                match frame.render() {
-                    Ok(rendered) => tokenizer.encode(&rendered),
-                    Err(e) => {
-                        eprintln!("[daemon] jinja render failed in muse_glimmer path ({e}) — falling back to BOS + raw prompt");
-                        tokenizer.encode(prompt)
-                    }
-                }
-            }
-        } else {
-            tokenizer.encode(prompt)
-        };
-        if ids.first() != Some(&bos_tok) {
-            ids.insert(0, bos_tok);
+    let prompt_ids: Vec<u32> = match glimmer_prompt_ids(
+        m.tokenizer.as_ref().unwrap(),
+        m.chat_template.as_ref(),
+        &mut m.asst_turn_cache,
+        bos_tok,
+        prompt,
+        system_prompt,
+        reasoning_effort,
+        max_think_tokens,
+        tools,
+        messages_history,
+        &glimmer_replay_hits,
+        &glimmer_replay_lookups,
+    ) {
+        Ok(ids) => ids,
+        Err(e) => {
+            emit_error_with_id(stdout, id, e);
+            return;
         }
-        ids
     };
 
     if prompt_ids.is_empty() {
@@ -4574,49 +4659,7 @@ pub fn generate_muse_glimmer(
     // end-of-turn token. Do NOT copy Gemma4's 106 fallback — Glimmer's
     // HF eos_token_id is a scalar, not a list. Check tokenizer for
     // end-of-turn / im_end style tokens and include if present.
-    let stop_set: Vec<u32> = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        let mut s = vec![cfg_eos_tok];
-        // Bundle eos_tok may be same as cfg_eos_tok; dedup below.
-        if !s.contains(&bundle.eos_tok) {
-            s.push(bundle.eos_tok);
-        }
-        // Candidate end-of-turn / chat-boundary tokens. Use special_token_id
-        // (covers vocab-registered specials) plus a single-id encode probe
-        // for tokenizers that expose the string via encode.
-        for candidate in [
-            // Muse Glimmer turn boundaries: `<|end_of_text|>` (200001) and `<|eot|>` (200008)
-            // always stop. `<|eom|>` does NOT always stop — it ends the CURRENT CHANNEL
-            // (self->keep decoding into answer, user->stop), so it is handled by the
-            // Harmony router, not the static stop set.
-            "<|eot|>",
-            "<|end_of_text|>",
-            "<end_of_turn>",
-            "<|end_of_turn|>",
-            "<|im_end|>",
-            "<|endoftext|>",
-            "</s>",
-            "<eos>",
-        ] {
-            if let Some(tid) = tokenizer.special_token_id(candidate) {
-                if !s.contains(&tid) {
-                    s.push(tid);
-                }
-            } else {
-                let ids = tokenizer.encode(candidate);
-                if ids.len() == 1 && !s.contains(&ids[0]) {
-                    // Only accept single-id encodings to avoid polluting stop
-                    // set with subword fragments.
-                    // For <|endoftext|> this will typically be multi-token and
-                    // thus ignored; special_token_id above is the reliable path
-                    // for that token.
-                    s.push(ids[0]);
-                }
-            }
-        }
-        s.dedup();
-        s
-    };
+    let stop_set = glimmer_stop_set(m.tokenizer.as_ref().unwrap(), cfg_eos_tok, bundle.eos_tok);
 
     // Capacity guard. No eviction on arch_id=14 — reset the KV cursors when
     // the requested run would overflow the physical cache.
