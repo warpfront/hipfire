@@ -24,7 +24,7 @@
 
 use crate::families::moe::MOE_GROUPED_BLOCK_M;
 use crate::pipeline::slowlink_prefill::{LayerRoutePlan, PanelRange};
-use crate::sp_plan::{plan_layer_split, SplitCost, SplitPlan, NUM_EXPERTS, ROUTE_TOPK};
+use crate::sp_plan::{plan_layer_split_weighted, SplitCost, SplitPlan, NUM_EXPERTS, ROUTE_TOPK};
 use crate::types::DispatchError;
 
 fn bail(message: impl std::fmt::Display) -> DispatchError {
@@ -170,6 +170,27 @@ pub fn plan_sp_layer_pinned(
     limits: SpLimits,
     pinned: &[bool],
 ) -> Result<SpLayerPlan, DispatchError> {
+    plan_sp_layer_weighted(plan, sorted, rows, cost, limits, pinned, &[])
+}
+
+/// [`plan_sp_layer_pinned`] where expert `e` costs `stream_scale[e]` streamed-expert units
+/// ([`plan_layer_split_weighted`]): a mixed-codec slab layer streams its W3 experts for less
+/// link time than its MQ4 ones. An empty `stream_scale` is [`plan_sp_layer_pinned`].
+pub fn plan_sp_layer_weighted(
+    plan: &LayerRoutePlan,
+    sorted: &[i32],
+    rows: usize,
+    cost: &SplitCost,
+    limits: SpLimits,
+    pinned: &[bool],
+    stream_scale: &[f64],
+) -> Result<SpLayerPlan, DispatchError> {
+    if !stream_scale.is_empty() && stream_scale.len() != NUM_EXPERTS {
+        return Err(bail(format!(
+            "the stream scale has {} entries, the layer {NUM_EXPERTS}",
+            stream_scale.len()
+        )));
+    }
     let exact = validated_counts(plan, sorted, rows, limits)?;
     if !pinned.is_empty() && pinned.len() != NUM_EXPERTS {
         return Err(bail(format!(
@@ -183,7 +204,7 @@ pub fn plan_sp_layer_pinned(
             .zip(pinned)
             .map(|(&count, &pin)| if pin { 0 } else { count })
             .collect();
-        let mut split = plan_layer_split(&free, cost);
+        let mut split = plan_layer_split_weighted(&free, cost, stream_scale);
         let extra: Vec<u16> = (0..NUM_EXPERTS)
             .filter(|&e| pinned[e] && exact[e] > 0)
             .map(|e| e as u16)
@@ -194,7 +215,7 @@ pub fn plan_sp_layer_pinned(
         split.stream_ids.sort_unstable();
         split
     } else {
-        plan_layer_split(&exact, cost)
+        plan_layer_split_weighted(&exact, cost, stream_scale)
     };
     split.stream_ids.dedup();
     assemble(plan, sorted, rows, split, limits)

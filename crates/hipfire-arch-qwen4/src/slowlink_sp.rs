@@ -26,6 +26,11 @@ pub const SP_ENV: &str = "HIPFIRE_QWEN4_SP";
 /// Typed developer boolean `developer.qwen4_sp_touched` (default off): the
 /// touched-only SP mode ([`SpMode::TouchedOnly`]).
 pub const SP_TOUCHED_ENV: &str = "HIPFIRE_QWEN4_SP_TOUCHED";
+/// Developer opt-in (default off, pure boolean developer key read through
+/// `hipfire_config::developer_bool`): run the HYBRID SP on a slab profile (the mq3-xts tier).
+/// Off until the card receipts (byte determinism, KLD) of that route land; the kill switches of
+/// the aggregate route are unaffected.
+pub const SP_SLAB_ENV: &str = "HIPFIRE_QWEN4_SP_SLAB";
 /// Lab-only: `all` (k = U, which selects [`SpMode::TouchedOnly`]), `cpu` (k = 0)
 /// or `auto` (the planner).
 #[cfg(feature = "lab")]
@@ -282,6 +287,8 @@ pub struct SpLoadFacts<'a> {
     pub pinned_budget_bytes: u64,
     /// `serve.prefix_cache` is on.
     pub prefix_cache: bool,
+    /// The slab-route hybrid SP is opted in ([`SP_SLAB_ENV`]); read on a slab profile only.
+    pub slab_sp: bool,
 }
 
 /// The frozen SP profile of a load.
@@ -379,9 +386,10 @@ impl fmt::Display for SpDecline {
             Self::Route { route, mode } => match mode {
                 SpMode::Hybrid => write!(
                     f,
-                    " ({route:?}; the hybrid mode serves {:?} and {:?})",
+                    " ({route:?}; the hybrid mode serves {:?} and {:?}, and {:?} when {SP_SLAB_ENV}=1)",
                     WindowRoute::Aggregate,
-                    WindowRoute::AggregateSymIu4
+                    WindowRoute::AggregateSymIu4,
+                    WindowRoute::SlabIu4
                 ),
                 SpMode::TouchedOnly => write!(
                     f,
@@ -485,8 +493,15 @@ fn admit_mode(facts: &SpLoadFacts<'_>, mode: SpMode) -> Result<SpProfile, SpDecl
     // hybrid mode K2-izes F32-tail tiles and carries its own row table, which are designed
     // for the F16 `Aggregate` route: on a symmetric-IU4 profile its windows run that route
     // (a per-window override) when everything it needs is present.
+    //
+    // The slab route (mq3-xts: MQ4 hot + W3 cold experts) keeps its own K2 arm in the HYBRID
+    // mode, opt-in until its card receipts land (`facts.slab_sp`,
+    // [`SP_SLAB_ENV`]): the GPU arm runs the cold-codec and MQ4 K2 per codec bucket over the
+    // window's A4 sidecars, the CPU arm reads the window's rotated F16 plane (an extra field of
+    // the slab SP layout) with each expert's own CPU quant. Touched-only is not wired for it.
     match (mode, route) {
         (_, WindowRoute::Aggregate) => {}
+        (SpMode::Hybrid, WindowRoute::SlabIu4) if facts.slab_sp => {}
         (SpMode::TouchedOnly, WindowRoute::AggregateSymIu4) => {}
         (SpMode::Hybrid, WindowRoute::AggregateSymIu4) if facts.f16_route_ready => {}
         (SpMode::Hybrid, WindowRoute::AggregateSymIu4) => {
@@ -497,6 +512,16 @@ fn admit_mode(facts: &SpLoadFacts<'_>, mode: SpMode) -> Result<SpProfile, SpDecl
     match mode {
         SpMode::Hybrid => admit_hybrid(facts, route),
         SpMode::TouchedOnly => admit_touched_only(facts, route),
+    }
+}
+
+/// The route a hybrid SP window runs on a profile of `base`: the F16 `Aggregate` route for
+/// every aggregate layout, the slab route itself for a slab profile.
+pub(crate) fn hybrid_window_route(base: WindowRoute) -> WindowRoute {
+    if base == WindowRoute::SlabIu4 {
+        WindowRoute::SlabIu4
+    } else {
+        WindowRoute::Aggregate
     }
 }
 
@@ -531,7 +556,7 @@ fn admit_hybrid(facts: &SpLoadFacts<'_>, base_route: WindowRoute) -> Result<SpPr
             Ok(SpProfile {
                 mode: SpMode::Hybrid,
                 base_route,
-                window_route: WindowRoute::Aggregate,
+                window_route: hybrid_window_route(base_route),
                 sp_max_rows,
                 s_cap: sp_max_rows * SP_S_CAP_FACTOR,
                 workers,
@@ -1385,7 +1410,84 @@ mod tests {
             hidden: 2560,
             pinned_budget_bytes: 1 << 30,
             prefix_cache: false,
+            slab_sp: false,
         }
+    }
+
+    /// The slab route (mq3-xts) arms the hybrid mode only when opted in, keeps the slab route
+    /// for its windows, and never arms touched-only; every aggregate route is unchanged by the
+    /// opt-in.
+    #[test]
+    fn admit_sp_slab_hybrid_is_opt_in_and_keeps_the_slab_route() {
+        let slab = |slab_sp: bool, knob: bool, touched_knob: bool| SpLoadFacts {
+            s1_route: Some(WindowRoute::SlabIu4),
+            slab_sp,
+            knob,
+            touched_knob,
+            ..facts()
+        };
+        // Opted out (the default): the named route decline, as before the slab arm existed.
+        assert_eq!(
+            admit_sp(&slab(false, true, false)).unwrap_err(),
+            SpDecline::Route {
+                route: WindowRoute::SlabIu4,
+                mode: SpMode::Hybrid
+            }
+        );
+        // Opted in: a hybrid profile whose windows keep the slab route.
+        let profile = admit_sp(&slab(true, true, false)).unwrap();
+        assert_eq!(profile.mode, SpMode::Hybrid);
+        assert_eq!(profile.base_route, WindowRoute::SlabIu4);
+        assert_eq!(profile.window_route, WindowRoute::SlabIu4);
+        assert_eq!(profile.sp_max_rows, 5_376);
+        assert_eq!(profile.workers, 16);
+        // A qualified window runs the slab route, an unqualified one the base route (the same).
+        for ok in [true, false] {
+            assert_eq!(
+                sp_window_route(WindowRoute::SlabIu4, Some(&profile), ok),
+                WindowRoute::SlabIu4
+            );
+        }
+        // Touched-only is not wired for the slab route, opted in or not.
+        assert_eq!(
+            admit_sp(&slab(true, false, true)).unwrap_err(),
+            SpDecline::Route {
+                route: WindowRoute::SlabIu4,
+                mode: SpMode::TouchedOnly
+            }
+        );
+        // The hybrid mode's CPU arm facts are still required.
+        assert_eq!(
+            admit_sp(&SpLoadFacts {
+                cpu_gate_up_quant: false,
+                ..slab(true, true, false)
+            })
+            .unwrap_err(),
+            SpDecline::Quants {
+                gate_up: false,
+                down: true
+            }
+        );
+        // The opt-in changes nothing for an aggregate profile.
+        for route in [WindowRoute::Aggregate, WindowRoute::AggregateSymIu4] {
+            for slab_sp in [false, true] {
+                let aggregate = admit_sp(&SpLoadFacts {
+                    s1_route: Some(route),
+                    slab_sp,
+                    ..facts()
+                })
+                .unwrap();
+                assert_eq!(aggregate.window_route, WindowRoute::Aggregate, "{route:?}");
+            }
+        }
+        assert_eq!(
+            hybrid_window_route(WindowRoute::SlabIu4),
+            WindowRoute::SlabIu4
+        );
+        assert_eq!(
+            hybrid_window_route(WindowRoute::AggregateSymIu4),
+            WindowRoute::Aggregate
+        );
     }
 
     #[test]

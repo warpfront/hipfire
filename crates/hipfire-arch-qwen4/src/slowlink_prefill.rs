@@ -2006,8 +2006,10 @@ pub(crate) fn bind_at_load(
     let sp_bind = if sp_knob {
         let pages = plan.spec.as_ref().map_or(0, |spec| spec.pages());
         // The F16 `Aggregate` route dry run: only a hybrid SP on a symmetric-IU4 profile needs
-        // it (its windows run the F16 route); every other load is ready by construction.
-        let f16_route_ready = if hybrid_knob {
+        // it (its windows run the F16 route); every other load is ready by construction (a
+        // slab profile's hybrid windows keep the slab route and never run the F16 arm).
+        let f16_route_ready = if hybrid_knob && profile.geometry.route != dsp::WindowRoute::SlabIu4
+        {
             match sp_f16_route_probe(&*forward, &*bundle, gpu, &profile) {
                 Ok(()) => true,
                 Err(why) => {

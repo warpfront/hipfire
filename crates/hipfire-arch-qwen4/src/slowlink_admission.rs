@@ -8508,6 +8508,7 @@ mod tests {
             hidden: 2560,
             pinned_budget_bytes: 1 << 30,
             prefix_cache: false,
+            slab_sp: false,
         }
     }
 

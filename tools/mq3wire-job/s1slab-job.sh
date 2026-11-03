@@ -4,6 +4,7 @@
 #                Same-route determinism (3 repeats inside one report) is the S1 acceptance; S==I equality of every state/logit digest is the
 #                (stronger, not required) byte-identity bonus: both routes run the same W3/MQ4 K2 on 768-row tiles.
 #   MODE=pp    : hipfire bench --matrix --pp ${PP:-1105,8192,16384}, arms S and I.
+# Optional EXTRA_ENV="VAR=VAL ..." is appended to arms S and A (e.g. EXTRA_ENV=HSA_ENABLE_SDMA=0 to test blit-kernel copies against the 7.1 GB/s SDMA link).
 # Optional I_VL=N pins arm I to N resident layers (compare against the S1 profile's own resident count in arm S).
 # Needs BIN=<dir with hipfire daemon qwen4_parity>. mq3 model + sidecars come from the lossyeval timing home (hardlinks, read-only).
 H=${HOMEDIR:-/home/kaden/qcal/release-0.4.5/mgmtp/singlecard/lossyeval/home-timing-mq3}; XN=/home/kaden/qcal/release-0.4.5/mgmtp/xtxnow
@@ -19,8 +20,8 @@ T0=$(date +%s)
 { echo "date=$(date -u +%FT%TZ) FABRIC_JOB=${FABRIC_JOB:-} MODE=$MODE"; uptime; cat /proc/loadavg; echo "GPU_MAX_HW_QUEUES=${GPU_MAX_HW_QUEUES:-unset (HIP default 4)}"; env | grep -E '^(HIPFIRE|GPU_MAX|ROCR|HSA)' | sort
   md5sum $B/* 2>/dev/null; echo "link: $(cat $D/current_link_width) x $(cat $D/current_link_speed)"; free -g | head -2; cat $B/SOURCE 2>/dev/null; } > $O/pre.txt 2>&1
 arm_env() { case $1 in
-  S) echo "HIPFIRE_QWEN4_SLOWLINK_PREFILL=1 HIPFIRE_QWEN4_TIER_COUNTERS=1" ;;
-  A) echo "HIPFIRE_QWEN4_TIER_COUNTERS=1" ;;   # product default (selector unset = Auto: slab floor 128 rows)
+  S) echo "HIPFIRE_QWEN4_SLOWLINK_PREFILL=1 HIPFIRE_QWEN4_TIER_COUNTERS=1 ${EXTRA_ENV:-}" ;;
+  A) echo "HIPFIRE_QWEN4_TIER_COUNTERS=1 ${EXTRA_ENV:-}" ;;   # product default (selector unset = Auto: slab floor 128 rows)
   I) echo "HIPFIRE_QWEN4_SLOWLINK_PREFILL=0 HIPFIRE_PREFILL_CHUNK_ROWS=768 HIPFIRE_QWEN4_TIER_COUNTERS=1 ${I_VL:+HIPFIRE_QWEN4_EXPERT_VRAM_LAYERS=$I_VL}" ;;
 esac; }
 case $MODE in
@@ -48,6 +49,7 @@ def strip(d): return {k:v for k,v in d.items() if k not in ("receipts","timing",
 print("rows $rows: S status",a.get("status"),"I status",b.get("status"),"| digests S==I:",strip(a)==strip(b))
 PY
   grep -h "slow-link prefill (S1)" $O/state-S-$rows.log | head -2 | cut -c1-400 | tee -a $O/summary.txt
+  grep -hE "qwen4 SP|sp: |SP window|sp_bypass" $O/state-S-$rows.log | sort -u | head -6 | cut -c1-300 | tee -a $O/summary.txt
   done ;;
 pp)
   for arm in ${ARMS:-S I}; do
@@ -57,6 +59,7 @@ pp)
     echo "rc=$?" > $O/pp-$arm/meta.txt; kill $V; sort -n $O/pp-$arm/vram.txt | tail -1 | awk '{printf "vram_peak_MiB=%.0f\n",$1/1048576}' >> $O/pp-$arm/meta.txt; $B/hipfire stop >/dev/null 2>&1; sleep 3
     echo "pp $arm $(tr '\n' ' ' < $O/pp-$arm/meta.txt)" | tee -a $O/summary.txt
     grep -h "slow-link prefill (S1)" $O/pp-$arm/err.log | head -1 | cut -c1-500 | tee -a $O/summary.txt
+    grep -hE "qwen4 SP|sp: |sp_bypass" $O/pp-$arm/err.log | sort -u | head -6 | cut -c1-300 | tee -a $O/summary.txt
   done ;;
 esac
 echo "ALLDONE $(date -u) elapsed $(( $(date +%s) - T0 ))s" | tee -a $O/summary.txt

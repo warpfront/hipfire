@@ -316,11 +316,12 @@ pub enum TileClass {
 /// The class a tile of `kind` takes in a window whose SP flag is `sp`
 /// ([`PromptRouteStorage::set_sp`]).
 ///
-/// Without SP every kind keeps its own class.  Under SP only the aggregate F16 route's tiles
-/// exist: an [`TileKind::AggregateF32Tail`] tile is K2-ized (it rotates its activations to F16
-/// and joins the K2 grouping, because a range-masked cohort is unsafe over sparse streamed
-/// groups) and every other kind is refused (a one-row decode tile, the slab route and the IU4
-/// routes never belong to an SP window).
+/// Without SP every kind keeps its own class.  Under SP the aggregate F16 route's tiles and the
+/// slab route's K2 tiles exist: an [`TileKind::AggregateF32Tail`] tile is K2-ized (it rotates
+/// its activations to F16 and joins the K2 grouping, because a range-masked cohort is unsafe
+/// over sparse streamed groups), a [`TileKind::SlabK2`] tile (mq3-xts) stays a K2 tile, and
+/// every other kind is refused (a one-row decode tile, a slab K1 tail and the IU4 aggregate
+/// route never belong to an SP window).
 pub fn sp_tile_class(kind: TileKind, sp: bool) -> Result<TileClass, DispatchError> {
     if !sp {
         return Ok(match kind {
@@ -330,7 +331,9 @@ pub fn sp_tile_class(kind: TileKind, sp: bool) -> Result<TileClass, DispatchErro
         });
     }
     match kind {
-        TileKind::AggregateWmma | TileKind::AggregateF32Tail => Ok(TileClass::K2),
+        TileKind::AggregateWmma | TileKind::AggregateF32Tail | TileKind::SlabK2 => {
+            Ok(TileClass::K2)
+        }
         other => Err(bail(format!(
             "a {other:?} tile does not run inside an SP window"
         ))),
@@ -411,11 +414,15 @@ impl PromptRouteLayout {
     /// SP hybrid row table (BF16 `[H_max, hidden]`, `H_max` = the grouped-row bound of
     /// `10 * rows`) and the hybrid inverse (I32 `[rows * 10]`), carved last in the same
     /// region.  SP K2-izes the aggregate F32-tail tiles and has no cohort, so the dims must be
-    /// the aggregate F16 route with `k1_rows == 0` and `tail_rows == 0`.
+    /// the aggregate F16 route or the slab route (mq3-xts: the window also carries the rotated
+    /// F16 activations the CPU arm reads) with `k1_rows == 0` and `tail_rows == 0`.
     pub fn with_sp_rows(dims: &PromptRouteDims) -> Result<Self, DispatchError> {
-        if dims.route != WindowRoute::Aggregate || dims.k1_rows != 0 || dims.tail_rows != 0 {
+        if !matches!(dims.route, WindowRoute::Aggregate | WindowRoute::SlabIu4)
+            || dims.k1_rows != 0
+            || dims.tail_rows != 0
+        {
             return Err(bail(format!(
-                "an SP window layout is the aggregate F16 route with no K1/tail cohort: {dims:?}"
+                "an SP window layout is the aggregate F16 or the slab route with no K1/tail cohort: {dims:?}"
             )));
         }
         Self::build(dims, true)
@@ -481,8 +488,12 @@ impl PromptRouteLayout {
         // the decode cohort's per-binding scratch rows (one decode tile's `[10, hidden]`).
         let aggregate = d.route.is_aggregate_layout();
         let wmma = d.route == WindowRoute::Aggregate && d.rows > d.k1_rows + d.tail_rows;
+        // An SP window on the slab route also carries the rotated F16 activations: the CPU arm
+        // (E1) reads them, as the aggregate route's WMMA arm does; the slab K2 arm reads the A4
+        // sidecar instead and has no panel-local slot map.
+        let slab_sp = sp && d.route == WindowRoute::SlabIu4;
         let tail_ids = field(mul(mul(d.tail_rows, K_TOP)?, I32_BYTES)?)?;
-        let x_f16 = field(if wmma {
+        let x_f16 = field(if wmma || slab_sp {
             mul(mul(d.rows, d.hidden)?, F16_BYTES)?
         } else {
             0
@@ -571,11 +582,14 @@ impl PromptRouteLayout {
     }
 
     /// Aggregate route: the window's rotated F16 activations `[rows, hidden]` (inside the
-    /// region, counted by [`Self::total_bytes`]); 0 on the slab route and for an aggregate
-    /// window with no WMMA-arm rows (`rows == k1_rows + tail_rows`).
+    /// region, counted by [`Self::total_bytes`]); 0 for an aggregate window with no WMMA-arm
+    /// rows (`rows == k1_rows + tail_rows`) and on the slab route except in an SP window
+    /// ([`Self::with_sp_rows`]), where the CPU arm reads the same plane.
     pub fn x_f16_bytes(&self) -> usize {
         let d = &self.dims;
-        if d.route == WindowRoute::Aggregate && d.rows > d.k1_rows + d.tail_rows {
+        let aggregate_wmma = d.route == WindowRoute::Aggregate && d.rows > d.k1_rows + d.tail_rows;
+        let slab_sp = d.route == WindowRoute::SlabIu4 && self.sp_rows_bytes != 0;
+        if aggregate_wmma || slab_sp {
             d.rows * d.hidden * F16_BYTES
         } else {
             0
@@ -1406,7 +1420,10 @@ pub fn prepare_routes(
         hip(gpu.slowlink_fill_bytes(&route_ids, 0xFF, slots * I32_BYTES))?;
     } else {
         let params = *call.params();
-        if call.kind == TileKind::AggregateWmma || k2_tail {
+        if call.kind == TileKind::AggregateWmma
+            || k2_tail
+            || (dst.sp && call.kind == TileKind::SlabK2)
+        {
             // The aggregate K2 arm reads the rotated F16 activations, the bytes the incumbent's
             // own gate/up rotation produces (`rotate_x_mq_batched_f16` is the F32 rotation
             // rounded to F16 row by row, whatever the tile's row count): rotate the tile once
@@ -5987,13 +6004,64 @@ mod slowlink_panel_tests {
         }
     }
 
+    /// The slab route's SP window carries the rotated F16 activations the CPU arm reads
+    /// (`x_f16`, hidden * 2 B per row) and the hybrid row table and inverse; every field of the
+    /// non-SP slab layout keeps its offset (the F16 plane is carved where the aggregate route's
+    /// is, after the zero-sized cohort fields, so nothing before it moves), the plane is not
+    /// charged to a non-SP slab window, and the SP fields sit past it.
+    #[test]
+    fn slowlink_sp_slab_layout_adds_the_f16_plane_and_the_hybrid_rows_only_under_sp() {
+        let slab = |rows: usize| PromptRouteDims {
+            k1_rows: 0,
+            ..dims(rows)
+        };
+        for rows in [5usize, 128, 1105, 5376] {
+            let base = PromptRouteLayout::new(&slab(rows)).unwrap();
+            let sp = PromptRouteLayout::with_sp_rows(&slab(rows)).unwrap();
+            assert_eq!(base.x_f16_bytes(), 0, "rows {rows}");
+            assert_eq!(sp.x_f16_bytes(), rows * 2560 * F16_BYTES, "rows {rows}");
+            // Every field up to the F16 plane is at the non-SP offset.
+            assert_eq!(
+                (
+                    sp.x_norm,
+                    sp.sorted,
+                    sp.tiles,
+                    sp.accumulator,
+                    sp.k1_shared,
+                    sp.tail_ids
+                ),
+                (
+                    base.x_norm,
+                    base.sorted,
+                    base.tiles,
+                    base.accumulator,
+                    base.k1_shared,
+                    base.tail_ids
+                )
+            );
+            assert_eq!(sp.x_f16, base.x_f16);
+            // The plane, the hybrid row table and the inverse are strictly new bytes.
+            assert!(sp.sp_rows >= sp.x_f16 + align_up(sp.x_f16_bytes()).unwrap());
+            assert!(sp.sp_inverse > sp.sp_rows && sp.total > sp.sp_inverse);
+            assert!(sp.total_bytes() > base.total_bytes());
+            // The A4 sidecars are the same Gpu scratch either way.
+            assert_eq!(sp.a4_sidecar_bytes(), base.a4_sidecar_bytes());
+        }
+    }
+
     #[test]
     fn slowlink_sp_layout_refuses_cohort_rows_and_other_routes() {
         assert!(PromptRouteLayout::with_sp_rows(&aggregate_dims(1024, 0, 0)).is_ok());
         assert!(PromptRouteLayout::with_sp_rows(&aggregate_dims(1024, 1, 0)).is_err());
         assert!(PromptRouteLayout::with_sp_rows(&aggregate_dims(1024, 0, 1)).is_err());
         assert!(PromptRouteLayout::with_sp_rows(&sym_iu4_dims(1024, 0, 0)).is_err());
+        // The slab route (`dims` is a slab window) is an SP layout only without a cohort.
         assert!(PromptRouteLayout::with_sp_rows(&dims(1024)).is_err());
+        let slab = |rows: usize| PromptRouteDims {
+            k1_rows: 0,
+            ..dims(rows)
+        };
+        assert!(PromptRouteLayout::with_sp_rows(&slab(1024)).is_ok());
         let mut degenerate = aggregate_dims(1024, 0, 0);
         degenerate.rows = 0;
         assert!(PromptRouteLayout::with_sp_rows(&degenerate).is_err());
@@ -6076,13 +6144,14 @@ mod slowlink_panel_tests {
             assert_eq!(sp_tile_class(kind, false).unwrap(), want, "{kind:?}");
             assert_eq!(want == K2, kind.is_k2(), "{kind:?}");
         }
-        // Under SP: the F32 tail becomes K2, the WMMA tile stays K2, a decode tile is an error
-        // (an SP window never holds one), and so is every kind outside the aggregate F16 route.
+        // Under SP: the F32 tail becomes K2, the WMMA tile and the slab K2 tile stay K2, a
+        // decode tile is an error (an SP window never holds one), and so is every other kind
+        // outside the aggregate F16 and slab routes.
         assert_eq!(sp_tile_class(TileKind::AggregateF32Tail, true).unwrap(), K2);
         assert_eq!(sp_tile_class(TileKind::AggregateWmma, true).unwrap(), K2);
+        assert_eq!(sp_tile_class(TileKind::SlabK2, true).unwrap(), K2);
         for kind in [
             TileKind::Decode,
-            TileKind::SlabK2,
             TileKind::SlabK1Tail,
             TileKind::AggregateIu4,
         ] {

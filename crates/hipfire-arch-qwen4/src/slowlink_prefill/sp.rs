@@ -33,7 +33,7 @@ use hipfire_dispatch::cpu_exec::{
     cpu_quant_for, moe_cpu_grouped_rows_bf16, CpuMoeExpert, SpCpuExpert, SpCpuScratch, SpCpuStats,
 };
 use hipfire_dispatch::pipeline::sp_layer::{
-    exact_counts, plan_sp_layer_pinned, touched_binding_ranges, touched_experts, touched_groups,
+    exact_counts, plan_sp_layer_weighted, touched_binding_ranges, touched_experts, touched_groups,
     SpLayerPlan, SpLimits,
 };
 use hipfire_dispatch::sp_plan::SplitCost;
@@ -173,6 +173,33 @@ pub(crate) fn uniform_cpu_dtypes(
     })
 }
 
+/// The `(gate_up, down)` dtype pair the slab hybrid's runtime records as its layer default (the
+/// pair of the first host expert), when EVERY host expert pair has a CPU quant. `None` for no
+/// experts or any pair the CPU engine cannot read. The CPU arm itself reads each expert's own
+/// pair (`Qwen4MoeLayerRuntime::s1_expert_dtypes`); this is the load-time proof they all exist.
+pub(crate) fn slab_cpu_dtypes(
+    pairs: impl IntoIterator<Item = (DType, DType)>,
+) -> Option<(DType, DType)> {
+    let mut first: Option<(DType, DType)> = None;
+    for pair in pairs {
+        cpu_quant_for(pair.0)?;
+        cpu_quant_for(pair.1)?;
+        first.get_or_insert(pair);
+    }
+    first
+}
+
+/// Streamed-expert units of every expert of a slab layer: its own payload bytes over the MQ4
+/// expert's (the reference the planner's per-expert stream cost is calibrated on). An expert
+/// the layer does not hold costs one unit (it is never active).
+pub(crate) fn sp_slab_stream_scale(extent_bytes: impl Fn(usize) -> Option<usize>) -> Vec<f64> {
+    let mq4 = crate::expert_arena::codec_slot_bytes(crate::expert_arena::CODEC_MQ4)
+        .map_or(1.0, |(gate_up, down)| (gate_up + down) as f64);
+    (0..hipfire_dispatch::sp_plan::NUM_EXPERTS)
+        .map(|id| extent_bytes(id).map_or(1.0, |bytes| bytes as f64 / mq4))
+        .collect()
+}
+
 /// Largest window rows whose SP layout fits the S1 route region (the
 /// `census.route_storage` charge), at most [`SP_MAX_ROWS`] and the admitted
 /// window rows: the pure `region_fit_rows` of [`SpLoadFacts`].
@@ -203,14 +230,21 @@ pub(crate) fn sp_window_layout(
             admitted.rows
         )));
     }
-    // The hybrid mode's windows run the F16 `Aggregate` route whatever the profile's own route
-    // is: on a symmetric-IU4 profile the SP layout (x_f16 window rows, the panel slot map, the
-    // hybrid row table) is carved from the route region the IU4 layout was charged.
+    // The hybrid mode's windows run the F16 `Aggregate` route on an aggregate profile whatever
+    // its own route is: on a symmetric-IU4 profile the SP layout (x_f16 window rows, the panel
+    // slot map, the hybrid row table) is carved from the route region the IU4 layout was
+    // charged. A slab profile (mq3-xts) keeps the slab route (its K2 arm runs per codec bucket
+    // over the A4 sidecars) and adds the rotated F16 plane for the CPU arm.
+    let route = if admitted.route == dsp::WindowRoute::SlabIu4 {
+        dsp::WindowRoute::SlabIu4
+    } else {
+        dsp::WindowRoute::Aggregate
+    };
     let dims = dsp::PromptRouteDims {
         rows,
         k1_rows: 0,
         tail_rows: 0,
-        route: dsp::WindowRoute::Aggregate,
+        route,
         ..admitted
     };
     let layout = dsp::PromptRouteLayout::with_sp_rows(&dims).map_err(dsp_err("SP route layout"))?;
@@ -309,25 +343,36 @@ pub(crate) fn sp_load_decision(
         hidden: profile.geometry.hidden,
         pinned_budget_bytes: 0,
         prefix_cache: false,
+        slab_sp: route == dsp::WindowRoute::SlabIu4
+            && hipfire_config::developer_bool(crate::slowlink_sp::SP_SLAB_ENV, false),
     };
     let mut dtypes = None;
     if mode == Some(SpMode::Hybrid) {
-        dtypes = uniform_cpu_dtypes(forward.band_layers().flat_map(|layer| {
-            forward
-                .moe
-                .get(layer)
-                .and_then(Option::as_ref)
-                .filter(|runtime| runtime.s1_host_mapped())
-                .into_iter()
-                .flat_map(|runtime| {
-                    (0..runtime.s1_num_experts()).filter_map(|id| runtime.s1_expert_dtypes(id))
-                })
-        }));
+        let host_dtypes = || {
+            forward.band_layers().flat_map(|layer| {
+                forward
+                    .moe
+                    .get(layer)
+                    .and_then(Option::as_ref)
+                    .filter(|runtime| runtime.s1_host_mapped())
+                    .into_iter()
+                    .flat_map(|runtime| {
+                        (0..runtime.s1_num_experts()).filter_map(|id| runtime.s1_expert_dtypes(id))
+                    })
+            })
+        };
+        // A slab layer mixes codecs (MQ4 hot + W3 cold): every expert pair needs a CPU quant
+        // and the CPU arm reads each expert's own pair; an aggregate layer set is one pair.
+        dtypes = if route == dsp::WindowRoute::SlabIu4 {
+            slab_cpu_dtypes(host_dtypes())
+        } else {
+            uniform_cpu_dtypes(host_dtypes())
+        };
         facts.cpu_gate_up_quant = dtypes.is_some();
         facts.cpu_down_quant = dtypes.is_some();
         facts.splice_workers = (gpu.arch == crate::slowlink_sp::SP_ARCH
-            && route.is_aggregate_layout())
-        .then(hipfire_dispatch::cpu_exec::splice_pool_threads);
+            && (route.is_aggregate_layout() || route == dsp::WindowRoute::SlabIu4))
+            .then(hipfire_dispatch::cpu_exec::splice_pool_threads);
         facts.region_fit_rows = sp_region_fit_rows(profile);
         facts.pinned_budget_bytes = sp_pinned_budget(
             rdna_compute::kv_slots::mem_available_bytes(),
@@ -1273,8 +1318,24 @@ impl Run<'_, '_> {
         } else {
             Vec::new()
         };
-        let plan = plan_sp_layer_pinned(&route_plan, sorted, rows, &cost, limits, &pinned)
-            .map_err(dsp_err("SP layer plan"))?;
+        // A slab layer streams its W3 experts for less link time than its MQ4 ones: each
+        // expert costs its own payload bytes over the reference (MQ4) expert's. Every other
+        // layer is the uniform model, bit for bit.
+        let stream_scale = if self.profile.geometry.route == dsp::WindowRoute::SlabIu4 {
+            sp_slab_stream_scale(|id| self.rt.schedule.expert_extent_bytes(layer, id))
+        } else {
+            Vec::new()
+        };
+        let plan = plan_sp_layer_weighted(
+            &route_plan,
+            sorted,
+            rows,
+            &cost,
+            limits,
+            &pinned,
+            &stream_scale,
+        )
+        .map_err(dsp_err("SP layer plan"))?;
         sp.protocol
             .plan(
                 plan.groups.len(),
@@ -1471,10 +1532,18 @@ impl Run<'_, '_> {
                 .schedule
                 .sources_of(layer)
                 .ok_or_else(|| invalid(format!("SP layer {layer} has no expert sources")))?;
-            let (gate_up_quant, down_quant) = (
+            let layer_quants = (
                 cpu_quant_for(*gate_up).ok_or_else(|| invalid("SP gate_up has no CPU quant"))?,
                 cpu_quant_for(*down).ok_or_else(|| invalid("SP down has no CPU quant"))?,
             );
+            // A slab layer's experts carry their own codec (MQ4 hot, W3 cold): each CPU expert
+            // reads its own dtype pair from the layer runtime; every other layer is one pair.
+            let slab_layer = self
+                .forward
+                .moe
+                .get(layer)
+                .and_then(Option::as_ref)
+                .filter(|_| self.profile.geometry.route == dsp::WindowRoute::SlabIu4);
             let mut experts: Vec<SpCpuExpert<'_>> = Vec::with_capacity(cpu_work.experts.len());
             for (expert, range) in &cpu_work.experts {
                 let source = sources.expert(*expert).ok_or_else(|| {
@@ -1499,6 +1568,29 @@ impl Run<'_, '_> {
                         ),
                         std::slice::from_raw_parts(source.down.addr as *const u8, source.down.len),
                     )
+                };
+                let (gate_up_quant, down_quant) = match slab_layer {
+                    Some(runtime) => {
+                        let (gate_up_dtype, down_dtype) =
+                            runtime.s1_expert_dtypes(*expert).ok_or_else(|| {
+                                invalid(format!(
+                                    "SP layer {layer} expert {expert} has no dtype pair"
+                                ))
+                            })?;
+                        (
+                            cpu_quant_for(gate_up_dtype).ok_or_else(|| {
+                                invalid(format!(
+                                    "SP layer {layer} expert {expert} gate_up has no CPU quant"
+                                ))
+                            })?,
+                            cpu_quant_for(down_dtype).ok_or_else(|| {
+                                invalid(format!(
+                                    "SP layer {layer} expert {expert} down has no CPU quant"
+                                ))
+                            })?,
+                        )
+                    }
+                    None => layer_quants,
                 };
                 experts.push(SpCpuExpert {
                     spans: CpuMoeExpert {
@@ -2183,6 +2275,51 @@ mod tests {
         );
     }
 
+    /// A slab layer mixes codecs: each expert has its own CPU quant pair (MQ4 hot, W3 cold) and
+    /// the load proves every pair exists; the stream cost of an expert is its own bytes over the
+    /// MQ4 expert's.
+    #[test]
+    fn sp_slab_cpu_quants_and_stream_scale_follow_each_experts_codec() {
+        use hipfire_cpu::quant::CpuQuant;
+        let mq4 = (DType::MQ4G256V2, DType::MQ4G128V2);
+        let w3 = (DType::MQ3I4G128R256, DType::MQ3I4G128R128);
+        // The layer default is the first host expert's pair; every pair needs a CPU quant.
+        assert_eq!(slab_cpu_dtypes([w3, mq4, w3]), Some(w3));
+        assert_eq!(slab_cpu_dtypes([mq4, w3]), Some(mq4));
+        assert_eq!(slab_cpu_dtypes([]), None, "no host expert");
+        assert_eq!(
+            slab_cpu_dtypes([mq4, (DType::Raw, DType::Raw)]),
+            None,
+            "one pair the CPU engine cannot read refuses the layer set"
+        );
+        // uniform_cpu_dtypes still refuses the same mix: the slab arm is the only mixed one.
+        assert_eq!(uniform_cpu_dtypes([mq4, w3]), None);
+        // The pairs the slab hybrid's CPU arm resolves per expert.
+        assert_eq!(
+            (cpu_quant_for(w3.0), cpu_quant_for(w3.1)),
+            (Some(CpuQuant::Mq3I4G128R256), Some(CpuQuant::Mq3I4G128R128))
+        );
+        assert_eq!(
+            (cpu_quant_for(mq4.0), cpu_quant_for(mq4.1)),
+            (Some(CpuQuant::Mq4G256V2), Some(CpuQuant::Mq4G128V2))
+        );
+        assert_eq!(cpu_quant_for(DType::Raw), None);
+
+        // Stream scale: MQ4 = 1 unit, W3 = 1,920,000 / 2,611,200, an absent expert 1.
+        let mq4_bytes = 2_611_200usize;
+        let w3_bytes = 1_920_000usize;
+        let scale = sp_slab_stream_scale(|id| match id % 3 {
+            0 => Some(mq4_bytes),
+            1 => Some(w3_bytes),
+            _ => None,
+        });
+        assert_eq!(scale.len(), 512);
+        assert_eq!(scale[0], 1.0);
+        assert!((scale[1] - 1_920_000.0 / 2_611_200.0).abs() < 1e-12);
+        assert_eq!(scale[2], 1.0);
+        assert!(scale[1] < 0.74 && scale[1] > 0.73);
+    }
+
     // ── placement and the CPU work ────────────────────────────────────
 
     #[test]
@@ -2829,6 +2966,7 @@ mod tests {
             hidden: profile.geometry.hidden,
             pinned_budget_bytes: 1 << 30,
             prefix_cache: false,
+            slab_sp: false,
         };
         let at =
             |route, window| super::super::slowlink_prompt::product_profile_window(route, window);
