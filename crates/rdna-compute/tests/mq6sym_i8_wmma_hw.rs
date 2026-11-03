@@ -800,6 +800,14 @@ fn tiles_for(n: usize, prefill_ok: bool) -> Vec<Tile> {
     v
 }
 
+/// Dynamic LDS of the T0 dot4 entry r<N> (`mq6sym_x_lds_bytes` in kernel/t0 commit 409d6239cf:
+/// 2 * (2 * (N + B) * 144 + 8 * N), B = 2 for N == 7). The competitor source is a snapshot of that
+/// commit; a later T0 revision may change this contract.
+fn t0_lds_bytes(n: usize) -> u32 {
+    let b = if n == 7 { 2 } else { 0 };
+    (2 * (2 * (n + b) * 144 + 8 * n)) as u32
+}
+
 /// T0 (dot4, N <= 8) vs T1 (WMMA) on the same weights / A8 blocks: both implement the one frozen
 /// fold, so every visible output word must be byte-identical (F32 and BF16), tails and all.
 fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t0_src: &str) {
@@ -834,7 +842,7 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
                     a.push_i32(n as i32);
                     a.pad_to(16);
                     let e = format!("gemv_mq6sym_i8_rows_r{n}{}_gfx1201", if bf16 { "_bf16" } else { "" });
-                    gpu.launch_kernel_blob(&e, [m.div_ceil(32) as u32, 1, 1], [128, 1, 1], (528 * n) as u32, a.as_mut_slice())
+                    gpu.launch_kernel_blob(&e, [m.div_ceil(32) as u32, 1, 1], [128, 1, 1], t0_lds_bytes(n), a.as_mut_slice())
                         .unwrap_or_else(|err| panic!("launch {e}: {err}"));
                     gpu.hip.device_synchronize().expect("sync");
                     let hd = download_bytes(gpu, &yd, bytes + GUARD_TAIL);
@@ -1389,7 +1397,7 @@ fn mq6sym_i8_wmma_timing_hw() {
                                     &format!("gemv_mq6sym_i8_rows_r{r}_gfx1201"),
                                     [m.div_ceil(32) as u32, 1, 1],
                                     [128, 1, 1],
-                                    (528 * r) as u32, // dynamic LDS of the T0 entry r<N>
+                                    t0_lds_bytes(r), // dynamic LDS of the T0 entry r<N>
                                     a.as_mut_slice(),
                                 )
                                 .expect("dot4 launch");
