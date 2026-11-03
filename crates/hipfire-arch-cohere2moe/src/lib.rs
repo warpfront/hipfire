@@ -29,6 +29,7 @@ pub mod carrier;
 pub mod cohere2moe;
 pub mod config;
 pub mod forward;
+mod program;
 pub mod spec_emit;
 pub mod spec_impl;
 pub use arch::Cohere2Moe;
