@@ -7184,7 +7184,10 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
     }
 
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&render_json(&out, shape))?);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&render_json(&out, shape))?
+        );
     } else {
         println!("{}", render_table(&out, shape));
     }
