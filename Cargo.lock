@@ -1347,6 +1347,7 @@ dependencies = [
  "half",
  "hip-bridge",
  "hipfire-config",
+ "hipfire-dispatch",
  "hipfire-runtime",
  "image",
  "rdna-compute",

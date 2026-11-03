@@ -69,6 +69,7 @@ pub mod forward;
 pub mod image;
 pub mod names;
 pub mod post;
+pub(crate) mod program;
 pub mod slot_engine;
 pub mod video;
 pub mod vision;

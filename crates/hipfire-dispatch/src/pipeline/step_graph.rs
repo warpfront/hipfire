@@ -162,7 +162,7 @@ pub enum OpKind {
     GatedFfn = 61,
     /// [`Step::BoundaryProject`] (#666 G18, Raon BF16-boundary projections).
     BoundaryProject = 62,
-    /// [`Step::Encoder`] (#666 G19, Qwen3.5 embedding encoder stages).
+    /// [`Step::Encoder`] (#666 G19/G20, Qwen3.5 / EmbeddingGemma 2 embedding encoder stages).
     Encoder = 63,
     /// Hand-route ops with no `Step` variant yet (dense TP decode): residual add.
     ResidualAdd = 1000,

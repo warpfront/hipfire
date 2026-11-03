@@ -631,6 +631,8 @@ refused at load under PP; Single and EP session behavior is unchanged.
 | `HIPFIRE_EMBED_PHASE` | `1` prints the per-phase timing of one `embed` request | `assemble \| encode \| mask+normalize \| serialize+write`, on stderr. **Its own knob, deliberately not `HIPFIRE_EMBED_DEBUG`**: that one also arms the encoder's per-layer finite `trace()`, which syncs the GPU every layer and inflated the same measurement from 334 ms to 678 ms — the first reading of it was wrong for exactly that reason. |
 | `HIPFIRE_EMBED_DEBUG` | `1` traces the embedding encoder | Prints a per-layer finite-value trace of the residual stream (absmax + non-finite count) and the VRAM free/total after load. Downloads one tensor per call, so it is strictly a debugging path — it is what localized a weight-format bug that NaN'd the last rows of every projection. |
 
+EmbeddingGemma 2 (arch 18) reads the same two knobs through the shared encoder steps. Its attention scale is 1.0, which the Q-tiled kernel cannot serve, so `HIPFIRE_EMBED_ATTN=no-gemm` has no effect there (the eager route stays) and its short or non-WMMA segments take the masked reference kernel. Its sliding-window band mask exists only on the eager route: a segment whose padded rows exceed `window + 1` (513 for the shipped config) is refused under `naive` and on archs without that route (gfx1200, non-WMMA).
+
 ### GGUF-native (dense Qwen3.5 / 3.6 / 3.8, gfx1201, developer, default off)
 
 | Variable | Default / sense | Notes |
