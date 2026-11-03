@@ -376,7 +376,7 @@ fn stage_route(
     Ok(())
 }
 
-/// Census taps of an RDA layer's intermediates (after `rda_mixer`): the
+/// Census taps of an RDA layer's intermediates (after `program::rda_steps`): the
 /// projections, the conv / prepare / recurrence outputs and the gated plane.
 /// With an armed ring the raw projections and prepare outputs live in the ring
 /// planes, not the scratch ones.
@@ -455,7 +455,7 @@ fn stage_rda(
     fire_stage_scratch(tap, gpu, l, "rda.gated", &scratch.rda_gated, rows, cap)
 }
 
-/// Census taps of an MLA layer's intermediates (after `mla_mixer`): the
+/// Census taps of an MLA layer's intermediates (after `program::mla_steps`): the
 /// projections, the normed q_a, q, and the gated attention output.
 fn stage_mla(
     tap: &mut Option<LayerTap<'_>>,
