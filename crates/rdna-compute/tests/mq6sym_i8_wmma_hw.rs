@@ -1170,7 +1170,8 @@ fn mq6sym_i8_wmma_timing_hw() {
             let mut keep_alive: Vec<GpuTensor> = Vec::new();
             let x = rand_activations(&mut rng, k, n);
             let xt = upload_f32(&mut gpu, &x);
-            let ybytes = n * m * 4;
+            // 48 token rows even for N < 48: the parked skinny kernel writes whole 16/32-token tiles
+            let ybytes = n.max(48) * m * 4;
             let y = gpu.alloc_tensor(&[ybytes], DType::Raw).expect("alloc y");
             let ybf = gpu.alloc_tensor(&[ybytes / 2], DType::Raw).expect("alloc ybf");
             // producer time (alone) with fresh reservation each batch (steady state)
@@ -1392,7 +1393,9 @@ fn mq6sym_i8_wmma_timing_hw() {
                         let arm = &mut arms[ai];
                         (arm.run)(&gpu, 0);
                     }
-                    gpu.hip.device_synchronize().unwrap();
+                    gpu.hip
+                        .device_synchronize()
+                        .unwrap_or_else(|e| panic!("arm {} ({cell}): {e}", arms[ai].name));
                     let us = {
                         let arm = &mut arms[ai];
                         time_batch(&mut gpu, iters, sets, &mut |g, i| (arm.run)(g, i))
@@ -1414,8 +1417,9 @@ fn mq6sym_i8_wmma_timing_hw() {
         }
 
         // ------- prefill cells (compute-bound; two weight sets) -------
-        let mut pre: Vec<usize> = dev_pre_n.to_vec();
-        if big {
+        // the lm_head is only ever evaluated for a handful of sampled rows: no prefill cells for it
+        let mut pre: Vec<usize> = if m > 100_000 { Vec::new() } else { dev_pre_n.to_vec() };
+        if big && m <= 100_000 {
             pre.push(16384);
         }
         for &n in &pre {
