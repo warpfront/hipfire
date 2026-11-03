@@ -11728,6 +11728,9 @@ mod tests {
         assert_eq!(DType::MQ4G128V2.row_bytes(640), Some(5 * 68));
         assert_eq!(DType::MQ4G128V2.row_bytes(129), Some(2 * 68));
         assert_eq!(DType::MQ6G256V2.row_bytes(2560), Some(10 * 200));
+        // qt51 is the unrotated sibling of qt19: the same 72-byte groups.
+        assert_eq!(DType::MQ2G256LloydU.row_bytes(2048), Some(8 * 72));
+        assert_eq!(DType::MQ2G256Lloyd.row_bytes(2048), Some(8 * 72));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(2560), Some(16 + 80 + 80 * 16));
         assert_eq!(DType::MFP4G32E8.row_bytes(4096), Some(2192));
         assert_eq!(DType::MFP4G32E8SOA.row_bytes(4096), Some(2192));
