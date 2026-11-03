@@ -231,8 +231,8 @@ enum WKind {
 }
 
 const EDGE_SCALES: [u16; 14] = [
-    0x0000, 0x8000, 0x0001, 0x0002, 0x03FF, 0x8155, 0x0400, 0x3C00, 0xBC00, 0x3800, 0x6FFF,
-    0x2E66, 0x5640, 0x0155,
+    0x0000, 0x8000, 0x0001, 0x0002, 0x03FF, 0x8155, 0x0400, 0x3C00, 0xBC00, 0x3800, 0x6FFF, 0x2E66,
+    0x5640, 0x0155,
 ];
 
 fn gen_weights(m: usize, k: usize, kind: WKind, seed: u64) -> Vec<u8> {
@@ -330,13 +330,22 @@ fn cpu_ref(w: &[u8], k: usize, rows: &[usize], rt: &RefTokens) -> Vec<f32> {
         .min(16);
     let chunk = rows.len().div_ceil(nthreads).max(1);
     std::thread::scope(|sc| {
-        for (ci, (rows_c, out_c)) in rows.chunks(chunk).zip(out.chunks_mut(chunk * nt)).enumerate() {
+        for (ci, (rows_c, out_c)) in rows
+            .chunks(chunk)
+            .zip(out.chunks_mut(chunk * nt))
+            .enumerate()
+        {
             let _ = ci;
             sc.spawn(move || {
                 let mut codes = vec![0i8; k];
                 let mut scales = vec![0f32; kb];
                 for (ri, &r) in rows_c.iter().enumerate() {
-                    decode_row(&w[r * gpr * GROUP..(r + 1) * gpr * GROUP], k, &mut codes, &mut scales);
+                    decode_row(
+                        &w[r * gpr * GROUP..(r + 1) * gpr * GROUP],
+                        k,
+                        &mut codes,
+                        &mut scales,
+                    );
                     for ti in 0..nt {
                         let mut acc = 0.0f32;
                         for b in 0..kb {
@@ -364,7 +373,12 @@ fn cpu_c_sum(w: &[u8], k: usize, rows: &[usize], rt: &RefTokens) -> Vec<i64> {
     let mut codes = vec![0i8; k];
     let mut scales = vec![0f32; kb];
     for (ri, &r) in rows.iter().enumerate() {
-        decode_row(&w[r * gpr * GROUP..(r + 1) * gpr * GROUP], k, &mut codes, &mut scales);
+        decode_row(
+            &w[r * gpr * GROUP..(r + 1) * gpr * GROUP],
+            k,
+            &mut codes,
+            &mut scales,
+        );
         for ti in 0..nt {
             let mut tot = 0i64;
             for b in 0..kb {
@@ -378,7 +392,13 @@ fn cpu_c_sum(w: &[u8], k: usize, rows: &[usize], rt: &RefTokens) -> Vec<i64> {
     out
 }
 
-fn pick_subset(total: usize, full_limit: usize, extra: &[usize], rng: &mut Lcg, rand_n: usize) -> Vec<usize> {
+fn pick_subset(
+    total: usize,
+    full_limit: usize,
+    extra: &[usize],
+    rng: &mut Lcg,
+    rand_n: usize,
+) -> Vec<usize> {
     if total <= full_limit {
         return (0..total).collect();
     }
@@ -405,7 +425,9 @@ fn pick_subset(total: usize, full_limit: usize, extra: &[usize], rng: &mut Lcg, 
 // ---------------------------------------------------------------- GPU helpers
 
 fn upload_bytes(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::Raw).expect("alloc raw");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::Raw)
+        .expect("alloc raw");
     gpu.hip.memcpy_htod(&t.buf, data).expect("htod");
     t
 }
@@ -419,7 +441,9 @@ fn download_bytes(gpu: &Gpu, t: &GpuTensor, n: usize) -> Vec<u8> {
 fn upload_f32(gpu: &mut Gpu, data: &[f32]) -> GpuTensor {
     let bytes: &[u8] =
         unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-    let t = gpu.alloc_tensor(&[data.len()], DType::F32).expect("alloc f32");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::F32)
+        .expect("alloc f32");
     gpu.hip.memcpy_htod(&t.buf, bytes).expect("htod f32");
     t
 }
@@ -436,13 +460,25 @@ struct Tile {
 
 impl Tile {
     fn narrow(rows: usize, ntok: usize) -> Tile {
-        Tile { rows, ntok, ys: false }
+        Tile {
+            rows,
+            ntok,
+            ys: false,
+        }
     }
     fn split(rows: usize, ntok: usize) -> Tile {
-        Tile { rows, ntok, ys: true }
+        Tile {
+            rows,
+            ntok,
+            ys: true,
+        }
     }
     fn p128() -> Tile {
-        Tile { rows: 128, ntok: 0, ys: false }
+        Tile {
+            rows: 128,
+            ntok: 0,
+            ys: false,
+        }
     }
     fn is_prefill(&self) -> bool {
         self.ntok == 0
@@ -453,21 +489,33 @@ impl Tile {
             format!("gemm_mq6sym_i8_set{b}_gfx1201")
         } else {
             let y = if self.ys { "y" } else { "" };
-            format!("gemm_mq6sym_i8_set{b}_m{}n{}{y}_gfx1201", self.rows, self.ntok)
+            format!(
+                "gemm_mq6sym_i8_set{b}_m{}n{}{y}_gfx1201",
+                self.rows, self.ntok
+            )
         }
     }
     fn label(&self) -> String {
         if self.is_prefill() {
             "p128".to_string()
         } else {
-            format!("m{}n{}{}", self.rows, self.ntok, if self.ys { "y" } else { "" })
+            format!(
+                "m{}n{}{}",
+                self.rows,
+                self.ntok,
+                if self.ys { "y" } else { "" }
+            )
         }
     }
     fn grid(&self, m: usize, n: usize) -> [u32; 3] {
         if self.is_prefill() {
             [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1]
         } else if self.ys {
-            [m.div_ceil(self.rows) as u32, n.div_ceil(self.ntok) as u32, 1]
+            [
+                m.div_ceil(self.rows) as u32,
+                n.div_ceil(self.ntok) as u32,
+                1,
+            ]
         } else {
             [m.div_ceil(self.rows) as u32, 1, 1]
         }
@@ -512,7 +560,17 @@ fn load_entries(gpu: &mut Gpu) {
     }
 }
 
-fn launch_sym(gpu: &Gpu, tile: Tile, bf16: bool, w: *mut c_void, xq: *mut c_void, y: *mut c_void, m: usize, k: usize, n: usize) {
+fn launch_sym(
+    gpu: &Gpu,
+    tile: Tile,
+    bf16: bool,
+    w: *mut c_void,
+    xq: *mut c_void,
+    y: *mut c_void,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
     let mut a = KernargBlob::new();
     a.push_ptr(w);
     a.push_ptr(xq);
@@ -520,14 +578,33 @@ fn launch_sym(gpu: &Gpu, tile: Tile, bf16: bool, w: *mut c_void, xq: *mut c_void
     a.push_i32(m as i32);
     a.push_i32(k as i32);
     a.push_i32(n as i32);
-    assert_eq!(a.len(), KERNARG_BYTES, "frozen ABI: 36 explicit kernarg bytes");
+    assert_eq!(
+        a.len(),
+        KERNARG_BYTES,
+        "frozen ABI: 36 explicit kernarg bytes"
+    );
     a.pad_to(16);
     let e = tile.entry(bf16);
-    gpu.launch_kernel_blob(&e, tile.grid(m, n), tile.block(), tile.lds(), a.as_mut_slice())
-        .unwrap_or_else(|err| panic!("launch {e}: {err}"));
+    gpu.launch_kernel_blob(
+        &e,
+        tile.grid(m, n),
+        tile.block(),
+        tile.lds(),
+        a.as_mut_slice(),
+    )
+    .unwrap_or_else(|err| panic!("launch {e}: {err}"));
 }
 
-fn launch_affine_src(gpu: &Gpu, bf16: bool, w: *mut c_void, xq: *mut c_void, y: *mut c_void, m: usize, k: usize, n: usize) {
+fn launch_affine_src(
+    gpu: &Gpu,
+    bf16: bool,
+    w: *mut c_void,
+    xq: *mut c_void,
+    y: *mut c_void,
+    m: usize,
+    k: usize,
+    n: usize,
+) {
     let mut a = KernargBlob::new();
     a.push_ptr(w);
     a.push_ptr(xq);
@@ -536,7 +613,11 @@ fn launch_affine_src(gpu: &Gpu, bf16: bool, w: *mut c_void, xq: *mut c_void, y: 
     a.push_i32(k as i32);
     a.push_i32(n as i32);
     a.pad_to(16);
-    let e = if bf16 { AFFINE_BF16_ENTRY } else { AFFINE_ENTRY };
+    let e = if bf16 {
+        AFFINE_BF16_ENTRY
+    } else {
+        AFFINE_ENTRY
+    };
     gpu.launch_kernel_blob(
         e,
         [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
@@ -583,7 +664,9 @@ fn produce_real(gpu: &mut Gpu, x: &[f32], k: usize, n: usize) -> (*mut c_void, V
     let prep = gpu
         .rotate_x_mq_i8_batched(&xt, Some(&xrot), res, k, n)
         .expect("real producer");
-    let ptr = gpu.int8_mmq_prepared_ptr(&prep, k, n).expect("prepared ptr");
+    let ptr = gpu
+        .int8_mmq_prepared_ptr(&prep, k, n)
+        .expect("prepared ptr");
     gpu.hip.device_synchronize().expect("sync");
     let nbytes = (k / 128) * n * BLK;
     let mut host = vec![0u8; nbytes];
@@ -732,7 +815,11 @@ fn run_case(
             if !got_eq {
                 mism += 1;
                 if first.is_empty() {
-                    first = format!("row {r} tok {t} want {want:e} ({:#010x}) got bytes {:02x?}", want.to_bits(), &ha[off..off + elt]);
+                    first = format!(
+                        "row {r} tok {t} want {want:e} ({:#010x}) got bytes {:02x?}",
+                        want.to_bits(),
+                        &ha[off..off + elt]
+                    );
                 }
             }
         }
@@ -755,7 +842,11 @@ fn run_case(
                 if !ok {
                     mism += 1;
                     if first.is_empty() {
-                        first = format!("C-probe row {r} tok {t} want {} got {:02x?}", sums[ri * toks.len() + ti], &ha[off..off + elt]);
+                        first = format!(
+                            "C-probe row {r} tok {t} want {} got {:02x?}",
+                            sums[ri * toks.len() + ti],
+                            &ha[off..off + elt]
+                        );
                     }
                 }
             }
@@ -767,13 +858,20 @@ fn run_case(
         st.words += cmp + (vis as u64) / (elt as u64);
         st.mismatches += mism + bad;
         if !pass {
-            st.fails.push(format!("{label} {} {} m{m} k{k} n{n}: {first}", tile.label(), if bf16 { "bf16" } else { "f32" }));
+            st.fails.push(format!(
+                "{label} {} {} m{m} k{k} n{n}: {first}",
+                tile.label(),
+                if bf16 { "bf16" } else { "f32" }
+            ));
         }
         if nonzero_ref * 4 < cmp && !matches!(label, "crafted/AllMin" | "crafted/AllMax") {
             // a mostly-zero reference would make the byte compare vacuous
             let zero_scale_heavy = label.contains("EdgeScales") || label.contains("Exhaustive");
             if !zero_scale_heavy {
-                st.fails.push(format!("{label} {} m{m} k{k} n{n}: reference mostly zero ({nonzero_ref}/{cmp})", tile.label()));
+                st.fails.push(format!(
+                    "{label} {} m{m} k{k} n{n}: reference mostly zero ({nonzero_ref}/{cmp})",
+                    tile.label()
+                ));
             }
         }
     }
@@ -825,7 +923,10 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
             let rows = pick_subset(m, 600, &[127, 128, 129, 255, 256, 1023, 1024], rng, 96);
             let toks: Vec<usize> = (0..n).collect();
             let rt = ref_tokens(&xq_host, k, n, &toks);
-            for (wi, wk) in [WKind::Random, WKind::EdgeScales, WKind::Exhaustive].into_iter().enumerate() {
+            for (wi, wk) in [WKind::Random, WKind::EdgeScales, WKind::Exhaustive]
+                .into_iter()
+                .enumerate()
+            {
                 let w_host = gen_weights(m, k, wk, 0x7000_0000 + (m * 8 + n) as u64 + wi as u64);
                 let w_dev = upload_bytes(gpu, &w_host);
                 let yref = cpu_ref(&w_host, k, &rows, &rt);
@@ -839,7 +940,8 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
                             let ok = if bf16 {
                                 u16::from_le_bytes([h[off], h[off + 1]]) == bf16_bits(want)
                             } else {
-                                u32::from_le_bytes([h[off], h[off + 1], h[off + 2], h[off + 3]]) == want.to_bits()
+                                u32::from_le_bytes([h[off], h[off + 1], h[off + 2], h[off + 3]])
+                                    == want.to_bits()
                             };
                             if !ok {
                                 bad += 1;
@@ -851,8 +953,12 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
                 for bf16 in [false, true] {
                     let elt = if bf16 { 2 } else { 4 };
                     let bytes = m * n * elt;
-                    let yd = gpu.alloc_tensor(&[bytes + GUARD_TAIL], DType::Raw).expect("alloc yd");
-                    gpu.hip.memset(&yd.buf, 0xA5, bytes + GUARD_TAIL).expect("memset");
+                    let yd = gpu
+                        .alloc_tensor(&[bytes + GUARD_TAIL], DType::Raw)
+                        .expect("alloc yd");
+                    gpu.hip
+                        .memset(&yd.buf, 0xA5, bytes + GUARD_TAIL)
+                        .expect("memset");
                     let mut a = KernargBlob::new();
                     a.push_ptr(w_dev.buf.as_ptr());
                     a.push_ptr(xq_ptr);
@@ -861,9 +967,18 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
                     a.push_i32(k as i32);
                     a.push_i32(n as i32);
                     a.pad_to(16);
-                    let e = format!("gemv_mq6sym_i8_rows_r{n}{}_gfx1201", if bf16 { "_bf16" } else { "" });
-                    gpu.launch_kernel_blob(&e, [m.div_ceil(32) as u32, 1, 1], [128, 1, 1], t0_lds_bytes(n), a.as_mut_slice())
-                        .unwrap_or_else(|err| panic!("launch {e}: {err}"));
+                    let e = format!(
+                        "gemv_mq6sym_i8_rows_r{n}{}_gfx1201",
+                        if bf16 { "_bf16" } else { "" }
+                    );
+                    gpu.launch_kernel_blob(
+                        &e,
+                        [m.div_ceil(32) as u32, 1, 1],
+                        [128, 1, 1],
+                        t0_lds_bytes(n),
+                        a.as_mut_slice(),
+                    )
+                    .unwrap_or_else(|err| panic!("launch {e}: {err}"));
                     gpu.hip.device_synchronize().expect("sync");
                     let hd = download_bytes(gpu, &yd, bytes + GUARD_TAIL);
                     let t0_bad = cpu_bad(&hd, bf16);
@@ -871,12 +986,30 @@ fn t0_parity(gpu: &mut Gpu, js: &mut Jsonl, st: &mut CaseStats, rng: &mut Lcg, t
                     let mut t1_bad_case = 0u64;
                     let mut par_bad_case = 0u64;
                     for tile in tiles_for(n, true) {
-                        let ym = gpu.alloc_tensor(&[bytes + GUARD_TAIL], DType::Raw).expect("alloc ym");
-                        gpu.hip.memset(&ym.buf, 0x5A, bytes + GUARD_TAIL).expect("memset");
-                        launch_sym(gpu, tile, bf16, w_dev.buf.as_ptr(), xq_ptr, ym.buf.as_ptr(), m, k, n);
+                        let ym = gpu
+                            .alloc_tensor(&[bytes + GUARD_TAIL], DType::Raw)
+                            .expect("alloc ym");
+                        gpu.hip
+                            .memset(&ym.buf, 0x5A, bytes + GUARD_TAIL)
+                            .expect("memset");
+                        launch_sym(
+                            gpu,
+                            tile,
+                            bf16,
+                            w_dev.buf.as_ptr(),
+                            xq_ptr,
+                            ym.buf.as_ptr(),
+                            m,
+                            k,
+                            n,
+                        );
                         gpu.hip.device_synchronize().expect("sync");
                         let hm = download_bytes(gpu, &ym, bytes + GUARD_TAIL);
-                        let d = hd[..bytes].iter().zip(&hm[..bytes]).filter(|(p, q)| p != q).count() as u64;
+                        let d = hd[..bytes]
+                            .iter()
+                            .zip(&hm[..bytes])
+                            .filter(|(p, q)| p != q)
+                            .count() as u64;
                         par_bad_case += d;
                         mism += d;
                         cmp_words += (bytes / elt) as u64;
@@ -935,7 +1068,9 @@ fn mq6sym_i8_wmma_bytes_hw() {
         let pass = diff == 0;
         js.line(&format!("{{\"kind\":\"producer_vs_cpu_quantizer\",\"k\":{k},\"n\":{n},\"bytes\":{},\"diff\":{diff},\"pass\":{pass}}}", host.len()));
         if !pass {
-            st.fails.push(format!("producer blocks differ from CPU quantizer k{k} n{n}: {diff} bytes"));
+            st.fails.push(format!(
+                "producer blocks differ from CPU quantizer k{k} n{n}: {diff} bytes"
+            ));
             st.mismatches += diff as u64;
         }
     }
@@ -947,7 +1082,11 @@ fn mq6sym_i8_wmma_bytes_hw() {
         // 0: zero; 1: spike (amax 127, rest 1e-3); 2: ties at +-(j+0.5) with d == 1; 3: saturation
         for i in 0..128 {
             x[k + i] = 1e-3;
-            x[2 * k + i] = if i % 2 == 0 { (i as f32 / 2.0) + 0.5 } else { -((i as f32 / 2.0).floor() + 0.5) };
+            x[2 * k + i] = if i % 2 == 0 {
+                (i as f32 / 2.0) + 0.5
+            } else {
+                -((i as f32 / 2.0).floor() + 0.5)
+            };
             x[3 * k + i] = if i % 3 == 0 { 127.0 } else { -127.0 };
             x[4 * k + i] = f32::from_bits(0x0000_0400 + i as u32); // subnormal inputs
             x[5 * k + i] = (i as f32 - 63.5) * 1.0e-30;
@@ -982,7 +1121,9 @@ fn mq6sym_i8_wmma_bytes_hw() {
         let diff = got.iter().zip(&want).filter(|(a, b)| a != b).count();
         js.line(&format!("{{\"kind\":\"standalone_quantizer_vs_cpu\",\"k\":{k},\"n\":{n},\"diff\":{diff},\"pass\":{}}}", diff == 0));
         if diff != 0 {
-            st.fails.push(format!("standalone quantizer differs from CPU quantizer: {diff} bytes"));
+            st.fails.push(format!(
+                "standalone quantizer differs from CPU quantizer: {diff} bytes"
+            ));
             st.mismatches += diff as u64;
         }
     }
@@ -995,7 +1136,7 @@ fn mq6sym_i8_wmma_bytes_hw() {
         (1000, 2560), // tail M for 32/64/128
         (2560, 6144), // out_proj shape
         (512, 2560),
-        (1, 256),     // single row (clamped tail everywhere)
+        (1, 256), // single row (clamped tail everywhere)
         (17, 512),
     ];
     let narrow_n = [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 16, 24, 32, 48];
@@ -1005,14 +1146,31 @@ fn mq6sym_i8_wmma_bytes_hw() {
             // one activation set per (k, n): real producer (random + zero token + outliers)
             let x = rand_activations(&mut rng, k, n);
             let (xq_ptr, _rot, xq_host) = produce_real(&mut gpu, &x, k, n);
-            for (wi, wk) in [WKind::Random, WKind::EdgeScales, WKind::Exhaustive].into_iter().enumerate() {
+            for (wi, wk) in [WKind::Random, WKind::EdgeScales, WKind::Exhaustive]
+                .into_iter()
+                .enumerate()
+            {
                 let w_host = gen_weights(m, k, wk, 0x5EED_0000 + (case_no << 8) + wi as u64);
                 let w_dev = upload_bytes(&mut gpu, &w_host);
                 for tile in tiles_for(n, true) {
                     for bf16 in [false, true] {
                         run_case(
-                            &mut gpu, &mut st, &mut js, &format!("real-act/{:?}", wk), tile, bf16,
-                            &w_host, &w_dev, xq_ptr, &xq_host, m, k, n, &mut rng, false, false,
+                            &mut gpu,
+                            &mut st,
+                            &mut js,
+                            &format!("real-act/{:?}", wk),
+                            tile,
+                            bf16,
+                            &w_host,
+                            &w_dev,
+                            xq_ptr,
+                            &xq_host,
+                            m,
+                            k,
+                            n,
+                            &mut rng,
+                            false,
+                            false,
                         );
                     }
                 }
@@ -1035,7 +1193,13 @@ fn mq6sym_i8_wmma_bytes_hw() {
                         1 => -127,
                         2 => 0,
                         3 => ((i as i32 * 5 + b as i32) % 255 - 127) as i8,
-                        4 => if i % 2 == 0 { 127 } else { -127 },
+                        4 => {
+                            if i % 2 == 0 {
+                                127
+                            } else {
+                                -127
+                            }
+                        }
                         _ => (rng.next_u32() % 255) as i32 as i8 - 127,
                     };
                 }
@@ -1057,8 +1221,22 @@ fn mq6sym_i8_wmma_bytes_hw() {
             for tile in tiles_for(n, true) {
                 for bf16 in [false, true] {
                     run_case(
-                        &mut gpu, &mut st, &mut js, &format!("crafted/{:?}", wk), tile, bf16,
-                        &w_host, &w_dev, xq_dev.buf.as_ptr(), &xq, m, k, n, &mut rng, probe, false,
+                        &mut gpu,
+                        &mut st,
+                        &mut js,
+                        &format!("crafted/{:?}", wk),
+                        tile,
+                        bf16,
+                        &w_host,
+                        &w_dev,
+                        xq_dev.buf.as_ptr(),
+                        &xq,
+                        m,
+                        k,
+                        n,
+                        &mut rng,
+                        probe,
+                        false,
                     );
                 }
             }
@@ -1079,8 +1257,22 @@ fn mq6sym_i8_wmma_bytes_hw() {
             for bf16 in [false, true] {
                 for tile in [Tile::p128()] {
                     run_case(
-                        &mut gpu, &mut st, &mut js, "prefill/real-act/Random", tile, bf16,
-                        &w_host, &w_dev, xq_ptr, &xq_host, m, k, n, &mut rng, false, false,
+                        &mut gpu,
+                        &mut st,
+                        &mut js,
+                        "prefill/real-act/Random",
+                        tile,
+                        bf16,
+                        &w_host,
+                        &w_dev,
+                        xq_ptr,
+                        &xq_host,
+                        m,
+                        k,
+                        n,
+                        &mut rng,
+                        false,
+                        false,
                     );
                 }
             }
@@ -1102,7 +1294,14 @@ fn mq6sym_i8_wmma_bytes_hw() {
         let (xq_ptr, _rot, xq_host) = produce_real(&mut gpu, &x, k, n);
         let w_host = gen_weights(m, k, WKind::Random, 0xBAD_C0DE);
         let mut undetected = 0usize;
-        for (what, tile) in [("code", Tile::narrow(64, 32)), ("scale", Tile::narrow(32, 32)), ("act", Tile::narrow(64, 48)), ("code", Tile::p128()), ("scale", Tile::p128()), ("act", Tile::p128())] {
+        for (what, tile) in [
+            ("code", Tile::narrow(64, 32)),
+            ("scale", Tile::narrow(32, 32)),
+            ("act", Tile::narrow(64, 48)),
+            ("code", Tile::p128()),
+            ("scale", Tile::p128()),
+            ("act", Tile::p128()),
+        ] {
             let mut w_bad = w_host.clone();
             let mut xq_bad = xq_host.clone();
             match what {
@@ -1117,22 +1316,46 @@ fn mq6sym_i8_wmma_bytes_hw() {
             let xq_dev = upload_bytes(&mut gpu, &xq_bad);
             let _ = xq_ptr;
             let pass = run_case(
-                &mut gpu, &mut st, &mut js, &format!("negative/{what}"), tile, false,
-                &w_host, &w_dev, xq_dev.buf.as_ptr(), &xq_host, m, k, n, &mut rng, false, true,
+                &mut gpu,
+                &mut st,
+                &mut js,
+                &format!("negative/{what}"),
+                tile,
+                false,
+                &w_host,
+                &w_dev,
+                xq_dev.buf.as_ptr(),
+                &xq_host,
+                m,
+                k,
+                n,
+                &mut rng,
+                false,
+                true,
             );
             if pass {
                 undetected += 1;
-                st.fails.push(format!("negative control {what} on {} was NOT detected", tile.label()));
+                st.fails.push(format!(
+                    "negative control {what} on {} was NOT detected",
+                    tile.label()
+                ));
             }
         }
-        js.line(&format!("{{\"kind\":\"negative_summary\",\"controls\":6,\"undetected\":{undetected}}}"));
+        js.line(&format!(
+            "{{\"kind\":\"negative_summary\",\"controls\":6,\"undetected\":{undetected}}}"
+        ));
     }
 
     // ---- G. z-ignored robustness: garbage z halves must leave every output byte unchanged ----
     {
         let mut z_bad_bytes = 0u64;
         let mut z_cases = 0u64;
-        for &(m, k, n) in &[(130usize, 2560usize, 24usize), (1000, 512, 48), (48, 6144, 5), (257, 256, 200)] {
+        for &(m, k, n) in &[
+            (130usize, 2560usize, 24usize),
+            (1000, 512, 48),
+            (48, 6144, 5),
+            (257, 256, 200),
+        ] {
             let x = rand_activations(&mut rng, k, n);
             let (_p, _rot, xq_host) = produce_real(&mut gpu, &x, k, n);
             let xq_dev = upload_bytes(&mut gpu, &xq_host);
@@ -1144,7 +1367,10 @@ fn mq6sym_i8_wmma_bytes_hw() {
                 }
             }
             assert_ne!(w_host, w_garb);
-            let (wa, wb) = (upload_bytes(&mut gpu, &w_host), upload_bytes(&mut gpu, &w_garb));
+            let (wa, wb) = (
+                upload_bytes(&mut gpu, &w_host),
+                upload_bytes(&mut gpu, &w_garb),
+            );
             for tile in tiles_for(n, true) {
                 for bf16 in [false, true] {
                     let ybytes = m * n * if bf16 { 2 } else { 4 };
@@ -1152,19 +1378,36 @@ fn mq6sym_i8_wmma_bytes_hw() {
                     for wt in [&wa, &wb] {
                         let y = gpu.alloc_tensor(&[ybytes], DType::Raw).expect("alloc y");
                         gpu.hip.memset(&y.buf, 0xA5, ybytes).expect("memset");
-                        launch_sym(&gpu, tile, bf16, wt.buf.as_ptr(), xq_dev.buf.as_ptr(), y.buf.as_ptr(), m, k, n);
+                        launch_sym(
+                            &gpu,
+                            tile,
+                            bf16,
+                            wt.buf.as_ptr(),
+                            xq_dev.buf.as_ptr(),
+                            y.buf.as_ptr(),
+                            m,
+                            k,
+                            n,
+                        );
                         gpu.hip.device_synchronize().expect("sync");
                         outs.push(download_bytes(&gpu, &y, ybytes));
                     }
-                    assert!(outs[0].iter().any(|&b| b != 0 && b != 0xA5), "vacuous z case");
-                    z_bad_bytes += outs[0].iter().zip(&outs[1]).filter(|(p, q)| p != q).count() as u64;
+                    assert!(
+                        outs[0].iter().any(|&b| b != 0 && b != 0xA5),
+                        "vacuous z case"
+                    );
+                    z_bad_bytes +=
+                        outs[0].iter().zip(&outs[1]).filter(|(p, q)| p != q).count() as u64;
                     z_cases += 1;
                 }
             }
         }
-        js.line(&format!("{{\"kind\":\"z_garbage\",\"cases\":{z_cases},\"mismatching_bytes\":{z_bad_bytes}}}"));
+        js.line(&format!(
+            "{{\"kind\":\"z_garbage\",\"cases\":{z_cases},\"mismatching_bytes\":{z_bad_bytes}}}"
+        ));
         if z_bad_bytes != 0 {
-            st.fails.push(format!("z-garbage: {z_bad_bytes} output bytes depend on z"));
+            st.fails
+                .push(format!("z-garbage: {z_bad_bytes} output bytes depend on z"));
         }
         st.mismatches += z_bad_bytes;
     }
@@ -1178,7 +1421,11 @@ fn mq6sym_i8_wmma_bytes_hw() {
         eprintln!("FAIL {f}");
     }
     assert!(st.cases > 0, "vacuous run");
-    assert!(verdict, "mq6sym wmma byte oracle: {} mismatching cases", st.fails.len());
+    assert!(
+        verdict,
+        "mq6sym wmma byte oracle: {} mismatching cases",
+        st.fails.len()
+    );
 }
 
 // ---------------------------------------------------------------- timing
@@ -1229,7 +1476,9 @@ fn time_batch(gpu: &mut Gpu, iters: usize, sets: usize, f: &mut dyn FnMut(&Gpu, 
     for i in 0..iters {
         f(gpu, i % sets);
     }
-    gpu.hip.event_record(&e1, gpu.active_stream.as_ref()).expect("record");
+    gpu.hip
+        .event_record(&e1, gpu.active_stream.as_ref())
+        .expect("record");
     gpu.hip.event_synchronize(&e1).expect("sync");
     let ms = gpu.hip.event_elapsed_ms(&e0, &e1).expect("elapsed");
     let _ = gpu.hip.event_destroy(e0);
@@ -1252,18 +1501,33 @@ fn mq6sym_i8_wmma_timing_hw() {
         return;
     }
     load_entries(&mut gpu);
-    gpu.ensure_kernel_public(AFFINE_MODULE, rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC, AFFINE_ENTRY)
-        .expect("load affine i8 (hipcc source)");
-    gpu.ensure_kernel_public(AFFINE_MODULE, rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC, AFFINE_BF16_ENTRY)
-        .expect("load affine i8 bf16 (hipcc source)");
-    let skinny_src = std::env::var("T1_SKINNY_SRC").ok().and_then(|p| std::fs::read_to_string(p).ok());
+    gpu.ensure_kernel_public(
+        AFFINE_MODULE,
+        rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC,
+        AFFINE_ENTRY,
+    )
+    .expect("load affine i8 (hipcc source)");
+    gpu.ensure_kernel_public(
+        AFFINE_MODULE,
+        rdna_compute::kernels::GEMM_MQ6G256V2_MMQ_I8_GFX12_SRC,
+        AFFINE_BF16_ENTRY,
+    )
+    .expect("load affine i8 bf16 (hipcc source)");
+    let skinny_src = std::env::var("T1_SKINNY_SRC")
+        .ok()
+        .and_then(|p| std::fs::read_to_string(p).ok());
     // Same-format dot4 loop (T0 slice, rows r1..r8): the whole source behind the A8 prelude.
     let dot4_src: Option<String> = std::env::var("T1_DOT4_SRC").ok().and_then(|p| {
         let src = std::fs::read_to_string(p).ok()?;
-        Some(format!("#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{QUANT_SRC}\n{src}"))
+        Some(format!(
+            "#define HIPFIRE_BLOCK_I8_128_QUANT_NO_STANDALONE 1\n{QUANT_SRC}\n{src}"
+        ))
     });
-    gpu.ensure_kernel_public(STREAM_MODULE, STREAM_SRC, "t1_stream_read").expect("load stream roofline");
-    let stream_out = gpu.alloc_tensor(&[16], DType::Raw).expect("alloc stream out");
+    gpu.ensure_kernel_public(STREAM_MODULE, STREAM_SRC, "t1_stream_read")
+        .expect("load stream roofline");
+    let stream_out = gpu
+        .alloc_tensor(&[16], DType::Raw)
+        .expect("alloc stream out");
     let stream_out_p = stream_out.buf.as_ptr();
     let mut js = Jsonl::new("timing");
     let filter: Option<Vec<String>> = std::env::var("T1_CELLS")
@@ -1271,7 +1535,10 @@ fn mq6sym_i8_wmma_timing_hw() {
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect());
     let big = std::env::var("T1_BIG").is_ok();
     let mut rng = Lcg(0x71_0000_71E5);
-    let rounds: usize = std::env::var("T1_ROUNDS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
+    let rounds: usize = std::env::var("T1_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
 
     // (name, M, K)
     let mut shapes: Vec<(&str, usize, usize)> = vec![
@@ -1296,7 +1563,10 @@ fn mq6sym_i8_wmma_timing_hw() {
         let sym_bytes = m * (k / 256) * GROUP;
         let aff_bytes = m * (k / 256) * AFFINE_GROUP;
         // cold cyclic sets: >= 6 and >= ~384 MiB of weights (far beyond the 64 MiB MALL)
-        let sets = (384usize << 20).div_ceil(sym_bytes).clamp(2, 16).max(if sym_bytes < (80 << 20) { 6 } else { 2 });
+        let sets = (384usize << 20)
+            .div_ceil(sym_bytes)
+            .clamp(2, 16)
+            .max(if sym_bytes < (80 << 20) { 6 } else { 2 });
         let mut sym_w: Vec<GpuTensor> = Vec::new();
         let mut aff_w: Vec<GpuTensor> = Vec::new();
         let proto_sym = timing_sym_weights(&mut rng, m, k);
@@ -1328,7 +1598,9 @@ fn mq6sym_i8_wmma_timing_hw() {
             // 48 token rows even for N < 48: the parked skinny kernel writes whole 16/32-token tiles
             let ybytes = n.max(48) * m * 4;
             let y = gpu.alloc_tensor(&[ybytes], DType::Raw).expect("alloc y");
-            let ybf = gpu.alloc_tensor(&[ybytes / 2], DType::Raw).expect("alloc ybf");
+            let ybf = gpu
+                .alloc_tensor(&[ybytes / 2], DType::Raw)
+                .expect("alloc ybf");
             // producer time (alone) with fresh reservation each batch (steady state)
             let prod_us = {
                 let mut v = Vec::new();
@@ -1342,9 +1614,13 @@ fn mq6sym_i8_wmma_timing_hw() {
                         gpu.hip.event_record(&e0, s).unwrap();
                         for _ in 0..50 {
                             let res = gpu.reserve_int8_mmq(k, n).expect("reserve");
-                            let _ = gpu.rotate_x_mq_i8_batched(&xt, None, res, k, n).expect("producer");
+                            let _ = gpu
+                                .rotate_x_mq_i8_batched(&xt, None, res, k, n)
+                                .expect("producer");
                         }
-                        gpu.hip.event_record(&e1, gpu.active_stream.as_ref()).unwrap();
+                        gpu.hip
+                            .event_record(&e1, gpu.active_stream.as_ref())
+                            .unwrap();
                         gpu.hip.event_synchronize(&e1).unwrap();
                         let ms = gpu.hip.event_elapsed_ms(&e0, &e1).unwrap();
                         let _ = gpu.hip.event_destroy(e0);
@@ -1357,7 +1633,9 @@ fn mq6sym_i8_wmma_timing_hw() {
             };
             // activation for the GEMM arms: the real producer's scratch
             let res = gpu.reserve_int8_mmq(k, n).expect("reserve");
-            let prep = gpu.rotate_x_mq_i8_batched(&xt, None, res, k, n).expect("producer");
+            let prep = gpu
+                .rotate_x_mq_i8_batched(&xt, None, res, k, n)
+                .expect("producer");
             let xq = gpu.int8_mmq_prepared_ptr(&prep, k, n).expect("xq ptr");
             gpu.hip.device_synchronize().unwrap();
             let yp = y.buf.as_ptr();
@@ -1380,7 +1658,9 @@ fn mq6sym_i8_wmma_timing_hw() {
                     arms.push(Arm {
                         name: format!("sym_{}_{}", tile.label(), if bf16 { "bf16" } else { "f32" }),
                         wbytes: sym_bytes,
-                        run: Box::new(move |g, i| launch_sym(g, tile, bf16, wp[i], xq, yb, m, k, n)),
+                        run: Box::new(move |g, i| {
+                            launch_sym(g, tile, bf16, wp[i], xq, yb, m, k, n)
+                        }),
                     });
                 }
             }
@@ -1389,7 +1669,9 @@ fn mq6sym_i8_wmma_timing_hw() {
                 arms.push(Arm {
                     name: "sym_p128_f32".into(),
                     wbytes: sym_bytes,
-                    run: Box::new(move |g, i| launch_sym(g, Tile::p128(), false, wp[i], xq, yp, m, k, n)),
+                    run: Box::new(move |g, i| {
+                        launch_sym(g, Tile::p128(), false, wp[i], xq, yp, m, k, n)
+                    }),
                 });
             }
             {
@@ -1413,8 +1695,14 @@ fn mq6sym_i8_wmma_timing_hw() {
                         a.push_u64(n16);
                         a.push_ptr(stream_out_p);
                         a.pad_to(16);
-                        g.launch_kernel_blob("t1_stream_read", [8192, 1, 1], [256, 1, 1], 0, a.as_mut_slice())
-                            .expect("stream launch");
+                        g.launch_kernel_blob(
+                            "t1_stream_read",
+                            [8192, 1, 1],
+                            [256, 1, 1],
+                            0,
+                            a.as_mut_slice(),
+                        )
+                        .expect("stream launch");
                     }),
                 });
             }
@@ -1426,7 +1714,11 @@ fn mq6sym_i8_wmma_timing_hw() {
                 let mut ok = true;
                 for r in 1..=8 {
                     ok &= gpu
-                        .ensure_kernel_public("t1_dot4_competitor", src, &format!("gemv_mq6sym_i8_rows_r{r}_gfx1201"))
+                        .ensure_kernel_public(
+                            "t1_dot4_competitor",
+                            src,
+                            &format!("gemv_mq6sym_i8_rows_r{r}_gfx1201"),
+                        )
                         .is_ok();
                 }
                 if ok {
@@ -1438,15 +1730,21 @@ fn mq6sym_i8_wmma_timing_hw() {
                         let x8 = rand_activations(&mut rng, k, 8);
                         let x8t = upload_f32(&mut gpu, &x8);
                         let res8 = gpu.reserve_int8_mmq(k, 8).expect("reserve8");
-                        let prep8 = gpu.rotate_x_mq_i8_batched(&x8t, None, res8, k, 8).expect("producer8");
+                        let prep8 = gpu
+                            .rotate_x_mq_i8_batched(&x8t, None, res8, k, 8)
+                            .expect("producer8");
                         let p8 = gpu.int8_mmq_prepared_ptr(&prep8, k, 8).expect("ptr8");
                         let nb8 = (k / 128) * 8 * BLK;
                         let xq8 = gpu.alloc_tensor(&[nb8], DType::Raw).expect("alloc xq8");
                         unsafe {
-                            gpu.hip.memcpy_dtod_raw(xq8.buf.as_ptr(), p8 as *const c_void, nb8).expect("dtod xq8");
+                            gpu.hip
+                                .memcpy_dtod_raw(xq8.buf.as_ptr(), p8 as *const c_void, nb8)
+                                .expect("dtod xq8");
                         }
                         let res = gpu.reserve_int8_mmq(k, n).expect("reserve");
-                        let prep = gpu.rotate_x_mq_i8_batched(&xt, None, res, k, n).expect("producer");
+                        let prep = gpu
+                            .rotate_x_mq_i8_batched(&xt, None, res, k, n)
+                            .expect("producer");
                         let again = gpu.int8_mmq_prepared_ptr(&prep, k, n).expect("xq ptr");
                         assert_eq!(again, xq, "scratch pointer moved");
                         gpu.hip.device_synchronize().unwrap();
@@ -1496,20 +1794,28 @@ fn mq6sym_i8_wmma_timing_hw() {
                 if nt > 0 {
                     let r = 16 * nt;
                     let x16 = {
-                        let v: Vec<u8> = (0..r * k * 2).map(|i| if i % 2 == 0 { 0x00 } else { 0x3C }).collect();
+                        let v: Vec<u8> = (0..r * k * 2)
+                            .map(|i| if i % 2 == 0 { 0x00 } else { 0x3C })
+                            .collect();
                         upload_bytes(&mut gpu, &v)
                     };
                     let x16p = x16.buf.as_ptr();
                     keep_alive.push(x16);
                     for &(mt, sw) in cfgs {
                         let entry = format!("gemm_mq6g256v2_xf16_skinny_x4_n{nt}_m{mt}_s{sw}");
-                        if gpu.ensure_kernel_public("t1_skinny_competitor", src, &entry).is_err() {
+                        if gpu
+                            .ensure_kernel_public("t1_skinny_competitor", src, &entry)
+                            .is_err()
+                        {
                             continue;
                         }
                         let ap = ap.clone();
                         let en = entry.clone();
                         arms.push(Arm {
-                            name: format!("parked_{}_f16", entry.trim_start_matches("gemm_mq6g256v2_xf16_skinny_x4_")),
+                            name: format!(
+                                "parked_{}_f16",
+                                entry.trim_start_matches("gemm_mq6g256v2_xf16_skinny_x4_")
+                            ),
                             wbytes: aff_bytes,
                             run: Box::new(move |g, i| {
                                 let mut a = KernargBlob::new();
@@ -1570,7 +1876,10 @@ fn mq6sym_i8_wmma_timing_hw() {
                 let med = median(&mut v);
                 let mn = samples[ai].iter().cloned().fold(f64::MAX, f64::min);
                 let wgbs = arm.wbytes as f64 / med / 1e3;
-                let traffic = (arm.wbytes + (k / 128) * n * BLK + n * m * if arm.name.contains("bf16") { 2 } else { 4 }) as f64;
+                let traffic = (arm.wbytes
+                    + (k / 128) * n * BLK
+                    + n * m * if arm.name.contains("bf16") { 2 } else { 4 })
+                    as f64;
                 js.line(&format!(
                     "{{\"kind\":\"skinny\",\"cell\":\"{cell}\",\"arm\":\"{}\",\"m\":{m},\"k\":{k},\"n\":{n},\"sets\":{sets},\"us_median\":{med:.2},\"us_min\":{mn:.2},\"weights_GBps\":{wgbs:.1},\"incl_producer_us\":{:.2},\"incl_producer_weights_GBps\":{:.1},\"total_traffic_GBps\":{:.1},\"weight_bytes\":{},\"producer_us\":{prod_us:.2}}}",
                     arm.name, med + prod_us, arm.wbytes as f64 / (med + prod_us) / 1e3, traffic / med / 1e3, arm.wbytes
@@ -1580,7 +1889,11 @@ fn mq6sym_i8_wmma_timing_hw() {
 
         // ------- prefill cells (compute-bound; two weight sets) -------
         // the lm_head is only ever evaluated for a handful of sampled rows: no prefill cells for it
-        let mut pre: Vec<usize> = if m > 100_000 || skip_prefill { Vec::new() } else { dev_pre_n.to_vec() };
+        let mut pre: Vec<usize> = if m > 100_000 || skip_prefill {
+            Vec::new()
+        } else {
+            dev_pre_n.to_vec()
+        };
         if big && m <= 100_000 && !skip_prefill {
             pre.push(16384);
         }
@@ -1592,9 +1905,18 @@ fn mq6sym_i8_wmma_timing_hw() {
             let x = rand_activations(&mut rng, k, n.min(4096));
             let nn = n.min(4096);
             let _ = nn;
-            let xt = upload_f32(&mut gpu, &if n > 4096 { rand_activations(&mut rng, k, n) } else { x });
+            let xt = upload_f32(
+                &mut gpu,
+                &if n > 4096 {
+                    rand_activations(&mut rng, k, n)
+                } else {
+                    x
+                },
+            );
             let res = gpu.reserve_int8_mmq(k, n).expect("reserve");
-            let prep = gpu.rotate_x_mq_i8_batched(&xt, None, res, k, n).expect("producer");
+            let prep = gpu
+                .rotate_x_mq_i8_batched(&xt, None, res, k, n)
+                .expect("producer");
             let xq = gpu.int8_mmq_prepared_ptr(&prep, k, n).expect("xq ptr");
             let y = gpu.alloc_tensor(&[n * m], DType::F32).expect("alloc y");
             let yp = y.buf.as_ptr();
@@ -1606,7 +1928,9 @@ fn mq6sym_i8_wmma_timing_hw() {
                 arms.push(Arm {
                     name: "sym_p128_f32".into(),
                     wbytes: sym_bytes,
-                    run: Box::new(move |g, i| launch_sym(g, Tile::p128(), false, wp[i], xq, yp, m, k, n)),
+                    run: Box::new(move |g, i| {
+                        launch_sym(g, Tile::p128(), false, wp[i], xq, yp, m, k, n)
+                    }),
                 });
             }
             {
@@ -1629,7 +1953,11 @@ fn mq6sym_i8_wmma_timing_hw() {
             let mut samples: Vec<Vec<f64>> = vec![Vec::new(); arms.len() + 1];
             let iters = if n >= 4096 { 6 } else { 12 };
             for r in 0..rounds {
-                let order: Vec<usize> = if r % 2 == 0 { vec![0, 1, 2] } else { vec![2, 1, 0] };
+                let order: Vec<usize> = if r % 2 == 0 {
+                    vec![0, 1, 2]
+                } else {
+                    vec![2, 1, 0]
+                };
                 for &ai in &order {
                     let us = if ai < 2 {
                         let arm = &mut arms[ai];
@@ -1640,13 +1968,19 @@ fn mq6sym_i8_wmma_timing_hw() {
                         // public launcher needs &mut Gpu: bracket manually
                         let e0 = gpu.hip.event_create().unwrap();
                         let e1 = gpu.hip.event_create().unwrap();
-                        gpu.gemm_mq6g256v2_i8_prequant(aff_t[0], xq, ytensor, m, k, n).expect("prod warm");
+                        gpu.gemm_mq6g256v2_i8_prequant(aff_t[0], xq, ytensor, m, k, n)
+                            .expect("prod warm");
                         gpu.hip.device_synchronize().unwrap();
-                        gpu.hip.event_record(&e0, gpu.active_stream.as_ref()).unwrap();
+                        gpu.hip
+                            .event_record(&e0, gpu.active_stream.as_ref())
+                            .unwrap();
                         for i in 0..iters {
-                            gpu.gemm_mq6g256v2_i8_prequant(aff_t[i % 2], xq, ytensor, m, k, n).expect("prod");
+                            gpu.gemm_mq6g256v2_i8_prequant(aff_t[i % 2], xq, ytensor, m, k, n)
+                                .expect("prod");
                         }
-                        gpu.hip.event_record(&e1, gpu.active_stream.as_ref()).unwrap();
+                        gpu.hip
+                            .event_record(&e1, gpu.active_stream.as_ref())
+                            .unwrap();
                         gpu.hip.event_synchronize(&e1).unwrap();
                         let ms = gpu.hip.event_elapsed_ms(&e0, &e1).unwrap();
                         let _ = gpu.hip.event_destroy(e0);
@@ -1656,7 +1990,11 @@ fn mq6sym_i8_wmma_timing_hw() {
                     samples[ai].push(us);
                 }
             }
-            let names = ["sym_p128_f32".to_string(), "affine_i8_hipcc_f32".to_string(), format!("affine_i8_production({prod_entry})")];
+            let names = [
+                "sym_p128_f32".to_string(),
+                "affine_i8_hipcc_f32".to_string(),
+                format!("affine_i8_production({prod_entry})"),
+            ];
             for (ai, nm) in names.iter().enumerate() {
                 let mut v = samples[ai].clone();
                 let med = median(&mut v);

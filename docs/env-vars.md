@@ -2596,6 +2596,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_TIER_COUNTERS` | crates/hipfire-arch-qwen4/src/bundle.rs, crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_TOKEN_READBACK_EARLY` | crates/hipfire-arch-qwen4/src/gpu_forward.rs | developer |
 | `HIPFIRE_QWEN4_TOOL_ARG_REPLAY` | crates/hipfire-generate/src/qwen.rs | developer |
+| `HIPFIRE_QWEN4_TRUNK_A8` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/trunk_a8.rs | developer |
 | `HIPFIRE_QWEN4_TRUNK_IU4` | crates/hipfire-arch-qwen4/src/gpu_forward.rs, crates/hipfire-arch-qwen4/src/weights.rs | developer |
 | `HIPFIRE_QWEN4_TRUNK_IU4_RAGGED` | crates/rdna-compute/examples/qwen4_trunk_zba_ragged.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_QWEN4_TRUNK_OVERLAY` | crates/hipfire-arch-qwen4/src/trunk_overlay.rs, crates/hipfire-cli/src/main.rs | developer |

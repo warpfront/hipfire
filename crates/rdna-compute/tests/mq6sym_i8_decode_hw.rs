@@ -193,7 +193,9 @@ fn scale_bits(mode: SMode, rng: &mut Rng) -> u16 {
             (exp << 10) | (rng.below(1024) as u16)
         }
         SMode::Zero => 0,
-        SMode::Subnormal => [0x0001u16, 0x0003, 0x01FF, 0x03FF, 0x8001, 0x83FF][rng.below(6) as usize],
+        SMode::Subnormal => {
+            [0x0001u16, 0x0003, 0x01FF, 0x03FF, 0x8001, 0x83FF][rng.below(6) as usize]
+        }
         SMode::Large => [0x6FFFu16, 0xEFFF, 0x6C00, 0x6E00][rng.below(4) as usize],
         SMode::Mixed => match rng.below(6) {
             0 => 0,
@@ -357,7 +359,12 @@ fn quant_block(x: &[f32]) -> QBlock {
     for &v in x {
         amax = amax.max(v.abs());
     }
-    let mut b = QBlock { d: 0.0, s: 0, q: [0; 128], ties: 0 };
+    let mut b = QBlock {
+        d: 0.0,
+        s: 0,
+        q: [0; 128],
+        ties: 0,
+    };
     if amax == 0.0 {
         return b;
     }
@@ -425,11 +432,12 @@ fn cpu_ref(w: &[u8], m: usize, k: usize, n: usize, blocks: &[u8]) -> Ref {
         for t in 0..n {
             let blk = &blocks[(b * n + t) * BLOCK_BYTES..(b * n + t + 1) * BLOCK_BYTES];
             dd[b * n + t] = f32::from_le_bytes(blk[0..4].try_into().unwrap());
-            qx[t * k + b * 128..t * k + (b + 1) * 128].copy_from_slice(&natural_from_qs(&blk[8..136]));
+            qx[t * k + b * 128..t * k + (b + 1) * 128]
+                .copy_from_slice(&natural_from_qs(&blk[8..136]));
         }
     }
     // per row: y[n], c[nb][n]; rows are independent -> chunk by 64 rows.
-    let per = 3 * 0 + (n + nb * n);
+    let per = n + nb * n;
     let mut flat = vec![0u32; m * per];
     par_chunks_mut(&mut flat, 64 * per, |ci, chunk| {
         let rows = chunk.len() / per;
@@ -481,7 +489,14 @@ fn cpu_ref(w: &[u8], m: usize, k: usize, n: usize, blocks: &[u8]) -> Ref {
 
 /// Quality diagnostic: f64 dequant (`s_h * (q - 32)`) x the producer's rotated F32 activation on
 /// a sample of rows. Returns (max |y - ref| / rms(ref), max rel on |ref| > 1e-2 rms, rms(ref)).
-fn quality_diag(w: &[u8], m: usize, k: usize, n: usize, xrot: &[f32], y: &[f32]) -> (f64, f64, f64) {
+fn quality_diag(
+    w: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    xrot: &[f32],
+    y: &[f32],
+) -> (f64, f64, f64) {
     let g_per_row = k / 256;
     let row_bytes = g_per_row * GROUP_BYTES;
     let stride = (m / 128).max(1);
@@ -537,7 +552,9 @@ fn gpu_gate() -> Option<Gpu> {
 }
 
 fn upload_u8(gpu: &mut Gpu, data: &[u8]) -> GpuTensor {
-    let t = gpu.alloc_tensor(&[data.len()], DType::Raw).expect("alloc raw");
+    let t = gpu
+        .alloc_tensor(&[data.len()], DType::Raw)
+        .expect("alloc raw");
     gpu.hip.memcpy_htod(&t.buf, data).expect("htod");
     t
 }
@@ -550,7 +567,14 @@ fn download(gpu: &Gpu, ptr: *mut c_void, bytes: usize) -> Vec<u8> {
     out
 }
 
-fn blob(w: *mut c_void, xq: *mut c_void, y: *mut c_void, m: usize, k: usize, n: usize) -> KernargBlob {
+fn blob(
+    w: *mut c_void,
+    xq: *mut c_void,
+    y: *mut c_void,
+    m: usize,
+    k: usize,
+    n: usize,
+) -> KernargBlob {
     let mut b = KernargBlob::new();
     b.push_ptr(w);
     b.push_ptr(xq);
@@ -560,7 +584,11 @@ fn blob(w: *mut c_void, xq: *mut c_void, y: *mut c_void, m: usize, k: usize, n: 
     b.push_i32(n as i32);
     assert_eq!(b.len(), 36, "frozen S6I8 ABI: 36 explicit kernarg bytes");
     b.pad_to(16);
-    assert_eq!(b.len(), 48, "36 explicit bytes padded to a 16-byte boundary");
+    assert_eq!(
+        b.len(),
+        48,
+        "36 explicit bytes padded to a 16-byte boundary"
+    );
     b
 }
 
@@ -584,7 +612,9 @@ fn produce(gpu: &mut Gpu, x: &[f32], k: usize, n: usize) -> (*mut c_void, Vec<u8
     let prepared = gpu
         .rotate_x_mq_i8_batched(&xt, Some(&xrot), res, k, n)
         .expect("producer");
-    let ptr = gpu.int8_mmq_prepared_ptr(&prepared, k, n).expect("prepared ptr");
+    let ptr = gpu
+        .int8_mmq_prepared_ptr(&prepared, k, n)
+        .expect("prepared ptr");
     let blocks = download(gpu, ptr, (k / 128) * n * BLOCK_BYTES);
     let rot = gpu.download_f32(&xrot).expect("xrot dl");
     (ptr, blocks, rot)
@@ -664,12 +694,17 @@ fn run_acts(
         let total = GUARD_WORDS + y_words + GUARD_WORDS;
         let ybuf = gpu.alloc_tensor(&[total], DType::F32).expect("y");
         let poison_bytes: Vec<u8> = (0..total).flat_map(|_| POISON.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&ybuf.buf, &poison_bytes).expect("poison");
+        gpu.hip
+            .memcpy_htod(&ybuf.buf, &poison_bytes)
+            .expect("poison");
         let yp = unsafe { (ybuf.buf.as_ptr() as *mut u8).add(GUARD_WORDS * 4) as *mut c_void };
         let mut b = blob(w_dev.buf.as_ptr(), xq, yp, m, k, n);
         launch_sym(gpu, &entry(n, false), &mut b, m, k, n);
         let yh = download(gpu, ybuf.buf.as_ptr(), total * 4);
-        let words: Vec<u32> = yh.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let words: Vec<u32> = yh
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         let guards_ok = words[..GUARD_WORDS].iter().all(|&v| v == POISON)
             && words[GUARD_WORDS + y_words..].iter().all(|&v| v == POISON);
         let mut y_bad = 0u64;
@@ -686,17 +721,26 @@ fn run_acts(
         tally.words += y_words as u64;
 
         // BF16 production entry.
-        let bt = gpu.alloc_tensor(&[(GUARD_WORDS * 2 + y_words) / 2 + 1], DType::F32).expect("ybf");
+        let bt = gpu
+            .alloc_tensor(&[(GUARD_WORDS * 2 + y_words) / 2 + 1], DType::F32)
+            .expect("ybf");
         let bwords = GUARD_WORDS * 2 + y_words;
-        let bpoison: Vec<u8> = (0..bt.byte_size() / 2).flat_map(|_| 0xDEADu16.to_le_bytes()).collect();
+        let bpoison: Vec<u8> = (0..bt.byte_size() / 2)
+            .flat_map(|_| 0xDEADu16.to_le_bytes())
+            .collect();
         gpu.hip.memcpy_htod(&bt.buf, &bpoison).expect("poison bf16");
         let bp = unsafe { (bt.buf.as_ptr() as *mut u8).add(GUARD_WORDS * 2) as *mut c_void };
         let mut b2 = blob(w_dev.buf.as_ptr(), xq, bp, m, k, n);
         launch_sym(gpu, &entry(n, true), &mut b2, m, k, n);
         let bh = download(gpu, bt.buf.as_ptr(), bt.byte_size());
-        let bw: Vec<u16> = bh.chunks_exact(2).map(|c| u16::from_le_bytes(c.try_into().unwrap())).collect();
+        let bw: Vec<u16> = bh
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         let bguards_ok = bw[..GUARD_WORDS].iter().all(|&v| v == 0xDEAD)
-            && bw[GUARD_WORDS + y_words..bwords].iter().all(|&v| v == 0xDEAD);
+            && bw[GUARD_WORDS + y_words..bwords]
+                .iter()
+                .all(|&v| v == 0xDEAD);
         let mut bf_bad = 0u64;
         for i in 0..y_words {
             if bw[GUARD_WORDS + i] != bf16_bits(rf.y[i]) {
@@ -710,14 +754,21 @@ fn run_acts(
         let dbg_total = GUARD_WORDS + y_words + c_words + GUARD_WORDS;
         let dbuf = gpu.alloc_tensor(&[dbg_total], DType::F32).expect("dbg");
         let dpoison: Vec<u8> = (0..dbg_total).flat_map(|_| POISON.to_le_bytes()).collect();
-        gpu.hip.memcpy_htod(&dbuf.buf, &dpoison).expect("poison dbg");
+        gpu.hip
+            .memcpy_htod(&dbuf.buf, &dpoison)
+            .expect("poison dbg");
         let dp = unsafe { (dbuf.buf.as_ptr() as *mut u8).add(GUARD_WORDS * 4) as *mut c_void };
         let mut b3 = blob(w_dev.buf.as_ptr(), xq, dp, m, k, n);
         launch_sym(gpu, &entry_dbg(n), &mut b3, m, k, n);
         let dh = download(gpu, dbuf.buf.as_ptr(), dbg_total * 4);
-        let dw: Vec<u32> = dh.chunks_exact(4).map(|c| u32::from_le_bytes(c.try_into().unwrap())).collect();
+        let dw: Vec<u32> = dh
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
         let dguards_ok = dw[..GUARD_WORDS].iter().all(|&v| v == POISON)
-            && dw[GUARD_WORDS + y_words + c_words..].iter().all(|&v| v == POISON);
+            && dw[GUARD_WORDS + y_words + c_words..]
+                .iter()
+                .all(|&v| v == POISON);
         let mut c_bad = 0u64;
         let mut dy_bad = 0u64;
         for i in 0..y_words {
@@ -801,7 +852,9 @@ fn bit_level_decoder_matches_triple_pack() {
     }
     // nibble-pair order round trip
     let mut q = [0i32; 128];
-    q.iter_mut().enumerate().for_each(|(i, v)| *v = (i as i32) - 64);
+    q.iter_mut()
+        .enumerate()
+        .for_each(|(i, v)| *v = (i as i32) - 64);
     let qs = qs_from_natural(&q);
     let back = natural_from_qs(&qs);
     for i in 0..128 {
@@ -820,7 +873,8 @@ fn mq6sym_i8_decode_ignores_z_hw() {
     let mut words = 0u64;
     for n in 1..=8 {
         for bf in [false, true] {
-            gpu.ensure_kernel_public(MODULE, &ksrc, &entry(n, bf)).expect("load kernel");
+            gpu.ensure_kernel_public(MODULE, &ksrc, &entry(n, bf))
+                .expect("load kernel");
         }
     }
     for &(m, k) in &[(48usize, 512usize), (640, 2560), (2560, 6144)] {
@@ -841,8 +895,12 @@ fn mq6sym_i8_decode_ignores_z_hw() {
                 let ybytes = n * m * if bf { 2 } else { 4 };
                 let mut outs: Vec<Vec<u8>> = Vec::new();
                 for wt in [&wd, &wgd] {
-                    let yb = gpu.alloc_tensor(&[ybytes.div_ceil(4)], DType::F32).expect("y");
-                    gpu.hip.memcpy_htod(&yb.buf, &vec![0xA5u8; yb.byte_size()]).expect("poison");
+                    let yb = gpu
+                        .alloc_tensor(&[ybytes.div_ceil(4)], DType::F32)
+                        .expect("y");
+                    gpu.hip
+                        .memcpy_htod(&yb.buf, &vec![0xA5u8; yb.byte_size()])
+                        .expect("poison");
                     let mut b = blob(wt.buf.as_ptr(), xq, yb.buf.as_ptr(), m, k, n);
                     launch_sym(&gpu, &entry(n, bf), &mut b, m, k, n);
                     outs.push(download(&gpu, yb.buf.as_ptr(), ybytes));
@@ -867,9 +925,11 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
     let dbg_src = format!("#define S6_DEBUG_C 1\n{ksrc}");
     for n in 1..=8 {
         for bf in [false, true] {
-            gpu.ensure_kernel_public(MODULE, &ksrc, &entry(n, bf)).expect("load kernel");
+            gpu.ensure_kernel_public(MODULE, &ksrc, &entry(n, bf))
+                .expect("load kernel");
         }
-        gpu.ensure_kernel_public(MODULE_DBG, &dbg_src, &entry_dbg(n)).expect("load debug-C kernel");
+        gpu.ensure_kernel_public(MODULE_DBG, &dbg_src, &entry_dbg(n))
+            .expect("load debug-C kernel");
     }
 
     let mut tally = Tally::default();
@@ -884,7 +944,14 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
         for &m in &ms {
             run_weights(
                 &mut gpu,
-                WSpec { name: "grid".into(), m, k, cm: CMode::Random, sm: SMode::Mixed, seed: 0x6000 ^ (m * 7 + k) as u64 },
+                WSpec {
+                    name: "grid".into(),
+                    m,
+                    k,
+                    cm: CMode::Random,
+                    sm: SMode::Mixed,
+                    seed: 0x6000 ^ (m * 7 + k) as u64,
+                },
                 &[(8, AMode::Outliers)],
                 k == 2560,
                 &mut tally,
@@ -896,7 +963,14 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
     for (m, k) in [(640usize, 2560usize), (48, 256), (2560, 6144)] {
         run_weights(
             &mut gpu,
-            WSpec { name: "nsweep".into(), m, k, cm: CMode::Random, sm: SMode::Normal, seed: 0x7000 ^ m as u64 },
+            WSpec {
+                name: "nsweep".into(),
+                m,
+                k,
+                cm: CMode::Random,
+                sm: SMode::Normal,
+                seed: 0x7000 ^ m as u64,
+            },
             &ns_all,
             true,
             &mut tally,
@@ -907,7 +981,14 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
     for m in [1usize, 17, 31, 33, 100, 2563] {
         run_weights(
             &mut gpu,
-            WSpec { name: "tail".into(), m, k: 512, cm: CMode::Random, sm: SMode::Mixed, seed: 0x8000 ^ m as u64 },
+            WSpec {
+                name: "tail".into(),
+                m,
+                k: 512,
+                cm: CMode::Random,
+                sm: SMode::Mixed,
+                seed: 0x8000 ^ m as u64,
+            },
             &[(1, AMode::Gauss), (3, AMode::Gauss), (8, AMode::Gauss)],
             false,
             &mut tally,
@@ -915,7 +996,10 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
         );
     }
     // D. weight classes (N 1/2/4/8).
-    let n4: Vec<(usize, AMode)> = [1usize, 2, 4, 8].iter().map(|&n| (n, AMode::Gauss)).collect();
+    let n4: Vec<(usize, AMode)> = [1usize, 2, 4, 8]
+        .iter()
+        .map(|&n| (n, AMode::Gauss))
+        .collect();
     for (name, cm, sm) in [
         ("exhaustive", CMode::Exhaustive, SMode::Normal),
         ("exhaustive_mixed", CMode::Exhaustive, SMode::Mixed),
@@ -930,7 +1014,14 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
         for (m, k) in [(256usize, 512usize), (640, 2560)] {
             run_weights(
                 &mut gpu,
-                WSpec { name: name.into(), m, k, cm, sm, seed: 0x9000 ^ (m + k) as u64 },
+                WSpec {
+                    name: name.into(),
+                    m,
+                    k,
+                    cm,
+                    sm,
+                    seed: 0x9000 ^ (m + k) as u64,
+                },
                 &n4,
                 false,
                 &mut tally,
@@ -939,12 +1030,27 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
         }
     }
     // E. activation classes through the real producer (normal scales / mixed scales).
-    for am in [AMode::Zero, AMode::HalfZero, AMode::Ties, AMode::Spike, AMode::Tiny, AMode::DenormSd, AMode::Outliers] {
+    for am in [
+        AMode::Zero,
+        AMode::HalfZero,
+        AMode::Ties,
+        AMode::Spike,
+        AMode::Tiny,
+        AMode::DenormSd,
+        AMode::Outliers,
+    ] {
         let acts: Vec<(usize, AMode)> = [1usize, 2, 4, 8].iter().map(|&n| (n, am)).collect();
         for sm in [SMode::Normal, SMode::Subnormal] {
             run_weights(
                 &mut gpu,
-                WSpec { name: format!("act_{sm:?}"), m: 512, k: 2560, cm: CMode::Random, sm, seed: 0xA000 },
+                WSpec {
+                    name: format!("act_{sm:?}"),
+                    m: 512,
+                    k: 2560,
+                    cm: CMode::Random,
+                    sm,
+                    seed: 0xA000,
+                },
                 &acts,
                 false,
                 &mut tally,
@@ -956,7 +1062,14 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
     if all {
         run_weights(
             &mut gpu,
-            WSpec { name: "lm_head".into(), m: 248320, k: 2560, cm: CMode::Random, sm: SMode::Normal, seed: 0xB000 },
+            WSpec {
+                name: "lm_head".into(),
+                m: 248320,
+                k: 2560,
+                cm: CMode::Random,
+                sm: SMode::Normal,
+                seed: 0xB000,
+            },
             &[(8, AMode::Outliers), (1, AMode::Gauss)],
             false,
             &mut tally,
@@ -970,9 +1083,16 @@ fn mq6sym_i8_decode_matches_cpu_bytes_hw() {
     );
     println!("{summary}");
     if let Ok(dir) = std::env::var("MQ6SYM_OUT") {
-        std::fs::write(format!("{dir}/correctness.txt"), format!("{report}{summary}\n")).ok();
+        std::fs::write(
+            format!("{dir}/correctness.txt"),
+            format!("{report}{summary}\n"),
+        )
+        .ok();
     }
-    assert!(tally.ties_seen > 0, "tie-designed activations never produced an exact .5 quantizer tie");
+    assert!(
+        tally.ties_seen > 0,
+        "tie-designed activations never produced an exact .5 quantizer tie"
+    );
     assert_eq!(tally.fail, 0, "{} case(s) failed", tally.fail);
 }
 
@@ -1029,7 +1149,10 @@ fn bench<F: FnMut(&mut Gpu, usize)>(gpu: &mut Gpu, min_iters: usize, mut f: F) -
         }
     });
     let est_us = (est_ms * 1000.0 / 32.0).max(0.5);
-    let iters = ((60_000.0 / est_us) as usize).clamp(64, 8000).max(min_iters).min(10_000);
+    let iters = ((60_000.0 / est_us) as usize)
+        .clamp(64, 8000)
+        .max(min_iters)
+        .min(10_000);
     let ms = timed(gpu, |g| {
         for i in 0..iters {
             f(g, i);
@@ -1093,7 +1216,15 @@ fn gbps(bytes: usize, us: f64) -> f64 {
 }
 
 fn rows_json(rows: &[Row]) -> String {
-    let arr = |v: &[f64]| format!("[{}]", v.iter().map(|x| format!("{x:.3}")).collect::<Vec<_>>().join(","));
+    let arr = |v: &[f64]| {
+        format!(
+            "[{}]",
+            v.iter()
+                .map(|x| format!("{x:.3}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    };
     let mut s = String::from("[\n");
     for (i, r) in rows.iter().enumerate() {
         write!(
@@ -1117,7 +1248,8 @@ fn rows_json(rows: &[Row]) -> String {
 fn mq6sym_i8_decode_timing_hw() {
     let Some(mut gpu) = gpu_gate() else { return };
     for n in 1..=8 {
-        gpu.ensure_kernel_public(MODULE, &kernel_src(), &entry(n, false)).expect("load kernel");
+        gpu.ensure_kernel_public(MODULE, &kernel_src(), &entry(n, false))
+            .expect("load kernel");
     }
     // A/B variants: MQ6SYM_VARIANTS="name=KEY:VAL+KEY:VAL;name2=..." (extra arms on the same
     // buffers, alternated with the baseline inside every rep).
@@ -1143,16 +1275,24 @@ fn mq6sym_i8_decode_timing_hw() {
                     writeln!(src, "#define S6_SUF _{name}").ok();
                     src.push_str(KERNEL_SRC);
                     for n in 1..=8 {
-                        gpu.ensure_kernel_public(&format!("{MODULE}_{name}"), &src, &format!("gemv_mq6sym_i8_rows_r{n}_{name}_gfx1201"))
-                            .expect("load variant");
+                        gpu.ensure_kernel_public(
+                            &format!("{MODULE}_{name}"),
+                            &src,
+                            &format!("gemv_mq6sym_i8_rows_r{n}_{name}_gfx1201"),
+                        )
+                        .expect("load variant");
                     }
                     (name.to_string(), chunk)
                 })
                 .collect()
         })
         .unwrap_or_default();
-    gpu.ensure_kernel_public(ROOF_MODULE, ROOF_SRC, ROOF).expect("load roof");
-    let reps: usize = std::env::var("MQ6SYM_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    gpu.ensure_kernel_public(ROOF_MODULE, ROOF_SRC, ROOF)
+        .expect("load roof");
+    let reps: usize = std::env::var("MQ6SYM_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let skip_lm = std::env::var("MQ6SYM_SKIP_LM").is_ok();
     let only: Option<Vec<usize>> = std::env::var("MQ6SYM_ROWS")
         .ok()
@@ -1170,7 +1310,11 @@ fn mq6sym_i8_decode_timing_hw() {
     if !skip_lm {
         cells.push((248320, 2560, true));
     }
-    cells.extend([(48usize, 2560usize, false), (512, 2560, false), (640, 2560, false)]);
+    cells.extend([
+        (48usize, 2560usize, false),
+        (512, 2560, false),
+        (640, 2560, false),
+    ]);
     if let Ok(filter) = std::env::var("MQ6SYM_CELLS") {
         let keep: Vec<String> = filter.split(',').map(|s| s.to_string()).collect();
         cells.retain(|&(m, k, _)| keep.contains(&format!("{m}x{k}")));
@@ -1186,11 +1330,17 @@ fn mq6sym_i8_decode_timing_hw() {
         let sym_stride = sym_bytes.div_ceil(256) * 256;
         let old_stride = old_bytes.div_ceil(256) * 256;
         let sets = COLD_TARGET.div_ceil(sym_stride).clamp(6, 4096);
-        let sym_buf = gpu.alloc_tensor(&[sym_stride * sets], DType::Raw).expect("sym buf");
-        let old_buf = gpu.alloc_tensor(&[old_stride * sets], DType::Raw).expect("old buf");
+        let sym_buf = gpu
+            .alloc_tensor(&[sym_stride * sets], DType::Raw)
+            .expect("sym buf");
+        let old_buf = gpu
+            .alloc_tensor(&[old_stride * sets], DType::Raw)
+            .expect("old buf");
         fill_random(&gpu, &sym_buf, &host);
         fill_random(&gpu, &old_buf, &host);
-        let old_sets: Vec<GpuTensor> = (0..sets).map(|i| old_buf.sub_offset(i * old_stride, old_bytes)).collect();
+        let old_sets: Vec<GpuTensor> = (0..sets)
+            .map(|i| old_buf.sub_offset(i * old_stride, old_bytes))
+            .collect();
         let sink = gpu.zeros(&[64], DType::F32).expect("sink");
         let n16 = (sym_bytes / 16) as u64;
         let roof_grid = (n16.div_ceil(1024)).clamp(1, 8192) as u32;
@@ -1208,7 +1358,9 @@ fn mq6sym_i8_decode_timing_hw() {
             let ysym = gpu.zeros(&[r * m], DType::F32).expect("ysym");
             // Prepared sidecar for the kernel-only arms.
             let res = gpu.reserve_int8_mmq(k, r).expect("reserve");
-            let prepared = gpu.rotate_x_mq_i8_batched(&x, None, res, k, r).expect("producer");
+            let prepared = gpu
+                .rotate_x_mq_i8_batched(&x, None, res, k, r)
+                .expect("producer");
             let xq = gpu.int8_mmq_prepared_ptr(&prepared, k, r).expect("xq ptr");
             let name = entry(r, false);
             let mut var_blobs: Vec<Vec<KernargBlob>> = variants
@@ -1216,7 +1368,9 @@ fn mq6sym_i8_decode_timing_hw() {
                 .map(|_| {
                     (0..sets)
                         .map(|s| {
-                            let w = unsafe { (sym_buf.buf.as_ptr() as *mut u8).add(s * sym_stride) as *mut c_void };
+                            let w = unsafe {
+                                (sym_buf.buf.as_ptr() as *mut u8).add(s * sym_stride) as *mut c_void
+                            };
                             blob(w, xq, ysym.buf.as_ptr(), m, k, r)
                         })
                         .collect()
@@ -1225,14 +1379,18 @@ fn mq6sym_i8_decode_timing_hw() {
             let mut var_us: Vec<Vec<f64>> = variants.iter().map(|_| Vec::new()).collect();
             let mut sym_blobs: Vec<KernargBlob> = (0..sets)
                 .map(|s| {
-                    let w = unsafe { (sym_buf.buf.as_ptr() as *mut u8).add(s * sym_stride) as *mut c_void };
+                    let w = unsafe {
+                        (sym_buf.buf.as_ptr() as *mut u8).add(s * sym_stride) as *mut c_void
+                    };
                     blob(w, xq, ysym.buf.as_ptr(), m, k, r)
                 })
                 .collect();
             let mut roof_blobs: Vec<KernargBlob> = (0..sets)
                 .map(|s| {
                     let mut b = KernargBlob::new();
-                    b.push_ptr(unsafe { (sym_buf.buf.as_ptr() as *mut u8).add(s * sym_stride) as *mut c_void });
+                    b.push_ptr(unsafe {
+                        (sym_buf.buf.as_ptr() as *mut u8).add(s * sym_stride) as *mut c_void
+                    });
                     b.push_u64(n16);
                     b.push_ptr(sink.buf.as_ptr());
                     b.pad_to(16);
@@ -1240,69 +1398,118 @@ fn mq6sym_i8_decode_timing_hw() {
                 })
                 .collect();
             let mut row = Row {
-                m, k, r, sets, sym_bytes, old_bytes,
-                sym_us: vec![], roof_us: vec![], prod_us: vec![], symprod_us: vec![],
-                old_rot_us: vec![], old_k_us: vec![], old_tot_us: vec![],
-                iso_sym_us: None, iso_roof_us: None,
+                m,
+                k,
+                r,
+                sets,
+                sym_bytes,
+                old_bytes,
+                sym_us: vec![],
+                roof_us: vec![],
+                prod_us: vec![],
+                symprod_us: vec![],
+                old_rot_us: vec![],
+                old_k_us: vec![],
+                old_tot_us: vec![],
+                iso_sym_us: None,
+                iso_roof_us: None,
             };
             let old_kernel = |g: &mut Gpu, i: usize, xrot: &GpuTensor, yold: &GpuTensor| {
                 let a = &old_sets[i % sets];
                 if r == 1 {
                     g.gemv_mq6g256v2(a, xrot, yold, m, k).expect("old gemv");
                 } else {
-                    g.gemm_mq6g256v2_f32_rows(a, xrot, yold, m, k, r).expect("old rows");
+                    g.gemm_mq6g256v2_f32_rows(a, xrot, yold, m, k, r)
+                        .expect("old rows");
                 }
             };
             for _rep in 0..reps {
                 // Alternate candidate / baseline / roofline inside each rep.
-                let us = bench(&mut gpu, sets, |g, i| launch_sym(g, &name, &mut sym_blobs[i % sets], m, k, r));
+                let us = bench(&mut gpu, sets, |g, i| {
+                    launch_sym(g, &name, &mut sym_blobs[i % sets], m, k, r)
+                });
                 row.sym_us.push(us);
-                for (vi, (vname, vchunk)) in variants.iter().enumerate() {
+                for (vi, (vname, _vchunk)) in variants.iter().enumerate() {
                     let vn = format!("gemv_mq6sym_i8_rows_r{r}_{vname}_gfx1201");
-                    let lds = lds_bytes(k, r) + (*vchunk as u32) * 0;
+                    let lds = lds_bytes(k, r);
                     let us = bench(&mut gpu, sets, |g, i| {
-                        g.launch_kernel_blob(&vn, [m.div_ceil(32) as u32, 1, 1], [128, 1, 1], lds, var_blobs[vi][i % sets].as_mut_slice())
-                            .expect("variant launch")
+                        g.launch_kernel_blob(
+                            &vn,
+                            [m.div_ceil(32) as u32, 1, 1],
+                            [128, 1, 1],
+                            lds,
+                            var_blobs[vi][i % sets].as_mut_slice(),
+                        )
+                        .expect("variant launch")
                     });
                     var_us[vi].push(us);
                 }
                 if !sym_only {
-                let us = bench(&mut gpu, sets, |g, i| old_kernel(g, i, &xrot, &yold));
-                row.old_k_us.push(us);
+                    let us = bench(&mut gpu, sets, |g, i| old_kernel(g, i, &xrot, &yold));
+                    row.old_k_us.push(us);
                 }
                 let us = bench(&mut gpu, sets, |g, i| {
-                    g.launch_kernel_blob(ROOF, [roof_grid, 1, 1], [256, 1, 1], 0, roof_blobs[i % sets].as_mut_slice()).expect("roof")
+                    g.launch_kernel_blob(
+                        ROOF,
+                        [roof_grid, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        roof_blobs[i % sets].as_mut_slice(),
+                    )
+                    .expect("roof")
                 });
                 row.roof_us.push(us);
                 if !sym_only {
-                let us = bench(&mut gpu, 64, |g, _| {
-                    let res = g.reserve_int8_mmq(k, r).expect("reserve");
-                    g.rotate_x_mq_i8_batched(&x, None, res, k, r).expect("producer");
-                });
-                row.prod_us.push(us);
-                let us = bench(&mut gpu, sets, |g, i| {
-                    let res = g.reserve_int8_mmq(k, r).expect("reserve");
-                    g.rotate_x_mq_i8_batched(&x, None, res, k, r).expect("producer");
-                    launch_sym(g, &name, &mut sym_blobs[i % sets], m, k, r);
-                });
-                row.symprod_us.push(us);
-                let us = bench(&mut gpu, 64, |g, _| g.rotate_x_mq_batched(&x, &xrot, k, r).expect("old rotate"));
-                row.old_rot_us.push(us);
-                let us = bench(&mut gpu, sets, |g, i| {
-                    g.rotate_x_mq_batched(&x, &xrot, k, r).expect("old rotate");
-                    old_kernel(g, i, &xrot, &yold);
-                });
-                row.old_tot_us.push(us);
+                    let us = bench(&mut gpu, 64, |g, _| {
+                        let res = g.reserve_int8_mmq(k, r).expect("reserve");
+                        g.rotate_x_mq_i8_batched(&x, None, res, k, r)
+                            .expect("producer");
+                    });
+                    row.prod_us.push(us);
+                    let us = bench(&mut gpu, sets, |g, i| {
+                        let res = g.reserve_int8_mmq(k, r).expect("reserve");
+                        g.rotate_x_mq_i8_batched(&x, None, res, k, r)
+                            .expect("producer");
+                        launch_sym(g, &name, &mut sym_blobs[i % sets], m, k, r);
+                    });
+                    row.symprod_us.push(us);
+                    let us = bench(&mut gpu, 64, |g, _| {
+                        g.rotate_x_mq_batched(&x, &xrot, k, r).expect("old rotate")
+                    });
+                    row.old_rot_us.push(us);
+                    let us = bench(&mut gpu, sets, |g, i| {
+                        g.rotate_x_mq_batched(&x, &xrot, k, r).expect("old rotate");
+                        old_kernel(g, i, &xrot, &yold);
+                    });
+                    row.old_tot_us.push(us);
                 }
             }
             if tiny {
-                row.iso_sym_us = Some(isolated(&mut gpu, 200, |g, i| launch_sym(g, &name, &mut sym_blobs[i % sets], m, k, r)));
+                row.iso_sym_us = Some(isolated(&mut gpu, 200, |g, i| {
+                    launch_sym(g, &name, &mut sym_blobs[i % sets], m, k, r)
+                }));
                 row.iso_roof_us = Some(isolated(&mut gpu, 200, |g, i| {
-                    g.launch_kernel_blob(ROOF, [roof_grid, 1, 1], [256, 1, 1], 0, roof_blobs[i % sets].as_mut_slice()).expect("roof")
+                    g.launch_kernel_blob(
+                        ROOF,
+                        [roof_grid, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        roof_blobs[i % sets].as_mut_slice(),
+                    )
+                    .expect("roof")
                 }));
             }
-            let (s, rf, p, sp) = (median(&row.sym_us), median(&row.roof_us), median(&row.prod_us), median(&row.symprod_us));
-            let (ok_, ort, ot) = (median(&row.old_k_us), median(&row.old_rot_us), median(&row.old_tot_us));
+            let (s, rf, p, sp) = (
+                median(&row.sym_us),
+                median(&row.roof_us),
+                median(&row.prod_us),
+                median(&row.symprod_us),
+            );
+            let (ok_, ort, ot) = (
+                median(&row.old_k_us),
+                median(&row.old_rot_us),
+                median(&row.old_tot_us),
+            );
             println!(
                 "CELL {m}x{k} rows={r} sets={sets} | sym_kernel {s:8.2} us {:6.1} GB/s | roofline {rf:8.2} us {:6.1} GB/s | producer {p:7.2} us | sym+prod {sp:8.2} us {:6.1} GB/s | old_kernel {ok_:8.2} us ({:6.1} GB/s on 200B) | old_rotate {ort:7.2} us | old_total {ot:8.2} us | speedup kernel {:.2}x total {:.2}x{}",
                 gbps(sym_bytes, s), gbps(sym_bytes, rf), gbps(sym_bytes, sp), gbps(old_bytes, ok_), ok_ / s, ot / sp,

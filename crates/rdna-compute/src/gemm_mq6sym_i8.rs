@@ -37,8 +37,9 @@ use hipfire_kernel_abi::{InvocationV1, MAX_FIELDS};
 use std::ffi::c_void;
 use std::sync::LazyLock;
 
-/// Largest `route_rows` the trunk route serves (the eager wide-verify cap).
-pub const QWEN4_TRUNK_A8_MAX_ROWS: usize = 64;
+/// Largest `route_rows` the trunk route serves: the eager wide-verify cap (a scope bound, not a
+/// measured crossover; above it prefill keeps the affine-I8 / FP8 / F16 routes).
+pub const QWEN4_TRUNK_A8_ROUTE_CAP: usize = crate::prefill_invariant::WIDE_VERIFY_MAX_ROWS;
 
 /// qt47 group bytes (8 B headers + 192 B 6-bit payload).
 const MQ6_GROUP_BYTES: usize = 200;
@@ -46,8 +47,9 @@ const MQ6_GROUP_BYTES: usize = 200;
 const BLOCK_I8_128_BYTES: usize = 136;
 /// Dynamic LDS of the 128x128 prefill entries (`MQ6SYM_P128_LDS_BYTES` of the kernel header).
 pub const MQ6SYM_P128_LDS_BYTES: u32 = 36864;
-/// `m` from which the launcher rule treats a projection as lm_head-sized.
-const LM_HEAD_MIN_ROWS: usize = 100_000;
+/// Weight-row count `m` from which a matrix is lm_head-class (M = 248320) in the T1 launcher rule;
+/// the trunk projections are M <= 12288. A shape class, not a token-row predicate.
+const LM_HEAD_CLASS_M: usize = 100_000;
 
 const GEMV_MODULE: &str = "gemv_mq6sym_i8_gfx1201";
 const GEMM_MODULE: &str = "gemm_mq6sym_i8_gfx1201";
@@ -61,7 +63,7 @@ const CHECK_SYMBOL: &str = "qwen4_mq6_sym_check_gfx1201";
 /// out_proj/o_proj (K=6144) and lm_head (M=248320). n=3 follows n=2; unmeasured tiny M
 /// (48/512/640) keeps T0.
 fn le8_uses_t1(m: usize, k: usize, n: usize) -> bool {
-    !matches!(n, 2 | 3) && k <= 2560 && (6144..LM_HEAD_MIN_ROWS).contains(&m)
+    !matches!(n, 2 | 3) && k <= 2560 && (6144..LM_HEAD_CLASS_M).contains(&m)
 }
 
 /// `HIPFIRE_QWEN4_TRUNK_A8` (`developer.qwen4_trunk_a8`, typed boolean). Read once.
@@ -98,7 +100,7 @@ fn trunk_a8_admits(g: TrunkA8Gate) -> bool {
         && g.k > 0
         && g.k % 256 == 0
         && g.m > 0
-        && (1..=QWEN4_TRUNK_A8_MAX_ROWS).contains(&g.route_rows)
+        && (1..=QWEN4_TRUNK_A8_ROUTE_CAP).contains(&g.route_rows)
 }
 
 /// One launchable tile of the symmetric A8 route.
@@ -179,7 +181,7 @@ fn tile_entry(tile: Tile, bf16: bool) -> &'static str {
 
 /// The T1 narrow tile for `1 <= n <= 48` (the measured launcher rule).
 fn narrow_tile(m: usize, n: usize) -> Tile {
-    if n > 8 && m >= LM_HEAD_MIN_ROWS {
+    if n > 8 && m >= LM_HEAD_CLASS_M {
         return Tile::M64N48;
     }
     if m <= 2560 && n >= 24 {
@@ -248,7 +250,7 @@ impl Gpu {
     /// Whether one projection of `m` rows x `k` with `rows` tokens takes the trunk A8 route:
     /// requested, verified symmetric, inside the Qwen4 forward, eager (no replay recording / graph
     /// capture), outside the prefill-invariant scope, `k % 256 == 0`, and
-    /// `1 <= route_rows <= QWEN4_TRUNK_A8_MAX_ROWS`.
+    /// `1 <= route_rows <= QWEN4_TRUNK_A8_ROUTE_CAP`.
     pub fn qwen4_trunk_a8_applies(&self, m: usize, k: usize, rows: usize) -> bool {
         trunk_a8_admits(TrunkA8Gate {
             requested: self.qwen4_trunk_a8_requested(),
@@ -264,7 +266,13 @@ impl Gpu {
     }
 
     /// Name of the kernel [`Gpu::gemm_mq6sym_i8_prequant`] launches for `m` x `k` x `n` tokens.
-    pub fn gemm_mq6sym_i8_kernel_name(&self, m: usize, k: usize, n: usize, bf16: bool) -> &'static str {
+    pub fn gemm_mq6sym_i8_kernel_name(
+        &self,
+        m: usize,
+        k: usize,
+        n: usize,
+        bf16: bool,
+    ) -> &'static str {
         tile_entry(mq6sym_i8_tile(m, k, n), bf16)
     }
 
@@ -444,9 +452,17 @@ mod tests {
                 assert_eq!(t(m, n), Tile::Gemv(n), "m={m} n={n}");
             }
             for m in [6144usize, 10240, 12288] {
-                let want = if matches!(n, 2 | 3) { Tile::Gemv(n) } else { Tile::M64N16 };
+                let want = if matches!(n, 2 | 3) {
+                    Tile::Gemv(n)
+                } else {
+                    Tile::M64N16
+                };
                 assert_eq!(t(m, n), want, "m={m} n={n}");
-                assert_eq!(mq6sym_i8_tile(m, 6144, n), Tile::Gemv(n), "k=6144 m={m} n={n}");
+                assert_eq!(
+                    mq6sym_i8_tile(m, 6144, n),
+                    Tile::Gemv(n),
+                    "k=6144 m={m} n={n}"
+                );
             }
         }
         // 9..=16.
