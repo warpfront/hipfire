@@ -17,7 +17,7 @@
 //! the published map: a slot is overwritten only by a fill issued after a retirement's table
 //! upload, which no staged forward straddles.
 //!
-//! # Window protocol (rank thread; no cross-rank state)
+//! # Window protocol (rank thread; the only cross-rank state is the PEER board)
 //!
 //! * [`UnitTailRank::note_call`] (the row-gather hook, once per MoE layer
 //!   call): a stream-ordered D2D of the call's routed ids into the log.
@@ -27,20 +27,30 @@
 //!   tables' upload on the compute stream, and only then the new fills on the
 //!   copy stream (it waits for the upload, so no copy can overwrite a slot a
 //!   table still names). Completed fills are published at the next retirement.
+//! * With `HIPFIRE_EP_UNIT_TAIL_PEER` (the protocol and its safety argument are the module docs
+//!   of [`crate::expert_unit_tail`]) the retirement also posts this rank's publications to the
+//!   shared [`PeerBoard`], takes every delta the peers posted so far, applies it to the
+//!   full-table image of the peer-owned entries [`peer_shared`] admits, uploads the touched full
+//!   tables with its own table uploads (compute stream, before its own fills) and only then
+//!   records the ACK the owners release quarantined slots on. Teardown frees the pools with the
+//!   mesh, like the static cores peer tables name.
 //!
 //! Any device error freezes the tail at its last uploaded table and logs once;
 //! it never fails a decode (every table state is valid: canonical, or a live
 //! slot with complete bytes).
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use hip_bridge::{Event, Stream, HIP_EVENT_DISABLE_TIMING};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::expert_ep_units::EpUnitPlan;
-use crate::expert_unit_tail::{EpUnitTailConfig, FillOp, TailPolicy, UnitKey, WindowUse};
+use crate::expert_unit_tail::{
+    EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, Retire, TailPolicy, UnitKey,
+    WindowUse, QUARANTINE_WINDOWS,
+};
 
 /// Ids one window's log holds (`calls x slots`); a window past this stops
 /// logging (counted, never fatal: it only thins the next admission).
@@ -121,6 +131,11 @@ struct FullTable {
     /// `shared[expert]`: the full table's canonical entries of `expert` are the decode table's
     /// (so a slot copy of the unit is a valid byte copy for both tables).
     shared: Vec<bool>,
+    /// The full-table entries as uploaded at install (the canonical pointers): what a peer-owned
+    /// entry returns to when its owner unpublishes the slot, and what [`peer_shared`] compares
+    /// the owner's canonical entries with.
+    base_gate_up: Vec<u64>,
+    base_down: Vec<u64>,
 }
 
 /// Which experts of a layer the full table shares with the decode table: the rank's OWNED experts
@@ -143,6 +158,81 @@ fn full_shared(
                 && decode.1[expert] == full.1[expert]
         })
         .collect()
+}
+
+/// May `rank`'s full table follow `owner`'s slot for `expert`? Only a PEER-owned entry
+/// (`owner != rank`, `expert % ranks == owner`, the static owner of the unit) whose install-time
+/// full-table entries `base` are exactly the owner's canonical entries `canon` (same unit bytes,
+/// so a copy in the owner's slot is a valid byte copy for this table too), both non-null. Any
+/// other entry (an owner's differing residency view, a null pointer, an own entry, which
+/// [`full_shared`] covers) is never touched.
+fn peer_shared(
+    rank: usize,
+    ranks: usize,
+    owner: usize,
+    expert: usize,
+    canon: [u64; 2],
+    base: [u64; 2],
+) -> bool {
+    owner != rank
+        && owner < ranks
+        && expert % ranks == owner
+        && canon[0] != 0
+        && canon[1] != 0
+        && canon == base
+}
+
+/// The u64 LE table entry of `expert` in a byte image.
+fn image_entry(bytes: &[u8], expert: usize) -> u64 {
+    let at = expert * 8;
+    u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8-byte table entry"))
+}
+
+/// Apply one peer delta (owner `owner`) to one layer's full-table image: a publication points the
+/// entry at the owner's slot, an unpublication returns it to `base` (the canonical entry). Only
+/// an entry [`peer_shared`] admits is ever written. `true` when the image changed.
+fn apply_peer_delta(
+    rank: usize,
+    ranks: usize,
+    owner: usize,
+    base: (&[u64], &[u64]),
+    image: (&mut [u8], &mut [u8]),
+    delta: &PeerDelta,
+) -> bool {
+    let expert = delta.unit.1 as usize;
+    if expert >= base.0.len()
+        || expert >= base.1.len()
+        || image.0.len() < (expert + 1) * 8
+        || image.1.len() < (expert + 1) * 8
+    {
+        return false;
+    }
+    let base_entry = [base.0[expert], base.1[expert]];
+    if !peer_shared(rank, ranks, owner, expert, delta.canon, base_entry) {
+        return false;
+    }
+    let want = delta.slot.unwrap_or(base_entry);
+    if [image_entry(image.0, expert), image_entry(image.1, expert)] == want {
+        return false;
+    }
+    let at = expert * 8;
+    image.0[at..at + 8].copy_from_slice(&want[0].to_le_bytes());
+    image.1[at..at + 8].copy_from_slice(&want[1].to_le_bytes());
+    true
+}
+
+impl FullTable {
+    /// [`apply_peer_delta`] on this table's image.
+    fn apply_peer(&mut self, rank: usize, ranks: usize, owner: usize, delta: &PeerDelta) -> bool {
+        apply_peer_delta(
+            rank,
+            ranks,
+            owner,
+            (&self.base_gate_up, &self.base_down),
+            (&mut self.image_gate_up, &mut self.image_down),
+            delta,
+        )
+    }
 }
 
 /// How one `(layer, expert)` read is served, for this rank.
@@ -191,6 +281,7 @@ struct Batch {
 
 struct Inner {
     rank: usize,
+    ranks: usize,
     experts: usize,
     trunk_layers: usize,
     /// `layer label -> index into layers` (managed mixed layers only).
@@ -225,6 +316,12 @@ struct Inner {
     upload_ns: u64,
     fill_ns: u64,
     uploads: u64,
+    /// PEER mode: the board shared by every rank of the mesh.
+    peer: Option<Arc<PeerBoard>>,
+    /// Peer deltas that changed a full-table image / that did not (an unmanaged layer, an entry
+    /// [`peer_shared`] does not admit, or an image already in that state).
+    peer_applied: u64,
+    peer_skipped: u64,
     released: bool,
 }
 
@@ -253,6 +350,7 @@ impl UnitTailRank {
         freeze: bool,
         log_enabled: bool,
         layers: Vec<TailLayerInit>,
+        peer: Option<Arc<PeerBoard>>,
     ) -> Result<Self, String> {
         use crate::expert_ep_units::EpLayerState;
         let geometry = *plan.geometry();
@@ -332,6 +430,8 @@ impl UnitTailRank {
                         image_gate_up: image(&full_gate_up),
                         image_down: image(&full_down),
                         shared,
+                        base_gate_up: full_gate_up,
+                        base_down: full_down,
                     })
                 }
             };
@@ -378,12 +478,16 @@ impl UnitTailRank {
         }
 
         let mut policy = TailPolicy::new(config, freeze, priority);
+        if peer.is_some() {
+            policy.enable_peer_quarantine();
+        }
         let seeds = policy.seed(&order);
         let slots = policy.slots();
 
         // Device state. Any failure frees what was made.
         let mut state = Inner {
             rank,
+            ranks,
             experts,
             trunk_layers,
             layer_of,
@@ -413,12 +517,26 @@ impl UnitTailRank {
             upload_ns: 0,
             fill_ns: 0,
             uploads: 0,
+            peer,
+            peer_applied: 0,
+            peer_skipped: 0,
             released: false,
         };
         let built = state.build_device(gpu, slots, &seeds);
         if let Err(error) = built {
             state.release(gpu);
             return Err(format!("tail install on rank {rank}: {error}"));
+        }
+        if let Some(board) = state.peer.clone() {
+            // The warm units are live from the start: post them as retirement 0 (the peers apply
+            // them at their first retirement).
+            match state.seed_deltas(&seeds) {
+                Ok(deltas) => board.post(rank, 0, deltas),
+                Err(error) => {
+                    state.release(gpu);
+                    return Err(format!("tail install on rank {rank}: {error}"));
+                }
+            }
         }
         eprintln!(
             "qwen4 EP rank {rank}: D2 tail on: {slots} evictable slots ({} MiB pool) over {} mixed layers \
@@ -440,6 +558,16 @@ impl UnitTailRank {
                 "qwen4 EP rank {rank}: D2 tail prefill slots on: {full_layers} full (chunk) tables follow the slot \
                  publications of {shared_entries} owned entries (full-table prefill reads a live slot from VRAM, not \
                  the pinned host arena)"
+            );
+        }
+        if state.peer.is_some() {
+            eprintln!(
+                "qwen4 EP rank {rank}: D2 tail PEER slots on: the full (chunk) tables also follow the slot \
+                 publications of the {} peer rank(s) for the peer-owned entries equal to the owner's canonical \
+                 ones (a full-table prefill reads a peer's live slot over P2P, not the peer's pinned host arena); \
+                 an evicted slot is quarantined until every peer's table dropped it (at most {} slots)",
+                ranks - 1,
+                QUARANTINE_WINDOWS * config.fill_per_step
             );
         }
         Ok(Self {
@@ -765,9 +893,20 @@ impl Inner {
             self.idle_events.push(batch.event);
         }
 
-        let retire = self
-            .policy
-            .retire((core_distinct, core_reads), &window, &completed);
+        let retire = match self.peer.clone() {
+            Some(board) => {
+                let owner = self.rank;
+                self.policy
+                    .retire_peer((core_distinct, core_reads), &window, &completed, |m| {
+                        board.released_through(owner, m)
+                    })
+            }
+            None => self
+                .policy
+                .retire((core_distinct, core_reads), &window, &completed),
+        };
+        // This retirement's index (the retirement counters of all ranks are one clock).
+        let j = self.policy.stats().windows;
         let t_retire = Instant::now();
 
         // Tables first (publish -> slot, evict -> canonical), then the copies.
@@ -788,28 +927,48 @@ impl Inner {
             layer.set(unit.1 as usize, gate_up, down);
             touched.insert(index);
         }
-        let mut touched: Vec<usize> = touched.into_iter().collect();
-        touched.sort_unstable();
+        // PEER mode: post this retirement's publications, then take and apply what the peers
+        // posted so far to the full tables' peer-owned entries.
+        let mut peer_touched: HashSet<usize> = HashSet::new();
+        let mut peer_take: Option<PeerTake> = None;
+        if let Some(board) = self.peer.clone() {
+            board.post(self.rank, j, self.publish_deltas(&retire)?);
+            let take = board.take(self.rank);
+            if take.newest().is_some_and(|k| k > j) {
+                return Err(format!(
+                    "peer posts through retirement {:?} reached rank {} at its retirement {j}: \
+                     the ranks' windows are out of step",
+                    take.newest(),
+                    self.rank
+                ));
+            }
+            peer_touched = self.apply_peer(&take);
+            peer_take = Some(take);
+        }
+        let mut order: Vec<usize> = touched.union(&peer_touched).copied().collect();
+        order.sort_unstable();
         let compute = gpu.active_stream.as_ref();
-        for &index in &touched {
+        for &index in &order {
             let layer = &self.layers[index];
-            gpu.hip
-                .memcpy_htod_async_on(
-                    &layer
-                        .table_gate_up
-                        .buf
-                        .byte_view(0, layer.image_gate_up.len()),
-                    &layer.image_gate_up,
-                    compute,
-                )
-                .map_err(io)?;
-            gpu.hip
-                .memcpy_htod_async_on(
-                    &layer.table_down.buf.byte_view(0, layer.image_down.len()),
-                    &layer.image_down,
-                    compute,
-                )
-                .map_err(io)?;
+            if touched.contains(&index) {
+                gpu.hip
+                    .memcpy_htod_async_on(
+                        &layer
+                            .table_gate_up
+                            .buf
+                            .byte_view(0, layer.image_gate_up.len()),
+                        &layer.image_gate_up,
+                        compute,
+                    )
+                    .map_err(io)?;
+                gpu.hip
+                    .memcpy_htod_async_on(
+                        &layer.table_down.buf.byte_view(0, layer.image_down.len()),
+                        &layer.image_down,
+                        compute,
+                    )
+                    .map_err(io)?;
+            }
             if let Some(full) = layer.full.as_ref() {
                 gpu.hip
                     .memcpy_htod_async_on(
@@ -830,6 +989,12 @@ impl Inner {
                     .map_err(io)?;
             }
             self.uploads += 1;
+        }
+        // The ACK: every peer delta this retirement applied is now enqueued on the compute
+        // stream ahead of every kernel of the next window. A failed upload returned above and
+        // records nothing, so the owners keep the slots this rank may still name quarantined.
+        if let (Some(board), Some(take)) = (self.peer.as_ref(), peer_take.as_ref()) {
+            board.ack(self.rank, j, take);
         }
         let t_upload = Instant::now();
         if !retire.fills.is_empty() {
@@ -867,6 +1032,67 @@ impl Inner {
         Ok(())
     }
 
+    /// The deltas of this retirement's publications (a published fill names its slot, an evicted
+    /// unit returns to canonical), for the peers.
+    fn publish_deltas(&self, retire: &Retire) -> Result<Vec<PeerDelta>, String> {
+        let canon = |unit: UnitKey| -> Result<[u64; 2], String> {
+            let index = self.layer_of[unit.0 as usize].ok_or("a delta names an unmanaged layer")?;
+            let layer = &self.layers[index];
+            Ok([
+                layer.canon_gate_up[unit.1 as usize],
+                layer.canon_down[unit.1 as usize],
+            ])
+        };
+        let mut deltas = Vec::with_capacity(retire.publish.len() + retire.unpublish.len());
+        for &(unit, slot) in &retire.publish {
+            let (gate_up, down) = self.slot_addresses(slot);
+            deltas.push(PeerDelta {
+                unit,
+                slot: Some([gate_up, down]),
+                canon: canon(unit)?,
+            });
+        }
+        for &unit in &retire.unpublish {
+            deltas.push(PeerDelta {
+                unit,
+                slot: None,
+                canon: canon(unit)?,
+            });
+        }
+        Ok(deltas)
+    }
+
+    /// The deltas that publish the warm start's `seeds`.
+    fn seed_deltas(&self, seeds: &[FillOp]) -> Result<Vec<PeerDelta>, String> {
+        self.publish_deltas(&Retire {
+            publish: seeds.iter().map(|op| (op.unit, op.slot)).collect(),
+            ..Retire::default()
+        })
+    }
+
+    /// Apply the peers' deltas to this rank's full-table images; the layers whose image changed.
+    fn apply_peer(&mut self, take: &PeerTake) -> HashSet<usize> {
+        let (rank, ranks) = (self.rank, self.ranks);
+        let mut touched = HashSet::new();
+        for (owner, delta) in &take.deltas {
+            let index = self.layer_of.get(delta.unit.0 as usize).copied().flatten();
+            let changed = index.and_then(|index| {
+                self.layers[index]
+                    .full
+                    .as_mut()
+                    .map(|full| (index, full.apply_peer(rank, ranks, *owner, delta)))
+            });
+            match changed {
+                Some((index, true)) => {
+                    touched.insert(index);
+                    self.peer_applied += 1;
+                }
+                _ => self.peer_skipped += 1,
+            }
+        }
+        touched
+    }
+
     fn freeze(&mut self, why: &str) {
         if self.frozen.is_none() {
             eprintln!(
@@ -874,6 +1100,11 @@ impl Inner {
                 self.rank
             );
             self.frozen = Some(why.to_string());
+            if let Some(board) = self.peer.as_ref() {
+                // This rank takes nothing more and never acknowledges again: the owners keep
+                // every slot it may still name quarantined.
+                board.detach(self.rank);
+            }
         }
         self.calls.clear();
         self.log_used = 0;
@@ -887,10 +1118,22 @@ impl Inner {
         let unix_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_millis());
+        let peer_note = if self.peer.is_some() {
+            format!(
+                " quarantined {} (now {}) peer-deltas applied {} skipped {}",
+                s.quarantined,
+                self.policy
+                    .count(crate::expert_unit_tail::SlotPhase::Quarantined),
+                self.peer_applied,
+                self.peer_skipped
+            )
+        } else {
+            String::new()
+        };
         eprintln!(
             "[unit-tail] rank {} {tag} windows {} reads/window {:.1}: core {:.2}% tail {:.2}% host {:.2}% \
              (slot hit {:.2}%, distinct hit {:.2}%) host distinct/window {:.2} ({:.3} MB) \
-             fills {} published {} evictions {} skipped {} stale {} live {}/{} late-in-flight {} \
+             fills {} published {} evictions {}{} skipped {} stale {} live {}/{} late-in-flight {} \
              host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} ({} table uploads){} \
              | raw unix_ms={unix_ms} unit_bytes={} core_reads={} tail_reads={} host_reads={} core_distinct={} tail_distinct={} host_distinct={} fills_issued={}",
             self.rank,
@@ -906,6 +1149,7 @@ impl Inner {
             s.fills_issued,
             s.fills_published,
             s.evictions,
+            peer_note,
             s.skipped_full,
             s.stale_completions,
             self.policy.count(crate::expert_unit_tail::SlotPhase::Live),
@@ -937,6 +1181,9 @@ impl Inner {
             return;
         }
         self.released = true;
+        if let Some(board) = self.peer.as_ref() {
+            board.detach(self.rank);
+        }
         // Nothing reads a slot or the log after this: drain the copy stream first.
         if let Some(stream) = self.copy_stream.take() {
             let _ = gpu.hip.stream_synchronize(&stream);
@@ -966,7 +1213,13 @@ impl Inner {
 
 #[cfg(test)]
 mod tests {
-    use super::{full_shared, live_slot_units, LiveSlot};
+    use super::{
+        apply_peer_delta, full_shared, image_entry, live_slot_units, peer_shared, LiveSlot,
+    };
+    use crate::expert_unit_tail::{
+        EpUnitTailConfig, PeerBoard, PeerDelta, SlotPhase, TailPolicy, UnitKey, WindowUse,
+    };
+    use std::collections::HashMap;
 
     fn image(entries: &[u64]) -> Vec<u8> {
         entries.iter().flat_map(|e| e.to_le_bytes()).collect()
@@ -1032,5 +1285,506 @@ mod tests {
         let decode_dn = [5u64, 0];
         let shared = full_shared(0, 1, (&decode_gu, &decode_dn), (&decode_gu, &decode_dn));
         assert_eq!(shared, [false, false]);
+    }
+
+    #[test]
+    fn peer_shared_admits_only_a_peer_owned_entry_equal_to_the_owner_canonical() {
+        // 2 ranks, this rank 1: rank 0 owns the even experts.
+        let canon = [100u64, 200];
+        assert!(peer_shared(1, 2, 0, 4, canon, canon));
+        // The full entry differs from the owner's canonical entries in either pointer.
+        assert!(!peer_shared(1, 2, 0, 4, canon, [100, 201]));
+        assert!(!peer_shared(1, 2, 0, 4, canon, [101, 200]));
+        // Not a peer: this rank's own entries are `full_shared`'s.
+        assert!(!peer_shared(1, 2, 1, 5, canon, canon));
+        // The expert is not owned by the delta's owner.
+        assert!(!peer_shared(1, 2, 0, 5, canon, canon));
+        assert!(!peer_shared(1, 2, 2, 4, canon, canon));
+        // A null canonical pointer is never followed.
+        assert!(!peer_shared(1, 2, 0, 4, [0, 200], [0, 200]));
+        assert!(!peer_shared(1, 2, 0, 4, [100, 0], [100, 0]));
+    }
+
+    #[test]
+    fn a_peer_delta_never_touches_an_entry_that_differs_from_the_owner_canonical() {
+        // 6 experts, 2 ranks, this rank 1: rank 0 owns experts 0, 2 and 4.
+        let owner_gu = [10u64, 11, 12, 13, 14, 15];
+        let owner_dn = [20u64, 21, 22, 23, 24, 25];
+        // This rank's full table (install-time entries): expert 2 names something else than the
+        // owner's canonical entries (a different residency view); expert 4 equals them.
+        let mut full_gu = owner_gu;
+        full_gu[2] = 99;
+        let full_dn = owner_dn;
+        let mut gu = image(&full_gu);
+        let mut dn = image(&full_dn);
+        let (start_gu, start_dn) = (gu.clone(), dn.clone());
+        let apply = |gu: &mut Vec<u8>, dn: &mut Vec<u8>, owner: usize, delta: PeerDelta| {
+            apply_peer_delta(
+                1,
+                2,
+                owner,
+                (&full_gu, &full_dn),
+                (gu.as_mut_slice(), dn.as_mut_slice()),
+                &delta,
+            )
+        };
+        let delta = |expert: u16, slot: Option<[u64; 2]>| PeerDelta {
+            unit: (0, expert),
+            slot,
+            canon: [owner_gu[expert as usize], owner_dn[expert as usize]],
+        };
+        // The differing entry is never written, by a publication or an unpublication.
+        assert!(!apply(&mut gu, &mut dn, 0, delta(2, Some([7000, 8000]))));
+        assert!(!apply(&mut gu, &mut dn, 0, delta(2, None)));
+        assert_eq!((&gu, &dn), (&start_gu, &start_dn));
+        // The equal entry follows its owner: both pointers name the slot, then return to the
+        // canonical entries; no neighbour moves.
+        assert!(apply(&mut gu, &mut dn, 0, delta(4, Some([7100, 8100]))));
+        assert_eq!((image_entry(&gu, 4), image_entry(&dn, 4)), (7100, 8100));
+        for expert in [0usize, 1, 2, 3, 5] {
+            assert_eq!(image_entry(&gu, expert), image_entry(&start_gu, expert));
+            assert_eq!(image_entry(&dn, expert), image_entry(&start_dn, expert));
+        }
+        assert!(
+            !apply(&mut gu, &mut dn, 0, delta(4, Some([7100, 8100]))),
+            "idempotent"
+        );
+        assert!(apply(&mut gu, &mut dn, 0, delta(4, None)));
+        assert_eq!((&gu, &dn), (&start_gu, &start_dn));
+        // This rank's own experts (1, 3, 5), a delta that claims this rank as its owner, an
+        // expert outside the table and a null canonical entry are all ignored.
+        assert!(!apply(&mut gu, &mut dn, 0, delta(3, Some([1, 2]))));
+        assert!(!apply(&mut gu, &mut dn, 1, delta(3, Some([1, 2]))));
+        let beyond = PeerDelta {
+            unit: (0, 6),
+            slot: Some([1, 2]),
+            canon: [16, 26],
+        };
+        assert!(!apply(&mut gu, &mut dn, 0, beyond));
+        let mut null = delta(4, Some([1, 2]));
+        null.canon = [0, 0];
+        assert!(!apply(&mut gu, &mut dn, 0, null));
+        assert_eq!((&gu, &dn), (&start_gu, &start_dn));
+    }
+
+    // ---- two-rank lockstep simulation of the board and both policies ----
+
+    const SIM_RANKS: usize = 2;
+    const SIM_LAYERS: u16 = 3;
+    const SIM_EXPERTS: u16 = 16;
+
+    /// The owner's canonical `[gate_up, down]` entries (its pinned host arena) of a unit.
+    fn sim_canon(unit: UnitKey) -> [u64; 2] {
+        let id = unit.0 as u64 * SIM_EXPERTS as u64 + unit.1 as u64;
+        [
+            0x7000_0000_0000 + id * 0x4000,
+            0x7000_0000_2000 + id * 0x4000,
+        ]
+    }
+
+    const SIM_POOL: u64 = 0x1000_0000_0000;
+    const SIM_POOL_SPAN: u64 = 0x1_0000_0000;
+
+    /// The addresses of `owner`'s pool slot (VRAM; one slot is 0x4000 bytes apart).
+    fn sim_slot_addr(owner: usize, slot: usize) -> [u64; 2] {
+        let base = SIM_POOL + owner as u64 * SIM_POOL_SPAN + slot as u64 * 0x4000;
+        [base, base + 0x2000]
+    }
+
+    fn sim_slot_of(address: u64) -> Option<(usize, usize)> {
+        (0..SIM_RANKS).find_map(|owner| {
+            let base = SIM_POOL + owner as u64 * SIM_POOL_SPAN;
+            (base..base + SIM_POOL_SPAN)
+                .contains(&address)
+                .then(|| (owner, ((address - base) / 0x4000) as usize))
+        })
+    }
+
+    /// The install-time full-table entries `reader` holds for a unit: the owner's canonical
+    /// entries, except some peer-owned ones that differ (another residency view).
+    fn sim_base(reader: usize, unit: UnitKey) -> [u64; 2] {
+        let canon = sim_canon(unit);
+        if unit.1 as usize % SIM_RANKS != reader && (unit.0 + unit.1) % 5 == 3 {
+            [canon[0] + 8, canon[1] + 8]
+        } else {
+            canon
+        }
+    }
+
+    fn rand(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    struct SimLayer {
+        base_gu: Vec<u64>,
+        base_dn: Vec<u64>,
+        img_gu: Vec<u8>,
+        img_dn: Vec<u8>,
+    }
+
+    struct SimRank {
+        policy: TailPolicy,
+        /// This rank's full-table images, one per layer.
+        layers: Vec<SimLayer>,
+        /// In-flight fills: `(slot, generation, retirements left)`.
+        flight: Vec<(usize, u64, u32)>,
+        /// `(owner, k)` -> the retirement at which this rank first applied the owner's post `k`.
+        applied_at: HashMap<(usize, u64), u64>,
+        covered: Option<u64>,
+        /// Slots this rank's policy quarantined -> the retirement they were evicted at.
+        quarantined_at: HashMap<usize, u64>,
+    }
+
+    #[derive(Default, Debug)]
+    struct SimTotals {
+        evictions: u64,
+        quarantined_refills: u64,
+        image_changes: u64,
+        published: u64,
+    }
+
+    struct Sim {
+        ranks: Vec<SimRank>,
+        board: PeerBoard,
+        /// `pool[owner][slot]`: the unit whose bytes the slot holds, or is being overwritten with.
+        pool: Vec<Vec<Option<UnitKey>>>,
+        rng: u64,
+        quarantine: bool,
+        totals: SimTotals,
+    }
+
+    impl Sim {
+        fn new(t: usize, f: usize, b: u32, quarantine: bool, seed: u64) -> Self {
+            let board = PeerBoard::new(SIM_RANKS);
+            let (mut ranks, mut pool) = (Vec::new(), Vec::new());
+            for r in 0..SIM_RANKS {
+                let mut priority = HashMap::new();
+                let mut owned: Vec<UnitKey> = Vec::new();
+                for layer in 0..SIM_LAYERS {
+                    for expert in (r as u16..SIM_EXPERTS).step_by(SIM_RANKS) {
+                        priority.insert((layer, expert), layer as u32 * 100 + expert as u32);
+                        owned.push((layer, expert));
+                    }
+                }
+                let config = EpUnitTailConfig {
+                    tail_units: t,
+                    fill_per_step: f,
+                    boundary_every: b,
+                };
+                let mut policy = TailPolicy::new(config, false, priority);
+                if quarantine {
+                    policy.enable_peer_quarantine();
+                }
+                let seeds = policy.seed(&owned);
+                let mut held = vec![None; t];
+                for op in &seeds {
+                    held[op.slot] = Some(op.unit);
+                }
+                // The warm start posts as retirement 0, like `UnitTailRank::install`.
+                board.post(
+                    r,
+                    0,
+                    seeds
+                        .iter()
+                        .map(|op| PeerDelta {
+                            unit: op.unit,
+                            slot: Some(sim_slot_addr(r, op.slot)),
+                            canon: sim_canon(op.unit),
+                        })
+                        .collect(),
+                );
+                let layers = (0..SIM_LAYERS)
+                    .map(|layer| {
+                        let (mut base_gu, mut base_dn) = (Vec::new(), Vec::new());
+                        for expert in 0..SIM_EXPERTS {
+                            let entry = sim_base(r, (layer, expert));
+                            base_gu.push(entry[0]);
+                            base_dn.push(entry[1]);
+                        }
+                        SimLayer {
+                            img_gu: image(&base_gu),
+                            img_dn: image(&base_dn),
+                            base_gu,
+                            base_dn,
+                        }
+                    })
+                    .collect();
+                ranks.push(SimRank {
+                    policy,
+                    layers,
+                    flight: Vec::new(),
+                    applied_at: HashMap::new(),
+                    covered: None,
+                    quarantined_at: HashMap::new(),
+                });
+                pool.push(held);
+            }
+            Self {
+                ranks,
+                board,
+                pool,
+                rng: seed | 1,
+                quarantine,
+                totals: SimTotals::default(),
+            }
+        }
+
+        /// One rank's retirement of window `w`, in the production order: its policy step, its
+        /// post, its fills, then the take / apply / upload / ack of the peers' deltas.
+        fn retire(&mut self, r: usize, w: u64) -> Result<(), String> {
+            let Sim {
+                ranks,
+                board,
+                pool,
+                rng,
+                quarantine,
+                totals,
+            } = self;
+            // The window's reads of this rank's own units, skewed to a drifting hot set.
+            let owned = SIM_EXPERTS as usize / SIM_RANKS;
+            let mut uses: Vec<WindowUse> = Vec::new();
+            for _ in 0..8 {
+                let layer = (rand(rng) % SIM_LAYERS as u64) as u16;
+                let idx = if rand(rng) % 3 != 0 {
+                    (rand(rng) as usize % 4 + (w / 40) as usize) % owned
+                } else {
+                    rand(rng) as usize % owned
+                };
+                let unit = (layer, (r + idx * SIM_RANKS) as u16);
+                let reads = 1 + (rand(rng) % 3) as u32;
+                match uses.iter_mut().find(|u| u.unit == unit) {
+                    Some(u) => u.reads += reads,
+                    None => uses.push(WindowUse { unit, reads }),
+                }
+            }
+            uses.sort_by_key(|u| u.unit);
+            let mut completed: Vec<(usize, u64)> = Vec::new();
+            ranks[r].flight.retain_mut(|(slot, generation, left)| {
+                if *left == 0 {
+                    completed.push((*slot, *generation));
+                    false
+                } else {
+                    *left -= 1;
+                    true
+                }
+            });
+            if rand(rng) % 17 == 0 {
+                completed.push((0, 1 << 40));
+            }
+            let retire = if *quarantine {
+                ranks[r]
+                    .policy
+                    .retire_peer((0, 0), &uses, &completed, |m| board.released_through(r, m))
+            } else {
+                ranks[r].policy.retire((0, 0), &uses, &completed)
+            };
+            let j = ranks[r].policy.stats().windows;
+            if j != w {
+                return Err(format!("rank {r}: retirement {j} at window {w}"));
+            }
+            totals.published += retire.publish.len() as u64;
+            totals.evictions = ranks.iter().map(|k| k.policy.stats().evictions).sum();
+            for slot in 0..ranks[r].policy.slots() {
+                if let Some(k) = ranks[r].policy.slot_evicted_at(slot) {
+                    ranks[r].quarantined_at.entry(slot).or_insert(k);
+                }
+            }
+            // Post this retirement's publications.
+            let mut deltas = Vec::new();
+            for &(unit, slot) in &retire.publish {
+                deltas.push(PeerDelta {
+                    unit,
+                    slot: Some(sim_slot_addr(r, slot)),
+                    canon: sim_canon(unit),
+                });
+            }
+            for &unit in &retire.unpublish {
+                deltas.push(PeerDelta {
+                    unit,
+                    slot: None,
+                    canon: sim_canon(unit),
+                });
+            }
+            board.post(r, j, deltas);
+            // The fills this retirement starts: a slot that was quarantined must have been
+            // acknowledged by EVERY peer at a retirement strictly before this one.
+            for op in &retire.fills {
+                if let Some(k) = ranks[r].quarantined_at.remove(&op.slot) {
+                    for q in (0..SIM_RANKS).filter(|&q| q != r) {
+                        match ranks[q].applied_at.get(&(r, k)) {
+                            Some(&applied) if j > applied => {}
+                            other => {
+                                return Err(format!(
+                                    "owner {r}: slot {} evicted at {k} refilled at {j}, peer {q} \
+                                     applied the unpublication at {other:?}",
+                                    op.slot
+                                ))
+                            }
+                        }
+                    }
+                    totals.quarantined_refills += 1;
+                }
+                pool[r][op.slot] = Some(op.unit);
+                let latency = (rand(rng) % 4) as u32;
+                ranks[r].flight.push((op.slot, op.generation, latency));
+            }
+            // Take every peer delta posted so far, apply it to the full-table images, "upload",
+            // acknowledge.
+            let take = board.take(r);
+            if let Some(top) = take.newest() {
+                if top > j {
+                    return Err(format!("rank {r}: peer post {top} ahead of retirement {j}"));
+                }
+                let owner = (r + 1) % SIM_RANKS;
+                let from = ranks[r].covered.map_or(0, |covered| covered + 1);
+                for k in from..=top {
+                    ranks[r].applied_at.insert((owner, k), j);
+                }
+                ranks[r].covered = Some(top);
+            }
+            for (owner, delta) in &take.deltas {
+                let layer = &mut ranks[r].layers[delta.unit.0 as usize];
+                if apply_peer_delta(
+                    r,
+                    SIM_RANKS,
+                    *owner,
+                    (&layer.base_gu, &layer.base_dn),
+                    (&mut layer.img_gu, &mut layer.img_dn),
+                    delta,
+                ) {
+                    totals.image_changes += 1;
+                }
+            }
+            board.ack(r, j, &take);
+            Ok(())
+        }
+
+        /// Every peer-owned full-table entry that left its install-time value names a slot of
+        /// its owner that holds exactly that unit's bytes right now (published and not being
+        /// overwritten), and an entry that differs from the owner's canonical one never moved.
+        fn check(&self) -> Result<(), String> {
+            for (q, reader) in self.ranks.iter().enumerate() {
+                for (layer, table) in reader.layers.iter().enumerate() {
+                    for expert in 0..SIM_EXPERTS as usize {
+                        let owner = expert % SIM_RANKS;
+                        if owner == q {
+                            continue;
+                        }
+                        let unit = (layer as u16, expert as u16);
+                        let entry = [
+                            image_entry(&table.img_gu, expert),
+                            image_entry(&table.img_dn, expert),
+                        ];
+                        let base = [table.base_gu[expert], table.base_dn[expert]];
+                        if entry == base {
+                            continue;
+                        }
+                        if base != sim_canon(unit) {
+                            return Err(format!("rank {q}: unshared entry of {unit:?} moved"));
+                        }
+                        let Some((slot_owner, slot)) = sim_slot_of(entry[0]) else {
+                            return Err(format!("rank {q}: {unit:?} names {entry:x?}"));
+                        };
+                        if slot_owner != owner || entry != sim_slot_addr(owner, slot) {
+                            return Err(format!("rank {q}: {unit:?} names a foreign slot"));
+                        }
+                        if self.pool[owner][slot] != Some(unit) {
+                            return Err(format!(
+                                "rank {q} names slot {slot} of owner {owner} for {unit:?}, which \
+                                 holds {:?}",
+                                self.pool[owner][slot]
+                            ));
+                        }
+                        match self.ranks[owner].policy.slot_phase(slot) {
+                            SlotPhase::Live | SlotPhase::Quarantined => {}
+                            phase => {
+                                return Err(format!(
+                                    "rank {q} names slot {slot} of owner {owner} in {phase:?}"
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+
+    fn run_sim(
+        t: usize,
+        f: usize,
+        b: u32,
+        quarantine: bool,
+        seed: u64,
+        windows: u64,
+    ) -> Result<SimTotals, String> {
+        let mut sim = Sim::new(t, f, b, quarantine, seed);
+        sim.check()?;
+        for w in 1..=windows {
+            // Both ranks retire every window; which one goes first is arbitrary.
+            let order = if rand(&mut sim.rng) & 1 == 0 {
+                [0, 1]
+            } else {
+                [1, 0]
+            };
+            for r in order {
+                sim.retire(r, w)?;
+                sim.check()?;
+            }
+        }
+        Ok(sim.totals)
+    }
+
+    /// The lever's safety property over random windows, random copy latency, stale completions
+    /// and either rank retiring first: no peer full-table entry ever names a slot that is not
+    /// live (or quarantined) with exactly that unit's bytes, in particular no slot is refilled
+    /// while a peer image names it, a refill follows every peer's ack by at least one
+    /// retirement, and an entry that differs from the owner's canonical one never moves.
+    #[test]
+    fn two_rank_lockstep_never_refills_a_slot_a_peer_image_names() {
+        let mut totals = SimTotals::default();
+        for (t, f, b) in [
+            (4usize, 2usize, 1u32),
+            (6, 3, 1),
+            (3, 1, 1),
+            (5, 2, 2),
+            (10, 4, 1),
+            (8, 8, 1),
+        ] {
+            for seed in [
+                0x9e37_79b9_7f4a_7c15u64,
+                0x2545_f491_4f6c_dd1d,
+                0x1234_5678_9abc_def1,
+            ] {
+                let run = run_sim(t, f, b, true, seed, 500)
+                    .unwrap_or_else(|error| panic!("T={t} F={f} b={b} seed={seed:#x}: {error}"));
+                totals.evictions += run.evictions;
+                totals.quarantined_refills += run.quarantined_refills;
+                totals.image_changes += run.image_changes;
+                totals.published += run.published;
+            }
+        }
+        // The runs exercised the protocol: units got published, peers' images followed them,
+        // slots were evicted into quarantine and refilled after the acks.
+        assert!(
+            totals.published > 0 && totals.image_changes > 0,
+            "{totals:?}"
+        );
+        assert!(
+            totals.evictions > 0 && totals.quarantined_refills > 0,
+            "{totals:?}"
+        );
+    }
+
+    /// The same runs with the pre-peer eviction (a victim is refilled in the retirement that
+    /// evicts it) trip the invariant: the simulation can see the hazard the quarantine closes.
+    #[test]
+    fn without_quarantine_a_peer_image_names_a_refilled_slot() {
+        let broke = (1..=4u64)
+            .any(|seed| run_sim(4, 2, 1, false, seed * 0x9e37_79b9_7f4a_7c15, 300).is_err());
+        assert!(broke, "the invariant never fired without the quarantine");
     }
 }

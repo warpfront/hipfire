@@ -688,7 +688,9 @@ impl Qwen4EpRowGatherHook {
 }
 
 /// Install the rank's D2 tail when `HIPFIRE_EP_UNIT_TAIL` asks for it. The tail needs the
-/// per-expert unit plan (a plan-less load is a load error, never a silent no-op).
+/// per-expert unit plan (a plan-less load is a load error, never a silent no-op). With
+/// `HIPFIRE_EP_UNIT_TAIL_PEER=1` (and the prefill lever) every rank gets the mesh's one shared
+/// [`crate::expert_unit_tail::PeerBoard`], created by the first rank to install (`peer_board`).
 fn install_unit_tail(
     hook: &Qwen4EpRowGatherHook,
     gpu: &mut Gpu,
@@ -696,6 +698,7 @@ fn install_unit_tail(
     trunk_layers: usize,
     bundle: &Qwen4Bundle,
     forward: &crate::gpu_forward::Qwen4GpuForward,
+    peer_board: &Mutex<Option<Arc<crate::expert_unit_tail::PeerBoard>>>,
 ) -> Result<(), String> {
     use crate::expert_unit_tail as tail;
     let raw = hipfire_config::developer_var(tail::EP_UNIT_TAIL_ENV).ok();
@@ -711,6 +714,45 @@ fn install_unit_tail(
     })?;
     let log = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_LOG_ENV, false);
     let prefill = hipfire_config::developer_bool(tail::EP_UNIT_TAIL_PREFILL_ENV, false);
+    let ranks = plan.geometry().ranks;
+    let peer = if !hipfire_config::developer_bool(tail::EP_UNIT_TAIL_PEER_ENV, false) {
+        None
+    } else if !prefill {
+        eprintln!(
+            "qwen4 EP rank {rank}: {}=1 is ignored: it needs {}=1",
+            tail::EP_UNIT_TAIL_PEER_ENV,
+            tail::EP_UNIT_TAIL_PREFILL_ENV
+        );
+        None
+    } else if ranks < 2 {
+        eprintln!(
+            "qwen4 EP rank {rank}: {}=1 is ignored: the mesh has no peer rank",
+            tail::EP_UNIT_TAIL_PEER_ENV
+        );
+        None
+    } else if rank >= ranks {
+        return Err(format!(
+            "{}: rank {rank} is outside the plan's {ranks} ranks",
+            tail::EP_UNIT_TAIL_PEER_ENV
+        ));
+    } else {
+        let mut slot = lock(peer_board);
+        match slot.as_ref() {
+            Some(board) if board.ranks() == ranks => Some(board.clone()),
+            Some(board) => {
+                return Err(format!(
+                    "{}: the shared peer board has {} ranks, the plan {ranks}",
+                    tail::EP_UNIT_TAIL_PEER_ENV,
+                    board.ranks()
+                ));
+            }
+            None => {
+                let board = Arc::new(tail::PeerBoard::new(ranks));
+                *slot = Some(board.clone());
+                Some(board)
+            }
+        }
+    };
     let installed = Arc::new(crate::expert_unit_tail_rank::UnitTailRank::install(
         gpu,
         rank,
@@ -720,6 +762,7 @@ fn install_unit_tail(
         hipfire_config::developer_bool(tail::EP_UNIT_TAIL_FREEZE_ENV, false),
         log,
         forward.tail_layers(prefill),
+        peer,
     )?);
     hook.install_tail(installed.clone())?;
     if prefill {
@@ -1451,6 +1494,8 @@ impl Qwen4Bundle {
         let split_slot: Mutex<Option<TrunkSplitRank>> = Mutex::new(None);
         let split_transport: Mutex<Option<Arc<EpRowGather>>> = Mutex::new(None);
         let ar_hc_slot: Mutex<Option<Arc<ArHcExchange>>> = Mutex::new(None);
+        let peer_board_slot: Mutex<Option<Arc<crate::expert_unit_tail::PeerBoard>>> =
+            Mutex::new(None);
         let release_rank0 = |gpu: &mut Gpu, error: String| -> String {
             gather.abort();
             let _ = gather.release(0, gpu);
@@ -1816,7 +1861,17 @@ impl Qwen4Bundle {
                     Some(plan) => hook.install_balanced(plan),
                     None => Ok(()),
                 })
-                .and_then(|()| install_unit_tail(&hook, gpu, rank, trunk_layers, bundle, &forward));
+                .and_then(|()| {
+                    install_unit_tail(
+                        &hook,
+                        gpu,
+                        rank,
+                        trunk_layers,
+                        bundle,
+                        &forward,
+                        &peer_board_slot,
+                    )
+                });
             bundle.execution = Some(forward);
             if result.is_ok() {
                 crate::trunk_route::install(ar_hc.as_ref().map(|exchange| {
