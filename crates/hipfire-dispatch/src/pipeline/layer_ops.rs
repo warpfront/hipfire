@@ -240,8 +240,9 @@ fn mq6_i8_route(gpu: &Gpu, weight: &WeightRef<'_>, rows: usize) -> bool {
 }
 
 /// Whether `weight` projects through the symmetric-MQ6 x int8-activation trunk
-/// route ([`Gpu::qwen4_trunk_a8_applies`]): decode, few-row verify and short
-/// prefill (1..=`QWEN4_TRUNK_A8_ROUTE_CAP` route rows) of a load-verified
+/// route ([`Gpu::qwen4_trunk_a8_applies`]): wide verify and short
+/// prefill (`QWEN4_TRUNK_A8_MIN_ROWS` = 9 and more route rows; decode and few-row
+/// verify keep the served F32 trunk kernels) of a load-verified
 /// symmetric qt47 model. It reads an F32 activation, so producers keep it F32,
 /// and it never fuses an epilogue, so the exact-INT8 route, its fused QSA
 /// norm+RoPE and the HC-write / shared-F16 routes all decline where it applies.
@@ -336,7 +337,7 @@ fn project_weights_inner(
     if input.dtype == DType::F32 {
         // gfx1201 symmetric qt47 trunk (`HIPFIRE_QWEN4_TRUNK_A8`, load-verified
         // z == -32*s): one FWHT + A8 block quantization per K feeds every MQ6
-        // member (F32 or BF16 output), decode through 64-row verify / prefill.
+        // member (F32 or BF16 output), 9-row wide verify and prefill chunks.
         // Never fuses an epilogue (`NormRopeEpi::fused` stays false: the caller
         // runs the separate norm / RoPE). All members of a K launch before the
         // next producer call, which would overwrite the shared quantized scratch.
