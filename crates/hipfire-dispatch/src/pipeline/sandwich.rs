@@ -686,6 +686,25 @@ pub struct Rope {
 }
 
 impl Rope {
+    /// The rotated channel span must be an even, non-zero prefix of the head
+    /// (the prefix kernels divide by it and index pairs below it);
+    /// `PartialHalved` may rotate zero pairs.
+    pub(crate) fn validate(&self, head_dim: usize) -> Result<(), DispatchError> {
+        let span = match self.kind {
+            RopeKind::RotateHalf | RopeKind::NoPe => return Ok(()),
+            RopeKind::PartialHalved { rot_pairs } if 2 * rot_pairs <= head_dim => return Ok(()),
+            RopeKind::PartialHalved { rot_pairs } => 2 * rot_pairs,
+            RopeKind::PrefixHalfSplit { rot_dim } | RopeKind::Interleaved { rot_dim } => rot_dim,
+        };
+        if span == 0 || span % 2 != 0 || span > head_dim {
+            return Err(DispatchError::Hip(format!(
+                "rope {:?}: rotated span {span} must be even and in 2..={head_dim}",
+                self.kind
+            )));
+        }
+        Ok(())
+    }
+
     /// Rotated pairs in the whole-head rotate-half pairing; `None` when the
     /// pairing is a prefix of the head.
     fn halved_pairs(&self, head_dim: usize) -> Option<usize> {
@@ -2662,6 +2681,36 @@ pub fn execute_softcap(gpu: &mut Gpu, op: &SoftcapOp<'_>) -> Result<(), Dispatch
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rope_span_must_be_an_even_nonzero_head_prefix() {
+        let rope = |kind| Rope { kind, theta: 1e4 };
+        for rot_dim in [0, 3, 130, 256] {
+            assert!(
+                rope(RopeKind::Interleaved { rot_dim })
+                    .validate(128)
+                    .is_err(),
+                "{rot_dim}"
+            );
+            assert!(
+                rope(RopeKind::PrefixHalfSplit { rot_dim })
+                    .validate(128)
+                    .is_err(),
+                "{rot_dim}"
+            );
+        }
+        for rot_dim in [2, 64, 128] {
+            assert!(rope(RopeKind::Interleaved { rot_dim })
+                .validate(128)
+                .is_ok());
+        }
+        assert!(rope(RopeKind::PartialHalved { rot_pairs: 0 })
+            .validate(128)
+            .is_ok());
+        assert!(rope(RopeKind::PartialHalved { rot_pairs: 65 })
+            .validate(128)
+            .is_err());
+    }
     use crate::pipeline::gated_mlp::{Activation, GatedMlpScratch, MlpLadder, MlpStorage, RmsNorm};
 
     /// A launch-free F32 tensor of `elements` at `addr` (never dereferenced).
