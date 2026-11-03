@@ -1668,14 +1668,13 @@ mod tests {
 
     #[test]
     fn mq4r_default_arches_run_the_gate() {
-        for gpu_arch in ["gfx1100", "gfx1151", "gfx1201"] {
+        assert!(route("gfx1201", "/m/flash-next.mq4r", false).default_route());
+        assert!(route("gfx1201", "/m/FLASH-NEXT.MQ4R", false).default_route());
+        // HIPF-254: Qwen4 is carved out of the MQ4R default on gfx1100/gfx1151.
+        for gpu_arch in ["gfx1100", "gfx1151"] {
             assert!(
-                route(gpu_arch, "/m/flash-next.mq4r", false).default_route(),
+                !route(gpu_arch, "/m/flash-next.mq4r", false).default_route(),
                 "{gpu_arch}"
-            );
-            assert!(
-                route(gpu_arch, "/m/FLASH-NEXT.MQ4R", false).default_route(),
-                "{gpu_arch} upper-case extension"
             );
         }
     }

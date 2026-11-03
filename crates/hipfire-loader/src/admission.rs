@@ -3867,10 +3867,17 @@ mod tests {
         );
         // A `.mq4r` load on a retained-default GPU is the retained AR route.
         assert_eq!(
-            qwen4_native_mtp(with(None), "gfx1151", mq4r, 1, 1, 1),
+            qwen4_native_mtp(with(None), "gfx1201", mq4r, 1, 1, 1),
             Ok(false)
         );
-        assert!(qwen4_native_mtp(with(Some(true)), "gfx1151", mq4r, 1, 1, 1).is_err());
+        assert!(qwen4_native_mtp(with(Some(true)), "gfx1201", mq4r, 1, 1, 1).is_err());
+        // gfx1100/gfx1151 never retain Qwen4 (HIPF-254): the head stays on.
+        for gpu_arch in ["gfx1100", "gfx1151"] {
+            assert_eq!(
+                qwen4_native_mtp(with(None), gpu_arch, mq4r, 1, 1, 1),
+                Ok(true)
+            );
+        }
         // Off the retained-default GPUs the name does not claim the load.
         assert_eq!(
             qwen4_native_mtp(with(None), "gfx1030", mq4r, 1, 1, 1),
