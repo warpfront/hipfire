@@ -20,8 +20,8 @@
 //! Run (GPU, through fabric): rda_layer_node digest | bench, flags via HIPFIRE_RAON_RDA_FUSED_PREP /
 //! HIPFIRE_RAON_RDA_SEGMENT / HIPFIRE_GATED_DELTA_VECTOR_CHUNKED.
 
-use hipfire_arch_raon::rda::{
-    rda_forward_rows, RaonRdaLayer, RdaGeometry, RdaLayerState, RdaProjected, RdaScratch,
+use hipfire_dispatch::pipeline::rda::{
+    rda_forward_rows, RdaGeometry, RdaLayer, RdaLayerState, RdaProjected, RdaScratch,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::json;
@@ -158,7 +158,7 @@ fn run_layer(
     gated: &GpuTensor,
     rows: usize,
 ) -> Res<()> {
-    let lw = RaonRdaLayer {
+    let lw = RdaLayer {
         conv_w_q: &w.cq,
         conv_w_k: &w.ck,
         conv_w_v: &w.cv,

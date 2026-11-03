@@ -7246,6 +7246,11 @@ fn awq_presence_matches(a: Option<&GpuTensor>, b: Option<&GpuTensor>) -> bool {
 }
 
 impl<'a> GroupedMoeOp<'a> {
+    /// [`Self::validate`] as the step-program preflight (`Step::GroupedMoe`).
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate().map(|_| ())
+    }
+
     /// Admission and operand validation; no launch happens before it passes.
     /// Every refusal is named; nothing falls back to a token loop.
     pub fn validate(&self) -> Result<GroupedMoeScratchPlan, DispatchError> {
@@ -7777,42 +7782,54 @@ pub struct GatedFfnOp<'a> {
     pub rows_exact: bool,
 }
 
+impl GatedFfnOp<'_> {
+    /// Operand and geometry checks of [`execute_gated_ffn`]; launch-free.
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        let op = self;
+        if op.hidden == 0 || op.mi == 0 || op.down_k < op.mi {
+            return Err(grouped_refusal("gated-ffn-geometry", ""));
+        }
+        let r = op.rows;
+        check_projection(&op.weights.gate, op.mi, op.hidden, "gated-ffn-gate")?;
+        check_projection(&op.weights.up, op.mi, op.hidden, "gated-ffn-up")?;
+        check_projection(&op.weights.down, op.hidden, op.down_k, "gated-ffn-down")?;
+        let rotated_gate = projection_kind(op.weights.gate.dtype, "gated-ffn-gate")?.1;
+        let rotated_up = projection_kind(op.weights.up.dtype, "gated-ffn-up")?.1;
+        if (rotated_gate && !awq_presence_matches(op.weights.gate.awq_scale, op.input_awq))
+            || (rotated_up && !awq_presence_matches(op.weights.up.awq_scale, op.input_awq))
+        {
+            return Err(grouped_refusal("gated-ffn-input-awq-mismatch", ""));
+        }
+        f32_like(op.x, "x")?;
+        scratch_need(op.x, mul(r, op.hidden)?, "x")?;
+        scratch_need(op.x_rot, mul(r, op.hidden)?, "x_rot")?;
+        scratch_need(op.out, mul(r, op.hidden)?, "out")?;
+        scratch_need(op.scratch.gate_out, mul(r, op.mi)?, "gate_out")?;
+        scratch_need(op.scratch.up_out, mul(r, op.mi)?, "up_out")?;
+        scratch_need(op.scratch.act, mul(r, op.down_k)?, "act")?;
+        scratch_need(op.scratch.rot, mul(r, op.down_k)?, "rot")?;
+        scratch_need(
+            op.scratch.tables,
+            rdna_compute::ffn_activation::single_expert_table_words(r),
+            "tables",
+        )?;
+        if (rotated_gate || rotated_up) && op.hidden % 256 != 0 {
+            return Err(grouped_refusal("gated-ffn-geometry", ""));
+        }
+        Ok(())
+    }
+}
+
 /// Execute a [`GatedFfnOp`].
 pub fn execute_gated_ffn(gpu: &mut Gpu, op: &GatedFfnOp<'_>) -> Result<(), DispatchError> {
     if op.rows == 0 {
         return Ok(());
     }
-    if op.hidden == 0 || op.mi == 0 || op.down_k < op.mi {
-        return Err(grouped_refusal("gated-ffn-geometry", ""));
-    }
+    op.validate_for_gpu(gpu)?;
     let r = op.rows;
-    check_projection(&op.weights.gate, op.mi, op.hidden, "gated-ffn-gate")?;
-    check_projection(&op.weights.up, op.mi, op.hidden, "gated-ffn-up")?;
-    check_projection(&op.weights.down, op.hidden, op.down_k, "gated-ffn-down")?;
     let rotated_gate = projection_kind(op.weights.gate.dtype, "gated-ffn-gate")?.1;
     let rotated_up = projection_kind(op.weights.up.dtype, "gated-ffn-up")?.1;
-    if (rotated_gate && !awq_presence_matches(op.weights.gate.awq_scale, op.input_awq))
-        || (rotated_up && !awq_presence_matches(op.weights.up.awq_scale, op.input_awq))
-    {
-        return Err(grouped_refusal("gated-ffn-input-awq-mismatch", ""));
-    }
-    f32_like(op.x, "x")?;
-    scratch_need(op.x, mul(r, op.hidden)?, "x")?;
-    scratch_need(op.x_rot, mul(r, op.hidden)?, "x_rot")?;
-    scratch_need(op.out, mul(r, op.hidden)?, "out")?;
-    scratch_need(op.scratch.gate_out, mul(r, op.mi)?, "gate_out")?;
-    scratch_need(op.scratch.up_out, mul(r, op.mi)?, "up_out")?;
-    scratch_need(op.scratch.act, mul(r, op.down_k)?, "act")?;
-    scratch_need(op.scratch.rot, mul(r, op.down_k)?, "rot")?;
-    scratch_need(
-        op.scratch.tables,
-        rdna_compute::ffn_activation::single_expert_table_words(r),
-        "tables",
-    )?;
     if rotated_gate || rotated_up {
-        if op.hidden % 256 != 0 {
-            return Err(grouped_refusal("gated-ffn-geometry", ""));
-        }
         rotate_input_basis(gpu, op.x, op.x_rot, op.input_awq, op.hidden, r)?;
     }
     gated_ffn_from_basis(

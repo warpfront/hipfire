@@ -20,7 +20,7 @@ serde_json.workspace = true
 [features]
 lab = []
 default = ["deltanet"]
-deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet"]
+deltanet = ["rdna-compute/deltanet", "hipfire-runtime/deltanet", "hipfire-dispatch/deltanet"]
 
 # Raon module/state/logits/bench oracle (PLAN §6.2). Exercises production
 # launchers; built with --features lab.

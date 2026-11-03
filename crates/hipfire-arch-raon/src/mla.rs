@@ -16,22 +16,18 @@
 //! ```
 //!
 //! This file owns only the Raon constants, checkpoint tensor naming, the
-//! mirror-admission arithmetic and the stage sequencing. The five
-//! projections (`q_a`, `q_b`, `kv_a`, `g`, `o`) are ordinary projections owned
-//! by `projection.rs`; the caller runs them and injects `q_b` through a
-//! closure because it sits between the latent norm and the attention.
+//! mirror-admission arithmetic and the route policy. The stage sequence is the
+//! layer program (`crate::program::mla_steps`).
 
+use hipfire_dispatch::pipeline::boundary_project::OutRound;
 use hipfire_dispatch::pipeline::latent_attention::{
-    execute_latent_attention, AbsorbOperands, AttentionRoute, ExpandedMirror, KvExpansion,
-    LatentAttentionOp, LatentCache, LatentGeometry, MlaRowsRoute, RowRange,
+    AbsorbOperands, AttentionRoute, LatentAttentionOp, LatentGeometry, MlaRowsRoute,
 };
-use hipfire_dispatch::types::DispatchError;
 use rdna_compute::latent_attention_absorb::latent_attention_absorb_packed_elems;
 use rdna_compute::latent_attention_decode::latent_attention_decode_workspace_elems;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::config::RaonConfig;
-use crate::projection::{project, OutRound};
 use crate::weights::{RaonMixer, RaonWeights};
 use hipfire_dispatch::pipeline::PrefillActTier;
 
@@ -97,33 +93,6 @@ impl MlaTensorNames {
         }
     }
 }
-
-/// Persistent per-layer operands of the latent route (weights borrowed).
-pub struct RaonMlaWeights<'a> {
-    /// `[576]` q latent norm gamma (F32 or BF16).
-    pub q_a_norm: &'a GpuTensor,
-    /// `[512]` kv latent norm gamma (F32 or BF16).
-    pub kv_a_norm: &'a GpuTensor,
-    /// How cached latents expand to K_nope/V (dense kernel or external projector).
-    pub kv_b: KvExpansion<'a>,
-}
-
-/// Per-layer, per-slot mutable operands (all caller-allocated, bounded).
-pub struct RaonMlaState<'a> {
-    pub cache: LatentCache<'a>,
-    pub mirror: ExpandedMirror<'a>,
-}
-
-/// Scratch planes for one call of `rows` rows (F32, BF16-valued).
-pub struct RaonMlaScratch<'a> {
-    /// `[rows, 576]` normalized q latent (input of the `q_b` projection).
-    pub qlat: &'a GpuTensor,
-    /// `[rows, 40*192]` output of the `q_b` projection.
-    pub q: &'a GpuTensor,
-    /// `[rows, 40*128]` attention output (gated in place).
-    pub y: &'a GpuTensor,
-}
-
 // ───────────────────────── route policy ─────────────────────────
 
 /// Load-time MLA route controls (PLAN §3.6). Read once; never re-read per call.
@@ -357,31 +326,37 @@ impl RaonMlaWork {
             latent_attention_absorb_packed_elems(cfg.n_heads, cfg.qk_nope, cfg.v_head, latent);
         let mut built: Vec<GpuTensor> = Vec::new();
         let r = (|| -> Result<(), String> {
+            let arch = gpu.arch.clone();
+            let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
+            let geometry = crate::program::latent_geometry(cfg);
             for layer_idx in cfg.mla_layers() {
                 let RaonMixer::Mla(mw) = &w.layers[layer_idx].mixer else {
                     return Err(format!("layer {layer_idx} is not an MLA layer"));
                 };
                 // The absorbed pack is built from an exact identity expansion: never tiered.
-                project(
-                    gpu,
+                let expand = [crate::program::project_one(
                     &mw.kv_b_proj,
                     &ident,
                     &plane,
                     latent,
+                    crate::program::rows_route(&arch, latent),
                     OutRound::Exact,
                     PrefillActTier::F16,
-                )?;
+                )];
+                crate::forward::run(gpu, &ctx, &expand)?;
                 let packed = gpu.zeros(&[elems], DType::BF16).map_err(hip)?;
-                if let Err(e) = gpu.latent_attention_absorb_pack(
-                    &plane,
-                    &packed,
-                    cfg.n_heads,
-                    cfg.qk_nope,
-                    cfg.v_head,
-                    latent,
-                ) {
+                let pack = [hipfire_dispatch::pipeline::Step::LatentAttention(
+                    LatentAttentionOp::PackAbsorbed {
+                        geometry,
+                        expanded: &plane,
+                        packed: &packed,
+                    },
+                )];
+                let ran = crate::forward::run(gpu, &ctx, &pack);
+                drop(pack);
+                if let Err(e) = ran {
                     let _ = gpu.free_tensor(packed);
-                    return Err(hip(e));
+                    return Err(format!("raon mla absorb pack: {e}"));
                 }
                 built.push(packed);
             }
@@ -492,97 +467,6 @@ pub const fn mirror_bytes_per_row() -> usize {
 pub fn admitted_mirror_rows(needed_rows: usize, budget_bytes: usize) -> Option<usize> {
     let need = needed_rows.checked_mul(mirror_bytes_per_row())?;
     (need <= budget_bytes).then_some(needed_rows)
-}
-
-/// Run the Raon MLA core for `rows` rows starting at the device position held
-/// in `state.cache.pos`:
-///
-/// 1. `qlat = RMS576(q_a_out)`; 2. `project_q_b(gpu, qlat, q)`;
-/// 3. split `kv_a_out` into the latent cache (norm over 512 only);
-/// 4. decompress the new rows into the mirror; 5. serial attention; 6. BF16
-///    sigmoid gate with `g_out`.
-///
-/// On return `scratch.y` holds the gated `[rows, 5120]` context, ready for the
-/// `o` projection. The position scalar is not advanced here (the layer
-/// schedule owner advances it once per call after all MLA layers consumed it).
-pub fn raon_mla_core(
-    gpu: &mut Gpu,
-    w: &RaonMlaWeights<'_>,
-    st: &RaonMlaState<'_>,
-    scratch: &RaonMlaScratch<'_>,
-    q_a_out: &GpuTensor,
-    kv_a_out: &GpuTensor,
-    g_out: &GpuTensor,
-    rows: usize,
-    project_q_b: &mut dyn FnMut(&mut Gpu, &GpuTensor, &GpuTensor) -> Result<(), DispatchError>,
-) -> Result<(), DispatchError> {
-    let geometry = raon_mla_geometry();
-    execute_latent_attention(
-        gpu,
-        &LatentAttentionOp::NormRows {
-            x: q_a_out,
-            gamma: w.q_a_norm,
-            out: scratch.qlat,
-            rows,
-            width: RAON_MLA_Q_LORA,
-            eps: RAON_MLA_EPS,
-        },
-    )?;
-    project_q_b(gpu, scratch.qlat, scratch.q)?;
-    execute_latent_attention(
-        gpu,
-        &LatentAttentionOp::SplitKv {
-            geometry,
-            cache: st.cache,
-            kv_a: kv_a_out,
-            gamma: w.kv_a_norm,
-            rows,
-            eps: RAON_MLA_EPS,
-        },
-    )?;
-    match w.kv_b {
-        KvExpansion::Dense { .. } => {
-            execute_latent_attention(
-                gpu,
-                &LatentAttentionOp::Decompress {
-                    geometry,
-                    cache: st.cache,
-                    mirror: st.mirror,
-                    expansion: w.kv_b,
-                    range: RowRange::NewRows { count: rows },
-                },
-            )?;
-        }
-        KvExpansion::External { .. } => {
-            return Err(DispatchError::Hip(
-                "raon_mla_core: external kv_b projector needs the caller to run \
-                 GatherLatent -> projector -> Decompress(External) itself"
-                    .into(),
-            ));
-        }
-    }
-    execute_latent_attention(
-        gpu,
-        &LatentAttentionOp::Attention {
-            geometry,
-            cache: st.cache,
-            mirror: Some(st.mirror),
-            q: scratch.q,
-            y: scratch.y,
-            rows,
-            scale: raon_mla_scale(&geometry),
-            route: AttentionRoute::Reference,
-        },
-    )?;
-    execute_latent_attention(
-        gpu,
-        &LatentAttentionOp::Gate {
-            y: scratch.y,
-            g: g_out,
-            out: scratch.y,
-            elements: rows * RAON_MLA_HEADS * RAON_MLA_V,
-        },
-    )
 }
 
 #[cfg(test)]
