@@ -14,7 +14,8 @@ use crate::carrier::{
     resolve_slot_vision_path, AssembledInput, NO_AUDIO_TOWER, NO_VIDEO_TOWER, NO_VISION_TOWER,
 };
 use crate::config::InputKind;
-use crate::forward::{encode_embeddings_batch, padded_rows, EncodeInput, MediaRows};
+use crate::forward::{encode_embeddings_batch, EncodeInput, MediaRows};
+use hipfire_dispatch::pipeline::encoder::padded_rows;
 use hipfire_runtime::loader_api::ModelSource;
 use hipfire_runtime::serve::{
     EmbedKind, EmbedRequest, EmbedResponse, EngineStats, SlotEngineConfig, SlotEngineHandle,

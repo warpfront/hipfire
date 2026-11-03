@@ -1375,12 +1375,6 @@ impl EmbedConfig {
         self.layer_attn[layer]
     }
 
-    /// Whether a sliding layer's window actually restricts anything at this
-    /// length: |i-j| <= window is vacuous once n-1 <= window.
-    pub fn window_bites(&self, layer: usize, n: usize) -> bool {
-        self.layer_types[layer] == LayerType::Sliding && n > self.sliding_window + 1
-    }
-
     pub fn rope_theta(&self, layer: usize) -> f32 {
         match self.layer_types[layer] {
             LayerType::Sliding => self.sliding_rope_theta,
@@ -1521,11 +1515,7 @@ mod tests {
         assert_eq!(cfg.bos_token_id, 2);
         assert_eq!(cfg.eos_token_id, 1);
         assert!((cfg.embed_scale() - (512.0f32).sqrt()).abs() < 1e-6);
-        // Window is a radius: it only bites past window+1 rows.
-        assert!(!cfg.window_bites(0, 513));
-        assert!(cfg.window_bites(0, 514));
-        assert!(!cfg.window_bites(5, 8192)); // full layer never masked
-                                             // Sidecar defaults before overlays.
+        // Sidecar defaults before overlays.
         assert_eq!(cfg.query_prompt, "task: search result | query: ");
         assert_eq!(cfg.document_prompt, "title: none | text: ");
         assert_eq!(cfg.query_length, 8192);

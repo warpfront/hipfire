@@ -215,7 +215,7 @@ pub enum Step<'a> {
     GatedFfn(crate::pipeline::moe_program::GatedFfnOp<'a>),
     /// Projections of one input plane with a BF16 output boundary and a tiered activation.
     BoundaryProject(crate::pipeline::boundary_project::BoundaryProjectOp<'a>),
-    /// One stage of a bidirectional hybrid encoder trunk over segmented rows.
+    /// One stage of a bidirectional encoder trunk over segmented rows.
     #[cfg(feature = "deltanet")]
     Encoder(crate::pipeline::encoder::EncoderOp<'a>),
 }

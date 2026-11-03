@@ -23,7 +23,7 @@
 //! activation) with the shared F16 activation copy in [`EncodeScratch`].
 
 use hipfire_dispatch::families::gemv::WeightRef;
-use hipfire_dispatch::pipeline::encoder::{EncoderHeads, EncoderOp, EncoderSegment};
+use hipfire_dispatch::pipeline::encoder::{AttnScale, EncoderHeads, EncoderOp, EncoderSegment};
 use hipfire_dispatch::pipeline::sandwich::{Rope, RopeKind};
 use hipfire_dispatch::pipeline::{ProjectLadder, ProjectOp, Step};
 use hipfire_dispatch::types::RotationPlan;
@@ -345,6 +345,8 @@ pub(crate) fn mixer_steps<'a>(
                     ctx: &s.ctx,
                     segments,
                     heads,
+                    scale: AttnScale::InvSqrtHeadDim,
+                    window: None,
                 }),
                 Step::Encoder(EncoderOp::SigmoidGate {
                     out: &s.ctx,
