@@ -143,6 +143,9 @@ pub struct ContinuousBatchScheduler {
     pub pending_sampling: std::collections::HashMap<AttemptKey, BatchSampling>,
     pub cohort_key: Option<BatchSamplingKey>,
     pub next_generation: u64,
+    /// The driving family samples each lane with its own config, so lanes
+    /// of different sampling keys share a batch (no cohort gate).
+    pub per_lane_sampling: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -182,6 +185,7 @@ impl ContinuousBatchScheduler {
             pending_sampling: std::collections::HashMap::new(),
             cohort_key: None,
             next_generation: 1,
+            per_lane_sampling: false,
         }
     }
 
@@ -245,7 +249,7 @@ impl ContinuousBatchScheduler {
         let lane_idx = self.lanes.iter().position(|l| l.is_empty())?;
         let front_key = self.inbox.front()?.clone();
         let req_sampling_key = self.cohort_key_for(&front_key)?;
-        if let Some(cohort) = &self.cohort_key {
+        if let Some(cohort) = self.cohort_key.as_ref().filter(|_| !self.per_lane_sampling) {
             if cohort != &req_sampling_key {
                 return None;
             }
@@ -293,7 +297,7 @@ impl ContinuousBatchScheduler {
             max_active_lanes: 0,
         };
         self.lanes[lane_idx] = BatchLane::Running(lane);
-        if self.cohort_key.is_none() {
+        if self.cohort_key.is_none() && !self.per_lane_sampling {
             self.cohort_key = Some(req_sampling_key);
         }
         Some((key, ticket))

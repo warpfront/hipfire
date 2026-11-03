@@ -4197,7 +4197,16 @@ fn main() {
                                 prompt_tokens.len(),
                                 max_tokens,
                             );
-                        if (started_in_think && !vmm_route) || vmm_singleton_now {
+                        // Lane families: a request no lane can hold runs on the
+                        // singleton, which serves it to its cache cap.
+                        let lane_singleton_now = lane_family
+                            && hipfire_engine::terminal::batch_lfm_exceeds_capacity(
+                                prompt_tokens.len(),
+                                max_tokens,
+                                batch_scheduler.as_ref().map_or(0, |s| s.lane_capacity),
+                            );
+                        let singleton_now = vmm_singleton_now || lane_singleton_now;
+                        if (started_in_think && !vmm_route) || singleton_now {
                             // Fixed-lane route: think-open prompts are sequential
                             // barriers; VMM route: see above. Transfer any
                             // pre-latched abort exactly once (transfer retires the
@@ -4207,7 +4216,7 @@ fn main() {
                                 gen_attempt_id,
                                 admission,
                             );
-                            if vmm_singleton_now {
+                            if singleton_now {
                                 // As on the not-eligible path: the sequential producer takes the singleton claim.
                                 batch_scope.rebind_for(gen_attempt_id);
                             }

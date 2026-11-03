@@ -73,6 +73,9 @@ pub(crate) trait LaneFamily {
     ) -> Result<bool, String>;
     /// Whether [`LaneFamily::prefill_lanes`] exists.
     fn batched_prefill(&self) -> bool;
+    /// Whether [`LaneFamily::sample`] honours each draw's own config, so
+    /// lanes of different sampling configs may share a batch.
+    fn per_lane_sampling(&self) -> bool;
     /// Equal-length prompts into lanes `0..prompts.len()` in one pass.
     fn prefill_lanes(
         &mut self,
@@ -140,6 +143,16 @@ pub fn render_lane_prompt(
         None => None,
     };
     if let Some(b) = m.muse_glimmer() {
+        // The singleton dispatch normalizes `prompt` and every message
+        // (`maybe_normalize_prompt`, `parse_generate_messages`); render the
+        // same tokens here.
+        let glimmer_prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(
+            msg.get("prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Hello"),
+        );
+        let glimmer_messages = hipfire_engine::prompt::parse_generate_messages(msg)
+            .map_err(|e| format!("invalid messages field: {e}"))?;
         // Same effort derivation the daemon hands the singleton route.
         let raw_effort = msg
             .get("reasoning_effort")
@@ -154,12 +167,12 @@ pub fn render_lane_prompt(
             // Batch requests are a single user turn: no assistant turn to replay.
             &mut hipfire_loader::AsstTurnCache::new_from_env(),
             b.config.bos_token,
-            &prompt,
+            &glimmer_prompt,
             system,
             effort.as_deref(),
             max_think,
             None,
-            messages.as_deref(),
+            glimmer_messages.as_deref(),
             &unused,
             &unused,
         )?;
@@ -246,6 +259,7 @@ pub fn drive_lane_continuous_batch(
     let family: &mut dyn LaneFamily = &mut *family;
     let route = family.route();
     let idle = family.idle_token();
+    sched.per_lane_sampling = family.per_lane_sampling();
     let loop_guards: Vec<hipfire_runtime::loop_guard::LoopGuard> = (0..batch_size)
         .map(
             |_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()),
@@ -624,27 +638,21 @@ pub fn drive_lane_continuous_batch(
                             );
                             continue;
                         }
+                        // A request a lane cannot hold is the singleton's
+                        // (it serves to its cache cap): hand it over, never refuse.
                         if batch_lfm_exceeds_capacity(
                             prompt_tokens.len(),
                             max_tokens_req,
                             sched.lane_capacity,
                         ) {
-                            emit_batch_admission_error(
-                                stdout,
-                                &id,
-                                attempt_id,
-                                admission,
-                                &format!(
-                                    "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
-                                    prompt_tokens.len(),
-                                    max_tokens_req,
-                                    sched.lane_capacity
-                                ),
-                                "context_length",
-                                false,
-                                false,
-                            );
-                            continue;
+                            let handoff = match handoff_admitted_started_in_think(
+                                &id, attempt_id, admission, json, route,
+                            ) {
+                                Ok(msg) => msg,
+                                Err(reason) => return fail_all(sched, gpu, family, stdout, reason),
+                            };
+                            barrier = Some(handoff);
+                            break;
                         }
                         // Explicit wire `seed` must reach the lane RNG on the
                         // batched route too; out-of-domain values are rejected
@@ -1451,6 +1459,10 @@ impl LaneFamily for LfmLanes<'_> {
     fn batched_prefill(&self) -> bool {
         true
     }
+    fn per_lane_sampling(&self) -> bool {
+        // `sample_product` takes one config per batch: lanes share a cohort.
+        false
+    }
     fn prefill_lanes(
         &mut self,
         gpu: &mut rdna_compute::Gpu,
@@ -1719,6 +1731,9 @@ impl LaneFamily for GlimmerLaneFamily<'_> {
     }
     fn batched_prefill(&self) -> bool {
         false
+    }
+    fn per_lane_sampling(&self) -> bool {
+        true
     }
     fn prefill_lanes(
         &mut self,
