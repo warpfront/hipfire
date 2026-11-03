@@ -3656,7 +3656,10 @@ pub(super) fn slowlink_admission(
     )?;
     match layer.buckets {
         SlabBuckets::Uniform(bucket) if bucket != 0 => {}
-        _ => return refuse("the layer is not uniform MQ4"),
+        // A mixed MQ4 + cold-codec layer (mq3-xts): its S1 K2 panel runs per codec bucket on
+        // codec-masked tiles (`slab_route::k2_panel_gate_up` / `k2_panel_down`).
+        SlabBuckets::Table(_) => {}
+        _ => return refuse("the layer is neither uniform MQ4 nor a mixed MQ4 + cold-codec slab"),
     }
     // The recipe/dtype/geometry predicates of `slab_k2` hold, so it differs from a K1 call
     // only in the route rows.

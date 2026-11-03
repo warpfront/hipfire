@@ -4683,6 +4683,64 @@ mod slowlink_ring {
         }
     }
 
+    /// A mixed MQ4 + W3 slab arena (mq3-xts): each expert's panel source is its OWN codec
+    /// extent (`codec_slot_bytes`), so the last expert ends exactly at the arena's end. The
+    /// dense-dtype stride the expert view carries (`m * row_stride`: 1,280 rows x 2,560 B =
+    /// 3,276,800 B for a planar W3 gate/up) overruns the host owner on the last W3 expert, the
+    /// 'extent is outside the host owner' load failure of the first S1 slab card run.
+    #[test]
+    fn slowlink_ring_slab_alias_uses_each_experts_own_codec_extent() {
+        use crate::expert_arena::{codec_slot_bytes, CODEC_MQ4, CODEC_W3};
+        const EXPERTS: usize = 512;
+        let alias_base = 0x5000_0000usize;
+        // Every third expert MQ4 (hot), the rest W3: expert 511 is W3 (511 % 3 == 1).
+        let codecs: Vec<u8> = (0..EXPERTS)
+            .map(|id| if id % 3 == 0 { CODEC_MQ4 } else { CODEC_W3 })
+            .collect();
+        let mut cursor = 0usize;
+        let mut real = Vec::new();
+        let mut dense = Vec::new();
+        for codec in &codecs {
+            let (gate_up, down) = codec_slot_bytes(*codec).unwrap();
+            real.push(Some(AliasExpert {
+                codec: PanelCodec(0),
+                gate_up_addr: alias_base + cursor,
+                gate_up_len: gate_up,
+                down_addr: alias_base + cursor + gate_up,
+                down_len: down,
+            }));
+            // The dense row-stride arithmetic: 1,280 x 2,560 and 2,560 x 640 bytes for W3.
+            let (dense_gate_up, dense_down) = if *codec == CODEC_MQ4 {
+                (gate_up, down)
+            } else {
+                (1280 * 2560, 2560 * 640)
+            };
+            dense.push(Some(AliasExpert {
+                codec: PanelCodec(0),
+                gate_up_addr: alias_base + cursor,
+                gate_up_len: dense_gate_up,
+                down_addr: alias_base + cursor + gate_up,
+                down_len: dense_down,
+            }));
+            cursor += gate_up + down;
+        }
+        let arena_bytes = cursor;
+        assert_eq!(arena_bytes, 171 * 2_611_200 + 341 * 1_920_000);
+        // SAFETY: never dereferenced.
+        let sources = unsafe {
+            LayerExpertSources::from_alias(15, HOST, alias_base, arena_bytes, &real, Arc::new(0u8))
+        }
+        .unwrap();
+        let last = sources.expert(EXPERTS - 1).unwrap();
+        assert_eq!(last.gate_up.len, 1_280_000);
+        assert_eq!(last.down.addr + last.down.len, HOST + arena_bytes);
+        // SAFETY: construction must fail.
+        let overrun = unsafe {
+            LayerExpertSources::from_alias(15, HOST, alias_base, arena_bytes, &dense, Arc::new(0u8))
+        };
+        assert!(overrun.is_err());
+    }
+
     #[test]
     fn slowlink_ring_partition_splits_on_codec_and_group_size() {
         let s = sources_with(5, Arc::new(0u8), |id| u32::from(id >= 6));

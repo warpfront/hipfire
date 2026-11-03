@@ -1744,20 +1744,24 @@ impl Qwen4MoeLayerRuntime {
         if self.tier.is_some() && !self.s1_tier_ok {
             return Err("expert tiers");
         }
-        if !self.experts_all_gate_up_mq4 {
+        // A slab layer's codec table decides (MQ4 hot + W3 cold, mq3-xts); its gate/up dtype is
+        // not one dtype. E8P keeps its refusal.
+        let slab_mq4_w3 = self
+            .slab
+            .as_ref()
+            .is_some_and(|slab| crate::slowlink_admission::s1_slab_codecs_admitted(&slab.codecs));
+        if !self.experts_all_gate_up_mq4 && !slab_mq4_w3 {
             return Err("experts are not uniform MQ4");
         }
         if self.expert_keep_mask.is_some() {
             return Err("expert-keep pruning mask");
         }
-        if let Some(slab) = self.slab.as_ref() {
-            if slab
-                .codecs
-                .iter()
-                .any(|codec| *codec != crate::expert_arena::CODEC_MQ4)
-            {
-                return Err("mixed-codec slab layer");
-            }
+        if self
+            .slab
+            .as_ref()
+            .is_some_and(|slab| !slab_mq4_w3 && !slab.codecs.is_empty())
+        {
+            return Err("slab layer holds a codec S1 has no panel for");
         }
         if self.expert_gate_up_entries.len() != self.experts.len()
             || self.expert_down_entries.len() != self.experts.len()
@@ -1784,6 +1788,11 @@ impl Qwen4MoeLayerRuntime {
         let expert = self.experts.get(id)?;
         if expert.gate_up.tensor.buf.size() == 0 || expert.down.tensor.buf.size() == 0 {
             return None;
+        }
+        // A slab layer's experts have their OWN codec extents: the expert view's `row_stride`
+        // is a dense-dtype stride that a planar W3/E8P payload does not have.
+        if let Some(slab) = self.slab.as_ref() {
+            return crate::expert_arena::codec_slot_bytes(*slab.codecs.get(id)?);
         }
         Some((
             crate::projection::checked_bytes(expert.gate_up.m, expert.gate_up.row_stride)?,

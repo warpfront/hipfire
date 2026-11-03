@@ -2117,19 +2117,47 @@ fn panel_gemms(
                     .window_xq
                     .as_ref()
                     .ok_or_else(|| bail("the window's route plan has not run"))?;
-                hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
-                    weights.gate_up_table,
-                    &tiles,
-                    &sorted,
-                    xq,
-                    params.y_gate_up_grouped,
-                    2 * d.mi,
-                    d.hidden,
-                    K_TOP,
-                    range.rows,
-                    d.rows,
-                    false,
-                ))?;
+                // A slab layer's experts carry a codec each (MQ4 hot + the cold codec): the
+                // K2 pair runs per codec bucket on codec-masked tiles, the ordinary slab tile
+                // lowering's arithmetic over this binding's device tables. The symmetric
+                // aggregate route is MQ4 throughout.
+                let slab_layer = if d.route == WindowRoute::SlabIu4 {
+                    Some(super::slab_route::layer(
+                        &gpu.arch,
+                        params.route_policy.as_ref(),
+                        &params.dtypes,
+                        params.expert_dtype_tags,
+                    )?)
+                } else {
+                    None
+                };
+                if let Some(layer) = slab_layer {
+                    super::slab_route::k2_panel_gate_up(
+                        gpu,
+                        layer,
+                        weights.gate_up_table,
+                        &tiles,
+                        &sorted,
+                        xq,
+                        params.y_gate_up_grouped,
+                        (2 * d.mi, d.hidden, K_TOP),
+                        (range.rows, d.rows),
+                    )?;
+                } else {
+                    hip(gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+                        weights.gate_up_table,
+                        &tiles,
+                        &sorted,
+                        xq,
+                        params.y_gate_up_grouped,
+                        2 * d.mi,
+                        d.hidden,
+                        K_TOP,
+                        range.rows,
+                        d.rows,
+                        false,
+                    ))?;
+                }
                 let xdown = hip(gpu.qwen4_moe_rotate128_i4(
                     params.y_gate_up_grouped,
                     &sorted,
@@ -2137,19 +2165,33 @@ fn panel_gemms(
                     range.rows,
                     slots,
                 ))?;
-                hip(gpu.gemm_qwen4_moe_down_iu4_sym(
-                    weights.down_table,
-                    &tiles,
-                    &sorted,
-                    &xdown,
-                    y_down,
-                    d.hidden,
-                    d.mi,
-                    1,
-                    range.rows,
-                    slots,
-                    false,
-                ))?;
+                if d.route == WindowRoute::SlabIu4 {
+                    super::slab_route::k2_panel_down(
+                        gpu,
+                        slab_layer.expect("the slab route resolved its layer"),
+                        weights.down_table,
+                        &tiles,
+                        &sorted,
+                        &xdown,
+                        y_down,
+                        (d.hidden, d.mi),
+                        (range.rows, slots),
+                    )?;
+                } else {
+                    hip(gpu.gemm_qwen4_moe_down_iu4_sym(
+                        weights.down_table,
+                        &tiles,
+                        &sorted,
+                        &xdown,
+                        y_down,
+                        d.hidden,
+                        d.mi,
+                        1,
+                        range.rows,
+                        slots,
+                        false,
+                    ))?;
+                }
             }
             WindowRoute::Aggregate => {
                 if !routes.planned || range.rows > AGGREGATE_PANEL_ROWS {
@@ -6109,8 +6151,8 @@ mod slowlink_panel_tests {
         let gemms = item_source(src, "fn panel_gemms(");
         assert_eq!(
             gemms.matches("y_down,").count(),
-            2,
-            "both down GEMMs write y_down"
+            3,
+            "the slab K2 helper, the symmetric MQ4 GEMM and the aggregate down all write y_down"
         );
         assert!(!gemms.contains("y_down_grouped"));
     }

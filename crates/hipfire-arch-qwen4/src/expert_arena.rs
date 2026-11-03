@@ -37,6 +37,19 @@ pub const CODEC_W3: u8 = rdna_compute::slab_admission::SLAB_CODEC_W3;
 /// (Codec id `2`, MQ2-I4, has no route anywhere and no constant.)
 pub const CODEC_E8P: u8 = rdna_compute::slab_admission::SLAB_CODEC_E8P;
 
+/// `(gate_up, down)` payload bytes of one expert of `codec` inside a slab arena (the format's
+/// own extents, [`ExpertFormat::gate_up_bytes`] / [`ExpertFormat::down_bytes`]): what S1's
+/// panel sources copy per expert. `None` for a codec id with no arena format.
+pub fn codec_slot_bytes(codec: u8) -> Option<(usize, usize)> {
+    let format = match codec {
+        CODEC_MQ4 => ExpertFormat::Mq4Xts,
+        CODEC_W3 => ExpertFormat::Mq3I4,
+        CODEC_E8P => ExpertFormat::E8pI4,
+        _ => return None,
+    };
+    Some((format.gate_up_bytes(), format.down_bytes()))
+}
+
 /// One expert inside its layer's arena. Offsets are relative to the arena base.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ArenaExpert {

@@ -2496,6 +2496,55 @@ pub struct LoadFacts<'a> {
     pub sym_iu4_source_symmetric: Option<bool>,
 }
 
+/// Whether a slab layer's codec table is one S1 streams: MQ4 and W3 only (the mq4 hot set plus
+/// the W3 cold bucket of mq3-xts). The codec of an expert never reaches the transport (one
+/// panel codec per layer; the kernels' pointer tables and codec tags carry it), so the only
+/// S1 requirement is that the layer's tile kernels exist: the dispatch classifier checks the
+/// K2 predicate per tile. E8P keeps its refusal (mixed MQ2/E8P source-priced layers are an
+/// admission decline of their own). An empty table is admitted.
+pub fn s1_slab_codecs_admitted(codecs: &[u8]) -> bool {
+    use crate::expert_arena::{CODEC_MQ4, CODEC_W3};
+    codecs
+        .iter()
+        .all(|codec| matches!(*codec, CODEC_MQ4 | CODEC_W3))
+}
+
+/// Gate/up and down payload bytes a SLAB layer's S1 page layout is sized by
+/// ([`PanelPageLayout::new`] divides them by the expert count): every expert at the
+/// largest slot a slab layer holds, the MQ4 expert (`[2 * mi, hidden]` gate/up and
+/// `[hidden, mi]` down: `MQ4G256V2` rows, or `MQ4G128V2` where K is not a multiple of 256, as
+/// the shipped artifact stores a K=640 down projection). A cold-codec expert (W3, E8P) is smaller, so
+/// the page payload bound holds for every mix; the copy still moves each expert's real
+/// extent (`LayerExpertSources::from_alias` carries per-expert lengths). Pure.
+pub fn slab_layer_payload_split(geometry: &ModelGeometry) -> Result<(u64, u64), String> {
+    use rdna_compute::DType;
+    let row = |k: usize| {
+        let dtype = if k % 256 == 0 {
+            DType::MQ4G256V2
+        } else {
+            DType::MQ4G128V2
+        };
+        dtype
+            .row_bytes(k)
+            .ok_or_else(|| format!("MQ4 expert row bytes for k={k} are undefined"))
+    };
+    let per_expert = |rows: usize, k: usize| -> Result<u64, String> {
+        checked_mul(rows as u64, row(k)? as u64, "slab expert slot bytes")
+    };
+    let experts = geometry.num_experts as u64;
+    let gate_up = checked_mul(
+        per_expert(2 * geometry.moe_intermediate, geometry.hidden)?,
+        experts,
+        "slab layer gate/up bytes",
+    )?;
+    let down = checked_mul(
+        per_expert(geometry.hidden, geometry.moe_intermediate)?,
+        experts,
+        "slab layer down bytes",
+    )?;
+    Ok((gate_up, down))
+}
+
 /// [`AdmissionInputs`] from [`LoadFacts`] and the measured narrow `link_gbps`:
 /// the non-expert and per-layer expert bytes from the manifest, the packed
 /// gate/up and down payload split, the exact session fixed snapshot bytes and
@@ -2535,9 +2584,13 @@ pub fn load_admission_inputs(
             )
         })
         .unwrap_or(0);
-    let (gate_up_layer_bytes, down_layer_bytes) =
-        residency::routed_layer_payload_split(facts.weights, facts.bytes_of)
-            .map_err(SlowlinkDecline::Geometry)?;
+    let (gate_up_layer_bytes, down_layer_bytes) = match route {
+        // A slab artifact has layer arenas, not packed gate/up and down tensors: the page
+        // layout is sized by the largest (MQ4) expert slot of the layer.
+        WindowRoute::SlabIu4 => slab_layer_payload_split(&geometry),
+        _ => residency::routed_layer_payload_split(facts.weights, facts.bytes_of),
+    }
+    .map_err(SlowlinkDecline::Geometry)?;
     // One boundary stage = the TARGET's session fixed parts only (the head's
     // rows are not staged), exactly what `Qwen4Bundle::prompt_txn_stage_bytes`
     // allocates ([`crate::state::Qwen4State::session_fixed_stage_bytes`], the
@@ -3053,17 +3106,49 @@ pub enum RequestBypass {
     Sp(crate::slowlink_sp::SpBypass),
 }
 
+/// Automatic-mode minimum request rows on the slab route ([`WindowRoute::SlabIu4`], mq3-xts).
+/// S1 over a slab artifact has no SP hybrid to serve a single tile, and its admitted placement
+/// replaces the incumbent's long-prefill expert stage: the incumbent a short request would
+/// fall back to reads every touched host expert zero-copy over the link (the first card run:
+/// 1,105 rows at 31 tok/s against 154 with the stage). One S1 sweep (the link floor of the host
+/// layers, row-count independent) wins once a request touches a large share of each layer's
+/// experts; below this many rows the touched-only zero-copy incumbent stays. 128 rows x top-10
+/// route 1,280 picks over 512 experts (about 92% of a layer touched, and the card measured
+/// 21.7 tok/s S1 against 23.7 incumbent: a tie); below it fewer experts are touched and the
+/// incumbent only gets cheaper while the sweep stays constant.
+pub const S1_SLAB_AUTO_MIN_ROWS: usize = 128;
+
 /// Judge a request against the frozen profile, before any mutation or S1
 /// allocation. `Err` is an incumbent request that uses only resources the
-/// profile already admitted.
+/// profile already admitted. The automatic floor is the route's
+/// ([`S1_SLAB_AUTO_MIN_ROWS`] on the slab route, one row past the tile otherwise).
 pub fn qualify_request(
     mode: SlowlinkMode,
     profile: &SlowlinkProfile,
     request: &RequestShape,
 ) -> Result<RequestVerdict, RequestBypass> {
+    qualify_request_at(
+        mode,
+        profile,
+        request,
+        if profile.geometry.route == WindowRoute::SlabIu4 {
+            S1_SLAB_AUTO_MIN_ROWS
+        } else {
+            profile.tile_rows.saturating_add(1)
+        },
+    )
+}
+
+/// [`qualify_request`] with the automatic-mode minimum as an argument.
+pub(crate) fn qualify_request_at(
+    mode: SlowlinkMode,
+    profile: &SlowlinkProfile,
+    request: &RequestShape,
+    auto_minimum: usize,
+) -> Result<RequestVerdict, RequestBypass> {
     let minimum = match mode {
         SlowlinkMode::Off => return Err(RequestBypass::KillSwitch),
-        SlowlinkMode::Auto => profile.tile_rows.saturating_add(1),
+        SlowlinkMode::Auto => auto_minimum,
         SlowlinkMode::Force => S1_MIN_FORCED_REQUEST_ROWS,
     };
     if request.rows == 0 {
@@ -3596,6 +3681,73 @@ mod tests {
             ),
         ];
         assert!(!mixed_source_priced_mq2r2_e8p(&e8p_only, &bytes_of));
+    }
+
+    /// The mq3-xts slab layer is smaller than the MQ4 layer (1,060 MiB largest arena against
+    /// 1,275 MiB) on the SAME page layout (pages are sized by the MQ4 slot): the same free
+    /// memory keeps strictly more layers resident, the charge being otherwise identical.
+    #[test]
+    fn slowlink_admission_mq3_slab_layers_fit_at_least_as_many_resident_layers() {
+        let base = inputs(free_for(&inputs(0), 7));
+        let mq4 = admit(&base).unwrap();
+        let mut mq3_inputs = base.clone();
+        mq3_inputs.layer_expert_bytes = 1060 * MIB;
+        let mq3 = admit(&mq3_inputs).unwrap();
+        assert_eq!(mq3.pages, mq4.pages);
+        assert_eq!(mq3.census, mq4.census);
+        assert!(mq3.resident_layers > mq4.resident_layers);
+    }
+
+    /// A slab (mq3-xts) layer has arenas, not packed projection tensors: the packed split
+    /// refuses it, so S1 sized its page layout from the MQ4 slot instead. The result is the
+    /// aggregate MQ4 artifact's split byte for byte (the same pages as the mq4 S1 profile), and
+    /// the page layout accepts it.
+    #[test]
+    fn slowlink_admission_slab_layer_payload_split_is_the_mq4_slot() {
+        let geometry = ModelGeometry {
+            hidden: 2560,
+            hc_count: 4,
+            num_experts: 512,
+            experts_per_token: 10,
+            moe_intermediate: 640,
+            shared_intermediate: 640,
+            route: WindowRoute::SlabIu4,
+        };
+        let (gate_up, down) = slab_layer_payload_split(&geometry).unwrap();
+        assert_eq!((gate_up, down), (GATE_UP_LAYER, DOWN_LAYER));
+        assert_eq!((gate_up + down) / 512, 2_611_200);
+        let mq4_slot = crate::expert_slabs::ExpertFormat::Mq4Xts;
+        assert_eq!(
+            ((gate_up / 512) as usize, (down / 512) as usize),
+            (mq4_slot.gate_up_bytes(), mq4_slot.down_bytes())
+        );
+        let pages = PanelPageLayout::new(512, gate_up, down).unwrap();
+        assert_eq!(pages.experts_per_page, 32);
+        assert_eq!(pages.gate_up_expert_bytes, 1_740_800);
+        assert_eq!(pages.down_expert_bytes, 870_400);
+        use crate::expert_arena::{CODEC_E8P, CODEC_MQ4, CODEC_W3};
+        use hipfire_runtime::weight_manifest::{ShardPolicy, WeightEntry};
+        assert!(s1_slab_codecs_admitted(&[
+            CODEC_MQ4, CODEC_W3, CODEC_W3, CODEC_MQ4
+        ]));
+        assert!(s1_slab_codecs_admitted(&[CODEC_MQ4; 4]));
+        assert!(s1_slab_codecs_admitted(&[]));
+        assert!(!s1_slab_codecs_admitted(&[CODEC_MQ4, CODEC_E8P]));
+        assert!(!s1_slab_codecs_admitted(&[CODEC_W3, CODEC_E8P]));
+        // An arena-only manifest has no packed projection pair (the incumbent refusal).
+        let arena = WeightEntry::model(
+            &format!(
+                "model.language_model.layers.0{}",
+                crate::expert_arena::ARENA_SUFFIX
+            ),
+            vec![4, 4, 256],
+            rdna_compute::DType::MQ4G256V2,
+            ShardPolicy::Replicate,
+        );
+        assert!(
+            crate::expert_residency::routed_layer_payload_split(&[arena], |_| Some(1_095_705_600))
+                .is_err()
+        );
     }
 
     #[test]
@@ -5329,7 +5481,17 @@ mod tests {
 
     #[test]
     fn slowlink_admission_request_truth_table() {
-        let profile = profile_at_ten();
+        let slab_profile = profile_at_ten();
+        assert_eq!(slab_profile.geometry.route, WindowRoute::SlabIu4);
+        // The floors below are the tile-relative aggregate/symmetric ones; the slab route's
+        // automatic floor is asserted at the end.
+        let profile = SlowlinkProfile {
+            geometry: ModelGeometry {
+                route: WindowRoute::Aggregate,
+                ..slab_profile.geometry
+            },
+            ..slab_profile.clone()
+        };
         let req = |rows| RequestShape {
             rows,
             entry_pos: 0,
@@ -5514,6 +5676,36 @@ mod tests {
         ] {
             assert_eq!(profile.windows_for(rows), windows, "{rows} rows");
         }
+        // The slab route (mq3-xts) has no SP hybrid and no incumbent stage under the S1
+        // placement: its automatic floor is S1_SLAB_AUTO_MIN_ROWS, so a chat-sized prompt of
+        // 128..=768 rows takes the ONE S1 sweep instead of the zero-copy incumbent. Forced
+        // mode keeps the legal-maximum floor; the kill switch wins.
+        assert_eq!(S1_SLAB_AUTO_MIN_ROWS, 128);
+        assert_eq!(
+            qualify_request(SlowlinkMode::Auto, &slab_profile, &req(127)),
+            Err(RequestBypass::TooShort {
+                rows: 127,
+                minimum: 128
+            })
+        );
+        for rows in [128, 512, 768, 769, 1105] {
+            assert_eq!(
+                qualify_request(SlowlinkMode::Auto, &slab_profile, &req(rows)),
+                Ok(RequestVerdict { rows, windows: 1 }),
+                "slab auto {rows}"
+            );
+        }
+        assert_eq!(
+            qualify_request(SlowlinkMode::Force, &slab_profile, &req(1105)),
+            Err(RequestBypass::TooShort {
+                rows: 1105,
+                minimum: 1537
+            })
+        );
+        assert_eq!(
+            qualify_request(SlowlinkMode::Off, &slab_profile, &req(1105)),
+            Err(RequestBypass::KillSwitch)
+        );
     }
 
     /// The REAL planner's window and sweep counts at the 22-tile window: every
