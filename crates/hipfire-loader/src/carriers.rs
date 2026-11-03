@@ -3150,6 +3150,37 @@ pub fn qwen4_ep_vram_layers(
         reserve,
         lane,
     } = ordinary_at(chunk_rows)?;
+    // The lane store is charged its FIRST prefill chunk of QSA context (the VMM backend commits
+    // pages on demand); a per-expert unit plan fills every byte the budget leaves, so the
+    // on-demand growth of the lanes' contexts up to `max_seq` (8 lanes x ~16k-token prompts)
+    // runs a rank out of VRAM (whole-layer placement hid it in the slack of its layer rounding).
+    // Charging it costs ~10% of the resident units (-639 of 6405 per rank), so it is OPT-IN
+    // (`HIPFIRE_EP_UNIT_LANE_GROWTH=1`, see [`qwen4_ep_lane_growth_bytes`]); by default the
+    // refusal is clean instead (`ep_provision_verdict`: HTTP 503, rank pool intact).
+    let lane_growth = qwen4_ep_lane_growth_bytes(
+        lane.as_ref(),
+        hipfire_config::developer_var(QWEN4_EP_UNIT_LANE_GROWTH_ENV).as_deref() == Ok("1"),
+        |lanes, row_budget| {
+            hipfire_arch_qwen4::ep::ep_lane_store_device_bytes_mixed(
+                &config,
+                state_format,
+                shared.backend,
+                shared.max_seq,
+                shared.max_seq,
+                shared.vmm_granularity,
+                lanes,
+                row_budget,
+                spec_k,
+                copy.as_ref(),
+                spec_k.map(|_| {
+                    hipfire_arch_qwen4::lane_switch::spec_lane_count(
+                        lanes,
+                        hipfire_arch_qwen4::lane_switch::max_active(),
+                    )
+                }),
+            )
+        },
+    );
     // DESIGN F1: a drop-zero planar load (`MQ4G256V2P` / `MQ4G128V2P` experts) takes the
     // decoupled reserve and the unit plan under it like the shipped layout: the donor segments,
     // loan mirrors and unit stage regions are sized from the planar per-expert strides
@@ -3379,11 +3410,16 @@ pub fn qwen4_ep_vram_layers(
             // replace the plan's suffix donors.
             let donors = match (unit_reserve, split.reserve.as_deref(), attempt.as_ref()) {
                 (true, Some(suffix), Some(attempt)) => {
-                    let lane_bytes = split
-                        .vram
-                        .reservation
-                        .as_ref()
-                        .map_or(0, |reservation| reservation.lane_bytes);
+                    if lane_growth > 0 {
+                        eprintln!(
+                            "qwen4 EP expert tier: lane context growth charged to the unit budget: {} MiB/rank (opted in: {}=1)",
+                            lane_growth >> 20,
+                            QWEN4_EP_UNIT_LANE_GROWTH_ENV
+                        );
+                    }
+                    let lane_bytes = split.vram.reservation.as_ref().map_or(0, |reservation| {
+                        reservation.lane_bytes.saturating_add(lane_growth)
+                    });
                     let planned = qwen4_ep_shadow_member_bytes(
                         &gpu.arch,
                         gpu.qwen4_f16_shadow_capable(),
@@ -3486,11 +3522,16 @@ pub fn qwen4_ep_vram_layers(
                     // The same reserve the whole-layer split above holds back: the
                     // ordinary reserve (placement charges applied) and, when a lane
                     // reservation applied, the AR-lane store.
-                    let lane_bytes = split
-                        .vram
-                        .reservation
-                        .as_ref()
-                        .map_or(0, |reservation| reservation.lane_bytes);
+                    if lane_growth > 0 {
+                        eprintln!(
+                            "qwen4 EP expert tier: lane context growth charged to the unit budget: {} MiB/rank (opted in: {}=1)",
+                            lane_growth >> 20,
+                            QWEN4_EP_UNIT_LANE_GROWTH_ENV
+                        );
+                    }
+                    let lane_bytes = split.vram.reservation.as_ref().map_or(0, |reservation| {
+                        reservation.lane_bytes.saturating_add(lane_growth)
+                    });
                     qwen4_ep_unit_plan(
                         path,
                         &base,
@@ -4036,6 +4077,32 @@ fn qwen4_ep_reserve_host_allowance(host: &Qwen4EpReserveHost<'_>) -> Result<u64,
 /// price). Unset keeps the requested chunk, as does an explicit
 /// `HIPFIRE_PREFILL_CHUNK_ROWS`.
 const QWEN4_EP_CHUNK_AUTOFIT_ENV: &str = "HIPFIRE_EP_CHUNK_AUTOFIT";
+
+/// Opt-in switch of the lane-context growth charge of per-expert unit plans: exact `1` charges the
+/// worst-case growth to `max_seq`; unset plans the units against the first-chunk lane store only (the default).
+const QWEN4_EP_UNIT_LANE_GROWTH_ENV: &str = "HIPFIRE_EP_UNIT_LANE_GROWTH";
+
+/// Per-rank bytes the AR/MTP lanes' QSA contexts can still commit beyond the first prefill chunk
+/// the lane store was charged: the store's device bytes with the context committed through
+/// `max_seq` (`full_bytes(lanes, row_budget)`) minus the charged bytes. `0` when no lane
+/// reservation applies (`lane` is `None` or its bytes are unavailable), `enabled` is off, or the
+/// full figure overflows.
+fn qwen4_ep_lane_growth_bytes(
+    lane: Option<&hipfire_arch_qwen4::expert_residency::EpLaneRequest>,
+    enabled: bool,
+    full_bytes: impl FnOnce(usize, usize) -> Option<u64>,
+) -> u64 {
+    if !enabled {
+        return 0;
+    }
+    let Some(lane) = lane else {
+        return 0;
+    };
+    let Ok(charged) = lane.bytes.as_ref() else {
+        return 0;
+    };
+    full_bytes(lane.lanes, lane.row_budget).map_or(0, |full| full.saturating_sub(*charged))
+}
 
 /// The ordinary expert-parallel placement inputs at one prefill chunk
 /// ([`qwen4_ep_vram_layers`]).
@@ -15602,6 +15669,42 @@ mod ep_lane_reservation_tests {
     use super::qwen4_ep_lane_request;
     use hipfire_arch_qwen4::Qwen4KvBackend;
     use hipfire_runtime::loader_api::BatchLoadRequest;
+
+    #[test]
+    fn lane_growth_is_the_full_context_commit_minus_the_charged_first_chunk() {
+        use super::qwen4_ep_lane_growth_bytes;
+        use hipfire_arch_qwen4::expert_residency::EpLaneRequest;
+        let lane = EpLaneRequest {
+            lanes: 8,
+            row_budget: 4096,
+            bytes: Ok(2_000),
+        };
+        let seen = std::cell::Cell::new((0, 0));
+        let growth = qwen4_ep_lane_growth_bytes(Some(&lane), true, |lanes, row_budget| {
+            seen.set((lanes, row_budget));
+            Some(5_000)
+        });
+        assert_eq!(growth, 3_000);
+        assert_eq!(seen.get(), (8, 4096));
+        // A figure below the charged one (a context that already fits the first chunk) is no growth.
+        assert_eq!(
+            qwen4_ep_lane_growth_bytes(Some(&lane), true, |_, _| Some(1_000)),
+            0
+        );
+        // Off, no lane reservation, unavailable bytes and overflow all charge nothing.
+        let never = |_: usize, _: usize| -> Option<u64> { panic!("not asked") };
+        assert_eq!(qwen4_ep_lane_growth_bytes(Some(&lane), false, never), 0);
+        assert_eq!(qwen4_ep_lane_growth_bytes(None, true, never), 0);
+        let refused = EpLaneRequest {
+            bytes: Err("not VMM".to_string()),
+            ..lane.clone()
+        };
+        assert_eq!(qwen4_ep_lane_growth_bytes(Some(&refused), true, never), 0);
+        assert_eq!(
+            qwen4_ep_lane_growth_bytes(Some(&lane), true, |_, _| None),
+            0
+        );
+    }
 
     fn request(vmm_batch: bool, lanes: usize, row_budget: usize) -> BatchLoadRequest {
         BatchLoadRequest {
