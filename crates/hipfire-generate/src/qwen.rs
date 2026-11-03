@@ -3289,6 +3289,7 @@ pub fn generate_dflash(
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     stop: &[String],
+    min_tokens: usize,
     // Request-resolved sampling temperature. 0.0 → greedy/argmax-accept (the
     // historical DFlash posture). >0 → distribution-preserving spec decode.
     // MTP (name=="mtp") honors temp>0 including user-explicit sampling and min_p
@@ -3928,6 +3929,7 @@ pub fn generate_dflash(
             tools: emit_tools,
             enable_grammar: grammar_enabled,
             stop: stop.to_vec(),
+            min_tokens,
             max_think: max_think_tokens,
             assistant_prefix: spec_assistant_prefix(started_in_think),
             think_mode: ThinkMode::NonThink,
@@ -4806,9 +4808,12 @@ pub fn generate_spec(
     // `SpecEmitRequest`; the arch's carrier turns it into the concrete
     // `Box<dyn SpecEmit>` (extracting its own grammar schema from `tools`).
     // VMM promotion needs a request whose spec emitter state an AR producer
-    // can reproduce: no tools/grammar, no stop strings, no think budget.
-    let promo_shape_ok =
-        emit_req.tools.is_none() && emit_req.stop.is_empty() && emit_req.max_think == 0;
+    // can reproduce: no tools/grammar, no stop strings, no `min_tokens`, no
+    // think budget.
+    let promo_shape_ok = emit_req.tools.is_none()
+        && emit_req.stop.is_empty()
+        && emit_req.min_tokens == 0
+        && emit_req.max_think == 0;
     let logprobs_top_k = emit_req.logprobs_top_k;
     // Logprob fields of emission token `index` (`tok`), from the target row
     // the speculator kept for it.
@@ -4829,6 +4834,7 @@ pub fn generate_spec(
         tools: emit_req.tools.as_deref(),
         enable_grammar: emit_req.enable_grammar,
         stop: emit_req.stop,
+        min_tokens: emit_req.min_tokens,
         max_think: emit_req.max_think,
         max_tokens,
         assistant_prefix: emit_req.assistant_prefix,
@@ -9809,6 +9815,7 @@ mod qwen_history_chain_tests {
                     tools: None,
                     enable_grammar: false,
                     stop: Vec::new(),
+                    min_tokens: 0,
                     max_think: 0,
                     max_tokens: 4096,
                     assistant_prefix: AssistantPrefix::OpenThink,
@@ -10805,6 +10812,7 @@ pub fn generate_qwen4_ar(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     stop: &[String],
+    min_tokens: usize,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     _request_seed: u32,
@@ -10960,6 +10968,7 @@ pub fn generate_qwen4_ar(
         max_think_tokens,
         started_in_think,
         stop,
+        min_tokens,
         // Same predicate as the native MTP emitter (`Qwen35Emit::from_ctx`
         // enables its tool router on `tools.is_some()`), so both Qwen4 routes
         // classify `<tool_call>` markup identically.

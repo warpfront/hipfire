@@ -597,6 +597,7 @@ pub fn generate_deepseek4_spec(
             tools: tools.map(|t| t.to_vec()),
             enable_grammar: tools.is_some(),
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: 0,
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
             think_mode,
@@ -2923,6 +2924,7 @@ fn generate_gemma4_spec(
             tools: None,
             enable_grammar: false,
             stop: Vec::new(),
+            min_tokens: 0,
             max_think: max_think_tokens,
             assistant_prefix: AssistantPrefix::Plain,
             think_mode: if enable_thinking {

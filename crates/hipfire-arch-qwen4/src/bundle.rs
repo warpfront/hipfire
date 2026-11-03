@@ -5034,6 +5034,23 @@ impl Qwen4Bundle {
         self.with_lanes(|store, _| store.set_lane_sampling(epoch, sampling))
     }
 
+    /// Make `epoch`'s lane a `min_tokens` lane (host only, this bundle's store;
+    /// see [`crate::lane::Qwen4LaneStore::set_lane_ignore_eos`]): its windows
+    /// never stop at EOS, so the driver can hold EOS inactive below the
+    /// request's `min_tokens`. After [`Self::admit_lane`] and before the lane's
+    /// first step. Under EP the root's store decides every window (the ranks
+    /// replay its decision, EOS rule included), so no rank fan-out is needed.
+    /// Not available under PP.
+    pub fn set_lane_ignore_eos(
+        &mut self,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+    ) -> Result<(), BundleError> {
+        if self.pp.is_some() {
+            return Err(pp_owner_required());
+        }
+        self.with_lanes(|store, _| store.set_lane_ignore_eos(epoch))
+    }
+
     /// Developer / oracle entry (the serve path never calls it): replace the
     /// row-local stage share policy of EVERY lane store of this load, so a
     /// measurement can compare shared and per-lane stage execution on the

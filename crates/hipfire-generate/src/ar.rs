@@ -34,7 +34,7 @@ use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
-use hipfire_runtime::stop_sequence::StopMatcher;
+use hipfire_runtime::stop_sequence::{MinTokens, StopMatcher};
 use std::any::Any;
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -497,6 +497,18 @@ pub struct QwenArSemanticProducer {
     pub stopped_by_filter: bool,
     /// User `stop` sequences, matched on answer text before it is emitted.
     pub stop: StopMatcher,
+    /// vLLM-compatible `min_tokens`: EOS ids, the filter's end-of-turn markers
+    /// and `stop` sequences are inactive until this many completion tokens are
+    /// committed (see [`MinTokens`]).
+    pub min_tokens: MinTokens,
+    /// Completion tokens committed before this producer took over (a request
+    /// promoted from a singleton into a lane arrives with its stream already
+    /// emitted).
+    pub committed_base: usize,
+    /// Whether the token last committed through [`Self::commit_raw`] was
+    /// sampled with stops active. Decode loops gate their own EOS-id checks
+    /// on it: below `min_tokens` an EOS id is an ordinary token.
+    pub last_stops_active: bool,
 }
 
 impl QwenArSemanticProducer {
@@ -523,7 +535,20 @@ impl QwenArSemanticProducer {
             raw_commit_positions: Vec::new(),
             stopped_by_filter: false,
             stop: StopMatcher::default(),
+            min_tokens: MinTokens::NONE,
+            committed_base: 0,
+            last_stops_active: true,
         }
+    }
+
+    /// Hold EOS, end-of-turn markers and `stop` sequences inactive until
+    /// `min_tokens` completion tokens are committed (`already_committed` of
+    /// them before this producer existed).
+    pub fn with_min_tokens(mut self, min_tokens: usize, already_committed: usize) -> Self {
+        self.min_tokens = MinTokens(min_tokens);
+        self.committed_base = already_committed;
+        self.last_stops_active = min_tokens <= already_committed;
+        self
     }
 
     /// Gate this turn's answer text on the request's `stop` sequences.
@@ -556,12 +581,18 @@ impl QwenArSemanticProducer {
         B: AsRef<[u8]>,
         E: FnMut(usize, &mut dyn std::io::Write),
     {
+        let committed_before = self.committed_base + self.raw_committed.len();
         let (pos, new_bytes) = raw_commit();
         self.raw_committed.push(token);
         self.raw_commit_positions.push(pos);
         match disposition {
             QwenArRawCommitDisposition::ClassifiedVisible => {
                 on_committed(pos, stdout);
+                // `min_tokens`: below it this token is ordinary content, so the
+                // filter's end-of-turn markers and `stop` sequences are off.
+                self.last_stops_active = self.min_tokens.stops_active(committed_before);
+                self.filter.set_stops_suspended(!self.last_stops_active);
+                self.stop.set_suspended(!self.last_stops_active);
                 if self.stopped_by_filter || self.stop.matched() {
                     return Ok(true);
                 }
@@ -967,6 +998,15 @@ impl GenerationRoute {
         )
     }
 
+    /// Routes that honour the vLLM-compatible `min_tokens`: exactly the routes
+    /// that honour `stop`, because both ride the same producers (the
+    /// `QwenArSemanticProducer` of AR and the `Qwen35Emit` of speculative
+    /// decode), whose EOS and stop sequences `min_tokens` holds inactive.
+    /// Every other route would ignore it, so `generate` refuses it.
+    pub const fn supports_min_tokens(self) -> bool {
+        self.supports_stop()
+    }
+
     /// Routes whose fall-through into `generate`'s generic AR body must take
     /// the Qwen3.5 branch (cumulative KV + DeltaNet state on a
     /// `Qwen35Bundle`). Both Qwen routes get there: `QwenAr`, and
@@ -1021,6 +1061,33 @@ pub fn stop_or_reject(
 ) -> Option<Vec<String>> {
     match hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")) {
         Ok(stops) => Some(stops),
+        Err(message) => {
+            crate::dense::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &message,
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            None
+        }
+    }
+}
+/// Parse the request's vLLM-compatible `min_tokens` against `max_tokens`. An
+/// invalid value (not a non-negative integer, or above `max_tokens`) emits one
+/// correlated `validation` error and returns `None`; the caller skips the
+/// request.
+pub fn min_tokens_or_reject(
+    stdout: &mut impl Write,
+    id: &str,
+    msg: &serde_json::Value,
+    max_tokens: usize,
+) -> Option<usize> {
+    match hipfire_runtime::stop_sequence::parse_min_tokens_field(msg.get("min_tokens"), max_tokens)
+    {
+        Ok(min_tokens) => Some(min_tokens),
         Err(message) => {
             crate::dense::emit_active_attempt_error(
                 stdout,
@@ -2016,6 +2083,7 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     max_think_tokens: usize,
     started_in_think: bool,
     stop: &[String],
+    min_tokens: usize,
     tool_protocol_enabled: bool,
     // Prompt tokens the prefill restored rather than computed (reported as
     // `cached_tokens`; prefill tok/s counts only the computed rest).
@@ -2181,9 +2249,12 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
     // User stop sequences gate the answer channel before it is emitted: a
     // stop spanning a token boundary is held back, and the matched text and
     // everything after it never reach the client.
+    // `min_tokens` keeps EOS and stops inactive until that many tokens are
+    // committed; the decode loop starts empty, so nothing is committed yet.
     let mut semantic =
         QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tool_protocol_enabled)
-            .with_stop(stop);
+            .with_stop(stop)
+            .with_min_tokens(min_tokens, 0);
     let mut streamed_tokens = Vec::new();
     let mut generated = 0usize;
     // Raw bytes of `streamed_tokens`, grown one token at a time.
@@ -2347,12 +2418,14 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             }
         };
         generated += 1;
-        // `filter_stop` also latches on a user stop-sequence match.
+        // `filter_stop` also latches on a user stop-sequence match. An EOS id
+        // below `min_tokens` is an ordinary token (`last_stops_active`).
         if filter_stop
-            || eos_tokens.contains(&next_token)
-            || m.tokenizer
-                .as_ref()
-                .is_some_and(|tokenizer| tokenizer.is_terminator(next_token))
+            || (semantic.last_stops_active
+                && (eos_tokens.contains(&next_token)
+                    || m.tokenizer
+                        .as_ref()
+                        .is_some_and(|tokenizer| tokenizer.is_terminator(next_token))))
         {
             natural_stop = true;
             break;
@@ -2559,6 +2632,7 @@ pub fn generate(
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
     think_mode: ThinkMode,
     stop: &[String],
+    min_tokens: usize,
     reasoning_effort: Option<&str>,
     enable_thinking: bool,
     // `Some(k)` emits OpenAI logprobs with k candidates per token. `None` is the
@@ -2722,6 +2796,27 @@ pub fn generate(
         let _ = stdout.flush();
         return;
     }
+    if min_tokens > 0 && !selected_route.supports_min_tokens() {
+        crate::dense::emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "min_tokens is not supported on producer route {} (routes with min_tokens: {})",
+                selected_route.name(),
+                GenerationRoute::ALL
+                    .iter()
+                    .filter(|r| r.supports_min_tokens())
+                    .map(|r| r.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
     let _route_scope = GenerationRouteScope::enter(selected_route, id);
 
     match hipfire_loader::generation_early_route(m.arch_id) {
@@ -2846,6 +2941,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -2886,6 +2982,7 @@ pub fn generate(
                 messages_history,
                 think_mode,
                 stop,
+                min_tokens,
                 reasoning_effort,
                 enable_thinking,
                 request_seed,
@@ -2915,6 +3012,7 @@ pub fn generate(
                 messages_history,
                 think_mode,
                 stop,
+                min_tokens,
                 reasoning_effort,
                 enable_thinking,
                 request_seed,
@@ -3005,6 +3103,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -3204,6 +3303,7 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 stop,
+                min_tokens,
                 enable_thinking,
             );
             return;
@@ -3248,6 +3348,7 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 stop,
+                min_tokens,
                 enable_thinking,
             );
             return;
@@ -3268,6 +3369,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -3350,6 +3452,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -3432,6 +3535,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -3601,6 +3705,7 @@ pub fn generate(
                 tools,
                 messages_history,
                 stop,
+                min_tokens,
                 temp,
                 top_p,
                 top_k,
@@ -5350,7 +5455,8 @@ pub fn generate(
         // seq_pos advance before classify).
         let mut semantic =
             QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty)
-                .with_stop(stop);
+                .with_stop(stop)
+                .with_min_tokens(min_tokens, 0);
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
@@ -5663,14 +5769,17 @@ pub fn generate(
                 }
             }
 
-            if next_token == config.eos_token {
-                break;
-            }
-            if im_end_token == Some(next_token) {
-                break;
-            }
-            if tokenizer.is_terminator(next_token) {
-                break;
+            // Below `min_tokens` the sampled EOS is an ordinary token.
+            if semantic.last_stops_active {
+                if next_token == config.eos_token {
+                    break;
+                }
+                if im_end_token == Some(next_token) {
+                    break;
+                }
+                if tokenizer.is_terminator(next_token) {
+                    break;
+                }
             }
 
             // max_think_tokens enforcement. Track whether we're inside an

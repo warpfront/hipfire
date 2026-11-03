@@ -252,13 +252,58 @@ where
     Ok(true)
 }
 
-/// Whether a generate message carries a `stop` the batch lanes cannot honour:
-/// any non-empty string or array form, or a value the sequential path rejects.
+/// Whether a generate message carries a `min_tokens` above zero, or a value
+/// the sequential path rejects (non-integer).
+fn request_sets_min_tokens(msg: &serde_json::Value) -> bool {
+    match msg.get("min_tokens") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(v) => v.as_u64() != Some(0),
+    }
+}
+
+/// The batching serve modes that cannot hold EOS and stops inactive below
+/// `min_tokens`: Flash-Next fn-lanes (single card and EP) can, everything else
+/// that batches (Qwen3.5 fixed-lane / VMM / EP continuous batch, dense LFM,
+/// pipeline-parallel Qwen4 lanes) cannot. Rerouting such a request to the
+/// singleton would silently serialize a batched serve, so it is refused.
+///
+/// `batching`: the server runs a continuous-batch scheduler (batch size above
+/// one) for this load. Returns the refusal message, or `None` when the request
+/// is served as asked (singleton-only serves never refuse).
+pub fn min_tokens_batch_refusal(
+    min_tokens: usize,
+    batching: bool,
+    qwen4: bool,
+    pp: usize,
+    vmm_route: bool,
+    ep: bool,
+) -> Option<String> {
+    if min_tokens == 0 || !batching || (qwen4 && pp <= 1) {
+        return None;
+    }
+    let route = match (qwen4, vmm_route, ep) {
+        (true, _, _) => "qwen4 pipeline-parallel lanes",
+        (false, _, true) => "ep continuous-batch",
+        (false, true, false) => "vmm lanes",
+        (false, false, false) => "continuous-batch",
+    };
+    Some(format!(
+        "min_tokens is not supported on the {route} route (continuous-batch/VMM lanes/promotion); \
+         serve with continuous_batch_size=1, or a Flash-Next fn-lanes load, to use it"
+    ))
+}
+
+/// Whether a generate message carries a stop control the Qwen3.5 batch lanes
+/// cannot honour: any non-empty `stop` (string or array form), a value the
+/// sequential path rejects, or a `min_tokens` above zero (EOS and stops stay
+/// inactive below it). Such a request takes the sequential path, which honours
+/// or rejects it. (Flash-Next fn-lanes honour `min_tokens` themselves.)
 fn request_has_stop(msg: &serde_json::Value) -> bool {
-    !matches!(
-        hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")),
-        Ok(stops) if stops.is_empty()
-    )
+    request_sets_min_tokens(msg)
+        || !matches!(
+            hipfire_runtime::stop_sequence::parse_stop_field(msg.get("stop")),
+            Ok(stops) if stops.is_empty()
+        )
 }
 
 /// Whether a generate message carries a think budget the singleton decode
@@ -2888,6 +2933,13 @@ pub fn is_vmm_batch_request_eligible(
     if !shape_ok || has_tools || has_image || !stop_ok || logprobs {
         return false;
     }
+    // Flash-Next fn-lanes hold EOS and stops inactive below `min_tokens` (the
+    // lane's windows run through an EOS and the driver decides); the Qwen3.5
+    // VMM lanes' EOS checks know nothing of it, so such a request decodes on
+    // the singleton route.
+    if m.qwen4().is_none() && request_sets_min_tokens(msg) {
+        return false;
+    }
     if m.kv_adaptive.is_some() || m.eviction.is_some() || pflash_active {
         return false;
     }
@@ -2946,6 +2998,34 @@ pub(crate) fn qwen4_lone_lane(topology: &str, has_speculator: bool) -> bool {
 pub(crate) fn qwen4_lone_request_takes_lane(m: &LoadedModel) -> bool {
     m.qwen4().is_some_and(|b| {
         b.lanes().is_some() && qwen4_lone_lane(b.lane_topology(), m.speculator.is_some())
+    })
+}
+
+/// [`qwen4_lone_lane`] for one request: a `min_tokens` request always enters
+/// the lane driver, on every topology and with a speculator loaded. A
+/// singleton cannot carry `min_tokens` into a lane (no promotion), so a lone
+/// first arrival that started on the singleton would serve alone for its whole
+/// generation while later arrivals wait; as a cohort of one it keeps the lane
+/// that does hold EOS inactive below `min_tokens`, and later arrivals join at
+/// the next step.
+pub(crate) fn qwen4_lone_lane_for_request(
+    topology: &str,
+    has_speculator: bool,
+    min_tokens_set: bool,
+) -> bool {
+    min_tokens_set || qwen4_lone_lane(topology, has_speculator)
+}
+
+/// [`qwen4_lone_lane_for_request`] for the loaded model and message
+/// (requires a staged lane store).
+fn qwen4_lone_request_takes_lane_for(msg: &serde_json::Value, m: &LoadedModel) -> bool {
+    m.qwen4().is_some_and(|b| {
+        b.lanes().is_some()
+            && qwen4_lone_lane_for_request(
+                b.lane_topology(),
+                m.speculator.is_some(),
+                request_sets_min_tokens(msg),
+            )
     })
 }
 
@@ -3218,9 +3298,11 @@ pub fn vmm_loaded_ack(
 /// (`vmm_route`) only when another batched generate is already waiting — a
 /// lonely request keeps the unchanged singleton route (exact singleton
 /// arithmetic/spec) — except on a Qwen4 EP/PP lane store, where a running
-/// singleton can never be promoted into a lane (`qwen4_lone_request_takes_lane`):
-/// there the lone request enters the lane driver as a cohort of one and later
-/// arrivals join at the next step; otherwise the fixed-lane predicate.
+/// singleton can never be promoted into a lane (`qwen4_lone_request_takes_lane`),
+/// and for a Flash-Next `min_tokens` request on any topology
+/// (`qwen4_lone_lane_for_request`): there the lone request enters the lane
+/// driver as a cohort of one and later arrivals join at the next step;
+/// otherwise the fixed-lane predicate.
 pub fn batch_request_eligible_for_route(
     vmm_route: bool,
     msg: &serde_json::Value,
@@ -3237,7 +3319,7 @@ pub fn batch_request_eligible_for_route(
             continuous_batch_size,
             serve_continuous_batch,
             pflash_active,
-        ) && (qwen4_lone_request_takes_lane(m) || inbox.has_pending_batch_generate())
+        ) && (qwen4_lone_request_takes_lane_for(msg, m) || inbox.has_pending_batch_generate())
     } else {
         is_batch_request_eligible(
             msg,
@@ -3302,7 +3384,10 @@ pub fn arm_promotion(
     // would be continued as AR (reseeded), never promoted. Sampled Qwen4
     // requests never promote either: their lane draws with its own RNG from
     // admission; a running singleton's RNG/sampler state is not imported.
+    // A singleton promoted into a lane keeps no `min_tokens` count: such a
+    // request stays on the singleton for its whole run.
     let permit = (armed
+        && !request_sets_min_tokens(msg)
         && m.qwen4().is_none_or(|b| {
             b.lanes().is_some() && qwen4_lane_promotion_supported(b.lane_topology())
         })
@@ -8226,6 +8311,12 @@ mod tests {
             &json!({"logprobs": false}),
             &neutral
         ));
+        // Flash-Next lanes hold EOS and stops inactive below `min_tokens`
+        // themselves, so the request stays on the lane route.
+        assert!(qwen4_lane_request_supported(
+            &json!({"min_tokens": 8}),
+            &neutral
+        ));
 
         let penalized = [
             hipfire_engine::scheduler::BatchSampling {
@@ -8262,6 +8353,85 @@ mod tests {
     }
 
     #[test]
+    fn a_lone_min_tokens_request_takes_a_lane_on_every_flash_next_topology() {
+        // Without `min_tokens` the rule is unchanged: single keeps the
+        // promotable singleton, EP/PP take the lane, a speculator keeps the
+        // singleton.
+        for (topology, spec, lane) in [
+            ("single", false, false),
+            ("single", true, false),
+            ("ep", false, true),
+            ("pp", false, true),
+            ("ep", true, false),
+        ] {
+            assert_eq!(qwen4_lone_lane_for_request(topology, spec, false), lane);
+            assert_eq!(
+                qwen4_lone_lane_for_request(topology, spec, false),
+                qwen4_lone_lane(topology, spec)
+            );
+            // A `min_tokens` request is a lane everywhere, MTP included.
+            assert!(
+                qwen4_lone_lane_for_request(topology, spec, true),
+                "{topology} spec={spec}"
+            );
+        }
+        // The message predicate sees min_tokens: 0 and null are neutral.
+        use serde_json::json;
+        assert!(request_sets_min_tokens(&json!({"min_tokens": 4})));
+        assert!(!request_sets_min_tokens(&json!({"min_tokens": 0})));
+        assert!(!request_sets_min_tokens(&json!({})));
+        // Qwen3.5 and the rest of the batching routes still refuse it.
+        assert!(min_tokens_batch_refusal(4, true, false, 1, true, false).is_some());
+        assert!(min_tokens_batch_refusal(4, true, true, 1, true, false).is_none());
+    }
+
+    #[test]
+    fn min_tokens_is_refused_on_every_batching_route_that_cannot_honour_it() {
+        let refusal = |min, batching, qwen4, pp, vmm, ep| {
+            min_tokens_batch_refusal(min, batching, qwen4, pp, vmm, ep)
+        };
+        // Zero is neutral everywhere; a singleton-only serve never refuses.
+        for (batching, qwen4, pp, vmm, ep) in [
+            (true, false, 1, false, false),
+            (true, false, 1, true, false),
+            (true, false, 1, false, true),
+            (true, true, 2, true, false),
+        ] {
+            assert_eq!(refusal(0, batching, qwen4, pp, vmm, ep), None);
+        }
+        for (qwen4, pp, vmm, ep) in [
+            (false, 1, false, false),
+            (false, 1, true, false),
+            (true, 1, true, false),
+            (true, 1, true, true),
+            (false, 1, false, true),
+        ] {
+            assert_eq!(
+                refusal(8, false, qwen4, pp, vmm, ep),
+                None,
+                "singleton-only"
+            );
+        }
+        // Flash-Next fn-lanes (single card, EP) honour it.
+        assert_eq!(refusal(8, true, true, 1, true, false), None);
+        assert_eq!(refusal(8, true, true, 1, true, true), None);
+        // Every other batching serve refuses, naming its route.
+        for (qwen4, pp, vmm, ep, route) in [
+            (false, 1, false, false, "continuous-batch"),
+            (false, 1, true, false, "vmm lanes"),
+            (false, 1, false, true, "ep continuous-batch"),
+            (true, 2, true, false, "qwen4 pipeline-parallel lanes"),
+        ] {
+            let message = refusal(8, true, qwen4, pp, vmm, ep).expect("refused");
+            assert!(
+                message.starts_with(&format!("min_tokens is not supported on the {route} route")),
+                "{message}"
+            );
+            assert!(message.contains("continuous-batch/VMM lanes/promotion"));
+        }
+    }
+
+    #[test]
     fn any_stop_form_leaves_the_batch_path() {
         use serde_json::json;
         for absent in [
@@ -8271,6 +8441,19 @@ mod tests {
             json!({"stop": ""}),
         ] {
             assert!(!request_has_stop(&absent), "{absent}");
+        }
+        // `min_tokens` holds EOS and stops inactive, which no batch lane does:
+        // zero is neutral, anything else (or malformed) leaves the batch path.
+        for neutral in [json!({"min_tokens": 0}), json!({"min_tokens": null})] {
+            assert!(!request_has_stop(&neutral), "{neutral}");
+        }
+        for present in [
+            json!({"min_tokens": 1}),
+            json!({"min_tokens": 64}),
+            json!({"min_tokens": -1}),
+            json!({"min_tokens": "3"}),
+        ] {
+            assert!(request_has_stop(&present), "{present}");
         }
         // The string form was batch-eligible before and silently ignored there.
         for present in [

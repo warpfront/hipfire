@@ -130,7 +130,9 @@ pub(crate) struct DecodeAdmission<'a> {
     pub epoch: RequestEpoch,
     pub position: usize,
     pub seed: u32,
-    pub eos: u32,
+    /// The accept rule's EOS; `None` for a `min_tokens` lane
+    /// ([`crate::lane::LaneHost::ignore_eos`]).
+    pub eos: Option<u32>,
     pub rng_seed: u64,
     pub prompt: &'a [u32],
     pub spec_k: Option<usize>,
@@ -187,7 +189,7 @@ impl LaneProto {
             seed: a.seed,
             // Drafting runs through an EOS draft (`set_driver_terminates`);
             // the accept rule's EOS is the plan's.
-            eos: Some(a.eos),
+            eos: a.eos,
             rng_seed: a.rng_seed,
             prompt: a.prompt.to_vec(),
             spec_k: a.spec_k,
@@ -1488,6 +1490,31 @@ mod tests {
                     .plan_window(None, &[Single::request(1, 3)], &budgets(LabRoutes::Batched))
                     .is_err());
             }
+        }
+    }
+
+    /// A lane admitted with no EOS rule (`min_tokens`: the root passes `None`)
+    /// runs its window through the EOS draft: every draft is accepted and the
+    /// bonus is emitted, where the same window under the EOS rule truncates at
+    /// the EOS. The driver, which owns termination, decides what an EOS means.
+    #[test]
+    fn a_lane_admitted_without_an_eos_rule_runs_its_window_through_an_eos() {
+        let window = || WindowScript {
+            drafts: vec![5, 77, 9],
+            picks: vec![5, 77, 9, 1],
+            keep_going: Vec::new(),
+            drop_last: Vec::new(),
+        };
+        for (eos, emitted) in [(Some(77), vec![5, 77]), (None, vec![5, 77, 9, 1])] {
+            let mut single = Single::new(false);
+            single.root.set_driver_terminates(true);
+            single.admit(1, eos, Some(3));
+            single.script.borrow_mut().windows.insert((1, 0), window());
+            let (_, out, _) =
+                single.step(&[Single::request(1, 3)], LabRoutes::Batched, wall(30_000.0));
+            let l = &out.lanes[0];
+            assert_eq!(l.emitted, emitted, "eos rule {eos:?}");
+            assert_eq!(l.source.offered, 3, "the chain runs through the EOS draft");
         }
     }
 

@@ -962,6 +962,11 @@ pub struct LaneHost {
     pub sampling: Option<LaneSampling>,
     /// The lane's xorshift32 sampler state (`0` while `sampling` is `None`).
     pub rng: u32,
+    /// `min_tokens` lane: the window accept never stops at EOS (the root
+    /// admits the lane with no EOS rule, `LaneAdmission::eos` = `None`, as the
+    /// fixed-count oracle lanes do), so a window runs through an EOS and the
+    /// driver, which owns termination, decides when an EOS ends the request.
+    pub ignore_eos: bool,
 }
 
 /// Staging of the lanes' native MTP windows.
@@ -1410,6 +1415,7 @@ impl<C: LaneCell> LaneTable<C> {
             stamp: self.next_stamp,
             sampling: None,
             rng: 0,
+            ignore_eos: false,
         };
         match self.cells[slot].as_mut() {
             Some(cell) => {
@@ -1561,7 +1567,7 @@ pub(crate) fn lane_sampled_commit(
     vocab: usize,
     s: &LaneSampling,
     rng: &mut u32,
-    eos: u32,
+    eos: Option<u32>,
 ) -> Result<hipfire_runtime::spec::GreedyAccept, String> {
     if vocab == 0 || rows.len() != (drafts.len() + 1) * vocab {
         return Err(format!(
@@ -1570,9 +1576,27 @@ pub(crate) fn lane_sampled_commit(
             drafts.len()
         ));
     }
-    hipfire_runtime::spec_sampling::accept_naive_prefix(drafts, Some(eos), |row| {
+    hipfire_runtime::spec_sampling::accept_naive_prefix(drafts, eos, |row| {
         Ok(lane_draw(s, rng, &rows[row * vocab..(row + 1) * vocab]))
     })
+}
+
+/// Mark `host` a `min_tokens` lane ([`LaneHost::ignore_eos`]): only while the
+/// lane is Prefilling with nothing prefilled or committed, so a refusal changes
+/// nothing and no window has run under the other EOS rule.
+pub(crate) fn mark_ignore_eos(host: &mut LaneHost) -> Result<(), String> {
+    if host.status != LaneStatus::Prefilling || host.prefilled != 0 || !host.generated.is_empty() {
+        return Err(format!(
+            "set_lane_ignore_eos: lane {:?} is {:?} with {} prefilled and {} committed; \
+             the flag is set before the first step",
+            host.epoch,
+            host.status,
+            host.prefilled,
+            host.generated.len()
+        ));
+    }
+    host.ignore_eos = true;
+    Ok(())
 }
 
 /// What [`lane_sample_step`] did to a request's picks.
@@ -1633,6 +1657,8 @@ pub(crate) fn lane_sample_step(
             Ok(LaneSampleOutcome::Ar)
         }
         Some(drafts) => {
+            // A `min_tokens` lane's naive window runs through an EOS.
+            let eos = (!host.ignore_eos).then_some(eos);
             let naive = lane_sampled_commit(drafts, logits, vocab, &s, &mut host.rng, eos)?;
             picks[..naive.committed.len()].copy_from_slice(&naive.committed);
             Ok(LaneSampleOutcome::Naive(naive))
@@ -2327,7 +2353,7 @@ impl Qwen4LaneStore {
             epoch,
             position,
             seed: pending_seed,
-            eos,
+            eos: Some(eos),
             rng_seed: 0,
             prompt: &root_prompt,
             spec_k: k,
@@ -2482,6 +2508,22 @@ impl Qwen4LaneStore {
         host.rng = sampling.initial_rng();
         host.sampling = Some(sampling);
         Ok(())
+    }
+
+    /// Make `epoch`'s lane a `min_tokens` lane (host only): its windows never
+    /// stop at EOS (see [`LaneHost::ignore_eos`]). After admission and before
+    /// the lane's first step; refused while a step is in flight or once the lane
+    /// has prefilled or committed anything.
+    pub fn set_lane_ignore_eos(&mut self, epoch: &RequestEpoch) -> Result<(), String> {
+        if self.phase != LanePhase::Idle {
+            return Err("set_lane_ignore_eos: a step is in flight".to_string());
+        }
+        let host = &mut self
+            .table
+            .get_mut(epoch)
+            .ok_or_else(|| format!("set_lane_ignore_eos: unknown or stale epoch {epoch:?}"))?
+            .host;
+        mark_ignore_eos(host)
     }
 
     pub fn lane(&self, epoch: &RequestEpoch) -> Option<&Qwen4LaneState> {
@@ -4183,6 +4225,7 @@ mod lane_sampling_tests {
             stamp: 0,
             sampling,
             rng: sampling.map_or(0, |s| s.initial_rng()),
+            ignore_eos: false,
         }
     }
 
@@ -4351,6 +4394,94 @@ mod lane_sampling_tests {
             assert_eq!(picks, before);
         }
         assert_eq!((host.rng, scratch.len()), (0, 0));
+    }
+
+    /// A `min_tokens` lane's sampled windows run through an EOS: the stream is
+    /// the whole AR stream, where the lane without the flag stops at the first
+    /// EOS draw.
+    #[test]
+    fn a_min_tokens_lane_draws_its_sampled_windows_through_an_eos() {
+        let _g = rng_guard();
+        let saved = sampler_rng_snapshot();
+        let (target, depth) = (30usize, 3usize);
+        let mut through = 0;
+        for case in 0..12u32 {
+            let s = sampling_for(case + 3);
+            let logits = logit_rows(case * 17 + 5, target + 8);
+            let (ar, _) = ar_draws(&logits, target + 8, &s);
+            let eos = ar[5];
+            for ignore in [false, true] {
+                let mut host = host_with(Some(s));
+                host.ignore_eos = ignore;
+                let mut scratch: Vec<f32> = Vec::new();
+                let mut stream: Vec<u32> = Vec::new();
+                while stream.len() < target && (ignore || stream.last() != Some(&eos)) {
+                    let pos = stream.len();
+                    let drafts: Vec<u32> = (0..depth).map(|j| ar[pos + j]).collect();
+                    let mut picks = vec![u32::MAX - 1; depth + 1];
+                    let window = &logits[pos * VOCAB..(pos + depth + 1) * VOCAB];
+                    let outcome = lane_sample_step(
+                        &mut host,
+                        Some(&drafts),
+                        &mut picks,
+                        eos,
+                        VOCAB,
+                        &mut scratch,
+                        |scratch| {
+                            scratch.clear();
+                            scratch.extend_from_slice(window);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                    let LaneSampleOutcome::Naive(naive) = outcome else {
+                        panic!("a verify window is a naive outcome: {outcome:?}");
+                    };
+                    stream.extend_from_slice(&naive.committed);
+                }
+                assert_eq!(
+                    &stream[..],
+                    &ar[..stream.len()],
+                    "case {case} ignore {ignore}"
+                );
+                let first = ar.iter().position(|&t| t == eos).unwrap();
+                if ignore {
+                    assert!(stream.len() >= target, "case {case}");
+                    through += usize::from(first + 1 < stream.len());
+                } else {
+                    assert_eq!(first + 1, stream.len(), "stops at the first EOS draw");
+                }
+            }
+        }
+        assert!(through > 0, "some window must straddle the EOS");
+        sampler_rng_restore(saved);
+    }
+
+    #[test]
+    fn ignore_eos_is_set_only_before_the_lane_starts() {
+        let mut host = host_with(None);
+        assert!(!host.ignore_eos);
+        mark_ignore_eos(&mut host).unwrap();
+        assert!(host.ignore_eos);
+        for refused in [
+            LaneHost {
+                prefilled: 1,
+                ..host_with(None)
+            },
+            LaneHost {
+                generated: vec![5],
+                ..host_with(None)
+            },
+            LaneHost {
+                status: LaneStatus::Decoding,
+                ..host_with(None)
+            },
+        ] {
+            let mut host = refused;
+            let error = mark_ignore_eos(&mut host).unwrap_err();
+            assert!(error.contains("before the first step"), "{error}");
+            assert!(!host.ignore_eos, "a refusal changes nothing");
+        }
     }
 
     #[test]

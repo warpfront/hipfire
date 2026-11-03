@@ -1401,7 +1401,7 @@ fn commit_with_proto(
                         epoch: r.epoch,
                         position: lane.state.position,
                         seed: pick,
-                        eos,
+                        eos: (!lane.host.ignore_eos).then_some(eos),
                         rng_seed: lane.host.sampling.map_or(0, |s| u64::from(s.seed)),
                         prompt: &lane.host.prompt,
                         spec_k: spec_config.map(|config| config.k),
@@ -1496,6 +1496,7 @@ mod tests {
             stamp: tag,
             sampling: None,
             rng: 0,
+            ignore_eos: false,
         }
     }
 

@@ -1879,6 +1879,10 @@ pub struct SpecEmitCtx<'a> {
     pub enable_grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
+    /// vLLM-compatible `min_tokens`: EOS, decoded end-of-turn markers and user
+    /// stop sequences are inactive until this many tokens have been committed
+    /// (0 ⇒ always active). See [`crate::stop_sequence::MinTokens`].
+    pub min_tokens: usize,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).
     pub max_think: usize,
     /// The turn's `max_tokens` cap. Used by arches whose emitter sizes a

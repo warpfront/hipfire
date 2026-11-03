@@ -3398,6 +3398,14 @@ fn main() {
                     .map(|v| v as usize)
                     .unwrap_or(hipfire_engine::scheduler::DEFAULT_GENERATE_MAX_TOKENS);
                 let _fit = request_guards::fit_max_tokens(&msg);
+                // vLLM-compatible `min_tokens`: EOS and stop sequences stay
+                // inactive until this many tokens are committed. Must not
+                // exceed `max_tokens`; an invalid value is rejected.
+                let Some(min_tokens) =
+                    hipfire_generate::ar::min_tokens_or_reject(&mut stdout, id, &msg, max_tokens)
+                else {
+                    continue;
+                };
                 // CACTUS acceptance-boost δ — OPT-IN (request `cactus_delta`), 0.0
                 // default = lossless/distribution-preserving. >0 is deliberately lossy
                 // (higher acceptance τ, KL-bounded distortion) and applies only to a
@@ -3602,6 +3610,20 @@ fn main() {
                     tp_penalties,
                     has_image,
                 ) {
+                    continue;
+                }
+                // The vision routes end on their own EOS checks and never see
+                // `min_tokens`; refuse it instead of silently ignoring it.
+                if min_tokens > 0 && has_image {
+                    hipfire_generate::dense::emit_active_attempt_error(
+                        &mut stdout,
+                        Some(id),
+                        "min_tokens is not supported on image requests",
+                        "unsupported",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
                     continue;
                 }
 
@@ -3900,6 +3922,32 @@ fn main() {
                     let pflash_active = pf_cfg_owned.as_ref().is_some_and(|c| {
                         !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off)
                     });
+                    // `min_tokens` is honoured by the singleton routes and the
+                    // Flash-Next fn-lanes only. On any other batching serve it is
+                    // refused (400), never rerouted to a serialized singleton.
+                    if min_tokens > 0 {
+                        let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
+                            == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
+                        if let Some(message) = hipfire_generate::batch::min_tokens_batch_refusal(
+                            min_tokens,
+                            continuous_batch_size > 1 && batch_scheduler.is_some(),
+                            qwen4_batch,
+                            m.pp,
+                            hipfire_generate::batch::vmm_route_active(vmm_batch, m),
+                            m.ep.is_some(),
+                        ) {
+                            hipfire_generate::dense::emit_active_attempt_error(
+                                &mut stdout,
+                                Some(id),
+                                &message,
+                                "unsupported",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    }
                     let ep_batch_eligible =
                         if !singleton_handoff && batch_scheduler.is_some() && m.ep.is_some() {
                             is_qwen_ep_batch_request_eligible(
@@ -4389,6 +4437,7 @@ fn main() {
                         messages_history.as_deref(),
                         think_mode,
                         &stop_seqs, // hunt3 M-F
+                        min_tokens,
                         reasoning_effort_jinja.as_deref(),
                         enable_thinking_jinja,
                         logprobs_top_k,

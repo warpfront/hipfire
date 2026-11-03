@@ -247,6 +247,17 @@ impl<'a> Owner<'a> {
         set.map_err(|e| e.to_string())
     }
 
+    /// Make a just-admitted lane a `min_tokens` lane (host-only): its windows
+    /// run through an EOS. Not available on a pipeline-parallel mesh.
+    fn set_ignore_eos(&mut self, epoch: &RequestEpoch) -> Result<(), String> {
+        if self.gpus.is_some() {
+            return Err("min_tokens is not supported on pipeline-parallel lanes".to_string());
+        }
+        self.bundle
+            .set_lane_ignore_eos(epoch)
+            .map_err(|e| e.to_string())
+    }
+
     fn force_seed(&mut self, epoch: &RequestEpoch, token: u32) -> Result<(), String> {
         let forced = match self.gpus.as_deref_mut() {
             Some(gpus) => self.bundle.pp_force_lane_seed(gpus, epoch, token),
@@ -918,6 +929,14 @@ fn plan_step(
     }))
 }
 
+/// Whether the token just committed ends a lane's turn: the filter or a stop
+/// sequence stopped it, or it is an EOS / terminator id while stops are active.
+/// Below `min_tokens` (`stops_active` false) an EOS id is an ordinary token:
+/// the lane's windows ran through it and the stream continues.
+fn turn_ends(stopped: bool, stops_active: bool, is_eos: bool) -> bool {
+    stopped || (stops_active && is_eos)
+}
+
 fn emit_forwarded(
     stdout: &mut Stdout,
     tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
@@ -933,10 +952,8 @@ fn emit_forwarded(
     let elapsed = ctl.start.elapsed().as_millis() as u64;
     lane.first_token_at.get_or_insert_with(Instant::now);
     let id = &lane.key.id;
-    let stopped = ctl
-        .semantic
-        .as_mut()
-        .ok_or("lane producer missing")?
+    let producer = ctl.semantic.as_mut().ok_or("lane producer missing")?;
+    let stopped = producer
         .commit_and_classify(
             stdout,
             token,
@@ -953,7 +970,11 @@ fn emit_forwarded(
             |pos, output| emit_committed_event(output, id, token, pos, elapsed),
         )
         .map_err(|e| e.to_string())?;
-    if stopped || token == eos || tokenizer.is_terminator(token) {
+    if turn_ends(
+        stopped,
+        producer.last_stops_active,
+        token == eos || tokenizer.is_terminator(token),
+    ) {
         return Ok(Some(false));
     }
     match qwen_ar_think_budget_step(&mut ctl.budget, &ctl.bytes, ctl.started_in_think, tokenizer) {
@@ -1302,6 +1323,27 @@ pub fn drive_qwen4_lane_batch(
                     )?;
                     continue;
                 }
+                // vLLM-compatible `min_tokens`: validated against `max_tokens`
+                // at the gateway and the daemon, so a malformed value cannot
+                // reach a lane; a stray one is refused rather than guessed at.
+                let min_tokens = match hipfire_runtime::stop_sequence::parse_min_tokens_field(
+                    req.original_msg.get("min_tokens"),
+                    req.max_tokens,
+                ) {
+                    Ok(n) => n,
+                    Err(message) => {
+                        lane_error(
+                            sched,
+                            m,
+                            &mut controls,
+                            ticket.lane,
+                            stdout,
+                            &message,
+                            "validation",
+                        )?;
+                        continue;
+                    }
+                };
                 let stop =
                     hipfire_runtime::stop_sequence::parse_stop_field(req.original_msg.get("stop"))
                         .map_err(|e| e.to_string())?;
@@ -1345,6 +1387,23 @@ pub fn drive_qwen4_lane_batch(
                         continue;
                     }
                 }
+                if min_tokens > 0 {
+                    // The lane's windows run through an EOS; the driver holds EOS
+                    // and stops inactive below `min_tokens` (`emit_forwarded`).
+                    if let Err(error) = Owner::of(m, gpu)?.set_ignore_eos(&epoch) {
+                        release_epoch(m, &epoch)?;
+                        lane_error(
+                            sched,
+                            m,
+                            &mut controls,
+                            ticket.lane,
+                            stdout,
+                            &error,
+                            "unsupported",
+                        )?;
+                        continue;
+                    }
+                }
                 emit_generation_start(ROUTE, stdout, &key.id, started);
                 // The singleton tools parser maps an empty array to None.
                 let tools = req
@@ -1357,7 +1416,8 @@ pub fn drive_qwen4_lane_batch(
                     slot,
                     semantic: Some(
                         QwenArSemanticProducer::new_with_tool_protocol(&key.id, started, tools)
-                            .with_stop(&stop),
+                            .with_stop(&stop)
+                            .with_min_tokens(min_tokens, 0),
                     ),
                     bytes: Vec::new(),
                     budget: ThinkBudget::new(req.max_think_tokens),
@@ -1774,6 +1834,19 @@ mod tests {
             mapped_ahead: false,
             _serving: serving,
         }
+    }
+
+    #[test]
+    fn a_lane_turn_ignores_an_eos_id_below_min_tokens_only() {
+        use super::turn_ends;
+        // Stops active: an EOS id ends the turn; so does a filter / stop match.
+        assert!(turn_ends(false, true, true));
+        assert!(turn_ends(true, true, false));
+        assert!(!turn_ends(false, true, false));
+        // Below `min_tokens`: the EOS id is ordinary, a (suspended) stop never
+        // reports, and nothing else changes.
+        assert!(!turn_ends(false, false, true));
+        assert!(!turn_ends(false, false, false));
     }
 
     #[test]

@@ -1619,6 +1619,8 @@ pub struct SpecEmitRequest {
     /// runs when `tools` is `Some`).
     pub enable_grammar: bool,
     pub stop: Vec<String>,
+    /// vLLM-compatible `min_tokens` (0 ⇒ none); see `SpecEmitCtx::min_tokens`.
+    pub min_tokens: usize,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     /// Reasoning-effort level (consumed by the ds4 emitter; ignored by ChatML).

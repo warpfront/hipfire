@@ -301,7 +301,8 @@ impl Qwen4Bundle {
                     epoch: request.epoch,
                     position: lane.state.position,
                     seed,
-                    eos: Some(eos),
+                    // A `min_tokens` lane's windows run through an EOS.
+                    eos: (!lane.host.ignore_eos).then_some(eos),
                     rng_seed: sampling.map_or(request.epoch.request_tag, |s| u64::from(s.seed)),
                     prompt: lane.host.prompt.clone(),
                     // An AR-only lane of a mixed store joins the root as an AR lane.

@@ -55,6 +55,52 @@ pub fn parse_stop_field(value: Option<&serde_json::Value>) -> Result<Vec<String>
     Ok(stops)
 }
 
+/// Parse the vLLM-compatible `min_tokens` field: absent/`null` is 0, otherwise
+/// a non-negative integer that must not exceed `max_tokens`. The message starts
+/// with `invalid min_tokens` so every gateway maps it to 400.
+pub fn parse_min_tokens_field(
+    value: Option<&serde_json::Value>,
+    max_tokens: usize,
+) -> Result<usize, String> {
+    let n = match value {
+        None | Some(serde_json::Value::Null) => return Ok(0),
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| "invalid min_tokens: expected a non-negative integer".to_owned())?,
+    };
+    if n > max_tokens as u64 {
+        return Err(format!(
+            "invalid min_tokens: {n} exceeds max_tokens ({max_tokens})"
+        ));
+    }
+    Ok(n as usize)
+}
+
+/// vLLM-compatible `min_tokens` gate shared by every decode loop that honours
+/// the request. While fewer than `min_tokens` completion tokens have been
+/// committed, end-of-sequence tokens, the decoded end-of-turn markers
+/// (`<|im_end|>`, `<|endoftext|>`) and user `stop` sequences are inactive: a
+/// sampled EOS is an ordinary token, its marker text is dropped from the
+/// client-visible stream, and generation continues. `max_tokens` still caps.
+///
+/// vLLM masks the EOS logit instead; here the sampled EOS is kept as a
+/// committed token (counted, fed back, never shown) because the decode loops
+/// sample before they know whether the token is EOS. Both end up with at least
+/// `min_tokens` completion tokens before any stop can take effect.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MinTokens(pub usize);
+
+impl MinTokens {
+    /// No minimum: every stop is active from the first token.
+    pub const NONE: Self = Self(0);
+
+    /// Whether EOS and stop sequences apply to the token sampled when
+    /// `committed_before` completion tokens were already committed.
+    pub fn stops_active(self, committed_before: usize) -> bool {
+        committed_before >= self.0
+    }
+}
+
 /// Streaming stop-sequence matcher over client-visible text.
 ///
 /// Feed each chunk through [`push`](Self::push) and emit what it returns.
@@ -71,6 +117,8 @@ pub struct StopMatcher {
     /// Tail of the stream that is a proper prefix of some stop sequence.
     held: String,
     matched: bool,
+    /// `min_tokens` not reached yet: text passes through unmatched.
+    suspended: bool,
 }
 
 impl StopMatcher {
@@ -82,7 +130,14 @@ impl StopMatcher {
             max_len,
             held: String::new(),
             matched: false,
+            suspended: false,
         }
+    }
+
+    /// Suspend (`true`) or resume (`false`) matching, for `min_tokens`. While
+    /// suspended `push` returns its input untouched and holds nothing back.
+    pub fn set_suspended(&mut self, suspended: bool) {
+        self.suspended = suspended;
     }
 
     /// Whether any stop sequence is configured.
@@ -100,7 +155,7 @@ impl StopMatcher {
         if self.matched {
             return Cow::Borrowed("");
         }
-        if self.stops.is_empty() {
+        if self.stops.is_empty() || self.suspended {
             return Cow::Borrowed(text);
         }
         self.held.push_str(text);
@@ -258,6 +313,41 @@ mod tests {
         let mut m = StopMatcher::new(&stops(&["🎉!"]));
         assert_eq!(m.push("hi 🎉"), "hi ");
         assert_eq!(m.push("?"), "🎉?");
+    }
+
+    #[test]
+    fn min_tokens_field_defaults_to_zero_and_is_capped_by_max_tokens() {
+        assert_eq!(parse_min_tokens_field(None, 16), Ok(0));
+        assert_eq!(parse_min_tokens_field(Some(&json!(null)), 16), Ok(0));
+        assert_eq!(parse_min_tokens_field(Some(&json!(0)), 16), Ok(0));
+        assert_eq!(parse_min_tokens_field(Some(&json!(16)), 16), Ok(16));
+        for bad in [json!(17), json!(-1), json!(1.5), json!("3"), json!([1])] {
+            let err = parse_min_tokens_field(Some(&bad), 16).expect_err("must reject");
+            assert!(err.starts_with("invalid min_tokens"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn min_tokens_gate_opens_after_min_tokens_commits() {
+        assert!(MinTokens::NONE.stops_active(0));
+        let gate = MinTokens(3);
+        // The token sampled with 0, 1 or 2 tokens already committed is one of
+        // the first three: ordinary. The fourth may stop.
+        assert!(!gate.stops_active(0) && !gate.stops_active(1) && !gate.stops_active(2));
+        assert!(gate.stops_active(3) && gate.stops_active(9));
+    }
+
+    #[test]
+    fn suspended_matcher_passes_text_through_then_matches_once_resumed() {
+        let mut m = StopMatcher::new(&stops(&["END"]));
+        m.set_suspended(true);
+        // A complete stop and a partial prefix both flow through untouched.
+        assert_eq!(m.push("a END b EN"), "a END b EN");
+        assert!(!m.matched());
+        m.set_suspended(false);
+        assert_eq!(m.push("x EN"), "x ");
+        assert_eq!(m.push("D tail"), "");
+        assert!(m.matched());
     }
 
     #[test]
