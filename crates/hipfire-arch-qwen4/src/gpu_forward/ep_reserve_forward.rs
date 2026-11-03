@@ -416,6 +416,95 @@ impl LaneTileNote {
 }
 
 // ---------------------------------------------------------------------------
+// The EP prefill tile route's row floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`)
+// ---------------------------------------------------------------------------
+
+/// [`QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV`] parsed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillTileKnob {
+    /// Unset or empty: the default floor (lowered on the A8 chain, else 512).
+    Unset,
+    /// A usable floor (the value as given; [`ep_prefill_tile_sym_floor`] clamps it to the
+    /// route's own range).
+    Floor(usize),
+    /// Refused: the reason, logged once; the default floor applies.
+    Refused(String),
+}
+
+/// Parse the knob. An integer in `LOWEST..=` anything is usable; below
+/// [`rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR`] (the few-row routes' rows: the gathered
+/// decode / verify MoE must keep them) or not an integer is refused.
+pub(crate) fn ep_prefill_tile_knob_from(value: Option<&str>) -> PrefillTileKnob {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return PrefillTileKnob::Unset;
+    };
+    let lowest = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR;
+    match value.parse::<usize>() {
+        Err(_) => PrefillTileKnob::Refused(format!("{value:?} is not an integer")),
+        Ok(rows) if rows < lowest => PrefillTileKnob::Refused(format!(
+            "{rows} is below the floor of {lowest} rows: calls of at most {} rows are decode and verify and keep the gathered MoE",
+            lowest - 1
+        )),
+        Ok(rows) => PrefillTileKnob::Floor(rows),
+    }
+}
+
+/// The knob, read once per process (every rank thread agrees); a refusal is logged once.
+static EP_PREFILL_TILE_KNOB: std::sync::LazyLock<Option<usize>> = std::sync::LazyLock::new(|| {
+    match ep_prefill_tile_knob_from(
+        hipfire_config::developer_var(QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV)
+            .ok()
+            .as_deref(),
+    ) {
+        PrefillTileKnob::Unset => None,
+        PrefillTileKnob::Floor(rows) => Some(rows),
+        PrefillTileKnob::Refused(reason) => {
+            eprintln!(
+                "  qwen4 EP prefill tile route: {QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV} ignored ({reason}); the default floor applies"
+            );
+            None
+        }
+    }
+});
+
+pub(super) fn ep_prefill_tile_knob() -> Option<usize> {
+    *EP_PREFILL_TILE_KNOB
+}
+
+/// The symmetric-IU4 row floor ([`Gpu::qwen4_moe_sym_iu4_floor`]) a forward runs under. Lowered
+/// only for a PREFILL forward (`prefill_scope`: lane tile, singleton prefill, MTP prompt-fill
+/// tile; never decode, verify or the MTP head) of an EP load whose owner-routed tile exchange is
+/// installed (`tile_hook`: the forward then takes the compact route with the exchange, never
+/// the symmetric arm on the full table), and never raised above today's floor or lowered below
+/// the few-row routes' rows. `a8_chain`: the A8 owner-routed chain is the active chain of this
+/// forward (`Gpu::qwen4_moe_ep_a8_requested`; the sub-512 floor is quality-neutral only on A8,
+/// the A4 chain fails the paired KLD there): an unset knob then lowers the floor to
+/// [`EP_PREFILL_TILE_DEFAULT_FLOOR`], else it stays 512. An explicit knob value wins either
+/// way (512 is the kill switch of the floor alone). Pure: the lane tile and the singleton of the
+/// same rows read the same value, so they take the same route.
+pub(crate) fn ep_prefill_tile_sym_floor(
+    knob: Option<usize>,
+    prefill_scope: bool,
+    tile_hook: bool,
+    a8_chain: bool,
+) -> usize {
+    let default = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS;
+    if !(prefill_scope && tile_hook) {
+        return default;
+    }
+    match knob {
+        Some(rows) => rows.clamp(rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR, default),
+        None if a8_chain => EP_PREFILL_TILE_DEFAULT_FLOOR,
+        None => default,
+    }
+}
+
+/// The floor of an EP prefill forward on the A8 chain when the knob is unset: the lowest one
+/// (9 rows: decode and verify, at most 8 rows, keep the gathered route).
+pub(crate) const EP_PREFILL_TILE_DEFAULT_FLOOR: usize =
+    rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR;
+
+// ---------------------------------------------------------------------------
 // Plan geometry (pure)
 // ---------------------------------------------------------------------------
 
@@ -2883,5 +2972,176 @@ mod tests {
         assert_eq!(note(false, false).label(), "full-table");
         assert_eq!(note(true, false).label(), "tile");
         assert_eq!(note(true, true).label(), "tile+stage");
+    }
+
+    #[test]
+    fn prefill_tile_knob_parses_and_refuses_below_the_few_row_routes() {
+        for unset in [None, Some(""), Some("   ")] {
+            assert_eq!(ep_prefill_tile_knob_from(unset), PrefillTileKnob::Unset);
+        }
+        for bad in ["abc", "-1", "1.5", "0x20", "9rows"] {
+            let PrefillTileKnob::Refused(reason) = ep_prefill_tile_knob_from(Some(bad)) else {
+                panic!("{bad:?} must be refused");
+            };
+            assert!(reason.contains("not an integer"), "{reason}");
+        }
+        // The few-row routes (decode, verify: at most 8 rows) keep the gathered MoE.
+        for rows in ["0", "1", "2", "8"] {
+            let PrefillTileKnob::Refused(reason) = ep_prefill_tile_knob_from(Some(rows)) else {
+                panic!("{rows} must be refused");
+            };
+            assert!(reason.contains("below the floor of 9"), "{reason}");
+        }
+        assert_eq!(
+            ep_prefill_tile_knob_from(Some("9")),
+            PrefillTileKnob::Floor(9)
+        );
+        assert_eq!(
+            ep_prefill_tile_knob_from(Some(" 128 ")),
+            PrefillTileKnob::Floor(128)
+        );
+        assert_eq!(
+            ep_prefill_tile_knob_from(Some("512")),
+            PrefillTileKnob::Floor(512)
+        );
+        assert_eq!(
+            ep_prefill_tile_knob_from(Some("100000")),
+            PrefillTileKnob::Floor(100000)
+        );
+    }
+
+    #[test]
+    fn prefill_tile_floor_decision_table() {
+        const DEFAULT: usize = 512;
+        // (knob, prefill scope, tile hook, A8 chain active) -> floor
+        let table: &[(Option<usize>, bool, bool, bool, usize)] = &[
+            // Unset: 9 iff the A8 chain is the active chain of an EP prefill forward with the
+            // symmetric-IU4 tile exchange installed; A8 killed (A4 chain) keeps 512.
+            (None, true, true, true, 9),
+            (None, true, true, false, DEFAULT),
+            // Not a prefill forward (decode, verify, MTP head): 512 whatever else is set.
+            (None, false, true, true, DEFAULT),
+            (Some(9), false, true, true, DEFAULT),
+            // No tile hook (single device, gfx1100 WMMA tile route, no exchange): 512.
+            (None, true, false, true, DEFAULT),
+            (Some(9), true, false, true, DEFAULT),
+            // An explicit knob wins over the A8 default, up and down: 512 is the kill switch of
+            // the floor alone, a lower value is a lab floor (also on the A4 chain).
+            (Some(512), true, true, true, DEFAULT),
+            (Some(9), true, true, false, 9),
+            (Some(128), true, true, true, 128),
+            (Some(128), true, true, false, 128),
+            (Some(511), true, true, true, 511),
+            // Never raised above today's floor, never lowered below the few-row routes' rows.
+            (Some(4096), true, true, true, DEFAULT),
+            (Some(2), true, true, true, 9),
+        ];
+        for &(knob, prefill, hook, a8, want) in table {
+            assert_eq!(
+                ep_prefill_tile_sym_floor(knob, prefill, hook, a8),
+                want,
+                "knob {knob:?} prefill {prefill} hook {hook} a8 {a8}"
+            );
+        }
+        assert_eq!(EP_PREFILL_TILE_DEFAULT_FLOOR, 9);
+    }
+
+    #[test]
+    fn prefill_tile_floor_decides_the_same_for_a_lane_tile_and_the_singleton() {
+        // The decision reads no row count and no lane state: a lane prefill tile, the singleton
+        // prefill and the MTP prompt-fill tile are all `prefill_scope` forwards of one load
+        // entering `enter_tile_scopes`, so they get the same floor and the same route for the
+        // same rows. Pinned at the one call site that feeds the decision.
+        // The scope that feeds it: enter_tile_scopes passes self.prefill_scope, the A8 request
+        // of the scope it just set and the installed hook, nothing per lane.
+        let src = include_str!("../gpu_forward.rs");
+        let at = src
+            .find("let sym_floor_now = ep_reserve_forward::ep_prefill_tile_sym_floor(")
+            .unwrap();
+        let call = &src[at..at + 260];
+        assert!(call.contains("self.prefill_scope"), "{call}");
+        assert!(call.contains("tile_hook"), "{call}");
+        assert!(call.contains("a8_chain"), "{call}");
+        assert!(!call.contains("lane"), "{call}");
+    }
+
+    #[test]
+    fn prefill_tile_floor_never_reaches_a_decode_or_verify_row_count() {
+        // The EP gathered row gather (2..=8 rows), the historic few-row routes (8) and the
+        // gfx1201 row-exact verify window (8) are all below every floor the function returns.
+        let few = QWEN4_EP_GATHER_MAX_ROWS
+            .max(rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS)
+            .max(hipfire_config::QWEN4_ROW_EXACT_VERIFY_ROWS_GFX1201);
+        assert_eq!(few, 8);
+        assert_eq!(rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR, few + 1);
+        for knob in (0..=700).map(Some).chain([None]) {
+            for prefill in [false, true] {
+                for hook in [false, true] {
+                    for a8 in [false, true] {
+                        let floor = ep_prefill_tile_sym_floor(knob, prefill, hook, a8);
+                        assert!(floor > few, "{knob:?} {prefill} {hook} {a8}: {floor}");
+                        assert!(floor <= rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS);
+                        // Rows 8 / 9 / 511 / 512 against the default A8 floor: the few-row
+                        // boundary and the historic floor, both sides.
+                        if knob.is_none() && prefill && hook && a8 {
+                            assert_eq!(floor, 9);
+                            assert!(
+                                [8usize, 9, 511, 512].map(|rows| rows >= floor)
+                                    == [false, true, true, true]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn declared_route_capability_follows_the_floor_in_scope() {
+        use hipfire_dispatch::families::moe::MoeRouteCapability::{
+            Fp8B128Grouped, Qt44Qt53Grouped, Qt44Qt53GroupedSymmetric as Symmetric,
+            SlabCodecGrouped,
+        };
+        // A verified-symmetric layer: the floor in scope decides.
+        assert_eq!(
+            declared_route_capability(false, false, true, 511, 512),
+            Qt44Qt53Grouped
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 512, 512),
+            Symmetric
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 8, 9),
+            Qt44Qt53Grouped
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 9, 9),
+            Symmetric
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 149, 9),
+            Symmetric
+        );
+        assert_eq!(
+            declared_route_capability(false, false, true, 149, 150),
+            Qt44Qt53Grouped
+        );
+        // An unverified layer never declares it, at any floor.
+        for floor in [9, 128, 512] {
+            assert_eq!(
+                declared_route_capability(false, false, false, 4096, floor),
+                Qt44Qt53Grouped
+            );
+        }
+        // Slab and FP8 layers are their own routes at every row count and floor.
+        assert_eq!(
+            declared_route_capability(true, false, true, 149, 9),
+            SlabCodecGrouped
+        );
+        assert_eq!(
+            declared_route_capability(false, true, true, 149, 9),
+            Fp8B128Grouped
+        );
     }
 }

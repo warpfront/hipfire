@@ -3205,6 +3205,7 @@ fn with_tile_frames<T>(
                 &forward.decode_q8,
                 tile.routing.route_rows,
                 geo.few_row_limit,
+                rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
                 None,
             )?;
             if let Qwen4FfnBinding::Moe(moe) = &mut description.ffn {

@@ -1991,6 +1991,12 @@ pub struct Gpu {
     /// so the wave's route / shared-expert / grouped-expert kernels are the sub-512 ones every
     /// lane's own singleton takes.
     pub qwen4_route_rows_cap: usize,
+    /// Routing-row floor of the aggregate symmetric IU4 MoE route for the forward in scope:
+    /// [`crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS`] (512) unless an expert-parallel PREFILL
+    /// forward lowered it (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`, set and restored by the Qwen4
+    /// forward's tile scopes; the route also never takes a call of at most `few_row_limit`
+    /// rows, see [`Gpu::qwen4_moe_sym_iu4_applies`]).
+    pub qwen4_moe_sym_iu4_floor: usize,
 }
 
 /// See [`Gpu::kv_fit_floor`]: plain data, no behaviour.
@@ -3308,6 +3314,7 @@ impl Gpu {
             qwen4_append_f16_moe_scope: false,
             qwen4_ep_a8_scope: false,
             qwen4_route_rows_cap: 0,
+            qwen4_moe_sym_iu4_floor: crate::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
         })
         .and_then(|mut gpu| {
             if gpu.flags.force_blob_path {

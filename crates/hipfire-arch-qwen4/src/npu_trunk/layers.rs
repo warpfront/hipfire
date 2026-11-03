@@ -103,6 +103,7 @@ pub(super) fn build_program<'a>(
             &owner.decode_q8,
             route_n,
             few_row_limit,
+            rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
             expert_stage,
         )?;
         if let (Some(gather), Qwen4FfnBinding::Moe(binding)) = (ep_gather, &mut description.ffn) {

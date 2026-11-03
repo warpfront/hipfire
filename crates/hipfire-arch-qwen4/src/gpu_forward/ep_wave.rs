@@ -324,6 +324,12 @@ impl Qwen4GpuForward {
         self.share_prompt_begin();
         self.ep_ordinary_note_call(n);
         let (scopes, _) = self.enter_tile_scopes(gpu, n);
+        // The wave's wide MoE call is a full-table call: the sub-512 floor of the owner-routed
+        // tile route (`ep_prefill_tile_sym_floor`) never reaches it. An admitted wave has no lane
+        // on the tile route, but a floor between the lanes' rows and the cap (knob 100, lanes of
+        // 60 rows) would still let the routing cap's 511 rows select the symmetric arm that no
+        // lane's own singleton takes; `leave_tile_scopes` restores the floor.
+        gpu.qwen4_moe_sym_iu4_floor = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS;
         let prior_cap = std::mem::replace(
             &mut gpu.qwen4_route_rows_cap,
             QWEN4_EXACT_WAVE_ROUTE_ROWS_CAP,
@@ -489,6 +495,65 @@ mod tests {
         assert_eq!(reasons.len(), cases.len(), "{reasons:#?}");
     }
 
+    /// The sub-512 owner-routed floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`, default 9 on the A8
+    /// chain) sends a lane tile of at least the floor to the tile route, which the full-table
+    /// wave cannot reproduce: such a burst is refused (serial tiles on the tile route). The
+    /// lane's route is the pure admission `rows >= max(floor, few-row limit + 1)` that
+    /// `Gpu::qwen4_moe_sym_iu4_applies` evaluates with the floor in scope.
+    #[test]
+    fn a_lowered_floor_refuses_the_wave_for_lanes_on_the_tile_route() {
+        use super::ep_reserve_forward::ep_prefill_tile_sym_floor;
+        let few = rdna_compute::prefill_invariant::FEW_ROW_ROUTE_ROWS;
+        let facts_under = |knob: Option<usize>, hook: bool, a8: bool, lanes: &[usize]| {
+            let floor = ep_prefill_tile_sym_floor(knob, true, hook, a8);
+            let mut f = facts(lanes);
+            f.lane_tile = lanes
+                .iter()
+                .map(|&rows| hook && rows >= floor.max(few + 1))
+                .collect();
+            f
+        };
+        // Default (unset knob) on the A8 chain: every 49..=511-row lane is on the tile route.
+        for lanes in [
+            &[149usize; 8][..],
+            &[60; 8],
+            &[49, 511],
+            &[60, 60, 149, 256],
+        ] {
+            let f = facts_under(None, true, true, lanes);
+            assert!(
+                refused(&f).contains("takes the owner-routed tile route"),
+                "{lanes:?}: {}",
+                refused(&f)
+            );
+        }
+        // A8 killed, floor kill switch (512), no tile hook: today's full-table lanes, wave admitted.
+        assert_eq!(
+            ep_wave_refusal(&facts_under(None, true, false, &[149; 8])),
+            None
+        );
+        assert_eq!(
+            ep_wave_refusal(&facts_under(None, true, true, &[149; 8])).is_some(),
+            true
+        );
+        assert_eq!(
+            ep_wave_refusal(&facts_under(Some(512), true, true, &[149; 8])),
+            None
+        );
+        assert_eq!(
+            ep_wave_refusal(&facts_under(None, false, true, &[149; 8])),
+            None
+        );
+        // A lab floor above every lane keeps them on the full table (wave admitted); one lane at
+        // the floor refuses the whole wave, naming that lane.
+        assert_eq!(
+            ep_wave_refusal(&facts_under(Some(300), true, true, &[60, 149, 256])),
+            None
+        );
+        let f = facts_under(Some(150), true, true, &[60, 149, 150]);
+        assert!(refused(&f).contains("lane 2 (150 rows)"), "{}", refused(&f));
+    }
+
     #[test]
     fn scratch_capacity_follows_the_mode_and_the_reserve_bank() {
         use Qwen4ForwardScratchMode::{FnSymGfx1201, Full};
@@ -558,6 +623,13 @@ mod tests {
         assert_eq!(body.matches("ep_wave_prelude(gpu)?").count(), 2);
         assert_eq!(body.matches("gpu.qwen4_route_rows_cap").count(), 2);
         assert!(body.contains("before_down(gpu)"));
+        // The wave's wide call is a full-table call whatever sub-512 floor the tile scope set.
+        assert!(
+            body.contains(
+                "gpu.qwen4_moe_sym_iu4_floor = rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS"
+            ),
+            "the wave pins the symmetric-IU4 floor to 512"
+        );
         assert!(body.contains("HOST_STAGE_QUIESCE"));
     }
 }

@@ -2144,6 +2144,7 @@ fn forward_lanes_scoped(
                     &fwd.decode_q8,
                     rows,
                     gpu.few_row_limit(),
+                    rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
                     None,
                 )?);
             }

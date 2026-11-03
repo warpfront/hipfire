@@ -52267,10 +52267,34 @@ fn sym_iu4_unsupported_notice(arch: &str, reason: &str) -> String {
     format!("HIPFIRE_QWEN4_MOE_SYM_IU4=1 on {arch}: {reason}; keeping the incumbent route")
 }
 
-/// Pure row admission of the aggregate route: at least [`QWEN4_MOE_SYM_IU4_MIN_ROWS`] routed
-/// rows and not the agent-turn append route.
+/// Pure row admission of the aggregate route at the default floor: at least
+/// [`QWEN4_MOE_SYM_IU4_MIN_ROWS`] routed rows and not the agent-turn append route. The
+/// pinned reference of [`sym_iu4_rows_admit_from`] (tests only; the device reads the latter).
+#[cfg(test)]
 pub(crate) fn sym_iu4_rows_admit(route_rows: usize, append_f16_moe_scope: bool) -> bool {
     route_rows >= QWEN4_MOE_SYM_IU4_MIN_ROWS && !append_f16_moe_scope
+}
+
+/// The lowest `HIPFIRE_EP_PREFILL_TILE_MIN_ROWS` floor of the aggregate route: the first row
+/// count above the historic few-row (decode-exact) routes, which keep the gathered row-twin
+/// MoE and are never the symmetric IU4 arm. The grouped IU4 launchers have no row floor of
+/// their own (`moe_sym_iu4_extents`: `m % 64`, `k`, `grouped_rows % 16` which
+/// `grouped_m_total_bound` always satisfies, spans, `slots <= 2^22`), so this is the lowest
+/// floor that leaves decode and every verify window (<= 8 rows on gfx1201) untouched.
+pub const QWEN4_MOE_SYM_IU4_LOWEST_FLOOR: usize = crate::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1;
+
+/// [`sym_iu4_rows_admit`] with the floor in scope (`Gpu::qwen4_moe_sym_iu4_floor`) and the
+/// call's few-row limit (`Gpu::few_row_limit`): the route never takes a call the exact
+/// few-row routes own, whatever the floor. At the default floor
+/// ([`QWEN4_MOE_SYM_IU4_MIN_ROWS`]) this is exactly [`sym_iu4_rows_admit`] for every few-row
+/// limit (at most `WIDE_VERIFY_MAX_ROWS`, far below the floor).
+pub(crate) fn sym_iu4_rows_admit_from(
+    route_rows: usize,
+    append_f16_moe_scope: bool,
+    floor: usize,
+    few_row_limit: usize,
+) -> bool {
+    route_rows >= floor.max(few_row_limit.saturating_add(1)) && !append_f16_moe_scope
 }
 
 /// Pure launch-extent admission of the grouped IU4 GEMMs, `dims = [m, k, x_row_div,
@@ -52629,8 +52653,12 @@ impl Gpu {
     /// and speculative verify stay on the incumbent). Never on the agent-turn
     /// append route (`Gpu::qwen4_append_f16_moe_scope`).
     pub fn qwen4_moe_sym_iu4_applies(&self, rows: usize) -> bool {
-        sym_iu4_rows_admit(self.route_rows(rows), self.qwen4_append_f16_moe_scope)
-            && self.qwen4_moe_sym_iu4_requested()
+        sym_iu4_rows_admit_from(
+            self.route_rows(rows),
+            self.qwen4_append_f16_moe_scope,
+            self.qwen4_moe_sym_iu4_floor,
+            self.few_row_limit(),
+        ) && self.qwen4_moe_sym_iu4_requested()
     }
 
     /// The aggregate symmetric-IU4 MoE descriptor of this device for MQ4 experts
@@ -58081,6 +58109,48 @@ mod route_selector_tests {
                 "{rows} {append}"
             );
         }
+    }
+
+    /// The floor in scope: the default floor is exactly the pinned 512-row admission for every
+    /// few-row limit; a lowered floor admits from itself but never a call the few-row routes own
+    /// (8 rows on gfx1201, up to `WIDE_VERIFY_MAX_ROWS` in a scoped wide verify); the append
+    /// route is excluded whatever the floor.
+    #[test]
+    fn moe_sym_iu4_floor_in_scope_is_the_pinned_default_and_never_reaches_few_row_routes() {
+        assert_eq!(QWEN4_MOE_SYM_IU4_LOWEST_FLOOR, 9);
+        for few in [8usize, 16, 64] {
+            for append in [false, true] {
+                for rows in 0..=9000usize {
+                    assert_eq!(
+                        sym_iu4_rows_admit_from(rows, append, QWEN4_MOE_SYM_IU4_MIN_ROWS, few),
+                        sym_iu4_rows_admit(rows, append),
+                        "default floor: rows {rows} few {few} append {append}"
+                    );
+                }
+            }
+        }
+        // Floor 9 (the lowest): rows 9.. take the arm, decode / verify (<= 8) do not.
+        for rows in 0..=8 {
+            assert!(!sym_iu4_rows_admit_from(rows, false, 9, 8), "{rows}");
+        }
+        for rows in [9, 10, 149, 511, 512, 513, 4096] {
+            assert!(sym_iu4_rows_admit_from(rows, false, 9, 8), "{rows}");
+        }
+        // A scoped wide verify of 64 rows keeps its exact routes whatever the floor says.
+        for rows in 0..=64 {
+            assert!(!sym_iu4_rows_admit_from(rows, false, 9, 64), "{rows}");
+        }
+        assert!(sym_iu4_rows_admit_from(65, false, 9, 64));
+        // A floor below the lowest is raised to the few-row limit, never under it.
+        assert!(!sym_iu4_rows_admit_from(8, false, 2, 8));
+        assert!(sym_iu4_rows_admit_from(9, false, 2, 8));
+        // The append route never takes the arm, at any floor.
+        for floor in [9, 100, 512] {
+            assert!(!sym_iu4_rows_admit_from(4096, true, floor, 8));
+        }
+        // Mid floor: the boundary is the floor itself.
+        assert!(!sym_iu4_rows_admit_from(127, false, 128, 8));
+        assert!(sym_iu4_rows_admit_from(128, false, 128, 8));
     }
 
     /// Entry selection pinned to literal symbols per descriptor, switch, row repeat and

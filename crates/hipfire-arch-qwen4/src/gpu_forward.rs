@@ -791,6 +791,21 @@ pub const QWEN4_EXPERT_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_QWEN4_EXPERT_STAGE_MI
 /// serves the resident bank). Integer >= 2, anything else is ignored.
 pub const QWEN4_EP_LANE_PREFILL_STAGE_MIN_ROWS_ENV: &str = "HIPFIRE_EP_LANE_PREFILL_STAGE_MIN_ROWS";
 
+/// The row floor at which an expert-parallel PREFILL forward (lane tile or singleton prefill:
+/// every forward that carries `prefill_scope`, on a load whose owner-routed tile exchange is
+/// installed) takes the owner-routed symmetric IU4 tile route, each rank computing only its
+/// owned experts, instead of the EP full table (every expert of both ranks through this rank's
+/// links). Unset (default): 9 rows while the A8 owner-routed chain is the forward's active chain
+/// (`HIPFIRE_QWEN4_MOE_EP_A8` not `0`, exact gfx1201: the sub-512 floor is quality-neutral only
+/// on A8), else 512 (the historic floor). An integer from
+/// [`rdna_compute::gemm::QWEN4_MOE_SYM_IU4_LOWEST_FLOOR`] (9: decode and verify, at most 8 rows,
+/// keep the gathered route) to 512 wins over the default (512 kills the lowered floor alone);
+/// anything else is ignored with one log line. Lane tile and singleton prefill of the same rows
+/// decide identically, so a lane stays byte-equal to its singleton. Dense, GDN, QSA and
+/// HC-stream routes keep their own 512-row gates: the IU4 chain reads the F32 activation the
+/// sub-512 routes already produce.
+pub const QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV: &str = "HIPFIRE_EP_PREFILL_TILE_MIN_ROWS";
+
 /// Whether a long forward that captures wide hidden rows (the native-MTP
 /// prompt fill's trunk tiles) stages like any other long forward. `0` keeps
 /// those tiles on the mapped reads; unset or `1` stages them. The capture
@@ -1462,6 +1477,7 @@ pub(crate) fn layer_desc<'a>(
     decode_q8: &'a [GpuTensor],
     rows: usize,
     few_row_limit: usize,
+    sym_floor: usize,
     stage: Option<&'a Qwen4ExpertStage>,
 ) -> Result<Qwen4LayerDescription<'a>, Qwen4GpuForwardError> {
     let attention = match layer.kind {
@@ -1511,7 +1527,7 @@ pub(crate) fn layer_desc<'a>(
                 route_policy: qwen4_route_policy(
                     config,
                     &shared,
-                    moe.route_capability(rows),
+                    moe.route_capability(rows, sym_floor),
                     moe.slab_cold_codec(),
                     moe.expert_keep_mask
                         .as_ref()
@@ -4151,21 +4167,42 @@ fn check_fp8_grouped_scratch(
     Ok(())
 }
 
+/// The route a QT44/QT53 layer declares for `rows` routing rows (pure of the layer's tensors:
+/// the unit tests pin it): a sealed expert slab and a stock-FP8 layer are their own routes at
+/// every row count; otherwise the symmetric variant once verified symmetric
+/// (`symmetric`) and `rows` reaches the IU4 arm's floor `sym_floor`.
+pub(crate) fn declared_route_capability(
+    slab: bool,
+    fp8: bool,
+    symmetric: bool,
+    rows: usize,
+    sym_floor: usize,
+) -> MoeRouteCapability {
+    if slab {
+        MoeRouteCapability::SlabCodecGrouped
+    } else if fp8 {
+        MoeRouteCapability::Fp8B128Grouped
+    } else if symmetric && rows >= sym_floor {
+        MoeRouteCapability::Qt44Qt53GroupedSymmetric
+    } else {
+        MoeRouteCapability::Qt44Qt53Grouped
+    }
+}
+
 impl Qwen4MoeLayerRuntime {
     /// The route this layer declares for a `rows`-row (routing rows) call: a
     /// stock-FP8 layer is always [`MoeRouteCapability::Fp8B128Grouped`]; a
     /// QT44/QT53 layer is the symmetric variant only once verified and the
-    /// chunk reaches the IU4 arm's row floor.
-    pub(crate) fn route_capability(&self, rows: usize) -> MoeRouteCapability {
-        if self.slab.is_some() {
-            MoeRouteCapability::SlabCodecGrouped
-        } else if self.fp8 {
-            MoeRouteCapability::Fp8B128Grouped
-        } else if self.symmetric && rows >= rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS {
-            MoeRouteCapability::Qt44Qt53GroupedSymmetric
-        } else {
-            MoeRouteCapability::Qt44Qt53Grouped
-        }
+    /// chunk reaches the IU4 arm's row floor `sym_floor` ([`Gpu::qwen4_moe_sym_iu4_floor`]:
+    /// 512 unless an EP prefill forward lowered it).
+    pub(crate) fn route_capability(&self, rows: usize, sym_floor: usize) -> MoeRouteCapability {
+        declared_route_capability(
+            self.slab.is_some(),
+            self.fp8,
+            self.symmetric,
+            rows,
+            sym_floor,
+        )
     }
 
     /// The sealed expert-slab layer's cold codec for its route policy
@@ -7229,7 +7266,7 @@ pub(crate) fn seal_moe_rows<'a>(
         route_policy: qwen4_route_policy(
             config,
             &shared,
-            runtime.route_capability(rows),
+            runtime.route_capability(rows, rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS),
             runtime.slab_cold_codec(),
             runtime
                 .expert_keep_mask
@@ -9119,6 +9156,7 @@ pub(crate) struct TileScopes {
     f16_moe: bool,
     ragged: bool,
     ep_a8: bool,
+    sym_floor: usize,
 }
 
 /// How a prefill chunk's staged PLE rows reach the device.
@@ -15036,6 +15074,38 @@ impl Qwen4GpuForward {
             &mut gpu.qwen4_ep_a8_scope,
             self.ep.is_some() && rows < rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS,
         );
+        // The owner-routed symmetric IU4 tile route's row floor (`HIPFIRE_EP_PREFILL_TILE_MIN_ROWS`):
+        // lowered only for a PREFILL forward (`prefill_scope`: never decode, verify or the MTP head)
+        // of an EP load whose SYMMETRIC-IU4 tile exchange is installed (not the gfx1100 F16 WMMA
+        // tile route, whose rows gate is its own); everything else keeps 512. The scope is what
+        // `ep_tile_active`, the layer descriptions and the sealed MoE all read, so they cannot
+        // disagree.
+        let tile_hook = self
+            .ep
+            .as_ref()
+            .and_then(|ep| ep.tile.as_ref())
+            .is_some_and(|route| route.hook.is_some() && !route.wmma);
+        // The A8 chain is the active owner-routed chain of this forward (`qwen4_ep_a8_scope` was
+        // set just above; `HIPFIRE_QWEN4_MOE_EP_A8=0` and a non-gfx1201 device are not): the
+        // sub-512 floor is quality-neutral only there.
+        let a8_chain = gpu.qwen4_moe_ep_a8_requested();
+        let sym_floor_now = ep_reserve_forward::ep_prefill_tile_sym_floor(
+            ep_reserve_forward::ep_prefill_tile_knob(),
+            self.prefill_scope,
+            tile_hook,
+            a8_chain,
+        );
+        if sym_floor_now != rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!(
+                    "  qwen4 EP prefill tile route: floor {sym_floor_now} rows{} ({QWEN4_EP_PREFILL_TILE_MIN_ROWS_ENV}; default {} rows); decode and verify are unchanged",
+                    if a8_chain { " (A8 chain)" } else { "" },
+                    rdna_compute::gemm::QWEN4_MOE_SYM_IU4_MIN_ROWS
+                );
+            });
+        }
+        let sym_floor = std::mem::replace(&mut gpu.qwen4_moe_sym_iu4_floor, sym_floor_now);
         (
             TileScopes {
                 scope,
@@ -15043,6 +15113,7 @@ impl Qwen4GpuForward {
                 f16_moe,
                 ragged,
                 ep_a8,
+                sym_floor,
             },
             append,
         )
@@ -15055,6 +15126,7 @@ impl Qwen4GpuForward {
         gpu.qwen4_append_f16_moe_scope = saved.f16_moe;
         gpu.qwen4_trunk_iu4_prefill_scope = saved.ragged;
         gpu.qwen4_ep_a8_scope = saved.ep_a8;
+        gpu.qwen4_moe_sym_iu4_floor = saved.sym_floor;
     }
 
     /// Bank and runtime selection, the only place decode-share state changes.
@@ -15842,6 +15914,7 @@ impl Qwen4GpuForward {
                 &self.decode_q8,
                 route_n,
                 few_row_limit,
+                gpu.qwen4_moe_sym_iu4_floor,
                 // Staged expert tables never replace the live table.
                 expert_stage.filter(|_| balanced_live.is_none()),
             )?;
