@@ -943,6 +943,19 @@ impl DraftReadPlan {
     }
 }
 
+/// MoE layers whose expert-row gather the sealed ledger plans per row group. The trunk shard's FFN
+/// is a partial route with the all-reduce fused into the HC write: trunk layers run NO gather, so
+/// the plan holds zero target exchanges, exactly what each rank's gather tally measures (the
+/// head's gathers are tallied as head ones). Sealing `moe_count` aborted every drafted step on an
+/// `OpLedger` mismatch (planned 48, measured 0).
+fn planned_gather_layers(moe_count: usize, trunk_shard: bool) -> usize {
+    if trunk_shard {
+        0
+    } else {
+        moe_count
+    }
+}
+
 fn rank_counts(step: &ExecStep, rank_head: bool) -> OpCounts {
     let totals = step.totals.unwrap_or((0, 0, 0, 0));
     OpCounts {
@@ -1832,6 +1845,7 @@ impl EpMeshLanes {
             .as_ref()
             .map(|forward| forward.moe_count())
             .ok_or_else(|| "Qwen4 forward resources are not attached".to_string())?;
+        let moe_layers = planned_gather_layers(moe_layers, bundle.config.trunk_shard.is_some());
         let moe_once = store.stage_policy().share(StageName::Moe) == StageShare::OnceAllRows;
         let world: Vec<RankOwnership> = (0..ranks).map(RankOwnership::ep).collect();
         let mut root = MeshRoot::new(

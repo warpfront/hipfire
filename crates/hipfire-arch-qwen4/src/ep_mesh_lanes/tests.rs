@@ -51,6 +51,10 @@ fn req(tag: u64, remaining: usize) -> LaneRequest {
 }
 
 fn root(floor: bool) -> MeshRoot {
+    root_with_moe_layers(floor, 48)
+}
+
+fn root_with_moe_layers(floor: bool, moe_layers: usize) -> MeshRoot {
     let world = vec![RankOwnership::ep(0), RankOwnership::ep(1)];
     MeshRoot::new(
         RankOwnership::ep(0),
@@ -58,7 +62,7 @@ fn root(floor: bool) -> MeshRoot {
         RootConfig {
             topology_generation: 3,
             stage: StagePolicy {
-                moe_layers: 48,
+                moe_layers,
                 moe_once: true,
                 stream_bf16: false,
             },
@@ -510,6 +514,45 @@ fn mesh_lane_ep_ranks_replay_identical_ordered_calls_and_the_ledger_merges() {
     assert!(sims.iter().all(|s| s.aborts.is_empty()));
     assert_eq!(sims[0].published, vec![driven.key.step_seq]);
     assert_eq!(sims[1].published, vec![driven.key.step_seq]);
+}
+
+/// The trunk shard's gatherless trunk: the sealed plan holds zero target exchanges, the verify
+/// crosses the row-gather barrier zero times, and the merged ledger agrees (production sealed 48
+/// against a measured 0 and aborted every drafted step).
+#[test]
+fn mesh_lane_trunk_shard_plans_zero_target_exchanges() {
+    assert_eq!(planned_gather_layers(48, false), 48);
+    assert_eq!(planned_gather_layers(48, true), 0);
+    let mut root = root_with_moe_layers(false, planned_gather_layers(48, true));
+    let mut fan = fanout_with(
+        vec![script(1, 0, &[10, 11, 12], &[10, 77, 5, 6])],
+        |_, _| {},
+    );
+    admit(&mut root, &mut fan, 1, 10, 9, None, Some(3));
+    let driven = drive_step(
+        &mut root,
+        &mut fan,
+        None,
+        &[req(1, 64)],
+        &budgets(LabRoutes::Batched, 3),
+        &mut GreedyRule,
+    )
+    .expect("a clean two-rank step");
+    let merged = root
+        .merge_evidence(
+            &driven.receipts,
+            ControllerInterval {
+                wall_us: 40_000.0,
+                prefill_ran: false,
+            },
+        )
+        .expect("coherent rank receipts");
+    assert_eq!(merged.counts.target_exchanges, 0);
+    assert_eq!(merged.counts.head_draft_calls, 3);
+    // Head rounds cross once per op (3); the gatherless verify crosses none.
+    assert_eq!(fan.rv.crossings(), 3);
+    let sims = fan.finish();
+    assert!(sims.iter().all(|s| s.aborts.is_empty()));
 }
 
 #[test]
