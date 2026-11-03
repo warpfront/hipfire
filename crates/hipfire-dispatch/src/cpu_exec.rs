@@ -137,15 +137,15 @@ pub(crate) fn in_splice_pool<R: Send>(f: impl FnOnce() -> R + Send) -> R {
     hipfire_cpu::splice_pool::install(splice_pool_config(), f)
 }
 
-/// Whether [`pool_spin_default`] is on when `HIPFIRE_CPU_POOL_SPIN` is unset. Flip to `true` only
-/// with the paired decode A/B receipts of the spin (the CHANGELOG entry names them).
-const POOL_SPIN_DEFAULT: bool = false;
+/// Whether the pool spin is on when `HIPFIRE_CPU_POOL_SPIN` is unset: on, with the paired decode
+/// A/B receipts the CHANGELOG entry names; `HIPFIRE_CPU_POOL_SPIN=0` is the kill switch.
+const POOL_SPIN_DEFAULT: bool = true;
 
 /// Default spin budget (both the workers' and the caller's), `HIPFIRE_CPU_POOL_SPIN_US`.
 const POOL_SPIN_DEFAULT_US: u64 = 2000;
 
 /// `HIPFIRE_CPU_POOL_SPIN` / `HIPFIRE_CPU_POOL_SPIN_US` (developer, read once): the spin budget of
-/// the CPU arm's pool wake and completion wait, or `None` when the spin is off.
+/// the CPU arm's pool wake and completion wait, or `None` when the spin is killed (`=0`).
 fn pool_spin() -> Option<std::time::Duration> {
     static SPIN: LazyLock<Option<std::time::Duration>> = LazyLock::new(|| {
         if !hipfire_config::developer_bool("HIPFIRE_CPU_POOL_SPIN", POOL_SPIN_DEFAULT) {
