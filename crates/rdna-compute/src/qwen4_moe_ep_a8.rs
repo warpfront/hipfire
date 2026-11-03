@@ -138,9 +138,11 @@ fn first_launch_receipt(stage: usize, line: impl FnOnce() -> String) {
 
 impl Gpu {
     /// Whether the EP owner-routed symmetric MoE prefill chain runs its A8 kernels
-    /// (`HIPFIRE_QWEN4_MOE_EP_A8=1`, exact gfx1201). Read once per process.
+    /// (`HIPFIRE_QWEN4_MOE_EP_A8=1`, exact gfx1201, eager: never while a graph is captured or a replay
+    /// recorded, where a lazy int8-scratch growth would invalidate the capture and the A4 chain's
+    /// pre-reserved scratch is the one in force). Flag read once per process.
     pub fn qwen4_moe_ep_a8_requested(&self) -> bool {
-        ep_a8_requested(&self.arch, *EP_A8)
+        ep_a8_requested(&self.arch, *EP_A8) && !self.graphs.capture_mode && !self.replay.is_recording()
     }
 
     fn qwen4_moe_ep_a8_require(&self, what: &str) -> HipResult<()> {

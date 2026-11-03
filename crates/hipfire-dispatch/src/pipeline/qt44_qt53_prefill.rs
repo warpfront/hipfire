@@ -1957,6 +1957,23 @@ pub(crate) fn gate_up_front(
         return slab_gate_up(gpu, p, grouped_rows);
     }
     if sym_iu4(gpu, p, use_path2) {
+        if gpu.qwen4_moe_ep_a8_requested() {
+            // HIPFIRE_QWEN4_MOE_EP_A8: the chain's int8 per-128 twin (FWHT256 + A8 producer, signed-IU8
+            // gate/up with the same BF16 SwiGLU epilogue). The fused front's A4 sidecar is not read.
+            let xq = hip(gpu.qwen4_moe_rotate256_i8(p.x_norm_batch, p.gate_up_k, p.batch_size))?;
+            return hip(gpu.gemm_qwen4_moe_gate_up_silu_a8_sym(
+                gate_up_ptrs,
+                gemm_tile_ids(p),
+                p.sorted_slot_index,
+                &xq,
+                p.y_gate_up_grouped,
+                2 * p.mi,
+                p.gate_up_k,
+                p.k_top,
+                grouped_rows,
+                p.batch_size,
+            ));
+        }
         let xq = match front {
             Some(front)
                 if gpu
@@ -2311,6 +2328,35 @@ fn down_stage(
         return release_stage(gpu, p);
     }
     if sym_iu4(gpu, p, use_path2) {
+        if gpu.qwen4_moe_ep_a8_requested() {
+            // HIPFIRE_QWEN4_MOE_EP_A8: grouped BF16 SwiGLU rows -> FWHT128 -> flat-slot A8 -> signed-IU8 down,
+            // the same BF16 grouped rows for the BF16-input combine.
+            let xq = hip(gpu.qwen4_moe_rotate128_i8(
+                p.y_gate_up_grouped,
+                p.sorted_slot_index,
+                p.down_k,
+                grouped_rows,
+                total_slots,
+            ))?;
+            if let Some(tx) = p.ep_tile_exchange {
+                tx.exchange
+                    .before_down(gpu)
+                    .map_err(|error| DispatchError::Hip(format!("qt44 tile exchange: {error}")))?;
+            }
+            hip(gpu.gemm_qwen4_moe_down_a8_sym(
+                down_ptrs,
+                gemm_tile_ids(p),
+                p.sorted_slot_index,
+                &xq,
+                p.y_down_grouped,
+                p.down_m,
+                p.down_k,
+                1,
+                grouped_rows,
+                total_slots,
+            ))?;
+            return release_stage(gpu, p);
+        }
         // Grouped BF16 SwiGLU rows -> FWHT128 -> compact flat-slot A4 ->
         // grouped IU4 down, BF16 per grouped row for the BF16-input combine.
         let xq = hip(gpu.qwen4_moe_rotate128_i4_gp(
