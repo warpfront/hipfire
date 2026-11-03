@@ -1279,6 +1279,7 @@ fn build_moe_prefill<'a>(
         ep_layer_idx: moe.layer_idx,
         ep_tile_exchange: moe.tile_exchange,
         expert_iu4: None,
+        mq2_lloyd: None,
     })
 }
 

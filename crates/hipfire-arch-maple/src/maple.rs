@@ -23,6 +23,12 @@
 //! partially-requantized checkpoint would otherwise mis-read the up half.
 
 use crate::config::MapleConfig;
+use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::families::moe::RoutedExpertWeights;
+use hipfire_dispatch::pipeline::{
+    ExpertBindingCache, ExpertMetadata, ExpertResource, ExpertResources, ExpertTable,
+};
+use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_mode::{KvMode, MAPLE_POLICY};
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16, KvCache, WeightTensor};
@@ -226,7 +232,7 @@ fn widen_to_f32(qt: u8, data: &[u8]) -> Option<Vec<f32>> {
 /// checkpoint carries every attention projection and every expert as
 /// MQ2G256LloydU (qt=51) but `model.layers.N.mlp.gate.weight` as **BF16**
 /// (qt=16) — the reference even declares `router_dtype: fp32`. So
-/// `batch::dense_qt51_gemm` CANNOT drive the router: that entry decodes
+/// the qt51 grouped projection (`ProjectLadder::GroupedLloydF16`) CANNOT drive the router: that entry decodes
 /// MQ2-Lloyd 72-byte groups, and pointed at BF16 bytes it would read them as
 /// 2-bit codes and return plausible-looking garbage with no error and no
 /// out-of-bounds fault (the BF16 blob is 8× the size the decoder reads).
@@ -293,6 +299,138 @@ pub struct MapleMoeFfn {
     pub experts: Vec<MapleExpert>, // per-expert buffers (owned here)
     pub expert_gate_up_ptrs: GpuTensor, // [2*n_exp] F32 = n_exp u64 device ptrs
     pub expert_down_ptrs: GpuTensor,
+    /// Load-time expert identity for the shared sealed-MoE executor; the
+    /// pointer tables and expert buffers above stay owned here.
+    pub(crate) table: ExpertTable,
+    pub(crate) cache: ExpertBindingCache,
+}
+
+impl MapleMoeFfn {
+    /// Upload the expert pointer tables and seal the layer's resident experts
+    /// for the shared MoE executor. Every expert of a layer must share one
+    /// gate/up and one down format.
+    fn seal(
+        gpu: &mut Gpu,
+        layer: usize,
+        router: WeightTensor,
+        router_f16: Option<GpuTensor>,
+        experts: Vec<MapleExpert>,
+    ) -> Result<Self, String> {
+        let first = experts
+            .first()
+            .ok_or_else(|| format!("maple L{layer}: MoE layer has no experts"))?;
+        let (gate_up_dtype, down_dtype) = (first.gate_up.gpu_dtype, first.down.gpu_dtype);
+        let mut metadata = Vec::with_capacity(experts.len());
+        for (e, expert) in experts.iter().enumerate() {
+            if expert.gate_up.gpu_dtype != gate_up_dtype || expert.down.gpu_dtype != down_dtype {
+                return Err(format!(
+                    "maple L{layer}: expert {e} format differs from expert 0 (mixed-format layers are not admitted)"
+                ));
+            }
+            let resource = |name: &str, w: &WeightTensor| {
+                let row = w.gpu_dtype.row_bytes(w.k).ok_or_else(|| {
+                    format!("maple L{layer}: no row layout for {:?}", w.gpu_dtype)
+                })?;
+                ExpertResource::new(
+                    format!("model.layers.{layer}.mlp.experts.{e}.{name}"),
+                    "maple-resident-v1",
+                    vec![w.m, w.k],
+                    w.gpu_dtype,
+                    w.m * row,
+                    row,
+                    16,
+                    dtype_rotation_plan(w.gpu_dtype),
+                )
+                .map_err(|err| format!("maple L{layer}: expert {e} {name}: {err:?}"))
+            };
+            let resources = ExpertResources::fused(
+                resource("gate_up", &expert.gate_up)?,
+                resource("down", &expert.down)?,
+            )
+            .map_err(|err| format!("maple L{layer}: expert {e}: {err:?}"))?;
+            metadata.push(
+                ExpertMetadata::new(e, 0, e, resources)
+                    .map_err(|err| format!("maple L{layer}: expert {e}: {err:?}"))?,
+            );
+        }
+        let table = ExpertTable::new(metadata)
+            .map_err(|err| format!("maple L{layer}: expert table: {err:?}"))?;
+        let mut cache = table
+            .prepare_binding(0, 1, gpu.device_id)
+            .map_err(|err| format!("maple L{layer}: expert binding: {err:?}"))?;
+        let ptr_table = |gpu: &mut Gpu, ptrs: Vec<u8>, label: &str| -> Result<GpuTensor, String> {
+            let t = gpu
+                .alloc_tensor(&[2 * experts.len()], DType::F32)
+                .map_err(|e| format!("maple: alloc {label}: {e:?}"))?;
+            if let Err(e) = gpu.hip.memcpy_htod(&t.buf, &ptrs) {
+                let _ = gpu.free_tensor(t);
+                return Err(format!("maple: htod {label}: {e:?}"));
+            }
+            Ok(t)
+        };
+        let ptrs = |f: fn(&MapleExpert) -> &WeightTensor| -> Vec<u8> {
+            experts
+                .iter()
+                .flat_map(|e| (f(e).buf.buf.as_ptr() as u64).to_ne_bytes())
+                .collect()
+        };
+        let expert_gate_up_ptrs = ptr_table(gpu, ptrs(|e| &e.gate_up), "gu_ptrs")?;
+        let expert_down_ptrs = match ptr_table(gpu, ptrs(|e| &e.down), "dn_ptrs") {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(expert_gate_up_ptrs);
+                return Err(e);
+            }
+        };
+        if let Err(err) = cache.bind_live(
+            &table,
+            &ResidentExperts(&experts),
+            &expert_gate_up_ptrs,
+            &expert_down_ptrs,
+            None,
+            None,
+        ) {
+            let _ = gpu.free_tensor(expert_gate_up_ptrs);
+            let _ = gpu.free_tensor(expert_down_ptrs);
+            return Err(format!("maple L{layer}: bind live experts: {err:?}"));
+        }
+        Ok(Self {
+            router,
+            router_f16,
+            experts,
+            expert_gate_up_ptrs,
+            expert_down_ptrs,
+            table,
+            cache,
+        })
+    }
+}
+
+/// Resident per-expert weights, as the sealed executor reads them.
+struct ResidentExperts<'a>(&'a [MapleExpert]);
+
+impl RoutedExpertWeights for ResidentExperts<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn get(&self, expert: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+        self.0
+            .get(expert)
+            .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
+    }
+}
+
+impl RoutedExpertWeights for MapleMoeFfn {
+    fn len(&self) -> usize {
+        self.experts.len()
+    }
+
+    fn get(&self, expert: usize) -> Option<(WeightRef<'_>, WeightRef<'_>)> {
+        self.experts
+            .get(expert)
+            .map(|e| (e.gate_up.dispatch_ref(), e.down.dispatch_ref()))
+    }
 }
 
 /// One-entry pointer tables for the dense attention projections, built ONCE at
@@ -317,7 +455,7 @@ pub struct MapleLayerWeights {
     pub q_norm: GpuTensor,
     pub k_norm: GpuTensor,
     /// Single-expert device-pointer tables for `wq`/`wk`/`wv`/`wo`, feeding
-    /// `batch::dense_qt51_gemm` for batched prefill.
+    /// the grouped qt51 prefill projections (`ProjectLadder::GroupedLloydF16`).
     pub attn_ptr_tables: AttnPtrTables,
     pub moe: MapleMoeFfn,
 }
@@ -460,27 +598,7 @@ impl MapleWeights {
                     .map_err(|e2| format!("maple: down L{l}E{e}: {e2}"))?;
                 experts.push(MapleExpert { gate_up, down });
             }
-            // Device pointer tables for the indexed-MoE GEMV kernels.
-            let gu_bytes: Vec<u8> = experts
-                .iter()
-                .flat_map(|e| (e.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
-                .collect();
-            let dn_bytes: Vec<u8> = experts
-                .iter()
-                .flat_map(|e| (e.down.buf.buf.as_ptr() as u64).to_ne_bytes())
-                .collect();
-            let expert_gate_up_ptrs = gpu
-                .alloc_tensor(&[2 * n_exp], DType::F32)
-                .map_err(|e| format!("maple: alloc gu_ptrs: {e:?}"))?;
-            let expert_down_ptrs = gpu
-                .alloc_tensor(&[2 * n_exp], DType::F32)
-                .map_err(|e| format!("maple: alloc dn_ptrs: {e:?}"))?;
-            gpu.hip
-                .memcpy_htod(&expert_gate_up_ptrs.buf, &gu_bytes)
-                .map_err(|e| format!("maple: htod gu_ptrs: {e:?}"))?;
-            gpu.hip
-                .memcpy_htod(&expert_down_ptrs.buf, &dn_bytes)
-                .map_err(|e| format!("maple: htod dn_ptrs: {e:?}"))?;
+            let moe = MapleMoeFfn::seal(gpu, l, router, router_f16, experts)?;
 
             layers.push(MapleLayerWeights {
                 input_norm,
@@ -492,13 +610,7 @@ impl MapleWeights {
                 q_norm,
                 k_norm,
                 attn_ptr_tables,
-                moe: MapleMoeFfn {
-                    router,
-                    router_f16,
-                    experts,
-                    expert_gate_up_ptrs,
-                    expert_down_ptrs,
-                },
+                moe,
             });
         }
 
@@ -544,6 +656,8 @@ impl MapleMoeFfn {
             experts,
             expert_gate_up_ptrs,
             expert_down_ptrs,
+            table: _,
+            cache: _,
         } = self;
         router.free_all(gpu);
         if let Some(t) = router_f16 {
@@ -630,10 +744,10 @@ pub struct MapleState {
     pub gate_batch: GpuTensor,    // [k_top*moe_inter]
     pub up_batch: GpuTensor,      // [k_top*moe_inter]
     pub act_batch: GpuTensor,     // [k_top*moe_inter] clamped SwiGLU output
-    /// `[k_top*hidden]` — per-rank down-projection outputs, UNWEIGHTED.
-    /// `DownMode::Expanded` (the decode default) writes one cell per
-    /// `(krank, row)` here and `moe_down_combine_k8_batched` folds the k_top
-    /// slices into `h` with `topk_weights` applied. Unused by `DownMode::Atomic`.
+    /// `[k_top*hidden]` — per-rank down-projection outputs, UNWEIGHTED. The
+    /// sealed decode MoE writes one cell per `(krank, row)` here and
+    /// `moe_down_combine_k8_batched` folds the k_top slices into `h` with
+    /// `topk_weights` applied (unused by the self-combining residual down).
     pub down_expanded: GpuTensor,
 
     // head
@@ -1037,7 +1151,7 @@ mod tests {
     fn the_router_is_not_ternary_so_it_cannot_take_the_qt51_path() {
         // The published checkpoint carries every attention projection and all
         // 18,432 expert tensors as qt=51, but `mlp.gate.weight` as BF16
-        // (qt=16). Driving the router through `batch::dense_qt51_gemm` would
+        // (qt=16). Driving the router through the qt51 grouped projection would
         // decode BF16 bytes as MQ2-Lloyd 72-byte groups: in-bounds (the BF16
         // blob is 8x larger than the decoder reads) and therefore SILENT.
         // `widen_to_f32` is the gate — it accepts the float/Q8 dtypes the F16

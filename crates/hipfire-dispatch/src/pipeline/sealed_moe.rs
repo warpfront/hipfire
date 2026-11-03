@@ -2495,6 +2495,27 @@ pub(super) fn produce_prefill_route<'a>(
     };
 
     match call.router {
+        MoeRouterInput::SoftmaxTopK if params.recipe == MoeRecipe::SoftmaxRoutedNoShared => {
+            // Exact per-row softmax (temperature 1) from the logits into the
+            // distinct score view, then the k8 renorm top-k over the scores.
+            let logits = params.prelude.router_logits;
+            if logits.buf.as_ptr() == scores.buf.as_ptr() {
+                return Err(invalid(
+                    "routed-only softmax prefill needs router scores distinct from the logits",
+                ));
+            }
+            gpu.softmax_temp_batched_into_f32(logits, scores, params.n_exp, params.batch_size, 1.0)
+                .map_err(|e| DispatchError::Hip(e.to_string()))?;
+            gpu.moe_topk_renorm_k8_batched(
+                scores,
+                params.topk_indices,
+                params.topk_weights,
+                params.n_exp,
+                normalize,
+                params.batch_size,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        }
         MoeRouterInput::SoftmaxTopK | MoeRouterInput::PrecomputedSoftmaxTopK => {
             if scores.shape.len() != 2
                 || scores.shape[0] != params.batch_size
@@ -2953,6 +2974,7 @@ pub fn seal_decode<'a>(
     let router = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
         crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+        crate::families::moe::MoeRecipe::SoftmaxRoutedNoShared => MoeRouterInput::SoftmaxTopK,
     };
     seal_decode_with_router(experts, ctx, params, router)
 }
@@ -2967,6 +2989,7 @@ fn seal_decode_with_router<'a>(
     let expected = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
         crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+        crate::families::moe::MoeRecipe::SoftmaxRoutedNoShared => MoeRouterInput::SoftmaxTopK,
     };
     if router != expected {
         return Err(invalid(
@@ -3067,21 +3090,21 @@ fn prepare_decode<'a>(
     require_context_device(ctx, experts)?;
     require_recipe_feature(params.recipe)?;
     resolve_decode_normalization(ctx, &mut params)?;
-    if params.recipe == MoeRecipe::SigmoidRoutedNoShared {
+    if params.recipe.routed_only() {
         if !sigmoid_decode_width_ok(&params) {
             return Err(invalid(format!(
-                "sigmoid MoE decode requires k=8 (1..={MOE_BIASED_SIGMOID_MAX_K} with a selection bias), got {}",
+                "routed-only MoE decode requires k=8 (1..={MOE_BIASED_SIGMOID_MAX_K} with a selection bias), got {}",
                 params.k
             )));
         }
         if params.ep_mode != MoeEpMode::None {
             return Err(invalid(
-                "sigmoid MoE decode does not support expert-parallel execution",
+                "routed-only MoE decode does not support expert-parallel execution",
             ));
         }
         if params.defer_routed_combine {
             return Err(invalid(
-                "sigmoid MoE decode does not support deferred combine",
+                "routed-only MoE decode does not support deferred combine",
             ));
         }
     }
@@ -3176,6 +3199,7 @@ pub fn preflight_decode<'a>(
     let router = match params.recipe {
         MoeRecipe::SoftmaxGatedShared { .. } => MoeRouterInput::SoftmaxTopK,
         MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+        MoeRecipe::SoftmaxRoutedNoShared => MoeRouterInput::SoftmaxTopK,
     };
     let (params, router) = prepare_decode(&experts, ctx, params, router)?;
     let _selection = moe_program::select_decode(ctx, &params, router)?;
@@ -3256,6 +3280,7 @@ pub fn seal_prefill<'a>(
             _ => MoeRouterInput::SoftmaxTopK,
         },
         crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+        crate::families::moe::MoeRecipe::SoftmaxRoutedNoShared => MoeRouterInput::SoftmaxTopK,
     };
     seal_prefill_with_router(experts, ctx, params, router)
 }
@@ -3288,6 +3313,7 @@ fn prepare_prefill<'a>(
             _ => MoeRouterInput::SoftmaxTopK,
         },
         crate::families::moe::MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+        crate::families::moe::MoeRecipe::SoftmaxRoutedNoShared => MoeRouterInput::SoftmaxTopK,
     };
     if router != expected {
         return Err(invalid(
@@ -3322,7 +3348,7 @@ fn seal_prefill_with_router<'a>(
         protocol: MoeProtocol::GroupedPrefill,
         router,
         contribution,
-        shared: if params.recipe == crate::families::moe::MoeRecipe::SigmoidRoutedNoShared {
+        shared: if params.recipe.routed_only() {
             MoeSharedContribution::None
         } else {
             MoeSharedContribution::PerRankResidual
@@ -3355,6 +3381,7 @@ pub fn preflight_prefill<'a>(
             _ => MoeRouterInput::SoftmaxTopK,
         },
         MoeRecipe::SigmoidRoutedNoShared => MoeRouterInput::SigmoidTopK,
+        MoeRecipe::SoftmaxRoutedNoShared => MoeRouterInput::SoftmaxTopK,
     };
     let (params, _router) = prepare_prefill(&experts, ctx, params, router)?;
     let _selection = moe_program::select_prefill(ctx, &params)?;
@@ -3631,13 +3658,21 @@ fn validate_shared_decode(params: &MoeParams<'_>, hidden: usize) -> Result<(), D
         (MoeRecipe::SoftmaxGatedShared { .. }, Some(_), None) => Err(invalid(
             "shared decode weights require shared dtype metadata",
         )),
-        (MoeRecipe::SigmoidRoutedNoShared, None, None) => Ok(()),
-        (MoeRecipe::SigmoidRoutedNoShared, Some(_), _) => Err(invalid(
-            "SigmoidRoutedNoShared decode cannot bind shared weights",
-        )),
-        (MoeRecipe::SigmoidRoutedNoShared, None, Some(_)) => Err(invalid(
-            "SigmoidRoutedNoShared decode cannot bind shared dtypes",
-        )),
+        (MoeRecipe::SigmoidRoutedNoShared | MoeRecipe::SoftmaxRoutedNoShared, None, None) => Ok(()),
+        (
+            recipe @ (MoeRecipe::SigmoidRoutedNoShared | MoeRecipe::SoftmaxRoutedNoShared),
+            Some(_),
+            _,
+        ) => Err(invalid(format!(
+            "{recipe:?} decode cannot bind shared weights"
+        ))),
+        (
+            recipe @ (MoeRecipe::SigmoidRoutedNoShared | MoeRecipe::SoftmaxRoutedNoShared),
+            None,
+            Some(_),
+        ) => Err(invalid(format!(
+            "{recipe:?} decode cannot bind shared dtypes"
+        ))),
     }
 }
 
@@ -3705,13 +3740,21 @@ fn validate_shared_prefill(
         (MoeRecipe::SoftmaxGatedShared { .. }, Some(_), None) => Err(invalid(
             "shared prefill weights require shared dtype metadata",
         )),
-        (MoeRecipe::SigmoidRoutedNoShared, None, None) => Ok(()),
-        (MoeRecipe::SigmoidRoutedNoShared, Some(_), _) => Err(invalid(
-            "SigmoidRoutedNoShared prefill cannot bind shared weights",
-        )),
-        (MoeRecipe::SigmoidRoutedNoShared, None, Some(_)) => Err(invalid(
-            "SigmoidRoutedNoShared prefill cannot bind shared dtypes",
-        )),
+        (MoeRecipe::SigmoidRoutedNoShared | MoeRecipe::SoftmaxRoutedNoShared, None, None) => Ok(()),
+        (
+            recipe @ (MoeRecipe::SigmoidRoutedNoShared | MoeRecipe::SoftmaxRoutedNoShared),
+            Some(_),
+            _,
+        ) => Err(invalid(format!(
+            "{recipe:?} prefill cannot bind shared weights"
+        ))),
+        (
+            recipe @ (MoeRecipe::SigmoidRoutedNoShared | MoeRecipe::SoftmaxRoutedNoShared),
+            None,
+            Some(_),
+        ) => Err(invalid(format!(
+            "{recipe:?} prefill cannot bind shared dtypes"
+        ))),
     }
 }
 
@@ -3739,13 +3782,13 @@ fn validate_decode(
     if params.defer_routed_combine && params.routed_out.is_some() {
         return Err(invalid("deferred routed combine requires routed_out=None"));
     }
-    if params.recipe == MoeRecipe::SigmoidRoutedNoShared
+    if params.recipe.routed_only()
         && (!sigmoid_decode_width_ok(params)
             || params.ep_mode != MoeEpMode::None
             || params.defer_routed_combine)
     {
         return Err(invalid(
-            "sigmoid MoE decode requires k=8 (k<=8 with a selection bias), no EP, and no deferred combine",
+            "routed-only MoE decode requires k=8 (k<=8 with a selection bias), no EP, and no deferred combine",
         ));
     }
     validate_selection_bias(params)?;
@@ -3886,16 +3929,16 @@ fn validate_prefill(
             params.k_top, params.n_exp
         )));
     }
-    if params.recipe == MoeRecipe::SigmoidRoutedNoShared {
+    if params.recipe.routed_only() {
         if params.k_top != 8 {
             return Err(invalid(format!(
-                "sigmoid MoE prefill requires k_top=8, got {}",
+                "routed-only MoE prefill requires k_top=8, got {}",
                 params.k_top
             )));
         }
         if !matches!(params.prelude.route, PrefillRouteMode::Replicated) {
             return Err(invalid(
-                "sigmoid MoE prefill requires replicated route authority",
+                "routed-only MoE prefill requires replicated route authority",
             ));
         }
     }
@@ -7555,6 +7598,91 @@ mod tests {
             "{error:?}"
         );
     }
+
+    #[test]
+    fn routed_softmax_decode_runs_declared_unrotated_lloyd_without_a_gate_side() {
+        use crate::families::moe::{MoeEpMode, MoeMq2Lloyd, MoeRecipe};
+        let table = table(8, DType::MQ2G256LloydU);
+        let mut cache = table.prepare_binding(0, 1, 0).unwrap();
+        let fixture = live_fixture(&table, 0x9c_0000);
+        bind_fixture(&table, &mut cache, &fixture);
+        let experts = BoundMoeExperts::from_cache(&table, &cache).unwrap();
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let scratch = decode_scratch(0x9d_0000);
+        let params = |declared: bool| {
+            let mut params = ep_decode_params(
+                &scratch,
+                &fixture.routed,
+                &fixture.gate_up_ptrs,
+                &fixture.down_ptrs,
+                0,
+                8,
+                8,
+                MoeEpMode::None,
+                None,
+                false,
+            );
+            params.recipe = MoeRecipe::SoftmaxRoutedNoShared;
+            params.shared = None;
+            params.dtypes.shared = None;
+            params.dtypes.experts_all_gate_up_mq4 = false;
+            params.dtypes.routed_gate_up = DType::MQ2G256LloydU;
+            params.dtypes.routed_down = DType::MQ2G256LloydU;
+            params.mq2_lloyd = declared.then_some(MoeMq2Lloyd {
+                swiglu_limit: 7.0,
+                uses_atomic_down: false,
+                native: None,
+                nonowned_gate_up_dummy: None,
+            });
+            params
+        };
+        // The routed-only softmax router owns its projection and top-k; the
+        // natural-basis experts take no input rotation, and a declared
+        // (deterministic) Lloyd down folds through the expanded combine.
+        let call = seal_decode(experts, &ctx, params(true)).unwrap();
+        assert_eq!(call.router_input(), MoeRouterInput::SoftmaxTopK);
+        assert_eq!(
+            moe_program::lowered_stages(&call).unwrap(),
+            [
+                MoeStage::Normalize,
+                MoeStage::RouterProjection,
+                MoeStage::Route,
+                MoeStage::GateUp,
+                MoeStage::Activation,
+                MoeStage::Down,
+                MoeStage::MutationFence,
+                MoeStage::Combine,
+            ]
+        );
+        // Undeclared, the same experts keep the self-combining down.
+        let call = seal_decode(experts, &ctx, params(false)).unwrap();
+        assert!(!moe_program::lowered_stages(&call)
+            .unwrap()
+            .contains(&MoeStage::Combine));
+        // A routed-only recipe binds no shared expert.
+        let mut shared = params(true);
+        shared.shared = ep_decode_params(
+            &scratch,
+            &fixture.routed,
+            &fixture.gate_up_ptrs,
+            &fixture.down_ptrs,
+            0,
+            8,
+            8,
+            MoeEpMode::None,
+            None,
+            false,
+        )
+        .shared;
+        assert!(shared.shared.is_some(), "the fixture binds a shared expert");
+        let error = seal_decode(experts, &ctx, shared)
+            .err()
+            .expect("routed-only softmax with shared weights must fail");
+        assert!(
+            format!("{error:?}").contains("cannot bind shared"),
+            "{error:?}"
+        );
+    }
     #[cfg(not(feature = "deltanet"))]
     #[test]
     fn sigmoid_decode_refuses_before_publication_without_deltanet() {
@@ -8004,6 +8132,7 @@ mod tests {
             ep_layer_idx: 0,
             ep_tile_exchange: None,
             expert_iu4: None,
+            mq2_lloyd: None,
         }
     }
 

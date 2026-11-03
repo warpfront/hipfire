@@ -794,10 +794,29 @@ impl Rope {
             RopeKind::PartialHalved { rot_pairs } => gpu.rope_partial_halved_f32_batched(
                 q, k, positions, n_heads, n_kv_heads, head_dim, rot_pairs, theta, rows,
             ),
-            RopeKind::PrefixHalfSplit { .. } => {
-                return Err(DispatchError::Hip(
-                    "prefix half-split RoPE is single-row only".into(),
-                ))
+            RopeKind::PrefixHalfSplit { rot_dim } => {
+                if gpu.flags.rope_interleaved_legacy {
+                    return Err(DispatchError::Hip(
+                        "prefix half-split RoPE refuses HIPFIRE_ROPE_INTERLEAVED_LEGACY".into(),
+                    ));
+                }
+                // Positions are absolute, so no compacted-KV phase offset.
+                #[cfg(feature = "deltanet")]
+                {
+                    gpu.rope_partial_interleaved_f32_batched(
+                        q, k, positions, n_heads, n_kv_heads, head_dim, rot_dim, theta, rows, 0,
+                    )
+                }
+                #[cfg(not(feature = "deltanet"))]
+                {
+                    let _ = rot_dim;
+                    return Err(DispatchError::UnsupportedVariant {
+                        family: "rope",
+                        variant: "prefix-half-split-requires-deltanet",
+                        arch: "",
+                        quant: "",
+                    });
+                }
             }
             #[cfg(feature = "deltanet")]
             RopeKind::Interleaved { rot_dim } => gpu.rope_interleaved_f32_batched(
