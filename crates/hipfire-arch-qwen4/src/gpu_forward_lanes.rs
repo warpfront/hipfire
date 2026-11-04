@@ -2533,6 +2533,29 @@ fn forward_lanes_scoped(
             }
             _ => Vec::new(),
         };
+        // The views one batched PLE op reads: ONE segment spanning the chunk's lanes. A dedicated
+        // scratch field's lane view runs to the end of its tensor, so the first lane's view held
+        // every lane's row; an alias-arena member (the compact plan) is bounded to its segment's
+        // `rows * pitch`, so the op needs the chunk's own view.
+        let ple_batch_views: Vec<SegViews> = ple_chunks
+            .iter()
+            .map(|(first, chunk)| {
+                SegViews::new(
+                    scratch,
+                    dims,
+                    vocab,
+                    ar_out,
+                    Segment {
+                        begin: lane_segs[*first].begin,
+                        rows: chunk.len(),
+                        first_lane: lane_segs[*first].first_lane,
+                    },
+                    ple_head_count * ple_row_width,
+                    bf16_state && !(band_scope.input && band_scope.output),
+                    scratch.ple_normed_field(n),
+                )
+            })
+            .collect::<Result<_, _>>()?;
         let mut steps: Vec<Step<'_>> = Vec::with_capacity(program.len() * lanes.len() * 2);
         let mut qsa_commits: Vec<QsaCommit> = Vec::new();
         let mut ple_split: Option<usize> = None;
@@ -2654,15 +2677,16 @@ fn forward_lanes_scoped(
                             if ple_split.is_none() {
                                 ple_split = Some(steps.len());
                             }
-                            if let Some((first, chunk)) = ple_chunks
-                                .iter()
-                                .find(|(first, chunk)| (*first..*first + chunk.len()).contains(&i))
+                            if let Some((chunk_index, (first, chunk))) =
+                                ple_chunks.iter().enumerate().find(|(_, (first, chunk))| {
+                                    (*first..*first + chunk.len()).contains(&i)
+                                })
                             {
                                 // `HIPFIRE_QWEN4_LANE_PLE_BATCH`: the chunk's lanes run
                                 // as one op at its first lane (lane rows are
                                 // independent; each keeps its own state).
                                 if *first == i {
-                                    let v = &views[i];
+                                    let v = &ple_batch_views[chunk_index];
                                     steps.push(Step::GroupedDepthwise(GroupedDepthwiseOp {
                                         rotation: &scratch.rotation,
                                         state_bf16: bf16_state,
