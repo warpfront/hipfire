@@ -1350,7 +1350,8 @@ mod tests {
         // the trunk part of the same manifest IS cut: strictly fewer resident bytes per rank
         let (plain, _) = resident_split_ranks(&manifest.weights, bytes, &ep2).unwrap();
         let (sharded, _) =
-            resident_split_ranks_trunk(&manifest.weights, bytes, &ep2, Some((&dims, mode))).unwrap();
+            resident_split_ranks_trunk(&manifest.weights, bytes, &ep2, Some((&dims, mode)))
+                .unwrap();
         let (head_plain, _) = resident_split_ranks(&head, bytes, &ep2).unwrap();
         assert!(head_plain > 0 && sharded < plain);
         // ... and by exactly the trunk's cut: dropping the head from both leaves the same delta
