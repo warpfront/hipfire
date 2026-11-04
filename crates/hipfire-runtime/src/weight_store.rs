@@ -18,8 +18,8 @@
 //! cleanup set.
 use crate::device_mesh::{DeviceMesh, DimKind, MeshEpoch};
 use crate::hfq_parallel::{
-    read_ranges_into_host, upload_ranges_to_device, DeviceRangeCopy, DirectReadStats, DirectSource,
-    HostRangeCopy, HFQ_READER_LANES,
+    read_ranges_into_host, reader_tuning, upload_ranges_to_device, DeviceRangeCopy,
+    DirectReadStats, DirectSource, HostRangeCopy,
 };
 use crate::mesh_placement::BandPlacement;
 use crate::model_source::{SourceFormat, SourcePayload, SourceRangeDescriptor};
@@ -1570,7 +1570,7 @@ fn upload_range_direct_device(
             dst_offset: 0,
         }];
         let started = std::time::Instant::now();
-        let stats = upload_ranges_to_device(gpu, direct, &copy, HFQ_READER_LANES)
+        let stats = upload_ranges_to_device(gpu, direct, &copy, reader_tuning())
             .map_err(|error| format!("direct source range upload failed: {error}"))?;
         rdna_compute::load_phases::add(
             "weights.device_upload",
@@ -1603,7 +1603,7 @@ fn read_host_range(
     // SAFETY: `dst` is the host pointer of a live pinned allocation of at
     // least `len` bytes that nothing else references until the caller joins
     // this read.
-    unsafe { read_ranges_into_host(direct, &copy, HFQ_READER_LANES) }
+    unsafe { read_ranges_into_host(direct, &copy, reader_tuning()) }
         .map_err(|error| format!("direct source range read failed: {error}"))
 }
 

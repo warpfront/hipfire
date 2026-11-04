@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 
 use hip_bridge::{DeviceBuffer, HipRuntime, HIP_HOST_MALLOC_MAPPED};
 use hipfire_runtime::hfq_parallel::{
-    self, DeviceRangeCopy, DirectSource, HostRangeCopy, HFQ_READER_LANES,
+    self, reader_tuning, DeviceRangeCopy, DirectSource, HostRangeCopy,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -1256,7 +1256,7 @@ unsafe fn fill_host_spans(
         })
         .collect::<Result<Vec<_>, ExpertTierOwnerError>>()?;
     // SAFETY: forwarded from the caller's contract.
-    unsafe { hfq_parallel::read_ranges_into_host(source, &copies, HFQ_READER_LANES) }
+    unsafe { hfq_parallel::read_ranges_into_host(source, &copies, reader_tuning()) }
         .map_err(|error| ExpertTierOwnerError::Source(error.to_string()))
 }
 
@@ -1378,7 +1378,7 @@ impl ExpertTierOwners {
                 })
                 .collect::<Result<Vec<_>, ExpertTierOwnerError>>()?;
             let stats =
-                hfq_parallel::upload_ranges_to_device(gpu, source, &copies, HFQ_READER_LANES)
+                hfq_parallel::upload_ranges_to_device(gpu, source, &copies, reader_tuning())
                     .map_err(ExpertTierOwnerError::Source)?;
             record_direct_stats(stats);
             rdna_compute::load_phases::add(
@@ -2719,7 +2719,14 @@ mod tests {
                 })
                 .collect();
             // SAFETY: every extent was checked inside the device owner image.
-            unsafe { hfq_parallel::read_ranges_into_host(&source, &device_reads, 4) }.unwrap();
+            unsafe {
+                hfq_parallel::read_ranges_into_host(
+                    &source,
+                    &device_reads,
+                    hfq_parallel::ReaderTuning::LEGACY,
+                )
+            }
+            .unwrap();
             for (tier, image) in [
                 (Placement::HostMapped, &owner),
                 (Placement::Device, &device),

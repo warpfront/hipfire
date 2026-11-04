@@ -5443,7 +5443,7 @@ pub fn qwen4_preload_resource_plan(
     let direct_branch =
         !use_ranges && hipfire_config::memory::qwen4_direct_load() && !hfq.has_overlay();
     let staging_upload_bytes = if direct_branch {
-        2 * hipfire_runtime::hfq_parallel::HFQ_READER_LANES as u64 * 16 * 1024 * 1024
+        hipfire_runtime::hfq_parallel::reader_tuning().staging_bytes()
     } else {
         hipfire_runtime::weight_store::RANGE_UPLOAD_CHUNK_BYTES as u64
     };
@@ -6519,8 +6519,9 @@ fn load_qwen4_rank_unscoped(
     };
     match &direct_source {
         Some(direct) => eprintln!(
-            "  qwen4 direct load: on ({} lanes, {})",
-            hipfire_runtime::hfq_parallel::HFQ_READER_LANES,
+            "  qwen4 direct load: on ({} lanes x {} MiB, {})",
+            hipfire_runtime::hfq_parallel::reader_tuning().lanes,
+            hipfire_runtime::hfq_parallel::reader_tuning().chunk_bytes >> 20,
             if direct.is_direct_available() {
                 "O_DIRECT"
             } else {

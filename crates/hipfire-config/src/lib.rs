@@ -7156,6 +7156,33 @@ mod tests {
     }
 
     #[test]
+    fn hfq_reader_knobs_parse_in_range_and_refuse_everything_else() {
+        use memory::{parse_hfq_reader_chunk_mib as chunk, parse_hfq_reader_lanes as lanes};
+        assert_eq!(lanes(None), Ok(None));
+        assert_eq!(lanes(Some("")), Ok(None));
+        assert_eq!(lanes(Some(" 16 ")), Ok(Some(16)));
+        assert_eq!(lanes(Some("1")), Ok(Some(1)));
+        assert_eq!(lanes(Some("64")), Ok(Some(64)));
+        assert_eq!(chunk(None), Ok(None));
+        assert_eq!(chunk(Some("4")), Ok(Some(4)));
+        assert_eq!(chunk(Some("16")), Ok(Some(16)));
+        for bad in ["0", "65", "-4", "4.0", "four"] {
+            let error = lanes(Some(bad)).unwrap_err();
+            assert!(error.contains("HIPFIRE_HFQ_READER_LANES"), "{bad}: {error}");
+        }
+        for bad in ["0", "17", "64", "eight"] {
+            let error = chunk(Some(bad)).unwrap_err();
+            assert!(
+                error.contains("HIPFIRE_HFQ_READER_CHUNK_MIB"),
+                "{bad}: {error}"
+            );
+        }
+        // The process snapshot of a test binary carries no knob.
+        assert_eq!(memory::hfq_reader_lanes(), Ok(None));
+        assert_eq!(memory::hfq_reader_chunk_mib(), Ok(None));
+    }
+
+    #[test]
     fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
         const KEY: &str = "developer.qwen4_sp";
         const ENV: &str = "HIPFIRE_QWEN4_SP";
@@ -10738,6 +10765,72 @@ pub mod memory {
     /// off; unset, empty and every other spelling keep the default (on).
     pub fn parse_qwen4_direct_load(raw: Option<&str>) -> bool {
         raw.map(str::trim) != Some("0")
+    }
+
+    /// Env name of the HFQ weight reader's lane count ([`hfq_reader_lanes`]).
+    pub const HFQ_READER_LANES_ENV: &str = "HIPFIRE_HFQ_READER_LANES";
+    /// Env name of the HFQ weight reader's read size ([`hfq_reader_chunk_mib`]).
+    pub const HFQ_READER_CHUNK_MIB_ENV: &str = "HIPFIRE_HFQ_READER_CHUNK_MIB";
+    /// Most reader lanes a caller may ask for.
+    pub const HFQ_READER_LANES_MAX: usize = 64;
+    /// Largest reader read size, MiB (the aligned bounce buffer's size).
+    pub const HFQ_READER_CHUNK_MIB_MAX: usize = 16;
+
+    fn parse_hfq_reader_knob(
+        env: &str,
+        raw: Option<&str>,
+        max: usize,
+        what: &str,
+    ) -> std::result::Result<Option<usize>, String> {
+        let Some(raw) = raw.map(str::trim).filter(|raw| !raw.is_empty()) else {
+            return Ok(None);
+        };
+        match raw.parse::<usize>() {
+            Ok(value) if (1..=max).contains(&value) => Ok(Some(value)),
+            _ => Err(format!(
+                "{env}={raw:?} is not a valid {what}: expected an integer from 1 to {max}"
+            )),
+        }
+    }
+
+    /// Pure body of [`hfq_reader_lanes`]: unset or blank is `None` (the
+    /// reader's built-in default); an integer in `1..=64` selects that lane
+    /// count; every other spelling is an error naming the accepted range.
+    pub fn parse_hfq_reader_lanes(raw: Option<&str>) -> std::result::Result<Option<usize>, String> {
+        parse_hfq_reader_knob(
+            HFQ_READER_LANES_ENV,
+            raw,
+            HFQ_READER_LANES_MAX,
+            "lane count",
+        )
+    }
+
+    /// Pure body of [`hfq_reader_chunk_mib`]: unset or blank is `None`; an
+    /// integer in `1..=16` selects that read size in MiB.
+    pub fn parse_hfq_reader_chunk_mib(
+        raw: Option<&str>,
+    ) -> std::result::Result<Option<usize>, String> {
+        parse_hfq_reader_knob(
+            HFQ_READER_CHUNK_MIB_ENV,
+            raw,
+            HFQ_READER_CHUNK_MIB_MAX,
+            "read size in MiB",
+        )
+    }
+
+    /// Developer `HIPFIRE_HFQ_READER_LANES=N` (`1..=64`): concurrent reads of the
+    /// HFQ weight reader (`hfq_parallel`). Unset keeps the reader's built-in
+    /// default; `4` with `HIPFIRE_HFQ_READER_CHUNK_MIB=16` is the pre-0.4.5 shape.
+    /// The reader resolves it once per process and falls back to the default
+    /// (with one stderr line) on an invalid value.
+    pub fn hfq_reader_lanes() -> std::result::Result<Option<usize>, String> {
+        parse_hfq_reader_lanes(process_value(HFQ_READER_LANES_ENV).as_deref())
+    }
+
+    /// Developer `HIPFIRE_HFQ_READER_CHUNK_MIB=N` (`1..=16`): size of each
+    /// reader read. Unset keeps the built-in default.
+    pub fn hfq_reader_chunk_mib() -> std::result::Result<Option<usize>, String> {
+        parse_hfq_reader_chunk_mib(process_value(HFQ_READER_CHUNK_MIB_ENV).as_deref())
     }
 
     /// Developer kill switch `HIPFIRE_EP_SHARE_HOST` for sharing one pinned host copy of a

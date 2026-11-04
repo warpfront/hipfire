@@ -21,13 +21,98 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Production default established by the DS4-shaped storage and canonical
-/// upload screens. Four lanes reached 1.76-1.91 GB/s without changing GPU
-/// allocation order; wider lane counts regressed on the same NVMe.
-pub const HFQ_READER_LANES: usize = 4;
-
+/// Largest read size: the aligned bounce buffer is allocated at this size (only
+/// the touched prefix becomes resident) and it is the pre-0.4.5 chunk.
 const DIRECT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const DIRECT_ALIGNMENT: usize = 4096;
+/// Idle bounce buffers kept for the next call; more than any sane lane count.
+const BOUNCE_POOL_MAX: usize = 64;
+
+/// Concurrent jobs of the ordered job reader ([`read_hfq_jobs_ordered`]):
+/// its callers submit windows of at most four large jobs, so more lanes would idle.
+const JOB_READER_LANES: usize = 4;
+
+/// I/O depth of the direct range reader: `lanes` concurrent synchronous reads of
+/// `chunk_bytes` each. Bytes read are identical for every tuning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReaderTuning {
+    pub lanes: usize,
+    pub chunk_bytes: usize,
+}
+
+impl ReaderTuning {
+    /// The pre-0.4.5 shape (4 lanes x 16 MiB), tuned on `hipx` (1.8-1.9 GB/s).
+    pub const LEGACY: Self = Self {
+        lanes: 4,
+        chunk_bytes: DIRECT_CHUNK_BYTES,
+    };
+    /// Built-in default: 16 lanes x 2 MiB. On the 9100 PRO NVMe (`hiptrx`) cold
+    /// `O_DIRECT` reads into heap memory measured 12.1 / 9.8 / 7.7 GB/s for 300 /
+    /// 18 / 6 MiB calls (old shape: 11.7 / 7.6 / 6.7): a ~18 MiB tensor is one call,
+    /// and 16 MiB reads left it only two reads deep. In-flight bytes (32 MiB) and
+    /// the pinned staging ring (64 MiB) are below the old shape's (64 / 128 MiB).
+    /// See `docs/env-vars.md` (`HIPFIRE_HFQ_READER_LANES`).
+    pub const DEFAULT: Self = Self {
+        lanes: 16,
+        chunk_bytes: 2 * 1024 * 1024,
+    };
+
+    /// `lanes` is clamped to `1..=64`, `chunk_bytes` to a 4 KiB multiple in
+    /// `4 KiB..=16 MiB` (the bounce buffer).
+    pub fn new(lanes: usize, chunk_bytes: usize) -> Self {
+        Self {
+            lanes: lanes.clamp(1, hipfire_config::memory::HFQ_READER_LANES_MAX),
+            chunk_bytes: (chunk_bytes / DIRECT_ALIGNMENT * DIRECT_ALIGNMENT)
+                .clamp(DIRECT_ALIGNMENT, DIRECT_CHUNK_BYTES),
+        }
+    }
+
+    /// Pinned bytes of the device-upload staging ring (two banks of `lanes` chunks).
+    pub fn staging_bytes(self) -> u64 {
+        2 * self.lanes as u64 * self.chunk_bytes as u64
+    }
+}
+
+/// Resolve the knobs over [`ReaderTuning::DEFAULT`]. An invalid value is
+/// reported in the returned messages and leaves that field at its default:
+/// a tuning knob never fails a load.
+pub fn resolve_tuning(
+    lanes: Result<Option<usize>, String>,
+    chunk_mib: Result<Option<usize>, String>,
+) -> (ReaderTuning, Vec<String>) {
+    let mut tuning = ReaderTuning::DEFAULT;
+    let mut problems = Vec::new();
+    match lanes {
+        Ok(Some(lanes)) => tuning.lanes = lanes,
+        Ok(None) => {}
+        Err(error) => problems.push(error),
+    }
+    match chunk_mib {
+        Ok(Some(mib)) => tuning.chunk_bytes = mib * 1024 * 1024,
+        Ok(None) => {}
+        Err(error) => problems.push(error),
+    }
+    (
+        ReaderTuning::new(tuning.lanes, tuning.chunk_bytes),
+        problems,
+    )
+}
+
+/// The process-wide tuning: `HIPFIRE_HFQ_READER_LANES` /
+/// `HIPFIRE_HFQ_READER_CHUNK_MIB` over the default, resolved once.
+pub fn reader_tuning() -> ReaderTuning {
+    static TUNING: std::sync::LazyLock<ReaderTuning> = std::sync::LazyLock::new(|| {
+        let (tuning, problems) = resolve_tuning(
+            hipfire_config::memory::hfq_reader_lanes(),
+            hipfire_config::memory::hfq_reader_chunk_mib(),
+        );
+        for problem in problems {
+            eprintln!("  hfq reader: {problem}; using the default");
+        }
+        tuning
+    });
+    *TUNING
+}
 
 /// One model file, with a mapping used only to query page residency.
 pub struct DirectSource {
@@ -39,6 +124,9 @@ pub struct DirectSource {
     // would put hipHostMalloc back on the critical path. The mutex also keeps
     // concurrent callers from reusing slots whose H2D is still pending.
     staging: Mutex<Option<(i32, Vec<hip_bridge::PinnedTransferBuffer>)>>,
+    // Idle aligned bounce buffers, kept so a call's lanes do not re-allocate and
+    // re-fault 16 MiB each per tensor.
+    bounce_pool: Mutex<Vec<AlignedBounce>>,
 }
 
 impl DirectSource {
@@ -77,6 +165,7 @@ impl DirectSource {
             view,
             identity,
             staging: Mutex::new(None),
+            bounce_pool: Mutex::new(Vec::new()),
         })
     }
 
@@ -199,6 +288,48 @@ impl Drop for AlignedBounce {
     }
 }
 
+// SAFETY: an `AlignedBounce` uniquely owns its anonymous allocation.
+unsafe impl Send for AlignedBounce {}
+
+/// A lane's bounce buffer, taken from the source's pool on first direct read
+/// and returned on drop.
+struct LaneBounce<'a> {
+    src: &'a DirectSource,
+    buf: Option<AlignedBounce>,
+}
+
+impl<'a> LaneBounce<'a> {
+    fn new(src: &'a DirectSource) -> Self {
+        Self { src, buf: None }
+    }
+
+    fn ptr(&mut self) -> io::Result<*mut u8> {
+        if self.buf.is_none() {
+            let pooled = self
+                .src
+                .bounce_pool
+                .lock()
+                .ok()
+                .and_then(|mut pool| pool.pop());
+            self.buf = Some(match pooled {
+                Some(buf) => buf,
+                None => AlignedBounce::new()?,
+            });
+        }
+        Ok(self.buf.as_ref().unwrap().ptr.as_ptr())
+    }
+}
+
+impl Drop for LaneBounce<'_> {
+    fn drop(&mut self) {
+        if let (Some(buf), Ok(mut pool)) = (self.buf.take(), self.src.bounce_pool.lock()) {
+            if pool.len() < BOUNCE_POOL_MAX {
+                pool.push(buf);
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct DirectChunk {
     offset: u64,
@@ -224,7 +355,7 @@ fn buffered_chunk(
 fn read_direct_chunk(
     src: &DirectSource,
     chunk: DirectChunk,
-    bounce: &mut Option<AlignedBounce>,
+    bounce: &mut LaneBounce<'_>,
 ) -> io::Result<DirectReadStats> {
     let mut stats = DirectReadStats::default();
     // SAFETY: the host API validates ranges; its caller guarantees disjoint,
@@ -250,12 +381,7 @@ fn read_direct_chunk(
         // hipHostMalloc/GTT mappings the kernel cannot pin for direct I/O
         // (`pread` -> EFAULT, measured on gfx1201 hot-set owners). The copy
         // out of the bounce buffer runs on the lane, in parallel.
-        if bounce.is_none() {
-            *bounce = Some(AlignedBounce::new()?);
-        }
-        let buf = unsafe {
-            std::slice::from_raw_parts_mut(bounce.as_mut().unwrap().ptr.as_ptr(), middle)
-        };
+        let buf = unsafe { std::slice::from_raw_parts_mut(bounce.ptr()?, middle) };
         read_exact_at(src.direct.as_ref().unwrap(), buf, offset)?;
         target.copy_from_slice(buf);
         let ns = rdna_compute::load_phases::ns_since(started);
@@ -275,15 +401,16 @@ fn read_direct_chunk(
     Ok(stats)
 }
 
-/// Read with up to four lanes. Destinations must be writable, nonoverlapping,
-/// and valid for the complete call. No read crosses the source EOF.
+/// Read with `tuning.lanes` concurrent lanes of `tuning.chunk_bytes` reads.
+/// Destinations must be writable, nonoverlapping, and valid for the complete
+/// call. No read crosses the source EOF.
 ///
 /// # Safety
 /// Every `dst` must designate `len` writable bytes, exclusive to this call.
 pub unsafe fn read_ranges_into_host(
     src: &DirectSource,
     copies: &[HostRangeCopy],
-    lanes: usize,
+    tuning: ReaderTuning,
 ) -> io::Result<DirectReadStats> {
     crate::model_source::verify_path_identity(&src.identity).map_err(io::Error::other)?;
     let mut chunks = Vec::new();
@@ -295,10 +422,10 @@ pub unsafe fn read_ranges_into_host(
                 "null host read destination",
             ));
         }
-        for start in (0..copy.len).step_by(DIRECT_CHUNK_BYTES) {
+        for start in (0..copy.len).step_by(tuning.chunk_bytes) {
             chunks.push(DirectChunk {
                 offset: copy.file_offset + start as u64,
-                len: (copy.len - start).min(DIRECT_CHUNK_BYTES),
+                len: (copy.len - start).min(tuning.chunk_bytes),
                 dst: copy.dst as usize + start,
             });
         }
@@ -306,11 +433,11 @@ pub unsafe fn read_ranges_into_host(
     let cursor = AtomicUsize::new(0);
     std::thread::scope(|scope| {
         let mut workers = Vec::new();
-        for _ in 0..lanes.clamp(1, HFQ_READER_LANES).min(chunks.len()) {
+        for _ in 0..tuning.lanes.max(1).min(chunks.len()) {
             let chunks = &chunks;
             let cursor = &cursor;
             workers.push(scope.spawn(move || {
-                let mut bounce = None;
+                let mut bounce = LaneBounce::new(src);
                 let mut stats = DirectReadStats::default();
                 loop {
                     let index = cursor.fetch_add(1, Ordering::Relaxed);
@@ -347,9 +474,9 @@ pub fn upload_ranges_to_device(
     gpu: &mut rdna_compute::Gpu,
     src: &DirectSource,
     copies: &[DeviceRangeCopy<'_>],
-    lanes: usize,
+    tuning: ReaderTuning,
 ) -> Result<DirectReadStats, String> {
-    let lanes = lanes.clamp(1, HFQ_READER_LANES);
+    let lanes = tuning.lanes.max(1);
     let mut chunks = Vec::new();
     for copy in copies {
         src.validate(copy.file_offset, copy.len)
@@ -361,10 +488,10 @@ pub fn upload_ranges_to_device(
         {
             return Err("direct upload exceeds device destination".into());
         }
-        for start in (0..copy.len).step_by(DIRECT_CHUNK_BYTES) {
+        for start in (0..copy.len).step_by(tuning.chunk_bytes) {
             chunks.push((
                 copy.file_offset + start as u64,
-                (copy.len - start).min(DIRECT_CHUNK_BYTES),
+                (copy.len - start).min(tuning.chunk_bytes),
                 copy.dst,
                 copy.dst_offset + start,
             ));
@@ -380,13 +507,16 @@ pub fn upload_ranges_to_device(
         .staging
         .lock()
         .map_err(|_| "direct staging lock poisoned")?;
-    if staging.as_ref().is_some_and(|(owner, _)| *owner != device) {
+    // A ring built for a smaller read size (a different tuning) cannot hold a chunk.
+    if staging.as_ref().is_some_and(|(owner, ring)| {
+        *owner != device || ring.iter().any(|buffer| buffer.size() < tuning.chunk_bytes)
+    }) {
         *staging = None;
     }
     let (_, buffers) = staging.get_or_insert_with(|| (device, Vec::new()));
     while buffers.len() < 2 * lanes.min(chunks.len()) {
         buffers.push(
-            hip.transfer_buffer(DIRECT_CHUNK_BYTES)
+            hip.transfer_buffer(tuning.chunk_bytes)
                 .map_err(|e| e.to_string())?,
         );
     }
@@ -428,7 +558,7 @@ pub fn upload_ranges_to_device(
                 })
                 .collect();
             stats.merge(
-                unsafe { read_ranges_into_host(src, &reads, lanes) }.map_err(|e| e.to_string())?,
+                unsafe { read_ranges_into_host(src, &reads, tuning) }.map_err(|e| e.to_string())?,
             );
             hip.event_record(start_event, Some(&stream))
                 .map_err(|e| e.to_string())?;
@@ -579,7 +709,7 @@ pub fn read_hfq_jobs_ordered(hfq: &HfqFile, jobs: &[HfqReadJob]) -> io::Result<V
     // Honor the model's page-cache policy: on discrete GPUs the carrier keeps
     // pages resident across loads (fadvise(DONTNEED) here would force a full
     // disk re-read on every restart); UMA / opt-in eviction keeps dropping.
-    read_jobs_from_path(hfq.path(), jobs, HFQ_READER_LANES, hfq.evicts_page_cache())
+    read_jobs_from_path(hfq.path(), jobs, JOB_READER_LANES, hfq.evicts_page_cache())
 }
 
 fn read_jobs_from_path(
@@ -806,7 +936,19 @@ mod tests {
         (file, bytes)
     }
 
-    fn assert_ranges(source: &DirectSource, bytes: &[u8], lanes: usize) -> DirectReadStats {
+    /// Shapes the tests cover: serial, the old default, and deep/small-read queues
+    /// whose chunk edges fall elsewhere than the 16 MiB ones.
+    fn tunings() -> [ReaderTuning; 5] {
+        [
+            ReaderTuning::new(1, DIRECT_CHUNK_BYTES),
+            ReaderTuning::LEGACY,
+            ReaderTuning::new(16, 4 * 1024 * 1024),
+            ReaderTuning::new(32, 1024 * 1024),
+            ReaderTuning::new(3, 3 * 4096),
+        ]
+    }
+
+    fn assert_ranges(source: &DirectSource, bytes: &[u8], tuning: ReaderTuning) -> DirectReadStats {
         let ranges = [
             (3, 4191),
             (DIRECT_CHUNK_BYTES - 17, DIRECT_CHUNK_BYTES + 95),
@@ -823,7 +965,7 @@ mod tests {
                 dst: unsafe { dst.as_mut_ptr().add(1) },
             })
             .collect();
-        let stats = unsafe { read_ranges_into_host(source, &copies, lanes) }.unwrap();
+        let stats = unsafe { read_ranges_into_host(source, &copies, tuning) }.unwrap();
         for (&(offset, len), dst) in ranges.iter().zip(destinations) {
             assert_eq!(&dst[1..len + 1], &bytes[offset..offset + len]);
             assert_eq!(dst[0], 0xa5);
@@ -840,13 +982,13 @@ mod tests {
     fn direct_ranges_odd_chunk_boundary_eof_and_lane_counts() {
         let (file, bytes) = direct_fixture(None);
         let source = DirectSource::open_path(file.path()).unwrap();
-        for lanes in [1, 4] {
+        for tuning in tunings() {
             // Newly written pages are resident; buffered path must retain them.
-            let stats = assert_ranges(&source, &bytes, lanes);
+            let stats = assert_ranges(&source, &bytes, tuning);
             #[cfg(target_os = "linux")]
             assert_eq!(stats.bytes_direct, 0);
             advise_dontneed(file.as_file(), 0, bytes.len());
-            assert_ranges(&source, &bytes, lanes);
+            assert_ranges(&source, &bytes, tuning);
             // Rewarm all pages for the next resident arm.
             let mut warm = vec![0; bytes.len()];
             read_exact_at(file.as_file(), &mut warm, 0).unwrap();
@@ -863,14 +1005,14 @@ mod tests {
         read_exact_at(file.as_file(), &mut first, 0).unwrap();
         // Drop the second and third chunks again, independent of readahead.
         advise_dontneed(file.as_file(), DIRECT_CHUNK_BYTES, DIRECT_CHUNK_BYTES * 2);
-        for lanes in [1, 4] {
+        for tuning in tunings() {
             let mut dst = vec![0; DIRECT_CHUNK_BYTES * 3];
             let copies = [HostRangeCopy {
                 file_offset: 0,
                 len: dst.len(),
                 dst: dst.as_mut_ptr(),
             }];
-            let stats = unsafe { read_ranges_into_host(&source, &copies, lanes) }.unwrap();
+            let stats = unsafe { read_ranges_into_host(&source, &copies, tuning) }.unwrap();
             assert_eq!(&dst, &bytes[..dst.len()]);
             #[cfg(target_os = "linux")]
             if cold && source.is_direct_available() {
@@ -894,7 +1036,7 @@ mod tests {
         // Some tmpfs kernels accept O_DIRECT as a no-op. Force its absence as
         // well, so the fallback is exercised independently of kernel behavior.
         source.direct = None;
-        for lanes in [1, 4] {
+        for tuning in tunings() {
             let mut dst = vec![0; bytes.len() - 3];
             let stats = unsafe {
                 read_ranges_into_host(
@@ -904,7 +1046,7 @@ mod tests {
                         len: dst.len(),
                         dst: dst.as_mut_ptr(),
                     }],
-                    lanes,
+                    tuning,
                 )
             }
             .unwrap();
@@ -929,7 +1071,7 @@ mod tests {
                     len: 5,
                     dst: dst.as_mut_ptr(),
                 }],
-                4,
+                ReaderTuning::LEGACY,
             )
         }
         .unwrap_err();
@@ -945,9 +1087,58 @@ mod tests {
                     len: 1,
                     dst: dst.as_mut_ptr(),
                 }],
-                1,
+                ReaderTuning::new(1, DIRECT_CHUNK_BYTES),
             )
         }
         .is_err());
+    }
+
+    #[test]
+    fn tuning_resolves_knobs_over_the_default_and_never_fails() {
+        let (tuning, problems) = resolve_tuning(Ok(None), Ok(None));
+        assert_eq!(tuning, ReaderTuning::DEFAULT);
+        assert!(problems.is_empty());
+        let (tuning, problems) = resolve_tuning(Ok(Some(4)), Ok(Some(16)));
+        assert_eq!(tuning, ReaderTuning::LEGACY);
+        assert!(problems.is_empty());
+        let (tuning, _) = resolve_tuning(Ok(Some(32)), Ok(Some(2)));
+        assert_eq!((tuning.lanes, tuning.chunk_bytes), (32, 2 * 1024 * 1024));
+        // An invalid knob is reported and that field keeps the default.
+        let (tuning, problems) = resolve_tuning(Err("bad lanes".into()), Ok(Some(8)));
+        assert_eq!(tuning.lanes, ReaderTuning::DEFAULT.lanes);
+        assert_eq!(tuning.chunk_bytes, 8 * 1024 * 1024);
+        assert_eq!(problems, ["bad lanes"]);
+        // Out-of-range struct values clamp to a usable shape.
+        let tuning = ReaderTuning::new(0, 1);
+        assert_eq!((tuning.lanes, tuning.chunk_bytes), (1, DIRECT_ALIGNMENT));
+        let tuning = ReaderTuning::new(1000, DIRECT_CHUNK_BYTES * 4);
+        assert_eq!((tuning.lanes, tuning.chunk_bytes), (64, DIRECT_CHUNK_BYTES));
+        assert_eq!(ReaderTuning::LEGACY.staging_bytes(), 128 * 1024 * 1024);
+    }
+
+    #[test]
+    fn bounce_buffers_are_pooled_across_calls() {
+        let (file, bytes) = direct_fixture(None);
+        let source = DirectSource::open_path(file.path()).unwrap();
+        advise_dontneed(file.as_file(), 0, bytes.len());
+        let tuning = ReaderTuning::new(4, 1024 * 1024);
+        let mut first = vec![0; DIRECT_CHUNK_BYTES];
+        let mut direct = 0;
+        for _ in 0..3 {
+            advise_dontneed(file.as_file(), 0, bytes.len());
+            let copies = [HostRangeCopy {
+                file_offset: 4096,
+                len: first.len(),
+                dst: first.as_mut_ptr(),
+            }];
+            let stats = unsafe { read_ranges_into_host(&source, &copies, tuning) }.unwrap();
+            direct += stats.bytes_direct;
+            assert_eq!(&first, &bytes[4096..4096 + first.len()]);
+        }
+        let pooled = source.bounce_pool.lock().unwrap().len();
+        assert!(pooled <= 4, "pooled {pooled}");
+        if direct > 0 {
+            assert!(pooled >= 1, "direct reads must return their bounce buffers");
+        }
     }
 }
