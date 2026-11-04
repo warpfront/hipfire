@@ -2698,6 +2698,52 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "gemm_mq6g256v2_f32_rows_x4_split_r8_w4_s1",
             ]
         );
+        // Packed-epilogue MQ6 rows kernels (`HIPFIRE_QWEN4_MQ6_R8_PK`, exact
+        // gfx1201 only): same (W, S) exports as the `_split_` family above.
+        if arch == "gfx1201" {
+            add!(
+                "gemm_mq6g256v2_f32_rows_pk",
+                kernels::GEMM_MQ6G256V2_F32_ROWS_PK_SRC,
+                [
+                    "gemm_mq6g256v2_f32_rows_pk_r3_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r3_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r3_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_pk_r4_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r4_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r4_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_pk_r5_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r5_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r5_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_pk_r6_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r6_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r6_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_pk_r7_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r7_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r7_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_pk_r8_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r8_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_pk_r8_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r3_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r3_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r3_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r4_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r4_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r4_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r5_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r5_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r5_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r6_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r6_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r6_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r7_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r7_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r7_w4_s1",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r8_w8_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r8_w4_s4",
+                    "gemm_mq6g256v2_f32_rows_x4_pk_r8_w4_s1",
+                ]
+            );
+        }
         add!(
             "gemv_mq4g128v2_moe_down_top10_indexed_batched_expanded",
             kernels::GEMV_MQ4G128V2_MOE_DOWN_TOP10_INDEXED_BATCHED_EXPANDED_SRC,
@@ -11845,6 +11891,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_MQ6_R8_PK` (default on, exact gfx1201, 3..=8 rows): packed-epilogue MQ6 rows kernels.
+        const MQ6_R8_PK_ADDED_MODULES: [&str; 1] = ["gemm_mq6g256v2_f32_rows_pk"];
+        for module in MQ6_R8_PK_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing MQ6 packed-epilogue module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -11882,7 +11942,8 @@ mod tests {
                 + HCFUSE_ADDED_MODULES.len()
                 + LANE_HC_ALLROWS_ADDED_MODULES.len()
                 + BF16_ALLROWS_ADDED_MODULES.len()
-                + MOE_DOWN_DNI_ADDED_MODULES.len(),
+                + MOE_DOWN_DNI_ADDED_MODULES.len()
+                + MQ6_R8_PK_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

@@ -1121,6 +1121,10 @@ name = "mq6_rows_split_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "mq6_r8_pk_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "bf16_rows_pm_oracle"
 required-features = ["lab"]
 

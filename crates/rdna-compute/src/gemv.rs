@@ -1204,6 +1204,44 @@ pub(crate) fn mq6_split_name(x4: bool, rows: usize, w: usize, s: usize) -> &'sta
     names!(3 4 5 6 7 8)
 }
 
+/// `(W, S)` of the packed-epilogue MQ6 kernels (`HIPFIRE_QWEN4_MQ6_R8_PK`,
+/// opt-in) for `rows` and total output rows `m_total`, or `None` to keep the
+/// incumbent route: 3..=8 rows and trunk-sized shapes (`m_total <= 16384`: the
+/// GDN / QSA projections and out projections, never the LM head) only. The
+/// launch geometry is the incumbent's ([`mq6_rows_split_config`]), so the only
+/// difference to the `_split_` kernel is the packed epilogue.
+pub(crate) fn mq6_rows_pk_config(
+    arch: &str,
+    rows: usize,
+    m_total: usize,
+) -> Option<(usize, usize)> {
+    if m_total > 16384 {
+        return None;
+    }
+    mq6_rows_split_config(arch, rows, m_total)
+}
+
+/// Export name of the packed-epilogue MQ6 kernel; `(rows, w, s)` must come from
+/// [`mq6_rows_pk_config`].
+pub(crate) fn mq6_pk_name(x4: bool, rows: usize, w: usize, s: usize) -> &'static str {
+    macro_rules! names {
+        ($($r:literal)*) => {
+            match (x4, rows, w, s) {
+                $(
+                    (false, $r, 8, 4) => concat!("gemm_mq6g256v2_f32_rows_pk_r", $r, "_w8_s4"),
+                    (false, $r, 4, 4) => concat!("gemm_mq6g256v2_f32_rows_pk_r", $r, "_w4_s4"),
+                    (false, $r, 4, 1) => concat!("gemm_mq6g256v2_f32_rows_pk_r", $r, "_w4_s1"),
+                    (true, $r, 8, 4) => concat!("gemm_mq6g256v2_f32_rows_x4_pk_r", $r, "_w8_s4"),
+                    (true, $r, 4, 4) => concat!("gemm_mq6g256v2_f32_rows_x4_pk_r", $r, "_w4_s4"),
+                    (true, $r, 4, 1) => concat!("gemm_mq6g256v2_f32_rows_x4_pk_r", $r, "_w4_s1"),
+                )*
+                _ => unreachable!("mq6 pk config comes from mq6_rows_pk_config"),
+            }
+        };
+    }
+    names!(3 4 5 6 7 8)
+}
+
 #[cfg(test)]
 mod mq6_rows_split_tests {
     use super::*;
@@ -1249,6 +1287,31 @@ mod mq6_rows_split_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn pk_config_mirrors_split_for_trunk_shapes_only() {
+        for rows in 3..=8 {
+            for m in [2560, 7808, 8192, 8240, 16384] {
+                assert_eq!(
+                    mq6_rows_pk_config("gfx1201", rows, m),
+                    mq6_rows_split_config("gfx1201", rows, m)
+                );
+            }
+            assert_eq!(mq6_rows_pk_config("gfx1201", rows, 16385), None);
+            assert_eq!(mq6_rows_pk_config("gfx1201", rows, 248320), None);
+            for x4 in [false, true] {
+                for (w, s) in [(8, 4), (4, 4), (4, 1)] {
+                    let n = mq6_pk_name(x4, rows, w, s);
+                    assert!(n.ends_with(&format!("_pk_r{rows}_w{w}_s{s}")));
+                    assert_eq!(n.contains("_x4_"), x4);
+                }
+            }
+        }
+        for rows in [0, 1, 2, 9] {
+            assert_eq!(mq6_rows_pk_config("gfx1201", rows, 2560), None);
+        }
+        assert_eq!(mq6_rows_pk_config("gfx1151", 8, 2560), None);
     }
 }
 
@@ -23953,14 +24016,27 @@ impl Gpu {
         }
         if self.flags.mq6_rows_split_enabled() {
             let m_total: usize = parts.iter().map(|(_, _, m)| m).sum();
-            if let Some((w, s)) = mq6_rows_split_config(&self.arch, rows, m_total) {
-                let name = mq6_split_name(true, rows, w, s);
+            let pk = self
+                .flags
+                .qwen4_mq6_r8_pk_enabled()
+                .then(|| mq6_rows_pk_config(&self.arch, rows, m_total))
+                .flatten();
+            if let Some((w, s)) = pk.or_else(|| mq6_rows_split_config(&self.arch, rows, m_total)) {
+                let (module, src, name) = if pk.is_some() {
+                    (
+                        "gemm_mq6g256v2_f32_rows_pk",
+                        kernels::GEMM_MQ6G256V2_F32_ROWS_PK_SRC,
+                        mq6_pk_name(true, rows, w, s),
+                    )
+                } else {
+                    (
+                        "gemm_mq6g256v2_f32_rows",
+                        kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+                        mq6_split_name(true, rows, w, s),
+                    )
+                };
                 self.bind_thread()?;
-                self.ensure_kernel(
-                    "gemm_mq6g256v2_f32_rows",
-                    kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
-                    name,
-                )?;
+                self.ensure_kernel(module, src, name)?;
                 let a = parts.map(|(wt, _, _)| wt.buf.as_ptr());
                 let y = parts.map(|(_, y, _)| y.buf.as_ptr());
                 let m = parts.map(|(_, _, m)| m as i32);
@@ -26462,14 +26538,27 @@ impl Gpu {
             return self.gemv_mq6g256v2_xbatch_pm(a_raw, x, y, m, k, rows);
         }
         if self.flags.mq6_rows_split_enabled() {
-            if let Some((w, s)) = mq6_rows_split_config(&self.arch, rows, m) {
-                let name = mq6_split_name(false, rows, w, s);
+            let pk = self
+                .flags
+                .qwen4_mq6_r8_pk_enabled()
+                .then(|| mq6_rows_pk_config(&self.arch, rows, m))
+                .flatten();
+            if let Some((w, s)) = pk.or_else(|| mq6_rows_split_config(&self.arch, rows, m)) {
+                let (module, src, name) = if pk.is_some() {
+                    (
+                        "gemm_mq6g256v2_f32_rows_pk",
+                        kernels::GEMM_MQ6G256V2_F32_ROWS_PK_SRC,
+                        mq6_pk_name(false, rows, w, s),
+                    )
+                } else {
+                    (
+                        "gemm_mq6g256v2_f32_rows",
+                        kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
+                        mq6_split_name(false, rows, w, s),
+                    )
+                };
                 self.bind_thread()?;
-                self.ensure_kernel(
-                    "gemm_mq6g256v2_f32_rows",
-                    kernels::GEMM_MQ6G256V2_F32_ROWS_SRC,
-                    name,
-                )?;
+                self.ensure_kernel(module, src, name)?;
                 let a_ptr = a_raw.buf.as_ptr();
                 let x_ptr = x.buf.as_ptr();
                 let y_ptr = y.buf.as_ptr();

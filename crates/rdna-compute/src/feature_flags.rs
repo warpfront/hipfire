@@ -872,6 +872,11 @@ pub struct FeatureFlags {
     /// 3..=8 rows, byte-identical to the incumbent rows kernels. Default on for
     /// exact gfx1201 and gfx1100; `0` restores the incumbent kernels.
     pub mq6_rows_split: bool,
+    /// Packed-epilogue MQ6G256V2 few-row kernels (`HIPFIRE_QWEN4_MQ6_R8_PK`,
+    /// developer, default on for exact gfx1201, `0` restores the split
+    /// kernels): 3..=8 rows, byte-identical to the stream-split family,
+    /// trunk-sized shapes only. Needs `mq6_rows_split`'s admission.
+    pub qwen4_mq6_r8_pk: bool,
     /// Exact gfx1201: the MQ4G256V2 gate+up verify kernel launches a reduced row-tile grid and loops (`HIPFIRE_GFX12_GATE_UP_TILE_LOOP`).
     pub gfx12_gate_up_tile_loop: bool,
     /// Split QSA decode attention (`HIPFIRE_QWEN4_QSA_DECODE_SPLITK`): split-K
@@ -1532,6 +1537,7 @@ impl FeatureFlags {
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
             mq6_rows_split: parse_bool("HIPFIRE_MQ6_ROWS_SPLIT")
                 .unwrap_or(matches!(arch, "gfx1201" | "gfx1100")),
+            qwen4_mq6_r8_pk: parse_bool("HIPFIRE_QWEN4_MQ6_R8_PK").unwrap_or(true),
             gfx12_gate_up_tile_loop: parse_bool("HIPFIRE_GFX12_GATE_UP_TILE_LOOP")
                 .unwrap_or(arch == "gfx1201"),
             qwen4_qsa_decode_splitk: value("HIPFIRE_QWEN4_QSA_DECODE_SPLITK").ok().as_deref()
@@ -1661,6 +1667,12 @@ impl FeatureFlags {
     /// gfx1201 / gfx1100: on unless `0`).
     pub fn mq6_rows_split_enabled(&self) -> bool {
         self.mq6_rows_split && matches!(self.arch.as_str(), "gfx1201" | "gfx1100")
+    }
+
+    /// Packed-epilogue MQ6 few-row kernels (`HIPFIRE_QWEN4_MQ6_R8_PK`, exact
+    /// gfx1201 only: on unless `0`; gfx1100 is not admitted).
+    pub fn qwen4_mq6_r8_pk_enabled(&self) -> bool {
+        self.qwen4_mq6_r8_pk && self.arch == "gfx1201" && self.mq6_rows_split_enabled()
     }
 
     /// gfx1201 MQ4G256V2 gate+up verify: the one-tile WMMA kernel loops over row
@@ -2252,6 +2264,7 @@ impl FeatureFlags {
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,
             mq6_rows_split: false,
+            qwen4_mq6_r8_pk: false,
             gfx12_gate_up_tile_loop: false,
             qwen4_qsa_decode_splitk: false,
             qwen4_qsa_extent_check: false,
@@ -3455,6 +3468,44 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_hc_pair_decode_enabled());
+    }
+
+    /// The packed-epilogue MQ6 rows kernels are default on (`=0` kills) and reach exact gfx1201 only.
+    #[test]
+    fn qwen4_mq6_r8_pk_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_QWEN4_MQ6_R8_PK" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(
+                unset.qwen4_mq6_r8_pk_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            assert!(!off.qwen4_mq6_r8_pk_enabled(), "{arch}: 0");
+            assert_eq!(on.qwen4_mq6_r8_pk_enabled(), arch == "gfx1201", "{arch}: 1");
+        }
+        // The split kill switch also removes the pk route.
+        let no_split = FeatureFlags::from_lookup("gfx1201", |n| {
+            if n == "HIPFIRE_MQ6_ROWS_SPLIT" {
+                Ok("0".into())
+            } else {
+                Err(())
+            }
+        });
+        assert!(!no_split.qwen4_mq6_r8_pk_enabled());
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_mq6_r8_pk_enabled());
     }
 
     #[test]

@@ -2635,6 +2635,10 @@ pub const GEMV_MQ6G256V2_XBATCH_RESIDUAL_SRC: &str = concat!(
 /// Shared-weight F32 MQ6G256V2 GEMV over 2–4 pre-rotated activation rows.
 pub const GEMM_MQ6G256V2_F32_ROWS_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq6g256v2_f32_rows.hip");
+/// Packed-epilogue stream-split MQ6G256V2 few-row kernels (3..=8 rows), opt-in
+/// `HIPFIRE_QWEN4_MQ6_R8_PK`; byte-identical to the `_split_` family.
+pub const GEMM_MQ6G256V2_F32_ROWS_PK_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq6g256v2_f32_rows_pk.hip");
 /// gfx1151 LM-head one-row candidate. Keep wave-uniform HFQ headers on scalar
 /// loads, lower lane-divergent packed weights to temporal VMEM, and specialize
 /// the hot 248320x2048 shape so the compiler removes dynamic tail control.
