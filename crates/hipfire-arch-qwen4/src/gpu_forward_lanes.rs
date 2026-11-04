@@ -1390,15 +1390,20 @@ fn run_items(
 }
 
 /// Opens the wide few-row scope (`Gpu::wide_verify_rows`, so `few_row_limit`
-/// admits `rows`) around exactly the all-rows HC steps of a lane program: the
+/// admits `rows`) around exactly the all-rows steps of a lane program: the
 /// interpreter announces every step before dispatching it
-/// ([`MoeStepHooks::before_step`]), and the scope is `rows` for an HC read /
-/// write of `rows` rows and the step's prior value for every other step, so
-/// every other stage keeps the routes of its own (at most
-/// [`LANE_MAX_ROWS`]-row) groups.
+/// ([`MoeStepHooks::before_step`]), and the scope is `rows` for an all-rows step and the
+/// step's prior value for every other step, so every other stage keeps the routes of its own
+/// (at most [`LANE_MAX_ROWS`]-row) groups. Without `exact` the all-rows steps are the HC
+/// read / write of `rows` rows; with `exact` (`HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`) every step
+/// of `rows` rows is: the GDN / QSA mixer steps (a lane's own rows are at most
+/// [`LANE_MAX_ROWS`] < `rows`, so only the all-rows projections match) and, with `moe`, the
+/// all-rows MoE call.
 struct HcAllRowsScope {
     rows: usize,
     prior: usize,
+    exact: bool,
+    moe: bool,
 }
 
 impl MoeStepHooks for HcAllRowsScope {
@@ -1416,6 +1421,9 @@ impl MoeStepHooks for HcAllRowsScope {
         let all_rows = match step {
             Step::HyperRead(op) => op.rows == self.rows,
             Step::HyperWrite(op) => op.rows == self.rows,
+            Step::GatedDeltaNet(op) => self.exact && op.rows == self.rows,
+            Step::IndexedAttention(op) => self.exact && op.rows == self.rows,
+            Step::Moe(_) => self.exact && self.moe,
             _ => false,
         };
         gpu.set_wide_verify_rows(if all_rows { self.rows } else { self.prior });
@@ -2317,13 +2325,22 @@ fn forward_lanes_scoped(
         &group_rows,
         policy,
     );
+    // Lab `HIPFIRE_QWEN4_LANE_ALLROWS_EXACT`: the all-rows steps run inside the wide few-row
+    // verify scope of `n` rows (`HcAllRowsScope`, descriptions and decode copies bound at `n`
+    // rows under that scope), so the projections take the row-exact singleton-derived 8-row
+    // tiles in one launch instead of the unscoped wide routes. The scope is ours: a scope
+    // already in force no longer refuses the all-rows stages.
+    let exact_flag = gpu.flags.qwen4_lane_allrows_exact_enabled();
     let all_stages = all_rows_stages_apply(
         gpu.flags.qwen4_lane_allrows_enabled(),
         hc_all,
-        gpu.wide_verify_rows,
+        if exact_flag { 0 } else { gpu.wide_verify_rows },
         gpu.flags.qwen4_gdn_qkv_bf16_enabled(),
         gpu.qwen4_bf16_streams(n) == bf16_state,
     );
+    let exact_scope = exact_flag && all_stages;
+    // The few-row limit an all-rows (`n`-row) segment's descriptions are bound under.
+    let exact_limit = n.max(gpu.few_row_limit());
     // Lab `HIPFIRE_QWEN4_LANE_ALLROWS_MOE`: on top of the all-rows stages the routed MoE is ONE
     // `ep_lane_moe_rows` call per layer over every row (the wide-group MoE of `n` rows) on its
     // own all-rows segment, and the HC writes a TP2 all-reduce carries go all-rows too: no
@@ -2436,7 +2453,11 @@ fn forward_lanes_scoped(
             rows: n,
             first_lane: 0,
         });
-        seg_desc_rows.push(seg_desc_rows[lane_segs.len()]);
+        seg_desc_rows.push(if exact_scope {
+            n
+        } else {
+            seg_desc_rows[lane_segs.len()]
+        });
     }
     // The MoE all-rows segment (same rows) binds the descriptions of `n` rows: exactly the set
     // a wide-class group of `n` rows (`widest == n`) binds.
@@ -2596,7 +2617,11 @@ fn forward_lanes_scoped(
                     config,
                     &fwd.decode_q8,
                     rows,
-                    gpu.few_row_limit(),
+                    if exact_scope && rows == n {
+                        exact_limit
+                    } else {
+                        gpu.few_row_limit()
+                    },
                     // The wave's MoE segment declares what the lanes' own singleton tiles do at
                     // the floor in scope (Tile route: the lowered floor, symmetric capability;
                     // full-table route: pinned 512); every lane step keeps the default.
@@ -2872,11 +2897,20 @@ fn forward_lanes_scoped(
                 let rr = if prefill {
                     gpu.route_rows(r)
                 } else if Some(i) == hc_seg {
-                    widest
+                    if exact_scope {
+                        n
+                    } else {
+                        widest
+                    }
                 } else {
                     r
                 };
                 let descs = &desc_sets[seg_desc_set[i]];
+                let row_limit = if exact_scope && r == n {
+                    exact_limit
+                } else {
+                    gpu.few_row_limit()
+                };
                 for &(op, stage) in &program[ops] {
                     stage_calls[stage.index()] += 1;
                     match op {
@@ -2896,14 +2930,14 @@ fn forward_lanes_scoped(
                                     &fwd.decode_q8,
                                     copy,
                                     rr,
-                                    gpu.few_row_limit(),
+                                    row_limit,
                                     read.input_mix_down,
                                 ),
                                 input_mix_up: decode_copy(
                                     &fwd.decode_q8,
                                     copy + 1,
                                     rr,
-                                    gpu.few_row_limit(),
+                                    row_limit,
                                     read.input_mix_up,
                                 ),
                                 normalized: &v.hc_normalized,
@@ -3320,6 +3354,7 @@ fn forward_lanes_scoped(
             eprintln!(
                 "[lane-step-trace] kind={kind} lanes={} rows={n} lane_rows={rows:?} groups={} \
                  group_rows={group_rows:?} hc_allrows={hc_all} stages_allrows={all_stages} \
+                 exact_scope={exact_scope} \
                  moe={moe_place} moe_rows={moe_rows:?} layers={layers} moe_calls={moe_calls} \
                  moe_calls_per_layer={:.2} launches=[{}]",
                 lanes.len(),
@@ -3328,7 +3363,13 @@ fn forward_lanes_scoped(
                 calls.join(" ")
             );
         }
-        validate_steps(gpu, &steps).map_err(|error| {
+        // Exact: the all-rows steps are validated under the scope they run in.
+        let preflight_prior = exact_scope.then(|| gpu.set_wide_verify_rows(n));
+        let preflight = validate_steps(gpu, &steps);
+        if let Some(prior) = preflight_prior {
+            gpu.set_wide_verify_rows(prior);
+        }
+        preflight.map_err(|error| {
             Qwen4GpuForwardError::Dispatch(format!("preflight lane program: {error:?}"))
         })?;
 
@@ -3398,6 +3439,8 @@ fn forward_lanes_scoped(
                 let mut scope = HcAllRowsScope {
                     rows: n,
                     prior: prior_wide,
+                    exact: exact_scope,
+                    moe: moe_all,
                 };
                 let result = execute_validated_steps_with_moe_hooks(gpu, &ctx, steps, &mut scope);
                 gpu.set_wide_verify_rows(prior_wide);
@@ -3534,7 +3577,12 @@ fn forward_lanes_scoped(
             let (_, lm_head) = head_ref()?;
             let hidden = view(&v.hc_mixed, 0, seg.rows * config.hidden_size);
             let rotation = view(&scratch.rotation, 0, seg.rows * config.hidden_size);
-            execute_lm_head(
+            // Exact: the all-rows LM head runs in the wide few-row scope like the steps before it.
+            let scoped = exact_scope && Some(i) == hc_seg;
+            if scoped {
+                gpu.set_wide_verify_rows(seg.rows);
+            }
+            let head = execute_lm_head(
                 gpu,
                 &lm_head,
                 &hidden,
@@ -3542,8 +3590,11 @@ fn forward_lanes_scoped(
                 seg.rows,
                 seg.rows,
                 Some(&rotation),
-            )
-            .map_err(|error| {
+            );
+            if scoped {
+                gpu.set_wide_verify_rows(prior_wide);
+            }
+            head.map_err(|error| {
                 Qwen4GpuForwardError::Dispatch(format!("execute lane LM head: {error:?}"))
             })?;
         }
