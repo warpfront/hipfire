@@ -20466,7 +20466,10 @@ mod tests {
             assert_eq!(down.owner, None, "rows {rows}");
             assert_eq!(down.offset, 0);
             assert_eq!(down.pitch, None);
-            assert_eq!(shared[F::MoeYDownGrouped as usize].owner, Some(F::Projection));
+            assert_eq!(
+                shared[F::MoeYDownGrouped as usize].owner,
+                Some(F::Projection)
+            );
             assert_eq!(down.elements, shared[F::MoeYDownGrouped as usize].elements);
             // Every other field is planned exactly as before (same owner, offset, size).
             for (index, field) in F::ALL.iter().enumerate() {
@@ -20474,14 +20477,19 @@ mod tests {
                     continue;
                 }
                 assert_eq!(own[index].owner, shared[index].owner, "{field:?} at {rows}");
-                assert_eq!(own[index].elements, shared[index].elements, "{field:?} at {rows}");
+                assert_eq!(
+                    own[index].elements, shared[index].elements,
+                    "{field:?} at {rows}"
+                );
             }
             // The arena only shrinks (the MoE group lost a member), and the dedicated root is
             // charged on top: the plan costs at most the root's bytes more than the shared plan.
             assert!(
                 own[F::Projection as usize].elements <= shared[F::Projection as usize].elements
             );
-            assert!(owned_bytes(&own) <= owned_bytes(&shared) + field_bytes(&own, F::MoeYDownGrouped));
+            assert!(
+                owned_bytes(&own) <= owned_bytes(&shared) + field_bytes(&own, F::MoeYDownGrouped)
+            );
             assert!(owned_bytes(&own) >= owned_bytes(&shared));
             let groups = super::compact_arena_groups_root(&config, rows, &own, true).unwrap();
             assert!(groups
