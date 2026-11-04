@@ -535,6 +535,33 @@ fn leave_planned_route(gpu: &mut Gpu, label: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Opt-in that keeps fn-lanes on a D2-armed single-card load (`HIPFIRE_QWEN4_LANES_ON_D2=1`).
+pub const LANES_ON_D2_ENV: &str = "HIPFIRE_QWEN4_LANES_ON_D2";
+
+/// [`LANES_ON_D2_ENV`] from the process configuration (default off: lanes are refused there).
+pub fn lanes_on_d2_enabled() -> bool {
+    hipfire_config::developer_bool(LANES_ON_D2_ENV, false)
+}
+
+/// Why a Qwen4 load must not stage lanes: a SINGLE-card topology with `split_layers > 0` (the CPU
+/// split, D2, owns the cold experts of those layers). The D2 CPU arm runs per lane (a lane step's
+/// MoE is per lane on gfx1100: no cross-lane row-twin proof, and the executors are 4-row), so a
+/// step of N lanes costs N singleton steps while a burst's prefills queue behind one another:
+/// measured TTFT 16-60x the singleton's. `None` for every EP / PP load, for a single-card load
+/// without D2 layers (e.g. a card that holds every expert) and when `allow` is set.
+pub fn d2_single_card_lane_refusal(
+    topology: &str,
+    split_layers: usize,
+    allow: bool,
+) -> Option<String> {
+    (topology == "single" && split_layers > 0 && !allow).then(|| {
+        format!(
+            "refused on a D2-armed single-card load ({split_layers} CPU-split layers; the per-lane D2 CPU arm \
+             serialises lanes: step = N x singleton; TTFT 16-60x; set {LANES_ON_D2_ENV}=1 to keep lanes)"
+        )
+    })
+}
+
 /// Kill switch of EP native-MTP lanes: exact `0` keeps the AR lane store (as
 /// before the mesh lane protocol); unset (the default) or any other value
 /// stages native-MTP lanes.
@@ -654,6 +681,12 @@ fn stage_qwen4_lanes(
         return refuse("model state not Qwen4");
     };
     let topology = bundle.lane_topology();
+    if let Some(why) =
+        d2_single_card_lane_refusal(topology, bundle.split_layers().len(), lanes_on_d2_enabled())
+    {
+        eprintln!("[daemon] qwen4 lanes: {why} — fallback to sequential");
+        return BatchStaging::default();
+    }
     let topology_log = match topology {
         "pp" => format!("pp {}", m.pp),
         "ep" => format!(
@@ -1117,10 +1150,41 @@ fn stage_qwen_vmm_dflash(m: &mut LoadedModel, gpu: &mut Gpu, row_budget: usize) 
 #[cfg(test)]
 mod tests {
     use super::{
-        ep_spec_lane_reservation, ep_spec_lane_reservation_with, ep_spec_off_reason,
-        stochastic_q8_state_without_ef, StateQuant,
+        d2_single_card_lane_refusal, ep_spec_lane_reservation, ep_spec_lane_reservation_with,
+        ep_spec_off_reason, stochastic_q8_state_without_ef, StateQuant,
     };
     use hipfire_runtime::loader_api::SpecLoadCfg;
+
+    /// The D2 lane refusal: single-card topology with CPU-split layers only, killed by the env.
+    #[test]
+    fn single_card_d2_loads_refuse_lanes_unless_allowed_and_nothing_else_changes() {
+        // D2-armed single card: refused, with the one explanatory line naming the knob.
+        let why = d2_single_card_lane_refusal("single", 5, false).expect("refused");
+        assert!(
+            why.contains("D2-armed single-card") && why.contains("HIPFIRE_QWEN4_LANES_ON_D2=1"),
+            "{why}"
+        );
+        // The opt-in keeps lanes.
+        assert_eq!(d2_single_card_lane_refusal("single", 5, true), None);
+        // A single card without D2 layers (e.g. every expert resident) is unchanged.
+        for allow in [false, true] {
+            assert_eq!(d2_single_card_lane_refusal("single", 0, allow), None);
+        }
+        // EP and PP lane paths never see the refusal, whatever the split count.
+        for topology in ["ep", "pp"] {
+            for split in [0usize, 1, 40] {
+                for allow in [false, true] {
+                    assert_eq!(
+                        d2_single_card_lane_refusal(topology, split, allow),
+                        None,
+                        "{topology} {split} {allow}"
+                    );
+                }
+            }
+        }
+        // Default (variable unset): lanes are refused.
+        assert!(!super::lanes_on_d2_enabled());
+    }
 
     #[test]
     fn ep_native_mtp_lanes_stage_unless_killed() {
