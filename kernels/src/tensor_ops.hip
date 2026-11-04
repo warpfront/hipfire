@@ -2235,127 +2235,137 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
 }
 
 #if defined(__GFX12__)
-// Decode HC read norm + the paired write's k4 gate GEMV in ONE launch (grid [rows],
-// block 256, hidden == 2560, four branches): `normalized` is bitwise hyper_norm_f32's
-// (same loads, `partial += v * v` in u order, the four side-by-side 256-wide LDS trees,
-// `v * inv * (1 + w)` expression) and `gates[row * 4 + g]` is bitwise what the write's
-// gemv_bf16_xf32_k4 / _k4_rows_r<R> / _otile_r<R> launch gives gate row g of the row:
-// the k4 split (gate row g, K quarter b = branch b, `gemv_bf16_xf32_row` over that
-// quarter: lane l reads positions l * 8 + 256 * s, s = 0..9, four chains a0..a3 in the
-// dwordx4 order, `(a0 + a1) + (a2 + a3)`, shfl_down 16..1) is replayed by waves 0..7
-// (wave w: branch w & 3, gate rows w >> 2 and (w >> 2) + 2) on the normalized branch
-// held in LDS as BF16 bits (the F32 `normalized` values are BF16-rounded, so the widen
-// is lossless), and the quarter fold is `(q0 + q1) + (q2 + q3)` with no `hc_act`.
-// Same accumulation text as hyper_write_norm_f32 (qwen4_gemv_bf16_xf32.hip).
-// `input` is the HC streams (BF16 bits when `state_bf16`); `gate_weight` is the write's
-// BF16 [4, 4 * hidden] block_inject.
+// Decode HC read norm + the paired write's k4 gate GEMV in ONE launch, in hyper_norm_f32's
+// geometry (grid [4 branches, rows], block 256, hidden == 2560).  Block (b, row) runs
+// hyper_norm_rows' single-batch path verbatim for branch b (same loads, `partial += v * v` in
+// u order, 256-wide LDS tree from blockDim/2, `v * inv * (1 + w)` expression) and keeps the
+// normalized branch in LDS as BF16 bits (the F32 values are BF16-rounded: the widen is
+// lossless).  Waves 0..3 then each run one k4 quarter job: gate row g = wave, K quarter b =
+// this branch, i.e. `gemv_bf16_xf32_row` over that quarter exactly as gemv_bf16_xf32_k4 does
+// (lane l reads positions l * 8 + 256 * s, s = 0..9; four chains a0..a3 in dwordx4 order;
+// `(a0 + a1) + (a2 + a3)`; shfl_down 16..1; same text as hyper_write_norm_f32's quarters_out
+// path in qwen4_gemv_bf16_xf32.hip).  The four gate-row weight slices of the branch load into
+// registers before the norm.  Each block stores its four quarters to `scratch`
+// `[rows][4 gates][4 quarters]`; the last of the row's four blocks to arrive (device atomic
+// counter `counters[row]`, zero between launches: the last block resets it) folds
+// `(q0 + q1) + (q2 + q3)` in fixed quarter order and writes `gates[row * 4 + g]`, so the
+// result does not depend on arrival order.  No `hc_act`.
+// `input` is the HC streams (BF16 bits when `state_bf16`); `gate_weight` is the write's BF16
+// [4, 4 * hidden] block_inject.  Not for recording / graph capture (the counters are one
+// persistent buffer per Gpu); the dispatch pairing guards that.
+template <typename T>
+static __device__ __forceinline__ void hyper_norm_gate_k4_branch(
+    const T* input,
+    const __hip_bfloat16* norm_weight,
+    const unsigned short* gate_weight,
+    float* normalized,
+    float* gates,
+    float* scratch,
+    unsigned int* counters) {
+    constexpr int hidden = 2560;
+    constexpr int wide = 4 * hidden;
+    const int branch = (int)blockIdx.x;
+    const int row = (int)blockIdx.y;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int offset = (row * 4 + branch) * hidden;
+    const int weight_offset = branch * hidden;
+    __shared__ float rms_sum[256];
+    __shared__ __align__(16) unsigned short xsb[hidden];
+    __shared__ unsigned int last_block;
+    // Gate row `wave`, quarter `branch`: weights up front (waves 0..3).
+    uint4 wv[10];
+    if (wave < 4) {
+        const unsigned short* w_row =
+            gate_weight + (size_t)wave * wide + weight_offset + lane * 8;
+#pragma unroll
+        for (int s = 0; s < 10; ++s) wv[s] = *(const uint4*)(w_row + s * 256);
+    }
+    float raw[10], weight[10];
+    float partial = 0.0f;
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        raw[u] = hc_stream_value(input[offset + tid + u * 256]);
+        weight[u] = bf16_to_f32(norm_weight[weight_offset + tid + u * 256]);
+    }
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        const float value = bf16_to_f32(bf16_round(raw[u]));
+        partial += value * value;
+    }
+    rms_sum[tid] = partial;
+    __syncthreads();
+    for (int stride = (int)blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            rms_sum[tid] += rms_sum[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float inv = rsqrtf(rms_sum[0] / (float)hidden + 1.0e-6f);
+#pragma unroll
+    for (int u = 0; u < 10; ++u) {
+        const float value = bf16_to_f32(bf16_round(
+            bf16_to_f32(bf16_round(raw[u])) * inv * (1.0f + weight[u])));
+        normalized[offset + tid + u * 256] = value;
+        xsb[tid + u * 256] = (unsigned short)(__float_as_uint(value) >> 16);
+    }
+    __syncthreads();
+    if (wave < 4) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+        for (int s = 0; s < 10; ++s) {
+            const uint4 xv = *(const uint4*)(xsb + lane * 8 + s * 256);
+            const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
+            const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
+            a0 += __uint_as_float(wv[s].x << 16) * xa.x;
+            a1 += __uint_as_float(wv[s].x & 0xFFFF0000u) * xa.y;
+            a2 += __uint_as_float(wv[s].y << 16) * xa.z;
+            a3 += __uint_as_float(wv[s].y & 0xFFFF0000u) * xa.w;
+            a0 += __uint_as_float(wv[s].z << 16) * xb.x;
+            a1 += __uint_as_float(wv[s].z & 0xFFFF0000u) * xb.y;
+            a2 += __uint_as_float(wv[s].w << 16) * xb.z;
+            a3 += __uint_as_float(wv[s].w & 0xFFFF0000u) * xb.w;
+        }
+        float sum = (a0 + a1) + (a2 + a3);
+        for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);
+        if (lane == 0) {
+            scratch[(size_t)(row * 4 + wave) * 4 + branch] = sum;
+            __threadfence();
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        last_block = atomicAdd(&counters[row], 1u) == 3u;
+    }
+    __syncthreads();
+    if (!last_block) return;
+    __threadfence();
+    if (tid < 4) {
+        const volatile float* q = scratch + (size_t)(row * 4 + tid) * 4;
+        const float q0 = q[0], q1 = q[1], q2 = q[2], q3 = q[3];
+        gates[(size_t)row * 4 + tid] = (q0 + q1) + (q2 + q3);
+    }
+    if (tid == 0) atomicExch(&counters[row], 0u);
+}
+
 extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_k4_outputs_f32(
     const void* input,
     const __hip_bfloat16* norm_weight,
     const unsigned short* gate_weight,
     float* normalized,
     float* gates,
+    float* scratch,
+    unsigned int* counters,
     int hidden,
     int state_bf16) {
-    constexpr int branches = 4;
-    constexpr int U = 10;
-    __shared__ __align__(16) unsigned short xsb[4 * 2560];
-    __shared__ float rms_sum[4 * 256];
-    __shared__ float quarter[16];
-    const int wide = branches * hidden;
-    const int row = (int)blockIdx.x;
-    const int tid = (int)threadIdx.x;
-    const int wave = tid >> 5;
-    const int lane = tid & 31;
-    const size_t in = (size_t)row * wide;
-    // Gate weights of this wave's two (gate row, quarter) jobs load up front.
-    const int qb = wave & 3;
-    const int g0 = wave >> 2;
-    uint4 wv0[U], wv1[U];
-    {
-        const unsigned short* w0 = gate_weight + (size_t)g0 * wide + qb * hidden + lane * 8;
-        const unsigned short* w1 = gate_weight + (size_t)(g0 + 2) * wide + qb * hidden + lane * 8;
-#pragma unroll
-        for (int s = 0; s < U; ++s) {
-            wv0[s] = *(const uint4*)(w0 + s * 256);
-            wv1[s] = *(const uint4*)(w1 + s * 256);
-        }
-    }
-    float raw[branches][U];
-    if (state_bf16) {
-        const unsigned short* s = (const unsigned short*)input + in;
-#pragma unroll
-        for (int b = 0; b < branches; ++b)
-#pragma unroll
-            for (int u = 0; u < U; ++u)
-                raw[b][u] = hc_stream_value(s[b * hidden + tid + 256 * u]);
-    } else {
-        const float* s = (const float*)input + in;
-#pragma unroll
-        for (int b = 0; b < branches; ++b)
-#pragma unroll
-            for (int u = 0; u < U; ++u)
-                raw[b][u] = hc_stream_value(s[b * hidden + tid + 256 * u]);
-    }
-#pragma unroll
-    for (int b = 0; b < branches; ++b) {
-        float partial = 0.0f;
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const float value = bf16_to_f32(bf16_round(raw[b][u]));
-            partial += value * value;
-        }
-        rms_sum[b * 256 + tid] = partial;
-    }
-    __syncthreads();
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-#pragma unroll
-            for (int b = 0; b < branches; ++b)
-                rms_sum[b * 256 + tid] += rms_sum[b * 256 + tid + stride];
-        }
-        __syncthreads();
-    }
-#pragma unroll
-    for (int b = 0; b < branches; ++b) {
-        const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
-#pragma unroll
-        for (int u = 0; u < U; ++u) {
-            const int j = b * hidden + tid + 256 * u;
-            const float value = bf16_to_f32(bf16_round(
-                bf16_to_f32(bf16_round(raw[b][u])) * inv * (1.0f + bf16_to_f32(norm_weight[j]))));
-            normalized[in + j] = value;
-            xsb[j] = (unsigned short)(__float_as_uint(value) >> 16);
-        }
-    }
-    __syncthreads();
-#pragma unroll
-    for (int job = 0; job < 2; ++job) {
-        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-#pragma unroll
-        for (int s = 0; s < U; ++s) {
-            const uint4 wv = job == 0 ? wv0[s] : wv1[s];
-            const uint4 xv = *(const uint4*)(xsb + qb * hidden + lane * 8 + s * 256);
-            const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
-            const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
-            a0 += __uint_as_float(wv.x << 16) * xa.x;
-            a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
-            a2 += __uint_as_float(wv.y << 16) * xa.z;
-            a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
-            a0 += __uint_as_float(wv.z << 16) * xb.x;
-            a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
-            a2 += __uint_as_float(wv.w << 16) * xb.z;
-            a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
-        }
-        float sum = (a0 + a1) + (a2 + a3);
-        for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);
-        if (lane == 0) quarter[(g0 + 2 * job) * 4 + qb] = sum;
-    }
-    __syncthreads();
-    if (tid < branches) {
-        const float* q = quarter + tid * 4;
-        gates[(size_t)row * branches + tid] = (q[0] + q[1]) + (q[2] + q[3]);
-    }
+    if (state_bf16)
+        hyper_norm_gate_k4_branch((const unsigned short*)input, norm_weight, gate_weight,
+                                  normalized, gates, scratch, counters);
+    else
+        hyper_norm_gate_k4_branch((const float*)input, norm_weight, gate_weight, normalized,
+                                  gates, scratch, counters);
 }
 #endif  // __GFX12__
 

@@ -3942,6 +3942,14 @@ pub const SITES: &[Site] = &[
         occurrences: 2,
         decisions: &["eager-only-refusals"],
     },
+    // hyper_norm_gate_k4_outputs refuses before submission under recording/capture (its row
+    // counters are one persistent per-Gpu buffer); the dispatch pairing never reaches it there.
+    Site {
+        file: "rdna-compute/src/tensor_ops.rs",
+        function: "hyper_norm_gate_k4_outputs",
+        occurrences: 2,
+        decisions: &["eager-only-refusals"],
+    },
     Site {
         file: "rdna-compute/src/verify_twins.rs",
         function: "stage_attention_fp8_e4m3_kv_batched_segs",

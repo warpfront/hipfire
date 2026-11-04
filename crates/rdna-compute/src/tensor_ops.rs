@@ -2720,6 +2720,10 @@ pub struct HyperNormGateK4Outputs<'a> {
     pub state_bf16: bool,
 }
 
+/// Bytes of the per-Gpu row-completion buffer of [`hyper_norm_gate_k4_outputs`]: 8 counters
+/// (padded to 64 B) and the `[8 rows][4 gates][4 quarters]` F32 quarter scratch.
+const HC_PAIR_SYNC_BYTES: usize = 64 + 8 * 16 * 4;
+
 impl HyperNormGateK4Outputs<'_> {
     /// Geometry the kernel supports: four branches, hidden 2560, 1..=8 rows.
     pub fn supports(branches: usize, hidden: usize, rows: usize) -> bool {
@@ -2747,6 +2751,14 @@ pub fn hyper_norm_gate_k4_outputs(gpu: &mut Gpu, p: &HyperNormGateK4Outputs<'_>)
     {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
     }
+    // The row-completion counters live in one persistent per-Gpu buffer that no recorded or
+    // captured launch may share with an eager one.
+    if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+        return Err(HipError::new(
+            0,
+            "hyper_norm_gate_k4_outputs: not available while recording or capturing",
+        ));
+    }
     let hidden = checked_i32(p.hidden, "HC norm-gate-k4 hidden width")?;
     let row_grid = checked_u32(p.rows, "HC norm-gate-k4 row grid")?;
     gpu.ensure_kernel_public(
@@ -2754,18 +2766,31 @@ pub fn hyper_norm_gate_k4_outputs(gpu: &mut Gpu, p: &HyperNormGateK4Outputs<'_>)
         TENSOR_OPS_SRC,
         "hyper_norm_gate_k4_outputs_f32",
     )?;
+    // `[8 u32 counters | pad to 64 B | 8 rows x 4 gates x 4 quarters f32]`, zeroed once.
+    if gpu.hc_pair_sync.is_none() {
+        gpu.bind_thread()?;
+        let sync = gpu.alloc_tensor(&[HC_PAIR_SYNC_BYTES / 4], DType::F32)?;
+        gpu.hip.memset(&sync.buf, 0, sync.buf.size())?;
+        gpu.hc_pair_sync = Some(sync);
+    }
+    let counters = gpu.hc_pair_sync.as_ref().unwrap().buf.as_ptr();
+    // SAFETY: the buffer is HC_PAIR_SYNC_BYTES long; the quarter scratch starts at byte 64.
+    let scratch = unsafe { (counters as *mut u8).add(64) } as *mut std::ffi::c_void;
     let mut args = KernargBlob::new();
     args.push_ptr(p.input.buf.as_ptr());
     args.push_ptr(p.norm_weight.buf.as_ptr());
     args.push_ptr(p.gate_weight.buf.as_ptr());
     args.push_ptr(p.normalized.buf.as_ptr());
     args.push_ptr(p.gates.buf.as_ptr());
+    args.push_ptr(scratch);
+    args.push_ptr(counters);
     args.push_i32(hidden);
     args.push_i32(i32::from(p.state_bf16));
     args.pad_to(16);
+    // Grid `[branches, rows]`, hyper_norm_f32's geometry: block (b, row) is one branch of one row.
     gpu.launch_blob_recorded(
         "hyper_norm_gate_k4_outputs_f32",
-        [row_grid, 1, 1],
+        [4, row_grid, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),

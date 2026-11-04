@@ -7,6 +7,7 @@
 //!
 //! ```text
 //! hc_pair_decode_oracle [SEEDS]        (default 32 seeds)
+//! hc_pair_decode_oracle --bench        (timing only: median us of the fused kernel vs the pair)
 //! ```
 //!
 //! On one GPU, for random HC streams (F32 words and BF16 bits, `state_bf16`), random BF16 norm
@@ -291,12 +292,108 @@ fn fused(
     Ok(out)
 }
 
+/// `--bench`: median microseconds per launch of the fused kernel and of the `hyper_norm` +
+/// k4 gate pair it replaces, at 1 and 8 rows, F32 streams. 200 samples per cell, each the
+/// hipEvent time of 10 back-to-back launches divided by 10 (so event overhead is amortised);
+/// 20 untimed warm-up launches first. No result is compared here.
+fn bench(gpu: &mut Gpu) -> Result<i32, String> {
+    const SAMPLES: usize = 200;
+    const BATCH: usize = 10;
+    let mut rng = Rng(0x5eed_0b5e_55ed_1234);
+    let nw = gen_values(WIDE, 0.5, &mut rng);
+    let gw = gen_values(BRANCHES * WIDE, 0.05, &mut rng);
+    let norm_weight = upload_typed(gpu, &bf16_bytes(&nw), WIDE, DType::BF16)?;
+    let gate_weight = upload_typed(gpu, &bf16_bytes(&gw), BRANCHES * WIDE, DType::BF16)?;
+    for rows in [1usize, 8] {
+        let values = gen_values(rows * WIDE, 1.0, &mut rng);
+        let n = rows * WIDE;
+        let input = upload_typed(gpu, &stream_bytes(&values, false), n, DType::F32)?;
+        let normalized = gpu.alloc_tensor(&[n], DType::F32).map_err(err)?;
+        let gates = gpu
+            .alloc_tensor(&[rows * BRANCHES], DType::F32)
+            .map_err(err)?;
+        let mut fused_launch = |gpu: &mut Gpu| -> Result<(), String> {
+            hyper_norm_gate_k4_outputs(
+                gpu,
+                &HyperNormGateK4Outputs {
+                    input: &input,
+                    norm_weight: &norm_weight,
+                    gate_weight: &gate_weight,
+                    normalized: &normalized,
+                    gates: &gates,
+                    rows,
+                    branches: BRANCHES,
+                    hidden: HIDDEN,
+                    state_bf16: false,
+                },
+            )
+            .map_err(err)
+        };
+        let mut pair_launch = |gpu: &mut Gpu| -> Result<(), String> {
+            hyper_norm(
+                gpu,
+                &HyperNorm {
+                    input: &input,
+                    norm_weight: &norm_weight,
+                    normalized: &normalized,
+                    branches: BRANCHES,
+                    hidden: HIDDEN,
+                    state_bf16: false,
+                },
+            )
+            .map_err(err)?;
+            gpu.gemv_bf16_xf32_k4_rows(
+                &gate_weight,
+                &normalized,
+                &gates,
+                BRANCHES,
+                WIDE,
+                None,
+                rows,
+            )
+            .map_err(err)
+        };
+        let start = gpu.hip.event_create().map_err(err)?;
+        let stop = gpu.hip.event_create().map_err(err)?;
+        let mut median_us = |gpu: &mut Gpu,
+                             body: &mut dyn FnMut(&mut Gpu) -> Result<(), String>|
+         -> Result<f64, String> {
+            for _ in 0..20 {
+                body(gpu)?;
+            }
+            let mut samples = Vec::with_capacity(SAMPLES);
+            for _ in 0..SAMPLES {
+                gpu.hip.event_record(&start, None).map_err(err)?;
+                for _ in 0..BATCH {
+                    body(gpu)?;
+                }
+                gpu.hip.event_record(&stop, None).map_err(err)?;
+                gpu.hip.event_synchronize(&stop).map_err(err)?;
+                let ms = gpu.hip.event_elapsed_ms(&start, &stop).map_err(err)?;
+                samples.push(ms as f64 * 1_000.0 / BATCH as f64);
+            }
+            samples.sort_by(f64::total_cmp);
+            Ok(samples[SAMPLES / 2])
+        };
+        let fused_us = median_us(gpu, &mut fused_launch)?;
+        let pair_us = median_us(gpu, &mut pair_launch)?;
+        println!(
+            "hc_pair_decode_oracle bench rows {rows}: fused {fused_us:.2} us, hyper_norm + k4 pair {pair_us:.2} us"
+        );
+        for t in [input, normalized, gates] {
+            gpu.free_tensor(t).map_err(err)?;
+        }
+    }
+    Ok(0)
+}
+
 fn run() -> Result<i32, String> {
-    let seeds: u64 = std::env::args()
-        .nth(1)
-        .map(|s| s.parse().map_err(|_| format!("bad seed count {s:?}")))
-        .transpose()?
-        .unwrap_or(32);
+    let arg = std::env::args().nth(1);
+    let bench_mode = arg.as_deref() == Some("--bench");
+    let seeds: u64 = match arg {
+        Some(s) if !bench_mode => s.parse().map_err(|_| format!("bad seed count {s:?}"))?,
+        _ => 32,
+    };
     let mut gpu = Gpu::init().map_err(err)?;
     println!("device arch: {}", gpu.arch);
     if !gpu.arch_caps.has_gfx11_plus_simt() {
@@ -305,6 +402,9 @@ fn run() -> Result<i32, String> {
             gpu.arch
         );
         return Ok(2);
+    }
+    if bench_mode {
+        return bench(&mut gpu);
     }
     let mut st = Stats::default();
     let mut control_ok = true;

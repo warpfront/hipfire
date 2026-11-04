@@ -1725,6 +1725,10 @@ pub struct Gpu {
     /// Monotonic aggregate-MoE launch census ([`Gpu::moe_route_launch_census`]); plain adds,
     /// no locking, bumped after a successful launch submission.
     pub(crate) moe_route_census: crate::gemm::MoeRouteLaunchCensus,
+    /// Row-completion counters and quarter scratch of `hyper_norm_gate_k4_outputs_f32`
+    /// (HIPFIRE_QWEN4_HC_PAIR_DECODE), allocated and zeroed on first use; the kernel's last
+    /// block of a row resets its counter, so it stays zero between launches.
+    pub(crate) hc_pair_sync: Option<GpuTensor>,
     /// The routed-expert weights this device reads through the Qwen4 MQ4 MoE
     /// launchers are in the drop-zero planar layout (`DType::MQ4G256V2P` /
     /// `MQ4G128V2P`, DESIGN F1) instead of the shipped qt44/qt53 layout. Set
@@ -3155,6 +3159,7 @@ impl Gpu {
             arch_caps,
             device_id: id,
             moe_route_census: crate::gemm::MoeRouteLaunchCensus::default(),
+            hc_pair_sync: None,
             mq4_experts_planar: false,
             moe32_gu: match hipfire_config::developer_var("HIPFIRE_QWEN4_MOE32_GU").as_deref() {
                 Ok("0") => 0,
