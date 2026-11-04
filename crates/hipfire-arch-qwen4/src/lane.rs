@@ -2568,6 +2568,17 @@ impl Qwen4LaneStore {
         self.spec.as_ref().map(|s| s.config)
     }
 
+    /// A non-owning view of the staged MTP store's prompt-fill Append scratch
+    /// ([`MtpAppendScratch::shared_view`]), for the singleton drafter under
+    /// `HIPFIRE_QWEN4_LANE_APPEND_SHARE`; `None` for an AR store or a store without the scratch.
+    pub(crate) fn spec_append_scratch_view(&self) -> Option<MtpAppendScratch> {
+        self.spec
+            .as_ref()?
+            .append_scratch
+            .as_ref()
+            .map(MtpAppendScratch::shared_view)
+    }
+
     /// `epoch`'s window counters (`None`: unknown lane or an AR lane); the
     /// retirement is the root's.
     pub fn lane_spec_stats(&self, epoch: &RequestEpoch) -> Option<LaneSpecStats> {

@@ -5650,8 +5650,25 @@ impl Qwen4MtpDrafter {
             let bundle = Self::bundle(target)?;
             if bundle.mtp_append_rows_supported(ops.gpu()?) {
                 let rows = MTP_FILL_ROWS.min(prefill_rows);
-                let scratch = MtpAppendScratch::new(ops.gpu()?, &bundle.config, rows, prefill_rows)
-                    .map_err(|error| format!("Qwen4 MTP append scratch allocation: {error}"))?;
+                // `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: with an MTP lane store staged, this scratch
+                // is a view of the store's own (same shape: `MTP_FILL_ROWS.min(chunk)` rows). The
+                // lane store and this drafter are never in use at the same time: both run on the
+                // one driver thread and the one stream of the bundle's single forward scratch,
+                // and no scratch tensor carries state between two passes (see
+                // `MtpAppendScratch::shared_view`). A longer prompt chunk than the lane
+                // store's id capacity takes the per-sub-chunk id upload
+                // (`prefill_uploads_chunk_ids`), which uploads the same bytes.
+                let shared = hipfire_config::qwen4_lane_append_share()
+                    .then(|| bundle.lane_append_scratch_view())
+                    .flatten()
+                    .filter(|view| view.rows() >= rows);
+                let scratch = match shared {
+                    Some(view) => view,
+                    None => MtpAppendScratch::new(ops.gpu()?, &bundle.config, rows, prefill_rows)
+                        .map_err(|error| {
+                        format!("Qwen4 MTP append scratch allocation: {error}")
+                    })?,
+                };
                 self.append_scratch = Some(scratch);
             }
         }
@@ -10808,6 +10825,24 @@ pub fn qwen4_capture_bytes(
 /// even with batched fill off).
 pub fn native_mtp_fill_scratch(gpu: &Gpu) -> bool {
     (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()) && mtp_fill_scratch_wanted(gpu)
+}
+
+/// Set by the EP loader (`qwen4_set_lane_append_shared`) when the load reserves MTP lanes under
+/// `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: the singleton drafter's Append scratch is then a view of
+/// the lane store's, so the native-MTP census charges it once (in the lane store).
+static LANE_APPEND_SHARED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set or clear [`LANE_APPEND_SHARED`]; cleared by every Qwen4 load.
+pub fn qwen4_set_lane_append_shared(on: bool) {
+    LANE_APPEND_SHARED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`native_mtp_fill_scratch`] as the native-MTP census of a placement charges it: the
+/// singleton drafter's Append scratch only where it is its own allocation
+/// ([`LANE_APPEND_SHARED`] off).
+pub fn native_mtp_fill_scratch_charged(gpu: &Gpu) -> bool {
+    native_mtp_fill_scratch(gpu) && !LANE_APPEND_SHARED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Device bytes native MTP adds to a load whose QSA context storage is

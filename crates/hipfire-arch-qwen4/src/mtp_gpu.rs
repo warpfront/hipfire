@@ -641,6 +641,9 @@ pub(crate) struct MtpAppendScratch {
     id_rows: usize,
     host_token_bytes: Vec<u8>,
     host_prompt_ids: Vec<u8>,
+    /// The tensors are non-owning views of another scratch ([`Self::shared_view`]):
+    /// [`Self::free_gpu`] frees nothing.
+    borrowed: bool,
 }
 
 impl MtpAppendScratch {
@@ -749,7 +752,41 @@ impl MtpAppendScratch {
             id_rows,
             host_token_bytes: vec![0; rows * std::mem::size_of::<i32>()],
             host_prompt_ids: vec![0; id_rows * std::mem::size_of::<i32>()],
+            borrowed: false,
         })
+    }
+
+    /// A second handle on this scratch's device buffers (`HIPFIRE_QWEN4_LANE_APPEND_SHARE`):
+    /// every tensor a non-owning alias of the owner's (`GpuTensor::shallow_clone`), with its
+    /// own host staging vectors. The view is freed by dropping it (`free_gpu` is a no-op); the
+    /// OWNER's `free_gpu` must outlive every use of the view. Safe to alternate with the owner
+    /// because no scratch tensor carries state between two uses: every pass writes each
+    /// `rows`-row view it reads (`append_rows`), and the prompt-id buffer is written by
+    /// [`Self::upload_prompt_ids`] immediately before the sub-chunk passes that read it, with no
+    /// other user of the scratch in between (one driver thread, one stream).
+    pub(crate) fn shared_view(&self) -> Self {
+        Self {
+            rows: self.rows,
+            token_ids: self.token_ids.shallow_clone(),
+            token_embedding: self.token_embedding.shallow_clone(),
+            embedding_norm: self.embedding_norm.shallow_clone(),
+            projected_embedding: self.projected_embedding.shallow_clone(),
+            hidden_norm: self.hidden_norm.shallow_clone(),
+            projected_hidden: self.projected_hidden.shallow_clone(),
+            wide: self.wide.shallow_clone(),
+            hc_normalized: self.hc_normalized.shallow_clone(),
+            hc_low: self.hc_low.shallow_clone(),
+            hc_up: self.hc_up.shallow_clone(),
+            hc_mixed: self.hc_mixed.shallow_clone(),
+            index: self.index.shallow_clone(),
+            qsa_k: self.qsa_k.shallow_clone(),
+            qsa_v: self.qsa_v.shallow_clone(),
+            prompt_ids: self.prompt_ids.shallow_clone(),
+            id_rows: self.id_rows,
+            host_token_bytes: vec![0; self.host_token_bytes.len()],
+            host_prompt_ids: vec![0; self.host_prompt_ids.len()],
+            borrowed: true,
+        }
     }
 
     /// Upload `tokens` (at most the id-row capacity) as the prompt chunk's i32
@@ -797,6 +834,9 @@ impl MtpAppendScratch {
     }
 
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), MtpGpuError> {
+        if self.borrowed {
+            return Ok(());
+        }
         let tensors = [
             self.token_ids,
             self.token_embedding,

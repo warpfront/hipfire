@@ -4708,6 +4708,21 @@ pub fn qwen4_lane_reserve_trim() -> bool {
     developer_bool(QWEN4_LANE_RESERVE_TRIM_ENV, true)
 }
 
+/// `HIPFIRE_QWEN4_LANE_APPEND_SHARE` (developer, default ON, exact `0` is the kill switch):
+/// the native-MTP singleton drafter's prompt-fill Append scratch (`MtpAppendScratch`) is a
+/// non-owning view of the staged lane store's own scratch instead of a second allocation
+/// of the same shape, and an EP load with spec lanes does not reserve it twice. The two
+/// are never in use at the same time (one driver thread, one stream, and the lane store and
+/// the singleton already share the bundle's one forward scratch), and the scratch is
+/// rewritten by every pass before it is read (see `Qwen4MtpDrafter::ensure_resources`).
+/// `0` restores the per-drafter allocation and the old reservation byte for byte.
+pub const QWEN4_LANE_APPEND_SHARE_ENV: &str = "HIPFIRE_QWEN4_LANE_APPEND_SHARE";
+
+/// [`QWEN4_LANE_APPEND_SHARE_ENV`] read through the process snapshot.
+pub fn qwen4_lane_append_share() -> bool {
+    developer_bool(QWEN4_LANE_APPEND_SHARE_ENV, true)
+}
+
 /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` (lab, default off): with
 /// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] on, treat every lane (greedy and seeded
 /// included) as wide-class. For oracles that measure the wide pass with greedy

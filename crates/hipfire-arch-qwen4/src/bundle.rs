@@ -3657,6 +3657,14 @@ impl Qwen4Bundle {
         self.mtp.is_some() && Qwen4MtpGpu::append_rows_supported(gpu, &self.weights, &self.config)
     }
 
+    /// The staged lane store's prompt-fill Append scratch as a non-owning view
+    /// ([`crate::lane::Qwen4LaneStore::spec_append_scratch_view`]): `None` without a staged MTP
+    /// lane store (or while a lane step holds the store out, which never overlaps a drafter's
+    /// resource provisioning: one driver thread).
+    pub(crate) fn lane_append_scratch_view(&self) -> Option<crate::mtp_gpu::MtpAppendScratch> {
+        self.lanes.as_ref()?.spec_append_scratch_view()
+    }
+
     /// Map the MTP head's QSA context through `last_position` (the row the
     /// last Append of a run writes) in one go: the coverage each Append's own
     /// `mapped_mtp` would grow to, so those calls then find it mapped. A VMM

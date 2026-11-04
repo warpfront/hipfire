@@ -4245,7 +4245,7 @@ fn placement_inputs_charged(
                 drafts,
                 head,
                 row_capture,
-                crate::mtp_spec::native_mtp_fill_scratch(gpu),
+                crate::mtp_spec::native_mtp_fill_scratch_charged(gpu),
             )
             .ok_or("qwen4: native MTP device bytes overflow")?,
         ))
@@ -9836,6 +9836,240 @@ mod tests {
             let error = native_mtp_granule_slack(&lists.0, &lists.1, &lists.2, g).unwrap_err();
             assert!(error.contains("overflows"), "{error}");
         }
+    }
+
+    /// `HIPFIRE_QWEN4_LANE_APPEND_SHARE` at the shipped EP2 serve shape (8 lanes, K5, a 48-row
+    /// all-rows lane step, max_seq 16384, 4096-row chunk): the native-MTP census of the
+    /// singleton drafter drops exactly the prompt-fill Append scratch allocations while the
+    /// lane store keeps its own, so the scratch is charged once; and the one scratch still
+    /// covers every user's maximum (the drafter's `MTP_FILL_ROWS.min(chunk)` rows, the lane
+    /// tile's sub-chunks of at most its row capacity, the 8 x 6 = 48 decode rows of a lane step
+    /// in the unchanged lane step buffers).
+    #[test]
+    fn lane_append_share_charges_the_scratch_once_and_covers_every_user() {
+        use crate::lane::census::{
+            lane_spec_census, CensusComponent, CensusInputs, LaneSpecBudget,
+        };
+        use crate::mtp_gpu::{MtpAppendScratch, MTP_FILL_ROWS};
+        use crate::weights::Qwen4BandScope;
+        use crate::{GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let head = language_head_dtype(&manifest.weights).unwrap();
+        let (max_seq, chunk, granularity) = (16384usize, 4096usize, 2usize << 20);
+        let context =
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, max_seq, granularity);
+        let singleton = |fill: bool| {
+            crate::mtp_spec::native_mtp_device_bytes(
+                &config,
+                &context,
+                chunk,
+                7,
+                head,
+                Some((GdnStateFormat::Q8, 8)),
+                fill,
+            )
+            .unwrap()
+        };
+        // The drafter's scratch: `MTP_FILL_ROWS.min(prefill_rows)` rows, `prefill_rows` ids.
+        let drafter_rows = MTP_FILL_ROWS.min(chunk);
+        let drafter_scratch =
+            MtpAppendScratch::device_bytes(&config, drafter_rows, chunk).unwrap() as u64;
+        let (charged, shared) = (singleton(true), singleton(false));
+        assert_eq!(charged - shared, drafter_scratch);
+        // The lane store's own scratch: `MTP_FILL_ROWS.min(spec_chunk_rows)` rows, as many ids.
+        let lane_rows = MTP_FILL_ROWS.min(chunk);
+        let lane_scratch =
+            MtpAppendScratch::device_bytes(&config, lane_rows, lane_rows).unwrap() as u64;
+        let format = Qwen4StateFormat {
+            qsa: crate::QsaKvFormat::Fp8,
+            gdn: GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: true,
+        };
+        let scope = Qwen4BandScope::single(&config);
+        let lane_context =
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, chunk, granularity);
+        let budget = LaneSpecBudget::new(8, 5, 0, 0, lane_context, 1).unwrap();
+        assert_eq!(budget.step_rows(), 48);
+        let inputs = CensusInputs {
+            config: &config,
+            format,
+            scope: &scope,
+            rank: 0,
+            append_scratch: Some((MTP_FILL_ROWS, MTP_FILL_ROWS)),
+        };
+        let census = lane_spec_census(&budget, &inputs).unwrap();
+        assert_eq!(
+            census.bytes_of(CensusComponent::AppendScratch),
+            Some(lane_scratch),
+            "the lane store keeps charging its own scratch"
+        );
+        // The shared scratch covers the drafter's rows and every sub-chunk a lane tile or the
+        // 48-row step can ask of it (`append_rows` takes at most the scratch rows per pass).
+        assert!(lane_rows >= drafter_rows);
+        assert!(lane_rows >= budget.step_rows());
+        assert_eq!(MTP_FILL_ROWS, 1024);
+        // The two ids buffers differ only by the id-row capacity (a view of the lane's: a
+        // longer prompt chunk takes the per-sub-chunk upload).
+        assert_eq!(
+            drafter_scratch - lane_scratch,
+            4 * (chunk - lane_rows) as u64
+        );
+        // What the census frees: one scratch at the shipped shape, in resident expert units
+        // (the planar 2,534,400-byte expert unit of symtrunk).
+        assert_eq!(charged - shared, 259_792_896 + 4 * (chunk as u64 - 1024));
+        assert!((charged - shared) / 2_534_400 >= 102);
+    }
+    /// Prints the per-rank reserve census of the shipped EP2 serve load (symtrunk, max_seq 16384,
+    /// 4096-row compact chunk, K7 window, QSA fp8 + BF16 pooled, GDN q8) beside the historical
+    /// floor: the receipt of the residency inventory. Asserts nothing.
+    #[test]
+    #[ignore = "receipt generator"]
+    fn ep2_reserve_census_receipt() {
+        use crate::{GdnStateFormat, Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let manifest = crate::weights::Qwen4Manifest::build(&config).expect("FN manifest");
+        let weights = &manifest.weights;
+        let format = Qwen4StateFormat {
+            qsa: crate::QsaKvFormat::Fp8,
+            gdn: GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: true,
+        };
+        let (max_seq, chunk, granularity) = (16384usize, 4096usize, 2usize << 20);
+        let mode = Qwen4ForwardScratchMode::FnSymGfx1201;
+        let census_context =
+            crate::Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, max_seq, granularity);
+        let context = crate::Qwen4ContextCommit::for_expert_reserve(
+            Qwen4KvBackend::Vmm,
+            false,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        let mib = |bytes: u64| format!("{:.2}", bytes as f64 / 1048576.0);
+        let state = state_census(&config, format, &census_context, chunk, mode).unwrap();
+        let head = language_head_dtype(weights).unwrap();
+        let mtp = |context: &crate::Qwen4ContextCommit| {
+            crate::mtp_spec::native_mtp_device_bytes(
+                &config,
+                context,
+                chunk,
+                7,
+                head,
+                Some((GdnStateFormat::Q8, 8)),
+                true,
+            )
+            .unwrap()
+        };
+        let gather = rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+            config.num_key_value_heads,
+            max_seq,
+        )
+        .unwrap() as u64;
+        let route_rows = f16_shadow_route_rows("gfx1201", chunk);
+        let f16 = f16_shadow_charge(true, route_rows, weights, config.num_hidden_layers).unwrap();
+        let i8 = shared_i8_charge(true, route_rows, weights, config.num_hidden_layers).unwrap();
+        let dims = rdna_compute::scratch::Qwen4PrefillWorkspaceDims {
+            hidden_size: config.hidden_size,
+            moe_intermediate_size: config.moe_intermediate_size,
+            num_experts: config.num_experts,
+            top_k: config.num_experts_per_tok,
+            hc_count: config.hc_count,
+            hc_lowrank: config.hc_lowrank,
+            gdn_format: Some(GdnStateFormat::Q8),
+            routed_i4: true,
+            include_short_tails: true,
+        };
+        let workspace = rdna_compute::scratch::qwen4_prefill_workspace_terms(chunk, &dims).unwrap();
+        let selector = rdna_compute::tensor_ops::qsa_bf16_split_capacity_bytes() as u64;
+        {
+            let (resident, scratch) = crate::mtp_gpu::Qwen4MtpGpu::device_bytes(
+                config.mtp_geometry(),
+                &census_context,
+                head,
+                false,
+            )
+            .unwrap();
+            println!(
+                "MTP head resident {resident} B ({} MiB), build scratch {scratch} B ({} MiB)",
+                mib(resident as u64),
+                mib(scratch as u64)
+            );
+            let sizes = crate::mtp_spec::native_mtp_request_allocation_sizes(
+                &config,
+                max_seq,
+                chunk,
+                7,
+                Some((GdnStateFormat::Q8, 8)),
+                true,
+            )
+            .unwrap();
+            println!(
+                "MTP request allocations ({} total {} MiB): {:?}",
+                sizes.len(),
+                mib(sizes.iter().sum()),
+                sizes.iter().map(|b| mib(*b)).collect::<Vec<_>>()
+            );
+            let measured_forward = crate::gpu_forward::Qwen4GpuForwardScratch::device_bytes(
+                &config,
+                AUTO_VRAM_RESERVE_CHUNK,
+                Qwen4ForwardScratchMode::Full,
+            )
+            .unwrap();
+            println!("historical measured Full forward at {AUTO_VRAM_RESERVE_CHUNK} rows: {} MiB (+ spec buffers)", mib(measured_forward));
+            let committed = context
+                .committed_layer_bytes(&config, format.layout().kv)
+                .unwrap() as u64
+                * config.n_full_layers() as u64;
+            let measured_context = config
+                .qsa_context_arena_bytes(AUTO_VRAM_RESERVE_MAX_SEQ, format.layout().kv)
+                .unwrap() as u64
+                * config.n_full_layers() as u64;
+            println!(
+                "context committed {} MiB vs measured-at-32768 {} MiB",
+                mib(committed),
+                mib(measured_context)
+            );
+        }
+        let mtp_census = mtp(&census_context);
+        let mut total = 0u64;
+        let mut line = |name: &str, bytes: u64| {
+            total += bytes;
+            println!("census {name:<32} {bytes:>14} B {:>10} MiB", mib(bytes));
+        };
+        line("QSA context (12 layers)", state.qsa_context);
+        line("state (singleton, w/o context)", state.state);
+        line("forward (scratch + spec buffers)", state.forward);
+        line("F16 weight shadows", f16);
+        line("INT8 shared-expert shadows", i8);
+        for (name, bytes) in workspace {
+            line(&format!("workspace {name}"), bytes);
+        }
+        line("QSA selector", selector);
+        line("native MTP", mtp_census);
+        line("QSA gather", gather);
+        println!("census TOTAL {total} B = {} MiB", mib(total));
+        let historical = auto_vram_reserve_with_forward(
+            &config,
+            &context,
+            chunk,
+            mode,
+            format.layout(),
+            Some(mtp(&context)),
+            Some(gather),
+            None,
+        )
+        .unwrap();
+        println!("historical floor {historical} B = {} MiB", mib(historical));
+        let base = historical.max(total);
+        println!(
+            "reserve = max(...) {} MiB + margin {} MiB = {} MiB",
+            mib(base),
+            mib(EXPERT_HOTSET_VRAM_MARGIN_BYTES),
+            mib(base + EXPERT_HOTSET_VRAM_MARGIN_BYTES)
+        );
     }
 }
 

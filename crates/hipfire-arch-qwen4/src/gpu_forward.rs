@@ -19771,6 +19771,39 @@ mod tests {
             .0
     }
 
+    /// Prints every owning scratch field of the compact EP forward at the shipped 4096-row chunk
+    /// (a receipt for the residency inventory; asserts only that the printed owners sum to the
+    /// plan's bytes).
+    #[test]
+    #[ignore = "receipt generator"]
+    fn forward_scratch_receipt() {
+        for (rows, mode) in [(4096usize, Mode::FnSymGfx1201), (512, Mode::FnSymGfx1201)] {
+            let slots = plan(rows, mode);
+            let mut total = 0u64;
+            println!("## forward scratch {mode:?} rows={rows}");
+            for (field, slot) in F::ALL.iter().zip(&slots) {
+                if slot.owner.is_some() {
+                    continue;
+                }
+                let bytes = slot.bytes().unwrap() as u64;
+                total += bytes;
+                println!(
+                    "  {field:?} {:?} {} B ({:.2} MiB)",
+                    slot.dtype,
+                    bytes,
+                    bytes as f64 / 1048576.0
+                );
+            }
+            println!(
+                "  owners total {} B = {:.2} MiB; qwen4_forward_device_bytes {} B",
+                total,
+                total as f64 / 1048576.0,
+                qwen4_forward_device_bytes(&fn_config(), rows, mode).unwrap()
+            );
+            assert_eq!(total, scratch_bytes(rows, mode));
+        }
+    }
+
     fn field_bytes(slots: &[ScratchSlot], field: F) -> u64 {
         slots[field as usize].bytes().expect("field bytes") as u64
     }

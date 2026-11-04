@@ -798,6 +798,7 @@ impl Carrier for Qwen4Carrier {
         // this one: the EP plan below sets it again when it moves the chunk.
         hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(None);
         hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_dedicated_exchange_root(false);
+        hipfire_arch_qwen4::mtp_spec::qwen4_set_lane_append_shared(false);
         self.admit_topology(
             hipfire_arch_qwen4::ARCH_ID,
             src.is_dir(),
@@ -3100,6 +3101,16 @@ pub fn qwen4_ep_vram_layers(
     let copy = (spec_k.is_some() && batch.spec_copy)
         .then(|| hipfire_arch_qwen4::ep::ep_default_copy_config(gpu.arch.as_str()))
         .flatten();
+    // `HIPFIRE_QWEN4_LANE_APPEND_SHARE`: with MTP lanes reserved on the exact VMM lane route the
+    // singleton drafter's prompt-fill Append scratch is a view of the lane store's own, so the
+    // native-MTP census below charges it once (the lane store's). Every later census of this
+    // load (the decoupled reserve, each rank's placement) reads the same process-wide gate.
+    hipfire_arch_qwen4::mtp_spec::qwen4_set_lane_append_shared(
+        spec_k.is_some()
+            && batch.lanes().is_some()
+            && shared.backend == hipfire_arch_qwen4::Qwen4KvBackend::Vmm
+            && hipfire_config::qwen4_lane_append_share(),
+    );
     let ordinary_at = |chunk: usize| -> Result<Qwen4EpPlacementAt, String> {
         let (non_expert, layer_experts, reserve, ..) = qwen4_placement_inputs(
             gpu,
