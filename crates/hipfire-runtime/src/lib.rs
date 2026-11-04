@@ -52,6 +52,7 @@ pub mod e8p_i4_reference;
 pub mod ep;
 pub mod ep_row_gather;
 pub mod ep_tile_exchange;
+pub mod hetero_placement;
 pub mod eval_common;
 pub mod external_rows;
 pub mod gguf;
