@@ -26,9 +26,7 @@
 
 use hip_bridge::KernargBlob;
 use hipfire_runtime::ar_hc_exchange::{ArHcExchange, ArHcMode};
-use rdna_compute::ar_hc_write::{
-    ar_hc_write_model, bf16_bits, ArHcWire, StreamKind, AR_HC_HIDDEN,
-};
+use rdna_compute::ar_hc_write::{ar_hc_write_model, bf16_bits, ArHcWire, StreamKind, AR_HC_HIDDEN};
 use rdna_compute::Gpu;
 use std::ffi::c_void;
 use std::sync::{Arc, Barrier, Mutex};
@@ -55,7 +53,9 @@ const ROWS: usize = 8;
 // (device -> host copy of `len` bytes)
 fn dl(gpu: &Gpu, buf: &hip_bridge::DeviceBuffer, len: usize) -> Result<Vec<u8>, String> {
     let mut v = vec![0u8; len];
-    gpu.hip.memcpy_dtoh(&mut v, buf).map_err(|e| e.to_string())?;
+    gpu.hip
+        .memcpy_dtoh(&mut v, buf)
+        .map_err(|e| e.to_string())?;
     Ok(v)
 }
 
@@ -73,7 +73,9 @@ fn bytes_u32(v: &[u32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 fn u16s(b: &[u8]) -> Vec<u16> {
-    b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    b.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
 }
 
 fn pack(p: &[f32]) -> Vec<u32> {
@@ -127,7 +129,8 @@ fn run_rank(
     gpu.ensure_kernel_public("arwire_hostile", HOSTILE_SRC, "arwire_hostile")
         .map_err(e)?;
     barrier.wait();
-    x.qualify(rank, &mut gpu, 8, 8).map_err(|er| format!("qualification: {er}"))?;
+    x.qualify(rank, &mut gpu, 8, 8)
+        .map_err(|er| format!("qualification: {er}"))?;
     barrier.wait();
     let n = ROWS * AR_HC_HIDDEN;
     let p: [Vec<f32>; 2] = [
@@ -146,20 +149,46 @@ fn run_rank(
     let gates = gpu.hip.malloc(ROWS * 16).map_err(e)?;
     let words = gpu.hip.malloc(n / 2 * 4).map_err(e)?;
     gpu.hip.memset(&gates, 0, ROWS * 16).map_err(e)?;
-    gpu.hip.memcpy_htod(&words, &bytes_u32(&pack(&p[1]))).map_err(e)?;
+    gpu.hip
+        .memcpy_htod(&words, &bytes_u32(&pack(&p[1])))
+        .map_err(e)?;
     let mut out = Outcome::default();
 
     let cases = [
-        Case { name: "split_d0_first", first: 0, second: Some(1), expect: Expect::Folds },
-        Case { name: "split_d1_first", first: 1, second: Some(0), expect: Expect::Folds },
-        Case { name: "last_granule_half", first: 3, second: None, expect: Expect::TimesOut },
-        Case { name: "d0_only", first: 0, second: None, expect: Expect::TimesOut },
+        Case {
+            name: "split_d0_first",
+            first: 0,
+            second: Some(1),
+            expect: Expect::Folds,
+        },
+        Case {
+            name: "split_d1_first",
+            first: 1,
+            second: Some(0),
+            expect: Expect::Folds,
+        },
+        Case {
+            name: "last_granule_half",
+            first: 3,
+            second: None,
+            expect: Expect::TimesOut,
+        },
+        Case {
+            name: "d0_only",
+            first: 0,
+            second: None,
+            expect: Expect::TimesOut,
+        },
     ];
     for case in &cases {
         // rank 0 publishes the bank its launch will use
         if rank == 0 {
-            gpu.hip.memcpy_htod(&partial, &bytes_f32(&p[0])).map_err(e)?;
-            gpu.hip.memcpy_htod(&streams, &bytes_u16(&streams_host)).map_err(e)?;
+            gpu.hip
+                .memcpy_htod(&partial, &bytes_f32(&p[0]))
+                .map_err(e)?;
+            gpu.hip
+                .memcpy_htod(&streams, &bytes_u16(&streams_host))
+                .map_err(e)?;
             shared.lock().unwrap().gen = x.generation(0, &mut gpu).map_err(e)?;
         }
         barrier.wait();
@@ -201,8 +230,14 @@ fn run_rank(
                 b.push_ptr(words.as_ptr());
                 b.push_u32((n / 4) as u32);
                 b.push_u32(sel);
-                gpu.launch_kernel_blob("arwire_hostile", [16, 1, 1], [256, 1, 1], 0, b.as_mut_slice())
-                    .map_err(|er| er.to_string())?;
+                gpu.launch_kernel_blob(
+                    "arwire_hostile",
+                    [16, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    b.as_mut_slice(),
+                )
+                .map_err(|er| er.to_string())?;
                 gpu.hip.device_synchronize().map_err(|er| er.to_string())
             };
             hostile(&gpu, case.first)?;
@@ -274,14 +309,36 @@ fn run_rank(
         for v in mine.iter_mut().take(4) {
             *v = f32::from_bits(0xFFFF_7000);
         }
-        assert_eq!(bf16_bits(mine[0]), 0xFFFF, "test premise: the payload half is all ones");
-        let p0: Vec<f32> = (0..n1).map(|i| if i < 4 { f32::from_bits(0xFFFF_7000) } else { val(0, i) }).collect();
-        let p1: Vec<f32> = (0..n1).map(|i| if i < 4 { f32::from_bits(0xFFFF_7000) } else { val(1, i) }).collect();
+        assert_eq!(
+            bf16_bits(mine[0]),
+            0xFFFF,
+            "test premise: the payload half is all ones"
+        );
+        let p0: Vec<f32> = (0..n1)
+            .map(|i| {
+                if i < 4 {
+                    f32::from_bits(0xFFFF_7000)
+                } else {
+                    val(0, i)
+                }
+            })
+            .collect();
+        let p1: Vec<f32> = (0..n1)
+            .map(|i| {
+                if i < 4 {
+                    f32::from_bits(0xFFFF_7000)
+                } else {
+                    val(1, i)
+                }
+            })
+            .collect();
         let st: Vec<u16> = streams_host[..4 * AR_HC_HIDDEN].to_vec();
         let g1 = vec![0f32; 4];
         let mut wantn = st.clone();
         ar_hc_write_model(&p0, &p1, &mut wantn, &g1, rows);
-        gpu.hip.memcpy_htod(&partial, &bytes_f32(&mine)).map_err(e)?;
+        gpu.hip
+            .memcpy_htod(&partial, &bytes_f32(&mine))
+            .map_err(e)?;
         gpu.hip.memcpy_htod(&streams, &bytes_u16(&st)).map_err(e)?;
         barrier.wait();
         // SAFETY: as above.
@@ -317,9 +374,13 @@ fn run_rank(
         }
         // the used bank re-armed
         let genw = x.generation(rank, &mut gpu).map_err(e)?;
-        let mb = x.download_mailbox(rank, &mut gpu, ArHcWire::Dense).map_err(e)?;
+        let mb = x
+            .download_mailbox(rank, &mut gpu, ArHcWire::Dense)
+            .map_err(e)?;
         let (stride, bank) = (x.bank_stride(ArHcWire::Dense), (genw & 1) as usize);
-        let rearmed = mb[bank * stride..(bank + 1) * stride].iter().all(|&b| b == 0xFF);
+        let rearmed = mb[bank * stride..(bank + 1) * stride]
+            .iter()
+            .all(|&b| b == 0xFF);
         barrier.wait();
         out.rows.push((
             format!("nan_pair+rearm rank {rank}"),
@@ -342,7 +403,10 @@ fn main() {
         match args[i].as_str() {
             "--devices" => {
                 i += 1;
-                let d: Vec<i32> = args[i].split(',').map(|s| s.parse().expect("device")).collect();
+                let d: Vec<i32> = args[i]
+                    .split(',')
+                    .map(|s| s.parse().expect("device"))
+                    .collect();
                 devices = [d[0], d[1]];
             }
             "--out" => {
@@ -367,7 +431,10 @@ fn main() {
             std::thread::spawn(move || run_rank(rank, dev, hold_ms, x, b, s))
         })
         .collect();
-    let results: Vec<Result<Outcome, String>> = handles.into_iter().map(|h| h.join().expect("thread")).collect();
+    let results: Vec<Result<Outcome, String>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread"))
+        .collect();
     let mut failed = false;
     let mut json = Vec::new();
     for (rank, r) in results.iter().enumerate() {
@@ -378,7 +445,10 @@ fn main() {
             }
             Ok(o) => {
                 for (name, ok, note) in &o.rows {
-                    eprintln!("rank {rank} {name}: {} ({note})", if *ok { "PASS" } else { "FAIL" });
+                    eprintln!(
+                        "rank {rank} {name}: {} ({note})",
+                        if *ok { "PASS" } else { "FAIL" }
+                    );
                     failed |= !ok;
                     json.push(format!(
                         "{{\"rank\":{rank},\"case\":\"{name}\",\"pass\":{ok},\"note\":\"{}\"}}",

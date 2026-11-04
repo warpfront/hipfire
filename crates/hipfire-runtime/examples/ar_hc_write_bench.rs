@@ -23,8 +23,8 @@
 //! The per-rank fit `t(rows) = a + b * rows` (least squares over the rows list) is printed
 //! for every series. Exit code 3 on any device wait error.
 
-use hipfire_runtime::ar_hc_exchange::ArHcExchange;
 use hip_bridge::KernargBlob;
+use hipfire_runtime::ar_hc_exchange::ArHcExchange;
 use hipfire_runtime::ar_hc_exchange::ArHcMode;
 use rdna_compute::ar_hc_write::{ar_hc_geometry, StreamKind, AR_HC_HIDDEN, AR_HC_ROW_CAP};
 use rdna_compute::Gpu;
@@ -151,11 +151,15 @@ fn run_rank(
             let hp: Vec<u8> = (0..n)
                 .flat_map(|i| (((i % 97) as f32 - 48.0) / 64.0).to_le_bytes())
                 .collect();
-            gpu.hip.memcpy_htod(&partial, &hp).map_err(|e| e.to_string())?;
+            gpu.hip
+                .memcpy_htod(&partial, &hp)
+                .map_err(|e| e.to_string())?;
             gpu.hip
                 .memset(&streams, 0, wide * kind.element_bytes())
                 .map_err(|e| e.to_string())?;
-            gpu.hip.memset(&gates, 0, rows * 16).map_err(|e| e.to_string())?;
+            gpu.hip
+                .memset(&gates, 0, rows * 16)
+                .map_err(|e| e.to_string())?;
             let launch = |gpu: &mut Gpu| -> Result<(), String> {
                 // SAFETY: live buffers of the extents `kind` / `rows` imply on this device.
                 unsafe {
@@ -182,20 +186,28 @@ fn run_rank(
             drain(&mut gpu)?;
             // pipelined
             barrier.wait();
-            gpu.hip.event_record(&start, None).map_err(|e| e.to_string())?;
+            gpu.hip
+                .event_record(&start, None)
+                .map_err(|e| e.to_string())?;
             for _ in 0..iters {
                 launch(&mut gpu)?;
             }
-            gpu.hip.event_record(&stop, None).map_err(|e| e.to_string())?;
+            gpu.hip
+                .event_record(&stop, None)
+                .map_err(|e| e.to_string())?;
             drain(&mut gpu)?;
             let pipe_us = event_ms(&gpu, &start, &stop)? * 1000.0 / iters as f64;
             // isolated
             let mut isos = Vec::with_capacity(iso);
             for _ in 0..iso {
                 barrier.wait();
-                gpu.hip.event_record(&start, None).map_err(|e| e.to_string())?;
+                gpu.hip
+                    .event_record(&start, None)
+                    .map_err(|e| e.to_string())?;
                 launch(&mut gpu)?;
-                gpu.hip.event_record(&stop, None).map_err(|e| e.to_string())?;
+                gpu.hip
+                    .event_record(&stop, None)
+                    .map_err(|e| e.to_string())?;
                 drain(&mut gpu)?;
                 isos.push(event_ms(&gpu, &start, &stop)? * 1000.0);
             }
@@ -208,11 +220,23 @@ fn run_rank(
             let mut probe8_us = 0.0;
             if probe {
                 let geom = ar_hc_geometry(rows).ok_or("no geometry")?;
-                for (mode, slot) in [(0, &mut probe_us), (1, &mut probe_half_us), (2, &mut probe8_us)] {
+                for (mode, slot) in [
+                    (0, &mut probe_us),
+                    (1, &mut probe_half_us),
+                    (2, &mut probe8_us),
+                ] {
                     let granules = (n / 4) as u32;
                     // mode 0: full wire (n/4 x 16 B); 1: half the granules x 16 B; 2: n/4 x 8 B
-                    let granules = if mode == 1 { granules.div_ceil(2) } else { granules };
-                    let sym = if mode == 2 { "arwire_probe_st8" } else { "arwire_probe_st16" };
+                    let granules = if mode == 1 {
+                        granules.div_ceil(2)
+                    } else {
+                        granules
+                    };
+                    let sym = if mode == 2 {
+                        "arwire_probe_st8"
+                    } else {
+                        "arwire_probe_st16"
+                    };
                     let run = |gpu: &Gpu, tag: u32| -> Result<(), String> {
                         let mut b = KernargBlob::new();
                         b.push_ptr(peer_sink);
@@ -233,12 +257,16 @@ fn run_rank(
                     }
                     drain(&mut gpu)?;
                     barrier.wait();
-                    gpu.hip.event_record(&start, None).map_err(|e| e.to_string())?;
+                    gpu.hip
+                        .event_record(&start, None)
+                        .map_err(|e| e.to_string())?;
                     for _ in 0..iters {
                         tag += 1;
                         run(&gpu, tag)?;
                     }
-                    gpu.hip.event_record(&stop, None).map_err(|e| e.to_string())?;
+                    gpu.hip
+                        .event_record(&stop, None)
+                        .map_err(|e| e.to_string())?;
                     drain(&mut gpu)?;
                     *slot = event_ms(&gpu, &start, &stop)? * 1000.0 / iters as f64;
                 }
@@ -262,7 +290,10 @@ fn run_rank(
     barrier.wait();
     x.release(rank, &mut gpu).map_err(|e| e.to_string())?;
     gpu.hip.free(sink).map_err(|e| e.to_string())?;
-    Ok(Rank { rows: out, err: None })
+    Ok(Rank {
+        rows: out,
+        err: None,
+    })
 }
 
 fn main() {
@@ -280,7 +311,10 @@ fn main() {
         match args[i].as_str() {
             "--rows" => {
                 i += 1;
-                rows_list = args[i].split(',').map(|s| s.parse().expect("rows")).collect();
+                rows_list = args[i]
+                    .split(',')
+                    .map(|s| s.parse().expect("rows"))
+                    .collect();
             }
             "--iters" => {
                 i += 1;
@@ -292,7 +326,10 @@ fn main() {
             }
             "--devices" => {
                 i += 1;
-                let d: Vec<i32> = args[i].split(',').map(|s| s.parse().expect("device")).collect();
+                let d: Vec<i32> = args[i]
+                    .split(',')
+                    .map(|s| s.parse().expect("device"))
+                    .collect();
                 devices = [d[0], d[1]];
             }
             "--out" => {
@@ -355,12 +392,14 @@ fn main() {
             Ok(res) => {
                 let _ = &res.err;
                 for kind in &kinds {
-                    let rows: Vec<&Row> = res.rows.iter().filter(|r| r.kind == kind.name()).collect();
+                    let rows: Vec<&Row> =
+                        res.rows.iter().filter(|r| r.kind == kind.name()).collect();
                     eprintln!("rank {rank} {} mode={} (payload {} B/row; wire 10240 tagged / 5120 dense; probes push 10240 / 5120 / 5120 B/row)", kind.name(), wire.name(), AR_HC_HIDDEN * 2);
                     eprintln!("  rows  pipe_us  iso_med  iso_min  probe_us  probe_half  probe_b64  pipe_wire_GB/s  probe_wire_GB/s");
                     for r in &rows {
                         let nominal = (r.rows * AR_HC_HIDDEN * 4) as f64;
-                        let actual = (r.rows * AR_HC_HIDDEN / 4 * x.wire_for(r.rows).granule_bytes()) as f64;
+                        let actual =
+                            (r.rows * AR_HC_HIDDEN / 4 * x.wire_for(r.rows).granule_bytes()) as f64;
                         eprintln!(
                             "  {:4}  {:7.1}  {:7.1}  {:7.1}  {:8.1}  {:10.1}  {:9.1}  {:14.1}  {:15.1}",
                             r.rows, r.pipe_us, r.iso_med_us, r.iso_min_us, r.probe_us, r.probe_half_us, r.probe8_us,

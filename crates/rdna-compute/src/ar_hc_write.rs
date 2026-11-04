@@ -209,7 +209,11 @@ pub fn ar_hc_geometry(rows: usize) -> Option<(u32, u32)> {
 
 impl Gpu {
     /// Resolve the kernel before graph capture (JIT is not capture-safe).
-    pub fn ensure_ar_hc_write_gfx1201_kernel(&mut self, kind: StreamKind, wire: ArHcWire) -> HipResult<()> {
+    pub fn ensure_ar_hc_write_gfx1201_kernel(
+        &mut self,
+        kind: StreamKind,
+        wire: ArHcWire,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
             return Err(HipError::new(

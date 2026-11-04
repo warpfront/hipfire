@@ -85,6 +85,7 @@ impl ArHcMode {
 
 /// First row count of a launch the hybrid mode sends on the dense wire (the measured
 /// crossover on gfx1201 is between 8 and 32 rows; see arwire/RESULT.md).
+// selector-receipt: receipts/selectors/ar_hc_dense_min_rows.json
 pub const AR_HC_DENSE_MIN_ROWS: usize = 16;
 
 /// `HIPFIRE_EP_AR_WIRE_DENSE` (developer, default on): `0` selects the original 16-byte tagged
@@ -314,7 +315,12 @@ impl ArHcExchange {
 
     /// Copy of the rank's mailbox region of `wire` (both banks). Oracle / negative tests only;
     /// the rank must be drained.
-    pub fn download_mailbox(&self, rank: usize, gpu: &mut Gpu, wire: ArHcWire) -> HipResult<Vec<u8>> {
+    pub fn download_mailbox(
+        &self,
+        rank: usize,
+        gpu: &mut Gpu,
+        wire: ArHcWire,
+    ) -> HipResult<Vec<u8>> {
         let slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
         let mail = slot
             .as_ref()
