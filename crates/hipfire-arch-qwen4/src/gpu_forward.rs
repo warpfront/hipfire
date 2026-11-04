@@ -3925,10 +3925,14 @@ impl Qwen4TileRoute {
         } else if !gpu.flags.moe_grouped_gemm || !gpu.qwen4_moe_sym_iu4_requested() {
             return refuse("the symmetric IU4 route is not requested");
         }
-        if mode != Qwen4ForwardScratchMode::Full && !qwen4_ep_dedicated_exchange_root() {
+        if mode != Qwen4ForwardScratchMode::Full
+            && !qwen4_ep_dedicated_exchange_root()
+            && !crate::weights::trunk_shard::trunk_shard_requested()
+        {
             // The compact plan lends `y_down_grouped` to a phase-disjoint field the peer
-            // would be reading (an EP compact load plans it as its own root:
-            // `qwen4_set_ep_dedicated_exchange_root`).
+            // would be reading. An EP compact load plans it as its own root
+            // (`qwen4_set_ep_dedicated_exchange_root`); under the trunk shard no peer ever reads
+            // it (the route only masks tiles, the FFN partial is folded by the all-reduce).
             return refuse("the compact scratch plan aliases y_down_grouped");
         }
         // Grouping scratch (gfx1100) or the full sym scratch (gfx1201) before the mesh enables

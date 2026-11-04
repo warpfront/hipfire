@@ -3618,9 +3618,11 @@ fn qwen4_ep_scratch_mode(
     } else {
         Qwen4ForwardScratchMode::Full
     };
-    // The compact plan under EP owns the tile exchange's root (the arena would alias it).
+    // The compact plan under EP owns the tile exchange's root (the arena would alias it) unless
+    // the trunk shard runs: its chunks only mask tiles, no peer ever reads the grouped rows.
     hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_dedicated_exchange_root(
-        mode == Qwen4ForwardScratchMode::FnSymGfx1201,
+        mode == Qwen4ForwardScratchMode::FnSymGfx1201
+            && !hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_requested(),
     );
     Ok(mode)
 }
