@@ -79,7 +79,7 @@ use hipfire_runtime::ngram_mod::NgramModConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::expert_capabilities::{self, ExpertQt, Route};
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::ops::Deref;
+use std::ops::{Deref, DerefMut};
 use std::time::Instant;
 
 pub mod census;
@@ -1544,6 +1544,12 @@ enum ScratchBacking {
 // thread-agnostic (as `LaneTokenRing`'s buffers, which assert the same).
 unsafe impl Send for SampleScratch {}
 
+impl Default for SampleScratch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SampleScratch {
     pub(crate) fn new() -> Self {
         Self {
@@ -1564,27 +1570,36 @@ impl SampleScratch {
     /// pinned buffer with (`None`: pageable `Vec`, today's path).
     fn landing(&mut self, pinned: Option<&HipRuntime>, n: usize) -> &mut [u8] {
         let floats = n.max(self.want);
-        if let (Some(hip), false) = (pinned, self.pinned_refused) {
-            let have = match &self.backing {
-                ScratchBacking::Pinned { len, .. } => *len,
-                ScratchBacking::Pageable(_) => 0,
-            };
-            if have < n {
-                match Self::alloc_pinned(hip, floats) {
-                    Ok(backing) => self.backing = backing,
-                    Err(error) => {
-                        static LOGGED: std::sync::atomic::AtomicBool =
-                            std::sync::atomic::AtomicBool::new(false);
-                        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            eprintln!(
-                                "[qwen4-lane] pinned logits scratch ({} bytes) refused, \
-                                 staying on pageable host memory: {error}",
-                                floats.saturating_mul(4)
-                            );
+        let pinned_len = match &self.backing {
+            ScratchBacking::Pinned { len, .. } => Some(*len),
+            ScratchBacking::Pageable(_) => None,
+        };
+        match (pinned, self.pinned_refused) {
+            (Some(hip), false) => {
+                if pinned_len.map_or(true, |len| len < n) {
+                    match Self::alloc_pinned(hip, floats) {
+                        Ok(backing) => self.backing = backing,
+                        Err(error) => {
+                            static LOGGED: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!(
+                                    "[qwen4-lane] pinned logits scratch ({} bytes) refused, \
+                                     staying on pageable host memory: {error}",
+                                    floats.saturating_mul(4)
+                                );
+                            }
+                            self.pinned_refused = true;
+                            self.backing = ScratchBacking::Pageable(Vec::new());
                         }
-                        self.pinned_refused = true;
-                        self.backing = ScratchBacking::Pageable(Vec::new());
                     }
+                }
+            }
+            // No pinned allocation allowed: a too-short pinned backing gives
+            // way to the pageable `Vec`.
+            _ => {
+                if pinned_len.is_some_and(|len| len < n) {
+                    self.backing = ScratchBacking::Pageable(Vec::new());
                 }
             }
         }
@@ -1599,6 +1614,14 @@ impl SampleScratch {
                 unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 4) }
             }
         }
+    }
+
+    /// Make the front `src.len()` floats of the backing `src` (a host-side
+    /// row, not a download), growing the backing if shorter.
+    pub(crate) fn fill(&mut self, src: &[f32]) {
+        // SAFETY: an f32 slice is `4 * len` initialized bytes.
+        let bytes = unsafe { std::slice::from_raw_parts(src.as_ptr().cast::<u8>(), src.len() * 4) };
+        self.landing(None, src.len()).copy_from_slice(bytes);
     }
 
     /// Test stand-in for a fetch: the pageable backing holds exactly `src`.
@@ -1635,6 +1658,18 @@ impl Deref for SampleScratch {
             // excludes the `&mut` landing slice.
             ScratchBacking::Pinned { ptr, len, .. } => unsafe {
                 std::slice::from_raw_parts(*ptr, *len)
+            },
+        }
+    }
+}
+
+impl DerefMut for SampleScratch {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        match &mut self.backing {
+            ScratchBacking::Pageable(v) => v,
+            // SAFETY: as `Deref`; `&mut self` makes this the only access.
+            ScratchBacking::Pinned { ptr, len, .. } => unsafe {
+                std::slice::from_raw_parts_mut(*ptr, *len)
             },
         }
     }
@@ -1700,26 +1735,6 @@ pub(crate) fn download_lane_rows(
         .qwen4_lane_pinned_logits_enabled()
         .then_some(&gpu.hip);
     copy_lane_rows(gpu, logits, begin, scratch.landing(pinned, n))
-}
-
-/// [`download_lane_rows`] into a caller-owned pageable `Vec<f32>` (the EP
-/// root's sampler host buffer, which the sampler also mutates in place).
-pub(crate) fn download_lane_rows_pageable(
-    gpu: &Gpu,
-    logits: &GpuTensor,
-    first_row: usize,
-    rows: usize,
-    vocab: usize,
-    scratch: &mut Vec<f32>,
-) -> Result<(), String> {
-    let (begin, n) = lane_rows_window(logits, first_row, rows, vocab)?;
-    if scratch.len() < n {
-        scratch.resize(n, 0.0);
-    }
-    // SAFETY: `scratch` holds at least `n` initialized f32s; any byte pattern
-    // is a valid f32.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, n * 4) };
-    copy_lane_rows(gpu, logits, begin, bytes)
 }
 
 /// One draw of a sampled lane: the AR singleton's `sample_cpu` (neutral

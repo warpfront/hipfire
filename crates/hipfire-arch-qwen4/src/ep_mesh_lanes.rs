@@ -66,7 +66,7 @@ use crate::ep::{gather_tally, GatherTally};
 use crate::gpu_forward_lanes::{
     forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, StageName, StageShare,
 };
-use crate::lane::download_lane_rows_pageable;
+use crate::lane::download_lane_rows;
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
 use crate::lane_exec::pick_at;
 use crate::mesh_lane_protocol::SamplingMode;
@@ -88,7 +88,7 @@ use crate::mtp_lanes::lane_call;
 use crate::mtp_spec::{
     draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH,
 };
-use crate::sampled_lane::{DraftRead, LaneSampler, RowHandle, TargetRowSource};
+use crate::sampled_lane::{DraftRead, LaneSampler, RowBuf, RowHandle, TargetRowSource};
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::SpecRequestConfig;
 use rdna_compute::{Gpu, GpuTensor};
@@ -347,7 +347,7 @@ impl TargetRowSource for EpRowSource {
         &mut self,
         key: &LaneWindowKey,
         row: usize,
-        host: &mut Vec<f32>,
+        host: &mut RowBuf,
     ) -> Result<(), String> {
         if !self.valid.load(Ordering::Acquire) {
             return Err("the step's target rows are no longer readable".to_string());
@@ -360,12 +360,18 @@ impl TargetRowSource for EpRowSource {
         if row >= rows {
             return Err(format!("verify row {row} of a {rows}-row window"));
         }
-        if host.len() != self.vocab {
-            host.resize(self.vocab, 0.0);
-        }
         // SAFETY: see `gpu`.
         let gpu = unsafe { &*self.gpu };
-        download_lane_rows_pageable(gpu, &self.logits, first + row, 1, self.vocab, host)
+        download_lane_rows(
+            gpu,
+            &self.logits,
+            first + row,
+            1,
+            self.vocab,
+            host.scratch_mut(),
+        )?;
+        host.set_len(self.vocab);
+        Ok(())
     }
 }
 

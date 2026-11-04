@@ -65,6 +65,7 @@ use hipfire_runtime::spec_sampling::{
     SparseDist, SpecRng,
 };
 
+use crate::lane::SampleScratch;
 use crate::mesh_lane_protocol::{
     AcceptRule, DraftProposal, LanePlan, LaneWindowKey, ProposalSource, SamplerOutput,
     SamplingMode, StepOutput,
@@ -257,6 +258,54 @@ impl DraftRead {
 // Target rows: lazy access to the sampler owner's verify logits
 // ---------------------------------------------------------------------------
 
+/// The host row a [`TargetRowSource`] fills: exactly one full-vocabulary F32
+/// row, derefs to it. The backing is a [`SampleScratch`], pinned host memory
+/// under `HIPFIRE_QWEN4_LANE_PINNED_LOGITS` (the EP source's D2H lands in it
+/// directly), else a pageable `Vec`; the row's bytes are the same either way.
+#[derive(Default)]
+pub struct RowBuf {
+    scratch: SampleScratch,
+    len: usize,
+}
+
+impl RowBuf {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Make the row `src` (a host-side copy, no download).
+    pub fn set(&mut self, src: &[f32]) {
+        self.scratch.fill(src);
+        self.len = src.len();
+    }
+
+    /// The backing a download lands in; follow with [`Self::set_len`].
+    pub(crate) fn scratch_mut(&mut self) -> &mut SampleScratch {
+        &mut self.scratch
+    }
+
+    /// The row is the front `len` floats of the backing (after a download of
+    /// `len` floats into [`Self::scratch_mut`]).
+    pub(crate) fn set_len(&mut self, len: usize) {
+        debug_assert!(len <= self.scratch.len());
+        self.len = len;
+    }
+}
+
+impl std::ops::Deref for RowBuf {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        &self.scratch[..self.len]
+    }
+}
+
+impl std::ops::DerefMut for RowBuf {
+    fn deref_mut(&mut self) -> &mut [f32] {
+        &mut self.scratch[..self.len]
+    }
+}
+
 /// The sampler owner's resident verify logits, read lazily by the root.
 ///
 /// Rows are fetched one at a time and only up to the row a verdict reads
@@ -269,7 +318,7 @@ pub trait TargetRowSource: Send {
         &mut self,
         key: &LaneWindowKey,
         row: usize,
-        host: &mut Vec<f32>,
+        host: &mut RowBuf,
     ) -> Result<(), String>;
 }
 
@@ -297,7 +346,7 @@ impl RowHandle {
         &self,
         key: &LaneWindowKey,
         row: usize,
-        host: &mut Vec<f32>,
+        host: &mut RowBuf,
     ) -> Result<(), String> {
         self.0
             .lock()
@@ -393,7 +442,10 @@ pub struct LaneSampler {
     vocab: u32,
     lanes: HashMap<RequestEpoch, LaneSamplerState>,
     rows: Option<RowHandle>,
-    host: Vec<f32>,
+    /// The target row a verify read lands in (pinned-backed, see [`RowBuf`]).
+    host: RowBuf,
+    /// The head's full-row draft read, copied host-side ([`DraftRead::FullRow`]).
+    draft_host: Vec<f32>,
     scratch: Vec<(u32, f32)>,
     target: SparseDist,
     /// The driver closes lanes (`MeshRoot::set_driver_terminates`): a
@@ -409,7 +461,8 @@ impl LaneSampler {
             vocab: vocab as u32,
             lanes: HashMap::new(),
             rows: None,
-            host: Vec::new(),
+            host: RowBuf::new(),
+            draft_host: Vec::new(),
             scratch: Vec::with_capacity(SampleSpec::MAX_POOL),
             target: SparseDist::default(),
             driver_terminates: false,
@@ -607,7 +660,7 @@ impl AcceptRule for LaneSampler {
         let vocab = self.vocab;
         let Self {
             lanes,
-            host,
+            draft_host,
             scratch,
             ..
         } = self;
@@ -634,7 +687,7 @@ impl AcceptRule for LaneSampler {
             st.params.spec,
             st.history.row(index),
             &st.params.policy,
-            host,
+            draft_host,
             scratch,
             &mut q,
         )?;
@@ -898,14 +951,13 @@ mod tests {
             &mut self,
             key: &LaneWindowKey,
             row: usize,
-            host: &mut Vec<f32>,
+            host: &mut RowBuf,
         ) -> Result<(), String> {
             if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(format!("injected row {row} read failure"));
             }
             let tag = key.request_epoch.request_tag;
-            host.clear();
-            host.extend_from_slice(self.synth.target.get(&tag).ok_or("no logits for lane")?);
+            host.set(self.synth.target.get(&tag).ok_or("no logits for lane")?);
             Ok(())
         }
     }

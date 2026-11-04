@@ -72,7 +72,7 @@ use hipfire_arch_qwen4::mesh_lane_protocol::{
     pack_classed_row_groups, AcceptRule, LaneKind, LanePlan, LaneRequest, SamplerOutput,
     SamplingMode, WindowBudgets,
 };
-use hipfire_arch_qwen4::sampled_lane::{LaneRng, RowHandle};
+use hipfire_arch_qwen4::sampled_lane::{LaneRng, RowBuf, RowHandle};
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch,
 };
@@ -447,7 +447,7 @@ impl AcceptRule for TeacherRule<'_> {
             .ok_or("the sampler owner returned no verify row handle")?;
         let mut cands: Vec<Vec<f32>> = Vec::with_capacity(d + 1);
         for r in 0..=d {
-            let mut host = Vec::new();
+            let mut host = RowBuf::new();
             handle.row_logits(&lane.key, r, &mut host)?;
             if host.len() != reference.rows[0].len() {
                 return Err(format!(
@@ -456,7 +456,7 @@ impl AcceptRule for TeacherRule<'_> {
                     reference.rows[0].len()
                 ));
             }
-            cands.push(host);
+            cands.push(host.to_vec());
         }
         let metrics: Vec<RowMetrics> = std::thread::scope(|s| {
             let handles: Vec<_> = cands

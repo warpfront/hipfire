@@ -898,10 +898,9 @@ impl TargetRowSource for ConstRows {
         &mut self,
         _key: &LaneWindowKey,
         _row: usize,
-        host: &mut Vec<f32>,
+        host: &mut RowBuf,
     ) -> Result<(), String> {
-        host.clear();
-        host.extend_from_slice(&self.0);
+        host.set(&self.0);
         Ok(())
     }
 }
@@ -1122,20 +1121,22 @@ impl TargetRowSource for KeyedRows {
         &mut self,
         key: &LaneWindowKey,
         row: usize,
-        host: &mut Vec<f32>,
+        host: &mut RowBuf,
     ) -> Result<(), String> {
         assert!(
             row < 4,
             "a K<=3 window has at most 4 verify rows, asked row {row}"
         );
-        host.clear();
-        host.extend((0..SAMPLED_VOCAB).map(|t| {
-            if t as u64 == key.request_epoch.request_tag {
-                60.0
-            } else {
-                0.0
-            }
-        }));
+        let row: Vec<f32> = (0..SAMPLED_VOCAB)
+            .map(|t| {
+                if t as u64 == key.request_epoch.request_tag {
+                    60.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        host.set(&row);
         Ok(())
     }
 }
