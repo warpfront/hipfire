@@ -2727,10 +2727,7 @@ impl HyperNormGateK4Outputs<'_> {
     }
 }
 
-pub fn hyper_norm_gate_k4_outputs(
-    gpu: &mut Gpu,
-    p: &HyperNormGateK4Outputs<'_>,
-) -> HipResult<()> {
+pub fn hyper_norm_gate_k4_outputs(gpu: &mut Gpu, p: &HyperNormGateK4Outputs<'_>) -> HipResult<()> {
     ensure_f32(p.normalized)?;
     ensure_f32(p.gates)?;
     if !HyperNormGateK4Outputs::supports(p.branches, p.hidden, p.rows) {

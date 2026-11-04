@@ -186,8 +186,16 @@ fn reference(gpu: &mut Gpu, c: &Case<'_>) -> Result<(Vec<f32>, Vec<f32>, Vec<f32
     let gates = gpu
         .alloc_tensor(&[c.rows * BRANCHES], DType::F32)
         .map_err(err)?;
-    gpu.gemv_bf16_xf32_k4_rows(c.gate_weight, &normalized, &gates, BRANCHES, WIDE, None, c.rows)
-        .map_err(err)?;
+    gpu.gemv_bf16_xf32_k4_rows(
+        c.gate_weight,
+        &normalized,
+        &gates,
+        BRANCHES,
+        WIDE,
+        None,
+        c.rows,
+    )
+    .map_err(err)?;
     let mut otile = Vec::new();
     if c.rows >= 2 {
         let y = gpu
@@ -292,7 +300,10 @@ fn run() -> Result<i32, String> {
     let mut gpu = Gpu::init().map_err(err)?;
     println!("device arch: {}", gpu.arch);
     if !gpu.arch_caps.has_gfx11_plus_simt() {
-        eprintln!("refusing: the fused kernel is a gfx11+ route ({})", gpu.arch);
+        eprintln!(
+            "refusing: the fused kernel is a gfx11+ route ({})",
+            gpu.arch
+        );
         return Ok(2);
     }
     let mut st = Stats::default();
@@ -369,7 +380,11 @@ fn run() -> Result<i32, String> {
         st.mismatches,
         if control_ok { "detected" } else { "BLIND" }
     );
-    Ok(if st.mismatches == 0 && control_ok { 0 } else { 1 })
+    Ok(if st.mismatches == 0 && control_ok {
+        0
+    } else {
+        1
+    })
 }
 
 fn main() {

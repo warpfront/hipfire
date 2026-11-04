@@ -45,6 +45,10 @@ reference-parity = ["rdna-compute/lab", "hipfire-dispatch/test-utils"]
 lab = ["hipfire-dispatch/test-utils"]
 kernel-timing = ["lab", "rdna-compute/kernel-timing"]
 [[example]]
+name = "hc_pair_decode_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "qwen4_parity"
 required-features = ["reference-parity"]
 
