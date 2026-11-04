@@ -52833,7 +52833,10 @@ impl Gpu {
                 _ => kernel.entries[usize::from(host_mapped)][1],
             };
             let gate_up = if gate_up_nt8 == 1 && !host_mapped && arch == 1 {
-                QWEN4_MOE_SYM_PM_GATE_UP[arch][gate_up_nt8]
+                // The descriptor's own NT8 gate/up entry: the drop-zero planar bundle (DESIGN F1)
+                // has its `..._sym_p_pm_..._nt8`, a hard-coded aggregate entry would bind the
+                // planar pointer table to the wrong contract.
+                kernel.entries[1][0]
             } else {
                 kernel.entries[usize::from(host_mapped)][0]
             };
@@ -52868,7 +52871,7 @@ impl Gpu {
                 n_experts,
             )[0]
         {
-            pair[0] = QWEN4_MOE_SYM_PM_GATE_UP[1][1];
+            pair[0] = self.qwen4_moe_sym_kernel()?.entries[1][0];
         }
         Some(pair)
     }

@@ -2539,10 +2539,19 @@ pub const EP_LANE_COMMIT_TOKENS_DEFAULT: usize = 2048;
 /// charge.
 pub const EP_LANE_COMMIT_CAP_MAX_SEQ: usize = 4096;
 
+/// The first-chunk charge of a context longer than [`EP_LANE_COMMIT_CAP_MAX_SEQ`]: the rows of
+/// the historical 4096-row EP prefill chunk. A larger prefill chunk (the compact-scratch 8192 /
+/// 16384 rows, `HIPFIRE_EP_COMPACT_SCRATCH`) must not raise what every lane is charged: a lane
+/// maps its context pages as tokens arrive, so the charge is lane accounting, not prompt-tile
+/// scratch, and growing it with the chunk took 1.5 GiB of resident experts per rank at 16384
+/// rows (8 lanes) for lanes that hold no more context than before.
+pub const EP_LANE_COMMIT_FIRST_CHUNK_ROWS: usize = 4096;
+
 /// The context rows the EP lane reservation and the lane staging fit check
 /// charge per lane, from the first prefill chunk `chunk_rows`, the admitted
 /// `max_seq` and the `HIPFIRE_EP_LANE_COMMIT_TOKENS` value (`None` = unset).
-/// Never above `chunk_rows`, never zero.
+/// Never above `chunk_rows`, never zero; the unset charge of a long context is the first
+/// [`EP_LANE_COMMIT_FIRST_CHUNK_ROWS`] rows whatever the chunk.
 pub fn ep_lane_commit_rows_for(
     chunk_rows: usize,
     max_seq: usize,
@@ -2554,7 +2563,7 @@ pub fn ep_lane_commit_rows_for(
         None if max_seq <= EP_LANE_COMMIT_CAP_MAX_SEQ => {
             chunk_rows.min(EP_LANE_COMMIT_TOKENS_DEFAULT)
         }
-        None => chunk_rows,
+        None => chunk_rows.min(EP_LANE_COMMIT_FIRST_CHUNK_ROWS),
     }
     .max(1)
 }
@@ -3649,6 +3658,11 @@ mod tests {
         // A longer admitted context keeps the first-chunk charge.
         assert_eq!(ep_lane_commit_rows_for(4096, 16384, None), 4096);
         assert_eq!(ep_lane_commit_rows_for(4096, 16384, Some(2048)), 2048);
+        // A larger prefill chunk never raises the unset charge of a long context.
+        assert_eq!(ep_lane_commit_rows_for(16384, 16384, None), 4096);
+        assert_eq!(ep_lane_commit_rows_for(8192, 16384, None), 4096);
+        assert_eq!(ep_lane_commit_rows_for(1024, 16384, None), 1024);
+        assert_eq!(ep_lane_commit_rows_for(16384, 16384, Some(0)), 16384);
     }
 
     /// At the Flash-Next geometry (fp8 QSA, q8 GDN, 2 MiB granules) the AR
