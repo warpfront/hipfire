@@ -25,7 +25,8 @@ use rdna_compute::tensor_ops::{
     gated_delta_conv_qknorm_route, gated_delta_gate_batched, gated_delta_gate_batched_rotate,
     gated_delta_step_batched, gated_delta_step_gate_wmma, gated_delta_step_gate_wmma_qknormed,
     gated_delta_step_gated, hc_activation_fused_f32, hc_state_bf16_add_f32, hc_state_bf16_to_f32,
-    hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_norm_gate_outputs, hyper_read_projected,
+    hyper_norm, hyper_norm_f16, hyper_norm_gate, hyper_norm_gate_k4_outputs,
+    hyper_norm_gate_outputs, hyper_read_projected,
     hyper_read_up_fused, hyper_read_up_fused_rotate, hyper_read_up_wmma, hyper_write,
     hyper_write_norm, indexed_attention_attention, indexed_attention_attention_batch_with_arena,
     indexed_attention_cache_append_batch, indexed_attention_decode_prologue,
@@ -34,7 +35,8 @@ use rdna_compute::tensor_ops::{
     indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
     GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
     GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, GdnStateFormat,
-    HcActivationFused, HyperNextGates, HyperNorm, HyperNormGate, HyperNormGateOutputs,
+    HcActivationFused, HyperNextGates, HyperNorm, HyperNormGate, HyperNormGateK4Outputs,
+    HyperNormGateOutputs,
     HyperReadProjected, HyperReadUpFused, HyperWrite, IndexedAttentionAttention,
     IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
     IndexedAttentionDecodePrologue, IndexedAttentionIndexKeyAppendBatch,
@@ -1572,7 +1574,29 @@ fn execute_hyper_read_inner(
         // across four (BF16) or eight (Q8_0) waves and applies the activation
         // below in its epilogue; a verify row is bitwise its decode row.
         if !normalized_ready {
-            hip(hyper_norm(gpu, &norm))?;
+            match paired.filter(|write| hyper_pair_decode_applies(gpu, op, write)) {
+                // Decode: the read's norm and the paired write's k4 gate GEMV in one
+                // launch; that write then skips its own norm + gate launches.
+                Some(write) => {
+                    let gates = view(write.gates, 0, op.rows * write.branches);
+                    hip(hyper_norm_gate_k4_outputs(
+                        gpu,
+                        &HyperNormGateK4Outputs {
+                            input: &input,
+                            norm_weight: op.norm_weight,
+                            gate_weight: write.block_inject.buf,
+                            normalized: &normalized,
+                            gates: &gates,
+                            rows: op.rows,
+                            branches: op.branches,
+                            hidden: op.hidden,
+                            state_bf16: op.state_bf16,
+                        },
+                    ))?;
+                    *gates_written = true;
+                }
+                None => hip(hyper_norm(gpu, &norm))?,
+            }
         }
         let down = &op.input_mix_down;
         let act = Some(1.0 / op.branches as f32);
@@ -2136,6 +2160,40 @@ pub fn execute_hyper_write_then_read(
     Ok(Some(next_gates.is_some()))
 }
 
+/// Whether the hyper write's gate projection takes the k4 route (the four-wave K split GEMV
+/// `gemv_bf16_xf32_k4` / `_k4_rows_r<R>` / `_otile_r<R>` / all-rows entries, every row bitwise the
+/// single-row kernel's) for `op.rows` route rows.
+fn hyper_write_gates_k4(gpu: &Gpu, op: &HyperWriteOp<'_>) -> bool {
+    gpu.arch_caps.has_gfx11_plus_simt()
+        && hc_decode_partitions(
+            op.block_inject.dtype,
+            op.block_inject.k,
+            gpu.route_rows(op.rows),
+            gpu.few_row_limit(),
+        ) == Some(4)
+}
+
+/// Whether the decode read `read` also produces its paired write's gates in the same launch
+/// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, exact gfx1201): the write's gate route is the k4 route and
+/// the geometry is the kernel's (four branches, hidden 2560, 1..=8 rows, BF16 `block_inject`
+/// `[4, 4 * hidden]` without AWQ scale, F32 gates). `hyper_norm_gate_k4_outputs_f32` is bitwise
+/// `hyper_norm` followed by that k4 gate GEMV, so the write then runs pregated.
+fn hyper_pair_decode_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWriteOp<'_>) -> bool {
+    gpu.flags.qwen4_hc_pair_decode_enabled()
+        && hyper_write_gates_k4(gpu, write)
+        && HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
+        && write.rows == read.rows
+        && write.branches == read.branches
+        && write.hidden == read.hidden
+        && write.state_bf16 == read.state_bf16
+        && write.block_inject.dtype == DType::BF16
+        && write.block_inject.m == write.branches
+        && write.block_inject.k == 4 * write.hidden
+        && write.block_inject.awq_scale.is_none()
+        && write.gates.dtype == DType::F32
+        && write.gates.numel() >= write.rows * write.branches
+}
+
 /// The hyper write's gates: its norm and BF16 gate projection of `input`.
 fn hyper_write_gates(
     gpu: &mut Gpu,
@@ -2148,13 +2206,7 @@ fn hyper_write_gates(
     // Decode and few-row verify (route rows within `few_row_limit`): the gate GEMV splits each row's
     // K across four waves, and a verify row is bitwise the decode row it
     // replaces (greedy MTP == AR depends on it).
-    let k4 = gpu.arch_caps.has_gfx11_plus_simt()
-        && hc_decode_partitions(
-            op.block_inject.dtype,
-            op.block_inject.k,
-            gpu.route_rows(op.rows),
-            gpu.few_row_limit(),
-        ) == Some(4);
+    let k4 = hyper_write_gates_k4(gpu, op);
     // Multi-row: one launch normalizes each row into LDS and projects the
     // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.

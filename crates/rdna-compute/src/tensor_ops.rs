@@ -2699,6 +2699,83 @@ pub fn hyper_norm_gate_outputs(gpu: &mut Gpu, p: &HyperNormGateOutputs<'_>) -> H
     )
 }
 
+/// Decode HC read norm + the paired write's k4 gate GEMV in one launch
+/// (`hyper_norm_gate_k4_outputs_f32`, `HIPFIRE_QWEN4_HC_PAIR_DECODE`): `normalized` is
+/// bitwise [`hyper_norm`]'s and `gates` bitwise the write's `gemv_bf16_xf32_k4` /
+/// `gemv_bf16_xf32_k4_rows_r<R>` / `_otile_r<R>` launch over that `normalized` (no
+/// `hc_act`), for 1..=8 rows. Four branches, hidden 2560.
+pub struct HyperNormGateK4Outputs<'a> {
+    pub input: &'a GpuTensor,
+    pub norm_weight: &'a GpuTensor,
+    /// The paired write's BF16 `[branches, branches * hidden]` gate weight.
+    pub gate_weight: &'a GpuTensor,
+    /// F32 `rows * branches * hidden` elements (the read's `normalized`).
+    pub normalized: &'a GpuTensor,
+    /// F32 `rows * branches` gate logits.
+    pub gates: &'a GpuTensor,
+    pub rows: usize,
+    pub branches: usize,
+    pub hidden: usize,
+    /// `input` holds BF16 bits (see [`Gpu::qwen4_bf16_streams`]).
+    pub state_bf16: bool,
+}
+
+impl HyperNormGateK4Outputs<'_> {
+    /// Geometry the kernel supports: four branches, hidden 2560, 1..=8 rows.
+    pub fn supports(branches: usize, hidden: usize, rows: usize) -> bool {
+        branches == 4 && hidden == 2560 && (1..=8).contains(&rows)
+    }
+}
+
+pub fn hyper_norm_gate_k4_outputs(
+    gpu: &mut Gpu,
+    p: &HyperNormGateK4Outputs<'_>,
+) -> HipResult<()> {
+    ensure_f32(p.normalized)?;
+    ensure_f32(p.gates)?;
+    if !HyperNormGateK4Outputs::supports(p.branches, p.hidden, p.rows) {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let wide = checked_product(p.branches, p.hidden, "HC norm-gate-k4 width")?;
+    ensure_f32(p.input)?;
+    let input_ok = p.input.numel() >= p.rows * wide;
+    if p.norm_weight.dtype != DType::BF16
+        || p.gate_weight.dtype != DType::BF16
+        || !gpu.arch_caps.has_gfx11_plus_simt()
+        || !input_ok
+        || p.norm_weight.numel() != wide
+        || p.gate_weight.numel() < p.branches * wide
+        || p.normalized.numel() < p.rows * wide
+        || p.gates.numel() < p.rows * p.branches
+    {
+        return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
+    }
+    let hidden = checked_i32(p.hidden, "HC norm-gate-k4 hidden width")?;
+    let row_grid = checked_u32(p.rows, "HC norm-gate-k4 row grid")?;
+    gpu.ensure_kernel_public(
+        "tensor_ops",
+        TENSOR_OPS_SRC,
+        "hyper_norm_gate_k4_outputs_f32",
+    )?;
+    let mut args = KernargBlob::new();
+    args.push_ptr(p.input.buf.as_ptr());
+    args.push_ptr(p.norm_weight.buf.as_ptr());
+    args.push_ptr(p.gate_weight.buf.as_ptr());
+    args.push_ptr(p.normalized.buf.as_ptr());
+    args.push_ptr(p.gates.buf.as_ptr());
+    args.push_i32(hidden);
+    args.push_i32(i32::from(p.state_bf16));
+    args.pad_to(16);
+    gpu.launch_blob_recorded(
+        "hyper_norm_gate_k4_outputs_f32",
+        [row_grid, 1, 1],
+        [256, 1, 1],
+        0,
+        args.as_mut_slice(),
+        crate::dispatch::ReplayLaunchBindings::NONE,
+    )
+}
+
 /// gfx1151 HC read tail: the BF16 `[4 * hidden, low_rank]` up projection of
 /// `low` fused with `hyper_read_projected` (four branches), bitwise
 /// identical to the multi-row BF16 GEMM followed by that kernel; the

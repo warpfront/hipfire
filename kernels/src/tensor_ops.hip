@@ -2234,6 +2234,131 @@ extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_f32(
     if (lane == 0) gates[(size_t)row * branches + wave] = sum;
 }
 
+#if defined(__GFX12__)
+// Decode HC read norm + the paired write's k4 gate GEMV in ONE launch (grid [rows],
+// block 256, hidden == 2560, four branches): `normalized` is bitwise hyper_norm_f32's
+// (same loads, `partial += v * v` in u order, the four side-by-side 256-wide LDS trees,
+// `v * inv * (1 + w)` expression) and `gates[row * 4 + g]` is bitwise what the write's
+// gemv_bf16_xf32_k4 / _k4_rows_r<R> / _otile_r<R> launch gives gate row g of the row:
+// the k4 split (gate row g, K quarter b = branch b, `gemv_bf16_xf32_row` over that
+// quarter: lane l reads positions l * 8 + 256 * s, s = 0..9, four chains a0..a3 in the
+// dwordx4 order, `(a0 + a1) + (a2 + a3)`, shfl_down 16..1) is replayed by waves 0..7
+// (wave w: branch w & 3, gate rows w >> 2 and (w >> 2) + 2) on the normalized branch
+// held in LDS as BF16 bits (the F32 `normalized` values are BF16-rounded, so the widen
+// is lossless), and the quarter fold is `(q0 + q1) + (q2 + q3)` with no `hc_act`.
+// Same accumulation text as hyper_write_norm_f32 (qwen4_gemv_bf16_xf32.hip).
+// `input` is the HC streams (BF16 bits when `state_bf16`); `gate_weight` is the write's
+// BF16 [4, 4 * hidden] block_inject.
+extern "C" __global__ __launch_bounds__(256) void hyper_norm_gate_k4_outputs_f32(
+    const void* input,
+    const __hip_bfloat16* norm_weight,
+    const unsigned short* gate_weight,
+    float* normalized,
+    float* gates,
+    int hidden,
+    int state_bf16) {
+    constexpr int branches = 4;
+    constexpr int U = 10;
+    __shared__ __align__(16) unsigned short xsb[4 * 2560];
+    __shared__ float rms_sum[4 * 256];
+    __shared__ float quarter[16];
+    const int wide = branches * hidden;
+    const int row = (int)blockIdx.x;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const size_t in = (size_t)row * wide;
+    // Gate weights of this wave's two (gate row, quarter) jobs load up front.
+    const int qb = wave & 3;
+    const int g0 = wave >> 2;
+    uint4 wv0[U], wv1[U];
+    {
+        const unsigned short* w0 = gate_weight + (size_t)g0 * wide + qb * hidden + lane * 8;
+        const unsigned short* w1 = gate_weight + (size_t)(g0 + 2) * wide + qb * hidden + lane * 8;
+#pragma unroll
+        for (int s = 0; s < U; ++s) {
+            wv0[s] = *(const uint4*)(w0 + s * 256);
+            wv1[s] = *(const uint4*)(w1 + s * 256);
+        }
+    }
+    float raw[branches][U];
+    if (state_bf16) {
+        const unsigned short* s = (const unsigned short*)input + in;
+#pragma unroll
+        for (int b = 0; b < branches; ++b)
+#pragma unroll
+            for (int u = 0; u < U; ++u)
+                raw[b][u] = hc_stream_value(s[b * hidden + tid + 256 * u]);
+    } else {
+        const float* s = (const float*)input + in;
+#pragma unroll
+        for (int b = 0; b < branches; ++b)
+#pragma unroll
+            for (int u = 0; u < U; ++u)
+                raw[b][u] = hc_stream_value(s[b * hidden + tid + 256 * u]);
+    }
+#pragma unroll
+    for (int b = 0; b < branches; ++b) {
+        float partial = 0.0f;
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const float value = bf16_to_f32(bf16_round(raw[b][u]));
+            partial += value * value;
+        }
+        rms_sum[b * 256 + tid] = partial;
+    }
+    __syncthreads();
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+#pragma unroll
+            for (int b = 0; b < branches; ++b)
+                rms_sum[b * 256 + tid] += rms_sum[b * 256 + tid + stride];
+        }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int b = 0; b < branches; ++b) {
+        const float inv = rsqrtf(rms_sum[b * 256] / (float)hidden + 1.0e-6f);
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int j = b * hidden + tid + 256 * u;
+            const float value = bf16_to_f32(bf16_round(
+                bf16_to_f32(bf16_round(raw[b][u])) * inv * (1.0f + bf16_to_f32(norm_weight[j]))));
+            normalized[in + j] = value;
+            xsb[j] = (unsigned short)(__float_as_uint(value) >> 16);
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int job = 0; job < 2; ++job) {
+        float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+#pragma unroll
+        for (int s = 0; s < U; ++s) {
+            const uint4 wv = job == 0 ? wv0[s] : wv1[s];
+            const uint4 xv = *(const uint4*)(xsb + qb * hidden + lane * 8 + s * 256);
+            const float4 xa = {__uint_as_float(xv.x << 16), __uint_as_float(xv.x & 0xFFFF0000u), __uint_as_float(xv.y << 16), __uint_as_float(xv.y & 0xFFFF0000u)};
+            const float4 xb = {__uint_as_float(xv.z << 16), __uint_as_float(xv.z & 0xFFFF0000u), __uint_as_float(xv.w << 16), __uint_as_float(xv.w & 0xFFFF0000u)};
+            a0 += __uint_as_float(wv.x << 16) * xa.x;
+            a1 += __uint_as_float(wv.x & 0xFFFF0000u) * xa.y;
+            a2 += __uint_as_float(wv.y << 16) * xa.z;
+            a3 += __uint_as_float(wv.y & 0xFFFF0000u) * xa.w;
+            a0 += __uint_as_float(wv.z << 16) * xb.x;
+            a1 += __uint_as_float(wv.z & 0xFFFF0000u) * xb.y;
+            a2 += __uint_as_float(wv.w << 16) * xb.z;
+            a3 += __uint_as_float(wv.w & 0xFFFF0000u) * xb.w;
+        }
+        float sum = (a0 + a1) + (a2 + a3);
+        for (int off = 16; off > 0; off >>= 1) sum += __shfl_down(sum, off);
+        if (lane == 0) quarter[(g0 + 2 * job) * 4 + qb] = sum;
+    }
+    __syncthreads();
+    if (tid < branches) {
+        const float* q = quarter + tid * 4;
+        gates[(size_t)row * branches + tid] = (q[0] + q[1]) + (q[2] + q[3]);
+    }
+}
+#endif  // __GFX12__
+
 // H4 read side: hyper_norm_gate_f32's exact norm + BF16 gate projection of the
 // streams, plus the normalized row for the HC down projection, in ONE launch,
 // so the paired HC write consumes `gate_logits` instead of re-reading the

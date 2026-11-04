@@ -3510,6 +3510,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hc_state_bf16_to_f32",
                 "hyper_norm_f32",
                 "hyper_norm_gate_f32",
+                "hyper_norm_gate_k4_outputs_f32",
                 "hyper_norm_gate_outputs",
                 "hyper_norm_gate_outputs_f32",
                 "hyper_read_f32",
@@ -3626,6 +3627,7 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "hc_state_bf16_to_f32",
                 "hyper_norm_f32",
                 "hyper_norm_gate_f32",
+                "hyper_norm_gate_k4_outputs_f32",
                 "hyper_norm_gate_outputs",
                 "hyper_norm_gate_outputs_f32",
                 "hyper_read_f32",
@@ -6271,6 +6273,7 @@ const QSA_LANES_TU_SYMBOLS: &[&str] = &[
     "hc_state_bf16_to_f32",
     "hyper_norm_f32",
     "hyper_norm_gate_f32",
+    "hyper_norm_gate_k4_outputs_f32",
     "hyper_norm_gate_outputs",
     "hyper_norm_gate_outputs_f32",
     "hyper_read_f32",
@@ -12532,6 +12535,7 @@ mod tests {
         for (symbol, gfx11, gfx12) in [
             ("hyper_write_bf16x2", true, true),
             ("hyper_write_bf16x8_gfx1201", false, true),
+            ("hyper_norm_gate_k4_outputs_f32", false, true),
             ("indexed_attention_decode_prologue_fp8", false, true),
             ("gated_delta_step_pipe128_q8", false, true),
         ] {
