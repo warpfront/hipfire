@@ -1408,7 +1408,10 @@ mod tests {
         assert_eq!(resolve_ep_unit_tail(Some("0")), Ok(None));
         assert_eq!(resolve_ep_unit_tail(Some("off")), Ok(None));
         assert_eq!(
-            resolve_ep_unit_tail(Some("512,8")).unwrap().unwrap().tail_units,
+            resolve_ep_unit_tail(Some("512,8"))
+                .unwrap()
+                .unwrap()
+                .tail_units,
             512
         );
         assert!(resolve_ep_unit_tail(Some("x")).is_err());
