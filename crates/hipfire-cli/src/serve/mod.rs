@@ -386,6 +386,65 @@ impl VmmBatchFlags {
     }
 }
 
+/// Lanes a plain `hipfire serve` batches with when it serves a Flash-Next
+/// (Qwen4) model expert-parallel over exact gfx1201 cards and neither
+/// `serve.continuous_batch_size` nor `serve.vmm_batch` is set anywhere
+/// ([`serve_batch_explicit`]).
+pub(crate) const SERVE_AUTO_BATCH_LANES: u64 = 8;
+
+/// HFQ `arch_id` of the Qwen4 (Flash-Next) family.
+const QWEN4_ARCH_ID: u32 = 16;
+
+/// The model/topology/GPU combination whose measured batching win makes
+/// batching the default: Qwen4 (`arch_id` 16) with an expert-parallel degree
+/// of at least 2 on `gfx1201`. Everything else keeps the configured values
+/// (`serve.continuous_batch_size` 1, `serve.vmm_batch` off).
+pub(crate) fn serve_auto_batch_eligible(arch_id: Option<u32>, ep: usize, gpu_arch: &str) -> bool {
+    arch_id == Some(QWEN4_ARCH_ID) && ep >= 2 && gpu_arch == "gfx1201"
+}
+
+/// Whether the user decided the batch settings: a `--continuous-batch-size`
+/// argument, any non-built-in source of `serve.vmm_batch` /
+/// `serve.continuous_batch_size` (config files, registry, one-shot), their
+/// environment spellings, or multi-slot mode (which refuses batching). An
+/// explicit setting, including `0` / `false` / `1`, is the kill switch of the
+/// default.
+pub(crate) fn serve_batch_explicit(
+    resolved: &hipfire_config::ResolvedConfig,
+    cli_batch_size: Option<u64>,
+    multi_slot: bool,
+) -> bool {
+    multi_slot
+        || cli_batch_size.is_some()
+        || ["serve.vmm_batch", "serve.continuous_batch_size"]
+            .iter()
+            .any(|key| {
+                resolved
+                    .get(key)
+                    .is_some_and(|value| !matches!(value.source, ConfigSource::BuiltIn))
+            })
+        || ["HIPFIRE_SERVE_VMM_BATCH", "HIPFIRE_CONTINUOUS_BATCH_SIZE"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+}
+
+/// [`serve_auto_batch_eligible`] for the model file at `path` (its HFQ header's
+/// `arch_id`, no mmap), the effective `topology.ep` and the load's target GPU.
+fn serve_auto_batch_for_path(
+    path: Option<&Path>,
+    resolved: &hipfire_config::ResolvedConfig,
+) -> bool {
+    let Some(arch_id) = path.and_then(|path| hipfire_registry::probe_hfq_arch_id(path).ok()) else {
+        return false;
+    };
+    arch_id == QWEN4_ARCH_ID
+        && serve_auto_batch_eligible(
+            Some(arch_id),
+            hipfire_loader::admission::effective_ep(arch_id),
+            &crate::ple::load_target_arch(resolved),
+        )
+}
+
 pub(crate) struct ServeRuntime {
     pub(crate) engine: Engine,
     pub(crate) paths: Paths,
@@ -438,6 +497,11 @@ pub(crate) struct ServeRuntime {
     /// on the multi-slot load params so the daemon's slot engine honours the
     /// same budget the CLI validated.
     pub(crate) max_batch_tokens: u64,
+    /// The configured `(serve.continuous_batch_size, serve.vmm_batch)` that a
+    /// load of a model the batching default does not cover reverts to; `Some`
+    /// only when the default was applied at startup ([`serve_batch_explicit`]
+    /// false and the default model eligible).
+    pub(crate) batch_fallback: Option<(u64, VmmBatchFlags)>,
 }
 
 pub(crate) struct ServeShared {
@@ -1787,6 +1851,36 @@ pub(crate) fn serve_foreground(
     }
     let vmm_batch = VmmBatchFlags::from_config(&global)?;
     let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
+    // Flash-Next expert-parallel on exact gfx1201 batches by default: a plain
+    // `hipfire serve` (no batch setting anywhere) stages the VMM
+    // continuous-batching lanes. Any explicit `serve.continuous_batch_size` /
+    // `serve.vmm_batch` (CLI, config, env) is the kill switch.
+    let batch_explicit =
+        serve_batch_explicit(&global, args.continuous_batch_size, multi_slot_enabled);
+    let (continuous_batch_size, vmm_batch, batch_fallback) = if !batch_explicit
+        && serve_auto_batch_for_path(
+            crate::resolve_model_path(paths, &registry, &default_model)
+                .ok()
+                .flatten()
+                .as_deref(),
+            &global,
+        ) {
+        eprintln!(
+            "serve: Flash-Next expert-parallel on gfx1201: batching on by default \
+             (serve.continuous_batch_size {SERVE_AUTO_BATCH_LANES}, serve.vmm_batch true); \
+             set either explicitly to override"
+        );
+        (
+            SERVE_AUTO_BATCH_LANES,
+            VmmBatchFlags {
+                enabled: true,
+                ..vmm_batch
+            },
+            Some((continuous_batch_size, vmm_batch)),
+        )
+    } else {
+        (continuous_batch_size, vmm_batch, None)
+    };
     let multi_slot_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4);
     let multi_slot_ctx = args
         .max_seq
@@ -1952,6 +2046,7 @@ pub(crate) fn serve_foreground(
             max_seq_override: args.max_seq,
             continuous_batch_size,
             vmm_batch,
+            batch_fallback,
             multi_slot_enabled,
             multi_slot_slots,
             multi_slot_ctx,
@@ -2369,9 +2464,18 @@ impl ServeRuntime {
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
             }
-            params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
-            if self.vmm_batch.enabled {
-                params["serve_vmm_batch"] = self.vmm_batch.load_params(self.max_batch_tokens);
+            // The startup default (batching on for Flash-Next EP on gfx1201)
+            // covers only the models it was measured on: any other load
+            // reverts to the configured values.
+            let (batch_size, vmm_batch) = match self.batch_fallback {
+                Some(configured) if !serve_auto_batch_for_path(Some(&path), &resolved) => {
+                    configured
+                }
+                _ => (self.continuous_batch_size, self.vmm_batch),
+            };
+            params["continuous_batch_size"] = serde_json::json!(batch_size);
+            if vmm_batch.enabled {
+                params["serve_vmm_batch"] = vmm_batch.load_params(self.max_batch_tokens);
             }
             // Experimental multi-slot: daemon owns SlotEngine instead of ordinary
             // LoadedModel. Future continuous-batch integration is deferred.
@@ -3119,6 +3223,68 @@ mod tests {
             last_activity: Instant::now() - Duration::from_secs(600),
             ..ServeMeta::new("test".to_owned())
         }
+    }
+
+    #[test]
+    fn flash_next_ep_on_gfx1201_batches_by_default_and_nothing_else_does() {
+        assert!(serve_auto_batch_eligible(Some(16), 2, "gfx1201"));
+        assert!(serve_auto_batch_eligible(Some(16), 4, "gfx1201"));
+        for (arch_id, ep, gpu) in [
+            (Some(16), 1, "gfx1201"),
+            (Some(16), 2, "gfx1151"),
+            (Some(16), 2, "gfx1100"),
+            (Some(16), 2, ""),
+            (Some(5), 2, "gfx1201"),
+            (None, 2, "gfx1201"),
+        ] {
+            assert!(
+                !serve_auto_batch_eligible(arch_id, ep, gpu),
+                "{arch_id:?} ep={ep} {gpu}"
+            );
+        }
+        assert_eq!(SERVE_AUTO_BATCH_LANES, 8);
+    }
+
+    #[test]
+    fn an_explicit_batch_setting_is_the_kill_switch_of_the_default() {
+        if ["HIPFIRE_SERVE_VMM_BATCH", "HIPFIRE_CONTINUOUS_BATCH_SIZE"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some())
+        {
+            return; // the ambient environment is itself an explicit setting
+        }
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert!(!serve_batch_explicit(&defaults, None, false));
+        assert!(serve_batch_explicit(&defaults, Some(1), false));
+        assert!(serve_batch_explicit(&defaults, None, true));
+        for (key, value) in [
+            ("serve.vmm_batch", hipfire_config::ConfigValue::Bool(false)),
+            (
+                "serve.continuous_batch_size",
+                hipfire_config::ConfigValue::Integer(1),
+            ),
+        ] {
+            let mut layer = ConfigLayer::default();
+            layer.set(key, value).unwrap();
+            let resolved = resolve(vec![NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/x"),
+                },
+                layer,
+            }])
+            .unwrap();
+            assert!(serve_batch_explicit(&resolved, None, false), "{key}");
+        }
+    }
+
+    #[test]
+    fn a_model_file_that_is_not_a_qwen4_hfq_gets_no_default_batching() {
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert!(!serve_auto_batch_for_path(None, &defaults));
+        assert!(!serve_auto_batch_for_path(
+            Some(std::path::Path::new("/nonexistent/model.mq4")),
+            &defaults
+        ));
     }
 
     #[test]
@@ -4119,6 +4285,7 @@ mod tests {
             max_seq_override: None,
             continuous_batch_size: 1,
             vmm_batch: VmmBatchFlags::default(),
+            batch_fallback: None,
             multi_slot_enabled: false,
             multi_slot_slots: 4,
             multi_slot_ctx: 8192,

@@ -17028,6 +17028,7 @@ effort = "high"
                     max_seq_override: None,
                     continuous_batch_size: 1,
                     vmm_batch: crate::serve::VmmBatchFlags::default(),
+                    batch_fallback: None,
                     multi_slot_enabled: false,
                     multi_slot_slots: 4,
                     multi_slot_ctx: 8192,

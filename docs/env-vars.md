@@ -638,7 +638,7 @@ harness exports pending their cleanup.
 | `HIPFIRE_IDLE_TIMEOUT` | Serve idle unload seconds |
 | `HIPFIRE_MAX_REQUEST_BYTES` | Body cap |
 | `HIPFIRE_SERVE_MAX_QUEUE` / `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | Admission queue |
-| `HIPFIRE_SERVE_VMM_BATCH` | Compatibility spelling of `serve.vmm_batch` (default off, experimental): the VMM continuous-batching route for concurrent requests. Qwen dense uniform MQ4G256V2 also admits exact gfx1100 with Q8 VMM KV: complete singleton target layers run per lane, with no cross-request DFlash/MTP verification installed; Q8 recurrent state requires error feedback, otherwise serve staging keeps the singleton route. Also gates the Flash-Next (qwen4, arch 16) exact AR fn-lanes route, which additionally needs `serve.continuous_batch_size >= 2` (greedy text chat only; see [SERVE.md](SERVE.md#flash-next-exact-lane-batching-qwen4-arch-16)). `0` stages no lane store and keeps the serial singleton route. |
+| `HIPFIRE_SERVE_VMM_BATCH` | Compatibility spelling of `serve.vmm_batch` (default off, experimental): the VMM continuous-batching route for concurrent requests. Qwen dense uniform MQ4G256V2 also admits exact gfx1100 with Q8 VMM KV: complete singleton target layers run per lane, with no cross-request DFlash/MTP verification installed; Q8 recurrent state requires error feedback, otherwise serve staging keeps the singleton route. Also gates the Flash-Next (qwen4, arch 16) exact AR fn-lanes route, which additionally needs `serve.continuous_batch_size >= 2` (greedy text chat only; see [SERVE.md](SERVE.md#flash-next-exact-lane-batching-qwen4-arch-16)). `0` stages no lane store and keeps the serial singleton route. **Default for Flash-Next EP:** `hipfire serve` on a Qwen4 (`arch_id` 16) HFQ with `topology.ep` >= 2 over exact gfx1201 cards batches by default (`serve.vmm_batch` on, `serve.continuous_batch_size` 8, `hipfire-cli` `serve_auto_batch_*`) when neither key is set by any source (CLI `--continuous-batch-size`, config, registry, `HIPFIRE_SERVE_VMM_BATCH` / `HIPFIRE_CONTINUOUS_BATCH_SIZE`); an explicit value, including `0` / `false` / `1`, is the kill switch. Every other model, topology and GPU keeps the built-in `off` / `1`. |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | Research budget nudge |
 | `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100, exact-gfx1201 or (opt-in) exact-gfx1151 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, HIP graph capture off, retained replay recording off) attend step leaves the batched flash kernel for the multi-row tile; default `4096` on gfx1100/gfx1201, unset on gfx1151 (setting any value > 0 opts gfx1151 in), `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path, tried before the ROCm root. For distributions whose ROCm prefix does not carry RCCL (nixpkgs: `rocmtoolkit-merged` has HIP/HSA, `librccl` is a separate store path). |
@@ -1245,7 +1245,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_COMP_DUMP` | crates/hipfire-arch-deepseek4/src/forward.rs, crates/hipfire-dispatch/src/pipeline/mla/compressor.rs | developer |
 | `HIPFIRE_CONTAINER` | scripts/container-gate.sh, scripts/test_container_gate.py | harness |
 | `HIPFIRE_CONTINUOUS_BATCH` | crates/hipfire-arch-qwen35/src/carrier.rs | developer |
-| `HIPFIRE_CONTINUOUS_BATCH_SIZE` | crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_CONTINUOUS_BATCH_SIZE` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_CONV_QKNORM` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/tests/conv_qknorm_parity.rs | developer |
 | `HIPFIRE_CONV_QKNORM_SHAPE` | crates/hipfire-dispatch/src/pipeline/hybrid.rs, crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_CONV_SCALAR_PREP` | crates/hipfire-dispatch/src/pipeline/hybrid.rs | developer |
@@ -2892,7 +2892,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SERVE_STREAM_STALL_TIMEOUT_MS` | crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD` | crates/hipfire-config/src/lib.rs, crates/hipfire-daemon/src/slots.rs | experimental |
 | `HIPFIRE_SERVE_UI` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | stable |
-| `HIPFIRE_SERVE_VMM_BATCH` | crates/hipfire-config/src/lib.rs | experimental |
+| `HIPFIRE_SERVE_VMM_BATCH` | crates/hipfire-cli/src/serve/mod.rs, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_SESSION_CACHE_BYTES` | crates/hipfire-config/src/lib.rs, experiments/qwen4-yarn-longctx/niah.sh | stable |
 | `HIPFIRE_SESSION_CACHE_DIR` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_SESSION_CACHE_DISK_BYTES` | crates/hipfire-config/src/lib.rs | stable |
