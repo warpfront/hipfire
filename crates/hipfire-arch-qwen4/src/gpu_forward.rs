@@ -3692,7 +3692,7 @@ fn ep_stage_chunk_route(tile_admitted: bool, trunk_shard: bool) -> bool {
 pub const QWEN4_EP_TRUNK_SHARD_PMASK_ENV: &str = "HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK";
 
 /// The partial tile mask switch (default on).
-fn trunk_shard_pmask_env_on() -> bool {
+pub(crate) fn trunk_shard_pmask_env_on() -> bool {
     hipfire_config::developer_bool(QWEN4_EP_TRUNK_SHARD_PMASK_ENV, true)
 }
 
@@ -3704,7 +3704,7 @@ fn trunk_partial_mask_on(trunk_chunk_partial: bool, env_on: bool) -> bool {
 /// The tile route's transport seen as a MASK-ONLY exchange (the trunk shard's partial chunk
 /// route): same owner table, never a peer wait or pull. Every rank's owned-slot partial is
 /// completed by the all-reduce of its FFN HC write.
-struct PartialMaskExchange<'a>(&'a (dyn MoeTileExchange + Send + Sync));
+pub(crate) struct PartialMaskExchange<'a>(pub(crate) &'a (dyn MoeTileExchange + Send + Sync));
 
 impl MoeTileExchange for PartialMaskExchange<'_> {
     fn owners(&self) -> (usize, &GpuTensor, usize) {
@@ -3732,6 +3732,38 @@ impl MoeTileExchange for PartialMaskExchange<'_> {
         _tiles: usize,
     ) -> Result<(), String> {
         Err("partial tile mask never pulls peer rows".into())
+    }
+}
+
+/// [`PartialMaskExchange`] over an owned transport handle (stored on the tile route).
+pub(crate) struct PartialMaskArc(Arc<dyn MoeTileExchange + Send + Sync>);
+
+impl MoeTileExchange for PartialMaskArc {
+    fn owners(&self) -> (usize, &GpuTensor, usize) {
+        self.0.owners()
+    }
+
+    fn mask_only(&self) -> bool {
+        true
+    }
+
+    fn before_down(&self, gpu: &mut Gpu) -> Result<(), String> {
+        PartialMaskExchange(&*self.0).before_down(gpu)
+    }
+
+    fn host_barrier(&self, what: u8, epoch: u32) -> Result<(), String> {
+        self.0.host_barrier(what, epoch)
+    }
+
+    fn exchange(
+        &self,
+        gpu: &mut Gpu,
+        layer_idx: u16,
+        tile_ids: &GpuTensor,
+        y_down_grouped: &GpuTensor,
+        tiles: usize,
+    ) -> Result<(), String> {
+        PartialMaskExchange(&*self.0).exchange(gpu, layer_idx, tile_ids, y_down_grouped, tiles)
     }
 }
 
@@ -3820,6 +3852,10 @@ pub(crate) struct Qwen4TileRoute {
     wmma: bool,
     /// The installed transport (`None` until the mesh agreed).
     hook: Option<Arc<dyn MoeTileExchange + Send + Sync>>,
+    /// The same transport seen as a MASK-ONLY exchange (the trunk shard's partial tile mask,
+    /// [`PartialMaskExchange`]); set with `hook`. The exact prefill wave binds it into its one MoE
+    /// call (it must outlive the wave program, so it lives here, not on the stack).
+    mask_hook: Option<Arc<dyn MoeTileExchange + Send + Sync>>,
 }
 
 impl Qwen4TileRoute {
@@ -3934,6 +3970,7 @@ impl Qwen4TileRoute {
             verdicts: Vec::new(),
             wmma,
             hook: None,
+            mask_hook: None,
         }))
     }
 
@@ -13587,6 +13624,7 @@ impl Qwen4GpuForward {
             ));
         }
         let wmma = route.wmma;
+        route.mask_hook = Some(Arc::new(PartialMaskArc(hook.clone())));
         route.hook = Some(hook);
         if !wmma {
             for layer in self

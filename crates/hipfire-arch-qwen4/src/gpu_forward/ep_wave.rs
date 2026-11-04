@@ -204,6 +204,11 @@ pub(crate) struct EpWaveFacts {
     /// (`Gpu::qwen4_moe_sym_iu4_applies` under the lane's tile scopes), else the F32 grouped
     /// chain. Only read on the Partial route.
     pub lane_sym: Vec<bool>,
+    /// Trunk-shard partial tile mask in effect on this load (`HIPFIRE_QWEN4_EP_TRUNK_SHARD_PMASK`
+    /// and the installed tile-route object): every lane's own partial chunk that the tile route
+    /// admits masks the non-owned tiles, and the wave's one MoE call must mask them the same way.
+    /// Only read on the Partial route.
+    pub partial_mask: bool,
 }
 
 impl EpWaveFacts {
@@ -296,6 +301,17 @@ pub(crate) fn ep_wave_refusal(facts: &EpWaveFacts) -> Option<String> {
                     facts.lane_rows[first_sym], facts.lane_rows[first_f32]
                 ));
             }
+            // The partial tile mask is per lane (its own tile-route admission): a wave reproduces
+            // lanes that are all masked or all unmasked, never a mix.
+            if facts.partial_mask {
+                let masked = facts.lane_tile.iter().filter(|tile| **tile).count();
+                if masked != 0 && masked != facts.lane_tile.len() {
+                    return refuse(
+                        "the lanes' own partial chunks differ in the tile mask (some lanes take the owner-routed tile admission, some do not)"
+                            .to_string(),
+                    );
+                }
+            }
             if sym != 0 {
                 if let Some(lane) = facts.lane_a8.iter().position(|a8| !*a8) {
                     return refuse(format!(
@@ -380,6 +396,26 @@ pub(crate) fn ep_wave_tile_exchange(
     let route = ep?.tile.as_ref()?;
     Some(hipfire_dispatch::families::moe::MoeTileExchangeParams {
         exchange: route.hook.as_deref()?,
+        tile_ids_owned: &route.tile_ids_owned,
+    })
+}
+
+/// Whether the trunk-shard partial tile mask is in effect: the switch and the installed tile
+/// route object (the same pair [`Qwen4GpuForward::forward_chunk_tile`] checks per chunk).
+pub(crate) fn ep_wave_partial_mask_on(ep: Option<&Qwen4ForwardEp>) -> bool {
+    super::trunk_shard_pmask_env_on()
+        && crate::trunk_route::ffn_partial_active()
+        && ep.is_some_and(|ep| ep.tile.as_ref().is_some_and(|route| route.hook.is_some()))
+}
+
+/// The mask-only exchange of the Partial wave's MoE call (see [`super::PartialMaskArc`]) and the
+/// owned-tile id buffer it masks with, when [`ep_wave_partial_mask_on`].
+pub(crate) fn ep_wave_partial_mask(
+    ep: Option<&Qwen4ForwardEp>,
+) -> Option<hipfire_dispatch::families::moe::MoeTileExchangeParams<'_>> {
+    let route = ep?.tile.as_ref()?;
+    Some(hipfire_dispatch::families::moe::MoeTileExchangeParams {
+        exchange: route.mask_hook.as_deref()?,
         tile_ids_owned: &route.tile_ids_owned,
     })
 }
@@ -494,6 +530,7 @@ impl Qwen4GpuForward {
             tile_wave_enabled: ep_wave_tile_enabled(),
             shard_wave_enabled: ep_wave_shard_enabled(),
             lane_sym,
+            partial_mask: ep_wave_partial_mask_on(self.ep.as_ref()),
         }
     }
 
@@ -620,6 +657,7 @@ mod tests {
             tile_wave_enabled: true,
             shard_wave_enabled: true,
             lane_sym: vec![false; lane_rows.len()],
+            partial_mask: false,
         }
     }
 
@@ -1050,15 +1088,22 @@ mod tests {
         );
         assert!(body.contains("exchange: route.hook.as_deref()?"));
         assert!(body.contains("tile_ids_owned: &route.tile_ids_owned"));
-        // The lane program binds the exchange on the Tile route only: the Partial wave has no
-        // cross-rank traffic in its MoE call (its ARs are the per-lane HC writes).
+        // The lane program binds the transport's exchange on the Tile route and, on the Partial
+        // route, only the MASK-ONLY exchange of the shard's partial tile mask: the Partial wave
+        // has no cross-rank traffic in its MoE call (its ARs are the per-lane HC writes).
         let lanes = include_str!("../gpu_forward_lanes.rs");
         let arm = &lanes[lanes
             .find("let route = wave_route.unwrap_or(EpWaveRoute::FullTable);")
             .unwrap()..];
         let arm = &arm[..arm.find("wave_moe_calls += 1;").unwrap()];
-        assert_eq!(arm.matches("moe.tile_exchange =").count(), 1, "{arm}");
+        assert_eq!(arm.matches("moe.tile_exchange =").count(), 2, "{arm}");
         assert!(arm.contains("if route == EpWaveRoute::Tile {"), "{arm}");
+        assert!(
+            arm.contains("route == EpWaveRoute::Partial")
+                && arm.contains("ep_wave_partial_mask_on(fwd.ep.as_ref())")
+                && arm.contains("ep_wave_partial_mask(fwd.ep.as_ref())"),
+            "{arm}"
+        );
         // Both routes run under the routing-row cap, set and restored once.
         assert_eq!(body.matches("gpu.qwen4_route_rows_cap").count(), 2);
         assert_eq!(body.matches("self.wave_route.replace(route)").count(), 1);

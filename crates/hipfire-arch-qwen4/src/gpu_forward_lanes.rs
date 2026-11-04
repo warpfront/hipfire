@@ -89,8 +89,9 @@
 use crate::bundle::Qwen4Bundle;
 use crate::config::LayerType;
 use crate::gpu_forward::ep_wave::{
-    ep_wave_expected_moe_calls, ep_wave_layer_moe, ep_wave_policy, ep_wave_refusal, ep_wave_route,
-    ep_wave_scope_rows, ep_wave_tile_exchange, EpWaveRoute,
+    ep_wave_expected_moe_calls, ep_wave_layer_moe, ep_wave_partial_mask, ep_wave_partial_mask_on,
+    ep_wave_policy, ep_wave_refusal, ep_wave_route, ep_wave_scope_rows, ep_wave_tile_exchange,
+    EpWaveRoute,
 };
 use crate::gpu_forward::{
     bind_ep_lane_gather, ep_lane, ep_lane_buffer, ep_lane_check_invocations, ep_lane_moe_rows,
@@ -2909,6 +2910,13 @@ fn forward_lanes_scoped(
                                             )
                                         })?,
                                     );
+                                }
+                                // The Partial wave masks the non-owned tiles like the lanes' own
+                                // partial chunks do (the trunk shard's partial tile mask).
+                                if route == EpWaveRoute::Partial
+                                    && ep_wave_partial_mask_on(fwd.ep.as_ref())
+                                {
+                                    moe.tile_exchange = ep_wave_partial_mask(fwd.ep.as_ref());
                                 }
                                 wave_moe_calls += 1;
                             } else if let Some(runtime) =
