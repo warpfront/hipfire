@@ -194,6 +194,57 @@ impl Bf16AllRowsTile {
     }
 }
 
+/// Output-rows-per-block x K-loop-unroll of a `gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U>` entry
+/// (the HC k4 all-rows kernel): a block owns `TM` output rows, up to `tpb` token rows and
+/// `4 * min(4, ceil(tpb / 4))` waves (four K quarters x token groups of four rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HcK4AllRowsTile {
+    M1U1,
+    M4U5,
+}
+
+impl HcK4AllRowsTile {
+    pub const ALL: [HcK4AllRowsTile; 2] = [HcK4AllRowsTile::M1U1, HcK4AllRowsTile::M4U5];
+
+    /// Token-row tiles per block the launcher accepts (`tpb`).
+    pub const TOKEN_TILES: [usize; 3] = [16, 32, 64];
+
+    /// Smallest K the routed launcher takes: the HC projections (K 10240) were swept; shorter K
+    /// (a quarter under 1024 leaves most lanes idle) stays on the incumbent route.
+    pub const MIN_K: usize = 4096;
+
+    /// The kernel entry symbol.
+    pub const fn entry(self) -> &'static str {
+        match self {
+            HcK4AllRowsTile::M1U1 => "gemv_bf16_xf32_k4_rows_allrows_m1u1",
+            HcK4AllRowsTile::M4U5 => "gemv_bf16_xf32_k4_rows_allrows_m4u5",
+        }
+    }
+
+    /// Output rows per block (`TM`).
+    pub const fn output_rows(self) -> usize {
+        match self {
+            HcK4AllRowsTile::M1U1 => 1,
+            HcK4AllRowsTile::M4U5 => 4,
+        }
+    }
+
+    /// The tile and token-row tile the routed launcher runs for `m` output rows over `rows`, from
+    /// the byte oracle's `--bench` sweep on the R9700 (HC down 320 x 10240, write gate 4 x 10240):
+    /// the few-output-row gate takes one output row per block (every block is latency-bound, more
+    /// blocks win), the 320-row down the four-row tile with a five-way unrolled K loop, 16 token
+    /// rows per block up to 32 rows and 32 above.
+    pub const fn pick(m: usize, rows: usize) -> (Self, usize) {
+        if m < 64 {
+            (HcK4AllRowsTile::M1U1, 16)
+        } else if rows <= 32 {
+            (HcK4AllRowsTile::M4U5, 16)
+        } else {
+            (HcK4AllRowsTile::M4U5, 32)
+        }
+    }
+}
+
 /// Singleton-DAG row-tile families, controlled by one lab selector per family.
 /// Logical rows use fixed eight-row physical tiles; selectors do not grant
 /// product admission. [`Gpu::row_tile_twin_enabled`] binds the eager verify
@@ -21637,6 +21688,9 @@ impl Gpu {
                 "gemv_bf16_xf32_k4_rows needs K % 32 == 0 and 1..=64 rows",
             ));
         }
+        if self.hc_k4_allrows_applies(k, rows) {
+            return self.gemv_bf16_xf32_k4_rows_allrows(weight, x, y, m, k, hc_act_scale, rows);
+        }
         if rows > FEW_ROW_ROUTE_ROWS && self.lane_hc_allrows_applies(rows) {
             return self.gemv_bf16_xf32_k4_rows_lane_allrows(
                 weight,
@@ -21948,6 +22002,127 @@ impl Gpu {
                 b.push_f32(scale);
                 b.push_i32(hc_act);
                 b.push_i32(rows_val);
+                b
+            },
+        )
+    }
+
+    /// Whether the HC k4 projection of `rows` activation rows takes the one-launch all-rows arm
+    /// (`HIPFIRE_QWEN4_HC_K4_ALLROWS`, exact gfx1201): the flag, `k % 32 == 0`, `k >=
+    /// [`HcK4AllRowsTile::MIN_K`]` and 9..=
+    /// [`WIDE_VERIFY_MAX_ROWS`] rows. Pure; every output is bitwise the k4 singleton's, so no scope
+    /// or recording state changes it.
+    pub fn hc_k4_allrows_applies(&self, k: usize, rows: usize) -> bool {
+        self.flags.qwen4_hc_k4_allrows_enabled()
+            && k >= HcK4AllRowsTile::MIN_K
+            && k.is_multiple_of(32)
+            && rows > FEW_ROW_ROUTE_ROWS
+            && rows <= WIDE_VERIFY_MAX_ROWS
+    }
+
+    /// [`Gpu::gemv_bf16_xf32_k4_rows`] for 9..=[`WIDE_VERIFY_MAX_ROWS`] rows in ONE
+    /// `gemv_bf16_xf32_k4_rows_allrows_m<TM>u<U>` launch ([`HcK4AllRowsTile::pick`]): each weight
+    /// quarter is loaded once per block and applied to every token row of the block; every output
+    /// is bitwise the single-row `gemv_bf16_xf32_k4` value (quarter chains, `(q0+q1)+(q2+q3)`
+    /// fold and `hc_act` epilogue verbatim). Needs the `HIPFIRE_QWEN4_HC_K4_ALLROWS` flag.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_xf32_k4_rows_allrows(
+        &mut self,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        let (tile, tpb) = HcK4AllRowsTile::pick(m, rows);
+        self.gemv_bf16_xf32_k4_rows_allrows_tile(tile, tpb, weight, x, y, m, k, hc_act_scale, rows)
+    }
+
+    /// [`Gpu::gemv_bf16_xf32_k4_rows_allrows`] on an explicit tile and token tile `tpb` (one of
+    /// [`HcK4AllRowsTile::TOKEN_TILES`]) for 1..=[`WIDE_VERIFY_MAX_ROWS`] rows (the byte oracle's
+    /// direct arm and the bench's sweep).
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_bf16_xf32_k4_rows_allrows_tile(
+        &mut self,
+        tile: HcK4AllRowsTile,
+        tpb: usize,
+        weight: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        hc_act_scale: Option<f32>,
+        rows: usize,
+    ) -> HipResult<()> {
+        let bad = |msg: &str| Err(hip_bridge::HipError::new(1, msg));
+        if !self.flags.qwen4_hc_k4_allrows_enabled() {
+            return bad("gemv_bf16_xf32_k4_rows_allrows needs HIPFIRE_QWEN4_HC_K4_ALLROWS on gfx1201");
+        }
+        if !k.is_multiple_of(32)
+            || k == 0
+            || k > i32::MAX as usize
+            || m == 0
+            || m > i32::MAX as usize
+            || !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+            || !HcK4AllRowsTile::TOKEN_TILES.contains(&tpb)
+        {
+            return bad("gemv_bf16_xf32_k4_rows_allrows needs K % 32 == 0, 1..=64 rows, tpb 16/32/64");
+        }
+        if weight.buf.size() < m * k * 2 || x.buf.size() < rows * k * 4 || y.buf.size() < rows * m * 4
+        {
+            return bad("gemv_bf16_xf32_k4_rows_allrows weight / x / y views too small");
+        }
+        self.bind_thread()?;
+        let func = tile.entry();
+        self.ensure_kernel(
+            "qwen4_gemv_bf16_xf32_allrows",
+            kernels::QWEN4_GEMV_BF16_XF32_ALLROWS_SRC,
+            func,
+        )?;
+        let w_ptr = weight.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let scale = hc_act_scale.unwrap_or(1.0);
+        let hc_act = i32::from(hc_act_scale.is_some());
+        let rows_val = rows as i32;
+        let tpb_val = tpb as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &w_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &scale as *const _ as *mut c_void,
+            &hc_act as *const _ as *mut c_void,
+            &rows_val as *const _ as *mut c_void,
+            &tpb_val as *const _ as *mut c_void,
+        ];
+        let waves = 4 * rows.min(tpb).div_ceil(4).min(4);
+        self.launch_maybe_blob(
+            func,
+            [
+                m.div_ceil(tile.output_rows()) as u32,
+                rows.div_ceil(tpb) as u32,
+                1,
+            ],
+            [(32 * waves) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(w_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_f32(scale);
+                b.push_i32(hc_act);
+                b.push_i32(rows_val);
+                b.push_i32(tpb_val);
                 b
             },
         )
@@ -27489,6 +27664,27 @@ mod bf16_allrows_tile_tests {
             assert_eq!(tile.output_rows().to_string(), tm);
             assert_eq!(tile.token_rows().to_string(), tn);
             assert!(32 * 64usize.div_ceil(tile.token_rows()) <= 512);
+        }
+        let hc_instances: Vec<&str> = kernels::QWEN4_GEMV_BF16_XF32_ALLROWS_SRC
+            .lines()
+            .filter(|l| l.starts_with("HC_K4_ALLROWS_ENTRY("))
+            .collect();
+        assert_eq!(hc_instances.len(), super::HcK4AllRowsTile::ALL.len());
+        for tile in super::HcK4AllRowsTile::ALL {
+            let suffix = tile
+                .entry()
+                .trim_start_matches("gemv_bf16_xf32_k4_rows_allrows_m");
+            let (tm, u) = suffix.split_once('u').expect("m<TM>u<U>");
+            let want = format!("HC_K4_ALLROWS_ENTRY({tm}, {u})");
+            assert!(hc_instances.contains(&want.as_str()), "{}", tile.entry());
+            assert_eq!(tile.output_rows().to_string(), tm);
+        }
+        for m in [1usize, 4, 63, 64, 320, 10240] {
+            for rows in 9..=64usize {
+                let (tile, tpb) = super::HcK4AllRowsTile::pick(m, rows);
+                assert!(super::HcK4AllRowsTile::ALL.contains(&tile));
+                assert!(super::HcK4AllRowsTile::TOKEN_TILES.contains(&tpb));
+            }
         }
         for m_total in [1usize, 127, 128, 1023, 1024, 1281, 2560] {
             for k in [8usize, 384, 1023, 1024, 2560] {

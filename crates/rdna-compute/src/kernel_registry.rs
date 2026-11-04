@@ -3022,7 +3022,9 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                     "gemv_bf16_xf32_x4_rows_allrows_m1t4",
                     "gemv_bf16_xf32_x4_rows_allrows_m2t4u10",
                     "gemv_bf16_xf32_x4_rows_allrows_m4t4",
-                    "gemv_bf16_xf32_x4_rows_allrows_m4t4u5"
+                    "gemv_bf16_xf32_x4_rows_allrows_m4t4u5",
+                    "gemv_bf16_xf32_k4_rows_allrows_m1u1",
+                    "gemv_bf16_xf32_k4_rows_allrows_m4u5"
                 ]
             );
             add!(
