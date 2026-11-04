@@ -4706,8 +4706,9 @@ pub fn qwen4_ep_wide_verify_all_lanes() -> bool {
 /// verify group may carry (`pack_classed_row_groups`' wide cap) and, with it, the EP
 /// row-gather capacity of the verify scope. An unsigned integer clamped to
 /// [`QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS`]`..=`[`QWEN4_EP_WIDE_VERIFY_ROWS_MAX`]; unset or
-/// unparsable is the default (32, today's shipped width). Read only when a wide verify
-/// flag is on ([`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] or `HIPFIRE_QWEN4_EP_WIDE_VERIFY`);
+/// unparsable is the default (32, today's shipped width). Read when a wide verify
+/// flag is on ([`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] or `HIPFIRE_QWEN4_EP_WIDE_VERIFY`), and, on
+/// exact gfx1201 EP ranks with `HIPFIRE_QWEN4_EP_WIDE_VERIFY` unset, as the gather capacity (default 48);
 /// the arch forward lowers it further to the lowest hard limit of any stage that runs
 /// the wide group (`gpu_forward::qwen4_ep_wide_group_cap`). Every rank of a mesh must
 /// run with the same value (the packing rule is shared by the root's verify seal and
@@ -4740,6 +4741,15 @@ pub fn qwen4_ep_wide_verify_rows() -> usize {
         qwen4_ep_wide_verify_rows_value(process_value(QWEN4_EP_WIDE_VERIFY_ROWS_ENV).as_deref())
     });
     *ROWS
+}
+
+/// [`qwen4_ep_wide_verify_rows`] when [`QWEN4_EP_WIDE_VERIFY_ROWS_ENV`] is explicitly set to an
+/// unsigned integer, else `None` (unset or unparsable): the exact-gfx1201 EP default gather
+/// capacity (`gpu_forward::qwen4_ep_gather_rows`) sizes itself from the variable only then.
+pub fn qwen4_ep_wide_verify_rows_explicit() -> Option<usize> {
+    process_value(QWEN4_EP_WIDE_VERIFY_ROWS_ENV)
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .map(|_| qwen4_ep_wide_verify_rows())
 }
 
 pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {

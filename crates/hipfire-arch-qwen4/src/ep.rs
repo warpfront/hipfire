@@ -1478,7 +1478,10 @@ impl Qwen4Bundle {
         }
         let spec = EpRowGatherSpec {
             ranks,
-            slots: ep_gather_slots(qwen4_ep_gather_rows(), self.config.num_experts_per_tok),
+            slots: ep_gather_slots(
+                qwen4_ep_gather_rows(&gpu.arch),
+                self.config.num_experts_per_tok,
+            ),
             row_bytes,
         };
         let fingerprint = self.ep_replication_fingerprint();

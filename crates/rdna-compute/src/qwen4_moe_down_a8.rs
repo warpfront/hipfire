@@ -28,9 +28,11 @@
 //!   `[ceil(M / 64), ceil(grouped_rows / 16)]`, block 128, static LDS 10944.
 //!
 //! Env (developer): `HIPFIRE_QWEN4_MOE_DOWN_A8` (`developer.qwen4_moe_down_a8`, typed boolean):
-//! `1` requests the GROUPED route (the 9..=64-row verify window) on exact gfx1201; unset and `0`
-//! (the default: off) keep the incumbent routed down. The window is reached only by the >8-row
-//! routes: singleton verify blocks of 9..=64 rows, prefill tails, and wide-class lane groups.
+//! default ON for an exact gfx1201 EP rank (set by the EP attach, `Gpu::set_qwen4_moe_down_a8_ep_default`),
+//! where it serves the 9..=64-row window only; `0` kills it (the incumbent routed down), and `1`
+//! requests it on any exact gfx1201 device for every row count the launchers admit (1..=64). The
+//! window is reached only by the >8-row routes: singleton verify blocks of 9..=64 rows, prefill
+//! tails, and the all-rows / wide-class lane groups.
 //! `HIPFIRE_QWEN4_MOE_DOWN_A8_INDEXED` (`developer.qwen4_moe_down_a8_indexed`) additionally
 //! enables the per-pick dot4 arm (decode / few-row verify), default off. The route
 //! additionally needs the loader's symmetric verdict ([`Gpu::set_qwen4_moe_down_a8_verified`]) and
@@ -94,10 +96,45 @@ fn down_a8_indexed_requested(flag: Option<bool>) -> bool {
     flag == Some(true)
 }
 
-/// Pure form of [`Gpu::qwen4_moe_down_a8_requested`]: exact gfx1201 and the flag explicitly on
-/// (default OFF: `HIPFIRE_QWEN4_MOE_DOWN_A8=1` enables it; unset and `0` are the same).
-fn down_a8_requested(arch: &str, flag: Option<bool>) -> bool {
-    arch == "gfx1201" && flag == Some(true)
+/// How the route was requested on a device ([`down_a8_request`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DownA8Request {
+    /// Not requested: the incumbent routed down.
+    Off,
+    /// `HIPFIRE_QWEN4_MOE_DOWN_A8=1`: every row count the launchers admit (1..=64).
+    Explicit,
+    /// Flag unset on an exact gfx1201 EP rank: only the >8-row window (9..=64 rows), so the
+    /// <= 8-row decode / AR8 / C1 launches never see it.
+    EpDefault,
+}
+
+/// Pure form of [`Gpu::qwen4_moe_down_a8_requested`]: exact gfx1201 only; `HIPFIRE_QWEN4_MOE_DOWN_A8`
+/// `1` is [`DownA8Request::Explicit`], `0` is [`DownA8Request::Off`] (the kill switch), and unset is
+/// [`DownA8Request::EpDefault`] on a rank that attached EP (`ep_default`), else off.
+fn down_a8_request(arch: &str, flag: Option<bool>, ep_default: bool) -> DownA8Request {
+    if arch != "gfx1201" {
+        return DownA8Request::Off;
+    }
+    match flag {
+        Some(true) => DownA8Request::Explicit,
+        Some(false) => DownA8Request::Off,
+        None if ep_default => DownA8Request::EpDefault,
+        None => DownA8Request::Off,
+    }
+}
+
+/// Pure form of [`Gpu::qwen4_moe_down_a8_requested`].
+fn down_a8_requested(arch: &str, flag: Option<bool>, ep_default: bool) -> bool {
+    down_a8_request(arch, flag, ep_default) != DownA8Request::Off
+}
+
+/// First row count of the route's window for a request: 1 when explicit, 9 (the first row count
+/// above the few-row routes) for the EP default.
+fn down_a8_min_rows(arch: &str, flag: Option<bool>, ep_default: bool) -> usize {
+    match down_a8_request(arch, flag, ep_default) {
+        DownA8Request::EpDefault => crate::prefill_invariant::FEW_ROW_ROUTE_ROWS + 1,
+        DownA8Request::Explicit | DownA8Request::Off => 1,
+    }
 }
 
 /// Pure inputs of [`down_a8_admits`].
@@ -132,9 +169,10 @@ fn down_a8_admits(g: DownA8Gate<'_>) -> bool {
         && g.k_top == DOWN_K_TOP
 }
 
-/// Whether `tokens` route rows are inside the route's row window.
-fn down_a8_rows_admit(tokens: usize) -> bool {
-    (1..=QWEN4_MOE_DOWN_A8_ROUTE_CAP).contains(&tokens)
+/// Whether `tokens` route rows are inside the route's row window `min_rows..=64`
+/// ([`down_a8_min_rows`]).
+fn down_a8_rows_admit(tokens: usize, min_rows: usize) -> bool {
+    (min_rows.max(1)..=QWEN4_MOE_DOWN_A8_ROUTE_CAP).contains(&tokens)
 }
 
 /// Token count of a grouped call whose X rows are one per top-10 pick (`x_row_div == 1`,
@@ -203,9 +241,29 @@ fn first_launch_receipt(kind: Kind, rows: usize, entry: &str) {
 
 impl Gpu {
     /// Whether the routed-down A8 route is requested on this device: exact gfx1201 and
-    /// `HIPFIRE_QWEN4_MOE_DOWN_A8` explicitly on (`1`; unset and `0` leave the incumbent down).
+    /// `HIPFIRE_QWEN4_MOE_DOWN_A8` not `0`: explicit `1`, or unset on an EP rank
+    /// ([`Gpu::set_qwen4_moe_down_a8_ep_default`]); unset elsewhere and `0` leave the incumbent down.
     pub fn qwen4_moe_down_a8_requested(&self) -> bool {
-        down_a8_requested(&self.arch, *QWEN4_MOE_DOWN_A8)
+        down_a8_requested(
+            &self.arch,
+            *QWEN4_MOE_DOWN_A8,
+            self.qwen4_moe_down_a8_ep_default,
+        )
+    }
+
+    /// First row count of the route's window on this device: 9 under the EP default, else 1.
+    pub(crate) fn qwen4_moe_down_a8_min_rows(&self) -> usize {
+        down_a8_min_rows(
+            &self.arch,
+            *QWEN4_MOE_DOWN_A8,
+            self.qwen4_moe_down_a8_ep_default,
+        )
+    }
+
+    /// Mark this device as an EP rank (set by the EP attach before the A8 verdict): an unset
+    /// `HIPFIRE_QWEN4_MOE_DOWN_A8` then requests the route (exact gfx1201, 9..=64-row window).
+    pub fn set_qwen4_moe_down_a8_ep_default(&mut self, on: bool) {
+        self.qwen4_moe_down_a8_ep_default = on;
     }
 
     /// Record the loader's verdict: every routed MoE layer this device serves has symmetric qt53
@@ -263,7 +321,7 @@ impl Gpu {
         k_top: usize,
     ) -> bool {
         down_a8_indexed_requested(*QWEN4_MOE_DOWN_A8_INDEXED)
-            && down_a8_rows_admit(batch_size)
+            && down_a8_rows_admit(batch_size, self.qwen4_moe_down_a8_min_rows())
             && self.qwen4_moe_down_a8_applies(m, k, k_top)
     }
 
@@ -275,7 +333,8 @@ impl Gpu {
         x_row_div: usize,
         x_src_rows: usize,
     ) -> bool {
-        grouped_tokens(x_row_div, x_src_rows).is_some_and(down_a8_rows_admit)
+        grouped_tokens(x_row_div, x_src_rows)
+            .is_some_and(|tokens| down_a8_rows_admit(tokens, self.qwen4_moe_down_a8_min_rows()))
             && self.qwen4_moe_down_a8_applies(m, k, DOWN_K_TOP)
     }
 
@@ -541,14 +600,25 @@ mod tests {
     }
 
     #[test]
-    fn requested_is_exact_gfx1201_and_opt_in() {
-        // Default OFF: unset and `0` do not request it (they are the same), `1` does.
-        assert!(!down_a8_requested("gfx1201", None));
-        assert!(down_a8_requested("gfx1201", Some(true)));
-        assert!(!down_a8_requested("gfx1201", Some(false)));
+    fn requested_is_exact_gfx1201_default_on_for_ep_ranks() {
+        // Unset: on only for an EP rank (`ep_default`), off elsewhere. `0` kills, `1` forces.
+        assert!(!down_a8_requested("gfx1201", None, false));
+        assert!(down_a8_requested("gfx1201", None, true));
+        assert!(down_a8_requested("gfx1201", Some(true), false));
+        assert!(down_a8_requested("gfx1201", Some(true), true));
+        assert!(!down_a8_requested("gfx1201", Some(false), false));
+        assert!(!down_a8_requested("gfx1201", Some(false), true));
+        assert_eq!(
+            down_a8_request("gfx1201", None, true),
+            DownA8Request::EpDefault
+        );
+        assert_eq!(
+            down_a8_request("gfx1201", Some(true), true),
+            DownA8Request::Explicit
+        );
         for arch in ["gfx1151", "gfx1100", "gfx1200", "gfx942", ""] {
-            assert!(!down_a8_requested(arch, None), "{arch}");
-            assert!(!down_a8_requested(arch, Some(true)), "{arch}");
+            assert!(!down_a8_requested(arch, None, true), "{arch}");
+            assert!(!down_a8_requested(arch, Some(true), true), "{arch}");
         }
     }
 
@@ -574,7 +644,7 @@ mod tests {
         assert!(!down_a8_indexed_requested(Some(false)));
         assert!(down_a8_indexed_requested(Some(true)));
         // The sub-switch alone never requests the route (the main flag + verdict gate it).
-        assert!(!down_a8_requested("gfx1201", None));
+        assert!(!down_a8_requested("gfx1201", None, false));
     }
 
     #[test]
@@ -606,15 +676,33 @@ mod tests {
     }
 
     #[test]
-    fn row_window_is_one_to_forty_eight() {
-        assert!(!down_a8_rows_admit(0));
-        assert!(down_a8_rows_admit(1));
-        assert!(down_a8_rows_admit(8));
-        assert!(down_a8_rows_admit(9));
-        assert!(down_a8_rows_admit(48));
-        assert!(down_a8_rows_admit(64));
-        assert!(!down_a8_rows_admit(65));
-        assert!(!down_a8_rows_admit(512));
+    fn row_window_is_one_to_sixty_four_when_explicit() {
+        assert!(!down_a8_rows_admit(0, 1));
+        assert!(down_a8_rows_admit(1, 1));
+        assert!(down_a8_rows_admit(8, 1));
+        assert!(down_a8_rows_admit(9, 1));
+        assert!(down_a8_rows_admit(48, 1));
+        assert!(down_a8_rows_admit(64, 1));
+        assert!(!down_a8_rows_admit(65, 1));
+        assert!(!down_a8_rows_admit(512, 1));
+    }
+
+    /// The EP default serves 9..=64 rows only: every row count the <= 8-row routes (decode, AR8,
+    /// C1, the few-row verify groups) launch with is outside the window, so they never take A8.
+    #[test]
+    fn ep_default_window_is_nine_to_sixty_four() {
+        let min = down_a8_min_rows("gfx1201", None, true);
+        assert_eq!(min, 9);
+        for rows in 0..=8 {
+            assert!(!down_a8_rows_admit(rows, min), "{rows}");
+        }
+        assert!(down_a8_rows_admit(9, min));
+        assert!(down_a8_rows_admit(48, min));
+        assert!(down_a8_rows_admit(64, min));
+        assert!(!down_a8_rows_admit(65, min));
+        // An explicit `1` keeps every row count; the kill switch and other devices have no window.
+        assert_eq!(down_a8_min_rows("gfx1201", Some(true), true), 1);
+        assert_eq!(down_a8_min_rows("gfx1201", Some(true), false), 1);
     }
 
     #[test]
@@ -625,7 +713,10 @@ mod tests {
         assert_eq!(grouped_tokens(1, 95), None);
         assert_eq!(grouped_tokens(10, 100), None);
         assert_eq!(grouped_tokens(1, 0), Some(0));
-        assert!(!grouped_tokens(1, 0).is_some_and(down_a8_rows_admit));
+        assert!(!grouped_tokens(1, 0).is_some_and(|t| down_a8_rows_admit(t, 1)));
+        // At the EP default a one-token (decode-shaped) grouped call is outside the window.
+        assert!(!grouped_tokens(1, 80).is_some_and(|t| down_a8_rows_admit(t, 9)));
+        assert!(grouped_tokens(1, 90).is_some_and(|t| down_a8_rows_admit(t, 9)));
     }
 
     #[test]

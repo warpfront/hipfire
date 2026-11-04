@@ -1405,7 +1405,9 @@ fn run_inner(args: &Args, report: &mut Value) -> R<i32> {
     let logits = gpu.zeros(&[vocab], DType::F32).map_err(e)?;
     report["vocab"] = json!(vocab);
     report["ranks"] = json!(bundle.ranks());
-    report["gather_rows"] = json!(hipfire_arch_qwen4::gpu_forward::qwen4_ep_gather_rows());
+    report["gather_rows"] = json!(hipfire_arch_qwen4::gpu_forward::qwen4_ep_gather_rows(
+        &gpu.arch
+    ));
 
     // Singleton references (before the lane store exists), then stage.
     let mut refs_by_set: Vec<Vec<RefLane>> = Vec::new();

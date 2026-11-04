@@ -1972,6 +1972,10 @@ pub struct Gpu {
     /// (set by the loader through [`Gpu::set_qwen4_moe_down_a8_verified`]); gates
     /// [`Gpu::qwen4_moe_down_a8_applies`].
     pub(crate) qwen4_moe_down_a8_verified: bool,
+    /// True on a device that attached EP (set by the EP attach through
+    /// [`Gpu::set_qwen4_moe_down_a8_ep_default`]): an unset `HIPFIRE_QWEN4_MOE_DOWN_A8` then
+    /// requests the route for the 9..=64-row window on exact gfx1201.
+    pub(crate) qwen4_moe_down_a8_ep_default: bool,
     /// True while the MTP head's MoE layer verdict is still owed (the route declines until the
     /// head settles it through [`Gpu::set_qwen4_moe_down_a8_head_pending`]).
     pub(crate) qwen4_moe_down_a8_head_pending: bool,
@@ -3343,6 +3347,7 @@ impl Gpu {
             qwen4_scope: false,
             qwen4_trunk_a8_verified: false,
             qwen4_moe_down_a8_verified: false,
+            qwen4_moe_down_a8_ep_default: false,
             qwen4_moe_down_a8_head_pending: false,
             qwen4_moe_down_a8_scratch: None,
             qwen4_moe_down_a8_scratch_bytes: 0,

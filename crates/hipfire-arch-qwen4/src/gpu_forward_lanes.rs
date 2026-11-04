@@ -25,8 +25,8 @@
 //!   under `HIPFIRE_QWEN4_LANE_HC_ALLROWS` the HC stages of a >8-row AR /
 //!   verify step take one all-rows segment instead, and under
 //!   `HIPFIRE_QWEN4_LANE_ALLROWS` so does every other non-MoE once-over-all-rows
-//!   stage: only the routed MoE keeps its groups, unless the lab
-//!   `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` makes it one EP call over every row on a
+//!   stage: only the routed MoE keeps its groups, unless
+//!   `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` (default on) makes it one EP call over every row on a
 //!   second all-rows segment; a wide-class step (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`)
 //!   is one group already, so its MoE is that one call through its group).
 //!   A stage moves to `OnceAllRows` only on byte evidence from the G0 oracle
@@ -1225,8 +1225,9 @@ fn all_rows_stages_apply(
 /// run, MoE calls per layer and the launches emitted per stage -- so a timing job can prove it
 /// measured the intended step. Read once.
 fn lane_step_trace_enabled() -> bool {
-    static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_STEP_TRACE", false));
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_STEP_TRACE", false)
+    });
     *ON
 }
 
@@ -1241,8 +1242,8 @@ fn lane_step_trace_enabled() -> bool {
 /// - `gather_cap` `None`: no EP row gather is installed (the call is the EP gathered forward);
 /// - `any_wide_lane`: a wide-class lane (`HIPFIRE_QWEN4_EP_SAMPLED_WIDE_VERIFY`) already packs
 ///   into its own classed group, and classes never share a group;
-/// - `n > gather_cap`: `ep_lane_moe_rows`' gather capacity (a rank sizes it to the wide group
-///   cap only with `HIPFIRE_QWEN4_EP_WIDE_VERIFY=1`, else 8 rows);
+/// - `n > gather_cap`: `ep_lane_moe_rows`' gather capacity (a rank sizes it to 48 rows by default
+///   on exact gfx1201, `HIPFIRE_QWEN4_EP_WIDE_VERIFY=0` restores 8 rows, an explicit `=1` the wide group cap);
 /// - `n` above the tightest wide stage limit ([`crate::gpu_forward::ep_wide_stage_limits`]:
 ///   the 512-slot owner assignment, the 16-bit crossing-tag slot field, the verify window);
 /// - `ar_write` (the trunk shard's fused all-reduce HC write carries the step) and `n` above
@@ -1275,13 +1276,11 @@ fn all_rows_moe_refusal(
     }
     if n > cap {
         return Some(format!(
-            "{n} rows exceed the {cap}-row EP gather capacity (HIPFIRE_QWEN4_EP_WIDE_VERIFY=1 and HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS size it)"
+            "{n} rows exceed the {cap}-row EP gather capacity (48 rows by default on exact gfx1201 EP; HIPFIRE_QWEN4_EP_WIDE_VERIFY=0 restores 8, HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS sizes it)"
         ));
     }
-    let (limit, binding) = crate::gpu_forward::ep_wide_group_cap_for(
-        n,
-        crate::gpu_forward::QWEN4_EP_WIDE_TOP_K,
-    );
+    let (limit, binding) =
+        crate::gpu_forward::ep_wide_group_cap_for(n, crate::gpu_forward::QWEN4_EP_WIDE_TOP_K);
     if limit < n {
         return Some(format!(
             "{n} rows exceed the {limit}-row limit of stage {}",
@@ -2341,7 +2340,7 @@ fn forward_lanes_scoped(
     let exact_scope = exact_flag && all_stages;
     // The few-row limit an all-rows (`n`-row) segment's descriptions are bound under.
     let exact_limit = n.max(gpu.few_row_limit());
-    // Lab `HIPFIRE_QWEN4_LANE_ALLROWS_MOE`: on top of the all-rows stages the routed MoE is ONE
+    // `HIPFIRE_QWEN4_LANE_ALLROWS_MOE` (default on): on top of the all-rows stages the routed MoE is ONE
     // `ep_lane_moe_rows` call per layer over every row (the wide-group MoE of `n` rows) on its
     // own all-rows segment, and the HC writes a TP2 all-reduce carries go all-rows too: no
     // family runs per <= 8-row group. A wide-class lane step already packs into one group of
@@ -6210,16 +6209,85 @@ mod tests {
     fn wide_class_lane_step_is_one_group_and_takes_no_all_rows_segment() {
         use crate::mesh_lane_protocol::pack_classed_row_groups_with_cap;
         let rows = [6usize; 8];
-        let wide_groups = segments_of_groups(pack_classed_row_groups_with_cap(&rows, &[true; 8], 48));
+        let wide_groups =
+            segments_of_groups(pack_classed_row_groups_with_cap(&rows, &[true; 8], 48));
         assert_eq!(wide_groups.len(), 1);
         assert_eq!(wide_groups[0].rows, 48);
         let group_rows: Vec<usize> = wide_groups.iter().map(|seg| seg.rows).collect();
         let production = LaneStagePolicy::production();
-        assert!(!hc_all_rows_applies(true, true, true, false, &group_rows, &production));
+        assert!(!hc_all_rows_applies(
+            true,
+            true,
+            true,
+            false,
+            &group_rows,
+            &production
+        ));
         // Row-exact lanes of the same rows (6 + 6 > 8 rows) are one group each: several groups.
         let exact = segments_of_groups(pack_classed_row_groups_with_cap(&rows, &[false; 8], 48));
         assert_eq!(exact.len(), 8);
         let exact_rows: Vec<usize> = exact.iter().map(|seg| seg.rows).collect();
-        assert!(hc_all_rows_applies(true, true, true, false, &exact_rows, &production));
+        assert!(hc_all_rows_applies(
+            true,
+            true,
+            true,
+            false,
+            &exact_rows,
+            &production
+        ));
+    }
+
+    /// The V1 default-on landing never reaches a step of <= 8 rows: no composition of 1..=8 rows
+    /// into once-over-all-rows groups takes the all-rows segment (so no all-rows stage and no
+    /// all-rows MoE), whatever the flags say; the one MoE call is open exactly to 9..=48 rows at the
+    /// default exact-gfx1201 EP gather capacity and refuses 49 and above (the groups stay).
+    #[test]
+    fn v1_default_never_touches_steps_of_eight_rows_or_fewer() {
+        fn compositions(total: usize, prefix: &mut Vec<usize>, out: &mut Vec<Vec<usize>>) {
+            if total == 0 {
+                out.push(prefix.clone());
+                return;
+            }
+            for first in 1..=total.min(LANE_MAX_ROWS) {
+                prefix.push(first);
+                compositions(total - first, prefix, out);
+                prefix.pop();
+            }
+        }
+        let production = LaneStagePolicy::production();
+        let cap = crate::gpu_forward::ep_gather_rows_resolved("gfx1201", None, None, false, 32);
+        assert_eq!(cap, 48);
+        for n in 1..=LANE_MAX_ROWS {
+            let mut groups = Vec::new();
+            compositions(n, &mut Vec::new(), &mut groups);
+            assert!(!groups.is_empty());
+            for group_rows in groups {
+                let segment =
+                    hc_all_rows_applies(true, true, true, false, &group_rows, &production);
+                assert!(!segment, "{group_rows:?}");
+                let stages = all_rows_stages_apply(true, segment, 0, false, true);
+                assert!(!stages, "{group_rows:?}");
+                assert!(
+                    all_rows_moe_refusal(stages, true, Some(cap), n, false, false, 40).is_some(),
+                    "{group_rows:?}"
+                );
+            }
+        }
+        // Above 8 rows the one call is open to the capacity and refuses past it.
+        for n in LANE_MAX_ROWS + 1..=cap {
+            assert_eq!(
+                all_rows_moe_refusal(true, true, Some(cap), n, false, false, 40),
+                None,
+                "{n}"
+            );
+        }
+        assert!(all_rows_moe_refusal(true, true, Some(cap), cap + 1, false, false, 40).is_some());
+        // The kill switch (`HIPFIRE_QWEN4_EP_WIDE_VERIFY=0`: 8-row capacity) keeps every group.
+        let killed =
+            crate::gpu_forward::ep_gather_rows_resolved("gfx1201", Some(false), None, false, 32);
+        assert_eq!(killed, LANE_MAX_ROWS);
+        for n in LANE_MAX_ROWS + 1..=cap {
+            assert!(all_rows_moe_refusal(true, true, Some(killed), n, false, false, 40).is_some());
+        }
     }
 }

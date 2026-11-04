@@ -279,14 +279,14 @@ fn main() {
 
 fn run(args: Args) -> R<i32> {
     let started = Instant::now();
-    let wide_flag = hipfire_arch_qwen4::gpu_forward::qwen4_ep_gather_rows()
+    let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
+    let wide_flag = hipfire_arch_qwen4::gpu_forward::qwen4_ep_gather_rows(&gpu.arch)
         > hipfire_arch_qwen4::gpu_forward::QWEN4_EP_GATHER_MAX_ROWS;
     eprintln!(
         "[fn_ep_wide_gather_oracle] loading {} (wide verify gather {})",
         args.model,
         if wide_flag { "ON" } else { "off" }
     );
-    let mut gpu = Gpu::init().map_err(|x| format!("Gpu::init: {x:?}"))?;
     let cask = hipfire_runtime::loader_api::CaskConfig::default();
     let mut model = load_with_lane_reservation(
         &args.model,
@@ -313,7 +313,7 @@ fn run(args: Args) -> R<i32> {
             bundle.with_rank_mut(&mut gpu, rank, |_, g, _| g.device_mem_info().map_err(e))?;
         free.push(json!({"rank": rank, "free_bytes": f, "total_bytes": t}));
     }
-    let gather_rows = hipfire_arch_qwen4::gpu_forward::qwen4_ep_gather_rows();
+    let gather_rows = hipfire_arch_qwen4::gpu_forward::qwen4_ep_gather_rows(&gpu.arch);
     let capacity_bytes =
         hipfire_arch_qwen4::gpu_forward::ep_gather_capacity_bytes(gather_rows, top_k, hidden);
     let off_bytes = hipfire_arch_qwen4::gpu_forward::ep_gather_capacity_bytes(

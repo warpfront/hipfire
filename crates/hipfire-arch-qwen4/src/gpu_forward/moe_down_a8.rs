@@ -18,7 +18,8 @@ use rdna_compute::Gpu;
 /// Outcome of the per-device verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoeDownA8Verdict {
-    /// Not requested (`HIPFIRE_QWEN4_MOE_DOWN_A8` is not `1`, or the card is not gfx1201).
+    /// Not requested (`HIPFIRE_QWEN4_MOE_DOWN_A8=0`, the card is not gfx1201, or a single-device load
+    /// with the flag not `1`: only an EP rank takes the route by default).
     NotRequested,
     /// The device serves no routed MoE layer.
     NoLayers,
@@ -76,7 +77,7 @@ pub(crate) fn moe_down_a8_info(
         )),
         MoeDownA8Verdict::Verified { n } => Some(format!(
             "qwen4 moe down A8: {n}/{n} MoE layers verified symmetric on device {device}; \
-             int8 routed-down route on{} (enabled by HIPFIRE_QWEN4_MOE_DOWN_A8=1)",
+             int8 routed-down route on{} (HIPFIRE_QWEN4_MOE_DOWN_A8=0 kills it)",
             if head_pending {
                 " once the MTP head layer is verified"
             } else {
@@ -95,7 +96,7 @@ pub(crate) fn moe_down_a8_head_info(symmetric: bool, trunk_verified: bool, devic
     match (symmetric, trunk_verified) {
         (true, true) => format!(
             "qwen4 moe down A8: MTP head MoE layer verified symmetric on device {device}; \
-             int8 routed-down route on (enabled by HIPFIRE_QWEN4_MOE_DOWN_A8=1)"
+             int8 routed-down route on (HIPFIRE_QWEN4_MOE_DOWN_A8=0 kills it)"
         ),
         (true, false) => format!(
             "qwen4 moe down A8: MTP head MoE layer verified symmetric on device {device}; \
@@ -287,7 +288,7 @@ mod tests {
         assert_eq!(
             moe_down_a8_info(&MoeDownA8Verdict::Verified { n: 40 }, 1, false).unwrap(),
             "qwen4 moe down A8: 40/40 MoE layers verified symmetric on device 1; \
-             int8 routed-down route on (enabled by HIPFIRE_QWEN4_MOE_DOWN_A8=1)"
+             int8 routed-down route on (HIPFIRE_QWEN4_MOE_DOWN_A8=0 kills it)"
         );
         let pending = moe_down_a8_info(&MoeDownA8Verdict::Verified { n: 40 }, 0, true).unwrap();
         assert!(pending.contains("once the MTP head layer is verified"));

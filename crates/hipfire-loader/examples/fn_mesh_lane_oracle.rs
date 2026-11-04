@@ -2460,9 +2460,9 @@ fn merged_json(m: &hipfire_arch_qwen4::mesh_lane_protocol::MergedCostEvidence) -
         "consumed_rows": m.counts.consumed_rows,
         "wall_us": m.wall_us,
         "critical_path_us": m.critical_path_us,
-        "draft_us": m.draft_us,
-        "verify_us": m.verify_us,
-        "prepare_us": m.prepare_us,
+        "draft_us": m.phase_us[0],
+        "verify_us": m.phase_us[1],
+        "prepare_us": m.phase_us[2],
         "synchronized": m.synchronized,
         "priced": m.priced,
         "unpriced_reason": m.unpriced_reason,
@@ -2805,8 +2805,8 @@ fn drive_mtp_inner(
         if let Some(prior) = mesh.last_evidence() {
             ev_wall.push(prior.wall_us);
             ev_crit.push(prior.critical_path_us);
-            ev_verify.push(prior.verify_us);
-            ev_draft.push(prior.draft_us);
+            ev_verify.push(prior.phase_us[1]);
+            ev_draft.push(prior.phase_us[0]);
             ev_groups.push(prior.counts.row_groups as f64);
             ev_ex.push(prior.counts.target_exchanges as f64);
             ev_head.push(prior.counts.head_draft_calls as f64);

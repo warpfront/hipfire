@@ -905,8 +905,10 @@ impl AcceptRule for RowCapture {
         _picks: &[u32],
         _rng: &mut LaneRng,
     ) -> Result<GreedyAccept, String> {
-        Err("the lanes KLD route plans forced windows only; a decode window was asked to accept"
-            .to_string())
+        Err(
+            "the lanes KLD route plans forced windows only; a decode window was asked to accept"
+                .to_string(),
+        )
     }
 
     fn observe_verify(&mut self, out: &SamplerOutput) {
@@ -1121,7 +1123,9 @@ fn run_group(
     let t_admit = Instant::now();
     for lane in lanes.iter_mut() {
         let chunk = chunk_tokens(lane.chunk);
-        bundle.force_lane_seed(&lane.epoch, chunk[from]).map_err(e)?;
+        bundle
+            .force_lane_seed(&lane.epoch, chunk[from])
+            .map_err(e)?;
         mesh.admit_lane(
             bundle,
             gpu,
@@ -1374,14 +1378,26 @@ fn score_lanes(
     extra.insert("lane_groups".into(), serde_json::json!(stats.groups));
     extra.insert("rows_per_lane_step".into(), serde_json::json!(k + 1));
     extra.insert("verify_steps".into(), serde_json::json!(stats.verify_steps));
-    extra.insert("prefill_steps".into(), serde_json::json!(stats.prefill_steps));
+    extra.insert(
+        "prefill_steps".into(),
+        serde_json::json!(stats.prefill_steps),
+    );
     extra.insert("step_rows_hist".into(), hist_json(&observed));
     extra.insert("step_rows_hist_planned".into(), hist_json(&planned));
-    extra.insert("step_rows_hist_matches_plan".into(), serde_json::json!(observed == planned));
+    extra.insert(
+        "step_rows_hist_matches_plan".into(),
+        serde_json::json!(observed == planned),
+    );
     extra.insert("step_lanes_hist".into(), hist_json(&stats.step_lanes));
-    extra.insert("prefill_wall_s".into(), serde_json::json!(stats.prefill_wall_s));
+    extra.insert(
+        "prefill_wall_s".into(),
+        serde_json::json!(stats.prefill_wall_s),
+    );
     extra.insert("admit_wall_s".into(), serde_json::json!(stats.admit_wall_s));
-    extra.insert("verify_wall_s".into(), serde_json::json!(stats.verify_wall_s));
+    extra.insert(
+        "verify_wall_s".into(),
+        serde_json::json!(stats.verify_wall_s),
+    );
     extra.insert("score_wall_s".into(), serde_json::json!(stats.score_wall_s));
     let chunks_digest = sha256_hex(chunk_sha.join("\n").as_bytes());
     finish_score(Finish {
@@ -1661,7 +1677,9 @@ mod tests {
 
     #[test]
     fn route_refuses_bad_values() {
-        for bad in ["lanes", "lanes:", "lanes:0", "lanes:8", "lanes:x", "lanes:-1", "batch"] {
+        for bad in [
+            "lanes", "lanes:", "lanes:0", "lanes:8", "lanes:x", "lanes:-1", "batch",
+        ] {
             assert!(
                 parse_args(&argv(&format!("{BASE} --route {bad}"))).is_err(),
                 "--route {bad} must be refused"

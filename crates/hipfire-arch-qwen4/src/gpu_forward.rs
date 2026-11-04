@@ -2582,12 +2582,13 @@ pub const QWEN4_EP_GATHER_MAX_ROWS: usize = 8;
 /// row-exactness bound is separate ([`crate::gpu_forward_lanes::LANE_MAX_ROWS`]).
 pub const QWEN4_EP_GATHER_VERIFY_ROWS: usize = hipfire_config::QWEN4_EP_WIDE_VERIFY_DEFAULT_ROWS;
 
-/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY=1` (developer, default off): size every EP
+/// `HIPFIRE_QWEN4_EP_WIDE_VERIFY` (developer): `1` sizes every EP
 /// rank's row-gather buffers, the gather transport's slot capacity and the
 /// balanced-owner slot array for [`qwen4_ep_wide_group_cap`] rows (32 unless
 /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` says otherwise) instead of
-/// [`QWEN4_EP_GATHER_MAX_ROWS`]. Capacity only: no route, segmentation or kernel
-/// choice changes with it; off allocates exactly what it always did.
+/// [`QWEN4_EP_GATHER_MAX_ROWS`]; unset on an exact gfx1201 EP rank it is on at
+/// [`QWEN4_EP_ALLROWS_GATHER_ROWS`] rows ([`ep_gather_rows_resolved`]), `0` restores the 8-row
+/// capacity. Capacity only: no route, segmentation or kernel choice changes with it.
 pub const QWEN4_EP_WIDE_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_WIDE_VERIFY";
 
 /// Routed experts per token of every Flash-Next trunk MoE layer: the grouped MoE
@@ -2682,14 +2683,50 @@ pub fn qwen4_ep_wide_group_cap() -> usize {
     *CAP
 }
 
-/// The rows one gathered EP call may carry on this process: 8 by default,
-/// [`qwen4_ep_wide_group_cap`] with a wide verify flag. Every rank reads the same
-/// process snapshot.
-pub fn qwen4_ep_gather_rows() -> usize {
-    ep_gather_rows(qwen4_ep_wide_flags_on(), qwen4_ep_wide_group_cap())
+/// Default gather capacity (rows) of an exact gfx1201 EP rank with `HIPFIRE_QWEN4_EP_WIDE_VERIFY`
+/// unset: the all-rows lane MoE's one-call window (`HIPFIRE_QWEN4_LANE_ALLROWS_MOE`, 9..=48
+/// rows). Capacity only (buffers, transport slots, slot-owner words): no route, segmentation or
+/// kernel choice of a <= 8-row call changes with it. `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` sizes it
+/// instead when set; `HIPFIRE_QWEN4_EP_WIDE_VERIFY=0` restores the 8-row capacity.
+pub const QWEN4_EP_ALLROWS_GATHER_ROWS: usize = 48;
+
+/// The rows one gathered EP call may carry on a rank of `arch`: the process wide-verify
+/// configuration ([`ep_gather_rows_resolved`]) with the exact-gfx1201 default.
+pub fn qwen4_ep_gather_rows(arch: &str) -> usize {
+    ep_gather_rows_resolved(
+        arch,
+        hipfire_config::developer_typed_bool(QWEN4_EP_WIDE_VERIFY_ENV),
+        hipfire_config::qwen4_ep_wide_verify_rows_explicit(),
+        hipfire_config::qwen4_ep_sampled_wide_verify(),
+        qwen4_ep_wide_group_cap(),
+    )
 }
 
-/// [`qwen4_ep_gather_rows`] for explicit flag and wide-cap values.
+/// Pure form of [`qwen4_ep_gather_rows`]. `wide_flag`: `HIPFIRE_QWEN4_EP_WIDE_VERIFY` as set (`None`
+/// unset); `rows_env`: `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ROWS` when set; `sampled`: the sampled
+/// wide-verify flag; `wide_cap`: [`qwen4_ep_wide_group_cap`]. An explicit `HIPFIRE_QWEN4_EP_WIDE_VERIFY`
+/// (either value) or any non-gfx1201 arch keeps [`ep_gather_rows`] of the explicit flags; an unset
+/// flag on exact gfx1201 sizes the capacity to `rows_env` (default
+/// [`QWEN4_EP_ALLROWS_GATHER_ROWS`]) lowered to the tightest stage limit, never below the
+/// explicit-flag capacity.
+pub fn ep_gather_rows_resolved(
+    arch: &str,
+    wide_flag: Option<bool>,
+    rows_env: Option<usize>,
+    sampled: bool,
+    wide_cap: usize,
+) -> usize {
+    let explicit = ep_gather_rows(wide_flag == Some(true) || sampled, wide_cap);
+    if arch != "gfx1201" || wide_flag.is_some() {
+        return explicit;
+    }
+    let requested = rows_env.unwrap_or(QWEN4_EP_ALLROWS_GATHER_ROWS);
+    ep_wide_group_cap_for(requested, QWEN4_EP_WIDE_TOP_K)
+        .0
+        .max(explicit)
+}
+
+/// [`ep_gather_rows`] for explicit flag and wide-cap values.
 pub const fn ep_gather_rows(wide_verify: bool, wide_cap: usize) -> usize {
     if wide_verify {
         wide_cap
@@ -4261,7 +4298,7 @@ impl Qwen4ForwardEp {
         seal: Qwen4EpRankSeal,
     ) -> Result<Self, Qwen4GpuForwardError> {
         validate_ep_placement(placement, config.num_experts)?;
-        let gather_rows = qwen4_ep_gather_rows();
+        let gather_rows = qwen4_ep_gather_rows(&gpu.arch);
         // Refuse at load, naming the stage, a capacity some stage cannot serve at this
         // model's top-k (the packer's process cap assumes `QWEN4_EP_WIDE_TOP_K`).
         ep_gather_capacity_check(gather_rows, config.num_experts_per_tok)?;
@@ -13525,7 +13562,7 @@ impl Qwen4GpuForward {
         let gather_rows = self
             .ep
             .as_ref()
-            .map_or_else(qwen4_ep_gather_rows, |ep| ep.gather_rows);
+            .map_or_else(|| qwen4_ep_gather_rows(&gpu.arch), |ep| ep.gather_rows);
         let Some(ep) = self.ep.as_mut() else {
             return Err(invalid("attach_ep on a forward without an EP placement"));
         };
@@ -13639,7 +13676,9 @@ impl Qwen4GpuForward {
                 }
             }
             // Int8 routed-down route (`HIPFIRE_QWEN4_MOE_DOWN_A8`, gfx1201): the rank's verdict
-            // over every routed layer of the full tables (host-mapped aliases included).
+            // over every routed layer of the full tables (host-mapped aliases included). An EP
+            // rank takes the route by default for its 9..=64-row window (`=0` kills it).
+            gpu.set_qwen4_moe_down_a8_ep_default(true);
             moe_down_a8::settle_trunk(
                 gpu,
                 !full.is_empty() && gpu.qwen4_moe_sym_iu4_requested(),
@@ -22475,6 +22514,48 @@ mod seal_view_identity_tests {
         assert!((mib(48) - 15.0).abs() < 0.01);
         // The process default (no wide flag in the test process) is the shipped 32.
         assert_eq!(qwen4_ep_wide_group_cap(), 32);
+    }
+
+    /// The exact-gfx1201 EP default gather capacity (`HIPFIRE_QWEN4_EP_WIDE_VERIFY` unset): 48 rows
+    /// (the all-rows lane MoE's one-call window), never touching another arch, an explicit
+    /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY` value (`0` is the kill switch: 8 rows) or the packer's wide cap.
+    #[test]
+    fn ep_gather_rows_default_is_48_on_exact_gfx1201_only() {
+        let rows = |arch, flag, rows_env, sampled| {
+            ep_gather_rows_resolved(arch, flag, rows_env, sampled, 32)
+        };
+        // Default: 48 on exact gfx1201, today's 8 everywhere else.
+        assert_eq!(
+            rows("gfx1201", None, None, false),
+            QWEN4_EP_ALLROWS_GATHER_ROWS
+        );
+        assert_eq!(QWEN4_EP_ALLROWS_GATHER_ROWS, 48);
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx906", ""] {
+            assert_eq!(
+                rows(arch, None, None, false),
+                QWEN4_EP_GATHER_MAX_ROWS,
+                "{arch}"
+            );
+        }
+        // Kill switch: `=0` restores the 8-row capacity; the sampled wide flag keeps its own cap.
+        assert_eq!(rows("gfx1201", Some(false), None, false), 8);
+        assert_eq!(rows("gfx1201", Some(false), Some(48), false), 8);
+        assert_eq!(rows("gfx1201", Some(false), None, true), 32);
+        // An explicit `=1` keeps today's meaning (the wide cap: 32 unless ROWS says otherwise).
+        assert_eq!(rows("gfx1201", Some(true), None, false), 32);
+        assert_eq!(
+            ep_gather_rows_resolved("gfx1201", Some(true), Some(48), false, 48),
+            48
+        );
+        // With the flag unset, ROWS sizes the default capacity (lowered to the tightest stage
+        // limit: 51 at top-10), and the sampled wide flag never lowers it below the default.
+        assert_eq!(rows("gfx1201", None, Some(32), false), 32);
+        assert_eq!(rows("gfx1201", None, Some(64), false), 51);
+        assert_eq!(rows("gfx1201", None, None, true), 48);
+        // The default capacity passes the load check at top-10.
+        assert!(
+            ep_gather_capacity_check(QWEN4_EP_ALLROWS_GATHER_ROWS, QWEN4_EP_WIDE_TOP_K).is_ok()
+        );
     }
 
     /// The buffer sequence of the emitted MoE invocations: lane-major (every
