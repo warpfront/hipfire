@@ -745,9 +745,11 @@ impl Rope {
     ) -> Result<(), DispatchError> {
         let per_row = self.positions_per_row();
         let rows = positions.numel() / per_row;
+        let elems = |heads: usize| rows.checked_mul(heads)?.checked_mul(head_dim);
+        let fits = |t: &GpuTensor, heads: usize| elems(heads).is_some_and(|n| t.numel() >= n);
         if positions.numel() % per_row != 0
-            || q.numel() < rows * n_heads * head_dim
-            || (n_kv_heads > 0 && k.numel() < rows * n_kv_heads * head_dim)
+            || !fits(q, n_heads)
+            || (n_kv_heads > 0 && !fits(k, n_kv_heads))
         {
             return Err(DispatchError::Hip(format!(
                 "rope: {} positions ({per_row}/row), q {} / k {} elements for {n_heads}/{n_kv_heads} heads of {head_dim}",
@@ -767,6 +769,27 @@ impl Rope {
             }
         }
         Ok(())
+    }
+
+    /// Every launch-free check of a `Step::Rope`: the rotated span on both
+    /// routes, the row extents when batched; mRoPE has no single-row route.
+    pub(crate) fn validate_step(
+        &self,
+        positions: Option<&GpuTensor>,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> Result<(), DispatchError> {
+        self.validate(head_dim)?;
+        match positions {
+            Some(p) => self.validate_rows(p, q, k, n_heads, n_kv_heads, head_dim),
+            None if matches!(self.kind, RopeKind::Mrope { .. }) => Err(DispatchError::Hip(
+                "mRoPE has no single-row route; pass per-row positions".into(),
+            )),
+            None => Ok(()),
+        }
     }
 
     /// RoPE of one row at the position in `pos_buf`; `n_kv_heads == 0` leaves
@@ -3069,6 +3092,16 @@ mod validation_tests {
         position: usize,
         rows: usize,
     ) -> Result<(), DispatchError> {
+        check_rope(route, kernels, position, rows, RopeKind::NoPe)
+    }
+
+    fn check_rope(
+        route: RowsRoute,
+        kernels: SandwichRoute,
+        position: usize,
+        rows: usize,
+        rope: RopeKind,
+    ) -> Result<(), DispatchError> {
         let big = tensor(16 * DIM * CAP);
         let pos_buf = unsafe { DeviceBuffer::from_raw(std::ptr::dangling_mut(), 4) };
         let op = SandwichAttentionOp {
@@ -3100,7 +3133,7 @@ mod validation_tests {
             }),
             q_scale: 1.0,
             rope: Rope {
-                kind: RopeKind::NoPe,
+                kind: rope,
                 theta: 1.0,
             },
             kv: SandwichKv {
@@ -3166,5 +3199,106 @@ mod validation_tests {
             check(RowsRoute::Decode, SandwichRoute::Wide, 8, 1),
             "windowed Q8 KV needs the steps route",
         );
+    }
+
+    #[test]
+    fn sandwich_attention_refuses_mrope() {
+        let mrope = RopeKind::Mrope {
+            rot_dim: DIM,
+            section: [DIM / 4, DIM / 8, DIM / 8],
+        };
+        refused(
+            check_rope(RowsRoute::Prefill, STEPS, 8, 4, mrope),
+            "encoder-only",
+        );
+    }
+
+    /// Batched RoPE of 4 rows, 2 Q heads of 8 and `n_kv` K heads.
+    fn rope_rows(
+        kind: RopeKind,
+        positions: usize,
+        q: usize,
+        k: usize,
+        n_kv: usize,
+    ) -> Result<(), DispatchError> {
+        Rope { kind, theta: 1.0 }.validate_rows(
+            &tensor(positions),
+            &tensor(q),
+            &tensor(k),
+            2,
+            n_kv,
+            8,
+        )
+    }
+
+    #[test]
+    fn batched_rope_takes_whole_rows_and_a_readable_mrope() {
+        let full = 4 * 2 * 8;
+        let m = RopeKind::Mrope {
+            rot_dim: 8,
+            section: [2, 1, 1],
+        };
+        assert!(rope_rows(m, 12, full, full, 2).is_ok());
+        assert!(rope_rows(m, 11, full, full, 2).is_err(), "partial row");
+        assert!(rope_rows(m, 12, full - 1, full, 2).is_err(), "short q");
+        assert!(rope_rows(m, 12, full, full - 1, 2).is_err(), "short k");
+        assert!(rope_rows(m, 12, full, 0, 0).is_ok(), "no K heads: k unread");
+        let partial = RopeKind::Mrope {
+            rot_dim: 4,
+            section: [1, 1, 0],
+        };
+        assert!(rope_rows(partial, 12, full, full, 2).is_ok());
+        for (rot_dim, section) in [
+            (16, [4, 2, 2]),
+            (7, [2, 1, 0]),
+            (8, [2, 2, 1]),
+            (8, [1, 1, 1]),
+        ] {
+            let kind = RopeKind::Mrope { rot_dim, section };
+            assert!(rope_rows(kind, 12, full, full, 2).is_err(), "{kind:?}");
+        }
+        assert!(rope_rows(RopeKind::RotateHalf, 4, full, full, 2).is_ok());
+        assert!(rope_rows(RopeKind::RotateHalf, 5, full, full, 2).is_err());
+        // A head count whose element bound overflows must be refused, not wrap to 0.
+        let rope = Rope {
+            kind: RopeKind::RotateHalf,
+            theta: 1.0,
+        };
+        let (p, t) = (tensor(4), tensor(full));
+        assert!(rope
+            .validate_rows(&p, &t, &t, usize::MAX / 4 + 1, 0, 8)
+            .is_err());
+    }
+
+    #[test]
+    fn rope_step_checks_the_span_on_both_routes() {
+        let full = 4 * 2 * 8;
+        let (p, t) = (tensor(4), tensor(full));
+        for kind in [
+            RopeKind::Interleaved { rot_dim: 10 },
+            RopeKind::Interleaved { rot_dim: 0 },
+            RopeKind::PrefixHalfSplit { rot_dim: 3 },
+            RopeKind::PartialHalved { rot_pairs: 5 },
+        ] {
+            let rope = Rope { kind, theta: 1.0 };
+            for positions in [None, Some(&p)] {
+                let r = rope.validate_step(positions, &t, &t, 2, 2, 8);
+                assert!(r.is_err(), "{kind:?} batched={}", positions.is_some());
+            }
+        }
+        let ok = Rope {
+            kind: RopeKind::Interleaved { rot_dim: 8 },
+            theta: 1.0,
+        };
+        assert!(ok.validate_step(Some(&p), &t, &t, 2, 2, 8).is_ok());
+        assert!(ok.validate_step(None, &t, &t, 2, 2, 8).is_ok());
+        let mrope = Rope {
+            kind: RopeKind::Mrope {
+                rot_dim: 8,
+                section: [2, 1, 1],
+            },
+            theta: 1.0,
+        };
+        assert!(mrope.validate_step(None, &t, &t, 2, 2, 8).is_err());
     }
 }

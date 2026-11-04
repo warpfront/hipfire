@@ -6742,8 +6742,8 @@ impl ProjectOp<'_> {
                 || k % 16 != 0)
         {
             return Err(DispatchError::Hip(format!(
-                "EncoderF16 projection takes an F16 [{m}, {k}] weight with k % 16 == 0, got {:?}",
-                self.weight.dtype
+                "EncoderF16 projection takes an F16 [{m}, {k}] weight with k % 16 == 0, got {:?} over a {:?} buffer",
+                self.weight.dtype, self.weight.buf.dtype
             )));
         }
         if self.ladder == ProjectLadder::GemmQ8Fp16 && self.weight.dtype != DType::Q8_0 {

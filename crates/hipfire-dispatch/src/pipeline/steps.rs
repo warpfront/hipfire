@@ -926,13 +926,13 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::Rope {
                 q,
                 k,
-                positions: Some(positions),
+                positions,
                 n_heads,
                 n_kv_heads,
                 head_dim,
                 rope,
                 ..
-            } => rope.validate_rows(positions, q, k, *n_heads, *n_kv_heads, *head_dim)?,
+            } => rope.validate_step(*positions, q, k, *n_heads, *n_kv_heads, *head_dim)?,
             Step::SandwichAttention(op) => op.validate_for_gpu(gpu)?,
             Step::SandwichMlp(op) => op.validate_for_gpu(gpu)?,
             Step::ParallelMoeMlp(op) => op.validate_for_gpu(gpu)?,
@@ -990,7 +990,6 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::RingKv(op) if op.positions.is_empty() => {
                 return Err(DispatchError::Hip("DS4 ring KV step with no rows".into()));
             }
-            Step::Rope { head_dim, rope, .. } => rope.validate(*head_dim)?,
             _ => {}
         }
     }
