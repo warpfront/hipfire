@@ -46,7 +46,11 @@ pub const NATIVE_ALL_MAX_ACTIVE: usize = 1 << 16;
 pub const NATIVE_ALL_LANE_K: usize = 5;
 
 /// The shipped lane draft-depth cap (`HIPFIRE_EP_MTP_LANE_K` unset, flag off).
-pub const DEFAULT_LANE_K: usize = 2;
+/// 5 with the lane cost profile of `mtp_lanes` (gfx1201: per-request fit, even
+/// split of one 8-row group over the step's lanes, so deeper K never spills at
+/// C2..C4); `HIPFIRE_EP_MTP_LANE_K=2` restores the previous cap (use
+/// `HIPFIRE_QWEN4_LANE_COST=0` with it for the previous lane floor).
+pub const DEFAULT_LANE_K: usize = 5;
 
 /// [`NATIVE_ALL_ENV`] on.
 pub fn native_all() -> bool {
@@ -149,7 +153,7 @@ mod tests {
         assert_eq!(max_active_for(true, Some(2)), NATIVE_ALL_MAX_ACTIVE);
         assert_eq!(default_lane_k_for(false), DEFAULT_LANE_K);
         assert_eq!(default_lane_k_for(true), NATIVE_ALL_LANE_K);
-        assert_eq!(DEFAULT_LANE_K, 2, "the shipped default the oracle pins");
+        assert_eq!(DEFAULT_LANE_K, 5, "the shipped default");
     }
 
     #[test]

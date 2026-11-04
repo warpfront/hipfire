@@ -47,7 +47,10 @@ use crate::lane_exec::LaneRoute;
 use crate::mesh_lane_copy::{
     head_outcome, CopyLane, CopyPool, CopyProposal, CopyShadow, HeadWindow,
 };
-use crate::mtp_lanes::{LaneCostModel, LaneSpecPolicy};
+use crate::mtp_lanes::{
+    lane_cost_trace_enabled, step_trace_line, LaneCostModel, LaneCostProfile, LaneSpecPolicy,
+    RouteTraceCtx,
+};
 use crate::mtp_spec::{target_commit_accept_len, HeadLag, NGRAM_DEPTHS};
 use crate::sampled_lane::{DraftRead, LaneRng, RowHandle};
 use hipfire_runtime::ngram_mod::NgramModConfig;
@@ -1470,6 +1473,10 @@ pub struct MeshRoot {
     next_lane_generation: u64,
     step_seq: u64,
     cost: LaneCostModel,
+    /// The lane cost profile of the loaded arch ([`Self::bind_cost_arch`]);
+    /// every lane admitted afterwards carries it.
+    profile: LaneCostProfile,
+    profile_bound: bool,
     pending_obs: Option<PendingObservation>,
     step: Option<StepState>,
     phase: StepPhase,
@@ -1509,6 +1516,8 @@ impl MeshRoot {
             next_lane_generation: 1,
             step_seq: 0,
             cost: LaneCostModel::new(),
+            profile: LaneCostProfile::LEGACY,
+            profile_bound: false,
             pending_obs: None,
             step: None,
             phase: StepPhase::Idle,
@@ -1518,6 +1527,23 @@ impl MeshRoot {
             copy_pool: None,
             copy_warm: 0,
         })
+    }
+
+    /// Bind the lane cost profile of `arch` (a `Gpu::arch` string) the first
+    /// time it is called, before the first lane is admitted: lanes admitted
+    /// from then on price their windows under it
+    /// ([`LaneCostProfile::for_arch`]); a root never bound, or bound to an
+    /// arch without a measured profile, keeps the gfx1151-prior pooled floor.
+    /// Later calls change nothing (lanes already admitted keep their own).
+    pub fn bind_cost_arch(&mut self, arch: &str) {
+        if self.profile_bound {
+            return;
+        }
+        self.profile_bound = true;
+        self.profile = LaneCostProfile::for_arch(arch);
+        if self.step_seq == 0 && self.lanes.is_empty() {
+            self.cost = LaneCostModel::with_prior(self.profile.prior_us());
+        }
     }
 
     /// Give the root a copy lane: requests that arm it (`LaneAdmission.copy`)
@@ -1564,6 +1590,17 @@ impl MeshRoot {
     #[cfg(test)]
     pub(crate) fn cost_fit(&self) -> (f64, f64, f64, f64) {
         self.cost.fit()
+    }
+
+    /// A lane's own cost fit: steps it learned from and `(F, a, r, G)`
+    /// (`None`: the lane prices from the pooled model).
+    #[cfg(test)]
+    pub(crate) fn test_lane_cost(
+        &self,
+        epoch: RequestEpoch,
+    ) -> Option<(u64, (f64, f64, f64, f64))> {
+        let cost = self.lanes.get(&epoch)?.policy.as_ref()?.own_cost()?;
+        Some((cost.observed(), cost.fit()))
     }
 
     /// Replace a lane's policy (tests: a promoted, floor-retired lane).
@@ -1745,7 +1782,7 @@ impl MeshRoot {
         self.next_lane_generation += 1;
         let policy = policy_seed.or_else(|| {
             a.spec_k
-                .map(|k| LaneSpecPolicy::with_floor(k, self.cfg.floor_enabled))
+                .map(|k| LaneSpecPolicy::with_profile(k, self.cfg.floor_enabled, &self.profile))
         });
         self.lanes.insert(
             a.epoch,
@@ -2011,7 +2048,7 @@ impl MeshRoot {
 
         let mut plans: Vec<LanePlan> = Vec::with_capacity(requests.len());
         let mut total_rows = 0usize;
-        for r in requests {
+        for (lane_index, r) in requests.iter().enumerate() {
             // The copy context proposes from committed history only: asking
             // it touches scratch, never the state a window publishes.
             let lane = self.lanes.get_mut(&r.epoch).expect("validated above");
@@ -2020,9 +2057,23 @@ impl MeshRoot {
                 lane_generation: lane.lane_generation,
                 window_seq: lane.window_seq,
             };
-            let max_drafts = (budgets.verify_rows_per_lane - 1)
+            let mut max_drafts = (budgets.verify_rows_per_lane - 1)
                 .min(r.remaining.saturating_sub(1))
                 .min(r.context_left.saturating_sub(1));
+            // A profile that prices the second row group (`G`) splits one
+            // row group evenly over the step's lanes (the first `rows % lanes`
+            // lanes take the odd rows): a lane drafts at most its share minus
+            // the seed row, so the step never spills while it has at most
+            // that many lanes. A lane squeezed to a zero budget routes
+            // `ArSynced` and observes nothing: it is never retired for being
+            // capped. Request order is the only tie-break (root-only,
+            // deterministic).
+            if let (Some(group_rows), LabRoutes::Floor) = (self.profile.step_row_cap(), budgets.lab)
+            {
+                let lanes = requests.len().max(1);
+                let share = group_rows / lanes + usize::from(lane_index < group_rows % lanes);
+                max_drafts = max_drafts.min(share.saturating_sub(1));
+            }
             let mut plan = LanePlan {
                 key,
                 kind: LaneKind::Decode,
@@ -2069,6 +2120,21 @@ impl MeshRoot {
                 let budget = max_drafts.min(policy.max_k());
                 plan.budget = budget;
                 let route = policy.route(max_drafts, budgets.lab);
+                if lane_cost_trace_enabled() {
+                    policy.trace_route(
+                        &RouteTraceCtx {
+                            request_tag: lane.epoch.request_tag,
+                            owner_generation: lane.epoch.owner_generation,
+                            window_seq: lane.window_seq,
+                            step_seq: self.step_seq + 1,
+                            lanes: requests.len(),
+                        },
+                        &self.cost,
+                        max_drafts,
+                        budgets.lab,
+                        route,
+                    );
+                }
                 plan.route = route;
                 if let LaneRoute::Batched { k_max } = route {
                     plan.source = ProposalSource::Native;
@@ -3172,8 +3238,15 @@ impl MeshRoot {
         agreement: &[(f32, f32)],
         retired: bool,
     ) -> Result<LaneAdmit, ProtocolError> {
+        let profile = self.profile;
         let policy = a.spec_k.map(|k| {
-            LaneSpecPolicy::promoted_with_floor(k, agreement, retired, self.cfg.floor_enabled)
+            LaneSpecPolicy::promoted_with_profile(
+                k,
+                agreement,
+                retired,
+                self.cfg.floor_enabled,
+                &profile,
+            )
         });
         self.admit_with(a, policy)
     }
@@ -3256,11 +3329,27 @@ impl MeshRoot {
             self.cost
                 .observe(p.decode_lanes, p.spill, p.verified, m.wall_us as f32);
         }
+        if lane_cost_trace_enabled() {
+            eprintln!(
+                "{}",
+                step_trace_line(
+                    p.key.step_seq,
+                    p.decode_lanes,
+                    p.spill,
+                    p.verified,
+                    m.wall_us,
+                    m.priced
+                )
+            );
+        }
         let spill_per_window = p.spill as f64 / p.verify_windows.max(1) as f64;
         for o in &p.lanes {
             let Some(policy) = self.lanes.get_mut(&o.epoch).and_then(|l| l.policy.as_mut()) else {
                 continue; // released since: nothing to teach
             };
+            if m.priced {
+                policy.observe_step(p.decode_lanes, p.spill, p.verified, m.wall_us as f32);
+            }
             observe_lane(&self.cost, policy, &p, o, m, spill_per_window);
         }
         self.counters.observations_applied += 1;
@@ -3374,6 +3463,19 @@ fn apply_evidence(
     if m.priced {
         cost.observe(p.decode_lanes, p.spill, p.verified, m.wall_us as f32);
     }
+    if lane_cost_trace_enabled() {
+        eprintln!(
+            "{}",
+            step_trace_line(
+                p.key.step_seq,
+                p.decode_lanes,
+                p.spill,
+                p.verified,
+                m.wall_us,
+                m.priced
+            )
+        );
+    }
     let spill_per_window = p.spill as f64 / p.verify_windows.max(1) as f64;
     for o in &p.lanes {
         let Some(sl) = staged.get_mut(&o.epoch) else {
@@ -3382,13 +3484,16 @@ fn apply_evidence(
         let Some(policy) = sl.policy.as_mut() else {
             continue;
         };
+        if m.priced {
+            policy.observe_step(p.decode_lanes, p.spill, p.verified, m.wall_us as f32);
+        }
         if o.source == ProposalSource::Copy {
             let drafts = o.window.drafts_generated;
             let bit = 1u64 << drafts.min(NGRAM_DEPTHS);
             let first_use = *warm & bit == 0;
             *warm |= bit;
             let units = if m.priced && !first_use {
-                cost.window_units(p.decode_lanes, drafts, spill_per_window)
+                policy.window_units(cost, p.decode_lanes, drafts, spill_per_window)
             } else {
                 f32::NAN
             };
@@ -3416,7 +3521,12 @@ fn observe_lane(
     match o.route {
         LaneRoute::Batched { k_max } if o.source == ProposalSource::Native => {
             let units = if m.units_valid {
-                cost.window_units(p.decode_lanes, o.window.drafts_generated, spill_per_window)
+                policy.window_units(
+                    cost,
+                    p.decode_lanes,
+                    o.window.drafts_generated,
+                    spill_per_window,
+                )
             } else {
                 f32::NAN
             };
@@ -5137,6 +5247,132 @@ mod tests {
         // The merged price moved the fit away from the prior.
         let fresh = Mesh::new(MeshKind::Ep, true);
         assert_ne!(fresh.root.cost_fit(), fit0);
+    }
+
+    /// Drive `steps` priced steps of `tags` (every lane in each step), the
+    /// last step's price settled; returns nothing, the root holds the fits.
+    fn priced_steps(m: &mut Mesh, tags: &[u64], steps: usize, b: &WindowBudgets) {
+        let reqs: Vec<LaneRequest> = tags.iter().map(|&t| req(t, 999)).collect();
+        let mut prior: Option<MergedCostEvidence> = None;
+        for _ in 0..steps {
+            let (_, out) = m.step_p(prior.as_ref(), &reqs, b);
+            prior = Some(m.merged(&out));
+        }
+        m.root.settle_evidence(prior.as_ref()).unwrap();
+    }
+
+    #[test]
+    fn mesh_lane_protocol_gfx1201_lane_fit_is_per_request_and_born_at_admission() {
+        let prior = LaneCostProfile::gfx1201().prior_us();
+        let b = budgets(LabRoutes::Floor, 3);
+        let mut m = Mesh::new(MeshKind::Ep, true);
+        m.root.bind_cost_arch("gfx1201");
+        let e1 = m.admit(1, 10, 7, None, Some(3));
+        for s in 0..8 {
+            script_matching(&m, 1, s, 8);
+        }
+        assert_eq!(
+            m.root.test_lane_cost(e1),
+            Some((0, (prior[0], prior[1], prior[2], prior[3])))
+        );
+        priced_steps(&mut m, &[1], 3, &b);
+        let (seen, fit) = m.root.test_lane_cost(e1).expect("per-request fit");
+        assert_eq!(seen, 3, "every priced step the lane took part in");
+        assert_ne!(fit, (prior[0], prior[1], prior[2], prior[3]));
+        // The request ends; its successor starts from the prior, not from
+        // the pooled history of the store.
+        m.root.release_lane(e1).unwrap();
+        let e2 = m.admit(2, 10, 7, None, Some(3));
+        assert_eq!(
+            m.root.test_lane_cost(e2),
+            Some((0, (prior[0], prior[1], prior[2], prior[3])))
+        );
+        assert!(m.root.cost_fit() != (prior[0], prior[1], prior[2], prior[3]));
+    }
+
+    #[test]
+    fn mesh_lane_protocol_lanes_do_not_learn_from_steps_they_are_not_in() {
+        let prior = LaneCostProfile::gfx1201().prior_us();
+        let b = budgets(LabRoutes::Floor, 3);
+        let mut m = Mesh::new(MeshKind::Ep, true);
+        m.root.bind_cost_arch("gfx1201");
+        let e1 = m.admit(1, 10, 7, None, Some(3));
+        let e2 = m.admit(2, 10, 7, None, Some(3));
+        for tag in [1, 2] {
+            for s in 0..8 {
+                script_matching(&m, tag, s, 8);
+            }
+        }
+        priced_steps(&mut m, &[1], 3, &b);
+        assert_eq!(m.root.test_lane_cost(e1).map(|c| c.0), Some(3));
+        assert_eq!(
+            m.root.test_lane_cost(e2),
+            Some((0, (prior[0], prior[1], prior[2], prior[3]))),
+            "the idle lane's fit is untouched"
+        );
+    }
+
+    #[test]
+    fn mesh_lane_protocol_gfx1201_steps_stay_inside_one_row_group() {
+        let rows = |arch: Option<&str>, lanes: u64, lab: LabRoutes| -> (usize, Vec<usize>) {
+            let mut m = Mesh::new(MeshKind::Ep, true);
+            if let Some(arch) = arch {
+                m.root.bind_cost_arch(arch);
+            }
+            let tags: Vec<u64> = (1..=lanes).collect();
+            for &t in &tags {
+                m.admit(t, 10, 7, None, Some(3));
+            }
+            let reqs: Vec<LaneRequest> = tags.iter().map(|&t| req(t, 99)).collect();
+            let start = m.s_plan(None, &reqs, &budgets(lab, 3)).unwrap();
+            let per: Vec<usize> = start.lanes.iter().map(LanePlan::max_rows).collect();
+            (per.iter().sum(), per)
+        };
+        // Unbound / gfx1151: every lane drafts its full budget (16 rows).
+        assert_eq!(rows(None, 4, LabRoutes::Floor).0, 16);
+        assert_eq!(rows(Some("gfx1151"), 4, LabRoutes::Floor).0, 16);
+        // gfx1201: one 8-row group split evenly over the lanes.
+        let (total, per) = rows(Some("gfx1201"), 4, LabRoutes::Floor);
+        assert_eq!((total, per.as_slice()), (8, &[2, 2, 2, 2][..]));
+        let (total, per) = rows(Some("gfx1201"), 3, LabRoutes::Floor);
+        assert_eq!((total, per.as_slice()), (8, &[3, 3, 2][..]));
+        // Two lanes take 4 rows each; eight lanes are 8 AR rows; the lab route
+        // modes bypass the cap (the oracle's forced routes).
+        assert_eq!(rows(Some("gfx1201"), 2, LabRoutes::Floor).1, vec![4, 4]);
+        assert_eq!(rows(Some("gfx1201"), 8, LabRoutes::Floor).1, vec![1; 8]);
+        assert_eq!(rows(Some("gfx1201"), 4, LabRoutes::Batched).0, 16);
+    }
+
+    #[test]
+    fn mesh_lane_protocol_unbound_or_gfx1151_roots_keep_the_pooled_legacy_fit() {
+        let b = budgets(LabRoutes::Floor, 3);
+        for arch in [None, Some("gfx1151"), Some("gfx1100")] {
+            let mut m = Mesh::new(MeshKind::Ep, true);
+            if let Some(arch) = arch {
+                m.root.bind_cost_arch(arch);
+            }
+            let e1 = m.admit(1, 10, 7, None, Some(3));
+            for s in 0..8 {
+                script_matching(&m, 1, s, 8);
+            }
+            priced_steps(&mut m, &[1], 3, &b);
+            assert_eq!(
+                m.root.test_lane_cost(e1),
+                None,
+                "{arch:?}: pooled legacy lane"
+            );
+            assert_ne!(
+                m.root.cost_fit(),
+                Mesh::new(MeshKind::Ep, true).root.cost_fit(),
+                "{arch:?}: the store-pooled model trained"
+            );
+        }
+        // The first bind wins: a later arch cannot change an admitted lane's world.
+        let mut m = Mesh::new(MeshKind::Ep, true);
+        m.root.bind_cost_arch("gfx1151");
+        m.root.bind_cost_arch("gfx1201");
+        let e1 = m.admit(1, 10, 7, None, Some(3));
+        assert_eq!(m.root.test_lane_cost(e1), None);
     }
 
     #[test]

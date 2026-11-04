@@ -1135,7 +1135,7 @@ mod tests {
         };
         assert_eq!(
             ep_spec_lane_reservation(true, on, "gfx1201").0,
-            Some(2),
+            Some(3),
             "the default reserves the native-MTP lane store"
         );
         // `HIPFIRE_EP_MTP_LANES=0`: the AR lane store, no spec K, no copy lane.
@@ -1153,14 +1153,14 @@ mod tests {
             ..SpecLoadCfg::default()
         };
         let (k, _) = ep_spec_lane_reservation_with(true, true, on, "gfx1201");
-        assert_eq!(k, Some(2));
-        // K is capped at the EP lane depth (`HIPFIRE_EP_MTP_LANE_K`, default 2).
+        assert_eq!(k, Some(3));
+        // K is capped at the EP lane depth (`HIPFIRE_EP_MTP_LANE_K`, default 5).
         let wide = SpecLoadCfg {
             mtp_k: Some(63),
             ..on
         };
         let (k, _) = ep_spec_lane_reservation_with(true, true, wide, "gfx1201");
-        assert_eq!(k, Some(2));
+        assert_eq!(k, Some(5));
         // `serve.batch_spec` off, MTP not explicit: AR store.
         assert_eq!(
             ep_spec_lane_reservation_with(true, false, on, "gfx1201"),

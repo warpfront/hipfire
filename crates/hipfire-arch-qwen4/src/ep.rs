@@ -2571,9 +2571,10 @@ pub fn ep_lane_commit_rows(chunk_rows: usize, max_seq: usize) -> usize {
 }
 
 /// Draft depth of EP native-MTP lanes: the load's resolved K capped at
-/// `HIPFIRE_EP_MTP_LANE_K` (default 2: with 3 MTP lanes it keeps 24 resident
-/// expert layers at 8 lanes where K=3 x 4 lanes keeps 23; measured; 5 under
-/// `HIPFIRE_EP_MTP_LANE_NATIVE_ALL`, see `lane_switch::default_lane_k`).
+/// `HIPFIRE_EP_MTP_LANE_K` (default 5, `lane_switch::DEFAULT_LANE_K`: served
+/// A/B on symtrunk, one-lane code decode 49.9 -> 129.8 tok/s with K=5 and the
+/// lane cost profile; K=2 kept 24 resident expert layers at 8 lanes where K=3
+/// x 4 lanes kept 23, K=5 with 3 MTP lanes keeps 6433 of 6559 units).
 pub fn ep_lane_spec_k(resolved_k: usize) -> usize {
     let cap = hipfire_config::developer_var("HIPFIRE_EP_MTP_LANE_K")
         .ok()

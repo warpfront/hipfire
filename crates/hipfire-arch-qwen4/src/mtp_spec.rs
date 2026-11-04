@@ -2108,7 +2108,10 @@ fn gdn_residual_trace_field(state: &crate::state::Qwen4State) -> String {
 /// their first windows and ran the whole response at AR speed (28–29 tok/s
 /// against 40–46 when drafting continued).  `HIPFIRE_MTP_FLOOR_MIN_WINDOWS=<n>`
 /// (n ≥ 1) overrides it; `3` restores retirement at the probe budget.
-/// Continuous-batching lanes keep retirement at the probe budget.
+/// Continuous-batching lanes keep retirement at the probe budget, except the
+/// gfx1201 lane profile (`mtp_lanes::LaneCostProfile::gfx1201`, kill switch
+/// `HIPFIRE_QWEN4_LANE_COST=0`), whose floor reads this threshold and the AR
+/// probe count below.
 const MTP_SINGLETON_FLOOR_MIN_WINDOWS: usize = 16;
 
 /// Ordinary AR tokens a singleton request's floor times, at the moment it
@@ -2124,7 +2127,7 @@ const MTP_SINGLETON_FLOOR_AR_PROBE_TOKENS: usize = 6;
 /// The singleton request's retirement threshold:
 /// `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` when it parses as an integer ≥ 1, else
 /// [`MTP_SINGLETON_FLOOR_MIN_WINDOWS`].
-fn singleton_floor_min_windows() -> usize {
+pub(crate) fn singleton_floor_min_windows() -> usize {
     hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_MIN_WINDOWS")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
@@ -2153,7 +2156,7 @@ pub(crate) type Qwen4Floor =
 /// retirement (see [`Qwen4Floor::with_retire_evidence`]).
 /// `HIPFIRE_MTP_FLOOR_AR_PROBE=<n>` overrides it; `0` is the kill switch and
 /// restores the single-calibration-token floor.
-fn singleton_floor_ar_probe_tokens() -> usize {
+pub(crate) fn singleton_floor_ar_probe_tokens() -> usize {
     hipfire_config::developer_var("HIPFIRE_MTP_FLOOR_AR_PROBE")
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())

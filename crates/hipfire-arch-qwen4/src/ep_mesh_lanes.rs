@@ -1968,6 +1968,9 @@ impl EpMeshLanes {
         } else {
             HeadState::Free
         };
+        // The lane cost profile of the loaded arch, bound before the first
+        // lane's policy is born (later calls change nothing).
+        self.root.bind_cost_arch(&gpu.arch);
         let admit = self
             .root
             .admit_lane(LaneAdmission {

@@ -41,14 +41,16 @@ use crate::mtp_gpu::MtpAppendScratch;
 use crate::mtp_spec::{
     accept_native_greedy, floor_with_call_log, mtp_append_prefill_chunk, mtp_prefill_chunk,
     mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
-    mtp_skip_intermediate_pick_enabled, prepare_native_window, publish_native_window, HeadTicket,
-    NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket, MTP_WINDOW_COST,
+    mtp_skip_intermediate_pick_enabled, prepare_native_window, publish_native_window,
+    singleton_floor_ar_probe_tokens, singleton_floor_min_windows, HeadTicket, NativeFinish,
+    PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket, MTP_WINDOW_COST,
 };
 
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::spec::{GreedyAccept, MtpWindow};
 use hipfire_runtime::spec_economics::{
     observe_agreement, Action, NativeWindow, WindowStats, AGREEMENT_PRIOR, DEFAULT_DECAY,
+    FLOOR_PROBE_WINDOWS,
 };
 use rdna_compute::{Gpu, GpuTensor};
 
@@ -63,6 +65,19 @@ use rdna_compute::{Gpu, GpuTensor};
 /// one to two windows +17.2 ms; it reproduces 8 lanes all drafting (295.5 ms)
 /// and 7 (269.8 ms).
 const COST_PRIOR_US: [f64; 4] = [16_900.0, 9_700.0, 8_200.0, 18_500.0];
+/// Prior `[F, a, r, G]` (µs) of the EP2 R9700 mesh (gfx1201). Fitted to the
+/// served lane steps of the cp5 receipts (`mgmtp/beatstack/runs/cp5`, beta
+/// 7eb5fe3674, `HIPFIRE_CB_PHASES` `[fn-lane-step]` lines, 45 061 pure-decode
+/// steps; script `stepshep/lcm-runs/fit_cp5.py`, non-negative least squares
+/// over the per-(lanes, native windows) medians): AR steps 18.9 ms at one lane
+/// to 37.5 ms at eight (`F = 15.7 ms`, `a = 2.7 ms`), 3.2 ms per verified
+/// draft, and a step whose rows overflow the first row group (4 lanes, 3
+/// native windows: 77.2 ms against the 45.9 ms the no-spill terms predict)
+/// pays `G = 31 ms`. The gfx1151 prior above prices a one-lane two-draft
+/// window at `1 + 16.4 / 26.6 = 1.62` AR rows, the measured 24.0 / 17.4 ms is
+/// 1.38, and its `F + 8a = 94.5 ms` against 37.5 ms measured is what drove
+/// the pooled fit's `F` negative after a C8 AR history.
+const COST_PRIOR_GFX1201_US: [f64; 4] = [15_700.0, 2_700.0, 3_250.0, 31_000.0];
 /// Weight of the ridge prior (never decays), in typical observations.
 const COST_PRIOR_WEIGHT: f64 = 8.0;
 /// Per-parameter scale of the prior's weight: the squared typical regressor
@@ -106,13 +121,25 @@ const COST_ALPHA_FLOOR_US: f64 = 1_000.0;
 pub(crate) struct LaneCostModel {
     xtx: [[f64; 4]; 4],
     xty: [f64; 4],
+    /// The ridge prior `θ₀` (µs) of this model's arch.
+    prior: [f64; 4],
+    /// Steps observed (usable walls only).
+    observed: u64,
 }
 
 impl LaneCostModel {
+    /// The gfx1151 prior (every arch without a measured profile).
     pub(crate) fn new() -> Self {
+        Self::with_prior(COST_PRIOR_US)
+    }
+
+    /// A fresh model whose ridge prior is `prior` = `[F, a, r, G]` (µs).
+    pub(crate) fn with_prior(prior: [f64; 4]) -> Self {
         Self {
             xtx: [[0.0; 4]; 4],
             xty: [0.0; 4],
+            prior,
+            observed: 0,
         }
     }
 
@@ -123,6 +150,7 @@ impl LaneCostModel {
         if !(wall_us.is_finite() && wall_us > 0.0) {
             return;
         }
+        self.observed += 1;
         let x = [1.0, lanes as f64, verified as f64, spill as f64];
         let y = f64::from(wall_us);
         for i in 0..4 {
@@ -142,7 +170,7 @@ impl LaneCostModel {
             let prior = COST_PRIOR_WEIGHT * COST_PRIOR_SCALE[i];
             m[i][..4].copy_from_slice(&self.xtx[i]);
             m[i][i] += prior;
-            m[i][4] = self.xty[i] + prior * COST_PRIOR_US[i];
+            m[i][4] = self.xty[i] + prior * self.prior[i];
         }
         for col in 0..4 {
             let pivot = (col..4)
@@ -162,7 +190,7 @@ impl LaneCostModel {
             theta[i] = (m[i][4] - tail) / m[i][i];
         }
         if theta.iter().any(|t| !t.is_finite()) {
-            theta = COST_PRIOR_US;
+            theta = self.prior;
         }
         for t in &mut theta[1..] {
             *t = t.max(0.0);
@@ -171,10 +199,14 @@ impl LaneCostModel {
     }
 
     /// The clamped `(F, a, r, G)` in µs.
-    #[cfg(test)]
     pub(crate) fn fit(&self) -> (f64, f64, f64, f64) {
         let [f, a, r, g] = self.solve();
         (f, a, r, g)
+    }
+
+    /// Steps this model has observed.
+    pub(crate) fn observed(&self) -> u64 {
+        self.observed
     }
 
     /// Cost of a window with `drafts` verified drafts carrying `spill_share`
@@ -204,6 +236,121 @@ pub(crate) fn floor_env_enabled() -> bool {
 
 const LANE_MAX_DRAFTS: usize = crate::gpu_forward_lanes::LANE_MAX_ROWS - 1;
 
+/// `HIPFIRE_QWEN4_LANE_COST` (developer; `0` opts out): the measured lane
+/// cost profile of an arch ([`LaneCostProfile::for_arch`]). Off, every arch
+/// runs the gfx1151-prior, store-pooled, probe-budget-retire lane floor
+/// this module had before profiles.
+pub(crate) fn lane_cost_profile_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_COST", true)
+}
+
+/// `HIPFIRE_QWEN4_LANE_ROW_CAP` (developer; default on, `0` off): the gfx1201
+/// profile's even split of one 8-row group over the step's lanes
+/// ([`LaneCostProfile::step_row_cap`]). Off, the lanes of a step draft up to
+/// their own budgets and the floors learn the spill (`G`) from the priced steps.
+pub(crate) fn lane_row_cap_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_ROW_CAP", true)
+}
+
+/// What a lane's floor prices windows with and how it retires, per arch.
+///
+/// The lane floor is the singleton's [`Qwen4Floor`]; the profile is what the
+/// lane feeds it and with which rules:
+///
+/// - `legacy` (every arch without a measured profile, gfx1151 included, and
+///   every arch under `HIPFIRE_QWEN4_LANE_COST=0`): the gfx1151 prior
+///   [`COST_PRIOR_US`], one fit pooled over the store's lanes and requests
+///   (the root's [`LaneCostModel`]), retirement at the probe budget with no
+///   AR probes: the floor this module shipped with, bit for bit.
+/// - `gfx1201`: the measured prior [`COST_PRIOR_GFX1201_US`]; **one fit per
+///   request** (the lane's own [`LaneCostModel`], born at admission from the
+///   prior and fed only the steps that lane takes part in), so the C8 AR
+///   history of an earlier request or of other lanes cannot steer a new
+///   request's price; and the singleton's retire rules
+///   ([`singleton_floor_min_windows`] observed windows before a verdict may
+///   retire it, [`singleton_floor_ar_probe_tokens`] AR probe windows at a
+///   would-be retirement, both read from the singleton's own
+///   `HIPFIRE_MTP_FLOOR_MIN_WINDOWS` / `HIPFIRE_MTP_FLOOR_AR_PROBE`);
+///   and a **row cap** on the step ([`LaneCostProfile::step_row_cap`]): the
+///   root splits one first row group evenly over the step's lanes (in request
+///   order, the odd rows to the first lanes) and a lane drafts at most its
+///   share minus its seed row, because a spilled group costs `G = 31 ms` on
+///   this arch (cp5: 4 lanes, 3 native windows 77 ms against 40.6 ms for 2
+///   native and 24.5 ms AR) and nothing a window emits pays for it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LaneCostProfile {
+    name: &'static str,
+    prior_us: [f64; 4],
+    per_request: bool,
+    retire_after: usize,
+    probe_tokens: usize,
+    /// Most verify rows one step may carry before its rows spill into a second
+    /// once-over-all-rows group (0: the step's rows are not capped).
+    step_rows: usize,
+}
+
+impl LaneCostProfile {
+    /// The pre-profile lane floor.
+    pub(crate) const LEGACY: Self = Self {
+        name: "legacy",
+        prior_us: COST_PRIOR_US,
+        per_request: false,
+        retire_after: FLOOR_PROBE_WINDOWS,
+        probe_tokens: 0,
+        step_rows: 0,
+    };
+
+    /// The gfx1201 (EP2 R9700) profile under the singleton's retire rules.
+    pub(crate) fn gfx1201() -> Self {
+        Self {
+            name: "gfx1201",
+            prior_us: COST_PRIOR_GFX1201_US,
+            per_request: true,
+            retire_after: singleton_floor_min_windows(),
+            probe_tokens: singleton_floor_ar_probe_tokens(),
+            step_rows: if lane_row_cap_enabled() {
+                crate::gpu_forward_lanes::LANE_MAX_ROWS
+            } else {
+                0
+            },
+        }
+    }
+
+    /// The profile of `arch` (a `Gpu::arch` string).
+    pub(crate) fn for_arch(arch: &str) -> Self {
+        Self::for_arch_with(arch, lane_cost_profile_enabled())
+    }
+
+    fn for_arch_with(arch: &str, enabled: bool) -> Self {
+        match arch {
+            "gfx1201" if enabled => Self::gfx1201(),
+            _ => Self::LEGACY,
+        }
+    }
+
+    pub(crate) fn name(&self) -> &'static str {
+        self.name
+    }
+
+    /// The rows a step may carry without spilling into a second row group
+    /// (`G`), `None` when the profile does not cap them.
+    pub(crate) fn step_row_cap(&self) -> Option<usize> {
+        (self.step_rows > 0).then_some(self.step_rows)
+    }
+
+    /// The prior `[F, a, r, G]` (µs).
+    pub(crate) fn prior_us(&self) -> [f64; 4] {
+        self.prior_us
+    }
+
+    /// A fresh floor under this profile's retire rules. The legacy profile is
+    /// exactly [`Qwen4Floor::new`].
+    fn floor(&self) -> Qwen4Floor {
+        Qwen4Floor::with_retire_after(MTP_WINDOW_COST, self.retire_after)
+            .with_retire_evidence(self.probe_tokens)
+    }
+}
+
 /// One lane's window router: the singleton's agreement and AR floor, priced
 /// in AR-row units (calibrated once at `ar_us = 1.0`; batched windows
 /// observed at [`LaneCostModel::window_units`], `ArSynced` windows as
@@ -222,12 +369,31 @@ pub(crate) struct LaneSpecPolicy {
     /// A promoted singleton whose floor already retired it: the head lags
     /// the trunk, so the lane is head-free AR for good (every route mode).
     promoted_retired: bool,
+    /// The profile this lane was admitted under.
+    profile: LaneCostProfile,
+    /// This request's own cost fit (`profile.per_request()`); `None` prices
+    /// from the store-pooled model.
+    cost: Option<LaneCostModel>,
 }
 
 impl LaneSpecPolicy {
+    /// The legacy-profile policy (tests).
+    #[cfg(test)]
     pub(crate) fn with_floor(k: usize, floor_enabled: bool) -> Self {
+        Self::with_profile(k, floor_enabled, &LaneCostProfile::LEGACY)
+    }
+
+    /// An admitted lane's policy under `profile`: a fresh floor, fresh
+    /// agreement and, for a per-request profile, a fresh cost fit.
+    pub(crate) fn with_profile(k: usize, floor_enabled: bool, profile: &LaneCostProfile) -> Self {
         let max_k = k.min(LANE_MAX_DRAFTS);
-        Self::with_agreement(max_k, vec![AGREEMENT_PRIOR; max_k], false, floor_enabled)
+        Self::with_agreement(
+            max_k,
+            vec![AGREEMENT_PRIOR; max_k],
+            false,
+            floor_enabled,
+            profile,
+        )
     }
 
     fn with_agreement(
@@ -235,8 +401,9 @@ impl LaneSpecPolicy {
         agreement: Vec<(f32, f32)>,
         promoted_retired: bool,
         floor_enabled: bool,
+        profile: &LaneCostProfile,
     ) -> Self {
-        let mut floor = Qwen4Floor::new(MTP_WINDOW_COST);
+        let mut floor = profile.floor();
         floor.set_capacity(max_k);
         let floor = floor_with_call_log(floor, "lane", floor_enabled);
         Self {
@@ -247,6 +414,10 @@ impl LaneSpecPolicy {
             calibrated: false,
             lab_windows: 0,
             promoted_retired,
+            profile: *profile,
+            cost: profile
+                .per_request
+                .then(|| LaneCostModel::with_prior(profile.prior_us)),
         }
     }
 
@@ -254,18 +425,73 @@ impl LaneSpecPolicy {
     /// `agreement` seeds the lane (performance only); `retired` (the
     /// singleton's floor retired it) keeps the lane `ArRetired`, otherwise
     /// the lane floor starts fresh like any admitted lane.
+    #[cfg(test)]
     pub(crate) fn promoted_with_floor(
         k: usize,
         agreement: &[(f32, f32)],
         retired: bool,
         floor_enabled: bool,
     ) -> Self {
+        Self::promoted_with_profile(
+            k,
+            agreement,
+            retired,
+            floor_enabled,
+            &LaneCostProfile::LEGACY,
+        )
+    }
+
+    /// [`Self::promoted_with_floor`] under `profile`.
+    pub(crate) fn promoted_with_profile(
+        k: usize,
+        agreement: &[(f32, f32)],
+        retired: bool,
+        floor_enabled: bool,
+        profile: &LaneCostProfile,
+    ) -> Self {
         Self::with_agreement(
             k.min(LANE_MAX_DRAFTS),
             agreement.to_vec(),
             retired,
             floor_enabled,
+            profile,
         )
+    }
+
+    /// One finished pure-decode step this lane took part in: trains the
+    /// lane's own cost fit (a per-request profile; the pooled model of the
+    /// store trains elsewhere).
+    pub(crate) fn observe_step(
+        &mut self,
+        lanes: usize,
+        spill: usize,
+        verified: usize,
+        wall_us: f32,
+    ) {
+        if let Some(cost) = self.cost.as_mut() {
+            cost.observe(lanes, spill, verified, wall_us);
+        }
+    }
+
+    /// This request's own cost fit (tests).
+    #[cfg(test)]
+    pub(crate) fn own_cost(&self) -> Option<&LaneCostModel> {
+        self.cost.as_ref()
+    }
+
+    /// AR-row price of a window of `drafts` verified drafts: this request's
+    /// own fit under a per-request profile, else the store's `pooled` model.
+    pub(crate) fn window_units(
+        &self,
+        pooled: &LaneCostModel,
+        lanes: usize,
+        drafts: usize,
+        spill_share: f64,
+    ) -> f32 {
+        self.cost
+            .as_ref()
+            .unwrap_or(pooled)
+            .window_units(lanes, drafts, spill_share)
     }
 
     /// Most drafts a window of this lane may carry.
@@ -350,18 +576,150 @@ impl LaneSpecPolicy {
         }
     }
 
-    /// A finished `ArSynced` window of budget `k`: one AR row, observed as an
-    /// interleaved window of one unit. A zero budget observes nothing.
+    /// A finished `ArSynced` window of budget `k`: one AR row. While the
+    /// floor is taking the AR probe tokens of a would-be retirement (only a
+    /// profile with retire evidence) the row is one of them: the singleton's
+    /// `floor_observe_ar` re-prices AR with it, here one unit like the
+    /// calibration. Otherwise it is observed as an interleaved window of one
+    /// unit. A zero budget observes nothing.
     pub(crate) fn observe_ar_synced(&mut self, window: &MtpWindow, k: usize) {
         if k == 0 {
             return;
         }
         observe_agreement(&mut self.agreement, window, DEFAULT_DECAY);
         if self.floor_enabled {
-            self.floor
-                .observe_native(NativeWindow::Interleaved, window, 1.0, k, &self.agreement);
+            if self.floor.needs_ar_sample() {
+                self.floor.observe_calibration(1.0, &self.agreement);
+            } else {
+                self.floor.observe_native(
+                    NativeWindow::Interleaved,
+                    window,
+                    1.0,
+                    k,
+                    &self.agreement,
+                );
+            }
         }
     }
+}
+
+/// `HIPFIRE_QWEN4_LANE_COST_TRACE=1` (developer; default off): one
+/// [`LANE_COST_TRACE_PREFIX`] JSON line on stderr per lane route decision
+/// (`"event":"route"`: the fitted `F, a, r, G`, the predicted native price per
+/// emitted token at each depth against the AR unit, the floor's own state,
+/// the chosen route, lane request tag / generation / window and step) and one
+/// per priced step the cost fits learn from (`"event":"step"`).
+pub(crate) fn lane_cost_trace_enabled() -> bool {
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_COST_TRACE", false)
+}
+
+/// The prefix of the lane cost trace lines.
+pub(crate) const LANE_COST_TRACE_PREFIX: &str = "QWEN4_LANE_COST_TRACE";
+
+/// Where a traced route decision was taken.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RouteTraceCtx {
+    pub request_tag: u64,
+    pub owner_generation: u64,
+    pub window_seq: u64,
+    pub step_seq: u64,
+    /// Lanes the step carries.
+    pub lanes: usize,
+}
+
+fn route_name(route: LaneRoute) -> String {
+    match route {
+        LaneRoute::Ar => "ar".to_string(),
+        LaneRoute::ArSynced => "ar_synced".to_string(),
+        LaneRoute::ArRetired => "ar_retired".to_string(),
+        LaneRoute::Batched { k_max } => format!("batched:{k_max}"),
+    }
+}
+
+impl LaneSpecPolicy {
+    /// The `"event":"route"` trace line of a decision: `pooled` is the
+    /// store's model (the price of a lane without its own fit), `budget` the
+    /// window's draft budget and `lab` the route mode. `native` lists, per
+    /// depth within the budget, the window's price in AR rows at this step's
+    /// lane count with no spill, the tokens it emits at the lane's measured
+    /// agreement and their ratio, the number the floor weighs against the AR
+    /// unit (1 per token).
+    pub(crate) fn route_trace_line(
+        &self,
+        ctx: &RouteTraceCtx,
+        pooled: &LaneCostModel,
+        budget: usize,
+        lab: LabRoutes,
+        route: LaneRoute,
+    ) -> String {
+        let model = self.cost.as_ref().unwrap_or(pooled);
+        let (f, a, r, g) = model.fit();
+        let mut native = String::new();
+        let depths = budget.min(self.max_k).min(self.agreement.len());
+        let mut prefix = 1.0f32;
+        let mut tokens = 1.0f32;
+        for (i, &(accepted, total)) in self.agreement.iter().take(depths).enumerate() {
+            prefix *= accepted / total.max(f32::MIN_POSITIVE);
+            tokens += prefix;
+            let units = model.window_units(ctx.lanes, i + 1, 0.0);
+            if !native.is_empty() {
+                native.push(',');
+            }
+            native.push_str(&format!(
+                "{{\"depth\":{},\"units\":{units:.4},\"tokens\":{tokens:.4},\"units_per_token\":{:.4}}}",
+                i + 1,
+                units / tokens
+            ));
+        }
+        let floor = self
+            .floor
+            .trace_line("", &self.agreement, "route", 0.0, 0, 0);
+        format!(
+            "{LANE_COST_TRACE_PREFIX} {{\"event\":\"route\",\"tag\":{},\"gen\":{},\"window_seq\":{},\"step_seq\":{},\"lanes\":{},\"profile\":\"{}\",\"fit\":\"{}\",\"obs\":{},\"fit_us\":{{\"F\":{f:.1},\"a\":{a:.1},\"r\":{r:.1},\"G\":{g:.1}}},\"budget\":{budget},\"lab\":{},\"floor_enabled\":{},\"retired\":{},\"route\":\"{}\",\"ar_units_per_token\":1.0,\"native\":[{native}],\"floor\":{}}}",
+            ctx.request_tag,
+            ctx.owner_generation,
+            ctx.window_seq,
+            ctx.step_seq,
+            ctx.lanes,
+            self.profile.name(),
+            if self.cost.is_some() { "request" } else { "pooled" },
+            model.observed(),
+            lab != LabRoutes::Floor,
+            self.floor_enabled,
+            self.retired(),
+            route_name(route),
+            floor.trim_start(),
+        )
+    }
+
+    /// Print the decision's trace line to stderr.
+    pub(crate) fn trace_route(
+        &self,
+        ctx: &RouteTraceCtx,
+        pooled: &LaneCostModel,
+        budget: usize,
+        lab: LabRoutes,
+        route: LaneRoute,
+    ) {
+        eprintln!("{}", self.route_trace_line(ctx, pooled, budget, lab, route));
+    }
+}
+
+/// The `"event":"step"` trace line of a priced step: what every lane's fit
+/// learned from it.
+pub(crate) fn step_trace_line(
+    step_seq: u64,
+    lanes: usize,
+    spill: usize,
+    verified: usize,
+    wall_us: f64,
+    priced: bool,
+) -> String {
+    format!(
+        "{LANE_COST_TRACE_PREFIX} {{\"event\":\"step\",\"step_seq\":{step_seq},\"lanes\":{lanes},\"spill\":{spill},\"verified\":{verified},\"rows\":{},\"row_groups\":{},\"wall_us\":{wall_us:.1},\"priced\":{priced}}}",
+        lanes + verified,
+        spill + 1
+    )
 }
 
 /// The copy lane's view of the lane's own floor (`crate::mesh_lane_copy`):
@@ -1806,6 +2164,364 @@ mod tests {
         assert_eq!(
             capped.route(1, LabRoutes::Cycle),
             LaneRoute::Batched { k_max: 1 }
+        );
+    }
+
+    // ---- lane cost profiles (gfx1201 measured prior, per-request fit) ----
+
+    /// Eight AR lanes, no drafts, no spill, `wall_us` long: the C8 history of
+    /// an earlier request (or of the other lanes).
+    fn c8_ar_history(model: &mut LaneCostModel, steps: usize, wall_us: f32) {
+        for _ in 0..steps {
+            model.observe(8, 0, 0, wall_us);
+        }
+    }
+
+    #[test]
+    fn the_gfx1151_prior_is_pinned_and_the_legacy_profile_is_the_old_floor() {
+        assert_eq!(COST_PRIOR_US, [16_900.0, 9_700.0, 8_200.0, 18_500.0]);
+        assert_eq!(LaneCostProfile::LEGACY.prior_us(), COST_PRIOR_US);
+        assert_eq!(
+            LaneCostModel::new().fit(),
+            LaneCostModel::with_prior(COST_PRIOR_US).fit()
+        );
+        // The legacy floor is `Qwen4Floor::new` exactly: the probe-budget
+        // retire, no AR probes.
+        let policy = LaneSpecPolicy::with_profile(3, true, &LaneCostProfile::LEGACY);
+        let diag = policy.floor.diagnostics();
+        let old = Qwen4Floor::new(MTP_WINDOW_COST).diagnostics();
+        assert_eq!(diag.retire_after, FLOOR_PROBE_WINDOWS);
+        assert_eq!(diag.probe_tokens, 0);
+        assert_eq!(
+            (diag.retire_after, diag.probe_tokens, diag.decay),
+            (old.retire_after, old.probe_tokens, old.decay)
+        );
+        assert!(
+            policy.cost.is_none(),
+            "legacy lanes price from the store's pooled model"
+        );
+    }
+
+    #[test]
+    fn profiles_follow_the_arch_and_gfx1151_stays_legacy() {
+        for arch in ["gfx1151", "gfx1100", "gfx1200", "gfx942", "", "gfx1201x"] {
+            assert_eq!(
+                LaneCostProfile::for_arch_with(arch, true),
+                LaneCostProfile::LEGACY,
+                "{arch}"
+            );
+        }
+        // The kill switch: gfx1201 with HIPFIRE_QWEN4_LANE_COST=0.
+        assert_eq!(
+            LaneCostProfile::for_arch_with("gfx1201", false),
+            LaneCostProfile::LEGACY
+        );
+        let p = LaneCostProfile::for_arch_with("gfx1201", true);
+        assert_eq!(p.name(), "gfx1201");
+        assert_eq!(p.prior_us(), COST_PRIOR_GFX1201_US);
+        assert_ne!(p.prior_us(), COST_PRIOR_US);
+        assert!(p.per_request);
+        // A lane admitted under it carries a fit of its own, born at the prior.
+        let lane = LaneSpecPolicy::with_profile(2, true, &p);
+        let own = lane.cost.as_ref().expect("per-request fit");
+        assert_eq!(fit_array(own), COST_PRIOR_GFX1201_US);
+        assert_eq!(own.observed(), 0);
+    }
+
+    #[test]
+    fn gfx1201_prior_prices_a_one_lane_native_window_below_its_tokens() {
+        // The measured C1 step: 24.0 ms native (2 drafts) against 17.4-18.9 ms
+        // AR, 1.3-1.4 AR rows for about 2.1 tokens.
+        let model = LaneCostModel::with_prior(COST_PRIOR_GFX1201_US);
+        let units = f64::from(model.window_units(1, 2, 0.0));
+        let want = 1.0 + 2.0 * 3_250.0 / (15_700.0 + 2_700.0);
+        assert!((units - want).abs() < 1e-4, "{units} vs {want}");
+        assert!((1.25..1.5).contains(&units), "{units}");
+        // A C4 window that spills a row group costs more than the 2-3 tokens
+        // it emits (cp5: 3 spilled windows 77 ms against 24.5 ms AR).
+        let spilled = model.window_units(4, 2, 1.0 / 3.0);
+        assert!(spilled > 2.5, "spilled C4 window {spilled}");
+    }
+
+    #[test]
+    fn a_fresh_request_does_not_inherit_a_c8_ar_history() {
+        // The failure this replaces: a pooled model trained on C8 AR steps on
+        // a card whose C8 step (37.5 ms) is far below the gfx1151 prior's
+        // F + 8a (94.5 ms) drives F negative, alpha(1) to its 1 ms floor and
+        // the price of a 2-draft window at C1 to 17 AR rows: AR for good.
+        let mut pooled = LaneCostModel::new();
+        c8_ar_history(&mut pooled, 3_000, 37_500.0);
+        assert!(pooled.fit().0 < 0.0, "{:?}", pooled.fit());
+        assert!(pooled.window_units(1, 2, 0.0) > 10.0);
+
+        // A per-request fit sees only its own lane's steps; a new request's
+        // lane is born at the prior whatever happened before it.
+        let profile = LaneCostProfile::gfx1201();
+        let mut earlier = LaneSpecPolicy::with_profile(2, true, &profile);
+        for _ in 0..3_000 {
+            earlier.observe_step(8, 0, 0, 37_500.0);
+        }
+        let earlier_fit = fit_array(earlier.cost.as_ref().unwrap());
+        assert_ne!(earlier_fit, COST_PRIOR_GFX1201_US);
+        let fresh = LaneSpecPolicy::with_profile(2, true, &profile);
+        assert_eq!(
+            fit_array(fresh.cost.as_ref().unwrap()),
+            COST_PRIOR_GFX1201_US
+        );
+        let units = f64::from(fresh.window_units(&pooled, 1, 2, 0.0));
+        assert!(units < 1.5, "fresh request C1 window {units}");
+        // Even the earlier request's own fit stays sane at C1 (the gfx1201
+        // prior is within the ridge's reach of the data).
+        assert!(f64::from(earlier.window_units(&pooled, 1, 2, 0.0)) < 1.6);
+    }
+
+    #[test]
+    fn lanes_and_requests_do_not_leak_into_each_other() {
+        let profile = LaneCostProfile::gfx1201();
+        let mut a = LaneSpecPolicy::with_profile(2, true, &profile);
+        let b = LaneSpecPolicy::with_profile(2, true, &profile);
+        for k in 0..200 {
+            let (lanes, verified, spill) = step_shape(k);
+            a.observe_step(lanes, spill, verified, 60_000.0);
+        }
+        assert_eq!(a.cost.as_ref().unwrap().observed(), 200);
+        assert_eq!(b.cost.as_ref().unwrap().observed(), 0);
+        assert_eq!(fit_array(b.cost.as_ref().unwrap()), COST_PRIOR_GFX1201_US);
+        // A per-request lane ignores the pooled model entirely.
+        let mut poisoned = LaneCostModel::new();
+        c8_ar_history(&mut poisoned, 3_000, 37_500.0);
+        let clean = LaneCostModel::with_prior(COST_PRIOR_GFX1201_US);
+        for (lanes, drafts, share) in [(1, 2, 0.0), (3, 2, 0.0), (4, 3, 0.5)] {
+            assert_eq!(
+                b.window_units(&poisoned, lanes, drafts, share),
+                clean.window_units(lanes, drafts, share)
+            );
+        }
+        // A legacy lane does the opposite: it prices from the pooled model it
+        // is handed and its own observe_step is a no-op.
+        let mut legacy = LaneSpecPolicy::with_profile(2, true, &LaneCostProfile::LEGACY);
+        legacy.observe_step(8, 0, 0, 37_500.0);
+        assert_eq!(
+            legacy.window_units(&poisoned, 1, 2, 0.0),
+            poisoned.window_units(1, 2, 0.0)
+        );
+    }
+
+    /// Route sequence of a lane that keeps losing: every native window
+    /// emits one token (nothing accepted) and prices at `native_units` AR
+    /// rows; AR windows price one unit and feed the probes. Stops at the
+    /// first retired route. The second vector is the floor's `probe_left`
+    /// after each window, the third its `observed` windows.
+    fn losing_run(
+        policy: &mut LaneSpecPolicy,
+        native_units: f32,
+        windows: usize,
+    ) -> (Vec<LaneRoute>, Vec<usize>, Vec<usize>) {
+        let (mut routes, mut probe_left, mut observed) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..windows {
+            let route = policy.route(2, LabRoutes::Floor);
+            routes.push(route);
+            match route {
+                LaneRoute::Batched { k_max } => {
+                    policy.observe_batched(&window(1, 0, k_max), native_units, k_max, 2)
+                }
+                LaneRoute::ArSynced => policy.observe_ar_synced(&window(1, 0, 0), 2),
+                LaneRoute::ArRetired | LaneRoute::Ar => break,
+            }
+            let diag = policy.floor.diagnostics();
+            probe_left.push(diag.probe_left);
+            observed.push(diag.observed);
+        }
+        (routes, probe_left, observed)
+    }
+
+    /// The singleton's floor, driven with the same calls the lane policy
+    /// makes (the singleton's own configuration): AR calibration of one
+    /// unit, then route / observe with the agreement the windows teach.
+    fn singleton_floor_run(native_units: f32, windows: usize) -> Vec<LaneRoute> {
+        let mut floor =
+            Qwen4Floor::with_retire_after(MTP_WINDOW_COST, singleton_floor_min_windows())
+                .with_retire_evidence(singleton_floor_ar_probe_tokens());
+        floor.set_capacity(2);
+        let mut agreement = vec![AGREEMENT_PRIOR; 2];
+        floor.observe_calibration(1.0, &agreement);
+        let mut routes = Vec::new();
+        for _ in 0..windows {
+            let provisional = floor.provisional_depth(&agreement, 2);
+            let batched = |depth: usize| match depth.min(2) {
+                0 => LaneRoute::ArSynced,
+                k_max => LaneRoute::Batched { k_max },
+            };
+            let route = match floor.route(&agreement, 2, provisional) {
+                Action::ArHeadFree => LaneRoute::ArRetired,
+                Action::ArSynced | Action::Interleaved => LaneRoute::ArSynced,
+                Action::Native(depth) => batched(depth),
+            };
+            routes.push(route);
+            match route {
+                LaneRoute::Batched { k_max } => {
+                    let w = window(1, 0, k_max);
+                    observe_agreement(&mut agreement, &w, DEFAULT_DECAY);
+                    floor.observe_window(
+                        NativeWindow::Batched,
+                        WindowStats::of(&w, k_max),
+                        native_units,
+                        2,
+                        &agreement,
+                    );
+                }
+                LaneRoute::ArSynced => {
+                    let w = window(1, 0, 0);
+                    observe_agreement(&mut agreement, &w, DEFAULT_DECAY);
+                    if floor.needs_ar_sample() {
+                        floor.observe_calibration(1.0, &agreement);
+                    } else {
+                        floor.observe_native(NativeWindow::Interleaved, &w, 1.0, 2, &agreement);
+                    }
+                }
+                LaneRoute::ArRetired | LaneRoute::Ar => break,
+            }
+        }
+        routes
+    }
+
+    #[test]
+    fn the_gfx1201_lane_floor_retires_and_reprobes_like_the_singleton() {
+        let profile = LaneCostProfile::gfx1201();
+        let mut policy = LaneSpecPolicy::with_profile(2, true, &profile);
+        // The floor is built the singleton's way.
+        let singleton =
+            Qwen4Floor::with_retire_after(MTP_WINDOW_COST, singleton_floor_min_windows())
+                .with_retire_evidence(singleton_floor_ar_probe_tokens())
+                .diagnostics();
+        let lane = policy.floor.diagnostics();
+        assert_eq!(
+            (lane.retire_after, lane.probe_tokens, lane.decay),
+            (
+                singleton.retire_after,
+                singleton.probe_tokens,
+                singleton.decay
+            )
+        );
+        assert!(
+            lane.retire_after > FLOOR_PROBE_WINDOWS,
+            "{}",
+            lane.retire_after
+        );
+        assert!(lane.probe_tokens > 0);
+
+        // A losing lane (windows price 3 AR rows for 1 token): the lane's
+        // route sequence is the singleton floor's, call for call.
+        let (lane_routes, probe_left, observed) = losing_run(&mut policy, 3.0, 200);
+        assert_eq!(lane_routes, singleton_floor_run(3.0, 200));
+        assert_eq!(lane_routes.last(), Some(&LaneRoute::ArRetired));
+        assert!(policy.retired());
+        // No verdict before `retire_after` observed windows...
+        let at_retire = *observed.last().unwrap();
+        assert!(
+            at_retire >= singleton_floor_min_windows(),
+            "retired after {at_retire} observed windows: {lane_routes:?}"
+        );
+        // ...then exactly the singleton's AR probe tokens, each one an AR
+        // row that the floor counts down...
+        let n = singleton_floor_ar_probe_tokens();
+        let countdown: Vec<usize> = (0..=n).rev().collect();
+        assert!(
+            probe_left.windows(n + 1).any(|w| w == &countdown[..]),
+            "probe_left {probe_left:?}"
+        );
+        // ...and the last one is followed by the sticky retirement.
+        assert_eq!(policy.route(2, LabRoutes::Floor), LaneRoute::ArRetired);
+    }
+
+    #[test]
+    fn the_legacy_lane_floor_retires_at_the_probe_budget_with_no_probes() {
+        let mut policy = LaneSpecPolicy::with_profile(2, true, &LaneCostProfile::LEGACY);
+        let mut old = LaneSpecPolicy::with_floor(2, true);
+        let (routes, probe_left, observed) = losing_run(&mut policy, 3.0, 200);
+        assert_eq!(routes, losing_run(&mut old, 3.0, 200).0);
+        assert_eq!(routes.last(), Some(&LaneRoute::ArRetired));
+        assert!(routes.len() <= FLOOR_PROBE_WINDOWS + 2, "{routes:?}");
+        assert!(probe_left.iter().all(|&p| p == 0), "{probe_left:?}");
+        assert!(
+            *observed.last().unwrap() <= FLOOR_PROBE_WINDOWS,
+            "{observed:?}"
+        );
+    }
+
+    #[test]
+    fn a_winning_gfx1201_lane_keeps_drafting_and_never_probes() {
+        let mut policy = LaneSpecPolicy::with_profile(2, true, &LaneCostProfile::gfx1201());
+        for _ in 0..64 {
+            let route = policy.route(2, LabRoutes::Floor);
+            match route {
+                LaneRoute::Batched { k_max } => {
+                    // 3 tokens for 1.4 AR rows.
+                    policy.observe_batched(&window(3, k_max, k_max), 1.4, k_max, 2)
+                }
+                other => panic!("a winning lane routed {other:?}"),
+            }
+        }
+        assert!(!policy.retired());
+    }
+
+    #[test]
+    fn the_route_trace_line_carries_fit_prediction_and_choice() {
+        let profile = LaneCostProfile::gfx1201();
+        let mut policy = LaneSpecPolicy::with_profile(2, true, &profile);
+        let pooled = LaneCostModel::new();
+        let route = policy.route(2, LabRoutes::Floor);
+        let ctx = RouteTraceCtx {
+            request_tag: 9,
+            owner_generation: 3,
+            window_seq: 5,
+            step_seq: 17,
+            lanes: 1,
+        };
+        let line = policy.route_trace_line(&ctx, &pooled, 2, LabRoutes::Floor, route);
+        let json = line
+            .strip_prefix(LANE_COST_TRACE_PREFIX)
+            .expect("prefix")
+            .trim();
+        let v: serde_json::Value = serde_json::from_str(json).expect("one JSON object");
+        assert_eq!(v["event"], "route");
+        assert_eq!(v["tag"], 9);
+        assert_eq!(v["gen"], 3);
+        assert_eq!(v["window_seq"], 5);
+        assert_eq!(v["step_seq"], 17);
+        assert_eq!(v["profile"], "gfx1201");
+        assert_eq!(v["fit"], "request");
+        assert_eq!(v["obs"], 0);
+        assert_eq!(v["fit_us"]["F"], 15_700.0);
+        assert_eq!(v["fit_us"]["G"], 31_000.0);
+        assert_eq!(v["route"], "batched:2");
+        assert_eq!(v["ar_units_per_token"], 1.0);
+        let native = v["native"].as_array().expect("native predictions");
+        assert_eq!(native.len(), 2);
+        let d1 = native[0]["units"].as_f64().unwrap();
+        assert!((d1 - (1.0 + 3_250.0 / 18_400.0)).abs() < 1e-3, "{d1}");
+        assert!(v["floor"]["ar_us"].as_f64().unwrap() > 0.0);
+        // The pooled lane says so.
+        let legacy = LaneSpecPolicy::with_profile(2, true, &LaneCostProfile::LEGACY);
+        let line = legacy.route_trace_line(&ctx, &pooled, 2, LabRoutes::Floor, LaneRoute::ArSynced);
+        let v: serde_json::Value =
+            serde_json::from_str(line.strip_prefix(LANE_COST_TRACE_PREFIX).unwrap().trim())
+                .unwrap();
+        assert_eq!(
+            (v["profile"].as_str(), v["fit"].as_str()),
+            (Some("legacy"), Some("pooled"))
+        );
+        assert_eq!(v["fit_us"]["F"], 16_900.0);
+        let step: serde_json::Value = serde_json::from_str(
+            step_trace_line(17, 4, 1, 6, 77_200.0, true)
+                .strip_prefix(LANE_COST_TRACE_PREFIX)
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(
+            (step["event"].as_str(), step["spill"].as_u64()),
+            (Some("step"), Some(1))
         );
     }
 }
