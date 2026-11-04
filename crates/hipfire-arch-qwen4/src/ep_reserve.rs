@@ -2593,10 +2593,11 @@ mod tests {
                 _ => numel as u64 * 1_740_800,
             })
         };
+        let ep2 = crate::expert_residency::EpExpertSpans::new(512, vec![256, 256]).unwrap();
         let (whole, whole_experts) =
-            resident_split_ranks_trunk(&weights, bytes_of, 2, None).unwrap();
+            resident_split_ranks_trunk(&weights, bytes_of, &ep2, None).unwrap();
         let (cut, cut_experts) =
-            resident_split_ranks_trunk(&weights, bytes_of, 2, Some((&dims, qsa))).unwrap();
+            resident_split_ranks_trunk(&weights, bytes_of, &ep2, Some((&dims, qsa))).unwrap();
         assert_eq!(
             whole_experts, cut_experts,
             "routed-expert bytes are never cut"
@@ -2637,8 +2638,8 @@ mod tests {
         assert_eq!(freed / planar, 485);
         // no shard: the census is the one it always was
         assert_eq!(
-            resident_split_ranks_trunk(&weights, bytes_of, 2, None).unwrap(),
-            crate::expert_residency::resident_split_ranks(&weights, bytes_of, 2).unwrap()
+            resident_split_ranks_trunk(&weights, bytes_of, &ep2, None).unwrap(),
+            crate::expert_residency::resident_split_ranks(&weights, bytes_of, &ep2).unwrap()
         );
     }
 }
