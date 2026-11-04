@@ -614,6 +614,36 @@ fn fifo_cohort_incompatible_head_blocks_later_compatible() {
     assert!(sched.commit_lane(lane_for_k3, &k3, admission(&k3)));
 }
 
+/// `assignable_front` is the read-only twin of `try_assign_one`: it names the request that
+/// would be assigned (a free lane and a matching cohort) and changes nothing, so an
+/// admission gate can leave the front queued exactly as a full lane set does.
+#[test]
+fn assignable_front_peeks_what_try_assign_one_would_assign() {
+    let _l = begin();
+    let mut sched = ContinuousBatchScheduler::new(1, 4096);
+    let k1 = AttemptKey::new("r1", 1);
+    let k2 = AttemptKey::new("r2", 2);
+    let k3 = AttemptKey::new("r3", 3);
+    batch_announce_terminal(&k1.id, k1.attempt_id);
+    batch_announce_terminal(&k2.id, k2.attempt_id);
+    batch_announce_terminal(&k3.id, k3.attempt_id);
+    // Nothing queued.
+    assert!(sched.assignable_front().is_none());
+    sched.enqueue(req(k1.clone(), sampling(0.3, 1.0)));
+    sched.enqueue(req(k2.clone(), sampling(0.7, 1.0)));
+    sched.enqueue(req(k3.clone(), sampling(0.3, 1.0)));
+    // A free lane and no cohort: the front. Peeking pops and binds nothing.
+    assert_eq!(sched.assignable_front(), Some(&k1));
+    assert_eq!(sched.assignable_front(), Some(&k1));
+    assert_eq!(sched.inbox.len(), 3);
+    assert_eq!(sched.active_count(), 0);
+    let (assigned, _ticket) = sched.try_assign_one().unwrap();
+    assert_eq!(&assigned, &k1);
+    // No free lane: nothing is assignable, the front stays queued.
+    assert!(sched.assignable_front().is_none());
+    assert_eq!(sched.inbox.front(), Some(&k2));
+}
+
 #[test]
 fn refill_reservation_awaiting_client_not_reused_until_commit() {
     let _l = begin();

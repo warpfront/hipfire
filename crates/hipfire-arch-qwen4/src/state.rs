@@ -2790,6 +2790,23 @@ impl Qwen4State {
             .checked_add(per_request)
     }
 
+    /// Device bytes the whole-model QSA context arenas of one state commit under
+    /// `context` (every QSA layer's [`Qwen4ContextCommit::committed_layer_bytes`]): the
+    /// pages `ensure_mapped_capacity` has mapped once the state holds `context.tokens`
+    /// tokens, at the VMM granule. It is the very term [`Self::device_bytes_with_mirror`]
+    /// adds per QSA layer, so a lane's planned page growth between two token counts is
+    /// the difference of two calls and cannot differ from what the census charges. The
+    /// lane page budget ([`crate::lane::pages`]) prices admissions with it.
+    pub(crate) fn context_commit_bytes(
+        config: &Qwen4Config,
+        format: Qwen4StateFormat,
+        context: &Qwen4ContextCommit,
+    ) -> Option<u64> {
+        let (_, qsa_layers) = scope_layer_counts(config, &Qwen4BandScope::single(config));
+        let per_layer = context.committed_layer_bytes(config, format.layout())?;
+        u64::try_from(per_layer.checked_mul(qsa_layers)?).ok()
+    }
+
     /// Every device allocation [`Self::device_bytes`] counts, one entry per
     /// allocation (aliases never appear: nothing in the state is a borrowed
     /// view of a counted tensor): each tensor of [`state_tensor_plan`] over

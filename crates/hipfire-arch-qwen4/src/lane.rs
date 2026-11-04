@@ -84,6 +84,7 @@ use std::time::Instant;
 
 pub mod census;
 pub(crate) mod groups;
+pub mod pages;
 use groups::GroupPlanner;
 
 /// Most lanes one store holds.
@@ -2021,6 +2022,10 @@ pub struct Qwen4LaneStore {
     proto: Option<LaneProto>,
     /// The copy lane this store was staged with (`None`: the default store).
     copy: Option<StoreCopy>,
+    /// Context rows each slot's live request reserved at admission
+    /// ([`pages`], the lane page budget); `0` = none. Host only, cleared when
+    /// the lane is released.
+    page_reserved: Vec<usize>,
 }
 
 impl Qwen4LaneStore {
@@ -2217,6 +2222,7 @@ impl Qwen4LaneStore {
             step_started: None,
             proto: Some(proto),
             copy: copy_arming,
+            page_reserved: vec![0; max_lanes],
         })
     }
 
@@ -2609,7 +2615,11 @@ impl Qwen4LaneStore {
 
     /// Free `epoch`'s lane (its device state stays allocated for reuse).
     pub fn release(&mut self, epoch: &RequestEpoch) -> Result<(), String> {
+        let slot = self.table.slot_of(epoch);
         self.table.release(epoch)?;
+        if let Some(slot) = slot {
+            self.page_reserved[slot] = 0;
+        }
         if let Some(proto) = self.proto.as_mut() {
             proto.release(epoch);
         }

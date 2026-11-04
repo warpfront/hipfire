@@ -4723,6 +4723,37 @@ pub fn qwen4_lane_append_share() -> bool {
     developer_bool(QWEN4_LANE_APPEND_SHARE_ENV, true)
 }
 
+/// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET` (developer, default ON, exact `0` is the kill switch):
+/// Flash-Next Qwen4 VMM lanes (single device and EP) reserve a request's worst-case context
+/// growth when it is admitted and admit it only while the unmapped growth already promised to
+/// live lanes plus its own fits the device's free memory (minus the load-time lane charge not
+/// yet consumed and a safety margin); a request that does not fit stays queued and is retried
+/// at the next step boundary instead of failing mid-step on a mapping refusal. `0` restores the
+/// previous admission (slots and context length only) exactly.
+pub const QWEN4_LANE_PAGE_BUDGET_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_BUDGET";
+
+/// [`QWEN4_LANE_PAGE_BUDGET_ENV`] read through the process snapshot.
+pub fn qwen4_lane_page_budget() -> bool {
+    developer_bool(QWEN4_LANE_PAGE_BUDGET_ENV, true)
+}
+
+/// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB` (developer): free device memory, in MiB, the lane
+/// page budget keeps untouched on every rank (unmodelled transient allocations, driver slack).
+/// Unset or unparsable = [`QWEN4_LANE_PAGE_BUDGET_MARGIN_DEFAULT_MIB`].
+pub const QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB";
+
+/// Default lane page budget margin per rank, MiB.
+pub const QWEN4_LANE_PAGE_BUDGET_MARGIN_DEFAULT_MIB: u64 = 256;
+
+/// [`QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB_ENV`] in bytes, read through the process snapshot.
+pub fn qwen4_lane_page_budget_margin_bytes() -> u64 {
+    developer_var(QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(QWEN4_LANE_PAGE_BUDGET_MARGIN_DEFAULT_MIB)
+        .saturating_mul(1 << 20)
+}
+
 /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` (lab, default off): with
 /// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] on, treat every lane (greedy and seeded
 /// included) as wide-class. For oracles that measure the wide pass with greedy

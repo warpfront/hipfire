@@ -488,9 +488,15 @@ impl RankLane<'_> {
                         ));
                     }
                 }
-                lane.state
-                    .ensure_mapped_capacity(gpu, end)
-                    .map_err(|e| format!("{epoch:?}: map {end} positions: {e}"))?;
+                lane.state.ensure_mapped_capacity(gpu, end).map_err(|e| {
+                    // A mapping refusal is a capacity condition (the page budget
+                    // normally keeps it from happening), not diverged state:
+                    // `lane_error_wire` answers it with a retryable overload.
+                    format!(
+                        "{}{end} positions for {epoch:?}: {e}",
+                        crate::lane_exec::PROVISION_MAP_REFUSED
+                    )
+                })?;
                 begin_lane_window(bundle, gpu, lane, plan)?;
             }
             Ok(())

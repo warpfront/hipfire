@@ -79,6 +79,9 @@ use crate::batch::{
 use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
+use hipfire_arch_qwen4::lane::pages::{
+    page_budget_enabled, reservation_rows, PageVerdict, LANE_PAGE_BUDGET_REFUSED,
+};
 use hipfire_arch_qwen4::lane::{LaneSampling, LaneSpecStats, LaneStatus};
 use hipfire_arch_qwen4::lane_exec::{
     LaneDraft, LaneRoute, Qwen4LaneExecutor, PROVISION_MAP_REFUSED,
@@ -236,6 +239,26 @@ impl<'a> Owner<'a> {
             None => self.bundle.admit_lane(&mut *self.gpu, epoch, prompt),
         };
         admitted.map_err(|e| e.to_string())
+    }
+
+    /// The lane page budget's verdict for a request reserving `rows` context rows
+    /// (`Owner::of` for a pipeline-parallel mesh has no per-rank lane pages: always fits).
+    fn page_verdict(&mut self, rows: usize) -> Result<PageVerdict, String> {
+        if self.gpus.is_some() {
+            return Ok(PageVerdict::Fit);
+        }
+        self.bundle.lane_page_verdict(&mut *self.gpu, rows)
+    }
+
+    /// Reserve `rows` context rows for the just-admitted lane of `epoch` (host-only; a pipeline
+    /// parallel mesh keeps none).
+    fn reserve_pages(&mut self, epoch: &RequestEpoch, rows: usize) -> Result<(), String> {
+        if self.gpus.is_some() {
+            return Ok(());
+        }
+        self.bundle
+            .reserve_lane_pages(epoch, rows)
+            .map_err(|e| e.to_string())
     }
 
     /// Install the request's sampler on a just-admitted lane (host-only).
@@ -418,6 +441,7 @@ fn adopt_promoted(
         }
         bytes
     });
+    let prompt_len = progress.prompt_len;
     let adopted = bytes.and_then(|bytes| {
         sched
             .adopt_running(pending, progress)
@@ -434,6 +458,20 @@ fn adopt_promoted(
         );
         return;
     };
+    // The promoted lane's remaining growth is promised to the page budget like an admitted
+    // lane's (best effort: it is already running and cannot be queued).
+    let max_seq = model.max_seq;
+    if let Some(bundle) = model.qwen4_mut() {
+        let rows = reservation_rows(
+            prompt_len,
+            max_tokens,
+            bundle.lane_page_draft_rows(),
+            max_seq,
+        );
+        if let Err(error) = bundle.reserve_lane_pages(&epoch, rows) {
+            eprintln!("  qwen4 lane page budget: promoted lane not reserved: {error}");
+        }
+    }
     controls[ticket.lane] = Some(LaneCtl {
         epoch,
         slot,
@@ -454,11 +492,13 @@ fn adopt_promoted(
 }
 
 /// The wire class and retryability of a failed lane step: a mapping refusal
-/// ([`PROVISION_MAP_REFUSED`], the lane could not commit the device pages its context needs) is a
-/// capacity condition, answered `overload` + retryable (HTTP 503, the request may be retried when
-/// other lanes finish); every other failure keeps the caller's class and is not retryable.
+/// ([`PROVISION_MAP_REFUSED`], the lane could not commit the device pages its context needs) or a
+/// page-budget refusal ([`LANE_PAGE_BUDGET_REFUSED`], the request can never fit the free device
+/// pages) is a capacity condition, answered `overload` + retryable (HTTP 503, the request may be
+/// retried when other lanes finish); every other failure keeps the caller's class and is not
+/// retryable.
 fn lane_error_wire<'a>(message: &str, class: &'a str) -> (&'a str, bool) {
-    if message.contains(PROVISION_MAP_REFUSED) {
+    if message.contains(PROVISION_MAP_REFUSED) || message.contains(LANE_PAGE_BUDGET_REFUSED) {
         ("overload", true)
     } else {
         (class, false)
@@ -567,6 +607,186 @@ fn render_request(
         enabled,
         effort.as_deref(),
     )
+}
+
+/// A rendered prompt: its token ids and whether generation starts inside a think block, or the
+/// refusal and its wire class.
+type Rendered = Result<(Vec<u32>, bool), (String, &'static str)>;
+
+/// Generation budget of a lane request over its rendered `prompt_len`
+/// (`max_tokens_fit` clamps it to the context left), the one rule the page
+/// gate's reservation and the admission checks share.
+fn lane_request_max_tokens(req: &BatchPendingRequest, prompt_len: usize, max_seq: usize) -> usize {
+    fit_max_tokens_if(
+        req.original_msg
+            .get("max_tokens_fit")
+            .and_then(|v| v.as_bool())
+            == Some(true),
+        req.max_tokens,
+        prompt_len + 1,
+        max_seq,
+    )
+}
+
+/// What the lane page budget does with the queue front ([`gate_decision`]).
+#[derive(Debug, PartialEq, Eq)]
+enum GateDecision {
+    /// Assign it a lane.
+    Admit,
+    /// Keep it queued; ask again at the next step boundary.
+    Queue(hipfire_arch_qwen4::lane::pages::PageShortfall),
+    /// It can never fit: assign it a lane only to refuse it (a retryable overload).
+    Refuse(hipfire_arch_qwen4::lane::pages::PageShortfall),
+}
+
+/// The gate's decision for a budget `verdict` with `active_lanes` lanes running on the
+/// scheduler. A request that does not fit waits only while a running lane can still
+/// change the answer; with no lane active, waiting would spin.
+fn gate_decision(verdict: PageVerdict, active_lanes: usize) -> GateDecision {
+    match verdict {
+        PageVerdict::Fit => GateDecision::Admit,
+        PageVerdict::Wait(short) if active_lanes > 0 => GateDecision::Queue(short),
+        PageVerdict::Wait(short) | PageVerdict::Never(short) => GateDecision::Refuse(short),
+    }
+}
+
+/// A request held back by the page budget, kept across ticks so the wait is announced once and
+/// its prompt is rendered once.
+struct PageWait {
+    key: AttemptKey,
+    since: Instant,
+    ticks: u64,
+    announced: bool,
+    rendered: Option<Rendered>,
+}
+
+/// The page gate's answer for the queue front.
+enum PageGate {
+    /// Assign the front a lane. Carries the prompt the gate rendered (so it is not rendered again)
+    /// and the refusal a request that can never fit gets once it holds a lane.
+    Proceed(Option<Rendered>, Option<String>),
+    /// Leave the front queued: stop assigning this tick.
+    Wait,
+}
+
+/// The lane page budget at the queue front (see `hipfire_arch_qwen4::lane::pages`): before the
+/// front request takes a lane, reserve-check its worst-case context growth against every rank's
+/// free device pages. `Proceed` with nothing when the kill switch is set
+/// (`HIPFIRE_QWEN4_LANE_PAGE_BUDGET=0`), nothing is assignable, the request goes back to the
+/// singleton, the admission below refuses it on its own terms, or the budget cannot be measured.
+fn page_budget_gate(
+    sched: &ContinuousBatchScheduler,
+    m: &mut LoadedModel,
+    gpu: &mut Gpu,
+    controls: &[Option<LaneCtl>],
+    initial: &HashSet<AttemptKey>,
+    wait: &mut Option<PageWait>,
+) -> Result<PageGate, String> {
+    if !page_budget_enabled() {
+        return Ok(PageGate::Proceed(None, None));
+    }
+    let Some(key) = sched.assignable_front().cloned() else {
+        return Ok(PageGate::Proceed(None, None));
+    };
+    let Some(req) = sched.pending.get(&key) else {
+        return Ok(PageGate::Proceed(None, None));
+    };
+    if !batch_is_current(&key.id, key.attempt_id, req.admission) {
+        return Ok(PageGate::Proceed(None, None));
+    }
+    let mut state = match wait.take() {
+        Some(state) if state.key == key => state,
+        _ => PageWait {
+            key: key.clone(),
+            since: Instant::now(),
+            ticks: 0,
+            announced: false,
+            rendered: None,
+        },
+    };
+    let rendered = state
+        .rendered
+        .take()
+        .unwrap_or_else(|| render_request(m, req));
+    // A request the singleton route takes back is not a lane request: no budget.
+    let lone = sched.inbox.len() == 1 && !controls.iter().flatten().any(|c| c.epoch.is_admitted());
+    let takes_lane = qwen4_lone_request_takes_lane(m);
+    if lone_arrival_hands_back(lone, takes_lane, initial.contains(&key), || {
+        rendered.as_ref().is_ok_and(|(prompt, _)| {
+            crate::qwen::plan_qwen4_session(m, prompt, SessionRoute::Ar) > 0
+        })
+    }) {
+        return Ok(PageGate::Proceed(Some(rendered), None));
+    }
+    let Ok((prompt, _)) = &rendered else {
+        return Ok(PageGate::Proceed(Some(rendered), None));
+    };
+    let max_tokens = lane_request_max_tokens(req, prompt.len(), m.max_seq);
+    let fits_context = prompt
+        .len()
+        .checked_add(max_tokens)
+        .and_then(|n| n.checked_add(1))
+        .is_some_and(|n| n <= m.max_seq);
+    if req.max_tokens == 0 || prompt.is_empty() || !fits_context {
+        // The admission below refuses it as a validation / context-length error.
+        return Ok(PageGate::Proceed(Some(rendered), None));
+    }
+    let prompt_len = prompt.len();
+    let rows = reservation_rows(
+        prompt_len,
+        max_tokens,
+        Owner::of(m, gpu)?.bundle.lane_page_draft_rows(),
+        m.max_seq,
+    );
+    let verdict = match Owner::of(m, gpu)?.page_verdict(rows) {
+        Ok(verdict) => verdict,
+        Err(error) => {
+            eprintln!(
+                "  qwen4 lane page budget: {error}; admitting {} without the budget",
+                key.id
+            );
+            return Ok(PageGate::Proceed(Some(rendered), None));
+        }
+    };
+    match gate_decision(verdict, sched.active_count()) {
+        GateDecision::Admit => {
+            if state.announced {
+                eprintln!(
+                    "  qwen4 lane page budget: admitted {} attempt {} after {:.0} ms and {} step boundaries queued",
+                    key.id,
+                    key.attempt_id,
+                    state.since.elapsed().as_secs_f64() * 1000.0,
+                    state.ticks
+                );
+            }
+            Ok(PageGate::Proceed(Some(rendered), None))
+        }
+        GateDecision::Queue(short) => {
+            state.ticks += 1;
+            if !state.announced {
+                state.announced = true;
+                eprintln!(
+                    "  qwen4 lane page budget: queued {} attempt {}: {prompt_len} prompt + {max_tokens} max tokens reserve {rows} context rows; {short}",
+                    key.id, key.attempt_id
+                );
+            }
+            state.rendered = Some(rendered);
+            *wait = Some(state);
+            Ok(PageGate::Wait)
+        }
+        GateDecision::Refuse(short) => {
+            eprintln!(
+                "  qwen4 lane page budget: refused {} attempt {}: {prompt_len} prompt + {max_tokens} max tokens reserve {rows} context rows and cannot fit with no lane active; {short}",
+                key.id, key.attempt_id
+            );
+            Ok(PageGate::Proceed(
+                Some(rendered),
+                Some(format!(
+                    "{LANE_PAGE_BUDGET_REFUSED}the request's context ({rows} rows) does not fit the free device memory: {short}"
+                )),
+            ))
+        }
+    }
 }
 
 /// A failed `draft_step`: its error and every lane it named.
@@ -1122,6 +1342,8 @@ pub fn drive_qwen4_lane_batch(
     let mut cursor = 0;
     let mut trace = StepTrace::new();
     let mut mix = MeshMix::default();
+    // The request the page budget is holding at the queue front, if any.
+    let mut page_wait: Option<PageWait> = None;
     let batch_size = sched.max_batch;
     // Requests already queued at entry; the promoted lane never passes the
     // inbox, so it is never handed back to the singleton.
@@ -1240,7 +1462,19 @@ pub fn drive_qwen4_lane_batch(
             )? {
                 inbox.push_front(barrier);
             }
-            while let Some((key, ticket)) = sched.try_assign_one() {
+            // The page budget gates the queue front before it takes a lane: a request
+            // whose worst-case context growth does not fit the free device pages stays
+            // queued, as for a full lane set, and is asked again at the next step
+            // boundary (never failed mid-step).
+            loop {
+                let (pre_rendered, budget_refusal) =
+                    match page_budget_gate(sched, m, gpu, &controls, &initial, &mut page_wait)? {
+                        PageGate::Wait => break,
+                        PageGate::Proceed(rendered, refusal) => (rendered, refusal),
+                    };
+                let Some((key, ticket)) = sched.try_assign_one() else {
+                    break;
+                };
                 let req = sched
                     .pending
                     .get(&key)
@@ -1248,15 +1482,15 @@ pub fn drive_qwen4_lane_batch(
                     .ok_or("assigned request missing")?;
                 let lone = sched.inbox.is_empty()
                     && !controls.iter().flatten().any(|c| c.epoch.is_admitted());
-                // The prompt rendered for the session-reuse probe below, kept so
-                // the lane does not render it twice.
-                let mut probed = None;
+                // The prompt rendered for the session-reuse probe below (or by the
+                // page gate), kept so the lane does not render it twice.
+                let mut probed = pre_rendered;
                 if lone_arrival_hands_back(
                     lone,
                     qwen4_lone_request_takes_lane(m),
                     initial.contains(&key),
                     || {
-                        let rendered = render_request(m, &req);
+                        let rendered = probed.take().unwrap_or_else(|| render_request(m, &req));
                         let reusable = rendered.as_ref().is_ok_and(|(prompt, _)| {
                             crate::qwen::plan_qwen4_session(m, prompt, SessionRoute::Ar) > 0
                         });
@@ -1286,15 +1520,7 @@ pub fn drive_qwen4_lane_batch(
                         continue;
                     }
                 };
-                let max_tokens = fit_max_tokens_if(
-                    req.original_msg
-                        .get("max_tokens_fit")
-                        .and_then(|v| v.as_bool())
-                        == Some(true),
-                    req.max_tokens,
-                    prompt.len() + 1,
-                    m.max_seq,
-                );
+                let max_tokens = lane_request_max_tokens(&req, prompt.len(), m.max_seq);
                 let required = prompt
                     .len()
                     .checked_add(max_tokens)
@@ -1308,6 +1534,8 @@ pub fn drive_qwen4_lane_batch(
                     ))
                 } else if required.is_none_or(|n| n > m.max_seq) {
                     Some((format!("qwen4 request exceeds context window: prompt={} + max_tokens={} + trailer=1 > max_seq={}", prompt.len(), max_tokens, m.max_seq), "context_length"))
+                } else if let Some(message) = budget_refusal {
+                    Some((message, "overload"))
                 } else {
                     None
                 };
@@ -1323,6 +1551,12 @@ pub fn drive_qwen4_lane_batch(
                     )?;
                     continue;
                 }
+                let lane_rows = reservation_rows(
+                    prompt.len(),
+                    max_tokens,
+                    Owner::of(m, gpu)?.bundle.lane_page_draft_rows(),
+                    m.max_seq,
+                );
                 // vLLM-compatible `min_tokens`: validated against `max_tokens`
                 // at the gateway and the daemon, so a malformed value cannot
                 // reach a lane; a stray one is refused rather than guessed at.
@@ -1364,6 +1598,21 @@ pub fn drive_qwen4_lane_batch(
                         continue;
                     }
                 };
+                // The page budget's reservation: from here the lane's worst-case growth
+                // is promised to it (cleared when the lane is released).
+                if let Err(error) = Owner::of(m, gpu)?.reserve_pages(&epoch, lane_rows) {
+                    release_epoch(m, &epoch)?;
+                    lane_error(
+                        sched,
+                        m,
+                        &mut controls,
+                        ticket.lane,
+                        stdout,
+                        &error,
+                        "internal",
+                    )?;
+                    continue;
+                }
                 if req.sampling.temp > 0.0 {
                     let s = &req.sampling;
                     let sampling = LaneSampling {
@@ -1803,6 +2052,83 @@ mod tests {
         assert_eq!(
             super::lane_error_wire("qwen4 lane draft failed: x", "gpu"),
             ("gpu", false)
+        );
+    }
+
+    /// A request the page budget can never fit is refused as a retryable overload, and so is
+    /// a mid-step mapping refusal; the budget's message does not read as one of the others.
+    #[test]
+    fn a_page_budget_refusal_is_a_retryable_overload() {
+        let refused = format!(
+            "{}the request's context (16384 rows) does not fit the free device memory: rank 1: ...",
+            hipfire_arch_qwen4::lane::pages::LANE_PAGE_BUDGET_REFUSED
+        );
+        assert_eq!(
+            super::lane_error_wire(&refused, "overload"),
+            ("overload", true)
+        );
+        // Whatever class the caller passed, the marker decides.
+        assert_eq!(super::lane_error_wire(&refused, "gpu"), ("overload", true));
+    }
+
+    /// The gate queues a request that does not fit while a lane can still change the answer,
+    /// admits one that fits, and refuses (never spins on) one that cannot fit with no lane active.
+    #[test]
+    fn the_gate_queues_while_lanes_run_and_refuses_when_waiting_cannot_help() {
+        use super::{gate_decision, GateDecision};
+        use hipfire_arch_qwen4::lane::pages::{PageShortfall, PageVerdict, RankPages};
+        let short = PageShortfall {
+            pages: RankPages {
+                rank: 1,
+                need: 4 << 30,
+                free: 1 << 30,
+                ..RankPages::default()
+            },
+            margin: 256 << 20,
+        };
+        assert_eq!(gate_decision(PageVerdict::Fit, 0), GateDecision::Admit);
+        assert_eq!(gate_decision(PageVerdict::Fit, 8), GateDecision::Admit);
+        assert_eq!(
+            gate_decision(PageVerdict::Wait(short), 3),
+            GateDecision::Queue(short)
+        );
+        // The store says wait but the scheduler has nothing running: waiting would spin.
+        assert_eq!(
+            gate_decision(PageVerdict::Wait(short), 0),
+            GateDecision::Refuse(short)
+        );
+        assert_eq!(
+            gate_decision(PageVerdict::Never(short), 3),
+            GateDecision::Refuse(short)
+        );
+    }
+
+    /// The gate sits before the lane assignment and the reservation after the admission, and the
+    /// kill switch short-circuits the gate before anything is read or rendered.
+    #[test]
+    fn the_page_gate_precedes_assignment_and_the_kill_switch_precedes_the_gate() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let body = &prod[drive..];
+        let gate = body.find("page_budget_gate(").expect("gate call");
+        let assign = body.find("sched.try_assign_one()").expect("assignment");
+        let admit = body
+            .find(".admit(epoch, prompt.clone())")
+            .expect("admission");
+        let reserve = body
+            .find(".reserve_pages(&epoch, lane_rows)")
+            .expect("reservation");
+        assert!(gate < assign && assign < admit && admit < reserve);
+        let gate_fn = prod.find("fn page_budget_gate(").expect("gate fn");
+        let gate_src = &prod[gate_fn..];
+        let switch = gate_src
+            .find("if !page_budget_enabled()")
+            .expect("kill switch");
+        let first_read = gate_src.find("sched.assignable_front()").expect("peek");
+        assert!(
+            switch < first_read,
+            "the kill switch is the first thing the gate checks"
         );
     }
 

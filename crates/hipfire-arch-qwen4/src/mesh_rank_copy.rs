@@ -658,12 +658,15 @@ pub(crate) fn begin_lane_window(
     let end = position
         .checked_add(mapped_rows(plan))
         .ok_or_else(|| "draft_step: position overflow".to_string())?;
+    // A mapping refusal is a capacity condition, classified like `provision_step`'s
+    // ([`crate::lane_exec::PROVISION_MAP_REFUSED`]): a retryable overload, no poison.
+    let refused = crate::lane_exec::PROVISION_MAP_REFUSED;
     spec.head
         .ensure_mapped_capacity(gpu, end)
-        .map_err(|e| format!("draft_step: map head arenas of {epoch:?}: {e}"))?;
+        .map_err(|e| format!("{refused}{end} head positions for {epoch:?}: {e}"))?;
     state
         .ensure_mapped_capacity(gpu, end)
-        .map_err(|e| format!("draft_step: map trunk arenas of {epoch:?}: {e}"))?;
+        .map_err(|e| format!("{refused}{end} positions for {epoch:?}: {e}"))?;
     if point == HeadTicketPoint::AtBegin {
         take_head_ticket(bundle, gpu, lane)
             .map_err(|e| format!("draft_step: head snapshot of {epoch:?}: {e}"))?;

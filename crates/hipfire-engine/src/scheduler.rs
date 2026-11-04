@@ -241,6 +241,21 @@ impl ContinuousBatchScheduler {
         self.pending_sampling.get(key).map(|s| s.key())
     }
 
+    /// The queued request [`Self::try_assign_one`] would assign right now: the
+    /// inbox front, when a lane is free and its sampling cohort matches the
+    /// active one. A read-only peek (nothing is popped or bound), so an
+    /// admission gate can decide before the request takes a lane and leave it
+    /// queued, exactly as a full lane set does.
+    pub fn assignable_front(&self) -> Option<&AttemptKey> {
+        self.lanes.iter().position(|l| l.is_empty())?;
+        let front = self.inbox.front()?;
+        let sampling_key = self.cohort_key_for(front)?;
+        match &self.cohort_key {
+            Some(cohort) if cohort != &sampling_key => None,
+            _ => Some(front),
+        }
+    }
+
     pub fn try_assign_one(&mut self) -> Option<(AttemptKey, LaneTicket)> {
         let lane_idx = self.lanes.iter().position(|l| l.is_empty())?;
         let front_key = self.inbox.front()?.clone();

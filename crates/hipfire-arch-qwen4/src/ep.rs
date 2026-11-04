@@ -2810,17 +2810,15 @@ fn stage_rank_lanes(
         .ep_placement()
         .map_or(0, |placement| placement.rank);
     let max_seq = bundle.state.max_seq_len;
-    // The rank's attached forward plan; an EP load always keeps `Full`.
-    let mode = bundle
-        .forward_scratch_mode()
-        .unwrap_or(crate::gpu_forward::Qwen4ForwardScratchMode::Full);
-    let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, mode);
+    // The rows the lane reservation charges per lane: the one helper the page
+    // budget's earmark reads, so the staged and the budgeted charge agree.
+    let charge_rows = bundle.lane_charge_rows(gpu);
     let need = ep_lane_store_device_bytes_mixed(
         &bundle.config,
         bundle.state_format(),
         bundle.state.qsa_backend(),
         max_seq,
-        ep_lane_commit_rows(chunk),
+        charge_rows,
         gpu.vmm_recommended_granularity().unwrap_or(1),
         max_lanes,
         row_budget,
@@ -3275,6 +3273,39 @@ impl Qwen4Bundle {
                 Err(message)
             }
         }
+    }
+
+    /// Every rank's lane page numbers for a request reserving `rows` rows, in
+    /// rank order ([`crate::lane::pages::rank_pages`]). Read only: nothing is
+    /// mapped or reserved, so a failure on any rank returns an error and
+    /// nothing diverges; the caller decides once on the root
+    /// ([`crate::lane::pages::page_verdict`]) so every rank shares the verdict.
+    pub(crate) fn ep_lane_page_numbers(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: usize,
+    ) -> Result<Vec<crate::lane::pages::RankPages>, String> {
+        let outcomes = self.ep_run_ranks(
+            false,
+            |bundle| Ok(bundle.lane_page_numbers_local(&*gpu, rows)),
+            &|bundle, peer_gpu, _| Ok(bundle.lane_page_numbers_local(&*peer_gpu, rows)),
+        )?;
+        outcomes.into_iter().collect()
+    }
+
+    /// `reserve_lane_pages` on every rank's store (host only): every rank
+    /// records the same rows for the same lane, so the ranks' tables agree.
+    pub(crate) fn ep_reserve_lane_pages(
+        &mut self,
+        epoch: &RequestEpoch,
+        rows: usize,
+    ) -> Result<(), BundleError> {
+        self.ep_lane_soft(
+            "reserve_lane_pages",
+            |bundle| bundle.reserve_lane_pages_local(epoch, rows),
+            &|bundle, _, _| bundle.reserve_lane_pages_local(epoch, rows),
+        )
+        .map_err(BundleError::Forward)
     }
 
     /// Best effort and void, like the singleton entry: a mesh failure or
