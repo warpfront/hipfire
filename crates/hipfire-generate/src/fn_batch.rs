@@ -2230,9 +2230,10 @@ mod tests {
     #[test]
     fn single_device_lone_request_keeps_the_singleton_route() {
         // Promotion exists on a single device: the lone request stays a
-        // singleton (unchanged), as does any EP/PP server with a speculator.
+        // singleton (unchanged), as does a PP server with a speculator; an EP
+        // server with a speculator admits it as a lane.
         assert!(simulate_burst("single", 8, 0, 3).is_none());
-        assert!(!crate::batch::qwen4_lone_lane("ep", true));
+        assert!(crate::batch::qwen4_lone_lane("ep", true));
         assert!(!crate::batch::qwen4_lone_lane("pp", true));
     }
 }
