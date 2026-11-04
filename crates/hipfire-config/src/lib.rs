@@ -7183,6 +7183,14 @@ mod tests {
     }
 
     #[test]
+    fn ep_gather_direct_is_on_unless_exactly_zero() {
+        use memory::parse_ep_gather_direct as parse;
+        assert!(parse(None) && parse(Some("")) && parse(Some("1")) && parse(Some("off")));
+        assert!(!parse(Some("0")) && !parse(Some(" 0 ")));
+        assert!(memory::ep_gather_direct());
+    }
+
+    #[test]
     fn qwen4_sp_is_a_typed_bool_developer_key_unset_follows_the_arch_default() {
         const KEY: &str = "developer.qwen4_sp";
         const ENV: &str = "HIPFIRE_QWEN4_SP";
@@ -10831,6 +10839,19 @@ pub mod memory {
     /// reader read. Unset keeps the built-in default.
     pub fn hfq_reader_chunk_mib() -> std::result::Result<Option<usize>, String> {
         parse_hfq_reader_chunk_mib(process_value(HFQ_READER_CHUNK_MIB_ENV).as_deref())
+    }
+
+    /// Developer kill switch `HIPFIRE_EP_GATHER_DIRECT` for the expert-parallel unit-arena
+    /// gather (`qwen4_unit_arena_payload`): default on, the owned experts' shipped spans are
+    /// read with the parallel `O_DIRECT` reader and repacked on every core. Exactly `0` keeps
+    /// the serial walk over the mapped stacks (mmap page faults + single-thread repack).
+    pub fn ep_gather_direct() -> bool {
+        parse_ep_gather_direct(process_value("HIPFIRE_EP_GATHER_DIRECT").as_deref())
+    }
+
+    /// Pure truth table behind [`ep_gather_direct`]: only a trimmed `0` is off.
+    pub fn parse_ep_gather_direct(raw: Option<&str>) -> bool {
+        raw.map(str::trim) != Some("0")
     }
 
     /// Developer kill switch `HIPFIRE_EP_SHARE_HOST` for sharing one pinned host copy of a

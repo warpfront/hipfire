@@ -47,6 +47,7 @@ struct Args {
     reps: usize,
     verify: bool,
     gpu: bool,
+    unit_bytes: usize,
 }
 
 fn list(raw: &str) -> Vec<usize> {
@@ -65,6 +66,7 @@ fn parse_args() -> Args {
         reps: 2,
         verify: false,
         gpu: false,
+        unit_bytes: 0,
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -78,6 +80,7 @@ fn parse_args() -> Args {
             "--reps" => args.reps = value().parse().expect("--reps integer"),
             "--verify" => args.verify = true,
             "--gpu" => args.gpu = true,
+            "--unit-bytes" => args.unit_bytes = value().parse().expect("--unit-bytes integer"),
             other => panic!("unknown argument {other}"),
         }
     }
@@ -150,11 +153,40 @@ fn main() {
                         let base = GIB + (run_index % slots) * region;
                         run_index += 1;
                         drop_cache(&buffered, base, region);
+                        // Shuffled unit slots of this run's region (scattered mode only).
+                        let unit_slots = match args.unit_bytes {
+                            0 => 0,
+                            unit => region as usize / unit,
+                        };
+                        let mut order: Vec<usize> = (0..unit_slots).collect();
+                        let mut state = 0x9e37_79b9_7f4a_7c15u64 ^ run_index;
+                        for i in (1..order.len()).rev() {
+                            state ^= state << 13;
+                            state ^= state >> 7;
+                            state ^= state << 17;
+                            order.swap(i, state as usize % (i + 1));
+                        }
                         let started = Instant::now();
                         let (mut direct, mut total) = (0u64, 0u64);
                         for call in 0..calls {
-                            let offset = base + (call * range) as u64;
-                            if offset + range as u64 > file_len {
+                            // (file offset, len, destination offset) of each copy of this call.
+                            let spans: Vec<(u64, usize, usize)> = if args.unit_bytes == 0 {
+                                vec![(base + (call * range) as u64, range, 0)]
+                            } else {
+                                // Scattered units, like the expert-unit spans of an EP load.
+                                let per_call = (range / args.unit_bytes).max(1);
+                                (0..per_call)
+                                    .map(|i| {
+                                        let slot = order[(call * per_call + i) % order.len()];
+                                        (
+                                            base + (slot * args.unit_bytes) as u64,
+                                            args.unit_bytes,
+                                            i * args.unit_bytes,
+                                        )
+                                    })
+                                    .collect()
+                            };
+                            if spans.iter().any(|s| s.0 + s.1 as u64 > file_len) {
                                 break;
                             }
                             let stats: DirectReadStats = match dest {
@@ -164,22 +196,29 @@ fn main() {
                                     } else {
                                         host_ptr
                                     };
-                                    let copies = [HostRangeCopy {
-                                        file_offset: offset,
-                                        len: range,
-                                        dst,
-                                    }];
-                                    // SAFETY: `dst` is `range` writable bytes owned by this call.
+                                    let copies: Vec<_> = spans
+                                        .iter()
+                                        .map(|&(file_offset, len, at)| HostRangeCopy {
+                                            file_offset,
+                                            len,
+                                            // SAFETY: `at + len` stays inside the `range`-byte owner.
+                                            dst: unsafe { dst.add(at) },
+                                        })
+                                        .collect();
+                                    // SAFETY: the copies are disjoint writable bytes of `dst`.
                                     unsafe { read_ranges_into_host(&source, &copies, tuning) }
                                         .expect("read")
                                 }
                                 _ => {
-                                    let copies = [DeviceRangeCopy {
-                                        file_offset: offset,
-                                        len: range,
-                                        dst: device_buf.as_ref().unwrap(),
-                                        dst_offset: 0,
-                                    }];
+                                    let copies: Vec<_> = spans
+                                        .iter()
+                                        .map(|&(file_offset, len, at)| DeviceRangeCopy {
+                                            file_offset,
+                                            len,
+                                            dst: device_buf.as_ref().unwrap(),
+                                            dst_offset: at,
+                                        })
+                                        .collect();
                                     upload_ranges_to_device(
                                         gpu.as_mut().unwrap(),
                                         &source,

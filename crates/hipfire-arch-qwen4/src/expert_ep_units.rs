@@ -702,6 +702,14 @@ pub enum UnitTier {
     Host,
 }
 
+/// Which of a layer's two shipped aggregate expert stacks a span belongs to
+/// ([`EpUnitLayerMap::gather_arena_mq4_planar_fetched`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShippedStack {
+    GateUp,
+    Down,
+}
+
 /// Position of one owned expert inside its tier's arena.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UnitSlot {
@@ -898,6 +906,76 @@ impl EpUnitLayerMap {
             )
             .map_err(|error| format!("layer {} expert {expert} down: {error}", self.layer))?;
         }
+        Ok(arena)
+    }
+
+    /// [`Self::gather_arena_mq4_planar`] with the shipped bytes of the owned experts of `tier`
+    /// supplied by `fetch` instead of two mapped stacks, and the planar repack run on every
+    /// core. `fetch(spans, scratch)` must fill `scratch` with the `spans` back to back, in
+    /// order; the spans are, per owned expert in ascending id, its shipped gate/up bytes then its
+    /// shipped down bytes: `(stack, byte offset inside that stack, len)` (expert `e` of a stack
+    /// sits at `e * per-expert shipped bytes`). The loader's `fetch` is one parallel `O_DIRECT`
+    /// read of every span; the arena bytes are identical to [`Self::gather_arena_mq4_planar`]
+    /// over the same stacks (each slot is an independent repack of its own two spans).
+    pub fn gather_arena_mq4_planar_fetched(
+        &self,
+        tier: UnitTier,
+        fetch: impl FnOnce(&[(ShippedStack, usize, usize)], &mut [u8]) -> Result<(), String>,
+    ) -> Result<Vec<u8>, String> {
+        use hipfire_runtime::mq4_planar::{
+            repack_tensor, shipped_bytes, Mq4PlanarKind, FLASH_NEXT_DOWN, FLASH_NEXT_GATE_UP,
+        };
+        use rayon::prelude::*;
+        let (gu_rows, gu_k) = FLASH_NEXT_GATE_UP;
+        let (dn_rows, dn_k) = FLASH_NEXT_DOWN;
+        let gu_src =
+            shipped_bytes(Mq4PlanarKind::GateUp, gu_rows, gu_k).map_err(|e| e.to_string())?;
+        let dn_src =
+            shipped_bytes(Mq4PlanarKind::Down, dn_rows, dn_k).map_err(|e| e.to_string())?;
+        let owned: Vec<usize> = self
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.is_some_and(|slot| slot.tier == tier))
+            .map(|(expert, _)| expert)
+            .collect();
+        debug_assert!(owned.len() == self.count(tier));
+        for (position, &expert) in owned.iter().enumerate() {
+            if self.slots[expert].map(|slot| slot.slot) != Some(position) {
+                return Err(format!(
+                    "EP unit arena layer {}: expert {expert} is not slot {position} of {tier:?}",
+                    self.layer
+                ));
+            }
+        }
+        let spans: Vec<(ShippedStack, usize, usize)> = owned
+            .iter()
+            .flat_map(|&expert| {
+                [
+                    (ShippedStack::GateUp, expert * gu_src, gu_src),
+                    (ShippedStack::Down, expert * dn_src, dn_src),
+                ]
+            })
+            .collect();
+        let mut scratch = vec![0u8; owned.len() * (gu_src + dn_src)];
+        fetch(&spans, &mut scratch)?;
+        let mut arena = vec![0u8; self.arena_entry_bytes(tier)];
+        let n = owned.len();
+        let (gate_up_block, rest) = arena.split_at_mut(n * self.gate_up_bytes);
+        let down_block = &mut rest[..n * self.down_bytes];
+        gate_up_block
+            .par_chunks_mut(self.gate_up_bytes.max(1))
+            .zip(down_block.par_chunks_mut(self.down_bytes.max(1)))
+            .zip(scratch.par_chunks(gu_src + dn_src))
+            .zip(owned.par_iter())
+            .try_for_each(|(((gu_dst, dn_dst), src), &expert)| {
+                let (gu, dn) = src.split_at(gu_src);
+                repack_tensor(Mq4PlanarKind::GateUp, gu_rows, gu_k, gu, gu_dst).map_err(
+                    |error| format!("layer {} expert {expert} gate/up: {error}", self.layer),
+                )?;
+                repack_tensor(Mq4PlanarKind::Down, dn_rows, dn_k, dn, dn_dst)
+                    .map_err(|error| format!("layer {} expert {expert} down: {error}", self.layer))
+            })?;
         Ok(arena)
     }
 }
@@ -2259,6 +2337,81 @@ mod planar_arena_tests {
         // A source stack of the wrong (planar) size is refused.
         assert!(map
             .gather_arena_mq4_planar(UnitTier::Vram, &gate_up_all[1..], &down_all)
+            .is_err());
+    }
+
+    #[test]
+    fn fetched_planar_gather_is_byte_identical_to_the_mapped_gather() {
+        let (gr, gk) = FLASH_NEXT_GATE_UP;
+        let (dr, dk) = FLASH_NEXT_DOWN;
+        let g = EpUnitGeometry {
+            layers: 1,
+            experts_per_layer: EXPERTS,
+            ranks: 2,
+            gate_up_bytes: planar_bytes(Mq4PlanarKind::GateUp, gr, gk).unwrap() as u64,
+            down_bytes: planar_bytes(Mq4PlanarKind::Down, dr, dk).unwrap() as u64,
+        };
+        let ids: Vec<u32> = vec![0, 2, 4, 1, 3, 5];
+        let budget = g.unit_bytes() + 2 * VRAM_ARENA_TAIL_PAD_BYTES;
+        let plan = place_routed_experts_units(
+            &g,
+            &EpUnitSource::Ranking {
+                ranking: EpRanking {
+                    rank: &ids,
+                    counts: None,
+                    sha256: None,
+                },
+                rank_budget_bytes: vec![budget; 2],
+            },
+        )
+        .unwrap();
+        let (mut gate_up_all, mut down_all) = (Vec::new(), Vec::new());
+        for expert in 0..EXPERTS {
+            gate_up_all.extend(symmetric_stack(
+                Mq4PlanarKind::GateUp,
+                gr,
+                gk,
+                11 + expert as u64,
+            ));
+            down_all.extend(symmetric_stack(
+                Mq4PlanarKind::Down,
+                dr,
+                dk,
+                97 + expert as u64,
+            ));
+        }
+        for rank in 0..2 {
+            let map = plan.layer_map(rank, 0);
+            for tier in [UnitTier::Vram, UnitTier::Host] {
+                let want = map
+                    .gather_arena_mq4_planar(tier, &gate_up_all, &down_all)
+                    .unwrap();
+                let mut calls = 0;
+                let got = map
+                    .gather_arena_mq4_planar_fetched(tier, |spans, scratch| {
+                        calls += 1;
+                        let mut at = 0;
+                        for &(stack, offset, len) in spans {
+                            let from = match stack {
+                                ShippedStack::GateUp => &gate_up_all,
+                                ShippedStack::Down => &down_all,
+                            };
+                            scratch[at..at + len].copy_from_slice(&from[offset..offset + len]);
+                            at += len;
+                        }
+                        assert_eq!(at, scratch.len());
+                        assert_eq!(spans.len(), 2 * map.count(tier));
+                        Ok(())
+                    })
+                    .unwrap();
+                assert_eq!(calls, 1);
+                assert_eq!(got, want, "rank {rank} {tier:?}");
+            }
+        }
+        // A failing fetch fails the gather.
+        let map = plan.layer_map(0, 0);
+        assert!(map
+            .gather_arena_mq4_planar_fetched(UnitTier::Vram, |_, _| Err("boom".into()))
             .is_err());
     }
 }

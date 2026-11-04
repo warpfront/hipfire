@@ -173,6 +173,12 @@ impl DirectSource {
         self.direct.is_some()
     }
 
+    /// Advise the kernel to drop `offset..offset + len` of the file from the page cache
+    /// (benchmarks and cold-load tests; mapped or dirty pages stay).
+    pub fn drop_cached_range(&self, offset: usize, len: usize) {
+        advise_dontneed(&self.buffered, offset, len);
+    }
+
     pub fn file_identity(&self) -> &crate::model_source::SourceFileIdentity {
         &self.identity
     }

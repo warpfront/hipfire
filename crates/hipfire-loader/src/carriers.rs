@@ -8569,11 +8569,18 @@ fn load_qwen4_rank_unscoped(
     let weights_started = std::time::Instant::now();
     let payload_source = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
         // A mixed layer's arena entries are gathered from the layer's full
-        // stacks (read by their original names), before the by-name read.
+        // stacks (read by their original names, or by parallel direct reads
+        // of the owned experts' spans), before the by-name read.
         if let (Some(units), Some(placement)) = (&ep_units, ep) {
-            if let Some(payload) =
-                crate::qwen4_slab::qwen4_unit_arena_payload(&source, units, placement.rank, entry)
-            {
+            if let Some(payload) = crate::qwen4_slab::qwen4_unit_arena_payload(
+                &source,
+                units,
+                placement.rank,
+                entry,
+                direct_source
+                    .as_ref()
+                    .filter(|_| hipfire_config::memory::ep_gather_direct()),
+            ) {
                 return payload;
             }
         }
