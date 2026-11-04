@@ -48,7 +48,9 @@ const HC_RANK: usize = 320;
 const SHARED_N: usize = 640;
 const SHARD_N: usize = 384;
 const MAXR: usize = 64;
-const REP_ROWS: [usize; 17] = [1, 2, 7, 8, 9, 10, 15, 16, 17, 24, 30, 31, 32, 33, 48, 63, 64];
+const REP_ROWS: [usize; 17] = [
+    1, 2, 7, 8, 9, 10, 15, 16, 17, 24, 30, 31, 32, 33, 48, 63, 64,
+];
 const BENCH_ROWS: [usize; 6] = [8, 16, 24, 30, 32, 48];
 const CALLS_PER_SAMPLE: usize = 20;
 
@@ -160,7 +162,9 @@ impl Hfq {
             return Err(format!("{name}: not BF16 (quant type {qt})"));
         }
         if shape.as_slice() != [rows as u32, cols as u32] || *size as usize != rows * cols * 2 {
-            return Err(format!("{name}: shape {shape:?} / size {size} != [{rows}, {cols}]"));
+            return Err(format!(
+                "{name}: shape {shape:?} / size {size} != [{rows}, {cols}]"
+            ));
         }
         let mut buf = vec![0u8; *size as usize];
         self.file
@@ -184,9 +188,21 @@ fn real_layer(h: &Hfq, l: usize) -> Result<Layer, String> {
     Ok(Layer {
         router: h.bf16(&format!("{p}.gate.weight"), 512, HIDDEN)?,
         selector: h.bf16(&format!("{p}.shared_expert_gate.weight"), 1, HIDDEN)?,
-        sgate: h.bf16(&format!("{p}.shared_expert.gate_proj.weight"), SHARED_N, HIDDEN)?,
-        sup: h.bf16(&format!("{p}.shared_expert.up_proj.weight"), SHARED_N, HIDDEN)?,
-        sdown: h.bf16(&format!("{p}.shared_expert.down_proj.weight"), HIDDEN, SHARED_N)?,
+        sgate: h.bf16(
+            &format!("{p}.shared_expert.gate_proj.weight"),
+            SHARED_N,
+            HIDDEN,
+        )?,
+        sup: h.bf16(
+            &format!("{p}.shared_expert.up_proj.weight"),
+            SHARED_N,
+            HIDDEN,
+        )?,
+        sdown: h.bf16(
+            &format!("{p}.shared_expert.down_proj.weight"),
+            HIDDEN,
+            SHARED_N,
+        )?,
     })
 }
 
@@ -532,11 +548,7 @@ fn check_case(
                         let o = alloc_out(gpu, rows * m);
                         run_mr(gpu, arm, &ws[p], &x, &o.live, m, k, rows);
                         let bad = mismatches(&fetch(gpu, &o), &expected(&refs[p][..rows * m], 0));
-                        rep.record(
-                            &format!("{label} mr[m={m}] {}", arm.name()),
-                            &detail,
-                            bad,
-                        );
+                        rep.record(&format!("{label} mr[m={m}] {}", arm.name()), &detail, bad);
                         free_outs(gpu, vec![o]);
                     }
                 }
@@ -558,7 +570,8 @@ fn launches(gpu: &mut Gpu, f: impl FnOnce(&mut Gpu)) -> usize {
     gpu.hip.device_synchronize().expect("sync");
     let stream = gpu.active_stream.as_ref().expect("capture stream");
     hip(
-        gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id, stream),
+        gpu.graphs
+            .begin_graph_capture(&gpu.hip, gpu.device_id, stream),
         "begin capture",
     );
     f(gpu);
@@ -597,7 +610,8 @@ fn route_proof(gpu: &mut Gpu) {
     );
     for n in &loaded {
         assert!(
-            !n.starts_with("gemv_bf16_xf32_x4_rows_r") && !n.contains("gemm_bf16_xf32_multirow_pto2"),
+            !n.starts_with("gemv_bf16_xf32_x4_rows_r")
+                && !n.contains("gemm_bf16_xf32_multirow_pto2"),
             "flag on: incumbent {n} was loaded"
         );
     }
@@ -623,7 +637,11 @@ fn route_proof(gpu: &mut Gpu) {
         });
     }
     set_allrows(gpu, true);
-    assert_eq!(counts[0], 30usize.div_ceil(8), "flag off x4 launches at 30 rows");
+    assert_eq!(
+        counts[0],
+        30usize.div_ceil(8),
+        "flag off x4 launches at 30 rows"
+    );
     assert_eq!(counts[2], 1, "flag on x4 launches at 30 rows");
     assert_eq!(counts[3], 1, "flag on multirow launches at 30 rows");
     println!(
@@ -708,7 +726,15 @@ fn controls(gpu: &mut Gpu, rep: &mut Report, router: &[u8], rng: &mut Rng) -> us
 // ---- HC k4 projection (HIPFIRE_QWEN4_HC_K4_ALLROWS) ----------------------------
 
 /// One HC tensor of a layer block (`input_mix_weight_down` `[320, 10240]` or `..._up` `[10240, 320]`).
-fn hc_tensor(h: &Option<Hfq>, l: usize, blk: &str, which: &str, m: usize, k: usize, rng: &mut Rng) -> (Vec<u8>, bool) {
+fn hc_tensor(
+    h: &Option<Hfq>,
+    l: usize,
+    blk: &str,
+    which: &str,
+    m: usize,
+    k: usize,
+    rng: &mut Rng,
+) -> (Vec<u8>, bool) {
     if let Some(h) = h {
         let name = format!("model.language_model.layers.{l}.{blk}_hyper_connection.input_mix_weight_{which}.weight");
         match h.bf16(&name, m, k) {
@@ -744,7 +770,11 @@ impl HcArm {
             HcArm::Lane => "lane_t8".into(),
             HcArm::Routed => "allrows_routed".into(),
             HcArm::Direct(t, tpb) => {
-                format!("direct_{}_tpb{tpb}", t.entry().trim_start_matches("gemv_bf16_xf32_k4_rows_allrows_"))
+                format!(
+                    "direct_{}_tpb{tpb}",
+                    t.entry()
+                        .trim_start_matches("gemv_bf16_xf32_k4_rows_allrows_")
+                )
             }
         }
     }
@@ -783,11 +813,26 @@ fn run_hc(
 }
 
 /// Per-row `gemv_bf16_xf32_k4` singleton over `nrows` rows: `[nrows * m]` words.
-fn hc_reference(gpu: &mut Gpu, w: &GpuTensor, x: &GpuTensor, m: usize, k: usize, act: Option<f32>, nrows: usize) -> Vec<u32> {
+fn hc_reference(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    m: usize,
+    k: usize,
+    act: Option<f32>,
+    nrows: usize,
+) -> Vec<u32> {
     let o = alloc_out(gpu, nrows * m);
     for r in 0..nrows {
         hip(
-            gpu.gemv_bf16_xf32_k4(w, &x.sub_offset(r * k, k), &o.live.sub_offset(r * m, m), m, k, act),
+            gpu.gemv_bf16_xf32_k4(
+                w,
+                &x.sub_offset(r * k, k),
+                &o.live.sub_offset(r * m, m),
+                m,
+                k,
+                act,
+            ),
             "k4 singleton",
         );
     }
@@ -879,7 +924,11 @@ fn hc_controls(gpu: &mut Gpu, rep: &mut Report, down: &[u8], rng: &mut Rng) -> u
     let o = alloc_out(gpu, (rows + 1) * m);
     run(gpu, &poisoned, &o.live, k, rows);
     let bad = mismatches(&fetch(gpu, &o), &expected(&want, m));
-    rep.record("HC pad row: rows live, pad output untouched", "rows=30", bad);
+    rep.record(
+        "HC pad row: rows live, pad output untouched",
+        "rows=30",
+        bad,
+    );
     free_outs(gpu, vec![o]);
     let o = alloc_out(gpu, (rows + 1) * m);
     run(gpu, &poisoned, &o.live, k, rows + 1);
@@ -894,11 +943,17 @@ fn hc_controls(gpu: &mut Gpu, rep: &mut Report, down: &[u8], rng: &mut Rng) -> u
     free_outs(gpu, vec![o]);
     let o = alloc_out(gpu, rows * m);
     run(gpu, &clean.sub_offset(k, rows * k), &o.live, k, rows);
-    report("row offset", mismatches(&fetch(gpu, &o)[GUARD..GUARD + rows * m], &want));
+    report(
+        "row offset",
+        mismatches(&fetch(gpu, &o)[GUARD..GUARD + rows * m], &want),
+    );
     free_outs(gpu, vec![o]);
     let o = alloc_out(gpu, rows * m);
     run(gpu, &clean, &o.live, k - 32, rows);
-    report("wrong K", mismatches(&fetch(gpu, &o)[GUARD..GUARD + rows * m], &want));
+    report(
+        "wrong K",
+        mismatches(&fetch(gpu, &o)[GUARD..GUARD + rows * m], &want),
+    );
     free_outs(gpu, vec![o]);
     for t in [w, clean, poisoned] {
         let _ = gpu.free_tensor(t);
@@ -919,12 +974,20 @@ fn hc_route_proof(gpu: &mut Gpu) {
     }
     let loaded = gpu.loaded_kernel_names();
     assert!(
-        loaded.iter().any(|n| n.starts_with("gemv_bf16_xf32_k4_rows_allrows_")),
+        loaded
+            .iter()
+            .any(|n| n.starts_with("gemv_bf16_xf32_k4_rows_allrows_")),
         "flag on: no all-rows k4 entry loaded"
     );
-    let n_on = launches(gpu, |g| run_hc(g, HcArm::Routed, &w, &x, &y.live, m, k, Some(0.25), rows));
-    let n_group = launches(gpu, |g| run_hc(g, HcArm::Group, &w, &x, &y.live, m, k, Some(0.25), rows));
-    let n_lane = launches(gpu, |g| run_hc(g, HcArm::Lane, &w, &x, &y.live, m, k, Some(0.25), rows));
+    let n_on = launches(gpu, |g| {
+        run_hc(g, HcArm::Routed, &w, &x, &y.live, m, k, Some(0.25), rows)
+    });
+    let n_group = launches(gpu, |g| {
+        run_hc(g, HcArm::Group, &w, &x, &y.live, m, k, Some(0.25), rows)
+    });
+    let n_lane = launches(gpu, |g| {
+        run_hc(g, HcArm::Lane, &w, &x, &y.live, m, k, Some(0.25), rows)
+    });
     assert_eq!(n_on, 1, "routed HC k4 at 30 rows is one launch");
     println!(
         "bf16_allrows_oracle: HC route proof ok; launches at 30 rows: group (tiled r8 + tail) {n_group}, lane_t8 {n_lane}, all-rows {n_on}"
@@ -1017,7 +1080,11 @@ impl Bench {
     }
 
     fn x(&self, i: usize) -> &GpuTensor {
-        if i == 4 { &self.xd } else { &self.xg }
+        if i == 4 {
+            &self.xd
+        } else {
+            &self.xg
+        }
     }
 
     fn mr(&self, gpu: &mut Gpu, i: usize, rows: usize) {
@@ -1039,7 +1106,12 @@ impl Bench {
         let ys: Vec<&GpuTensor> = idx.iter().map(|&i| &self.o[i].live).collect();
         let ms: Vec<usize> = idx.iter().map(|&i| BENCH_M[i]).collect();
         hip(
-            gpu.gemv_bf16_xf32_x4_rows(parts4(&ws, &ys, &ms), self.x(idx[0]), BENCH_K[idx[0]], rows),
+            gpu.gemv_bf16_xf32_x4_rows(
+                parts4(&ws, &ys, &ms),
+                self.x(idx[0]),
+                BENCH_K[idx[0]],
+                rows,
+            ),
             "bench x4",
         );
     }
@@ -1127,7 +1199,9 @@ fn bench(gpu: &mut Gpu, layer: &Layer, reps: usize, rng: &mut Rng) {
             ms(16, 48, true)
         );
     }
-    println!("bf16_allrows_oracle: tile sweep (direct tile entries, us per call, best per row marked *)");
+    println!(
+        "bf16_allrows_oracle: tile sweep (direct tile entries, us per call, best per row marked *)"
+    );
     let shapes: [(&str, &[usize]); 4] = [
         ("router 512x2560", &[0]),
         ("gate 384x2560", &[2]),
@@ -1138,7 +1212,11 @@ fn bench(gpu: &mut Gpu, layer: &Layer, reps: usize, rng: &mut Rng) {
         println!("{name}");
         print!("| rows |");
         for tile in Bf16AllRowsTile::ALL {
-            print!(" {} |", tile.entry().trim_start_matches("gemv_bf16_xf32_x4_rows_allrows_"));
+            print!(
+                " {} |",
+                tile.entry()
+                    .trim_start_matches("gemv_bf16_xf32_x4_rows_allrows_")
+            );
         }
         println!(" pick |");
         println!("|---:|{}---|", "---:|".repeat(Bf16AllRowsTile::ALL.len()));
@@ -1183,7 +1261,11 @@ fn hc_bench(gpu: &mut Gpu, down: &[u8], reps: usize, rng: &mut Rng) {
             run_hc(g, arm, &wg, &xv, &og.live, 4, HC_K, None, rows);
         }
     };
-    let names = ["HC down 320x10240", "HC gate 4x10240", "HC set (down + gate)"];
+    let names = [
+        "HC down 320x10240",
+        "HC gate 4x10240",
+        "HC set (down + gate)",
+    ];
     println!("bf16_allrows_oracle: HC k4 bench (graph replay, median of {reps} x {CALLS_PER_SAMPLE} calls)");
     println!("| case | rows | off us | on us | speedup | launches off->on |");
     println!("|---|---:|---:|---:|---:|---|");
@@ -1200,7 +1282,11 @@ fn hc_bench(gpu: &mut Gpu, down: &[u8], reps: usize, rng: &mut Rng) {
             }
             println!(
                 "| {name} | {rows} | {:.2} | {:.2} | {:.3}x | {}->{} |",
-                us[0], us[1], us[0] / us[1], n[0], n[1]
+                us[0],
+                us[1],
+                us[0] / us[1],
+                n[0],
+                n[1]
             );
         }
     }
@@ -1210,7 +1296,10 @@ fn hc_bench(gpu: &mut Gpu, down: &[u8], reps: usize, rng: &mut Rng) {
     };
     println!(
         "  HC set: 8->30 off {:.4} on {:.4} ms/row | 16->48 off {:.4} on {:.4} ms/row",
-        ms(8, 30, false), ms(8, 30, true), ms(16, 48, false), ms(16, 48, true)
+        ms(8, 30, false),
+        ms(8, 30, true),
+        ms(16, 48, false),
+        ms(16, 48, true)
     );
     println!("bf16_allrows_oracle: HC tile sweep (direct entries, us per call, best per row marked *; columns tile/tpb)");
     let shapes: [(&str, usize); 2] = [("HC down 320x10240", 0), ("HC gate 4x10240", 1)];
@@ -1222,14 +1311,20 @@ fn hc_bench(gpu: &mut Gpu, down: &[u8], reps: usize, rng: &mut Rng) {
             .collect();
         print!("| rows | lane_t8 |");
         for (t, p) in &cols {
-            print!(" {}/{p} |", t.entry().trim_start_matches("gemv_bf16_xf32_k4_rows_allrows_"));
+            print!(
+                " {}/{p} |",
+                t.entry()
+                    .trim_start_matches("gemv_bf16_xf32_k4_rows_allrows_")
+            );
         }
         println!(" pick |");
         println!("|---:|{}---|", "---:|".repeat(cols.len() + 1));
         for rows in SWEEP_ROWS {
             let mut us = vec![time_us(gpu, reps, |g| call(g, case, HcArm::Lane, rows))];
             for &(t, p) in &cols {
-                us.push(time_us(gpu, reps, |g| call(g, case, HcArm::Direct(t, p), rows)));
+                us.push(time_us(gpu, reps, |g| {
+                    call(g, case, HcArm::Direct(t, p), rows)
+                }));
             }
             let best = us.iter().copied().fold(f64::INFINITY, f64::min);
             print!("| {rows} |");
@@ -1237,7 +1332,11 @@ fn hc_bench(gpu: &mut Gpu, down: &[u8], reps: usize, rng: &mut Rng) {
                 print!(" {:.2}{} |", v, if *v == best { "*" } else { "" });
             }
             let (pt, pp) = HcK4AllRowsTile::pick(if case == 0 { HC_RANK } else { 4 }, rows);
-            println!(" {}/{pp} |", pt.entry().trim_start_matches("gemv_bf16_xf32_k4_rows_allrows_"));
+            println!(
+                " {}/{pp} |",
+                pt.entry()
+                    .trim_start_matches("gemv_bf16_xf32_k4_rows_allrows_")
+            );
         }
     }
     for tns in [wd, wg, x, od.whole, og.whole] {
@@ -1248,7 +1347,8 @@ fn hc_bench(gpu: &mut Gpu, down: &[u8], reps: usize, rng: &mut Rng) {
 fn main() {
     let mut model = DEFAULT_MODEL.to_string();
     let mut layers: Vec<usize> = vec![0, 23, 47];
-    let (mut seeds, mut synthetic, mut do_bench, mut oracle, mut reps) = (1usize, false, false, true, 7usize);
+    let (mut seeds, mut synthetic, mut do_bench, mut oracle, mut reps) =
+        (1usize, false, false, true, 7usize);
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -1313,7 +1413,11 @@ fn main() {
             let tag = format!("L{l}");
             let gate_k = HIDDEN * 2;
             let (router, selector) = (lay.router.as_slice(), lay.selector.as_slice());
-            let (sgate, sup, sdown) = (lay.sgate.as_slice(), lay.sup.as_slice(), lay.sdown.as_slice());
+            let (sgate, sup, sdown) = (
+                lay.sgate.as_slice(),
+                lay.sup.as_slice(),
+                lay.sdown.as_slice(),
+            );
             let (sgate384, sup384) = (&sgate[..SHARD_N * gate_k], &sup[..SHARD_N * gate_k]);
             let shard = down_shard(sdown);
             let cases: [(&str, Vec<(&[u8], usize)>, usize); 6] = [
@@ -1328,7 +1432,11 @@ fn main() {
                     HIDDEN,
                 ),
                 ("shared-down 2560 K640", vec![(sdown, HIDDEN)], SHARED_N),
-                ("shared-down shard 2560 K384", vec![(shard.as_slice(), HIDDEN)], SHARD_N),
+                (
+                    "shared-down shard 2560 K384",
+                    vec![(shard.as_slice(), HIDDEN)],
+                    SHARD_N,
+                ),
                 (
                     "ragged 37+1+5+130 K2560",
                     vec![
@@ -1352,7 +1460,16 @@ fn main() {
                     ("vector m96 K1536", 96, 1536),
                 ] {
                     let w = synth_bf16(&mut rng, m * k);
-                    check_case(&mut gpu, &mut rep, seeds, "synthetic", label, &[(w.as_slice(), m)], k, &mut rng);
+                    check_case(
+                        &mut gpu,
+                        &mut rep,
+                        seeds,
+                        "synthetic",
+                        label,
+                        &[(w.as_slice(), m)],
+                        k,
+                        &mut rng,
+                    );
                 }
                 let detected = controls(&mut gpu, &mut rep, &lay.router, &mut rng);
                 println!("bf16_allrows_oracle: controls detected: {detected}/3");
@@ -1366,15 +1483,58 @@ fn main() {
             for blk in ["attn", "mlp"] {
                 let (down, real) = hc_tensor(&hfq, l, blk, "down", HC_RANK, HC_K, &mut rng);
                 let (up, _) = hc_tensor(&hfq, l, blk, "up", HC_K, HC_RANK, &mut rng);
-                println!("bf16_allrows_oracle: layer {l} {blk} HC weights: {}", if real { "real" } else { "synthetic" });
+                println!(
+                    "bf16_allrows_oracle: layer {l} {blk} HC weights: {}",
+                    if real { "real" } else { "synthetic" }
+                );
                 let tag = format!("L{l} {blk}");
                 // The decode read (hc_act, 0.25 stream scale) and the raw gate projection.
-                check_hc(&mut gpu, &mut rep, seeds, &format!("{tag} down 320x10240"), &down, HC_RANK, HC_K, Some(0.25), &mut rng);
-                check_hc(&mut gpu, &mut rep, seeds, &format!("{tag} down 320x10240"), &down, HC_RANK, HC_K, None, &mut rng);
+                check_hc(
+                    &mut gpu,
+                    &mut rep,
+                    seeds,
+                    &format!("{tag} down 320x10240"),
+                    &down,
+                    HC_RANK,
+                    HC_K,
+                    Some(0.25),
+                    &mut rng,
+                );
+                check_hc(
+                    &mut gpu,
+                    &mut rep,
+                    seeds,
+                    &format!("{tag} down 320x10240"),
+                    &down,
+                    HC_RANK,
+                    HC_K,
+                    None,
+                    &mut rng,
+                );
                 // The M = 4 write gate shape (first four down rows), K 10240.
-                check_hc(&mut gpu, &mut rep, seeds, &format!("{tag} gate 4x10240"), &down[..4 * HC_K * 2], 4, HC_K, None, &mut rng);
+                check_hc(
+                    &mut gpu,
+                    &mut rep,
+                    seeds,
+                    &format!("{tag} gate 4x10240"),
+                    &down[..4 * HC_K * 2],
+                    4,
+                    HC_K,
+                    None,
+                    &mut rng,
+                );
                 // The generic k4 shape: M 10240, K 320 (part 80).
-                check_hc(&mut gpu, &mut rep, seeds, &format!("{tag} up 10240x320"), &up, HC_K, HC_RANK, Some(0.25), &mut rng);
+                check_hc(
+                    &mut gpu,
+                    &mut rep,
+                    seeds,
+                    &format!("{tag} up 10240x320"),
+                    &up,
+                    HC_K,
+                    HC_RANK,
+                    Some(0.25),
+                    &mut rng,
+                );
                 if i == 0 && blk == "attn" {
                     let detected = hc_controls(&mut gpu, &mut rep, &down, &mut rng);
                     println!("bf16_allrows_oracle: HC controls detected: {detected}/3");
@@ -1405,7 +1565,12 @@ fn main() {
         }
     }
     if do_bench {
-        bench(&mut gpu, bench_layer.as_ref().expect("bench layer"), reps, &mut rng);
+        bench(
+            &mut gpu,
+            bench_layer.as_ref().expect("bench layer"),
+            reps,
+            &mut rng,
+        );
         let (down, _) = hc_tensor(&hfq, layers[0], "attn", "down", HC_RANK, HC_K, &mut rng);
         hc_bench(&mut gpu, &down, reps, &mut rng);
     }

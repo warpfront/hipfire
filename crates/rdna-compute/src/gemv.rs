@@ -22058,7 +22058,9 @@ impl Gpu {
     ) -> HipResult<()> {
         let bad = |msg: &str| Err(hip_bridge::HipError::new(1, msg));
         if !self.flags.qwen4_hc_k4_allrows_enabled() {
-            return bad("gemv_bf16_xf32_k4_rows_allrows needs HIPFIRE_QWEN4_HC_K4_ALLROWS on gfx1201");
+            return bad(
+                "gemv_bf16_xf32_k4_rows_allrows needs HIPFIRE_QWEN4_HC_K4_ALLROWS on gfx1201",
+            );
         }
         if !k.is_multiple_of(32)
             || k == 0
@@ -22068,9 +22070,13 @@ impl Gpu {
             || !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
             || !HcK4AllRowsTile::TOKEN_TILES.contains(&tpb)
         {
-            return bad("gemv_bf16_xf32_k4_rows_allrows needs K % 32 == 0, 1..=64 rows, tpb 16/32/64");
+            return bad(
+                "gemv_bf16_xf32_k4_rows_allrows needs K % 32 == 0, 1..=64 rows, tpb 16/32/64",
+            );
         }
-        if weight.buf.size() < m * k * 2 || x.buf.size() < rows * k * 4 || y.buf.size() < rows * m * 4
+        if weight.buf.size() < m * k * 2
+            || x.buf.size() < rows * k * 4
+            || y.buf.size() < rows * m * 4
         {
             return bad("gemv_bf16_xf32_k4_rows_allrows weight / x / y views too small");
         }
@@ -24376,19 +24382,24 @@ impl Gpu {
     ) -> HipResult<()> {
         let bad = |msg: &str| Err(hip_bridge::HipError::new(1, msg));
         if !self.flags.qwen4_bf16_allrows_enabled() {
-            return bad("gemv_bf16_xf32_x4_rows_allrows needs HIPFIRE_QWEN4_BF16_ALLROWS on gfx1201");
+            return bad(
+                "gemv_bf16_xf32_x4_rows_allrows needs HIPFIRE_QWEN4_BF16_ALLROWS on gfx1201",
+            );
         }
         if !(1..=WIDE_VERIFY_MAX_ROWS).contains(&rows) || k == 0 || k > i32::MAX as usize {
             return bad("gemv_bf16_xf32_x4_rows_allrows needs 1..=64 rows and 0 < K <= i32::MAX");
         }
-        if parts.iter().all(|&(_, _, m)| m == 0) || parts.iter().any(|&(_, _, m)| m > i32::MAX as usize)
+        if parts.iter().all(|&(_, _, m)| m == 0)
+            || parts.iter().any(|&(_, _, m)| m > i32::MAX as usize)
         {
             return bad("gemv_bf16_xf32_x4_rows_allrows needs a part with 0 < m <= i32::MAX");
         }
         if !x4_rows_fit(&parts, x, k, rows)
             || parts.iter().any(|&(w, _, m)| w.buf.size() < m * k * 2)
         {
-            return bad("gemv_bf16_xf32_x4_rows_allrows weight / x / y views too small for the rows");
+            return bad(
+                "gemv_bf16_xf32_x4_rows_allrows weight / x / y views too small for the rows",
+            );
         }
         self.bind_thread()?;
         let func = tile.entry();
