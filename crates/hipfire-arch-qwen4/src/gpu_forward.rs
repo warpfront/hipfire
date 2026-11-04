@@ -6838,6 +6838,8 @@ pub(crate) struct Qwen4ExpertStage {
     /// EP only: this rank's sealed compact slot of every expert, per MoE layer
     /// (empty below the first host layer); `None` on a single card.
     ep_slots: Option<Vec<Vec<Option<usize>>>>,
+    /// EP rank of this stage (0 on a single card), for receipts.
+    ep_rank: usize,
     bytes: [usize; 2],
     copy_stream: hip_bridge::Stream,
     ready: Vec<hip_bridge::Event>,
@@ -7156,6 +7158,7 @@ impl Qwen4ExpertStage {
             },
             first_host,
             ep_slots,
+            ep_rank: bundle.weights.ep_placement().map_or(0, |placement| placement.rank),
             bytes,
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
