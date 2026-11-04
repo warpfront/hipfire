@@ -8064,6 +8064,14 @@ pub const QWEN4_GEMV_BF16_XF32_OTILE_SRC: &str =
 /// incumbent `gemv_bf16_xf32_row_multi` / `_k4_rows_body` device arithmetic verbatim.
 pub const QWEN4_GEMV_BF16_XF32_LANE_ALLROWS_SRC: &str =
     include_str!("../../../kernels/src/qwen4_gemv_bf16_xf32_lane_allrows.gfx1201.hip");
+/// Module `qwen4_gemv_bf16_xf32_allrows` (`HIPFIRE_QWEN4_BF16_ALLROWS`, default on, `=0` kills
+/// it, exact gfx1201): `gemv_bf16_xf32_x4_rows_allrows_m<TM>t<TN>`, up to four BF16 matrices over
+/// 9..=64 activation rows in ONE launch (the MoE call's router, selector, shared gate/up and shared
+/// down). Each output is bitwise the single-row `gemv_bf16_xf32` value (verbatim per-lane chains,
+/// fold and shuffle tree); weights are loaded once per output tile and applied to every row.
+/// Standalone source.
+pub const QWEN4_GEMV_BF16_XF32_ALLROWS_SRC: &str =
+    include_str!("../../../kernels/src/qwen4_gemv_bf16_xf32_allrows.gfx1201.hip");
 /// Module `qsa_pooled_bf16_mirror` (`HIPFIRE_QWEN4_QSA_POOLED_BF16`, exact
 /// gfx1151): `qsa_pooled_f32_to_bf16_mirror`, the lossless high-half copy of
 /// the BF16-rounded F32 pooled index keys, and the lab exactness probe

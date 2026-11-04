@@ -196,6 +196,27 @@ pub fn qwen4_set_ep_auto_prefill_chunk(rows: Option<usize>) {
     EP_AUTO_PREFILL_CHUNK_ROWS.store(rows.unwrap_or(0), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether the compact forward scratch plan of this process keeps `MoeYDownGrouped` OUT of the phase
+/// arena, as its own allocation (the exchange root). An expert-parallel owner-routed prefill chunk
+/// has each rank's peer read the BF16 grouped down rows of its owned tiles between the rank's
+/// producer event and the peer's done event ([`MoeTileExchange`]); the arena would hand those bytes
+/// to the next phase's fields while the peer may still be reading, so the tile route needs a root of
+/// its own. Set by the EP loader ([`qwen4_set_ep_dedicated_exchange_root`]) before any plan or census
+/// is taken and cleared by every Qwen4 load, so the planner, every rank's allocation and the census
+/// agree and a single-device load never carries it.
+static EP_DEDICATED_EXCHANGE_ROOT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Set or clear [`EP_DEDICATED_EXCHANGE_ROOT`].
+pub fn qwen4_set_ep_dedicated_exchange_root(on: bool) {
+    EP_DEDICATED_EXCHANGE_ROOT.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the compact plan gives `MoeYDownGrouped` its own allocation ([`EP_DEDICATED_EXCHANGE_ROOT`]).
+pub(crate) fn qwen4_ep_dedicated_exchange_root() -> bool {
+    EP_DEDICATED_EXCHANGE_ROOT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The expert-parallel auto-fit chunk, if the load chose one.
 pub fn qwen4_ep_auto_prefill_chunk() -> Option<usize> {
     match EP_AUTO_PREFILL_CHUNK_ROWS.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3904,9 +3925,14 @@ impl Qwen4TileRoute {
         } else if !gpu.flags.moe_grouped_gemm || !gpu.qwen4_moe_sym_iu4_requested() {
             return refuse("the symmetric IU4 route is not requested");
         }
-        if mode != Qwen4ForwardScratchMode::Full {
+        if mode != Qwen4ForwardScratchMode::Full
+            && !qwen4_ep_dedicated_exchange_root()
+            && !crate::weights::trunk_shard::trunk_shard_requested()
+        {
             // The compact plan lends `y_down_grouped` to a phase-disjoint field the peer
-            // would be reading.
+            // would be reading. An EP compact load plans it as its own root
+            // (`qwen4_set_ep_dedicated_exchange_root`); under the trunk shard no peer ever reads
+            // it (the route only masks tiles, the FFN partial is folded by the all-reduce).
             return refuse("the compact scratch plan aliases y_down_grouped");
         }
         // Grouping scratch (gfx1100) or the full sym scratch (gfx1201) before the mesh enables
@@ -7804,6 +7830,17 @@ pub(crate) fn compact_arena_groups(
     max_chunk: usize,
     slots: &[ScratchSlot],
 ) -> Result<Vec<Vec<(ScratchField, usize, Option<usize>)>>, Qwen4GpuForwardError> {
+    compact_arena_groups_root(config, max_chunk, slots, false)
+}
+
+/// [`compact_arena_groups`] with `own_exchange_root`: `MoeYDownGrouped` is not a member of the MoE
+/// group (an EP compact plan allocates it on its own, [`EP_DEDICATED_EXCHANGE_ROOT`]).
+pub(crate) fn compact_arena_groups_root(
+    config: &Qwen4Config,
+    max_chunk: usize,
+    slots: &[ScratchSlot],
+    own_exchange_root: bool,
+) -> Result<Vec<Vec<(ScratchField, usize, Option<usize>)>>, Qwen4GpuForwardError> {
     use ScratchField as F;
     let layout = Qwen4ScratchLayout::for_rows(program_dims(config), max_chunk)
         .map_err(|error| invalid(error.to_string()))?;
@@ -7859,6 +7896,8 @@ pub(crate) fn compact_arena_groups(
         (F::PleValue, layout.hidden),
         (F::PleNormedWide, layout.wide),
     ])?);
+    // Under an EP compact load `MoeYDownGrouped` is the tile exchange's root (a peer reads it after
+    // this rank's down): it keeps its own allocation instead of arena offset 0.
     groups.push(
         [
             F::MoeYDownGrouped,
@@ -7876,6 +7915,7 @@ pub(crate) fn compact_arena_groups(
             F::MoeRotBatch,
         ]
         .iter()
+        .filter(|&&field| !(own_exchange_root && field == F::MoeYDownGrouped))
         .map(|&field| (field, slots[field as usize].elements, None))
         .collect(),
     );
@@ -8061,6 +8101,24 @@ impl Qwen4GpuForwardScratch {
         max_chunk: usize,
         mode: Qwen4ForwardScratchMode,
         scope: &Qwen4BandScope,
+    ) -> Result<(Vec<ScratchSlot>, usize), Qwen4GpuForwardError> {
+        Self::plan_scoped_root(
+            config,
+            max_chunk,
+            mode,
+            scope,
+            qwen4_ep_dedicated_exchange_root(),
+        )
+    }
+
+    /// [`Self::plan_scoped`] with the compact plan's exchange-root choice explicit
+    /// ([`EP_DEDICATED_EXCHANGE_ROOT`]); `Full` ignores it.
+    fn plan_scoped_root(
+        config: &Qwen4Config,
+        max_chunk: usize,
+        mode: Qwen4ForwardScratchMode,
+        scope: &Qwen4BandScope,
+        own_exchange_root: bool,
     ) -> Result<(Vec<ScratchSlot>, usize), Qwen4GpuForwardError> {
         use ScratchField as F;
         if max_chunk == 0 {
@@ -8359,7 +8417,7 @@ impl Qwen4GpuForwardScratch {
             // Phase arena: `Projection` owns one allocation; every field of
             // a step-local group is a view of it at a 64-element-aligned
             // offset.  Groups never run at once, so they overlap.
-            let groups = compact_arena_groups(config, max_chunk, &slots)?;
+            let groups = compact_arena_groups_root(config, max_chunk, &slots, own_exchange_root)?;
             let mut arena = 0usize;
             let mut placed: Vec<(F, usize, Option<usize>)> = Vec::new();
             for group in &groups {
@@ -20392,6 +20450,56 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An EP compact plan (`own_exchange_root`) keeps `MoeYDownGrouped` out of the arena as its own
+    /// BF16-grouped-rows allocation, never shrinks any other field and never touches `Full`.
+    #[test]
+    fn ep_compact_plan_owns_the_exchange_root() {
+        let config = fn_config();
+        let scope = crate::weights::Qwen4BandScope::single(&config);
+        for rows in [512usize, 4096, 16384] {
+            let shared = plan(rows, Mode::FnSymGfx1201);
+            let (own, _) =
+                Scratch::plan_scoped_root(&config, rows, Mode::FnSymGfx1201, &scope, true).unwrap();
+            let down = own[F::MoeYDownGrouped as usize];
+            assert_eq!(down.owner, None, "rows {rows}");
+            assert_eq!(down.offset, 0);
+            assert_eq!(down.pitch, None);
+            assert_eq!(
+                shared[F::MoeYDownGrouped as usize].owner,
+                Some(F::Projection)
+            );
+            assert_eq!(down.elements, shared[F::MoeYDownGrouped as usize].elements);
+            // Every other field is planned exactly as before (same owner, offset, size).
+            for (index, field) in F::ALL.iter().enumerate() {
+                if *field == F::MoeYDownGrouped || *field == F::Projection {
+                    continue;
+                }
+                assert_eq!(own[index].owner, shared[index].owner, "{field:?} at {rows}");
+                assert_eq!(
+                    own[index].elements, shared[index].elements,
+                    "{field:?} at {rows}"
+                );
+            }
+            // The arena only shrinks (the MoE group lost a member), and the dedicated root is
+            // charged on top: the plan costs at most the root's bytes more than the shared plan.
+            assert!(
+                own[F::Projection as usize].elements <= shared[F::Projection as usize].elements
+            );
+            assert!(
+                owned_bytes(&own) <= owned_bytes(&shared) + field_bytes(&own, F::MoeYDownGrouped)
+            );
+            assert!(owned_bytes(&own) >= owned_bytes(&shared));
+            let groups = super::compact_arena_groups_root(&config, rows, &own, true).unwrap();
+            assert!(groups
+                .iter()
+                .flatten()
+                .all(|&(field, _, _)| field != F::MoeYDownGrouped));
+        }
+        let (full_own, _) =
+            Scratch::plan_scoped_root(&config, 4096, Mode::Full, &scope, true).unwrap();
+        assert_eq!(full_own, plan(4096, Mode::Full));
     }
 
     #[test]

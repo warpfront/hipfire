@@ -797,6 +797,7 @@ impl Carrier for Qwen4Carrier {
         // A chunk chosen by an earlier expert-parallel load never leaks into
         // this one: the EP plan below sets it again when it moves the chunk.
         hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(None);
+        hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_dedicated_exchange_root(false);
         self.admit_topology(
             hipfire_arch_qwen4::ARCH_ID,
             src.is_dir(),
@@ -949,7 +950,9 @@ impl Carrier for Qwen4Carrier {
             if let Some(note) = &split.fit_note {
                 eprintln!("{note}");
             }
-            hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(split.chunk_rows);
+            if split.chunk_rows.is_some() {
+                hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(split.chunk_rows);
+            }
             if let Some(reserve_plan) = &plan.ep_reserve {
                 eprintln!("{}", reserve_plan.describe());
             }
@@ -3067,10 +3070,9 @@ pub fn qwen4_ep_vram_layers(
         gpu,
         &config,
     )?;
-    // The plan every rank's `load_qwen4_rank` takes: an expert-parallel load
-    // never takes the compact plan (the owner-routed EP prefill refuses it),
-    // so the reserve charges the `Full` plan.
-    let scratch_mode = hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full;
+    // The plan every rank's `load_qwen4_rank` takes (`qwen4_ep_scratch_mode`: the
+    // `Full` plan unless `HIPFIRE_EP_COMPACT_SCRATCH` admits the compact one).
+    let scratch_mode = qwen4_ep_scratch_mode(gpu, hfq, &config, &manifest)?;
     let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
         crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
             hfq.tensor_data(&entry.name)
@@ -3597,6 +3599,45 @@ const QWEN4_EP_UNIT_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE";
 /// `HIPFIRE_EP_UNIT_RESERVE_SHADOWS=1` (lab, default off): under `HIPFIRE_EP_UNIT_RESERVE=1`, host
 /// the weight shadows in the donor segments (S4) instead of keeping them dedicated VRAM.
 const QWEN4_EP_UNIT_RESERVE_SHADOWS_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE_SHADOWS";
+
+/// `HIPFIRE_EP_COMPACT_SCRATCH` (EpPrefill; developer variable, default ON): an expert-parallel load
+/// takes the compact forward scratch plan (`FnSymGfx1201`, the single-device gfx1201 default) at the
+/// unchanged 4096-row EP chunk. Exact `0` keeps the `Full` plan (as does
+/// `HIPFIRE_QWEN4_COMPACT_SCRATCH=0`, through the shared mode selector). The plan is decided
+/// identically by the planner and by every rank.
+const QWEN4_EP_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_EP_COMPACT_SCRATCH";
+
+/// The EP prefill chunk a compact load keeps (the plan's own default is the 16384 rows that change
+/// greedy output, which owes a KLD check); an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` still wins.
+const QWEN4_EP_COMPACT_CHUNK_ROWS: usize = 4096;
+
+fn qwen4_ep_scratch_mode(
+    gpu: &rdna_compute::Gpu,
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    config: &hipfire_arch_qwen4::config::Qwen4Config,
+    manifest: &hipfire_arch_qwen4::weights::Qwen4Manifest,
+) -> Result<hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode, String> {
+    use hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode;
+    let mode = if hipfire_config::developer_var(QWEN4_EP_COMPACT_SCRATCH_ENV).as_deref() == Ok("0")
+    {
+        Qwen4ForwardScratchMode::Full
+    } else {
+        hipfire_arch_qwen4::artifact::source_forward_scratch_mode(gpu, hfq, config, manifest)
+            .map_err(|error| error.to_string())?
+    };
+    if mode == Qwen4ForwardScratchMode::FnSymGfx1201 {
+        hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(Some(
+            QWEN4_EP_COMPACT_CHUNK_ROWS,
+        ));
+    }
+    // The compact plan under EP owns the tile exchange's root (the arena would alias it) unless
+    // the trunk shard runs: its chunks only mask tiles, no peer ever reads the grouped rows.
+    hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_dedicated_exchange_root(
+        mode == Qwen4ForwardScratchMode::FnSymGfx1201
+            && !hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_requested(),
+    );
+    Ok(mode)
+}
 
 fn qwen4_ep_unit_reserve_on() -> bool {
     hipfire_arch_qwen4::expert_ep_units::ep_unit_reserve_on(
@@ -6476,12 +6517,11 @@ fn load_qwen4_rank_unscoped(
     // payload while the mapping is still readable and before any
     // placement input: `auto` charges exactly the plan `attach_forward`
     // allocates below.
-    // An expert-parallel load never takes the compact plan: the owner-routed
-    // EP prefill refuses it, so the rank keeps `Full` and the split helper
-    // charges the same.
+    // An expert-parallel load takes the plan `qwen4_ep_scratch_mode` decides
+    // (the same call as the planner, so the split helper charges the same).
     let scratch_mode = match full_scratch_mode {
         Some(mode) => mode,
-        None if ep.is_some() => hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode::Full,
+        None if ep.is_some() => qwen4_ep_scratch_mode(ctx.gpu, &hfq, &config, &manifest)?,
         None => {
             let _scan = rdna_compute::load_phases::span("qwen4_symmetry_scan");
             hipfire_arch_qwen4::artifact::source_forward_scratch_mode(
