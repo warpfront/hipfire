@@ -52,6 +52,21 @@
 //! dumps (singleton vs lane, or lane vs lane across an env flag) is a script's job
 //! (`kl_rows.py`); the oracle only emits the rows.
 //!
+//! `--verify-logits-dump DIR` (`--spec mtp` only; DIR must not exist; does not imply `--logits`)
+//! writes the verify-row distributions of the native-MTP lane arm: before the root decides each
+//! step, every lane's verify rows (seed + drafts, lanes concatenated in plan order, read from
+//! rank 0's resident step logits) are appended as raw f32 to
+//! `DIR/verify/{mtp:k=..,routes=..}/{K=..|burst=..}/lane{L}-prompt{P}.f32`, with one
+//! `lane{L}-prompt{P}.rows.jsonl` line per row: `step`, `row` (0 = the seed), `position` (the
+//! absolute position of the row's input token), `hash` (SHA-256 of the tokens fed up to and
+//! including that input token, u32 LE: prompt ++ committed ++ drafts[..row]), `lane_rows` and
+//! `step_rows` (the step's total verify rows). The singleton reference is dumped beside it:
+//! `DIR/ref/prompt{P}.f32` (row `s` = after forward `s`) and `prompt{P}.rows.jsonl` with
+//! `{row, position = prompt_len - 1 + s, hash = SHA-256(prompt ++ ids[..s])}`. A lane verify row
+//! whose (position, hash) equals a reference row's saw the singleton's own input prefix, so its
+//! logits are comparable to that reference row; `kl_rows.py --verify` matches on it and skips
+//! (counting) the rest (rows after a rejected draft, rows past `--tokens`).
+//!
 //! Exit 0: every compared K/prompt equal. 1: mismatch. 2: refusal or error.
 //!
 //! The lane driver runs behind [`LaneBackend`]; [`LocalLanes`] is the Single/EP
@@ -115,12 +130,14 @@ use hipfire_arch_qwen4::ep_mesh_lanes::{EpMeshLanes, MeshLaneAdmission, MeshStep
 use hipfire_arch_qwen4::gpu_forward_lanes::{LaneStagePolicy, StageName};
 use hipfire_arch_qwen4::lane::{LabRoutes, LaneSpecConfig};
 use hipfire_arch_qwen4::mesh_lane_protocol::{
-    GreedyRule, LaneRequest, SamplingMode, WindowBudgets,
+    AcceptRule, GreedyRule, LanePlan, LaneRequest, SamplerOutput, SamplingMode, WindowBudgets,
 };
+use hipfire_arch_qwen4::sampled_lane::LaneRng;
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::slot_batch::{
     BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind, RowRange, SlotBatch,
 };
+use hipfire_runtime::spec::GreedyAccept;
 use rdna_compute::slot_pool::SlotId;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use serde_json::{json, Value};
@@ -242,6 +259,9 @@ struct Args {
     logits: bool,
     /// `--logits-dump DIR`: write every compared logits row as raw f32 (needs `--logits`).
     logits_dump: Option<PathBuf>,
+    /// `--verify-logits-dump DIR` (`--spec mtp`): write every lane verify row's raw f32 logits
+    /// with its (position, prefix hash), and the singleton rows with theirs.
+    verify_logits_dump: Option<PathBuf>,
     /// Policies to sweep, in order (never empty); default is the store's
     /// construction policy only.
     policies: Vec<PolicyEntry>,
@@ -531,6 +551,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
     let mut skip_model_hash = false;
     let mut logits = false;
     let mut logits_dump: Option<PathBuf> = None;
+    let mut verify_logits_dump: Option<PathBuf> = None;
     let mut policies = None;
     let mut tokens_sweep = None;
     let mut reserve_lanes = None;
@@ -560,6 +581,9 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             "--logits-dump" => {
                 logits_dump = Some(PathBuf::from(value("--logits-dump")?));
                 logits = true;
+            }
+            "--verify-logits-dump" => {
+                verify_logits_dump = Some(PathBuf::from(value("--verify-logits-dump")?))
             }
             "--policies" => policies = Some(parse_policies(&value("--policies")?)?),
             "--tokens-sweep" => {
@@ -624,6 +648,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
             (soak_seconds.is_some(), "--soak-seconds"),
             (soak_seed.is_some(), "--soak-seed"),
             (fault_point.is_some(), "--fault-point"),
+            (verify_logits_dump.is_some(), "--verify-logits-dump"),
         ] {
             if given {
                 return Err(format!("{flag} needs --spec mtp"));
@@ -667,6 +692,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> R<Args> {
         skip_model_hash,
         logits,
         logits_dump,
+        verify_logits_dump,
         policies: policies.unwrap_or_else(|| {
             vec![PolicyEntry {
                 spec: DEFAULT_POLICY_SPEC.to_string(),
@@ -696,6 +722,7 @@ over one reference; --tokens-sweep N sets tokens per lane for every policy after
 --reserve-lanes N loads through the admitted route with the daemon's VMM-batch request (serve.vmm_batch, \
 continuous_batch_size N) so a qwen4 EP load reserves N AR lanes before the expert split (planner capacity \
 only; default off = plain load_model, N=1 is the same plan). \
+--verify-logits-dump DIR (needs --spec mtp) writes every verify row's raw f32 logits with its (position, prefix hash) next to the singleton's rows (see the module docs; compare with kl_rows.py --verify). \
 --spec mtp (--k 1..=7, default 3; --routes default cycle) selects the native-MTP lane arm; --soak-seconds and \
 --fault-point need it and are exclusive. Its execution is not yet implemented by S3/S5: the invocation is \
 validated and recorded in DIR/manifest.json (expanded command, prompt fixture hashes, binary sha), then refused. \
@@ -762,10 +789,17 @@ fn dump_row(path: &Path, bytes: &[u8]) -> R<()> {
         .map_err(|x| format!("dump logits row to {}: {x}", path.display()))
 }
 
-/// `--logits-dump`: the per-lane row files of one policy's run set (the directory is created):
-/// `root/lane/{policy}/{label}/lane{L}-prompt{P}.f32`, path-unsafe characters of the policy
-/// spec and run label replaced by `_`.
-fn lane_dump_paths(root: &Path, spec: &str, label: &str, members: &[usize]) -> R<Vec<PathBuf>> {
+/// `--logits-dump` / `--verify-logits-dump`: the per-lane row files of one policy's (or the MTP
+/// arm's) run set (the directory is created): `root/{kind}/{policy}/{label}/lane{L}-prompt{P}.f32`
+/// with `kind` = `lane` (AR) or `verify` (MTP), path-unsafe characters of the policy spec and run
+/// label replaced by `_`.
+fn lane_dump_paths(
+    root: &Path,
+    kind: &str,
+    spec: &str,
+    label: &str,
+    members: &[usize],
+) -> R<Vec<PathBuf>> {
     let safe = |text: &str| -> String {
         text.chars()
             .map(|c| {
@@ -777,7 +811,7 @@ fn lane_dump_paths(root: &Path, spec: &str, label: &str, members: &[usize]) -> R
             })
             .collect()
     };
-    let dir = root.join("lane").join(safe(spec)).join(safe(label));
+    let dir = root.join(kind).join(safe(spec)).join(safe(label));
     std::fs::create_dir_all(&dir)
         .map_err(|x| format!("create logits dump dir {}: {x}", dir.display()))?;
     Ok(members
@@ -785,6 +819,150 @@ fn lane_dump_paths(root: &Path, spec: &str, label: &str, members: &[usize]) -> R
         .enumerate()
         .map(|(lane, prompt)| dir.join(format!("lane{lane}-prompt{prompt}.f32")))
         .collect())
+}
+
+/// The key a logits row is matched on between the singleton and a lane: SHA-256 of the tokens fed
+/// up to and including the row's input token (each as u32 LE).
+fn token_hasher(tokens: &[u32]) -> Sha256 {
+    let mut hasher = Sha256::new();
+    for token in tokens {
+        hasher.update(token.to_le_bytes());
+    }
+    hasher
+}
+
+fn hasher_hex(hasher: &Sha256) -> String {
+    hex(&hasher.clone().finalize())
+}
+
+/// `--verify-logits-dump`: the singleton's per-row keys, one line per logits row of
+/// `prompt{P}.f32` (row 0 = after the prefill: input token = the last prompt token at position
+/// `prompt_len - 1`; row `s` = after forward `s`: input token `ids[s-1]` at `prompt_len - 1 + s`).
+fn write_ref_rows(path: &Path, prompt: &[u32], ids: &[u32]) -> R<()> {
+    let mut hasher = token_hasher(prompt);
+    let mut text = String::new();
+    for s in 0..=ids.len() {
+        if s > 0 {
+            hasher.update(ids[s - 1].to_le_bytes());
+        }
+        let line = json!({
+            "row": s,
+            "position": prompt.len() - 1 + s,
+            "hash": hasher_hex(&hasher),
+        });
+        text.push_str(&line.to_string());
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|x| format!("write {}: {x}", path.display()))
+}
+
+/// One lane of a `--verify-logits-dump` step: the tokens fed before its seed plus the seed
+/// (`prompt ++ committed`, the seed is the last), and its row file.
+struct VerifyLane {
+    tag: u64,
+    fed: Vec<u32>,
+    path: PathBuf,
+}
+
+/// `--verify-logits-dump`: the greedy accept rule that, before the root decides, writes every
+/// verify row of every lane to the lane's file (raw f32 logits, then one `rows.jsonl` line with
+/// the row's step, position, prefix hash and the step's row counts). The root calls `accept` on
+/// its own (rank 0's) thread after every rank's verify forward and before any prepare, so the
+/// store's resident step logits still hold the verify rows (plan order, lanes concatenated).
+struct VerifyDump {
+    /// SAFETY: the rank-0 `Gpu` outlives the step that borrows this rule (`mesh.step` runs it on
+    /// this thread); it is read only for the device synchronize + row download.
+    gpu: *const Gpu,
+    /// A view of the store's step logits.
+    logits: GpuTensor,
+    vocab: usize,
+    step: usize,
+    lanes: Vec<VerifyLane>,
+    /// Request tag -> first logits row of the lane in this step.
+    first: std::collections::HashMap<u64, usize>,
+    step_rows: usize,
+}
+
+impl VerifyDump {
+    fn dump(&mut self, lane: &LanePlan, drafts: &[u32]) -> R<()> {
+        let tag = lane.key.request_epoch.request_tag;
+        let mine = self
+            .lanes
+            .iter()
+            .find(|l| l.tag == tag)
+            .ok_or_else(|| format!("verify dump: lane tag {tag} is not in this step"))?;
+        let first = *self
+            .first
+            .get(&tag)
+            .ok_or_else(|| format!("verify dump: no verify rows for lane tag {tag}"))?;
+        let (position, seed) = (
+            mine.fed.len() - 1,
+            *mine.fed.last().expect("fed has the seed"),
+        );
+        if lane.seed != seed || lane.position != position {
+            return Err(format!(
+                "verify dump: lane tag {tag} plans seed {} at {}, the oracle's committed stream says {seed} at {position}",
+                lane.seed, lane.position
+            ));
+        }
+        // SAFETY: see `gpu`.
+        let gpu = unsafe { &*self.gpu };
+        let mut hasher = token_hasher(&mine.fed);
+        let meta = mine.path.with_extension("rows.jsonl");
+        for row in 0..=drafts.len() {
+            if row > 0 {
+                hasher.update(drafts[row - 1].to_le_bytes());
+            }
+            let bytes = read_view(gpu, &self.logits, (first + row) * self.vocab, self.vocab)?;
+            dump_row(&mine.path, &bytes)?;
+            let line = json!({
+                "step": self.step,
+                "row": row,
+                "position": position + row,
+                "hash": hasher_hex(&hasher),
+                "lane_rows": drafts.len() + 1,
+                "step_rows": self.step_rows,
+            });
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&meta)
+                .and_then(|mut file| writeln!(file, "{line}"))
+                .map_err(|x| format!("write {}: {x}", meta.display()))?;
+        }
+        Ok(())
+    }
+}
+
+impl AcceptRule for VerifyDump {
+    fn accept(
+        &mut self,
+        lane: &LanePlan,
+        drafts: &[u32],
+        picks: &[u32],
+        rng: &mut LaneRng,
+    ) -> Result<GreedyAccept, String> {
+        if picks.len() != drafts.len() + 1 {
+            return Err(format!(
+                "verify dump: {} picks for {} drafts",
+                picks.len(),
+                drafts.len()
+            ));
+        }
+        self.dump(lane, drafts)?;
+        GreedyRule.accept(lane, drafts, picks, rng)
+    }
+
+    fn observe_verify(&mut self, out: &SamplerOutput) {
+        self.first.clear();
+        let mut first = 0usize;
+        for (key, picks) in &out.picks {
+            self.first.insert(key.request_epoch.request_tag, first);
+            first += picks.len();
+        }
+        self.step_rows = first;
+    }
 }
 
 fn device_info(gpu: &Gpu) -> Value {
@@ -1987,7 +2165,7 @@ fn run_policy(
                 let dump_paths = match args
                     .logits_dump
                     .as_deref()
-                    .map(|root| lane_dump_paths(root, spec, &label, &set.members))
+                    .map(|root| lane_dump_paths(root, "lane", spec, &label, &set.members))
                     .transpose()
                 {
                     Ok(paths) => paths,
@@ -2563,9 +2741,37 @@ fn drive_mtp_inner(
             });
         }
         let started = Instant::now();
-        let report = mesh
-            .step(bundle, gpu, &requests, &budgets, &mut GreedyRule)
-            .map_err(mesh_step_error)?;
+        let report = match cfg.dump {
+            Some(paths) => {
+                let tensor = bundle
+                    .lanes()
+                    .and_then(|store| store.logits())
+                    .ok_or("verify dump: the lane store has no step logits")?;
+                let mut rule = VerifyDump {
+                    gpu: &*gpu as *const Gpu,
+                    logits: tensor.sub_offset(0, tensor.numel()),
+                    vocab,
+                    step: steps,
+                    lanes: active
+                        .iter()
+                        .map(|&i| VerifyLane {
+                            tag: lanes[i].epoch.request_tag,
+                            fed: cfg.prompts[i]
+                                .iter()
+                                .chain(&lanes[i].committed)
+                                .copied()
+                                .collect(),
+                            path: paths[i].clone(),
+                        })
+                        .collect(),
+                    first: std::collections::HashMap::new(),
+                    step_rows: 0,
+                };
+                mesh.step(bundle, gpu, &requests, &budgets, &mut rule)
+            }
+            None => mesh.step(bundle, gpu, &requests, &budgets, &mut GreedyRule),
+        }
+        .map_err(mesh_step_error)?;
         let wall = started.elapsed().as_secs_f64();
         steps += 1;
         steps_wall += wall;
@@ -2748,13 +2954,19 @@ fn drive_mtp_ep(
             args.tokens
         );
         let selected: Vec<&[u32]> = set.members.iter().map(|&i| prompts[i]).collect();
+        let dump_paths = args
+            .verify_logits_dump
+            .as_deref()
+            .map(|root| lane_dump_paths(root, "verify", &label, &label_set, &set.members))
+            .transpose()
+            .map_err(|x| format!("{label_set}: {x}"))?;
         let cfg = DriveCfg {
             prompts: &selected,
             tokens: args.tokens,
             max_lanes,
             row_budget,
             want_logits: false,
-            dump: None,
+            dump: dump_paths.as_deref(),
         };
         let out = match drive_mtp_k(
             bundle,
@@ -3007,6 +3219,10 @@ fn expanded_argv(args: &Args, cwd: &Path) -> Vec<String> {
     }
     if let Some(dir) = &args.logits_dump {
         argv.push("--logits-dump".to_string());
+        argv.push(absolute_path(&dir.display().to_string(), cwd));
+    }
+    if let Some(dir) = &args.verify_logits_dump {
+        argv.push("--verify-logits-dump".to_string());
         argv.push(absolute_path(&dir.display().to_string(), cwd));
     }
     argv
@@ -3440,7 +3656,11 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
         }))
         .collect::<Vec<_>>());
 
-    if let Some(root) = &args.logits_dump {
+    let dump_root = args
+        .logits_dump
+        .as_ref()
+        .or(args.verify_logits_dump.as_ref());
+    if let Some(root) = dump_root {
         std::fs::create_dir(root)
             .and_then(|()| std::fs::create_dir(root.join("ref")))
             .map_err(|x| format!("create logits dump dir {}: {x}", root.display()))?;
@@ -3453,10 +3673,8 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
             prompt.path,
             prompt.ids.len()
         );
-        let dump = args
-            .logits_dump
-            .as_ref()
-            .map(|root| root.join("ref").join(format!("prompt{index}.f32")));
+        let dump = dump_root.map(|root| root.join("ref").join(format!("prompt{index}.f32")));
+        let want_logits = args.logits || args.verify_logits_dump.is_some();
         let reference = match pp_gpus.as_deref_mut() {
             Some(gpus) => reference_run(
                 &mut PpSingle {
@@ -3467,7 +3685,7 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
                 },
                 &prompt.ids,
                 args.tokens,
-                args.logits,
+                want_logits,
                 dump.as_deref(),
             ),
             None => reference_run(
@@ -3478,10 +3696,17 @@ fn run_inner(args: &Args, report: &mut Value, ids_lines: &mut Vec<Value>) -> R<V
                 },
                 &prompt.ids,
                 args.tokens,
-                args.logits,
+                want_logits,
                 dump.as_deref(),
             ),
         }?;
+        if let (Some(root), Some(_)) = (&args.verify_logits_dump, &dump) {
+            write_ref_rows(
+                &root.join("ref").join(format!("prompt{index}.rows.jsonl")),
+                &prompt.ids,
+                &reference.ids,
+            )?;
+        }
         ids_lines.push(json!({"kind": "reference", "prompt": index, "ids": reference.ids}));
         references.push(reference);
     }
@@ -3645,6 +3870,60 @@ mod tests {
         assert!(args.logits && args.skip_model_hash);
         assert_eq!((args.pp, args.tokens, args.max_seq), (1, 8, 4096));
         assert_eq!(args.prompt_files.len(), 4);
+    }
+
+    /// `--verify-logits-dump`: needs `--spec mtp`, does not imply `--logits`, and the singleton
+    /// row keys are one JSON line per row with the prefix hash of the fed tokens.
+    #[test]
+    fn verify_logits_dump_flag_and_reference_row_keys() {
+        let line = format!(
+            "{BASE} --ks 1 --spec mtp --verify-logits-dump out/vd{}",
+            files(1)
+        );
+        let args = parse_args_from(argv(&line)).unwrap();
+        assert!(!args.logits);
+        assert_eq!(args.verify_logits_dump, Some(PathBuf::from("out/vd")));
+        let line = format!("{BASE} --ks 1 --verify-logits-dump out/vd{}", files(1));
+        assert_eq!(
+            parse_args_from(argv(&line)).unwrap_err(),
+            "--verify-logits-dump needs --spec mtp"
+        );
+
+        let dir = std::env::temp_dir().join(format!("{TOOL}-ref-rows-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("prompt0.rows.jsonl");
+        write_ref_rows(&path, &[7, 8, 9], &[1, 2]).unwrap();
+        let rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter()
+                .map(|r| r["position"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![2, 3, 4]
+        );
+        // Row s hashes prompt ++ ids[..s]; a lane row with the same fed tokens hashes the same.
+        for (s, fed) in [
+            (0, vec![7u32, 8, 9]),
+            (1, vec![7, 8, 9, 1]),
+            (2, vec![7, 8, 9, 1, 2]),
+        ] {
+            assert_eq!(
+                rows[s]["hash"],
+                json!(hasher_hex(&token_hasher(&fed))),
+                "row {s}"
+            );
+        }
+        // A different prefix (a rejected draft) hashes differently.
+        assert_ne!(
+            rows[1]["hash"],
+            json!(hasher_hex(&token_hasher(&[7, 8, 9, 3])))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -4130,7 +4409,7 @@ mod tests {
         let slices: Vec<&[u32]> = prompts.iter().map(Vec::as_slice).collect();
         let root = std::env::temp_dir().join(format!("{TOOL}-logits-dump-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        let paths = lane_dump_paths(&root, "per-lane:moe=once", "K=2", &[0, 1]).unwrap();
+        let paths = lane_dump_paths(&root, "lane", "per-lane:moe=once", "K=2", &[0, 1]).unwrap();
         assert!(paths[1].ends_with("lane/per-lane_moe=once/K=2/lane1-prompt1.f32"));
         let mut backend = FakeLanes::new(4, 3);
         let cfg = DriveCfg {
