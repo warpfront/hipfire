@@ -150,6 +150,12 @@ pub const EP_UNIT_TAIL_PEER_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PEER";
 pub const EP_UNIT_TAIL_PINS_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_PINS";
 /// `1`: print a `[unit-tail]` counter line every 64 windows and at release.
 pub const EP_UNIT_TAIL_LOG_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_LOG";
+/// Default on (`=0` is the kill switch): a retirement's fills are enqueued by the next forward's
+/// first row-gather call instead of at the retirement, so they run under that forward rather
+/// than inside the lane window's device-wide prepare sync, and the next retirement waits for
+/// them before it polls (the policy sees the same completions). `=0` issues them at the
+/// retirement and polls them.
+pub const EP_UNIT_TAIL_FILL_OVERLAP_ENV: &str = "HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP";
 /// `G` (whole units, default [`EP_UNIT_TAIL_STAGE_GAP_DEFAULT`]): with the prefill lever, the
 /// slot-aware unit stage merges two H2D copy runs across a slot-live gap shorter than `G` units
 /// (the gap units are copied too and simply not referenced: their stage-table entries still name

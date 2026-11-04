@@ -30,6 +30,15 @@
 //!   tables' upload on the compute stream, and only then the new fills on the
 //!   copy stream (it waits for the upload, so no copy can overwrite a slot a
 //!   table still names). Completed fills are published at the next retirement.
+//! * Fill overlap (`HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP`, default on): the retirement makes the
+//!   copy stream wait for the table upload but does NOT enqueue the fills yet; the first
+//!   row-gather call of the next forward does, so the copies run under that forward instead of
+//!   inside the lane window's `prepare_commit` device-wide sync that follows the retirement. The
+//!   next retirement waits for the last batch's event before it polls, so every fill issued so
+//!   far is complete when the policy steps: the policy sees exactly the completions the
+//!   device-wide sync gave it. A deferred fill targets a `Filling` slot no table and no staged
+//!   forward names (published slots only), so issuing it later changes no read. `=0` issues
+//!   the fills at the retirement and polls them (the previous behaviour).
 //! * With `HIPFIRE_EP_UNIT_TAIL_PEER` (the protocol and its safety argument are the module docs
 //!   of [`crate::expert_unit_tail`]) the retirement also posts this rank's publications to the
 //!   shared [`PeerBoard`], takes every delta the peers posted so far, applies it to the
@@ -507,6 +516,13 @@ struct Inner {
     log_ns: u64,
     upload_ns: u64,
     fill_ns: u64,
+    /// Host time the retirements spent waiting for the previous fills' event (fill overlap).
+    fill_wait_ns: u64,
+    /// Fill overlap (`HIPFIRE_EP_UNIT_TAIL_FILL_OVERLAP`): the fills of the last retirement wait
+    /// here (the copy stream already waits for its table upload) until the next forward's first
+    /// row-gather call issues them.
+    fill_overlap: bool,
+    deferred: Vec<FillOp>,
     uploads: u64,
     /// H2D calls and bytes of the retirements' table uploads (changed entry ranges only).
     upload_calls: u64,
@@ -563,6 +579,7 @@ impl UnitTailRank {
         config: EpUnitTailConfig,
         freeze: bool,
         log_enabled: bool,
+        fill_overlap: bool,
         layers: Vec<TailLayerInit>,
         peer: Option<Arc<PeerBoard>>,
         pin_board: Option<Arc<PeerBoard>>,
@@ -838,6 +855,9 @@ impl UnitTailRank {
             log_ns: 0,
             upload_ns: 0,
             fill_ns: 0,
+            fill_wait_ns: 0,
+            fill_overlap,
+            deferred: Vec::new(),
             uploads: 0,
             upload_calls: 0,
             upload_bytes: 0,
@@ -890,7 +910,7 @@ impl UnitTailRank {
         eprintln!(
             "qwen4 EP rank {rank}: D2 tail on: {slots} evictable slots ({} MiB pool) over {} mixed layers \
              {owners_note}, \
-             {} warm units published, F={} fills/window{}{}; retires every {} routed ids or {} windows",
+             {} warm units published, F={} fills/window{}{}{}; retires every {} routed ids or {} windows",
             ((slots * (gub + dnb)) >> 20),
             state.layers.len(),
             seeds.len(),
@@ -901,6 +921,11 @@ impl UnitTailRank {
                 String::new()
             },
             if freeze { ", FROZEN (no admission)" } else { "" },
+            if fill_overlap {
+                ", fills overlap the next forward"
+            } else {
+                ""
+            },
             retire_ids,
             crate::expert_unit_tail::RETIRE_MAX_WINDOWS
         );
@@ -1169,6 +1194,43 @@ impl Inner {
         Ok(())
     }
 
+    /// Enqueue `fills` on the copy stream (which already waits for their retirement's table
+    /// upload) and record their batch event, which the next retirement polls (or waits for,
+    /// under fill overlap).
+    fn issue_batch(&mut self, gpu: &Gpu, fills: &[FillOp]) -> Result<(), String> {
+        self.issue_copies(gpu, fills)?;
+        let event = match self.idle_events.pop() {
+            Some(event) => event,
+            None => gpu
+                .hip
+                .event_create_with_flags(HIP_EVENT_DISABLE_TIMING)
+                .map_err(io)?,
+        };
+        let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
+        if let Err(error) = gpu.hip.event_record(&event, Some(stream)) {
+            self.idle_events.push(event);
+            return Err(io(error));
+        }
+        self.batches.push_back(Batch {
+            event,
+            fills: fills.iter().map(|f| (f.slot, f.generation)).collect(),
+        });
+        Ok(())
+    }
+
+    /// Fill overlap: issue the last retirement's deferred fills (nothing when none wait). A
+    /// frozen or released tail drops them: their slots stay `Filling`, which nothing reads.
+    fn issue_deferred(&mut self, gpu: &Gpu) -> Result<(), String> {
+        if self.deferred.is_empty() {
+            return Ok(());
+        }
+        let fills = std::mem::take(&mut self.deferred);
+        if self.frozen.is_some() || self.released {
+            return Ok(());
+        }
+        self.issue_batch(gpu, &fills)
+    }
+
     fn note_call(&mut self, gpu: &mut Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
         let layer = layer_idx as usize;
         // The cadence's input: every rank enters this call with the same `slots` (the extent of
@@ -1177,6 +1239,11 @@ impl Inner {
         if layer < self.trunk_layers && slots > 0 {
             self.window_routed += slots as u64;
             self.window_seen = true;
+        }
+        // Fill overlap: the first row-gather call after a retirement starts its fills, so they
+        // run under this forward (enqueued after the copy stream's wait for the table upload).
+        if let Err(error) = self.issue_deferred(gpu) {
+            self.freeze(&format!("deferred fills: {error}"));
         }
         if self.frozen.is_some()
             || self.released
@@ -1382,6 +1449,18 @@ impl Inner {
         self.host_only_reads += host_only;
         window.sort_by_key(|w| w.unit);
 
+        // Fill overlap: every fill issued so far (the last retirement's, started under the
+        // forward that just ended) completes before the poll, as the lane window's device-wide
+        // prepare sync made them complete before. The wait is the part of the copies the forward
+        // did not hide.
+        if self.fill_overlap {
+            self.issue_deferred(gpu)?;
+            if let Some(last) = self.batches.back() {
+                let t_wait = Instant::now();
+                gpu.hip.event_synchronize(&last.event).map_err(io)?;
+                self.fill_wait_ns += t_wait.elapsed().as_nanos() as u64;
+            }
+        }
         // Completed fills (issued in order on one stream: stop at the first pending).
         let mut completed: Vec<(usize, u64)> = Vec::new();
         while let Some(batch) = self.batches.front() {
@@ -1492,24 +1571,12 @@ impl Inner {
             gpu.hip.event_record(ready, compute).map_err(io)?;
             let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
             gpu.hip.stream_wait_event(stream, ready).map_err(io)?;
-            self.issue_copies(gpu, &retire.fills)?;
-            let event = match self.idle_events.pop() {
-                Some(event) => event,
-                None => gpu
-                    .hip
-                    .event_create_with_flags(HIP_EVENT_DISABLE_TIMING)
-                    .map_err(io)?,
-            };
-            let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
-            gpu.hip.event_record(&event, Some(stream)).map_err(io)?;
-            self.batches.push_back(Batch {
-                event,
-                fills: retire
-                    .fills
-                    .iter()
-                    .map(|f| (f.slot, f.generation))
-                    .collect(),
-            });
+            if self.fill_overlap {
+                // Issued by the next forward's first row-gather call (`issue_deferred`).
+                self.deferred = retire.fills.clone();
+            } else {
+                self.issue_batch(gpu, &retire.fills)?;
+            }
         }
         let t_end = Instant::now();
         self.log_ns += (t_log - t0).as_nanos() as u64;
@@ -1655,7 +1722,8 @@ impl Inner {
              (slot hit {:.2}%, distinct hit {:.2}%) host distinct/window {:.2} ({:.3} MB) /retirement {:.2} \
              fills {} published {} evictions {}{} skipped {} stale {} live {}/{} late-in-flight {} \
              host-only reads {} log overflow {} | us/window: log {:.0} retire {:.0} upload {:.0} fill {:.0} (us/retirement: {:.0} {:.0} {:.0} {:.0}) ({} layer uploads: {} H2D calls, {} B){} \
-             | raw unix_ms={unix_ms} retirements={} unit_bytes={} core_reads={} tail_reads={} host_reads={} core_distinct={} tail_distinct={} host_distinct={} fills_issued={}",
+             | raw unix_ms={unix_ms} retirements={} unit_bytes={} core_reads={} tail_reads={} host_reads={} core_distinct={} tail_distinct={} host_distinct={} fills_issued={} \
+             fill_overlap={} fill_wait_us={:.0}",
             self.rank,
             s.windows,
             s.retirements,
@@ -1704,6 +1772,8 @@ impl Inner {
             s.tail_distinct,
             s.host_distinct,
             s.fills_issued,
+            self.fill_overlap,
+            self.fill_wait_ns as f64 / 1e3,
         );
     }
 
@@ -1712,6 +1782,7 @@ impl Inner {
             return;
         }
         self.released = true;
+        self.deferred.clear();
         if let Some(board) = self.peer.as_ref() {
             board.detach(self.rank);
         }
