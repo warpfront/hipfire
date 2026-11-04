@@ -50,6 +50,47 @@ pub const AR_HC_GEN_BYTES: usize = 256;
 
 const KERNEL: &str = "ar_hc_write_gfx1201";
 const KERNEL_F32S: &str = "ar_hc_write_f32s_gfx1201";
+const KERNEL_D8: &str = "ar_hc_write_d8_gfx1201";
+const KERNEL_D8_F32S: &str = "ar_hc_write_d8_f32s_gfx1201";
+
+/// The mailbox wire format of one transport (fixed per [`ArHcExchange`] at construction).
+///
+/// * `Tagged`: the original 16-byte granule `{d0d1, tag, d2d3, tag}` (8 payload bytes per 16
+///   wire bytes), validated by the generation tag. The kill-switch format.
+/// * `Dense`: an 8-byte granule `{d0d1, d2d3}` (all 8 bytes payload), validated per dword by
+///   the EMPTY marker `0xFFFF_FFFF`; the consumer re-arms what it read, so the mailbox is
+///   EMPTY at the start of every launch (see the kernel header for the argument).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ArHcWire {
+    Tagged,
+    Dense,
+}
+
+impl ArHcWire {
+    /// Wire bytes of one granule (four bf16 partial values).
+    pub fn granule_bytes(self) -> usize {
+        match self {
+            Self::Tagged => 16,
+            Self::Dense => 8,
+        }
+    }
+
+    /// Byte every mailbox byte holds before a launch writes it: tag 0 never matches a live
+    /// generation (`0x00`), and the dense EMPTY dword is all ones (`0xFF`).
+    pub fn idle_fill(self) -> u8 {
+        match self {
+            Self::Tagged => 0x00,
+            Self::Dense => 0xFF,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tagged => "tagged",
+            Self::Dense => "dense",
+        }
+    }
+}
 
 /// Storage of the HC streams the fused write updates in place (the two production HC
 /// writes): BF16 bits (`hyper_write_bf16x2`, the F16 prefill route, rows at or above
@@ -72,14 +113,15 @@ impl StreamKind {
         }
     }
 
-    /// The device entry of this kind.
-    pub fn symbol(self) -> &'static str {
-        match self {
-            Self::Bf16 => KERNEL,
-            Self::F32 => KERNEL_F32S,
+    /// The device entry of this kind on `wire`.
+    pub fn symbol(self, wire: ArHcWire) -> &'static str {
+        match (wire, self) {
+            (ArHcWire::Tagged, Self::Bf16) => KERNEL,
+            (ArHcWire::Tagged, Self::F32) => KERNEL_F32S,
+            (ArHcWire::Dense, Self::Bf16) => KERNEL_D8,
+            (ArHcWire::Dense, Self::F32) => KERNEL_D8_F32S,
         }
     }
-
     /// Bytes per stream element.
     pub fn element_bytes(self) -> usize {
         match self {
@@ -113,9 +155,15 @@ impl StreamKind {
     }
 }
 
-/// Bytes of one mailbox bank able to hold `max_rows` rows of partials.
+/// Bytes of one mailbox bank able to hold `max_rows` rows of partials on the TAGGED wire (the
+/// larger of the two: a dense bank fits in it).
 pub fn ar_hc_bank_bytes(max_rows: usize) -> usize {
-    (max_rows * AR_HC_HIDDEN / AR_HC_GRANULE_VALUES * AR_HC_GRANULE_BYTES).next_multiple_of(256)
+    ar_hc_bank_bytes_for(ArHcWire::Tagged, max_rows)
+}
+
+/// Bytes of one mailbox bank able to hold `max_rows` rows of partials on `wire`.
+pub fn ar_hc_bank_bytes_for(wire: ArHcWire, max_rows: usize) -> usize {
+    (max_rows * AR_HC_HIDDEN / AR_HC_GRANULE_VALUES * wire.granule_bytes()).next_multiple_of(256)
 }
 
 /// Launch geometry for `rows` rows: `(blocks, lanes)`. Granules per lane stay within
@@ -161,7 +209,7 @@ pub fn ar_hc_geometry(rows: usize) -> Option<(u32, u32)> {
 
 impl Gpu {
     /// Resolve the kernel before graph capture (JIT is not capture-safe).
-    pub fn ensure_ar_hc_write_gfx1201_kernel(&mut self, kind: StreamKind) -> HipResult<()> {
+    pub fn ensure_ar_hc_write_gfx1201_kernel(&mut self, kind: StreamKind, wire: ArHcWire) -> HipResult<()> {
         self.bind_thread()?;
         if self.arch != "gfx1201" {
             return Err(HipError::new(
@@ -169,7 +217,7 @@ impl Gpu {
                 &format!("ar_hc_write_gfx1201 requires gfx1201, got {}", self.arch),
             ));
         }
-        self.ensure_kernel(KERNEL, kernels::AR_HC_WRITE_GFX1201_SRC, kind.symbol())
+        self.ensure_kernel(KERNEL, kernels::AR_HC_WRITE_GFX1201_SRC, kind.symbol(wire))
     }
 
     /// Push this rank's f32 partial `[rows, 2560]` (bf16-rounded) into the peer's mailbox,
@@ -192,6 +240,7 @@ impl Gpu {
         partial: *mut c_void,
         streams: *mut c_void,
         kind: StreamKind,
+        wire: ArHcWire,
         gates: *const c_void,
         peer_mailbox: *mut c_void,
         local_mailbox: *const c_void,
@@ -202,7 +251,7 @@ impl Gpu {
         geometry: (u32, u32),
         mixed_dbg: *mut c_void,
     ) -> HipResult<()> {
-        self.ensure_ar_hc_write_gfx1201_kernel(kind)?;
+        self.ensure_ar_hc_write_gfx1201_kernel(kind, wire)?;
         let fail = |what: &str| HipError::new(0, &format!("ar_hc_write_gfx1201: {what}"));
         if ar_hc_geometry_with(rows, geometry.0, geometry.1).is_none() {
             return Err(fail(&format!("unsupported row count {rows}")));
@@ -218,7 +267,7 @@ impl Gpu {
             )));
         }
         let count = rows * AR_HC_HIDDEN;
-        if bank_stride < ar_hc_bank_bytes(rows) || !bank_stride.is_multiple_of(256) {
+        if bank_stride < ar_hc_bank_bytes_for(wire, rows) || !bank_stride.is_multiple_of(256) {
             return Err(fail(&format!(
                 "bank stride {bank_stride} cannot hold {rows} rows"
             )));
@@ -252,7 +301,7 @@ impl Gpu {
             &mixed_dbg as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            kind.symbol(),
+            kind.symbol(wire),
             [geometry.0, 1, 1],
             [geometry.1, 1, 1],
             0,
@@ -651,7 +700,13 @@ mod tests {
         assert_eq!(StreamKind::F32.row_bytes(), 4 * 2560 * 4);
         assert_eq!(StreamKind::from_state_bf16(true), StreamKind::Bf16);
         assert_eq!(StreamKind::from_state_bf16(false), StreamKind::F32);
-        assert_ne!(StreamKind::Bf16.symbol(), StreamKind::F32.symbol());
+        for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+            assert_ne!(StreamKind::Bf16.symbol(wire), StreamKind::F32.symbol(wire));
+        }
+        assert_ne!(
+            StreamKind::Bf16.symbol(ArHcWire::Tagged),
+            StreamKind::Bf16.symbol(ArHcWire::Dense)
+        );
         assert_eq!(StreamKind::F32.alignment(), 16);
     }
 
@@ -660,14 +715,23 @@ mod tests {
     #[test]
     fn kernel_source_has_both_entries() {
         let src = kernels::AR_HC_WRITE_GFX1201_SRC;
-        for kind in StreamKind::ALL {
-            assert!(
-                src.contains(&format!("void {}(", kind.symbol())),
-                "{}",
-                kind.symbol()
-            );
+        for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+            for kind in StreamKind::ALL {
+                assert!(
+                    src.contains(&format!("void {}(", kind.symbol(wire))),
+                    "{}",
+                    kind.symbol(wire)
+                );
+            }
         }
-        assert!(src.contains("arhc_entry<true>") && src.contains("arhc_entry<false>"));
+        for inst in [
+            "arhc_entry<true, false>",
+            "arhc_entry<false, false>",
+            "arhc_entry<true, true>",
+            "arhc_entry<false, true>",
+        ] {
+            assert!(src.contains(inst), "{inst}");
+        }
     }
 
     /// The kernel source compiles offline for gfx1201 (hipcc `--genco`, no GPU touched) and
@@ -713,12 +777,14 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let image = std::fs::read(&obj).unwrap();
-        for kind in StreamKind::ALL {
-            let symbol = kind.symbol();
-            assert!(
-                image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
-                "{symbol} missing"
-            );
+        for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+            for kind in StreamKind::ALL {
+                let symbol = kind.symbol(wire);
+                assert!(
+                    image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+                    "{symbol} missing"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

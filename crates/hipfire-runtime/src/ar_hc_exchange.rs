@@ -6,8 +6,10 @@
 //! (`rdna_compute::ar_hc_write`, kernel `ar_hc_write_gfx1201`) for the Flash-Next EP2 trunk
 //! shard (`HIPFIRE_QWEN4_EP_TRUNK_SHARD`).
 //!
-//! Each rank owns one fine-grained VRAM mailbox (two banks of 16-byte tagged granules,
-//! `hipDeviceMallocFinegrained`) that the PEER writes, and one 256-byte block holding the
+//! Each rank owns one fine-grained VRAM mailbox that the PEER writes (`hipDeviceMallocFinegrained`):
+//! a TAGGED region (two banks of 16-byte tagged granules) and, unless `HIPFIRE_EP_AR_WIRE_DENSE=0`,
+//! a DENSE region (two banks of 8-byte untagged granules, EMPTY = all ones; launches of at
+//! least [`AR_HC_DENSE_MIN_ROWS`] rows use it, see the kernel header for the argument), and one 256-byte block holding the
 //! device-resident generation word and arrival ticket. Mailboxes are registered per rank
 //! (any thread, that rank's `Gpu`) BEFORE peer access is enabled
 //! ([`ArHcExchange::enable_peers`]), then [`ArHcExchange::qualify`] runs a short eager
@@ -22,8 +24,8 @@
 
 use hip_bridge::{DeviceBuffer, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED};
 use rdna_compute::ar_hc_write::{
-    ar_hc_bank_bytes, ar_hc_fold, ar_hc_geometry, ar_hc_write_model, ar_hc_write_model_f32,
-    StreamKind, AR_HC_GEN_BYTES, AR_HC_HIDDEN, AR_HC_ROW_CAP,
+    ar_hc_bank_bytes_for, ar_hc_fold, ar_hc_geometry, ar_hc_write_model, ar_hc_write_model_f32,
+    ArHcWire, StreamKind, AR_HC_GEN_BYTES, AR_HC_HIDDEN, AR_HC_ROW_CAP,
 };
 use rdna_compute::Gpu;
 use std::ffi::c_void;
@@ -49,7 +51,7 @@ unsafe impl Sync for ArHcExchange {}
 /// The two-rank fused all-reduce transport.
 pub struct ArHcExchange {
     max_rows: usize,
-    bank_stride: usize,
+    mode: ArHcMode,
     ranks: [Mutex<Option<RankMail>>; 2],
     /// Mailbox / generation base pointers, 0 until registered (lock-free launch reads).
     mailbox_ptr: [AtomicUsize; 2],
@@ -58,9 +60,55 @@ pub struct ArHcExchange {
     enabled: AtomicBool,
 }
 
+/// Which mailbox wires a transport uses (see the kernel header for the two formats).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArHcMode {
+    /// Every launch on the 16-byte tagged wire (the kill-switch format).
+    Tagged,
+    /// Every launch on the dense 8-byte wire (oracles and benches).
+    Dense,
+    /// Dense for launches of at least [`AR_HC_DENSE_MIN_ROWS`] rows, tagged below (the product
+    /// default: the dense re-arm costs ~1 us of fixed latency that decode-sized launches
+    /// do not earn back, the byte saving is only worth it at prefill sizes).
+    Hybrid,
+}
+
+impl ArHcMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Tagged => "tagged",
+            Self::Dense => "dense",
+            Self::Hybrid => "hybrid",
+        }
+    }
+}
+
+/// First row count of a launch the hybrid mode sends on the dense wire (the measured
+/// crossover on gfx1201 is between 8 and 32 rows; see arwire/RESULT.md).
+pub const AR_HC_DENSE_MIN_ROWS: usize = 16;
+
+/// `HIPFIRE_EP_AR_WIRE_DENSE` (developer, default on): `0` selects the original 16-byte tagged
+/// granule wire for every launch (the kill switch); anything else the hybrid default.
+pub const AR_WIRE_DENSE_ENV: &str = "HIPFIRE_EP_AR_WIRE_DENSE";
+
+/// The mode the process selects (`HIPFIRE_EP_AR_WIRE_DENSE`).
+pub fn ar_hc_mode_from_env() -> ArHcMode {
+    if hipfire_config::developer_bool(AR_WIRE_DENSE_ENV, true) {
+        ArHcMode::Hybrid
+    } else {
+        ArHcMode::Tagged
+    }
+}
+
 impl ArHcExchange {
-    /// Transport for launches of up to `max_rows` rows each (<= [`AR_HC_ROW_CAP`]).
+    /// Transport for launches of up to `max_rows` rows each (<= [`AR_HC_ROW_CAP`]) in the mode
+    /// `HIPFIRE_EP_AR_WIRE_DENSE` selects (hybrid unless killed).
     pub fn new(max_rows: usize) -> HipResult<Self> {
+        Self::with_mode(max_rows, ar_hc_mode_from_env())
+    }
+
+    /// [`Self::new`] in an explicit mode (oracles and benches).
+    pub fn with_mode(max_rows: usize, mode: ArHcMode) -> HipResult<Self> {
         if max_rows == 0 || max_rows > AR_HC_ROW_CAP {
             return Err(err(format!(
                 "ar_hc_exchange: max_rows {max_rows} outside 1..={AR_HC_ROW_CAP}"
@@ -68,7 +116,7 @@ impl ArHcExchange {
         }
         Ok(Self {
             max_rows,
-            bank_stride: ar_hc_bank_bytes(max_rows),
+            mode,
             ranks: [Mutex::new(None), Mutex::new(None)],
             mailbox_ptr: [AtomicUsize::new(0), AtomicUsize::new(0)],
             gen_ptr: [AtomicUsize::new(0), AtomicUsize::new(0)],
@@ -77,17 +125,79 @@ impl ArHcExchange {
         })
     }
 
-    /// Bytes of one mailbox bank.
-    pub fn bank_stride(&self) -> usize {
-        self.bank_stride
+    pub fn mode(&self) -> ArHcMode {
+        self.mode
+    }
+
+    /// The wire a launch of `rows` rows (a slice of at most `max_rows`) uses.
+    pub fn wire_for(&self, rows: usize) -> ArHcWire {
+        match self.mode {
+            ArHcMode::Tagged => ArHcWire::Tagged,
+            ArHcMode::Dense => ArHcWire::Dense,
+            ArHcMode::Hybrid if rows >= AR_HC_DENSE_MIN_ROWS => ArHcWire::Dense,
+            ArHcMode::Hybrid => ArHcWire::Tagged,
+        }
+    }
+
+    /// Whether launches of this transport can use `wire` (its kernels are resolved at register).
+    fn uses_wire(&self, wire: ArHcWire) -> bool {
+        match wire {
+            ArHcWire::Tagged => self.mode != ArHcMode::Dense,
+            ArHcWire::Dense => self.mode != ArHcMode::Tagged,
+        }
+    }
+
+    /// The dense region exists iff some launch can use it. The tagged region always exists.
+    fn has_dense_region(&self) -> bool {
+        self.uses_wire(ArHcWire::Dense)
+    }
+
+    /// Bytes of one bank of `wire`'s region.
+    pub fn bank_stride(&self, wire: ArHcWire) -> usize {
+        ar_hc_bank_bytes_for(wire, self.max_rows)
+    }
+
+    /// Byte offset of `wire`'s region in the mailbox: the tagged region first, then the dense.
+    pub fn region_offset(&self, wire: ArHcWire) -> usize {
+        match wire {
+            ArHcWire::Tagged => 0,
+            ArHcWire::Dense => 2 * self.bank_stride(ArHcWire::Tagged),
+        }
+    }
+
+    /// Bytes of the whole mailbox of one rank.
+    pub fn mailbox_bytes(&self) -> usize {
+        let tagged = 2 * self.bank_stride(ArHcWire::Tagged);
+        if self.has_dense_region() {
+            tagged + 2 * self.bank_stride(ArHcWire::Dense)
+        } else {
+            tagged
+        }
+    }
+
+    /// Base device address of rank `rank`'s mailbox (0 until registered). Oracle / negative
+    /// tests only: the peer writes it, the owner polls it.
+    pub fn mailbox_addr(&self, rank: usize) -> usize {
+        self.mailbox_ptr[rank].load(Ordering::Acquire)
     }
 
     /// Device bytes a rank spends on the mailbox and generation block.
     pub fn rank_bytes(&self) -> usize {
-        2 * self.bank_stride + AR_HC_GEN_BYTES
+        self.mailbox_bytes() + AR_HC_GEN_BYTES
     }
 
-    /// Allocate rank `rank`'s mailbox (fine-grained, zeroed) and generation block on `gpu`
+    /// Fill every region with its idle pattern (tagged 0x00, dense 0xFF): one host copy of the
+    /// whole mailbox (load / reset time only).
+    fn idle_fill_mailbox(&self, gpu: &mut Gpu, mailbox: &DeviceBuffer) -> HipResult<()> {
+        let mut pattern = vec![ArHcWire::Tagged.idle_fill(); self.mailbox_bytes()];
+        if self.has_dense_region() {
+            let from = self.region_offset(ArHcWire::Dense);
+            pattern[from..].fill(ArHcWire::Dense.idle_fill());
+        }
+        gpu.hip.memcpy_htod(mailbox, &pattern)
+    }
+
+    /// Allocate rank `rank`'s mailbox (fine-grained, every region idle-filled) and generation block on `gpu`
     /// and resolve the kernel (JIT is not capture-safe). Call on the rank's thread before
     /// [`Self::enable_peers`] on any rank.
     pub fn register(&self, rank: usize, gpu: &mut Gpu) -> HipResult<()> {
@@ -96,15 +206,19 @@ impl ArHcExchange {
         }
         gpu.bind_thread()?;
         for kind in StreamKind::ALL {
-            gpu.ensure_ar_hc_write_gfx1201_kernel(kind)?;
+            for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+                if self.uses_wire(wire) {
+                    gpu.ensure_ar_hc_write_gfx1201_kernel(kind, wire)?;
+                }
+            }
         }
         gpu.ensure_device_wait_block()?;
         let mut slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
         if slot.is_some() {
             return Err(err(format!("ar_hc_exchange: rank {rank} registered twice")));
         }
-        let mailbox = gpu.hip.malloc_peer_finegrained(2 * self.bank_stride)?;
-        if let Err(e) = gpu.hip.memset(&mailbox, 0, 2 * self.bank_stride) {
+        let mailbox = gpu.hip.malloc_peer_finegrained(self.mailbox_bytes())?;
+        if let Err(e) = self.idle_fill_mailbox(gpu, &mailbox) {
             let _ = gpu.hip.free(mailbox);
             return Err(e);
         }
@@ -171,7 +285,8 @@ impl ArHcExchange {
         self.enabled.store(false, Ordering::Release);
     }
 
-    /// Zero the rank's generation block and mailbox (tag 0 never matches a live generation).
+    /// Zero the rank's generation block and idle-fill its mailbox (tagged region: tag 0 never
+    /// matches a live generation; dense region: every slot EMPTY).
     /// BOTH ranks must be drained and reset before either launches again.
     pub fn reset(&self, rank: usize, gpu: &mut Gpu) -> HipResult<()> {
         let slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
@@ -180,7 +295,38 @@ impl ArHcExchange {
             .ok_or_else(|| err("ar_hc_exchange: reset before register".into()))?;
         gpu.bind_thread()?;
         gpu.hip.memset(&mail.gen, 0, AR_HC_GEN_BYTES)?;
-        gpu.hip.memset(&mail.mailbox, 0, 2 * self.bank_stride)
+        self.idle_fill_mailbox(gpu, &mail.mailbox)
+    }
+
+    /// The rank's device generation word (launches completed since the last reset). The next
+    /// launch's tag is this plus one (0xFFFF_FFFF wraps to 2) and its bank is `tag & 1`.
+    /// Oracle / negative tests only; the rank must be drained.
+    pub fn generation(&self, rank: usize, gpu: &mut Gpu) -> HipResult<u32> {
+        let slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
+        let mail = slot
+            .as_ref()
+            .ok_or_else(|| err("ar_hc_exchange: generation before register".into()))?;
+        gpu.bind_thread()?;
+        let mut word = [0u8; 4];
+        gpu.hip.memcpy_dtoh(&mut word, &mail.gen)?;
+        Ok(u32::from_le_bytes(word))
+    }
+
+    /// Copy of the rank's mailbox region of `wire` (both banks). Oracle / negative tests only;
+    /// the rank must be drained.
+    pub fn download_mailbox(&self, rank: usize, gpu: &mut Gpu, wire: ArHcWire) -> HipResult<Vec<u8>> {
+        let slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
+        let mail = slot
+            .as_ref()
+            .ok_or_else(|| err("ar_hc_exchange: download before register".into()))?;
+        gpu.bind_thread()?;
+        let mut bytes = vec![0u8; 2 * self.bank_stride(wire)];
+        let whole = self.mailbox_bytes();
+        let mut all = vec![0u8; whole];
+        gpu.hip.memcpy_dtoh(&mut all, &mail.mailbox)?;
+        let off = self.region_offset(wire);
+        bytes.copy_from_slice(&all[off..off + 2 * self.bank_stride(wire)]);
+        Ok(bytes)
     }
 
     /// Free this rank's buffers (the rank must be drained).
@@ -245,6 +391,8 @@ impl ArHcExchange {
         let mut done = 0usize;
         while done < rows {
             let n = slice.min(rows - done);
+            let wire = self.wire_for(n);
+            let region = self.region_offset(wire);
             let geometry = ar_hc_geometry(n)
                 .ok_or_else(|| err(format!("ar_hc_exchange: no launch geometry for {n} rows")))?;
             let dbg = if mixed_dbg.is_null() {
@@ -267,10 +415,11 @@ impl ArHcExchange {
                     .add(done * kind.row_bytes())
                     .cast::<c_void>(),
                 kind,
+                wire,
                 gates.cast::<u8>().add(done * 4 * 4).cast::<c_void>(),
-                peer_mail as *mut c_void,
-                local_mail as *const c_void,
-                self.bank_stride,
+                (peer_mail + region) as *mut c_void,
+                (local_mail + region) as *const c_void,
+                self.bank_stride(wire),
                 &mail.gen,
                 rank == 0,
                 n,
@@ -283,7 +432,9 @@ impl ArHcExchange {
     }
 
     /// Load-time qualification of rank `rank` over BOTH stream kinds (BF16 bits, then F32
-    /// words), run CONCURRENTLY on both ranks' threads (the kernels rendezvous): see
+    /// words) and every wire this transport can use (the launch of `rows` rows, and under the
+    /// hybrid mode also one of [`AR_HC_DENSE_MIN_ROWS`] rows that takes the dense wire), run
+    /// CONCURRENTLY on both ranks' threads (the kernels rendezvous): see
     /// [`Self::qualify_kind`].
     pub fn qualify(
         &self,
@@ -292,8 +443,18 @@ impl ArHcExchange {
         rows: usize,
         exchanges: usize,
     ) -> HipResult<()> {
+        let mut sizes = vec![rows];
+        let dense_rows = rows.max(AR_HC_DENSE_MIN_ROWS);
+        if self.mode == ArHcMode::Hybrid
+            && self.wire_for(rows) != ArHcWire::Dense
+            && self.wire_for(dense_rows.min(self.max_rows)) == ArHcWire::Dense
+        {
+            sizes.push(dense_rows.min(self.max_rows));
+        }
         for kind in StreamKind::ALL {
-            self.qualify_kind(rank, gpu, kind, rows, exchanges)?;
+            for &r in &sizes {
+                self.qualify_kind(rank, gpu, kind, r, exchanges)?;
+            }
         }
         Ok(())
     }
@@ -488,9 +649,25 @@ mod tests {
     fn sizes_and_bounds() {
         assert!(ArHcExchange::new(0).is_err());
         assert!(ArHcExchange::new(AR_HC_ROW_CAP + 1).is_err());
-        let x = ArHcExchange::new(32).unwrap();
-        assert_eq!(x.bank_stride(), 32 * 640 * 16);
-        assert_eq!(x.rank_bytes(), 2 * 32 * 640 * 16 + 256);
+        let t = 32 * 640 * 16usize;
+        let d8 = 32 * 640 * 8usize;
+        let x = ArHcExchange::with_mode(32, ArHcMode::Tagged).unwrap();
+        assert_eq!(x.bank_stride(ArHcWire::Tagged), t);
+        assert_eq!(x.rank_bytes(), 2 * t + 256);
+        for rows in [1usize, 16, 32] {
+            assert_eq!(x.wire_for(rows), ArHcWire::Tagged);
+        }
+        let d = ArHcExchange::with_mode(32, ArHcMode::Dense).unwrap();
+        assert_eq!(d.bank_stride(ArHcWire::Dense), d8);
+        assert_eq!(d.region_offset(ArHcWire::Dense), 2 * t);
+        assert_eq!(d.rank_bytes(), 2 * t + 2 * d8 + 256);
+        assert_eq!(d.wire_for(1), ArHcWire::Dense);
+        let h = ArHcExchange::with_mode(32, ArHcMode::Hybrid).unwrap();
+        assert_eq!(h.rank_bytes(), d.rank_bytes());
+        assert_eq!(h.wire_for(AR_HC_DENSE_MIN_ROWS - 1), ArHcWire::Tagged);
+        assert_eq!(h.wire_for(AR_HC_DENSE_MIN_ROWS), ArHcWire::Dense);
+        assert_eq!(ArHcWire::Dense.idle_fill(), 0xFF);
+        assert_eq!(ArHcWire::Tagged.idle_fill(), 0x00);
         assert!(x.enabled());
         x.disable();
         assert!(!x.enabled());

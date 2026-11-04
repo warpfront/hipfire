@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! ar_hc_write_oracle [--rows 1,8,32,100,256] [--iters 2000] [--devices 0,1] [--out DIR]
-//!                    [--stream f32|bf16|both]
+//!                    [--stream f32|bf16|both] [--wire tagged|dense|hybrid]
 //! ```
 //!
 //! `--stream` picks the HC stream kind(s) under test (default `both`): `bf16` = BF16 bits
@@ -23,13 +23,16 @@
 //!  * rank 0 streams byte-equal to rank 1 streams;
 //!  * the kernel's folded `m` (debug output) byte-equal to the host fold, on both ranks;
 //!  * `|m - (p0 + p1)| <= (2^-8 + 2^-23)(|p0| + |p1|)` against the exact sum.
+//! On the dense wire every iteration also checks that the bank the launch used is back to
+//! all-EMPTY (0xFF) in the rank's own mailbox (the consumer re-arm).
 //! Also a bounded-wait fault check at the end (rank 1 skips a launch; rank 0's wait must
 //! record `AR_HC_WRITE_GFX1201` in the wait block and the step must fail) unless `--no-fault`.
 //! Exit code 3 on any failure; a JSON receipt lands in `--out` (default `.`).
 
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
+use hipfire_runtime::ar_hc_exchange::ArHcMode;
 use rdna_compute::ar_hc_write::{
-    ar_hc_fold, ar_hc_fold_bound, bf16_bits, bf16_round, StreamKind, AR_HC_HIDDEN,
+    ar_hc_fold, ar_hc_fold_bound, bf16_bits, bf16_round, ArHcWire, StreamKind, AR_HC_HIDDEN,
 };
 use rdna_compute::tensor_ops::{hyper_write, HyperWrite};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -215,6 +218,28 @@ fn run_rank(
             gpu.hip.device_synchronize().map_err(|e| e.to_string())?;
             gpu.take_device_wait_error()
                 .map_err(|e| format!("iter {it}: {e}"))?;
+            if x.wire_for(rows) == ArHcWire::Dense {
+                // consumer re-arm: the bank this launch used is all EMPTY again (the peer
+                // cannot write it before this rank's next launch)
+                let gen = x.generation(rank, &mut gpu).map_err(|e| e.to_string())?;
+                let mb = x
+                    .download_mailbox(rank, &mut gpu, ArHcWire::Dense)
+                    .map_err(|e| e.to_string())?;
+                let (stride, bank) = (x.bank_stride(ArHcWire::Dense), (gen & 1) as usize);
+                if let Some(at) = mb[bank * stride..(bank + 1) * stride]
+                    .iter()
+                    .position(|&b| b != 0xFF)
+                {
+                    tally.fused_ne_ref += 1;
+                    tally.first.get_or_insert_with(|| {
+                        format!(
+                            "{} rows {rows} iter {it} rank {rank}: mailbox bank {bank} byte {at} not re-armed ({:#04x})",
+                            kind.name(),
+                            mb[bank * stride + at]
+                        )
+                    });
+                }
+            }
             let got = gpu
                 .download_raw_bytes(&streams)
                 .map_err(|e| e.to_string())?[..wide * kind.element_bytes()]
@@ -363,6 +388,7 @@ fn main() {
     let mut out = ".".to_string();
     let mut fault = true;
     let mut kinds = StreamKind::ALL.to_vec();
+    let mut wire = hipfire_runtime::ar_hc_exchange::ar_hc_mode_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -399,6 +425,15 @@ fn main() {
                     other => panic!("--stream takes f32|bf16|both, got {other}"),
                 };
             }
+            "--wire" => {
+                i += 1;
+                wire = match args[i].as_str() {
+                    "tagged" => ArHcMode::Tagged,
+                    "dense" => ArHcMode::Dense,
+                    "hybrid" => ArHcMode::Hybrid,
+                    other => panic!("--wire takes tagged|dense|hybrid, got {other}"),
+                };
+            }
             "--no-fault" => fault = false,
             other => panic!("unknown argument {other}"),
         }
@@ -406,7 +441,7 @@ fn main() {
     }
     let max_rows = *rows_list.iter().max().unwrap();
     let x = Arc::new(
-        ArHcExchange::new(max_rows.min(rdna_compute::ar_hc_write::AR_HC_ROW_CAP))
+        ArHcExchange::with_mode(max_rows.min(rdna_compute::ar_hc_write::AR_HC_ROW_CAP), wire)
             .expect("exchange"),
     );
     let barrier = Arc::new(Barrier::new(2));
@@ -458,7 +493,8 @@ fn main() {
         }
     }
     let receipt = format!(
-        "{{\"oracle\":\"ar_hc_write_oracle\",\"pass\":{},\"iters\":{iters},\"streams\":[{}],\"devices\":[{},{}],\"results\":[{}]}}",
+        "{{\"oracle\":\"ar_hc_write_oracle\",\"wire\":\"{}\",\"pass\":{},\"iters\":{iters},\"streams\":[{}],\"devices\":[{},{}],\"results\":[{}]}}",
+        wire.name(),
         !failed,
         kinds.iter().map(|k| format!("\"{}\"", k.name())).collect::<Vec<_>>().join(","),
         devices[0], devices[1], json_rows.join(",")
