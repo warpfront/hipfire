@@ -168,6 +168,11 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_BF16_ROWS_OTILE`): the HC down k4 rows and the x4 rows
     /// (MoE gate-side, shared down) at 2..=8 rows, default off.
     pub qwen4_bf16_rows_otile: bool,
+    /// One-launch all-rows BF16 router / shared-expert GEMVs at 9..=64 rows
+    /// (`HIPFIRE_QWEN4_BF16_ALLROWS`): the MoE call's `gemm_bf16_xf32_multirow` /
+    /// `gemv_bf16_xf32_x4_rows` row-group launches become one launch, bitwise the same
+    /// outputs. Default on for exact gfx1201.
+    pub qwen4_bf16_allrows: bool,
     /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
@@ -1075,6 +1080,7 @@ impl FeatureFlags {
             qwen4_decode_head_fuse: parse_bool("HIPFIRE_QWEN4_DECODE_HEAD_FUSE")
                 .unwrap_or(arch == "gfx1151"),
             qwen4_bf16_rows_otile: parse_bool("HIPFIRE_QWEN4_BF16_ROWS_OTILE").unwrap_or(true),
+            qwen4_bf16_allrows: parse_bool("HIPFIRE_QWEN4_BF16_ALLROWS").unwrap_or(true),
             qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
@@ -1809,6 +1815,12 @@ impl FeatureFlags {
         self.qwen4_bf16_rows_otile && self.arch == "gfx1201"
     }
 
+    /// One-launch all-rows BF16 router / shared-expert GEMVs at 9..=64 rows
+    /// (`HIPFIRE_QWEN4_BF16_ALLROWS`, default on, `=0` kills it). Exact gfx1201 only.
+    pub fn qwen4_bf16_allrows_enabled(&self) -> bool {
+        self.qwen4_bf16_allrows && self.arch == "gfx1201"
+    }
+
     /// The fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`). Exact gfx1151 / gfx1201.
     pub fn qwen4_ple_fuse_enabled(&self) -> bool {
@@ -1967,6 +1979,7 @@ impl FeatureFlags {
             qwen4_decode_zba_x3: false,
             qwen4_decode_head_fuse: false,
             qwen4_bf16_rows_otile: false,
+            qwen4_bf16_allrows: false,
             qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
@@ -3135,6 +3148,40 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_bf16_rows_otile_enabled());
+    }
+
+    /// The all-rows BF16 router / shared-expert GEMVs are default on (`=0` kills) and reach exact
+    /// gfx1201 only.
+    #[test]
+    fn qwen4_bf16_allrows_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_QWEN4_BF16_ALLROWS" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_bf16_allrows_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_bf16_allrows_enabled(), "{arch}: 0");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(
+                on.qwen4_bf16_allrows_enabled(),
+                arch == "gfx1201",
+                "{arch}: 1"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_bf16_allrows_enabled());
     }
 
     #[test]

@@ -66,6 +66,10 @@ required-features = ["lab"]
 name = "otile_bf16_rows_oracle"
 required-features = ["lab"]
 
+[[example]]
+name = "bf16_allrows_oracle"
+required-features = ["lab"]
+
 # Hardware smoke of weight slabs (HIPFIRE_WEIGHT_SLAB): packing, readback,
 # alignment, ledger split, free/unload cycles.
 [[example]]

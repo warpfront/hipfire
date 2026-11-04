@@ -32104,6 +32104,11 @@ impl Gpu {
                 "gemm_bf16_xf32_multirow buffer capacity is too small",
             ));
         }
+        // `HIPFIRE_QWEN4_BF16_ALLROWS` (exact gfx1201): 9..=64 rows in one launch that loads
+        // each weight once per output tile; every output word is bitwise the arms below'.
+        if self.bf16_allrows_applies(batch_size) {
+            return self.gemm_bf16_xf32_multirow_allrows(weight, x, y, m, k, batch_size);
+        }
         // gfx1151 tile selection, measured on the production prefill shapes
         // (`.codeinsight+research/qwen4/pp500-kernel-check/dense-multirow-pick`
         // for the original sixteen-token tile, `dense-loadvec` for the

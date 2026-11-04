@@ -3013,6 +3013,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 kernels::QWEN4_GEMV_BF16_XF32_LANE_ALLROWS_SRC,
                 ["gemv_bf16_xf32_k4_rows_lane_t8"]
             );
+            // `HIPFIRE_QWEN4_BF16_ALLROWS` (default on, `=0` kills it): the MoE call's router / shared
+            // GEMVs of 9..=64 rows in one launch.
+            add!(
+                "qwen4_gemv_bf16_xf32_allrows",
+                kernels::QWEN4_GEMV_BF16_XF32_ALLROWS_SRC,
+                [
+                    "gemv_bf16_xf32_x4_rows_allrows_m1t4",
+                    "gemv_bf16_xf32_x4_rows_allrows_m2t4u10",
+                    "gemv_bf16_xf32_x4_rows_allrows_m4t4",
+                    "gemv_bf16_xf32_x4_rows_allrows_m4t4u5"
+                ]
+            );
             add!(
                 "moe_route_scatter_top10_f32",
                 kernels::MOE_ROUTE_SCATTER_TOP10_F32_SRC,
@@ -11790,6 +11802,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_BF16_ALLROWS` (default on, exact gfx1201): the all-rows BF16 router / shared GEMVs.
+        const BF16_ALLROWS_ADDED_MODULES: [&str; 1] = ["qwen4_gemv_bf16_xf32_allrows"];
+        for module in BF16_ALLROWS_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing BF16 all-rows module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -11825,7 +11851,8 @@ mod tests {
                 + F1_PLANAR_ADDED_MODULES.len()
                 + MOE_EPILOGUE_FUSE_ADDED_MODULES.len()
                 + HCFUSE_ADDED_MODULES.len()
-                + LANE_HC_ALLROWS_ADDED_MODULES.len(),
+                + LANE_HC_ALLROWS_ADDED_MODULES.len()
+                + BF16_ALLROWS_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name
