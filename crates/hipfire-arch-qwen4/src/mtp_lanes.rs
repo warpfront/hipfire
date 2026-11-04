@@ -244,12 +244,14 @@ pub(crate) fn lane_cost_profile_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_COST", true)
 }
 
-/// `HIPFIRE_QWEN4_LANE_ROW_CAP` (developer; default on, `0` off): the gfx1201
+/// `HIPFIRE_QWEN4_LANE_ROW_CAP` (developer; default off, `1` on): the gfx1201
 /// profile's even split of one 8-row group over the step's lanes
-/// ([`LaneCostProfile::step_row_cap`]). Off, the lanes of a step draft up to
-/// their own budgets and the floors learn the spill (`G`) from the priced steps.
+/// ([`LaneCostProfile::step_row_cap`]). Off (the default since the all-rows
+/// lane step, `HIPFIRE_QWEN4_LANE_ALLROWS`, runs a >8-row step as one pass), the
+/// lanes of a step draft up to their own budgets and the floors learn the
+/// spill (`G`) from the priced steps; `1` restores the one-group cap.
 pub(crate) fn lane_row_cap_enabled() -> bool {
-    hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_ROW_CAP", true)
+    hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_ROW_CAP", false)
 }
 
 /// What a lane's floor prices windows with and how it retires, per arch.
