@@ -2009,7 +2009,12 @@ pub(crate) fn capture_ring_total_slots(
 
 /// [`capture_ring_total_slots`] under the process configuration.
 pub(crate) fn current_capture_ring_total_slots(rows: usize, gdn_layers: usize) -> Option<usize> {
-    capture_ring_total_slots(compact_capture_ring(), lane_reserve_trim(), rows, gdn_layers)
+    capture_ring_total_slots(
+        compact_capture_ring(),
+        lane_reserve_trim(),
+        rows,
+        gdn_layers,
+    )
 }
 
 /// The snapshot-arena mirror allocation (elements, dtype) of one state
@@ -4112,10 +4117,9 @@ impl Qwen4State {
             for (index, layer) in self.gdn.iter().enumerate() {
                 let state = layer.recurrent.numel();
                 match pool.as_ref() {
-                    Some(pool) => rings.push(pool.sub_offset(
-                        CAPTURE_POOL_STRIDE * index * state,
-                        ring_slots * state,
-                    )),
+                    Some(pool) => rings.push(
+                        pool.sub_offset(CAPTURE_POOL_STRIDE * index * state, ring_slots * state),
+                    ),
                     None => rings.push(
                         gpu.zeros(&[ring_slots * state], layer.recurrent.dtype)
                             .map_err(StateError::Hip)?,

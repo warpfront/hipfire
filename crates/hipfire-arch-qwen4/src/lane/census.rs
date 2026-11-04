@@ -1490,9 +1490,11 @@ mod tests {
             let mut touched = std::collections::HashSet::new();
             for layer in 0..gdn_layers {
                 for logical in [0usize, rows] {
-                    let slot =
-                        CAPTURE_POOL_STRIDE * layer + capture_ring_slot(true, rows, logical);
-                    assert!(touched.insert(slot), "layer {layer} target {slot} is shared");
+                    let slot = CAPTURE_POOL_STRIDE * layer + capture_ring_slot(true, rows, logical);
+                    assert!(
+                        touched.insert(slot),
+                        "layer {layer} target {slot} is shared"
+                    );
                 }
             }
             assert_eq!(touched.len(), 2 * gdn_layers);
@@ -1510,8 +1512,11 @@ mod tests {
         );
         assert_eq!(budget.step_rows(), 48);
         let gdn = GdnStateFormat::Q8;
-        let census = lane_spec_census(&budget, &inputs(&config, gdn, &Qwen4BandScope::single(&config), 0))
-            .unwrap();
+        let census = lane_spec_census(
+            &budget,
+            &inputs(&config, gdn, &Qwen4BandScope::single(&config), 0),
+        )
+        .unwrap();
         let wide = (config.hc_count * config.hidden_size * 4) as u64;
         // Step buffers cover 48 decode rows + 8 prompt-completing rows, unchanged by the trim.
         assert_eq!(
@@ -1519,7 +1524,10 @@ mod tests {
             Some((48 + 8) * config.vocab_size as u64 * 4)
         );
         assert_eq!(census.bytes_of(CensusComponent::StepTop1), Some(56 * 4));
-        assert_eq!(census.bytes_of(CensusComponent::WideHidden), Some(48 * wide));
+        assert_eq!(
+            census.bytes_of(CensusComponent::WideHidden),
+            Some(48 * wide)
+        );
         assert!(census.bytes_of(CensusComponent::DraftTop1).unwrap() >= lanes as u64 * 8);
         // The census ring line is the allocator's own inventory under the current flag state,
         // so before/after totals differ by exactly `lanes` rings.
@@ -1529,12 +1537,10 @@ mod tests {
             .find(|l| l.component == CensusComponent::CaptureRing)
             .unwrap();
         let total_with = |trim: bool| {
-            let ring = sum(
-                &Qwen4State::row_capture_allocation_sizes_layout(
-                    &config, gdn, rows, gdn_layers, true, trim,
-                )
-                .unwrap(),
-            );
+            let ring = sum(&Qwen4State::row_capture_allocation_sizes_layout(
+                &config, gdn, rows, gdn_layers, true, trim,
+            )
+            .unwrap());
             census.total().unwrap() - ring_line.bytes().unwrap() + lanes as u64 * ring
         };
         assert_eq!(
@@ -1563,10 +1569,22 @@ mod tests {
         let m = |bytes: u64| mib(bytes);
         for (max_seq, chunk) in [(4096usize, 2048usize), (16384, 4096), (32768, 4096)] {
             let ctx = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, chunk, 2 << 20);
-            let ar = Qwen4State::device_bytes_with_mirror(&config, format, &ctx, &scope, StateMirror::Absent)
-                .unwrap() as u64;
-            let snap = Qwen4State::device_bytes_with_mirror(&config, format, &ctx, &scope, StateMirror::Snapshot)
-                .unwrap() as u64;
+            let ar = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &ctx,
+                &scope,
+                StateMirror::Absent,
+            )
+            .unwrap() as u64;
+            let snap = Qwen4State::device_bytes_with_mirror(
+                &config,
+                format,
+                &ctx,
+                &scope,
+                StateMirror::Snapshot,
+            )
+            .unwrap() as u64;
             let head: Vec<u64> = MtpGpuState::allocation_sizes(&config, &ctx).unwrap();
             let wide = (config.hc_count * config.hidden_size * 4) as u64;
             let layout = |trim: bool| {
@@ -1577,35 +1595,95 @@ mod tests {
             };
             let (before, after) = (layout(false), layout(true));
             println!("## max_seq {max_seq} chunk {chunk} (K{k} -> {rows}-row ring), per MTP lane over an AR lane");
-            println!("AR lane target state                 {:>14} B {:>9} MiB (not MTP)", ar, m(ar));
-            println!("snapshot mirror of the target state  {:>14} B {:>9} MiB", snap - ar, m(snap - ar));
-            println!("MTP head state (QSA arenas+carries)  {:>14} B {:>9} MiB  {} allocations", sum(&head), m(sum(&head)), head.len());
-            println!("pending hidden                       {:>14} B {:>9} MiB", wide, m(wide));
-            let slot = gdn.storage().state_bytes(config.linear_num_value_heads, 128, 128) as u64;
-            for (name, ring) in [("capture ring BEFORE (kill switch)", &before), ("capture ring AFTER  (default)    ", &after)] {
-                println!("{name} {:>14} B {:>9} MiB  {} allocations", sum(ring), m(sum(ring)), ring.len());
+            println!(
+                "AR lane target state                 {:>14} B {:>9} MiB (not MTP)",
+                ar,
+                m(ar)
+            );
+            println!(
+                "snapshot mirror of the target state  {:>14} B {:>9} MiB",
+                snap - ar,
+                m(snap - ar)
+            );
+            println!(
+                "MTP head state (QSA arenas+carries)  {:>14} B {:>9} MiB  {} allocations",
+                sum(&head),
+                m(sum(&head)),
+                head.len()
+            );
+            println!(
+                "pending hidden                       {:>14} B {:>9} MiB",
+                wide,
+                m(wide)
+            );
+            let slot = gdn
+                .storage()
+                .state_bytes(config.linear_num_value_heads, 128, 128) as u64;
+            for (name, ring) in [
+                ("capture ring BEFORE (kill switch)", &before),
+                ("capture ring AFTER  (default)    ", &after),
+            ] {
+                println!(
+                    "{name} {:>14} B {:>9} MiB  {} allocations",
+                    sum(ring),
+                    m(sum(ring)),
+                    ring.len()
+                );
             }
-            println!("  state slot {slot} B x {} layers x {} slots (before) | pool {} slots (after)", gdn_layers, rows + 1, 2 * (gdn_layers - 1) + rows + 1);
+            println!(
+                "  state slot {slot} B x {} layers x {} slots (before) | pool {} slots (after)",
+                gdn_layers,
+                rows + 1,
+                2 * (gdn_layers - 1) + rows + 1
+            );
             let before_lane = (snap - ar) + sum(&head) + wide + sum(&before);
             let after_lane = (snap - ar) + sum(&head) + wide + sum(&after);
-            println!("PER-LANE MTP increment BEFORE {:>14} B {:>9} MiB", before_lane, m(before_lane));
-            println!("PER-LANE MTP increment AFTER  {:>14} B {:>9} MiB  (-{} MiB)", after_lane, m(after_lane), m(before_lane - after_lane));
-            println!("8 lanes: BEFORE {} MiB, AFTER {} MiB; 5 extra lanes (3 -> 8) BEFORE {} MiB", m(8 * before_lane), m(8 * after_lane), m(5 * before_lane));
+            println!(
+                "PER-LANE MTP increment BEFORE {:>14} B {:>9} MiB",
+                before_lane,
+                m(before_lane)
+            );
+            println!(
+                "PER-LANE MTP increment AFTER  {:>14} B {:>9} MiB  (-{} MiB)",
+                after_lane,
+                m(after_lane),
+                m(before_lane - after_lane)
+            );
+            println!(
+                "8 lanes: BEFORE {} MiB, AFTER {} MiB; 5 extra lanes (3 -> 8) BEFORE {} MiB",
+                m(8 * before_lane),
+                m(8 * after_lane),
+                m(5 * before_lane)
+            );
             let budget = LaneSpecBudget::new(lanes, k, 0, 0, ctx, 1).unwrap();
             let census = lane_spec_census(&budget, &inputs(&config, gdn, &scope, 0)).unwrap();
             for line in &census.lines {
                 println!(
                     "    census {:<18} x{:<2} {:>14} B {:>10} MiB",
-                    line.component.name(), line.copies, line.bytes().unwrap(), mib(line.bytes().unwrap())
+                    line.component.name(),
+                    line.copies,
+                    line.bytes().unwrap(),
+                    mib(line.bytes().unwrap())
                 );
             }
             println!("    census TOTAL {} MiB", mib(census.total().unwrap()));
             let mtp_lane = (snap - ar)
                 + sum(&head)
                 + wide
-                + sum(&Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, rows, gdn_layers).unwrap());
-            let shared: u64 = census.lines.iter().filter(|l| l.copies == 1).map(|l| l.bytes().unwrap()).sum();
-            assert_eq!(census.total().unwrap(), lanes as u64 * (ar + mtp_lane) + shared);
+                + sum(&Qwen4State::row_capture_allocation_sizes_scoped(
+                    &config, gdn, rows, gdn_layers,
+                )
+                .unwrap());
+            let shared: u64 = census
+                .lines
+                .iter()
+                .filter(|l| l.copies == 1)
+                .map(|l| l.bytes().unwrap())
+                .sum();
+            assert_eq!(
+                census.total().unwrap(),
+                lanes as u64 * (ar + mtp_lane) + shared
+            );
         }
     }
 
