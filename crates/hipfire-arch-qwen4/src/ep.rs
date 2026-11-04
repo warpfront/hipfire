@@ -2615,10 +2615,15 @@ pub fn ep_lane_spec_k(resolved_k: usize) -> usize {
 /// reservation, the daemon's request and the batch staging share, so the
 /// reserved and the staged store cannot differ.
 pub fn ep_default_copy_config(gpu_arch: &str) -> Option<crate::lane::LaneCopyConfig> {
-    // Copy widens every lane's ring to 8 rows (about 3.7 GiB per rank at 8
-    // lanes) and so costs resident experts: armed only on request
-    // (`HIPFIRE_EP_MTP_LANE_COPY=1`) and where the singleton policy arms it.
-    if !hipfire_config::developer_bool("HIPFIRE_EP_MTP_LANE_COPY", false)
+    // Copy lane: on by default where the singleton policy arms it
+    // (`HIPFIRE_EP_MTP_LANE_COPY=0` kills it). Only the first
+    // `HIPFIRE_QWEN4_LANE_COPY_LANES` lane slots (default 2) hold the widened
+    // 8-row capture ring and may take copy windows, and a step with more
+    // lanes offers none: at higher occupancy a copy window costs more than
+    // it saves and each wide ring costs resident experts. `0` lanes = off.
+    let wide_lanes = copy_wide_lanes();
+    if wide_lanes == 0
+        || !hipfire_config::developer_bool("HIPFIRE_EP_MTP_LANE_COPY", true)
         || !hipfire_config::mtp_ngram_copy_enabled_for_arch(crate::ARCH_ID, gpu_arch)
     {
         return None;
@@ -2628,8 +2633,21 @@ pub fn ep_default_copy_config(gpu_arch: &str) -> Option<crate::lane::LaneCopyCon
     Some(crate::lane::LaneCopyConfig {
         ngram,
         head_lag_rows: 8,
+        wide_lanes,
     })
 }
+
+/// Lane slots that hold the copy lane's widened ring
+/// (`HIPFIRE_QWEN4_LANE_COPY_LANES`, default [`COPY_WIDE_LANES`]).
+fn copy_wide_lanes() -> usize {
+    hipfire_config::developer_var("HIPFIRE_QWEN4_LANE_COPY_LANES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(COPY_WIDE_LANES)
+}
+
+/// Default lane slots (and the step's lane cap) of the copy lane.
+pub const COPY_WIDE_LANES: usize = 2;
 
 /// Device bytes one rank's lane store commits, for `lanes` lanes at
 /// `row_budget` rows (`spec_k` = native-MTP lanes; EP stages AR lanes only).
@@ -3905,6 +3923,129 @@ mod tests {
         // Monotone: every extra AR-only slot saves bytes.
         let sizes: Vec<u64> = (0..=lanes).map(|n| bytes(lanes, Some(n))).collect();
         assert!(sizes.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    /// A copy store prices the widened capture ring only for its first
+    /// `wide_lanes` slots; every later slot keeps the legacy `k + 1`-row ring
+    /// (`Qwen4LaneStore::admit`), so planned bytes follow the allocation:
+    /// `all-wide - (lanes - wide) * (wide ring - narrow ring)` per lane.
+    #[test]
+    fn ep_copy_store_bytes_price_a_narrow_ring_past_the_wide_lanes() {
+        use crate::lane::census::{
+            lane_spec_census, CensusComponent, CensusInputs, LaneSpecBudget,
+        };
+        use crate::weights::Qwen4BandScope;
+        use crate::{Qwen4KvBackend, Qwen4StateFormat};
+        let config = crate::config::compact_test_config();
+        let single = Qwen4BandScope::single(&config);
+        let (max_seq, chunk, granularity) = (16384usize, 256usize, 2usize << 20);
+        let context = crate::kv_backend::Qwen4ContextCommit::new(
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+        );
+        let format = Qwen4StateFormat {
+            qsa: crate::QsaKvFormat::Fp8,
+            gdn: crate::GdnStateFormat::Q8,
+            qsa_f16_arena: false,
+            qsa_pooled_bf16: false,
+        };
+        let copy = |wide_lanes: usize| crate::lane::LaneCopyConfig {
+            ngram: hipfire_runtime::ngram_mod::NgramModConfig {
+                n_max: 7,
+                n_min: 1,
+                n_match: 4,
+                ..Default::default()
+            },
+            head_lag_rows: 8,
+            wide_lanes,
+        };
+        let (k, lanes) = (5usize, 8usize);
+        let bytes = |wide_lanes: usize, spec_lanes: Option<usize>| {
+            ep_lane_store_device_bytes_mixed(
+                &config,
+                format,
+                Qwen4KvBackend::Vmm,
+                max_seq,
+                chunk,
+                granularity,
+                lanes,
+                lanes,
+                Some(k),
+                Some(&copy(wide_lanes)),
+                spec_lanes,
+            )
+            .unwrap()
+        };
+        let append_scratch = (crate::mtp_spec::mtp_fill_scratch_requested()
+            && crate::mtp_gpu::MtpAppendScratch::allocation_sizes(
+                &config,
+                crate::mtp_gpu::MTP_FILL_ROWS,
+                crate::mtp_gpu::MTP_FILL_ROWS,
+            )
+            .is_some())
+        .then_some((crate::mtp_gpu::MTP_FILL_ROWS, crate::mtp_gpu::MTP_FILL_ROWS));
+        let inputs = CensusInputs {
+            config: &config,
+            format,
+            scope: &single,
+            rank: 0,
+            append_scratch,
+        };
+        let ring = |budget: LaneSpecBudget| {
+            lane_spec_census(&budget, &inputs)
+                .unwrap()
+                .bytes_of(CensusComponent::CaptureRing)
+                .unwrap()
+                / lanes as u64
+        };
+        let narrow = ring(LaneSpecBudget::new(lanes, k, 0, 0, context, 1).unwrap());
+        let wide = ring(
+            crate::mesh_rank_copy::copy_budget(lanes, k, &copy(usize::MAX), 8, context, 1).unwrap(),
+        );
+        assert!(wide > narrow, "the copy ring is wider ({wide} vs {narrow})");
+        let all_wide = bytes(usize::MAX, None);
+        for w in 0..=lanes {
+            assert_eq!(
+                bytes(w, None),
+                all_wide - (lanes - w) as u64 * (wide - narrow),
+                "wide_lanes={w}"
+            );
+        }
+        assert_eq!(bytes(lanes, None), all_wide);
+        // With no wide slot the copy store costs the legacy store plus the
+        // owed-row storage alone: its step buffers keep the native rows.
+        let legacy = ep_lane_store_device_bytes_mixed(
+            &config,
+            format,
+            Qwen4KvBackend::Vmm,
+            max_seq,
+            chunk,
+            granularity,
+            lanes,
+            lanes,
+            Some(k),
+            None,
+            None,
+        )
+        .unwrap();
+        let lag = lane_spec_census(
+            &crate::mesh_rank_copy::copy_budget(lanes, k, &copy(0), 8, context, 1).unwrap(),
+            &inputs,
+        )
+        .unwrap()
+        .bytes_of(CensusComponent::HeadLag)
+        .unwrap();
+        assert_eq!(
+            bytes(0, None),
+            legacy + lag,
+            "step buffers match the legacy store"
+        );
+        // A mixed store: only the MTP slots carry a ring, wide on the first two.
+        let mixed_all = bytes(usize::MAX, Some(3));
+        assert_eq!(bytes(2, Some(3)), mixed_all - (wide - narrow));
+        assert_eq!(bytes(5, Some(3)), mixed_all);
     }
 
     /// The AR lane store a rank stages carries no snapshot mirror: the one

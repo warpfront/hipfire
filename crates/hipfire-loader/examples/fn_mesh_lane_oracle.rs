@@ -2697,6 +2697,7 @@ fn drive_mtp_inner(
                         rng_seed: lanes[idx].epoch.request_tag,
                         prompt: cfg.prompts[idx].to_vec(),
                         spec_k: Some(depth),
+                        copy_capable: true,
                     },
                 )?;
                 prefill_timing.admit_wall += admit_clock.elapsed().as_secs_f64();
@@ -2916,6 +2917,7 @@ fn drive_mtp_ep(
         Some(hipfire_arch_qwen4::lane::LaneCopyConfig {
             ngram,
             head_lag_rows: 8,
+            wide_lanes: usize::MAX,
         })
     } else {
         None

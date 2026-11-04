@@ -163,6 +163,14 @@ impl CopyLane {
         self.ctx.sync_emitted(&self.stream);
     }
 
+    /// Retain a published window's committed tokens without indexing them: a
+    /// crowded step runs no copy window, so the n-gram pool catches up in one
+    /// pass at the next [`Self::offer`] (the proposal syncs it from the
+    /// stream). The committed shadow is untouched.
+    pub(crate) fn defer(&mut self, emitted: &[u32]) {
+        self.stream.extend_from_slice(emitted);
+    }
+
     /// Ask the pool for a proposal over the authoritative history (the
     /// pending seed is its last token) and run the take-length chooser on
     /// `shadow`, the request's (possibly staged) state. `take_cap` is the

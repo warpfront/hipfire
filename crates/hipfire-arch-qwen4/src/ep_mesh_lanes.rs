@@ -1768,6 +1768,9 @@ pub struct MeshLaneAdmission {
     pub prompt: Vec<u32>,
     /// `Some(k)`: a native-MTP lane; `None`: a plain AR lane.
     pub spec_k: Option<usize>,
+    /// The lane's slot holds the widened capture ring a copy window needs
+    /// (`Qwen4LaneStore::lane_copy_capable`); only such a lane arms copy.
+    pub copy_capable: bool,
 }
 
 /// The EP mesh's lane transaction owner: the root plus rank 0's executor
@@ -1877,7 +1880,8 @@ impl EpMeshLanes {
             Some(copy) => {
                 root = root
                     .with_copy_lane(copy.config.ngram)
-                    .map_err(|e| e.to_string())?;
+                    .map_err(|e| e.to_string())?
+                    .with_copy_max_lanes(copy.config.wide_lanes);
                 true
             }
             None => false,
@@ -1980,7 +1984,7 @@ impl EpMeshLanes {
                 prompt: admission.prompt,
                 spec_k: admission.spec_k,
                 head,
-                copy: self.copy_armed && admission.spec_k.is_some(),
+                copy: self.copy_armed && admission.copy_capable && admission.spec_k.is_some(),
                 head_lag: Vec::new(),
             })
             .map_err(|e| e.to_string())?;

@@ -989,12 +989,13 @@ pub struct LaneSpecConfig {
     pub spec_lanes: Option<usize>,
 }
 
-/// The opt-in copy lane of a store (lab/oracle only: the default store stages
-/// none). Arming it widens every lane's verify rows and GDN ring to
-/// `1 + max(k, take cap)` rows, gives each spec lane `head_lag_rows` owed
-/// head rows of storage and arms the root's copy lane
-/// ([`crate::mesh_lane_protocol::MeshRoot::with_copy_lane`]) for every spec
-/// request. [`crate::mesh_rank_copy::copy_budget`] is the one place that
+/// The copy lane of a store (EP serve stages it by default,
+/// [`crate::ep::ep_default_copy_config`]). Arming it widens the store's verify
+/// rows to `1 + max(k, take cap)` and the GDN ring of the first `wide_lanes`
+/// slots to the same width (later slots keep `k + 1` rows and never copy),
+/// gives each spec lane `head_lag_rows` owed head rows of storage and arms the
+/// root's copy lane ([`crate::mesh_lane_protocol::MeshRoot::with_copy_lane`])
+/// for the requests in a wide slot. [`crate::mesh_rank_copy::copy_budget`] is the one place that
 /// derives the budget the allocator and the census both read.
 #[derive(Clone, Copy, Debug)]
 pub struct LaneCopyConfig {
@@ -1003,6 +1004,10 @@ pub struct LaneCopyConfig {
     /// Owed head rows one retired lane may hold before the root flushes them
     /// (`WindowBudgets.head_lag_rows`; at least 1).
     pub head_lag_rows: usize,
+    /// Lanes (the first `wide_lanes` slots) that hold the widened capture
+    /// ring and may take copy windows; the other slots keep the native
+    /// `k + 1`-row ring and never copy (`usize::MAX`: every lane).
+    pub wide_lanes: usize,
 }
 
 /// A store's resolved copy lane: the request and what its budget resolved to.
@@ -1786,6 +1791,9 @@ pub struct Qwen4LaneStore {
     table: LaneTable<Qwen4LaneState>,
     row_budget: usize,
     ring_rows: usize,
+    /// The capture ring of a slot past the copy lane's `wide_lanes`
+    /// (`k + 1` rows; equals `ring_rows` without a copy lane).
+    narrow_ring_rows: usize,
     format: Qwen4StateFormat,
     backend: Qwen4KvBackend,
     policy: LaneStagePolicy,
@@ -1918,8 +1926,9 @@ impl Qwen4LaneStore {
                 );
             }
         }
-        // The copy lane (opt-in) widens every lane's verify rows and ring to
-        // `1 + max(k, take cap)` and adds the owed-row storage; without it the
+        // The copy lane widens the store's verify rows and the first
+        // `wide_lanes` slots' ring to `1 + max(k, take cap)` and adds the
+        // owed-row storage (`ring_rows` is the wide ring); without it the
         // store keeps its `k + 1`-row shape exactly.
         let (ring_rows, rows_cap, lag_rows, copy_arming) = match (spec, copy) {
             (Some(spec), Some(copy)) => {
@@ -1998,6 +2007,7 @@ impl Qwen4LaneStore {
             table: LaneTable::new(max_lanes),
             row_budget: row_budget.min(max_lanes),
             ring_rows,
+            narrow_ring_rows: spec.map_or(ring_rows, |s| s.k + 1),
             format: bundle.state_format(),
             backend: bundle.state.qsa_backend(),
             policy,
@@ -2147,7 +2157,30 @@ impl Qwen4LaneStore {
             1,
         )
         .ok()?;
-        census::lane_spec_census(&budget, &inputs).ok()?.total()
+        let wide = census::lane_spec_census(&budget, &inputs).ok()?;
+        Self::narrow_ring_slots(wide, &inputs, max_lanes, spec_k, context, copy)?.total()
+    }
+
+    /// The widened copy census with its capture rings split to `wide_lanes`
+    /// wide slots and the rest at the legacy `k + 1`-row ring (the allocation
+    /// `admit` makes), a no-op when every lane is wide.
+    fn narrow_ring_slots(
+        wide: census::LaneCensus,
+        inputs: &census::CensusInputs<'_>,
+        max_lanes: usize,
+        spec_k: usize,
+        context: &Qwen4ContextCommit,
+        copy: &LaneCopyConfig,
+    ) -> Option<census::LaneCensus> {
+        if copy.wide_lanes >= max_lanes {
+            return Some(wide);
+        }
+        let narrow = census::lane_spec_census(
+            &census::LaneSpecBudget::new(max_lanes, spec_k, 0, 0, *context, 1).ok()?,
+            inputs,
+        )
+        .ok()?;
+        census::split_capture_ring(wide, &narrow, copy.wide_lanes)
     }
 
     /// [`Self::device_bytes`] / [`Self::device_bytes_with_copy`] of a MIXED
@@ -2195,7 +2228,7 @@ impl Qwen4LaneStore {
             None => census::LaneSpecBudget::new(max_lanes, spec_k, 0, 0, *context, 1).ok()?,
         };
         let census = census::lane_spec_census(&budget, &inputs).ok()?;
-        census::mixed_lane_census(
+        let mixed = census::mixed_lane_census(
             census,
             max_lanes,
             spec_lanes,
@@ -2207,8 +2240,13 @@ impl Qwen4LaneStore {
                 Self::state_mirror(None),
             )
             .and_then(|bytes| u64::try_from(bytes).ok())?,
-        )?
-        .total()
+        )?;
+        match copy {
+            Some((_, copy)) => {
+                Self::narrow_ring_slots(mixed, &inputs, max_lanes, spec_k, context, copy)?.total()
+            }
+            None => mixed.total(),
+        }
     }
 
     /// Admit `epoch` with its canonical `prompt` into the lowest free lane
@@ -2223,6 +2261,7 @@ impl Qwen4LaneStore {
         prompt: Vec<u32>,
     ) -> Result<usize, String> {
         let store_ring_rows = self.ring_rows;
+        let (narrow_ring_rows, wide_lanes) = self.ring_split();
         let store_spec_cfg = self
             .spec
             .as_ref()
@@ -2236,7 +2275,12 @@ impl Qwen4LaneStore {
             // A slot past the mixed store's MTP lanes is an AR-only lane:
             // no capture ring, no head.
             let (ring_rows, spec_cfg) = if slot < spec_lanes {
-                (store_ring_rows, store_spec_cfg)
+                let ring = if slot < wide_lanes {
+                    store_ring_rows
+                } else {
+                    narrow_ring_rows
+                };
+                (ring, store_spec_cfg)
             } else {
                 (0, None)
             };
@@ -2286,7 +2330,8 @@ impl Qwen4LaneStore {
         if self.phase != LanePhase::Idle {
             return Err("admit_promoted: a step is in flight".to_string());
         }
-        let ring_rows = self.ring_rows;
+        let (narrow_ring_rows, wide_lanes) = self.ring_split();
+        let wide_ring_rows = self.ring_rows;
         let spec_cfg = self
             .spec
             .as_ref()
@@ -2325,6 +2370,11 @@ impl Qwen4LaneStore {
                     Ok(None)
                 }
                 None => {
+                    let ring_rows = if slot < wide_lanes {
+                        wide_ring_rows
+                    } else {
+                        narrow_ring_rows
+                    };
                     let (state, mut spec) = new_payload(gpu, bundle, slot, ring_rows, spec_cfg)?;
                     let seeded = match (spec_cfg, spec.as_mut(), parts.as_ref()) {
                         (Some(_), Some(spec), Some(parts)) => spec.promote(gpu, parts),
@@ -2413,6 +2463,26 @@ impl Qwen4LaneStore {
     /// copy off on every lane).
     pub(crate) fn copy(&self) -> Option<StoreCopy> {
         self.copy
+    }
+
+    /// `(narrow ring rows, wide lanes)`: slots at or past `wide_lanes` hold
+    /// the narrow ring (no copy lane: every slot is wide).
+    fn ring_split(&self) -> (usize, usize) {
+        match self.copy {
+            Some(c) => (self.narrow_ring_rows, c.config.wide_lanes),
+            None => (self.ring_rows, usize::MAX),
+        }
+    }
+
+    /// Whether `epoch`'s lane holds the widened ring a copy window needs
+    /// (false without a copy lane or for a slot past its `wide_lanes`).
+    pub(crate) fn lane_copy_capable(&self, epoch: &RequestEpoch) -> bool {
+        let Some(copy) = self.copy else {
+            return false;
+        };
+        self.table
+            .slot_of(epoch)
+            .is_some_and(|slot| slot < copy.config.wide_lanes)
     }
 
     /// Whether the store runs the copy lane.

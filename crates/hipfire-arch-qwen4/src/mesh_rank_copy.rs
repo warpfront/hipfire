@@ -396,6 +396,10 @@ pub fn copy_budget(
     }
     Ok(
         LaneSpecBudget::new(lanes, native_k, take_cap, 0, context, owner_mask)?
+            // Copy windows (up to `1 + take cap` rows) run in steps of at most
+            // `wide_lanes` lanes and every other window is native, so the step
+            // buffers keep the native `k + 1` rows per lane.
+            .with_step_rows_per_lane(native_k + 1)
             .with_head_lag_rows(copy.head_lag_rows),
     )
 }
@@ -1484,6 +1488,7 @@ mod tests {
                 ..Default::default()
             },
             head_lag_rows: 5,
+            wide_lanes: usize::MAX,
         };
         let budget = copy_budget(3, 2, &copy, 8, context, 1).unwrap();
         assert_eq!(budget.copy_take_cap, 7);
@@ -1524,6 +1529,7 @@ mod tests {
         let ok = LaneCopyConfig {
             ngram,
             head_lag_rows: 2,
+            wide_lanes: usize::MAX,
         };
         // The take cap is min(n_max, row_exact - 1).
         let b = copy_budget(2, 1, &ok, 8, context, 1).unwrap();
@@ -1535,6 +1541,7 @@ mod tests {
         // A lag-free budget could never hold an owed row.
         let none = LaneCopyConfig {
             head_lag_rows: 0,
+            wide_lanes: usize::MAX,
             ..ok
         };
         assert!(copy_budget(2, 1, &none, 8, context, 1).is_err());

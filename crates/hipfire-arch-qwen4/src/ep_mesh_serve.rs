@@ -315,6 +315,7 @@ impl Qwen4Bundle {
                     prompt: lane.host.prompt.clone(),
                     // An AR-only lane of a mixed store joins the root as an AR lane.
                     spec_k: lane.spec.is_some().then_some(spec_k),
+                    copy_capable: store.lane_copy_capable(&request.epoch),
                 });
                 (admission, sampling)
             };

@@ -1137,6 +1137,7 @@ fn run_group(
                 rng_seed: lane.epoch.request_tag,
                 prompt: chunk[..from].to_vec(),
                 spec_k: Some(k),
+                copy_capable: true,
             },
         )?;
         lane.in_mesh = true;

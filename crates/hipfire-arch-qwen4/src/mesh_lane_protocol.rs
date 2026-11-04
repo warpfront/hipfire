@@ -1576,6 +1576,9 @@ pub struct MeshRoot {
     driver_terminates: bool,
     /// The root's copy lane (`None`: copy off on every lane).
     copy_pool: Option<CopyPool>,
+    /// Steps with more lanes than this offer no copy windows (`usize::MAX`:
+    /// every step may). Root-only and read at planning, so ranks agree.
+    copy_max_lanes: usize,
     /// Bit `d`: this root already priced a copy takeover of `d` candidates
     /// (the first of a row count binds its specialised verify symbols and is
     /// observed unpriced, as the singleton's `ngram_warm_depths`).
@@ -1614,6 +1617,7 @@ impl MeshRoot {
             counters: RootCounters::default(),
             driver_terminates: false,
             copy_pool: None,
+            copy_max_lanes: usize::MAX,
             copy_warm: 0,
         })
     }
@@ -1651,6 +1655,14 @@ impl MeshRoot {
                 .map_err(|e| ProtocolError::Config(format!("copy lane config: {e}")))?,
         );
         Ok(self)
+    }
+
+    /// Offer copy windows only in steps of at most `lanes` lanes (the copy
+    /// ring is a few lanes wide, and at higher occupancy a copy window costs
+    /// more than it saves). Call before the first admission.
+    pub fn with_copy_max_lanes(mut self, lanes: usize) -> Self {
+        self.copy_max_lanes = lanes;
+        self
     }
 
     /// The root rank's ownership (the only rank that chooses, draws, accepts).
@@ -2118,7 +2130,11 @@ impl MeshRoot {
                     rng: l.rng,
                     policy: l.policy.clone(),
                     window: None,
-                    copy: l.copy.as_ref().map(|c| c.shadow.clone()),
+                    // A crowded step runs no copy window: no shadow is staged
+                    // (nothing to observe, nothing to publish).
+                    copy: (requests.len() <= self.copy_max_lanes)
+                        .then(|| l.copy.as_ref().map(|c| c.shadow.clone()))
+                        .flatten(),
                     copy_prop: None,
                 },
             );
@@ -2137,6 +2153,7 @@ impl MeshRoot {
 
         let mut plans: Vec<LanePlan> = Vec::with_capacity(requests.len());
         let mut total_rows = 0usize;
+        let copy_step = requests.len() <= self.copy_max_lanes;
         for (lane_index, r) in requests.iter().enumerate() {
             // The copy context proposes from committed history only: asking
             // it touches scratch, never the state a window publishes.
@@ -2183,7 +2200,10 @@ impl MeshRoot {
                 head: lane.head,
             };
             let sl = staged.get_mut(&lane.epoch).expect("staged lane");
-            let copy_active = sl.copy.as_ref().is_some_and(|c| c.active);
+            // A crowded step runs no copy window, so a retired lane owes the
+            // head no rows for one (no per-token owed-row copies, no capacity
+            // flush): it plans as a copy-free lane and its lag is dropped.
+            let copy_active = copy_step && sl.copy.as_ref().is_some_and(|c| c.active);
             if let Some(forced) = &r.forced {
                 if forced.is_empty() || forced.len() > budgets.verify_rows_per_lane {
                     return Err(ProtocolError::Budget(format!(
@@ -2246,7 +2266,7 @@ impl MeshRoot {
                 // The copy source (its own chooser, apart from the native
                 // one; the retired lane keeps it).
                 let prop = match (copy_active, lane.copy.as_mut(), sl.copy.as_ref()) {
-                    (true, Some(copy), Some(shadow)) => copy.offer(
+                    (true, Some(copy), Some(shadow)) if copy_step => copy.offer(
                         shadow,
                         policy,
                         budgets.lab,
@@ -3255,9 +3275,16 @@ impl MeshRoot {
                 lane.generated.extend_from_slice(&up.emitted);
                 lane.head = up.head;
                 lane.lag = up.lag;
-                if let (Some(copy), Some(shadow)) = (lane.copy.as_mut(), st.copy) {
-                    copy.shadow = shadow;
-                    copy.append(&up.emitted);
+                if let Some(copy) = lane.copy.as_mut() {
+                    match st.copy {
+                        Some(shadow) => {
+                            copy.shadow = shadow;
+                            copy.append(&up.emitted);
+                        }
+                        // A crowded step staged no shadow: keep the tokens,
+                        // index them at the next copy offer.
+                        None => copy.defer(&up.emitted),
+                    }
                 }
                 if up.terminal && !self.driver_terminates {
                     lane.status = LaneStatus::Terminal;
@@ -7402,6 +7429,147 @@ mod tests {
             m.ranks[0].calls, m.ranks[1].calls,
             "every rank saw the identical ordered calls"
         );
+    }
+
+    /// A step with more lanes than `copy_max_lanes` offers no copy window (the
+    /// wide ring is a few lanes wide and copy loses at higher occupancy); a
+    /// step within the cap still copies.
+    #[test]
+    fn mesh_lane_protocol_copy_is_offered_only_in_steps_within_the_lane_cap() {
+        let b = cycle_budgets();
+        for (lanes, copies) in [(2usize, true), (3, false)] {
+            let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+            m.root.copy_max_lanes = 2;
+            let tags: Vec<u64> = (1..=lanes as u64).collect();
+            for &t in &tags {
+                admit_cycle(&mut m, t, None);
+                script_cycle(&m, t, 0, 20);
+            }
+            let reqs: Vec<LaneRequest> = tags.iter().map(|&t| req(t, 99)).collect();
+            let (start, _) = m.step(&reqs, &b);
+            for l in &start.lanes {
+                assert_eq!(
+                    l.source == ProposalSource::Copy,
+                    copies,
+                    "{lanes} lanes: {:?}",
+                    l.source
+                );
+            }
+        }
+    }
+
+    /// Root CPU cost per phase of one scripted window (microseconds, median of
+    /// 400 steps): the receipt of what the lane driver adds on the host between
+    /// GPU phases. `cargo test --release -p hipfire-arch-qwen4 --lib
+    /// root_cpu_cost_receipt -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "receipt generator: prints the root's per-phase host cost"]
+    fn root_cpu_cost_receipt() {
+        use std::time::Instant;
+        let b = budgets(LabRoutes::Floor, 7);
+        for (lanes, copy) in [(1usize, false), (1, true), (8, false), (8, true)] {
+            let mut m = Mesh::new_with(MeshKind::Ep, true, copy.then(copy_cfg));
+            let tags: Vec<u64> = (1..=lanes as u64).collect();
+            for &t in &tags {
+                m.admit_with(t, 10, 7, None, Some(5), (1..=10).collect(), copy);
+            }
+            let reqs: Vec<LaneRequest> = tags.iter().map(|&t| req(t, 100_000)).collect();
+            let mut phases: Vec<[f64; 7]> = Vec::new();
+            let mut prior: Option<MergedCostEvidence> = None;
+            for seq in 0..400u64 {
+                for &t in &tags {
+                    script_matching(&m, t, seq, 3);
+                }
+                let mut t = [0f64; 7];
+                let mut lap = |i: usize, t0: &mut Instant| {
+                    t[i] = t0.elapsed().as_secs_f64() * 1e6;
+                    *t0 = Instant::now();
+                };
+                let mut t0 = Instant::now();
+                let _ = m.s_plan(prior.as_ref(), &reqs, &b).unwrap();
+                lap(0, &mut t0);
+                m.s_ready().unwrap();
+                lap(1, &mut t0);
+                m.s_draft().unwrap();
+                lap(2, &mut t0);
+                m.s_verify().unwrap();
+                lap(3, &mut t0);
+                m.s_decide(&mut GreedyRule).unwrap();
+                lap(4, &mut t0);
+                m.s_prepare().unwrap();
+                lap(5, &mut t0);
+                let out = m.s_publish();
+                lap(6, &mut t0);
+                prior = Some(m.merged(&out));
+                if seq >= 50 {
+                    phases.push(t);
+                }
+            }
+            let med = |i: usize| {
+                let mut v: Vec<f64> = phases.iter().map(|p| p[i]).collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            println!(
+                "lanes {lanes} copy {copy}: plan {:.1} ready {:.1} draft {:.1} verify {:.1} decide {:.1} prepare {:.1} publish {:.1} us",
+                med(0), med(1), med(2), med(3), med(4), med(5), med(6)
+            );
+        }
+    }
+
+    /// A crowded step stages no copy shadow and indexes nothing, yet the next
+    /// small step proposes from the full history (the pool catches up from the
+    /// retained stream at the offer).
+    #[test]
+    fn mesh_lane_protocol_copy_catches_up_after_a_crowded_step() {
+        let b = cycle_budgets();
+        for kind in BOTH {
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            m.root.copy_max_lanes = 1;
+            let e = admit_cycle(&mut m, 1, None);
+            m.admit(2, 10, 7, None, None);
+            // Crowded (two lanes): a native window, no copy offered.
+            script_cycle(&m, 1, 0, 20);
+            m.script_window(2, 0, &[], &[600]);
+            let (start, out) = m.step(&[req(1, 99), req(2, 99)], &b);
+            assert_eq!(start.lanes[0].source, ProposalSource::Native, "{kind:?}");
+            let emitted = lane_out(&out, 1).emitted.clone();
+            assert!(!emitted.is_empty());
+            let (_, seed) = m.root.lane_position(e).unwrap();
+            // The history is not indexed yet, but a small step proposes the
+            // cycle's continuation of the new seed.
+            script_cycle(&m, 1, 1, seed);
+            let (start, _) = m.step(&[req(1, 99)], &b);
+            let lane = &start.lanes[0];
+            assert_eq!(lane.source, ProposalSource::Copy, "{kind:?}");
+            assert_eq!(lane.copy_drafts.first(), Some(&(seed + 1)), "{kind:?}");
+        }
+    }
+
+    /// A crowded step (more lanes than the copy cap) drops a retired copy
+    /// lane's owed head rows instead of accruing them (the copy window they
+    /// serve cannot run); a step within the cap keeps them.
+    #[test]
+    fn mesh_lane_protocol_crowded_step_drops_a_retired_copy_lanes_owed_head_rows() {
+        let b = cycle_budgets();
+        for (cap, expect_lag) in [(2usize, true), (1, false)] {
+            let mut m = Mesh::new_with(MeshKind::Ep, false, Some(copy_cfg()));
+            m.root.copy_max_lanes = cap;
+            let e = admit_retired(&mut m, true);
+            m.admit(2, 10, 7, None, None);
+            m.script_window(1, 0, &[], &[6]);
+            m.script_window(2, 0, &[], &[600]);
+            let (start, _) = m.step(&[req(1, 99), req(2, 99)], &b);
+            assert_eq!(start.lanes[0].route, LaneRoute::ArRetired);
+            let (head, owed) = m.root.head_state(e).unwrap();
+            if expect_lag {
+                assert_eq!(head, HeadState::Lag { from: 30 }, "cap {cap}");
+                assert_eq!(owed, &[5u32][..]);
+            } else {
+                assert_eq!(head, HeadState::Free, "cap {cap}");
+                assert!(owed.is_empty());
+            }
+        }
     }
 
     #[test]

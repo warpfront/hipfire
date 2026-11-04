@@ -1065,6 +1065,7 @@ fn run_arm_inner(
                     rng_seed: lanes[i].epoch.request_tag,
                     prompt: prompts[i].to_vec(),
                     spec_k: Some(depth),
+                    copy_capable: true,
                 },
             )?;
             lanes[i].in_mesh = true;

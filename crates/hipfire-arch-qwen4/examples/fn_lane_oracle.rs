@@ -3545,6 +3545,7 @@ fn real_main() -> R<bool> {
         Some(LaneCopyConfig {
             ngram,
             head_lag_rows: args.lag_rows,
+            wide_lanes: usize::MAX,
         })
     } else {
         None

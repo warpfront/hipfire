@@ -88,6 +88,9 @@ pub struct LaneSpecBudget {
     /// Device bytes of sampled-verify scratch a head owner holds once (shared
     /// across lanes); `0` for greedy-only and the host-draw naive sampler.
     pub sampling_scratch: u64,
+    /// Decode rows per lane the step buffers hold (`verify_rows_per_lane`
+    /// unless [`Self::with_step_rows_per_lane`] narrows it).
+    step_rows_per_lane: usize,
 }
 
 impl LaneSpecBudget {
@@ -147,6 +150,7 @@ impl LaneSpecBudget {
             context_commit,
             owner_mask,
             sampling_scratch: 0,
+            step_rows_per_lane: verify_rows_per_lane,
         })
     }
 
@@ -207,9 +211,19 @@ impl LaneSpecBudget {
         self
     }
 
-    /// Decode rows the step buffers hold: `lanes * verify_rows_per_lane`.
+    /// With the step buffers sized for `rows` decode rows per lane (at least 1
+    /// and at most `verify_rows_per_lane`): a store whose widest windows come
+    /// from a few lanes in small steps (the copy lane) keeps the native
+    /// `native_k + 1`-row step buffers.
+    pub fn with_step_rows_per_lane(mut self, rows: usize) -> Self {
+        self.step_rows_per_lane = rows.clamp(1, self.verify_rows_per_lane);
+        self
+    }
+
+    /// Decode rows the step buffers hold: `lanes * step_rows_per_lane`
+    /// (`verify_rows_per_lane` unless narrowed).
     pub fn step_rows(&self) -> usize {
-        self.lanes * self.verify_rows_per_lane
+        self.lanes * self.step_rows_per_lane
     }
 
     /// Whether rank/band `rank` owns the MTP head and the sampler.
@@ -717,6 +731,38 @@ pub(crate) fn mixed_lane_census(
         }
     }
     census.lines.extend(ar_state);
+    Some(census)
+}
+
+/// The census of a copy store whose capture ring is wide only on its first
+/// `wide_lanes` MTP slots: `census` is the widened budget's, `narrow` the
+/// legacy (`k + 1`-row ring) budget's over the same lanes and band. Every
+/// `CaptureRing` line (its `copies` already reduced to the MTP slots) splits
+/// into `min(wide_lanes, copies)` wide copies and the rest at the narrow
+/// allocation, exactly as `Qwen4LaneStore::admit` sizes each slot. `None`
+/// when the narrow census has no ring line to price the narrow slots from.
+pub(crate) fn split_capture_ring(
+    mut census: LaneCensus,
+    narrow: &LaneCensus,
+    wide_lanes: usize,
+) -> Option<LaneCensus> {
+    let narrow_line = narrow
+        .lines
+        .iter()
+        .find(|l| l.component == CensusComponent::CaptureRing)?;
+    let mut extra = Vec::new();
+    for line in &mut census.lines {
+        if line.component != CensusComponent::CaptureRing || line.copies <= wide_lanes {
+            continue;
+        }
+        extra.push(CensusLine {
+            component: CensusComponent::CaptureRing,
+            copies: line.copies - wide_lanes,
+            allocations: narrow_line.allocations.clone(),
+        });
+        line.copies = wide_lanes;
+    }
+    census.lines.extend(extra);
     Some(census)
 }
 
