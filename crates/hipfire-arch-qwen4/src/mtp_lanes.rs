@@ -714,11 +714,15 @@ pub(crate) fn step_trace_line(
     verified: usize,
     wall_us: f64,
     priced: bool,
+    phase_us: [f64; 3],
 ) -> String {
     format!(
-        "{LANE_COST_TRACE_PREFIX} {{\"event\":\"step\",\"step_seq\":{step_seq},\"lanes\":{lanes},\"spill\":{spill},\"verified\":{verified},\"rows\":{},\"row_groups\":{},\"wall_us\":{wall_us:.1},\"priced\":{priced}}}",
+        "{LANE_COST_TRACE_PREFIX} {{\"event\":\"step\",\"step_seq\":{step_seq},\"lanes\":{lanes},\"spill\":{spill},\"verified\":{verified},\"rows\":{},\"row_groups\":{},\"wall_us\":{wall_us:.1},\"priced\":{priced},\"draft_us\":{:.1},\"verify_us\":{:.1},\"prepare_us\":{:.1}}}",
         lanes + verified,
-        spill + 1
+        spill + 1,
+        phase_us[0],
+        phase_us[1],
+        phase_us[2]
     )
 }
 
@@ -2513,7 +2517,7 @@ mod tests {
         );
         assert_eq!(v["fit_us"]["F"], 16_900.0);
         let step: serde_json::Value = serde_json::from_str(
-            step_trace_line(17, 4, 1, 6, 77_200.0, true)
+            step_trace_line(17, 4, 1, 6, 77_200.0, true, [1.0, 2.0, 3.0])
                 .strip_prefix(LANE_COST_TRACE_PREFIX)
                 .unwrap()
                 .trim(),

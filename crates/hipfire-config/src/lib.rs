@@ -7155,6 +7155,48 @@ mod tests {
         assert_eq!(memory::validate_qwen4_d2_window_rows(), Ok(()));
     }
 
+    /// The default D2 window: 8 on exact gfx1100 without slab owners, 4 everywhere else (other
+    /// arches, slab owners, an unknown arch), an explicit knob always wins, an invalid one reads 4.
+    #[test]
+    fn qwen4_d2_window_default_is_eight_on_gfx1100_aggregate_only_and_explicit_wins() {
+        use memory::{
+            qwen4_d2_window_default_for as default_for, resolve_d2_window_rows as resolve,
+        };
+        assert_eq!(default_for("gfx1100", false), 8);
+        assert_eq!(
+            default_for("gfx1100", true),
+            4,
+            "slab owners (mq3/mq2-xts) are unmeasured at 8"
+        );
+        for arch in [
+            "gfx1201", "gfx1151", "gfx1200", "gfx942", "gfx906", "gfx1100x", "",
+        ] {
+            for slab in [false, true] {
+                assert_eq!(default_for(arch, slab), 4, "{arch:?} slab={slab}");
+            }
+        }
+        // Unset: the load default (clamped into 4..=8); explicit valid values win over it.
+        assert_eq!(resolve(None, 8), 8);
+        assert_eq!(resolve(None, 4), 4);
+        assert_eq!(resolve(None, 99), 8);
+        assert_eq!(resolve(None, 0), 4);
+        for rows in 4..=8usize {
+            for load_default in [4usize, 8] {
+                assert_eq!(resolve(Some(&rows.to_string()), load_default), rows);
+            }
+        }
+        // `=4` is the kill on gfx1100; an invalid spelling reads as 4 (the load refuses it).
+        assert_eq!(resolve(Some("4"), 8), 4);
+        for bad in ["", "3", "9", "eight"] {
+            assert_eq!(resolve(Some(bad), 8), 4, "{bad:?}");
+        }
+        // The loader's per-load record round-trips (and is restored for the other tests).
+        memory::set_qwen4_d2_window_load_default(8);
+        assert_eq!(memory::qwen4_d2_window_rows(), 8);
+        memory::set_qwen4_d2_window_load_default(4);
+        assert_eq!(memory::qwen4_d2_window_rows(), 4);
+    }
+
     #[test]
     fn hfq_reader_knobs_parse_in_range_and_refuse_everything_else() {
         use memory::{parse_hfq_reader_chunk_mib as chunk, parse_hfq_reader_lanes as lanes};
@@ -10684,7 +10726,8 @@ pub mod memory {
 
     /// Env name of the D2 verify-window knob ([`qwen4_d2_window_rows`]).
     pub const QWEN4_D2_WINDOW_ROWS_ENV: &str = "HIPFIRE_QWEN4_D2_WINDOW_ROWS";
-    /// Rows the D2 CPU split qualifies by default (`CPU_SPLIT_MAX_ROWS`).
+    /// Rows the D2 CPU split qualifies by default (`CPU_SPLIT_MAX_ROWS`) and the smallest window the
+    /// knob accepts; [`qwen4_d2_window_default_for`] widens the default on exact gfx1100.
     pub const QWEN4_D2_WINDOW_ROWS_DEFAULT: usize = 4;
     /// Most rows [`qwen4_d2_window_rows`] may raise the window to: the GPU
     /// few-row route's proven width on every arch the D2 split runs on.
@@ -10706,7 +10749,8 @@ pub mod memory {
             }
             _ => Err(format!(
                 "{QWEN4_D2_WINDOW_ROWS_ENV}={raw:?} is not a D2 verify window: expected an integer \
-                 from {QWEN4_D2_WINDOW_ROWS_DEFAULT} (the default) to {QWEN4_D2_WINDOW_ROWS_CEILING}"
+                 from {QWEN4_D2_WINDOW_ROWS_DEFAULT} to {QWEN4_D2_WINDOW_ROWS_CEILING} (unset: 8 on gfx1100 \
+                 without slab owners, 4 elsewhere)"
             )),
         }
     }
@@ -10718,19 +10762,54 @@ pub mod memory {
         parse_d2_window_rows(process_value(QWEN4_D2_WINDOW_ROWS_ENV).as_deref()).map(|_| ())
     }
 
-    /// `developer.qwen4_d2_window_rows` (env `HIPFIRE_QWEN4_D2_WINDOW_ROWS`,
-    /// default `4`, range `4..=8`): the widest whole-window verify the D2
-    /// CPU-cold/GPU-hot split qualifies without the lab-wide oracle override.
-    /// Snapshot-read once per process (cached): the per-call D2 gates and the
-    /// native-MTP `auto` K cap read it on hot paths. An invalid value reads as
-    /// the default here and is refused at load by
-    /// [`validate_qwen4_d2_window_rows`].
+    /// D2 verify window of a load on `arch` whose expert owners are (`slab_owners`) or are not
+    /// expert-slab arenas, when the knob is unset: **8 on exact gfx1100** (7900 XTX; aggregate /
+    /// tier / whole-layer owners; measured hipx XTX, n=5, native MTP K 3 -> 7: sym-calib code
+    /// 1.019 [1.011, 1.028], shipped mq4 code 1.054, story 1.021; MTP text byte-identical on 8/8
+    /// prompts), **4 everywhere else** (every other arch, and a slab owner such as mq3-xts or
+    /// mq2-xts on gfx1100, unmeasured at 8). An explicit [`QWEN4_D2_WINDOW_ROWS_ENV`] always wins.
+    pub fn qwen4_d2_window_default_for(arch: &str, slab_owners: bool) -> usize {
+        if arch == "gfx1100" && !slab_owners {
+            8
+        } else {
+            QWEN4_D2_WINDOW_ROWS_DEFAULT
+        }
+    }
+
+    /// Pure body of [`qwen4_d2_window_rows`]: an explicit valid knob wins, an unset knob is the
+    /// load's default, an invalid one reads as the default `4` (the load refuses it through
+    /// [`validate_qwen4_d2_window_rows`]).
+    pub fn resolve_d2_window_rows(raw: Option<&str>, load_default: usize) -> usize {
+        match raw {
+            None => load_default.clamp(QWEN4_D2_WINDOW_ROWS_DEFAULT, QWEN4_D2_WINDOW_ROWS_CEILING),
+            Some(_) => parse_d2_window_rows(raw).unwrap_or(QWEN4_D2_WINDOW_ROWS_DEFAULT),
+        }
+    }
+
+    static D2_WINDOW_LOAD_DEFAULT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(QWEN4_D2_WINDOW_ROWS_DEFAULT);
+
+    /// Record the unset-knob window of the load being built ([`qwen4_d2_window_default_for`]); the
+    /// Qwen4 loader calls it once per load before any executor is sized. Every reader then sees it.
+    pub fn set_qwen4_d2_window_load_default(rows: usize) {
+        D2_WINDOW_LOAD_DEFAULT.store(
+            rows.clamp(QWEN4_D2_WINDOW_ROWS_DEFAULT, QWEN4_D2_WINDOW_ROWS_CEILING),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// `developer.qwen4_d2_window_rows` (env `HIPFIRE_QWEN4_D2_WINDOW_ROWS`, range `4..=8`; unset =
+    /// the load default [`qwen4_d2_window_default_for`]: 8 on exact gfx1100 without slab owners,
+    /// else 4; `4` is the kill value): the widest whole-window verify the D2 CPU-cold/GPU-hot
+    /// split qualifies without the lab-wide oracle override. The per-call D2 gates and the
+    /// native-MTP `auto` K cap read it on hot paths (the env snapshot is the process one; the
+    /// default part is one relaxed atomic load). An invalid value reads as 4 here and is refused
+    /// at load by [`validate_qwen4_d2_window_rows`].
     pub fn qwen4_d2_window_rows() -> usize {
-        static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *ROWS.get_or_init(|| {
-            parse_d2_window_rows(process_value(QWEN4_D2_WINDOW_ROWS_ENV).as_deref())
-                .unwrap_or(QWEN4_D2_WINDOW_ROWS_DEFAULT)
-        })
+        resolve_d2_window_rows(
+            process_value(QWEN4_D2_WINDOW_ROWS_ENV).as_deref(),
+            D2_WINDOW_LOAD_DEFAULT.load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// `developer.qwen4_sp` (env `HIPFIRE_QWEN4_SP`), a typed boolean read once
