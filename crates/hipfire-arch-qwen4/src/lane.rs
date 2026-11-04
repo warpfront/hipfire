@@ -73,11 +73,13 @@ use crate::weights::{
     HyperConnectionWeights, MoeWeights, Qwen4BandScope, Qwen4FfnWeights, Qwen4LayerWeights,
     Qwen4TierRecipe, Qwen4Weights, TensorRef,
 };
+use hip_bridge::{HipRuntime, PinnedHostBuffer};
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
 use hipfire_runtime::ngram_mod::NgramModConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use rdna_compute::expert_capabilities::{self, ExpertQt, Route};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use std::ops::Deref;
 use std::time::Instant;
 
 pub mod census;
@@ -1511,17 +1513,140 @@ impl<C: LaneCell> LaneTable<C> {
     }
 }
 
-/// Download `rows` consecutive F32 logits rows of `logits` starting at row
-/// `first_row` into the front of `scratch` (grown only if shorter than
-/// `rows * vocab`, never shrunk): one synchronous D2H.
-pub(crate) fn download_lane_rows(
-    gpu: &Gpu,
+/// Host landing buffer for downloaded lane logits rows: pageable `Vec<f32>`, or
+/// (`HIPFIRE_QWEN4_LANE_PINNED_LOGITS`) a pinned `hipHostMalloc` buffer the
+/// one synchronous D2H of [`download_lane_rows`] DMAs into directly. Derefs to
+/// the backing's whole `[f32]` (the front `rows * vocab` floats of it are the
+/// last fetch); the sampler reads that slice, so the bytes it sees are the
+/// device bytes either way. The pinned buffer is freed when this is dropped.
+pub(crate) struct SampleScratch {
+    backing: ScratchBacking,
+    /// Floats a first allocation / growth reserves at least
+    /// ([`Self::reserve_hint`]).
+    want: usize,
+    /// A pinned allocation was refused: stay pageable (logged once).
+    pinned_refused: bool,
+}
+
+enum ScratchBacking {
+    Pageable(Vec<f32>),
+    Pinned {
+        buf: PinnedHostBuffer,
+        /// `buf`'s base, 4-aligned and `len * 4` bytes long (checked at
+        /// allocation); the only reason [`Deref`] does not go through `buf`.
+        ptr: *mut f32,
+        len: usize,
+    },
+}
+
+// SAFETY: the raw pointer in `Pinned` is `buf`'s own allocation, owned by this
+// value alone; `PinnedHostBuffer`'s free function and library handle are
+// thread-agnostic (as `LaneTokenRing`'s buffers, which assert the same).
+unsafe impl Send for SampleScratch {}
+
+impl SampleScratch {
+    pub(crate) fn new() -> Self {
+        Self {
+            backing: ScratchBacking::Pageable(Vec::new()),
+            want: 0,
+            pinned_refused: false,
+        }
+    }
+
+    /// Reserve room for `floats` at the first allocation (the widest request
+    /// the store expects); allocates nothing itself.
+    pub(crate) fn reserve_hint(&mut self, floats: usize) {
+        self.want = self.want.max(floats);
+    }
+
+    /// `n` floats' bytes to land a download in, growing the backing (never
+    /// shrinking) if shorter than `n`. `pinned` is the runtime to allocate the
+    /// pinned buffer with (`None`: pageable `Vec`, today's path).
+    fn landing(&mut self, pinned: Option<&HipRuntime>, n: usize) -> &mut [u8] {
+        let floats = n.max(self.want);
+        if let (Some(hip), false) = (pinned, self.pinned_refused) {
+            let have = match &self.backing {
+                ScratchBacking::Pinned { len, .. } => *len,
+                ScratchBacking::Pageable(_) => 0,
+            };
+            if have < n {
+                match Self::alloc_pinned(hip, floats) {
+                    Ok(backing) => self.backing = backing,
+                    Err(error) => {
+                        static LOGGED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!(
+                                "[qwen4-lane] pinned logits scratch ({} bytes) refused, \
+                                 staying on pageable host memory: {error}",
+                                floats.saturating_mul(4)
+                            );
+                        }
+                        self.pinned_refused = true;
+                        self.backing = ScratchBacking::Pageable(Vec::new());
+                    }
+                }
+            }
+        }
+        match &mut self.backing {
+            ScratchBacking::Pinned { buf, .. } => &mut buf.as_bytes_mut()[..n * 4],
+            ScratchBacking::Pageable(v) => {
+                if v.len() < n {
+                    v.resize(floats, 0.0);
+                }
+                // SAFETY: `v` holds at least `n` initialized f32s; any byte
+                // pattern is a valid f32.
+                unsafe { std::slice::from_raw_parts_mut(v.as_mut_ptr() as *mut u8, n * 4) }
+            }
+        }
+    }
+
+    /// Test stand-in for a fetch: the pageable backing holds exactly `src`.
+    #[cfg(test)]
+    fn set_for_test(&mut self, src: &[f32]) {
+        self.backing = ScratchBacking::Pageable(src.to_vec());
+    }
+
+    fn alloc_pinned(hip: &HipRuntime, floats: usize) -> Result<ScratchBacking, String> {
+        let bytes = floats
+            .checked_mul(4)
+            .ok_or_else(|| "lane logits scratch overflow".to_string())?;
+        let mut buf = hip.host_buffer(bytes).map_err(|e| e.to_string())?;
+        let ptr = buf.as_bytes_mut().as_mut_ptr().cast::<f32>();
+        if ptr.align_offset(std::mem::align_of::<f32>()) != 0 {
+            return Err("pinned buffer is not f32-aligned".to_string());
+        }
+        Ok(ScratchBacking::Pinned {
+            buf,
+            ptr,
+            len: floats,
+        })
+    }
+}
+
+impl Deref for SampleScratch {
+    type Target = [f32];
+
+    fn deref(&self) -> &[f32] {
+        match &self.backing {
+            ScratchBacking::Pageable(v) => v,
+            // SAFETY: `ptr..ptr + len` is `buf`'s live, initialized (zeroed at
+            // allocation, then written by D2H) allocation, 4-aligned; `&self`
+            // excludes the `&mut` landing slice.
+            ScratchBacking::Pinned { ptr, len, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr, *len)
+            },
+        }
+    }
+}
+
+/// The checked `(begin, n)` element window of lane logits rows.
+fn lane_rows_window(
     logits: &GpuTensor,
     first_row: usize,
     rows: usize,
     vocab: usize,
-    scratch: &mut Vec<f32>,
-) -> Result<(), String> {
+) -> Result<(usize, usize), String> {
     let n = rows
         .checked_mul(vocab)
         .ok_or_else(|| "lane logits rows overflow".to_string())?;
@@ -1538,18 +1663,63 @@ pub(crate) fn download_lane_rows(
             first_row.saturating_add(rows)
         ));
     }
-    if scratch.len() < n {
-        scratch.resize(n, 0.0);
-    }
-    let view = logits.sub_offset(begin, n);
-    // SAFETY: `scratch` holds at least `n` initialized f32s; any byte pattern
-    // is a valid f32.
-    let bytes = unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, n * 4) };
+    Ok((begin, n))
+}
+
+/// One synchronous D2H of `bytes.len()` bytes of `logits` from element `begin`.
+fn copy_lane_rows(
+    gpu: &Gpu,
+    logits: &GpuTensor,
+    begin: usize,
+    bytes: &mut [u8],
+) -> Result<(), String> {
+    let view = logits.sub_offset(begin, bytes.len() / 4);
     gpu.hip
         .memcpy_dtoh(bytes, &view.buf)
         .map_err(|e| format!("lane logits download: {e}"))?;
     gpu.take_device_wait_error()
         .map_err(|e| format!("lane logits download: {e}"))
+}
+
+/// Download `rows` consecutive F32 logits rows of `logits` starting at row
+/// `first_row` into the front of `scratch` (grown only if shorter than
+/// `rows * vocab`, never shrunk): one synchronous D2H, straight into the
+/// scratch's pinned buffer when `HIPFIRE_QWEN4_LANE_PINNED_LOGITS` is on
+/// (exact gfx1201, default), else into its pageable `Vec`.
+pub(crate) fn download_lane_rows(
+    gpu: &Gpu,
+    logits: &GpuTensor,
+    first_row: usize,
+    rows: usize,
+    vocab: usize,
+    scratch: &mut SampleScratch,
+) -> Result<(), String> {
+    let (begin, n) = lane_rows_window(logits, first_row, rows, vocab)?;
+    let pinned = gpu
+        .flags
+        .qwen4_lane_pinned_logits_enabled()
+        .then_some(&gpu.hip);
+    copy_lane_rows(gpu, logits, begin, scratch.landing(pinned, n))
+}
+
+/// [`download_lane_rows`] into a caller-owned pageable `Vec<f32>` (the EP
+/// root's sampler host buffer, which the sampler also mutates in place).
+pub(crate) fn download_lane_rows_pageable(
+    gpu: &Gpu,
+    logits: &GpuTensor,
+    first_row: usize,
+    rows: usize,
+    vocab: usize,
+    scratch: &mut Vec<f32>,
+) -> Result<(), String> {
+    let (begin, n) = lane_rows_window(logits, first_row, rows, vocab)?;
+    if scratch.len() < n {
+        scratch.resize(n, 0.0);
+    }
+    // SAFETY: `scratch` holds at least `n` initialized f32s; any byte pattern
+    // is a valid f32.
+    let bytes = unsafe { std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, n * 4) };
+    copy_lane_rows(gpu, logits, begin, bytes)
 }
 
 /// One draw of a sampled lane: the AR singleton's `sample_cpu` (neutral
@@ -1634,8 +1804,8 @@ pub(crate) fn lane_sample_step(
     picks: &mut [u32],
     eos: u32,
     vocab: usize,
-    scratch: &mut Vec<f32>,
-    fetch: impl FnOnce(&mut Vec<f32>) -> Result<(), String>,
+    scratch: &mut SampleScratch,
+    fetch: impl FnOnce(&mut SampleScratch) -> Result<(), String>,
 ) -> Result<LaneSampleOutcome, String> {
     let Some(s) = host.sampling else {
         return Ok(LaneSampleOutcome::Greedy);
@@ -1778,10 +1948,10 @@ pub(crate) struct StepParts<'a> {
     /// Decode rows the step buffers hold: `max_lanes * (k + 1)` with spec,
     /// else `max_lanes`.
     pub rows_cap: usize,
-    /// Reused host F32 scratch for the logits rows of sampled lanes (sized
-    /// once at [`Qwen4LaneStore::set_sampled`], grown only if a request needs
-    /// more rows; never allocated per step).
-    pub sample_host: &'a mut Vec<f32>,
+    /// Reused host F32 scratch for the logits rows of sampled lanes (reserved
+    /// at [`Qwen4LaneStore::set_sampled`], allocated at the first fetch and grown
+    /// only if a request needs more rows; never allocated per step).
+    pub sample_host: &'a mut SampleScratch,
     pub spec: Option<&'a mut SpecStore>,
 }
 
@@ -1820,8 +1990,10 @@ pub struct Qwen4LaneStore {
     /// `serve.batch_sampled`: lanes may carry a [`LaneSampling`].
     sampled: bool,
     /// Host scratch the sampled lanes' downloaded logits rows reuse (empty
-    /// unless staged `sampled` on a band with step outputs).
-    sample_host: Vec<f32>,
+    /// unless staged `sampled` on a band with step outputs). Pinned host memory
+    /// when [`rdna_compute::feature_flags::FeatureFlags::qwen4_lane_pinned_logits_enabled`];
+    /// freed with the store (or when sampling is turned off).
+    sample_host: SampleScratch,
     /// The band this store's lane states are scoped to.
     scope: Qwen4BandScope,
     pub(crate) phase: LanePhase,
@@ -2023,7 +2195,7 @@ impl Qwen4LaneStore {
             },
             spec: spec_store,
             sampled: false,
-            sample_host: Vec::new(),
+            sample_host: SampleScratch::new(),
             scope,
             phase: LanePhase::Idle,
             next_step_id: 0,
@@ -2512,17 +2684,14 @@ impl Qwen4LaneStore {
         if on {
             if self.logits.is_some() {
                 let rows = self.spec.as_ref().map_or(1, |spec| spec.config.k + 1);
-                let need = rows.saturating_mul(vocab);
-                if self.sample_host.len() < need {
-                    self.sample_host.resize(need, 0.0);
-                }
+                self.sample_host.reserve_hint(rows.saturating_mul(vocab));
             }
         } else {
             for cell in self.table.cells.iter_mut().flatten() {
                 cell.host.sampling = None;
                 cell.host.rng = 0;
             }
-            self.sample_host = Vec::new();
+            self.sample_host = SampleScratch::new();
         }
     }
 
@@ -3000,6 +3169,30 @@ impl Qwen4LaneStore {
 mod tests {
     use super::*;
     use crate::expert_arena::ArenaExpert;
+
+    /// Without a pinned runtime (flag off / allocation refused) the scratch is
+    /// the pageable `Vec` of old: reserved at the first landing, grown only when
+    /// shorter than the request, never shrunk, and the landing bytes are the
+    /// slice the sampler reads.
+    #[test]
+    fn sample_scratch_pageable_landing_grows_never_shrinks_and_aliases_deref() {
+        let mut s = SampleScratch::new();
+        assert!(s.is_empty());
+        s.reserve_hint(8);
+        assert!(s.is_empty(), "a hint allocates nothing");
+        let bytes = s.landing(None, 3);
+        assert_eq!(bytes.len(), 12);
+        for (i, chunk) in bytes.chunks_exact_mut(4).enumerate() {
+            chunk.copy_from_slice(&(i as f32 + 0.5).to_ne_bytes());
+        }
+        assert_eq!(s.len(), 8, "first landing reserves the hint");
+        assert_eq!(&s[..3], &[0.5, 1.5, 2.5]);
+        s.landing(None, 2);
+        assert_eq!(s.len(), 8, "a shorter request never shrinks");
+        s.landing(None, 11);
+        assert_eq!(s.len(), 11, "a longer request grows to fit");
+        assert_eq!(&s[..3], &[0.5, 1.5, 2.5], "growth keeps the prefix");
+    }
 
     /// A window that offered `o` drafts and accepted the first `a` reaches
     /// depths `1..=min(o, a + 1)` and accepts depths `1..=a`.
@@ -4349,7 +4542,7 @@ mod lane_sampling_tests {
                     u32::MAX
                 };
                 let mut host = host_with(Some(s));
-                let mut scratch: Vec<f32> = Vec::new();
+                let mut scratch = SampleScratch::new();
                 let mut stream: Vec<u32> = Vec::new();
                 let mut step = 0usize;
                 while stream.len() < target && stream.last() != Some(&eos) {
@@ -4377,8 +4570,7 @@ mod lane_sampling_tests {
                         VOCAB,
                         &mut scratch,
                         |scratch| {
-                            scratch.clear();
-                            scratch.extend_from_slice(window);
+                            scratch.set_for_test(window);
                             Ok(())
                         },
                     )
@@ -4432,7 +4624,7 @@ mod lane_sampling_tests {
             let logits = logit_rows(case + 1000, count);
             let (ar, state) = ar_draws(&logits, count, &s);
             let mut host = host_with(Some(s));
-            let mut scratch: Vec<f32> = Vec::new();
+            let mut scratch = SampleScratch::new();
             let mut got = Vec::new();
             for i in 0..count {
                 let mut picks = [u32::MAX - 1];
@@ -4444,8 +4636,7 @@ mod lane_sampling_tests {
                     VOCAB,
                     &mut scratch,
                     |scratch| {
-                        scratch.clear();
-                        scratch.extend_from_slice(row(&logits, i));
+                        scratch.set_for_test(row(&logits, i));
                         Ok(())
                     },
                 )
@@ -4462,7 +4653,7 @@ mod lane_sampling_tests {
     #[test]
     fn a_lane_without_sampling_is_untouched() {
         let mut host = host_with(None);
-        let mut scratch: Vec<f32> = Vec::new();
+        let mut scratch = SampleScratch::new();
         for drafts in [None, Some(&[4u32, 5][..])] {
             let mut picks = vec![9u32, 8, 7][..drafts.map_or(1, |d| d.len() + 1)].to_vec();
             let before = picks.clone();
@@ -4499,7 +4690,7 @@ mod lane_sampling_tests {
             for ignore in [false, true] {
                 let mut host = host_with(Some(s));
                 host.ignore_eos = ignore;
-                let mut scratch: Vec<f32> = Vec::new();
+                let mut scratch = SampleScratch::new();
                 let mut stream: Vec<u32> = Vec::new();
                 while stream.len() < target && (ignore || stream.last() != Some(&eos)) {
                     let pos = stream.len();
@@ -4514,8 +4705,7 @@ mod lane_sampling_tests {
                         VOCAB,
                         &mut scratch,
                         |scratch| {
-                            scratch.clear();
-                            scratch.extend_from_slice(window);
+                            scratch.set_for_test(window);
                             Ok(())
                         },
                     )
@@ -4574,7 +4764,7 @@ mod lane_sampling_tests {
     fn sample_step_refuses_a_row_count_mismatch() {
         let s = sampling_for(1);
         let mut host = host_with(Some(s));
-        let mut scratch: Vec<f32> = Vec::new();
+        let mut scratch = SampleScratch::new();
         let mut picks = [1u32, 2];
         let error = lane_sample_step(&mut host, None, &mut picks, 0, VOCAB, &mut scratch, |_| {
             panic!("refused before the fetch")
@@ -4591,8 +4781,7 @@ mod lane_sampling_tests {
             VOCAB,
             &mut scratch,
             |scratch| {
-                scratch.clear();
-                scratch.resize(VOCAB, 0.0);
+                scratch.set_for_test(&[0.0; VOCAB]);
                 Ok(())
             },
         )

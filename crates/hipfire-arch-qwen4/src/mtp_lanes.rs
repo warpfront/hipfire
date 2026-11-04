@@ -1319,7 +1319,7 @@ pub(crate) fn prefill_tile(
     lane: &mut Qwen4LaneState,
     tokens: &[u32],
     append_scratch: Option<&mut MtpAppendScratch>,
-    sample_host: &mut Vec<f32>,
+    sample_host: &mut crate::lane::SampleScratch,
 ) -> Result<Option<u32>, String> {
     let Qwen4LaneState { host, state, spec } = lane;
     let spec = spec

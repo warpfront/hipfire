@@ -66,7 +66,7 @@ use crate::ep::{gather_tally, GatherTally};
 use crate::gpu_forward_lanes::{
     forward_lanes, row_group_count, LaneOutputs, LaneRowKind, LaneRows, StageName, StageShare,
 };
-use crate::lane::download_lane_rows;
+use crate::lane::download_lane_rows_pageable;
 use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStore, StepParts};
 use crate::lane_exec::pick_at;
 use crate::mesh_lane_protocol::SamplingMode;
@@ -365,7 +365,7 @@ impl TargetRowSource for EpRowSource {
         }
         // SAFETY: see `gpu`.
         let gpu = unsafe { &*self.gpu };
-        download_lane_rows(gpu, &self.logits, first + row, 1, self.vocab, host)
+        download_lane_rows_pageable(gpu, &self.logits, first + row, 1, self.vocab, host)
     }
 }
 

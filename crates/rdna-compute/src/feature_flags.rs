@@ -168,6 +168,10 @@ pub struct FeatureFlags {
     /// 8-row tiles (physical 64 rows) in one launch instead of the unscoped wide routes. With
     /// it the all-rows stages are no longer refused while a scope is in force.
     pub qwen4_lane_allrows_exact: bool,
+    /// `HIPFIRE_QWEN4_LANE_PINNED_LOGITS` (default on for exact gfx1201 only, `=0` kills it):
+    /// the sampled lanes' F32 logits rows (one D2H per fetch) land in a pinned host buffer of
+    /// the lane store instead of a pageable `Vec<f32>`. The bytes the sampler reads are the same.
+    pub qwen4_lane_pinned_logits: bool,
     /// Fused multi-lane fn-lanes GDN decode Core, conv/params prologue + output
     /// rotation epilogue in the step launch (`HIPFIRE_QWEN4_GDN_LANES_FUSE`),
     /// default off on every arch (exact gfx1201 only, and only with
@@ -1103,6 +1107,7 @@ impl FeatureFlags {
             qwen4_lane_allrows: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS").unwrap_or(true),
             qwen4_lane_allrows_moe: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_MOE").unwrap_or(true),
             qwen4_lane_allrows_exact: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_EXACT").unwrap_or(false),
+            qwen4_lane_pinned_logits: parse_bool("HIPFIRE_QWEN4_LANE_PINNED_LOGITS").unwrap_or(true),
             qwen4_gdn_lanes_fuse: parse_bool("HIPFIRE_QWEN4_GDN_LANES_FUSE").unwrap_or(true),
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
                 .unwrap_or(arch == "gfx1151" || is_gfx1201),
@@ -1820,6 +1825,13 @@ impl FeatureFlags {
         self.qwen4_lane_allrows_exact && self.arch == "gfx1201"
     }
 
+    /// The sampled lane rows' D2H lands in pinned host memory
+    /// (`HIPFIRE_QWEN4_LANE_PINNED_LOGITS`). Exact gfx1201 only, default on (`=0` restores the
+    /// pageable `Vec` path).
+    pub fn qwen4_lane_pinned_logits_enabled(&self) -> bool {
+        self.qwen4_lane_pinned_logits && self.arch == "gfx1201"
+    }
+
     /// Fused multi-lane fn-lanes GDN decode Core (`HIPFIRE_QWEN4_GDN_LANES_FUSE`): the
     /// conv + gate-parameter launch is the step kernel's prologue and the output
     /// projection's rotation its epilogue. Exact gfx1201 only, default off (`=1`
@@ -2043,6 +2055,7 @@ impl FeatureFlags {
             qwen4_lane_allrows: false,
             qwen4_lane_allrows_moe: false,
             qwen4_lane_allrows_exact: false,
+            qwen4_lane_pinned_logits: false,
             qwen4_gdn_lanes_fuse: false,
             qwen4_moe_down_r4: false,
             qwen4_shared_down_fuse: false,
@@ -3192,6 +3205,39 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_allrows_exact_enabled());
+    }
+
+    /// The pinned lane-logits download is default on for exact gfx1201 only (`=0` kills it).
+    #[test]
+    fn qwen4_lane_pinned_logits_flag_is_default_on_and_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |name: &str| -> std::result::Result<String, ()> {
+                if name == "HIPFIRE_QWEN4_LANE_PINNED_LOGITS" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, |_| Err(())).qwen4_lane_pinned_logits_enabled(),
+                arch == "gfx1201",
+                "{arch}"
+            );
+            assert!(
+                !FeatureFlags::from_lookup(arch, with("0")).qwen4_lane_pinned_logits_enabled(),
+                "{arch}"
+            );
+            assert_eq!(
+                FeatureFlags::from_lookup(arch, with("1")).qwen4_lane_pinned_logits_enabled(),
+                arch == "gfx1201",
+                "{arch}"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_pinned_logits_enabled());
     }
 
     /// The wave-per-token router defaults on for exact gfx1151 / gfx1201; `0` turns it off.
