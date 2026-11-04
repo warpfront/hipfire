@@ -1903,6 +1903,28 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Settle the int8 routed-down route's MTP-head verdict (`HIPFIRE_QWEN4_MOE_DOWN_A8`) if the
+    /// trunk verdict left it pending: verify the attached head's MoE layer, or settle as symmetric
+    /// when no head is loaded for this rank. Called exactly where the pending state can have been
+    /// set and the head's presence is final: by the loader after its head-attach step (single-device
+    /// loads; an EP rank's trunk verdict does not exist yet there, so it is a no-op) and by the
+    /// EP mesh attach right after `attach_ep` set the rank's verdict on the full tables (the head
+    /// is attached before the mesh, so `attach_mtp`'s own settle ran while nothing was pending).
+    /// `announce` prints the one final-verdict INFO line. A no-op when nothing is pending.
+    pub fn settle_moe_down_a8_head(
+        &mut self,
+        gpu: &mut Gpu,
+        announce: bool,
+    ) -> Result<(), BundleError> {
+        crate::gpu_forward::moe_down_a8::settle_load_head(
+            gpu,
+            self.config.mtp_geometry(),
+            self.mtp.as_mut().and_then(|mtp| mtp.moe.as_mut()),
+            announce,
+        )
+        .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     /// Reserve the GDN capture ring the first native MTP window captures into,
     /// before any window or captured graph can grow it: the support and rows of
     /// [`crate::mtp_spec::native_mtp_capture`] for a `max_k`-draft window, ensured

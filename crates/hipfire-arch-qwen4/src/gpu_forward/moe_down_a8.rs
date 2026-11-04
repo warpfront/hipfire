@@ -155,16 +155,17 @@ pub(crate) fn settle_mtp_head(
     if !gpu.qwen4_moe_down_a8_head_pending() {
         return Ok(());
     }
-    let symmetric = match head {
+    let head_flag = match head {
         Some(layer) => {
             let saved = layer.symmetric;
             let verdict = layer.verify_symmetric(gpu, config);
             layer.symmetric = saved;
-            verdict?
+            Some(verdict?)
         }
-        None => true,
+        None => None,
     };
-    settle_head(gpu, symmetric);
+    let (_, symmetric) = head_settlement(true, head_flag);
+    settle_head(gpu, symmetric.unwrap_or(true));
     Ok(())
 }
 
@@ -183,6 +184,71 @@ pub(crate) fn settle_head(gpu: &mut Gpu, symmetric: bool) {
             moe_down_a8_head_info(symmetric, trunk_verified, device)
         );
     }
+}
+
+/// The pending -> settled transition of the head verdict, pure: `pending` as the trunk verdict left
+/// it, `head` the head layer's symmetric flag when a head MoE runtime is attached (`None`: no head
+/// is loaded for this rank, which settles as symmetric). Returns `(pending_after, symmetric)`,
+/// `pending_after` always false: a verdict that is owed when the head is built or the load ends is
+/// settled by whichever of those comes last, never left pending.
+pub(crate) fn head_settlement(pending: bool, head: Option<bool>) -> (bool, Option<bool>) {
+    if !pending {
+        return (false, None);
+    }
+    (false, Some(head.unwrap_or(true)))
+}
+
+/// Settle a load's head verdict at the end of the rank's load (EP: right after `attach_ep` set the
+/// trunk verdict on the full tables; every other load: after the head attach step, whether or not a
+/// head was attached): a verdict still owed is taken from the attached head layer, or settles as
+/// symmetric when no head is loaded. `announce` prints the one final-verdict INFO line.
+pub(crate) fn settle_load_head(
+    gpu: &mut Gpu,
+    config: &crate::config::Qwen4Config,
+    head: Option<&mut super::Qwen4MoeLayerRuntime>,
+    announce: bool,
+) -> Result<(), super::Qwen4GpuForwardError> {
+    // An optional route must never fail a load: a head-verify error turns the route off device-wide
+    // (fail closed) and says so; the device error itself resurfaces on its next real use.
+    if let Err(error) = settle_mtp_head(gpu, config, head) {
+        eprintln!(
+            "[INFO] qwen4 moe down A8: MTP head verify failed on device {}: {error}; int8 routed-down route off (incumbent down)",
+            gpu.device_id
+        );
+        gpu.set_qwen4_moe_down_a8_verified(false);
+        gpu.set_qwen4_moe_down_a8_head_pending(false);
+    }
+    debug_assert!(!gpu.qwen4_moe_down_a8_head_pending());
+    if announce {
+        if let Some(line) = moe_down_a8_final_info(
+            gpu.qwen4_moe_down_a8_requested(),
+            gpu.qwen4_moe_down_a8_is_verified(),
+            gpu.qwen4_moe_down_a8_head_pending(),
+            gpu.device_id,
+        ) {
+            eprintln!("[INFO] {line}");
+        }
+    }
+    Ok(())
+}
+
+/// The one final-verdict INFO line of a rank's load (`None` when the route is not requested: the
+/// kill / non-gfx1201 states have their own line or none).
+pub(crate) fn moe_down_a8_final_info(
+    requested: bool,
+    verified: bool,
+    head_pending: bool,
+    device: i32,
+) -> Option<String> {
+    if !requested {
+        return None;
+    }
+    let on = verified && !head_pending;
+    Some(format!(
+        "qwen4 moe down A8: final verdict on device {device}: grouped route {} (trunk verified {verified}, MTP head verdict {})",
+        if on { "ON (9..64-row verify window)" } else { "OFF" },
+        if head_pending { "PENDING (route declines)" } else { "settled" },
+    ))
 }
 
 #[cfg(test)]
@@ -278,5 +344,77 @@ mod tests {
         assert!(moe_down_a8_head_info(true, true, 0).contains("route on"));
         assert!(moe_down_a8_head_info(true, false, 0).contains("stays off"));
         assert!(moe_down_a8_head_info(false, true, 0).contains("not symmetric"));
+    }
+
+    #[test]
+    fn a_pending_head_verdict_always_settles() {
+        // Not owed: untouched.
+        assert_eq!(head_settlement(false, None), (false, None));
+        assert_eq!(head_settlement(false, Some(false)), (false, None));
+        // Owed with a head attached: its verdict; owed with no head loaded: symmetric.
+        assert_eq!(head_settlement(true, Some(true)), (false, Some(true)));
+        assert_eq!(head_settlement(true, Some(false)), (false, Some(false)));
+        assert_eq!(head_settlement(true, None), (false, Some(true)));
+        // The trunk verdict leaves the head pending exactly when the trunk verified and the model
+        // has a head MoE layer; every such load must reach `head_settlement`.
+        assert!(moe_down_a8_verdict(true, false, true, 48, 48).verified());
+    }
+
+    #[test]
+    fn the_final_verdict_line_names_the_route_state() {
+        let on = moe_down_a8_final_info(true, true, false, 1).unwrap();
+        assert!(
+            on.contains("device 1") && on.contains("grouped route ON") && on.contains("settled")
+        );
+        let pending = moe_down_a8_final_info(true, true, true, 0).unwrap();
+        assert!(pending.contains("route OFF") && pending.contains("PENDING"));
+        assert!(moe_down_a8_final_info(true, false, false, 0)
+            .unwrap()
+            .contains("route OFF"));
+        assert_eq!(moe_down_a8_final_info(false, true, false, 0), None);
+    }
+
+    /// Hardware-free ordering assertion of the EP settlement call site: an EP rank settles right after
+    /// `attach_ep` set the trunk verdict (the head is attached BEFORE the mesh attach, so
+    /// `attach_mtp`'s own settle ran while nothing was pending).
+    #[test]
+    fn the_ep_rank_attach_settles_the_head_verdict_after_attach_ep() {
+        let ep = include_str!("../ep.rs");
+        let attach = ep
+            .find(".attach_ep(gpu, bundle, &sources, installed)")
+            .expect("attach_ep call");
+        let restore = ep[attach..]
+            .find("bundle.execution = Some(forward);")
+            .expect("restore");
+        let settle = ep[attach..]
+            .find("settle_moe_down_a8_head(gpu, true)")
+            .expect("EP settle call");
+        assert!(
+            restore < settle,
+            "the settle needs the forward back in the bundle"
+        );
+    }
+
+    /// The loader settles every single-device load's owed head verdict AFTER its head-attach step,
+    /// whether or not a head was attached (a load with no native-MTP head never reaches
+    /// `attach_mtp`'s own settle), and an EP rank's load leaves it to the mesh attach.
+    #[test]
+    fn the_loader_settles_the_head_verdict_after_the_head_attach_step() {
+        let loader = include_str!("../../../hipfire-loader/src/carriers.rs");
+        let attach = loader
+            .find("bundle.attach_mtp(ctx.gpu, ctx.max_seq)")
+            .expect("loader attach_mtp call");
+        let settle = loader[attach..]
+            .find("bundle.settle_moe_down_a8_head(ctx.gpu, true)")
+            .expect("loader settle call");
+        assert!(
+            settle < 6000,
+            "the settle follows the head attach step closely"
+        );
+        let guard = &loader[attach..attach + settle];
+        assert!(
+            guard.contains("if ep.is_none()"),
+            "EP ranks settle in the mesh attach"
+        );
     }
 }

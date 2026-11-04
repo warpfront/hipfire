@@ -1953,6 +1953,14 @@ impl Qwen4Bundle {
                     )
                 });
             bundle.execution = Some(forward);
+            // `attach_ep` just set this rank's down-A8 trunk verdict on the full tables and, with a
+            // head MoE layer, left the head verdict pending; the head was attached before the mesh
+            // (`attach_mtp` settled nothing then), so take it now, before any decode.
+            let result = result.and_then(|()| {
+                bundle
+                    .settle_moe_down_a8_head(gpu, true)
+                    .map_err(|error| format!("settle the MoE down A8 head verdict: {error}"))
+            });
             if result.is_ok() {
                 crate::trunk_route::install(ar_hc.as_ref().map(|exchange| {
                     crate::trunk_route::TrunkShardRoute::new(exchange.clone(), rank, true, true)

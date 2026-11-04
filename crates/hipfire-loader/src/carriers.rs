@@ -9009,6 +9009,17 @@ fn load_qwen4_rank_unscoped(
             0,
         );
     }
+    // Int8 routed-down route (`HIPFIRE_QWEN4_MOE_DOWN_A8`): a head verdict the trunk verdict left
+    // owed settles here for every single-device load, with the head attached above or not (a load
+    // without a native-MTP head never reaches `attach_mtp`'s own settle). An EP rank's trunk
+    // verdict does not exist yet: the mesh attach settles it right after `attach_ep`.
+    if ep.is_none() {
+        if let Err(error) = bundle.settle_moe_down_a8_head(ctx.gpu, true) {
+            let detail = error.to_string();
+            let _ = bundle.free_gpu(ctx.gpu);
+            return Err(format!("qwen4: MoE down A8 head verdict failed: {detail}"));
+        }
+    }
     // Actual CPU-owned expert storage for an admitted lab-wide window (D1 splice
     // and/or D2 split): the checked REQUESTED plan is consumed BEFORE any allocation
     // (host/device budget charge), then real reservations land on the execution
