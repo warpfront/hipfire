@@ -1387,27 +1387,225 @@ mod tests {
 
     /// DESIGN §6's scale check, from the real allocation helper: per capture row
     /// per whole-model Q8 lane (36 GDN layers) about 2.85 MiB of per-row inputs
-    /// plus `slots / rows` Q8 state sets of 27.84 MiB: 58.54 MiB/row in the
-    /// 2R-slot layout (kill switch), `rows + 1` slots by default.
+    /// plus `slots / (36 * rows)` Q8 state sets of 27.84 MiB, where `slots` is the
+    /// state's ring slots across its 36 layers: `2 * 35 + rows + 1` in the shared
+    /// pool (default), `36 * (rows + 1)` per-layer with
+    /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM=0`, `72 * rows` with the compact kill switch.
     #[test]
     fn capture_ring_scale_matches_the_design_check() {
-        use crate::state::{capture_ring_slots, compact_capture_ring};
+        use crate::state::{capture_ring_slots, current_capture_ring_total_slots};
         let config = compact_test_config();
         let gdn_layers = config.n_linear_layers();
         assert_eq!(gdn_layers, 36);
         let set_mib = (gdn_layers * 811_008) as f64 / (1u64 << 20) as f64;
         for rows in [2usize, 4, 8] {
             assert_eq!(capture_ring_slots(false, rows), Some(2 * rows));
-            let slots = capture_ring_slots(compact_capture_ring(), rows).unwrap();
+            let slots = current_capture_ring_total_slots(rows, gdn_layers).unwrap();
             let bytes =
                 Qwen4State::row_capture_bytes_scoped(&config, GdnStateFormat::Q8, rows, gdn_layers)
                     .unwrap();
             let per_row_mib = bytes as f64 / rows as f64 / (1u64 << 20) as f64;
-            let expected = 2.85 + slots as f64 / rows as f64 * set_mib;
+            let expected = 2.85 + slots as f64 / gdn_layers as f64 / rows as f64 * set_mib;
             assert!(
                 (per_row_mib - expected).abs() < 0.15,
                 "rows={rows} slots={slots}: {per_row_mib} MiB/row, expected {expected}"
             );
+        }
+    }
+
+    /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` at the shipped EP2 serve shape (K5 = the landed depth
+    /// cap, so a 6-row verify window / capture ring per lane; 8 lanes; a 48-row all-rows lane
+    /// step; symtrunk's 48 layers = 36 GDN + 12 QSA): the capture ring of a lane before (one
+    /// `rows + 1`-slot ring per GDN layer) and after (one shared pool), per format, and every
+    /// buffer of the trimmed layout still covers its maximum use.
+    #[test]
+    fn lane_reserve_trim_sizes_and_covers_the_depth_cap_five_c8_step() {
+        use crate::state::{capture_ring_slot, capture_view_start, CAPTURE_POOL_STRIDE};
+        let config = compact_test_config();
+        let (lanes, k) = (8usize, 5usize);
+        let rows = k + 1;
+        let gdn_layers = config.n_linear_layers();
+        assert_eq!((config.num_hidden_layers, gdn_layers), (48, 36));
+        let vh = config.linear_num_value_heads;
+        let qkv = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+            + vh * config.linear_value_head_dim;
+        for gdn in FORMATS {
+            let layout = |compact: bool, trim: bool| {
+                Qwen4State::row_capture_allocation_sizes_layout(
+                    &config, gdn, rows, gdn_layers, compact, trim,
+                )
+                .unwrap()
+            };
+            let (before, after) = (layout(true, false), layout(true, true));
+            let slot = gdn.storage().state_bytes(vh, 128, 128) as u64;
+            let inputs = (rows * qkv * 4) as u64;
+            let recurrence = (rows * (qkv + 2 * vh) * 4) as u64;
+            let output = (rows * vh * 128 * 4) as u64;
+            let table = (gdn_layers * 16) as u64;
+            // Kill switch (`=0`): the previous per-layer layout, allocation for allocation.
+            assert_eq!(before.len(), 3 * gdn_layers + 2);
+            for layer in before[..3 * gdn_layers].chunks(3) {
+                assert_eq!(layer, [(rows as u64 + 1) * slot, inputs, recurrence]);
+            }
+            assert_eq!(before[3 * gdn_layers..], [output, table]);
+            // Default: one pool, then (inputs, recurrence) per layer.
+            let pool_slots = (CAPTURE_POOL_STRIDE * (gdn_layers - 1) + rows + 1) as u64;
+            assert_eq!(after.len(), 2 * gdn_layers + 3);
+            assert_eq!(after[0], pool_slots * slot);
+            for layer in after[1..1 + 2 * gdn_layers].chunks(2) {
+                assert_eq!(layer, [inputs, recurrence]);
+            }
+            assert_eq!(after[1 + 2 * gdn_layers..], [output, table]);
+            let (before_bytes, after_bytes) = (sum(&before), sum(&after));
+            // The trim removes exactly the slots no layer's window can touch.
+            assert_eq!(
+                before_bytes - after_bytes,
+                (gdn_layers as u64 * (rows as u64 + 1) - pool_slots) * slot
+            );
+            if gdn.storage() == GdnStateFormat::Q8 {
+                // 36 x (7 x 811008 + 245760 + 248064) + 147456 + 576 = 212.00 MiB per lane
+                // before; one 77-slot pool + the inputs = 76.65 MiB after: -135.35 MiB/lane.
+                assert_eq!(before_bytes, 222_299_712);
+                assert_eq!(after_bytes, 80_373_312);
+                assert_eq!(before_bytes - after_bytes, 175 * 811_008);
+            }
+            // Every view of every layer, for every block length a K5 window (2..=6 rows,
+            // rollback 1..=5 kept rows) and both halves, ends inside the pool.
+            let max_end = (0..gdn_layers)
+                .flat_map(|layer| {
+                    [0usize, rows].into_iter().flat_map(move |base| {
+                        (1..=rows).map(move |n| {
+                            CAPTURE_POOL_STRIDE * layer
+                                + capture_view_start(true, rows, base, n)
+                                + n
+                        })
+                    })
+                })
+                .max()
+                .unwrap() as u64;
+            assert!(after[0] >= max_end * slot, "pool covers every view");
+            assert_eq!(max_end, pool_slots, "and nothing more");
+            // The two write targets of a layer are the only slots touched; no two layers share
+            // one.
+            let mut touched = std::collections::HashSet::new();
+            for layer in 0..gdn_layers {
+                for logical in [0usize, rows] {
+                    let slot =
+                        CAPTURE_POOL_STRIDE * layer + capture_ring_slot(true, rows, logical);
+                    assert!(touched.insert(slot), "layer {layer} target {slot} is shared");
+                }
+            }
+            assert_eq!(touched.len(), 2 * gdn_layers);
+            // The per-use buffers keep their per-window size (a 6-row verify's inputs, the
+            // recurrence, the rollback's discarded output).
+            assert_eq!(after[1], inputs);
+            assert_eq!(after[2], recurrence);
+        }
+        // The whole store at 8 lanes, K5, a 48-row step.
+        let ctx = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, 16384, 4096, 2 << 20);
+        let budget = LaneSpecBudget::new(lanes, k, 0, 0, ctx, 1).unwrap();
+        assert_eq!(
+            (budget.verify_rows_per_lane, budget.capture_rows_per_lane),
+            (rows, rows)
+        );
+        assert_eq!(budget.step_rows(), 48);
+        let gdn = GdnStateFormat::Q8;
+        let census = lane_spec_census(&budget, &inputs(&config, gdn, &Qwen4BandScope::single(&config), 0))
+            .unwrap();
+        let wide = (config.hc_count * config.hidden_size * 4) as u64;
+        // Step buffers cover 48 decode rows + 8 prompt-completing rows, unchanged by the trim.
+        assert_eq!(
+            census.bytes_of(CensusComponent::StepLogits),
+            Some((48 + 8) * config.vocab_size as u64 * 4)
+        );
+        assert_eq!(census.bytes_of(CensusComponent::StepTop1), Some(56 * 4));
+        assert_eq!(census.bytes_of(CensusComponent::WideHidden), Some(48 * wide));
+        assert!(census.bytes_of(CensusComponent::DraftTop1).unwrap() >= lanes as u64 * 8);
+        // The census ring line is the allocator's own inventory under the current flag state,
+        // so before/after totals differ by exactly `lanes` rings.
+        let ring_line = census
+            .lines
+            .iter()
+            .find(|l| l.component == CensusComponent::CaptureRing)
+            .unwrap();
+        let total_with = |trim: bool| {
+            let ring = sum(
+                &Qwen4State::row_capture_allocation_sizes_layout(
+                    &config, gdn, rows, gdn_layers, true, trim,
+                )
+                .unwrap(),
+            );
+            census.total().unwrap() - ring_line.bytes().unwrap() + lanes as u64 * ring
+        };
+        assert_eq!(
+            total_with(false) - total_with(true),
+            lanes as u64 * 175 * 811_008
+        );
+        let expected = total_with(crate::state::lane_reserve_trim());
+        assert_eq!(census.total().unwrap(), expected);
+    }
+
+    /// Prints what one native-MTP lane adds to an EP2 rank over an AR-only lane at the shipped
+    /// shape (K5 -> 6-row ring, 8 lanes, QSA fp8 / GDN q8, 2 MiB VMM granules), before and after
+    /// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM`:
+    /// `cargo test --release -p hipfire-arch-qwen4 --lib lane::census::tests::lane_mtp_itemisation_receipt -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "receipt generator: prints the per-lane itemisation, asserts the sum identity"]
+    fn lane_mtp_itemisation_receipt() {
+        use crate::state::StateMirror;
+        let config = compact_test_config();
+        let gdn = GdnStateFormat::Q8;
+        let format = format_of(gdn);
+        let scope = Qwen4BandScope::single(&config);
+        let (lanes, k) = (8usize, 5usize);
+        let rows = k + 1;
+        let gdn_layers = config.n_linear_layers();
+        let m = |bytes: u64| mib(bytes);
+        for (max_seq, chunk) in [(4096usize, 2048usize), (16384, 4096), (32768, 4096)] {
+            let ctx = Qwen4ContextCommit::new(Qwen4KvBackend::Vmm, max_seq, chunk, 2 << 20);
+            let ar = Qwen4State::device_bytes_with_mirror(&config, format, &ctx, &scope, StateMirror::Absent)
+                .unwrap() as u64;
+            let snap = Qwen4State::device_bytes_with_mirror(&config, format, &ctx, &scope, StateMirror::Snapshot)
+                .unwrap() as u64;
+            let head: Vec<u64> = MtpGpuState::allocation_sizes(&config, &ctx).unwrap();
+            let wide = (config.hc_count * config.hidden_size * 4) as u64;
+            let layout = |trim: bool| {
+                Qwen4State::row_capture_allocation_sizes_layout(
+                    &config, gdn, rows, gdn_layers, true, trim,
+                )
+                .unwrap()
+            };
+            let (before, after) = (layout(false), layout(true));
+            println!("## max_seq {max_seq} chunk {chunk} (K{k} -> {rows}-row ring), per MTP lane over an AR lane");
+            println!("AR lane target state                 {:>14} B {:>9} MiB (not MTP)", ar, m(ar));
+            println!("snapshot mirror of the target state  {:>14} B {:>9} MiB", snap - ar, m(snap - ar));
+            println!("MTP head state (QSA arenas+carries)  {:>14} B {:>9} MiB  {} allocations", sum(&head), m(sum(&head)), head.len());
+            println!("pending hidden                       {:>14} B {:>9} MiB", wide, m(wide));
+            let slot = gdn.storage().state_bytes(config.linear_num_value_heads, 128, 128) as u64;
+            for (name, ring) in [("capture ring BEFORE (kill switch)", &before), ("capture ring AFTER  (default)    ", &after)] {
+                println!("{name} {:>14} B {:>9} MiB  {} allocations", sum(ring), m(sum(ring)), ring.len());
+            }
+            println!("  state slot {slot} B x {} layers x {} slots (before) | pool {} slots (after)", gdn_layers, rows + 1, 2 * (gdn_layers - 1) + rows + 1);
+            let before_lane = (snap - ar) + sum(&head) + wide + sum(&before);
+            let after_lane = (snap - ar) + sum(&head) + wide + sum(&after);
+            println!("PER-LANE MTP increment BEFORE {:>14} B {:>9} MiB", before_lane, m(before_lane));
+            println!("PER-LANE MTP increment AFTER  {:>14} B {:>9} MiB  (-{} MiB)", after_lane, m(after_lane), m(before_lane - after_lane));
+            println!("8 lanes: BEFORE {} MiB, AFTER {} MiB; 5 extra lanes (3 -> 8) BEFORE {} MiB", m(8 * before_lane), m(8 * after_lane), m(5 * before_lane));
+            let budget = LaneSpecBudget::new(lanes, k, 0, 0, ctx, 1).unwrap();
+            let census = lane_spec_census(&budget, &inputs(&config, gdn, &scope, 0)).unwrap();
+            for line in &census.lines {
+                println!(
+                    "    census {:<18} x{:<2} {:>14} B {:>10} MiB",
+                    line.component.name(), line.copies, line.bytes().unwrap(), mib(line.bytes().unwrap())
+                );
+            }
+            println!("    census TOTAL {} MiB", mib(census.total().unwrap()));
+            let mtp_lane = (snap - ar)
+                + sum(&head)
+                + wide
+                + sum(&Qwen4State::row_capture_allocation_sizes_scoped(&config, gdn, rows, gdn_layers).unwrap());
+            let shared: u64 = census.lines.iter().filter(|l| l.copies == 1).map(|l| l.bytes().unwrap()).sum();
+            assert_eq!(census.total().unwrap(), lanes as u64 * (ar + mtp_lane) + shared);
         }
     }
 

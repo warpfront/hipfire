@@ -4694,6 +4694,20 @@ pub fn qwen4_ep_sampled_wide_verify() -> bool {
     developer_bool(QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV, false)
 }
 
+/// `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` (developer, default ON, exact `0` is the kill
+/// switch): the Flash-Next GDN verify capture ring of every state (an MTP lane's, the
+/// singleton's) is laid out as ONE shared pool allocation whose per-layer windows overlap
+/// only in ring slots no kernel touches, instead of `rows + 1` slots per GDN layer. Same
+/// kernels, same views, same bytes written; it only removes dead allocation, which an EP2
+/// serve load turns into resident expert units (see `Qwen4State::ensure_row_capture`).
+/// `0` restores the per-layer allocation (and the old lane reservation) byte for byte.
+pub const QWEN4_LANE_RESERVE_TRIM_ENV: &str = "HIPFIRE_QWEN4_LANE_RESERVE_TRIM";
+
+/// [`QWEN4_LANE_RESERVE_TRIM_ENV`] read through the process snapshot.
+pub fn qwen4_lane_reserve_trim() -> bool {
+    developer_bool(QWEN4_LANE_RESERVE_TRIM_ENV, true)
+}
+
 /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` (lab, default off): with
 /// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] on, treat every lane (greedy and seeded
 /// included) as wide-class. For oracles that measure the wide pass with greedy
