@@ -19,9 +19,11 @@
 //! AR-only lanes, so the reservation (and the resident-expert cost) is that
 //! of `max_active` MTP lanes, not of every lane.
 
-/// Default `max_active`: native windows up to 3 lanes in a step (3 MTP lanes
-/// at K=2 keep 24 resident expert layers at 8 lanes; measured).
-pub const DEFAULT_MAX_ACTIVE: usize = 3;
+/// Default `max_active`: native windows up to 8 lanes in a step (native C8; `8` is the lane store
+/// size of the serve route, so every slot carries MTP state). `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3`
+/// restores the previous switch (3 MTP lanes at K=2 keep 24 resident expert layers at 8 lanes;
+/// measured), which forced AR windows from 5 active lanes up.
+pub const DEFAULT_MAX_ACTIVE: usize = 8;
 
 /// `HIPFIRE_EP_MTP_LANE_NATIVE_ALL=1` (developer; default off): every lane slot
 /// carries MTP state and no step is forced to AR windows by the lane count.
@@ -154,6 +156,27 @@ mod tests {
         assert_eq!(default_lane_k_for(false), DEFAULT_LANE_K);
         assert_eq!(default_lane_k_for(true), NATIVE_ALL_LANE_K);
         assert_eq!(DEFAULT_LANE_K, 5, "the shipped default");
+    }
+
+    /// Native C8 is the default: a step of up to 8 lanes runs native windows whatever the previous
+    /// mode was, and every slot of an 8-lane store carries MTP state; `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3`
+    /// restores the previous switch (AR from 5 lanes up).
+    #[test]
+    fn native_c8_is_the_default_and_the_explicit_value_restores_the_old_switch() {
+        assert_eq!(DEFAULT_MAX_ACTIVE, 8);
+        let cap = max_active_for(false, None);
+        for lanes in 1..=8 {
+            assert!(native_mode(lanes, false, cap), "{lanes}");
+            assert!(native_mode(lanes, true, cap), "{lanes}");
+        }
+        assert_eq!(spec_lane_count(8, cap), 8);
+        assert!(!native_mode(10, true, cap));
+        let previous = max_active_for(false, Some(3));
+        assert_eq!(previous, 3);
+        assert!(native_mode(3, false, previous));
+        assert!(!native_mode(5, false, previous));
+        assert!(!native_mode(8, true, previous));
+        assert_eq!(spec_lane_count(8, previous), 3);
     }
 
     #[test]

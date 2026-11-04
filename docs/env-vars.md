@@ -684,6 +684,13 @@ harness exports pending their cleanup.
 | `HIPFIRE_FAULT_HIP` / `HIPFIRE_FAULT_PREFIX_PUBLISH` / `HIPFIRE_FAULT_MTP_FULL_REJECT` | Test-only fault injection used by `test_serve_prefix_cache`: `HIP` fails one `upload`/`launch`/`sync` below the HIP bridge, `PREFIX_PUBLISH=1` fails the first prefix-cache publication, `MTP_FULL_REJECT=1` forces every MTP draft to be rejected. Never set in production. |
 | `HIPFIRE_MODULE_LOAD_AUDIT=1` | Developer-only module-load audit (default off): records HIP recipes, module handles/images and resolved symbols for offline route-closure audits. Qwen3.5-family loads also print `route plan axes:` with the resolved architecture, heads, speculation route, context ceiling, KV/state formats, backend and prefill chunk, including when `HIPFIRE_ROUTE_PLAN=0` is used. A sealed route has every planned module bound before `loaded` and no unplanned loads afterwards. Never set in production or timing runs. |
 
+`HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` (developer; default 8, native C8 -- was 3): the step-level
+switch of multi-card native-MTP lanes (`lane_switch::max_active`) runs native windows while a
+step carries at most this many lanes and AR windows from `max_active + 2` lanes up (the
+previous count holds in between), and only that many store slots carry MTP state; at the
+default every slot of an 8-lane serve store runs native windows. `=3` restores the previous
+switch (AR from 5 lanes up).
+
 `HIPFIRE_EP_MTP_LANE_NATIVE_ALL=1` (developer, default off) makes every lane slot
 an MTP lane and stops the step-level switch from forcing AR windows by lane count
 (`lane_switch::max_active` becomes unbounded, `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` is
@@ -718,9 +725,10 @@ native-MTP mesh lanes with root Leviathan acceptance (the `ep2` cohort has no
 native-MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so that `N` lanes run
 native windows at every `N`; they are native-window coverage arms, not the shipped
 switching policy. `lane_cross` (`ep2`, `HIPFIRE_SAMPLED_MTP_LANES=8` only; the
-`ep2` cohort of any other lane count has no such arm) is the shipped policy:
+`ep2` cohort of any other lane count has no such arm) is the switching policy
+of the previous default (`max_active` 3; the default is now 8, native C8):
 native batched drafting (`HIPFIRE_MTP_INCREMENTAL=0`, `HIPFIRE_MTP_AR_FLOOR=0`)
-under `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3` (the shipped
+under `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3` (the previous
 `lane_switch::DEFAULT_MAX_ACTIVE`, pinned so the identity records it) with a
 staggered trial: 3 of the 8 requests are admitted at tick 0 and the other 5
 once the first group has forwarded its prompt, so the early lanes' first decode

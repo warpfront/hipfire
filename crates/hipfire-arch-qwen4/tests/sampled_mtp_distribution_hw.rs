@@ -4766,12 +4766,11 @@ mod coverage_logic {
         }
     }
 
-    /// `lane_cross` is a forced batched, floor-off arm that pins the shipped
+    /// `lane_cross` is a forced batched, floor-off arm that pins the previous shipped
     /// `max_active` (3); the fixed-count native arms pin 8; the native arms
     /// pin the cohort's lane depth and the reference pins nothing.
     #[test]
     fn the_crossing_lane_arm_runs_batched_floor_off_with_the_shipped_max_active() {
-        use hipfire_arch_qwen4::lane_switch::DEFAULT_MAX_ACTIVE;
         let find = |arm: &str, name: &str| {
             arm_overrides(arm, "leviathan")
                 .into_iter()
@@ -4786,9 +4785,12 @@ mod coverage_logic {
         assert_eq!(
             find(lane_suite::CROSS_ARM, max_active),
             Some(Some("3")),
-            "the pin is the shipped default"
+            "the pin is the previous shipped switch (the default is now 8)"
         );
-        assert_eq!(lane_suite::CROSS_MAX_ACTIVE, DEFAULT_MAX_ACTIVE.to_string());
+        assert_eq!(
+            lane_suite::CROSS_MAX_ACTIVE,
+            lane_suite::CROSS_MAX_ACTIVE_N.to_string()
+        );
         assert_eq!(find("lane_batched", max_active), Some(Some("8")));
         assert_eq!(find("lane_adaptive", max_active), Some(Some("8")));
         assert_eq!(find("lane_adaptive", FLOOR_ENV), Some(None));

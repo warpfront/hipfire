@@ -1542,11 +1542,13 @@ mod tests {
     }
 
     #[test]
-    fn the_crossing_env_check_pins_the_shipped_max_active_and_eight_lanes() {
+    fn the_crossing_env_check_pins_the_crossing_max_active_and_eight_lanes() {
         use hipfire_arch_qwen4::lane_switch::DEFAULT_MAX_ACTIVE;
         let cross = ArmKind::Cross;
-        assert_eq!(lane_suite::CROSS_MAX_ACTIVE_N, DEFAULT_MAX_ACTIVE);
-        assert!(check_ep_env(cross, 8, DEFAULT_MAX_ACTIVE, 2).is_ok());
+        // The crossing arm pins the previous shipped switch (3), below the native-C8 default,
+        // so eight lanes still cross it.
+        assert!(lane_suite::CROSS_MAX_ACTIVE_N < DEFAULT_MAX_ACTIVE);
+        assert!(check_ep_env(cross, 8, lane_suite::CROSS_MAX_ACTIVE_N, 2).is_ok());
         // The fixed-count pin (8) would never switch: refused for the crossing arm.
         let wide = check_ep_env(cross, 8, 8, 2).unwrap_err();
         assert!(wide.contains("HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8"), "{wide}");
@@ -1557,13 +1559,13 @@ mod tests {
             );
         }
         for lanes in 1..=7 {
-            let error = check_ep_env(cross, lanes, DEFAULT_MAX_ACTIVE, 2).unwrap_err();
+            let error = check_ep_env(cross, lanes, lane_suite::CROSS_MAX_ACTIVE_N, 2).unwrap_err();
             assert!(
                 error.contains("lane_cross runs 8 lanes"),
                 "{lanes}: {error}"
             );
         }
-        assert!(check_ep_env(cross, 8, DEFAULT_MAX_ACTIVE, 1)
+        assert!(check_ep_env(cross, 8, lane_suite::CROSS_MAX_ACTIVE_N, 1)
             .unwrap_err()
             .contains("topology.ep"));
     }

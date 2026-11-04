@@ -146,9 +146,9 @@ pub const CROSS_LANES: usize = 8;
 /// Requests of a [`CROSS_ARM`] trial admitted at tick 0 (the rest follow once
 /// they have finished their prompt prefill).
 pub const CROSS_FIRST_GROUP: usize = 3;
-/// `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` of [`CROSS_ARM`]: the shipped
-/// `lane_switch::DEFAULT_MAX_ACTIVE` (a test keeps the two equal), pinned so
-/// every shard's identity records it.
+/// `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE` of [`CROSS_ARM`]: the previous shipped
+/// `lane_switch::DEFAULT_MAX_ACTIVE` (3; the default is now 8, native C8), pinned so
+/// eight lanes cross the switch and every shard's identity records it.
 pub const CROSS_MAX_ACTIVE: &str = "3";
 /// [`CROSS_MAX_ACTIVE`] as a number: steps carrying at most this many lanes
 /// run native windows, steps carrying `CROSS_MAX_ACTIVE_N + 2` or more run AR
@@ -1609,9 +1609,10 @@ mod tests {
     #[test]
     fn the_crossing_pin_is_the_shipped_switch_geometry() {
         use hipfire_arch_qwen4::lane_switch::{native_mode, DEFAULT_MAX_ACTIVE};
-        // The arm cannot drift from the product default.
-        assert_eq!(CROSS_MAX_ACTIVE_N, DEFAULT_MAX_ACTIVE);
-        assert_eq!(CROSS_MAX_ACTIVE.parse::<usize>(), Ok(DEFAULT_MAX_ACTIVE));
+        // The arm pins the previous shipped switch geometry (3), below the native-C8 default, so
+        // eight lanes cross it; its two spellings agree.
+        assert!(CROSS_MAX_ACTIVE_N < DEFAULT_MAX_ACTIVE);
+        assert_eq!(CROSS_MAX_ACTIVE.parse::<usize>(), Ok(CROSS_MAX_ACTIVE_N));
         // The first group alone runs native windows whatever the previous
         // step's mode was; all eight lanes run AR windows.
         assert!(CROSS_FIRST_GROUP <= CROSS_MAX_ACTIVE_N);
