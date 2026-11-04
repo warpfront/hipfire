@@ -80,7 +80,7 @@ use crate::common::{emit_committed_event, fit_max_tokens_if};
 use hipfire_arch_qwen4::bundle::{Qwen4Bundle, Qwen4PpLaneExecutor};
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
 use hipfire_arch_qwen4::lane::pages::{
-    page_budget_enabled, reservation_rows, PageVerdict, LANE_PAGE_BUDGET_REFUSED,
+    page_budget_enabled, reservation_rows, PageDecision, PageVerdict, LANE_PAGE_BUDGET_REFUSED,
 };
 use hipfire_arch_qwen4::lane::{LaneSampling, LaneSpecStats, LaneStatus};
 use hipfire_arch_qwen4::lane_exec::{
@@ -233,21 +233,31 @@ impl<'a> Owner<'a> {
         }
     }
 
-    fn admit(&mut self, epoch: RequestEpoch, prompt: Vec<u32>) -> Result<usize, String> {
+    /// Admit into `slot` when the page budget chose one (every EP rank takes the root's
+    /// choice), else the lowest free lane.
+    fn admit(
+        &mut self,
+        epoch: RequestEpoch,
+        prompt: Vec<u32>,
+        slot: Option<usize>,
+    ) -> Result<usize, String> {
         let admitted = match self.gpus.as_deref_mut() {
             Some(gpus) => self.bundle.pp_admit_lane(gpus, epoch, prompt),
-            None => self.bundle.admit_lane(&mut *self.gpu, epoch, prompt),
+            None => self
+                .bundle
+                .admit_lane_in(&mut *self.gpu, epoch, prompt, slot),
         };
         admitted.map_err(|e| e.to_string())
     }
 
-    /// The lane page budget's verdict for a request reserving `rows` context rows
-    /// (`Owner::of` for a pipeline-parallel mesh has no per-rank lane pages: always fits).
-    fn page_verdict(&mut self, rows: usize) -> Result<PageVerdict, String> {
+    /// The lane page budget's decision for a request reserving `rows` context rows: the
+    /// verdict and the slot to admit into (a pipeline-parallel mesh has no per-rank lane
+    /// pages: always fits, no slot choice).
+    fn page_decision(&mut self, rows: usize) -> Result<PageDecision, String> {
         if self.gpus.is_some() {
-            return Ok(PageVerdict::Fit);
+            return Ok(PageDecision::UNBUDGETED);
         }
-        self.bundle.lane_page_verdict(&mut *self.gpu, rows)
+        self.bundle.lane_page_decision(&mut *self.gpu, rows)
     }
 
     /// Reserve `rows` context rows for the just-admitted lane of `epoch` (host-only; a pipeline
@@ -497,8 +507,14 @@ fn adopt_promoted(
 /// pages) is a capacity condition, answered `overload` + retryable (HTTP 503, the request may be
 /// retried when other lanes finish); every other failure keeps the caller's class and is not
 /// retryable.
+/// The HIP runtime's out-of-memory text (a lane step that ran out of device memory outside a context map).
+const DEVICE_OUT_OF_MEMORY: &str = "out of memory";
+
 fn lane_error_wire<'a>(message: &str, class: &'a str) -> (&'a str, bool) {
-    if message.contains(PROVISION_MAP_REFUSED) || message.contains(LANE_PAGE_BUDGET_REFUSED) {
+    if message.contains(PROVISION_MAP_REFUSED)
+        || message.contains(LANE_PAGE_BUDGET_REFUSED)
+        || message.contains(DEVICE_OUT_OF_MEMORY)
+    {
         ("overload", true)
     } else {
         (class, false)
@@ -534,6 +550,80 @@ fn lane_error(
     let _ = sched.abort_lane(idx, &key, admission);
     controls[idx] = None;
     released
+}
+
+/// Requests put back in line after a step failed on a capacity condition: how often each went back
+/// and which already announced their `gen_start` (it must not be announced twice).
+#[derive(Default)]
+struct RequeueBook {
+    started: HashSet<AttemptKey>,
+    counts: std::collections::HashMap<AttemptKey, u32>,
+}
+
+/// Times one request may be put back in line before it is failed instead (a request that keeps
+/// failing its mappings must not cycle forever).
+const MAX_REQUEUES: u32 = 2;
+
+impl RequeueBook {
+    /// Whether `key` already announced its start; consumes the mark.
+    fn take_started(&mut self, key: &AttemptKey) -> bool {
+        self.started.remove(key)
+    }
+
+    /// Whether `key` may go back in line once more; counts it when it may.
+    fn allow(&mut self, key: &AttemptKey) -> bool {
+        if self.counts.len() > 4096 {
+            self.counts.clear();
+        }
+        let count = self.counts.entry(key.clone()).or_insert(0);
+        if *count >= MAX_REQUEUES {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+}
+
+/// A lane of a failed step. A mapping refusal ([`PROVISION_MAP_REFUSED`]: the device ran out of pages the
+/// lane needed, on a rank the budget could not see) of a request that has emitted nothing yet goes back to
+/// the FRONT of the queue (bounded by [`MAX_REQUEUES`]) and is admitted again at a later step boundary, when
+/// the page budget re-measures the device: no client error, no second `gen_start`. A refused request that
+/// already streamed tokens, a request out of requeues and every other failure fail exactly as before
+/// ([`lane_error`]: a mapping refusal is a retryable 503 overload). Mapped pages cannot be handed back to
+/// the device (a VMM range that is unmapped and mapped again translates to its old pages on gfx1201, see
+/// hip-bridge `vmm.rs`); they stay with the lane's slot, which the budget counts as mapped and reuses.
+fn lane_step_failed(
+    sched: &mut ContinuousBatchScheduler,
+    model: &mut LoadedModel,
+    controls: &mut [Option<LaneCtl>],
+    idx: usize,
+    stdout: &mut Stdout,
+    message: &str,
+    requeue: &mut RequeueBook,
+) -> Result<(), String> {
+    if page_budget_enabled() && message.contains(PROVISION_MAP_REFUSED) {
+        let candidate = match &sched.lanes[idx] {
+            BatchLane::Running(l) | BatchLane::Seeding(l) if l.streamed_tokens.is_empty() => {
+                Some((l.key.clone(), l.ticket.admission))
+            }
+            _ => None,
+        };
+        if let Some((key, admission)) = candidate {
+            if requeue.allow(&key) {
+                let released = controls[idx].as_mut().map_or(Ok(()), |c| release(model, c));
+                if released.is_ok() && sched.requeue_lane(idx, &key, admission) {
+                    controls[idx] = None;
+                    requeue.started.insert(key.clone());
+                    eprintln!(
+                        "  qwen4 lane page budget: requeued {} attempt {} after a mapping refusal mid-step ({message})",
+                        key.id, key.attempt_id
+                    );
+                    return Ok(());
+                }
+            }
+        }
+    }
+    lane_error(sched, model, controls, idx, stdout, message, "gpu")
 }
 
 fn cancel_lane(
@@ -664,9 +754,24 @@ struct PageWait {
 enum PageGate {
     /// Assign the front a lane. Carries the prompt the gate rendered (so it is not rendered again)
     /// and the refusal a request that can never fit gets once it holds a lane.
-    Proceed(Option<Rendered>, Option<String>),
+    Proceed {
+        rendered: Option<Rendered>,
+        refusal: Option<String>,
+        /// The slot the budget chose (`None`: the lowest free one).
+        slot: Option<usize>,
+    },
     /// Leave the front queued: stop assigning this tick.
     Wait,
+}
+
+impl PageGate {
+    fn proceed(rendered: Option<Rendered>, refusal: Option<String>, slot: Option<usize>) -> Self {
+        Self::Proceed {
+            rendered,
+            refusal,
+            slot,
+        }
+    }
 }
 
 /// The lane page budget at the queue front (see `hipfire_arch_qwen4::lane::pages`): before the
@@ -680,19 +785,20 @@ fn page_budget_gate(
     gpu: &mut Gpu,
     controls: &[Option<LaneCtl>],
     initial: &HashSet<AttemptKey>,
+    requeued: &RequeueBook,
     wait: &mut Option<PageWait>,
 ) -> Result<PageGate, String> {
     if !page_budget_enabled() {
-        return Ok(PageGate::Proceed(None, None));
+        return Ok(PageGate::proceed(None, None, None));
     }
     let Some(key) = sched.assignable_front().cloned() else {
-        return Ok(PageGate::Proceed(None, None));
+        return Ok(PageGate::proceed(None, None, None));
     };
     let Some(req) = sched.pending.get(&key) else {
-        return Ok(PageGate::Proceed(None, None));
+        return Ok(PageGate::proceed(None, None, None));
     };
     if !batch_is_current(&key.id, key.attempt_id, req.admission) {
-        return Ok(PageGate::Proceed(None, None));
+        return Ok(PageGate::proceed(None, None, None));
     }
     let mut state = match wait.take() {
         Some(state) if state.key == key => state,
@@ -711,15 +817,20 @@ fn page_budget_gate(
     // A request the singleton route takes back is not a lane request: no budget.
     let lone = sched.inbox.len() == 1 && !controls.iter().flatten().any(|c| c.epoch.is_admitted());
     let takes_lane = qwen4_lone_request_takes_lane(m);
-    if lone_arrival_hands_back(lone, takes_lane, initial.contains(&key), || {
-        rendered.as_ref().is_ok_and(|(prompt, _)| {
-            crate::qwen::plan_qwen4_session(m, prompt, SessionRoute::Ar) > 0
-        })
-    }) {
-        return Ok(PageGate::Proceed(Some(rendered), None));
+    if lone_arrival_hands_back(
+        lone,
+        takes_lane,
+        initial.contains(&key) || requeued.started.contains(&key),
+        || {
+            rendered.as_ref().is_ok_and(|(prompt, _)| {
+                crate::qwen::plan_qwen4_session(m, prompt, SessionRoute::Ar) > 0
+            })
+        },
+    ) {
+        return Ok(PageGate::proceed(Some(rendered), None, None));
     }
     let Ok((prompt, _)) = &rendered else {
-        return Ok(PageGate::Proceed(Some(rendered), None));
+        return Ok(PageGate::proceed(Some(rendered), None, None));
     };
     let max_tokens = lane_request_max_tokens(req, prompt.len(), m.max_seq);
     let fits_context = prompt
@@ -729,7 +840,7 @@ fn page_budget_gate(
         .is_some_and(|n| n <= m.max_seq);
     if req.max_tokens == 0 || prompt.is_empty() || !fits_context {
         // The admission below refuses it as a validation / context-length error.
-        return Ok(PageGate::Proceed(Some(rendered), None));
+        return Ok(PageGate::proceed(Some(rendered), None, None));
     }
     let prompt_len = prompt.len();
     let rows = reservation_rows(
@@ -738,17 +849,18 @@ fn page_budget_gate(
         Owner::of(m, gpu)?.bundle.lane_page_draft_rows(),
         m.max_seq,
     );
-    let verdict = match Owner::of(m, gpu)?.page_verdict(rows) {
-        Ok(verdict) => verdict,
+    let decision = match Owner::of(m, gpu)?.page_decision(rows) {
+        Ok(decision) => decision,
         Err(error) => {
             eprintln!(
                 "  qwen4 lane page budget: {error}; admitting {} without the budget",
                 key.id
             );
-            return Ok(PageGate::Proceed(Some(rendered), None));
+            return Ok(PageGate::proceed(Some(rendered), None, None));
         }
     };
-    match gate_decision(verdict, sched.active_count()) {
+    let slot = decision.slot;
+    match gate_decision(decision.verdict, sched.active_count()) {
         GateDecision::Admit => {
             if state.announced {
                 eprintln!(
@@ -759,7 +871,7 @@ fn page_budget_gate(
                     state.ticks
                 );
             }
-            Ok(PageGate::Proceed(Some(rendered), None))
+            Ok(PageGate::proceed(Some(rendered), None, slot))
         }
         GateDecision::Queue(short) => {
             state.ticks += 1;
@@ -779,11 +891,12 @@ fn page_budget_gate(
                 "  qwen4 lane page budget: refused {} attempt {}: {prompt_len} prompt + {max_tokens} max tokens reserve {rows} context rows and cannot fit with no lane active; {short}",
                 key.id, key.attempt_id
             );
-            Ok(PageGate::Proceed(
+            Ok(PageGate::proceed(
                 Some(rendered),
                 Some(format!(
                     "{LANE_PAGE_BUDGET_REFUSED}the request's context ({rows} rows) does not fit the free device memory: {short}"
                 )),
+                slot,
             ))
         }
     }
@@ -1344,6 +1457,8 @@ pub fn drive_qwen4_lane_batch(
     let mut mix = MeshMix::default();
     // The request the page budget is holding at the queue front, if any.
     let mut page_wait: Option<PageWait> = None;
+    // Requests a failed step put back in line (see `lane_step_failed`).
+    let mut requeue = RequeueBook::default();
     let batch_size = sched.max_batch;
     // Requests already queued at entry; the promoted lane never passes the
     // inbox, so it is never handed back to the singleton.
@@ -1441,7 +1556,9 @@ pub fn drive_qwen4_lane_batch(
                             key.attempt_id,
                             admission,
                         );
-                        emit_generation_start(ROUTE, stdout, &key.id, false);
+                        if !requeue.take_started(&key) {
+                            emit_generation_start(ROUTE, stdout, &key.id, false);
+                        }
                         emit_generation_cancel(ROUTE, stdout, &key.id, 0);
                         sched.abort_queued(&key, admission);
                     }
@@ -1467,11 +1584,22 @@ pub fn drive_qwen4_lane_batch(
             // queued, as for a full lane set, and is asked again at the next step
             // boundary (never failed mid-step).
             loop {
-                let (pre_rendered, budget_refusal) =
-                    match page_budget_gate(sched, m, gpu, &controls, &initial, &mut page_wait)? {
-                        PageGate::Wait => break,
-                        PageGate::Proceed(rendered, refusal) => (rendered, refusal),
-                    };
+                let (pre_rendered, budget_refusal, budget_slot) = match page_budget_gate(
+                    sched,
+                    m,
+                    gpu,
+                    &controls,
+                    &initial,
+                    &requeue,
+                    &mut page_wait,
+                )? {
+                    PageGate::Wait => break,
+                    PageGate::Proceed {
+                        rendered,
+                        refusal,
+                        slot,
+                    } => (rendered, refusal, slot),
+                };
                 let Some((key, ticket)) = sched.try_assign_one() else {
                     break;
                 };
@@ -1488,7 +1616,7 @@ pub fn drive_qwen4_lane_batch(
                 if lone_arrival_hands_back(
                     lone,
                     qwen4_lone_request_takes_lane(m),
-                    initial.contains(&key),
+                    initial.contains(&key) || requeue.started.contains(&key),
                     || {
                         let rendered = probed.take().unwrap_or_else(|| render_request(m, &req));
                         let reusable = rendered.as_ref().is_ok_and(|(prompt, _)| {
@@ -1582,7 +1710,7 @@ pub fn drive_qwen4_lane_batch(
                     hipfire_runtime::stop_sequence::parse_stop_field(req.original_msg.get("stop"))
                         .map_err(|e| e.to_string())?;
                 let epoch = next_lane_epoch()?;
-                let admitted = Owner::of(m, gpu)?.admit(epoch, prompt.clone());
+                let admitted = Owner::of(m, gpu)?.admit(epoch, prompt.clone(), budget_slot);
                 let slot = match admitted {
                     Ok(slot) => slot,
                     Err(e) => {
@@ -1654,7 +1782,10 @@ pub fn drive_qwen4_lane_batch(
                         continue;
                     }
                 }
-                emit_generation_start(ROUTE, stdout, &key.id, started);
+                // A request put back in line after a mapping refusal already announced its start.
+                if !requeue.take_started(&key) {
+                    emit_generation_start(ROUTE, stdout, &key.id, started);
+                }
                 // The singleton tools parser maps an empty array to None.
                 let tools = req
                     .original_msg
@@ -1720,14 +1851,14 @@ pub fn drive_qwen4_lane_batch(
                             .iter()
                             .position(|c| c.as_ref().is_some_and(|c| c.epoch == *epoch))
                         {
-                            lane_error(
+                            lane_step_failed(
                                 sched,
                                 m,
                                 &mut controls,
                                 idx,
                                 stdout,
                                 &format!("qwen4 lane draft failed: {}", failure.error),
-                                "gpu",
+                                &mut requeue,
                             )?;
                         }
                     }
@@ -1769,14 +1900,14 @@ pub fn drive_qwen4_lane_batch(
                                 .iter()
                                 .position(|c| c.as_ref().is_some_and(|c| c.epoch == request.epoch))
                             {
-                                lane_error(
+                                lane_step_failed(
                                     sched,
                                     m,
                                     &mut controls,
                                     idx,
                                     stdout,
                                     &format!("qwen4 lane step failed: {error}"),
-                                    "gpu",
+                                    &mut requeue,
                                 )?;
                             }
                         }
@@ -1803,14 +1934,14 @@ pub fn drive_qwen4_lane_batch(
                                 .iter()
                                 .position(|c| c.as_ref().is_some_and(|c| c.epoch == request.epoch))
                             {
-                                lane_error(
+                                lane_step_failed(
                                     sched,
                                     m,
                                     &mut controls,
                                     idx,
                                     stdout,
                                     &format!("qwen4 lane step failed: {error}"),
-                                    "gpu",
+                                    &mut requeue,
                                 )?;
                             }
                         }
@@ -2055,6 +2186,63 @@ mod tests {
         );
     }
 
+    /// A lane step that ran out of device memory outside a context map is a retryable overload too.
+    #[test]
+    fn a_device_out_of_memory_step_is_a_retryable_overload() {
+        assert_eq!(
+            super::lane_error_wire(
+                "qwen4 lane step failed: forward_step: GpuPool: hipMalloc(2088960 B): out of memory",
+                "gpu"
+            ),
+            ("overload", true)
+        );
+    }
+
+    /// A request goes back in line a bounded number of times, announces its start once, and a request
+    /// that was never requeued announces it normally.
+    #[test]
+    fn a_requeued_request_is_bounded_and_announces_its_start_once() {
+        use super::{RequeueBook, MAX_REQUEUES};
+        use hipfire_engine::terminal::AttemptKey;
+        let mut book = RequeueBook::default();
+        let key = AttemptKey::new("r1", 1);
+        let other = AttemptKey::new("r2", 2);
+        assert!(
+            !book.take_started(&key),
+            "never requeued: announce the start"
+        );
+        for _ in 0..MAX_REQUEUES {
+            assert!(book.allow(&key));
+        }
+        assert!(
+            !book.allow(&key),
+            "out of requeues: the request fails instead"
+        );
+        assert!(book.allow(&other), "the bound is per request");
+        book.started.insert(key.clone());
+        assert!(
+            book.take_started(&key),
+            "requeued: the start was already announced"
+        );
+        assert!(!book.take_started(&key), "consumed once");
+    }
+
+    /// Every failure site of a lane step (draft, executor, mesh) goes through `lane_step_failed`, which
+    /// requeues only a mapping refusal of a request that streamed nothing and only with the budget on.
+    #[test]
+    fn every_step_failure_site_goes_through_the_requeue_rule() {
+        let src = include_str!("fn_batch.rs");
+        let prod = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let drive = prod.find("pub fn drive_qwen4_lane_batch").expect("drive");
+        let body = &prod[drive..];
+        assert_eq!(body.matches("lane_step_failed(").count(), 3);
+        let rule = prod.find("fn lane_step_failed(").expect("rule");
+        let rule_src = &prod[rule..(rule + 2400).min(prod.len())];
+        assert!(rule_src.contains("page_budget_enabled()"));
+        assert!(rule_src.contains("PROVISION_MAP_REFUSED"));
+        assert!(rule_src.contains("streamed_tokens.is_empty()"));
+    }
+
     /// A request the page budget can never fit is refused as a retryable overload, and so is
     /// a mid-step mapping refusal; the budget's message does not read as one of the others.
     #[test]
@@ -2114,7 +2302,7 @@ mod tests {
         let gate = body.find("page_budget_gate(").expect("gate call");
         let assign = body.find("sched.try_assign_one()").expect("assignment");
         let admit = body
-            .find(".admit(epoch, prompt.clone())")
+            .find(".admit(epoch, prompt.clone(), budget_slot)")
             .expect("admission");
         let reserve = body
             .find(".reserve_pages(&epoch, lane_rows)")

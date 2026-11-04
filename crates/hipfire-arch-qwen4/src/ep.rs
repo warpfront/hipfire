@@ -3061,17 +3061,18 @@ impl Qwen4Bundle {
         gpu: &mut Gpu,
         epoch: RequestEpoch,
         prompt: Vec<u32>,
+        preferred: Option<usize>,
     ) -> Result<usize, BundleError> {
         self.ep_lane_soft(
             "admit_lane",
             |bundle| {
                 bundle
-                    .admit_lane(gpu, epoch, prompt.clone())
+                    .admit_lane_in(gpu, epoch, prompt.clone(), preferred)
                     .map_err(bundle_text)
             },
             &|bundle, peer_gpu, _| {
                 bundle
-                    .admit_lane(peer_gpu, epoch, prompt.clone())
+                    .admit_lane_in(peer_gpu, epoch, prompt.clone(), preferred)
                     .map_err(bundle_text)
             },
         )
@@ -3275,8 +3276,8 @@ impl Qwen4Bundle {
         }
     }
 
-    /// Every rank's lane page numbers for a request reserving `rows` rows, in
-    /// rank order ([`crate::lane::pages::rank_pages`]). Read only: nothing is
+    /// Every rank's lane page report for a request reserving `rows` rows, in
+    /// rank order ([`crate::lane::pages::rank_numbers`]). Read only: nothing is
     /// mapped or reserved, so a failure on any rank returns an error and
     /// nothing diverges; the caller decides once on the root
     /// ([`crate::lane::pages::page_verdict`]) so every rank shares the verdict.
@@ -3284,7 +3285,7 @@ impl Qwen4Bundle {
         &mut self,
         gpu: &mut Gpu,
         rows: usize,
-    ) -> Result<Vec<crate::lane::pages::RankPages>, String> {
+    ) -> Result<Vec<crate::lane::pages::RankNumbers>, String> {
         let outcomes = self.ep_run_ranks(
             false,
             |bundle| Ok(bundle.lane_page_numbers_local(&*gpu, rows)),

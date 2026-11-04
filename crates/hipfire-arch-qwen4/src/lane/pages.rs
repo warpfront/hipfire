@@ -84,6 +84,185 @@ pub fn page_margin_bytes() -> u64 {
     hipfire_config::qwen4_lane_page_budget_margin_bytes()
 }
 
+/// `HIPFIRE_QWEN4_LANE_PAGE_TRACE` (developer, default off): stderr lines naming every rank's
+/// page numbers at each admission and the free device bytes before and after every lane
+/// context map with the bytes the budget predicted for it (`[lane-pages]`).
+pub fn page_trace() -> bool {
+    hipfire_config::qwen4_lane_page_trace()
+}
+
+/// One `[lane-pages] rank` line: the rank's free bytes (and the pool bytes parked, which
+/// `free` does not include), the budget's terms and every slot's reservation and mapped pages.
+fn trace_rank(
+    geometry: &PageGeometry<'_>,
+    slots: &[SlotPages],
+    numbers: &RankNumbers,
+    parked: u64,
+) {
+    const MIB: f64 = (1u64 << 20) as f64;
+    let pages = &numbers.pages;
+    let mib = |bytes: u64| bytes as f64 / MIB;
+    let detail: Vec<String> = slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| {
+            format!(
+                "{index}:{}{}/res={}/trunk={:.1}M@{}t/head={}",
+                if slot.live { "live" } else { "idle" },
+                if geometry.slot_has_head(index) {
+                    "+h"
+                } else {
+                    ""
+                },
+                slot.reserved_rows,
+                mib(slot.have_trunk),
+                slot.mapped_tokens,
+                slot.have_head
+                    .map_or_else(|| "-".to_string(), |bytes| format!("{:.1}M", mib(bytes))),
+            )
+        })
+        .collect();
+    eprintln!(
+        "[lane-pages] rank={} free={:.1}M parked={:.1}M earmark={:.1}M (cold={} reserve={:.0}M) outstanding={:.1}M need={:.1}M active={} slots=[{}]",
+        pages.rank,
+        mib(pages.free),
+        mib(parked),
+        mib(pages.earmark),
+        !geometry.warm,
+        mib(geometry.cold_reserve),
+        mib(pages.outstanding),
+        mib(pages.need),
+        pages.active_lanes,
+        detail.join(" "),
+    );
+}
+
+/// What the map trace needs of a store, as plain values (so it can be held while a lane of the
+/// store is borrowed mutably).
+#[derive(Clone, Copy)]
+pub(crate) struct MapTraceInputs {
+    format: Qwen4StateFormat,
+    backend: Qwen4KvBackend,
+    max_seq: usize,
+    head_max_seq: Option<usize>,
+    granularity: usize,
+    rank: usize,
+}
+
+impl MapTraceInputs {
+    pub(crate) fn new(bundle: &Qwen4Bundle, store: &Qwen4LaneStore, gpu: &Gpu) -> Self {
+        Self {
+            format: store.format,
+            backend: store.backend,
+            max_seq: bundle.state.max_seq_len,
+            head_max_seq: store.spec.as_ref().map(|spec| spec.head_max_seq),
+            granularity: gpu.vmm_recommended_granularity().unwrap_or(1),
+            rank: bundle
+                .weights
+                .ep_placement()
+                .map_or(0, |placement| placement.rank),
+        }
+    }
+}
+
+/// The device's free bytes and one lane's mapped context pages before `provision_step` maps its
+/// context for a step; [`Self::finish`] prints the `[lane-pages] map` line after.
+pub(crate) struct LaneMapProbe {
+    free: u64,
+    trunk: u64,
+    head: Option<u64>,
+}
+
+impl LaneMapProbe {
+    fn free_of(gpu: &Gpu) -> u64 {
+        gpu.device_mem_info().map_or(0, |(free, _)| free as u64)
+    }
+
+    fn pages_of(gpu: &Gpu, lane: &super::Qwen4LaneState) -> (u64, Option<u64>) {
+        (
+            lane.state.mapped_context_bytes(gpu).map_or(0, |b| b as u64),
+            lane.spec
+                .as_ref()
+                .map(|spec| spec.head.mapped_context_bytes(gpu).map_or(0, |b| b as u64)),
+        )
+    }
+
+    pub(crate) fn start(gpu: &Gpu, lane: &super::Qwen4LaneState) -> Self {
+        let (trunk, head) = Self::pages_of(gpu, lane);
+        Self {
+            free: Self::free_of(gpu),
+            trunk,
+            head,
+        }
+    }
+
+    /// `end` positions were just mapped: print the free bytes before and after, what the arenas
+    /// mapped and what the budget's arithmetic ([`PageGeometry::trunk`] / [`PageGeometry::head`], the
+    /// census' figure at the driver granule) planned for the same growth.
+    pub(crate) fn finish(
+        self,
+        inputs: &MapTraceInputs,
+        config: &Qwen4Config,
+        gpu: &Gpu,
+        lane: &super::Qwen4LaneState,
+        end: usize,
+    ) {
+        const MIB: f64 = (1u64 << 20) as f64;
+        let mib = |bytes: u64| bytes as f64 / MIB;
+        let geometry = PageGeometry {
+            config,
+            format: inputs.format,
+            backend: inputs.backend,
+            max_seq: inputs.max_seq,
+            granularity: inputs.granularity,
+            charge_rows: 0,
+            warm: true,
+            cold_reserve: 0,
+            spec: inputs.head_max_seq.map(|head_max_seq| PageSpec {
+                k: 0,
+                spec_lanes: None,
+                head_max_seq,
+                copy: None,
+            }),
+        };
+        let (trunk, head) = Self::pages_of(gpu, lane);
+        let free = Self::free_of(gpu);
+        let planned_trunk = geometry
+            .trunk(end)
+            .map_or(0, |bytes| bytes.saturating_sub(self.trunk));
+        let head_part = match (self.head, head) {
+            (Some(before), Some(after)) => {
+                let planned = geometry
+                    .head(end.min(inputs.head_max_seq.unwrap_or(0)))
+                    .map_or(0, |bytes| bytes.saturating_sub(before));
+                format!(
+                    " head +{:.2}M (planned {:.2}M)",
+                    mib(after.saturating_sub(before)),
+                    mib(planned)
+                )
+            }
+            _ => String::new(),
+        };
+        eprintln!(
+            "[lane-pages] map rank={} epoch={:?} end={end} free {:.1}M -> {:.1}M (took {:.2}M) trunk +{:.2}M (planned {:.2}M){head_part}",
+            inputs.rank,
+            lane.host.epoch,
+            mib(self.free),
+            mib(free),
+            mib(self.free.saturating_sub(free)),
+            mib(trunk.saturating_sub(self.trunk)),
+            mib(planned_trunk),
+        );
+    }
+}
+
+impl Qwen4LaneStore {
+    /// The values [`MapTraceInputs`] reads.
+    pub(crate) fn map_trace_inputs(&self, bundle: &Qwen4Bundle, gpu: &Gpu) -> MapTraceInputs {
+        MapTraceInputs::new(bundle, self, gpu)
+    }
+}
+
 /// Context rows a request reserves: its prompt, its generation budget, the
 /// trailer row the admission length check charges, and the draft rows a verify
 /// window can map past the last budgeted position
@@ -201,13 +380,91 @@ pub fn page_verdict(ranks: &[RankPages], margin: u64) -> PageVerdict {
     }
 }
 
-/// [`page_verdict`] under the kill switch: `enabled == false` is today's
-/// admission (everything fits).
-pub fn budget_verdict(enabled: bool, ranks: &[RankPages], margin: u64) -> PageVerdict {
-    if enabled {
-        page_verdict(ranks, margin)
-    } else {
-        PageVerdict::Fit
+/// One free slot's growth as a rank prices it (see [`RankNumbers`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SlotNeed {
+    /// The slot carries MTP state (a head).
+    pub head: bool,
+    /// Growth for the request in this slot beyond the load-time charge, from
+    /// the pages the slot already holds; `None` = a live slot.
+    pub need: Option<u64>,
+}
+
+/// One rank's report to the root: its [`RankPages`] (with the request priced for
+/// this rank's own best free slot) plus the per-slot needs the root chooses the
+/// slot from, and the slot-independent growth (the shared gather workspace).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RankNumbers {
+    pub pages: RankPages,
+    pub(crate) slots: Vec<SlotNeed>,
+    pub(crate) extra: u64,
+}
+
+/// The admission decision: the verdict and the slot every rank admits the
+/// request into (`None`: no choice, the lowest free slot as before).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageDecision {
+    pub verdict: PageVerdict,
+    pub slot: Option<usize>,
+}
+
+impl PageDecision {
+    /// Today's admission: everything fits, the lowest free slot.
+    pub const UNBUDGETED: Self = Self {
+        verdict: PageVerdict::Fit,
+        slot: None,
+    };
+}
+
+/// The slot every rank admits into: among the free slots (free on every rank), prefer
+/// slots that carry MTP state (low concurrency keeps landing on native lanes, as the
+/// lowest-free-slot rule did), and among those the one that needs the fewest new pages
+/// on its worst rank, because a slot keeps the pages it mapped for an earlier request:
+/// the request then reuses them instead of mapping fresh ones. Ties take the lowest
+/// slot. A pure function of the ranks' vectors, so the root decides once.
+pub(crate) fn choose_slot(ranks: &[RankNumbers]) -> Option<usize> {
+    let slots = ranks.first()?.slots.len();
+    let free: Vec<usize> = (0..slots)
+        .filter(|&slot| {
+            ranks
+                .iter()
+                .all(|rank| rank.slots.get(slot).is_some_and(|s| s.need.is_some()))
+        })
+        .collect();
+    let head = free.iter().any(|&slot| ranks[0].slots[slot].head);
+    free.into_iter()
+        .filter(|&slot| ranks[0].slots[slot].head == head)
+        .min_by_key(|&slot| {
+            let worst = ranks
+                .iter()
+                .filter_map(|rank| rank.slots[slot].need)
+                .max()
+                .unwrap_or(0);
+            (worst, slot)
+        })
+}
+
+/// The decision over every rank's report: choose the slot once
+/// ([`choose_slot`]), price the request in it on every rank, and run
+/// [`page_verdict`]. `enabled == false` is the kill switch: today's admission.
+pub fn page_decision(enabled: bool, ranks: &[RankNumbers], margin: u64) -> PageDecision {
+    if !enabled {
+        return PageDecision::UNBUDGETED;
+    }
+    let slot = choose_slot(ranks);
+    let priced: Vec<RankPages> = ranks
+        .iter()
+        .map(|rank| {
+            let mut pages = rank.pages;
+            if let Some(need) = slot.and_then(|slot| rank.slots[slot].need) {
+                pages.need = need.saturating_add(rank.extra);
+            }
+            pages
+        })
+        .collect();
+    PageDecision {
+        verdict: page_verdict(&priced, margin),
+        slot,
     }
 }
 
@@ -221,6 +478,13 @@ pub(crate) struct PageGeometry<'a> {
     pub granularity: usize,
     /// Rows the load-time lane reservation charges per lane.
     pub charge_rows: usize,
+    /// A lane has prefilled past the charged rows on this rank since the load:
+    /// the lazily grown non-lane memory of a long prefill is already out of
+    /// the free figure.
+    pub warm: bool,
+    /// Free bytes the first long prefill is expected to take beyond the lanes'
+    /// own pages while the rank is not `warm`.
+    pub cold_reserve: u64,
     pub spec: Option<PageSpec<'a>>,
 }
 
@@ -254,6 +518,8 @@ pub(crate) struct SlotPages {
     pub materialised: bool,
     /// Mapped bytes of the trunk context arenas.
     pub have_trunk: u64,
+    /// Tokens the trunk's context arenas cover.
+    pub mapped_tokens: usize,
     /// Mapped bytes of the head's context arenas (`None`: no head state).
     pub have_head: Option<u64>,
     /// The lane's head retired to head-free AR: it maps no more.
@@ -342,9 +608,8 @@ fn gather_pages(gather: &GatherPages, tokens: usize) -> Result<u64, String> {
     Ok(bytes.div_ceil(granule).saturating_mul(granule))
 }
 
-/// One rank's numbers for a request reserving `rows` rows into the lowest free
-/// slot. `free` is the rank's measured free device memory. A legacy context
-/// backend maps nothing on demand: all zeros.
+/// [`rank_numbers`]' pages alone: the request priced in this rank's best free slot.
+#[cfg(test)]
 pub(crate) fn rank_pages(
     geometry: &PageGeometry<'_>,
     slots: &[SlotPages],
@@ -353,6 +618,20 @@ pub(crate) fn rank_pages(
     free: u64,
     rows: usize,
 ) -> Result<RankPages, String> {
+    rank_numbers(geometry, slots, gather, rank, free, rows).map(|numbers| numbers.pages)
+}
+
+/// One rank's report for a request reserving `rows` rows. `free` is the rank's
+/// measured free device memory. A legacy context backend maps nothing on
+/// demand: all zeros.
+pub(crate) fn rank_numbers(
+    geometry: &PageGeometry<'_>,
+    slots: &[SlotPages],
+    gather: Option<&GatherPages>,
+    rank: usize,
+    free: u64,
+    rows: usize,
+) -> Result<RankNumbers, String> {
     let active_lanes = slots.iter().filter(|slot| slot.live).count();
     let mut pages = RankPages {
         rank,
@@ -360,8 +639,24 @@ pub(crate) fn rank_pages(
         active_lanes,
         ..RankPages::default()
     };
+    let mut needs: Vec<SlotNeed> = slots
+        .iter()
+        .enumerate()
+        .map(|(index, slot)| SlotNeed {
+            head: geometry.slot_has_head(index),
+            need: (!slot.live).then_some(0),
+        })
+        .collect();
+    let mut extra = 0u64;
     if geometry.backend != Qwen4KvBackend::Vmm {
-        return Ok(pages);
+        return Ok(RankNumbers {
+            pages,
+            slots: needs,
+            extra,
+        });
+    }
+    if !geometry.warm {
+        pages.earmark = geometry.cold_reserve;
     }
     let charge = geometry.charge_rows.min(geometry.max_seq);
     let trunk_charged = geometry.trunk(charge)?;
@@ -391,15 +686,17 @@ pub(crate) fn rank_pages(
         }
     }
     let rows = rows.min(geometry.max_seq);
-    if let Some(index) = slots.iter().position(|slot| !slot.live) {
-        pages.need = slot_growth(
-            geometry,
-            index,
-            &slots[index],
-            rows,
-            trunk_charged,
-            head_charged,
-        )?;
+    for (index, slot) in slots.iter().enumerate() {
+        if !slot.live {
+            needs[index].need = Some(slot_growth(
+                geometry,
+                index,
+                slot,
+                rows,
+                trunk_charged,
+                head_charged,
+            )?);
+        }
     }
     if let Some(gather) = gather {
         // One workspace per GPU, shared by every lane: it grows to the largest
@@ -415,9 +712,22 @@ pub(crate) fn rank_pages(
             .earmark
             .saturating_add(charged.saturating_sub(committed));
         pages.outstanding = pages.outstanding.saturating_add(live);
-        pages.need = pages.need.saturating_add(all.saturating_sub(live));
+        extra = all.saturating_sub(live);
     }
-    Ok(pages)
+    let numbers = RankNumbers {
+        pages,
+        slots: needs,
+        extra,
+    };
+    // This rank's own best slot, for its report line and the single-rank tests.
+    let local = std::slice::from_ref(&numbers);
+    let mut pages = numbers.pages;
+    if let Some(need) = choose_slot(local).and_then(|slot| numbers.slots[slot].need) {
+        pages.need = need.saturating_add(numbers.extra);
+    } else {
+        pages.need = numbers.extra;
+    }
+    Ok(RankNumbers { pages, ..numbers })
 }
 
 impl Qwen4LaneStore {
@@ -524,6 +834,7 @@ impl Qwen4LaneStore {
                     reserved_rows,
                     materialised: true,
                     have_trunk,
+                    mapped_tokens: cell.state.mapped_context_tokens(),
                     have_head,
                     head_retired,
                 })
@@ -560,16 +871,20 @@ impl Qwen4LaneStore {
 }
 
 impl Qwen4Bundle {
+    /// Rows of the first prefill chunk on this rank (the one expression the load
+    /// reservation, [`crate::ep`]'s staging fit check and the lane tiles use).
+    pub(crate) fn lane_prefill_chunk(&self, gpu: &Gpu) -> usize {
+        let mode = self
+            .forward_scratch_mode()
+            .unwrap_or(crate::gpu_forward::Qwen4ForwardScratchMode::Full);
+        crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, self.state.max_seq_len, mode)
+    }
+
     /// Rows the load-time lane reservation charges per lane on this rank: the
     /// one expression [`crate::ep`]'s staging fit check and the loader's
     /// reservation use, so the earmark equals what the load reserved.
     pub(crate) fn lane_charge_rows(&self, gpu: &Gpu) -> usize {
-        let max_seq = self.state.max_seq_len;
-        let mode = self
-            .forward_scratch_mode()
-            .unwrap_or(crate::gpu_forward::Qwen4ForwardScratchMode::Full);
-        let chunk = crate::gpu_forward::qwen4_prefill_chunk_requested(gpu, max_seq, mode);
-        crate::ep::ep_lane_commit_rows(chunk)
+        crate::ep::ep_lane_commit_rows(self.lane_prefill_chunk(gpu))
     }
 
     /// Draft rows to add to a request's reservation ([`reservation_rows`]);
@@ -580,13 +895,13 @@ impl Qwen4Bundle {
             .map_or(0, |store| store.page_draft_rows())
     }
 
-    /// This rank's page numbers for a request reserving `rows` rows
-    /// ([`rank_pages`]).
+    /// This rank's report for a request reserving `rows` rows
+    /// ([`rank_numbers`]).
     pub(crate) fn lane_page_numbers_local(
         &self,
         gpu: &Gpu,
         rows: usize,
-    ) -> Result<RankPages, String> {
+    ) -> Result<RankNumbers, String> {
         let store = self
             .lanes
             .as_ref()
@@ -600,13 +915,29 @@ impl Qwen4Bundle {
             .map(|(free, _)| free as u64)
             .map_err(|error| format!("rank {rank}: device memory query failed: {error}"))?;
         let granularity = gpu.vmm_recommended_granularity().unwrap_or(1);
+        let charge_rows = self.lane_charge_rows(gpu);
+        let slots = store.page_slots(gpu)?;
+        // A lane that mapped past the charged rows has run a long prompt tile (a step
+        // provisions and forwards in one tick, so what a gate sees mapped has run): the
+        // lazily grown non-lane memory of a long prefill (pooled tile scratch, GEMM input
+        // buffers, kernel modules) is then out of `free`. The flag is sticky: it never
+        // clears, whatever the slots later hold.
+        let warm = store
+            .long_prefill_seen
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || slots.iter().any(|slot| slot.mapped_tokens > charge_rows);
+        store
+            .long_prefill_seen
+            .store(warm, std::sync::atomic::Ordering::Relaxed);
         let geometry = PageGeometry {
             config: &self.config,
             format: store.format,
             backend: store.backend,
             max_seq: self.state.max_seq_len,
             granularity,
-            charge_rows: self.lane_charge_rows(gpu),
+            charge_rows,
+            warm,
+            cold_reserve: hipfire_config::qwen4_lane_page_budget_cold_bytes(),
             spec: store.spec.as_ref().map(|spec| PageSpec {
                 k: spec.config.k,
                 spec_lanes: spec.config.spec_lanes,
@@ -614,7 +945,6 @@ impl Qwen4Bundle {
                 copy: store.copy.as_ref().map(|copy| &copy.config),
             }),
         };
-        let slots = store.page_slots(gpu)?;
         let gather = self
             .state
             .qsa
@@ -631,26 +961,47 @@ impl Qwen4Bundle {
                 committed: gpu.qsa_gather_scratch_bytes() as u64,
                 granule: granularity as u64,
             });
-        rank_pages(&geometry, &slots, gather.as_ref(), rank, free, rows)
-            .map_err(|error| format!("rank {rank}: {error}"))
+        let numbers = rank_numbers(&geometry, &slots, gather.as_ref(), rank, free, rows)
+            .map_err(|error| format!("rank {rank}: {error}"))?;
+        if page_trace() {
+            trace_rank(&geometry, &slots, &numbers, gpu.pool_parked_bytes() as u64);
+        }
+        Ok(numbers)
     }
 
-    /// The page budget's verdict for a request reserving `rows` rows: this
-    /// rank's numbers (single device) or every rank's (EP, evaluated once on
-    /// the root so all ranks share the verdict). `Fit` under the kill switch
-    /// and on a pipeline-parallel store, which has no per-rank lane pages.
-    pub fn lane_page_verdict(&mut self, gpu: &mut Gpu, rows: usize) -> Result<PageVerdict, String> {
+    /// The page budget's decision for a request reserving `rows` rows: this
+    /// rank's numbers (single device) or every rank's (EP, evaluated once on the
+    /// root so all ranks share the verdict and the slot). Today's admission
+    /// under the kill switch and on a pipeline-parallel store, which has no
+    /// per-rank lane pages.
+    pub fn lane_page_decision(
+        &mut self,
+        gpu: &mut Gpu,
+        rows: usize,
+    ) -> Result<PageDecision, String> {
         // The kill switch measures nothing: today's admission, exactly.
         let enabled = page_budget_enabled();
         if !enabled || self.pp.is_some() {
-            return Ok(budget_verdict(false, &[], 0));
+            return Ok(page_decision(false, &[], 0));
         }
         let ranks = if self.ep.is_some() {
             self.ep_lane_page_numbers(gpu, rows)?
         } else {
             vec![self.lane_page_numbers_local(gpu, rows)?]
         };
-        Ok(budget_verdict(enabled, &ranks, page_margin_bytes()))
+        let decision = page_decision(true, &ranks, page_margin_bytes());
+        if page_trace() {
+            eprintln!(
+                "[lane-pages] decision rows={rows} slot={:?} verdict={}",
+                decision.slot,
+                match decision.verdict {
+                    PageVerdict::Fit => "fit",
+                    PageVerdict::Wait(_) => "wait",
+                    PageVerdict::Never(_) => "never",
+                }
+            );
+        }
+        Ok(decision)
     }
 
     /// Reserve `rows` context rows for the just-admitted lane of `epoch` on
@@ -710,6 +1061,8 @@ mod tests {
             max_seq: MAX_SEQ,
             granularity: GRANULE,
             charge_rows: ep_lane_commit_rows_for(4096, None),
+            warm: true,
+            cold_reserve: 0,
             spec,
         }
     }
@@ -735,6 +1088,7 @@ mod tests {
             reserved_rows: reserved,
             materialised: true,
             have_trunk: g.trunk(mapped).unwrap(),
+            mapped_tokens: mapped,
             have_head: g.slot_has_head(index).then(|| g.head(mapped).unwrap()),
             head_retired: false,
         }
@@ -1020,15 +1374,164 @@ mod tests {
         ));
     }
 
+    /// One rank's report for tests: `numbers` over `slots` with `free` bytes.
+    fn numbers_of(
+        g: &PageGeometry<'_>,
+        slots: &[SlotPages],
+        rank: usize,
+        free: u64,
+        rows: usize,
+    ) -> RankNumbers {
+        rank_numbers(g, slots, None, rank, free, rows).unwrap()
+    }
+
     #[test]
     fn the_kill_switch_admits_exactly_as_before() {
-        let hopeless = ranks_with(0, 4096 * MIB, 4096 * MIB, 4096 * MIB, 0);
-        assert!(matches!(
-            budget_verdict(true, &[hopeless], 256 * MIB),
-            PageVerdict::Never(_)
-        ));
+        let config = compact_test_config();
+        let g = geometry(&config, None);
+        // Nothing free, a full long request: the budget refuses it, the kill switch does not
+        // measure, queue or choose a slot: the lowest free slot, as before.
+        let slots = vec![SlotPages::default(); 2];
+        let hopeless = numbers_of(&g, &slots, 0, 0, MAX_SEQ);
+        let on = page_decision(true, std::slice::from_ref(&hopeless), 256 * MIB);
+        assert!(matches!(on.verdict, PageVerdict::Never(_)));
+        let off = page_decision(false, std::slice::from_ref(&hopeless), 256 * MIB);
+        assert_eq!(off, PageDecision::UNBUDGETED);
+        assert_eq!(off.verdict, PageVerdict::Fit);
+        assert_eq!(off.slot, None);
+    }
+
+    /// A free slot keeps the pages it mapped for an earlier request, and the request that takes it
+    /// reuses them: the budget prices the request in the slot that needs the fewest new pages (the
+    /// one the hoard from the failed or retired lanes sits in), not the lowest index.
+    #[test]
+    fn a_hoarded_free_slot_counts_as_available_to_the_request_that_takes_it() {
+        let config = compact_test_config();
+        let g = geometry(&config, None);
+        let rows = reservation_rows(16_000, 64, 0, MAX_SEQ);
+        let hoard = |mapped: usize| SlotPages {
+            live: false,
+            materialised: true,
+            have_trunk: g.trunk(mapped).unwrap(),
+            mapped_tokens: mapped,
+            ..SlotPages::default()
+        };
+        // Slot 0 idle at the charge, slot 2 idle and hoarding 12288 rows, slot 1 live.
+        let slots = vec![hoard(2048), mapped_lane(&g, 1, rows, 4096), hoard(12288)];
+        let numbers = numbers_of(&g, &slots, 0, 100 * MIB, rows);
+        let decision = page_decision(true, std::slice::from_ref(&numbers), 0);
+        assert_eq!(decision.slot, Some(2), "the hoarded slot, not the lowest");
+        let full = g.trunk(rows).unwrap() - g.trunk(2048).unwrap();
+        let reused = g.trunk(rows).unwrap() - g.trunk(12288).unwrap();
+        assert!(reused < full);
+        assert_eq!(numbers.slots[0].need, Some(full));
+        assert_eq!(numbers.slots[2].need, Some(reused));
         assert_eq!(
-            budget_verdict(false, &[hopeless], 256 * MIB),
+            numbers.slots[1].need, None,
+            "a live slot is not a candidate"
+        );
+        // With no lane active and nothing free: the request still fits the hoard (zero new pages)
+        // when its rows are inside the pages the slot already holds.
+        let idle = vec![hoard(2048), hoard(16384)];
+        let numbers = numbers_of(&g, &idle, 0, 0, rows);
+        let decision = page_decision(true, std::slice::from_ref(&numbers), 0);
+        assert_eq!(
+            (decision.slot, decision.verdict),
+            (Some(1), PageVerdict::Fit)
+        );
+    }
+
+    /// The slot is chosen once from every rank's vector, whatever the rank order, and an MTP
+    /// store keeps landing low concurrency on a slot that carries MTP state.
+    #[test]
+    fn the_slot_is_chosen_once_for_every_rank_and_prefers_mtp_slots() {
+        let config = compact_test_config();
+        let g = geometry(&config, Some(mtp(Some(2))));
+        let rows = reservation_rows(16_000, 64, 7, MAX_SEQ);
+        let hoard = |index: usize, mapped: usize| SlotPages {
+            live: false,
+            materialised: true,
+            have_trunk: g.trunk(mapped).unwrap(),
+            mapped_tokens: mapped,
+            have_head: g.slot_has_head(index).then(|| g.head(mapped).unwrap()),
+            ..SlotPages::default()
+        };
+        // Rank 0 hoards in MTP slot 1; rank 1 hoards in MTP slot 0; AR slot 3 hoards most on both.
+        let r0 = vec![
+            hoard(0, 2048),
+            hoard(1, 8192),
+            hoard(2, 2048),
+            hoard(3, 16384),
+        ];
+        let r1 = vec![
+            hoard(0, 8192),
+            hoard(1, 2048),
+            hoard(2, 2048),
+            hoard(3, 16384),
+        ];
+        let a = numbers_of(&g, &r0, 0, 4096 * MIB, rows);
+        let b = numbers_of(&g, &r1, 1, 4096 * MIB, rows);
+        let forward = page_decision(true, &[a.clone(), b.clone()], 256 * MIB);
+        let backward = page_decision(true, &[b, a], 256 * MIB);
+        assert_eq!(forward.slot, backward.slot);
+        assert_eq!(forward.verdict, backward.verdict);
+        // MTP slots 0 and 1 are free: the AR slot 3 hoard is not preferred; the two MTP slots tie on
+        // their worst rank (each rank hoards 8192 in one of them), so the lowest index wins.
+        assert_eq!(forward.slot, Some(0));
+        // Only AR slots free: the AR slot with the larger hoard.
+        let ar_only = |hoards: [usize; 2]| {
+            let mut v: Vec<SlotPages> = vec![
+                mapped_lane(&g, 0, rows, 2048),
+                mapped_lane(&g, 1, rows, 2048),
+            ];
+            v.push(hoard(2, hoards[0]));
+            v.push(hoard(3, hoards[1]));
+            v
+        };
+        let n = numbers_of(&g, &ar_only([2048, 12288]), 0, 4096 * MIB, rows);
+        assert_eq!(page_decision(true, &[n], 0).slot, Some(3));
+    }
+
+    /// While no lane has mapped past the first chunk the first long tile's non-lane memory is still
+    /// ahead: the budget holds `cold_reserve` back; afterwards it is already out of `free`. j7704:
+    /// 1002 MiB free per card, two admitted lanes promised 584 MiB, and the first tile alone took
+    /// more than the rest.
+    #[test]
+    fn the_first_long_tile_is_reserved_until_it_has_run() {
+        let config = compact_test_config();
+        let mut g = geometry(&config, Some(mtp(None)));
+        g.warm = false;
+        g.cold_reserve = 1280 * MIB;
+        let rows = reservation_rows(16_303, 64, 7, MAX_SEQ);
+        // The j7704 shape: all eight slots allocated at the charge, none live.
+        let idle: Vec<SlotPages> = (0..8)
+            .map(|i| SlotPages {
+                live: false,
+                materialised: true,
+                have_trunk: g.trunk(2048).unwrap(),
+                mapped_tokens: 2048,
+                have_head: g.slot_has_head(i).then(|| g.head(2048).unwrap()),
+                ..SlotPages::default()
+            })
+            .collect();
+        let cold = numbers_of(&g, &idle, 0, 1002 * MIB, rows);
+        assert_eq!(cold.pages.earmark, 1280 * MIB);
+        let decision = page_decision(true, std::slice::from_ref(&cold), 256 * MIB);
+        // No lane active and the 1002 MiB cannot cover the first tile plus the lane: refused up front
+        // (a clean overload at admission), not admitted to fail mid-step.
+        assert!(matches!(decision.verdict, PageVerdict::Never(_)));
+        // The same card after one long tile ran: only the lane's own growth is promised.
+        g.warm = true;
+        let warm = numbers_of(&g, &idle, 0, 1002 * MIB, rows);
+        assert_eq!(warm.pages.earmark, 0);
+        assert_eq!(
+            page_decision(true, std::slice::from_ref(&warm), 256 * MIB).verdict,
+            PageVerdict::Fit
+        );
+        // A request inside the charge never waits for the cold reserve.
+        let small = numbers_of(&g, &idle, 0, 0, 1000);
+        assert_eq!(
+            page_decision(true, &[small], 256 * MIB).verdict,
             PageVerdict::Fit
         );
     }

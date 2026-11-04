@@ -4968,10 +4968,23 @@ impl Qwen4Bundle {
         epoch: hipfire_runtime::slot_batch::RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, BundleError> {
+        self.admit_lane_in(gpu, epoch, prompt, None)
+    }
+
+    /// [`Self::admit_lane`] into `preferred` when that slot is free (the lane page
+    /// budget's choice, made once on the root; every EP rank admits into it), else the
+    /// lowest free lane.
+    pub fn admit_lane_in(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: hipfire_runtime::slot_batch::RequestEpoch,
+        prompt: Vec<u32>,
+        preferred: Option<usize>,
+    ) -> Result<usize, BundleError> {
         if self.ep.is_some() {
-            return self.ep_admit_lane(gpu, epoch, prompt);
+            return self.ep_admit_lane(gpu, epoch, prompt, preferred);
         }
-        self.with_lanes(|store, bundle| store.admit(gpu, bundle, epoch, prompt))
+        self.with_lanes(|store, bundle| store.admit_in(gpu, bundle, epoch, prompt, preferred))
     }
 
     /// Free `epoch`'s lane (its device state stays allocated for reuse).

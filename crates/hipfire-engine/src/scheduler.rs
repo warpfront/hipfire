@@ -12,9 +12,9 @@ use std::time::Instant;
 use crate::terminal::{
     batch_active_owner_matches, batch_bind_active, batch_check_abort,
     batch_clear_terminal_at_generation, batch_is_current, batch_mark_ready_with_pending,
-    batch_poll_decision, batch_ready_owner_matches, batch_transition_to_queued, AttemptKey,
-    BatchGeneration, ClientTerminalDecision, LaneTicket, SingletonTransfer,
-    CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_poll_decision, batch_ready_owner_matches, batch_requeue_active,
+    batch_transition_to_queued, AttemptKey, BatchGeneration, ClientTerminalDecision, LaneTicket,
+    SingletonTransfer, CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 
 // ── Batch sampling controls and cohort key ───────────────────────────────
@@ -495,6 +495,38 @@ impl ContinuousBatchScheduler {
         self.inbox.retain(|k| k != expected);
         batch_clear_terminal_at_generation(&expected.id, expected.attempt_id, admission);
         self.maybe_clear_cohort();
+        true
+    }
+
+    /// Put a running lane's request back at the FRONT of the inbox after a step failed on a capacity condition
+    /// before the request emitted anything: the lane becomes empty (its generation advances) and the request keeps
+    /// its pending entry and its place in line, to be assigned again at a later step boundary. False (nothing
+    /// changed) unless the lane runs `expected` under `admission` and the terminal registry accepts the
+    /// `Active` -> `Queued` transition.
+    pub fn requeue_lane(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        if lane >= self.lanes.len() || !self.pending.contains_key(expected) {
+            return false;
+        }
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
+                (q.ticket, q.ticket.generation)
+            }
+            _ => return false,
+        };
+        if ticket.admission != admission
+            || !batch_requeue_active(&expected.id, expected.attempt_id, admission, ticket)
+        {
+            return false;
+        }
+        self.lanes[lane] = BatchLane::Empty {
+            generation: lane_generation + 1,
+        };
+        self.inbox.push_front(expected.clone());
         true
     }
 

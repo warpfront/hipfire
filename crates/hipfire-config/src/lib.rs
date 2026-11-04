@@ -4754,6 +4754,38 @@ pub fn qwen4_lane_page_budget_margin_bytes() -> u64 {
         .saturating_mul(1 << 20)
 }
 
+/// `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_COLD_MIB` (developer): free device memory, in MiB per rank,
+/// the lane page budget holds back for the FIRST long prompt tile of a process, while no lane has
+/// yet prefilled past the charged lane rows. That tile grows memory no lane owns (pooled tile
+/// scratch, GEMM input buffers, kernel modules); it is taken from `free` once and stays out of it,
+/// so the reservation only has to cover it until the first long tile has run. Unset or unparsable =
+/// [`QWEN4_LANE_PAGE_BUDGET_COLD_DEFAULT_MIB`]; `0` holds nothing back.
+pub const QWEN4_LANE_PAGE_BUDGET_COLD_MIB_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_BUDGET_COLD_MIB";
+
+/// Default cold-start reserve per rank, MiB: the served card test (j7704) saw the first 4096-row tile
+/// of two lanes take more than the 1002 MiB left free per card, with the lanes' own pages under 200 MiB.
+pub const QWEN4_LANE_PAGE_BUDGET_COLD_DEFAULT_MIB: u64 = 1280;
+
+/// [`QWEN4_LANE_PAGE_BUDGET_COLD_MIB_ENV`] in bytes, read through the process snapshot.
+pub fn qwen4_lane_page_budget_cold_bytes() -> u64 {
+    developer_var(QWEN4_LANE_PAGE_BUDGET_COLD_MIB_ENV)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(QWEN4_LANE_PAGE_BUDGET_COLD_DEFAULT_MIB)
+        .saturating_mul(1 << 20)
+}
+
+/// `HIPFIRE_QWEN4_LANE_PAGE_TRACE` (developer, default off): stderr `[lane-pages]` lines with every
+/// rank's lane page numbers at each admission and the free device bytes before and after every lane
+/// context map next to the bytes the budget predicted for it, so a card test can show predicted ==
+/// actual and name whatever else took the memory.
+pub const QWEN4_LANE_PAGE_TRACE_ENV: &str = "HIPFIRE_QWEN4_LANE_PAGE_TRACE";
+
+/// [`QWEN4_LANE_PAGE_TRACE_ENV`] read through the process snapshot.
+pub fn qwen4_lane_page_trace() -> bool {
+    developer_bool(QWEN4_LANE_PAGE_TRACE_ENV, false)
+}
+
 /// `HIPFIRE_QWEN4_EP_WIDE_VERIFY_ALL_LANES` (lab, default off): with
 /// [`QWEN4_EP_SAMPLED_WIDE_VERIFY_ENV`] on, treat every lane (greedy and seeded
 /// included) as wide-class. For oracles that measure the wide pass with greedy

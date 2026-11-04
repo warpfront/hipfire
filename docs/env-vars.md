@@ -1126,7 +1126,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1988
+**Count:** 1990
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2590,7 +2590,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QWEN4_LANE_COST_TRACE` | crates/hipfire-arch-qwen4/src/mtp_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_HC_ALLROWS` | crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs, crates/hipfire-dispatch/examples/hc_allrows_oracle.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PAGE_BUDGET` | crates/hipfire-arch-qwen4/src/lane/pages.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_COLD_MIB` | crates/hipfire-config/src/lib.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PAGE_BUDGET_MARGIN_MIB` | crates/hipfire-arch-qwen4/src/lane/pages.rs, crates/hipfire-config/src/lib.rs | developer |
+| `HIPFIRE_QWEN4_LANE_PAGE_TRACE` | crates/hipfire-arch-qwen4/src/lane/pages.rs, crates/hipfire-arch-qwen4/src/lane_exec.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PINNED_LOGITS` | crates/rdna-compute/src/feature_flags.rs | developer |
 | `HIPFIRE_QWEN4_LANE_PLE_BATCH` | crates/hipfire-arch-qwen4/examples/ple_lanes_oracle.rs, crates/hipfire-arch-qwen4/src/gpu_forward_lanes.rs | developer |
 | `HIPFIRE_QWEN4_LANE_RESERVE_TRIM` | crates/hipfire-arch-qwen4/src/lane/census.rs, crates/hipfire-arch-qwen4/src/state.rs | developer |

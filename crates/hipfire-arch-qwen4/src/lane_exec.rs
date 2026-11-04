@@ -1062,32 +1062,47 @@ fn provision_inner(
         plan_and_draft(bundle, gpu, store, &requests, &[])?;
     }
     check_sealed(plan, store.proto_mut()?)?;
+    // `HIPFIRE_QWEN4_LANE_PAGE_TRACE`: free bytes before/after every lane map and what the budget planned.
+    let trace = crate::lane::pages::page_trace().then(|| store.map_trace_inputs(bundle, gpu));
     for (r, &end) in plan.requests.iter().zip(ends) {
         let lane = store
             .lane_mut(&r.epoch)
             .ok_or_else(|| format!("provision_step: epoch {:?} vanished", r.epoch))?;
-        lane.state.ensure_mapped_capacity(gpu, end).map_err(|e| {
-            format!(
-                "{PROVISION_MAP_REFUSED}{end} positions for {:?}: {e}",
-                r.epoch
-            )
-        })?;
-        if let Some(spec) = lane.spec.as_mut() {
-            // A head-free (retired, no copy future) lane's head lags the
-            // trunk and is never touched; a lagging head (copy future) is
-            // mapped like a live one: its owed rows are appended at prepare.
-            let head_live = spec.window.as_ref().is_none_or(|w| w.head_live);
-            if head_live {
-                spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
-                    format!(
-                        "{PROVISION_MAP_REFUSED}{end} head positions for {:?}: {e}",
-                        r.epoch
-                    )
-                })?;
-            }
+        let probe = trace
+            .as_ref()
+            .map(|_| crate::lane::pages::LaneMapProbe::start(gpu, lane));
+        let mapped = provision_lane_maps(gpu, lane, r.epoch, end);
+        if let (Some(probe), Some(inputs)) = (probe, trace.as_ref()) {
+            probe.finish(inputs, &bundle.config, gpu, lane, end);
         }
+        mapped?;
     }
     store.phase = LanePhase::Provisioned(StepKey::of(plan));
+    Ok(())
+}
+
+/// Map one lane's trunk (and, unless retired, head) context through `end` positions; a refusal carries
+/// [`PROVISION_MAP_REFUSED`].
+fn provision_lane_maps(
+    gpu: &mut Gpu,
+    lane: &mut crate::lane::Qwen4LaneState,
+    epoch: RequestEpoch,
+    end: usize,
+) -> Result<(), String> {
+    lane.state
+        .ensure_mapped_capacity(gpu, end)
+        .map_err(|e| format!("{PROVISION_MAP_REFUSED}{end} positions for {epoch:?}: {e}"))?;
+    if let Some(spec) = lane.spec.as_mut() {
+        // A head-free (retired, no copy future) lane's head lags the
+        // trunk and is never touched; a lagging head (copy future) is
+        // mapped like a live one: its owed rows are appended at prepare.
+        let head_live = spec.window.as_ref().is_none_or(|w| w.head_live);
+        if head_live {
+            spec.head.ensure_mapped_capacity(gpu, end).map_err(|e| {
+                format!("{PROVISION_MAP_REFUSED}{end} head positions for {epoch:?}: {e}")
+            })?;
+        }
+    }
     Ok(())
 }
 

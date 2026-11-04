@@ -1375,7 +1375,19 @@ impl<C: LaneCell> LaneTable<C> {
         prompt: Vec<u32>,
         prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
     ) -> Result<usize, String> {
-        self.admit_host(epoch, prompt, None, prepare)
+        self.admit_in(epoch, prompt, None, prepare)
+    }
+
+    /// [`Self::admit`] into `preferred` when that slot is free (the page budget's choice,
+    /// [`pages::choose_slot`]), else into the lowest free slot.
+    fn admit_in(
+        &mut self,
+        epoch: RequestEpoch,
+        prompt: Vec<u32>,
+        preferred: Option<usize>,
+        prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
+    ) -> Result<usize, String> {
+        self.admit_host(epoch, prompt, None, preferred, prepare)
     }
 
     /// Admit `epoch` as an already-decoding request (a promoted singleton):
@@ -1390,7 +1402,13 @@ impl<C: LaneCell> LaneTable<C> {
         pending_seed: u32,
         prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
     ) -> Result<usize, String> {
-        self.admit_host(epoch, prompt, Some((generated, pending_seed)), prepare)
+        self.admit_host(
+            epoch,
+            prompt,
+            Some((generated, pending_seed)),
+            None,
+            prepare,
+        )
     }
 
     fn admit_host(
@@ -1398,6 +1416,7 @@ impl<C: LaneCell> LaneTable<C> {
         epoch: RequestEpoch,
         prompt: Vec<u32>,
         decoding: Option<(Vec<u32>, u32)>,
+        preferred: Option<usize>,
         prepare: impl FnOnce(usize, Option<&mut C>) -> Result<Option<C::Payload>, String>,
     ) -> Result<usize, String> {
         if !epoch.is_admitted() {
@@ -1409,7 +1428,8 @@ impl<C: LaneCell> LaneTable<C> {
         if prompt.is_empty() {
             return Err("admit: empty prompt".to_string());
         }
-        let Some(slot) = self.live.iter().position(|live| !*live) else {
+        let preferred = preferred.filter(|&slot| self.live.get(slot) == Some(&false));
+        let Some(slot) = preferred.or_else(|| self.live.iter().position(|live| !*live)) else {
             return Err(format!("admit: all {} lanes are busy", self.max_lanes()));
         };
         let (prefilled, generated, pending_seed, status) = match decoding {
@@ -2026,6 +2046,9 @@ pub struct Qwen4LaneStore {
     /// ([`pages`], the lane page budget); `0` = none. Host only, cleared when
     /// the lane is released.
     page_reserved: Vec<usize>,
+    /// A prompt tile past the first chunk has run on this store's device
+    /// ([`pages`]): sticky, never cleared.
+    pub(crate) long_prefill_seen: std::sync::atomic::AtomicBool,
 }
 
 impl Qwen4LaneStore {
@@ -2223,6 +2246,7 @@ impl Qwen4LaneStore {
             proto: Some(proto),
             copy: copy_arming,
             page_reserved: vec![0; max_lanes],
+            long_prefill_seen: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -2453,6 +2477,19 @@ impl Qwen4LaneStore {
         epoch: RequestEpoch,
         prompt: Vec<u32>,
     ) -> Result<usize, String> {
+        self.admit_in(gpu, bundle, epoch, prompt, None)
+    }
+
+    /// [`Self::admit`] into `preferred` when that slot is free (the lane page budget's
+    /// choice: every rank admits into the slot the root chose).
+    pub fn admit_in(
+        &mut self,
+        gpu: &mut Gpu,
+        bundle: &Qwen4Bundle,
+        epoch: RequestEpoch,
+        prompt: Vec<u32>,
+        preferred: Option<usize>,
+    ) -> Result<usize, String> {
         let store_ring_rows = self.ring_rows;
         let (narrow_ring_rows, wide_lanes) = self.ring_split();
         let store_spec_cfg = self
@@ -2464,41 +2501,42 @@ impl Qwen4LaneStore {
             .as_ref()
             .and_then(|s| s.config.spec_lanes)
             .unwrap_or(usize::MAX);
-        self.table.admit(epoch, prompt, |slot, existing| {
-            // A slot past the mixed store's MTP lanes is an AR-only lane:
-            // no capture ring, no head.
-            let (ring_rows, spec_cfg) = if slot < spec_lanes {
-                let ring = if slot < wide_lanes {
-                    store_ring_rows
+        self.table
+            .admit_in(epoch, prompt, preferred, |slot, existing| {
+                // A slot past the mixed store's MTP lanes is an AR-only lane:
+                // no capture ring, no head.
+                let (ring_rows, spec_cfg) = if slot < spec_lanes {
+                    let ring = if slot < wide_lanes {
+                        store_ring_rows
+                    } else {
+                        narrow_ring_rows
+                    };
+                    (ring, store_spec_cfg)
                 } else {
-                    narrow_ring_rows
+                    (0, None)
                 };
-                (ring, store_spec_cfg)
-            } else {
-                (0, None)
-            };
-            match existing {
-                Some(cell) => {
-                    cell.state
-                        .reset(gpu)
-                        .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
-                    cell.state.row_capture_armed = false;
-                    match (spec_cfg, cell.spec.as_mut()) {
-                        (Some(_), Some(spec)) => spec
+                match existing {
+                    Some(cell) => {
+                        cell.state
                             .reset(gpu)
-                            .map_err(|e| format!("admit: reset lane {slot}: {e}"))?,
-                        (None, None) => {}
-                        _ => {
-                            return Err(format!(
-                                "admit: lane {slot} spec state does not match the store"
-                            ));
+                            .map_err(|e| format!("admit: reset lane {slot}: {e}"))?;
+                        cell.state.row_capture_armed = false;
+                        match (spec_cfg, cell.spec.as_mut()) {
+                            (Some(_), Some(spec)) => spec
+                                .reset(gpu)
+                                .map_err(|e| format!("admit: reset lane {slot}: {e}"))?,
+                            (None, None) => {}
+                            _ => {
+                                return Err(format!(
+                                    "admit: lane {slot} spec state does not match the store"
+                                ));
+                            }
                         }
+                        Ok(None)
                     }
-                    Ok(None)
+                    None => new_payload(gpu, bundle, slot, ring_rows, spec_cfg).map(Some),
                 }
-                None => new_payload(gpu, bundle, slot, ring_rows, spec_cfg).map(Some),
-            }
-        })
+            })
     }
 
     /// Admit `epoch` straight into Decoding (a promoted singleton): `prompt`
