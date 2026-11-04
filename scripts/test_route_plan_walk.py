@@ -78,6 +78,24 @@ class BoundedPlan(unittest.TestCase):
         self.assertEqual([m["_name"] for m in plan[-3:]], list(walk.BOUNDED_DEPTH_PROMPTS))
         self.assertTrue(all("_name" not in m or m["_name"] == "think-short" for m in plan[:-3]))
 
+    def test_product_profile_adds_the_sp_and_s1_row_classes_and_keeps_the_caps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            prompts = prompt_dir(pathlib.Path(tmp))
+            bounded = walk.bounded_plan(prompts)
+            plan = walk.product_plan(prompts)
+        words = [m["_words"] for m in plan if "_words" in m]
+        for n in walk.PRODUCT_EXTRA_WORDS:
+            self.assertIn(n, words)
+        self.assertEqual(len(plan), len(bounded) + len(walk.PRODUCT_EXTRA_WORDS))
+        self.assertTrue(all(m["max_tokens"] <= walk.BOUNDED_MAX_TOKENS for m in plan if m["type"] == "generate"))
+        # the resume chain still directly follows its own prompt, and the depth prompts stay last
+        chain = [i for i, m in enumerate(plan) if "chain_user" in m]
+        self.assertEqual([m for m in plan[chain[0] - 1:chain[0]]][0]["type"], "generate")
+        self.assertEqual([m.get("_name") for m in plan[-3:]], list(walk.BOUNDED_DEPTH_PROMPTS))
+        # a long product prompt (>= BOUNDED_LONG_WORDS) decodes at most BOUNDED_LONG_TOKENS
+        self.assertTrue(all(m["max_tokens"] <= walk.BOUNDED_LONG_TOKENS for m in plan
+                            if m.get("_words", 0) >= walk.BOUNDED_LONG_WORDS))
+
     def test_plan_covers_sampling_sweep_resume_and_thinking(self):
         with tempfile.TemporaryDirectory() as tmp:
             plan = walk.bounded_plan(prompt_dir(pathlib.Path(tmp)))
