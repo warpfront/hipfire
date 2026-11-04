@@ -591,21 +591,14 @@ impl RankLane<'_> {
             // order of finishing does not move any lane's state.
             let want_read_any = round.ops.iter().try_fold(false, |any, op| {
                 let plan = plan_of(&op.key)?;
-                Ok::<_, String>(
-                    any || (sampler
-                        && plan.sampling == SamplingMode::Leviathan
-                        && plan.source == ProposalSource::Native),
-                )
+                Ok::<_, String>(any || (sampler && plan.wants_candidate_read()))
             })?;
             // One batched head call per round (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`):
             // decided from the root's plan alone (every rank takes the same
             // branch: the head's gather parity advances once per batched call).
             let any_distribution_read = round.ops.iter().try_fold(false, |any, op| {
                 let plan = plan_of(&op.key)?;
-                Ok::<_, String>(
-                    any || (plan.sampling == SamplingMode::Leviathan
-                        && plan.source == ProposalSource::Native),
-                )
+                Ok::<_, String>(any || plan.wants_candidate_read())
             })?;
             let batched = crate::mtp_lanes::draft_round_batchable(
                 bundle,
@@ -695,9 +688,7 @@ impl RankLane<'_> {
                     let top =
                         &spec_store.draft_top1_host[slot * slot_bytes..(slot + 1) * slot_bytes];
                     let plan = plan_of(&op.key)?;
-                    let want_read = sampler
-                        && plan.sampling == SamplingMode::Leviathan
-                        && plan.source == ProposalSource::Native;
+                    let want_read = sampler && plan.wants_candidate_read();
                     let (token, margin, read) = if batched {
                         let (token, margin) =
                             crate::mtp_lanes::finish_batched_draft(bundle, &mut *lanes[slot], top)

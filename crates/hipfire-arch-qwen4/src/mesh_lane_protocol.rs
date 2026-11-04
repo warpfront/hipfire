@@ -582,6 +582,20 @@ pub struct LanePlan {
 }
 
 impl LanePlan {
+    /// Whether a head rank must copy out the head's candidate read for this
+    /// lane's draft proposals (a Leviathan lane draws its tokens from `q`):
+    /// a native window, and a copy window whose first-candidate confirmation
+    /// can miss into a native one (`copy_confirm` with `native_depth > 0`: the
+    /// proposal that fails the confirmation is the native draft 0, drawn from
+    /// the same `q`). Decided from the root's plan alone, so every rank agrees.
+    pub fn wants_candidate_read(&self) -> bool {
+        self.sampling == SamplingMode::Leviathan
+            && (self.source == ProposalSource::Native
+                || (self.source == ProposalSource::Copy
+                    && self.copy_confirm
+                    && self.native_depth > 0))
+    }
+
     /// Rows this lane's verify block carries at most (exact once drafting
     /// ends).
     pub fn max_rows(&self) -> usize {
@@ -4292,6 +4306,11 @@ pub(crate) mod scripted {
         pub capacity_error: Option<String>,
         draft_idx: HashMap<LaneWindowKey, usize>,
         pub evidence_unpriced: bool,
+        /// The planned lanes of the begun window (for `device_reads`).
+        plans: HashMap<LaneWindowKey, LanePlan>,
+        /// Produce the proposals' candidate read exactly as a device rank
+        /// does: `Some` iff [`LanePlan::wants_candidate_read`].
+        pub device_reads: bool,
     }
 
     impl ScriptedExecutor {
@@ -4309,6 +4328,8 @@ pub(crate) mod scripted {
                 capacity_error: None,
                 draft_idx: HashMap::new(),
                 evidence_unpriced: false,
+                plans: HashMap::new(),
+                device_reads: false,
             }
         }
 
@@ -4342,6 +4363,7 @@ pub(crate) mod scripted {
         fn begin_window(&mut self, start: &WindowStart) -> RankReady {
             self.calls.push(Call::Begin(start.key.step_seq));
             self.draft_idx.clear();
+            self.plans = start.lanes.iter().map(|l| (l.key, l.clone())).collect();
             let cap = if self.fail_at == Some(FailAt::Begin) {
                 Err("scripted capacity failure".to_string())
             } else {
@@ -4395,7 +4417,12 @@ pub(crate) mod scripted {
                         token,
                         keep_going: w.keep_going.get(j).copied().unwrap_or(true),
                         drop_last: w.drop_last.get(j).copied().unwrap_or(false),
-                        read: None,
+                        read: (self.device_reads
+                            && self
+                                .plans
+                                .get(&op.key)
+                                .is_some_and(LanePlan::wants_candidate_read))
+                        .then(|| crate::sampled_lane::DraftRead::Candidates(vec![(token, 0.0)])),
                     });
                 }
                 res.proposals = Some(props);
@@ -7023,6 +7050,83 @@ mod tests {
                 !first,
                 "the committed 500 is not the proposal's first token"
             );
+        }
+    }
+
+    /// A sampler-like rule: a Leviathan lane's native proposal must carry the
+    /// head's candidate read (`LaneSampler::draft_token`).
+    struct NeedsReadRule;
+
+    impl AcceptRule for NeedsReadRule {
+        fn accept(
+            &mut self,
+            lane: &LanePlan,
+            drafts: &[u32],
+            picks: &[u32],
+            _rng: &mut LaneRng,
+        ) -> Result<GreedyAccept, String> {
+            Ok(accept_greedy_prefix(drafts, picks, lane.eos))
+        }
+
+        fn draft_token(
+            &mut self,
+            lane: &LanePlan,
+            _index: usize,
+            _prior: &[u32],
+            proposal: &DraftProposal,
+            _rng: &mut LaneRng,
+        ) -> Result<u32, String> {
+            if lane.sampling == SamplingMode::Leviathan
+                && lane.source == ProposalSource::Native
+                && proposal.read.is_none()
+            {
+                return Err("Leviathan lane: the head proposal carries no candidate read".into());
+            }
+            Ok(proposal.token)
+        }
+    }
+
+    /// A sampled (Leviathan) lane whose copy confirmation MISSES falls back to
+    /// the native route with the head's own drafts: those drafts are drawn
+    /// from `q`, so the very proposal that failed the confirmation must have
+    /// carried the head's candidate read (a device rank decides that from the
+    /// plan alone, [`LanePlan::wants_candidate_read`]). The poison this guards
+    /// (copy lane on a sampled serve, `mesh quarantined, reload to recover`):
+    /// a Copy plan produced no read, the miss turned it native, and the root
+    /// had no `q` to draw from.
+    #[test]
+    fn mesh_lane_protocol_sampled_copy_confirm_miss_still_carries_the_candidate_read() {
+        let b = cycle_budgets();
+        for kind in BOTH {
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            for r in &mut m.ranks {
+                r.device_reads = true;
+            }
+            admit_cycle(&mut m, 1, None);
+            // The head's first draft (999) misses the copy's first candidate.
+            m.script_window(1, 0, &[999, 998, 997], &[500, 501, 502, 503]);
+            let mut request = req(1, 99);
+            request.sampling = SamplingMode::Leviathan;
+            let out = m
+                .run(None, &[request], &b, &mut NeedsReadRule)
+                .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            let l = lane_out(&out, 1);
+            assert_eq!(l.source.confirm, ConfirmOutcome::Missed, "{kind:?}");
+            assert_eq!(l.source.source, ProposalSource::Native, "{kind:?}");
+            assert_eq!(l.source.offered, 3, "{kind:?}");
+            // A confirmed hit abandons the head's draft: no read needed.
+            let mut m = Mesh::new_with(kind, false, Some(copy_cfg()));
+            for r in &mut m.ranks {
+                r.device_reads = true;
+            }
+            admit_cycle(&mut m, 1, None);
+            script_cycle(&m, 1, 0, 20);
+            let mut request = req(1, 99);
+            request.sampling = SamplingMode::Leviathan;
+            let out = m
+                .run(None, &[request], &b, &mut NeedsReadRule)
+                .unwrap_or_else(|e| panic!("{kind:?}: {e}"));
+            assert_eq!(lane_out(&out, 1).source.confirm, ConfirmOutcome::Confirmed);
         }
     }
 
