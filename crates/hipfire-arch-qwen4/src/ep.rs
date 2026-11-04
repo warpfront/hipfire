@@ -2538,53 +2538,39 @@ pub fn ep_lane_row_budget(requested_row_budget: usize, lanes: usize) -> usize {
 /// headroom the placement keeps (the measured worst case is in the receipts).
 pub const EP_LANE_COMMIT_TOKENS_ENV: &str = "HIPFIRE_EP_LANE_COMMIT_TOKENS";
 
-/// Default rows charged per lane context: the largest count whose committed
-/// pages equal a fresh lane's (2 MiB VMM granules, Flash-Next geometry: the
-/// per-lane state is flat up to 3072 rows).
+/// Default rows charged per lane context at every admitted `max_seq`: the
+/// largest count whose committed pages equal a fresh lane's (2 MiB VMM
+/// granules, Flash-Next geometry: the per-lane state is flat up to 3072 rows).
+/// Context growth past it maps from the placement's headroom. Measured worst
+/// case at max_seq 16384 (EP2 R9700, symtrunk, 8 MTP lanes after the lane
+/// reserve trim and the shared append scratch; j7686): 8 concurrent ~16.3k
+/// prompts served 8/8 on every serve, peak 32603 of 32624 MiB, while the
+/// previous 4096-row charge at that context left 195 resident expert units
+/// per rank unused (6743 -> 6938). Before those two reservations shrank, the
+/// same worst case ran the 2048 charge out of device memory (`provision_step`
+/// map OOM), which is why a context above 4096 used to keep the 4096 charge;
+/// `HIPFIRE_EP_LANE_COMMIT_TOKENS=4096` restores it.
 pub const EP_LANE_COMMIT_TOKENS_DEFAULT: usize = 2048;
 
-/// The default cap only applies to a context that fits the cap's measured
-/// worst case: 8 lanes growing to the full 4096-row context were measured
-/// with the cap (2.9 GiB peak headroom 1.5 GiB), while 8 lanes growing to
-/// 16384 rows ran the cap out of device memory (`provision_step` map OOM, 8
-/// failed requests), so a longer admitted context keeps the first-chunk
-/// charge.
-pub const EP_LANE_COMMIT_CAP_MAX_SEQ: usize = 4096;
-
-/// The first-chunk charge of a context longer than [`EP_LANE_COMMIT_CAP_MAX_SEQ`]: the rows of
-/// the historical 4096-row EP prefill chunk. A larger prefill chunk (the compact-scratch 8192 /
-/// 16384 rows, `HIPFIRE_EP_COMPACT_SCRATCH`) must not raise what every lane is charged: a lane
-/// maps its context pages as tokens arrive, so the charge is lane accounting, not prompt-tile
-/// scratch, and growing it with the chunk took 1.5 GiB of resident experts per rank at 16384
-/// rows (8 lanes) for lanes that hold no more context than before.
-pub const EP_LANE_COMMIT_FIRST_CHUNK_ROWS: usize = 4096;
-
 /// The context rows the EP lane reservation and the lane staging fit check
-/// charge per lane, from the first prefill chunk `chunk_rows`, the admitted
-/// `max_seq` and the `HIPFIRE_EP_LANE_COMMIT_TOKENS` value (`None` = unset).
-/// Never above `chunk_rows`, never zero; the unset charge of a long context is the first
-/// [`EP_LANE_COMMIT_FIRST_CHUNK_ROWS`] rows whatever the chunk.
-pub fn ep_lane_commit_rows_for(
-    chunk_rows: usize,
-    max_seq: usize,
-    requested: Option<usize>,
-) -> usize {
+/// charge per lane, from the first prefill chunk `chunk_rows` and the
+/// `HIPFIRE_EP_LANE_COMMIT_TOKENS` value (`None` = unset). Never above
+/// `chunk_rows`, never zero. A larger prefill chunk never raises the unset
+/// charge: a lane maps its context pages as tokens arrive, so the charge is
+/// lane accounting, not prompt-tile scratch.
+pub fn ep_lane_commit_rows_for(chunk_rows: usize, requested: Option<usize>) -> usize {
     match requested {
         Some(0) => chunk_rows,
         Some(rows) => chunk_rows.min(rows),
-        None if max_seq <= EP_LANE_COMMIT_CAP_MAX_SEQ => {
-            chunk_rows.min(EP_LANE_COMMIT_TOKENS_DEFAULT)
-        }
-        None => chunk_rows.min(EP_LANE_COMMIT_FIRST_CHUNK_ROWS),
+        None => chunk_rows.min(EP_LANE_COMMIT_TOKENS_DEFAULT),
     }
     .max(1)
 }
 
 /// [`ep_lane_commit_rows_for`] under the process configuration.
-pub fn ep_lane_commit_rows(chunk_rows: usize, max_seq: usize) -> usize {
+pub fn ep_lane_commit_rows(chunk_rows: usize) -> usize {
     ep_lane_commit_rows_for(
         chunk_rows,
-        max_seq,
         hipfire_config::developer_var(EP_LANE_COMMIT_TOKENS_ENV)
             .ok()
             .and_then(|v| v.parse::<usize>().ok()),
@@ -2834,7 +2820,7 @@ fn stage_rank_lanes(
         bundle.state_format(),
         bundle.state.qsa_backend(),
         max_seq,
-        ep_lane_commit_rows(chunk, max_seq),
+        ep_lane_commit_rows(chunk),
         gpu.vmm_recommended_granularity().unwrap_or(1),
         max_lanes,
         row_budget,
@@ -3716,28 +3702,32 @@ mod tests {
     }
 
     /// The lane reservation charges each lane's context at the commit rows,
-    /// not the first prefill chunk: unset caps the chunk at the default, `0`
-    /// is the old charge, an explicit value is the charged rows (never above
-    /// the chunk, never zero).
+    /// not the first prefill chunk, at every admitted context: unset caps the
+    /// chunk at the default, `0` is the whole chunk, an explicit value is the
+    /// charged rows (never above the chunk, never zero; `4096` is the previous
+    /// long-context charge).
     #[test]
     fn ep_lane_commit_rows_cap_the_first_chunk_charge() {
         assert_eq!(
-            ep_lane_commit_rows_for(4096, 4096, None),
+            ep_lane_commit_rows_for(4096, None),
             EP_LANE_COMMIT_TOKENS_DEFAULT
         );
-        assert_eq!(ep_lane_commit_rows_for(1024, 4096, None), 1024);
-        assert_eq!(ep_lane_commit_rows_for(4096, 4096, Some(0)), 4096);
-        assert_eq!(ep_lane_commit_rows_for(4096, 4096, Some(512)), 512);
-        assert_eq!(ep_lane_commit_rows_for(4096, 4096, Some(8192)), 4096);
-        assert_eq!(ep_lane_commit_rows_for(0, 4096, None), 1);
-        // A longer admitted context keeps the first-chunk charge.
-        assert_eq!(ep_lane_commit_rows_for(4096, 16384, None), 4096);
-        assert_eq!(ep_lane_commit_rows_for(4096, 16384, Some(2048)), 2048);
-        // A larger prefill chunk never raises the unset charge of a long context.
-        assert_eq!(ep_lane_commit_rows_for(16384, 16384, None), 4096);
-        assert_eq!(ep_lane_commit_rows_for(8192, 16384, None), 4096);
-        assert_eq!(ep_lane_commit_rows_for(1024, 16384, None), 1024);
-        assert_eq!(ep_lane_commit_rows_for(16384, 16384, Some(0)), 16384);
+        assert_eq!(ep_lane_commit_rows_for(1024, None), 1024);
+        assert_eq!(ep_lane_commit_rows_for(4096, Some(0)), 4096);
+        assert_eq!(ep_lane_commit_rows_for(4096, Some(512)), 512);
+        assert_eq!(ep_lane_commit_rows_for(4096, Some(8192)), 4096);
+        assert_eq!(ep_lane_commit_rows_for(0, None), 1);
+        // A larger prefill chunk never raises the unset charge.
+        assert_eq!(
+            ep_lane_commit_rows_for(16384, None),
+            EP_LANE_COMMIT_TOKENS_DEFAULT
+        );
+        assert_eq!(
+            ep_lane_commit_rows_for(8192, None),
+            EP_LANE_COMMIT_TOKENS_DEFAULT
+        );
+        assert_eq!(ep_lane_commit_rows_for(16384, Some(4096)), 4096);
+        assert_eq!(ep_lane_commit_rows_for(16384, Some(0)), 16384);
     }
 
     /// At the Flash-Next geometry (fp8 QSA, q8 GDN, 2 MiB granules) the AR
@@ -3769,8 +3759,8 @@ mod tests {
             )
             .unwrap()
         };
-        let old = bytes(ep_lane_commit_rows_for(4096, 4096, Some(0)));
-        let new = bytes(ep_lane_commit_rows_for(4096, 4096, None));
+        let old = bytes(ep_lane_commit_rows_for(4096, Some(0)));
+        let new = bytes(ep_lane_commit_rows_for(4096, None));
         assert_eq!(old - new, 8 * (48u64 << 20));
         assert_eq!(old, bytes(4096));
     }

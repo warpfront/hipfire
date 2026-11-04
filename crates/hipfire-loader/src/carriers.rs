@@ -3152,7 +3152,7 @@ pub fn qwen4_ep_vram_layers(
                 state_format,
                 shared.backend,
                 shared.max_seq,
-                hipfire_arch_qwen4::ep::ep_lane_commit_rows(chunk, shared.max_seq),
+                hipfire_arch_qwen4::ep::ep_lane_commit_rows(chunk),
                 shared.vmm_granularity,
                 lanes,
                 row_budget,
