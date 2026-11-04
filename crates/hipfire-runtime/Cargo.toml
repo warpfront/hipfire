@@ -894,3 +894,8 @@ required-features = ["lab"]
 [[example]]
 name = "ar_hc_write_oracle"
 required-features = ["lab"]
+
+# Load-path benches (HFQ direct reader grid); developer-only.
+[[example]]
+name = "bench_hfq_reader"
+required-features = ["lab"]

@@ -10,7 +10,7 @@
 //! cache, times each way and compares the two arenas byte for byte (SHA-256).
 //!
 //! ```text
-//! cargo run --release -p hipfire-arch-qwen4 --example bench_ep_gather -- \
+//! cargo run --release -p hipfire-arch-qwen4 --features lab --example bench_ep_gather -- \
 //!     --file MODEL.mq4 [--layers 0,10,20] [--budget-pct 45]
 //! ```
 

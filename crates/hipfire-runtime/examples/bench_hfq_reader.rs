@@ -11,7 +11,7 @@
 //! the pinned staging ring (`device`).
 //!
 //! ```text
-//! cargo run --release -p hipfire-runtime --example bench_hfq_reader -- \
+//! cargo run --release -p hipfire-runtime --features lab --example bench_hfq_reader -- \
 //!     --file MODEL.mq4 [--lanes 4,8,16,32] [--chunk-mib 4,8,16] \
 //!     [--range-mib 300,18] [--gib 6] [--reps 2] [--verify] [--gpu]
 //! ```

@@ -163,3 +163,8 @@ required-features = ["lab", "reference-parity"]
 [[example]]
 name = "trunk_shard_layer_oracle"
 required-features = ["lab"]
+
+# EP unit-arena gather bench (mmap vs parallel O_DIRECT); developer-only.
+[[example]]
+name = "bench_ep_gather"
+required-features = ["lab"]
