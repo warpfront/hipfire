@@ -6921,10 +6921,21 @@ fn load_qwen4_rank_unscoped(
         qwen4_shared_charges(layer_experts, staged, slab_stage, 0)
             .map_err(|error| format!("qwen4: {error}"))
     };
-    // `HIPFIRE_QWEN4_D2_WINDOW_ROWS` (default off, `4..=8`): an invalid value
-    // refuses the load before any placement or allocation.
+    // `HIPFIRE_QWEN4_D2_WINDOW_ROWS` (`4..=8`): an invalid value refuses the load before any
+    // placement or allocation. Unset, the window is this load's default: 8 on exact gfx1100
+    // for aggregate / tier / whole-layer owners, 4 for a slab recipe, under EP and on every
+    // other arch (an explicit value wins). Recorded before any D2 executor is sized.
     hipfire_config::memory::validate_qwen4_d2_window_rows()
         .map_err(|error| format!("qwen4: {error}"))?;
+    hipfire_config::memory::set_qwen4_d2_window_load_default(
+        hipfire_config::memory::qwen4_d2_window_default_for(
+            &ctx.gpu.arch,
+            matches!(
+                manifest.identity.recipe,
+                hipfire_arch_qwen4::weights::Qwen4TierRecipe::FlashNextSlab { .. }
+            ) || ep.is_some(),
+        ),
+    );
     let mut settled_placement_charges = None;
     let explicit =
         residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
