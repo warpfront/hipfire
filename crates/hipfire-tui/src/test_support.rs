@@ -384,6 +384,24 @@ pub fn online_dashboard(
     }
 }
 
+/// Install `text` at `path` as an executable script, without this process ever
+/// holding a write descriptor on it. A script written with `fs::write` and then
+/// exec'd fails `ETXTBSY` whenever another thread forks while the write
+/// descriptor is open (the child keeps its copy until its own exec), and the
+/// App tests fork the fake CLI from background threads. The write is done by a
+/// short-lived `sh` that exits before this returns, so no fork of this process
+/// can ever inherit a writer of the script.
+#[cfg(unix)]
+pub fn write_executable(path: &Path, text: &str) {
+    let status = std::process::Command::new("sh")
+        .args(["-c", "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+        .arg(text)
+        .arg(path)
+        .status()
+        .expect("spawn sh to install the script");
+    assert!(status.success(), "installing {}: {status}", path.display());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

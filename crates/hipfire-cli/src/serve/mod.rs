@@ -4265,34 +4265,15 @@ mod tests {
     #[test]
     fn clear_resident_drops_every_resident_field() {
         use saddle_core::caps::ReasoningContract;
-        use std::os::unix::fs::PermissionsExt;
         let paths = test_paths("clear-resident");
         let root = paths.root.clone();
         fs::create_dir_all(&root).unwrap();
         let daemon = root.join("fake-daemon-clear-resident.py");
-        fs::write(&daemon, include_str!("fake_daemon.py")).unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&daemon, include_str!("fake_daemon.py"));
         let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
         let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
-        // Bounded ETXTBSY retry: the script was just written and a parallel
-        // test's fork may still hold the write fd.
-        const ETXTBSY: i32 = 26;
-        let mut engine = None;
-        for attempt in 0..8u64 {
-            match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None) {
-                Ok(spawned) => {
-                    engine = Some(spawned);
-                    break;
-                }
-                Err(hipfire_client::ClientError::Spawn { source, .. })
-                    if source.raw_os_error() == Some(ETXTBSY) =>
-                {
-                    thread::sleep(Duration::from_millis(5 * (1 + attempt)));
-                }
-                Err(error) => panic!("fake daemon spawn failed: {error}"),
-            }
-        }
-        let engine = engine.expect("fake daemon spawn exhausted ETXTBSY retries");
+        let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)
+            .expect("fake daemon spawn");
         let mut runtime = ServeRuntime {
             engine,
             paths,

@@ -2225,6 +2225,28 @@ mod tests {
         }
     }
 
+    /// Install `text` at `path` as an executable script, without this process
+    /// ever holding a write descriptor on it. A script written with `fs::write`
+    /// and then exec'd fails `ETXTBSY` whenever another thread forks while the
+    /// write descriptor is open (the child keeps its copy until its own exec):
+    /// the tests of this module fork hipcc from several threads. The write is
+    /// done by a short-lived `sh` that exits before this returns, so no fork of
+    /// this process can ever inherit a writer of the script.
+    fn write_executable(path: &Path, text: &str) {
+        #[cfg(unix)]
+        {
+            let status = Command::new("sh")
+                .args(["-c", "printf %s \"$1\" > \"$2\" && chmod 755 \"$2\"", "sh"])
+                .arg(text)
+                .arg(path)
+                .status()
+                .expect("spawn sh to install the script");
+            assert!(status.success(), "installing {}: {status}", path.display());
+        }
+        #[cfg(not(unix))]
+        std::fs::write(path, text).unwrap();
+    }
+
     #[test]
     fn custom_arm_cache_key_cannot_alias_hipcc() {
         let baseline = KernelCompiler::hash_parts(
@@ -2854,14 +2876,7 @@ mod tests {
                 blob_path.display()
             )
         };
-        std::fs::write(&hipcc, script).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&hipcc).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&hipcc, perms).unwrap();
-        }
+        write_executable(&hipcc, &script);
         hipcc
     }
 
@@ -3234,19 +3249,13 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let calls = root.join("calls");
         let hipcc = bin.join("slow_hipcc");
-        std::fs::write(
+        write_executable(
             &hipcc,
-            format!(
+            &format!(
                 "#!/bin/sh\necho x >> \"{}\"\nsleep 0.3\nout=\"\"\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = \"-o\" ]; then out=\"$2\"; shift 2; continue; fi\n  shift\ndone\nprintf COMPILED > \"$out\"\n",
                 calls.display()
             ),
-        )
-        .unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&hipcc, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+        );
         let ranks = 4;
         let start = Arc::new(std::sync::Barrier::new(ranks));
         let results = (0..ranks)
@@ -3853,10 +3862,9 @@ mod tests {
                     .unwrap_or_else(|| compiler.hipcc_bin.clone());
                 let log = arm.join("events");
                 let wrapper = arm.join("timed-hipcc");
-                std::fs::write(&wrapper, format!(
+                write_executable(&wrapper, &format!(
                 "#!/bin/sh\ncase \" $* \" in *' -o '*) ;; *) exec '{}' \"$@\" ;; esac\nprintf 'start %s %s\\n' \"$(date +%s%N)\" \"$$\" >> '{}'\n'{}' \"$@\"\nstatus=$?\nprintf 'end %s %s\\n' \"$(date +%s%N)\" \"$$\" >> '{}'\nexit \"$status\"\n",
-                inner.display(), log.display(), inner.display(), log.display())).unwrap();
-                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                inner.display(), log.display(), inner.display(), log.display()));
                 compiler.hipcc_bin = wrapper;
                 let sources = [
                 "extern \"C\" __global__ void first() {} extern \"C\" __global__ void second() {}",

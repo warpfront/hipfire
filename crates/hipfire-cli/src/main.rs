@@ -68,6 +68,8 @@ mod pull_select;
 mod serve;
 mod setup;
 mod spill;
+#[cfg(all(test, unix))]
+mod test_exec;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
 use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
@@ -11117,20 +11119,18 @@ mod tests {
     /// and return the argv it was launched with.
     #[cfg(unix)]
     fn recorded_quantizer_argv(label: &str, extra: &[&str]) -> Result<Vec<String>> {
-        use std::os::unix::fs::PermissionsExt;
         let paths = test_paths(label);
         let bin = paths.root.join("bin");
         fs::create_dir_all(&bin)?;
         let record = paths.root.join("argv.txt");
         let script = bin.join("hipfire-quantize");
-        fs::write(
+        crate::test_exec::write_executable(
             &script,
-            format!(
+            &format!(
                 "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile [ $# -gt 0 ]; do\n  if [ \"$1\" = --output ]; then : > \"$2\"; fi\n  shift\ndone\n",
                 record.display()
             ),
-        )?;
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+        );
         let input = paths.root.join("model");
         fs::create_dir_all(&input)?;
         let out = paths.root.join("out.hfq");
@@ -11142,30 +11142,11 @@ mod tests {
             out.display().to_string(),
         ];
         argv.extend(extra.iter().map(|s| s.to_string()));
-        // The script was just written: a sibling test's fork may still hold its
-        // write fd, so exec can fail ETXTBSY. Bounded retry like the fake-daemon
-        // spawns.
-        let mut attempt = 0u64;
-        loop {
-            let cli = Cli::try_parse_from(&argv)?;
-            let Some(Commands::Quantize(args)) = cli.command else {
-                panic!("expected quantize subcommand");
-            };
-            match quantize_command(&paths, args) {
-                Err(error)
-                    if attempt < 8
-                        && error
-                            .root_cause()
-                            .downcast_ref::<io::Error>()
-                            .and_then(io::Error::raw_os_error)
-                            == Some(libc::ETXTBSY) =>
-                {
-                    attempt += 1;
-                    thread::sleep(Duration::from_millis(5 * attempt));
-                }
-                other => break other?,
-            }
-        }
+        let cli = Cli::try_parse_from(&argv)?;
+        let Some(Commands::Quantize(args)) = cli.command else {
+            panic!("expected quantize subcommand");
+        };
+        quantize_command(&paths, args)?;
         let lines = fs::read_to_string(&record)?
             .lines()
             .map(str::to_owned)
@@ -16901,12 +16882,10 @@ effort = "high"
     /// Scenario selection is driven by generate request prompt/model fixture tags.
     #[cfg(unix)]
     fn write_task11_fake_daemon(root: &Path) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
         let daemon = root.join("task11-fake-daemon.py");
         // Python keeps correlated id/attempt_id, full reset ack, and commit handshake.
         let script = include_str!("serve/fake_daemon.py");
-        fs::write(&daemon, script).unwrap();
-        fs::set_permissions(&daemon, fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_exec::write_executable(&daemon, script);
         daemon
     }
 
@@ -16956,33 +16935,9 @@ effort = "high"
             let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
             let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved).unwrap();
 
-            // Bounded ETXTBSY retry like hipfire-client fake daemons.
-            const ETXTBSY: i32 = 26;
-            let mut engine = None;
-            let mut last = None;
-            for attempt in 0..8 {
-                match Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None) {
-                    Ok(e) => {
-                        engine = Some(e);
-                        break;
-                    }
-                    Err(hipfire_client::ClientError::Spawn { source, path })
-                        if source.raw_os_error() == Some(ETXTBSY) =>
-                    {
-                        last = Some(format!("spawn {path:?}: {source}"));
-                        thread::sleep(Duration::from_millis(
-                            5u64.saturating_mul(1 + attempt as u64),
-                        ));
-                    }
-                    Err(err) => panic!("Task11HttpHarness spawn non-retryable: {err}"),
-                }
-            }
-            let mut engine = engine.unwrap_or_else(|| {
-                panic!(
-                    "Task11HttpHarness exhausted ETXTBSY retries: {}",
-                    last.unwrap_or_default()
-                )
-            });
+            let mut engine =
+                Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, None)
+                    .expect("Task11HttpHarness spawn");
             engine.ping().expect("fake daemon ping");
 
             let registry = hipfire_registry::bundled().unwrap();
@@ -25115,17 +25070,7 @@ effort = "high"
             let Some(Commands::Run(args)) = cli.command else {
                 panic!("expected run command");
             };
-            // The script was just written: bounded ETXTBSY retry like the
-            // other fake-daemon spawns.
-            for attempt in 0..8u64 {
-                match run_command(&paths, args.clone()) {
-                    Err(error) if format!("{error:#}").contains("os error 26") => {
-                        thread::sleep(Duration::from_millis(5 * (1 + attempt)));
-                    }
-                    other => return other,
-                }
-            }
-            bail!("fake daemon spawn kept failing with ETXTBSY")
+            run_command(&paths, args.clone())
         };
         let loads = || -> Vec<serde_json::Value> {
             let raw = fs::read_to_string(paths.root.join("requests.log")).unwrap_or_default();
