@@ -7158,7 +7158,10 @@ impl Qwen4ExpertStage {
             },
             first_host,
             ep_slots,
-            ep_rank: bundle.weights.ep_placement().map_or(0, |placement| placement.rank),
+            ep_rank: bundle
+                .weights
+                .ep_placement()
+                .map_or(0, |placement| placement.rank),
             bytes,
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
