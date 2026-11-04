@@ -1425,6 +1425,7 @@ impl Qwen4ExpertStage {
             compact_bound: Vec::new(),
             first_host,
             ep_slots: None,
+            ep_rank: 0,
             bytes: lent.map_or([0, 0], |(window, _)| window),
             copy_stream: gpu.hip.stream_create_non_blocking()?,
             ready: Vec::with_capacity(2),
@@ -1739,6 +1740,7 @@ impl Qwen4ExpertStage {
             compact_bound: Vec::new(),
             first_host,
             ep_slots: None,
+            ep_rank: 0,
             bytes: [0, 0],
             copy_stream,
             ready: Vec::with_capacity(2),
@@ -2223,6 +2225,7 @@ impl Qwen4ExpertStage {
             // EP marker only (compact-route gate): a unit stage rebases its own
             // slab tables and never redirects through sealed donor slots.
             ep_slots: Some(Vec::new()),
+            ep_rank: rank,
             bytes: if borrow.is_some() { lent_bytes } else { [0, 0] },
             copy_stream,
             ready: Vec::with_capacity(2),
@@ -2629,7 +2632,7 @@ impl Qwen4ExpertStage {
                  slots over {served_layers} layers ({:.1} MiB not copied, {rejected} live slots \
                  refused); merge gap {} units: {bridged_pieces} slot-live pieces ({:.1} MiB) \
                  copied anyway inside the staged bytes",
-                self.placement.map_or(0, |placement| placement.rank),
+                self.ep_rank,
                 state.forwards,
                 mib(staged),
                 mib(tail_off),
@@ -2975,7 +2978,7 @@ impl Qwen4GpuForward {
             "qwen4 EP rank {}: D2 tail prefill stage on: {} mixed staged layers name live tail \
              slots in their stage tables and skip those units' H2D bytes (copy runs merge across \
              slot-live gaps shorter than {} units)",
-            stage.placement.map_or(0, |placement| placement.rank),
+            stage.ep_rank,
             slots.layers.len(),
             slots.gap_units
         );
