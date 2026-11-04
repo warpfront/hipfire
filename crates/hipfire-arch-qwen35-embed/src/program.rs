@@ -186,7 +186,7 @@ impl EncodeScratch {
     /// Free everything but the residual stream and return it.
     pub fn into_hidden(self, gpu: &mut Gpu) -> Result<GpuTensor, String> {
         let hidden = self.hidden;
-        free_all(
+        let freed = free_all(
             gpu,
             [
                 self.positions,
@@ -196,8 +196,14 @@ impl EncodeScratch {
                 self.dense,
                 self.arena,
             ],
-        )?;
-        Ok(hidden)
+        );
+        match freed {
+            Ok(()) => Ok(hidden),
+            Err(e) => {
+                let _ = gpu.free_tensor(hidden);
+                Err(e)
+            }
+        }
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
