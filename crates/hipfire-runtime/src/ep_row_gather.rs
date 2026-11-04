@@ -260,10 +260,20 @@ impl SpinBarrier {
         let mut spins = 0u32;
         let mut reported = false;
         loop {
+            // The abort flag is read BEFORE the generation. A peer that
+            // completed this crossing and then aborted (a tag disagreement
+            // found after the crossing, which is the peer's own verdict on a
+            // crossing that did complete) must read as a completed crossing
+            // here too: reading the generation first leaves a window, between
+            // the two loads, in which the peer completes and aborts, and this
+            // waiter would then return the abort instead of crossing and
+            // naming the disagreement itself. Seeing the abort store implies
+            // seeing every store before it, the generation bump included.
+            let aborted = self.is_aborted();
             if self.generation.load(Ordering::Acquire) != generation {
                 return Ok(());
             }
-            if self.is_aborted() {
+            if aborted {
                 return Err("ep_row_gather barrier aborted");
             }
             if spins < 2048 {

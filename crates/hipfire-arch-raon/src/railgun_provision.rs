@@ -365,5 +365,7 @@ fn run(
 }
 
 // The tests drive fake `from-cache` shell scripts, so they are unix-only.
+// `pub(crate)`: `railgun_decode`'s tests spawn fake binaries too and must hold
+// the same spawn lock (`tests::spawn_lock`).
 #[cfg(all(test, unix))]
-mod tests;
+pub(crate) mod tests;

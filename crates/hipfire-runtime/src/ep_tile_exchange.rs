@@ -1203,6 +1203,40 @@ pub(crate) mod tests {
         }
     }
 
+    /// Both ranks name the disagreement in EVERY round, never an abort. The
+    /// first rank to see the mismatch aborts the barrier; the other rank,
+    /// still spinning in the crossing that did complete, must read it as
+    /// completed and name the mismatch itself. One pair is descheduled at the
+    /// wrong instant too rarely to show that, so many pairs cross at once, more
+    /// than there are CPUs, and every wait is interrupted all the time.
+    #[test]
+    fn a_disagreement_is_named_by_both_ranks_in_every_round() {
+        const ROUNDS: u32 = 300;
+        let pairs = 2 * std::thread::available_parallelism().map_or(8, usize::from);
+        let drivers: Vec<_> = (0..pairs)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    for round in 0..ROUNDS {
+                        let t = bare(2, Duration::from_secs(30));
+                        let other = t.clone();
+                        let peer = std::thread::spawn(move || {
+                            other.host_barrier(1, HOST_RESERVE_ACQUIRE, round)
+                        });
+                        let mine = t.host_barrier(0, HOST_RESERVE_RESTORE, round);
+                        let theirs = peer.join().expect("peer");
+                        for result in [mine, theirs] {
+                            let text = result.expect_err("disagreement").to_string();
+                            assert!(text.contains("different points"), "round {round}: {text}");
+                        }
+                    }
+                })
+            })
+            .collect();
+        for driver in drivers {
+            driver.join().expect("driver");
+        }
+    }
+
     #[test]
     fn a_timeout_reports_every_ranks_last_crossing_and_exchange_counter() {
         // The budget is generous because rank 0 must first cross an exchange

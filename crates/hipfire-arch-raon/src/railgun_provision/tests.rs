@@ -4,15 +4,31 @@
 //! scripts (no analyzer, no device).
 
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard};
 
 use super::*;
 
 /// Exec of a script fails with `ETXTBSY` while any process holds it open for
 /// writing, and a fork inherits every open descriptor until its exec. So
 /// writing an executable and spawning both hold this lock: no test forks while
-/// another has a script open for writing.
+/// another has a script open for writing. It is one lock for the whole crate's
+/// test binary (`railgun_decode`'s tests spawn fake binaries too): two
+/// modules with a lock each would not exclude each other.
 static SPAWN: Mutex<()> = Mutex::new(());
+
+/// Hold this across every spawn of a fake binary (directly or through
+/// `provision` / `run_provision`) and across every write of one.
+pub(crate) fn spawn_lock() -> MutexGuard<'static, ()> {
+    SPAWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Write `text` to `path` and make it executable, holding the spawn lock for
+/// the whole write (the descriptor is open only inside the lock).
+pub(crate) fn write_executable(path: &Path, text: &str) {
+    let _g = spawn_lock();
+    fs::write(path, text).expect("script");
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod");
+}
 
 struct Rig {
     root: PathBuf,
@@ -58,14 +74,12 @@ impl Rig {
              OUT=\"\"\nwhile [ $# -gt 0 ]; do [ \"$1\" = --out ] && OUT=\"$2\"; shift; done\n{body}\n",
             calls = self.root.join("calls").display()
         );
-        let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
-        fs::write(&path, text).expect("script");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        write_executable(&path, &text);
         path
     }
 
     fn run(&self, binary: Option<&Path>) -> Result<Provisioned, String> {
-        let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = spawn_lock();
         provision(&self.spec, binary, Duration::from_secs(20))
     }
 }
@@ -221,7 +235,7 @@ fn a_hung_run_is_killed_at_the_timeout() {
     let bin = rig.script("fc-hang", "sleep 30");
     let started = Instant::now();
     let e = {
-        let _g = SPAWN.lock().unwrap_or_else(|e| e.into_inner());
+        let _g = spawn_lock();
         provision(&rig.spec, Some(&bin), Duration::from_millis(150)).expect_err("timeout")
     };
     assert!(e.contains("was killed"), "{e}");

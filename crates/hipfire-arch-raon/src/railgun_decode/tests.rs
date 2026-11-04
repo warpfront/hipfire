@@ -1621,10 +1621,8 @@ const NEEDS_TRANSPORT: &str = "#!/bin/sh\n\
 
 #[cfg(unix)]
 fn fake_binary(root: &Path, text: &str) -> PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let path = root.join("from-cache-fake");
-    std::fs::write(&path, text).expect("script");
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    crate::railgun_provision::tests::write_executable(&path, text);
     path
 }
 
@@ -1665,6 +1663,10 @@ fn the_transport_kernels_are_loaded_before_the_subcommand_is_spawned() {
     let (spec, root) = ordered_spec("order");
     let hot = spec.hot_dir.clone();
     let script = fake_binary(&root, NEEDS_TRANSPORT);
+    // The subcommand is spawned under the crate-wide spawn lock (see
+    // `railgun_provision::tests::spawn_lock`): a fork elsewhere in this test
+    // binary must not hold a write descriptor of any script while it execs.
+    let _spawn = crate::railgun_provision::tests::spawn_lock();
     let mut o = pending_owner(spec);
     let prepared = Cell::new(0);
     // The load puts the module in the hot cache, as `railgun_transport_digests`
@@ -1689,6 +1691,7 @@ fn without_the_pre_spawn_load_the_missing_entry_refusal_is_not_persisted() {
     let (spec, root) = ordered_spec("missing");
     let marker = spec.hot_dir.join(crate::railgun_provision::MARKER);
     let script = fake_binary(&root, NEEDS_TRANSPORT);
+    let _spawn = crate::railgun_provision::tests::spawn_lock();
     let mut o = pending_owner(spec.clone());
     o.run_provision(&mut || Ok(()), &|| Some(script.clone()));
     assert!(

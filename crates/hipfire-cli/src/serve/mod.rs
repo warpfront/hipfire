@@ -3755,21 +3755,50 @@ mod tests {
         });
     }
 
+    /// The queue timeout of the tests that park an acquirer behind a holder.
+    /// It is a hang guard only: these tests release the holder when they have
+    /// observed the acquirer parked, so no verdict may depend on how long a
+    /// loaded host takes to run a thread
+    /// (`admission_queue_is_bounded_and_times_out` owns the timeout contract).
+    const ADMISSION_HANG_GUARD: Duration = Duration::from_secs(120);
+
+    /// `(eligible admitted, ineligible holds the backend, parked)`, read under
+    /// the state mutex every admission decision is made under.
+    fn admission_state(admission: &Admission) -> (usize, bool, usize) {
+        let state = admission.state.lock().unwrap_or_else(|e| e.into_inner());
+        (state.eligible, state.ineligible_busy, state.queued)
+    }
+
+    /// Block until `count` requests are parked in the admission queue. A
+    /// spawned acquirer queues only once the OS has run its thread, which a
+    /// loaded host can delay past any fixed sleep; the condition is the queue
+    /// length itself. An acquirer that returns instead of parking is the
+    /// failure under test (admitted past a holder it must wait for).
+    fn wait_queued<T>(admission: &Admission, count: usize, acquirer: &thread::JoinHandle<T>) {
+        while admission_state(admission).2 != count {
+            assert!(
+                !acquirer.is_finished(),
+                "the acquirer returned without parking: {admission:?}"
+            );
+            thread::yield_now();
+        }
+    }
+
     #[test]
     fn admission_eligible_concurrent_up_to_capacity() {
-        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let admission = Arc::new(Admission::new_with_capacity(8, ADMISSION_HANG_GUARD, 2));
         let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
         let g2 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
         assert_eq!(admission.inflight(), 2);
-        // Third eligible same model should queue, then timeout quickly.
+        // Third eligible same model parks until a holder leaves.
         let admission2 = Arc::clone(&admission);
         let handle =
             thread::spawn(move || admission2.acquire_for(true, Some("qwen3.5:7b")).unwrap());
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(admission.inflight(), 3); // 2 held + 1 queued
+        wait_queued(&admission, 1, &handle);
+        assert_eq!(admission_state(&admission), (2, false, 1)); // 2 held + 1 parked
         drop(g1);
         let g3 = handle.join().unwrap();
-        assert_eq!(admission.inflight(), 2);
+        assert_eq!(admission_state(&admission), (2, false, 0));
         drop(g2);
         drop(g3);
         assert_eq!(admission.inflight(), 0);
@@ -3777,41 +3806,43 @@ mod tests {
 
     #[test]
     fn admission_ineligible_is_exclusive() {
-        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let admission = Arc::new(Admission::new_with_capacity(8, ADMISSION_HANG_GUARD, 2));
         let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
         // Ineligible must wait for eligible to finish, even though capacity not full.
         let admission2 = Arc::clone(&admission);
         let handle = thread::spawn(move || admission2.acquire().unwrap());
-        thread::sleep(Duration::from_millis(50));
-        assert!(admission.inflight() == 2); // 1 eligible + 1 queued ineligible
+        wait_queued(&admission, 1, &handle);
+        // 1 eligible held, the ineligible request parked and not admitted.
+        assert_eq!(admission_state(&admission), (1, false, 1));
         drop(g1);
         let g_inelig = handle.join().unwrap();
-        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission_state(&admission), (0, true, 0));
         // While ineligible holds, eligible must wait.
         let admission3 = Arc::clone(&admission);
         let handle2 =
             thread::spawn(move || admission3.acquire_for(true, Some("qwen3.5:7b")).unwrap());
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(admission.inflight(), 2);
+        wait_queued(&admission, 1, &handle2);
+        assert_eq!(admission_state(&admission), (0, true, 1));
         drop(g_inelig);
         let g2 = handle2.join().unwrap();
-        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission_state(&admission), (1, false, 0));
         drop(g2);
     }
 
     #[test]
     fn admission_model_lease_prevents_cross_model_batch() {
-        let admission = Arc::new(Admission::new_with_capacity(8, Duration::from_secs(1), 2));
+        let admission = Arc::new(Admission::new_with_capacity(8, ADMISSION_HANG_GUARD, 2));
         let g1 = admission.acquire_for(true, Some("qwen3.5:7b")).unwrap();
         // Different model cannot share batch lanes, must wait for exclusive.
         let admission2 = Arc::clone(&admission);
         let handle =
             thread::spawn(move || admission2.acquire_for(true, Some("qwen3.5:14b")).unwrap());
-        thread::sleep(Duration::from_millis(50));
-        assert_eq!(admission.inflight(), 2); // 1 held + 1 queued due to model mismatch
+        wait_queued(&admission, 1, &handle);
+        // 1 held + 1 parked on the model mismatch.
+        assert_eq!(admission_state(&admission), (1, false, 1));
         drop(g1);
         let g2 = handle.join().unwrap();
-        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission_state(&admission), (1, false, 0));
         drop(g2);
     }
 
