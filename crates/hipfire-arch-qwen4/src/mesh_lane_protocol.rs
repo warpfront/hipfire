@@ -5759,7 +5759,7 @@ mod tests {
     }
 
     #[test]
-    fn mesh_lane_protocol_gfx1201_steps_stay_inside_one_row_group() {
+    fn mesh_lane_protocol_gfx1201_steps_draft_full_budgets_without_the_row_cap() {
         let rows = |arch: Option<&str>, lanes: u64, lab: LabRoutes| -> (usize, Vec<usize>) {
             let mut m = Mesh::new(MeshKind::Ep, true);
             if let Some(arch) = arch {
@@ -5777,15 +5777,12 @@ mod tests {
         // Unbound / gfx1151: every lane drafts its full budget (16 rows).
         assert_eq!(rows(None, 4, LabRoutes::Floor).0, 16);
         assert_eq!(rows(Some("gfx1151"), 4, LabRoutes::Floor).0, 16);
-        // gfx1201: one 8-row group split evenly over the lanes.
+        // gfx1201 with the step-row cap off (the default since the all-rows lane
+        // step, `HIPFIRE_QWEN4_LANE_ROW_CAP=1` restores the one-group split):
+        // every lane drafts its own budget and the step runs as one pass.
         let (total, per) = rows(Some("gfx1201"), 4, LabRoutes::Floor);
-        assert_eq!((total, per.as_slice()), (8, &[2, 2, 2, 2][..]));
-        let (total, per) = rows(Some("gfx1201"), 3, LabRoutes::Floor);
-        assert_eq!((total, per.as_slice()), (8, &[3, 3, 2][..]));
-        // Two lanes take 4 rows each; eight lanes are 8 AR rows; the lab route
-        // modes bypass the cap (the oracle's forced routes).
-        assert_eq!(rows(Some("gfx1201"), 2, LabRoutes::Floor).1, vec![4, 4]);
-        assert_eq!(rows(Some("gfx1201"), 8, LabRoutes::Floor).1, vec![1; 8]);
+        assert_eq!((total, per.as_slice()), (16, &[4, 4, 4, 4][..]));
+        assert_eq!(rows(Some("gfx1201"), 8, LabRoutes::Floor).1, vec![4; 8]);
         assert_eq!(rows(Some("gfx1201"), 4, LabRoutes::Batched).0, 16);
     }
 
