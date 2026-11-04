@@ -950,7 +950,9 @@ impl Carrier for Qwen4Carrier {
             if let Some(note) = &split.fit_note {
                 eprintln!("{note}");
             }
-            hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(split.chunk_rows);
+            if split.chunk_rows.is_some() {
+                hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(split.chunk_rows);
+            }
             if let Some(reserve_plan) = &plan.ep_reserve {
                 eprintln!("{}", reserve_plan.describe());
             }
@@ -3598,11 +3600,16 @@ const QWEN4_EP_UNIT_RESERVE_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE";
 /// the weight shadows in the donor segments (S4) instead of keeping them dedicated VRAM.
 const QWEN4_EP_UNIT_RESERVE_SHADOWS_ENV: &str = "HIPFIRE_EP_UNIT_RESERVE_SHADOWS";
 
-/// `HIPFIRE_EP_COMPACT_SCRATCH` (EpPrefill; developer variable): an expert-parallel load takes the
-/// compact forward scratch plan (`FnSymGfx1201`, the single-card gfx1201 default) and with it the
-/// 16384-row prefill chunk of that plan. Exact `1` opts in; any other value keeps the `Full` plan
-/// (the 4096-row EP chunk). The plan is decided identically by the planner and by every rank.
+/// `HIPFIRE_EP_COMPACT_SCRATCH` (EpPrefill; developer variable, default ON): an expert-parallel load
+/// takes the compact forward scratch plan (`FnSymGfx1201`, the single-device gfx1201 default) at the
+/// unchanged 4096-row EP chunk. Exact `0` keeps the `Full` plan (as does
+/// `HIPFIRE_QWEN4_COMPACT_SCRATCH=0`, through the shared mode selector). The plan is decided
+/// identically by the planner and by every rank.
 const QWEN4_EP_COMPACT_SCRATCH_ENV: &str = "HIPFIRE_EP_COMPACT_SCRATCH";
+
+/// The EP prefill chunk a compact load keeps (the plan's own default is the 16384 rows that change
+/// greedy output, which owes a KLD check); an explicit `HIPFIRE_PREFILL_CHUNK_ROWS` still wins.
+const QWEN4_EP_COMPACT_CHUNK_ROWS: usize = 4096;
 
 fn qwen4_ep_scratch_mode(
     gpu: &rdna_compute::Gpu,
@@ -3611,13 +3618,18 @@ fn qwen4_ep_scratch_mode(
     manifest: &hipfire_arch_qwen4::weights::Qwen4Manifest,
 ) -> Result<hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode, String> {
     use hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode;
-    let mode = if hipfire_config::developer_var(QWEN4_EP_COMPACT_SCRATCH_ENV).as_deref() == Ok("1")
+    let mode = if hipfire_config::developer_var(QWEN4_EP_COMPACT_SCRATCH_ENV).as_deref() == Ok("0")
     {
+        Qwen4ForwardScratchMode::Full
+    } else {
         hipfire_arch_qwen4::artifact::source_forward_scratch_mode(gpu, hfq, config, manifest)
             .map_err(|error| error.to_string())?
-    } else {
-        Qwen4ForwardScratchMode::Full
     };
+    if mode == Qwen4ForwardScratchMode::FnSymGfx1201 {
+        hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(Some(
+            QWEN4_EP_COMPACT_CHUNK_ROWS,
+        ));
+    }
     // The compact plan under EP owns the tile exchange's root (the arena would alias it) unless
     // the trunk shard runs: its chunks only mask tiles, no peer ever reads the grouped rows.
     hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_dedicated_exchange_root(
