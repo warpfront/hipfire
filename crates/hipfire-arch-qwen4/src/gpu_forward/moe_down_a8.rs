@@ -18,9 +18,8 @@ use rdna_compute::Gpu;
 /// Outcome of the per-device verification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MoeDownA8Verdict {
-    /// Not requested: `killed` when `HIPFIRE_QWEN4_MOE_DOWN_A8=0` turned it off on a gfx1201
-    /// card, else the card is not gfx1201.
-    NotRequested { killed: bool },
+    /// Not requested (`HIPFIRE_QWEN4_MOE_DOWN_A8` is not `1`, or the card is not gfx1201).
+    NotRequested,
     /// The device serves no routed MoE layer.
     NoLayers,
     /// The load-time header check did not run (`HIPFIRE_QWEN4_MOE_SYM_IU4=0`, an S1 `Aggregate`
@@ -38,18 +37,16 @@ impl MoeDownA8Verdict {
     }
 }
 
-/// Pure verdict from the load-time check: `requested` (flag + exact gfx1201), `killed` (the
-/// device is gfx1201 and the flag is false), `checked` (the symmetric header check ran on the
-/// layers), and the `(verified, total)` layer counts.
+/// Pure verdict from the load-time check: `requested` (flag + exact gfx1201), `checked` (the
+/// symmetric header check ran on the layers), and the `(verified, total)` layer counts.
 pub(crate) fn moe_down_a8_verdict(
     requested: bool,
-    killed: bool,
     checked: bool,
     verified: usize,
     total: usize,
 ) -> MoeDownA8Verdict {
     if !requested {
-        return MoeDownA8Verdict::NotRequested { killed };
+        return MoeDownA8Verdict::NotRequested;
     }
     if total == 0 {
         return MoeDownA8Verdict::NoLayers;
@@ -72,18 +69,14 @@ pub(crate) fn moe_down_a8_info(
     head_pending: bool,
 ) -> Option<String> {
     match verdict {
-        MoeDownA8Verdict::NotRequested { killed: true } => Some(format!(
-            "qwen4 moe down A8: killed by HIPFIRE_QWEN4_MOE_DOWN_A8=0 on device {device}; \
-             int8 routed-down route off (incumbent down)"
-        )),
-        MoeDownA8Verdict::NotRequested { killed: false } | MoeDownA8Verdict::NoLayers => None,
+        MoeDownA8Verdict::NotRequested | MoeDownA8Verdict::NoLayers => None,
         MoeDownA8Verdict::NotChecked => Some(format!(
             "qwen4 moe down A8: routed expert headers were not checked on device {device} \
              (symmetric header check did not run); int8 routed-down route off"
         )),
         MoeDownA8Verdict::Verified { n } => Some(format!(
             "qwen4 moe down A8: {n}/{n} MoE layers verified symmetric on device {device}; \
-             int8 routed-down route on{} (HIPFIRE_QWEN4_MOE_DOWN_A8=0 kills it)",
+             int8 routed-down route on{} (enabled by HIPFIRE_QWEN4_MOE_DOWN_A8=1)",
             if head_pending {
                 " once the MTP head layer is verified"
             } else {
@@ -102,7 +95,7 @@ pub(crate) fn moe_down_a8_head_info(symmetric: bool, trunk_verified: bool, devic
     match (symmetric, trunk_verified) {
         (true, true) => format!(
             "qwen4 moe down A8: MTP head MoE layer verified symmetric on device {device}; \
-             int8 routed-down route on (HIPFIRE_QWEN4_MOE_DOWN_A8=0 kills it)"
+             int8 routed-down route on (enabled by HIPFIRE_QWEN4_MOE_DOWN_A8=1)"
         ),
         (true, false) => format!(
             "qwen4 moe down A8: MTP head MoE layer verified symmetric on device {device}; \
@@ -126,13 +119,7 @@ pub(crate) fn settle_trunk(
     head_moe: bool,
 ) -> MoeDownA8Verdict {
     let device = gpu.device_id;
-    let verdict = moe_down_a8_verdict(
-        gpu.qwen4_moe_down_a8_requested(),
-        gpu.arch == "gfx1201" && gpu.qwen4_moe_down_a8_explicitly_off(),
-        checked,
-        verified,
-        total,
-    );
+    let verdict = moe_down_a8_verdict(gpu.qwen4_moe_down_a8_requested(), checked, verified, total);
     gpu.set_qwen4_moe_down_a8_verified(verdict.verified());
     let head_pending = verdict.verified() && head_moe;
     gpu.set_qwen4_moe_down_a8_head_pending(head_pending);
@@ -258,27 +245,23 @@ mod tests {
     #[test]
     fn verdict_table() {
         assert_eq!(
-            moe_down_a8_verdict(false, true, true, 40, 40),
-            MoeDownA8Verdict::NotRequested { killed: true }
+            moe_down_a8_verdict(false, true, 40, 40),
+            MoeDownA8Verdict::NotRequested
         );
         assert_eq!(
-            moe_down_a8_verdict(false, false, true, 40, 40),
-            MoeDownA8Verdict::NotRequested { killed: false }
-        );
-        assert_eq!(
-            moe_down_a8_verdict(true, false, true, 0, 0),
+            moe_down_a8_verdict(true, true, 0, 0),
             MoeDownA8Verdict::NoLayers
         );
         assert_eq!(
-            moe_down_a8_verdict(true, false, false, 0, 40),
+            moe_down_a8_verdict(true, false, 0, 40),
             MoeDownA8Verdict::NotChecked
         );
         assert_eq!(
-            moe_down_a8_verdict(true, false, true, 40, 40),
+            moe_down_a8_verdict(true, true, 40, 40),
             MoeDownA8Verdict::Verified { n: 40 }
         );
         assert_eq!(
-            moe_down_a8_verdict(true, false, true, 39, 40),
+            moe_down_a8_verdict(true, true, 39, 40),
             MoeDownA8Verdict::Failed {
                 verified: 39,
                 total: 40
@@ -296,15 +279,15 @@ mod tests {
             total: 1
         }
         .verified());
-        assert!(!MoeDownA8Verdict::NotRequested { killed: true }.verified());
+        assert!(!MoeDownA8Verdict::NotRequested.verified());
     }
 
     #[test]
-    fn verified_line_names_count_device_and_kill_switch() {
+    fn verified_line_names_count_device_and_enabling_switch() {
         assert_eq!(
             moe_down_a8_info(&MoeDownA8Verdict::Verified { n: 40 }, 1, false).unwrap(),
             "qwen4 moe down A8: 40/40 MoE layers verified symmetric on device 1; \
-             int8 routed-down route on (HIPFIRE_QWEN4_MOE_DOWN_A8=0 kills it)"
+             int8 routed-down route on (enabled by HIPFIRE_QWEN4_MOE_DOWN_A8=1)"
         );
         let pending = moe_down_a8_info(&MoeDownA8Verdict::Verified { n: 40 }, 0, true).unwrap();
         assert!(pending.contains("once the MTP head layer is verified"));
@@ -323,14 +306,11 @@ mod tests {
         .unwrap();
         assert!(failed.contains("3/40 MoE layers verified symmetric on device 2"));
         assert!(failed.ends_with("route off (incumbent down)"));
-        let killed =
-            moe_down_a8_info(&MoeDownA8Verdict::NotRequested { killed: true }, 1, false).unwrap();
-        assert!(killed.contains("HIPFIRE_QWEN4_MOE_DOWN_A8=0"));
         assert!(moe_down_a8_info(&MoeDownA8Verdict::NotChecked, 0, false)
             .unwrap()
             .contains("not checked"));
         assert_eq!(
-            moe_down_a8_info(&MoeDownA8Verdict::NotRequested { killed: false }, 1, false),
+            moe_down_a8_info(&MoeDownA8Verdict::NotRequested, 1, false),
             None
         );
         assert_eq!(
@@ -357,7 +337,7 @@ mod tests {
         assert_eq!(head_settlement(true, None), (false, Some(true)));
         // The trunk verdict leaves the head pending exactly when the trunk verified and the model
         // has a head MoE layer; every such load must reach `head_settlement`.
-        assert!(moe_down_a8_verdict(true, false, true, 48, 48).verified());
+        assert!(moe_down_a8_verdict(true, true, 48, 48).verified());
     }
 
     #[test]

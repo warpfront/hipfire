@@ -28,12 +28,12 @@
 //!   `[ceil(M / 64), ceil(grouped_rows / 16)]`, block 128, static LDS 10944.
 //!
 //! Env (developer): `HIPFIRE_QWEN4_MOE_DOWN_A8` (`developer.qwen4_moe_down_a8`, typed boolean):
-//! default ON on exact gfx1201 (requests the GROUPED route, the 9..=64-row window); `0` is the
-//! kill switch and keeps the incumbent routed down. The window is reached only by the >8-row
+//! `1` requests the GROUPED route (the 9..=64-row verify window) on exact gfx1201; unset and `0`
+//! (the default: off) keep the incumbent routed down. The window is reached only by the >8-row
 //! routes: singleton verify blocks of 9..=64 rows, prefill tails, and wide-class lane groups.
 //! `HIPFIRE_QWEN4_MOE_DOWN_A8_INDEXED` (`developer.qwen4_moe_down_a8_indexed`) additionally
-//! enables the per-pick dot4 arm (decode / few-row verify), default off (measured at 8 rows only).
-//! The route additionally needs the loader's symmetric verdict ([`Gpu::set_qwen4_moe_down_a8_verified`]) and
+//! enables the per-pick dot4 arm (decode / few-row verify), default off. The route
+//! additionally needs the loader's symmetric verdict ([`Gpu::set_qwen4_moe_down_a8_verified`]) and
 //! a settled MTP-head verdict ([`Gpu::set_qwen4_moe_down_a8_head_pending`]).
 
 use crate::dispatch::Gpu;
@@ -94,10 +94,10 @@ fn down_a8_indexed_requested(flag: Option<bool>) -> bool {
     flag == Some(true)
 }
 
-/// Pure form of [`Gpu::qwen4_moe_down_a8_requested`]: exact gfx1201 and the flag not `0`
-/// (default ON; `HIPFIRE_QWEN4_MOE_DOWN_A8=0` is the kill switch).
+/// Pure form of [`Gpu::qwen4_moe_down_a8_requested`]: exact gfx1201 and the flag explicitly on
+/// (default OFF: `HIPFIRE_QWEN4_MOE_DOWN_A8=1` enables it; unset and `0` are the same).
 fn down_a8_requested(arch: &str, flag: Option<bool>) -> bool {
-    arch == "gfx1201" && flag != Some(false)
+    arch == "gfx1201" && flag == Some(true)
 }
 
 /// Pure inputs of [`down_a8_admits`].
@@ -203,15 +203,9 @@ fn first_launch_receipt(kind: Kind, rows: usize, entry: &str) {
 
 impl Gpu {
     /// Whether the routed-down A8 route is requested on this device: exact gfx1201 and
-    /// `HIPFIRE_QWEN4_MOE_DOWN_A8` not `0` (default on; `0` kills it and leaves the incumbent down).
+    /// `HIPFIRE_QWEN4_MOE_DOWN_A8` explicitly on (`1`; unset and `0` leave the incumbent down).
     pub fn qwen4_moe_down_a8_requested(&self) -> bool {
         down_a8_requested(&self.arch, *QWEN4_MOE_DOWN_A8)
-    }
-
-    /// Whether `HIPFIRE_QWEN4_MOE_DOWN_A8=0` was given explicitly (the load logs the killed state
-    /// only then).
-    pub fn qwen4_moe_down_a8_explicitly_off(&self) -> bool {
-        *QWEN4_MOE_DOWN_A8 == Some(false)
     }
 
     /// Record the loader's verdict: every routed MoE layer this device serves has symmetric qt53
@@ -547,9 +541,9 @@ mod tests {
     }
 
     #[test]
-    fn requested_is_exact_gfx1201_default_on_with_a_kill_switch() {
-        // Default ON: unset and `1` request it, `0` kills it; never off gfx1201.
-        assert!(down_a8_requested("gfx1201", None));
+    fn requested_is_exact_gfx1201_and_opt_in() {
+        // Default OFF: unset and `0` do not request it (they are the same), `1` does.
+        assert!(!down_a8_requested("gfx1201", None));
         assert!(down_a8_requested("gfx1201", Some(true)));
         assert!(!down_a8_requested("gfx1201", Some(false)));
         for arch in ["gfx1151", "gfx1100", "gfx1200", "gfx942", ""] {
@@ -579,8 +573,8 @@ mod tests {
         assert!(!down_a8_indexed_requested(None));
         assert!(!down_a8_indexed_requested(Some(false)));
         assert!(down_a8_indexed_requested(Some(true)));
-        // The sub-switch rides on the main flag: killed (`HIPFIRE_QWEN4_MOE_DOWN_A8=0`) it is never requested.
-        assert!(!down_a8_requested("gfx1201", Some(false)));
+        // The sub-switch alone never requests the route (the main flag + verdict gate it).
+        assert!(!down_a8_requested("gfx1201", None));
     }
 
     #[test]
