@@ -1106,6 +1106,9 @@ pub struct MergedCostEvidence {
     /// Diagnostic critical path of the device phases (EP: Σ phase
     /// max-over-ranks; PP: wavefront interval + non-pipeline phases).
     pub critical_path_us: f64,
+    /// The slowest rank's `[draft, verify, prepare]` phase microseconds
+    /// (diagnostic: the `QWEN4_LANE_COST_TRACE` step line).
+    pub phase_us: [f64; 3],
     /// Every contributing phase timing was synchronized.
     pub synchronized: bool,
     /// Whether the controller wall may train the fit.
@@ -1320,6 +1323,8 @@ pub fn merge_evidence(
         counts,
         wall_us: interval.wall_us,
         critical_path_us: critical,
+        phase_us: [TimedPhase::Draft, TimedPhase::Verify, TimedPhase::Prepare]
+            .map(|phase| phase_max.get(&phase).copied().unwrap_or(0.0)),
         synchronized,
         priced: reason.is_none(),
         // The floor's model units stay valid unless a rank is incomplete or
@@ -3338,7 +3343,8 @@ impl MeshRoot {
                     p.spill,
                     p.verified,
                     m.wall_us,
-                    m.priced
+                    m.priced,
+                    m.phase_us
                 )
             );
         }
@@ -3472,7 +3478,8 @@ fn apply_evidence(
                 p.spill,
                 p.verified,
                 m.wall_us,
-                m.priced
+                m.priced,
+                m.phase_us
             )
         );
     }

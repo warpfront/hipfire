@@ -20,9 +20,15 @@ use super::*;
 use crate::gpu_forward::seal_moe_rows;
 use crate::program::Qwen4LayerScratch;
 
-/// Whether batched head rounds are requested (`HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`).
+/// Whether batched head rounds are on: `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS=1`
+/// asks for them on any load, `=0` kills them, and unset they are on exactly
+/// where the lane route exists: an expert-parallel Qwen4 load
+/// (`topology.ep` >= 2, [`hipfire_config::topology::qwen4_ep`]).
 pub(crate) fn draft_rounds_enabled() -> bool {
-    hipfire_config::developer_bool(MTP_DRAFT_ROUNDS_ENV, false)
+    hipfire_config::developer_bool(
+        MTP_DRAFT_ROUNDS_ENV,
+        hipfire_config::topology::qwen4_ep().is_ok_and(|ep| ep >= 2),
+    )
 }
 
 /// `HIPFIRE_QWEN4_MTP_DRAFT_ROUNDS_XBATCH` (default on; `0` ranks every row
