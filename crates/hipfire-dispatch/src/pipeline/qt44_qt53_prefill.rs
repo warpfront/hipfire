@@ -527,6 +527,12 @@ pub(crate) fn input_basis_front(
     Ok(MoeFront { xq, x16, x8: None })
 }
 
+/// The device address of a fused front's routed int4 sidecar (the gate/up's
+/// activation for `n` rows), while it is still the live reservation.
+pub(crate) fn front_xq_ptr(gpu: &Gpu, front: &MoeFront, k: usize, n: usize) -> Option<*mut std::ffi::c_void> {
+    gpu.int4_mmq_prepared_ptr(&front.xq, k, n).ok()
+}
+
 /// Whether the path-2 F16 WMMA gate/up rotates the activation straight to
 /// F16 itself (the bytes the F32 rotation + conversion produce): only when no
 /// shared projection reads the F32 basis `x_rot_batch`.

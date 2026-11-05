@@ -201,9 +201,34 @@ fn build_prefill(gpu: &mut rdna_compute::Gpu, cfg: &ResponderConfig, serve: Pref
             unsafe {
                 std::slice::from_raw_parts_mut(io4.x_norm as *mut u8, c.max_rows * int4_row_bytes(c.dim)).fill(0);
             }
-            let admits = [MIN_SUB_CHUNK_ROWS, c.max_rows]
+            // Every layer must take the symmetric route (its own header check),
+            // since the floor is one value for the whole load.
+            let symmetric = |l: &ColdPrefillLayer| {
+                l.route_policy().is_some_and(|p| {
+                    p.capability == crate::families::moe::MoeRouteCapability::Qt44Qt53GroupedSymmetric
+                })
+            };
+            let asym = layers
                 .iter()
-                .all(|&r| run_cold_prefill(gpu, &p.layers[layer], &p.scratch, r, io4).is_ok());
+                .zip(&p.layers)
+                .filter(|(cl, l)| cl.cold_bitmap.iter().any(|&b| b != 0) && !symmetric(l))
+                .count();
+            let mut admits = asym == 0;
+            if !admits {
+                eprintln!("  hetero responder: {asym} layers' cold experts failed the symmetric header check; the primary sends F16");
+            }
+            for r in [MIN_SUB_CHUNK_ROWS, c.max_rows].into_iter().filter(|_| admits) {
+                if let Err(e) = run_cold_prefill(gpu, &p.layers[layer], &p.scratch, r, io4) {
+                    eprintln!("  hetero responder: int4 rows refused at {r} rows ({e:?}); the primary sends F16");
+                    admits = false;
+                    break;
+                }
+            }
+            eprintln!(
+                "  hetero responder: prefill route {:?}, int4 floor {}",
+                p.layers[layer].route_policy().map(|p| p.capability),
+                if admits { MIN_SUB_CHUNK_ROWS } else { 0 }
+            );
             let st = gpu.active_stream.as_ref().expect("responder stream is installed");
             gpu.hip.stream_synchronize(st).map_err(|e| e.to_string())?;
             if admits {

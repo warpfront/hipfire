@@ -164,7 +164,7 @@ pub fn qwen4_prefill_chunk_requested(
     max_seq: usize,
     mode: Qwen4ForwardScratchMode,
 ) -> usize {
-    prefill_chunk_requested_from(
+    let chunk = prefill_chunk_requested_from(
         &gpu.arch,
         hipfire_config::developer_var(QWEN4_PREFILL_CHUNK_ROWS_ENV)
             .ok()
@@ -172,7 +172,14 @@ pub fn qwen4_prefill_chunk_requested(
         max_seq,
         mode,
         || crate::host_link::host_link(gpu),
-    )
+    );
+    // `topology.hetero_experts`: the expert device's prefill slot holds one
+    // chunk of at most HETERO_PREFILL_MAX_ROWS rows.
+    if matches!(crate::hetero::requested(), Ok(Some(_))) {
+        chunk.min(crate::hetero::HETERO_PREFILL_MAX_ROWS)
+    } else {
+        chunk
+    }
 }
 
 /// The explicit `HIPFIRE_PREFILL_CHUNK_ROWS` value rounded down to whole
@@ -1576,6 +1583,8 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// `topology.hetero_experts`: this trunk layer's device-side split (in
     /// place of `cpu_split`; never both).
     hetero: Option<hipfire_dispatch::hetero_device::HeteroDeviceSplit>,
+    /// The layer's prefill attachment to the same split.
+    hetero_prefill: Option<hipfire_dispatch::hetero_device::HeteroPrefillSplit>,
     /// Keeps the frozen payload owners and borrowed pointer tables alive.
     tier: Option<crate::expert_tier_owners::ExpertTierLease>,
     tier_identity: Option<hipfire_dispatch::families::moe::ExpertTierIdentity>,
@@ -1880,6 +1889,10 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
 
     fn hetero_split(&self) -> Option<&hipfire_dispatch::hetero_device::HeteroDeviceSplit> {
         self.hetero.as_ref()
+    }
+
+    fn hetero_prefill(&self) -> Option<&hipfire_dispatch::hetero_device::HeteroPrefillSplit> {
+        self.hetero_prefill.as_ref()
     }
 
     fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
@@ -4192,6 +4205,7 @@ impl Qwen4MoeLayerRuntime {
             cpu_cold_owners,
             cpu_split: None,
             hetero: None,
+            hetero_prefill: None,
             tier: tier_layer.as_ref().map(|view| view.lease()),
             tier_identity,
             slab: None,
@@ -4245,6 +4259,7 @@ impl Qwen4MoeLayerRuntime {
             // experts are computed by the gfx1151 responder from these tables.
             let owners = self.cpu_cold_owners.as_ref().expect("placement came from the owners");
             let (mut gate_up, mut down) = (vec![0u64; placement.len()], vec![0u64; placement.len()]);
+            let mut spans: Option<(DType, DType, usize, usize)> = None;
             for (e, &cold) in placement.iter().enumerate() {
                 if cold == 0 {
                     continue;
@@ -4255,8 +4270,49 @@ impl Qwen4MoeLayerRuntime {
                 })?;
                 gate_up[e] = payload.gate_up.as_ptr() as u64;
                 down[e] = payload.down.as_ptr() as u64;
+                let this = (expert.gate_up.dtype, expert.down.dtype, payload.gate_up.len(), payload.down.len());
+                if *spans.get_or_insert(this) != this {
+                    return Err(Qwen4GpuForwardError::Dispatch(format!(
+                        "layer {} hetero: cold experts differ in format or size ({spans:?} vs {this:?})",
+                        self.label
+                    )));
+                }
             }
-            let split = crate::hetero::attach_device_layer(
+            // A layer with no cold expert still attaches (its requests answer
+            // with an all-zero partial); its formats are the layer's own.
+            let (gate_up_dtype, down_dtype, gate_up_bytes, down_bytes) = spans.unwrap_or((
+                self.experts[0].gate_up.dtype,
+                self.experts[0].down.dtype,
+                self.experts[0].gate_up.tensor.buf.size(),
+                self.experts[0].down.tensor.buf.size(),
+            ));
+            let shared = MoeSharedWeights {
+                selector: self.shared_scalar.dispatch_ref(),
+                gate: self.shared_gate.dispatch_ref(),
+                up: self.shared_up.dispatch_ref(),
+                down: self.shared_down.dispatch_ref(),
+            };
+            let prefill_cold = hipfire_dispatch::hetero_prefill::ColdPrefillConfig {
+                dim: config.hidden_size,
+                mi: config.moe_intermediate_size,
+                top_k: config.num_experts_per_tok,
+                n_experts: placement.len(),
+                max_rows: crate::hetero::HETERO_PREFILL_MAX_ROWS,
+                gate_up_dtype,
+                down_dtype,
+                gate_up_bytes,
+                down_bytes,
+                route_policy: Some(qwen4_route_policy(
+                    config,
+                    &shared,
+                    self.route_capability(crate::hetero::HETERO_PREFILL_MAX_ROWS),
+                    self.slab_cold_codec(),
+                    0,
+                )),
+                experts_all_gate_up_mq4: self.experts_all_gate_up_mq4,
+                recipe: MoeRecipe::SoftmaxGatedShared { bf16_round_trip: true, shared_after_combine: true },
+            };
+            let (split, prefill) = crate::hetero::attach_device_layer(
                 gpu,
                 self.label,
                 config.num_hidden_layers,
@@ -4265,9 +4321,11 @@ impl Qwen4MoeLayerRuntime {
                 config.num_experts_per_tok,
                 &placement,
                 (gate_up, down),
+                prefill_cold,
             )
             .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("layer {} {error}", self.label)))?;
             self.hetero = Some(split);
+            self.hetero_prefill = Some(prefill);
             return Ok(self);
         }
         // `HIPFIRE_QWEN4_D2_RETURN`, `HIPFIRE_QWEN4_D2_READY` and
@@ -4678,6 +4736,7 @@ impl Qwen4MoeLayerRuntime {
             cpu_cold_owners,
             cpu_split: None,
             hetero: None,
+            hetero_prefill: None,
             tier: None,
             tier_identity: None,
             label: layer_label,
@@ -13168,11 +13227,10 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         self.share_check()?;
-        if tokens.len() == 1 || (tokens.is_empty() && argmax_of.is_some()) {
-            // Every one-row MoE call of the device split publishes a request:
-            // check the earlier tokens' waits, then advance the token counter.
-            crate::hetero::begin_token(gpu).map_err(Qwen4GpuForwardError::Dispatch)?;
-        }
+        // Every MoE call of the device split (one-row decode and prefill
+        // chunks alike) publishes requests: check the earlier waits, then
+        // advance the token counter so this forward's sequences are fresh.
+        crate::hetero::begin_token(gpu).map_err(Qwen4GpuForwardError::Dispatch)?;
         if self.share.is_none() && self.moe_borrow.is_empty() {
             return self.forward_chunk_tile(
                 bundle,

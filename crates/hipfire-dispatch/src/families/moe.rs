@@ -1535,6 +1535,12 @@ pub trait RoutedExpertWeights {
     fn hetero_split(&self) -> Option<&crate::hetero_device::HeteroDeviceSplit> {
         None
     }
+
+    /// The layer's prefill attachment to the hetero split: multi-row grouped
+    /// prefill sends its cold experts to the expert device.
+    fn hetero_prefill(&self) -> Option<&crate::hetero_device::HeteroPrefillSplit> {
+        None
+    }
 }
 
 /// Expert-parallel row exchange for the indexed decode MoE and the few-row

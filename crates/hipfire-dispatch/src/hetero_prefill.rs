@@ -197,7 +197,7 @@ impl ColdPrefillLayer {
         let mut cache = table.prepare_binding(0, 1, gpu.device_id)?;
         let upload = |gpu: &mut Gpu, entries: &[u64]| -> Result<GpuTensor, DispatchError> {
             let bytes: Vec<u8> = entries.iter().flat_map(|v| v.to_ne_bytes()).collect();
-            let t = gpu.alloc_tensor(&[n * 2], DType::F32).map_err(hip)?;
+            let t = gpu.alloc_tensor(&[entries.len() * 2], DType::F32).map_err(hip)?;
             gpu.hip.memcpy_htod(&t.buf, &bytes).map_err(hip)?;
             Ok(t)
         };
@@ -206,7 +206,48 @@ impl ColdPrefillLayer {
         let cold_bitmap = gpu.alloc_tensor(&[n.div_ceil(4)], DType::F32).map_err(hip)?;
         gpu.hip.memcpy_htod(&cold_bitmap.buf, &cold.cold_bitmap).map_err(hip)?;
         cache.bind_live(&table, &experts, &gate_up_ptrs, &down_ptrs, None, None)?;
-        Ok(Self { table, cache, experts, gate_up_ptrs, down_ptrs, cold_bitmap })
+        let mut layer = Self { table, cache, experts, gate_up_ptrs, down_ptrs, cold_bitmap };
+        layer.verify_symmetric(gpu, cold, &upload)?;
+        Ok(layer)
+    }
+
+    /// The symmetric IU4 route is declared from a header check of the experts
+    /// this device computes (as the primary declares its own after load), not
+    /// from the primary's policy: every cold QT44 gate/up and QT53 down header
+    /// must satisfy `zp == -8 sc`. A layer without cold experts keeps the
+    /// policy it was given.
+    fn verify_symmetric(
+        &mut self,
+        gpu: &mut Gpu,
+        cold: &ColdLayer,
+        upload: &dyn Fn(&mut Gpu, &[u64]) -> Result<GpuTensor, DispatchError>,
+    ) -> Result<(), DispatchError> {
+        use crate::families::moe::MoeRouteCapability as Cap;
+        let c = &mut self.experts.cfg;
+        let Some(policy) = c.route_policy.as_mut() else {
+            return Ok(());
+        };
+        let qt = c.gate_up_dtype == DType::MQ4G256V2 && c.down_dtype == DType::MQ4G128V2;
+        if !qt || !matches!(policy.capability, Cap::Qt44Qt53Grouped | Cap::Qt44Qt53GroupedSymmetric) {
+            return Ok(());
+        }
+        let gu: Vec<u64> = cold.gate_up.iter().copied().filter(|&p| p != 0).collect();
+        let dn: Vec<u64> = cold.down.iter().copied().filter(|&p| p != 0).collect();
+        if gu.is_empty() {
+            return Ok(());
+        }
+        let (gu_t, dn_t) = (upload(gpu, &gu)?, upload(gpu, &dn)?);
+        let symmetric = gpu.qwen4_moe_sym_check(&gu_t, 2 * c.mi, c.dim, gu.len(), 136).map_err(hip)?
+            && gpu.qwen4_moe_sym_check(&dn_t, c.dim, c.mi, dn.len(), 68).map_err(hip)?;
+        let _ = gpu.free_tensor(gu_t);
+        let _ = gpu.free_tensor(dn_t);
+        policy.capability = if symmetric { Cap::Qt44Qt53GroupedSymmetric } else { Cap::Qt44Qt53Grouped };
+        Ok(())
+    }
+
+    /// The route this layer's calls declare (after the header check).
+    pub fn route_policy(&self) -> Option<MoeRoutePolicy> {
+        self.experts.cfg.route_policy
     }
 }
 
@@ -373,7 +414,7 @@ pub fn run_cold_prefill(
             per_expert_down: None,
         },
         recipe: c.recipe,
-        route_policy: c.route_policy,
+        route_policy: layer.route_policy(),
         prelude: MoePrefillPrelude {
             normalization: MoeNormalization::Provided,
             router,
