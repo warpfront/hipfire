@@ -8377,6 +8377,7 @@ mod tests {
             cpu_split: false,
             cpwait: false,
             hetero_prefill: false,
+            hetero_defer_join: false,
         })
     }
 
@@ -9238,6 +9239,7 @@ mod tests {
                 cpu_split: false,
                 cpwait: false,
                 hetero_prefill: false,
+                hetero_defer_join: false,
             });
             let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
             assert_eq!(
@@ -9304,6 +9306,7 @@ mod tests {
             cpu_split: false,
             cpwait: false,
             hetero_prefill: false,
+            hetero_defer_join: false,
         });
         let call = lowering_call(&ctx, experts, selection, SealedParams::Prefill(params));
         let stages = moe_program::lowered_stages(&call).unwrap();
@@ -9717,13 +9720,33 @@ mod tests {
                 if st.contains(&MoeStage::Scatter) {
                     assert!(at(MoeStage::PublishColdRows) < at(MoeStage::Scatter), "{label}");
                 }
-                // Joined after the hot combine, before the shared expert's down.
-                assert!(at(MoeStage::Combine) < at(MoeStage::JoinColdRows), "{label}");
-                assert!(at(MoeStage::JoinColdRows) < at(MoeStage::SharedDown), "{label}");
+                // Joined last, after the hot combine and the shared expert's down:
+                // the same accumulation order as the layer-major schedule's
+                // deferred join, so both schedules are bitwise equal.
+                assert!(at(MoeStage::Combine) < at(MoeStage::SharedDown), "{label}");
+                assert!(at(MoeStage::SharedDown) < at(MoeStage::JoinColdRows), "{label}");
+                assert_eq!(*st.last().unwrap(), MoeStage::JoinColdRows, "{label}");
                 for absent in [MoeStage::PrepareSplit, MoeStage::JoinSplit, MoeStage::CpuSplice, MoeStage::PublishCold, MoeStage::AwaitCold, MoeStage::InstallCold] {
                     assert!(!st.contains(&absent), "{absent:?}: {label}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn hetero_prefill_with_a_deferred_join_leaves_the_join_to_the_caller() {
+        for route in SPLIT_ROUTES {
+            let st = split_prefill_stages(2048, Some(route), false, |_| {}, |s| {
+                s.hetero_prefill = true;
+                s.hetero_defer_join = true;
+            })
+            .unwrap();
+            let label = format!("{route:?}: {st:?}");
+            assert!(!st.contains(&MoeStage::JoinColdRows), "{label}");
+            let at = |stage: MoeStage| st.iter().position(|s| *s == stage).unwrap_or_else(|| panic!("{stage:?}: {label}"));
+            assert!(at(MoeStage::PublishColdRows) < at(MoeStage::GateUp), "{label}");
+            assert!(at(MoeStage::Combine) < at(MoeStage::SharedDown), "{label}");
+            assert_eq!(*st.last().unwrap(), MoeStage::SharedDown, "{label}");
         }
     }
 

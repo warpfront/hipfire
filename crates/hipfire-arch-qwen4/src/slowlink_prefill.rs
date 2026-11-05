@@ -4244,6 +4244,495 @@ pub(crate) fn try_run_prompt(
     }
 }
 
+// ── layer-major hetero prompt (`topology.hetero_experts`) ───────────────
+
+/// The layer-major prompt schedule of the hetero expert split: the S1 tile
+/// machinery (HC-stream arena, per-tile frames, PLE cursor, QSA cursors,
+/// window transaction) without S1's profile, ring or panels. Each layer's MoE
+/// publishes its cold slots to the expert device and returns after the hot
+/// combine (the join is deferred); the tile's join and closing HC write run
+/// only after the other tiles of the window ran their layer, so every cold
+/// exchange overlaps other tiles' trunk and hot-expert work:
+///
+/// `pre(t, L0)` for every tile, then for each layer `l` and tile `t`:
+/// `post(t, l)` and `pre(t, l + 1)` (or the tile's output after the last).
+///
+/// Each layer's tiles still run in ascending order (QSA cursors, GDN state and
+/// causal attention), exactly as S1's resident layers. `Ok(false)` declines
+/// before any mutation: the incumbent runs.
+pub(crate) fn try_run_hetero_prompt(
+    forward: &mut Qwen4GpuForward,
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    tokens: &[u32],
+    mut output: PromptOutput<'_>,
+) -> R<bool> {
+    let tile_rows = forward.scratch.max_chunk;
+    let rows = tokens.len();
+    // One tile gains nothing from the schedule.
+    if rows <= tile_rows {
+        return Ok(false);
+    }
+    let decline = |why: &str| {
+        eprintln!("  qwen4 hetero layer-major prompt: {rows} rows declined ({why}); the chunk-major exchange runs");
+        Ok(false)
+    };
+    // Capture output (the MTP seed) is not wired here.
+    if matches!(output, PromptOutput::Capture { .. }) {
+        return decline("capture output");
+    }
+    if let Err(why) = bundle.slowlink_prompt_eligible() {
+        return decline(why);
+    }
+    if let Some(why) = forward.slowlink_forward_blocker(&bundle.config) {
+        return decline(why);
+    }
+    let entry = bundle.state.position;
+    let Some(end) = entry.checked_add(rows).filter(|&end| end <= bundle.state.max_seq_len) else {
+        return decline("context capacity");
+    };
+    if tokens.iter().any(|&t| t as usize >= bundle.config.vocab_size) {
+        return decline("token outside the vocabulary");
+    }
+    // Session boundaries: every tile ends at one (its layers' state is
+    // snapshotted there right after the tile's mixer, see `pre`).
+    let cuts = bundle.prompt_txn_cuts(entry, end);
+    let few_row_limit = few_row_limit_of(forward, gpu, tile_rows);
+    let geo = RunGeo::new(forward, bundle, few_row_limit, bundle.config.num_experts)?;
+    let Some(lm) = crate::hetero::layer_major(gpu, tile_rows, geo.wide, geo.hidden).map_err(invalid)? else {
+        return Ok(false);
+    };
+    let slots = lm.shared.slots();
+    // The plan: windows of `slots` tiles; a tile's arena region is its slot's.
+    let mut tiles: Vec<TilePlan> = Vec::new();
+    let mut windows: Vec<WindowPlan> = Vec::new();
+    let mut prompt_row = 0;
+    while prompt_row < rows {
+        let first = tiles.len();
+        let window_prompt_row = prompt_row;
+        let mut window_row = 0;
+        for slot in 0..slots {
+            if prompt_row >= rows {
+                break;
+            }
+            let position = entry + prompt_row;
+            let to_cut = cuts.iter().find(|&&c| c > position).map_or(usize::MAX, |&c| c - position);
+            let n = tile_rows.min(rows - prompt_row).min(to_cut);
+            tiles.push(TilePlan {
+                index: tiles.len(),
+                window: windows.len(),
+                prompt_row,
+                window_row,
+                stream_offset: slot * tile_rows * geo.wide,
+                rows: n,
+                position: entry + prompt_row,
+                routing: tile_routing(forward, gpu, n),
+                ends_at_cut: None,
+                last_in_window: false,
+            });
+            prompt_row += n;
+            window_row += n;
+        }
+        if let Some(last) = tiles.last_mut() {
+            last.last_in_window = true;
+        }
+        let (w_start, w_end) = (entry + window_prompt_row, entry + window_prompt_row + window_row);
+        // The transaction's own boundaries of this window; each must be a tile end.
+        let window_cuts = bundle.prompt_txn_cuts(w_start, w_end);
+        for (i, &cut) in window_cuts.iter().enumerate() {
+            let tile = tiles[first..]
+                .iter_mut()
+                .find(|t| t.position + t.rows == cut)
+                .ok_or_else(|| invalid(format!("session boundary {cut} is not a tile end")))?;
+            tile.ends_at_cut = Some(i);
+        }
+        windows.push(WindowPlan {
+            index: windows.len(),
+            prompt_row: window_prompt_row,
+            rows: window_row,
+            position: w_start,
+            tiles: first..tiles.len(),
+            stream_bytes: (window_row * geo.wide * 4) as u64,
+            cuts: window_cuts,
+            k1_rows: 0,
+            tail_rows: 0,
+        });
+    }
+    let last_rows = tiles.last().map_or(0, |tile| tile.rows);
+    validate_head(forward, bundle, &output, &geo, last_rows).map_err(invalid)?;
+    // The boundary snapshot stages (S1 binds them at load; this path binds them
+    // on its first request with session boundaries, idempotently).
+    if !cuts.is_empty() {
+        bundle
+            .slowlink_bind_boundary_stages(&mut *gpu)
+            .map_err(|error| invalid(format!("boundary stage allocation failed: {error}")))?;
+    }
+    eprintln!(
+        "  qwen4 hetero layer-major prompt: {rows} rows from position {entry}, {} windows of up to {slots} x {tile_rows}-row tiles",
+        windows.len()
+    );
+    let ple_retained = forward.slowlink_begin(gpu)?;
+    lm.shared.set_defer_join(true);
+    let outcome = {
+        let mut run = HeteroRun {
+            forward: &mut *forward,
+            bundle: &mut *bundle,
+            gpu: &mut *gpu,
+            geo: &geo,
+            tokens,
+            output: &mut output,
+            ple: PleCursor { retained: ple_retained, histories: Vec::new() },
+            lm: &lm,
+        };
+        let mut outcome = Ok(());
+        for window in &windows {
+            let w = WinCtx {
+                window,
+                tiles: &tiles[window.tiles.clone()],
+                tokens: &tokens[window.prompt_row..window.prompt_row + window.rows],
+                last_window: window.index + 1 == windows.len(),
+            };
+            if let Err(error) = run.window(&w) {
+                outcome = Err(error);
+                break;
+            }
+        }
+        outcome
+    };
+    lm.shared.set_defer_join(false);
+    if outcome.is_err() {
+        lm.shared.clear_pending();
+    }
+    outcome.map(|()| true)
+}
+
+struct HeteroRun<'a, 'o> {
+    forward: &'a mut Qwen4GpuForward,
+    bundle: &'a mut Qwen4Bundle,
+    gpu: &'a mut Gpu,
+    geo: &'a RunGeo,
+    tokens: &'a [u32],
+    output: &'a mut PromptOutput<'o>,
+    ple: PleCursor,
+    lm: &'a crate::hetero::LayerMajor,
+}
+
+impl HeteroRun<'_, '_> {
+    /// One window: a fresh exchange sequence, the transaction, the diagonal
+    /// walk, commit (or abort, restoring the entry state).
+    fn window(&mut self, w: &WinCtx<'_>) -> R<()> {
+        let _ = self.tokens;
+        crate::hetero::begin_token(&mut *self.gpu).map_err(invalid)?;
+        let txn = self
+            .bundle
+            .prompt_txn_begin(&mut *self.gpu, w.tokens)
+            .map_err(bundle_err("begin"))?;
+        let mut txn = txn;
+        match self.body(w, &mut txn) {
+            Ok(()) => self
+                .bundle
+                .prompt_txn_commit(&mut *self.gpu, txn, w.tokens)
+                .map_err(bundle_err("commit")),
+            Err(error) => {
+                self.lm.shared.clear_pending();
+                match self.bundle.prompt_txn_abort(&mut *self.gpu, txn) {
+                    Ok(()) => Err(error),
+                    Err(abort) => Err(invalid(format!("{error}; transaction abort failed: {abort}"))),
+                }
+            }
+        }
+    }
+
+    fn body(&mut self, w: &WinCtx<'_>, txn: &mut PromptTxn) -> R<()> {
+        let geo = self.geo;
+        self.ple.histories = PleCursor::histories_for(self.bundle.state.ple_history, w.tiles, w.tokens);
+        if w.tiles
+            .iter()
+            .any(|tile| tile.routing.route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS)
+        {
+            if let Some(qsa) = self.bundle.state.qsa.first().filter(|qsa| qsa.f16_arena.is_none()) {
+                ensure_qsa_gathered_wmma_workspace(
+                    &mut *self.gpu,
+                    qsa.format,
+                    geo.config.num_key_value_heads,
+                    w.window.end_position(),
+                )?;
+            }
+        }
+        let first = geo.band.start;
+        for ti in 0..w.tiles.len() {
+            self.embed_tile(w, ti)?;
+            self.pre(w, ti, first)?;
+            self.cut_if(txn, &w.tiles[ti], first)?;
+        }
+        for layer in geo.band.clone() {
+            for ti in 0..w.tiles.len() {
+                self.post(w, ti, layer)?;
+                if layer < geo.last_layer {
+                    self.pre(w, ti, layer + 1)?;
+                    self.cut_if(txn, &w.tiles[ti], layer + 1)?;
+                } else {
+                    self.tile_output(w, ti)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn slot(&self, ti: usize) -> usize {
+        ti % self.lm.shared.slots()
+    }
+
+    /// Layer `layer`'s state at the session boundary tile `tile` ends at:
+    /// taken right after the tile's mixer (all of the layer's state moved),
+    /// before the next tile's mixer of the same layer.
+    fn cut_if(&mut self, txn: &mut PromptTxn, tile: &TilePlan, layer: usize) -> R<()> {
+        if let Some(cut) = tile.ends_at_cut {
+            self.bundle
+                .prompt_txn_layer_cut(&mut *self.gpu, txn, cut, layer)
+                .map_err(bundle_err("layer cut"))?;
+        }
+        Ok(())
+    }
+
+    /// Tile `ti`'s layer up to its hot combine: PLE (at its layer), mixer
+    /// prefix, MoE with the join deferred; the MoE result is held in the
+    /// tile's FFN buffer until `post`.
+    fn pre(&mut self, w: &WinCtx<'_>, ti: usize, layer: usize) -> R<()> {
+        let tile = &w.tiles[ti];
+        let n = tile.rows;
+        self.lm.shared.set_slot(self.slot(ti)).map_err(|e| invalid(format!("{e:?}")))?;
+        self.gpu.set_router_row_base(if n > 1 { tile.position } else { 0 });
+        let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, n);
+        let outcome = self.pre_scoped(w, ti, layer);
+        Qwen4GpuForward::leave_tile_scopes(&mut *self.gpu, scopes);
+        if let Some((full_len, raw_len, pooled_len, selected_len, position)) = outcome? {
+            let slot = self
+                .bundle
+                .state
+                .qsa_local(layer)
+                .ok_or_else(|| invalid("QSA state slot missing"))?;
+            let state = self
+                .bundle
+                .state
+                .qsa_mut(slot)
+                .ok_or_else(|| invalid("QSA state slot disappeared"))?;
+            state.full_len = full_len;
+            state.raw_len = raw_len;
+            state.pooled_len = pooled_len;
+            state.selected_len = selected_len;
+            state.position = position;
+        }
+        Ok(())
+    }
+
+    fn pre_scoped(&mut self, w: &WinCtx<'_>, ti: usize, layer: usize) -> R<Option<(usize, usize, usize, usize, usize)>> {
+        let geo = self.geo;
+        let tile = &w.tiles[ti];
+        let n = tile.rows;
+        if geo.ple_layer == Some(layer) {
+            if let Some(owner) = self.bundle.ple.as_ref() {
+                let ple_weights = self
+                    .bundle
+                    .weights
+                    .layer(layer)
+                    .and_then(|weights| weights.ple.as_ref())
+                    .ok_or_else(|| invalid("PLE weights missing"))?;
+                let desc = crate::gpu_forward::ple_desc(&self.bundle.weights, ple_weights)?;
+                let rows_f16 = crate::gpu_forward::qwen4_ple_rows_f16(
+                    &*self.gpu,
+                    tile.routing.bf16_streams,
+                    geo.dims.hc_count,
+                    geo.hidden,
+                    &desc,
+                    n,
+                );
+                let len = n * geo.ple_heads * geo.ple_width;
+                let staged = view(&self.forward.scratch.ple_staged, 0, len);
+                let rows = view(&self.forward.scratch.ple_rows, 0, len);
+                self.ple.stage_tile(
+                    owner,
+                    &mut self.forward.host_ple,
+                    &mut *self.gpu,
+                    w,
+                    ti,
+                    &staged,
+                    &rows,
+                    rows_f16,
+                    geo.ple_heads,
+                    geo.ple_width,
+                )?;
+            }
+        }
+        let ffn = &self.lm.ffn[self.slot(ti)];
+        with_tile_frame(
+            &*self.forward,
+            &*self.bundle,
+            &mut *self.gpu,
+            &self.lm.streams,
+            geo,
+            tile,
+            layer,
+            |gpu, frame| {
+                let env = frame.env;
+                let mut steps: Vec<Step<'_>> = Vec::with_capacity(8);
+                if geo.ple_layer == Some(layer) {
+                    let ple_weights = frame.layer.ple.as_ref().ok_or_else(|| invalid("PLE weights missing"))?;
+                    let (step, _rows_f16) = env.ple_step(gpu, ple_weights, geo.ple_heads, geo.ple_width)?;
+                    steps.push(step);
+                }
+                env.push_mixer_prefix(&mut steps, layer, frame.layer, frame.description)?;
+                match &frame.description.ffn {
+                    Qwen4FfnBinding::Moe(moe) => env.moe_steps(&mut steps, frame.ctx, *moe, frame.scratch_desc)?,
+                    Qwen4FfnBinding::Dense(dense) => steps.push(env.dense_step(dense)),
+                }
+                validate_steps(&*gpu, &steps).map_err(dsp_err("preflight"))?;
+                let mut qsa = None;
+                for step in &steps {
+                    if let Step::IndexedAttention(op) = step {
+                        qsa = Some(op.next_lengths().map_err(dsp_err("derive QSA state"))?);
+                    }
+                }
+                execute_validated_steps(gpu, frame.ctx, &steps).map_err(dsp_err("layer program"))?;
+                // Hold the tile's MoE/FFN result until its join: the next
+                // tile's layer rewrites the shared FFN output.
+                let src = view(&env.scratch.ffn_output, 0, n * geo.hidden);
+                let dst = view(ffn, 0, n * geo.hidden);
+                gpu.copy_d2d(&src, &dst, src.byte_size())?;
+                Ok(qsa)
+            },
+        )
+    }
+
+    /// Tile `ti`'s join (the expert device's cold partial into its FFN result)
+    /// and closing HC write of `layer`.
+    fn post(&mut self, w: &WinCtx<'_>, ti: usize, layer: usize) -> R<()> {
+        let geo = self.geo;
+        let tile = &w.tiles[ti];
+        let n = tile.rows;
+        let slot = self.slot(ti);
+        let ffn = view(&self.lm.ffn[slot], 0, n * geo.hidden);
+        if let Some(runtime) = self.forward.moe.get(layer).and_then(Option::as_ref) {
+            if let Some(split) = hipfire_dispatch::families::moe::RoutedExpertWeights::hetero_prefill(runtime) {
+                split.join_slot(&mut *self.gpu, slot, n, &ffn).map_err(|e| invalid(format!("{e:?}")))?;
+            }
+        }
+        self.gpu.set_router_row_base(if n > 1 { tile.position } else { 0 });
+        let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, n);
+        let result = with_tile_frame(
+            &*self.forward,
+            &*self.bundle,
+            &mut *self.gpu,
+            &self.lm.streams,
+            geo,
+            tile,
+            layer,
+            |gpu, frame| {
+                let steps = [frame.env.mlp_write_step(frame.description, &ffn)];
+                validate_steps(&*gpu, &steps).map_err(dsp_err("preflight"))?;
+                execute_validated_steps(gpu, frame.ctx, &steps).map_err(dsp_err("hyper write"))
+            },
+        );
+        Qwen4GpuForward::leave_tile_scopes(&mut *self.gpu, scopes);
+        result
+    }
+
+    /// Tile `ti`'s embedding into its arena region.
+    fn embed_tile(&mut self, w: &WinCtx<'_>, ti: usize) -> R<()> {
+        let geo = self.geo;
+        let tile = &w.tiles[ti];
+        let n = tile.rows;
+        for (index, token) in w.tile_tokens(ti).iter().copied().enumerate() {
+            self.forward.host_token_bytes[index * 4..index * 4 + 4].copy_from_slice(&(token as i32).to_ne_bytes());
+        }
+        let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, n);
+        let result = (|| -> R<()> {
+            let scratch = &self.forward.scratch;
+            self.gpu.memcpy_htod_auto(
+                &scratch.token_ids.buf,
+                &self.forward.host_token_bytes[..n * std::mem::size_of::<i32>()],
+            )?;
+            let ids = view(&scratch.token_ids, 0, n * std::mem::size_of::<i32>());
+            let embedding_rot = view(&scratch.embedding_rot, 0, n * geo.hidden);
+            let embeddings = view(&scratch.embeddings, 0, n * geo.hidden);
+            let table = self.bundle.weights.resident(&self.bundle.weights.root.embedding)?;
+            execute_embedding(
+                &mut *self.gpu,
+                &EmbeddingOp { table, rotated: &embedding_rot, token_ids: &ids, output: &embeddings, rows: n, dim: geo.hidden },
+            )
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("Qwen4 embedding: {error:?}")))?;
+            let tile_streams = f32_view(&self.lm.streams, tile.stream_offset, n * geo.wide);
+            if tile.routing.bf16_streams {
+                self.gpu.hc_streams_init_from_embed_batched_bf16(
+                    &embeddings,
+                    &tile_streams,
+                    geo.hidden as i32,
+                    geo.config.hc_count as i32,
+                    n as i32,
+                )?;
+            } else {
+                self.gpu.hc_streams_init_from_embed_batched(
+                    &embeddings,
+                    &tile_streams,
+                    geo.hidden as i32,
+                    geo.config.hc_count as i32,
+                    n as i32,
+                )?;
+            }
+            Ok(())
+        })();
+        Qwen4GpuForward::leave_tile_scopes(&mut *self.gpu, scopes);
+        self.forward.slowlink_note_ids_rewritten();
+        result
+    }
+
+    /// The head of the request's last tile (logits and greedy id).
+    fn tile_output(&mut self, w: &WinCtx<'_>, ti: usize) -> R<()> {
+        let geo = self.geo;
+        let tile = &w.tiles[ti];
+        let n = tile.rows;
+        if !(w.last_window && tile.last_in_window) {
+            return Ok(());
+        }
+        let Some((logits, top1)) = self.output.head() else {
+            return Ok(());
+        };
+        let (scopes, _) = self.forward.enter_tile_scopes(&mut *self.gpu, n);
+        let result = (|| -> R<()> {
+            let tile_streams = f32_view(&self.lm.streams, tile.stream_offset, n * geo.wide);
+            let scratch = &self.forward.scratch;
+            let final_hyper =
+                crate::gpu_forward::hyper_read_desc(&self.bundle.weights, &self.bundle.weights.root.final_hyper)?;
+            let lm_head = crate::gpu_forward::dense_ref(&self.bundle.weights, &self.bundle.weights.root.lm_head)?;
+            let router_logits = matrix_view(&scratch.router_logits, n, router_columns(geo.dims))?;
+            let scratch_desc = layer_scratch(scratch, &router_logits);
+            execute_final_hyper(
+                &mut *self.gpu,
+                geo.dims,
+                &final_hyper,
+                &tile_streams,
+                &scratch_desc,
+                n,
+                tile.routing.bf16_streams,
+            )
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 final hyper: {error:?}")))?;
+            let final_hidden = view(&scratch.hc_mixed, 0, n * geo.hidden);
+            let head_rotation = view(&scratch.rotation, 0, n * geo.hidden);
+            execute_lm_head(&mut *self.gpu, &lm_head, &final_hidden, logits, n, 1, Some(&head_rotation))
+                .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("execute Qwen4 LM head: {error:?}")))?;
+            if let Some(top1) = top1 {
+                argmax_f32(
+                    &mut *self.gpu,
+                    &ArgmaxF32 { logits, indices: top1, rows: 1, vocab: geo.config.vocab_size },
+                )?;
+            }
+            Ok(())
+        })();
+        Qwen4GpuForward::leave_tile_scopes(&mut *self.gpu, scopes);
+        result
+    }
+}
+
 // ── production-primitive self-test ───────────────────────────────────
 
 /// Compute-stream delay (in repeats of the transport's delay kernel) that

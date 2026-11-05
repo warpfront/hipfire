@@ -84,6 +84,11 @@ use hipfire_dispatch::hetero_responder::{ColdLayer, HeteroResponder, PrefillServ
 /// to it (`gpu_forward::qwen4_prefill_chunk_requested`).
 pub const HETERO_PREFILL_MAX_ROWS: usize = 2048;
 
+/// Prefill slots of the mailbox: the tiles the layer-major hetero schedule
+/// keeps in flight (`slowlink_prefill::try_run_hetero_prompt`); the
+/// chunk-major path uses slot 0.
+pub const HETERO_PREFILL_SLOTS: usize = 4;
+
 /// `hetero_await_cold` poll bound: each poll is a PCIe read (~1-2 us) plus a
 /// short sleep, so this bounds a dead or stalled expert device at ~2 s.
 const AWAIT_MAX_POLLS: u32 = 1_000_000;
@@ -101,6 +106,7 @@ struct DeviceContext {
     responder: Option<HeteroResponder>,
     prefill: Arc<HeteroPrefillShared>,
     prefill_cold: ColdPrefillConfig,
+    prefill_offsets: Vec<hipfire_dispatch::hetero_mailbox::PrefillOffsets>,
 }
 
 // SAFETY: the raw mailbox address and the counter's device pointer are plain
@@ -141,8 +147,14 @@ pub(crate) fn attach_device_layer(
     if guard.is_none() {
         let geom = MailboxGeometry { layers, max_rows: 1, top_k, dim };
         let pgeom = PrefillGeometry { max_rows: prefill_cold.max_rows, top_k, dim, sub_chunks: MAX_SUB_CHUNKS };
-        let poff = pgeom.offsets(geom.total_bytes());
-        let total = poff.error + pgeom.bytes();
+        let mut poffs = Vec::with_capacity(HETERO_PREFILL_SLOTS);
+        let mut end = geom.total_bytes();
+        for _ in 0..HETERO_PREFILL_SLOTS {
+            let o = pgeom.offsets(end);
+            end = o.error + pgeom.bytes();
+            poffs.push(o);
+        }
+        let total = end;
         let flags = hip_bridge::HIP_HOST_MALLOC_MAPPED | hip_bridge::HIP_HOST_MALLOC_COHERENT;
         let mailbox = gpu.hip.host_malloc(total, flags).map_err(hip)?.cast::<u8>();
         // SAFETY: fresh pinned allocation of `total` bytes: zero = never written.
@@ -157,7 +169,7 @@ pub(crate) fn attach_device_layer(
                 dtype: rdna_compute::DType::F32,
             }
         };
-        let prefill = HeteroPrefillShared::new(gpu, mailbox as u64, poff, pgeom, placement.len(), counter_view, AWAIT_MAX_POLLS)
+        let prefill = HeteroPrefillShared::new(gpu, mailbox as u64, &poffs, pgeom, placement.len(), counter_view, AWAIT_MAX_POLLS)
             .map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
         *guard = Some(DeviceContext {
             mailbox: mailbox as usize,
@@ -169,10 +181,11 @@ pub(crate) fn attach_device_layer(
             responder: None,
             prefill: Arc::new(prefill),
             prefill_cold,
+            prefill_offsets: poffs,
         });
         eprintln!(
-            "  qwen4 hetero experts: device split, {layers} layers, mailbox {} KiB pinned",
-            geom.total_bytes() / 1024
+            "  qwen4 hetero experts: device split, {layers} layers, mailbox {} MiB pinned ({HETERO_PREFILL_SLOTS} prefill slots)",
+            total >> 20
         );
     }
     let ctx = guard.as_mut().expect("initialized above");
@@ -210,11 +223,11 @@ pub(crate) fn attach_device_layer(
             mailbox_base: b,
             n_experts: ctx.n_experts,
             mi: ctx.mi,
-            prefill: Some(PrefillServe {
-                offsets: ctx.prefill.offsets,
-                sub_chunks: MAX_SUB_CHUNKS,
-                cold: ctx.prefill_cold,
-            }),
+            prefill: ctx
+                .prefill_offsets
+                .iter()
+                .map(|&offsets| PrefillServe { offsets, sub_chunks: MAX_SUB_CHUNKS, cold: ctx.prefill_cold })
+                .collect(),
         };
         let responder = HeteroResponder::start(cfg, layers_v).map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
         eprintln!("  qwen4 hetero experts: responder on gfx1151 (HIP device {EXPERT_DEVICE}) recorded {layers} layer graphs");
@@ -305,4 +318,75 @@ mod tests {
         let e = check_primary("gfx1151").unwrap_err();
         assert!(e.contains("topology.hetero_experts") && e.contains("gfx1201,gfx1151"), "{e}");
     }
+}
+
+/// The layer-major prompt schedule's resources (see
+/// `slowlink_prefill::try_run_hetero_prompt`): the load's prefill exchange,
+/// the HC-stream arena (one `tile_rows x wide` F32 region per slot) and one
+/// FFN-output buffer per slot (a tile's MoE result held until its join).
+pub(crate) struct LayerMajor {
+    pub shared: Arc<HeteroPrefillShared>,
+    pub streams: rdna_compute::GpuTensor,
+    pub ffn: Vec<rdna_compute::GpuTensor>,
+}
+
+/// (tile rows, wide, hidden) the arena was sized for, and its owners.
+static ARENA: Mutex<Option<((usize, usize, usize), rdna_compute::GpuTensor, Vec<rdna_compute::GpuTensor>)>> =
+    Mutex::new(None);
+
+fn view_of(t: &rdna_compute::GpuTensor) -> rdna_compute::GpuTensor {
+    // SAFETY: a non-owning view of an arena tensor that lives for the process.
+    rdna_compute::GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(t.buf.as_ptr(), t.buf.size()) },
+        shape: t.shape.clone(),
+        dtype: t.dtype,
+    }
+}
+
+/// `Some` when this load runs the hetero split with its prefill exchange and
+/// `HIPFIRE_HETERO_LAYER_MAJOR` is not `0`. The arena is allocated on first use
+/// (once per process: a daemon holds one model).
+pub(crate) fn layer_major(
+    gpu: &mut rdna_compute::Gpu,
+    tile_rows: usize,
+    wide: usize,
+    hidden: usize,
+) -> Result<Option<LayerMajor>, String> {
+    if std::env::var("HIPFIRE_HETERO_LAYER_MAJOR").is_ok_and(|v| v == "0") {
+        return Ok(None);
+    }
+    let shared = {
+        let guard = lock_device()?;
+        match guard.as_ref() {
+            Some(ctx) if ctx.responder.is_some() => Arc::clone(&ctx.prefill),
+            _ => return Ok(None),
+        }
+    };
+    if tile_rows > shared.geom.max_rows {
+        return Ok(None);
+    }
+    let slots = shared.slots();
+    let hip = |e: hip_bridge::HipError| format!("topology.hetero_experts: layer-major arena: {e}");
+    let mut arena = ARENA.lock().map_err(|_| "topology.hetero_experts: arena lock poisoned".to_owned())?;
+    let shape = (tile_rows, wide, hidden);
+    if arena.as_ref().is_none_or(|(s, _, _)| *s != shape) {
+        if let Some((_, streams, ffn)) = arena.take() {
+            let _ = gpu.free_tensor(streams);
+            for t in ffn {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        let streams = gpu.alloc_tensor(&[slots * tile_rows * wide], rdna_compute::DType::F32).map_err(hip)?;
+        let ffn = (0..slots)
+            .map(|_| gpu.alloc_tensor(&[tile_rows * hidden], rdna_compute::DType::F32))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(hip)?;
+        eprintln!(
+            "  qwen4 hetero experts: layer-major prompt arena {} MiB ({slots} tiles of {tile_rows} rows)",
+            (slots * tile_rows * (wide + hidden) * 4) >> 20
+        );
+        *arena = Some((shape, streams, ffn));
+    }
+    let (_, streams, ffn) = arena.as_ref().expect("allocated above");
+    Ok(Some(LayerMajor { shared, streams: view_of(streams), ffn: ffn.iter().map(view_of).collect() }))
 }
