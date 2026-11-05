@@ -2855,6 +2855,18 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             ]
         );
         add!("zero_f32", kernels::ZERO_F32_SRC, ["zero_f32"]);
+        add!(
+            "hetero_split",
+            kernels::HETERO_SPLIT_SRC,
+            [
+                "hetero_token_advance",
+                "hetero_publish_cold",
+                "hetero_await_cold",
+                "hetero_install_cold",
+                "hetero_mask_hot",
+                "hetero_store_seq"
+            ]
+        );
     }
     if matches!(arch, "gfx1201" | "gfx1100") {
         add!(
@@ -10815,9 +10827,21 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // The device-side hetero expert split (`hetero.rs`, `hetero_split.hip`).
+        const HETERO_SPLIT_ADDED_MODULES: [&str; 1] = ["hetero_split"];
+        for module in HETERO_SPLIT_ADDED_MODULES {
+            assert!(by_name.contains_key(module), "missing hetero split module {module}");
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
+                + HETERO_SPLIT_ADDED_MODULES.len()
                 + MQ3V25_ADDED_MODULES.len()
                 + PRE_S1_ADDED_SINCE_P0
                 + S1_ADDED_MODULES.len()

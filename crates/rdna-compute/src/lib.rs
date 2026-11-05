@@ -100,6 +100,8 @@ pub mod mq6_railgun;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
 pub mod norm;
+pub mod hetero;
+pub use hetero::HeteroSlotPtrs;
 pub mod npu_trunk;
 mod packed_mq4;
 pub mod page_pool;
