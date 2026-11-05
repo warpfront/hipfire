@@ -168,6 +168,11 @@ def qwen4_shadow_failures(shadow):
             f"prepared dispatches {identity.get('dispatch_count')} != "
             f"captured body launches {capture.get('body_launches', capture.get('launches'))}"
         )
+    if not int(capture.get("body_launches") or 0) < int(capture.get("launches") or 0):
+        failures.append(
+            f"shadow plan covers the whole window ({capture.get('body_launches')} body of "
+            f"{capture.get('launches')} launches): the LM head would replay twice"
+        )
     if identity.get("queue_count") != 1 or identity.get("phase_count") != 1:
         failures.append(f"prepared route is not single-queue/single-phase: {identity!r}")
 
