@@ -108,7 +108,9 @@ pub struct PrefillOffsets {
     /// primary before the request word).
     pub layer: usize,
     pub rows: usize,
-    pub x_rot: usize,
+    /// The chunk's normed rows, `rows x dim` f32 (the expert device runs its
+    /// own input basis).
+    pub x_norm: usize,
     pub ids: usize,
     pub weights: usize,
     /// The expert device's weighted cold partial, `rows x dim` f32.
@@ -121,13 +123,13 @@ impl PrefillGeometry {
     /// offsets and the slot's size.
     fn local(&self) -> (PrefillOffsets, usize) {
         let slots = self.max_rows * self.top_k;
-        let x_rot = ARRAY_ALIGN;
-        let ids = align(x_rot + self.max_rows * self.dim * 4);
+        let x_norm = ARRAY_ALIGN;
+        let ids = align(x_norm + self.max_rows * self.dim * 4);
         let weights = align(ids + slots * 4);
         let partial = align(weights + slots * 4);
         let end = align(partial + self.max_rows * self.dim * 4);
         (
-            PrefillOffsets { req_seq: 0, resp_seq: 64, error: 128, layer: 192, rows: 196, x_rot, ids, weights, partial },
+            PrefillOffsets { req_seq: 0, resp_seq: 64, error: 128, layer: 192, rows: 196, x_norm, ids, weights, partial },
             end,
         )
     }
@@ -143,7 +145,7 @@ impl PrefillGeometry {
             error: b + o.error,
             layer: b + o.layer,
             rows: b + o.rows,
-            x_rot: b + o.x_rot,
+            x_norm: b + o.x_norm,
             ids: b + o.ids,
             weights: b + o.weights,
             partial: b + o.partial,
@@ -171,7 +173,7 @@ mod tests {
             (o.error, 4),
             (o.layer, 4),
             (o.rows, 4),
-            (o.x_rot, P.max_rows * P.dim * 4),
+            (o.x_norm, P.max_rows * P.dim * 4),
             (o.ids, slots * 4),
             (o.weights, slots * 4),
             (o.partial, P.max_rows * P.dim * 4),

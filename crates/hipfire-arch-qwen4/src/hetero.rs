@@ -186,6 +186,7 @@ pub(crate) fn attach_device_layer(
             mailbox_base: b,
             n_experts: ctx.n_experts,
             mi: ctx.mi,
+            prefill: None,
         };
         let responder = HeteroResponder::start(cfg, layers_v).map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
         eprintln!("  qwen4 hetero experts: responder on gfx1151 (HIP device {EXPERT_DEVICE}) recorded {layers} layer graphs");
