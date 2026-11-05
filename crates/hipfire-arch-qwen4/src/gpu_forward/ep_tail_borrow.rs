@@ -65,9 +65,9 @@ pub(crate) const EP_TAIL_BORROW_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_TAIL_BORROW
 /// Developer knob: `1` prints one stderr line per closed epoch.
 pub(crate) const EP_TAIL_BORROW_LOG_ENV: &str = "HIPFIRE_QWEN4_EP_TAIL_BORROW_LOG";
 
-/// Whether the borrow is on when [`EP_TAIL_BORROW_ENV`] is unset. One constant flips the
-/// shipped default once the served A/B lands.
-pub const EP_TAIL_BORROW_DEFAULT_ON: bool = false;
+/// Whether the borrow is on when [`EP_TAIL_BORROW_ENV`] is unset: on since the served A/B
+/// (PrefBorrow2, 2026-11-05: pp16k 1.13x, pp32k 1.12x, decode within noise).
+pub const EP_TAIL_BORROW_DEFAULT_ON: bool = true;
 
 /// Borrowed rows of `=1` and of the shipped default.
 pub const EP_TAIL_BORROW_DEFAULT_ROWS: usize = 8192;
@@ -1541,15 +1541,15 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_default_is_off_and_one_constant_flips_it() {
-        // Unset with the shipped constant: whatever the facts, no plan, no note.
-        assert!(!EP_TAIL_BORROW_DEFAULT_ON);
-        let off = resolve_ep_tail_borrow(None, EP_TAIL_BORROW_DEFAULT_ON, &facts());
-        assert_eq!(off, EpTailBorrowResolution { plan: None, note: None });
-        // The same resolver with the default flipped plans the 8192-row borrow.
-        let on = resolve_ep_tail_borrow(None, true, &facts());
+    fn the_shipped_default_is_on_and_one_constant_flips_it() {
+        // Unset with the shipped constant: the 8192-row borrow, no note.
+        assert!(EP_TAIL_BORROW_DEFAULT_ON);
+        let on = resolve_ep_tail_borrow(None, EP_TAIL_BORROW_DEFAULT_ON, &facts());
         assert_eq!(on.plan, plan(BORROWED));
         assert_eq!(on.note, None);
+        // The same resolver with the default off plans nothing and says nothing.
+        let off = resolve_ep_tail_borrow(None, false, &facts());
+        assert_eq!(off, EpTailBorrowResolution { plan: None, note: None });
         // An empty value is unset.
         assert_eq!(resolve_ep_tail_borrow(Some("  "), false, &facts()).plan, None);
     }
