@@ -8586,6 +8586,11 @@ impl ReplayController {
         Ok(())
     }
 
+    /// The identity the tape latched under `key`, if any.
+    pub fn route_identity(&self, key: u64) -> Option<&str> {
+        self.route_identities.get(&key).map(String::as_str)
+    }
+
     /// The identities latched for the tape being recorded or replayed.
     pub fn route_identity_count(&self) -> usize {
         self.route_identities.len()
