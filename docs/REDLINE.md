@@ -426,6 +426,14 @@ A retained route is valid only when all of the following hold.
   artifact. Absent or ambiguous alias blocks preparation.
 - Unsupported scratch, implicit SGPR, loader-kernarg, workgroup, grid, shared
   memory, or symbol metadata blocks installation before `Ready`.
+- Scratch (private segment) on gfx10/gfx11 is supported: the vendor PM4-IB packet
+  skips the command processor's AQL scratch setup, so the retained route owns a
+  constant `COMPUTE_TMPRING_SIZE` plan sized for the largest private segment of
+  the tape and one device-memory ring per queue lane
+  (`crates/redline-rocr/src/pm4_gfx10_scratch.rs`; primary sources cited there).
+  `HIPFIRE_PMSCRATCH_PM4_SCRATCH=0` removes the rings, and a private-segment
+  kernel then blocks installation again. Dynamic-callstack kernels and gfx12
+  scratch remain unsupported.
 - Artifact path, artifact digest, symbol, loader kernarg size/alignment, padded
   blob, grid, block, and shared memory are one identity contract. A stable
   kernel-name hash alone is insufficient.

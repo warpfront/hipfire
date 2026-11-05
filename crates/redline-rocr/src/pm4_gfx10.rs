@@ -67,6 +67,8 @@ const COMPUTE_USER_DATA_0: u32 = 0x240;
 const LDS_SIZE_MASK: u32 = 0x00ff_8000;
 const LDS_SIZE_SHIFT: u32 = 15;
 const LEGACY_LDS_GRANULE: u32 = 512;
+/// `COMPUTE_PGM_RSRC2.SCRATCH_EN` (bit 0; Mesa `registers/gfx10.json`).
+const SCRATCH_EN: u32 = 1;
 
 const ENABLE_SGPR_PRIVATE_SEGMENT_BUFFER: u16 = 1 << 0;
 const ENABLE_SGPR_DISPATCH_PTR: u16 = 1 << 1;
@@ -717,15 +719,29 @@ impl Gfx10Pm4CommandBuffer {
         // A command buffer that owns a ring pins it on every dispatch, even a
         // zero-private kernel: WAVESIZE must stay constant while any earlier
         // wave can still use the ring. Without a ring the legacy zero stays.
+        // A dispatch that actually enables scratch (`COMPUTE_PGM_RSRC2.SCRATCH_EN`
+        // or a private segment) re-emits the ring registers even when
+        // register-state elision knows their value: eliding them after an
+        // intervening non-scratch dispatch hangs the queue on gfx1100 (the
+        // retained qwen3.8-27b.mq3-xt tape: `STATEFUL=static` hangs, `legacy`
+        // runs), so the write must accompany every scratch dispatch.
         match self.scratch {
             Some(scratch) => {
+                let enables_scratch =
+                    image.private_segment_size != 0 || image.compute_pgm_rsrc2 & SCRATCH_EN != 0;
                 if scratch.family() == Gfx10ScratchFamily::Gfx11 {
-                    self.set_sh_regs(
-                        COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11,
-                        &scratch.gfx11_dispatch_scratch_base(),
-                    );
+                    let base = scratch.gfx11_dispatch_scratch_base();
+                    if enables_scratch {
+                        self.force_sh_regs(COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11, &base);
+                    } else {
+                        self.set_sh_regs(COMPUTE_DISPATCH_SCRATCH_BASE_LO_GFX11, &base);
+                    }
                 }
-                self.set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[scratch.tmpring_size()]);
+                if enables_scratch {
+                    self.force_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[scratch.tmpring_size()]);
+                } else {
+                    self.set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[scratch.tmpring_size()]);
+                }
             }
             None => self.set_sh_regs(COMPUTE_TMPRING_SIZE_GFX10, &[0]),
         }
@@ -904,6 +920,17 @@ impl Gfx10Pm4CommandBuffer {
         for (run_first, run_values) in changed_runs {
             self.emit_set_sh_regs(run_first, &run_values);
         }
+    }
+
+    /// Emit `values` unconditionally, keeping the elision state coherent.
+    fn force_sh_regs(&mut self, first: u32, values: &[u32]) {
+        debug_assert!(!values.is_empty());
+        if let Some(register_state) = self.register_state.as_mut() {
+            for (offset, value) in values.iter().copied().enumerate() {
+                register_state.insert(first + offset as u32, value);
+            }
+        }
+        self.emit_set_sh_regs(first, values);
     }
 
     fn emit_set_sh_regs(&mut self, first: u32, values: &[u32]) {

@@ -20,3 +20,12 @@ case "$arch" in gfx10*) hipcc "${flags[@]}" -mwavefrontsize64 "$here/probe.hip" 
   cat "$root/kernels/src/gemv_mq4g256v2_residual.hip"
 } > "$out/mq4_residual_$arch.hip"
 hipcc "${flags[@]}" "$out/mq4_residual_$arch.hip" -o "$out/mq4_residual_$arch.co"
+# MQ3 residual (the kernel that refused the retained gfx1100 route for
+# qwen3.8-27b.mq3-xt: private segment 16 B/lane), same concatenation as
+# kernels.rs GEMV_MQ3G256V2_RESIDUAL_SRC.
+{
+  printf '#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n'
+  cat "$root/kernels/src/gfx12_weight_cache_policy.inc"
+  cat "$root/kernels/src/gemv_mq3g256v2_residual.hip"
+} > "$out/mq3_residual_$arch.hip"
+hipcc "${flags[@]}" "$out/mq3_residual_$arch.hip" -o "$out/mq3_residual_$arch.co"

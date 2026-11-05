@@ -490,6 +490,88 @@ fn case_chain(rig: &mut Rig, tally: &mut Tally, dyn_kernel: &Kernel, plain: &Ker
     Ok(())
 }
 
+/// The mirror of `case_chain`: the stream opens with a non-scratch kernel (so
+/// the ring registers are first written next to a `SCRATCH_EN = 0` dispatch)
+/// and scratch kernels follow, with and without an idle between them. This is
+/// the shape of a retained decode tape (rmsnorm first, scratch GEMV later); a
+/// stream that elides the ring registers after the first dispatch hangs here.
+fn case_order(rig: &mut Rig, tally: &mut Tally, dyn_kernel: &Kernel, plain: &Kernel) -> R<()> {
+    let ring = rig.ring(&[dyn_kernel, plain])?;
+    let threads = 32_768_usize;
+    let geometry = LaunchGeometry::new([threads as u32, 1, 1], [64, 1, 1]).map_err(err)?;
+    let mut rng = Rng(0x0dd0_0ddf_aced_beef);
+    let input = random_words(&mut rng, threads);
+    let s1 = plain_mix_ref(&input);
+    let s2 = scratch_dyn_ref(&s1, threads, 24);
+    let s3 = plain_mix_ref(&s2);
+    let reference = scratch_dyn_ref(&s3, threads, 24);
+
+    let run = |rig: &mut Rig, pm4: bool| -> R<Vec<u32>> {
+        let input_buffer = rig.words(&input)?;
+        let o1 = rig.zeros(threads * 4)?;
+        let o2 = rig.zeros(threads * 4)?;
+        let o3 = rig.zeros(threads * 4)?;
+        let mut o4 = rig.zeros(threads * 4)?;
+        let plain_args = |rig: &Rig, from: &KernargBuffer, to: &KernargBuffer| {
+            kernarg_for(rig, plain, geometry, &ptr_bytes(&[Part::Ptr(from), Part::Ptr(to)]))
+        };
+        let dyn_args = |rig: &Rig, from: &KernargBuffer, to: &KernargBuffer| {
+            kernarg_for(
+                rig,
+                dyn_kernel,
+                geometry,
+                &ptr_bytes(&[
+                    Part::Ptr(from),
+                    Part::Ptr(to),
+                    Part::I32(threads as i32),
+                    Part::I32(24),
+                ]),
+            )
+        };
+        let a1 = plain_args(rig, &input_buffer, &o1)?;
+        let a2 = dyn_args(rig, &o1, &o2)?;
+        let a3 = plain_args(rig, &o2, &o3)?;
+        let a4 = dyn_args(rig, &o3, &o4)?;
+        if pm4 {
+            let mut commands = Rig::new_stream(ring.as_ref());
+            commands
+                .dispatch(plain, geometry, 0, a1.address())
+                .map_err(err)?;
+            commands.dependency_rmw_same_agent();
+            commands
+                .dispatch(dyn_kernel, geometry, 0, a2.address())
+                .map_err(err)?;
+            commands.dependency_rmw_same_agent();
+            commands
+                .dispatch(plain, geometry, 0, a3.address())
+                .map_err(err)?;
+            commands.dependency_rmw_same_agent();
+            commands
+                .dispatch(dyn_kernel, geometry, 0, a4.address())
+                .map_err(err)?;
+            rig.run_pm4(commands)?;
+        } else {
+            rig.run_aql(plain, geometry, &a1)?;
+            rig.run_aql(dyn_kernel, geometry, &a2)?;
+            rig.run_aql(plain, geometry, &a3)?;
+            rig.run_aql(dyn_kernel, geometry, &a4)?;
+        }
+        Ok(read_words(&mut o4, threads))
+    };
+    let aql = run(rig, false)?;
+    let pm4 = run(rig, true)?;
+    tally.check(
+        "order plain->scratch->plain->scratch (non-scratch first)",
+        aql == pm4 && pm4 == reference,
+        format!(
+            "lanes={threads} pm4_vs_aql_mismatch={} pm4_vs_cpu_mismatch={}",
+            mismatches(&pm4, &aql),
+            mismatches(&pm4, &reference)
+        ),
+    );
+    Ok(())
+}
+
 fn case_alias(rig: &mut Rig, tally: &mut Tally, alias: &Kernel) -> R<()> {
     let ring = rig.ring(&[alias])?;
     let lanes = if Gfx10KernelImage::from_hsa(alias).map_err(err)?.wave32 {
@@ -632,10 +714,21 @@ fn case_alias_control(rig: &mut Rig, tally: &mut Tally, alias: &Kernel) -> R<()>
     Ok(())
 }
 
-fn case_mq4(rig: &mut Rig, tally: &mut Tally, residual: &Kernel) -> R<()> {
+/// A product MQ residual GEMV (`y[row] += A[row] . x`) over clean, wild and
+/// edge-value inputs: AQL anchor vs PM4 (with a ring when the kernel has a
+/// private segment). `group_bytes` is the weight group stride (136 MQ4, 104
+/// MQ3); `blocks` the launch's block count.
+fn case_residual(
+    rig: &mut Rig,
+    tally: &mut Tally,
+    residual: &Kernel,
+    label: &str,
+    group_bytes: usize,
+    blocks: impl Fn(usize) -> usize,
+) -> R<()> {
     let image = Gfx10KernelImage::from_hsa(residual).map_err(err)?;
     println!(
-        "mq4 kernel private_segment_size={} wave32={} kernel_code_properties={:#06x} rsrc2={:#010x}",
+        "{label} kernel private_segment_size={} wave32={} kernel_code_properties={:#06x} rsrc2={:#010x}",
         image.private_segment_size,
         image.wave32,
         image.kernel_code_properties,
@@ -643,8 +736,8 @@ fn case_mq4(rig: &mut Rig, tally: &mut Tally, residual: &Kernel) -> R<()> {
     );
     let ring = rig.ring(&[residual])?;
     let (m, k) = (2048_usize, 4096_usize);
-    let row_bytes = (k / 256) * 136;
-    let geometry = LaunchGeometry::new([(m as u32 / 2) * 32, 1, 1], [32, 1, 1]).map_err(err)?;
+    let row_bytes = (k / 256) * group_bytes;
+    let geometry = LaunchGeometry::new([blocks(m) as u32 * 32, 1, 1], [32, 1, 1]).map_err(err)?;
     let mut rng = Rng(0xc0ff_ee00_dead_beef);
     for (name, wild, special_x) in [
         ("clean", false, false),
@@ -654,12 +747,13 @@ fn case_mq4(rig: &mut Rig, tally: &mut Tally, residual: &Kernel) -> R<()> {
         let mut a = vec![0_u8; m * row_bytes];
         for row in 0..m {
             for group in 0..k / 256 {
-                let base = row * row_bytes + group * 136;
-                let scale = f16_bits(&mut rng, wild);
-                let zero = f16_bits(&mut rng, wild);
-                a[base..base + 2].copy_from_slice(&scale.to_le_bytes());
-                a[base + 2..base + 4].copy_from_slice(&zero.to_le_bytes());
-                for byte in &mut a[base + 4..base + 136] {
+                let base = row * row_bytes + group * group_bytes;
+                // Eight header bytes: two (scale, zero-point) f16 pairs.
+                for half in 0..4 {
+                    let value = f16_bits(&mut rng, wild);
+                    a[base + 2 * half..base + 2 * half + 2].copy_from_slice(&value.to_le_bytes());
+                }
+                for byte in &mut a[base + 8..base + group_bytes] {
                     *byte = rng.next() as u8;
                 }
             }
@@ -730,7 +824,7 @@ fn case_mq4(rig: &mut Rig, tally: &mut Tally, residual: &Kernel) -> R<()> {
         let pm4_again = run(rig, true)?;
         let nan_lanes = pm4.iter().filter(|w| (**w & 0x7fff_ffff) > 0x7f80_0000).count();
         tally.check(
-            &format!("mq4 residual {name} M={m} K={k}"),
+            &format!("{label} residual {name} M={m} K={k}"),
             aql == pm4 && pm4 == pm4_again,
             format!(
                 "private={} rows={m} pm4_vs_aql_mismatch={} pm4_rerun_mismatch={} nan_rows={nan_lanes}",
@@ -746,6 +840,7 @@ fn case_mq4(rig: &mut Rig, tally: &mut Tally, residual: &Kernel) -> R<()> {
 fn main() -> R<()> {
     let mut probe = PathBuf::new();
     let mut mq4 = PathBuf::new();
+    let mut mq3 = PathBuf::new();
     let mut only = String::new();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -753,6 +848,7 @@ fn main() -> R<()> {
         match flag.as_str() {
             "--probe" => probe = value.into(),
             "--mq4" => mq4 = value.into(),
+            "--mq3" => mq3 = value.into(),
             "--only" => only = value,
             other => return Err(format!("unknown argument {other}")),
         }
@@ -789,6 +885,9 @@ fn main() -> R<()> {
         if wanted("chain") {
             case_chain(&mut rig, &mut tally, &dyn_kernel, &plain)?;
         }
+        if wanted("order") {
+            case_order(&mut rig, &mut tally, &dyn_kernel, &plain)?;
+        }
         if wanted("alias") {
             case_alias(&mut rig, &mut tally, &alias)?;
         }
@@ -803,7 +902,19 @@ fn main() -> R<()> {
         )
         .map_err(err)?;
         let residual = exe.kernel("gemv_mq4g256v2_residual.kd").map_err(err)?;
-        case_mq4(&mut rig, &mut tally, &residual)?;
+        // Dual-row kernel: one block per two rows.
+        case_residual(&mut rig, &mut tally, &residual, "mq4", 136, |m| m.div_ceil(2))?;
+    }
+    if !mq3.as_os_str().is_empty() && wanted("mq3") {
+        let exe = Executable::load(
+            &rig.device,
+            Arc::from(std::fs::read(&mq3).map_err(err)?.into_boxed_slice()),
+        )
+        .map_err(err)?;
+        let residual = exe.kernel("gemv_mq3g256v2_residual.kd").map_err(err)?;
+        // The product launcher (`gemv_mq3g256v2_residual`, rows = 1) issues one
+        // block per row of a dual-row kernel; the upper half returns early.
+        case_residual(&mut rig, &mut tally, &residual, "mq3", 104, |m| m)?;
     }
     println!(
         "RESULT arch={} cases={} failures={}",
