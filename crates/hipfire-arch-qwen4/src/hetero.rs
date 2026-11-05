@@ -87,7 +87,35 @@ pub const HETERO_PREFILL_MAX_ROWS: usize = 2048;
 /// Prefill slots of the mailbox: the tiles the layer-major hetero schedule
 /// keeps in flight (`slowlink_prefill::try_run_hetero_prompt`); the
 /// chunk-major path uses slot 0.
-pub const HETERO_PREFILL_SLOTS: usize = 4;
+pub const HETERO_PREFILL_SLOTS: usize = 8;
+
+/// Layer-major tile rows for a `rows`-row prompt (`HIPFIRE_HETERO_TILE_ROWS`,
+/// whole 256-row steps, at least 512 so every tile keeps the expert device's
+/// grouped arm), at most the forward's chunk.
+pub(crate) fn layer_major_tile_rows(max_chunk: usize, rows: usize) -> usize {
+    std::env::var("HIPFIRE_HETERO_TILE_ROWS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .map(|r| r / 256 * 256)
+        .filter(|&r| r >= 512)
+        // Measured (R9700 + gfx1151, 4 tiles in flight): 2048-row tiles run
+        // 4K/8K at 1,902/1,868 tok/s vs 1,654/1,611 at 1024 rows (the
+        // primary's per-row cost falls with the batch); a prompt below two
+        // full tiles splits into 1024-row tiles (2K: 1,741 vs 1,660 one chunk).
+        .unwrap_or(if rows >= 2 * max_chunk { max_chunk } else { 1024 })
+        .min(max_chunk)
+}
+
+/// Tiles the layer-major schedule keeps in flight (`HIPFIRE_HETERO_TILES`,
+/// default 4), at most the mailbox's slots.
+pub(crate) fn layer_major_tiles(slots: usize) -> usize {
+    std::env::var("HIPFIRE_HETERO_TILES")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&t| t >= 2)
+        .unwrap_or(4)
+        .min(slots)
+}
 
 /// `hetero_await_cold` poll bound: each poll is a PCIe read (~1-2 us) plus a
 /// short sleep, so this bounds a dead or stalled expert device at ~2 s.

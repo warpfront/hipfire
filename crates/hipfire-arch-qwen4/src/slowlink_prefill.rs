@@ -4267,8 +4267,8 @@ pub(crate) fn try_run_hetero_prompt(
     tokens: &[u32],
     mut output: PromptOutput<'_>,
 ) -> R<bool> {
-    let tile_rows = forward.scratch.max_chunk;
     let rows = tokens.len();
+    let tile_rows = crate::hetero::layer_major_tile_rows(forward.scratch.max_chunk, rows);
     // One tile gains nothing from the schedule.
     if rows <= tile_rows {
         return Ok(false);
@@ -4302,7 +4302,7 @@ pub(crate) fn try_run_hetero_prompt(
     let Some(lm) = crate::hetero::layer_major(gpu, tile_rows, geo.wide, geo.hidden).map_err(invalid)? else {
         return Ok(false);
     };
-    let slots = lm.shared.slots();
+    let slots = crate::hetero::layer_major_tiles(lm.shared.slots());
     // The plan: windows of `slots` tiles; a tile's arena region is its slot's.
     let mut tiles: Vec<TilePlan> = Vec::new();
     let mut windows: Vec<WindowPlan> = Vec::new();
@@ -4375,6 +4375,7 @@ pub(crate) fn try_run_hetero_prompt(
     lm.shared.set_defer_join(true);
     let outcome = {
         let mut run = HeteroRun {
+            trace: std::env::var("HIPFIRE_HETERO_PREFILL_TRACE").is_ok_and(|v| v == "1").then(HeteroTrace::default),
             forward: &mut *forward,
             bundle: &mut *bundle,
             gpu: &mut *gpu,
@@ -4406,7 +4407,19 @@ pub(crate) fn try_run_hetero_prompt(
     outcome.map(|()| true)
 }
 
+/// `HIPFIRE_HETERO_PREFILL_TRACE=1`: stream-time brackets of every `pre` and
+/// `post` of a window (diagnosis only: synchronizes at the window end).
+#[derive(Default)]
+struct HeteroTrace {
+    marks: Vec<(bool, hip_bridge::Event, hip_bridge::Event)>,
+    /// Inside `pre`: (mixer prefix, MoE) brackets.
+    split: Vec<(hip_bridge::Event, hip_bridge::Event, hip_bridge::Event)>,
+    /// Inside the mixer prefix: one bracket per step.
+    ops: Vec<(&'static str, hip_bridge::Event, hip_bridge::Event)>,
+}
+
 struct HeteroRun<'a, 'o> {
+    trace: Option<HeteroTrace>,
     forward: &'a mut Qwen4GpuForward,
     bundle: &'a mut Qwen4Bundle,
     gpu: &'a mut Gpu,
@@ -4460,16 +4473,100 @@ impl HeteroRun<'_, '_> {
             }
         }
         let first = geo.band.start;
+        let wall = std::time::Instant::now();
+        let result = self.walk(w, txn, first);
+        self.report_trace(w, wall)?;
+        result
+    }
+
+    /// Bracket `f` on the main stream when tracing.
+    fn traced(&mut self, post: bool, f: impl FnOnce(&mut Self) -> R<()>) -> R<()> {
+        let Some(_) = self.trace.as_ref() else {
+            return f(self);
+        };
+        let begin = self.gpu.hip.event_create()?;
+        self.gpu.hip.event_record(&begin, self.gpu.active_stream.as_ref())?;
+        let out = f(self);
+        let end = self.gpu.hip.event_create()?;
+        self.gpu.hip.event_record(&end, self.gpu.active_stream.as_ref())?;
+        if let Some(t) = self.trace.as_mut() {
+            t.marks.push((post, begin, end));
+        }
+        out
+    }
+
+    fn report_trace(&mut self, w: &WinCtx<'_>, wall: std::time::Instant) -> R<()> {
+        let Some(t) = self.trace.as_mut() else {
+            return Ok(());
+        };
+        let marks = std::mem::take(&mut t.marks);
+        let (Some(first), Some(last)) = (marks.first(), marks.last()) else {
+            return Ok(());
+        };
+        self.gpu.hip.event_synchronize(&last.2)?;
+        let span = self.gpu.hip.event_elapsed_ms(&first.1, &last.2)? as f64;
+        let (mut pre, mut post) = (0f64, 0f64);
+        for (is_post, b, e) in &marks {
+            let ms = self.gpu.hip.event_elapsed_ms(b, e)? as f64;
+            if *is_post {
+                post += ms;
+            } else {
+                pre += ms;
+            }
+        }
+        let layers = self.geo.band.len() as f64;
+        let (mut mixer, mut moe) = (0f64, 0f64);
+        for (a, b, c) in std::mem::take(&mut t.split) {
+            mixer += self.gpu.hip.event_elapsed_ms(&a, &b)? as f64;
+            moe += self.gpu.hip.event_elapsed_ms(&b, &c)? as f64;
+            for e in [a, b, c] {
+                let _ = self.gpu.hip.event_destroy(e);
+            }
+        }
+        eprintln!("hetero layer-major trace: per layer mixer prefix {:.2} ms, MoE (publish+hot+shared) {:.2} ms", mixer / layers, moe / layers);
+        let mut by_op: Vec<(&'static str, f64, usize)> = Vec::new();
+        for (name, x, y) in std::mem::take(&mut t.ops) {
+            let ms = self.gpu.hip.event_elapsed_ms(&x, &y)? as f64;
+            match by_op.iter_mut().find(|(n, _, _)| *n == name) {
+                Some(e) => {
+                    e.1 += ms;
+                    e.2 += 1;
+                }
+                None => by_op.push((name, ms, 1)),
+            }
+            let _ = self.gpu.hip.event_destroy(x);
+            let _ = self.gpu.hip.event_destroy(y);
+        }
+        by_op.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let ops: Vec<String> = by_op.iter().map(|(n, ms, c)| format!("{n} {:.2} ms ({c})", ms / layers)).collect();
+        eprintln!("hetero layer-major trace: mixer per layer by op: {}", ops.join(", "));
+        eprintln!(
+            "hetero layer-major trace: {} tiles, {} rows: stream span {span:.1} ms (wall {:.1}), per layer pre {:.2} ms post {:.2} ms (post = joins incl. waits + HC writes)",
+            w.tiles.len(),
+            w.window.rows,
+            wall.elapsed().as_secs_f64() * 1e3,
+            pre / layers,
+            post / layers
+        );
+        for (_, b, e) in marks {
+            let _ = self.gpu.hip.event_destroy(b);
+            let _ = self.gpu.hip.event_destroy(e);
+        }
+        Ok(())
+    }
+
+    fn walk(&mut self, w: &WinCtx<'_>, txn: &mut PromptTxn, first: usize) -> R<()> {
+        let geo = self.geo;
         for ti in 0..w.tiles.len() {
             self.embed_tile(w, ti)?;
-            self.pre(w, ti, first)?;
+            self.traced(false, |s| s.pre(w, ti, first))?;
             self.cut_if(txn, &w.tiles[ti], first)?;
         }
         for layer in geo.band.clone() {
             for ti in 0..w.tiles.len() {
-                self.post(w, ti, layer)?;
+                self.traced(true, |s| s.post(w, ti, layer))?;
                 if layer < geo.last_layer {
-                    self.pre(w, ti, layer + 1)?;
+                    self.traced(false, |s| s.pre(w, ti, layer + 1))?;
                     self.cut_if(txn, &w.tiles[ti], layer + 1)?;
                 } else {
                     self.tile_output(w, ti)?;
@@ -4480,7 +4577,8 @@ impl HeteroRun<'_, '_> {
     }
 
     fn slot(&self, ti: usize) -> usize {
-        ti % self.lm.shared.slots()
+        // A window holds at most `layer_major_tiles` tiles: index = slot.
+        ti
     }
 
     /// Layer `layer`'s state at the session boundary tile `tile` ends at:
@@ -4565,7 +4663,10 @@ impl HeteroRun<'_, '_> {
             }
         }
         let ffn = &self.lm.ffn[self.slot(ti)];
-        with_tile_frame(
+        let trace = self.trace.is_some();
+        let mut split_marks: Option<(hip_bridge::Event, hip_bridge::Event, hip_bridge::Event)> = None;
+        let mut op_marks: Vec<(&'static str, hip_bridge::Event, hip_bridge::Event)> = Vec::new();
+        let out = with_tile_frame(
             &*self.forward,
             &*self.bundle,
             &mut *self.gpu,
@@ -4593,7 +4694,24 @@ impl HeteroRun<'_, '_> {
                         qsa = Some(op.next_lengths().map_err(dsp_err("derive QSA state"))?);
                     }
                 }
-                execute_validated_steps(gpu, frame.ctx, &steps).map_err(dsp_err("layer program"))?;
+                if trace {
+                    let moe_at = steps.iter().position(|s| matches!(s, Step::Moe(_))).unwrap_or(steps.len());
+                    let (a, b, c) = (gpu.hip.event_create()?, gpu.hip.event_create()?, gpu.hip.event_create()?);
+                    gpu.hip.event_record(&a, gpu.active_stream.as_ref())?;
+                    for step in &steps[..moe_at] {
+                        let (x, y) = (gpu.hip.event_create()?, gpu.hip.event_create()?);
+                        gpu.hip.event_record(&x, gpu.active_stream.as_ref())?;
+                        execute_validated_steps(gpu, frame.ctx, std::slice::from_ref(step)).map_err(dsp_err("layer program"))?;
+                        gpu.hip.event_record(&y, gpu.active_stream.as_ref())?;
+                        op_marks.push((step.variant_name(), x, y));
+                    }
+                    gpu.hip.event_record(&b, gpu.active_stream.as_ref())?;
+                    execute_validated_steps(gpu, frame.ctx, &steps[moe_at..]).map_err(dsp_err("layer program"))?;
+                    gpu.hip.event_record(&c, gpu.active_stream.as_ref())?;
+                    split_marks = Some((a, b, c));
+                } else {
+                    execute_validated_steps(gpu, frame.ctx, &steps).map_err(dsp_err("layer program"))?;
+                }
                 // Hold the tile's MoE/FFN result until its join: the next
                 // tile's layer rewrites the shared FFN output.
                 let src = view(&env.scratch.ffn_output, 0, n * geo.hidden);
@@ -4601,7 +4719,12 @@ impl HeteroRun<'_, '_> {
                 gpu.copy_d2d(&src, &dst, src.byte_size())?;
                 Ok(qsa)
             },
-        )
+        );
+        if let (Some(t), Some(m)) = (self.trace.as_mut(), split_marks) {
+            t.split.push(m);
+            t.ops.extend(op_marks);
+        }
+        out
     }
 
     /// Tile `ti`'s join (the expert device's cold partial into its FFN result)
