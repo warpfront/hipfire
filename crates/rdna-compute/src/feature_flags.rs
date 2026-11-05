@@ -223,6 +223,11 @@ pub struct FeatureFlags {
     /// outputs are not bitwise the SIMT route's (f32 summation order). Default on for exact
     /// gfx1201 (`=0` kills it).
     pub qwen4_lane_wmma: bool,
+    /// EP2 all-reduce / sequence-parallel HC apply fast path (`HIPFIRE_EP_AR_FAST_APPLY`): bf16
+    /// rounding by selects instead of the branchy `hip_bfloat16` casts (bit-identical for all
+    /// 2^32 inputs) and, for tagged launches of at most `AR_HC_SPLIT_MAX_ROWS` rows, one lane
+    /// per (granule, branch). Byte-identical. Default on for exact gfx1201 (`=0` kills it).
+    pub ep_ar_fast_apply: bool,
     /// Decode HC read norm + the paired write's k4 gate GEMV in one launch
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, 1..=8 rows): bitwise the unfused `hyper_norm` +
     /// `gemv_bf16_xf32_k4` sequence. Default on for exact gfx1201 (`=0` kills it).
@@ -1163,6 +1168,7 @@ impl FeatureFlags {
             qwen4_bf16_allrows: parse_bool("HIPFIRE_QWEN4_BF16_ALLROWS").unwrap_or(true),
             qwen4_hc_k4_allrows: parse_bool("HIPFIRE_QWEN4_HC_K4_ALLROWS").unwrap_or(true),
             qwen4_lane_wmma: parse_bool("HIPFIRE_QWEN4_LANE_WMMA").unwrap_or(true),
+            ep_ar_fast_apply: parse_bool("HIPFIRE_EP_AR_FAST_APPLY").unwrap_or(true),
             qwen4_hc_pair_decode: parse_bool("HIPFIRE_QWEN4_HC_PAIR_DECODE").unwrap_or(true),
             stream_ordered_copies: parse_bool("HIPFIRE_STREAM_ORDERED_COPIES").unwrap_or(true),
             qwen4_hc_pair_allrows: parse_bool("HIPFIRE_QWEN4_HC_PAIR_ALLROWS").unwrap_or(true),
@@ -1970,6 +1976,12 @@ impl FeatureFlags {
         self.qwen4_lane_wmma && self.arch == "gfx1201"
     }
 
+    /// EP2 AR / SP HC apply fast path (`HIPFIRE_EP_AR_FAST_APPLY`, default on, `=0` kills it).
+    /// Exact gfx1201 only (the only arch with those kernels).
+    pub fn ep_ar_fast_apply_enabled(&self) -> bool {
+        self.ep_ar_fast_apply && self.arch == "gfx1201"
+    }
+
     /// Decode HC read norm + paired write k4 gate GEMV in one launch
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, default on, `=0` kills it). Exact gfx1201 only.
     pub fn qwen4_hc_pair_decode_enabled(&self) -> bool {
@@ -2150,6 +2162,7 @@ impl FeatureFlags {
             qwen4_bf16_allrows: false,
             qwen4_hc_k4_allrows: false,
             qwen4_lane_wmma: false,
+            ep_ar_fast_apply: false,
             qwen4_hc_pair_decode: false,
             stream_ordered_copies: false,
             qwen4_hc_pair_allrows: false,
@@ -3612,6 +3625,39 @@ mod tests {
             assert_eq!(on.qwen4_lane_wmma_enabled(), arch == "gfx1201", "{arch}: 1");
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_wmma_enabled());
+    }
+
+    /// The EP2 AR fast apply is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn ep_ar_fast_apply_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_EP_AR_FAST_APPLY" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.ep_ar_fast_apply_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.ep_ar_fast_apply_enabled(), "{arch}: 0");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(
+                on.ep_ar_fast_apply_enabled(),
+                arch == "gfx1201",
+                "{arch}: 1"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").ep_ar_fast_apply_enabled());
     }
 
     /// The decode HC read/write pair fusion is default on (`=0` kills) and reaches exact gfx1201 only.

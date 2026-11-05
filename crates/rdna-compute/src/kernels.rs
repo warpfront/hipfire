@@ -10912,6 +10912,23 @@ pub const SP_HC_RS_AG_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/sp_hc_rs_ag.gfx1201.hip")
 );
 
+/// [`AR_HC_WRITE_GFX1201_SRC`] with the `hip_bfloat16` casts in the HC apply rounding
+/// (`ARHC_RND_HIP_BF16`, kill switch `HIPFIRE_EP_AR_FAST_APPLY=0`; the default source rounds
+/// with bit-identical selects).
+pub const AR_HC_WRITE_GFX1201_HIPBF16_SRC: &str = concat!(
+    "#define ARHC_RND_HIP_BF16 1\n",
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/ar_hc_write.gfx1201.hip")
+);
+
+/// [`SP_HC_RS_AG_GFX1201_SRC`] with the `hip_bfloat16` casts (`HIPFIRE_EP_AR_FAST_APPLY=0`).
+pub const SP_HC_RS_AG_GFX1201_HIPBF16_SRC: &str = concat!(
+    "#define ARHC_RND_HIP_BF16 1\n",
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/ar_hc_write.gfx1201.hip"),
+    include_str!("../../../kernels/src/sp_hc_rs_ag.gfx1201.hip")
+);
+
 /// 16-bit partial-sum exchange for the dense TP residual reduction
 /// (`HIPFIRE_TP_EXCHANGE=bf16|f16`): `tp_pack16_{bf16,f16}` converts an f32
 /// partial to 16 bits, `tp_fold16_{bf16,f16}` sums rank-ordered 16-bit

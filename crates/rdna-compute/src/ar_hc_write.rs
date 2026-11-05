@@ -52,6 +52,13 @@ const KERNEL: &str = "ar_hc_write_gfx1201";
 const KERNEL_F32S: &str = "ar_hc_write_f32s_gfx1201";
 const KERNEL_D8: &str = "ar_hc_write_d8_gfx1201";
 const KERNEL_D8_F32S: &str = "ar_hc_write_d8_f32s_gfx1201";
+const KERNEL_S: &str = "ar_hc_write_s_gfx1201";
+const KERNEL_S_F32S: &str = "ar_hc_write_s_f32s_gfx1201";
+/// Most rows of a branch-split launch (tagged wire, `HIPFIRE_EP_AR_FAST_APPLY`): one lane per
+/// (granule, branch) item, 4 * rows * 640 items within [`AR_HC_MAX_BLOCKS`] blocks of at most
+/// [`AR_HC_MAX_LANES`] lanes (12 rows: 64 x 480).
+// selector-receipt: receipts/selectors/ar_hc_split_max_rows.json
+pub const AR_HC_SPLIT_MAX_ROWS: usize = 12;
 
 /// The mailbox wire format of one transport (fixed per [`ArHcExchange`] at construction).
 ///
@@ -120,6 +127,13 @@ impl StreamKind {
             (ArHcWire::Tagged, Self::F32) => KERNEL_F32S,
             (ArHcWire::Dense, Self::Bf16) => KERNEL_D8,
             (ArHcWire::Dense, Self::F32) => KERNEL_D8_F32S,
+        }
+    }
+    /// The branch-split tagged entry of this kind ([`ar_hc_split_geometry`]).
+    pub fn split_symbol(self) -> &'static str {
+        match self {
+            Self::Bf16 => KERNEL_S,
+            Self::F32 => KERNEL_S_F32S,
         }
     }
     /// Bytes per stream element.
@@ -207,6 +221,22 @@ pub fn ar_hc_geometry(rows: usize) -> Option<(u32, u32)> {
     ar_hc_geometry_with(rows, AR_HC_DEFAULT_BLOCKS, AR_HC_DEFAULT_LANES)
 }
 
+/// Launch geometry `(blocks, lanes)` of a branch-split launch of `rows` rows (1 ..=
+/// [`AR_HC_SPLIT_MAX_ROWS`]): `items = 4 * granules` (one per lane), up to 64 lanes per block
+/// spread over at most [`AR_HC_MAX_BLOCKS`] blocks; the kernel's per-block item count
+/// `per = round_up4(ceil(items / blocks))` fits the lanes (a granule's four items share a
+/// block and a wave).
+pub fn ar_hc_split_geometry(rows: usize) -> Option<(u32, u32)> {
+    if rows == 0 || rows > AR_HC_SPLIT_MAX_ROWS {
+        return None;
+    }
+    let items = rows * AR_HC_HIDDEN;
+    let b = items.div_ceil(64).min(AR_HC_MAX_BLOCKS);
+    let per = items.div_ceil(b).next_multiple_of(4);
+    let t = per.next_multiple_of(32);
+    (t <= AR_HC_MAX_LANES).then_some((b as u32, t as u32))
+}
+
 impl Gpu {
     /// Resolve the kernel before graph capture (JIT is not capture-safe).
     pub fn ensure_ar_hc_write_gfx1201_kernel(
@@ -221,7 +251,16 @@ impl Gpu {
                 &format!("ar_hc_write_gfx1201 requires gfx1201, got {}", self.arch),
             ));
         }
-        self.ensure_kernel(KERNEL, kernels::AR_HC_WRITE_GFX1201_SRC, kind.symbol(wire))
+        let src = if self.flags.ep_ar_fast_apply_enabled() {
+            kernels::AR_HC_WRITE_GFX1201_SRC
+        } else {
+            kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC
+        };
+        self.ensure_kernel(KERNEL, src, kind.symbol(wire))?;
+        if wire == ArHcWire::Tagged && self.flags.ep_ar_fast_apply_enabled() {
+            self.ensure_kernel(KERNEL, src, kind.split_symbol())?;
+        }
+        Ok(())
     }
 
     /// Push this rank's f32 partial `[rows, 2560]` (bf16-rounded) into the peer's mailbox,
@@ -232,7 +271,9 @@ impl Gpu {
     /// `peer_mailbox` is the PEER's mailbox (peer access enabled), `local_mailbox` this
     /// rank's own; each holds two banks `bank_stride` bytes apart. `generation` is this
     /// rank's [`AR_HC_GEN_BYTES`] block. `mixed_dbg` (oracle only, null otherwise) receives
-    /// the folded `m`. One launch.
+    /// the folded `m`. One launch. Tagged launches of at most [`AR_HC_SPLIT_MAX_ROWS`] rows
+    /// take the branch-split entry at [`ar_hc_split_geometry`] instead of `geometry`
+    /// (`HIPFIRE_EP_AR_FAST_APPLY`, byte-identical).
     ///
     /// # Safety
     /// Every pointer must address live device memory of the extents above on this rank's
@@ -286,6 +327,13 @@ impl Gpu {
                 kind.alignment()
             )));
         }
+        let split = (wire == ArHcWire::Tagged && self.flags.ep_ar_fast_apply_enabled())
+            .then(|| ar_hc_split_geometry(rows))
+            .flatten();
+        let (symbol, geometry) = match split {
+            Some(g) => (kind.split_symbol(), g),
+            None => (kind.symbol(wire), geometry),
+        };
         let gen_ptr = generation.as_ptr();
         let stride_arg = u32::try_from(bank_stride).map_err(|_| fail("bank stride exceeds u32"))?;
         let first_arg = i32::from(local_is_first);
@@ -305,7 +353,7 @@ impl Gpu {
             &mixed_dbg as *const _ as *mut c_void,
         ];
         self.launch_maybe_blob(
-            kind.symbol(wire),
+            symbol,
             [geometry.0, 1, 1],
             [geometry.1, 1, 1],
             0,
@@ -547,11 +595,8 @@ impl Gpu {
                 &format!("sp_hc_rs_gfx1201 requires gfx1201, got {}", self.arch),
             ));
         }
-        self.ensure_kernel(
-            SP_MODULE,
-            kernels::SP_HC_RS_AG_GFX1201_SRC,
-            sp_rs_symbol(kind),
-        )
+        let src = self.sp_hc_rs_ag_src();
+        self.ensure_kernel(SP_MODULE, src, sp_rs_symbol(kind))
     }
 
     /// Resolve the all-gather kernel of `elem` before graph capture.
@@ -563,7 +608,18 @@ impl Gpu {
                 &format!("sp_ag_rows_gfx1201 requires gfx1201, got {}", self.arch),
             ));
         }
-        self.ensure_kernel(SP_MODULE, kernels::SP_HC_RS_AG_GFX1201_SRC, elem.symbol())
+        let src = self.sp_hc_rs_ag_src();
+        self.ensure_kernel(SP_MODULE, src, elem.symbol())
+    }
+
+    /// SP module source: bf16 rounding by selects, or the `hip_bfloat16` casts under
+    /// `HIPFIRE_EP_AR_FAST_APPLY=0` (bit-identical either way).
+    fn sp_hc_rs_ag_src(&self) -> &'static str {
+        if self.flags.ep_ar_fast_apply_enabled() {
+            kernels::SP_HC_RS_AG_GFX1201_SRC
+        } else {
+            kernels::SP_HC_RS_AG_GFX1201_HIPBF16_SRC
+        }
     }
 
     /// Reduce-scatter fused into the HC write: push `bf16(partial)` of the PEER row range
@@ -1002,6 +1058,42 @@ mod tests {
         );
     }
 
+    /// A branch-split launch gives every (granule, branch) item exactly one lane, keeps the
+    /// four items of a granule inside one block and one wave (aligned group of four lanes),
+    /// and exists exactly for 1 ..= AR_HC_SPLIT_MAX_ROWS rows. Mirrors arhc_split_entry.
+    #[test]
+    fn split_geometry_covers_every_item_once() {
+        assert!(ar_hc_split_geometry(0).is_none());
+        assert!(ar_hc_split_geometry(AR_HC_SPLIT_MAX_ROWS + 1).is_none());
+        for rows in 1..=AR_HC_SPLIT_MAX_ROWS {
+            let (blocks, lanes) = ar_hc_split_geometry(rows).expect("split geometry");
+            assert!(blocks as usize <= AR_HC_MAX_BLOCKS && lanes as usize <= AR_HC_MAX_LANES);
+            assert_eq!(lanes % 32, 0);
+            let items = rows * AR_HC_HIDDEN;
+            let per = (items.div_ceil(blocks as usize) + 3) & !3;
+            assert!(
+                per <= lanes as usize,
+                "rows {rows}: per {per} > lanes {lanes}"
+            );
+            let mut seen = vec![0u8; items];
+            for blk in 0..blocks as usize {
+                let (i0, i1) = (blk * per, items.min(blk * per + per));
+                assert_eq!(i0 % 4, 0);
+                for tid in 0..per {
+                    let i = i0 + tid;
+                    if i < i1 {
+                        seen[i] += 1;
+                        // the granule's four items: same block, lanes tid & !3 .. +3 (one wave)
+                        assert_eq!(i & 3, tid & 3);
+                    }
+                }
+            }
+            assert!(seen.iter().all(|&c| c == 1), "rows {rows}");
+        }
+        assert_eq!(ar_hc_split_geometry(1), Some((40, 64)));
+        assert_eq!(ar_hc_split_geometry(8), Some((64, 320)));
+    }
+
     #[test]
     fn bank_bytes_are_aligned_and_sized() {
         assert_eq!(ar_hc_bank_bytes(1), (640 * 16usize).next_multiple_of(256));
@@ -1180,16 +1272,26 @@ mod tests {
     /// the F32 instantiation.
     #[test]
     fn kernel_source_has_both_entries() {
-        let src = kernels::AR_HC_WRITE_GFX1201_SRC;
-        for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+        for src in [
+            kernels::AR_HC_WRITE_GFX1201_SRC,
+            kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC,
+        ] {
+            for wire in [ArHcWire::Tagged, ArHcWire::Dense] {
+                for kind in StreamKind::ALL {
+                    assert!(
+                        src.contains(&format!("void {}(", kind.symbol(wire))),
+                        "{}",
+                        kind.symbol(wire)
+                    );
+                }
+            }
             for kind in StreamKind::ALL {
-                assert!(
-                    src.contains(&format!("void {}(", kind.symbol(wire))),
-                    "{}",
-                    kind.symbol(wire)
-                );
+                assert!(src.contains(&format!("void {}(", kind.split_symbol())));
             }
         }
+        assert!(kernels::AR_HC_WRITE_GFX1201_HIPBF16_SRC.starts_with("#define ARHC_RND_HIP_BF16"));
+        assert!(kernels::SP_HC_RS_AG_GFX1201_HIPBF16_SRC.starts_with("#define ARHC_RND_HIP_BF16"));
+        let src = kernels::AR_HC_WRITE_GFX1201_SRC;
         for inst in [
             "arhc_entry<true, false>",
             "arhc_entry<false, false>",
@@ -1251,6 +1353,13 @@ mod tests {
                     "{symbol} missing"
                 );
             }
+        }
+        for kind in StreamKind::ALL {
+            let symbol = kind.split_symbol();
+            assert!(
+                image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+                "{symbol} missing"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

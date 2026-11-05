@@ -27,6 +27,9 @@
 //! all-EMPTY (0xFF) in the rank's own mailbox (the consumer re-arm).
 //! Also a bounded-wait fault check at the end (rank 1 skips a launch; rank 0's wait must
 //! record `AR_HC_WRITE_GFX1201` in the wait block and the step must fail) unless `--no-fault`.
+//! Rounding check (rank 0, unless `--no-rnd-check`): the kernel's bf16 rounding helpers
+//! (`arhc_rnd_bits` / `arhc_rnd`, written as selects) against `hip_bfloat16` over all 2^32
+//! f32 bit patterns on device: zero mismatches and full coverage required.
 //! Exit code 3 on any failure; a JSON receipt lands in `--out` (default `.`).
 
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
@@ -39,6 +42,65 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::ffi::c_void;
 use std::sync::{Arc, Barrier, Mutex};
 
+/// The product module's helpers (prepended) vs `hip_bfloat16`, every f32 bit pattern.
+const RND_CHECK_SRC: &str = r#"
+extern "C" __global__ __launch_bounds__(256) void arhc_rnd_check(unsigned long long *out) {
+    const unsigned long long n = 1ull << 32;
+    const unsigned long long stride = (unsigned long long)gridDim.x * blockDim.x;
+    unsigned long long bad = 0, seen = 0;
+    unsigned first = 0;
+    for (unsigned long long i = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x; i < n; i += stride) {
+        const unsigned u = (unsigned)i;
+        const float f = __uint_as_float(u);
+        const hip_bfloat16 h = static_cast<hip_bfloat16>(f);
+        const unsigned want = (unsigned)h.data;
+        const unsigned wantf = __float_as_uint(static_cast<float>(h));
+        if (arhc_rnd_bits(f) != want || __float_as_uint(arhc_rnd(f)) != wantf) {
+            if (bad == 0) first = u;
+            ++bad;
+        }
+        ++seen;
+    }
+    atomicAdd(out + 0, bad);
+    atomicAdd(out + 1, seen);
+    if (bad != 0) atomicExch(out + 2, (unsigned long long)first);
+}
+"#;
+
+/// Run the rounding check; `Ok(note)` starts with "ok" or "FAIL".
+fn rnd_check(gpu: &mut Gpu) -> Result<String, String> {
+    let e = |e: hip_bridge::HipError| e.to_string();
+    let src = format!(
+        "{}{}",
+        rdna_compute::kernels::AR_HC_WRITE_GFX1201_SRC,
+        RND_CHECK_SRC
+    );
+    gpu.ensure_kernel_public("arhc_rnd_check", &src, "arhc_rnd_check")
+        .map_err(e)?;
+    let out = gpu.hip.malloc(24).map_err(e)?;
+    gpu.hip.memset(&out, 0, 24).map_err(e)?;
+    let mut b = hip_bridge::KernargBlob::new();
+    b.push_ptr(out.as_ptr());
+    gpu.launch_kernel_blob(
+        "arhc_rnd_check",
+        [4096, 1, 1],
+        [256, 1, 1],
+        0,
+        b.as_mut_slice(),
+    )
+    .map_err(e)?;
+    gpu.hip.device_synchronize().map_err(e)?;
+    let mut w = [0u8; 24];
+    gpu.hip.memcpy_dtoh(&mut w, &out).map_err(e)?;
+    gpu.hip.free(out).map_err(e)?;
+    let v = |i: usize| u64::from_le_bytes(w[i * 8..i * 8 + 8].try_into().unwrap());
+    let (bad, seen, first) = (v(0), v(1), v(2));
+    Ok(if bad == 0 && seen == 1u64 << 32 {
+        format!("ok: arhc_rnd_bits/arhc_rnd == hip_bfloat16 on all {seen} f32 bit patterns")
+    } else {
+        format!("FAIL: {bad} mismatches (first input 0x{first:08x}), {seen} of 2^32 inputs covered")
+    })
+}
 struct Rng(u64);
 impl Rng {
     fn next(&mut self) -> u64 {
@@ -85,6 +147,7 @@ struct RankResult {
     tallies: Vec<(StreamKind, usize, Tally)>,
     streams: Vec<(usize, Vec<u8>)>,
     fault: Option<String>,
+    rnd: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -95,6 +158,7 @@ fn run_rank(
     kinds: Vec<StreamKind>,
     iters: usize,
     fault: bool,
+    rnd: bool,
     x: Arc<ArHcExchange>,
     barrier: Arc<Barrier>,
     shared_ref: Arc<Mutex<Vec<Vec<u8>>>>,
@@ -107,6 +171,12 @@ fn run_rank(
     barrier.wait();
     x.qualify(rank, &mut gpu, 8, 16)
         .map_err(|e| format!("qualification: {e}"))?;
+    barrier.wait();
+    let rnd_note = if rnd && rank == 0 {
+        Some(rnd_check(&mut gpu)?)
+    } else {
+        None
+    };
     barrier.wait();
     let mut tallies = Vec::new();
     let mut last_streams = Vec::new();
@@ -378,6 +448,7 @@ fn run_rank(
         tallies,
         streams: Vec::new(),
         fault: fault_note,
+        rnd: rnd_note,
     })
 }
 
@@ -387,6 +458,7 @@ fn main() {
     let mut devices = [0i32, 1i32];
     let mut out = ".".to_string();
     let mut fault = true;
+    let mut rnd = true;
     let mut kinds = StreamKind::ALL.to_vec();
     let mut wire = hipfire_runtime::ar_hc_exchange::ar_hc_mode_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -435,6 +507,7 @@ fn main() {
                 };
             }
             "--no-fault" => fault = false,
+            "--no-rnd-check" => rnd = false,
             other => panic!("unknown argument {other}"),
         }
         i += 1;
@@ -456,7 +529,7 @@ fn main() {
                 kinds.clone(),
             );
             let dev = devices[rank];
-            std::thread::spawn(move || run_rank(rank, dev, rl, kinds, iters, fault, x, b, s))
+            std::thread::spawn(move || run_rank(rank, dev, rl, kinds, iters, fault, rnd, x, b, s))
         })
         .collect();
     let results: Vec<Result<RankResult, String>> = handles
@@ -488,6 +561,14 @@ fn main() {
                 if let Some(f) = &res.fault {
                     eprintln!("rank {rank} fault check: {f}");
                     failed |= f.starts_with("FAIL");
+                }
+                if let Some(f) = &res.rnd {
+                    eprintln!("rank {rank} rounding check: {f}");
+                    failed |= !f.starts_with("ok");
+                    json_rows.push(format!(
+                        "{{\"rank\":{rank},\"rnd_check\":\"{f}\",\"pass\":{}}}",
+                        f.starts_with("ok")
+                    ));
                 }
             }
         }

@@ -22,6 +22,15 @@
 //!    posted-store ceiling the current kernel is compared against.
 //! The per-rank fit `t(rows) = a + b * rows` (least squares over the rows list) is printed
 //! for every series. Exit code 3 on any device wait error.
+//!
+//! `--breakdown`: instead of the series above, the phase breakdown of `arhc_lab/breakdown.rs`
+//! (launch floor / push / rendezvous poll / fold+apply / ticket tail, spin-gated pipelines,
+//! realtime stamps) for both wires per (stream kind, rows) case.
+
+#[path = "arhc_lab/breakdown.rs"]
+mod breakdown;
+#[path = "arhc_lab/pushlab.rs"]
+mod pushlab;
 
 use hip_bridge::KernargBlob;
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
@@ -84,6 +93,8 @@ struct Row {
 
 struct Rank {
     rows: Vec<Row>,
+    bd: Vec<breakdown::BdRow>,
+    pl: Vec<(String, f64)>,
     err: Option<String>,
 }
 
@@ -106,6 +117,7 @@ fn run_rank(
     x: Arc<ArHcExchange>,
     barrier: Arc<Barrier>,
     probe_ptrs: Arc<Mutex<[usize; 2]>>,
+    bd: Option<(bool, Arc<Mutex<[usize; 2]>>)>,
 ) -> Result<Rank, String> {
     let max_rows = *rows_list.iter().max().unwrap();
     let mut gpu = Gpu::init_with_device(device).map_err(|e| e.to_string())?;
@@ -122,6 +134,22 @@ fn run_rank(
         .memset(&sink, 0, probe_bytes)
         .map_err(|e| e.to_string())?;
     probe_ptrs.lock().unwrap()[rank] = sink.as_ptr() as usize;
+    let lab = match &bd {
+        Some((false, p)) => {
+            let l = breakdown::alloc(&mut gpu, max_rows)?;
+            p.lock().unwrap()[rank] = l.mbox.as_ptr() as usize;
+            Some(l)
+        }
+        _ => None,
+    };
+    let plab = match &bd {
+        Some((true, p)) => {
+            let l = pushlab::alloc(&mut gpu)?;
+            p.lock().unwrap()[rank] = l.sink.as_ptr() as usize;
+            Some(l)
+        }
+        _ => None,
+    };
     barrier.wait();
     x.enable_peers(rank, &mut gpu).map_err(|e| e.to_string())?;
     for sym in ["arwire_probe_st16", "arwire_probe_st8"] {
@@ -133,6 +161,32 @@ fn run_rank(
         .map_err(|e| format!("qualification: {e}"))?;
     barrier.wait();
     let peer_sink = probe_ptrs.lock().unwrap()[1 - rank] as *mut c_void;
+    if let (Some(l), Some((_, p))) = (&lab, &bd) {
+        let peer_lab = p.lock().unwrap()[1 - rank];
+        let res = breakdown::run(
+            rank, &mut gpu, l, peer_lab, &x, &barrier, &rows_list, &kinds, iters, iso,
+        );
+        barrier.wait();
+        x.release(rank, &mut gpu).map_err(|e| e.to_string())?;
+        return Ok(Rank {
+            rows: Vec::new(),
+            bd: res?,
+            pl: Vec::new(),
+            err: None,
+        });
+    }
+    if let (Some(_), Some((_, p))) = (&plab, &bd) {
+        let peer = p.lock().unwrap()[1 - rank];
+        let res = pushlab::run(&mut gpu, peer, &barrier, iters);
+        barrier.wait();
+        x.release(rank, &mut gpu).map_err(|e| e.to_string())?;
+        return Ok(Rank {
+            rows: Vec::new(),
+            bd: Vec::new(),
+            pl: res?,
+            err: None,
+        });
+    }
     let start = gpu.hip.event_create().map_err(|e| e.to_string())?;
     let stop = gpu.hip.event_create().map_err(|e| e.to_string())?;
     let mut out = Vec::new();
@@ -292,6 +346,8 @@ fn run_rank(
     gpu.hip.free(sink).map_err(|e| e.to_string())?;
     Ok(Rank {
         rows: out,
+        bd: Vec::new(),
+        pl: Vec::new(),
         err: None,
     })
 }
@@ -304,6 +360,8 @@ fn main() {
     let mut out = ".".to_string();
     let mut kinds = StreamKind::ALL.to_vec();
     let mut probe = true;
+    let mut breakdown_mode = false;
+    let mut push_lab = false;
     let mut wire = hipfire_runtime::ar_hc_exchange::ar_hc_mode_from_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -355,6 +413,8 @@ fn main() {
                 };
             }
             "--no-probe" => probe = false,
+            "--breakdown" => breakdown_mode = true,
+            "--push-lab" => push_lab = true,
             other => panic!("unknown argument {other}"),
         }
         i += 1;
@@ -364,17 +424,22 @@ fn main() {
     let x = Arc::new(ArHcExchange::with_mode(max_rows, wire).expect("exchange"));
     let barrier = Arc::new(Barrier::new(2));
     let ptrs = Arc::new(Mutex::new([0usize; 2]));
+    let bd_ptrs =
+        (breakdown_mode || push_lab).then(|| (push_lab, Arc::new(Mutex::new([0usize; 2]))));
     let handles: Vec<_> = (0..2)
         .map(|rank| {
-            let (x, b, p, rl, kinds) = (
+            let (x, b, p, rl, kinds, bdp) = (
                 x.clone(),
                 barrier.clone(),
                 ptrs.clone(),
                 rows_list.clone(),
                 kinds.clone(),
+                bd_ptrs.clone(),
             );
             let dev = devices[rank];
-            std::thread::spawn(move || run_rank(rank, dev, rl, kinds, iters, iso, probe, x, b, p))
+            std::thread::spawn(move || {
+                run_rank(rank, dev, rl, kinds, iters, iso, probe, x, b, p, bdp)
+            })
         })
         .collect();
     let results: Vec<Result<Rank, String>> = handles
@@ -391,6 +456,57 @@ fn main() {
             }
             Ok(res) => {
                 let _ = &res.err;
+                for (label, us) in &res.pl {
+                    // ovl/push rows push 163840 granules x 8 B (4x for "4x bytes") per direction
+                    let bytes = if label.contains("4x bytes") { 4.0 } else { 1.0 } * 163840.0 * 8.0;
+                    let gbs = if label.contains("apply") {
+                        0.0
+                    } else {
+                        bytes / us / 1e3
+                    };
+                    eprintln!(
+                        "rank {rank} PUSHLAB {label:36} {us:8.2} us  {gbs:6.1} GB/s per direction"
+                    );
+                    json.push(format!(
+                        "{{\"rank\":{rank},\"push_lab\":\"{label}\",\"us\":{us:.3},\"gbs\":{gbs:.2}}}"
+                    ));
+                }
+                for r in &res.bd {
+                    eprintln!(
+                        "rank {rank} BREAKDOWN {} {} rows={} geometry={}x{}",
+                        r.kind,
+                        if r.dense { "dense" } else { "tagged" },
+                        r.rows,
+                        r.geometry.0,
+                        r.geometry.1
+                    );
+                    eprintln!(
+                        "  {:24} {:>8} {:>8} {:>8}",
+                        "series", "pipe_us", "iso_med", "iso_min"
+                    );
+                    let mut js = Vec::new();
+                    for (label, p, im, imin) in &r.series {
+                        eprintln!("  {label:24} {p:8.2} {im:8.2} {imin:8.2}");
+                        js.push(format!(
+                            "{{\"series\":\"{label}\",\"pipe_us\":{p:.3},\"iso_med_us\":{im:.3},\"iso_min_us\":{imin:.3}}}"
+                        ));
+                    }
+                    let st = r.stamps.unwrap_or_default();
+                    eprintln!(
+                        "  stamps (m31, us since block entry, mean): push_issued {:.2} poll_done {:.2} apply_issued {:.2} ticket_done {:.2}; body span med {:.2}; gap med {:.2}; stamp/event span {:.3}",
+                        st[0], st[1], st[2], st[3], st[4], st[5], st[6]
+                    );
+                    json.push(format!(
+                        "{{\"rank\":{rank},\"breakdown\":true,\"stream\":\"{}\",\"wire\":\"{}\",\"rows\":{},\"grid\":{},\"lanes\":{},\"series\":[{}],\"stamps_us\":[{}]}}",
+                        r.kind,
+                        if r.dense { "dense" } else { "tagged" },
+                        r.rows,
+                        r.geometry.0,
+                        r.geometry.1,
+                        js.join(","),
+                        st.iter().map(|v| format!("{v:.3}")).collect::<Vec<_>>().join(",")
+                    ));
+                }
                 for kind in &kinds {
                     let rows: Vec<&Row> =
                         res.rows.iter().filter(|r| r.kind == kind.name()).collect();
