@@ -38,6 +38,7 @@ pub mod profile;
 pub mod railgun_guard;
 pub mod reg;
 pub mod sync;
+pub mod valu_sched;
 pub mod vopd;
 pub mod kernels {
     pub mod argmax_regrid_pm;
@@ -164,6 +165,10 @@ pub struct Builder {
     hazard: Gfx12Sgpr,
     gfx11_hazard: Gfx11Hazards,
     delay_alu: Option<DelayAlu>,
+    /// `enable_valu_schedule`: the buffered run of plain VALU instructions.
+    valu_window: Option<Vec<Instruction>>,
+    /// The last single-slot `s_delay_alu` (pc, its target pc) a later hint may merge into.
+    delay_merge: Option<(usize, usize)>,
     labels: Vec<String>,
     current_label: String,
     lds_access_allowed: bool,
@@ -244,6 +249,8 @@ impl Builder {
             hazard: Gfx12Sgpr::default(),
             gfx11_hazard: Gfx11Hazards::for_arch(arch),
             delay_alu: None,
+            valu_window: None,
+            delay_merge: None,
             labels: vec!["entry".into()],
             current_label: "entry".into(),
             lds_access_allowed: false,
@@ -266,16 +273,91 @@ impl Builder {
     }
     /// The program so far (read-only).
     pub fn program(&self) -> &Program {
+        self.assert_flushed();
         &self.program
     }
     /// The wait ledger at the current point (read-only).
     pub fn ledger(&self) -> &Ledger {
+        self.assert_flushed();
         &self.ledger
     }
     /// Emit `s_delay_alu` issue hints before dependent VALU instructions (see
     /// `hazard::DelayAlu`). Opt-in, so existing kernels keep their bytes.
     pub fn enable_delay_alu(&mut self) {
         self.delay_alu = Some(DelayAlu::default())
+    }
+    /// gfx12: buffer each run of plain VALU instructions and list-schedule it
+    /// (latency, memory waits) with VOPD dual-issue packing (`valu_sched`).
+    /// Opt-in, so existing kernels keep their bytes.
+    pub fn enable_valu_schedule(&mut self) -> Result<(), String> {
+        if !self.spec.arch.gfx12() || !self.spec.wave32 {
+            return Err("valu schedule: gfx12 wave32 only (VOPD)".into());
+        }
+        self.valu_window = Some(vec![]);
+        Ok(())
+    }
+    /// Emit the buffered VALU run in scheduled order. Every point that reads or
+    /// appends the program other than a buffered VALU flushes first; emitters
+    /// that compare `ledger()` across a body call this before reading it.
+    pub fn flush_valu(&mut self) -> Result<(), String> {
+        let pending = match self.valu_window.as_mut() {
+            Some(w) if !w.is_empty() => std::mem::take(w),
+            _ => return Ok(()),
+        };
+        let arch = self.spec.arch;
+        let dag = valu_sched::Dag::new(pending);
+        let n = dag.len();
+        let mut issued: Vec<Option<usize>> = vec![None; n];
+        let mut done = 0;
+        let mut now = 0;
+        // A wait the ledger would need before the instruction: none sorts first,
+        // then the weakest (largest remaining count).
+        let wait_key = |b: &Builder, i: &Instruction| -> usize {
+            b.ledger
+                .required(i)
+                .iter()
+                .map(|(_, c, _)| 256 - usize::from(*c))
+                .sum()
+        };
+        while done < n {
+            let ready: Vec<usize> = (0..n).filter(|i| dag.ready(&issued, *i)).collect();
+            let key = |i: usize| {
+                (
+                    wait_key(self, &dag.insns[i]),
+                    dag.stall(&issued, i, now),
+                    usize::MAX - dag.height[i],
+                    i,
+                )
+            };
+            let a = *ready.iter().min_by_key(|i| key(**i)).unwrap();
+            let ka = key(a);
+            let partner = ready
+                .iter()
+                .copied()
+                .filter(|b| *b != a && wait_key(self, &dag.insns[*b]) <= ka.0)
+                .filter_map(|b| {
+                    valu_sched::pair(arch, &dag.insns[a], &dag.insns[b]).map(|p| (b, p))
+                })
+                .min_by_key(|(b, _)| key(*b));
+            issued[a] = Some(now);
+            done += 1;
+            match partner {
+                Some((b, packet)) => {
+                    issued[b] = Some(now);
+                    done += 1;
+                    self.emit_now(packet)?
+                }
+                None => self.emit_now(dag.insns[a].clone())?,
+            }
+            now += 1;
+        }
+        Ok(())
+    }
+    fn assert_flushed(&self) {
+        assert!(
+            self.valu_window.as_ref().map_or(true, Vec::is_empty),
+            "read the program/ledger after Builder::flush_valu"
+        )
     }
     /// Enable the descriptor's workgroup Z input without changing instructions.
     ///
@@ -296,6 +378,8 @@ impl Builder {
         self.place_label(name)
     }
     fn place_label(&mut self, name: &str) -> Result<(), String> {
+        self.flush_valu()?;
+        self.delay_merge = None;
         if self.labels.iter().any(|l| l == name) {
             return Err(format!("duplicate label {name}"));
         }
@@ -327,6 +411,7 @@ impl Builder {
         Ok(())
     }
     fn emit_wait(&mut self, c: Counter, n: u8, reason: Reason) -> Result<(), String> {
+        self.flush_valu()?;
         let entries = Ledger::wait_instruction(self.spec.arch, &[(c, n, reason.clone())])?;
         for (_, _, text, _) in entries {
             let pc_index = self.program.instructions.len();
@@ -348,6 +433,7 @@ impl Builder {
         self.emit_wait(c, n, Reason::Barrier)
     }
     fn emit_required(&mut self, mut required: Vec<(Counter, u8, Reason)>) -> Result<(), String> {
+        self.flush_valu()?;
         let (first_counter, second_counter, _) = combined_wait(self.spec.arch, 0, 0);
         let first = required
             .iter()
@@ -403,6 +489,7 @@ impl Builder {
     /// gfx12 `s_wait_alu depctr_vm_vsrc(0)`: every issued VMEM store has read its
     /// sources, so they may be redefined without waiting for store completion.
     pub fn release_store_sources(&mut self) -> Result<(), String> {
+        self.flush_valu()?;
         if !self.spec.arch.gfx12() {
             return Err("depctr_vm_vsrc requires gfx12".into());
         }
@@ -489,8 +576,23 @@ impl Builder {
         }
         Ok(())
     }
-    /// Every instruction goes through here: waits, hazard guards, ledger.
+    /// Every instruction goes through here; with `enable_valu_schedule` a plain
+    /// VALU instruction is checked and buffered, anything else flushes the run.
     fn emit(&mut self, insn: Instruction) -> Result<(), String> {
+        if self.valu_window.is_some() && valu_sched::schedulable(&insn) {
+            insn.validate(self.spec.arch)?;
+            for r in insn.defs.iter().chain(&insn.uses) {
+                self.regs
+                    .verify_access(*r, &self.current_label, &self.labels)?
+            }
+            self.valu_window.as_mut().unwrap().push(insn);
+            return Ok(());
+        }
+        self.flush_valu()?;
+        self.emit_now(insn)
+    }
+    /// Waits, hazard guards, ledger.
+    fn emit_now(&mut self, insn: Instruction) -> Result<(), String> {
         insn.validate(self.spec.arch)?;
         if self
             .program
@@ -630,14 +732,44 @@ impl Builder {
                 .and_then(|d| d.step(mnemonic, &insn.uses, &insn.defs))
             {
                 let pc_index = self.program.instructions.len();
-                self.program
-                    .instructions
-                    .push(Instruction::new(text.clone(), vec![], vec![]));
-                self.hazards.push(HazardProof {
-                    pc_index,
-                    insn: text,
-                    rule: "VALU dependency issue hint".into(),
-                });
+                // Scheduled code: fold a single-dependency hint into the previous
+                // hint's second slot (`instskip`/`instid1`, as AMDGPUInsertDelayAlu
+                // does) when its target is 1..=5 instructions after that hint's.
+                let merged = match (self.valu_window.is_some(), self.delay_merge) {
+                    (true, Some((at, target)))
+                        if !text.contains('|') && (1..=5).contains(&(pc_index - target)) =>
+                    {
+                        let d = pc_index - target;
+                        let skip = if d == 1 {
+                            "NEXT".to_string()
+                        } else {
+                            format!("SKIP_{}", d - 1)
+                        };
+                        let second = text.trim_start_matches("s_delay_alu instid0");
+                        let old = &mut self.program.instructions[at].text;
+                        *old = format!("{old} | instskip({skip}) | instid1{second}");
+                        self.hazards
+                            .iter_mut()
+                            .rev()
+                            .find(|h| h.pc_index == at)
+                            .expect("merged hint has its proof")
+                            .insn = old.clone();
+                        self.delay_merge = None;
+                        true
+                    }
+                    _ => false,
+                };
+                if !merged {
+                    self.program
+                        .instructions
+                        .push(Instruction::new(text.clone(), vec![], vec![]));
+                    self.hazards.push(HazardProof {
+                        pc_index,
+                        insn: text.clone(),
+                        rule: "VALU dependency issue hint".into(),
+                    });
+                    self.delay_merge = (!text.contains('|')).then_some((pc_index, pc_index + 1));
+                }
             }
         }
         self.ledger.record(self.spec.arch, &insn);
@@ -778,6 +910,7 @@ impl Builder {
         &mut self,
         body: impl FnOnce(&mut Builder) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.flush_valu()?;
         let mut draft = self.clone();
         let start = draft.program.instructions.len();
         body(&mut draft)?;
@@ -818,6 +951,7 @@ impl Builder {
         self.signal(transitions)
     }
     fn signal(&mut self, transitions: &[Transition]) -> Result<(), String> {
+        self.flush_valu()?;
         if !self.spec.arch.gfx12() {
             return Err("split barriers require gfx12".into());
         }
@@ -835,6 +969,7 @@ impl Builder {
         self.arrive()
     }
     fn arrive(&mut self) -> Result<(), String> {
+        self.flush_valu()?;
         let transitions = self
             .pending_barrier
             .take()
@@ -911,13 +1046,14 @@ impl Builder {
         head: &str,
         body: impl Fn(&mut Builder) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.flush_valu()?;
         let entry = self.ledger.shape();
         let mut start = self.clone();
         for runs in 1..=MAX_LOOP_RUNS {
             let mut run = start.clone();
             run.label(head)?;
             run.loop_heads.push(head.into());
-            let result = body(&mut run);
+            let result = body(&mut run).and_then(|()| run.flush_valu());
             run.loop_heads.pop();
             result?;
             if run.ledger.shape() != entry {
@@ -985,7 +1121,8 @@ impl Builder {
         }
     }
     /// Finish only after every declared lifetime has both endpoints and all live aliases are disjoint.
-    pub fn finish(self) -> Result<Emitted, String> {
+    pub fn finish(mut self) -> Result<Emitted, String> {
+        self.flush_valu()?;
         if self.pending_barrier.is_some() {
             return Err("unmatched barrier signal".into());
         }

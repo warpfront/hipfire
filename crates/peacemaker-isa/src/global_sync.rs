@@ -391,6 +391,7 @@ impl Builder {
         body: impl FnOnce(&mut Builder) -> Result<(), String>,
     ) -> Result<(), String> {
         self.untyped()?;
+        self.flush_valu()?;
         let name = &abi.name;
         if let Some(open) = &self.open_region {
             return Err(format!("region {name} inside region {open}"));
