@@ -79,6 +79,15 @@ pub enum MoeStage {
     /// the same stream. Lowered only after the routed `Down` and before the
     /// canonical `Combine`; it never completes or synchronizes the stream.
     JoinSplit,
+    /// Device-side hetero split ([`MoeDecodeSelection::hetero_device`]): publish
+    /// the route into the layer's mailbox slot and write the device-masked ids
+    /// the routed GPU tail reads. Lowered before `GateUp`; a device kernel.
+    PublishCold,
+    /// Bounded device wait for the expert device's cold rows. After
+    /// `MutationFence`, before `InstallCold`.
+    AwaitCold,
+    /// Cold slot rows into the expanded down buffer, before `Combine`.
+    InstallCold,
 }
 
 fn router_shared_fuse_allowed(
@@ -210,6 +219,10 @@ pub(super) struct MoeDecodeSelection {
     /// a command-processor wait before the CPU arithmetic, and `JoinSplit`
     /// (last) releases it. Implies `cpu_split`.
     pub(super) cpwait: bool,
+    /// Device-side hetero split of the one-row decode
+    /// ([`crate::families::moe::RoutedExpertWeights::hetero_split`]): every
+    /// split stage is a device kernel. Exclusive with `cpu_split`.
+    pub(super) hetero_device: bool,
     /// A3B decode norm fold admitted for this layer (exact gfx1201, MQ4G256V2
     /// hidden-2048 router + shared quartet after a plain norm, rows == 1, kill
     /// switch `HIPFIRE_A3B_NORM_FOLD` not `0`); see [`a3b_norm_fold_admitted`].
@@ -663,6 +676,13 @@ impl<'a> MoeStepState<'a> {
         params: &MoeParams<'p>,
         selection: &MoeDecodeSelection,
     ) -> Result<Option<MoeParams<'p>>, DispatchError> {
+        if selection.hetero_device {
+            let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+            let split = experts.hetero_split().ok_or_else(|| {
+                split_error("the hetero device split sealed into this call is no longer attached")
+            })?;
+            return Ok(Some(params.with_topk_indices(&split.masked_ids)));
+        }
         if !selection.cpu_split {
             return Ok(None);
         }
@@ -748,7 +768,52 @@ impl<'a> SealedMoeOp<'a> {
             MoeStage::CpuSplice => self.cpu_splice(gpu),
             MoeStage::PrepareSplit => self.prepare_split(gpu),
             MoeStage::JoinSplit => self.join_split(gpu),
+            MoeStage::PublishCold => self.publish_cold(gpu),
+            MoeStage::AwaitCold => self.await_cold(gpu),
+            MoeStage::InstallCold => self.install_cold(gpu),
         }
+    }
+
+    fn hetero_split<'p>(
+        params: &MoeParams<'p>,
+    ) -> Result<&'p crate::hetero_device::HeteroDeviceSplit, DispatchError> {
+        let experts: &'p dyn crate::families::moe::RoutedExpertWeights = params.routed_experts;
+        experts
+            .hetero_split()
+            .ok_or_else(|| split_error("the hetero device split sealed into this call is no longer attached"))
+    }
+
+    /// `PublishCold`: the layer's route into its mailbox slot plus the
+    /// device-masked ids (cold -> -1) the routed GPU tail reads.
+    pub(super) fn publish_cold(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.state.decode_parts()?;
+        Self::hetero_split(params)?.publish(
+            gpu,
+            params.batch_size,
+            params.k,
+            params.hidden,
+            params.x_rot_local,
+            params.topk_indices,
+            params.topk_weights,
+        )
+    }
+
+    /// `AwaitCold`: bounded device wait for the expert device's response.
+    pub(super) fn await_cold(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.state.decode_parts()?;
+        Self::hetero_split(params)?.await_cold(gpu)
+    }
+
+    /// `InstallCold`: cold slot rows into the expanded down buffer.
+    pub(super) fn install_cold(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
+        let (params, _) = self.state.decode_parts()?;
+        Self::hetero_split(params)?.install(
+            gpu,
+            params.batch_size * params.k,
+            params.hidden,
+            params.topk_indices,
+            params.down_expanded,
+        )
     }
 
     pub(super) fn normalize(&self, gpu: &mut Gpu) -> Result<(), DispatchError> {
@@ -2363,6 +2428,9 @@ fn lower_decode<'a>(
     state: &'a MoeStepState<'a>,
 ) -> Result<SmallVec<[Step<'a>; INLINE_STEP_CAPACITY]>, DispatchError> {
     let (params, selection) = state.decode_parts()?;
+    if selection.hetero_device && selection.cpu_split {
+        return Err(split_error("the hetero device split and the CPU split are exclusive"));
+    }
     if selection.cpu_split {
         if let Some(reason) = cpu_split_decode_conflict(
             params,
@@ -2449,6 +2517,11 @@ fn lower_decode<'a>(
                 Step::MoeStage(op(state), MoeStage::PrepareSplit),
             )?;
         }
+        if selection.hetero_device {
+            // Device publish of the route and the device-masked ids, strictly
+            // before the routed GPU tail that reads them.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::PublishCold))?;
+        }
         if !selection.cpu_deferred_experts {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::GateUp))?;
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Activation))?;
@@ -2458,6 +2531,12 @@ fn lower_decode<'a>(
             &mut steps,
             Step::MoeStage(op(state), MoeStage::MutationFence),
         )?;
+        if selection.hetero_device {
+            // The expert device's cold rows join the expanded rows the
+            // canonical combine folds.
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::AwaitCold))?;
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InstallCold))?;
+        }
         if selection.cpu_split && !selection.cpwait {
             // The cold slot rows are queued behind the GPU down (same stream)
             // and before the canonical combine of the original route.
@@ -3364,6 +3443,20 @@ pub(super) fn select_decode(
             }
             None => false,
         };
+    let hetero_device = params.batch_size == 1 && params.routed_experts.hetero_split().is_some();
+    if hetero_device {
+        if cpu_split {
+            return Err(DispatchError::Hip(
+                "sealed moe: hetero device split and the CPU tier split are exclusive".into(),
+            ));
+        }
+        if !resolution.use_gpu_topk || !resolution.needs_x_rot_local || !params.down_writes_expanded() {
+            return Err(DispatchError::Hip(
+                "sealed moe: hetero device split requires the GPU top-K path, a rotated local activation and an expanded down".into(),
+            ));
+        }
+    }
+    let no_fuse = cpu_split || hetero_device;
     if params.ep_mode == crate::families::moe::MoeEpMode::RootRoutedPartial {
         if !resolution.use_gpu_topk {
             return Err(DispatchError::Hip(
@@ -3523,25 +3616,26 @@ pub(super) fn select_decode(
     resolution.check_generic_route(route)?;
     Ok(MoeDecodeSelection {
         resolution,
-        router_shared_fuse: router_shared_fuse && !cpu_split,
+        router_shared_fuse: router_shared_fuse && !no_fuse,
         exact_wave64_router,
         wave64_router,
-        down_last_combine: down_last_combine && !cpu_split,
+        down_last_combine: down_last_combine && !no_fuse,
         route,
         // The split's routed down always writes the expanded F32 slot rows the
         // canonical combine folds: no fused or self-combining down arm exists.
-        ninepath_d3: !cpu_split && ninepath_hfq4 && matches!(ninepath_mode, "1" | "d3" | "on"),
-        ninepath_d4: !cpu_split
+        ninepath_d3: !no_fuse && ninepath_hfq4 && matches!(ninepath_mode, "1" | "d3" | "on"),
+        ninepath_d4: !no_fuse
             && ninepath_eligible
             && !matches!(ninepath_mode, "0" | "off" | "d3"),
-        ninepath_mq3l: ninepath_mq3l && !cpu_split,
-        ninepath_mq4v2: ninepath_mq4v2 && !cpu_split,
+        ninepath_mq3l: ninepath_mq3l && !no_fuse,
+        ninepath_mq4v2: ninepath_mq4v2 && !no_fuse,
         ninepath_mq4g128v2: ninepath_mq4g128v2
-            && !cpu_split
+            && !no_fuse
             && !matches!(ninepath_mode, "0" | "off" | "d3"),
-        ninepath_mq6v2: ninepath_mq6v2 && !cpu_split,
+        ninepath_mq6v2: ninepath_mq6v2 && !no_fuse,
         cpu_deferred_experts: params.cpu_deferred_experts,
         cpu_split,
+        hetero_device,
         cpwait: cpu_split
             && crate::families::moe::cpu_split_executor(params.routed_experts, params.batch_size)
                 .is_some_and(CpuSplitExecutor::cpwait_active),
@@ -3550,9 +3644,9 @@ pub(super) fn select_decode(
             params,
             &resolution,
             route,
-            router_shared_fuse && !cpu_split,
+            router_shared_fuse && !no_fuse,
             skip_routing,
-            cpu_split,
+            no_fuse,
         ),
     })
 }
