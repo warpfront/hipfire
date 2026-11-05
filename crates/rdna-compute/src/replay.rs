@@ -22,7 +22,8 @@ use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
-    Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
+    Gfx10KernelImage, Gfx10Pm4CommandBuffer, Gfx10Scratch, Gfx10ScratchFamily, Gfx10ScratchPlan,
+    Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
     Gfx11DispatchInterleave, Gfx12DispatchPacing, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy,
     GpuBatchTiming, GpuDevice, GpuMultiQueueTiming, GpuSelector, HeaderPolicy, KernargBuffer,
     KernargPool, Kernel, LaunchGeometry, PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence,
@@ -162,6 +163,111 @@ impl Pm4Architecture {
                 device_name
             ))
         }
+    }
+}
+
+/// Kill switch for retained gfx10/gfx11 PM4 scratch (private-segment) rings.
+/// Default on; `0`/`false`/`off` restores the pre-A5 behaviour where a kernel
+/// with a private segment refuses the retained route.
+const PM4_SCRATCH_ENV: &str = "HIPFIRE_PMSCRATCH_PM4_SCRATCH";
+/// Upper bound on one scratch ring's backing memory. The ring is sized for the
+/// device's full wave capacity; this only trims it for huge per-wave needs.
+const PM4_SCRATCH_RING_CAP_BYTES: u64 = 256 << 20;
+
+fn pm4_scratch_enabled() -> bool {
+    hipfire_config::developer_var(PM4_SCRATCH_ENV)
+        .map(|value| !matches!(value.as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+}
+
+/// The scratch rings one retained legacy (gfx10/gfx11) PM4 route owns: one
+/// constant `COMPUTE_TMPRING_SIZE` plan sized for the largest private segment
+/// of every retained kernel, and one backing allocation per queue lane.
+///
+/// Lane `i` of every phase runs on queue `i`, and phases are serialized by the
+/// graph, so a lane's ring is never shared by two live streams; concurrent
+/// lanes get distinct rings. Rings are plain device memory the route keeps
+/// alive for as long as its IBs exist, independent of hipfire's scratch-buffer
+/// growth (which only re-resolves resource bindings in kernargs).
+struct Pm4ScratchRings {
+    plan: Option<Gfx10ScratchPlan>,
+    pool: Option<KernargPool>,
+    rings: Vec<(KernargBuffer, Gfx10Scratch)>,
+}
+
+impl Pm4ScratchRings {
+    fn for_kernels(
+        architecture: Pm4Architecture,
+        device: &GpuDevice,
+        kernels: &[Kernel],
+    ) -> Result<Self, String> {
+        let none = Self {
+            plan: None,
+            pool: None,
+            rings: Vec::new(),
+        };
+        let family = match architecture {
+            Pm4Architecture::Gfx10 => Gfx10ScratchFamily::Gfx10,
+            Pm4Architecture::Gfx11 => Gfx10ScratchFamily::Gfx11,
+            Pm4Architecture::Gfx12 => return Ok(none),
+        };
+        if !pm4_scratch_enabled() {
+            return Ok(none);
+        }
+        // Kernels whose descriptor cannot be adapted fail at their own
+        // dispatch with the kernel's name; they do not size the ring.
+        let required = kernels
+            .iter()
+            .filter_map(|kernel| Gfx10KernelImage::from_hsa(kernel).ok())
+            .map(|image| image.scratch_bytes_per_wave())
+            .max()
+            .unwrap_or(0);
+        if required == 0 {
+            return Ok(none);
+        }
+        let topology = device
+            .scratch_topology()
+            .map_err(|error| format!("PM4 scratch topology: {error}"))?;
+        let plan = Gfx10ScratchPlan::new(family, topology, required, PM4_SCRATCH_RING_CAP_BYTES)
+            .map_err(|error| format!("PM4 scratch ring: {error}"))?;
+        let pool = KernargPool::discover_device_local(device)
+            .map_err(|error| format!("PM4 scratch pool: {error}"))?;
+        eprintln!(
+            "[redline] PM4 scratch ring arch={} need_per_wave={required} bytes_per_wave={} \
+             wave_slots={} backing_bytes_per_lane={} tmpring_size={:#010x}",
+            device.name(),
+            plan.bytes_per_wave(),
+            plan.slots(),
+            plan.backing_bytes(),
+            plan.tmpring_size(),
+        );
+        Ok(Self {
+            plan: Some(plan),
+            pool: Some(pool),
+            rings: Vec::new(),
+        })
+    }
+
+    /// The ring for queue lane `lane`, allocating it (and any lower lane's) on
+    /// first use. `None` when no retained kernel has a private segment.
+    fn ring(&mut self, lane: usize) -> Result<Option<Gfx10Scratch>, String> {
+        let (Some(plan), Some(pool)) = (self.plan, self.pool.as_ref()) else {
+            return Ok(None);
+        };
+        while self.rings.len() <= lane {
+            let backing = pool
+                .allocate_scratch_backing(plan.backing_bytes() as usize)
+                .map_err(|error| format!("PM4 scratch backing: {error}"))?;
+            let scratch = plan
+                .bind(backing.address() as usize as u64)
+                .map_err(|error| format!("PM4 scratch backing: {error}"))?;
+            self.rings.push((backing, scratch));
+        }
+        Ok(Some(self.rings[lane].1))
+    }
+
+    fn into_backings(self) -> Vec<KernargBuffer> {
+        self.rings.into_iter().map(|(backing, _)| backing).collect()
     }
 }
 
@@ -488,6 +594,14 @@ impl Pm4Commands {
             Self::Gfx12(commands) => commands
                 .dispatch(kernel, geometry, dynamic_group_bytes, kernarg_address)
                 .map_err(|error| error.to_string()),
+        }
+    }
+
+    /// Pin the route's scratch ring on this stream (legacy gfx10/gfx11 only;
+    /// gfx12 has none and `None` leaves the stream untouched).
+    fn set_scratch(&mut self, scratch: Option<Gfx10Scratch>) {
+        if let (Self::Legacy { commands, .. }, Some(scratch)) = (self, scratch) {
+            *commands = std::mem::take(commands).with_scratch(scratch);
         }
     }
 
@@ -5145,6 +5259,9 @@ pub struct PreparedPm4Replay {
     /// through every replay; dropped only after queue quiescence via normal
     /// PreparedPm4Replay teardown (field order: graph first).
     _dependency_fence: Option<KernargBuffer>,
+    /// Scratch-ring backing allocations (one per queue lane) the IBs address
+    /// by absolute VA; freed only after `graph` has quiesced.
+    _scratch: Vec<KernargBuffer>,
     dynamic_gdn_frames: Vec<usize>,
     dynamic_kernarg_bindings: Vec<(usize, ReplayKernargBinding)>,
     dynamic_grids: Vec<(usize, ReplayGridBinding, [u32; 3], [u32; 3])>,
@@ -6376,6 +6493,7 @@ impl ReplayController {
             kernargs.push(kernarg);
             geometries.push(geometry);
         }
+        let mut scratch_rings = Pm4ScratchRings::for_kernels(pm4_architecture, &device, &kernels)?;
         // GDN frames, synthesized position bindings and engine-declared
         // bindings, from the one builder the recorded-HIP oracle also uses. New
         // tapes leave the legacy `dynamic_gdn_frames` vector empty so replay has
@@ -6560,6 +6678,7 @@ impl ReplayController {
                 resource_limits_policy,
                 dependency_mode,
             );
+            commands.set_scratch(scratch_rings.ring(0)?);
             let pacing = if dispatch_profile {
                 Gfx12DispatchPacing::None
             } else {
@@ -6906,7 +7025,7 @@ impl ReplayController {
                 };
                 if lane_count > 1 {
                     let mut lanes = (0..lane_count)
-                        .map(|_| {
+                        .map(|lane_index| -> Result<Pm4Commands, String> {
                             let mut commands = Pm4Commands::new(
                                 pm4_architecture,
                                 self.pm4_register_policy,
@@ -6914,10 +7033,11 @@ impl ReplayController {
                                 dispatch_interleave,
                                 resource_limits_policy,
                             );
+                            commands.set_scratch(scratch_rings.ring(lane_index)?);
                             commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
-                            commands
+                            Ok(commands)
                         })
-                        .collect::<Vec<_>>();
+                        .collect::<Result<Vec<_>, String>>()?;
                     let lane_indices = if let Some(split) = phase.lane_split {
                         if lane_count != 2 || split == 0 || split >= phase.indices.len() {
                             return Err(format!(
@@ -6998,6 +7118,7 @@ impl ReplayController {
                     dispatch_interleave,
                     resource_limits_policy,
                 );
+                commands.set_scratch(scratch_rings.ring(0)?);
                 commands.acquire_entry(gfx12_gcr_trim, entry_acquire_policy);
                 let mut resource_frontier = ResourceFrontier::default();
                 for (position, index) in phase.indices.iter().copied().enumerate() {
@@ -7147,6 +7268,7 @@ impl ReplayController {
                 .rposition(|kernarg| kernarg.is_device_local() && !kernarg.is_empty()),
             kernargs,
             _dependency_fence: dependency_fence,
+            _scratch: scratch_rings.into_backings(),
             dynamic_gdn_frames,
             dynamic_kernarg_bindings,
             dynamic_grids,
