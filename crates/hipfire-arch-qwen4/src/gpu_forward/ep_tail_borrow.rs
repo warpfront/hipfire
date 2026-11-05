@@ -1252,12 +1252,12 @@ impl Qwen4GpuForward {
             wide_hidden_capture,
             output_policy,
         );
-        let swapped = self.ep_tail_swap_out();
+        self.ep_tail_swap_out();
         if let Some(borrow) = self.ep_tail_borrow.as_mut() {
             borrow.stats.tiles += 1;
             borrow.epoch_tiles += 1;
         }
-        let merged = merge_share_result(result, swapped);
+        let merged = result;
         if merged.is_err() {
             // A failed tile leaves borrowed-bank bytes in the pool: close (blocking) before
             // reporting; a close that fails poisons the borrow.
@@ -1283,19 +1283,17 @@ impl Qwen4GpuForward {
         Ok(())
     }
 
-    /// Swap the resident bank back into `scratch`; a no-op when it already is.
-    fn ep_tail_swap_out(&mut self) -> Result<(), Qwen4GpuForwardError> {
-        let borrow = self
-            .ep_tail_borrow
-            .as_mut()
-            .expect("an EP tail borrow forward");
-        let EpTailState::Attached(attached) = &mut borrow.state else {
-            return Ok(());
-        };
-        if let Some(resident) = attached.parked.take() {
-            attached.bank = Some(std::mem::replace(&mut self.scratch, resident));
+    /// Swap the resident bank back into `scratch`; a no-op when it already is, and on a
+    /// forward without a borrow (a rank whose load never planned one, a refused or unattached
+    /// borrow): teardown runs this on every forward.
+    fn ep_tail_swap_out(&mut self) {
+        if let Some(EpTailBorrow {
+            state: EpTailState::Attached(attached),
+            ..
+        }) = self.ep_tail_borrow.as_mut()
+        {
+            put_back_resident(&mut attached.bank, &mut attached.parked, &mut self.scratch);
         }
-        Ok(())
     }
 
     /// Open the epoch (acquire): refuse under capture, drain the device, suspend the tail
@@ -1471,7 +1469,7 @@ impl Qwen4GpuForward {
     /// restore, so resuming the tail is safe whatever the peers do, and nothing reads it
     /// afterwards. The first error is returned (the teardown continues).
     pub(super) fn ep_tail_teardown(&mut self, gpu: &mut Gpu) -> Option<hip_bridge::HipError> {
-        let _ = self.ep_tail_swap_out();
+        self.ep_tail_swap_out();
         if let Some(borrow) = self.ep_tail_borrow.as_ref().filter(|borrow| borrow.log) {
             let (rank, stats) = (
                 self.ep.as_ref().map_or(0, |ep| ep.placement.rank),
@@ -1491,16 +1489,23 @@ impl Qwen4GpuForward {
                 ))
             );
         }
-        let (tail, open) = {
-            let borrow = self.ep_tail_borrow.as_ref()?;
-            let EpTailState::Attached(attached) = &borrow.state else {
-                return None;
-            };
-            (attached.tail.clone(), borrow.epoch.open())
-        };
-        if !open {
+        let state = self
+            .ep_tail_borrow
+            .as_ref()
+            .map(|borrow| match &borrow.state {
+                EpTailState::Attached(attached) => {
+                    Some((attached.tail.clone(), borrow.epoch.open()))
+                }
+                _ => None,
+            });
+        let teardown = ep_tail_teardown_action(
+            state
+                .as_ref()
+                .map(|attached| attached.as_ref().map(|(_, open)| *open)),
+        );
+        let (EpTailTeardown::Close, Some(Some((tail, _)))) = (teardown, state) else {
             return None;
-        }
+        };
         let mut first = None;
         if let Err(error) = gpu.hip.device_synchronize() {
             first = Some(error);
@@ -1520,6 +1525,34 @@ impl Qwen4GpuForward {
             borrow.epoch.closed();
         }
         first
+    }
+}
+
+/// What a forward's teardown does with its EP tail borrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EpTailTeardown {
+    /// Nothing to undo: no borrow on this rank, a borrow never attached (planned or refused),
+    /// or no epoch open.
+    Nothing,
+    /// An epoch is open: restore the pool and resume the tail locally (no rendezvous).
+    Close,
+}
+
+/// The teardown decision of one rank: `None` when its forward has no borrow at all (the load
+/// never planned one on this rank), `Some(None)` when the borrow is not attached, and
+/// `Some(Some(open))` when attached, with whether an epoch is open.
+pub(crate) fn ep_tail_teardown_action(borrow: Option<Option<bool>>) -> EpTailTeardown {
+    match borrow {
+        Some(Some(true)) => EpTailTeardown::Close,
+        _ => EpTailTeardown::Nothing,
+    }
+}
+
+/// Put the resident bank back into `scratch` when the borrowed one is swapped in (`parked`
+/// holds the resident); otherwise nothing changes.
+fn put_back_resident<B>(bank: &mut Option<B>, parked: &mut Option<B>, scratch: &mut B) {
+    if let Some(resident) = parked.take() {
+        *bank = Some(std::mem::replace(scratch, resident));
     }
 }
 
@@ -2168,5 +2201,47 @@ mod tests {
         );
         // The bracket still balances and reports nothing to recover.
         assert_eq!(epoch.end_prompt(true, false), EpTailPromptEnd::Clean);
+    }
+
+    /// j8085: a rank whose forward has no borrow at all tore down through the swap-out and
+    /// panicked ("an EP tail borrow forward"). Teardown is decided per rank: only an attached
+    /// borrow with an open epoch closes; every other rank, including one with no borrow,
+    /// does nothing.
+    #[test]
+    fn teardown_with_no_borrow_on_one_rank_does_nothing_there() {
+        // Rank 0 tears down mid-epoch; rank 1 never planned a borrow.
+        let ranks = [Some(Some(true)), None];
+        let actions: Vec<_> = ranks
+            .iter()
+            .map(|&rank| ep_tail_teardown_action(rank))
+            .collect();
+        assert_eq!(actions, [EpTailTeardown::Close, EpTailTeardown::Nothing]);
+        // Attached without an open epoch, and planned or refused but never attached.
+        assert_eq!(
+            ep_tail_teardown_action(Some(Some(false))),
+            EpTailTeardown::Nothing
+        );
+        assert_eq!(ep_tail_teardown_action(Some(None)), EpTailTeardown::Nothing);
+    }
+
+    #[test]
+    fn swap_out_puts_back_the_resident_bank_only_when_it_is_parked() {
+        // Borrowed bank swapped in: the resident comes back, the borrowed bank is kept.
+        let (mut bank, mut parked, mut scratch) = (None, Some("resident"), "borrowed");
+        put_back_resident(&mut bank, &mut parked, &mut scratch);
+        assert_eq!(
+            (bank, parked, scratch),
+            (Some("borrowed"), None, "resident")
+        );
+        // Already resident (the teardown of a rank that never borrowed a tile): no change,
+        // and a second call is a no-op too.
+        let (mut bank, mut parked, mut scratch) = (Some("borrowed"), None, "resident");
+        for _ in 0..2 {
+            put_back_resident(&mut bank, &mut parked, &mut scratch);
+            assert_eq!(
+                (bank, parked, scratch),
+                (Some("borrowed"), None, "resident")
+            );
+        }
     }
 }
