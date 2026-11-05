@@ -510,6 +510,14 @@ fn qwen4_ep_owner_assign_pinned(arch: Arch) -> Result<(String, Vec<u8>), String>
         serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
     ))
 }
+/// The PM row argmax twin of `argmax_f32_batched_regrid` (`argmax_f32_batched_regrid_pm_gfx1201`), one symbol per module.
+fn argmax_regrid(arch: Arch) -> Result<(String, Vec<u8>), String> {
+    let (_, text, proof) = peacemaker_isa::kernels::argmax_regrid_pm::emit_module(arch)?;
+    Ok((
+        text,
+        serde_json::to_vec_pretty(&proof).map_err(|e| e.to_string())?,
+    ))
+}
 /// The PM tile-ownership mask of the owner-routed EP chunk MoE (`ep_tile_mask_pm_gfx1100` / `ep_tile_mask_pm_gfx1201`), one symbol per module.
 fn ep_tile_mask(arch: Arch) -> Result<(String, Vec<u8>), String> {
     let (_, text, proof) = peacemaker_isa::kernels::ep_tile_mask::emit_module(arch)?;
@@ -1864,6 +1872,7 @@ fn run() -> Result<(), String> {
             "spec_accept_pm" => spec_accept(arch)?,
             "qwen4_ep_owner_assign_pm" => qwen4_ep_owner_assign(arch)?,
             "qwen4_ep_owner_assign_pinned_pm" => qwen4_ep_owner_assign_pinned(arch)?,
+            "argmax_regrid_pm" => argmax_regrid(arch)?,
             "ep_tile_mask_pm" => ep_tile_mask(arch)?,
             "moe_slot_ops_pm" => moe_slot_ops(arch)?,
             "qwen4_moe_down_gp_pm" => qwen4_moe_down_gp(arch)?,
@@ -1957,6 +1966,7 @@ fn run() -> Result<(), String> {
         || kernel == "qwen4_ep_owner_assign_pm"
         || kernel == "qwen4_ep_owner_assign_pinned_pm"
         || kernel == "ep_tile_mask_pm"
+        || kernel == "argmax_regrid_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_pm"
         || kernel == "ep_gather_grouped_rows_by_tile_owner_n8_pm"
         || kernel == "moe_slot_ops_pm"
@@ -1980,7 +1990,7 @@ fn run() -> Result<(), String> {
         && !mtp_det
         && (shape.is_some() || m7.is_some())
     {
-        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, fa_prefill_pm, fa_prefill_fp8_pm, fa_qprep_pm, iu4_c8_producer_pm, gdn_chunk_prep_pm, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, moe_rotate_i4_pm, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, qwen4_ep_owner_assign_pinned_pm, ep_tile_mask_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, moe_slot_ops_v2_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
+        return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, fa_prefill_pm, fa_prefill_fp8_pm, fa_qprep_pm, iu4_c8_producer_pm, gdn_chunk_prep_pm, mq4_fp8_verify, mq_i4_rows, mq_i4_a4, moe_rotate_i4_pm, qwen4_lane_rows, spec_sampling_rows_pm, spec_accept_pm, qwen4_ep_owner_assign_pm, qwen4_ep_owner_assign_pinned_pm, ep_tile_mask_pm, argmax_regrid_pm, ep_gather_grouped_rows_by_tile_owner_pm, ep_gather_grouped_rows_by_tile_owner_n8_pm, moe_slot_ops_pm, moe_slot_ops_v2_pm, mtp_dense_det_gfx11 and mtp_q8_det_gfx11 (--m7 only)".into());
     }
     if spec_pm && co.is_none() && (shape.is_some() || m7.is_some()) {
         return Err("spec_*_pm --shape/--m7 require --co (M7 certifies the linked object)".into());
@@ -2240,6 +2250,12 @@ fn run() -> Result<(), String> {
             (
                 peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::symbol(arch),
                 peacemaker_isa::kernels::qwen4_ep_owner_assign_pinned_pm::contract(arch, &e),
+            )
+        } else if kernel == "argmax_regrid_pm" {
+            let e = peacemaker_isa::kernels::argmax_regrid_pm::emit(arch)?;
+            (
+                peacemaker_isa::kernels::argmax_regrid_pm::symbol(arch),
+                peacemaker_isa::kernels::argmax_regrid_pm::contract(arch, &e),
             )
         } else if kernel == "ep_tile_mask_pm" {
             let e = peacemaker_isa::kernels::ep_tile_mask::emit(arch)?;

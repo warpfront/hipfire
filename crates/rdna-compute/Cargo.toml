@@ -1306,3 +1306,7 @@ required-features = ["lab"]
 [[example]]
 name = "gated_delta_vector_chunk_node"
 required-features = ["deltanet"]
+
+[[example]]
+name = "argmax_regrid_pm_oracle"
+required-features = ["lab"]

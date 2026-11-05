@@ -888,6 +888,10 @@ pub struct FeatureFlags {
     /// per-row `topk_values_batched_f32` / `argmax_f32_batched` launches (the
     /// gfx1201 multi-block re-grid is default-on there).
     pub select_regrid_off: bool,
+    /// PeaceMaker B4: on exact gfx1201 the re-grid batched argmax runs the builder
+    /// twin `argmax_f32_batched_regrid_pm_gfx1201` (byte-identical, certified);
+    /// `HIPFIRE_ARGMAX_REGRID_PM=0` restores the hipcc re-grid kernel.
+    pub argmax_regrid_pm: bool,
     /// Railgun D8: exact gfx1201 DFlash rollback without the restore copy: the
     /// GDN tape replay reads the pre-verify state from the snapshot buffers and
     /// writes the live ones (the snapshot stays the pre-window state).
@@ -1578,6 +1582,7 @@ impl FeatureFlags {
                 == Some("1"),
             gdn_replay_ml_off: value("HIPFIRE_GDN_REPLAY_ML_OFF").ok().as_deref() == Some("1"),
             select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
+            argmax_regrid_pm: value("HIPFIRE_ARGMAX_REGRID_PM").ok().as_deref() != Some("0"),
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
             fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
@@ -2349,6 +2354,7 @@ impl FeatureFlags {
             mq_prologue_fuse_off: false,
             gdn_replay_ml_off: false,
             select_regrid_off: false,
+            argmax_regrid_pm: false,
             dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
             fn_lane_pm_rows: false,

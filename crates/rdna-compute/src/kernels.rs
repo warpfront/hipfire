@@ -11223,6 +11223,11 @@ pub const EP_TILE_MASK_PM_GFX1201: &[u8] =
 /// ([`crate::Gpu::qwen4_slab_tile_masks`]); the owner-routed EP exchange stays gfx1201-only.
 pub const EP_TILE_MASK_PM_GFX1100: &[u8] =
     include_bytes!("../../../kernels/ep_tile_mask_pm_gfx1100.hxaco");
+/// Certified builder (PeaceMaker) module of the re-grid batched row argmax, gfx1201
+/// (`peacemaker-isa emit --kernel argmax_regrid_pm --arch gfx1201`): the byte twin of
+/// `argmax_f32_batched_regrid`, default on there (`HIPFIRE_ARGMAX_REGRID_PM=0` opts out).
+pub const ARGMAX_REGRID_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/argmax_regrid_pm_gfx1201.hxaco");
 
 /// Certified builder (PeaceMaker) module of the owner-routed chunk MoE tile pull, two-rank
 /// specialization, gfx1201 (`peacemaker-isa emit --kernel ep_gather_grouped_rows_by_tile_owner_pm

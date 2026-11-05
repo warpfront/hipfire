@@ -18,6 +18,10 @@
 //! single-thread one (1.6 ms -> tens of microseconds on a 260K vocabulary).
 //! `topk_values_fixup_f32` (the shipping body behind a marker check) stays
 //! defined: the published kernel pack pins its source.
+//!
+//! On exact gfx1201 the argmax runs the PeaceMaker builder twin
+//! `argmax_f32_batched_regrid_pm_gfx1201` (`HIPFIRE_ARGMAX_REGRID_PM=0` keeps the hipcc
+//! kernel; byte-identical, checked by `examples/argmax_regrid_pm_oracle.rs`).
 
 use crate::dispatch::{Gpu, GpuTensor};
 use crate::kernels;
@@ -32,6 +36,11 @@ pub const SELECT_REGRID_MODULE: &str = "select_regrid";
 pub const TOPK_VALUES_REGRID_SYMBOL: &str = "topk_values_regrid_f32";
 /// Argmax re-grid entry.
 pub const ARGMAX_REGRID_SYMBOL: &str = "argmax_f32_batched_regrid";
+/// Builder (PeaceMaker) twin of [`ARGMAX_REGRID_SYMBOL`] (module key == device symbol),
+/// gfx1201 only, default on (`HIPFIRE_ARGMAX_REGRID_PM=0` opts out).
+pub const ARGMAX_REGRID_PM_GFX1201_SYMBOL: &str = "argmax_f32_batched_regrid_pm_gfx1201";
+/// Largest row length the PM twin's 32-bit byte extents admit; longer rows take the hipcc re-grid.
+pub const ARGMAX_REGRID_PM_MAX_N: usize = 1 << 29;
 /// Shipping top-K body entered only for rows the re-grid marked (tie).
 pub const TOPK_VALUES_FIXUP_SRC: &str = concat!(
     "#define HIPFIRE_TOPK_FIXUP_MARKED 1\n",
@@ -145,8 +154,25 @@ impl Gpu {
     }
 
     /// Batched argmax over `[batch x n]` rows with the shipping kernel's
-    /// exact tie order, through `launch_maybe_blob` like the shipping launch.
+    /// exact tie order. On exact gfx1201 (opt out with `HIPFIRE_ARGMAX_REGRID_PM=0`)
+    /// and `n <= ARGMAX_REGRID_PM_MAX_N` the builder twin runs, otherwise the
+    /// hipcc re-grid kernel; both are byte-identical to the shipping argmax.
     pub(crate) fn argmax_f32_batched_regrid(
+        &mut self,
+        data: &GpuTensor,
+        result: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if self.flags.argmax_regrid_pm && self.arch_caps.is_gfx1201() && n <= ARGMAX_REGRID_PM_MAX_N
+        {
+            return self.argmax_f32_batched_regrid_pm(data, result, n, batch_size);
+        }
+        self.argmax_f32_batched_regrid_hipcc(data, result, n, batch_size)
+    }
+
+    /// The hipcc re-grid argmax, through `launch_maybe_blob` like the shipping launch.
+    fn argmax_f32_batched_regrid_hipcc(
         &mut self,
         data: &GpuTensor,
         result: &GpuTensor,
@@ -180,6 +206,76 @@ impl Gpu {
                 b
             },
         )
+    }
+
+    /// The builder twin of [`Self::argmax_f32_batched_regrid_hipcc`]: same ABI (data, result,
+    /// n), grid `[batch, 1, 1]`, block 1024, 256 bytes static LDS.
+    fn argmax_f32_batched_regrid_pm(
+        &mut self,
+        data: &GpuTensor,
+        result: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.ensure_embedded_kernel(
+            ARGMAX_REGRID_PM_GFX1201_SYMBOL,
+            kernels::ARGMAX_REGRID_PM_GFX1201,
+            ARGMAX_REGRID_PM_GFX1201_SYMBOL,
+        )?;
+        let dp = data.buf.as_ptr();
+        let rp = result.buf.as_ptr();
+        let nn = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &dp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &nn as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            ARGMAX_REGRID_PM_GFX1201_SYMBOL,
+            [batch_size as u32, 1, 1],
+            [SELECT_REGRID_BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(dp);
+                b.push_ptr(rp);
+                b.push_i32(nn);
+                b
+            },
+        )
+    }
+
+    /// The hipcc re-grid batched argmax on ANY arch, ignoring `HIPFIRE_ARGMAX_REGRID_PM` and
+    /// [`Self::select_regrid_enabled`] (parity gates and the PM oracle's reference arm).
+    pub fn argmax_f32_batched_regrid_hipcc_forced(
+        &mut self,
+        data: &GpuTensor,
+        result: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.argmax_f32_batched_regrid_hipcc(data, result, n, batch_size)
+    }
+
+    /// The builder-twin batched argmax, ignoring the flag (oracle and timing arm); errors on
+    /// any arch but exact gfx1201 or for `n > ARGMAX_REGRID_PM_MAX_N`.
+    pub fn argmax_f32_batched_regrid_pm_forced(
+        &mut self,
+        data: &GpuTensor,
+        result: &GpuTensor,
+        n: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1201() || n > ARGMAX_REGRID_PM_MAX_N {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "argmax_f32_batched_regrid_pm_forced: exact gfx1201 and n <= 2^29 only",
+            ));
+        }
+        self.argmax_f32_batched_regrid_pm(data, result, n, batch_size)
     }
 
     /// The re-grid + tie-recompute raw top-K on ANY arch, bypassing

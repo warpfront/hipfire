@@ -39,6 +39,7 @@ pub mod reg;
 pub mod sync;
 pub mod vopd;
 pub mod kernels {
+    pub mod argmax_regrid_pm;
     pub mod bf16;
     pub mod ceil_probe;
     pub mod common;
