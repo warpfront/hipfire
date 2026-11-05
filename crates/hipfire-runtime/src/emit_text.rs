@@ -405,6 +405,25 @@ impl Default for ToolOutputRouter {
     }
 }
 
+/// Add turn-terminator ids to `blocked` while a tool-call span is open.
+///
+/// Repeated ids are ignored. When `in_tool_call` is false, `blocked` is
+/// left unchanged.
+pub fn block_terminators_while_in_tool_call(
+    blocked: &mut Vec<u32>,
+    in_tool_call: bool,
+    terminators: impl IntoIterator<Item = u32>,
+) {
+    if !in_tool_call {
+        return;
+    }
+    for id in terminators {
+        if !blocked.contains(&id) {
+            blocked.push(id);
+        }
+    }
+}
+
 impl ToolOutputRouter {
     /// Fresh router with empty buffers.
     pub fn new() -> Self {
@@ -436,6 +455,17 @@ impl ToolOutputRouter {
     /// Whether a fail-closed malformed verdict has already latched.
     pub fn is_malformed(&self) -> bool {
         self.malformed.is_some()
+    }
+
+    /// True while this request's tool protocol is inside an unclosed `<tool_call>`.
+    pub fn in_tool_call(&self) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        match self.state {
+            RouteState::InToolCall => true,
+            RouteState::Normal => false,
+        }
     }
 
     /// Feed one decoded text chunk. May emit zero or more ordered events.
@@ -1531,8 +1561,9 @@ pub fn tool_call_args_object_complete(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        extract_lfm_tool_calls, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
-        ToolOutputRouter, ToolRouteError, ToolRouteEvent, TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
+        block_terminators_while_in_tool_call, extract_lfm_tool_calls, extract_tool_calls_from_text,
+        ThinkOutputRouter, ThinkRouteEvent, ToolOutputRouter, ToolRouteError, ToolRouteEvent,
+        TOOL_CALL_CLOSE, TOOL_CALL_OPEN,
     };
     use crate::prompt_frame::ToolCall;
 
@@ -1986,6 +2017,39 @@ mod tests {
         assert_eq!(t2, Terminal::Ok);
         assert_eq!(v2, vis);
         assert_eq!(c2.len(), 2);
+    }
+
+    #[test]
+    fn router_in_tool_call_follows_the_open_span() {
+        let mut router = ToolOutputRouter::new();
+        assert!(!router.in_tool_call());
+        router.push("before").expect("prose");
+        assert!(!router.in_tool_call());
+        router
+            .push("<tool_call><function=read><parameter=path>/tmp/x</parameter>")
+            .expect("open");
+        assert!(router.in_tool_call());
+        router.push("</function></tool_call>").expect("close");
+        assert!(!router.in_tool_call());
+    }
+
+    #[test]
+    fn disabled_router_is_never_inside_a_tool_call() {
+        let mut router = ToolOutputRouter::disabled();
+        router
+            .push("<tool_call><function=read></function></tool_call>")
+            .expect("disabled text");
+        assert!(!router.in_tool_call());
+        assert!(router.finish().expect("disabled finish").is_empty());
+    }
+
+    #[test]
+    fn terminator_mask_waits_until_a_tool_call_is_open() {
+        let mut blocked = vec![7];
+        block_terminators_while_in_tool_call(&mut blocked, false, [1, 2, 3]);
+        assert_eq!(blocked, vec![7]);
+        block_terminators_while_in_tool_call(&mut blocked, true, [1, 2, 1, 7]);
+        assert_eq!(blocked, vec![7, 1, 2]);
     }
 
     #[test]
