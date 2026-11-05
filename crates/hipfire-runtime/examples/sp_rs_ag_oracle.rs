@@ -8,7 +8,7 @@
 //! (`ar_hc_write_d8_*`) on two gfx1201 cards, both on the DENSE wire of one `ArHcExchange`.
 //!
 //! ```text
-//! sp_rs_ag_oracle [--rows 1,2,7,16,255,256,300,511,512,613] [--iters 200] [--case-iters 3]
+//! sp_rs_ag_oracle [--rows 1,2,7,16,255,256,300,511,512,513,613,1025,3073,3585] [--iters 200] [--case-iters 3]
 //!                 [--devices 0,1] [--out DIR] [--stream bf16|f32|both] [--no-fault] [--bench]
 //! ```
 //!
@@ -906,7 +906,9 @@ fn run_rank(
 
 fn main() {
     let mut cfg = Config {
-        rows_list: vec![1, 2, 7, 16, 255, 256, 300, 511, 512, 613],
+        rows_list: vec![
+            1, 2, 7, 16, 255, 256, 300, 511, 512, 513, 613, 1025, 3073, 3585,
+        ],
         iters: 200,
         case_iters: 3,
         kinds: StreamKind::ALL.to_vec(),

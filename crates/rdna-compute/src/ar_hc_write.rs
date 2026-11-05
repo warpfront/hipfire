@@ -540,25 +540,32 @@ pub fn sp_ag_rows_per_launch(row_elems: usize, bank_stride: usize) -> usize {
 }
 
 /// Slices of a tile exchange: the launches covering an own range of `own_rows` rows and a peer
-/// range of `peer_rows` rows in chunks of at most `cap` rows per range. Each item is
+/// range of `peer_rows` rows, at most `cap` rows per range per launch. Each item is
 /// `((own_off, own_n), (peer_off, peer_n))`, offsets relative to the start of the range. The
 /// ranks of a pair compute mirrored lists (rank A's peer chunks are rank B's own chunks), so
 /// launch `i` pushes exactly the granules the other rank's launch `i` polls.
+///
+/// Lockstep: `k = max(ceil(own/cap), ceil(peer/cap))` launches, and BOTH ranges are cut into
+/// `k` balanced chunks, non-empty whenever the range has at least `k` rows. A launch that only
+/// pushed (or only polled) would let its rank run ahead of the peer by a generation, and two
+/// launches later its push reuses bank `tag & 1` while the peer still polls it (overwritten
+/// granules or a bank timeout). Chunking only changes which launch carries a row, never the
+/// per-row fold. A range empty as a whole (or shorter than `k`) cannot be non-empty in every
+/// launch; the SP route never plans one (`SP_MIN_ROWS`).
 pub fn sp_slices(
     own_rows: usize,
     peer_rows: usize,
     cap: usize,
 ) -> Vec<((usize, usize), (usize, usize))> {
     assert!(cap > 0, "slice cap must be positive");
-    let n = own_rows.div_ceil(cap).max(peer_rows.div_ceil(cap));
-    (0..n)
-        .map(|i| {
-            let chunk = |total: usize| {
-                let off = (i * cap).min(total);
-                (off, cap.min(total - off))
-            };
-            (chunk(own_rows), chunk(peer_rows))
-        })
+    let k = own_rows.div_ceil(cap).max(peer_rows.div_ceil(cap));
+    let chunk = |total: usize, i: usize| {
+        let (base, extra) = (total / k, total % k);
+        let off = i * base + i.min(extra);
+        (off, base + usize::from(i < extra))
+    };
+    (0..k)
+        .map(|i| (chunk(own_rows, i), chunk(peer_rows, i)))
         .collect()
 }
 
@@ -1450,6 +1457,42 @@ mod tests {
             assert_eq!((own_sum, peer_sum), (a, b));
         }
         assert!(sp_slices(0, 0, SP_ROW_CAP).is_empty());
+    }
+
+    /// Transport hazard regression: a launch with an empty own or peer range never polls (or never
+    /// pushes), so that rank runs ahead and reuses bank `tag & 1` while the other still polls.
+    /// With both ranges non-empty every launch must both push and poll.
+    #[test]
+    fn sp_slices_every_launch_pushes_and_polls() {
+        for rows in [512usize, 513, 1025, 3073, 3585, 4096, 4097] {
+            let [(_, a), (_, b)] = sp_even_split(rows);
+            for (own, peer) in [
+                (a, b),
+                (b, a),
+                (1537, 700),
+                (700, 1537),
+                (300, 3000),
+                (2, 600),
+            ] {
+                let launches = sp_slices(own, peer, SP_ROW_CAP);
+                let k = own.div_ceil(SP_ROW_CAP).max(peer.div_ceil(SP_ROW_CAP));
+                assert_eq!(launches.len(), k, "own {own} peer {peer}");
+                let (mut os, mut ps) = (0, 0);
+                for (i, ((oo, on), (po, pn))) in launches.iter().copied().enumerate() {
+                    if own >= k && peer >= k {
+                        assert!(
+                            on > 0 && pn > 0,
+                            "launch {i} of own {own} peer {peer}: {on}/{pn}"
+                        );
+                    }
+                    assert!(on <= SP_ROW_CAP && pn <= SP_ROW_CAP);
+                    assert_eq!((oo, po), (os, ps), "chunks are contiguous and ordered");
+                    os += on;
+                    ps += pn;
+                }
+                assert_eq!((os, ps), (own, peer));
+            }
+        }
     }
 
     #[test]
