@@ -18,6 +18,7 @@ use crate::families::moe::{
     MoeDtypes, MoeNormalization, MoePrefillParams, MoePrefillPrelude, MoeQ8RouterPolicy,
     MoeRecipe, MoeRoutePolicy, RoutedExpertWeights,
 };
+use crate::hetero_mailbox::{int4_row_bytes, ROWS_F16, ROWS_INT4};
 use crate::hetero_responder::ColdLayer;
 use crate::pipeline::{
     checked_grouped_m_total_bound, seal_prefill, BoundMoeExperts, ExpertBindingCache,
@@ -274,8 +275,11 @@ impl ColdPrefillScratch {
 /// Device addresses of the prefill mailbox fields a call reads and writes.
 #[derive(Clone, Copy, Debug)]
 pub struct ColdPrefillIo {
-    /// `[rows, dim]` F16 normed rows (the routed experts' natural activation).
+    /// The rows in `format`: `[rows, dim]` F16 normed rows, or the int4
+    /// activation sidecar of the symmetric IU4 producer.
     pub x_norm: u64,
+    /// [`ROWS_F16`] or [`ROWS_INT4`].
+    pub format: u32,
     /// `[rows, top_k]` i32 route ids (unmasked).
     pub ids: u64,
     /// `[rows, top_k]` F32 route weights.
@@ -322,7 +326,23 @@ pub fn run_cold_prefill(
     let x_norm = GpuTensor { buf: s.x_norm_batch.buf.byte_view(0, row_bytes), shape: vec![rows, c.dim], dtype: DType::F32 };
     let weights = GpuTensor { buf: s.topk_weights.buf.byte_view(0, slots * 4), shape: vec![slots], dtype: DType::F32 };
     let partial = GpuTensor { buf: s.x_batch.buf.byte_view(0, row_bytes), shape: vec![rows, c.dim], dtype: DType::F32 };
-    gpu.hetero_f16_to_f32(io.x_norm, &x_norm, (rows * c.dim) as i32).map_err(hip)?;
+    // F16 rows are widened for the call's own basis; an int4 sidecar is
+    // copied into this device's IU4 reservation and consumed as is.
+    let xq = match io.format {
+        ROWS_F16 => {
+            gpu.hetero_f16_to_f32(io.x_norm, &x_norm, (rows * c.dim) as i32).map_err(hip)?;
+            None
+        }
+        ROWS_INT4 => {
+            let res = gpu.reserve_int4_mmq(c.dim, rows).map_err(hip)?;
+            let bytes = rows * int4_row_bytes(c.dim);
+            let dst = view(res.ptr() as u64, bytes, vec![bytes], DType::Raw);
+            let src = view(io.x_norm, bytes, vec![bytes], DType::Raw);
+            copy(gpu, &dst.buf, &src.buf, bytes)?;
+            Some(rdna_compute::scratch::Int4MmqPrepared::from_reservation(res))
+        }
+        f => return Err(err(format!("unknown row format {f}"))),
+    };
     copy(gpu, &weights.buf, &mb_w.buf, slots * 4)?;
     zero(gpu, &partial.buf, row_bytes)?;
     gpu.hetero_mask_hot(io.ids, &layer.cold_bitmap, c.n_experts as i32, slots as i32, &s.topk_indices)
@@ -360,7 +380,7 @@ pub fn run_cold_prefill(
             router_logits: &s.router,
             router_scores: &s.router,
             norm_topk_prob: false,
-            route: PrefillRouteMode::HeteroCold,
+            route: PrefillRouteMode::HeteroCold { xq: xq.as_ref() },
             shared: None,
             q8_router_policy: MoeQ8RouterPolicy::DispatcherEntry,
         },

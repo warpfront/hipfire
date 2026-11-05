@@ -24,6 +24,7 @@ use hipfire_dispatch::families::moe::{
 use hipfire_dispatch::hetero_prefill::{
     run_cold_prefill, ColdPrefillConfig, ColdPrefillIo, ColdPrefillLayer, ColdPrefillScratch,
 };
+use hipfire_dispatch::hetero_mailbox::{int4_row_bytes, ROWS_F16, ROWS_INT4};
 use hipfire_dispatch::hetero_responder::ColdLayer;
 use hipfire_dispatch::igpu_split::{ColdArmDims, IgpuColdArm};
 use rdna_compute::{DType, Gpu};
@@ -244,7 +245,7 @@ fn main() {
     let ids_mb = pinned(&gpu, MAX_ROWS * TOP_K * 4, true).cast::<i32>();
     let w_mb = pinned(&gpu, MAX_ROWS * TOP_K * 4, true).cast::<f32>();
     let part_mb = pinned(&gpu, MAX_ROWS * DIM * 2, true).cast::<u16>();
-    let io = ColdPrefillIo { x_norm: x_mb as u64, ids: ids_mb as u64, weights: w_mb as u64, partial: part_mb as u64 };
+    let io = ColdPrefillIo { x_norm: x_mb as u64, format: ROWS_F16, ids: ids_mb as u64, weights: w_mb as u64, partial: part_mb as u64 };
     // SAFETY: the pinned BF16 partial of MAX_ROWS rows.
     let partial = || -> Vec<f32> {
         unsafe { std::slice::from_raw_parts(part_mb, MAX_ROWS * DIM) }
@@ -380,6 +381,47 @@ fn main() {
         fail(format!("zero-cold chunk: element {i} is nonzero"));
     }
     println!("zero-cold chunk: partial all zero");
+
+    // The shipped int4 activation (symmetric route): the rows are F16-exact, so
+    // this device's own producer over them is the sidecar the primary would
+    // ship, and the int4 call must equal the F16 call bitwise. A 256-row block
+    // (below the IU4 arm) and the F16 route must refuse it.
+    let x4_mb = pinned(&gpu, MAX_ROWS * int4_row_bytes(DIM), true);
+    let io4 = ColdPrefillIo { x_norm: x4_mb as u64, format: ROWS_INT4, ..io };
+    for rows in [512usize, 2048, 256] {
+        let c = case(&mut rng, rows);
+        run_on(&mut gpu, &layer, &c);
+        let want = partial();
+        let xs = gpu.upload_f32(&c.x, &[rows, DIM]).unwrap();
+        let prepared = gpu.qwen4_moe_rotate256_i4(&xs, DIM, rows).unwrap();
+        let ptr = gpu.int4_mmq_prepared_ptr(&prepared, DIM, rows).unwrap();
+        let bytes = rows * int4_row_bytes(DIM);
+        // SAFETY: the live sidecar and the pinned int4 area.
+        let (src, dst) = unsafe {
+            (
+                hip_bridge::DeviceBuffer::from_raw(ptr, bytes),
+                hip_bridge::DeviceBuffer::from_raw(x4_mb.cast(), bytes),
+            )
+        };
+        gpu.hip.memcpy_dtod(&dst, &src, bytes).unwrap();
+        // SAFETY: poison the partial; ids/weights are still this case's.
+        unsafe { std::slice::from_raw_parts_mut(part_mb, MAX_ROWS * DIM).fill((SENTINEL.to_bits() >> 16) as u16) };
+        let got = run_cold_prefill(&mut gpu, &layer, &scratch, rows, io4);
+        gpu.hip.device_synchronize().unwrap();
+        let expect_ok = symmetric && rows >= 512;
+        match (got, expect_ok) {
+            (Ok(()), true) => {
+                let g = partial();
+                if let Some(i) = (0..rows * DIM).find(|&i| g[i].to_bits() != want[i].to_bits()) {
+                    fail(format!("int4 rows {rows}: element {i}: {} != F16 path {}", g[i], want[i]));
+                }
+                println!("int4 rows {rows}: shipped sidecar == own F16 basis, bitwise");
+            }
+            (Err(e), false) => println!("int4 rows {rows}: refused as expected ({})", format!("{e:?}").chars().take(90).collect::<String>()),
+            (Ok(()), false) => fail(format!("int4 rows {rows}: accepted where the IU4 arm does not run")),
+            (Err(e), true) => fail(format!("int4 rows {rows}: {e:?}")),
+        }
+    }
 
     // Timing: 2,048 rows, synchronous per call (the responder's shape).
     let c = case(&mut rng, MAX_ROWS);

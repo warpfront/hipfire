@@ -283,7 +283,15 @@ pub enum PrefillRouteMode<'a> {
     /// `topk_weights` (hot slots masked to -1), and this call runs the routed
     /// experts only, combining into `x_batch`, which the caller zeroed as the
     /// cold partial. Single binding, no shared expert, softmax recipe only.
-    HeteroCold,
+    ///
+    /// `xq`: the primary's int4 activation sidecar for these rows (the
+    /// symmetric IU4 producer is bitwise identical on both devices), copied
+    /// into this device's IU4 reservation. With it no input basis runs and the
+    /// gate/up must take the symmetric IU4 arm (any other arm fails closed);
+    /// `None` runs the call's own basis from `x_norm_batch`.
+    HeteroCold {
+        xq: Option<&'a rdna_compute::scratch::Int4MmqPrepared>,
+    },
 }
 
 /// The producer that owns the route buffers used by a sealed call.
@@ -3218,7 +3226,7 @@ pub fn seal_prefill<'a>(
 ) -> Result<SealedMoeCall<'a>, DispatchError> {
     let router = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
-            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold => {
+            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold { .. } => {
                 MoeRouterInput::PrecomputedSoftmaxTopK
             }
             _ => MoeRouterInput::SoftmaxTopK,
@@ -3252,7 +3260,7 @@ fn prepare_prefill<'a>(
     }
     let expected = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
-            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold => {
+            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold { .. } => {
                 MoeRouterInput::PrecomputedSoftmaxTopK
             }
             _ => MoeRouterInput::SoftmaxTopK,
@@ -3293,7 +3301,7 @@ fn seal_prefill_with_router<'a>(
         router,
         contribution,
         shared: if params.recipe == crate::families::moe::MoeRecipe::SigmoidRoutedNoShared
-            || matches!(params.prelude.route, PrefillRouteMode::HeteroCold)
+            || matches!(params.prelude.route, PrefillRouteMode::HeteroCold { .. })
         {
             MoeSharedContribution::None
         } else {
@@ -3310,7 +3318,7 @@ fn seal_prefill_with_router<'a>(
                 let receipt = adopt_prefill_route(&call, proof)?;
                 call.attach_route_receipt(receipt)?;
             }
-            PrefillRouteMode::HeteroCold => {
+            PrefillRouteMode::HeteroCold { .. } => {
                 let receipt = hetero_cold_route(&call)?;
                 call.attach_route_receipt(receipt)?;
             }
@@ -3356,7 +3364,7 @@ pub fn preflight_prefill<'a>(
 ) -> Result<(), DispatchError> {
     let router = match params.recipe {
         crate::families::moe::MoeRecipe::SoftmaxGatedShared { .. } => match params.prelude.route {
-            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold => {
+            PrefillRouteMode::AdoptRoot { .. } | PrefillRouteMode::HeteroCold { .. } => {
                 MoeRouterInput::PrecomputedSoftmaxTopK
             }
             _ => MoeRouterInput::SoftmaxTopK,
@@ -3396,7 +3404,7 @@ pub fn seal_prefill_ep<'a>(
                 "compact EP prefill requires ProduceRoot or AdoptRoot route authority",
             ));
         }
-        PrefillRouteMode::HeteroCold => {
+        PrefillRouteMode::HeteroCold { .. } => {
             return Err(invalid(
                 "compact EP prefill never admits the HeteroCold route (Single expert device only)",
             ));
@@ -3794,6 +3802,15 @@ fn validate_hetero_cold_prefill(params: &MoePrefillParams<'_>) -> Result<(), Dis
     if params.cpu_deferred_experts || params.ep_row_gather.is_some() || params.ep_tile_exchange.is_some() {
         return Err(invalid("HeteroCold prefill admits no CPU-deferred window or EP exchange"));
     }
+    if matches!(params.prelude.route, PrefillRouteMode::HeteroCold { xq: Some(_) })
+        && !params
+            .route_policy
+            .is_some_and(|policy| policy.capability == MoeRouteCapability::Qt44Qt53GroupedSymmetric)
+    {
+        return Err(invalid(
+            "HeteroCold int4 activation requires the symmetric QT44/QT53 route policy",
+        ));
+    }
     Ok(())
 }
 
@@ -3992,7 +4009,7 @@ fn validate_prefill(
         .ok_or_else(|| invalid("prefill hidden capacity overflows"))?;
     validate_grouped_m_total_max(total_slots, params.n_exp, params.m_total_max)?;
     validate_normalization(&params.prelude.normalization, hidden, batch_hidden)?;
-    if matches!(params.prelude.route, PrefillRouteMode::HeteroCold) {
+    if matches!(params.prelude.route, PrefillRouteMode::HeteroCold { .. }) {
         validate_hetero_cold_prefill(params)?;
     } else {
         validate_shared_prefill(params, hidden)?;
@@ -9626,7 +9643,7 @@ mod tests {
     }
 
     fn hetero_cold_route(params: &mut MoePrefillParams<'_>) {
-        params.prelude.route = PrefillRouteMode::HeteroCold;
+        params.prelude.route = PrefillRouteMode::HeteroCold { xq: None };
         params.prelude.shared = None;
         params.dtypes.shared = None;
         params.prelude.normalization = crate::families::moe::MoeNormalization::Provided;

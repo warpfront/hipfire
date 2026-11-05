@@ -119,8 +119,8 @@ pub struct PrefillGeometry {
 }
 
 /// One sub-chunk's words: the request and response on their own lines, and
-/// the request's layer, first row and row count (three u32 the primary
-/// writes before the request word) on a third.
+/// the request's layer, first row, row count and row format (four u32 the
+/// primary writes before the request word) on a third.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SubChunkWords {
     pub req_seq: usize,
@@ -128,6 +128,20 @@ pub struct SubChunkWords {
     pub layer: usize,
     pub row_off: usize,
     pub rows: usize,
+    /// [`ROWS_F16`] or [`ROWS_INT4`].
+    pub format: usize,
+}
+
+/// Row format of a sub-chunk: F16 rows at `x_norm + row_off * dim * 2`.
+pub const ROWS_F16: u32 = 0;
+/// Row format of a sub-chunk: the symmetric IU4 producer's sidecar of the
+/// block's rows (block-major, `dim / 128` records of 72 B per row) at
+/// `x_norm + row_off * int4_row_bytes(dim)`.
+pub const ROWS_INT4: u32 = 1;
+
+/// Bytes per row of the int4 activation sidecar.
+pub const fn int4_row_bytes(dim: usize) -> usize {
+    dim / 128 * 72
 }
 
 /// Byte offsets of the prefill slot fields from the mailbox base.
@@ -136,10 +150,13 @@ pub struct PrefillOffsets {
     /// Shared by every sub-chunk: the first timed-out wait records its
     /// sequence here, and the primary skips the whole chunk's add.
     pub error: usize,
+    /// Written once by the expert device at start: the smallest block it
+    /// accepts as [`ROWS_INT4`] (0 = never; send F16).
+    pub int4_min_rows: usize,
     /// `sub[..sub_chunks]` are live.
     pub sub: [SubChunkWords; MAX_SUB_CHUNKS],
-    /// The chunk's normed rows, `rows x dim` F16 (the expert device runs its
-    /// own input basis).
+    /// The chunk's rows per sub-chunk format: normed F16 rows (the expert
+    /// device runs its own basis) or the int4 sidecar.
     pub x_norm: usize,
     /// `rows x top_k` i32 route ids and F32 weights.
     pub ids: usize,
@@ -159,23 +176,25 @@ impl PrefillGeometry {
         );
     }
 
-    /// Local layout (from a 256-aligned start): the error word on line 0, each
-    /// sub-chunk's request, response and meta on three lines, then 256-aligned
-    /// arrays; returns the offsets and the slot's size.
+    /// Local layout (from a 256-aligned start): the error word on line 0, the
+    /// int4 floor on line 1, each sub-chunk's request, response and meta on
+    /// three lines, then 256-aligned arrays; returns the offsets and the size.
     fn local(&self) -> (PrefillOffsets, usize) {
         self.check();
         let mut sub = [SubChunkWords::default(); MAX_SUB_CHUNKS];
         for (i, w) in sub.iter_mut().enumerate().take(self.sub_chunks) {
-            let b = LINE * (1 + 3 * i);
-            *w = SubChunkWords { req_seq: b, resp_seq: b + LINE, layer: b + 2 * LINE, row_off: b + 2 * LINE + 4, rows: b + 2 * LINE + 8 };
+            let b = LINE * (2 + 3 * i);
+            let m = b + 2 * LINE;
+            *w = SubChunkWords { req_seq: b, resp_seq: b + LINE, layer: m, row_off: m + 4, rows: m + 8, format: m + 12 };
         }
         let slots = self.max_rows * self.top_k;
-        let x_norm = align(LINE * (1 + 3 * self.sub_chunks));
-        let ids = align(x_norm + self.max_rows * self.dim * 2);
+        let x_norm = align(LINE * (2 + 3 * self.sub_chunks));
+        let row_area = (self.max_rows * self.dim * 2).max(self.max_rows * int4_row_bytes(self.dim));
+        let ids = align(x_norm + row_area);
         let weights = align(ids + slots * 4);
         let partial = align(weights + slots * 4);
         let end = align(partial + self.max_rows * self.dim * 2);
-        (PrefillOffsets { error: 0, sub, x_norm, ids, weights, partial }, end)
+        (PrefillOffsets { error: 0, int4_min_rows: LINE, sub, x_norm, ids, weights, partial }, end)
     }
 
     /// Offsets from the mailbox base when the slot starts at (or after)
@@ -191,10 +210,12 @@ impl PrefillGeometry {
                 layer: b + w.layer,
                 row_off: b + w.row_off,
                 rows: b + w.rows,
+                format: b + w.format,
             };
         }
         PrefillOffsets {
             error: b + o.error,
+            int4_min_rows: b + o.int4_min_rows,
             sub,
             x_norm: b + o.x_norm,
             ids: b + o.ids,
@@ -236,9 +257,9 @@ mod tests {
     fn prefill_ranges(base: usize) -> Vec<(usize, usize)> {
         let o = P.offsets(base);
         let slots = P.max_rows * P.top_k;
-        let mut v = vec![(o.error, 4)];
+        let mut v = vec![(o.error, 4), (o.int4_min_rows, 4)];
         for s in &o.sub[..P.sub_chunks] {
-            v.extend([(s.req_seq, 4), (s.resp_seq, 4), (s.layer, 4), (s.row_off, 4), (s.rows, 4)]);
+            v.extend([(s.req_seq, 4), (s.resp_seq, 4), (s.layer, 4), (s.row_off, 4), (s.rows, 4), (s.format, 4)]);
         }
         v.extend([
             (o.x_norm, P.max_rows * P.dim * 2),
@@ -268,11 +289,13 @@ mod tests {
     #[test]
     fn prefill_words_have_their_own_cache_lines() {
         let o = P.offsets(0);
-        let mut lines = vec![o.error / 64];
+        // The error word (primary-written) and the int4 floor (expert-written) apart.
+        let mut lines = vec![o.error / 64, o.int4_min_rows / 64];
         for s in &o.sub[..P.sub_chunks] {
             lines.extend([s.req_seq / 64, s.resp_seq / 64, s.layer / 64]);
-            assert_eq!(s.row_off / 64, s.layer / 64, "the primary-written meta shares one line");
-            assert_eq!(s.rows / 64, s.layer / 64, "the primary-written meta shares one line");
+            for w in [s.row_off, s.rows, s.format] {
+                assert_eq!(w / 64, s.layer / 64, "the primary-written meta shares one line");
+            }
         }
         let mut sorted = lines.clone();
         sorted.sort();
@@ -281,6 +304,14 @@ mod tests {
         for &(off, _) in &prefill_ranges(0)[prefill_ranges(0).len() - 4..] {
             assert!(!lines.contains(&(off / 64)), "an array shares a word's line");
         }
+    }
+
+    #[test]
+    fn the_row_area_holds_either_format() {
+        let o = P.offsets(0);
+        let int4 = P.max_rows * int4_row_bytes(P.dim);
+        assert_eq!(int4_row_bytes(2560), 1440);
+        assert!(o.ids - o.x_norm >= (P.max_rows * P.dim * 2).max(int4));
     }
 
     #[test]

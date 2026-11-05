@@ -1307,7 +1307,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(64),
             write(72),
         ]),
-        "hetero_release_rows" => Some(vec![read(0), write(24), write(32)]),
+        "hetero_release_rows" => Some(vec![read(0), write(32), write(40)]),
         "hetero_add_partial" => Some(vec![read(0), read(8), write(24)]),
         "hetero_f16_to_f32" => Some(vec![read(0), write(8)]),
         "hetero_f32_to_bf16" => Some(vec![read(0), write(8)]),
