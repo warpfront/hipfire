@@ -927,6 +927,12 @@ required-features = ["lab"]
 name = "sp_rs_ag_oracle"
 required-features = ["lab"]
 
+# Two-card byte oracle (+ bench) of the sequence-parallel QSA selection (own-range select, compact
+# block-id all-gather, expand) against the full-tile select; `--features lab`.
+[[example]]
+name = "qsa_sp_gather_oracle"
+required-features = ["lab"]
+
 # Load-path benches (HFQ direct reader grid); developer-only.
 [[example]]
 name = "bench_hfq_reader"

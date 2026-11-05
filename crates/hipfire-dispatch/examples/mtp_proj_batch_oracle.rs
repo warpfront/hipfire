@@ -439,6 +439,7 @@ fn make_op<'a>(
     attention_output: &'a GpuTensor,
 ) -> IndexedAttentionOp<'a> {
     IndexedAttentionOp {
+        sp_select: None,
         indexer_qk: q8_ref(&w.indexer_qk, INDEX_W, HIDDEN),
         indexer_q_norm: &w.indexer_q_norm,
         indexer_k_norm: &w.indexer_k_norm,

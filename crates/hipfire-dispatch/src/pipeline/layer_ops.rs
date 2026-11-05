@@ -19,6 +19,7 @@ use crate::families::gemm::{GemmFamily, GemmParams};
 use crate::families::gemv::WeightRef;
 use crate::types::DispatchError;
 use crate::types::KernelKey;
+use rdna_compute::qsa_sp_select::QsaSpBlocks;
 use rdna_compute::tensor_ops::{
     argmax_f32, bf16_roundtrip_f32, gated_delta_chunk_route, gated_delta_conv_params,
     gated_delta_conv_params_batched, gated_delta_conv_params_qknorm_batched,
@@ -31,16 +32,16 @@ use rdna_compute::tensor_ops::{
     indexed_attention_attention_batch_with_arena, indexed_attention_cache_append_batch,
     indexed_attention_decode_prologue, indexed_attention_index_key_append_batch,
     indexed_attention_norm_rope_batch, indexed_attention_pool_rope_incremental,
-    indexed_attention_reuse_selection, indexed_attention_select_batch_mirrored, scale_f32,
-    ArgmaxF32, Bf16Roundtrip, GatedDeltaConv, GatedDeltaConvBatched, GatedDeltaGate,
-    GatedDeltaGateBatched, GatedDeltaParams, GatedDeltaParamsBatched, GatedDeltaStep,
-    GatedDeltaStepBatched, GdnStateFormat, HcActivationFused, HyperNextGates, HyperNorm,
-    HyperNormGate, HyperNormGateK4Outputs, HyperNormGateOutputs, HyperReadProjected,
-    HyperReadUpFused, HyperWrite, IndexedAttentionAttention, IndexedAttentionAttentionBatch,
-    IndexedAttentionCacheAppendBatch, IndexedAttentionDecodePrologue,
-    IndexedAttentionIndexKeyAppendBatch, IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope,
-    IndexedAttentionReuseSelection, IndexedAttentionSelectBatch, QsaF16ArenaRef, QsaKvFormat,
-    ScaleF32,
+    indexed_attention_reuse_selection, indexed_attention_select_batch,
+    indexed_attention_select_batch_mirrored, scale_f32, ArgmaxF32, Bf16Roundtrip, GatedDeltaConv,
+    GatedDeltaConvBatched, GatedDeltaGate, GatedDeltaGateBatched, GatedDeltaParams,
+    GatedDeltaParamsBatched, GatedDeltaStep, GatedDeltaStepBatched, GdnStateFormat,
+    HcActivationFused, HyperNextGates, HyperNorm, HyperNormGate, HyperNormGateK4Outputs,
+    HyperNormGateOutputs, HyperReadProjected, HyperReadUpFused, HyperWrite,
+    IndexedAttentionAttention, IndexedAttentionAttentionBatch, IndexedAttentionCacheAppendBatch,
+    IndexedAttentionDecodePrologue, IndexedAttentionIndexKeyAppendBatch,
+    IndexedAttentionNormRopeBatch, IndexedAttentionPoolRope, IndexedAttentionReuseSelection,
+    IndexedAttentionSelectBatch, QsaF16ArenaRef, QsaKvFormat, ScaleF32,
 };
 use rdna_compute::tensor_ops::{
     gated_delta_conv_params_batched_mixed, gated_delta_conv_params_qknorm_batched_mixed,
@@ -2986,6 +2987,7 @@ pub fn execute_indexed_attention_core_rows(
         mode: op.mode,
         trunk_a4: op.trunk_a4,
         phase: MixerPhase::Core,
+        sp_select: None,
     };
     sub.validate_for_gpu(gpu)?;
     let shifted = arenas
@@ -3992,6 +3994,10 @@ pub struct IndexedAttentionOp<'a> {
     pub trunk_a4: u16,
     /// Which part of the mixer this call runs (see [`MixerPhase`]).
     pub phase: MixerPhase,
+    /// Sequence-parallel QSA selection of the tile (`Full` mode, whole phase only): this rank
+    /// selects its own rows and receives the peer's through the gather. `None`: every rank selects
+    /// every row.
+    pub sp_select: Option<QsaSpSelect<'a>>,
 }
 
 impl IndexedAttentionOp<'_> {
@@ -4790,6 +4796,105 @@ fn qsa_norm_source(
     })
 }
 
+/// Sequence-parallel selection of a full-mode tile ([`QsaSpSelect`]): this rank runs the batched
+/// select over its own rows only, packs their chosen block ids into a compact
+/// `[rows][budget_blocks]` i32 buffer (the dead head of `index_scratch`), all-gathers the compact
+/// rows and expands the peer rows back into the exact `[rows][capacity]` selection bytes of
+/// `selected_batch`. Returns whether the persistent selected indices were written (only the rank
+/// whose range ends at the tile's last row can).
+///
+/// Byte-exact against the full-tile select: every selection row is a pure function of its own
+/// query row, its position and the pooled keys (blocks ranked score descending, block ascending;
+/// the split route is byte-identical to the fused kernel), so selecting a row sub-range yields the
+/// rows the full select would. The compact ids are block numbers (>= 0, pads 0) and never hit the
+/// all-gather wire's EMPTY marker (`0xFFFFFFFF`).
+fn qsa_sp_select(
+    gpu: &mut Gpu,
+    op: &IndexedAttentionOp<'_>,
+    select: &IndexedAttentionSelectBatch<'_>,
+    selected_batch: &GpuTensor,
+    index_batch: &GpuTensor,
+    index_width: usize,
+    sp: &QsaSpSelect<'_>,
+) -> Result<bool, DispatchError> {
+    let (own, peer) = (sp.own, sp.peer);
+    let budget_blocks = select.budget_blocks;
+    let contiguous = (own.0 == 0 && peer.0 == own.1) || (peer.0 == 0 && own.0 == peer.1);
+    if op.phase != MixerPhase::Whole
+        || own.1 < 1
+        || peer.1 < 1
+        || own.1 + peer.1 != op.rows
+        || !contiguous
+    {
+        return Err(DispatchError::Hip(format!(
+            "sequence-parallel QSA select needs a whole-phase op whose own {own:?} and peer {peer:?} \
+             row ranges are non-empty, contiguous and cover its {} rows",
+            op.rows
+        )));
+    }
+    if budget_blocks > index_width {
+        return Err(DispatchError::Hip(format!(
+            "sequence-parallel QSA select packs {budget_blocks} block ids into an index scratch \
+             row of {index_width} words"
+        )));
+    }
+    let position = select.position_start;
+    // `index_batch` is F32 (one unit = one element); `selected_batch` is raw bytes.
+    let selected_row_bytes = select.capacity * std::mem::size_of::<i32>();
+    let own_query = view(index_batch, own.0 * index_width, own.1 * index_width);
+    let own_selected = view(
+        selected_batch,
+        own.0 * selected_row_bytes,
+        own.1 * selected_row_bytes,
+    );
+    let sub = IndexedAttentionSelectBatch {
+        query: &own_query,
+        pooled: select.pooled,
+        pooled_bf16: select.pooled_bf16,
+        pooled_bf16_valid_blocks: select.pooled_bf16_valid_blocks,
+        selected: &own_selected,
+        rows: own.1,
+        query_row_stride: select.query_row_stride,
+        block_count: (position + own.0 + own.1) / select.compress,
+        index_heads: select.index_heads,
+        index_dim: select.index_dim,
+        budget_blocks,
+        compress: select.compress,
+        position_start: position + own.0,
+        capacity: select.capacity,
+        shape_blocks: select.shape_blocks,
+    };
+    let persisted = if own.0 + own.1 == op.rows {
+        hip(indexed_attention_select_batch_mirrored(
+            gpu,
+            &sub,
+            op.state.selected_indices,
+        ))?
+    } else {
+        hip(indexed_attention_select_batch(gpu, &sub))?;
+        false
+    };
+    // The index scratch is dead after the select: its leading `rows * budget_blocks` words (F32
+    // view, 4 bytes each) hold the compact block ids.
+    let compact = view(op.index_scratch, 0, op.rows * budget_blocks);
+    let blocks = QsaSpBlocks {
+        selected: selected_batch,
+        compact: &compact,
+        tile_rows: op.rows,
+        position_start: position,
+        block_count: select.block_count,
+        budget_blocks,
+        compress: select.compress,
+        capacity: select.capacity,
+    };
+    hip(gpu.qsa_sp_pack_blocks(&blocks, own.0, own.1))?;
+    sp.gather
+        .gather_selection(gpu, &compact, 2 * budget_blocks, own, peer)
+        .map_err(|e| DispatchError::Hip(format!("QSA selection gather: {e}")))?;
+    hip(gpu.qsa_sp_expand_blocks(&blocks, peer.0, peer.1))?;
+    Ok(persisted)
+}
+
 fn execute_indexed_attention_hc_impl(
     gpu: &mut Gpu,
     op: &IndexedAttentionOp<'_>,
@@ -5326,12 +5431,24 @@ fn execute_indexed_attention_hc_impl(
         shape_blocks: op.state.pooled_capacity,
     };
     // The final row's selection also lands in the persistent selected indices
-    // (the copy at the end is then skipped).
-    let selection_persisted = hip(indexed_attention_select_batch_mirrored(
-        gpu,
-        &select,
-        op.state.selected_indices,
-    ))?;
+    // (the copy at the end is then skipped). Under the sequence-parallel selection the rank
+    // holding the tile's last row does that.
+    let selection_persisted = match op.sp_select {
+        None => hip(indexed_attention_select_batch_mirrored(
+            gpu,
+            &select,
+            op.state.selected_indices,
+        ))?,
+        Some(sp) => qsa_sp_select(
+            gpu,
+            op,
+            &select,
+            &selected_batch,
+            &index_batch,
+            index_width,
+            &sp,
+        )?,
+    };
     hip(indexed_attention_attention_batch_with_arena(
         gpu,
         &IndexedAttentionAttentionBatch {
@@ -5797,6 +5914,34 @@ pub trait RowGather: Send + Sync {
         row_elems: usize,
         rows: usize,
     ) -> Result<(), String>;
+}
+
+/// The transport of [`QsaSpSelect`]: all-gathers rows of the compact selection buffer across the
+/// ranks, the ranges being the caller's.
+pub trait QsaSelectGather: Send + Sync {
+    /// All-gather rows of `buf` (`[rows][row_elems]` 16-bit words, row 0 at the base): send `own`,
+    /// receive `peer` in place. Ranges are (first row, rows), mirrored on the peer rank.
+    fn gather_selection(
+        &self,
+        gpu: &mut Gpu,
+        buf: &GpuTensor,
+        row_elems: usize,
+        own: (usize, usize),
+        peer: (usize, usize),
+    ) -> Result<(), String>;
+}
+
+/// Sequence-parallel QSA selection of one prefill tile (the Flash-Next EP2 route,
+/// `HIPFIRE_QWEN4_EP_SP_INDEXER`): this rank selects only the rows of `own`, the peer the rows of
+/// `peer`; the two ranges are contiguous and cover the tile. The chosen block ids travel through
+/// `gather` and each rank rebuilds the peer rows' selection bytes locally.
+#[derive(Clone, Copy)]
+pub struct QsaSpSelect<'a> {
+    /// (first row, rows) selected by this rank.
+    pub own: (usize, usize),
+    /// (first row, rows) selected by the peer rank.
+    pub peer: (usize, usize),
+    pub gather: &'a dyn QsaSelectGather,
 }
 
 impl RowGatherOp<'_> {
@@ -6668,6 +6813,7 @@ mod tests {
             mode,
             trunk_a4: 0,
             phase: MixerPhase::Whole,
+            sp_select: None,
         }
     }
 

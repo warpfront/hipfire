@@ -2442,6 +2442,7 @@ fn head_attention_op<'a>(
 ) -> IndexedAttentionOp<'a> {
     let hidden = config.hidden_size;
     IndexedAttentionOp {
+        sp_select: None,
         indexer_qk: qsa.indexer_qk,
         indexer_q_norm: qsa.indexer_q_norm,
         indexer_k_norm: qsa.indexer_k_norm,

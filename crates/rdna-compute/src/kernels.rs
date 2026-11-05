@@ -10929,6 +10929,11 @@ pub const SP_HC_RS_AG_GFX1201_HIPBF16_SRC: &str = concat!(
     include_str!("../../../kernels/src/sp_hc_rs_ag.gfx1201.hip")
 );
 
+/// Sequence-parallel QSA selection exchange (`qsa_sp_pack_blocks` / `qsa_sp_expand_blocks`):
+/// packs a rank's chosen block ids into a compact row and rebuilds the full selection
+/// rows byte-identically from a gathered compact buffer.
+pub const QSA_SP_SELECT_SRC: &str = include_str!("../../../kernels/src/qsa_sp_select.hip");
+
 /// 16-bit partial-sum exchange for the dense TP residual reduction
 /// (`HIPFIRE_TP_EXCHANGE=bf16|f16`): `tp_pack16_{bf16,f16}` converts an f32
 /// partial to 16 bits, `tp_fold16_{bf16,f16}` sums rank-ordered 16-bit

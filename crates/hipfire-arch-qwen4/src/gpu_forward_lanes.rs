@@ -3137,6 +3137,7 @@ fn forward_lanes_scoped(
                                 .get(slot)
                                 .ok_or_else(|| invalid("QSA state slot missing"))?;
                             let op = IndexedAttentionOp {
+                                sp_select: None,
                                 rotation: &scratch.rotation,
                                 mode: IndexedAttentionMode::Full,
                                 indexer_qk: weights.indexer_qk,

@@ -11,7 +11,7 @@
 //! tables ([`install`]) and read where the forward builds its HC writes. It is leaked once
 //! per load (a few bytes): the forward borrows it as `&'static dyn HyperWriteAr`.
 
-use hipfire_dispatch::pipeline::{HyperWriteAr, RowGather};
+use hipfire_dispatch::pipeline::{HyperWriteAr, QsaSelectGather, RowGather};
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
 use rdna_compute::ar_hc_write::{sp_even_split, SpAgElem, StreamKind};
 use rdna_compute::{Gpu, GpuTensor};
@@ -41,6 +41,27 @@ pub(crate) fn sp_switch(raw: Option<&str>) -> bool {
 /// Whether the process asks for the sequence-parallel prefill route ([`SP_ENV`], [`sp_switch`]).
 pub(crate) fn sp_requested() -> bool {
     sp_switch(hipfire_config::developer_var(SP_ENV).ok().as_deref())
+}
+
+/// Switch of the sequence-parallel QSA indexer inside a sequence-parallel chunk (each rank selects
+/// its own work-balanced rows and the block ids are all-gathered): unset (or `1` / `on` / `true`)
+/// = ON wherever the sequence-parallel prefill route runs ([`SP_ENV`]); `0` / `off` / `false` is
+/// the kill switch (every rank selects every row); any other value is off (fail safe).
+pub(crate) const SP_INDEXER_ENV: &str = "HIPFIRE_QWEN4_EP_SP_INDEXER";
+
+/// Whether the raw [`SP_INDEXER_ENV`] value asks for the sequence-parallel QSA indexer.
+pub(crate) fn sp_indexer_switch(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), None | Some("" | "1" | "on" | "true"))
+}
+
+/// Whether the process asks for the sequence-parallel QSA indexer ([`SP_INDEXER_ENV`],
+/// [`sp_indexer_switch`]).
+pub(crate) fn sp_indexer_requested() -> bool {
+    sp_indexer_switch(
+        hipfire_config::developer_var(SP_INDEXER_ENV)
+            .ok()
+            .as_deref(),
+    )
 }
 
 /// The row split of one sequence-parallel chunk on one rank: `own` / `peer` are
@@ -75,6 +96,8 @@ pub(crate) struct TrunkShardRoute {
     ffn: bool,
     /// [`SP_ENV`] was on when the route was installed.
     sp_on: bool,
+    /// [`SP_INDEXER_ENV`] was on when the route was installed.
+    sp_indexer_on: bool,
     /// The sequence-parallel split of the chunk program being executed ([`sp_begin`] /
     /// [`sp_end`]); `None` outside one. A mutex, not a cell: the route is a `Sync`
     /// [`HyperWriteAr`], though only its own rank thread ever touches the state.
@@ -89,6 +112,7 @@ impl TrunkShardRoute {
             attn,
             ffn,
             sp_on: sp_requested(),
+            sp_indexer_on: sp_indexer_requested(),
             sp: Mutex::new(None),
         }
     }
@@ -211,6 +235,47 @@ impl RowGather for TrunkShardRoute {
     }
 }
 
+impl QsaSelectGather for TrunkShardRoute {
+    fn gather_selection(
+        &self,
+        gpu: &mut Gpu,
+        buf: &GpuTensor,
+        row_elems: usize,
+        own: (usize, usize),
+        peer: (usize, usize),
+    ) -> Result<(), String> {
+        let sp = self.sp_state().ok_or_else(|| {
+            format!(
+                "rank {}: selection gather outside a sequence-parallel chunk",
+                self.rank
+            )
+        })?;
+        if own.0 + own.1 > sp.n || peer.0 + peer.1 > sp.n {
+            return Err(format!(
+                "rank {}: selection gather of {own:?} / {peer:?} in a sequence-parallel chunk of {}",
+                self.rank, sp.n
+            ));
+        }
+        // The ranges are the work-balanced split (different lengths), so the gather runs in
+        // lockstep slices: every launch carries rows both ways.
+        // SAFETY: `buf` is the live compact selection (`rows * row_elems` BF16-sized words, the
+        // dispatch op sized it); the gather touches only the rows of `own` / `peer`, which
+        // lie inside the armed chunk.
+        unsafe {
+            self.exchange.sp_ag_rows_lockstep(
+                self.rank,
+                gpu,
+                buf.buf.as_ptr(),
+                SpAgElem::Bf16,
+                row_elems,
+                own,
+                peer,
+            )
+        }
+        .map_err(|error| format!("rank {}: sequence-parallel gather: {error}", self.rank))
+    }
+}
+
 thread_local! {
     static ROUTE: Cell<Option<&'static TrunkShardRoute>> = const { Cell::new(None) };
 }
@@ -272,6 +337,52 @@ pub(crate) fn sp_end() {
     }
 }
 
+/// The sequence-parallel QSA selection of this thread's rank: `(rank, route)` when this thread's
+/// [`sp_route`] exists and [`SP_INDEXER_ENV`] was on at install, else `None` (every rank selects
+/// every row).
+pub(crate) fn sp_qsa_gather() -> Option<(usize, &'static dyn QsaSelectGather)> {
+    sp_route()
+        .filter(|r| r.sp_indexer_on)
+        .map(|r| (r.rank, r as &'static dyn QsaSelectGather))
+}
+
+/// The work-balanced row split of the QSA indexer select of an `n`-row tile starting at
+/// `position_start`, as `[(first row, rows); 2]` (rank 0 first, from row 0). Row `r` selects over
+/// `position_start + r + 1` visible tokens, so its cost grows with `r` and an even row split
+/// leaves the later rows' rank with more work. The cut `s` is the smallest in `[1, n - 1]` whose
+/// left side (rows `0..s`) costs at least the right side, or the one before it when that makes
+/// the larger side smaller (ties go to the smaller `s`). Needs `n >= 2` (both ranks own a row);
+/// the SP route only runs chunks of at least [`SP_MIN_ROWS`].
+pub(crate) fn qsa_select_split(n: usize, position_start: usize) -> [(usize, usize); 2] {
+    debug_assert!(n >= 2, "a QSA select split needs two rows, got {n}");
+    let n = n.max(2);
+    let (p, n128) = (position_start as u128, n as u128);
+    // Cost of rows `0..s`: sum of `p + r + 1`.
+    let left = |s: u128| s * p + s * (s + 1) / 2;
+    let total = left(n128);
+    let right = |s: u128| total - left(s);
+    // Smallest `s` in `[1, n - 1]` with `left(s) >= right(s)`; `left` grows with `s`.
+    let (mut lo, mut hi) = (1u128, n128 - 1);
+    if left(hi) < right(hi) {
+        lo = hi;
+    }
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if left(mid) >= right(mid) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    let mut s = lo;
+    // `s - 1` has `left < right`: its larger side is `right(s - 1)`.
+    if s > 1 && left(s) >= right(s) && right(s - 1) <= left(s) {
+        s -= 1;
+    }
+    let s = s as usize;
+    [(0, s), (s, n - s)]
+}
+
 /// Resolve the SP kernels of `exchange` on `gpu` when [`SP_ENV`] is on and the exchange has a
 /// dense mailbox region (load time: JIT is not capture-safe); a no-op otherwise.
 pub(crate) fn sp_prepare(exchange: &ArHcExchange, gpu: &mut Gpu) -> Result<(), String> {
@@ -279,6 +390,10 @@ pub(crate) fn sp_prepare(exchange: &ArHcExchange, gpu: &mut Gpu) -> Result<(), S
         exchange
             .sp_ensure_kernels(gpu)
             .map_err(|e| format!("resolve the sequence-parallel kernels: {e}"))?;
+        if sp_indexer_requested() {
+            gpu.ensure_qsa_sp_select_kernels()
+                .map_err(|e| format!("resolve the sequence-parallel QSA select kernels: {e}"))?;
+        }
     }
     Ok(())
 }
@@ -373,6 +488,98 @@ mod tests {
             assert_eq!(a.own.0 + a.own.1, a.peer.0);
             assert_eq!(a.own.1 + a.peer.1, n);
             assert!(a.own.1 >= SP_MIN_ROWS / 2 && b.own.1 >= SP_MIN_ROWS / 2);
+        }
+    }
+
+    #[test]
+    fn sp_indexer_switch_is_default_on_with_a_kill_switch() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("on"),
+            Some("true"),
+            Some(" 1 "),
+        ] {
+            assert!(sp_indexer_switch(on), "{on:?}");
+        }
+        for off in [
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("lab"),
+            Some("2"),
+        ] {
+            assert!(!sp_indexer_switch(off), "{off:?}");
+        }
+        assert_ne!(SP_INDEXER_ENV, SP_ENV);
+    }
+
+    /// The work of a range of rows `[first, first + rows)` of a tile at `position_start`.
+    fn qsa_range_cost(position_start: usize, first: usize, rows: usize) -> u128 {
+        (first..first + rows)
+            .map(|r| (position_start + r + 1) as u128)
+            .sum()
+    }
+
+    #[test]
+    fn qsa_select_split_covers_the_tile_and_balances_the_work() {
+        for (p, n) in [
+            (0usize, 2usize),
+            (0, 3),
+            (0, 5),
+            (7, 2),
+            (7, 9),
+            (1000, 33),
+            (0, 4096),
+            (0, 4097),
+            (1_000_000, 4096),
+            (1_000_001, 4097),
+        ] {
+            let [a, b] = qsa_select_split(n, p);
+            assert_eq!(a.0, 0, "P={p} n={n}");
+            assert_eq!(a.0 + a.1, b.0, "P={p} n={n}");
+            assert_eq!(a.1 + b.1, n, "P={p} n={n}");
+            assert!(a.1 >= 1 && b.1 >= 1, "P={p} n={n}");
+        }
+    }
+
+    /// Small tiles: the split is the smallest cut minimising the larger side (brute force).
+    #[test]
+    fn qsa_select_split_is_the_smallest_minimax_cut() {
+        for p in [0usize, 1, 3, 64, 1000] {
+            for n in 2..40usize {
+                let cost = |s: usize| qsa_range_cost(p, 0, s).max(qsa_range_cost(p, s, n - s));
+                let best = (1..n).min_by_key(|&s| (cost(s), s)).unwrap();
+                assert_eq!(qsa_select_split(n, p)[0].1, best, "P={p} n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn qsa_select_split_at_zero_position_favours_the_cheaper_rows() {
+        let n = 4096;
+        let [a, b] = qsa_select_split(n, 0);
+        assert!((2890..=2900).contains(&a.1), "rank 0 rows {}", a.1);
+        let (left, right) = (qsa_range_cost(0, a.0, a.1), qsa_range_cost(0, b.0, b.1));
+        let total = left + right;
+        let bound = total.div_ceil(2) + (n as u128);
+        assert!(left.max(right) <= bound, "{left} / {right}");
+    }
+
+    #[test]
+    fn qsa_select_split_deep_in_the_context_is_near_even() {
+        let [a, b] = qsa_select_split(4096, 1_000_000);
+        // Rank 0's rows are the cheaper ones by about `n / 2` tokens each, so it takes
+        // ~`n^2 / (8 P)` (here ~2) rows more than half.
+        assert!((2048..=2051).contains(&a.1), "rank 0 rows {}", a.1);
+        assert_eq!(a.1 + b.1, 4096);
+    }
+
+    #[test]
+    fn qsa_select_split_of_two_rows_is_one_each() {
+        for p in [0usize, 5, 1_000_000] {
+            assert_eq!(qsa_select_split(2, p), [(0, 1), (1, 1)]);
         }
     }
 

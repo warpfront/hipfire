@@ -131,6 +131,7 @@ pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
 pub mod qsa_pooled_mirror;
+pub mod qsa_sp_select;
 pub mod qwen35_fa_batch;
 pub mod qwen4_moe_down_a8;
 pub mod railgun_check;

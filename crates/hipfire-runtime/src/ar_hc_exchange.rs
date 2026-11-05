@@ -786,6 +786,85 @@ impl ArHcExchange {
         }
         Ok(())
     }
+
+    /// [`Self::sp_ag_rows`] for ranges of different lengths (a work-balanced split). Every
+    /// launch carries rows in both directions ([`sp_lockstep_slices`]), so each launch waits
+    /// for the peer's matching launch and the two ranks stay in lockstep.
+    ///
+    /// [`sp_slices`] pads the shorter range with empty chunks. A launch with no peer rows only
+    /// pushes and does not wait, so the rank with the longer range runs ahead. Its push two
+    /// launches later reuses a mailbox bank the peer may still be polling, which overwrites
+    /// granules not yet consumed or leaves the peer waiting on a re-armed slot. Mirrored on
+    /// the peer (it computes the swapped list).
+    ///
+    /// # Safety
+    /// As [`Self::sp_ag_rows`].
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sp_ag_rows_lockstep(
+        &self,
+        rank: usize,
+        gpu: &mut Gpu,
+        buf: *mut c_void,
+        elem: SpAgElem,
+        row_elems: usize,
+        own: (usize, usize),
+        peer: (usize, usize),
+    ) -> HipResult<()> {
+        let cap = sp_ag_rows_per_launch(row_elems, self.bank_stride(ArHcWire::Dense))
+            .min(self.sp_row_cap());
+        let slices = sp_lockstep_slices(own.1, peer.1, cap).ok_or_else(|| {
+            err(format!(
+                "ar_hc_exchange: no lockstep all-gather of {own:?} / {peer:?} rows of {row_elems} \
+                 (launch cap {cap} rows)"
+            ))
+        })?;
+        for ((own_off, own_n), (peer_off, peer_n)) in slices {
+            // SAFETY: forwarded from this function's contract; each slice lies inside its range
+            // and fits one launch (`own_n`, `peer_n` <= cap).
+            unsafe {
+                self.sp_ag_rows(
+                    rank,
+                    gpu,
+                    buf,
+                    elem,
+                    row_elems,
+                    (own.0 + own_off, own_n),
+                    (peer.0 + peer_off, peer_n),
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Lockstep slices of an all-gather between an own range of `own_rows` and a peer range of
+/// `peer_rows` rows: `k = max(ceil(own_rows / cap), ceil(peer_rows / cap))` launches, each range
+/// cut into `k` near-equal non-empty chunks (`floor(i * len / k)` boundaries). Items are
+/// `((own_off, own_n), (peer_off, peer_n))` relative to the range starts, every `n` in
+/// `1..=cap`. The list is a function of the two lengths only, so the peer's list is this one
+/// with the pairs swapped. `None` when `cap == 0`, a range is empty, or a range is shorter than
+/// `k`.
+pub fn sp_lockstep_slices(
+    own_rows: usize,
+    peer_rows: usize,
+    cap: usize,
+) -> Option<Vec<((usize, usize), (usize, usize))>> {
+    if cap == 0 || own_rows == 0 || peer_rows == 0 {
+        return None;
+    }
+    let k = own_rows.div_ceil(cap).max(peer_rows.div_ceil(cap));
+    if own_rows < k || peer_rows < k {
+        return None;
+    }
+    let chunk = |len: usize, i: usize| {
+        let (a, b) = (i * len / k, (i + 1) * len / k);
+        (a, b - a)
+    };
+    Some(
+        (0..k)
+            .map(|i| (chunk(own_rows, i), chunk(peer_rows, i)))
+            .collect(),
+    )
 }
 
 /// Host mirror of one qualification partial element: an fp32 value in [-1, 1) that differs
@@ -865,5 +944,45 @@ mod tests {
             }
         }
         assert!(seen.len() > 400);
+    }
+
+    /// Lockstep slices: both directions carry rows in every launch, every chunk fits the cap,
+    /// the chunks tile both ranges in order, and the peer's list is the swapped one.
+    #[test]
+    fn lockstep_slices_tile_both_ranges_in_every_launch() {
+        for (a, b, cap) in [
+            (2896, 1200, 256),
+            (2048, 2048, 256),
+            (1916, 1915, 256),
+            (257, 2, 256),
+            (5793, 2399, 256),
+            (7, 4, 2),
+            (1, 1, 1),
+        ] {
+            let s = sp_lockstep_slices(a, b, cap).unwrap();
+            let k = a.div_ceil(cap).max(b.div_ceil(cap));
+            assert_eq!(s.len(), k, "{a}/{b}/{cap}");
+            let (mut na, mut nb) = (0, 0);
+            for &((oa, ca), (ob, cb)) in &s {
+                assert!(
+                    (1..=cap).contains(&ca) && (1..=cap).contains(&cb),
+                    "{a}/{b}/{cap}"
+                );
+                assert_eq!((oa, ob), (na, nb));
+                na += ca;
+                nb += cb;
+            }
+            assert_eq!((na, nb), (a, b));
+            let swapped: Vec<_> = sp_lockstep_slices(b, a, cap)
+                .unwrap()
+                .into_iter()
+                .map(|(x, y)| (y, x))
+                .collect();
+            assert_eq!(swapped, s);
+        }
+        // A range shorter than the launch count, an empty range or a zero cap has none.
+        assert!(sp_lockstep_slices(600, 2, 256).is_none());
+        assert!(sp_lockstep_slices(0, 5, 256).is_none());
+        assert!(sp_lockstep_slices(5, 5, 0).is_none());
     }
 }

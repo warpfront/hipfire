@@ -63,7 +63,7 @@ use hipfire_dispatch::pipeline::{
     seal_decode, validate_steps, BoundMoeExperts, ClearOp, EmbeddingOp, ExpertBindingCache,
     ExpertMetadata, ExpertResource, ExpertResources, ExpertTable, GatedDeltaNetOp,
     GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
-    IndexedAttentionState, MixerPhase, MoeStepHooks, RowGatherOp, Step,
+    IndexedAttentionState, MixerPhase, MoeStepHooks, QsaSpSelect, RowGatherOp, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
@@ -9619,6 +9619,12 @@ pub(crate) struct SpViews {
     pub(crate) rows: crate::trunk_route::SpRows,
     /// The transport of the program's `RowGather` steps.
     pub(crate) exec: &'static dyn hipfire_dispatch::pipeline::RowGather,
+    /// The transport and this rank of the sequence-parallel QSA select (`None`: every rank
+    /// selects every row; [`crate::trunk_route::sp_qsa_gather`]).
+    pub(crate) qsa: Option<(
+        usize,
+        &'static dyn hipfire_dispatch::pipeline::QsaSelectGather,
+    )>,
     /// HC streams: the view starts at byte `own.0 * row_bytes` of the stream kind (BF16 bits or
     /// F32 words), so it is offset in half the F32 elements under BF16 streams.
     pub(crate) streams: GpuTensor,
@@ -9657,6 +9663,7 @@ impl SpViews {
                 .attention_output
                 .sub_offset(row0 * hidden, own * hidden),
             ffn_output: scratch.ffn_output.sub_offset(row0 * hidden, own * hidden),
+            qsa: crate::trunk_route::sp_qsa_gather(),
         }
     }
 }
@@ -9997,6 +10004,24 @@ impl<'a> LayerPhaseEnv<'a> {
                     input_width: dims.hidden,
                     trunk_a4: self.trunk_a4.get(layer_index).copied().unwrap_or(0),
                     phase: MixerPhase::Whole,
+                    // Sequence-parallel QSA select: each rank selects its own work-balanced
+                    // rows when the compact block ids fit an index scratch row (a load fact, so
+                    // both ranks decide alike); the peer's rows arrive through the gather.
+                    sp_select: self
+                        .sp
+                        .and_then(|sp| sp.qsa)
+                        .filter(|_| {
+                            (dims.indexer_n_heads + dims.indexer_kv_heads) * dims.indexer_head_dim
+                                >= dims.indexer_budget / dims.indexer_compress_ratio
+                        })
+                        .map(|(rank, gather)| {
+                            let split = crate::trunk_route::qsa_select_split(n, state.position);
+                            QsaSpSelect {
+                                own: split[rank],
+                                peer: split[1 - rank],
+                                gather,
+                            }
+                        }),
                 }));
             }
         }
@@ -16466,7 +16491,17 @@ impl Qwen4GpuForward {
                                 crate::trunk_route::SP_MIN_ROWS
                             );
                         }
-                        Some(SpViews::new(&self.scratch, route, rows, dims, bf16_state))
+                        let views = SpViews::new(&self.scratch, route, rows, dims, bf16_state);
+                        if views.qsa.is_some() {
+                            static NOTED_QSA: std::sync::atomic::AtomicBool =
+                                std::sync::atomic::AtomicBool::new(false);
+                            if !NOTED_QSA.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                eprintln!(
+                                    "  qwen4 EP sequence-parallel QSA indexer (HIPFIRE_QWEN4_EP_SP_INDEXER, =0 replicates the selection): each rank selects its work-balanced row range, block ids all-gathered"
+                                );
+                            }
+                        }
+                        Some(views)
                     }
                     Some(why) => {
                         static NOTED: std::sync::atomic::AtomicBool =

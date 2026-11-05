@@ -85,8 +85,8 @@ pub use layer_ops::{
     validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp, GatedDeltaNetOp,
     GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp, HyperNormOp, HyperReadOp,
     HyperWriteAr, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
-    LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp, QsaProjectionHook, QsaTrunkArenas,
-    RowGather, RowGatherOp,
+    LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp, QsaProjectionHook, QsaSelectGather,
+    QsaSpSelect, QsaTrunkArenas, RowGather, RowGatherOp,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,

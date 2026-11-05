@@ -209,6 +209,7 @@ pub(super) fn build_program<'a>(
                     _ => return Err(invalid("QSA descriptor kind mismatch")),
                 };
                 steps.push(Step::IndexedAttention(IndexedAttentionOp {
+                    sp_select: None,
                     rotation: &scratch.rotation,
                     mode: IndexedAttentionMode::Full,
                     indexer_qk: weights.indexer_qk,
