@@ -72,6 +72,8 @@ mod gpu_test;
 pub mod graph;
 pub mod grouped_ops;
 pub mod hc_row_fold;
+pub mod hcw;
+pub mod hcw_lab;
 pub mod head_lanes;
 pub mod iu4_c8_pm;
 mod kernel_abi;

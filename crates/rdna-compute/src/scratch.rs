@@ -377,6 +377,9 @@ pub struct ScratchState {
     pub paro_fused_scratch: Option<Vec<GpuTensor>>,
     pub fp16_x_scratch: Option<DeviceBuffer>,
     pub fp16_x_scratch_bytes: usize,
+    /// Fixed-size split-K scratch of the HCW WMMA route (`crate::hcw`): allocated lazily on
+    /// first use, zeroed once, never grown or replaced.
+    pub hcw_scratch: Option<crate::hcw::HcwScratch>,
     /// Global score rows for the QSA block selector when an arena's pooled
     /// block count exceeds its dynamic-LDS row (contexts past 61,440 tokens):
     /// `QSA_SELECT_GLOBAL_ROWS` rows of the arena's padded block count.

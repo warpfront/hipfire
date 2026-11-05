@@ -3230,6 +3230,7 @@ impl Gpu {
                 paro_fused_scratch: None,
                 fp16_x_scratch: None,
                 fp16_x_scratch_bytes: 0,
+                hcw_scratch: None,
                 qsa_select_scores: None,
                 qsa_select_scores_bytes: 0,
                 gdn_state_f32: None,

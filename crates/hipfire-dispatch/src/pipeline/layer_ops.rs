@@ -1628,7 +1628,26 @@ fn execute_hyper_read_inner(
                 gpu.gemv_bf16_xf32_k4_rows(down.buf, &normalized, low, down.m, down.k, act, op.rows)
             })
         };
-        split_projections(gpu, op.rows, &[(down, &low)], launch)?;
+        if gpu.hcw_applies(op.rows, rdna_compute::gemv::HCW_MIN_ROWS_DOWN)
+            && down.dtype == DType::BF16
+            && down.awq_scale.is_none()
+            && down.k % 128 == 0
+        {
+            // HCW WMMA down + hc_act epilogue. One BF16 term is exact: `normalized` is
+            // `hyper_norm`'s BF16-rounded output and the weight is BF16.
+            hip(gpu.hcw_gemm_fixed(
+                &rdna_compute::hcw::HcwWeight::Bf16(down.buf),
+                &normalized,
+                &low,
+                down.m,
+                down.k,
+                op.rows,
+                1,
+                act,
+            ))?;
+        } else {
+            split_projections(gpu, op.rows, &[(down, &low)], launch)?;
+        }
         activated = true;
     } else {
         if !normalized_ready {
@@ -1710,6 +1729,32 @@ fn execute_hyper_read_inner(
             if hip(hyper_read_up_fused_rotate(gpu, &read, &rotated))? {
                 return Ok(());
             }
+        }
+        // Exact gfx1201 at HCW_MIN_ROWS_UP..=64 rows, the k4 route's F32 `normalized` / `low`
+        // (`low` is hc_act's BF16-rounded output, so one BF16 term is exact): the HCW WMMA
+        // up read. The launcher needs `low_rank % 32 == 0`, `low_rank <= 512`, `hidden % 16 == 0`.
+        if gpu.hcw_applies(op.rows, rdna_compute::gemv::HCW_MIN_ROWS_UP)
+            && !read.normalized_bf16
+            && read.low.dtype == DType::F32
+            && read.normalized.dtype == DType::F32
+            && read.mixed.dtype == DType::F32
+            && op.low_rank % 32 == 0
+            && op.hidden % 16 == 0
+        {
+            return hip(
+                rdna_compute::hcw::hcw_read_up(
+                    gpu,
+                    &rdna_compute::hcw::HcwWeight::Bf16(op.input_mix_up.buf),
+                    read.low,
+                    read.normalized,
+                    read.mixed,
+                    op.rows,
+                    op.hidden,
+                    op.low_rank,
+                    1,
+                )
+                .map(|_| ()),
+            );
         }
         return hip(hyper_read_up_fused(gpu, &read));
     }

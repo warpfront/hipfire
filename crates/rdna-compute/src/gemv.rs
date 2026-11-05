@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
+use crate::hcw::HcwWeight;
 use crate::kernels;
 use crate::prefill_invariant::{few_row_groups, FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::LazyLock;
+
+/// Lower row bound of the HCW WMMA route (`HIPFIRE_QWEN4_HCW`, [`Gpu::hcw_applies`]) at the HC
+/// down call site; the upper bound is [`WIDE_VERIFY_MAX_ROWS`]. Tunable per family.
+pub const HCW_MIN_ROWS_DOWN: usize = 16;
+/// [`HCW_MIN_ROWS_DOWN`] for the HC up + branch mix call site.
+pub const HCW_MIN_ROWS_UP: usize = 32;
+/// [`HCW_MIN_ROWS_DOWN`] for the dense BF16 `x4` rows route.
+pub const HCW_MIN_ROWS_DENSE: usize = 16;
 
 // The hybrid-buffer MoE gate/up kernel stays compiled but is never selected:
 // see `crate::gemm::miscompiled_optin_decision`.
@@ -22082,6 +22091,14 @@ impl Gpu {
         )
     }
 
+    /// Whether a HCW WMMA projection of `rows` activation rows is taken: the
+    /// `HIPFIRE_QWEN4_HCW` flag (exact gfx1201) and `min_rows..=`[`WIDE_VERIFY_MAX_ROWS`] rows,
+    /// `min_rows` the matching `HCW_MIN_ROWS_*` constant. Pure; outputs are NOT bitwise the SIMT
+    /// route's (f32 summation order differs), but are deterministic.
+    pub fn hcw_applies(&self, rows: usize, min_rows: usize) -> bool {
+        self.flags.qwen4_hcw_enabled() && (min_rows..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+    }
+
     /// Whether the HC k4 projection of `rows` activation rows takes the one-launch all-rows arm
     /// (`HIPFIRE_QWEN4_HC_K4_ALLROWS`, exact gfx1201): the flag, `k % 32 == 0`, `k >=
     /// [`HcK4AllRowsTile::MIN_K`]` and 9..=
@@ -24358,6 +24375,18 @@ impl Gpu {
                     1,
                     "gemv_bf16_xf32_x4_rows x / y views too small for the rows",
                 ));
+            }
+            if self.hcw_applies(rows, HCW_MIN_ROWS_DENSE)
+                && x.dtype == DType::F32
+                && parts
+                    .iter()
+                    .all(|&(_, y, m)| m == 0 || (y.dtype == DType::F32 && k.is_multiple_of(128)))
+            {
+                // Terms 2: general f32 activations, no `hc_act`. Parts with m == 0 are padding.
+                for &(w, y, m) in parts.iter().filter(|p| p.2 > 0) {
+                    self.hcw_gemm_fixed(&HcwWeight::Bf16(w), x, y, m, k, rows, 2, None)?;
+                }
+                return Ok(());
             }
             if self.row_tile_twin_enabled(WideTwinFamily::Bf16, rows) {
                 return self.lab_gemv_bf16_xf32_rows_x4_t8(parts, x, k, rows);
@@ -27805,5 +27834,21 @@ mod bf16_allrows_tile_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod hcw_row_bounds_tests {
+    use super::*;
+
+    /// Every per-family lower bound leaves a non-empty `min..=WIDE_VERIFY_MAX_ROWS` window above
+    /// the few-row (<= 8) routes; the fixed `Gpu` scratch is sized for at most 64 rows.
+    #[test]
+    fn hcw_min_rows_windows_are_non_empty_and_above_few_rows() {
+        for min in [HCW_MIN_ROWS_DOWN, HCW_MIN_ROWS_UP, HCW_MIN_ROWS_DENSE] {
+            assert!(min > FEW_ROW_ROUTE_ROWS, "min {min}");
+            assert!(min <= WIDE_VERIFY_MAX_ROWS, "min {min}");
+        }
+        assert_eq!(WIDE_VERIFY_MAX_ROWS, 64);
     }
 }
