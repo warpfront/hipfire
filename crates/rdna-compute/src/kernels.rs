@@ -11255,7 +11255,7 @@ pub const MOE_SLOT_OPS_V2_PM_GFX1201: &[u8] =
 /// Certified PeaceMaker exact twin of the down A4 producer `qwen4_moe_rotate128_i4`, gfx1201
 /// (module `moe_rotate_i4_pm_gfx1201`, symbol `moe_rotate_i4_pm_gfx1201`, 56-byte kernarg
 /// `h@0 sorted@8 xq@16 signs1@24 signs2@32 K@40 P@44 L@48`). Grid `[P, K/128, 1]`, block
-/// `[32, 1, 1]`; the FWHT128 + C2 `{5,7}` arithmetic of `mq_i4_a4_pm_gfx1201` with the row
+/// `[32, 1, 1]`; the FWHT128 + C2 `{5,7}` arithmetic of `mq_i4_a4` (`peacemaker-isa` emitter) with the row
 /// width a runtime kernarg. Selected only by `HIPFIRE_MOE_ROTATE_I4_PM`
 /// (`PrefillRoute::MoeRotateI4Pm`).
 pub const MOE_ROTATE_I4_PM_GFX1201: &[u8] =

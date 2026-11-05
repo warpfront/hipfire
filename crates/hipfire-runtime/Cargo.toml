@@ -165,11 +165,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 # not listed here (bench_q8, probe_wmma, dump_meta, …) build under any
 # feature combination.
 
-# Raw PM dense-row K1 GPU byte oracle (no production dispatch wiring).
-[[example]]
-name = "mq_i4_rows_byte_oracle"
-required-features = ["lab"]
-
 # GPU oracle + bench of `lane_draw::lane_draws` (the lane-wide sampled verify):
 # p tables vs the device-law host model, verdicts, chi-square distribution, timing.
 [[example]]
@@ -184,11 +179,6 @@ required-features = ["lab"]
 # K-E1 E8P-on-IU4 NT1 gate/up + down synthetic G1 oracle (raw PM module + device BF16 probe hook; no production dispatch).
 [[example]]
 name = "qwen4_moe_sym_e8p_g1_oracle"
-required-features = ["lab"]
-
-# Raw PM K3 (R128 / K640 A4 producer) GPU runner for the byte oracle (no production dispatch wiring).
-[[example]]
-name = "mq_i4_a4_byte_oracle"
 required-features = ["lab"]
 
 # Raw PM K1 MoE decode-GEMV G1 byte oracle + timing runner (no production dispatch wiring).

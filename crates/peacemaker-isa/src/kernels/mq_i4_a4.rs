@@ -5,7 +5,8 @@
 //! Row-local R128 / K640 `block_i4_128` (A4) producer for the sub-4-bit down
 //! projection (K3), emitted with the checked ISA builder for gfx1201 only:
 //! the single symbol `mq_i4_a4_r128_k640` in the module `mq_i4_a4_pm_gfx1201`
-//! (bundle `kernels/mq_i4_a4_pm_gfx1201.hxaco`). It is the PM form of
+//! (no standalone image is committed: the arithmetic ships inside the dispatched
+//! `moe_rotate_i4_pm_gfx1201`, which builds from this file). It is the PM form of
 //! `kernels/src/qwen4_moe_rotate128_i4.hip` for the FN down profile (rotation
 //! width 128, `K = 640` = five K128 groups, MQ-I4 qt132/qt134), emitting the
 //! same bytes as that kernel's C2 `{5,7}` quantizer under the standalone lane
