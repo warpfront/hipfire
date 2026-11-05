@@ -155,6 +155,11 @@ PEACEMAKER_KERNELS = [
     "gemv_mq2_xbatch_pm_gfx1201",
     "qwen4_moe_gu_few_pm_gfx1201",
     "npu_trunk_pack_pm_gfx1151",
+    "gated_delta_chunk_pm_gfx1151",
+    "gated_delta_chunk_arena_pm_gfx1151",
+    "gated_delta_chunk_q8_pm_gfx1151",
+    "gated_delta_chunk_q8_arena_pm_gfx1151",
+    "gated_delta_chunk_pm_gfx1100",
 ]
 
 MIRRORS: dict[str, dict] = {
