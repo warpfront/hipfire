@@ -538,7 +538,7 @@ pub fn ensure_gdn_pair_counters(gpu: &mut Gpu) -> HipResult<()> {
             GDN_PAIR_COUNTERS_BYTES
         };
         let counters = gpu.hip.malloc(bytes)?;
-        gpu.hip.memset(&counters, 0, bytes)?;
+        gpu.memset_stream_ordered(&counters, 0, bytes)?;
         gpu.scratch.gdn_pair_counters = Some(counters);
     }
     Ok(())
@@ -2770,7 +2770,7 @@ pub fn hyper_norm_gate_k4_outputs(gpu: &mut Gpu, p: &HyperNormGateK4Outputs<'_>)
     if gpu.hc_pair_sync.is_none() {
         gpu.bind_thread()?;
         let sync = gpu.alloc_tensor(&[HC_PAIR_SYNC_BYTES / 4], DType::F32)?;
-        gpu.hip.memset(&sync.buf, 0, sync.buf.size())?;
+        gpu.memset_stream_ordered(&sync.buf, 0, sync.buf.size())?;
         gpu.hc_pair_sync = Some(sync);
     }
     let counters = gpu.hc_pair_sync.as_ref().unwrap().buf.as_ptr();

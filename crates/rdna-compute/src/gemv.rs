@@ -3427,8 +3427,14 @@ impl Gpu {
     /// Lazily initialize MagnumQuant FWHT sign tables (256 floats each, seeds 42 and 1042).
     pub fn ensure_mq_signs(&mut self) -> HipResult<()> {
         // bind_thread: skip — delegated to scratch.rs
-        self.scratch
-            .ensure_mq_signs(&self.hip, &mut self.pool, self.device_id)
+        self.scratch.ensure_mq_signs(
+            &self.hip,
+            &mut self.pool,
+            self.device_id,
+            self.active_stream
+                .as_ref()
+                .filter(|_| self.flags.stream_ordered_copies),
+        )
     }
 
     /// Lazily initialize MagnumQuant FWHT sign tables for G128 (128 floats each, seeds 43 and 1043).
@@ -3437,8 +3443,14 @@ impl Gpu {
     /// self-sufficient so models that carry only MQ4G128 weights still get the scratch buffer.
     pub fn ensure_mq_signs_128(&mut self) -> HipResult<()> {
         // bind_thread: skip — delegated to scratch.rs
-        self.scratch
-            .ensure_mq_signs_128(&self.hip, &mut self.pool, self.device_id)
+        self.scratch.ensure_mq_signs_128(
+            &self.hip,
+            &mut self.pool,
+            self.device_id,
+            self.active_stream
+                .as_ref()
+                .filter(|_| self.flags.stream_ordered_copies),
+        )
     }
 
     /// MagnumQuant GEMV: FWHT-rotated HFQ4-G256.

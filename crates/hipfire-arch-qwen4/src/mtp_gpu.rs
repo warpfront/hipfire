@@ -809,7 +809,7 @@ impl MtpAppendScratch {
         for (bytes, &token) in self.host_prompt_ids.chunks_exact_mut(4).zip(tokens) {
             bytes.copy_from_slice(&(token as i32).to_ne_bytes());
         }
-        gpu.memcpy_htod_auto(
+        gpu.upload_stream_ordered(
             &self.prompt_ids.buf,
             &self.host_prompt_ids[..tokens.len() * std::mem::size_of::<i32>()],
         )?;
@@ -1249,7 +1249,7 @@ fn grow_context_arena(
             growth.offset_bytes / element,
             (end - growth.offset_bytes) / element,
         );
-        gpu.hip.memset(&fresh.buf, 0, fresh.buf.size())?;
+        gpu.memset_stream_ordered(&fresh.buf, 0, fresh.buf.size())?;
     }
     Ok(())
 }
@@ -1692,7 +1692,7 @@ impl MtpGpuState {
             }
             // An unmapped VMM arena has an empty accessible prefix.
             if tensor.buf.size() > 0 {
-                gpu.hip.memset(&tensor.buf, 0, tensor.buf.size())?;
+                gpu.memset_stream_ordered(&tensor.buf, 0, tensor.buf.size())?;
             }
         }
         self.position = 0;
@@ -3372,7 +3372,7 @@ impl Qwen4MtpGpu {
         self.scratch
             .host_token_bytes
             .copy_from_slice(&(token as i32).to_ne_bytes());
-        gpu.memcpy_htod_auto(&self.scratch.token_ids.buf, &self.scratch.host_token_bytes)?;
+        gpu.upload_stream_ordered(&self.scratch.token_ids.buf, &self.scratch.host_token_bytes)?;
         Ok(())
     }
 

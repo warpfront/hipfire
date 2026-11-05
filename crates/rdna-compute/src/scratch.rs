@@ -2135,6 +2135,7 @@ impl ScratchState {
         hip: &HipRuntime,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
+        stream: Option<&hip_bridge::Stream>,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
         if self.mq_signs1.is_some() {
@@ -2146,8 +2147,8 @@ impl ScratchState {
         let s2b: Vec<u8> = s2.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let s1t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G256], DType::F32)?;
         let s2t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G256], DType::F32)?;
-        hip.memcpy_htod(&s1t.buf, &s1b)?;
-        hip.memcpy_htod(&s2t.buf, &s2b)?;
+        upload_ordered(hip, stream, &s1t.buf, &s1b)?;
+        upload_ordered(hip, stream, &s2t.buf, &s2b)?;
         // Allocate scratch buffers — 32K elements covers K up to 32768
         let x_rot = alloc_tensor_on(hip, pool, device_id, &[MQ_X_ROT_ELEMS], DType::F32)?;
         let x_q8 = hip.malloc(MQ_X_Q8_BYTES)?; // INT8 buffer for dp4a
@@ -2206,6 +2207,7 @@ impl ScratchState {
         hip: &HipRuntime,
         pool: &mut crate::pool::GpuPool,
         device_id: i32,
+        stream: Option<&hip_bridge::Stream>,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
         if self.mq_signs1_128.is_some() && self.mq_x_rot.is_some() {
@@ -2218,8 +2220,8 @@ impl ScratchState {
             let s2b: Vec<u8> = signs2.iter().flat_map(|v| v.to_ne_bytes()).collect();
             let s1t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G128], DType::F32)?;
             let s2t = alloc_tensor_on(hip, pool, device_id, &[MQ_FWHT_SIGNS_G128], DType::F32)?;
-            hip.memcpy_htod(&s1t.buf, &s1b)?;
-            hip.memcpy_htod(&s2t.buf, &s2b)?;
+            upload_ordered(hip, stream, &s1t.buf, &s1b)?;
+            upload_ordered(hip, stream, &s2t.buf, &s2b)?;
             self.mq_signs1_128 = Some(s1t);
             self.mq_signs2_128 = Some(s2t);
         }
@@ -3820,7 +3822,7 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -3886,7 +3888,7 @@ impl ScratchState {
         batch_size: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -3953,7 +3955,7 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs_128(hip, pool, device_id)?;
+        self.ensure_mq_signs_128(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1_128.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2_128.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 128) as u32;
@@ -4018,7 +4020,7 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -4089,7 +4091,7 @@ impl ScratchState {
         batch_size: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         let s1_ptr = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -4164,7 +4166,7 @@ impl ScratchState {
         x_rot: &GpuTensor,
         k: usize,
     ) -> HipResult<*mut c_void> {
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
         compile_and_load_kernel(
             compiler,
             hip,
@@ -4246,7 +4248,7 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<()> {
         crate::graph::bind_thread(hip, device_id)?;
-        self.ensure_mq_signs(hip, pool, device_id)?;
+        self.ensure_mq_signs(hip, pool, device_id, stream.filter(|_| !capture_mode))?;
 
         let xq_ptr = self.mq_x_q8.as_ref().unwrap().as_ptr();
         let xs_ptr = self.mq_x_scales.as_ref().unwrap().as_ptr();
@@ -5231,5 +5233,23 @@ mod scratch_growth_epoch_tests {
         let mid = scratch_growth_epoch();
         note_scratch_growth();
         assert!(scratch_growth_epoch() > mid);
+    }
+}
+
+/// Blocking H→D copy for the first-request scratch initializers: on `stream` with one wait on it
+/// when the caller passes its steady copy stream (`Gpu::steady_copy_stream`), else the blocking
+/// null-stream copy.
+fn upload_ordered(
+    hip: &HipRuntime,
+    stream: Option<&hip_bridge::Stream>,
+    dst: &hip_bridge::DeviceBuffer,
+    src: &[u8],
+) -> HipResult<()> {
+    match stream {
+        Some(stream) => {
+            hip.memcpy_htod_async(dst, src, stream)?;
+            hip.stream_synchronize(stream)
+        }
+        None => hip.memcpy_htod(dst, src),
     }
 }

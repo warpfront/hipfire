@@ -1398,8 +1398,7 @@ impl Inner {
         let used = self.log_used;
         {
             let log = self.log.as_ref().ok_or("no log")?;
-            gpu.hip
-                .memcpy_dtoh(&mut self.log_host[..used], &log.buf.byte_view(0, used))
+            gpu.dtoh_stream_ordered(&mut self.log_host[..used], &log.buf.byte_view(0, used))
                 .map_err(io)?;
         }
         let calls = std::mem::take(&mut self.calls);

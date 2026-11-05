@@ -2870,6 +2870,7 @@ impl Gpu {
     /// Existing `sync()` callers keep their unbounded semantics; use this
     /// where a deadline is already meaningful (collective rendezvous,
     /// watchdog paths) rather than migrating every sync.
+    #[track_caller]
     pub fn sync_with_deadline(&self, deadline: std::time::Duration) -> HipResult<()> {
         self.bind_thread()?;
         // Timing-disabled event: a pure completion probe, no profiling state.
@@ -4284,6 +4285,7 @@ impl Gpu {
     /// dependency with the capturing stream. This method routes to
     /// `memcpy_htod_async` on the active (capturing) stream when in capture
     /// mode, falling back to sync `memcpy_htod` otherwise.
+    #[track_caller]
     pub fn memcpy_htod_auto(&self, dst: &hip_bridge::DeviceBuffer, src: &[u8]) -> HipResult<()> {
         self.bind_thread()?;
         if self.graphs.capture_mode {
@@ -4306,6 +4308,7 @@ impl Gpu {
     /// an error rather than enqueued onto the capturing stream (where it would
     /// either fail the capture or silently produce a replay that returns stale
     /// activations).
+    #[track_caller]
     pub fn memcpy_dtoh_auto(
         &self,
         dst: &mut [u8],
@@ -6833,6 +6836,7 @@ impl Gpu {
     /// Byte oracle: rebuild every shadow into a temporary allocation with the same builders
     /// and compare it with the live region, span bytes only (padding is unspecified).
     /// Returns `Ok(Err(..))` naming the first differing member/offset. Requires `ready`.
+    #[track_caller]
     pub fn verify_borrowed_shadows(&mut self) -> HipResult<Result<(), String>> {
         const CHUNK: usize = 64 << 20;
         self.bind_thread()?;
@@ -7147,6 +7151,7 @@ impl Gpu {
     /// (at least [`EXPORT_WEIGHT_TAIL_PAD_BYTES`]), synchronize, publish read-only
     /// and export the FD.
     #[cfg(target_os = "linux")]
+    #[track_caller]
     fn fill_exportable_weight_arena(
         &self,
         arena: &mut VmmArena,
@@ -8376,6 +8381,7 @@ impl Gpu {
 
     /// Copy the slab frontiers into the fork owners and zero their private tails,
     /// ordered on the active/default stream.
+    #[track_caller]
     fn fill_forked_vmm_tensors(
         &mut self,
         prefix: &VmmPrefixSet,
@@ -8820,6 +8826,7 @@ impl Gpu {
     /// `.buf` is host RAM readable by kernels — exactly what an offloaded layer's weight
     /// read must dereference. Byte-for-byte identical contents to the device path; only
     /// the physical location differs.
+    #[track_caller]
     pub fn upload_f32_host(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let numel = shape
@@ -8849,6 +8856,7 @@ impl Gpu {
     ///
     /// `data` is little-endian f16 words, exactly `shape.iter().product()` of
     /// them.
+    #[track_caller]
     pub fn upload_f16_bits(&mut self, data: &[u16], shape: &[usize]) -> HipResult<GpuTensor> {
         HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
@@ -8885,6 +8893,7 @@ impl Gpu {
     }
 
     /// In-place constant fill of an existing F32 tensor (sync htod).
+    #[track_caller]
     pub fn fill_f32(&mut self, tensor: &GpuTensor, value: f32) -> HipResult<()> {
         self.bind_thread()?;
         let data = vec![value; tensor.numel()];
@@ -8901,6 +8910,7 @@ impl Gpu {
     ///
     /// Like every `download_*` reader, this fails once the copy completes if a
     /// bounded device wait timed out ([`Self::take_device_wait_error`]).
+    #[track_caller]
     pub fn download_f16_bits(&self, tensor: &GpuTensor) -> HipResult<Vec<u16>> {
         self.bind_thread()?;
         if tensor.dtype != DType::F16 {
@@ -8923,6 +8933,7 @@ impl Gpu {
     /// timed out ([`Self::take_device_wait_error`]). The copy follows the
     /// step that produced `tensor`, so a stalled peer or rendezvous fails
     /// the request here rather than handing back garbage.
+    #[track_caller]
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
         self.bind_thread()?;
         let numel = tensor.numel();
@@ -8977,6 +8988,7 @@ impl Gpu {
 
     /// [`Self::download_f32`] into a caller-owned buffer (resized to the
     /// tensor), so a per-row reader reuses one host allocation.
+    #[track_caller]
     pub fn download_f32_into(&self, tensor: &GpuTensor, out: &mut Vec<f32>) -> HipResult<()> {
         self.bind_thread()?;
         let numel = tensor.numel();
@@ -8997,6 +9009,7 @@ impl Gpu {
     /// The tensors must have been written by work on the active stream (a
     /// decode graph replay or the eager forward). With no active stream the
     /// device is drained once and each part is a blocking copy.
+    #[track_caller]
     pub fn download_f32_stream_ordered_append(
         &self,
         parts: &mut [(&GpuTensor, &mut Vec<f32>)],
@@ -9036,6 +9049,7 @@ impl Gpu {
     /// captured the copy is enqueued on the capturing stream without a wait (the caller
     /// keeps `src` alive and rewrites it in place, as with [`Self::memcpy_htod_auto`]).
     /// With no active stream this is the blocking `hipMemcpy` as before.
+    #[track_caller]
     pub fn htod_stream_ordered(
         &self,
         dst: &hip_bridge::DeviceBuffer,
@@ -9062,6 +9076,7 @@ impl Gpu {
     /// step's selector, say): no legacy stream hop and one host round trip. Each source must
     /// have been written by work on the active stream. With no active stream each part is a
     /// blocking copy.
+    #[track_caller]
     pub fn dtoh_stream_ordered_batch(
         &self,
         parts: &mut [(&hip_bridge::DeviceBuffer, &mut [u8])],
@@ -9080,12 +9095,89 @@ impl Gpu {
         self.take_device_wait_error()
     }
 
+    /// The active stream when the steady-state copies run on it
+    /// (`HIPFIRE_STREAM_ORDERED_COPIES`, default on); `None` puts them back on the legacy null
+    /// stream. A blocking copy on the null stream enqueues a packet on its own hardware queue that
+    /// waits for the work queued on the active stream; when the queue mapper places that queue
+    /// on the same CP pipe as the active stream's, the CP time-slices the two for as long as the
+    /// packet waits, and every dispatch on the device pays the slice.
+    pub fn steady_copy_stream(&self) -> Option<&hip_bridge::Stream> {
+        self.active_stream
+            .as_ref()
+            .filter(|_| self.flags.stream_ordered_copies)
+    }
+
+    /// Blocking D→H copy of `src`'s first `dst.len()` bytes, ordered on
+    /// [`Self::steady_copy_stream`] and read with one wait on that stream (the blocking
+    /// null-stream copy when there is none), then [`Self::take_device_wait_error`].
+    #[track_caller]
+    pub fn dtoh_stream_ordered(
+        &self,
+        dst: &mut [u8],
+        src: &hip_bridge::DeviceBuffer,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => {
+                self.hip.memcpy_dtoh_async(dst, src, Some(stream))?;
+                self.hip.stream_synchronize(stream)?;
+            }
+            None => self.hip.memcpy_dtoh(dst, src)?,
+        }
+        self.take_device_wait_error()
+    }
+
+    /// Blocking H→D copy of `src` into `dst`, ordered on [`Self::steady_copy_stream`]: enqueued
+    /// there and returned once the stream executed it, so `src` is free on return as with the
+    /// blocking copy. While a graph is captured the copy goes to the capturing stream without a
+    /// wait (the caller keeps `src` alive, as with [`Self::memcpy_htod_auto`]). With no stream it
+    /// is [`Self::memcpy_htod_auto`].
+    #[track_caller]
+    pub fn upload_stream_ordered(
+        &self,
+        dst: &hip_bridge::DeviceBuffer,
+        src: &[u8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) if self.graphs.capture_mode => {
+                self.hip.memcpy_htod_async(dst, src, stream)
+            }
+            Some(stream) => {
+                self.hip.memcpy_htod_async(dst, src, stream)?;
+                self.hip.stream_synchronize(stream)
+            }
+            None => self.memcpy_htod_auto(dst, src),
+        }
+    }
+
+    /// Blocking `hipMemset` of `buf[..size]` ordered on [`Self::steady_copy_stream`]: enqueued
+    /// there and returned once the stream executed it, the blocking memset's contract without a
+    /// packet on the null stream's queue (the blocking null-stream memset when there is none).
+    #[track_caller]
+    pub fn memset_stream_ordered(
+        &self,
+        buf: &hip_bridge::DeviceBuffer,
+        value: i32,
+        size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        match self.steady_copy_stream() {
+            Some(stream) => {
+                self.hip.memset_async(buf, value, size, stream)?;
+                self.hip.stream_synchronize(stream)
+            }
+            None => self.hip.memset(buf, value, size),
+        }
+    }
+
     /// Read a `DType::Raw` tensor back as raw bytes — no widening and no dtype
     /// reinterpretation, so a caller can compare code blobs bit-for-bit.
     ///
     /// Works for host-located tensors too: `memcpy_dtoh` reads through the
     /// mapped handle across PCIe, which is what makes the offload parity check
     /// (device upload vs host upload) a plain `Vec<u8>` equality.
+    #[track_caller]
     pub fn download_raw_bytes(&self, tensor: &GpuTensor) -> HipResult<Vec<u8>> {
         self.bind_thread()?;
         let n = tensor.byte_size();
@@ -12220,6 +12312,7 @@ mod tests {
     /// memset (the `grow_context_arena` contract), and every earlier step's
     /// bytes survive each later growth.
     #[test]
+    #[track_caller]
     fn vmm_grow_steps_preserve_prior_bytes_and_zero_fresh() {
         use hip_bridge::DeviceBuffer;
         let Some((mut gpu, _guard)) = try_gpu() else {

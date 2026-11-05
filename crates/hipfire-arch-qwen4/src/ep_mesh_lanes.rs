@@ -685,8 +685,7 @@ impl RankLane<'_> {
                 }
                 let (from, to) = (chunk.start * slot_bytes, chunk.end * slot_bytes);
                 let chunk_top1 = spec_store.draft_top1.sub_offset(from, to - from);
-                gpu.hip
-                    .memcpy_dtoh(&mut spec_store.draft_top1_host[from..to], &chunk_top1.buf)
+                gpu.dtoh_stream_ordered(&mut spec_store.draft_top1_host[from..to], &chunk_top1.buf)
                     .map_err(|e| format!("draft download: {e}"))?;
                 gpu.take_device_wait_error()
                     .map_err(|e| format!("draft download: {e}"))?;
@@ -831,12 +830,11 @@ impl RankLane<'_> {
                 lane.state.row_capture_armed = false;
             }
             forwarded?;
-            gpu.hip
-                .memcpy_dtoh(
-                    &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
-                    &top1.buf,
-                )
-                .map_err(|e| e.to_string())?;
+            gpu.dtoh_stream_ordered(
+                &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
+                &top1.buf,
+            )
+            .map_err(|e| e.to_string())?;
             gpu.take_device_wait_error().map_err(|e| e.to_string())?;
             // The window's forward is retired on this rank: the D2 expert tail (when installed)
             // judges it and rewrites its decode tables before the next window launches.

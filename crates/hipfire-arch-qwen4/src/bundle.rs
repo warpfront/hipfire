@@ -2573,8 +2573,7 @@ impl Qwen4Bundle {
                 "Qwen4 spec host argmax capacity is too small".to_string(),
             ));
         }
-        gpu.hip
-            .memcpy_dtoh(&mut self.spec_host_top1[..bytes_len], &top1.buf)
+        gpu.dtoh_stream_ordered(&mut self.spec_host_top1[..bytes_len], &top1.buf)
             .map_err(BundleError::Hip)?;
         gpu.take_device_wait_error().map_err(BundleError::Hip)?;
         let mut picks = Vec::with_capacity(output_count);

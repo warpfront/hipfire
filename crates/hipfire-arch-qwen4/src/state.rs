@@ -780,8 +780,7 @@ fn grow_context_arena(
             "grow_context_arena",
         );
     }
-    gpu.hip
-        .memset(&view.buf, 0, view.buf.size())
+    gpu.memset_stream_ordered(&view.buf, 0, view.buf.size())
         .map_err(StateError::Hip)?;
     if gpu.flags.qwen4_qsa_extent_check {
         gpu.qsa_extent_post_launch(
@@ -3054,11 +3053,9 @@ impl Qwen4State {
         self.snapshot_arena.invalidate();
         self.reset_gdn_residual(gpu, GdnResidualTransition::Reset)?;
         for layer in &self.gdn {
-            gpu.hip
-                .memset(&layer.recurrent.buf, 0, layer.recurrent.buf.size())
+            gpu.memset_stream_ordered(&layer.recurrent.buf, 0, layer.recurrent.buf.size())
                 .map_err(StateError::Hip)?;
-            gpu.hip
-                .memset(&layer.conv.buf, 0, layer.conv.buf.size())
+            gpu.memset_stream_ordered(&layer.conv.buf, 0, layer.conv.buf.size())
                 .map_err(StateError::Hip)?;
         }
         // VMM context arenas expose only their mapped prefix: nothing past
@@ -3102,8 +3099,7 @@ impl Qwen4State {
                         "Qwen4State::reset",
                     );
                 }
-                gpu.hip
-                    .memset(&tensor.buf, 0, tensor.buf.size())
+                gpu.memset_stream_ordered(&tensor.buf, 0, tensor.buf.size())
                     .map_err(StateError::Hip)?;
                 if gpu.flags.qwen4_qsa_extent_check {
                     gpu.qsa_extent_post_launch(
@@ -3124,13 +3120,11 @@ impl Qwen4State {
             layer.position = 0;
         }
         if let Some(ple_conv) = &self.ple_conv {
-            gpu.hip
-                .memset(&ple_conv.buf, 0, ple_conv.buf.size())
+            gpu.memset_stream_ordered(&ple_conv.buf, 0, ple_conv.buf.size())
                 .map_err(StateError::Hip)?;
         }
         if let Some(hyper_feedback) = &self.hyper_feedback {
-            gpu.hip
-                .memset(&hyper_feedback.buf, 0, hyper_feedback.buf.size())
+            gpu.memset_stream_ordered(&hyper_feedback.buf, 0, hyper_feedback.buf.size())
                 .map_err(StateError::Hip)?;
         }
         self.ple_history.reset();
@@ -4175,7 +4169,7 @@ impl Qwen4State {
                 gpu.zeros(&[table_bytes], DType::Raw)
                     .map_err(StateError::Hip)?,
             );
-            gpu.memcpy_htod_auto(&tail.last().expect("pointer table").buf, &pointers)
+            gpu.upload_stream_ordered(&tail.last().expect("pointer table").buf, &pointers)
                 .map_err(StateError::Hip)?;
             Ok(())
         })();
@@ -6721,7 +6715,7 @@ mod tests {
 
     /// Source audit (CPU): the Qwen4 QSA arena paths never unmap, release or
     /// reallocate a live VMM owner. `reset_inner` clears in place with
-    /// `memset` (a VMM owner's buffer is its mapped prefix); growth is one
+    /// `memset_stream_ordered` (a VMM owner's buffer is its mapped prefix); growth is one
     /// `grow_vmm_tensor` forward map plus a memset of exactly the new bytes;
     /// hipMemUnmap is not called anywhere in this crate.
     #[test]
@@ -6755,7 +6749,10 @@ mod tests {
         for token in forbidden.into_iter().chain(["grow_vmm_tensor"]) {
             assert!(!reset.contains(token), "reset_inner contains `{token}`");
         }
-        assert!(reset.contains(".memset("), "reset clears arenas in place");
+        assert!(
+            reset.contains(".memset_stream_ordered("),
+            "reset clears arenas in place"
+        );
 
         let ensure = code(src, "    pub fn ensure_mapped_capacity(", "\n    }\n");
         for token in forbidden.into_iter().chain(["memset", "grow_vmm_tensor"]) {

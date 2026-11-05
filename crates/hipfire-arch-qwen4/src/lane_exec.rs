@@ -1532,8 +1532,7 @@ fn run_prefill_tiles(
     ended?;
     if !final_tiles.is_empty() {
         let used = (rows_cap + n_prefill) * std::mem::size_of::<i32>();
-        gpu.hip
-            .memcpy_dtoh(&mut top1_host[..used], &top1.buf)
+        gpu.dtoh_stream_ordered(&mut top1_host[..used], &top1.buf)
             .map_err(|e| e.to_string())?;
         gpu.take_device_wait_error().map_err(|e| e.to_string())?;
         for &(i, row) in &final_tiles {

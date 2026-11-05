@@ -16718,7 +16718,7 @@ impl Qwen4GpuForward {
                     active,
                 )?;
             } else {
-                gpu.memcpy_htod_auto(
+                gpu.upload_stream_ordered(
                     &self.scratch.token_ids.buf,
                     &self.host_token_bytes[..n * std::mem::size_of::<i32>()],
                 )?;

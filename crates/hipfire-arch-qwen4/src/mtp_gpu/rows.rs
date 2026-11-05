@@ -629,7 +629,7 @@ impl Qwen4MtpGpu {
             draft.observe_request(lane.request, lane.token);
             token_bytes[row * 4..row * 4 + 4].copy_from_slice(&(lane.token as i32).to_ne_bytes());
         }
-        gpu.memcpy_htod_auto(&rs.token_ids.buf, &token_bytes[..n * 4])?;
+        gpu.upload_stream_ordered(&rs.token_ids.buf, &token_bytes[..n * 4])?;
 
         // Stages 2-4: the row stages once over all rows, the attention per
         // lane (under [`projection_batch`] only its core: the projections run

@@ -216,6 +216,11 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_QWEN4_HC_PAIR_DECODE`, 1..=8 rows): bitwise the unfused `hyper_norm` +
     /// `gemv_bf16_xf32_k4` sequence. Default on for exact gfx1201 (`=0` kills it).
     pub qwen4_hc_pair_decode: bool,
+    /// The steady-state blocking copies and fills that used to go to the legacy null stream
+    /// (`Gpu::dtoh_stream_ordered`, `Gpu::upload_stream_ordered`, `Gpu::memset_stream_ordered`,
+    /// `Gpu::ensure_mq_signs*`) run on the active stream and wait on it
+    /// (`HIPFIRE_STREAM_ORDERED_COPIES`, default on; `=0` restores the null-stream copies).
+    pub stream_ordered_copies: bool,
     /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
@@ -1141,6 +1146,7 @@ impl FeatureFlags {
             qwen4_bf16_allrows: parse_bool("HIPFIRE_QWEN4_BF16_ALLROWS").unwrap_or(true),
             qwen4_hc_k4_allrows: parse_bool("HIPFIRE_QWEN4_HC_K4_ALLROWS").unwrap_or(true),
             qwen4_hc_pair_decode: parse_bool("HIPFIRE_QWEN4_HC_PAIR_DECODE").unwrap_or(true),
+            stream_ordered_copies: parse_bool("HIPFIRE_STREAM_ORDERED_COPIES").unwrap_or(true),
             qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
@@ -2105,6 +2111,7 @@ impl FeatureFlags {
             qwen4_bf16_allrows: false,
             qwen4_hc_k4_allrows: false,
             qwen4_hc_pair_decode: false,
+            stream_ordered_copies: false,
             qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,

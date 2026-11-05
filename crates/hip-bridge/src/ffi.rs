@@ -2117,6 +2117,7 @@ impl HipRuntime {
         }
     }
 
+    #[track_caller]
     pub fn memcpy_peer(
         &self,
         dst: &DeviceBuffer,
@@ -2126,6 +2127,7 @@ impl HipRuntime {
         size: usize,
     ) -> HipResult<()> {
         self.plan_deny("hipMemcpyPeer")?;
+        crate::null_stream::note("hipMemcpyPeer", std::panic::Location::caller());
         assert!(
             size <= dst.size(),
             "size ({size}) exceeds dst ({})",
@@ -2912,6 +2914,7 @@ impl HipRuntime {
     }
 
     /// Copy host data into GPU buffer at a byte offset.
+    #[track_caller]
     pub fn memcpy_htod_offset(
         &self,
         dst: &DeviceBuffer,
@@ -2919,6 +2922,7 @@ impl HipRuntime {
         src: &[u8],
     ) -> HipResult<()> {
         self.plan_deny("hipMemcpy H2D offset")?;
+        crate::null_stream::note("hipMemcpy H2D offset", std::panic::Location::caller());
         assert!(
             offset + src.len() <= dst.size,
             "offset ({}) + source ({}) exceeds device buffer ({})",
@@ -2945,6 +2949,7 @@ impl HipRuntime {
     }
 
     /// Copy bytes between GPU buffers with offsets on both sides.
+    #[track_caller]
     pub fn memcpy_dtod_at(
         &self,
         dst: &DeviceBuffer,
@@ -2953,6 +2958,7 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        crate::null_stream::note("hipMemcpy D2D at", std::panic::Location::caller());
         if let Some(r) = self.plan_copy_at(
             "hipMemcpy D2D at offset",
             dst,
@@ -2984,6 +2990,7 @@ impl HipRuntime {
     }
 
     /// Copy bytes from one GPU buffer at an offset to another GPU buffer.
+    #[track_caller]
     pub fn memcpy_dtod_offset(
         &self,
         dst: &DeviceBuffer,
@@ -2991,6 +2998,7 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        crate::null_stream::note("hipMemcpy D2D offset", std::panic::Location::caller());
         if let Some(r) = self.plan_copy_at("hipMemcpy D2D offset", dst, 0, src, src_offset, size) {
             return r;
         }
@@ -3011,8 +3019,10 @@ impl HipRuntime {
         self.check(code, "hipMemcpy D2D offset")
     }
 
+    #[track_caller]
     pub fn memcpy_htod(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
         self.plan_deny("hipMemcpy H2D")?;
+        crate::null_stream::note("hipMemcpy H2D", std::panic::Location::caller());
         if hip_fault_consume(0, "upload") {
             return Err(hip_fault_err("upload"));
         }
@@ -3042,6 +3052,7 @@ impl HipRuntime {
     #[track_caller]
     pub fn memcpy_dtoh(&self, dst: &mut [u8], src: &DeviceBuffer) -> HipResult<()> {
         self.plan_deny("hipMemcpy D2H")?;
+        crate::null_stream::note("hipMemcpy D2H", std::panic::Location::caller());
         assert!(
             dst.len() <= src.size,
             "destination ({}) exceeds device buffer ({})",
@@ -3093,6 +3104,7 @@ impl HipRuntime {
         src_offset: usize,
     ) -> HipResult<()> {
         self.plan_deny("hipMemcpy D2H at offset")?;
+        crate::null_stream::note("hipMemcpy D2H at", std::panic::Location::caller());
         assert!(
             src_offset + dst.len() <= src.size,
             "src_offset ({}) + dst len ({}) exceeds device buffer ({})",
@@ -3138,12 +3150,14 @@ impl HipRuntime {
         self.check(code, "hipMemcpy D2H at offset")
     }
 
+    #[track_caller]
     pub fn memcpy_dtod(
         &self,
         dst: &DeviceBuffer,
         src: &DeviceBuffer,
         size: usize,
     ) -> HipResult<()> {
+        crate::null_stream::note("hipMemcpy D2D", std::panic::Location::caller());
         if let Some(r) = self.plan_copy_at("hipMemcpy D2D", dst, 0, src, 0, size) {
             return r;
         }
@@ -3194,6 +3208,7 @@ impl HipRuntime {
 
     #[track_caller]
     pub fn memset(&self, buf: &DeviceBuffer, value: i32, size: usize) -> HipResult<()> {
+        crate::null_stream::note("hipMemset", std::panic::Location::caller());
         if self.plan.active() {
             return self.plan.memset_bytes(
                 "hipMemset",
@@ -3234,6 +3249,7 @@ impl HipRuntime {
 
     /// Fill `count` 32-bit words of `buf` with `value`, ordered on `stream`
     /// (the null stream when `None`) without blocking the host.
+    #[track_caller]
     pub fn memset_d32_async(
         &self,
         buf: &DeviceBuffer,
@@ -3241,6 +3257,9 @@ impl HipRuntime {
         count: usize,
         stream: Option<&Stream>,
     ) -> HipResult<()> {
+        if stream.is_none() {
+            crate::null_stream::note("hipMemsetD32Async", std::panic::Location::caller());
+        }
         if self.plan.active() {
             return self.plan.memset_words(
                 "hipMemsetD32Async",
@@ -3452,6 +3471,7 @@ impl HipRuntime {
     ///
     /// # Safety
     /// `params` must contain valid pointers to kernel arguments matching the kernel signature.
+    #[track_caller]
     pub unsafe fn launch_kernel(
         &self,
         func: &Function,
@@ -3461,6 +3481,9 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        if stream.is_none() {
+            crate::null_stream::note("hipModuleLaunchKernel", std::panic::Location::caller());
+        }
         if self.plan.active() {
             return Err(self.plan.refuse(&format!(
                 "HIP API hipModuleLaunchKernel(kernelParams) function handle {:#x} reached in plan mode",
@@ -3528,6 +3551,7 @@ impl HipRuntime {
     /// # Safety
     /// `kernarg_blob` must have layout + size matching the kernel signature,
     /// and all contained pointers must be valid GPU addresses.
+    #[track_caller]
     pub unsafe fn launch_kernel_blob(
         &self,
         func: &Function,
@@ -3537,6 +3561,9 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        if stream.is_none() {
+            crate::null_stream::note("hipModuleLaunchKernel", std::panic::Location::caller());
+        }
         if self.plan.active() {
             self.validate_launch_grid(grid)?;
             self.plan
@@ -3652,8 +3679,12 @@ impl HipRuntime {
         Ok(Event(event))
     }
 
+    #[track_caller]
     pub fn event_record(&self, event: &Event, stream: Option<&Stream>) -> HipResult<()> {
         self.plan_deny("hipEventRecord")?;
+        if stream.is_none() {
+            crate::null_stream::note("hipEventRecord", std::panic::Location::caller());
+        }
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3725,8 +3756,12 @@ impl HipRuntime {
     /// [`Self::stream_wait_event`] on an optional stream: `None` is the
     /// legacy/default (null) stream, the one `rdna_compute::Gpu` launches on
     /// while it has no active stream.
+    #[track_caller]
     pub fn stream_wait_event_on(&self, stream: Option<&Stream>, event: &Event) -> HipResult<()> {
         self.plan_deny("hipStreamWaitEvent")?;
+        if stream.is_none() {
+            crate::null_stream::note("hipStreamWaitEvent", std::panic::Location::caller());
+        }
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         // SAFETY: stream/event/graph handles are live opaque HIP objects owned by the
         // wrappers; out-params are stack locals. Destroy/sync require the caller
@@ -3827,8 +3862,10 @@ impl HipRuntime {
 
     /// Host-asynchronous H→D copy on the legacy/default stream: `src` must
     /// stay unchanged until the stream reaches the copy.
+    #[track_caller]
     pub fn memcpy_htod_async_default(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
         self.plan_deny("hipMemcpyAsync H2D(default stream)")?;
+        crate::null_stream::note("hipMemcpyAsync H2D", std::panic::Location::caller());
         assert!(src.len() <= dst.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
@@ -3846,6 +3883,7 @@ impl HipRuntime {
         self.check(code, "hipMemcpyAsync H2D default stream")
     }
 
+    #[track_caller]
     pub fn memcpy_dtoh_async(
         &self,
         dst: &mut [u8],
@@ -3853,6 +3891,9 @@ impl HipRuntime {
         stream: Option<&Stream>,
     ) -> HipResult<()> {
         self.plan_deny("hipMemcpyAsync D2H")?;
+        if stream.is_none() {
+            crate::null_stream::note("hipMemcpyAsync D2H", std::panic::Location::caller());
+        }
         assert!(dst.len() <= src.size);
         // SAFETY: pointers are live HIP allocations or host slices; sizes were
         // asserted to fit. Same-device/stream and host-buffer lifetime across
@@ -3922,6 +3963,7 @@ impl HipRuntime {
     /// intended for non-capture hot paths where a sync `memcpy_dtod_at`
     /// would stall the host. Not suitable for hipGraph capture (use
     /// `memcpy_dtod_async_at` with an explicit stream instead).
+    #[track_caller]
     pub fn memcpy_dtod_async_default_at(
         &self,
         dst: &DeviceBuffer,
@@ -3930,6 +3972,7 @@ impl HipRuntime {
         src_offset: usize,
         size: usize,
     ) -> HipResult<()> {
+        crate::null_stream::note("hipMemcpyAsync D2D", std::panic::Location::caller());
         if let Some(r) = self.plan_copy_at(
             "hipMemcpyAsync D2D offset default stream",
             dst,
@@ -3986,6 +4029,7 @@ impl HipRuntime {
     /// and stream-ordering. This helper never synchronizes or allocates.
     /// hipGraph capture requires an explicit `Some(stream)`.
     #[allow(clippy::too_many_arguments)]
+    #[track_caller]
     pub fn memcpy_dtod_2d_async_at(
         &self,
         dst: &DeviceBuffer,
@@ -3999,6 +4043,9 @@ impl HipRuntime {
         stream: Option<&Stream>,
     ) -> HipResult<()> {
         self.plan_deny("hipMemcpy2DAsync D2D")?;
+        if stream.is_none() {
+            crate::null_stream::note("hipMemcpy2DAsync D2D", std::panic::Location::caller());
+        }
         if width == 0 || height == 0 {
             return Ok(());
         }

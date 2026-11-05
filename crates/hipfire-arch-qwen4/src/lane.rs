@@ -1196,8 +1196,7 @@ impl LaneSpec {
             .reset(gpu)
             .map_err(|e| format!("lane head reset: {e}"))?;
         self.draft = DraftHeadRequestState::default();
-        gpu.hip
-            .memset(&self.pending_hidden.buf, 0, self.pending_hidden.buf.size())
+        gpu.memset_stream_ordered(&self.pending_hidden.buf, 0, self.pending_hidden.buf.size())
             .map_err(|e| format!("lane pending hidden reset: {e}"))?;
         self.window = None;
         if let Some(lag) = self.lag.as_mut() {
@@ -1730,8 +1729,7 @@ fn copy_lane_rows(
     bytes: &mut [u8],
 ) -> Result<(), String> {
     let view = logits.sub_offset(begin, bytes.len() / 4);
-    gpu.hip
-        .memcpy_dtoh(bytes, &view.buf)
+    gpu.dtoh_stream_ordered(bytes, &view.buf)
         .map_err(|e| format!("lane logits download: {e}"))?;
     gpu.take_device_wait_error()
         .map_err(|e| format!("lane logits download: {e}"))

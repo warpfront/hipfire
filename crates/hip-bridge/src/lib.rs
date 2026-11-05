@@ -14,6 +14,7 @@ mod error;
 mod ffi;
 mod kernarg;
 mod launch_grid;
+pub mod null_stream;
 mod plan_tape;
 mod rccl;
 pub mod registry;
