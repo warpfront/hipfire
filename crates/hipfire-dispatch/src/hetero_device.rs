@@ -115,6 +115,10 @@ struct PrefillSlot {
     err_local: GpuTensor,
     /// What `publish` staged for `send`: rows and the sidecar snapshot.
     staged: Mutex<Option<(usize, Option<u64>)>>,
+    /// The chunk's route (i32 ids, F32 weights), staged in primary memory and
+    /// copied across by the out stream: remote stores from the main stream
+    /// would make its next event wait for their flush across the link.
+    route_local: GpuTensor,
 }
 
 /// Load-wide prefill exchange state, shared by every layer of the load: the
@@ -185,11 +189,15 @@ impl HeteroPrefillShared {
                 x_f16: gpu.alloc_tensor(&[words], rdna_compute::DType::F32).map_err(hip)?,
                 xq: gpu.alloc_tensor(&[xq_words], rdna_compute::DType::F32).map_err(hip)?,
                 partial: gpu.alloc_tensor(&[words], rdna_compute::DType::F32).map_err(hip)?,
-                published: gpu.hip.event_create().map_err(hip)?,
-                returned: gpu.hip.event_create().map_err(hip)?,
+                // Dependency-only events (no timestamps), per hip_bridge's guidance.
+                published: gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING).map_err(hip)?,
+                returned: gpu.hip.event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING).map_err(hip)?,
                 pending: Default::default(),
                 err_local: gpu.alloc_tensor(&[64], rdna_compute::DType::F32).map_err(hip)?,
                 staged: Mutex::new(None),
+                route_local: gpu
+                    .alloc_tensor(&[2 * geom.max_rows * geom.top_k], rdna_compute::DType::F32)
+                    .map_err(hip)?,
             });
         }
         Ok(Self {
@@ -340,8 +348,8 @@ impl HeteroPrefillSplit {
             top_k as i32,
             dim as i32,
             &ps.x_f16,
-            mb + o.ids as u64,
-            mb + o.weights as u64,
+            ps.route_local.buf.as_ptr() as u64,
+            ps.route_local.buf.as_ptr() as u64 + (g.max_rows * g.top_k * 4) as u64,
             &self.masked_ids,
         )
         .map_err(hip)?;
@@ -397,6 +405,20 @@ impl HeteroPrefillSplit {
         };
         on_stream(gpu, &sh.out, |gpu| {
             gpu.hip.stream_wait_event_on(gpu.active_stream.as_ref(), &ps.published).map_err(hip)?;
+            // The route first (every sub-chunk's release follows it in order).
+            let route = rows * g.top_k * 4;
+            // SAFETY: the slot's ids and weights fields in the live pinned mailbox.
+            let (mb_ids, mb_w) = unsafe {
+                (
+                    hip_bridge::DeviceBuffer::from_raw((mb + o.ids as u64) as *mut std::ffi::c_void, route),
+                    hip_bridge::DeviceBuffer::from_raw((mb + o.weights as u64) as *mut std::ffi::c_void, route),
+                )
+            };
+            let st = gpu.active_stream.as_ref().expect("side stream installed");
+            gpu.hip.memcpy_dtod_async_at(&mb_ids, 0, &ps.route_local.buf, 0, route, st).map_err(hip)?;
+            gpu.hip
+                .memcpy_dtod_async_at(&mb_w, 0, &ps.route_local.buf, g.max_rows * g.top_k * 4, route, st)
+                .map_err(hip)?;
             for i in 0..subs {
                 let (off, n) = split.sub_range(rows, i);
                 if n == 0 {

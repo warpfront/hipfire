@@ -748,6 +748,37 @@ impl<'a> MoeStepState<'a> {
     }
 }
 
+/// `HIPFIRE_MOE_STAGE_HOST_TRACE=1`: host wall time per sealed-MoE stage,
+/// summed and printed every 4096 stages (diagnosis only).
+static STAGE_HOST_TRACE: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| std::env::var("HIPFIRE_MOE_STAGE_HOST_TRACE").is_ok_and(|v| v == "1"));
+
+static STAGE_HOST: std::sync::Mutex<Vec<(String, std::time::Duration, u64)>> = std::sync::Mutex::new(Vec::new());
+
+fn stage_host_record(stage: MoeStage, took: std::time::Duration) {
+    let Ok(mut v) = STAGE_HOST.lock() else { return };
+    let name = format!("{stage:?}");
+    match v.iter_mut().find(|(n, _, _)| *n == name) {
+        Some(e) => {
+            e.1 += took;
+            e.2 += 1;
+        }
+        None => v.push((name, took, 1)),
+    }
+    let total: u64 = v.iter().map(|e| e.2).sum();
+    if total % 4096 == 0 {
+        let mut sorted = v.clone();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let line: Vec<String> = sorted
+            .iter()
+            .take(10)
+            .map(|(n, d, c)| format!("{n} {:.1} ms/{c} ({:.0} us)", d.as_secs_f64() * 1e3, d.as_secs_f64() * 1e6 / *c as f64))
+            .collect();
+        eprintln!("moe stage host time: {}", line.join(", "));
+        v.clear();
+    }
+}
+
 /// Opaque operand for one granular sealed MoE operation. The private state
 /// field is the API-privacy boundary: external code cannot construct one,
 /// clone one, or extract its program/state.
@@ -769,6 +800,20 @@ impl<'a> SealedMoeOp<'a> {
     }
 
     pub(super) fn execute_stage(
+        &self,
+        gpu: &mut Gpu,
+        stage: MoeStage,
+    ) -> Result<(), DispatchError> {
+        if !*STAGE_HOST_TRACE {
+            return self.execute_stage_inner(gpu, stage);
+        }
+        let t = std::time::Instant::now();
+        let out = self.execute_stage_inner(gpu, stage);
+        stage_host_record(stage, t.elapsed());
+        out
+    }
+
+    fn execute_stage_inner(
         &self,
         gpu: &mut Gpu,
         stage: MoeStage,
