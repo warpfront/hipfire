@@ -28,3 +28,30 @@ every pass (5 timed passes).
 **Proof A: PASS (Mapped-only works).** The iGPU reads the existing host-mapped expert tier
 in place at its full local bandwidth. No copy, and no allocation-flag change, is needed for
 the cold arm.
+
+## Proof B: CPU-driven iGPU responder latency (`pingpong.hip`)
+
+```
+hipcc -O2 -std=c++20 --offload-arch=gfx1151 --offload-arch=gfx1201 pingpong.hip -o pingpong
+for i in 1 2 3; do ./pingpong 20000 5120 ABC; done
+```
+
+The R9700 posts a 5 KB payload (one Flash-Next hidden row) plus a flag into pinned
+coherent host memory; the Strix side answers with 5 KB plus a flag. Every spin is bounded.
+Plain loads and stores only (no PCIe atomics on this link). Three runs, all
+`payload errors a=0 b=0`, no kernel faults:
+
+| mode | round trip |
+|---|---|
+| A: persistent kernels on both GPUs | 21.0-22.4 us |
+| C: a Strix host thread spins on the flag, launches one captured hipGraph per request; its kernel answers and stores the flag | 23.0-23.2 us |
+| B: host-mediated (kernel + hipMemcpy + sync on each side) | 204-205 us |
+
+**Proof B: CPU-driven responder.** C is within 1.1x of A, against the 2x decision
+threshold. The decode arm launches captured gfx1151 graphs of the existing MoE kernels from
+a host thread. That reuses kernels unchanged and never pins iGPU CUs while idle. At 48
+layers per token, the transport costs about 1.1 ms per token.
+
+(A throwaway predecessor of this probe measured mode A at 14.8 us. The committed version
+differs in flag access (`__hip_atomic` system-scope on both sides) and in the responder
+block size. Both modes here are measured with the same code.)
