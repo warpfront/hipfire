@@ -66,7 +66,7 @@ pub(crate) const EP_TAIL_BORROW_VERIFY_ENV: &str = "HIPFIRE_QWEN4_EP_TAIL_BORROW
 pub(crate) const EP_TAIL_BORROW_LOG_ENV: &str = "HIPFIRE_QWEN4_EP_TAIL_BORROW_LOG";
 
 /// Whether the borrow is on when [`EP_TAIL_BORROW_ENV`] is unset: on since the served A/B
-/// (PrefBorrow2, 2026-11-05: pp16k 1.13x, pp32k 1.12x, decode within noise).
+/// (PrefBorrow2, 2026-11-05: pp32k 1.06x, pp16k 1.05x, pp4k 1.01x; decode within noise).
 pub const EP_TAIL_BORROW_DEFAULT_ON: bool = true;
 
 /// Borrowed rows of `=1` and of the shipped default.
