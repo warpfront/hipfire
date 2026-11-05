@@ -12009,6 +12009,30 @@ mod tests {
     }
 
     #[test]
+    fn retained_body_end_is_scoped_to_one_capture() {
+        let mut controller = ReplayController::new_armed(ReplayBackendRequest::Shadow);
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("body", None, [1; 3], [32, 1, 1], 0, &[1]);
+        controller.mark_body_end();
+        controller.record_hip_launch("head", None, [1; 3], [32, 1, 1], 0, &[2]);
+        assert_eq!(controller.retained_body_launches(), 1);
+        controller.finish_capture().unwrap();
+        // Outside a recording window the mark is ignored.
+        controller.mark_body_end();
+        assert_eq!(controller.retained_body_launches(), 1);
+        // A new capture with no mark is its whole window.
+        controller.begin_capture().unwrap();
+        controller.record_hip_launch("a", None, [1; 3], [32, 1, 1], 0, &[1]);
+        controller.record_hip_launch("b", None, [1; 3], [32, 1, 1], 0, &[2]);
+        assert_eq!(controller.retained_body_launches(), 2);
+        controller.mark_body_end();
+        controller.record_hip_launch("c", None, [1; 3], [32, 1, 1], 0, &[3]);
+        // A model reset drops the mark with the launches.
+        controller.apply_model_default(true, ReplayTransport::AqlPackets);
+        assert_eq!(controller.retained_body_launches(), 0);
+    }
+
+    #[test]
     fn ineligible_forward_neither_records_nor_routes_plain_ar() {
         let mut controller = ReplayController::new(ReplayBackendRequest::Auto);
         controller.set_forward_eligible(false);

@@ -852,6 +852,8 @@ fn capture_phase(
     );
     // The plan covers the retained body only: the LM head (the capture forward's
     // last launch) runs on HIP after every replay and must not be on the tape.
+    // ponytail: only the last launch is checked; a mark moved past the final
+    // hyper (forward-owned scratch, perf-only double run) still passes.
     let body = gpu.replay.retained_body_launches();
     let dispatch_matches = identity
         .as_ref()
