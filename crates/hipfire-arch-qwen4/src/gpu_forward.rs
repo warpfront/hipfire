@@ -1573,6 +1573,9 @@ pub(crate) struct Qwen4MoeLayerRuntime {
     /// The layer's preallocated split executor (masked route + slot storage),
     /// released through `free_gpu` only.
     cpu_split: Option<hipfire_dispatch::cpu_split::CpuSplitExecutor>,
+    /// `topology.hetero_experts`: this trunk layer's device-side split (in
+    /// place of `cpu_split`; never both).
+    hetero: Option<hipfire_dispatch::hetero_device::HeteroDeviceSplit>,
     /// Keeps the frozen payload owners and borrowed pointer tables alive.
     tier: Option<crate::expert_tier_owners::ExpertTierLease>,
     tier_identity: Option<hipfire_dispatch::families::moe::ExpertTierIdentity>,
@@ -1873,6 +1876,10 @@ impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
 
     fn cpu_split(&self) -> Option<&hipfire_dispatch::cpu_split::CpuSplitExecutor> {
         self.cpu_split.as_ref()
+    }
+
+    fn hetero_split(&self) -> Option<&hipfire_dispatch::hetero_device::HeteroDeviceSplit> {
+        self.hetero.as_ref()
     }
 
     fn tier_identity(&self) -> Option<&hipfire_dispatch::families::moe::ExpertTierIdentity> {
@@ -4184,6 +4191,7 @@ impl Qwen4MoeLayerRuntime {
             cpu_expert_owners,
             cpu_cold_owners,
             cpu_split: None,
+            hetero: None,
             tier: tier_layer.as_ref().map(|view| view.lease()),
             tier_identity,
             slab: None,
@@ -4230,6 +4238,38 @@ impl Qwen4MoeLayerRuntime {
         else {
             return Ok(self);
         };
+        let hetero = crate::hetero::requested()
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("layer {} hetero: {error}", self.label)))?;
+        if hetero.is_some() && self.label < config.num_hidden_layers {
+            // Device-side split (design v3): no D2 executor; the layer's cold
+            // experts are computed by the gfx1151 responder from these tables.
+            let owners = self.cpu_cold_owners.as_ref().expect("placement came from the owners");
+            let (mut gate_up, mut down) = (vec![0u64; placement.len()], vec![0u64; placement.len()]);
+            for (e, &cold) in placement.iter().enumerate() {
+                if cold == 0 {
+                    continue;
+                }
+                let expert = &self.experts[e];
+                let payload = owners.payload(e, expert.gate_up.dtype, expert.down.dtype).ok_or_else(|| {
+                    Qwen4GpuForwardError::Dispatch(format!("layer {} hetero: cold expert {e} has no host span", self.label))
+                })?;
+                gate_up[e] = payload.gate_up.as_ptr() as u64;
+                down[e] = payload.down.as_ptr() as u64;
+            }
+            let split = crate::hetero::attach_device_layer(
+                gpu,
+                self.label,
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.num_experts_per_tok,
+                &placement,
+                (gate_up, down),
+            )
+            .map_err(|error| Qwen4GpuForwardError::Dispatch(format!("layer {} {error}", self.label)))?;
+            self.hetero = Some(split);
+            return Ok(self);
+        }
         // `HIPFIRE_QWEN4_D2_RETURN`, `HIPFIRE_QWEN4_D2_READY` and
         // `HIPFIRE_QWEN4_D2_JOIN` are read from the immutable process snapshot
         // for this load: an invalid spelling refuses the load before any
@@ -4637,6 +4677,7 @@ impl Qwen4MoeLayerRuntime {
             cpu_expert_owners: None,
             cpu_cold_owners,
             cpu_split: None,
+            hetero: None,
             tier: None,
             tier_identity: None,
             label: layer_label,
@@ -13127,6 +13168,11 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         self.share_check()?;
+        if tokens.len() == 1 || (tokens.is_empty() && argmax_of.is_some()) {
+            // Every one-row MoE call of the device split publishes a request:
+            // check the earlier tokens' waits, then advance the token counter.
+            crate::hetero::begin_token(gpu).map_err(Qwen4GpuForwardError::Dispatch)?;
+        }
         if self.share.is_none() && self.moe_borrow.is_empty() {
             return self.forward_chunk_tile(
                 bundle,

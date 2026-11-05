@@ -72,9 +72,175 @@ pub(crate) fn arm_for(primary_arch: &str, dims: ColdArmDims) -> Result<Option<Ar
     Ok(Some(arm))
 }
 
+// ---- Device-side split (design v3) ---------------------------------------
+
+use hipfire_dispatch::hetero_device::HeteroDeviceSplit;
+use hipfire_dispatch::hetero_mailbox::MailboxGeometry;
+use hipfire_dispatch::hetero_responder::{ColdLayer, HeteroResponder, ResponderConfig};
+
+/// `hetero_await_cold` poll bound: each poll is a PCIe read (~1-2 us) plus a
+/// short sleep, so this bounds a dead or stalled expert device at ~2 s.
+const AWAIT_MAX_POLLS: u32 = 1_000_000;
+
+/// Load-wide state of the device-side split: the pinned mailbox, the device
+/// token counter, each layer's cold tables until the last layer attaches, and
+/// then the responder.
+struct DeviceContext {
+    mailbox: usize,
+    geom: MailboxGeometry,
+    counter: rdna_compute::GpuTensor,
+    n_experts: usize,
+    mi: usize,
+    pending: Vec<Option<ColdLayer>>,
+    responder: Option<HeteroResponder>,
+}
+
+// SAFETY: the raw mailbox address and the counter's device pointer are plain
+// addresses; every access goes through HIP or atomics on pinned memory.
+unsafe impl Send for DeviceContext {}
+
+static DEVICE: Mutex<Option<DeviceContext>> = Mutex::new(None);
+
+fn lock_device() -> Result<std::sync::MutexGuard<'static, Option<DeviceContext>>, String> {
+    DEVICE.lock().map_err(|_| "topology.hetero_experts: device context lock poisoned".to_owned())
+}
+
+/// Whether every layer has attached (the responder can start).
+pub(crate) fn all_attached<T>(pending: &[Option<T>]) -> bool {
+    !pending.is_empty() && pending.iter().all(Option::is_some)
+}
+
+/// Attach trunk layer `layer` of `layers` to the device-side split: allocate
+/// the load's mailbox and counter on first use, return the layer's
+/// [`HeteroDeviceSplit`], and start the responder once every layer attached.
+/// `placement[e] == 1` marks a cold (host-tier) expert; `tables` are the cold
+/// experts' (gate/up, down) byte addresses (0 for hot ones).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn attach_device_layer(
+    gpu: &mut rdna_compute::Gpu,
+    layer: usize,
+    layers: usize,
+    dim: usize,
+    mi: usize,
+    top_k: usize,
+    placement: &[u8],
+    tables: (Vec<u64>, Vec<u64>),
+) -> Result<HeteroDeviceSplit, String> {
+    check_primary(&gpu.arch)?;
+    let hip = |e: hip_bridge::HipError| format!("topology.hetero_experts: {e}");
+    let mut guard = lock_device()?;
+    if guard.is_none() {
+        let geom = MailboxGeometry { layers, max_rows: 1, top_k, dim };
+        let flags = hip_bridge::HIP_HOST_MALLOC_MAPPED | hip_bridge::HIP_HOST_MALLOC_COHERENT;
+        let mailbox = gpu.hip.host_malloc(geom.total_bytes(), flags).map_err(hip)?.cast::<u8>();
+        // SAFETY: fresh pinned allocation of `total_bytes`: zero = never written.
+        unsafe { std::ptr::write_bytes(mailbox, 0, geom.total_bytes()) };
+        let counter = gpu.alloc_tensor(&[1], rdna_compute::DType::F32).map_err(hip)?;
+        gpu.memcpy_htod_auto(&counter.buf, &0u32.to_ne_bytes()).map_err(hip)?;
+        *guard = Some(DeviceContext {
+            mailbox: mailbox as usize,
+            geom,
+            counter,
+            n_experts: placement.len(),
+            mi,
+            pending: (0..layers).map(|_| None).collect(),
+            responder: None,
+        });
+        eprintln!(
+            "  qwen4 hetero experts: device split, {layers} layers, mailbox {} KiB pinned",
+            geom.total_bytes() / 1024
+        );
+    }
+    let ctx = guard.as_mut().expect("initialized above");
+    if ctx.geom.layers != layers || layer >= layers || ctx.n_experts != placement.len() {
+        return Err(format!("topology.hetero_experts: layer {layer} of {layers} does not match the load's geometry"));
+    }
+    ctx.pending[layer] = Some(ColdLayer { gate_up: tables.0, down: tables.1, cold_bitmap: placement.to_vec() });
+    let bitmap = gpu.alloc_tensor(&[placement.len().div_ceil(4)], rdna_compute::DType::F32).map_err(hip)?;
+    gpu.memcpy_htod_auto(&bitmap.buf, placement).map_err(hip)?;
+    let masked_ids = gpu.alloc_tensor(&[top_k], rdna_compute::DType::F32).map_err(hip)?;
+    let o = ctx.geom.slot(layer);
+    let b = ctx.mailbox as u64;
+    let slot = rdna_compute::HeteroSlotPtrs {
+        req_seq: b + o.req_seq as u64,
+        resp_seq: b + o.resp_seq as u64,
+        error: b + o.error as u64,
+        x_rot: b + o.x_rot as u64,
+        ids: b + o.ids as u64,
+        weights: b + o.weights as u64,
+        cold_out: b + o.cold_out as u64,
+    };
+    // SAFETY: a non-owning view of the load's counter, which outlives the load.
+    let counter = unsafe {
+        rdna_compute::GpuTensor {
+            buf: hip_bridge::DeviceBuffer::from_raw(ctx.counter.buf.as_ptr(), 4),
+            shape: vec![1],
+            dtype: rdna_compute::DType::F32,
+        }
+    };
+    if all_attached(&ctx.pending) && ctx.responder.is_none() {
+        let layers_v: Vec<ColdLayer> = ctx.pending.iter().map(|l| l.clone().expect("all attached")).collect();
+        let cfg = ResponderConfig {
+            ordinal: EXPERT_DEVICE,
+            geom: ctx.geom,
+            mailbox_base: b,
+            n_experts: ctx.n_experts,
+            mi: ctx.mi,
+        };
+        let responder = HeteroResponder::start(cfg, layers_v).map_err(|e| format!("topology.hetero_experts: {e:?}"))?;
+        eprintln!("  qwen4 hetero experts: responder on gfx1151 (HIP device {EXPERT_DEVICE}) recorded {layers} layer graphs");
+        ctx.responder = Some(responder);
+    }
+    Ok(HeteroDeviceSplit {
+        layer: layer as u32,
+        layers: layers as u32,
+        slot,
+        counter,
+        cold_bitmap: bitmap,
+        masked_ids,
+        n_experts: placement.len() as i32,
+        max_polls: AWAIT_MAX_POLLS,
+    })
+}
+
+/// Start of every one-row forward: fail closed on an earlier timeout or a
+/// stopped responder, then advance the device token counter (an eager launch on
+/// the primary's stream, ahead of the token's split stages). No-op without a
+/// device split.
+pub(crate) fn begin_token(gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+    let guard = lock_device()?;
+    let Some(ctx) = guard.as_ref() else {
+        return Ok(());
+    };
+    let Some(responder) = ctx.responder.as_ref() else {
+        return Err("topology.hetero_experts: not every layer attached the device split; no responder".into());
+    };
+    if let Some(f) = responder.failure() {
+        return Err(format!("topology.hetero_experts: responder stopped: {f}"));
+    }
+    for l in 0..ctx.geom.layers {
+        let addr = ctx.mailbox + ctx.geom.slot(l).error;
+        // SAFETY: an aligned word in the live pinned mailbox.
+        let e = unsafe { &*(addr as *const std::sync::atomic::AtomicU32) }.load(std::sync::atomic::Ordering::Acquire);
+        if e != 0 {
+            return Err(format!(
+                "topology.hetero_experts: layer {l} timed out waiting for the expert device (seq {e}); the split is poisoned"
+            ));
+        }
+    }
+    gpu.hetero_token_advance(&ctx.counter).map_err(|e| format!("topology.hetero_experts: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn responder_starts_only_when_every_layer_attached() {
+        assert!(!all_attached::<u8>(&[]));
+        assert!(!all_attached(&[Some(1), None]));
+        assert!(all_attached(&[Some(1), Some(2)]));
+    }
 
     #[test]
     fn hetero_requires_primary_gfx1201_then_gfx1151() {
