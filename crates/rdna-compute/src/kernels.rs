@@ -10901,6 +10901,17 @@ pub const AR_HC_WRITE_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/ar_hc_write.gfx1201.hip")
 );
 
+/// gfx1201 EP2 sequence-parallel prefill exchange: reduce-scatter fused into the HC write
+/// (`sp_hc_rs_d8_gfx1201` / `sp_hc_rs_d8_f32s_gfx1201`) and the row all-gather
+/// (`sp_ag_rows_bf16_d8_gfx1201` / `sp_ag_rows_f32bf16_d8_gfx1201`). Appended to the
+/// `ar_hc_write` helpers it reuses (dense wire, generation protocol, bounded wait); the two
+/// new wait-site macros live in the `.hip` itself.
+pub const SP_HC_RS_AG_GFX1201_SRC: &str = concat!(
+    include_str!("../../../kernels/src/device_wait_deadline.h"),
+    include_str!("../../../kernels/src/ar_hc_write.gfx1201.hip"),
+    include_str!("../../../kernels/src/sp_hc_rs_ag.gfx1201.hip")
+);
+
 /// 16-bit partial-sum exchange for the dense TP residual reduction
 /// (`HIPFIRE_TP_EXCHANGE=bf16|f16`): `tp_pack16_{bf16,f16}` converts an f32
 /// partial to 16 bits, `tp_fold16_{bf16,f16}` sums rank-ordered 16-bit

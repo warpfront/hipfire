@@ -616,6 +616,178 @@ impl ArHcExchange {
     }
 }
 
+use rdna_compute::ar_hc_write::{
+    sp_ag_geometry, sp_ag_rows_per_launch, sp_rs_geometry, sp_slices, SpAgElem, SP_ROW_CAP,
+};
+
+/// Sequence-parallel launches (`rdna_compute::ar_hc_write::sp_*`) on the DENSE region of the same
+/// mailboxes and the same generation words as [`ArHcExchange::write`], so SP and all-reduce
+/// launches interleave freely as long as both ranks issue mirrored launches in the same order.
+/// The transport must be in [`ArHcMode::Dense`] or [`ArHcMode::Hybrid`] (it has a dense region).
+impl ArHcExchange {
+    /// Whether this transport has the dense region the SP kernels need.
+    pub fn sp_available(&self) -> bool {
+        self.uses_wire(ArHcWire::Dense)
+    }
+
+    /// Most rows of each range one SP launch of this transport serves.
+    pub fn sp_row_cap(&self) -> usize {
+        self.max_rows.min(SP_ROW_CAP)
+    }
+
+    /// Resolve every SP kernel on `gpu` (JIT is not capture-safe); call at load next to
+    /// [`Self::register`].
+    pub fn sp_ensure_kernels(&self, gpu: &mut Gpu) -> HipResult<()> {
+        for kind in StreamKind::ALL {
+            gpu.ensure_sp_hc_rs_gfx1201_kernel(kind)?;
+        }
+        for elem in SpAgElem::ALL {
+            gpu.ensure_sp_ag_rows_gfx1201_kernel(elem)?;
+        }
+        Ok(())
+    }
+
+    /// Dense-region addresses `(peer mailbox, local mailbox)` of `rank` after the usual launch
+    /// checks.
+    fn sp_endpoints(&self, rank: usize) -> HipResult<(usize, usize)> {
+        if !self.enabled() {
+            return Err(err("ar_hc_exchange: route is disabled".into()));
+        }
+        if !self.sp_available() {
+            return Err(err(
+                "ar_hc_exchange: the SP launches need a dense mailbox region (mode dense or hybrid)"
+                    .into(),
+            ));
+        }
+        if rank >= 2 || !self.peers_enabled[rank].load(Ordering::Acquire) {
+            return Err(err(format!(
+                "ar_hc_exchange: rank {rank} has no peer access"
+            )));
+        }
+        let peer = 1 - rank;
+        let (peer_mail, local_mail, gen) = (
+            self.mailbox_ptr[peer].load(Ordering::Acquire),
+            self.mailbox_ptr[rank].load(Ordering::Acquire),
+            self.gen_ptr[rank].load(Ordering::Acquire),
+        );
+        if peer_mail == 0 || local_mail == 0 || gen == 0 {
+            return Err(err(
+                "ar_hc_exchange: SP launch before both ranks registered".into(),
+            ));
+        }
+        let region = self.region_offset(ArHcWire::Dense);
+        Ok((peer_mail + region, local_mail + region))
+    }
+
+    /// Reduce-scatter fused into the HC write of `rank`: the own rows `own = (row0, rows)` of
+    /// the full-tile `partial` / `streams` / `gates` are folded and written, the peer rows
+    /// `peer` are pushed to the peer rank (whose own range it is). Ranges longer than
+    /// [`Self::sp_row_cap`] launch in mirrored slices ([`sp_slices`]), each its own generation.
+    /// The own rows equal those of [`Self::write`] over the same partials. `mixed_dbg` (oracle,
+    /// nullable) receives `m` of the own rows at the full-tile offset.
+    ///
+    /// # Safety
+    /// The pointers must address live device memory of the full tile on `gpu`'s device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sp_rs_write(
+        &self,
+        rank: usize,
+        gpu: &mut Gpu,
+        partial: *mut c_void,
+        streams: *mut c_void,
+        kind: StreamKind,
+        gates: *const c_void,
+        own: (usize, usize),
+        peer: (usize, usize),
+        mixed_dbg: *mut c_void,
+    ) -> HipResult<()> {
+        let (peer_mail, local_mail) = self.sp_endpoints(rank)?;
+        let slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
+        let mail = slot
+            .as_ref()
+            .ok_or_else(|| err("ar_hc_exchange: SP launch after release".into()))?;
+        gpu.bind_thread()?;
+        let stride = self.bank_stride(ArHcWire::Dense);
+        for ((own_off, own_n), (peer_off, peer_n)) in sp_slices(own.1, peer.1, self.sp_row_cap()) {
+            let geometry = sp_rs_geometry(own_n, peer_n).ok_or_else(|| {
+                err(format!(
+                    "ar_hc_exchange: no SP launch geometry for {own_n} own / {peer_n} peer rows"
+                ))
+            })?;
+            // SAFETY: forwarded from this function's contract; the row ranges lie inside the
+            // caller's tile.
+            gpu.sp_hc_rs_write_gfx1201(
+                partial,
+                streams,
+                kind,
+                gates,
+                peer_mail as *mut c_void,
+                local_mail as *const c_void,
+                stride,
+                &mail.gen,
+                rank == 0,
+                (own.0 + own_off, own_n),
+                (peer.0 + peer_off, peer_n),
+                geometry,
+                mixed_dbg,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// All-gather of rows of `buf` (`[rows][row_elems]` of `elem`): the own rows are sent, the
+    /// peer rows received in place. Longer ranges launch in mirrored slices.
+    ///
+    /// # Safety
+    /// `buf` must address the live full buffer on `gpu`'s device.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sp_ag_rows(
+        &self,
+        rank: usize,
+        gpu: &mut Gpu,
+        buf: *mut c_void,
+        elem: SpAgElem,
+        row_elems: usize,
+        own: (usize, usize),
+        peer: (usize, usize),
+    ) -> HipResult<()> {
+        let (peer_mail, local_mail) = self.sp_endpoints(rank)?;
+        let stride = self.bank_stride(ArHcWire::Dense);
+        let cap = sp_ag_rows_per_launch(row_elems, stride).min(self.sp_row_cap());
+        if cap == 0 {
+            return Err(err(format!(
+                "ar_hc_exchange: row_elems {row_elems} does not fit a dense bank of {stride} bytes"
+            )));
+        }
+        let slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
+        let mail = slot
+            .as_ref()
+            .ok_or_else(|| err("ar_hc_exchange: SP launch after release".into()))?;
+        gpu.bind_thread()?;
+        for ((own_off, own_n), (peer_off, peer_n)) in sp_slices(own.1, peer.1, cap) {
+            let geometry = sp_ag_geometry(own_n, peer_n, row_elems).ok_or_else(|| {
+                err(format!(
+                    "ar_hc_exchange: no SP all-gather geometry for {own_n} own / {peer_n} peer rows of {row_elems}"
+                ))
+            })?;
+            // SAFETY: as above.
+            gpu.sp_ag_rows_gfx1201(
+                buf,
+                elem,
+                row_elems,
+                peer_mail as *mut c_void,
+                local_mail as *const c_void,
+                stride,
+                &mail.gen,
+                (own.0 + own_off, own_n),
+                (peer.0 + peer_off, peer_n),
+                geometry,
+            )?;
+        }
+        Ok(())
+    }
+}
+
 /// Host mirror of one qualification partial element: an fp32 value in [-1, 1) that differs
 /// per (exchange, rank, index).
 fn qualify_partial(exchange: usize, rank: usize, i: usize) -> f32 {

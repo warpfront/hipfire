@@ -337,6 +337,468 @@ pub fn ar_hc_granules_per_lane(rows: usize, geometry: (u32, u32)) -> usize {
 }
 
 // ----------------------------------------------------------------------------------------
+// Sequence-parallel (SP) reduce-scatter + all-gather (`kernels/src/sp_hc_rs_ag.gfx1201.hip`)
+// ----------------------------------------------------------------------------------------
+//
+// Dense wire only. A launch names an OWN row range (rows this rank folds / receives) and a
+// PEER row range (rows this rank pushes) as `(row0, rows)` of the full tile; mailbox slots are
+// granule indices relative to the first row of the pushed range, so the ranges the two ranks
+// pass are mirror images: rank A's `peer` is rank B's `own` and vice versa.
+
+const SP_MODULE: &str = "sp_hc_rs_ag_gfx1201";
+const SP_RS_D8: &str = "sp_hc_rs_d8_gfx1201";
+const SP_RS_D8_F32S: &str = "sp_hc_rs_d8_f32s_gfx1201";
+const SP_AG_BF16: &str = "sp_ag_rows_bf16_d8_gfx1201";
+const SP_AG_F32BF16: &str = "sp_ag_rows_f32bf16_d8_gfx1201";
+
+/// Most rows of EACH range (own / peer) one SP launch serves; the caller slices longer ranges
+/// with [`sp_slices`].
+pub const SP_ROW_CAP: usize = AR_HC_ROW_CAP;
+/// Bytes of one dense granule (four bf16 values).
+pub const SP_GRANULE_BYTES: usize = 8;
+/// Granules per row of a hidden-width tile.
+pub const SP_GRANULES_PER_ROW: usize = AR_HC_HIDDEN / AR_HC_GRANULE_VALUES;
+/// Most granules a launch can poll (`blocks x lanes x AR_HC_KMAX`).
+pub const SP_MAX_POLL_GRANULES: usize = AR_HC_MAX_BLOCKS * AR_HC_MAX_LANES * AR_HC_KMAX;
+
+/// Element format of the all-gathered buffer.
+///
+/// * `Bf16`: u16 bits (`[rows][row_elems]`, two per wire dword), base 8-byte aligned.
+/// * `F32Bf16`: f32 words holding BF16-exact values (`hc_mixed`: `hyper_read` stores
+///   `bf16r(value / 4)`); the wire carries the upper 16 bits of each word and the receiver
+///   stores `bits << 16`. Base 16-byte aligned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SpAgElem {
+    Bf16,
+    F32Bf16,
+}
+
+impl SpAgElem {
+    pub const ALL: [Self; 2] = [Self::Bf16, Self::F32Bf16];
+
+    /// Device entry of this element format.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Bf16 => SP_AG_BF16,
+            Self::F32Bf16 => SP_AG_F32BF16,
+        }
+    }
+
+    /// Bytes per buffer element.
+    pub fn element_bytes(self) -> usize {
+        match self {
+            Self::Bf16 => 2,
+            Self::F32Bf16 => 4,
+        }
+    }
+
+    /// Required byte alignment of the buffer base.
+    pub fn alignment(self) -> usize {
+        match self {
+            Self::Bf16 => 8,
+            Self::F32Bf16 => 16,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Bf16 => "bf16",
+            Self::F32Bf16 => "f32bf16",
+        }
+    }
+}
+
+/// Device entry of the reduce-scatter for `kind`.
+pub fn sp_rs_symbol(kind: StreamKind) -> &'static str {
+    match kind {
+        StreamKind::Bf16 => SP_RS_D8,
+        StreamKind::F32 => SP_RS_D8_F32S,
+    }
+}
+
+/// Block / lane shape for `granules` polled granules: the [`ar_hc_geometry_exact`] search
+/// over a granule count (more blocks first, then the 512-lane fallback of
+/// [`ar_hc_geometry_with`]), at most [`AR_HC_KMAX`] granules per lane.
+fn sp_geometry_granules(granules: usize) -> Option<(u32, u32)> {
+    fn exact(granules: usize, blocks0: usize, lanes0: usize) -> Option<(u32, u32)> {
+        let mut b = blocks0
+            .min(granules.div_ceil(32))
+            .clamp(1, AR_HC_MAX_BLOCKS);
+        loop {
+            let per = granules.div_ceil(b);
+            let t = lanes0.min(per.div_ceil(32) * 32).clamp(32, AR_HC_MAX_LANES);
+            if per.div_ceil(t) <= AR_HC_KMAX {
+                return Some((b as u32, t as u32));
+            }
+            if b >= AR_HC_MAX_BLOCKS {
+                return None;
+            }
+            b += 1;
+        }
+    }
+    if granules == 0 {
+        return None;
+    }
+    exact(
+        granules,
+        AR_HC_DEFAULT_BLOCKS as usize,
+        AR_HC_DEFAULT_LANES as usize,
+    )
+    .or_else(|| exact(granules, AR_HC_DEFAULT_BLOCKS as usize, AR_HC_MAX_LANES))
+}
+
+/// Launch geometry `(blocks, lanes)` of a reduce-scatter launch with `own_rows` rows folded
+/// and `peer_rows` rows pushed (each at most [`SP_ROW_CAP`], not both zero). It is the
+/// geometry of the larger range, so the poll side (own rows) stays within [`AR_HC_KMAX`]
+/// granules per lane and the push side is spread over the same blocks.
+pub fn sp_rs_geometry(own_rows: usize, peer_rows: usize) -> Option<(u32, u32)> {
+    if own_rows > SP_ROW_CAP || peer_rows > SP_ROW_CAP {
+        return None;
+    }
+    sp_geometry_granules(own_rows.max(peer_rows) * SP_GRANULES_PER_ROW)
+}
+
+/// Launch geometry `(blocks, lanes)` of an all-gather launch pushing `own_rows` and polling
+/// `peer_rows` rows of `row_elems` elements (each at most [`SP_ROW_CAP`] rows, not both zero,
+/// `row_elems % 4 == 0`).
+pub fn sp_ag_geometry(own_rows: usize, peer_rows: usize, row_elems: usize) -> Option<(u32, u32)> {
+    if row_elems == 0
+        || !row_elems.is_multiple_of(AR_HC_GRANULE_VALUES)
+        || own_rows > SP_ROW_CAP
+        || peer_rows > SP_ROW_CAP
+    {
+        return None;
+    }
+    sp_geometry_granules(own_rows.max(peer_rows) * (row_elems / AR_HC_GRANULE_VALUES))
+}
+
+/// Granules per lane of the busiest block of `granules` polled granules at `geometry`.
+pub fn sp_granules_per_lane(granules: usize, geometry: (u32, u32)) -> usize {
+    granules
+        .div_ceil(geometry.0 as usize)
+        .div_ceil(geometry.1 as usize)
+}
+
+/// Most rows of one all-gather launch for `row_elems`-wide rows: the row cap, the granule
+/// capacity of one mailbox bank and the poll capacity of one launch.
+pub fn sp_ag_rows_per_launch(row_elems: usize, bank_stride: usize) -> usize {
+    let gpr = row_elems / AR_HC_GRANULE_VALUES;
+    if gpr == 0 {
+        return 0;
+    }
+    SP_ROW_CAP
+        .min(bank_stride / SP_GRANULE_BYTES / gpr)
+        .min(SP_MAX_POLL_GRANULES / gpr)
+}
+
+/// Slices of a tile exchange: the launches covering an own range of `own_rows` rows and a peer
+/// range of `peer_rows` rows in chunks of at most `cap` rows per range. Each item is
+/// `((own_off, own_n), (peer_off, peer_n))`, offsets relative to the start of the range. The
+/// ranks of a pair compute mirrored lists (rank A's peer chunks are rank B's own chunks), so
+/// launch `i` pushes exactly the granules the other rank's launch `i` polls.
+pub fn sp_slices(
+    own_rows: usize,
+    peer_rows: usize,
+    cap: usize,
+) -> Vec<((usize, usize), (usize, usize))> {
+    assert!(cap > 0, "slice cap must be positive");
+    let n = own_rows.div_ceil(cap).max(peer_rows.div_ceil(cap));
+    (0..n)
+        .map(|i| {
+            let chunk = |total: usize| {
+                let off = (i * cap).min(total);
+                (off, cap.min(total - off))
+            };
+            (chunk(own_rows), chunk(peer_rows))
+        })
+        .collect()
+}
+
+/// Even two-way split of `rows` rows: `[(row0, n); 2]`, rank 0 first (it takes the extra row
+/// of an odd count).
+pub fn sp_even_split(rows: usize) -> [(usize, usize); 2] {
+    let first = rows.div_ceil(2);
+    [(0, first), (first, rows - first)]
+}
+
+/// The wire dword of a payload dword: a NaN-pair dword `0xFFFF_FFFF` (the EMPTY marker)
+/// travels as `0xFFFF_FFFE`; everything else is unchanged.
+pub fn sp_wire_dword(w: u32) -> u32 {
+    if w == u32::MAX {
+        u32::MAX - 1
+    } else {
+        w
+    }
+}
+
+/// What an f32 word of a [`SpAgElem::F32Bf16`] buffer arrives as: its upper 16 bits widened
+/// back (identity for BF16-exact values).
+pub fn sp_f32bf16_wire(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() & 0xFFFF_0000)
+}
+
+impl Gpu {
+    /// Resolve the reduce-scatter kernel of `kind` before graph capture.
+    pub fn ensure_sp_hc_rs_gfx1201_kernel(&mut self, kind: StreamKind) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(HipError::new(
+                0,
+                &format!("sp_hc_rs_gfx1201 requires gfx1201, got {}", self.arch),
+            ));
+        }
+        self.ensure_kernel(
+            SP_MODULE,
+            kernels::SP_HC_RS_AG_GFX1201_SRC,
+            sp_rs_symbol(kind),
+        )
+    }
+
+    /// Resolve the all-gather kernel of `elem` before graph capture.
+    pub fn ensure_sp_ag_rows_gfx1201_kernel(&mut self, elem: SpAgElem) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(HipError::new(
+                0,
+                &format!("sp_ag_rows_gfx1201 requires gfx1201, got {}", self.arch),
+            ));
+        }
+        self.ensure_kernel(SP_MODULE, kernels::SP_HC_RS_AG_GFX1201_SRC, elem.symbol())
+    }
+
+    /// Reduce-scatter fused into the HC write: push `bf16(partial)` of the PEER row range
+    /// into the peer's dense mailbox, wait (bounded) for the peer's partial of the OWN range,
+    /// fold in rank order and apply the production HC write to the own rows of `streams`
+    /// only. `partial` (`[rows, 2560]` f32), `streams` (`[rows, 4, 2560]` of `kind`) and
+    /// `gates` (`[rows, 4]` f32) are the full-tile base pointers; `own` / `peer` are
+    /// `(row0, rows)` of the tile (disjoint, each at most [`SP_ROW_CAP`], not both empty; an
+    /// empty own range still pushes). `peer_mailbox` / `local_mailbox` address the DENSE
+    /// region of the peer's / this rank's mailbox, `bank_stride` its bank size. `mixed_dbg`
+    /// (oracle only) receives the folded `m` of the own rows at the full-tile offset. The
+    /// own rows are bit-identical to those of `ar_hc_write_d8_*` over the same partials.
+    /// One launch; both ranks must issue mirrored launches in the same order.
+    ///
+    /// # Safety
+    /// Every pointer must address live device memory of the full-tile extents on this rank's
+    /// device (the mailboxes through peer access).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sp_hc_rs_write_gfx1201(
+        &mut self,
+        partial: *mut c_void,
+        streams: *mut c_void,
+        kind: StreamKind,
+        gates: *const c_void,
+        peer_mailbox: *mut c_void,
+        local_mailbox: *const c_void,
+        bank_stride: usize,
+        generation: &DeviceBuffer,
+        local_is_first: bool,
+        own: (usize, usize),
+        peer: (usize, usize),
+        geometry: (u32, u32),
+        mixed_dbg: *mut c_void,
+    ) -> HipResult<()> {
+        self.ensure_sp_hc_rs_gfx1201_kernel(kind)?;
+        let fail = |what: &str| HipError::new(0, &format!("sp_hc_rs_gfx1201: {what}"));
+        if own.1 + peer.1 == 0 {
+            return Err(fail("empty own and peer ranges"));
+        }
+        if sp_rs_geometry(own.1, peer.1).is_none() {
+            return Err(fail(&format!(
+                "unsupported ranges own {own:?} peer {peer:?} (cap {SP_ROW_CAP} rows each)"
+            )));
+        }
+        if own.1 > 0 && peer.1 > 0 && own.0 < peer.0 + peer.1 && peer.0 < own.0 + own.1 {
+            return Err(fail(&format!("own {own:?} and peer {peer:?} overlap")));
+        }
+        if geometry.0 == 0
+            || geometry.1 == 0
+            || geometry.0 as usize > AR_HC_MAX_BLOCKS
+            || geometry.1 as usize > AR_HC_MAX_LANES
+            || sp_granules_per_lane(own.1 * SP_GRANULES_PER_ROW, geometry) > AR_HC_KMAX
+        {
+            return Err(fail(&format!(
+                "invalid geometry {geometry:?} for own {own:?} peer {peer:?}"
+            )));
+        }
+        let granules = own.1.max(peer.1) * SP_GRANULES_PER_ROW;
+        if granules * SP_GRANULE_BYTES > bank_stride || !bank_stride.is_multiple_of(256) {
+            return Err(fail(&format!(
+                "bank stride {bank_stride} cannot hold {granules} dense granules"
+            )));
+        }
+        if (streams as usize) % kind.alignment() != 0
+            || (partial as usize) % 16 != 0
+            || (gates as usize) % 16 != 0
+        {
+            return Err(fail(&format!(
+                "operands are not aligned ({} streams {}, partial/gates 16 bytes)",
+                kind.name(),
+                kind.alignment()
+            )));
+        }
+        let int = |v: usize| i32::try_from(v).map_err(|_| fail("row index exceeds i32"));
+        let (own_row0, own_rows, peer_row0, peer_rows) =
+            (int(own.0)?, int(own.1)?, int(peer.0)?, int(peer.1)?);
+        let gen_ptr = generation.as_ptr();
+        let stride_arg = u32::try_from(bank_stride).map_err(|_| fail("bank stride exceeds u32"))?;
+        let first_arg = i32::from(local_is_first);
+        let wait_block = self.device_wait_block()?;
+        let mut params: [*mut c_void; 14] = [
+            &partial as *const _ as *mut c_void,
+            &streams as *const _ as *mut c_void,
+            &gates as *const _ as *mut c_void,
+            &peer_mailbox as *const _ as *mut c_void,
+            &local_mailbox as *const _ as *mut c_void,
+            &stride_arg as *const _ as *mut c_void,
+            &gen_ptr as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
+            &first_arg as *const _ as *mut c_void,
+            &own_row0 as *const _ as *mut c_void,
+            &own_rows as *const _ as *mut c_void,
+            &peer_row0 as *const _ as *mut c_void,
+            &peer_rows as *const _ as *mut c_void,
+            &mixed_dbg as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            sp_rs_symbol(kind),
+            [geometry.0, 1, 1],
+            [geometry.1, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(partial);
+                b.push_ptr(streams);
+                b.push_ptr(gates);
+                b.push_ptr(peer_mailbox);
+                b.push_ptr(local_mailbox);
+                b.push_u32(stride_arg);
+                b.push_ptr(gen_ptr);
+                b.push_ptr(wait_block);
+                b.push_i32(first_arg);
+                b.push_i32(own_row0);
+                b.push_i32(own_rows);
+                b.push_i32(peer_row0);
+                b.push_i32(peer_rows);
+                b.push_ptr(mixed_dbg);
+                b
+            },
+        )
+    }
+
+    /// All-gather of rows of `buf` (`[rows][row_elems]` of `elem`, `row_elems % 4 == 0`):
+    /// push the OWN rows (`(row0, rows)`) into the peer's dense mailbox, wait (bounded) for
+    /// the PEER range's rows and write them into `buf`. Both ranks end with the same buffer.
+    /// Finite values are byte-exact; a NaN-pair wire dword `0xFFFF_FFFF` arrives as
+    /// `0xFFFF_FFFE`. Ranges are disjoint, each at most [`SP_ROW_CAP`] rows and within the
+    /// bank ([`sp_ag_rows_per_launch`]). Pointers and generation as for
+    /// [`Self::sp_hc_rs_write_gfx1201`]. One launch.
+    ///
+    /// # Safety
+    /// Every pointer must address live device memory of the full buffer on this rank's
+    /// device (the mailbox through peer access).
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn sp_ag_rows_gfx1201(
+        &mut self,
+        buf: *mut c_void,
+        elem: SpAgElem,
+        row_elems: usize,
+        peer_mailbox: *mut c_void,
+        local_mailbox: *const c_void,
+        bank_stride: usize,
+        generation: &DeviceBuffer,
+        own: (usize, usize),
+        peer: (usize, usize),
+        geometry: (u32, u32),
+    ) -> HipResult<()> {
+        self.ensure_sp_ag_rows_gfx1201_kernel(elem)?;
+        let fail = |what: &str| HipError::new(0, &format!("sp_ag_rows_gfx1201: {what}"));
+        if own.1 + peer.1 == 0 {
+            return Err(fail("empty own and peer ranges"));
+        }
+        if sp_ag_geometry(own.1, peer.1, row_elems).is_none() {
+            return Err(fail(&format!(
+                "unsupported ranges own {own:?} peer {peer:?} row_elems {row_elems}"
+            )));
+        }
+        if own.1 > 0 && peer.1 > 0 && own.0 < peer.0 + peer.1 && peer.0 < own.0 + own.1 {
+            return Err(fail(&format!("own {own:?} and peer {peer:?} overlap")));
+        }
+        let gpr = row_elems / AR_HC_GRANULE_VALUES;
+        if geometry.0 == 0
+            || geometry.1 == 0
+            || geometry.0 as usize > AR_HC_MAX_BLOCKS
+            || geometry.1 as usize > AR_HC_MAX_LANES
+            || sp_granules_per_lane(peer.1 * gpr, geometry) > AR_HC_KMAX
+        {
+            return Err(fail(&format!(
+                "invalid geometry {geometry:?} for own {own:?} peer {peer:?} row_elems {row_elems}"
+            )));
+        }
+        let granules = own.1.max(peer.1) * gpr;
+        if granules * SP_GRANULE_BYTES > bank_stride || !bank_stride.is_multiple_of(256) {
+            return Err(fail(&format!(
+                "bank stride {bank_stride} cannot hold {granules} dense granules"
+            )));
+        }
+        if (buf as usize) % elem.alignment() != 0 {
+            return Err(fail(&format!(
+                "buffer is not {}-byte aligned ({})",
+                elem.alignment(),
+                elem.name()
+            )));
+        }
+        let int = |v: usize| i32::try_from(v).map_err(|_| fail("index exceeds i32"));
+        let (row_elems_arg, own_row0, own_rows, peer_row0, peer_rows) = (
+            int(row_elems)?,
+            int(own.0)?,
+            int(own.1)?,
+            int(peer.0)?,
+            int(peer.1)?,
+        );
+        let gen_ptr = generation.as_ptr();
+        let stride_arg = u32::try_from(bank_stride).map_err(|_| fail("bank stride exceeds u32"))?;
+        let wait_block = self.device_wait_block()?;
+        let mut params: [*mut c_void; 11] = [
+            &buf as *const _ as *mut c_void,
+            &row_elems_arg as *const _ as *mut c_void,
+            &peer_mailbox as *const _ as *mut c_void,
+            &local_mailbox as *const _ as *mut c_void,
+            &stride_arg as *const _ as *mut c_void,
+            &gen_ptr as *const _ as *mut c_void,
+            &wait_block as *const _ as *mut c_void,
+            &own_row0 as *const _ as *mut c_void,
+            &own_rows as *const _ as *mut c_void,
+            &peer_row0 as *const _ as *mut c_void,
+            &peer_rows as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            elem.symbol(),
+            [geometry.0, 1, 1],
+            [geometry.1, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(buf);
+                b.push_i32(row_elems_arg);
+                b.push_ptr(peer_mailbox);
+                b.push_ptr(local_mailbox);
+                b.push_u32(stride_arg);
+                b.push_ptr(gen_ptr);
+                b.push_ptr(wait_block);
+                b.push_i32(own_row0);
+                b.push_i32(own_rows);
+                b.push_i32(peer_row0);
+                b.push_i32(peer_rows);
+                b
+            },
+        )
+    }
+}
+
+// ----------------------------------------------------------------------------------------
 // Host numerics model
 // ----------------------------------------------------------------------------------------
 
@@ -802,5 +1264,168 @@ mod tests {
         assert!(src.contains(&format!("#define AR_HC_TICKET_WORD {AR_HC_TICKET_WORD}")));
         assert!(src.contains("HF_WAIT_SITE_AR_HC_WRITE_GFX1201"));
         assert!(AR_HC_TICKET_WORD * 4 + 4 <= AR_HC_GEN_BYTES);
+    }
+
+    #[test]
+    fn sp_geometry_keeps_the_poll_side_within_kmax() {
+        for own in 0..=SP_ROW_CAP {
+            for peer in [0usize, 1, 2, 7, 16, 255, 256] {
+                if own + peer == 0 {
+                    assert_eq!(sp_rs_geometry(own, peer), None);
+                    continue;
+                }
+                let g = sp_rs_geometry(own, peer).expect("every capped range pair has a geometry");
+                assert!((1..=AR_HC_MAX_BLOCKS as u32).contains(&g.0), "{own} {peer}");
+                assert!((32..=AR_HC_MAX_LANES as u32).contains(&g.1), "{own} {peer}");
+                assert!(sp_granules_per_lane(own * SP_GRANULES_PER_ROW, g) <= AR_HC_KMAX);
+                assert!(sp_granules_per_lane(peer * SP_GRANULES_PER_ROW, g) <= AR_HC_KMAX);
+            }
+        }
+        assert_eq!(sp_rs_geometry(SP_ROW_CAP + 1, 1), None);
+        assert_eq!(sp_rs_geometry(1, SP_ROW_CAP + 1), None);
+        // the symmetric shape equals the all-reduce launch of the same row count
+        for rows in [1usize, 2, 7, 16, 255, 256] {
+            assert_eq!(sp_rs_geometry(rows, rows), ar_hc_geometry(rows), "{rows}");
+        }
+    }
+
+    #[test]
+    fn sp_ag_geometry_covers_the_hidden_and_narrow_rows() {
+        for row_elems in [4usize, 640, 2560] {
+            for own in [0usize, 1, 3, 128, 256] {
+                for peer in [1usize, 2, 255, 256] {
+                    let g = sp_ag_geometry(own, peer, row_elems).expect("geometry");
+                    let gpr = row_elems / 4;
+                    assert!(sp_granules_per_lane(own * gpr, g) <= AR_HC_KMAX);
+                    assert!(sp_granules_per_lane(peer * gpr, g) <= AR_HC_KMAX);
+                    assert!(g.0 as usize <= AR_HC_MAX_BLOCKS && g.1 as usize <= AR_HC_MAX_LANES);
+                }
+            }
+        }
+        assert_eq!(sp_ag_geometry(0, 0, 2560), None);
+        assert_eq!(sp_ag_geometry(1, 1, 0), None);
+        assert_eq!(sp_ag_geometry(1, 1, 2), None);
+        assert_eq!(sp_ag_geometry(1, 1, 2562), None);
+        assert_eq!(sp_ag_geometry(SP_ROW_CAP + 1, 1, 2560), None);
+        // a full 256-row hidden-width launch fits one dense bank of the exchange
+        let bank = ar_hc_bank_bytes_for(ArHcWire::Dense, AR_HC_ROW_CAP);
+        assert_eq!(sp_ag_rows_per_launch(2560, bank), SP_ROW_CAP);
+        assert_eq!(sp_ag_rows_per_launch(640, bank), SP_ROW_CAP);
+        assert_eq!(sp_ag_rows_per_launch(2560, 128 * 640 * 8), 128);
+        assert_eq!(sp_ag_rows_per_launch(2, bank), 0);
+    }
+
+    #[test]
+    fn sp_slices_mirror_between_the_two_ranks() {
+        for (a, b) in [
+            (1usize, 0usize),
+            (0, 1),
+            (256, 256),
+            (257, 256),
+            (306, 307),
+            (0, 613),
+            (613, 1),
+        ] {
+            let rank_a = sp_slices(a, b, SP_ROW_CAP);
+            let rank_b = sp_slices(b, a, SP_ROW_CAP);
+            assert_eq!(rank_a.len(), rank_b.len());
+            let (mut own_sum, mut peer_sum) = (0, 0);
+            for (sa, sb) in rank_a.iter().zip(&rank_b) {
+                assert_eq!(sa.0, sb.1, "A's own chunk is B's peer chunk");
+                assert_eq!(sa.1, sb.0);
+                assert!(sa.0 .1 <= SP_ROW_CAP && sa.1 .1 <= SP_ROW_CAP);
+                assert!(sa.0 .1 + sa.1 .1 > 0);
+                own_sum += sa.0 .1;
+                peer_sum += sa.1 .1;
+            }
+            assert_eq!((own_sum, peer_sum), (a, b));
+        }
+        assert!(sp_slices(0, 0, SP_ROW_CAP).is_empty());
+    }
+
+    #[test]
+    fn sp_even_split_and_wire_models() {
+        assert_eq!(sp_even_split(1), [(0, 1), (1, 0)]);
+        assert_eq!(sp_even_split(7), [(0, 4), (4, 3)]);
+        assert_eq!(sp_even_split(512), [(0, 256), (256, 256)]);
+        assert_eq!(sp_wire_dword(u32::MAX), u32::MAX - 1);
+        assert_eq!(sp_wire_dword(0x3f80_3f80), 0x3f80_3f80);
+        assert_eq!(
+            sp_f32bf16_wire(bf16_round(1.2345)).to_bits(),
+            bf16_round(1.2345).to_bits()
+        );
+    }
+
+    #[test]
+    fn sp_wait_sites_are_defined_in_the_sp_source() {
+        let src = kernels::SP_HC_RS_AG_GFX1201_SRC;
+        assert!(src.contains("#define HF_WAIT_SITE_SP_HC_RS_GFX1201 12u"));
+        assert!(src.contains("#define HF_WAIT_SITE_SP_AG_ROWS_GFX1201 13u"));
+        assert!(src.contains(&format!("#define AR_HC_KMAX {AR_HC_KMAX}")));
+        for kind in StreamKind::ALL {
+            assert!(src.contains(&format!("void {}(", sp_rs_symbol(kind))));
+        }
+        for elem in SpAgElem::ALL {
+            assert!(src.contains(&format!("void {}(", elem.symbol())));
+        }
+        // the header and the AR kernel file the SP source builds on are not edited by it
+        assert!(!kernels::DEVICE_WAIT_DEADLINE_H.contains("SP_HC_RS"));
+        assert!(!kernels::AR_HC_WRITE_GFX1201_SRC.contains("SP_HC_RS"));
+    }
+
+    /// The SP kernel source compiles offline for gfx1201 (hipcc `--genco`, no GPU touched)
+    /// and exports every entry. Skipped when hipcc is absent.
+    #[test]
+    fn sp_kernel_source_compiles_for_gfx1201() {
+        let hipcc = ["/opt/rocm/bin/hipcc", "hipcc"].into_iter().find(|p| {
+            std::process::Command::new(p)
+                .arg("--version")
+                .output()
+                .is_ok()
+        });
+        let Some(hipcc) = hipcc else {
+            eprintln!("hipcc not found: skipped");
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("sp-hc-rs-ag-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("sp_hc_rs_ag.hip");
+        let obj = dir.join("sp_hc_rs_ag.hsaco");
+        std::fs::write(&src, kernels::SP_HC_RS_AG_GFX1201_SRC).unwrap();
+        let out = std::process::Command::new(hipcc)
+            .args([
+                "-x",
+                "hip",
+                "--genco",
+                "--offload-arch=gfx1201",
+                "-O3",
+                "--no-offload-compress",
+                "-fuse-cuid=none",
+                "-mcode-object-version=6",
+            ])
+            .arg(&src)
+            .arg("-o")
+            .arg(&obj)
+            .env("HIP_VISIBLE_DEVICES", "-1")
+            .env("ROCR_VISIBLE_DEVICES", "-1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "hipcc: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let image = std::fs::read(&obj).unwrap();
+        let symbols = StreamKind::ALL
+            .map(sp_rs_symbol)
+            .into_iter()
+            .chain(SpAgElem::ALL.map(SpAgElem::symbol));
+        for symbol in symbols {
+            assert!(
+                image.windows(symbol.len()).any(|w| w == symbol.as_bytes()),
+                "{symbol} missing"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
