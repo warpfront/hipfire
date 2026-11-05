@@ -148,7 +148,13 @@ impl LaneTokenRing {
     fn drain(&mut self, gpu: &Gpu, index: usize) -> HipResult<()> {
         match (self.state.drain(index), self.slots[index].fence.as_ref()) {
             (PleDrain::Nothing, _) => {}
-            (PleDrain::Fence, Some(fence)) => gpu.hip.event_synchronize(fence)?,
+            // A slot reused long after its copy (the usual case) has a completed fence:
+            // the non-blocking query retires it without a host synchronization call.
+            (PleDrain::Fence, Some(fence)) => {
+                if !gpu.hip.event_query(fence)? {
+                    gpu.hip.event_synchronize(fence)?;
+                }
+            }
             // A Fenced slot without an event cannot arise; drain the whole
             // device rather than trust it.
             (PleDrain::Fence, None) | (PleDrain::Device, _) => gpu.hip.device_synchronize()?,
