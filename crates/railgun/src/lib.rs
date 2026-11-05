@@ -31,6 +31,7 @@ pub mod contract;
 pub mod copy;
 pub mod index_bind;
 pub mod kernel;
+pub mod mesh;
 pub mod mq6;
 #[cfg(feature = "npu")]
 pub mod npu;

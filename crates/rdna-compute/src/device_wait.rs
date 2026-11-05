@@ -69,10 +69,13 @@ pub enum DeviceWaitSite {
     ArHcWriteGfx1201 = 11,
     SpHcRsGfx1201 = 12,
     SpAgRowsGfx1201 = 13,
+    EpBoundaryWait = 14,
+    /// Written by the host ([`DeviceWaitPoison`]), never by a kernel.
+    EpBoundaryPoison = 15,
 }
 
 impl DeviceWaitSite {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::TpSignalWait2Gfx1201,
         Self::TpSignalWait3Gfx1201,
         Self::TpSignalBarrierGfx1100,
@@ -86,6 +89,8 @@ impl DeviceWaitSite {
         Self::ArHcWriteGfx1201,
         Self::SpHcRsGfx1201,
         Self::SpAgRowsGfx1201,
+        Self::EpBoundaryWait,
+        Self::EpBoundaryPoison,
     ];
 
     pub fn from_code(code: u32) -> Option<Self> {
@@ -108,6 +113,8 @@ impl DeviceWaitSite {
             Self::ArHcWriteGfx1201 => "AR_HC_WRITE_GFX1201",
             Self::SpHcRsGfx1201 => "SP_HC_RS_GFX1201",
             Self::SpAgRowsGfx1201 => "SP_AG_ROWS_GFX1201",
+            Self::EpBoundaryWait => "EP_BOUNDARY_WAIT",
+            Self::EpBoundaryPoison => "EP_BOUNDARY_POISON",
         }
     }
 
@@ -128,6 +135,7 @@ impl DeviceWaitSite {
             Self::ArHcWriteGfx1201 => "ar_hc_write_gfx1201",
             Self::SpHcRsGfx1201 => "sp_hc_rs_d8_gfx1201",
             Self::SpAgRowsGfx1201 => "sp_ag_rows_bf16_d8_gfx1201",
+            Self::EpBoundaryWait | Self::EpBoundaryPoison => "ep_boundary_signal_wait",
         }
     }
 
@@ -150,12 +158,16 @@ impl DeviceWaitSite {
                 "the wavegrid rendezvous (workgroups not co-resident)"
             }
             Self::HcControlRsqrtOnce => "control row 0's rsqrt",
+            Self::EpBoundaryWait | Self::EpBoundaryPoison => "every EP rank's boundary epoch",
         }
     }
 
     fn detail_label(self) -> &'static str {
         match self {
-            Self::TpSignalWait2Gfx1201 | Self::TpSignalWait3Gfx1201 => "epoch",
+            Self::TpSignalWait2Gfx1201 | Self::TpSignalWait3Gfx1201 | Self::EpBoundaryWait => {
+                "epoch"
+            }
+            Self::EpBoundaryPoison => "poison",
             Self::TpSignalBarrierGfx1100
             | Self::TpSignalReduceGfx1100
             | Self::TpPeerPushGfx1201
@@ -196,6 +208,14 @@ impl fmt::Display for DeviceWaitTimeout {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let device = self.device_id;
         match self.site() {
+            Some(site @ DeviceWaitSite::EpBoundaryPoison) => write!(
+                f,
+                "EP boundary poisoned on GPU {device}: another rank failed, so {} stopped \
+                 waiting ({} {}); this step's results are invalid and the request was aborted",
+                site.kernel(),
+                site.detail_label(),
+                self.detail,
+            ),
             Some(site) => write!(
                 f,
                 "device wait timeout on GPU {device}: {} waited {DEVICE_WAIT_TIMEOUT_MS} ms for {} \
@@ -320,6 +340,39 @@ impl DeviceWaitMapping {
     /// Release the block. The caller must have synchronized the device.
     pub(crate) fn free(self, hip: &HipRuntime) -> HipResult<()> {
         hip.host_free(self.host as *mut c_void)
+    }
+
+    pub(crate) fn poison_handle(&self) -> DeviceWaitPoison {
+        DeviceWaitPoison { host: self.host }
+    }
+}
+
+/// Stops one device's bounded waits from any host thread: it stores
+/// [`DeviceWaitSite::EpBoundaryPoison`] into the device's wait block, so every
+/// waiter on that device stops at its next check (`hf_wait_expired`) and the
+/// host's step check reports the poison. An EP mesh uses it to release ranks
+/// spinning on a boundary whose peer failed on the host.
+#[derive(Clone, Copy, Debug)]
+pub struct DeviceWaitPoison {
+    host: usize,
+}
+
+impl DeviceWaitPoison {
+    /// # Safety
+    /// The owning `Gpu` (and so its wait block) must still be alive.
+    pub unsafe fn poison(&self, detail: u32) {
+        use std::ptr::{addr_of_mut, write_volatile};
+        let block = self.host as *mut DeviceWaitBlock;
+        // SAFETY: the caller guarantees the block is live. A device timeout
+        // racing this store is fine: any nonzero code fails the step.
+        unsafe {
+            write_volatile(addr_of_mut!((*block).detail), detail);
+            fence(Ordering::Release);
+            write_volatile(
+                addr_of_mut!((*block).code),
+                DeviceWaitSite::EpBoundaryPoison as u32,
+            );
+        }
     }
 }
 

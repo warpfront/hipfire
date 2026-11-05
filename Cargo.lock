@@ -1885,6 +1885,7 @@ dependencies = [
  "minijinja",
  "minijinja-contrib",
  "proptest",
+ "railgun",
  "rayon",
  "rdna-compute",
  "regex",
