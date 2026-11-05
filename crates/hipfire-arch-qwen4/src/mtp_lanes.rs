@@ -1338,6 +1338,7 @@ pub(crate) fn prefill_tile(
     tokens: &[u32],
     append_scratch: Option<&mut MtpAppendScratch>,
     sample_host: &mut crate::lane::SampleScratch,
+    sample_arena: &mut Option<hipfire_runtime::lane_draw::LaneDrawArena>,
 ) -> Result<Option<u32>, String> {
     let Qwen4LaneState { host, state, spec } = lane;
     let spec = spec
@@ -1388,6 +1389,21 @@ pub(crate) fn prefill_tile(
     if let (Some(pick), true) = (pick, end == host.prompt.len()) {
         let vocab = bundle.config.vocab_size;
         let mut one = [pick];
+        if crate::lane::lane_device_sample(gpu) {
+            let logits = bundle
+                .spec_logits_rows(0, 1)
+                .map_err(|e| format!("prefill_tile: {e}"))?;
+            let mut request = [crate::lane::LaneDeviceRequest {
+                host: &mut *host,
+                drafts: None,
+                picks: &mut one,
+                eos: 0,
+                logits,
+            }];
+            crate::lane::lane_sample_device(gpu, sample_arena, vocab, &mut request)
+                .map_err(|e| format!("prefill_tile: {e}"))?;
+            return Ok(Some(one[0]));
+        }
         let gpu_ref: &Gpu = gpu;
         let bundle_ref: &Qwen4Bundle = bundle;
         lane_sample_step(host, None, &mut one, 0, vocab, sample_host, |scratch| {

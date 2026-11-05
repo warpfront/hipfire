@@ -785,6 +785,12 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
             "sample_topk_finalize_fast65"
         ]
     );
+    // Lane-wide sampled verify (`Gpu::lane_leviathan_verify_enqueue`).
+    add!(
+        "lane_leviathan",
+        kernels::LANE_LEVIATHAN_SRC,
+        ["lane_leviathan_verify"]
+    );
     // Qwen4 logit-policy penalty prepass (AR greedy rows, sampled-MTP verify
     // rows; `Gpu::apply_penalty_table`).
     add!(
@@ -11884,6 +11890,20 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` (default on, exact gfx1201): the lane-wide sampled verify.
+        const LANE_LEVIATHAN_ADDED_MODULES: [&str; 1] = ["lane_leviathan"];
+        for module in LANE_LEVIATHAN_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing lane-wide sampled verify module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         // `HIPFIRE_QWEN4_MOE_DOWN_DNI` (default on, exact gfx1201, <=8 rows): the per-pick K=640 down kernel.
         const MOE_DOWN_DNI_ADDED_MODULES: [&str; 1] = ["gemv_mq4g128v2_moe_down_top10_dni"];
         for module in MOE_DOWN_DNI_ADDED_MODULES {
@@ -11966,7 +11986,8 @@ mod tests {
                 + BF16_ALLROWS_ADDED_MODULES.len()
                 + MOE_DOWN_DNI_ADDED_MODULES.len()
                 + MQ6_R8_PK_ADDED_MODULES.len()
-                + PMASK_IMPLICIT_ZERO_ADDED_MODULES.len(),
+                + PMASK_IMPLICIT_ZERO_ADDED_MODULES.len()
+                + LANE_LEVIATHAN_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

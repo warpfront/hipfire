@@ -64,6 +64,7 @@ pub mod imagedec;
 pub mod kv_adaptive;
 pub mod kv_backend;
 pub mod kv_mode;
+pub mod lane_draw;
 pub mod llama;
 pub mod llama_spec;
 pub mod lloyd_lut;

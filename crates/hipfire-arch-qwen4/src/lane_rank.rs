@@ -319,7 +319,9 @@ impl LocalLaneRank<'_> {
             top1_host,
             rows_cap,
             sample_host,
+            sample_arena,
             spec,
+            ..
         } = parts;
         let hidden: Option<&GpuTensor> = spec.as_ref().map(|s| &s.hidden);
         let n_dec: usize = plan.lanes.iter().map(|l| l.rows.len()).sum();
@@ -389,26 +391,73 @@ impl LocalLaneRank<'_> {
             hipfire_dispatch::families::moe::MoeRowGather::decode_step_end(gather.hook, gpu);
         }
 
-        // A sampled lane's argmax picks are replaced by its sampler's draws
-        // (`lane_sample_step`: one D2H of the request's logits rows); a
-        // greedy lane takes the unchanged argmax path.
+        // A sampled lane's argmax picks are replaced by its sampler's draws; a
+        // greedy lane takes the unchanged argmax path. On the device
+        // (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`) every sampled lane of the step is
+        // drawn by one `lane_sample_device` call; else each by `lane_sample_step`
+        // (one D2H of the request's logits rows).
         let mut picks: Vec<Vec<u32>> = Vec::with_capacity(plan.lanes.len());
-        let mut naive: Vec<Option<GreedyAccept>> = Vec::with_capacity(plan.lanes.len());
+        let mut naive: Vec<Option<GreedyAccept>> = vec![None; plan.lanes.len()];
+        let mut row0: Vec<usize> = Vec::with_capacity(plan.lanes.len());
         let mut first = 0usize;
-        for (i, (vl, lane)) in plan.lanes.iter().zip(lanes.iter_mut()).enumerate() {
+        for vl in &plan.lanes {
             let rows = vl.rows.len();
-            let mut lane_picks: Vec<u32> =
-                (0..rows).map(|j| pick_at(top1_host, first + j)).collect();
-            let mut window = None;
-            // A forced advance draws nothing: no sampling, no RNG.
-            if lane.host.sampling.is_some() && !forced[i] {
+            picks.push((0..rows).map(|j| pick_at(top1_host, first + j)).collect());
+            row0.push(first);
+            first += rows;
+        }
+        if crate::lane::lane_device_sample(gpu) {
+            let mut requests: Vec<crate::lane::LaneDeviceRequest<'_>> = Vec::new();
+            let mut owners: Vec<usize> = Vec::new();
+            for (i, ((vl, lane), lane_picks)) in plan
+                .lanes
+                .iter()
+                .zip(lanes.iter_mut())
+                .zip(picks.iter_mut())
+                .enumerate()
+            {
+                // A forced advance draws nothing: no sampling, no RNG.
+                if lane.host.sampling.is_none() || forced[i] {
+                    continue;
+                }
+                let rows = vl.rows.len();
+                requests.push(crate::lane::LaneDeviceRequest {
+                    host: &mut lane.host,
+                    drafts: (rows > 1).then(|| &vl.rows[1..]),
+                    picks: lane_picks,
+                    eos: lane_eos,
+                    logits: logits.sub_offset(row0[i] * vocab, rows * vocab),
+                });
+                owners.push(i);
+            }
+            let outcomes =
+                crate::lane::lane_sample_device(gpu, sample_arena, vocab, &mut requests)?;
+            for (i, outcome) in owners.into_iter().zip(outcomes) {
+                if let LaneSampleOutcome::Naive(w) = outcome {
+                    naive[i] = Some(w);
+                }
+            }
+        } else {
+            for (i, ((vl, lane), lane_picks)) in plan
+                .lanes
+                .iter()
+                .zip(lanes.iter_mut())
+                .zip(picks.iter_mut())
+                .enumerate()
+            {
+                // A forced advance draws nothing: no sampling, no RNG.
+                if lane.host.sampling.is_none() || forced[i] {
+                    continue;
+                }
+                let rows = vl.rows.len();
+                let first = row0[i];
                 let drafts = (rows > 1).then(|| &vl.rows[1..]);
                 let gpu_ref: &Gpu = gpu;
                 let logits_ref: &GpuTensor = logits;
                 let sampled = lane_sample_step(
                     &mut lane.host,
                     drafts,
-                    &mut lane_picks,
+                    lane_picks,
                     lane_eos,
                     vocab,
                     sample_host,
@@ -416,12 +465,9 @@ impl LocalLaneRank<'_> {
                 )
                 .map_err(|error| format!("lane {:?}: {error}", vl.key.request_epoch))?;
                 if let LaneSampleOutcome::Naive(w) = sampled {
-                    window = Some(w);
+                    naive[i] = Some(w);
                 }
             }
-            picks.push(lane_picks);
-            naive.push(window);
-            first += rows;
         }
         let wide: Vec<bool> = plan.lanes.iter().map(|l| l.wide).collect();
         Ok((picks, naive, row_group_count(&dec_rows, &wide)))
@@ -707,15 +753,13 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                 plan.ledger.row_groups
             )));
         }
-        result.sampler = Some(SamplerOutput {
-            picks: plan
-                .lanes
+        result.sampler = Some(SamplerOutput::picks_only(
+            plan.lanes
                 .iter()
                 .zip(&picks)
                 .map(|(l, p)| (l.key, p.clone()))
                 .collect(),
-            rows: None,
-        });
+        ));
         let flight = self.flight_mut()?;
         flight.picks = picks;
         flight.naive = naive;

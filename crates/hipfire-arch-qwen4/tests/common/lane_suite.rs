@@ -62,12 +62,20 @@
 //! # Merge key
 //!
 //! A shard's key is `(executor, topology, artifact, lanes, lane K, route,
-//! sampling, state format)` plus its `range`. [`plan_lane_merge`] accepts a set only when
+//! draw route, sampling, state format)` plus its `range`. [`plan_lane_merge`] accepts a set only when
 //! every shard of one arm shares its key, every arm shares the cross-arm
 //! fields (all of the above but `route`), each arm's route is the one its name
 //! declares, the file-name range equals the config's range, the ranges tile
 //! `0..trials` exactly, row counts match, and every declared arm is present.
 //! Anything else is an error that names the first violated field.
+//!
+//! The draw route (`lane_suite.lane_draw_route`, `device` or `host`) is the
+//! sampled-token route the arm RESOLVED at run time
+//! (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` and the device's support): it is known
+//! only once the arm has a loaded GPU, so the arm process adds it to the
+//! config after the load ([`with_draw_route`]). It is a cross-arm field, so a
+//! merge or a verdict never mixes ids drawn on the device with ids drawn on
+//! the host ([`draw_route_coverage`]).
 
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -449,17 +457,26 @@ pub fn lane_env_overrides(arm: &str, lane_k: usize) -> Vec<(&'static str, Option
 }
 
 /// Salt of a lane arm's request seeds, distinct per arm and from every
-/// singleton arm salt.
+/// singleton arm salt. A request's seed is `trial_seed(salt ^ index)`, so two
+/// salts whose XOR is below the request count would hand both arms the SAME
+/// seed set, permuted (`index ^ (a ^ b)`): coupled arms, not independent
+/// samples (the earlier `0x1A4E_xxxx` salts differed in their low 16 bits only).
+/// The arms therefore differ above bit 32 ([`LANE_SALT_SPLIT_BIT`]), beyond any
+/// request index.
 pub fn lane_salt(arm: &str) -> Result<u64, String> {
     match arm {
-        "lane_ar" => Ok(0x1A4E_A200),
-        "lane_batched" => Ok(0x1A4E_BA7C),
-        "lane_adaptive" => Ok(0x1A4E_ADA9),
-        "lane_copy" => Ok(0x1A4E_C0B1),
-        "lane_cross" => Ok(0x1A4E_C705),
+        "lane_ar" => Ok(0x1A4E_A200_0000_0000),
+        "lane_batched" => Ok(0x1A4E_BA7C_0000_0000),
+        "lane_adaptive" => Ok(0x1A4E_ADA9_0000_0000),
+        "lane_copy" => Ok(0x1A4E_C0B1_0000_0000),
+        "lane_cross" => Ok(0x1A4E_C705_0000_0000),
         other => Err(format!("{other} is not a lane arm")),
     }
 }
+
+/// Every pair of lane arm salts differs at or above this bit, so no request
+/// index (< 2^32) maps one arm's seed set onto another's.
+pub const LANE_SALT_SPLIT_BIT: u32 = 32;
 
 /// The seed of the request that occupies `lane` of global `trial`: the
 /// SplitMix64 `trial_seed` of `salt` and the request's global index
@@ -632,6 +649,63 @@ pub fn lane_config(
     Ok(config)
 }
 
+/// The `lane_suite` key recording the resolved sampled-token draw route.
+pub const DRAW_ROUTE_KEY: &str = "lane_draw_route";
+
+/// The draw routes a lane arm can resolve: `device` (one lane-wide device
+/// launch draws every sampled token) or `host` (the host sampler).
+pub const DRAW_ROUTES: [&str; 2] = ["device", "host"];
+
+/// `config` with the arm's resolved draw route recorded in its `lane_suite`
+/// block. The arm process resolves the route once its GPU is loaded, so the
+/// pre-GPU config ([`lane_config`]) has none.
+pub fn with_draw_route(mut config: Value, route: &str) -> Result<Value, String> {
+    if !DRAW_ROUTES.contains(&route) {
+        return Err(format!(
+            "lane draw route {route:?} is not one of {DRAW_ROUTES:?}"
+        ));
+    }
+    let block = config["lane_suite"]
+        .as_object_mut()
+        .ok_or("config has no lane_suite block to record the draw route in")?;
+    block.insert(DRAW_ROUTE_KEY.to_string(), json!(route));
+    Ok(config)
+}
+
+/// The draw route a config recorded (`lane_suite.lane_draw_route`); a config
+/// without a valid one (ids produced before the route was recorded) is an error.
+pub fn recorded_draw_route(config: &Value) -> Result<&'static str, String> {
+    let recorded = &config["lane_suite"][DRAW_ROUTE_KEY];
+    recorded
+        .as_str()
+        .and_then(|route| DRAW_ROUTES.iter().copied().find(|known| *known == route))
+        .ok_or_else(|| {
+            format!(
+                "config records lane_suite.{DRAW_ROUTE_KEY} {recorded}, not one of {DRAW_ROUTES:?}"
+            )
+        })
+}
+
+/// The cohort's draw routes as a report line (`arm=route` per arm) plus the
+/// coverage failures: a cohort whose arms ran under different routes is
+/// refused (its arms' RNG streams and draw laws would differ).
+pub fn draw_route_coverage(routes: &[(&str, &str)]) -> (String, Vec<String>) {
+    let per_arm = routes
+        .iter()
+        .map(|(arm, route)| format!("{arm}={route}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let distinct: BTreeSet<&str> = routes.iter().map(|(_, route)| *route).collect();
+    let failures = if distinct.len() > 1 {
+        vec![format!(
+            "the cohort's arms ran under different lane draw routes ({per_arm}): regenerate every arm under one HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE setting"
+        )]
+    } else {
+        Vec::new()
+    };
+    (format!("lane draw route: {per_arm}\n"), failures)
+}
+
 /// The merge key of one shard (everything but its range).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LaneShardKey {
@@ -642,6 +716,7 @@ pub struct LaneShardKey {
     pub lanes: usize,
     pub lane_k: usize,
     pub route: String,
+    pub draw_route: String,
     pub sampling: String,
     pub state_format: String,
 }
@@ -696,6 +771,9 @@ impl LaneShardKey {
                 lane_route(&arm)
             ));
         }
+        let draw_route = recorded_draw_route(config)
+            .map_err(|e| format!("{arm}: {e}"))?
+            .to_owned();
         if let Some(refusal) =
             cross_placement_failure(&arm, Topology::parse(Some(&topology))?, lanes)
         {
@@ -788,6 +866,7 @@ impl LaneShardKey {
                 lanes,
                 lane_k,
                 route,
+                draw_route,
                 sampling: Value::Object(sampling).to_string(),
                 state_format,
             },
@@ -837,6 +916,9 @@ fn key_difference(a: &LaneShardKey, b: &LaneShardKey, cross_arm: bool) -> Option
     }
     if !cross_arm && a.route != b.route {
         return Some("route");
+    }
+    if a.draw_route != b.draw_route {
+        return Some("lane draw route");
     }
     if a.sampling != b.sampling {
         return Some("sampling");
@@ -1728,6 +1810,20 @@ mod tests {
         );
     }
 
+    /// The tests' shards are the ones a device-route arm wrote.
+    fn lane_config(
+        base: Value,
+        arm: &str,
+        placement: Placement,
+        state_format: &str,
+        range: (usize, usize),
+    ) -> Result<Value, String> {
+        with_draw_route(
+            super::lane_config(base, arm, placement, state_format, range)?,
+            "device",
+        )
+    }
+
     fn k_shard(arm: &str, range: (usize, usize), lanes: usize, lane_k: usize) -> LaneShard {
         let mut base = base_config(arm);
         base["identity"]["env"][TOPOLOGY_ENV] = json!("ep2");
@@ -1899,6 +1995,17 @@ mod tests {
             "cross salt is shared"
         );
         assert_eq!(LANE_ARMS[0], LANE_REFERENCE_ARM);
+        // Independent arms: `salt_a ^ index` never equals `salt_b ^ index'`
+        // for request indices below 2^LANE_SALT_SPLIT_BIT.
+        let all: Vec<u64> = salts.iter().copied().collect();
+        for (i, &a) in all.iter().enumerate() {
+            for &b in &all[i + 1..] {
+                assert!(
+                    (a ^ b) >> LANE_SALT_SPLIT_BIT != 0,
+                    "salts {a:#x} and {b:#x} share a seed set"
+                );
+            }
+        }
         assert!(lane_salt("ar").is_err() && lane_route("interleaved").is_none());
         assert_eq!(
             lane_env_overrides("lane_copy", 2),
@@ -2116,6 +2223,69 @@ mod tests {
         f: impl FnOnce(&mut LaneShard),
     ) {
         f(&mut set.get_mut(arm).unwrap()[index]);
+    }
+
+    #[test]
+    fn the_draw_route_is_part_of_the_shard_identity_and_the_merge_key() {
+        let device = lane_config(
+            base_config("lane_ar"),
+            "lane_ar",
+            placement(FIXTURE_TOPOLOGY, 8),
+            "q8",
+            (0, 100),
+        )
+        .unwrap();
+        assert_eq!(recorded_draw_route(&device), Ok("device"));
+        let host = with_draw_route(device.clone(), "host").unwrap();
+        assert_eq!(recorded_draw_route(&host), Ok("host"));
+        assert_ne!(device, host);
+        assert!(with_draw_route(device.clone(), "gpu").is_err());
+        assert_eq!(
+            LaneShardKey::from_config(&host).unwrap().0.draw_route,
+            "host"
+        );
+        // Ids recorded before the route existed carry none and are refused.
+        let mut bare = host.clone();
+        bare["lane_suite"]
+            .as_object_mut()
+            .unwrap()
+            .remove(DRAW_ROUTE_KEY);
+        assert!(recorded_draw_route(&bare).is_err());
+        assert!(LaneShardKey::from_config(&bare).is_err());
+        // One arm's shards under two routes, and two arms under two routes.
+        let mut set = full_set();
+        edit(&mut set, "lane_ar", 1, |s| {
+            s.config = with_draw_route(s.config.clone(), "host").unwrap();
+        });
+        let error = plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err();
+        assert!(error.contains("lane draw route"), "{error}");
+        let mut set = full_set();
+        for index in 0..3 {
+            edit(&mut set, "lane_batched", index, |s| {
+                s.config = with_draw_route(s.config.clone(), "host").unwrap();
+            });
+        }
+        let error = plan_lane_merge(&set, TRIALS, FIXTURE_TOPOLOGY).unwrap_err();
+        assert!(error.contains("lane draw route"), "{error}");
+    }
+
+    #[test]
+    fn the_draw_route_coverage_prints_the_route_per_arm_and_refuses_a_mixed_cohort() {
+        let (line, failures) =
+            draw_route_coverage(&[("lane_ar", "device"), ("lane_batched", "device")]);
+        assert_eq!(
+            line,
+            "lane draw route: lane_ar=device lane_batched=device\n"
+        );
+        assert!(failures.is_empty());
+        let (line, failures) =
+            draw_route_coverage(&[("lane_ar", "host"), ("lane_batched", "device")]);
+        assert!(line.contains("lane_ar=host") && line.contains("lane_batched=device"));
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("different lane draw routes"),
+            "{failures:?}"
+        );
     }
 
     #[test]

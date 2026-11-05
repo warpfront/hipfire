@@ -25,7 +25,11 @@
 //! - **Root-only decisions.** Policy (route/depth/source), the per-request
 //!   RNG, acceptance and `consumed_rows` exist only in [`MeshRoot`], which
 //!   can only be built for the root/sampler rank. A follower result that
-//!   carries proposals or sampler output aborts the step.
+//!   carries proposals or sampler output aborts the step. A sampled lane may
+//!   have its verify rows drawn on the sampler owner's device
+//!   ([`DeviceSampleSpec`]): the root *lends* the lane's staged RNG state for
+//!   that one verify and takes the advanced state back in [`DevicePick`]; the
+//!   committed RNG still moves only at [`MeshRoot::publish_commit`].
 //! - **Plan purity.** [`MeshRoot::plan_window`] reads only root-owned state
 //!   and the *merged* evidence of the previous step; rank-local timings
 //!   reach it solely through [`merge_evidence`].
@@ -54,6 +58,7 @@ use crate::mtp_lanes::{
 use crate::mtp_spec::{target_commit_accept_len, HeadLag, NGRAM_DEPTHS};
 use crate::sampled_lane::{DraftRead, LaneRng, RowHandle};
 use hipfire_runtime::ngram_mod::NgramModConfig;
+use hipfire_runtime::sampler::SamplerConfig;
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::{accept_greedy_prefix, GreedyAccept, MtpWindow};
 use std::collections::{HashMap, HashSet};
@@ -816,6 +821,55 @@ pub struct OpLedger {
     pub wide_groups: usize,
 }
 
+/// What the root lends the sampler owner to draw one sampled lane's verify
+/// rows on its device (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`): the lane's sampler
+/// policy, the staged RNG state, the penalty-window source (the committed
+/// tokens before row 0), each draft's distribution `q` as the root drew it and
+/// the EOS rule. Only the sampler owner reads it; followers ignore it.
+/// Equality compares the policy's `Debug` text (exact for the f32 fields), as
+/// [`SamplerConfig`] is not `Eq`, and the `q` probabilities bitwise.
+#[derive(Clone, Debug)]
+pub struct DeviceSampleSpec {
+    pub cfg: SamplerConfig,
+    /// The lane's xorshift32 verify stream going into the window.
+    pub rng_state: u32,
+    /// Committed tokens before row 0 (the seed included); the sampler windows
+    /// it with `cfg.repeat_window` exactly as the serial sampler does.
+    pub history: Vec<u32>,
+    /// Per draft, `(token, prob)` of the distribution it was drawn from; an
+    /// empty entry is the point mass on the draft (a copy proposal).
+    pub q: Vec<Vec<(u32, f32)>>,
+    pub eos: Option<u32>,
+}
+
+impl PartialEq for DeviceSampleSpec {
+    fn eq(&self, other: &Self) -> bool {
+        self.rng_state == other.rng_state
+            && self.eos == other.eos
+            && self.history == other.history
+            && self.q.len() == other.q.len()
+            && self.q.iter().zip(&other.q).all(|(a, b)| {
+                a.len() == b.len()
+                    && a.iter()
+                        .zip(b)
+                        .all(|(x, y)| x.0 == y.0 && x.1.to_bits() == y.1.to_bits())
+            })
+            && format!("{:?}", self.cfg) == format!("{:?}", other.cfg)
+    }
+}
+
+impl Eq for DeviceSampleSpec {}
+
+/// The sampler owner's device draw of one lane window: the emitted tokens (the
+/// accepted drafts then the draw that ended the window), the accepted-draft
+/// count and the lane's advanced RNG state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DevicePick {
+    pub tokens: Vec<u32>,
+    pub accepted: usize,
+    pub advanced_rng: u32,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifyPlan {
     pub key: MeshStepKey,
@@ -825,6 +879,9 @@ pub struct VerifyPlan {
     /// Lanes per PP microbatch boundary (`[lanes]` for EP / unsplit).
     pub microbatches: Vec<usize>,
     pub ledger: OpLedger,
+    /// Per lane (plan order): the device draw the sampler owner makes for the
+    /// lane's rows (`None`: the lane is greedy or drawn on the host).
+    pub samples: Vec<Option<DeviceSampleSpec>>,
     pub digest: u64,
 }
 
@@ -907,14 +964,24 @@ pub struct SamplerOutput {
     /// Per lane (plan order): the target's pick at every row.
     pub picks: Vec<(LaneWindowKey, Vec<u32>)>,
     /// Lazy access to the sampler owner's resident verify logits, for the
-    /// root's sampled acceptance (S4). `None` on greedy-only steps.
+    /// root's sampled acceptance (S4). `None` on greedy-only steps and when
+    /// every sampled lane was drawn on device.
     pub rows: Option<RowHandle>,
+    /// Per lane (plan order): the device draw of a lane whose
+    /// [`VerifyPlan::samples`] entry was set (the root decides from it, no
+    /// row read); `None` elsewhere.
+    pub device: Vec<Option<DevicePick>>,
 }
 
 impl SamplerOutput {
-    /// Greedy picks only (no distribution rows).
+    /// Greedy picks only (no distribution rows, no device draws).
     pub fn picks_only(picks: Vec<(LaneWindowKey, Vec<u32>)>) -> Self {
-        Self { picks, rows: None }
+        let device = vec![None; picks.len()];
+        Self {
+            picks,
+            rows: None,
+            device,
+        }
     }
 }
 
@@ -1041,6 +1108,20 @@ pub trait AcceptRule {
     /// The sampler owner's verify output, before any `accept` of the step.
     fn observe_verify(&mut self, _out: &SamplerOutput) {}
 
+    /// The sampler owner's device draw of `lane`'s sealed verify rows, if this
+    /// rule wants one (`drafts` are the rows after the seed; `rng` the lane's
+    /// *staged* RNG, lent to the sampler owner for this verify). `Some` makes
+    /// the root decide the lane from the returned [`DevicePick`] instead of
+    /// [`Self::accept`]. Never called for greedy-mode or forced lanes.
+    fn device_sample(
+        &mut self,
+        _lane: &LanePlan,
+        _drafts: &[u32],
+        _rng: &LaneRng,
+    ) -> Result<Option<DeviceSampleSpec>, String> {
+        Ok(None)
+    }
+
     /// The step published: fold its emitted tokens into rule-side history.
     fn on_publish(&mut self, _out: &StepOutput) {}
 }
@@ -1058,6 +1139,60 @@ impl AcceptRule for GreedyRule {
     ) -> Result<GreedyAccept, String> {
         Ok(accept_greedy_prefix(drafts, picks, lane.eos))
     }
+}
+
+/// The root's decision of one lane window from the sampler owner's device draw
+/// ([`DevicePick`], `hipfire_runtime::lane_draw`): accepted drafts, then the
+/// token that ended the window (a rejected draft's residual replacement, which
+/// never equals that draft, or the bonus), or an accepted EOS draft last;
+/// validated against the root's own drafts instead of trusted. The count of
+/// accepted drafts includes an accepted EOS draft (a draw reporting it either
+/// way is taken), `hit_eos` is `eos == last token`, and the lane's staged verify
+/// RNG becomes the device's advanced state.
+pub(crate) fn device_accept(
+    pick: &DevicePick,
+    drafts: &[u32],
+    eos: Option<u32>,
+    rng: &mut LaneRng,
+) -> Result<GreedyAccept, String> {
+    let n = pick.tokens.len();
+    if n == 0 || n > drafts.len() + 1 {
+        return Err(format!(
+            "device draw returned {n} tokens for a {}-draft window",
+            drafts.len()
+        ));
+    }
+    if pick.advanced_rng == 0 {
+        return Err("device draw returned the stuck RNG state 0".to_string());
+    }
+    let last = n - 1;
+    for j in 0..last {
+        if pick.tokens[j] != drafts[j] || eos == Some(pick.tokens[j]) {
+            return Err(format!(
+                "device draw continued past row {j}, which ends the window"
+            ));
+        }
+    }
+    let tail_matches = last < drafts.len() && pick.tokens[last] == drafts[last];
+    let tail_eos = eos == Some(pick.tokens[last]);
+    if tail_matches && !tail_eos {
+        return Err(format!(
+            "device draw ended on accepted draft {last} that is not EOS"
+        ));
+    }
+    let accepted = last + usize::from(tail_matches);
+    if pick.accepted != accepted && !(tail_matches && pick.accepted + 1 == accepted) {
+        return Err(format!(
+            "device draw reports {} accepted drafts for tokens {:?} over drafts {drafts:?}",
+            pick.accepted, pick.tokens
+        ));
+    }
+    rng.set_naive_state(pick.advanced_rng);
+    Ok(GreedyAccept {
+        committed: pick.tokens.clone(),
+        accepted,
+        hit_eos: tail_eos,
+    })
 }
 
 /// A rank's proof it repaired/truncated its owned state to the decision.
@@ -2750,9 +2885,19 @@ impl MeshRoot {
     /// Seal the verify schedule after data-dependent draft truncation/EOS:
     /// final rows, row groups, the expected operation ledger and a digest.
     pub fn seal_verify(&mut self) -> Result<VerifyPlan, ProtocolError> {
+        self.seal_verify_with(&mut GreedyRule)
+    }
+
+    /// [`Self::seal_verify`] asking `rule` for each sampled lane's device draw
+    /// ([`AcceptRule::device_sample`]) while it seals the rows.
+    pub fn seal_verify_with(
+        &mut self,
+        rule: &mut dyn AcceptRule,
+    ) -> Result<VerifyPlan, ProtocolError> {
         self.check_phase("seal_verify", StepPhase::Drafted)?;
         let s = self.step_ref();
         let mut lanes = Vec::with_capacity(s.start.lanes.len());
+        let mut samples: Vec<Option<DeviceSampleSpec>> = Vec::with_capacity(s.start.lanes.len());
         for (i, l) in s.start.lanes.iter().enumerate() {
             let rows: Vec<u32> = match &l.kind {
                 LaneKind::Forced(t) => std::iter::once(l.seed)
@@ -2771,6 +2916,24 @@ impl MeshRoot {
             };
             let wide = !matches!(l.kind, LaneKind::Forced(_))
                 && crate::gpu_forward_lanes::lane_is_wide(l.wide_verify);
+            let spec =
+                if matches!(l.kind, LaneKind::Forced(_)) || l.sampling == SamplingMode::Greedy {
+                    None
+                } else {
+                    // The rule sees the window's final source, as `accept` does
+                    // in `decide_commit` (point-mass q only for a window that
+                    // stayed a copy window).
+                    let mut eff = l.clone();
+                    eff.source = final_source(l, s.draft[i].confirm);
+                    match rule.device_sample(&eff, &rows[1..], &s.staged[i].rng) {
+                        Ok(spec) => spec,
+                        Err(e) => {
+                            let reason = format!("device sample of lane {i}: {e}");
+                            return Err(self.fail(None, reason));
+                        }
+                    }
+                };
+            samples.push(spec);
             lanes.push(VerifyLane {
                 key: l.key,
                 position: l.position,
@@ -2838,6 +3001,7 @@ impl MeshRoot {
             groups,
             microbatches,
             ledger,
+            samples,
             digest: d.finish(),
         };
         self.step_mut().verify = Some(plan.clone());
@@ -2930,6 +3094,19 @@ impl MeshRoot {
                 "picks do not cover the sealed rows".into(),
             ));
         }
+        if out.device.len() != plan.lanes.len()
+            || plan.samples.len() != plan.lanes.len()
+            || out
+                .device
+                .iter()
+                .zip(&plan.samples)
+                .any(|(d, s)| d.is_some() != s.is_some())
+        {
+            return Err(self.fail(
+                Some(sampler.rank),
+                "device draws do not match the sealed device-sample lanes".into(),
+            ));
+        }
         let s = self.step_mut();
         s.picks = Some(out);
         s.phase = StepPhase::Verified;
@@ -2980,7 +3157,11 @@ impl MeshRoot {
                     // only for a window that stayed a copy window).
                     let mut eff = l.clone();
                     eff.source = fsrc;
-                    let acc = match rule.accept(&eff, drafts, lane_picks, &mut rng) {
+                    let window = match picks.device.get(i).and_then(Option::as_ref) {
+                        Some(pick) => device_accept(pick, drafts, l.eos, &mut rng),
+                        None => rule.accept(&eff, drafts, lane_picks, &mut rng),
+                    };
+                    let acc = match window {
                         Ok(acc) => acc,
                         Err(e) => {
                             return Err(
@@ -4198,7 +4379,7 @@ pub fn run_mesh_step(
             return Err(abort_all_after(root, ranks, e));
         }
     }
-    let plan = match root.seal_verify() {
+    let plan = match root.seal_verify_with(rule) {
         Ok(p) => p,
         Err(e) => return Err(abort_all_after(root, ranks, e)),
     };
@@ -7768,5 +7949,94 @@ mod tests {
             s.begin(&start, Ok(())).status,
             ReadyStatus::Rejected { .. }
         ));
+    }
+
+    // ---- device draws -----------------------------------------------------
+
+    fn pick(tokens: &[u32], accepted: usize, rng: u32) -> DevicePick {
+        DevicePick {
+            tokens: tokens.to_vec(),
+            accepted,
+            advanced_rng: rng,
+        }
+    }
+
+    /// The root's decision from a device draw is `accept_naive_prefix`'s window
+    /// (accepted drafts then the ending draw, EOS per the token rule) and takes
+    /// the advanced RNG back; an inconsistent draw is an error, never trusted.
+    #[test]
+    fn device_accept_matches_the_naive_window_shapes() {
+        let drafts = [5u32, 6, 7];
+        let mut rng = LaneRng::new(1);
+        let before = rng.fingerprint().1;
+        // Every draft accepted plus the bonus.
+        let acc = device_accept(&pick(&[5, 6, 7, 9], 3, 11), &drafts, None, &mut rng).unwrap();
+        assert_eq!(
+            (acc.committed, acc.accepted, acc.hit_eos),
+            (vec![5, 6, 7, 9], 3, false)
+        );
+        assert_eq!(rng.fingerprint().1, 11);
+        assert_ne!(before, 11);
+        // First draft rejected: the draw replaces it.
+        let acc = device_accept(&pick(&[4], 0, 12), &drafts, None, &mut rng).unwrap();
+        assert_eq!((acc.committed, acc.accepted), (vec![4], 0));
+        // A mid-window mismatch.
+        let acc = device_accept(&pick(&[5, 8], 1, 13), &drafts, None, &mut rng).unwrap();
+        assert_eq!((acc.committed, acc.accepted), (vec![5, 8], 1));
+        // The correction is EOS: hit_eos by the token rule.
+        let acc = device_accept(&pick(&[5, 2], 1, 14), &drafts, Some(2), &mut rng).unwrap();
+        assert!(acc.hit_eos && acc.accepted == 1);
+        // An accepted EOS draft ends the window with no bonus; the device's own
+        // `accepted` excludes it, the root's count includes it (both accepted).
+        for device_accepted in [1usize, 2] {
+            let acc = device_accept(
+                &pick(&[5, 6], device_accepted, 15),
+                &drafts,
+                Some(6),
+                &mut rng,
+            )
+            .unwrap();
+            assert_eq!(
+                (acc.committed.clone(), acc.accepted, acc.hit_eos),
+                (vec![5, 6], 2, true)
+            );
+            assert_eq!(target_commit_accept_len(&acc), 1);
+        }
+        // A one-row AR window: the bonus is the draw.
+        let acc = device_accept(&pick(&[3], 0, 16), &[], None, &mut rng).unwrap();
+        assert_eq!(
+            (acc.committed, acc.accepted, acc.hit_eos),
+            (vec![3], 0, false)
+        );
+        assert_eq!(rng.fingerprint().1, 16);
+    }
+
+    #[test]
+    fn device_accept_refuses_inconsistent_draws_and_leaves_the_rng_alone() {
+        let drafts = [5u32, 6];
+        let mut rng = LaneRng::new(1);
+        let before = rng.fingerprint();
+        let bad = [
+            // Nothing drawn / too many tokens.
+            (pick(&[], 0, 9), None),
+            (pick(&[5, 6, 7, 8], 2, 9), None),
+            // Stuck RNG state.
+            (pick(&[5, 6, 7], 2, 0), None),
+            // Continued past a mismatch / past an EOS draft.
+            (pick(&[4, 6, 7], 0, 9), None),
+            (pick(&[5, 6, 7], 2, 9), Some(5)),
+            // Ended on an accepted draft that is not EOS.
+            (pick(&[5], 1, 9), None),
+            // Wrong accepted count.
+            (pick(&[5, 8], 0, 9), None),
+            (pick(&[5, 6, 7], 1, 9), None),
+        ];
+        for (p, eos) in bad {
+            assert!(
+                device_accept(&p, &drafts, eos, &mut rng).is_err(),
+                "{p:?} eos {eos:?}"
+            );
+            assert_eq!(rng.fingerprint(), before, "{p:?}");
+        }
     }
 }

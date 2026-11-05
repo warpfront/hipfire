@@ -2511,6 +2511,7 @@ mod tests {
             offered: native * 3,
             accepted: native,
             emitted: native * 2 + copy + ar,
+            native_mode: ar == 0,
         };
         mix.note(&facts(2, 2, 0, 0));
         mix.note(&facts(2, 1, 1, 0));

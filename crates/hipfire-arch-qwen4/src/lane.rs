@@ -1879,6 +1879,125 @@ pub(crate) fn lane_sample_step(
     }
 }
 
+/// Whether sampled lanes draw on the device (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`,
+/// default on exact gfx1201): [`lane_sample_device`] instead of
+/// [`lane_sample_step`].
+pub(crate) fn lane_device_sample(gpu: &Gpu) -> bool {
+    gpu.flags.qwen4_lane_device_sample_enabled()
+        && hipfire_runtime::lane_draw::lane_draws_supported(gpu)
+}
+
+/// A sampled lane's AR policy as the device sampler's config (neutral
+/// penalties, no blocked tokens: what [`lane_draw`] draws with on the host).
+fn lane_sampler_config(s: &LaneSampling) -> hipfire_runtime::sampler::SamplerConfig {
+    hipfire_runtime::sampler::SamplerConfig {
+        temperature: s.temperature,
+        top_p: s.top_p,
+        repeat_penalty: 1.0,
+        repeat_window: 0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        blocked_tokens: Vec::new(),
+        top_k: s.top_k,
+        min_p: s.min_p,
+    }
+}
+
+/// One request of [`lane_sample_device`]: [`lane_sample_step`]'s arguments,
+/// with the request's `picks.len()` resident logits rows instead of a fetch.
+pub(crate) struct LaneDeviceRequest<'a> {
+    pub host: &'a mut LaneHost,
+    pub drafts: Option<&'a [u32]>,
+    pub picks: &'a mut [u32],
+    pub eos: u32,
+    /// `picks.len() * vocab` F32 logits (a view of the step's rows).
+    pub logits: GpuTensor,
+}
+
+/// [`lane_sample_step`] for every request at once, on the device: ONE
+/// `hipfire_runtime::lane_draw::lane_draws` call over all sampled requests
+/// (one H2D, one launch, one D2H of ids / accept counts / RNG; no logits row
+/// crosses to the host). An AR row is one draw from the shared device
+/// sampler's law on the lane's xorshift32 stream; a verify window's argmax
+/// drafts are verified as point-mass proposals (accept `d` with probability
+/// `p(d)`, else the residual draw `p` without `d`), so every emitted token is
+/// distributed as the AR draw. Outcomes are in request order (`Greedy` for a
+/// lane without sampler, nothing drawn); every drawing lane's `host.rng`
+/// advances and its picks are rewritten exactly as [`lane_sample_step`] does.
+pub(crate) fn lane_sample_device(
+    gpu: &mut Gpu,
+    arena: &mut Option<hipfire_runtime::lane_draw::LaneDrawArena>,
+    vocab: usize,
+    requests: &mut [LaneDeviceRequest<'_>],
+) -> Result<Vec<LaneSampleOutcome>, String> {
+    use hipfire_runtime::lane_draw::{lane_draws, LaneDrawArena, LaneDrawJob};
+    let mut outcomes: Vec<LaneSampleOutcome> = Vec::with_capacity(requests.len());
+    let mut drawing: Vec<usize> = Vec::new();
+    let mut cfgs = Vec::new();
+    for (i, r) in requests.iter().enumerate() {
+        let Some(s) = r.host.sampling else {
+            outcomes.push(LaneSampleOutcome::Greedy);
+            continue;
+        };
+        let want = r.drafts.map_or(1, |d| d.len() + 1);
+        if r.picks.len() != want || vocab == 0 || r.logits.numel() < want * vocab {
+            return Err(format!(
+                "lane device sample: {} picks for a {want}-row request over {} logits (vocab {vocab})",
+                r.picks.len(),
+                r.logits.numel()
+            ));
+        }
+        outcomes.push(LaneSampleOutcome::Ar);
+        drawing.push(i);
+        cfgs.push(lane_sampler_config(&s));
+    }
+    if drawing.is_empty() {
+        return Ok(outcomes);
+    }
+    let draws = {
+        let jobs: Vec<LaneDrawJob<'_>> = drawing
+            .iter()
+            .zip(&cfgs)
+            .map(|(&i, cfg)| {
+                let r = &requests[i];
+                let drafts = r.drafts.unwrap_or(&[]);
+                LaneDrawJob {
+                    logits: &r.logits,
+                    rows: drafts.len() + 1,
+                    vocab,
+                    drafts,
+                    q: &[],
+                    history: &[],
+                    cfg,
+                    rng_state: r.host.rng,
+                    // A `min_tokens` lane's window runs through an EOS.
+                    eos: (r.drafts.is_some() && !r.host.ignore_eos).then_some(r.eos),
+                }
+            })
+            .collect();
+        let arena = arena.get_or_insert_with(LaneDrawArena::new);
+        lane_draws(gpu, arena, &jobs).map_err(|e| format!("lane device sample: {e}"))?
+    };
+    for (&i, draw) in drawing.iter().zip(draws) {
+        let r = &mut requests[i];
+        r.host.rng = draw.advanced_rng;
+        match r.drafts {
+            None => r.picks[0] = draw.tokens[0],
+            Some(_) => {
+                let eos = (!r.host.ignore_eos).then_some(r.eos);
+                let hit_eos = eos == draw.tokens.last().copied();
+                r.picks[..draw.tokens.len()].copy_from_slice(&draw.tokens);
+                outcomes[i] = LaneSampleOutcome::Naive(hipfire_runtime::spec::GreedyAccept {
+                    committed: draw.tokens,
+                    accepted: draw.accepted,
+                    hit_eos,
+                });
+            }
+        }
+    }
+    Ok(outcomes)
+}
+
 /// Buffers and policy shared by the MTP lanes of one store.
 pub(crate) struct SpecStore {
     pub config: LaneSpecConfig,
@@ -1986,6 +2105,9 @@ pub(crate) struct StepParts<'a> {
     /// at [`Qwen4LaneStore::set_sampled`], allocated at the first fetch and grown
     /// only if a request needs more rows; never allocated per step).
     pub sample_host: &'a mut SampleScratch,
+    /// The device lane sampler's arena, created at the first device draw
+    /// (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`) and freed with the store.
+    pub sample_arena: &'a mut Option<hipfire_runtime::lane_draw::LaneDrawArena>,
     pub spec: Option<&'a mut SpecStore>,
 }
 
@@ -2028,6 +2150,8 @@ pub struct Qwen4LaneStore {
     /// when [`rdna_compute::feature_flags::FeatureFlags::qwen4_lane_pinned_logits_enabled`];
     /// freed with the store (or when sampling is turned off).
     sample_host: SampleScratch,
+    /// See [`StepParts::sample_arena`].
+    sample_arena: Option<hipfire_runtime::lane_draw::LaneDrawArena>,
     /// The band this store's lane states are scoped to.
     scope: Qwen4BandScope,
     pub(crate) phase: LanePhase,
@@ -2237,6 +2361,7 @@ impl Qwen4LaneStore {
             spec: spec_store,
             sampled: false,
             sample_host: SampleScratch::new(),
+            sample_arena: None,
             scope,
             phase: LanePhase::Idle,
             next_step_id: 0,
@@ -3023,6 +3148,7 @@ impl Qwen4LaneStore {
             top1_host,
             rows_cap,
             sample_host,
+            sample_arena,
             spec,
             scope,
             ..
@@ -3041,6 +3167,7 @@ impl Qwen4LaneStore {
             top1_host,
             rows_cap: *rows_cap,
             sample_host,
+            sample_arena,
             spec: spec.as_mut(),
         })
     }
@@ -3170,8 +3297,12 @@ impl Qwen4LaneStore {
             logits,
             top1,
             spec,
+            sample_arena,
             ..
         } = self;
+        if let Some(arena) = sample_arena {
+            arena.free_gpu(gpu);
+        }
         let mut first: Option<String> = None;
         for lane in table.into_cells() {
             let Qwen4LaneState { state, spec, .. } = lane;

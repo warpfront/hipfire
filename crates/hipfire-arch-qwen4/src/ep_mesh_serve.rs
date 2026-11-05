@@ -95,6 +95,10 @@ pub struct MeshStepFacts {
     pub accepted: usize,
     /// Tokens emitted over every lane.
     pub emitted: usize,
+    /// The step's `lane_switch` decision: native windows (`true`), or every
+    /// lane on the one-token `ArSynced` AR window (`false`; the lane counters
+    /// book those as draft-less native windows, the facts as `ar_windows`).
+    pub native_mode: bool,
 }
 
 impl Qwen4Bundle {
@@ -242,7 +246,18 @@ impl Qwen4Bundle {
         {
             mesh.note_prefill();
         }
-        let result = self.mesh_decode_step_with(&mut mesh, gpu, requests);
+        let native_mode = self.mesh_native_on;
+        let result =
+            self.mesh_decode_step_with(&mut mesh, gpu, requests)
+                .map(|(decoded, facts)| {
+                    (
+                        decoded,
+                        MeshStepFacts {
+                            native_mode,
+                            ..facts
+                        },
+                    )
+                });
         self.mesh_last_end = Some(Instant::now());
         self.mesh_lanes = Some(mesh);
         if result.is_err() {
@@ -286,6 +301,12 @@ impl Qwen4Bundle {
         let mut seeds: Vec<u32> = Vec::with_capacity(requests.len());
         let mut lane_requests: Vec<LaneRequest> = Vec::with_capacity(requests.len());
         let mut retired_before: Vec<bool> = Vec::with_capacity(requests.len());
+        // `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`: a sampled lane's verify rows are drawn on
+        // the sampler owner's device (one lane-wide Leviathan launch against the drafts'
+        // q, continuing the lane's xorshift32 stream from its prompt-completing draw);
+        // `=0` reads the rows to the root's host sampler.
+        let device_sample = gpu.flags.qwen4_lane_device_sample_enabled()
+            && hipfire_runtime::lane_draw::lane_draws_supported(gpu);
         for request in requests {
             let (admission, sampling) = {
                 let store = self
@@ -311,7 +332,16 @@ impl Qwen4Bundle {
                     seed,
                     // A `min_tokens` lane's windows run through an EOS.
                     eos: (!lane.host.ignore_eos).then_some(eos),
-                    rng_seed: sampling.map_or(request.epoch.request_tag, |s| u64::from(s.seed)),
+                    // The device draws continue the lane's AR stream where the prompt-
+                    // completing draw left it (a restart at the request seed would reuse
+                    // that draw's uniform for the first decode row).
+                    rng_seed: sampling.map_or(request.epoch.request_tag, |s| {
+                        if device_sample {
+                            u64::from(lane.host.rng)
+                        } else {
+                            u64::from(s.seed)
+                        }
+                    }),
                     prompt: lane.host.prompt.clone(),
                     // An AR-only lane of a mixed store joins the root as an AR lane.
                     spec_k: lane.spec.is_some().then_some(spec_k),

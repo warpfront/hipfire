@@ -58,6 +58,16 @@
 //! likewise); a step with no sampled lane issues exactly the greedy device
 //! work and downloads.
 //!
+//! With `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (default on exact gfx1201) no
+//! logits row is downloaded: every sampled lane of a step (its AR row, its
+//! verify window, or its prompt-completing tile) is drawn by ONE
+//! `hipfire_runtime::lane_draw::lane_draws` launch (`lane::lane_sample_device`)
+//! under the shared device sampler's law on the lane's xorshift32 stream. A
+//! window's argmax drafts are verified as point-mass proposals (accept `d` with
+//! probability `p(d)`, else the residual draw from `p` without `d`), so every
+//! emitted token is still distributed as the AR draw; seeded tokens differ from
+//! the host path. Every rank draws the same tokens from its identical rows.
+//!
 //! Under an attached expert-parallel mesh every mutating entry below runs the
 //! identical call on every rank (rank 0 on the caller's thread, peers on
 //! their workers; `Qwen4Bundle::ep_lane_*`), and the host results (drafts,
@@ -1288,6 +1298,7 @@ fn run_prefill_tiles(
         top1_host,
         rows_cap,
         sample_host,
+        sample_arena,
         spec,
         policy,
         ..
@@ -1460,7 +1471,15 @@ fn run_prefill_tiles(
                 if tile_clock.is_some() {
                     crate::mtp_spec::lane_fill_split_arm();
                 }
-                let pick = prefill_tile(bundle, gpu, &mut **lane, tokens, scratch, sample_host)?;
+                let pick = prefill_tile(
+                    bundle,
+                    gpu,
+                    &mut **lane,
+                    tokens,
+                    scratch,
+                    sample_host,
+                    sample_arena,
+                )?;
                 if completes {
                     picks[r.rows.end() - 1] = pick
                         .ok_or_else(|| "the prompt-completing tile produced no pick".to_string())?;
@@ -1537,11 +1556,49 @@ fn run_prefill_tiles(
         gpu.take_device_wait_error().map_err(|e| e.to_string())?;
         for &(i, row) in &final_tiles {
             picks[row] = pick_at(top1_host, rows_cap + i);
-            // A sampled lane's prompt-completing pick is its first draw, from
-            // the tile's final logits row (one D2H); a greedy lane keeps the
-            // argmax.
+        }
+        // A sampled lane's prompt-completing pick is its first draw, from the
+        // tile's final logits row; a greedy lane keeps the argmax. On the device
+        // (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`) every completing tile of the step
+        // is drawn by one `lane_sample_device` call; else each by one D2H.
+        let device = crate::lane::lane_device_sample(gpu);
+        if device {
+            let mut ones: Vec<[u32; 1]> =
+                final_tiles.iter().map(|&(_, row)| [picks[row]]).collect();
+            let mut one_slots: Vec<Option<&mut [u32; 1]>> = ones.iter_mut().map(Some).collect();
+            let mut requests: Vec<crate::lane::LaneDeviceRequest<'_>> = Vec::new();
+            let mut owners: Vec<usize> = Vec::new();
+            for (i, lane) in lanes.iter_mut().enumerate() {
+                let Some(k) = final_tiles.iter().position(|&(t, _)| t == i) else {
+                    continue;
+                };
+                if lane.host.sampling.is_none() {
+                    continue;
+                }
+                let one = one_slots[k]
+                    .take()
+                    .ok_or_else(|| format!("prefill tile {i} completes twice"))?;
+                // An MTP lane's first draw takes eos 0 exactly as its serial `prefill_tile` does.
+                let eos = if lane.spec.is_some() { 0 } else { lane_eos };
+                requests.push(crate::lane::LaneDeviceRequest {
+                    host: &mut lane.host,
+                    drafts: None,
+                    picks: one,
+                    eos,
+                    logits: logits.sub_offset((rows_cap + i) * vocab, vocab),
+                });
+                owners.push(k);
+            }
+            crate::lane::lane_sample_device(gpu, sample_arena, vocab, &mut requests)?;
+            drop(requests);
+            drop(one_slots);
+            for k in owners {
+                picks[final_tiles[k].1] = ones[k][0];
+            }
+        }
+        for &(i, row) in &final_tiles {
             let lane = &mut *lanes[i];
-            if lane.host.sampling.is_some() {
+            if lane.host.sampling.is_some() && !device {
                 let gpu_ref: &Gpu = gpu;
                 let logits_ref: &GpuTensor = logits;
                 let mut one = [picks[row]];

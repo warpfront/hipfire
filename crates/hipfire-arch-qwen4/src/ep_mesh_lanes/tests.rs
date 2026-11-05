@@ -1270,3 +1270,260 @@ fn mesh_lane_ep_eight_sampled_lanes_each_emit_their_own_marker() {
         fan.inner.finish();
     }
 }
+
+// ---- device-drawn sampled lanes (HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE) ------------
+
+/// A rank fan whose sampler owner answers a verify like the device sampler does:
+/// every lane the root lent a spec is drawn by the shared device sampler's CPU
+/// model (`hipfire_runtime::lane_draw::reference_draw`) over that lane's keyed
+/// rows, drafts, q, history and RNG, and the rows themselves are withheld
+/// (`rows: None`) unless `host_rows`. The head's candidate read is the keyed
+/// spike of [`KeyedFan`] (a Leviathan lane draws its drafts from it on the root).
+struct DeviceFan {
+    inner: ThreadedFanout,
+    /// Also hand the root a row handle (what the sampler owner does for a lane
+    /// it was not asked to draw on device).
+    host_rows: bool,
+    /// Answer without the device picks the plan asked for.
+    withhold: bool,
+    /// Specs the plans lent, per verify.
+    lent: Vec<usize>,
+    /// The draw made for each lent lane (by request tag), per verify.
+    draws: Vec<(u64, hipfire_runtime::lane_draw::LaneDraw)>,
+}
+
+impl MeshFanout for DeviceFan {
+    fn admit(&mut self, admit: &LaneAdmit) -> Result<(), RankError> {
+        self.inner.admit(admit)
+    }
+    fn release(&mut self, epoch: &RequestEpoch) -> Result<(), RankError> {
+        self.inner.release(epoch)
+    }
+    fn begin(&mut self, start: &WindowStart) -> Result<Vec<RankReady>, RankError> {
+        self.inner.begin(start)
+    }
+    fn reject(&mut self, key: &MeshStepKey) {
+        self.inner.reject(key)
+    }
+    fn draft(&mut self, round: &DraftRound) -> Result<Vec<RankDraftResult>, RankError> {
+        let mut results = self.inner.draft(round)?;
+        for proposal in results
+            .iter_mut()
+            .filter_map(|r| r.proposals.as_mut())
+            .flatten()
+        {
+            let marker = proposal.key.request_epoch.request_tag as u32;
+            let mut candidates = vec![(marker, 60.0f32)];
+            candidates.extend(
+                (0..SAMPLED_VOCAB as u32)
+                    .filter(|&t| t != marker)
+                    .take(7)
+                    .map(|t| (t, -60.0f32)),
+            );
+            proposal.read = Some(DraftRead::Candidates(candidates));
+        }
+        Ok(results)
+    }
+    fn verify(&mut self, plan: &VerifyPlan) -> Result<Vec<RankVerifyResult>, RankError> {
+        let mut results = self.inner.verify(plan)?;
+        self.lent.push(plan.samples.iter().flatten().count());
+        for sampler in results.iter_mut().filter_map(|r| r.sampler.as_mut()) {
+            if self.host_rows {
+                sampler.rows = Some(RowHandle::new(KeyedRows));
+            }
+            if self.withhold {
+                continue;
+            }
+            sampler.device = plan
+                .lanes
+                .iter()
+                .zip(&plan.samples)
+                .map(|(vl, spec)| {
+                    let spec = spec.as_ref()?;
+                    let tag = vl.key.request_epoch.request_tag;
+                    let marker = tag as usize;
+                    let row: Vec<f32> = (0..SAMPLED_VOCAB)
+                        .map(|t| if t == marker { 60.0 } else { 0.0 })
+                        .collect();
+                    let rows = row.repeat(vl.rows.len());
+                    let draw = hipfire_runtime::lane_draw::reference_draw(
+                        &rows,
+                        SAMPLED_VOCAB,
+                        &vl.rows[1..],
+                        &spec.q,
+                        &spec.history,
+                        &spec.cfg,
+                        spec.rng_state,
+                        spec.eos,
+                    );
+                    self.draws.push((tag, draw.clone()));
+                    Some(DevicePick {
+                        tokens: draw.tokens,
+                        accepted: draw.accepted,
+                        advanced_rng: draw.advanced_rng,
+                    })
+                })
+                .collect();
+        }
+        Ok(results)
+    }
+    fn prepare(&mut self, d: &CommitDecision) -> Result<Vec<PreparedReceipt>, RankError> {
+        self.inner.prepare(d)
+    }
+    fn publish(&mut self, d: &CommitDecision) -> Vec<Option<String>> {
+        self.inner.publish(d)
+    }
+    fn abort(&mut self, key: &MeshStepKey, phase: StepPhase, reason: &str) {
+        self.inner.abort(key, phase, reason)
+    }
+    fn evidence(&mut self, key: &MeshStepKey) -> Vec<Option<RankCostEvidence>> {
+        self.inner.evidence(key)
+    }
+}
+
+/// Admit eight Leviathan sampled lanes (each lane's head read and target rows
+/// are its own marker spike) and run one step; returns each lane's emitted
+/// tokens, its naive RNG state after the step, the specs lent per verify, the
+/// naive states before the step and the device draws the sampler owner made.
+#[allow(clippy::type_complexity)]
+fn device_step(
+    device: bool,
+    host_rows: bool,
+    withhold: bool,
+    k: usize,
+) -> (
+    Result<Vec<(Vec<u32>, u32)>, ProtocolError>,
+    Vec<usize>,
+    Vec<u32>,
+    Vec<(u64, hipfire_runtime::lane_draw::LaneDraw)>,
+) {
+    let tags: Vec<u64> = (1..=8).collect();
+    let mut root = root(false);
+    let mut fan = DeviceFan {
+        inner: fanout_with(
+            tags.iter()
+                .map(|&tag| script(tag, 0, &vec![tag as u32; k], &vec![tag as u32; k + 1]))
+                .collect(),
+            |_, _| {},
+        ),
+        host_rows,
+        withhold,
+        lent: Vec::new(),
+        draws: Vec::new(),
+    };
+    let mut sampler = LaneSampler::new(SAMPLED_VOCAB);
+    sampler.set_device_sample(device);
+    let mut initial = Vec::new();
+    for &tag in &tags {
+        let a = root
+            .admit_lane(LaneAdmission {
+                epoch: epoch(tag),
+                position: 10,
+                seed: 9,
+                eos: None,
+                rng_seed: 1000 + tag,
+                prompt: vec![1, 2, 3],
+                spec_k: Some(k),
+                head: HeadState::Aligned,
+                copy: false,
+                head_lag: Vec::new(),
+            })
+            .unwrap();
+        fan.admit(&a).unwrap();
+        sampler
+            .admit(
+                epoch(tag),
+                &SpecRequestConfig {
+                    temp: 1.0,
+                    rng_seed: 1000 + tag,
+                    ..SpecRequestConfig::default()
+                },
+                &[1, 2, 3],
+                9,
+            )
+            .unwrap();
+        initial.push(root.rng_fingerprint(epoch(tag)).unwrap().1);
+    }
+    let requests: Vec<LaneRequest> = tags.iter().map(|&tag| sampled_req(tag)).collect();
+    let driven = drive_step(
+        &mut root,
+        &mut fan,
+        None,
+        &requests,
+        &budgets(LabRoutes::Batched, k),
+        &mut sampler,
+    );
+    let lanes = driven.map(|d| {
+        d.output
+            .lanes
+            .iter()
+            .zip(&tags)
+            .map(|(lane, &tag)| {
+                (
+                    lane.emitted.clone(),
+                    root.rng_fingerprint(epoch(tag)).unwrap().1,
+                )
+            })
+            .collect()
+    });
+    let lent = fan.lent.clone();
+    let draws = fan.draws.clone();
+    fan.inner.finish();
+    (lanes, lent, initial, draws)
+}
+
+#[test]
+fn mesh_lane_ep_device_picks_decide_eight_sampled_lanes_without_row_reads() {
+    for k in [2usize, 3] {
+        // Device: the sampler owner returns no rows at all (a row read by the
+        // root would abort the step), only the lent lanes' device draws.
+        let (device, lent, initial, draws) = device_step(true, false, false, k);
+        let device = device.expect("a device-drawn eight-lane step on two scripted ranks");
+        assert_eq!(lent, vec![8], "K={k}: every sampled lane was lent a spec");
+        assert_eq!(draws.len(), 8, "K={k}: one reference draw per lane");
+        // The host Leviathan path over the same keyed rows and head reads: the
+        // flag off lends nothing, the rows are read and the naive RNG stays put.
+        let (host, host_lent, _, host_draws) = device_step(false, true, false, k);
+        let host = host.expect("the host Leviathan step");
+        assert_eq!(host_lent, vec![0], "K={k}: the flag off lends nothing");
+        assert!(host_draws.is_empty(), "K={k}: the host path draws nothing");
+        for (i, (emitted, rng)) in device.iter().enumerate() {
+            let tag = i as u32 + 1;
+            // Keyed spikes make the law a point mass on the lane's marker, so
+            // the device and host paths emit the same window.
+            assert_eq!(
+                emitted, &host[i].0,
+                "K={k}: lane {tag} device vs host window"
+            );
+            assert!(
+                emitted.len() == k + 1 && emitted.iter().all(|&t| t == tag),
+                "K={k}: lane {tag} emitted {emitted:?}"
+            );
+            // The root decided from the stand-in's own reference draw and took
+            // its advanced state back.
+            let (_, draw) = draws
+                .iter()
+                .find(|(t, _)| *t == u64::from(tag))
+                .expect("a draw for every lane");
+            assert_eq!(emitted, &draw.tokens, "K={k}: lane {tag} tokens");
+            assert_eq!(*rng, draw.advanced_rng, "K={k}: lane {tag} advanced RNG");
+            assert_ne!(*rng, initial[i], "K={k}: lane {tag} RNG never advanced");
+            assert_eq!(
+                host[i].1, initial[i],
+                "K={k}: the host path left the naive RNG"
+            );
+        }
+    }
+}
+
+#[test]
+fn mesh_lane_ep_device_step_aborts_when_the_owner_withholds_the_lent_draws() {
+    // The root lent specs; an owner that answers with greedy picks and no device
+    // draws (and no rows) is a protocol violation: abort, never a silent
+    // greedy decision.
+    let (result, lent, _, draws) = device_step(true, false, true, 3);
+    assert!(draws.is_empty(), "the owner made no draw");
+    assert_eq!(lent, vec![8]);
+    let error = result.expect_err("missing device draws must abort");
+    assert!(matches!(error, ProtocolError::Aborted(_)), "{error}");
+}

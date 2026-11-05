@@ -54,12 +54,27 @@
 //! A sampled lane (`SamplingMode::Leviathan`) is served by the root's
 //! [`LaneSampler`] ([`EpMeshLanes::step_sampled`]). Rank 0 (the sampler owner)
 //! copies the head's exact rescored candidates into every native
-//! [`DraftProposal::read`] right after the draft finish of each op, before another
-//! lane's op can overwrite them, and returns a [`RowHandle`] over its resident
-//! verify logits in [`SamplerOutput::rows`]; the root draws every proposal
-//! and every accept/residual/bonus on the lane's staged RNG. The ranks only
-//! replay the committed tokens, exactly as for greedy lanes. The handle is
-//! valid from the verify until the step's prepare (or abort).
+//! [`DraftProposal::read`] right after the draft finish of each op, before
+//! another lane's op can overwrite them; the root draws every proposal from its
+//! `q` on the lane's staged RNG.
+//!
+//! With `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (the default on exact gfx1201) the
+//! root lends the sampler owner each sampled lane's staged verify RNG, sampler
+//! policy, penalty-window source and draft distributions in
+//! [`VerifyPlan::samples`] ([`crate::mesh_lane_protocol::DeviceSampleSpec`]).
+//! Right after the verify forward on the same stream, rank 0 draws every
+//! sampled lane's window with ONE `lane_draws` launch ([`device_draws`]:
+//! Leviathan acceptance under the shared device sampler's law, one D2H of ids,
+//! accept counts and RNG for all lanes) and returns them in
+//! [`SamplerOutput::device`]; the root decides from them
+//! (`mesh_lane_protocol::device_accept`). No logits row crosses to the host
+//! and no host scan runs.
+//!
+//! With the flag off (`=0`) rank 0 returns a [`RowHandle`] over its resident
+//! verify logits in [`SamplerOutput::rows`] and the root draws every
+//! accept/residual/bonus on the host. The handle is valid from the verify
+//! until the step's prepare (or abort). The ranks only replay the committed
+//! tokens, exactly as for greedy lanes.
 
 use crate::bundle::{BundleError, Qwen4Bundle};
 use crate::ep::{gather_tally, GatherTally};
@@ -71,13 +86,13 @@ use crate::lane::{LabRoutes, LaneSpec, LaneStatus, Qwen4LaneState, Qwen4LaneStor
 use crate::lane_exec::pick_at;
 use crate::mesh_lane_protocol::SamplingMode;
 use crate::mesh_lane_protocol::{
-    AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DraftProposal, DraftRound,
-    EvidenceError, HeadState, LaneAdmission, LaneAdmit, LaneKind, LaneMeshExecutor, LanePlan,
-    LaneRequest, LaneWindowKey, MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts, OpLedger,
-    PhaseTiming, PreparedReceipt, ProposalSource, ProtocolError, RankCostEvidence, RankDraftResult,
-    RankError, RankOwnership, RankReady, RankSession, RankVerifyResult, ReadyStatus, RootConfig,
-    SamplerOutput, StagePolicy, StepOutput, StepPhase, TimedPhase, VerifyPlan, WindowBudgets,
-    WindowStart,
+    AbortRecord, AcceptRule, CommitDecision, ControllerInterval, DevicePick, DraftProposal,
+    DraftRound, EvidenceError, HeadState, LaneAdmission, LaneAdmit, LaneKind, LaneMeshExecutor,
+    LanePlan, LaneRequest, LaneWindowKey, MergedCostEvidence, MeshRoot, MeshStepKey, OpCounts,
+    OpLedger, PhaseTiming, PreparedReceipt, ProposalSource, ProtocolError, RankCostEvidence,
+    RankDraftResult, RankError, RankOwnership, RankReady, RankSession, RankVerifyResult,
+    ReadyStatus, RootConfig, SamplerOutput, StagePolicy, StepOutput, StepPhase, TimedPhase,
+    VerifyPlan, WindowBudgets, WindowStart,
 };
 use crate::mesh_rank_copy::{
     arm_lane_verify, begin_lane_window, catch_up_lane, head_ticket_point, is_probe_op,
@@ -89,6 +104,7 @@ use crate::mtp_spec::{
     draft_accept_estimate, HeadTicket, TargetTicket, DRAFT_ACCEPT_MAX, MTP_ROW_WORTH,
 };
 use crate::sampled_lane::{DraftRead, LaneSampler, RowBuf, RowHandle, TargetRowSource};
+use hipfire_runtime::lane_draw::{lane_draws, LaneDraw, LaneDrawArena, LaneDrawJob};
 use hipfire_runtime::slot_batch::RequestEpoch;
 use hipfire_runtime::spec::SpecRequestConfig;
 use rdna_compute::{Gpu, GpuTensor};
@@ -373,6 +389,18 @@ impl TargetRowSource for EpRowSource {
         host.set_len(self.vocab);
         Ok(())
     }
+}
+
+/// What one rank's verify forward returned.
+struct VerifyOut {
+    /// The argmax pick at every row, per lane.
+    picks: Vec<Vec<u32>>,
+    /// Each lane's resulting target position.
+    ends: Vec<usize>,
+    /// A view of the step's `n_dec * vocab` decode logits rows.
+    logits: GpuTensor,
+    /// The device draws of the lanes the root lent a spec (sampler owner only).
+    device: Vec<Option<DevicePick>>,
 }
 
 impl RankLane<'_> {
@@ -769,8 +797,12 @@ impl RankLane<'_> {
 
     /// The one trunk forward over every lane's sealed rows (arming the ring and
     /// taking the target ticket of every multi-row lane first); the picks per
-    /// lane and each lane's resulting target position.
-    fn verify_device(&mut self, plan: &VerifyPlan) -> R<(Vec<Vec<u32>>, Vec<usize>, GpuTensor)> {
+    /// lane and each lane's resulting target position. On the sampler owner,
+    /// right after the forward on the same stream, every lane the root lent a
+    /// [`crate::mesh_lane_protocol::DeviceSampleSpec`] is drawn on device
+    /// ([`device_draws`]): only ids, accept counts and RNG states come back.
+    fn verify_device(&mut self, plan: &VerifyPlan) -> R<VerifyOut> {
+        let sampler = self.own().sampler;
         let Self { bundle, gpu, .. } = self;
         let vocab = bundle.lane_vocab();
         let epochs: Vec<RequestEpoch> = plan.lanes.iter().map(|l| l.key.request_epoch).collect();
@@ -782,6 +814,7 @@ impl RankLane<'_> {
                 policy,
                 top1_host,
                 rows_cap,
+                sample_arena,
                 spec,
                 ..
             } = store.step_parts(&epochs)?;
@@ -830,6 +863,13 @@ impl RankLane<'_> {
                 lane.state.row_capture_armed = false;
             }
             forwarded?;
+            // The sampled lanes' device draws, enqueued right behind the
+            // forward on its stream (the sampler owner only).
+            let device = if sampler {
+                device_draws(gpu, sample_arena, plan, logits, vocab)?
+            } else {
+                vec![None; plan.lanes.len()]
+            };
             gpu.dtoh_stream_ordered(
                 &mut top1_host[..n_dec * std::mem::size_of::<i32>()],
                 &top1.buf,
@@ -856,9 +896,14 @@ impl RankLane<'_> {
                 first += v.rows.len();
             }
             let ends = lanes.iter().map(|lane| lane.state.position).collect();
-            // A view of the step's decode logits rows (the root's sampled rule
-            // reads single rows from it before the prepare phase).
-            Ok((picks, ends, logits.sub_offset(0, n_dec * vocab)))
+            // A view of the step's decode logits rows (the root's host sampled
+            // rule reads single rows from it before the prepare phase).
+            Ok(VerifyOut {
+                picks,
+                ends,
+                logits: logits.sub_offset(0, n_dec * vocab),
+                device,
+            })
         })
     }
 
@@ -1168,7 +1213,12 @@ impl LaneMeshExecutor for RankLane<'_> {
         let before = gather_tally();
         let t0 = Instant::now();
         self.exec.drop_rows();
-        let (picks, ends, logits) = self.verify_device(plan).map_err(|e| rank_err(rank, e))?;
+        let VerifyOut {
+            picks,
+            ends,
+            logits,
+            device,
+        } = self.verify_device(plan).map_err(|e| rank_err(rank, e))?;
         let tally = gather_tally().since(before);
         let row_counts: Vec<usize> = plan.lanes.iter().map(|l| l.rows.len()).collect();
         let Some(step) = self.exec.step.as_mut() else {
@@ -1219,14 +1269,18 @@ impl LaneMeshExecutor for RankLane<'_> {
                     .map(|(l, p)| (l.key, p))
                     .collect(),
             );
-            let sampled = self.exec.step.as_ref().is_some_and(|s| {
+            // The host rows are needed only by a sampled lane the root did not
+            // lend a device draw (`=0`, or a Leviathan lane).
+            let host_rows = self.exec.step.as_ref().is_some_and(|s| {
                 s.lanes
                     .iter()
-                    .any(|w| w.plan.sampling != SamplingMode::Greedy)
+                    .zip(&device)
+                    .any(|(w, d)| w.plan.sampling != SamplingMode::Greedy && d.is_none())
             });
-            if sampled {
+            if host_rows {
                 out.rows = Some(self.rows_handle(plan, logits));
             }
+            out.device = device;
             result.sampler = Some(out);
         }
         Ok(result)
@@ -1516,7 +1570,7 @@ pub(crate) fn drive_step<F: MeshFanout>(
             return Err(abort_after(root, fan, &key, error));
         }
     }
-    let plan = match root.seal_verify() {
+    let plan = match root.seal_verify_with(rule) {
         Ok(plan) => plan,
         Err(error) => return Err(abort_after(root, fan, &key, error)),
     };
@@ -2193,10 +2247,85 @@ impl EpMeshLanes {
                 "the mesh lane sampler is in use".to_string(),
             ))
         })?;
+        sampler.set_device_sample(
+            gpu.flags.qwen4_lane_device_sample_enabled()
+                && hipfire_runtime::lane_draw::lane_draws_supported(gpu),
+        );
         let report = self.step(bundle, gpu, requests, budgets, &mut sampler);
         self.sampler = Some(sampler);
         report
     }
+}
+
+/// The sampler owner's device draws of one verify: every lane whose
+/// [`VerifyPlan::samples`] entry is set is drawn by ONE
+/// [`lane_draws`] call over its rows of the step's `logits` (Leviathan
+/// acceptance against the lane's draft distributions under the shared device
+/// sampler's law, enqueued right behind the forward on its stream), with one
+/// D2H of ids, accept counts and RNG states for all lanes.
+fn device_draws(
+    gpu: &mut Gpu,
+    arena: &mut Option<LaneDrawArena>,
+    plan: &VerifyPlan,
+    logits: &GpuTensor,
+    vocab: usize,
+) -> R<Vec<Option<DevicePick>>> {
+    let mut device: Vec<Option<DevicePick>> = vec![None; plan.lanes.len()];
+    if plan.samples.iter().all(Option::is_none) {
+        return Ok(device);
+    }
+    if plan.samples.len() != plan.lanes.len() {
+        return Err(format!(
+            "{} device-sample entries for {} lanes",
+            plan.samples.len(),
+            plan.lanes.len()
+        ));
+    }
+    let arena = arena.get_or_insert_with(LaneDrawArena::new);
+    // Each sampled lane's rows are a view of the step logits.
+    let mut views: Vec<(usize, GpuTensor)> = Vec::new();
+    let mut first = 0usize;
+    for (i, vl) in plan.lanes.iter().enumerate() {
+        if plan.samples[i].is_some() {
+            views.push((i, logits.sub_offset(first * vocab, vl.rows.len() * vocab)));
+        }
+        first += vl.rows.len();
+    }
+    let jobs: Vec<LaneDrawJob<'_>> = views
+        .iter()
+        .map(|(i, view)| {
+            let vl = &plan.lanes[*i];
+            let spec = plan.samples[*i].as_ref().expect("view of a sampled lane");
+            LaneDrawJob {
+                logits: view,
+                rows: vl.rows.len(),
+                vocab,
+                drafts: &vl.rows[1..],
+                q: &spec.q,
+                history: &spec.history,
+                cfg: &spec.cfg,
+                rng_state: spec.rng_state,
+                eos: spec.eos,
+            }
+        })
+        .collect();
+    let draws: Vec<LaneDraw> =
+        lane_draws(gpu, arena, &jobs).map_err(|e| format!("device lane sample: {e}"))?;
+    if draws.len() != jobs.len() {
+        return Err(format!(
+            "device lane sample returned {} draws for {} lanes",
+            draws.len(),
+            jobs.len()
+        ));
+    }
+    for ((i, _), draw) in views.iter().zip(draws) {
+        device[*i] = Some(DevicePick {
+            tokens: draw.tokens,
+            accepted: draw.accepted,
+            advanced_rng: draw.advanced_rng,
+        });
+    }
+    Ok(device)
 }
 
 #[cfg(test)]

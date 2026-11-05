@@ -81,6 +81,7 @@ pub mod kernels;
 pub mod kv_slots;
 pub mod lane_fa;
 pub mod lane_gdn;
+pub mod lane_leviathan;
 pub mod lane_proj;
 pub mod lane_rows_pm;
 pub mod latent_attention;

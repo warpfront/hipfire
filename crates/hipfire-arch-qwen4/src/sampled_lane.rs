@@ -33,6 +33,20 @@
 //!   to "the root draws, ranks replay the committed decision".
 //! * [`SamplingMode::Greedy`]: the shared accept-prefix rule, no draw.
 //!
+//! # Device draws (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`)
+//!
+//! With [`LaneSampler::set_device_sample`] on, a [`SamplingMode::Leviathan`]
+//! lane's drafts are still drawn by the root from `q` ([`AcceptRule::draft_token`]),
+//! but its verify rows never cross to the host: [`AcceptRule::device_sample`]
+//! lends the sampler owner the lane's staged xorshift32 verify state, its
+//! sampler policy, its penalty-window source and every draft's `q` (a copy
+//! window's drafts are point masses), the owner draws all lent lanes with ONE
+//! lane-wide launch (`hipfire_runtime::lane_draw::lane_draws`: Leviathan
+//! accept / residual / bonus under the shared device sampler's law) and the
+//! root decides from the returned ids, accept count and advanced RNG
+//! (`mesh_lane_protocol::device_accept`). `rows` stays unread and
+//! [`Self::accept_leviathan`] is never called for the lane.
+//!
 //! # q lifetime
 //!
 //! The head's exact rescored candidates live in a buffer the *next* Draft
@@ -67,8 +81,8 @@ use hipfire_runtime::spec_sampling::{
 
 use crate::lane::SampleScratch;
 use crate::mesh_lane_protocol::{
-    AcceptRule, DraftProposal, LanePlan, LaneWindowKey, ProposalSource, SamplerOutput,
-    SamplingMode, StepOutput,
+    AcceptRule, DeviceSampleSpec, DraftProposal, LanePlan, LaneWindowKey, ProposalSource,
+    SamplerOutput, SamplingMode, StepOutput,
 };
 
 // ---------------------------------------------------------------------------
@@ -123,6 +137,11 @@ impl LaneRng {
 
     fn naive_mut(&mut self) -> &mut u32 {
         &mut self.naive
+    }
+
+    /// The naive state after a device draw ([`crate::mesh_lane_protocol::device_accept`]).
+    pub(crate) fn set_naive_state(&mut self, state: u32) {
+        self.naive = state;
     }
 
     /// What the streams would draw next, without advancing them: equal
@@ -451,6 +470,9 @@ pub struct LaneSampler {
     /// The driver closes lanes (`MeshRoot::set_driver_terminates`): a
     /// `terminal` window does not end the request, only a release does.
     driver_terminates: bool,
+    /// Draw [`SamplingMode::NaiveSampled`] lanes on the sampler owner's device
+    /// ([`AcceptRule::device_sample`]) instead of reading their rows.
+    device: bool,
 }
 
 impl LaneSampler {
@@ -466,12 +488,19 @@ impl LaneSampler {
             scratch: Vec::with_capacity(SampleSpec::MAX_POOL),
             target: SparseDist::default(),
             driver_terminates: false,
+            device: false,
         }
     }
 
     /// See the `driver_terminates` field.
     pub fn set_driver_terminates(&mut self, on: bool) {
         self.driver_terminates = on;
+    }
+
+    /// See the `device` field. Set per step by the driver from
+    /// `qwen4_lane_device_sample_enabled`.
+    pub fn set_device_sample(&mut self, on: bool) {
+        self.device = on;
     }
 
     /// Register a sampled request: its sampler, the full rendered `prompt`
@@ -702,6 +731,55 @@ impl AcceptRule for LaneSampler {
         self.rows = out.rows.clone();
     }
 
+    fn device_sample(
+        &mut self,
+        lane: &LanePlan,
+        drafts: &[u32],
+        rng: &LaneRng,
+    ) -> Result<Option<DeviceSampleSpec>, String> {
+        if !self.device || lane.sampling != SamplingMode::Leviathan {
+            return Ok(None);
+        }
+        let st = self
+            .lanes
+            .get_mut(&lane.key.request_epoch)
+            .ok_or_else(|| format!("sampled lane {:?} has no registered sampler", lane.key))?;
+        // Each draft's q exactly as `accept_leviathan` would verify it: a copy
+        // proposal is the point mass (empty entry), a native draft the
+        // distribution `draft_token` drew it from.
+        let q: Vec<Vec<(u32, f32)>> = match lane.source {
+            ProposalSource::Copy => vec![Vec::new(); drafts.len()],
+            _ if drafts.is_empty() => Vec::new(),
+            _ => {
+                if st.q_key != Some(lane.key) {
+                    return Err(format!(
+                        "Leviathan lane {:?}: no draft distributions for this window",
+                        lane.key
+                    ));
+                }
+                let qs = st.q.get(..drafts.len()).ok_or_else(|| {
+                    format!(
+                        "Leviathan lane: {} draft distributions for {} drafts",
+                        st.q.len(),
+                        drafts.len()
+                    )
+                })?;
+                qs.iter().map(|d| d.entries().to_vec()).collect()
+            }
+        };
+        // Row 0's history: the trailing window of the prompt tail and the
+        // committed tokens (the pending seed included); the device appends
+        // each draft itself.
+        st.history.begin_window(&st.emitted);
+        Ok(Some(DeviceSampleSpec {
+            cfg: st.params.policy.clone(),
+            rng_state: rng.naive_state(),
+            history: st.history.row(0).to_vec(),
+            q,
+            eos: lane.eos,
+        }))
+    }
+
     fn on_publish(&mut self, out: &StepOutput) {
         self.rows = None;
         for lane in &out.lanes {
@@ -729,6 +807,7 @@ mod tests {
     use super::*;
     use crate::lane::LabRoutes;
     use crate::lane_exec::LaneRoute;
+    use crate::mesh_lane_protocol::DevicePick;
     use crate::mesh_lane_protocol::{
         run_mesh_step, CommitDecision, ConfirmOutcome, DraftRound, HeadState, LaneAdmission,
         LaneAdmit, LaneKind, LaneMeshExecutor, LaneOutput, LaneRequest, MeshKind, MeshRoot,
@@ -736,6 +815,7 @@ mod tests {
         RankOwnership, RankReady, RankSession, RankVerifyResult, RootConfig, SourceAccounting,
         StagePolicy, StepPhase, VerifyPlan, WindowBudgets, WindowStart,
     };
+    use hipfire_runtime::lane_draw::{reference_draw, LaneDraw};
     use hipfire_runtime::llama::sample_top_k_p_with_state;
 
     // ---- statistics ------------------------------------------------------
@@ -944,6 +1024,8 @@ mod tests {
     struct SynthRows {
         synth: Arc<Synth>,
         fail: Arc<std::sync::atomic::AtomicBool>,
+        /// Verify-row reads served (a device-drawn lane reads none).
+        reads: Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl TargetRowSource for SynthRows {
@@ -956,10 +1038,39 @@ mod tests {
             if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
                 return Err(format!("injected row {row} read failure"));
             }
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tag = key.request_epoch.request_tag;
             host.set(self.synth.target.get(&tag).ok_or("no logits for lane")?);
             Ok(())
         }
+    }
+
+    /// The fake device sampler of a rank: the shared device sampler's CPU model
+    /// (`lane_draw::reference_draw`) over the lane's rows (the stationary
+    /// target repeats one row per verify row) with the lent spec's q, history,
+    /// config, RNG and EOS.
+    fn device_draw(row: &[f32], drafts: &[u32], spec: &DeviceSampleSpec) -> LaneDraw {
+        reference_draw(
+            &row.repeat(drafts.len() + 1),
+            V,
+            drafts,
+            &spec.q,
+            &spec.history,
+            &spec.cfg,
+            spec.rng_state,
+            spec.eos,
+        )
+    }
+
+    /// One lent window as the sampler owner's stand-in saw and drew it.
+    struct DrawRecord {
+        key: LaneWindowKey,
+        /// The lane's sealed drafts (`rows[1..]`).
+        drafts: Vec<u32>,
+        /// The spec the root lent (not the one a negative control draws with).
+        spec: DeviceSampleSpec,
+        draw: LaneDraw,
     }
 
     /// A direct-rule harness: the sampler plus constant rows per tag.
@@ -968,6 +1079,7 @@ mod tests {
         s.rows = Some(RowHandle::new(SynthRows {
             synth: Synth::new(tags),
             fail: Arc::default(),
+            reads: Arc::default(),
         }));
         s
     }
@@ -1039,11 +1151,13 @@ mod tests {
         let h = RowHandle::new(SynthRows {
             synth: Synth::new(&[1]),
             fail: Arc::default(),
+            reads: Arc::default(),
         });
         assert_eq!(h, h.clone());
         let other = RowHandle::new(SynthRows {
             synth: Synth::new(&[1]),
             fail: Arc::default(),
+            reads: Arc::default(),
         });
         assert_ne!(h, other);
     }
@@ -1578,6 +1692,15 @@ mod tests {
         synth: Arc<Synth>,
         rows: RowHandle,
         row_fail: Arc<std::sync::atomic::AtomicBool>,
+        /// Verify-row reads the root made through `rows`.
+        row_reads: Arc<std::sync::atomic::AtomicUsize>,
+        /// Draw the lanes the root lent a spec on this rank's "device"
+        /// ([`device_draw`]), returning no rows for them.
+        device: bool,
+        /// Negative control: draw with a q other than the lent one.
+        wrong_q: bool,
+        /// Every draw this rank made on its "device" since last taken.
+        draws: Vec<DrawRecord>,
         modes: HashMap<LaneWindowKey, SamplingMode>,
         buffer: Vec<(u32, f32)>,
         fail: Option<Fail>,
@@ -1586,14 +1709,20 @@ mod tests {
     impl SynthExec {
         fn new(own: RankOwnership, synth: Arc<Synth>) -> Self {
             let row_fail: Arc<std::sync::atomic::AtomicBool> = Arc::default();
+            let row_reads: Arc<std::sync::atomic::AtomicUsize> = Arc::default();
             Self {
                 session: RankSession::new(own),
                 rows: RowHandle::new(SynthRows {
                     synth: synth.clone(),
                     fail: row_fail.clone(),
+                    reads: row_reads.clone(),
                 }),
                 synth,
                 row_fail,
+                row_reads,
+                device: false,
+                wrong_q: false,
+                draws: Vec::new(),
                 modes: HashMap::new(),
                 buffer: Vec::new(),
                 fail: None,
@@ -1674,18 +1803,48 @@ mod tests {
             }
             let mut res = self.session.on_verify(plan)?;
             if self.session.ownership().sampler {
-                let picks = plan
+                let mut picks = Vec::new();
+                let mut device = Vec::new();
+                for (i, l) in plan.lanes.iter().enumerate() {
+                    let tag = l.key.request_epoch.request_tag;
+                    let row = &self.synth.target[&tag];
+                    picks.push((l.key, vec![argmax_of(row); l.rows.len()]));
+                    device.push(match plan.samples.get(i).and_then(Option::as_ref) {
+                        Some(spec) if self.device => {
+                            let drafts = &l.rows[1..];
+                            let lent = if self.wrong_q {
+                                DeviceSampleSpec {
+                                    q: vec![(0..8).map(|t| (t, 0.125)).collect(); drafts.len()],
+                                    ..spec.clone()
+                                }
+                            } else {
+                                spec.clone()
+                            };
+                            let draw = device_draw(row, drafts, &lent);
+                            self.draws.push(DrawRecord {
+                                key: l.key,
+                                drafts: drafts.to_vec(),
+                                spec: spec.clone(),
+                                draw: draw.clone(),
+                            });
+                            Some(DevicePick {
+                                tokens: draw.tokens,
+                                accepted: draw.accepted,
+                                advanced_rng: draw.advanced_rng,
+                            })
+                        }
+                        _ => None,
+                    });
+                }
+                let host_rows = plan
                     .lanes
                     .iter()
-                    .map(|l| {
-                        let tag = l.key.request_epoch.request_tag;
-                        let pick = argmax_of(&self.synth.target[&tag]);
-                        (l.key, vec![pick; l.rows.len()])
-                    })
-                    .collect();
+                    .zip(&device)
+                    .any(|(l, d)| self.modes[&l.key] != SamplingMode::Greedy && d.is_none());
                 res.sampler = Some(SamplerOutput {
                     picks,
-                    rows: Some(self.rows.clone()),
+                    rows: host_rows.then(|| self.rows.clone()),
+                    device,
                 });
             }
             Ok(res)
@@ -1788,6 +1947,24 @@ mod tests {
                 .unwrap();
             self.copy = true;
             self
+        }
+
+        /// Draw the sampled lanes on the sampler owner's device: the rule lends
+        /// specs, the owner rank answers with `reference_draw`s.
+        fn with_device(mut self) -> Self {
+            self.sampler.set_device_sample(true);
+            for r in &mut self.ranks {
+                r.device = true;
+            }
+            self
+        }
+
+        /// Verify rows the root read from the sampler owner so far.
+        fn row_reads(&self) -> usize {
+            self.ranks
+                .iter()
+                .map(|r| r.row_reads.load(std::sync::atomic::Ordering::Relaxed))
+                .sum()
         }
 
         fn admit(
@@ -2274,6 +2451,7 @@ mod tests {
         s.rows = Some(RowHandle::new(SynthRows {
             synth: Synth::new(&[9]),
             fail: Arc::default(),
+            reads: Arc::default(),
         }));
         assert!(s.accept(&stray, &[], &[0], &mut rng).is_err());
         // Greedy lanes in the same step need nothing.
@@ -2412,5 +2590,415 @@ mod tests {
         s.admit(epoch(1), &cfg, &[1], 2).unwrap();
         s.on_publish(&output(true));
         assert!(s.is_registered(&epoch(1)), "the driver releases it");
+    }
+
+    // ---- Device draws (HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE) -----------------
+
+    fn penalty_cfg(seed: u64) -> SpecRequestConfig {
+        SpecRequestConfig {
+            repeat_penalty: 1.4,
+            repeat_window: 6,
+            presence_penalty: 0.3,
+            ..request_cfg(1.0, 0.95, Some(6), 0.0, seed)
+        }
+    }
+
+    /// Draw configs of the device tests: a truncating one and one with every
+    /// penalty active (a history-dependent law).
+    fn plain_cfg(tag: u64) -> SpecRequestConfig {
+        request_cfg(1.0, 0.9, Some(5), 0.0, 700 + tag)
+    }
+
+    fn penalized_cfg(tag: u64) -> SpecRequestConfig {
+        penalty_cfg(900 + tag)
+    }
+
+    /// What one device-drawn mesh run produced.
+    struct DeviceRun {
+        emitted: HashMap<u64, Vec<u32>>,
+        /// The first token of every window, per lane.
+        firsts: HashMap<u64, Vec<u32>>,
+        /// Verify rows the root read from the sampler owner.
+        reads: usize,
+        /// Windows per final proposal source.
+        sources: HashMap<usize, usize>,
+        accepted: usize,
+    }
+
+    /// Run `arm` for `steps` steps with the device flag on. Unless `wrong_q`
+    /// (the negative control: the stand-in draws with a q that is not the one
+    /// the root lent), every window is checked against the stand-in's own
+    /// inputs: the lent spec's RNG chain, history, q shape and config, the
+    /// stand-in's draw equal to `reference_draw` of those inputs, the root's
+    /// emitted window equal to that draw and the root's staged naive RNG equal
+    /// to the draw's advanced state.
+    fn run_device(
+        kind: MeshKind,
+        arm: &Arm,
+        cfg: &dyn Fn(u64) -> SpecRequestConfig,
+        tags: &[u64],
+        steps: usize,
+        wrong_q: bool,
+    ) -> DeviceRun {
+        let mut m = Mesh::with_floor(kind, tags, arm.lab == LabRoutes::Floor);
+        if !arm.copy.is_empty() {
+            m = m.with_copy();
+        }
+        m = m.with_device();
+        for r in &mut m.ranks {
+            r.wrong_q = wrong_q;
+        }
+        let mut full: HashMap<u64, Vec<u32>> = HashMap::new();
+        let mut chain: HashMap<u64, u32> = HashMap::new();
+        for &t in tags {
+            m.admit(t, &cfg(t), arm.spec_k, true);
+            // The lane's penalty source: the prompt `admit` registers, the
+            // pending seed, then every committed token.
+            full.insert(t, vec![1, 2, 3, t as u32, 1]);
+            chain.insert(t, cfg(t).rng_seed as u32);
+        }
+        let mut run = DeviceRun {
+            emitted: tags.iter().map(|&t| (t, Vec::new())).collect(),
+            firsts: tags.iter().map(|&t| (t, Vec::new())).collect(),
+            reads: 0,
+            sources: HashMap::new(),
+            accepted: 0,
+        };
+        for _ in 0..steps {
+            let out = m.step(arm, tags).unwrap();
+            let records: Vec<DrawRecord> = m
+                .ranks
+                .iter_mut()
+                .flat_map(|r| std::mem::take(&mut r.draws))
+                .collect();
+            assert_eq!(records.len(), out.lanes.len(), "one device draw per lane");
+            for l in &out.lanes {
+                let tag = l.key.request_epoch.request_tag;
+                let rec = records
+                    .iter()
+                    .find(|r| r.key == l.key)
+                    .expect("a device draw for every sealed lane");
+                if !wrong_q {
+                    let c = cfg(tag);
+                    let want = reference_draw(
+                        &target_logits(tag).repeat(rec.drafts.len() + 1),
+                        V,
+                        &rec.drafts,
+                        &rec.spec.q,
+                        &rec.spec.history,
+                        &rec.spec.cfg,
+                        rec.spec.rng_state,
+                        rec.spec.eos,
+                    );
+                    assert_eq!(rec.draw, want, "lane {tag}: the stand-in is reference_draw");
+                    assert_eq!(l.emitted, want.tokens, "lane {tag}: emitted window");
+                    assert_eq!(l.source.offered, rec.drafts.len());
+                    let n = l.source.accepted;
+                    assert_eq!(
+                        l.emitted[..n],
+                        rec.drafts[..n],
+                        "lane {tag}: accepted drafts"
+                    );
+                    assert_eq!(
+                        m.root.rng_fingerprint(epoch(tag)).unwrap().1,
+                        want.advanced_rng,
+                        "lane {tag}: the root took the device's advanced RNG back"
+                    );
+                    assert_eq!(rec.spec.rng_state, chain[&tag], "lane {tag}: RNG chain");
+                    let hist = &full[&tag];
+                    let w = c.penalty_window();
+                    assert_eq!(
+                        rec.spec.history,
+                        hist[hist.len().saturating_sub(w)..],
+                        "lane {tag}: row-0 history"
+                    );
+                    assert_eq!(rec.spec.eos, None);
+                    assert_eq!(rec.spec.cfg.temperature, c.temp);
+                    assert_eq!(rec.spec.cfg.top_p, c.top_p);
+                    assert_eq!(rec.spec.cfg.repeat_penalty, c.repeat_penalty);
+                    assert_eq!(rec.spec.cfg.repeat_window, c.repeat_window);
+                    assert_eq!(rec.spec.q.len(), rec.drafts.len());
+                    match l.source.source {
+                        ProposalSource::Copy => assert!(
+                            rec.spec.q.iter().all(Vec::is_empty),
+                            "lane {tag}: a copy window's q is the point mass"
+                        ),
+                        ProposalSource::Native => assert!(
+                            rec.spec.q.iter().all(|e| !e.is_empty()),
+                            "lane {tag}: a native window's q is the draft's distribution"
+                        ),
+                        ProposalSource::None => assert!(rec.drafts.is_empty()),
+                    }
+                }
+                chain.insert(tag, rec.draw.advanced_rng);
+                full.get_mut(&tag).unwrap().extend_from_slice(&l.emitted);
+                run.emitted
+                    .get_mut(&tag)
+                    .unwrap()
+                    .extend_from_slice(&l.emitted);
+                run.firsts.get_mut(&tag).unwrap().push(l.emitted[0]);
+                *run.sources.entry(l.source.source as usize).or_default() += 1;
+                run.accepted += l.source.accepted;
+            }
+        }
+        run.reads = m.row_reads();
+        run
+    }
+
+    /// Leviathan lanes on EP and PP, native (`spec_k` 3) and copy windows,
+    /// plain and penalized configs, the device on: the root reads no verify
+    /// row, every lane emits, and each window is exactly `reference_draw` of
+    /// the spec the rank was lent (checked per window in [`run_device`]).
+    #[test]
+    fn sampled_lane_device_leviathan_windows_are_the_reference_draws_without_row_reads() {
+        let tags = [1u64, 2, 3];
+        let all = arms();
+        for kind in [MeshKind::Ep, MeshKind::Pp] {
+            for arm in [&all[1], &all[3]] {
+                for (name, cfg) in [
+                    ("plain", &plain_cfg as &dyn Fn(u64) -> SpecRequestConfig),
+                    ("penalized", &penalized_cfg),
+                ] {
+                    let what = format!("{kind:?} {} {name}", arm.name);
+                    let run = run_device(kind, arm, cfg, &tags, 400, false);
+                    assert_eq!(run.reads, 0, "{what}: the device path reads no row");
+                    assert!(
+                        run.emitted.values().all(|t| !t.is_empty()),
+                        "{what}: every lane emitted"
+                    );
+                    assert!(
+                        run.sources.contains_key(&(ProposalSource::Native as usize)),
+                        "{what}: {:?}",
+                        run.sources
+                    );
+                    if arm.name == "lane_copy" {
+                        assert!(
+                            run.sources.contains_key(&(ProposalSource::Copy as usize)),
+                            "{what}: {:?}",
+                            run.sources
+                        );
+                    } else {
+                        assert!(
+                            !run.sources.contains_key(&(ProposalSource::Copy as usize)),
+                            "{what}: {:?}",
+                            run.sources
+                        );
+                    }
+                    assert!(run.accepted > 0, "{what}: no draft was ever accepted");
+                }
+            }
+        }
+    }
+
+    /// The device path through the mesh plumbing draws the target law: each
+    /// lane's emitted stream (marginal and pairs) and the first token of every
+    /// window are iid `p`. A native window proves the lent q is the
+    /// distribution the root drew its drafts from; the copy arm adds windows
+    /// whose q is the point mass.
+    #[test]
+    fn sampled_lane_device_path_matches_the_target_distribution() {
+        let tags = [1u64, 2, 3];
+        let all = arms();
+        let cfg = |t: u64| request_cfg(1.0, 1.0, None, 0.0, 9000 + t * 7919);
+        for kind in [MeshKind::Ep, MeshKind::Pp] {
+            for arm in [&all[1], &all[3]] {
+                let run = run_device(kind, arm, &cfg, &tags, 9_000, false);
+                assert_eq!(run.reads, 0);
+                if arm.name == "lane_copy" {
+                    assert!(
+                        run.sources.contains_key(&(ProposalSource::Copy as usize)),
+                        "{:?}",
+                        run.sources
+                    );
+                }
+                for &t in &tags {
+                    let want = ref_dist(&target_logits(t), 1.0, 1.0, None, 0.0);
+                    let what = format!("device {kind:?} {} lane {t}", arm.name);
+                    assert_stream_law(&what, &run.emitted[&t], &want);
+                    let mut first = vec![0u64; V];
+                    for &tok in &run.firsts[&t] {
+                        first[tok as usize] += 1;
+                    }
+                    assert_law(&format!("{what}: first position"), &first, &want);
+                }
+            }
+        }
+    }
+
+    /// The statistic has power over the q wiring: a rank that draws with a q
+    /// other than the one the root lent (uniform over eight tokens) fails the
+    /// same law check a correct wiring passes.
+    #[test]
+    fn sampled_lane_device_negative_control_wrong_q_is_detected() {
+        let tags = [1u64, 2, 3];
+        let arm = arms().remove(1);
+        let cfg = |t: u64| request_cfg(1.0, 1.0, None, 0.0, 9000 + t * 7919);
+        let run = run_device(MeshKind::Ep, &arm, &cfg, &tags, 9_000, true);
+        let rejected = tags.iter().any(|&t| {
+            let want = ref_dist(&target_logits(t), 1.0, 1.0, None, 0.0);
+            let mut marginal = vec![0u64; V];
+            for &tok in &run.emitted[&t] {
+                marginal[tok as usize] += 1;
+            }
+            let n = run.emitted[&t].len() as u64;
+            let (stat, df) = chi_square(&marginal, &want, n);
+            stat > critical(df)
+        });
+        assert!(rejected, "the law check must reject a wrong lent q");
+    }
+
+    /// `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE=0` (the rule's flag off): no lane is
+    /// lent a spec, the sampler owner returns rows and the root reads them.
+    #[test]
+    fn sampled_lane_device_flag_off_keeps_the_host_row_path() {
+        let arm = arms().remove(1);
+        let mut m = Mesh::new(MeshKind::Ep, &[1]);
+        // A device-capable rank, but the rule's flag is off: nothing is lent.
+        for r in &mut m.ranks {
+            r.device = true;
+        }
+        m.admit(1, &request_cfg(1.0, 0.9, None, 0.0, 5), arm.spec_k, true);
+        let out = m.step(&arm, &[1]).unwrap();
+        assert!(!out.lanes[0].emitted.is_empty());
+        assert!(m.row_reads() > 0, "the host path read its rows");
+        assert!(
+            m.ranks.iter().all(|r| r.draws.is_empty()),
+            "nothing was lent, nothing drawn on device"
+        );
+    }
+
+    /// The rule's hook lends a spec only with the flag on, only to a
+    /// Leviathan lane that is registered, with the lane's own staged naive
+    /// RNG, EOS and row-0 penalty history, and q exactly as the root drew
+    /// the drafts: the SparseDist entries `draft_token` built for a native
+    /// window, an empty entry per draft (the point mass) for a copy window.
+    #[test]
+    fn sampled_lane_device_sample_hook_is_gated_by_flag_and_mode() {
+        let mut s = rule_sampler(&[1]);
+        s.admit(epoch(1), &penalty_cfg(1), &[7, 8, 9], 4).unwrap();
+        let mut rng = LaneRng::new(123);
+        let head = head_candidates(1);
+        let native = lane_plan(1, SamplingMode::Leviathan, ProposalSource::Native, Some(2));
+        let mut drafts = Vec::new();
+        for i in 0..3 {
+            let p = proposal(1, 0, &head);
+            let t = s.draft_token(&native, i, &drafts, &p, &mut rng).unwrap();
+            drafts.push(t);
+        }
+        let drawn: Vec<Vec<(u32, f32)>> = s.lanes[&epoch(1)]
+            .q
+            .iter()
+            .map(|d| d.entries().to_vec())
+            .collect();
+        assert_eq!(drawn.len(), 3);
+        for entries in &drawn {
+            let mass: f32 = entries.iter().map(|e| e.1).sum();
+            assert!(
+                !entries.is_empty() && (mass - 1.0).abs() < 1e-3,
+                "{entries:?}"
+            );
+        }
+        let rng_before = rng.naive_state();
+        assert_eq!(rng_before, 123);
+
+        // Flag off: nothing is lent, whatever the lane.
+        assert_eq!(
+            s.device_sample(&native, &drafts, &rng),
+            Ok(None),
+            "flag off"
+        );
+        s.set_device_sample(true);
+
+        // A native Leviathan window: q is what `draft_token` drew from.
+        let spec = s
+            .device_sample(&native, &drafts, &rng)
+            .unwrap()
+            .expect("a Leviathan lane is lent a spec");
+        assert_eq!(spec.rng_state, rng_before);
+        assert_eq!(spec.eos, Some(2));
+        assert_eq!(spec.history, vec![7, 8, 9, 4], "prompt tail + pending seed");
+        assert_eq!(spec.cfg.temperature, 1.0);
+        assert_eq!(spec.cfg.repeat_window, 6);
+        assert_eq!(spec.q, drawn, "q is the SparseDist entries of each draft");
+        assert_eq!(rng.naive_state(), rng_before, "lending never draws");
+
+        // A copy window: the point mass, an empty entry per draft.
+        let copy = lane_plan(1, SamplingMode::Leviathan, ProposalSource::Copy, Some(2));
+        let spec = s
+            .device_sample(&copy, &[5, 6], &rng)
+            .unwrap()
+            .expect("a copy Leviathan lane is lent a spec");
+        assert_eq!(spec.q, vec![Vec::<(u32, f32)>::new(); 2]);
+        assert_eq!(spec.history, vec![7, 8, 9, 4]);
+        assert_eq!(spec.rng_state, rng_before);
+
+        // A native window with no drafts (a one-row window) carries no q.
+        let spec = s.device_sample(&native, &[], &rng).unwrap().unwrap();
+        assert!(spec.q.is_empty());
+
+        // A native window whose distributions were not drawn for its key.
+        let mut stale = native.clone();
+        stale.key = key(1, 1);
+        assert!(s.device_sample(&stale, &[5], &rng).is_err());
+
+        // Naive and greedy lanes are never lent a spec.
+        for mode in [SamplingMode::NaiveSampled, SamplingMode::Greedy] {
+            let lane = lane_plan(1, mode, ProposalSource::Native, None);
+            assert_eq!(s.device_sample(&lane, &[5], &rng), Ok(None), "{mode:?}");
+        }
+
+        // An unregistered Leviathan lane is an error; the mode gate precedes it.
+        let stranger = lane_plan(9, SamplingMode::Leviathan, ProposalSource::Native, None);
+        assert!(s.device_sample(&stranger, &[5], &rng).is_err());
+        let naive_stranger = lane_plan(9, SamplingMode::NaiveSampled, ProposalSource::Native, None);
+        assert_eq!(s.device_sample(&naive_stranger, &[5], &rng), Ok(None));
+    }
+
+    /// A device-drawn window that fails anywhere after it was lent leaves the
+    /// committed RNG, history and generated IDs untouched (the lent state is
+    /// staged, never published).
+    #[test]
+    fn sampled_lane_device_abort_does_not_advance_rng() {
+        let arm = arms().remove(1);
+        for fail in [Fail::Draft(1), Fail::Verify, Fail::Prepare] {
+            let mut m = Mesh::new(MeshKind::Ep, &[1, 2]).with_device();
+            for t in [1u64, 2] {
+                m.admit(
+                    t,
+                    &request_cfg(1.0, 0.9, None, 0.0, 50 + t),
+                    arm.spec_k,
+                    true,
+                );
+            }
+            m.step(&arm, &[1, 2]).unwrap();
+            assert!(
+                m.ranks.iter().any(|r| !r.draws.is_empty()),
+                "{fail:?}: the first window was device-drawn"
+            );
+            for r in &mut m.ranks {
+                r.draws.clear();
+            }
+            let snapshot = |m: &Mesh| -> Vec<_> {
+                [1u64, 2]
+                    .iter()
+                    .map(|&t| {
+                        (
+                            m.root.rng_fingerprint(epoch(t)),
+                            m.root.generated(epoch(t)).map(<[u32]>::to_vec),
+                            m.sampler.lanes[&epoch(t)].emitted.clone(),
+                        )
+                    })
+                    .collect()
+            };
+            let before = snapshot(&m);
+            m.ranks[1].fail = Some(fail);
+            let err = m.step(&arm, &[1, 2]).unwrap_err();
+            assert!(
+                matches!(err, ProtocolError::Aborted(_)),
+                "{fail:?}: {err:?}"
+            );
+            assert_eq!(before, snapshot(&m), "{fail:?}");
+            assert_eq!(m.row_reads(), 0, "{fail:?}: no row was ever read");
+        }
     }
 }

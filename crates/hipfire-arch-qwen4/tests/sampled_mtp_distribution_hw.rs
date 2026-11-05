@@ -370,10 +370,20 @@
 //! artifact once through the product loader with the serve's `serve.vmm_batch`
 //! lane reservation, stages one lane store and runs its `START..END` trials
 //! through it, recycling the lanes. `lane_ar` is target-only AR lanes (lane
-//! executor AR rows, host draws from each lane's RNG: the reference);
+//! executor AR rows: the reference);
 //! `lane_batched` and `lane_adaptive` are native-MTP mesh lanes
-//! (`Qwen4Bundle::ep_mesh_decode_step`, root Leviathan acceptance, every lane
-//! MTP, no copy lane). The fixed-count MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so
+//! (`Qwen4Bundle::ep_mesh_decode_step`, Leviathan acceptance against each
+//! draft's q, every lane MTP, no copy lane). With
+//! `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (the default on gfx1201) every sampled
+//! draw of every arm (AR rows, the prompt-completing first token, native and
+//! copy verify windows) is one lane-wide device launch
+//! (`hipfire_runtime::lane_draw::lane_draws`) under the shared device sampler's
+//! law (a copy proposal is a point-mass q); `=0` restores the host sampler. The
+//! arm resolves the route from its loaded `Gpu` and records it as
+//! `lane_suite.lane_draw_route` (`device` or `host`) in its config and merge key,
+//! so ids from one route are a config error under the other, shards of two
+//! routes never merge, and the verdict prints each arm's route and refuses a
+//! cohort that mixes them. The fixed-count MTP arms pin `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=8` so
 //! `N` lanes run native windows at every lane count `1..=8` (the step switch would otherwise run
 //! AR windows above `max_active + 1` lanes): they are native-window coverage arms, not the shipped
 //! switching policy. The mesh router calibrates inline, so the

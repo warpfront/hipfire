@@ -10132,6 +10132,11 @@ pub const SAMPLE_TOP_P_SRC: &str = include_str!("../../../kernels/src/sample_top
 pub const SAMPLE_TOP_P_PARALLEL_SRC: &str =
     include_str!("../../../kernels/src/sample_top_p_parallel.hip");
 
+/// Lane-wide sampled verify (`Gpu::lane_leviathan_verify_enqueue`): one
+/// workgroup per verify row builds the target distribution under the shared
+/// sampler's law; the last row of each lane runs its Leviathan verdict.
+pub const LANE_LEVIATHAN_SRC: &str = include_str!("../../../kernels/src/lane_leviathan.hip");
+
 /// Penalty stage of the host logit policy (repeat, presence, frequency)
 /// applied in place to logit rows from a host-built token table
 /// (`logit_penalty_table_rows`, launched by `Gpu::apply_penalty_table`): the

@@ -65,6 +65,34 @@ fn lane_arm_config(
     )
 }
 
+/// An existing result's config against `expected`, the arm's pre-GPU config.
+/// The recorded config also carries the draw route the arm resolved once its GPU
+/// was loaded ([`lane_suite::with_draw_route`]); `expected` is compared under
+/// that recorded route, which is returned. A config with no valid route is
+/// refused (its ids predate the route being recorded).
+fn check_lane_config(ids_path: &Path, expected: &Value) -> Result<&'static str, String> {
+    let recorded = fs::read(ids_path.with_extension("config.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    match recorded.as_ref().map(lane_suite::recorded_draw_route) {
+        Some(Ok(route)) => {
+            check_config(
+                ids_path,
+                &lane_suite::with_draw_route(expected.clone(), route)?,
+            )?;
+            Ok(route)
+        }
+        other => {
+            // An unreadable or different config gets check_config's own error.
+            check_config(ids_path, expected)?;
+            Err(match other {
+                Some(Err(e)) => format!("{}: {e}", ids_path.display()),
+                _ => format!("{}: its config cannot be read", ids_path.display()),
+            })
+        }
+    }
+}
+
 /// One lane arm process. Everything an arm would need is validated first (the
 /// environment contract, neutral penalties, the shard range, the config and any
 /// existing result's config), so a wrong invocation fails for its own reason;
@@ -107,7 +135,7 @@ pub(super) fn run_lane_arm(
     };
     let ids_path = dir.join(format!("{stem}.ids.json"));
     if ids_path.exists() {
-        check_config(&ids_path, &config)?;
+        check_lane_config(&ids_path, &config)?;
     }
     println!(
         "ARM {arm} executor={} topology={} lanes={} trials {}..{} of {} rows_per_trial={}",
@@ -321,6 +349,7 @@ pub(super) fn lane_verdict(
     let model_id = hw_identity::model_identity(model, dir)?;
     let cohort = lane_suite::cohort_arms(placement.topology, placement.lanes);
     let mut samples: BTreeMap<&str, Vec<Vec<u32>>> = BTreeMap::new();
+    let mut routes: Vec<(&str, &str)> = Vec::new();
     for &arm in cohort {
         let ids_path = dir.join(format!("{arm}.ids.json"));
         if !ids_path.exists() {
@@ -336,7 +365,7 @@ pub(super) fn lane_verdict(
             placement,
             (0, trials),
         )?;
-        check_config(&ids_path, &expected)?;
+        routes.push((arm, check_lane_config(&ids_path, &expected)?));
         let rows = read_rows(&ids_path)?;
         if rows.len() != trials * placement.lanes {
             return Err(format!(
@@ -357,6 +386,13 @@ pub(super) fn lane_verdict(
     // check above already compared it with this environment's).
     let adaptive_config = read_json(&dir.join("lane_adaptive.ids.config.json"))?;
     if let Some(failure) = lane_suite::adaptive_floor_failure(&adaptive_config) {
+        judged.coverage.push(format!("{failure}\n"));
+    }
+    // Every arm's resolved draw route is printed; a cohort that ran under
+    // different routes is refused.
+    let (route_line, route_failures) = lane_suite::draw_route_coverage(&routes);
+    judged.report.push_str(&route_line);
+    for failure in route_failures {
         judged.coverage.push(format!("{failure}\n"));
     }
     fs::write(dir.join("report.txt"), &judged.report).map_err(|e| e.to_string())?;
@@ -704,7 +740,11 @@ mod tests {
         if state != "q8" {
             base["identity"]["env"][lane_suite::STATE_QUANT_ENV] = json!(state);
         }
-        let config = lane_suite::lane_config(base, arm, placement, state, range).unwrap();
+        let config = lane_suite::with_draw_route(
+            lane_suite::lane_config(base, arm, placement, state, range).unwrap(),
+            "device",
+        )
+        .unwrap();
         let stem = format!("{arm}.{}-{}", range.0, range.1);
         let ids: Vec<Vec<u32>> = (0..(range.1 - range.0) * lanes)
             .map(|row| vec![range.0 as u32, row as u32])

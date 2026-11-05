@@ -14,9 +14,25 @@
 //!
 //! | arm | store | decode |
 //! |---|---|---|
-//! | `lane_ar` | AR lanes (no spec), sampled | lane executor AR rows, host draw from the lane's own RNG |
-//! | `lane_batched` / `lane_adaptive` | native-MTP lanes, every lane MTP (`spec_lanes: None`), no copy lane | `Qwen4Bundle::ep_mesh_decode_step` (root Leviathan) |
+//! | `lane_ar` | AR lanes (no spec), sampled | lane executor AR rows; each row's token drawn from the lane's own RNG (device launch or host sampler, see below) |
+//! | `lane_batched` / `lane_adaptive` | native-MTP lanes, every lane MTP (`spec_lanes: None`), no copy lane | `Qwen4Bundle::ep_mesh_decode_step` (Leviathan acceptance against each draft's q) |
 //! | `lane_cross` | native-MTP lanes as above, `HIPFIRE_EP_MTP_LANE_MAX_ACTIVE=3` (the shipped `lane_switch::DEFAULT_MAX_ACTIVE`, pinned) | the same mesh step under the native<->AR switch at 3; 8 lanes only, staggered admission |
+//!
+//! # Draw route
+//!
+//! With `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` on (the default on gfx1201), every
+//! sampled draw (the AR rows, the prompt-completing first token, the native and
+//! the copy verify windows) is ONE lane-wide device launch
+//! (`hipfire_runtime::lane_draw::lane_draws`): Leviathan against each draft's q
+//! (a copy proposal is a point mass) under the shared device sampler's law, with
+//! the lane's xorshift32 stream as the RNG. With `=0` (or on a device the launch
+//! does not support) the host sampler draws, as before. The two routes draw the
+//! same distribution from different streams, so seeded ids differ between
+//! them. The arm resolves the route from the loaded `Gpu` (`lane_draw_route`)
+//! and records it as `lane_suite.lane_draw_route` (`device` or `host`) in its
+//! config; ids produced under one route are a hard config error under the
+//! other, a merge refuses mixed routes, and the verdict prints each arm's route
+//! and refuses a cohort that ran under different ones.
 //!
 //! The native arms (`lane_batched`, `lane_adaptive`, `lane_cross`) draft at the
 //! lane depth the cohort chose with `HIPFIRE_SAMPLED_MTP_LANE_K` (2, the
@@ -52,8 +68,10 @@
 //!
 //! The evidence the verdict reads is derived from real counters only: each
 //! mesh window is classified from the lane's `LaneSpecStats` delta
-//! (`Qwen4Bundle::lane_spec_stats_for`) and the sums are cross-checked against
-//! the step's `MeshStepFacts`; a disagreement fails the shard.
+//! (`Qwen4Bundle::lane_spec_stats_for`) and the step's `lane_switch` decision
+//! (`MeshStepFacts::native_mode`: a switched step's draft-less windows are AR
+//! windows), and the sums are cross-checked against the step's
+//! `MeshStepFacts`; a disagreement fails the shard.
 
 use super::*;
 use hipfire_arch_qwen4::ep_mesh_serve::{MeshDecodeRequest, MeshStepFacts};
@@ -255,11 +273,16 @@ impl WindowFact {
 
 /// The one window a lane ran between two `LaneSpecStats` reads. Exactly one of
 /// the native / copy / AR window counters moves by one, no forced window ran,
-/// and the draft counters move only with their window kind.
+/// and the draft counters move only with their window kind. `native_mode` is
+/// the step's `lane_switch` decision (`MeshStepFacts::native_mode`): in a
+/// switched step (`false`) every lane runs the one-token `ArSynced` window,
+/// which the lane counters book as a draft-less native window, so it is an
+/// AR window here (a drafted window there is an error).
 pub(super) fn classify_window(
     before: &LaneSpecStats,
     after: &LaneSpecStats,
     emitted: usize,
+    native_mode: bool,
 ) -> Result<WindowFact, String> {
     let delta = |name: &str, before: u64, after: u64| {
         after
@@ -284,6 +307,19 @@ pub(super) fn classify_window(
         ));
     }
     match (windows, ar, copy) {
+        (1, 0, 0) if !native_mode => {
+            if drafts != 0 || accepted != 0 || copy_drafts != 0 || copy_accepted != 0 {
+                return Err(format!(
+                    "a window of a switched (AR) mesh step moved a draft counter ({drafts} drafts, {accepted} accepted)"
+                ));
+            }
+            Ok(WindowFact {
+                kind: WindowKind::Ar,
+                offered: 0,
+                accepted: 0,
+                emitted,
+            })
+        }
         (1, 0, 0) => {
             if copy_drafts != 0 || copy_accepted != 0 {
                 return Err("a native window moved the copy counters".into());
@@ -295,6 +331,7 @@ pub(super) fn classify_window(
                 emitted,
             })
         }
+        (0, 0, 1) if !native_mode => Err("a switched (AR) mesh step ran a copy window".into()),
         (0, 0, 1) => {
             if drafts != 0 || accepted != 0 {
                 return Err("a copy window moved the native draft counters".into());
@@ -1188,7 +1225,12 @@ fn drive_trial(
                     .lane_spec_stats_for(&advance.epoch)
                     .ok_or_else(|| format!("request {i} lost its MTP lane counters"))?;
                 let req = &mut reqs[i];
-                let fact = classify_window(&req.stats, &after, advance.committed_ids.len())?;
+                let fact = classify_window(
+                    &req.stats,
+                    &after,
+                    advance.committed_ids.len(),
+                    facts.native_mode,
+                )?;
                 let expected = prompt.len() + req.ids.len() + advance.committed_ids.len() - 1;
                 if advance.committed_position != expected {
                     return Err(format!(
@@ -1275,6 +1317,22 @@ fn apply_executor_advance(
     Ok(())
 }
 
+// ------------------------------------------------------------------ draw route
+
+/// The sampled-draw route this process resolves, exactly as the product does
+/// (`lane::lane_device_sample`, which integration tests cannot see): `device`
+/// when the flag is on and the device supports the lane-wide draw launch,
+/// `host` otherwise.
+fn lane_draw_route(gpu: &Gpu) -> &'static str {
+    if gpu.flags.qwen4_lane_device_sample_enabled()
+        && hipfire_runtime::lane_draw::lane_draws_supported(gpu)
+    {
+        "device"
+    } else {
+        "host"
+    }
+}
+
 // ----------------------------------------------------------------- the arm
 
 /// One EP2 lane arm shard: load, stage once, run `range`'s trials, write the
@@ -1294,6 +1352,13 @@ pub(super) fn run_ep_arm(
     let sampler = LaneSamplerSpec::from_settings(settings)?;
     let lanes = placement.lanes;
     let mut run = EpLanes::load(model, arm, lanes, placement.lane_k)?;
+    // The route is resolved from the loaded GPU, so it joins the config here;
+    // ids already on disk must have been produced under the same route.
+    let route = lane_draw_route(&run.gpu);
+    let config = lane_suite::with_draw_route(config.clone(), route)?;
+    if ids_path.exists() {
+        check_config(&ids_path, &config)?;
+    }
     let prompt = render_prompt(
         &run.tokenizer,
         &run.template,
@@ -1303,7 +1368,7 @@ pub(super) fn run_ep_arm(
     settings.fixture.check_prompt(prompt.len(), &settings.pen)?;
     let env = own_env(&lane_run::LANE_CONTROL_ENV);
     println!(
-        "ARM {arm} arch={} prompt_tokens={} trials {}..{} lanes={lanes} temp={} top_p={} top_k={:?} min_p={} fixture={} state={} route_class={}",
+        "ARM {arm} arch={} lane_draw_route={route} prompt_tokens={} trials {}..{} lanes={lanes} temp={} top_p={} top_k={:?} min_p={} fixture={} state={} route_class={}",
         run.gpu.arch,
         prompt.len(),
         range.0,
@@ -1405,7 +1470,7 @@ pub(super) fn run_ep_arm(
         serde_json::to_vec(&rows).map_err(|e| e.to_string())?,
     )
     .map_err(|e| e.to_string())?;
-    write_config(&ids_path, config)?;
+    write_config(&ids_path, &config)?;
     write_receipt(&ids_path, &hw_identity::receipt(&run.gpu, model))?;
     write_json(
         &dir.join(format!("{stem}.evidence.json")),
@@ -1643,16 +1708,16 @@ mod tests {
     fn windows_classify_from_the_lane_counter_deltas() {
         let zero = stats(0, 0, 0, 0, 0, 0, 0);
         assert_eq!(
-            classify_window(&zero, &stats(1, 0, 0, 3, 2, 0, 0), 3).unwrap(),
+            classify_window(&zero, &stats(1, 0, 0, 3, 2, 0, 0), 3, true).unwrap(),
             native(3, 2, 3)
         );
-        // The calibration window: native, no drafts.
+        // A draft-less window of a native step: native, no drafts.
         assert_eq!(
-            classify_window(&zero, &stats(1, 0, 0, 0, 0, 0, 0), 1).unwrap(),
+            classify_window(&zero, &stats(1, 0, 0, 0, 0, 0, 0), 1, true).unwrap(),
             native(0, 0, 1)
         );
         assert_eq!(
-            classify_window(&zero, &stats(0, 0, 1, 0, 0, 3, 3), 4).unwrap(),
+            classify_window(&zero, &stats(0, 0, 1, 0, 0, 3, 3), 4, true).unwrap(),
             WindowFact {
                 kind: WindowKind::Copy,
                 offered: 3,
@@ -1660,38 +1725,53 @@ mod tests {
                 emitted: 4
             }
         );
+        let ar = WindowFact {
+            kind: WindowKind::Ar,
+            offered: 0,
+            accepted: 0,
+            emitted: 1,
+        };
         let before = stats(2, 0, 0, 5, 3, 0, 0);
         assert_eq!(
-            classify_window(&before, &stats(2, 1, 0, 5, 3, 0, 0), 1).unwrap(),
-            WindowFact {
-                kind: WindowKind::Ar,
-                offered: 0,
-                accepted: 0,
-                emitted: 1
-            }
+            classify_window(&before, &stats(2, 1, 0, 5, 3, 0, 0), 1, true).unwrap(),
+            ar
         );
+        // The product switch above max_active (`native_mode` false): the
+        // lane counters book the one-token `ArSynced` window as a draft-less
+        // native window; it is an AR window, as is a retired lane's.
+        assert_eq!(
+            classify_window(&before, &stats(3, 0, 0, 5, 3, 0, 0), 1, false).unwrap(),
+            ar
+        );
+        assert_eq!(
+            classify_window(&before, &stats(2, 1, 0, 5, 3, 0, 0), 1, false).unwrap(),
+            ar
+        );
+        // A switched step never drafts or copies.
+        assert!(classify_window(&before, &stats(3, 0, 0, 7, 4, 0, 0), 3, false).is_err());
+        assert!(classify_window(&before, &stats(2, 0, 1, 5, 3, 2, 1), 2, false).is_err());
     }
 
     #[test]
     fn a_window_that_is_not_exactly_one_kind_is_an_error() {
         let zero = stats(0, 0, 0, 0, 0, 0, 0);
-        assert!(classify_window(&zero, &zero, 1).is_err(), "no window moved");
-        assert!(classify_window(&zero, &stats(1, 1, 0, 0, 0, 0, 0), 1).is_err());
-        assert!(classify_window(&zero, &stats(2, 0, 0, 0, 0, 0, 0), 1).is_err());
-        assert!(
-            classify_window(&stats(1, 0, 0, 0, 0, 0, 0), &zero, 1).is_err(),
-            "backwards"
-        );
-        // A native window may not move the copy counters, nor the reverse.
-        assert!(classify_window(&zero, &stats(1, 0, 0, 0, 0, 1, 1), 1).is_err());
-        assert!(classify_window(&zero, &stats(0, 0, 1, 1, 0, 1, 0), 1).is_err());
-        assert!(classify_window(&zero, &stats(0, 1, 0, 1, 0, 0, 0), 1).is_err());
-        let mut forced = zero;
-        forced.forced_windows = 1;
-        forced.windows = 1;
-        assert!(classify_window(&zero, &forced, 1)
-            .unwrap_err()
-            .contains("forced"));
+        for native_mode in [true, false] {
+            let c = |before: &LaneSpecStats, after: &LaneSpecStats| {
+                classify_window(before, after, 1, native_mode)
+            };
+            assert!(c(&zero, &zero).is_err(), "no window moved");
+            assert!(c(&zero, &stats(1, 1, 0, 0, 0, 0, 0)).is_err());
+            assert!(c(&zero, &stats(2, 0, 0, 0, 0, 0, 0)).is_err());
+            assert!(c(&stats(1, 0, 0, 0, 0, 0, 0), &zero).is_err(), "backwards");
+            // A native window may not move the copy counters, nor the reverse.
+            assert!(c(&zero, &stats(1, 0, 0, 0, 0, 1, 1)).is_err());
+            assert!(c(&zero, &stats(0, 0, 1, 1, 0, 1, 0)).is_err());
+            assert!(c(&zero, &stats(0, 1, 0, 1, 0, 0, 0)).is_err());
+            let mut forced = zero;
+            forced.forced_windows = 1;
+            forced.windows = 1;
+            assert!(c(&zero, &forced).unwrap_err().contains("forced"));
+        }
     }
 
     #[test]
@@ -1873,6 +1953,7 @@ mod tests {
             offered: 0,
             accepted: 0,
             emitted: 2,
+            native_mode: true,
         });
         evidence.mesh.note(&MeshStepFacts {
             lanes: 2,
@@ -1882,6 +1963,7 @@ mod tests {
             offered: 6,
             accepted: 4,
             emitted: 6,
+            native_mode: true,
         });
         assert_eq!(evidence.check_mesh(8), Ok(()));
         assert!(evidence.check_mesh(9).unwrap_err().contains("emitted"));

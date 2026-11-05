@@ -170,6 +170,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 name = "mq_i4_rows_byte_oracle"
 required-features = ["lab"]
 
+# GPU oracle + bench of `lane_draw::lane_draws` (the lane-wide sampled verify):
+# p tables vs the device-law host model, verdicts, chi-square distribution, timing.
+[[example]]
+name = "lane_draw_bench"
+required-features = ["lab"]
+
 # K2 G1 oracle for the MQ3-I4 NT1 gate/up (raw PM module; no production dispatch).
 [[example]]
 name = "qwen4_moe_sym_w3_g1_oracle"

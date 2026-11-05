@@ -181,6 +181,12 @@ pub struct FeatureFlags {
     /// the sampled lanes' F32 logits rows (one D2H per fetch) land in a pinned host buffer of
     /// the lane store instead of a pageable `Vec<f32>`. The bytes the sampler reads are the same.
     pub qwen4_lane_pinned_logits: bool,
+    /// `HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE` (default on for exact gfx1201 only, `=0` kills it):
+    /// Qwen4 EP lanes draw every T>0 token on the device with one lane-wide launch per step
+    /// (`hipfire_runtime::lane_draw::lane_draws`: Leviathan verify of the sampled drafts
+    /// against their q, AR rows, the prompt-completing draw; only ids, accept counts and RNG
+    /// come back) instead of reading each logits row to the host and drawing there.
+    pub qwen4_lane_device_sample: bool,
     /// Fused multi-lane fn-lanes GDN decode Core, conv/params prologue + output
     /// rotation epilogue in the step launch (`HIPFIRE_QWEN4_GDN_LANES_FUSE`),
     /// default off on every arch (exact gfx1201 only, and only with
@@ -1138,6 +1144,7 @@ impl FeatureFlags {
             qwen4_lane_allrows_moe: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_MOE").unwrap_or(true),
             qwen4_lane_allrows_exact: parse_bool("HIPFIRE_QWEN4_LANE_ALLROWS_EXACT").unwrap_or(false),
             qwen4_lane_pinned_logits: parse_bool("HIPFIRE_QWEN4_LANE_PINNED_LOGITS").unwrap_or(true),
+            qwen4_lane_device_sample: parse_bool("HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE").unwrap_or(true),
             qwen4_gdn_lanes_fuse: parse_bool("HIPFIRE_QWEN4_GDN_LANES_FUSE").unwrap_or(true),
             qwen4_moe_down_r4: parse_bool("HIPFIRE_QWEN4_MOE_DOWN_R4")
                 .unwrap_or(arch == "gfx1151" || is_gfx1201),
@@ -1882,6 +1889,12 @@ impl FeatureFlags {
         self.qwen4_lane_pinned_logits && self.arch == "gfx1201"
     }
 
+    /// Qwen4 EP lanes draw T>0 tokens on the device (`HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE`).
+    /// Exact gfx1201 only, default on (`=0` restores the host row-read sampler exactly).
+    pub fn qwen4_lane_device_sample_enabled(&self) -> bool {
+        self.qwen4_lane_device_sample && self.arch == "gfx1201"
+    }
+
     /// Fused multi-lane fn-lanes GDN decode Core (`HIPFIRE_QWEN4_GDN_LANES_FUSE`): the
     /// conv + gate-parameter launch is the step kernel's prologue and the output
     /// projection's rotation its epilogue. Exact gfx1201 only, default off (`=1`
@@ -2114,6 +2127,7 @@ impl FeatureFlags {
             qwen4_lane_allrows_moe: false,
             qwen4_lane_allrows_exact: false,
             qwen4_lane_pinned_logits: false,
+            qwen4_lane_device_sample: false,
             qwen4_gdn_lanes_fuse: false,
             qwen4_moe_down_r4: false,
             qwen4_shared_down_fuse: false,
@@ -3338,6 +3352,39 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_pinned_logits_enabled());
+    }
+
+    /// The device lane sampler is default on for exact gfx1201 only (`=0` kills it).
+    #[test]
+    fn qwen4_lane_device_sample_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_QWEN4_LANE_DEVICE_SAMPLE" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_lane_device_sample_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_lane_device_sample_enabled(), "{arch}: 0");
+            let on = FeatureFlags::from_lookup(arch, with("1"));
+            assert_eq!(
+                on.qwen4_lane_device_sample_enabled(),
+                arch == "gfx1201",
+                "{arch}: 1"
+            );
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_lane_device_sample_enabled());
     }
 
     /// The wave-per-token router defaults on for exact gfx1151 / gfx1201; `0` turns it off.
