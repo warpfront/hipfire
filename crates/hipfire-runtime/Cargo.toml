@@ -523,9 +523,6 @@ name = "ep_decode_parity"
 required-features = ["lab"]
 
 [[example]]
-name = "hetero_route_skew"
-
-[[example]]
 name = "eval_hipfire_gemma4"
 required-features = ["lab"]
 
