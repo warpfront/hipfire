@@ -4844,6 +4844,17 @@ pub const LANE_ROWS_BF16_PM_GFX1201: &[u8] =
 /// Bare lowercase SHA-256 of [`LANE_ROWS_BF16_PM_GFX1201`], without a newline.
 pub const LANE_ROWS_BF16_PM_GFX1201_SHA256: &str =
     include_str!("../../../kernels/lane_rows_bf16_pm_gfx1201.hxaco.sha256");
+/// gfx1201 PeaceMaker x-batched MQ2G256V2 GEMV (`gemv_mq2g256v2_xbatch_pm`,
+/// WideNet F05 `r4_b4_u1_native_anchor`, ELF sha256 `3cb0e724…eaf0`): the
+/// ABI (`A, x, y, M, K, B`, 36-byte kernarg) and per-row reduction order of
+/// [`GEMV_MQ2G256V2_XBATCH_SRC`], four output rows per 32-lane wave (grid
+/// `ceil(M/4)`). Byte-identical to the hipcc kernel on the differential and
+/// `mq2_xbatch_oracle` corpora; tested, not yet proven anchor-relative.
+pub const GEMV_MQ2_XBATCH_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco");
+/// Bare lowercase SHA-256 of [`GEMV_MQ2_XBATCH_PM_GFX1201`], without a newline.
+pub const GEMV_MQ2_XBATCH_PM_GFX1201_SHA256: &str =
+    include_str!("../../../kernels/gemv_mq2_xbatch_pm_gfx1201.hxaco.sha256");
 /// Genuine gfx1100 MQ6/Q8 fixed-eight-row-tile module. Each family is derived
 /// from its gfx1100 singleton object; unsupported shape recipes refuse rather
 /// than substituting another architecture's arithmetic.

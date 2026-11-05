@@ -138,6 +138,40 @@ pub struct F2GdnTargets<'a> {
     pub eps: f32,
 }
 
+/// `HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM` (on unless `0`): the MTP draft head's
+/// x-batched MQ2 ranking GEMV runs the gfx1201 PeaceMaker module where it
+/// covers the shape; `0` keeps the hipcc kernel. Read once.
+static MQ2_XBATCH_PM: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM", true));
+
+static MQ2_XBATCH_PM_VERIFIED: LazyLock<Result<(), String>> = LazyLock::new(|| {
+    use sha2::{Digest, Sha256};
+    let actual = format!(
+        "{:x}",
+        Sha256::digest(kernels::GEMV_MQ2_XBATCH_PM_GFX1201)
+    );
+    if actual == kernels::GEMV_MQ2_XBATCH_PM_GFX1201_SHA256 {
+        Ok(())
+    } else {
+        Err(format!(
+            "gemv_mq2_xbatch_pm_gfx1201 SHA256 {actual} differs from pinned {}",
+            kernels::GEMV_MQ2_XBATCH_PM_GFX1201_SHA256
+        ))
+    }
+});
+
+/// Code of an x-batched V2 GEMV launch: a hipcc source (one output row per
+/// wave) or an embedded PeaceMaker module (`rows_per_block` rows per wave).
+#[derive(Clone, Copy)]
+enum XbatchCode {
+    Hip(&'static str),
+    Pm {
+        module: &'static str,
+        image: &'static [u8],
+        rows_per_block: usize,
+    },
+}
+
 // Dispatch settings are process-wide, like FeatureFlags; resolve off the hot path.
 static DISPATCH_IU4_SYMFOLD: LazyLock<bool> =
     LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0"));
@@ -42521,21 +42555,74 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        let pm = *MQ2_XBATCH_PM && self.mq2_xbatch_pm_covers(m, k);
+        self.gemv_mq2g256v2_xbatch_with(a_raw, x, y, m, k, batch_size, pm)
+    }
+
+    /// Whether the gfx1201 PeaceMaker x-batched MQ2 module covers this shape:
+    /// exact gfx1201, `K % 256 == 0`, and every buffer of a four-row chunk
+    /// within the module's 32-bit buffer offsets.
+    pub fn mq2_xbatch_pm_covers(&self, m: usize, k: usize) -> bool {
+        const LIMIT: usize = i32::MAX as usize;
+        self.arch == "gfx1201"
+            && m > 0
+            && k > 0
+            && k.is_multiple_of(256)
+            && (k / 256)
+                .checked_mul(72)
+                .and_then(|row| row.checked_mul(m))
+                .is_some_and(|bytes| bytes <= LIMIT)
+            && m.checked_mul(16).is_some_and(|bytes| bytes <= LIMIT)
+            && k.checked_mul(16).is_some_and(|bytes| bytes <= LIMIT)
+    }
+
+    /// [`Self::gemv_mq2g256v2_xbatch`] on an explicit kernel: `pm` runs the
+    /// gfx1201 PeaceMaker module (an error where
+    /// [`Self::mq2_xbatch_pm_covers`] refuses), otherwise the hipcc kernel.
+    /// Both write the same bytes; `mq2_xbatch_oracle` pins that.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_mq2g256v2_xbatch_with(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        pm: bool,
+    ) -> HipResult<()> {
         if self.fp8_verify_scope {
             return Err(crate::gemm_fp8_verify::fp8_verify_scope_error(
                 "gemv_mq2g256v2_xbatch",
             ));
         }
-        self.gemv_v2_xbatch_rows(
-            "gemv_mq2g256v2_xbatch",
-            kernels::GEMV_MQ2G256V2_XBATCH_SRC,
-            a_raw,
-            x,
-            y,
-            m,
-            k,
-            batch_size,
-        )
+        let code = if pm {
+            if !self.mq2_xbatch_pm_covers(m, k) {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    &format!(
+                        "gemv_mq2g256v2_xbatch_pm: {} M={m} K={k} outside the gfx1201 module",
+                        self.arch
+                    ),
+                ));
+            }
+            MQ2_XBATCH_PM_VERIFIED
+                .clone()
+                .map_err(|reason| hip_bridge::HipError::new(1, &reason))?;
+            XbatchCode::Pm {
+                module: "gemv_mq2_xbatch_pm_gfx1201",
+                image: kernels::GEMV_MQ2_XBATCH_PM_GFX1201,
+                rows_per_block: 4,
+            }
+        } else {
+            XbatchCode::Hip(kernels::GEMV_MQ2G256V2_XBATCH_SRC)
+        };
+        let func = if pm {
+            "gemv_mq2g256v2_xbatch_pm"
+        } else {
+            "gemv_mq2g256v2_xbatch"
+        };
+        self.gemv_v2_xbatch_rows(func, code, a_raw, x, y, m, k, batch_size)
     }
 
     /// MQ4G256V2 without WMMA: the x-batched scalar GEMV decodes each weight
@@ -42565,7 +42652,16 @@ impl Gpu {
         } else {
             ("gemv_mq4g256v2_xbatch", kernels::GEMV_MQ4G256V2_XBATCH_SRC)
         };
-        self.gemv_v2_xbatch_rows(func, source, a_raw, x, y, m, k, batch_size)
+        self.gemv_v2_xbatch_rows(
+            func,
+            XbatchCode::Hip(source),
+            a_raw,
+            x,
+            y,
+            m,
+            k,
+            batch_size,
+        )
     }
 
     /// Launch an x-batched V2 GEMV (`A, x, y, M, K, B` ABI) over `batch_size`
@@ -42575,7 +42671,7 @@ impl Gpu {
     fn gemv_v2_xbatch_rows(
         &mut self,
         func: &'static str,
-        source: &'static str,
+        code: XbatchCode,
         a_raw: &GpuTensor,
         x: &GpuTensor,
         y: &GpuTensor,
@@ -42589,7 +42685,21 @@ impl Gpu {
             "{func}: x-batch V2 GEMV requires K%256==0"
         );
         self.bind_thread()?;
-        self.ensure_kernel(func, source, func)?;
+        let rows_per_block = match code {
+            XbatchCode::Hip(source) => {
+                self.ensure_kernel(func, source, func)?;
+                1
+            }
+            XbatchCode::Pm {
+                module,
+                image,
+                rows_per_block,
+            } => {
+                self.ensure_embedded_kernel(module, image, func)?;
+                rows_per_block
+            }
+        };
+        let grid_x = m.div_ceil(rows_per_block) as u32;
         let a_ptr = a_raw.buf.as_ptr();
         let m_val = m as i32;
         let k_val = k as i32;
@@ -42608,7 +42718,7 @@ impl Gpu {
                 &k_val as *const _ as *mut c_void,
                 &b_val as *const _ as *mut c_void,
             ];
-            self.launch_maybe_blob(func, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            self.launch_maybe_blob(func, [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(a_ptr);
                 b.push_ptr(x_ptr);
@@ -46823,7 +46933,16 @@ impl Gpu {
         } else {
             ("gemv_mq6g256v2_xbatch", kernels::GEMV_MQ6G256V2_XBATCH_SRC)
         };
-        self.gemv_v2_xbatch_rows(func, source, a_raw, x, y, m, k, batch_size)
+        self.gemv_v2_xbatch_rows(
+            func,
+            XbatchCode::Hip(source),
+            a_raw,
+            x,
+            y,
+            m,
+            k,
+            batch_size,
+        )
     }
 
     pub fn gemm_mq6g256v2_batched_lmhead(
