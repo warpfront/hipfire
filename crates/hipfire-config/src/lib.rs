@@ -7305,9 +7305,34 @@ mod tests {
         assert_eq!(memory::qwen4_mtp_head_resident(), None);
     }
 
+    /// `memory::set_qwen4_d2_window_load_default` writes a process-global atomic that
+    /// `memory::qwen4_d2_window_rows` reads, and libtest runs tests on parallel threads: a test
+    /// that writes the load default (or reads the resolved window, which depends on it) holds
+    /// this lock for its whole body. Dropping the guard restores the default 4 even when an
+    /// assertion in the holder panics, so a failure cannot leak a wider window into the other
+    /// test.
+    struct D2WindowLoadDefaultGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for D2WindowLoadDefaultGuard {
+        // Runs before the field drops, i.e. while the lock is still held.
+        fn drop(&mut self) {
+            memory::set_qwen4_d2_window_load_default(memory::QWEN4_D2_WINDOW_ROWS_DEFAULT);
+        }
+    }
+
+    fn lock_d2_window_load_default() -> D2WindowLoadDefaultGuard {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let guard = LOCK.lock().unwrap_or_else(|poison| poison.into_inner());
+        memory::set_qwen4_d2_window_load_default(memory::QWEN4_D2_WINDOW_ROWS_DEFAULT);
+        D2WindowLoadDefaultGuard { _lock: guard }
+    }
+
     #[test]
     fn qwen4_d2_window_rows_parses_four_to_eight_and_refuses_everything_else() {
         use memory::parse_d2_window_rows as parse;
+        let _window = lock_d2_window_load_default();
         assert_eq!(parse(None), Ok(4));
         for rows in 4..=8usize {
             assert_eq!(parse(Some(&rows.to_string())), Ok(rows));
@@ -7331,6 +7356,7 @@ mod tests {
         use memory::{
             qwen4_d2_window_default_for as default_for, resolve_d2_window_rows as resolve,
         };
+        let _window = lock_d2_window_load_default();
         assert_eq!(default_for("gfx1100", false), 8);
         assert_eq!(
             default_for("gfx1100", true),
@@ -7359,7 +7385,7 @@ mod tests {
         for bad in ["", "3", "9", "eight"] {
             assert_eq!(resolve(Some(bad), 8), 4, "{bad:?}");
         }
-        // The loader's per-load record round-trips (and is restored for the other tests).
+        // The loader's per-load record round-trips (the guard restores it for the other tests).
         memory::set_qwen4_d2_window_load_default(8);
         assert_eq!(memory::qwen4_d2_window_rows(), 8);
         memory::set_qwen4_d2_window_load_default(4);
