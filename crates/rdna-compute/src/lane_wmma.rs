@@ -150,7 +150,11 @@ fn weight_args(
     w: &LaneWmmaWeight<'_>,
     rows_w: usize,
     k: usize,
-) -> HipResult<(*const std::ffi::c_void, *const std::ffi::c_void, &'static str)> {
+) -> HipResult<(
+    *const std::ffi::c_void,
+    *const std::ffi::c_void,
+    &'static str,
+)> {
     let elems = rows_w
         .checked_mul(k)
         .ok_or_else(|| err("weight extent overflow"))?;
@@ -348,7 +352,11 @@ impl Gpu {
         // back on every path (including a launch error): the fixed buffer is never dropped.
         let scratch = match self.scratch.lane_wmma_scratch.take() {
             Some(s) => s,
-            None => LaneWmmaScratch::new(self, LANE_WMMA_SCRATCH_PARTIAL_FLOATS, LANE_WMMA_SCRATCH_COUNTERS)?,
+            None => LaneWmmaScratch::new(
+                self,
+                LANE_WMMA_SCRATCH_PARTIAL_FLOATS,
+                LANE_WMMA_SCRATCH_COUNTERS,
+            )?,
         };
         let out = lane_wmma_gemm(
             self,
@@ -412,13 +420,25 @@ mod tests {
     #[test]
     fn fixed_scratch_covers_product_shapes() {
         // (m, k) of the three product sites: HC down, shared/dense widths, wide-ish gates.
-        for (m, k) in [(320usize, 10240usize), (4, 10240), (384, 2560), (2560, 384), (64, 4096)] {
+        for (m, k) in [
+            (320usize, 10240usize),
+            (4, 10240),
+            (384, 2560),
+            (2560, 384),
+            (64, 4096),
+        ] {
             for rows in 16..=64usize {
                 let s = lane_wmma_auto_split_k(m, k, rows, 1);
                 let blocks = m.div_ceil(16) * rows.div_ceil(64);
                 if s > 1 {
-                    assert!(s * rows * m <= LANE_WMMA_SCRATCH_PARTIAL_FLOATS, "m {m} k {k} rows {rows}");
-                    assert!(blocks <= LANE_WMMA_SCRATCH_COUNTERS, "m {m} k {k} rows {rows}");
+                    assert!(
+                        s * rows * m <= LANE_WMMA_SCRATCH_PARTIAL_FLOATS,
+                        "m {m} k {k} rows {rows}"
+                    );
+                    assert!(
+                        blocks <= LANE_WMMA_SCRATCH_COUNTERS,
+                        "m {m} k {k} rows {rows}"
+                    );
                 }
             }
         }

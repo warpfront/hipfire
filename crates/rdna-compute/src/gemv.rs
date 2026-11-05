@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 use crate::dispatch::{DType, Gpu, GpuTensor, FP8_GEMV_MIN_M};
-use crate::lane_wmma::LaneWmmaWeight;
 use crate::kernels;
+use crate::lane_wmma::LaneWmmaWeight;
 use crate::prefill_invariant::{few_row_groups, FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
 use hip_bridge::HipResult;
 use std::ffi::c_void;
@@ -22092,7 +22092,8 @@ impl Gpu {
     /// `HIPFIRE_QWEN4_LANE_WMMA` flag (exact gfx1201) and [`LANE_WMMA_MIN_ROWS`]..=[`WIDE_VERIFY_MAX_ROWS`] rows. Pure; outputs are NOT bitwise the SIMT
     /// route's (f32 summation order differs), but are deterministic.
     pub fn lane_wmma_applies(&self, rows: usize) -> bool {
-        self.flags.qwen4_lane_wmma_enabled() && (LANE_WMMA_MIN_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
+        self.flags.qwen4_lane_wmma_enabled()
+            && (LANE_WMMA_MIN_ROWS..=WIDE_VERIFY_MAX_ROWS).contains(&rows)
     }
 
     /// Whether the HC k4 projection of `rows` activation rows takes the one-launch all-rows arm

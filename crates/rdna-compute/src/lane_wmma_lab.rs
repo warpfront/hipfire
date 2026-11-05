@@ -87,7 +87,9 @@ fn need_dtype(t: &GpuTensor, want: DType, what: &str) -> HipResult<()> {
 
 fn need_aligned(ptr: usize, align: usize, what: &str) -> HipResult<()> {
     if ptr % align != 0 {
-        return Err(err(format!("{what}: pointer {ptr:#x} not {align}-byte aligned")));
+        return Err(err(format!(
+            "{what}: pointer {ptr:#x} not {align}-byte aligned"
+        )));
     }
     Ok(())
 }
@@ -223,7 +225,11 @@ pub fn lane_wmma_hc_up_w8(
     need_aligned(np as usize, 2, "normalized")?;
     need_aligned(mp as usize, 4, "mixed")?;
     let groups = crate::tensor_ops::hc_up_v2_groups(p.rows);
-    let grid = [u32_of(p.hidden / 16, "grid x")?, u32_of(groups, "grid y")?, 1];
+    let grid = [
+        u32_of(p.hidden / 16, "grid x")?,
+        u32_of(groups, "grid y")?,
+        1,
+    ];
     let block = [512u32, 1, 1];
     gpu.ensure_kernel_public(
         LANE_WMMA_HC_UP_W8_MODULE,

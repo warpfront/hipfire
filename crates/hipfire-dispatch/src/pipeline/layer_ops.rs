@@ -1741,20 +1741,18 @@ fn execute_hyper_read_inner(
             && op.low_rank % 32 == 0
             && op.hidden % 16 == 0
         {
-            return hip(
-                rdna_compute::lane_wmma::lane_wmma_read_up(
-                    gpu,
-                    &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(op.input_mix_up.buf),
-                    read.low,
-                    read.normalized,
-                    read.mixed,
-                    op.rows,
-                    op.hidden,
-                    op.low_rank,
-                    1,
-                )
-                .map(|_| ()),
-            );
+            return hip(rdna_compute::lane_wmma::lane_wmma_read_up(
+                gpu,
+                &rdna_compute::lane_wmma::LaneWmmaWeight::Bf16(op.input_mix_up.buf),
+                read.low,
+                read.normalized,
+                read.mixed,
+                op.rows,
+                op.hidden,
+                op.low_rank,
+                1,
+            )
+            .map(|_| ()));
         }
         return hip(hyper_read_up_fused(gpu, &read));
     }

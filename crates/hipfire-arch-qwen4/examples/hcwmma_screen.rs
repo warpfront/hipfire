@@ -50,9 +50,15 @@ use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::pipeline::project_weight;
 use hipfire_runtime::hfq::HfqFile;
 use rayon::prelude::*;
-use rdna_compute::lane_wmma::{lane_wmma_gemm, lane_wmma_read_up, LaneWmmaCfg, LaneWmmaLaunch, LaneWmmaScratch, LaneWmmaWeight};
-use rdna_compute::lane_wmma_lab::{lane_wmma_hc_down_fused_w8, lane_wmma_hc_up_w8, w8_planar_from_q8_0};
-use rdna_compute::tensor_ops::{hyper_norm, hyper_read_up_fused, hyper_read_up_wmma, HyperNorm, HyperReadUpFused};
+use rdna_compute::lane_wmma::{
+    lane_wmma_gemm, lane_wmma_read_up, LaneWmmaCfg, LaneWmmaLaunch, LaneWmmaScratch, LaneWmmaWeight,
+};
+use rdna_compute::lane_wmma_lab::{
+    lane_wmma_hc_down_fused_w8, lane_wmma_hc_up_w8, w8_planar_from_q8_0,
+};
+use rdna_compute::tensor_ops::{
+    hyper_norm, hyper_read_up_fused, hyper_read_up_wmma, HyperNorm, HyperReadUpFused,
+};
 use rdna_compute::{DType, Gpu, GpuTensor, HipResult, LabLaunchWitness};
 use serde_json::{json, Value};
 
@@ -151,7 +157,14 @@ fn err_stats(a: &[f32], r: &[f32]) -> (f64, f64) {
         num += d * d;
         den += f64::from(r[i]) * f64::from(r[i]);
     }
-    (max_abs, if den > 0.0 { (num / den).sqrt() } else { f64::NAN })
+    (
+        max_abs,
+        if den > 0.0 {
+            (num / den).sqrt()
+        } else {
+            f64::NAN
+        },
+    )
 }
 
 /// `(max_rel, mean_rel)` = `(max|a - r| / max|r|, mean|a - r| / mean|r|)` over the common prefix.
@@ -319,7 +332,10 @@ struct Capture {
 
 impl Capture {
     fn start(&self) {
-        self.launches.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.launches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
         self.on.store(true, Ordering::Relaxed);
     }
     fn stop(&self) -> Vec<String> {
@@ -678,14 +694,34 @@ fn load_wt(gpu: &mut Gpu, name: &str, bytes: &[u8], m: usize, k: usize) -> R<(Wt
 
 fn load_weights(gpu: &mut Gpu, hfq: &Hfq, layer: usize) -> R<(Weights, Vec<Value>)> {
     let hc = "attn_hyper_connection";
-    let down_b = hfq.bf16(layer, &format!("{hc}.input_mix_weight_down.weight"), &[RANK, WIDE])?;
-    let up_b = hfq.bf16(layer, &format!("{hc}.input_mix_weight_up.weight"), &[WIDE, RANK])?;
+    let down_b = hfq.bf16(
+        layer,
+        &format!("{hc}.input_mix_weight_down.weight"),
+        &[RANK, WIDE],
+    )?;
+    let up_b = hfq.bf16(
+        layer,
+        &format!("{hc}.input_mix_weight_up.weight"),
+        &[WIDE, RANK],
+    )?;
     let norm_b = hfq.bf16(layer, &format!("{hc}.hc_norm.weight"), &[WIDE])?;
-    let inject_b = hfq.bf16(layer, &format!("{hc}.block_inject_weight.weight"), &[4, WIDE])?;
+    let inject_b = hfq.bf16(
+        layer,
+        &format!("{hc}.block_inject_weight.weight"),
+        &[4, WIDE],
+    )?;
     let se = "mlp.shared_expert";
-    let gate_full = hfq.bf16(layer, &format!("{se}.gate_proj.weight"), &[SH_FULL_I, HIDDEN])?;
+    let gate_full = hfq.bf16(
+        layer,
+        &format!("{se}.gate_proj.weight"),
+        &[SH_FULL_I, HIDDEN],
+    )?;
     let up_full = hfq.bf16(layer, &format!("{se}.up_proj.weight"), &[SH_FULL_I, HIDDEN])?;
-    let down_full = hfq.bf16(layer, &format!("{se}.down_proj.weight"), &[HIDDEN, SH_FULL_I])?;
+    let down_full = hfq.bf16(
+        layer,
+        &format!("{se}.down_proj.weight"),
+        &[HIDDEN, SH_FULL_I],
+    )?;
 
     // Rank 0 of EP2: gate/up rows [0, SH_I) are a contiguous prefix; down columns [0, SH_I) repack row by row.
     let gate_s = gate_full[..SH_I * HIDDEN * 2].to_vec();
@@ -708,7 +744,13 @@ fn load_weights(gpu: &mut Gpu, hfq: &Hfq, layer: usize) -> R<(Weights, Vec<Value
     let inj = one(gpu, "block_inject_weight", &inject_b, 4, WIDE)?;
     let gate = one(gpu, "shared_expert.gate_proj[0:384]", &gate_s, SH_I, HIDDEN)?;
     let sup = one(gpu, "shared_expert.up_proj[0:384]", &up_s, SH_I, HIDDEN)?;
-    let sdown = one(gpu, "shared_expert.down_proj[:,0:384]", &down_s, HIDDEN, SH_I)?;
+    let sdown = one(
+        gpu,
+        "shared_expert.down_proj[:,0:384]",
+        &down_s,
+        HIDDEN,
+        SH_I,
+    )?;
     let norm = upload_bf16_bytes(gpu, &norm_b)?;
     Ok((
         Weights {
@@ -756,13 +798,22 @@ struct Cold {
 impl Cold {
     /// The original followed by its extra copies: as many as `bytes_per_call` needs to cover `COLD_BYTES`
     /// (just the original when `on` is false).
-    fn pick<'a>(&'a self, on: bool, key: &str, wt: &'a Wt, bytes_per_call: usize) -> Vec<&'a WCopy> {
+    fn pick<'a>(
+        &'a self,
+        on: bool,
+        key: &str,
+        wt: &'a Wt,
+        bytes_per_call: usize,
+    ) -> Vec<&'a WCopy> {
         if !on {
             return vec![&wt.main];
         }
         let need = COLD_BYTES.div_ceil(bytes_per_call.max(1)).max(1);
         let extras = self.sets.get(key).map(|v| v.as_slice()).unwrap_or(&[]);
-        std::iter::once(&wt.main).chain(extras.iter()).take(need).collect()
+        std::iter::once(&wt.main)
+            .chain(extras.iter())
+            .take(need)
+            .collect()
     }
 }
 
@@ -831,12 +882,22 @@ fn auto_split(m: usize, k: usize, rows: usize, nn: usize) -> usize {
 
 /// `(partial floats, counters)` large enough for every `lane_wmma_gemm` call this run makes.
 fn scratch_need(cli: &Cli, rows_run: &[usize]) -> (usize, usize) {
-    let shapes = [(RANK, WIDE), (4, WIDE), (SH_I, HIDDEN), (SH_I, HIDDEN), (HIDDEN, SH_I)];
+    let shapes = [
+        (RANK, WIDE),
+        (4, WIDE),
+        (SH_I, HIDDEN),
+        (SH_I, HIDDEN),
+        (HIDDEN, SH_I),
+    ];
     let (mut part, mut cnt) = (1usize, 1usize);
     for &(m, k) in &shapes {
         for &rows in rows_run {
             let nn = cli.nn.unwrap_or_else(|| auto_nn(m));
-            let s = if cli.split > 0 { cli.split } else { auto_split(m, k, rows, nn) };
+            let s = if cli.split > 0 {
+                cli.split
+            } else {
+                auto_split(m, k, rows, nn)
+            };
             part = part.max(s * rows * m);
             // Counters for nn = 1 bound the nn = 2 grid too.
             cnt = cnt.max(m.div_ceil(16) * rows.div_ceil(64));
@@ -938,7 +999,10 @@ fn run_rows(
     let scope = (rows > 8 && rows <= SMALL_ROWS).then_some(rows);
     let cold_on = ctx.cold && small;
     ctx.inc.clear();
-    println!("=== rows {rows} ({} family, scope {scope:?}, ref rows {nr}) ===", if small { "decode" } else { "prefill" });
+    println!(
+        "=== rows {rows} ({} family, scope {scope:?}, ref rows {nr}) ===",
+        if small { "decode" } else { "prefill" }
+    );
     if let Some(r) = scope {
         let prior = gpu.set_wide_verify_rows(r);
         println!(
@@ -973,8 +1037,14 @@ fn run_rows(
     // ---- hc_down ------------------------------------------------------------------------------
     let raw_b = dot_ref(&w.down.h_bf, RANK, WIDE, norm_ref, nr);
     let raw_w = dot_ref(&w.down.h_w8, RANK, WIDE, norm_ref, nr);
-    let down_rb: Vec<f32> = raw_b.iter().map(|&v| hc_act_ref(v as f32, HC_SCALE)).collect();
-    let down_rw: Vec<f32> = raw_w.iter().map(|&v| hc_act_ref(v as f32, HC_SCALE)).collect();
+    let down_rb: Vec<f32> = raw_b
+        .iter()
+        .map(|&v| hc_act_ref(v as f32, HC_SCALE))
+        .collect();
+    let down_rw: Vec<f32> = raw_w
+        .iter()
+        .map(|&v| hc_act_ref(v as f32, HC_SCALE))
+        .collect();
     let mut low_host: Option<Vec<f32>> = None;
     let y_down = alloc(gpu, rows * RANK, DType::F32)?;
     {
@@ -990,10 +1060,15 @@ fn run_rows(
                     family: "hc_down",
                     rows,
                     arm: "incumbent",
-                    launcher: launcher!("Gpu::gemv_bf16_xf32_k4_rows(w,x,y,{RANK},{WIDE},Some({HC_SCALE}),{rows})"),
+                    launcher: launcher!(
+                        "Gpu::gemv_bf16_xf32_k4_rows(w,x,y,{RANK},{WIDE},Some({HC_SCALE}),{rows})"
+                    ),
                     weight_bytes: wb_b,
                     scope,
-                    chk: Some(Check { exact: &down_rb, bf16: None }),
+                    chk: Some(Check {
+                        exact: &down_rb,
+                        bf16: None,
+                    }),
                     inc: true,
                 },
                 Some((&y_b, rows * RANK)),
@@ -1012,7 +1087,10 @@ fn run_rows(
             // F16 copy of the normalized activations (what the F16 WMMA route's norm writes).
             let x16 = upload_u16(
                 gpu,
-                &normh.iter().map(|&v| f16::from_f32(v).to_bits()).collect::<Vec<_>>(),
+                &normh
+                    .iter()
+                    .map(|&v| f16::from_f32(v).to_bits())
+                    .collect::<Vec<_>>(),
                 DType::F16,
             )?;
             let low16 = alloc(gpu, rows * RANK, DType::BF16)?;
@@ -1133,7 +1211,10 @@ fn run_rows(
                     launcher: "tensor_ops::hyper_read_up_fused (BF16 up, low F32)",
                     weight_bytes: wb_b,
                     scope,
-                    chk: Some(Check { exact: &up_rb, bf16: None }),
+                    chk: Some(Check {
+                        exact: &up_rb,
+                        bf16: None,
+                    }),
                     inc: true,
                 },
                 Some((&mixed, n_out)),
@@ -1160,7 +1241,10 @@ fn run_rows(
             // F16 normalized + packed BF16 low through `hyper_read_up_wmma` (the dispatch's route).
             let x16 = upload_u16(
                 gpu,
-                &normh.iter().map(|&v| f16::from_f32(v).to_bits()).collect::<Vec<_>>(),
+                &normh
+                    .iter()
+                    .map(|&v| f16::from_f32(v).to_bits())
+                    .collect::<Vec<_>>(),
                 DType::F16,
             )?;
             let low16 = upload_u16(
@@ -1184,10 +1268,14 @@ fn run_rows(
                     family: "hc_up",
                     rows,
                     arm: "incumbent",
-                    launcher: "tensor_ops::hyper_read_up_wmma (BF16 up, packed BF16 low, F16 normalized)",
+                    launcher:
+                        "tensor_ops::hyper_read_up_wmma (BF16 up, packed BF16 low, F16 normalized)",
                     weight_bytes: wb_b,
                     scope,
-                    chk: Some(Check { exact: &up_rb, bf16: None }),
+                    chk: Some(Check {
+                        exact: &up_rb,
+                        bf16: None,
+                    }),
                     inc: true,
                 },
                 Some((&mixed, n_out)),
@@ -1278,7 +1366,10 @@ fn run_rows(
                 },
                 weight_bytes: wb_b,
                 scope,
-                chk: Some(Check { exact: &gate_rb, bf16: None }),
+                chk: Some(Check {
+                    exact: &gate_rb,
+                    bf16: None,
+                }),
                 inc: true,
             },
             Some((&y_inc, rows * 4)),
@@ -1289,8 +1380,15 @@ fn run_rows(
                     g.gemv_bf16_xf32_k4_rows(&c.bf, &norm32, &y_inc, 4, WIDE, None, rows)
                         .map_err(es)
                 } else {
-                    project_weight(g, &wref(&c.bf, DType::BF16, 4, WIDE), &norm32, &y_inc, rows, Some(&rot))
-                        .map_err(es)
+                    project_weight(
+                        g,
+                        &wref(&c.bf, DType::BF16, 4, WIDE),
+                        &norm32,
+                        &y_inc,
+                        rows,
+                        Some(&rot),
+                    )
+                    .map_err(es)
                 }
             },
         );
@@ -1346,14 +1444,25 @@ fn run_rows(
                     launcher: launcher!("pipeline::project_weight(BF16 [{m},{k}])"),
                     weight_bytes: wb_b,
                     scope,
-                    chk: Some(Check { exact: &rb, bf16: None }),
+                    chk: Some(Check {
+                        exact: &rb,
+                        bf16: None,
+                    }),
                     inc: true,
                 },
                 Some((&y_inc, rows * m)),
                 |g| {
                     let c = lb[ib % lb.len()];
                     ib += 1;
-                    project_weight(g, &wref(&c.bf, DType::BF16, m, k), x, &y_inc, rows, Some(&rot)).map_err(es)
+                    project_weight(
+                        g,
+                        &wref(&c.bf, DType::BF16, m, k),
+                        x,
+                        &y_inc,
+                        rows,
+                        Some(&rot),
+                    )
+                    .map_err(es)
                 },
             );
             gemm_arms(
@@ -1505,7 +1614,8 @@ fn run() -> R<()> {
     );
     gpu.set_lab_launch_observer(Some(observer));
 
-    let hfq = Hfq(HfqFile::open(Path::new(&cli.model)).map_err(|e| format!("open {}: {e}", cli.model.display()))?);
+    let hfq = Hfq(HfqFile::open(Path::new(&cli.model))
+        .map_err(|e| format!("open {}: {e}", cli.model.display()))?);
     let (w, weight_errors) = load_weights(&mut gpu, &hfq, cli.layer)?;
     let rows_run: Vec<usize> = cli
         .rows
@@ -1514,7 +1624,9 @@ fn run() -> R<()> {
         .filter(|&r| !(cli.no_prefill && r > SMALL_ROWS))
         .collect();
     if rows_run.len() != cli.rows.len() {
-        println!("--no-prefill: skipping prefill-family rows (> {SMALL_ROWS}); running {rows_run:?}");
+        println!(
+            "--no-prefill: skipping prefill-family rows (> {SMALL_ROWS}); running {rows_run:?}"
+        );
     }
     if rows_run.is_empty() {
         return Err("--no-prefill left no rows to run".into());
@@ -1522,8 +1634,12 @@ fn run() -> R<()> {
     let max_rows = *rows_run.iter().max().expect("rows");
     let host = make_host(max_rows);
     let (part, cnt) = scratch_need(&cli, &rows_run);
-    println!("hcw scratch: {part} partial floats ({} MB), {cnt} counters", part * 4 >> 20);
-    let scratch = LaneWmmaScratch::new(&mut gpu, part, cnt).map_err(|e| format!("LaneWmmaScratch::new: {e:?}"))?;
+    println!(
+        "hcw scratch: {part} partial floats ({} MB), {cnt} counters",
+        part * 4 >> 20
+    );
+    let scratch = LaneWmmaScratch::new(&mut gpu, part, cnt)
+        .map_err(|e| format!("LaneWmmaScratch::new: {e:?}"))?;
     let cold = if cli.cold && rows_run.iter().any(|&r| r <= SMALL_ROWS) {
         println!(
             "--cold: decode-family arms (rows <= {SMALL_ROWS}) cycle weight copies so each arm's working set is >= {} MB (MALL 64 MB); N printed per arm",
