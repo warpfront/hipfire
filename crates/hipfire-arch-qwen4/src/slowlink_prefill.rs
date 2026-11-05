@@ -4306,12 +4306,18 @@ pub(crate) fn try_run_hetero_prompt(
     // The plan: windows of `slots` tiles; a tile's arena region is its slot's.
     let mut tiles: Vec<TilePlan> = Vec::new();
     let mut windows: Vec<WindowPlan> = Vec::new();
+    // Balanced windows: a window of few tiles leaves its exchanges nothing to
+    // overlap (a lone tile waits out every join), so spread the tiles evenly
+    // over the fewest windows of at most `slots` tiles.
+    let total_tiles = rows.div_ceil(tile_rows);
+    let window_count = total_tiles.div_ceil(slots);
+    let per_window = |w: usize| total_tiles / window_count + usize::from(w < total_tiles % window_count);
     let mut prompt_row = 0;
     while prompt_row < rows {
         let first = tiles.len();
         let window_prompt_row = prompt_row;
         let mut window_row = 0;
-        for slot in 0..slots {
+        for slot in 0..per_window(windows.len()).min(slots) {
             if prompt_row >= rows {
                 break;
             }
@@ -4459,6 +4465,18 @@ impl HeteroRun<'_, '_> {
     fn body(&mut self, w: &WinCtx<'_>, txn: &mut PromptTxn) -> R<()> {
         let geo = self.geo;
         self.ple.histories = PleCursor::histories_for(self.bundle.state.ple_history, w.tiles, w.tokens);
+        // Every tile reaches the PLE layer back to back (layer-major), so the
+        // one-tile lookahead of `stage_tile` hides almost nothing: warm every
+        // tile's rows now (best effort, no lease), while layer 0 runs.
+        if let Some(owner) = self.bundle.ple.as_ref() {
+            let fit = owner.rows.max_rows_per_prefetch().max(1);
+            for ti in 0..w.tiles.len() {
+                let ids = self.ple.histories[ti].row_ids(&owner.metadata, w.tile_tokens(ti));
+                for part in ids.chunks(fit) {
+                    let _ = owner.rows.warm(part.to_vec());
+                }
+            }
+        }
         if w.tiles
             .iter()
             .any(|tile| tile.routing.route_rows >= rdna_compute::gemm::QWEN4_F16_WMMA_MIN_TOKENS)
@@ -4714,9 +4732,14 @@ impl HeteroRun<'_, '_> {
                 }
                 // Hold the tile's MoE/FFN result until its join: the next
                 // tile's layer rewrites the shared FFN output.
-                let src = view(&env.scratch.ffn_output, 0, n * geo.hidden);
-                let dst = view(ffn, 0, n * geo.hidden);
-                gpu.copy_d2d(&src, &dst, src.byte_size())?;
+                // Stream-ordered and asynchronous: a synchronous copy would make
+                // the host wait for the device to drain before enqueueing the
+                // next tile's layer, idling the device in between.
+                let bytes = n * geo.hidden * std::mem::size_of::<f32>();
+                match gpu.active_stream.as_ref() {
+                    Some(st) => gpu.hip.memcpy_dtod_async_at(&ffn.buf, 0, &env.scratch.ffn_output.buf, 0, bytes, st),
+                    None => gpu.hip.memcpy_dtod_async_default_at(&ffn.buf, 0, &env.scratch.ffn_output.buf, 0, bytes),
+                }?;
                 Ok(qsa)
             },
         );
