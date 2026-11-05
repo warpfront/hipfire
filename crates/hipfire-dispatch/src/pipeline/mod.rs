@@ -79,13 +79,14 @@ pub use layer_ops::{
     execute_gated_delta_net_uncovered, execute_grouped_depthwise, execute_grouped_depthwise_rows,
     execute_hyper_norm, execute_hyper_read, execute_hyper_write, execute_indexed_attention,
     execute_indexed_attention_arena, execute_indexed_attention_core_rows,
-    execute_indexed_attention_uncovered, execute_lm_head, execute_project, gdn_qkv_projection_bf16,
-    grouped_depthwise_lanes_admitted, project_weight, project_weights,
+    execute_indexed_attention_uncovered, execute_lm_head, execute_project, execute_row_gather,
+    gdn_qkv_projection_bf16, grouped_depthwise_lanes_admitted, project_weight, project_weights,
     qsa_projection_hook_installed, reset_qsa_projection_slot, set_qsa_projection_hook,
     validate_lm_head, BroadcastAddOp, ClearOp, CoreWindow, EmbeddingOp, GatedDeltaNetOp,
     GatedShortConvOp, GdnRowCapture, GdnTrunkArenas, GroupedDepthwiseOp, HyperNormOp, HyperReadOp,
     HyperWriteAr, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp, IndexedAttentionState,
     LaneAttentionOp, MixerPhase, ProjectLadder, ProjectOp, QsaProjectionHook, QsaTrunkArenas,
+    RowGather, RowGatherOp,
 };
 pub use step_graph::{
     op_kind_of, Alias, OpDecl, OpId, OpKind, ResourceClass, ResourceDecl, ResourceId, SplitRule,

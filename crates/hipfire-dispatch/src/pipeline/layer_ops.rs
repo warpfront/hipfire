@@ -5725,6 +5725,68 @@ pub fn execute_clear(gpu: &mut Gpu, op: &ClearOp<'_>) -> Result<(), DispatchErro
     hip(gpu.zero_f32(&span))
 }
 
+/// Sequence-parallel all-gather of the rows of one scratch tensor (the Flash-Next EP2 prefill
+/// route, `HIPFIRE_QWEN4_EP_SEQ_PARALLEL`): the rows this rank produced are sent to the peer and
+/// the peer's rows received in place, so every rank holds all `rows` rows again. The row ranges
+/// belong to the architecture crate's transport ([`RowGather`]); the step is a fusion barrier like
+/// [`ClearOp`].
+pub struct RowGatherOp<'a> {
+    /// The FULL tensor (row 0 at its base), never an own-row view.
+    pub tensor: &'a GpuTensor,
+    /// `true`: the tensor holds F32 words that are BF16-exact (4 bytes per element); `false`:
+    /// BF16 bits (2 bytes per element).
+    pub f32_bf16: bool,
+    /// Elements per row (a multiple of 4).
+    pub row_elems: usize,
+    /// Rows of the full tile.
+    pub rows: usize,
+    pub exec: &'a dyn RowGather,
+}
+
+/// The transport of [`RowGatherOp`]: gathers rows `0..rows` of `tensor` (`[rows][row_elems]` of
+/// the declared element kind) across the ranks, the row split being the implementor's state.
+pub trait RowGather: Send + Sync {
+    fn row_gather(
+        &self,
+        gpu: &mut Gpu,
+        tensor: &GpuTensor,
+        f32_bf16: bool,
+        row_elems: usize,
+        rows: usize,
+    ) -> Result<(), String>;
+}
+
+impl RowGatherOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.row_elems == 0 || !self.row_elems.is_multiple_of(4) {
+            return Err(DispatchError::Hip(
+                "row gather needs rows > 0 and a row of a multiple of 4 elements".into(),
+            ));
+        }
+        let elem_bytes = if self.f32_bf16 { 4 } else { 2 };
+        let need = checked_mul(
+            checked_mul(self.rows, self.row_elems, "row gather elements")?,
+            elem_bytes,
+            "row gather bytes",
+        )?;
+        if self.tensor.dtype != DType::F32 || self.tensor.buf.size() < need {
+            return Err(DispatchError::Hip(format!(
+                "row gather needs an F32-typed tensor of {need} bytes, got {:?} with {} bytes",
+                self.tensor.dtype,
+                self.tensor.buf.size()
+            )));
+        }
+        Ok(())
+    }
+}
+
+pub fn execute_row_gather(gpu: &mut Gpu, op: &RowGatherOp<'_>) -> Result<(), DispatchError> {
+    op.validate_for_gpu(gpu)?;
+    op.exec
+        .row_gather(gpu, op.tensor, op.f32_bf16, op.row_elems, op.rows)
+        .map_err(|e| DispatchError::Hip(format!("row gather: {e}")))
+}
+
 /// Embedding-table lookup for `rows` token ids (`token_ids`: `rows` i32 bytes).
 /// MQ4 v2 tables stage rows in `rotated` (`rows * dim` F32) before FWHT decode.
 pub struct EmbeddingOp<'a> {

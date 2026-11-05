@@ -63,7 +63,7 @@ use hipfire_dispatch::pipeline::{
     seal_decode, validate_steps, BoundMoeExperts, ClearOp, EmbeddingOp, ExpertBindingCache,
     ExpertMetadata, ExpertResource, ExpertResources, ExpertTable, GatedDeltaNetOp,
     GroupedDepthwiseOp, HyperReadOp, HyperWriteOp, IndexedAttentionMode, IndexedAttentionOp,
-    IndexedAttentionState, MixerPhase, MoeStepHooks, Step,
+    IndexedAttentionState, MixerPhase, MoeStepHooks, RowGatherOp, Step,
 };
 use hipfire_dispatch::types::dtype_rotation_plan;
 use hipfire_dispatch::types::DispatchError;
@@ -769,6 +769,9 @@ pub fn qwen4_decode_share_class_spans(
 pub const QWEN4_FORWARD_HEADROOM_BYTES: u64 = 1 << 30;
 
 const QWEN4_STEP_INLINE_CAPACITY: usize = 384;
+/// Extra step capacity of a sequence-parallel chunk program (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`):
+/// two `RowGather`s per layer plus the PLE-layer and final stream gathers.
+const QWEN4_SP_EXTRA_STEPS: usize = 192;
 const QWEN4_QSA_INLINE_CAPACITY: usize = 12;
 
 /// Long-prefill host-expert staging (G2). `1`/`0` force it on/off; unset it
@@ -9608,6 +9611,71 @@ pub(crate) fn stage_ple_rows(
     Ok(())
 }
 
+/// Own-row views of the scratch a sequence-parallel chunk program
+/// (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`) builds its HC reads and writes over: every tensor is the
+/// view of this rank's rows `rows.own` of the full tile. They are built once per chunk and
+/// borrowed by every layer's steps ([`LayerPhaseEnv::sp`]).
+pub(crate) struct SpViews {
+    pub(crate) rows: crate::trunk_route::SpRows,
+    /// The transport of the program's `RowGather` steps.
+    pub(crate) exec: &'static dyn hipfire_dispatch::pipeline::RowGather,
+    /// HC streams: the view starts at byte `own.0 * row_bytes` of the stream kind (BF16 bits or
+    /// F32 words), so it is offset in half the F32 elements under BF16 streams.
+    pub(crate) streams: GpuTensor,
+    pub(crate) gates: GpuTensor,
+    pub(crate) normalized: GpuTensor,
+    pub(crate) low: GpuTensor,
+    pub(crate) up: GpuTensor,
+    pub(crate) hc_mixed: GpuTensor,
+    pub(crate) attention_output: GpuTensor,
+    pub(crate) ffn_output: GpuTensor,
+}
+
+impl SpViews {
+    pub(crate) fn new(
+        scratch: &Qwen4GpuForwardScratch,
+        route: &'static crate::trunk_route::TrunkShardRoute,
+        rows: crate::trunk_route::SpRows,
+        dims: Qwen4ProgramDims,
+        bf16_state: bool,
+    ) -> Self {
+        let (row0, own) = rows.own;
+        let (wide, hidden, branches, low_rank) =
+            (dims.wide(), dims.hidden, dims.hc_count, dims.hc_lowrank);
+        Self {
+            rows,
+            exec: route,
+            streams: scratch
+                .streams
+                .sub_offset(row0 * wide / if bf16_state { 2 } else { 1 }, own * wide),
+            gates: scratch.hc_gates.sub_offset(row0 * branches, own * branches),
+            normalized: scratch.hc_normalized.sub_offset(row0 * wide, own * wide),
+            low: scratch.hc_low.sub_offset(row0 * low_rank, own * low_rank),
+            up: scratch.hc_up.sub_offset(row0 * wide, own * wide),
+            hc_mixed: scratch.hc_mixed.sub_offset(row0 * hidden, own * hidden),
+            attention_output: scratch
+                .attention_output
+                .sub_offset(row0 * hidden, own * hidden),
+            ffn_output: scratch.ffn_output.sub_offset(row0 * hidden, own * hidden),
+        }
+    }
+}
+
+/// The tensors and rows one layer's HC reads and writes run over: the whole tile, or under
+/// sequence parallelism the own-row views ([`SpViews`]).
+#[derive(Clone, Copy)]
+struct HcViews<'a> {
+    streams: &'a GpuTensor,
+    gates: &'a GpuTensor,
+    normalized: &'a GpuTensor,
+    low: &'a GpuTensor,
+    up: &'a GpuTensor,
+    mixed: &'a GpuTensor,
+    attention_output: &'a GpuTensor,
+    ffn_output: &'a GpuTensor,
+    rows: usize,
+}
+
 /// Typed per-layer step construction shared by the chunk-major forward
 /// (`forward_chunk_scoped`) and the S1 layer-major prompt schedule
 /// (`crate::slowlink_prefill`). Every lowering of a layer's HC read / mixer /
@@ -9641,9 +9709,66 @@ pub(crate) struct LayerPhaseEnv<'a> {
     /// The MoE FFN of this program is the rank's PARTIAL (trunk-shard route): its HC write
     /// carries the all-reduce. False outside the route and for the S1 layer-major schedule.
     pub(crate) ffn_partial: bool,
+    /// `Some`: the sequence-parallel chunk program of this rank (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`):
+    /// the HC reads and writes run over the own rows and a `RowGather` follows each read.
+    /// `None` everywhere else.
+    pub(crate) sp: Option<&'a SpViews>,
 }
 
 impl<'a> LayerPhaseEnv<'a> {
+    /// Step-count ceiling of the program (the sequence-parallel one adds its gathers).
+    pub(crate) fn step_limit(&self) -> usize {
+        QWEN4_STEP_INLINE_CAPACITY
+            + if self.sp.is_some() {
+                QWEN4_SP_EXTRA_STEPS
+            } else {
+                0
+            }
+    }
+
+    fn hc_views(&self) -> HcViews<'a> {
+        let scratch: &'a Qwen4GpuForwardScratch = self.scratch;
+        match self.sp {
+            Some(sp) => HcViews {
+                streams: &sp.streams,
+                gates: &sp.gates,
+                normalized: &sp.normalized,
+                low: &sp.low,
+                up: &sp.up,
+                mixed: &sp.hc_mixed,
+                attention_output: &sp.attention_output,
+                ffn_output: &sp.ffn_output,
+                rows: sp.rows.own.1,
+            },
+            None => HcViews {
+                streams: self.streams,
+                gates: self.gates,
+                normalized: &scratch.hc_normalized,
+                low: &scratch.hc_low,
+                up: &scratch.hc_up,
+                mixed: &scratch.hc_mixed,
+                attention_output: &scratch.attention_output,
+                ffn_output: &scratch.ffn_output,
+                rows: self.rows,
+            },
+        }
+    }
+
+    /// Under sequence parallelism, the all-gather that completes `scratch.hc_mixed` (the mixer
+    /// and the MoE read every row of it) after an own-row HC read.
+    fn push_hc_mixed_gather(&self, steps: &mut Vec<Step<'a>>) {
+        if let Some(sp) = self.sp {
+            let scratch: &'a Qwen4GpuForwardScratch = self.scratch;
+            steps.push(Step::RowGather(RowGatherOp {
+                tensor: &scratch.hc_mixed,
+                f32_bf16: true,
+                row_elems: self.bundle.config.hidden_size,
+                rows: sp.rows.n,
+                exec: sp.exec,
+            }));
+        }
+    }
+
     /// The PLE depthwise step of the PLE layer and whether it stages its rows
     /// as F16 (decided once; the staging closure agrees on it).
     pub(crate) fn ple_step(
@@ -9714,7 +9839,8 @@ impl<'a> LayerPhaseEnv<'a> {
         let (n, route_n, few_row_limit) = (self.rows, self.route_n, self.few_row_limit);
         let bf16_state = self.bf16_state;
         let attn_read = &description.attn_hyper.read;
-        if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
+        let hc = self.hc_views();
+        if steps.len() >= self.step_limit() {
             return Err(invalid(
                 "Qwen4 generic layer program inline capacity exhausted",
             ));
@@ -9722,7 +9848,7 @@ impl<'a> LayerPhaseEnv<'a> {
         steps.push(Step::HyperRead(HyperReadOp {
             rotation: &scratch.rotation,
             state_bf16: bf16_state,
-            input: self.streams,
+            input: hc.streams,
             norm_weight: attn_read.norm,
             input_mix_down: decode_copy(
                 self.decode_q8,
@@ -9738,15 +9864,16 @@ impl<'a> LayerPhaseEnv<'a> {
                 few_row_limit,
                 attn_read.input_mix_up,
             ),
-            normalized: &scratch.hc_normalized,
-            low: &scratch.hc_low,
-            up: &scratch.hc_up,
-            mixed: &scratch.hc_mixed,
-            rows: n,
+            normalized: hc.normalized,
+            low: hc.low,
+            up: hc.up,
+            mixed: hc.mixed,
+            rows: hc.rows,
             branches: dims.hc_count,
             hidden: config.hidden_size,
             low_rank: dims.hc_lowrank,
         }));
+        self.push_hc_mixed_gather(steps);
 
         match layer.kind {
             LayerType::LinearAttention => {
@@ -9879,14 +10006,14 @@ impl<'a> LayerPhaseEnv<'a> {
             ar: crate::trunk_route::attn_writer(),
             rotation: &scratch.rotation,
             state_bf16: bf16_state,
-            input: self.streams,
+            input: hc.streams,
             norm_weight: attn_write.norm,
             block_inject: attn_write.block_inject,
-            normalized: &scratch.hc_normalized,
-            mixed: &scratch.attention_output,
-            gates: self.gates,
-            output: self.streams,
-            rows: n,
+            normalized: hc.normalized,
+            mixed: hc.attention_output,
+            gates: hc.gates,
+            output: hc.streams,
+            rows: hc.rows,
             branches: dims.hc_count,
             hidden: config.hidden_size,
         }));
@@ -9895,7 +10022,7 @@ impl<'a> LayerPhaseEnv<'a> {
         steps.push(Step::HyperRead(HyperReadOp {
             rotation: &scratch.rotation,
             state_bf16: bf16_state,
-            input: self.streams,
+            input: hc.streams,
             norm_weight: mlp_read.norm,
             input_mix_down: decode_copy(
                 self.decode_q8,
@@ -9911,15 +10038,16 @@ impl<'a> LayerPhaseEnv<'a> {
                 few_row_limit,
                 mlp_read.input_mix_up,
             ),
-            normalized: &scratch.hc_normalized,
-            low: &scratch.hc_low,
-            up: &scratch.hc_up,
-            mixed: &scratch.hc_mixed,
-            rows: n,
+            normalized: hc.normalized,
+            low: hc.low,
+            up: hc.up,
+            mixed: hc.mixed,
+            rows: hc.rows,
             branches: dims.hc_count,
             hidden: config.hidden_size,
             low_rank: dims.hc_lowrank,
         }));
+        self.push_hc_mixed_gather(steps);
         Ok(())
     }
 
@@ -9992,6 +10120,14 @@ impl<'a> LayerPhaseEnv<'a> {
         mixed: &'a GpuTensor,
     ) -> Step<'a> {
         let scratch = self.scratch;
+        let hc = self.hc_views();
+        // Under sequence parallelism the FFN output is the chunk's `scratch.ffn_output` (the MoE
+        // layers' write carries the all-reduce, checked per band before the program is built), so
+        // the own-row view of it replaces `mixed`.
+        debug_assert!(
+            self.sp.is_none() || mixed.buf.as_ptr() == scratch.ffn_output.buf.as_ptr(),
+            "a sequence-parallel chunk writes the FFN output of `scratch.ffn_output` only"
+        );
         let mlp_write = &description.mlp_hyper.write;
         Step::HyperWrite(HyperWriteOp {
             // Under the trunk-shard route every forward's FFN is this rank's partial (decode and
@@ -10007,14 +10143,18 @@ impl<'a> LayerPhaseEnv<'a> {
             }),
             rotation: &scratch.rotation,
             state_bf16: self.bf16_state,
-            input: self.streams,
+            input: hc.streams,
             norm_weight: mlp_write.norm,
             block_inject: mlp_write.block_inject,
-            normalized: &scratch.hc_normalized,
-            mixed,
-            gates: self.gates,
-            output: self.streams,
-            rows: self.rows,
+            normalized: hc.normalized,
+            mixed: if self.sp.is_some() {
+                hc.ffn_output
+            } else {
+                mixed
+            },
+            gates: hc.gates,
+            output: hc.streams,
+            rows: hc.rows,
             branches: self.dims.hc_count,
             hidden: self.bundle.config.hidden_size,
         })
@@ -16276,7 +16416,84 @@ impl Qwen4GpuForward {
                 .map_err(|error| invalid(format!("EP stage quiesce barrier: {error}")))?;
             }
         }
-        if config.num_hidden_layers.saturating_mul(7).saturating_add(1) > QWEN4_STEP_INLINE_CAPACITY
+        // Sequence-parallel prefill (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`, default on, `0` kills): a wide EP2
+        // trunk-shard prefill chunk runs its HC reads / writes over this rank's half of the rows
+        // (own-row views), the HC write as a reduce-scatter (`TrunkShardRoute::ar_hyper_write`)
+        // and `RowGather` steps rejoin the rows where a mixer, the MoE or the PLE conv needs all
+        // of them. Decided on `n` and load-time facts only, so both ranks always agree; any
+        // reject runs today's all-reduce route for the whole chunk. Silent per chunk: the
+        // ordinary rejects (flag off, not a wide prefill chunk) log nothing, the first chunk
+        // that takes SP and the first structural reject log one line each.
+        let sp_rows = crate::trunk_route::sp_rows(n).filter(|_| {
+            ep.is_some()
+                && trunk_chunk_partial
+                && self.prefill_scope
+                && n >= crate::trunk_route::SP_MIN_ROWS
+                && route_n == n
+        });
+        let sp_views: Option<SpViews> = match (sp_rows, crate::trunk_route::sp_route()) {
+            (Some(rows), Some(route)) => {
+                let reject: Option<&'static str> =
+                    if mesh_run || segment.as_ref().is_some_and(|s| !(s.first && s.last)) {
+                        Some("a mesh pipeline segment")
+                    } else if self.layer_capture.is_some() {
+                        Some("the DFlash2 layer capture")
+                    } else if crate::chunk_dump::config().is_some() {
+                        Some("the chunk dump")
+                    } else if self.cut_layers.is_some() {
+                        Some("HIPFIRE_QWEN4_CUT_LAYERS")
+                    } else if self.qsa_tap.is_some() {
+                        Some("the QSA parity tap")
+                    } else if gpu.replay.is_recording() || gpu.graphs.capture_mode {
+                        Some("a recorded or captured forward")
+                    } else if band.clone().any(|index| {
+                        !bundle
+                            .weights
+                            .layer(index)
+                            .is_some_and(|layer| matches!(layer.ffn, Qwen4FfnWeights::Moe(_)))
+                    }) {
+                        Some("a layer whose FFN write does not carry the all-reduce")
+                    } else {
+                        None
+                    };
+                match reject {
+                    None => {
+                        static NOTED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!(
+                                "  qwen4 EP sequence-parallel prefill (HIPFIRE_QWEN4_EP_SEQ_PARALLEL, =0 restores the all-reduce route): chunks of >= {} rows split their rows across the two ranks (reduce-scatter HC write, row all-gather)",
+                                crate::trunk_route::SP_MIN_ROWS
+                            );
+                        }
+                        Some(SpViews::new(&self.scratch, route, rows, dims, bf16_state))
+                    }
+                    Some(why) => {
+                        static NOTED: std::sync::atomic::AtomicBool =
+                            std::sync::atomic::AtomicBool::new(false);
+                        if !NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            eprintln!(
+                                "  qwen4 EP sequence-parallel prefill declined for a chunk: {why}; those chunks run the all-reduce route"
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+        let step_capacity = QWEN4_STEP_INLINE_CAPACITY
+            + if sp_views.is_some() {
+                QWEN4_SP_EXTRA_STEPS
+            } else {
+                0
+            };
+        // 7 steps per layer (9 under sequence parallelism: two gathers) and the final head.
+        if config
+            .num_hidden_layers
+            .saturating_mul(if sp_views.is_some() { 9 } else { 7 })
+            .saturating_add(if sp_views.is_some() { 3 } else { 1 })
+            > step_capacity
         {
             return Err(invalid(
                 "Qwen4 generic layer program inline capacity exhausted",
@@ -16392,7 +16609,7 @@ impl Qwen4GpuForward {
         // Heap, not an inline SmallVec: 384 inline steps are ~567 KiB, and the `attempt`
         // closure below moves `steps`, so the frame held three copies (~1.7 MiB). That
         // overflowed the 2 MiB stack of an EP peer rank's worker thread in a chunk forward.
-        let mut steps: Vec<Step<'_>> = Vec::with_capacity(QWEN4_STEP_INLINE_CAPACITY);
+        let mut steps: Vec<Step<'_>> = Vec::with_capacity(step_capacity);
         // `HIPFIRE_QWEN4_PLE_FUSE`: the PLE rows are staged straight as F16 for
         // the BF16 key/value projections (decided once; the step op and the
         // staging closure agree on it).
@@ -16425,6 +16642,7 @@ impl Qwen4GpuForward {
             // Every forward's FFN is this rank's partial under the trunk-shard route (gathered
             // shapes: the gather is skipped; chunks: the compact table above).
             ffn_partial: ep.is_some() && crate::trunk_route::ffn_partial_active(),
+            sp: sp_views.as_ref(),
         };
         // DFlash2 layer capture: each captured layer's slot, keyed by the
         // step (the next layer's mixer) before which the streams hold its
@@ -16452,10 +16670,22 @@ impl Qwen4GpuForward {
                     .ple
                     .as_ref()
                     .ok_or_else(|| invalid("PLE weights missing"))?;
-                if steps.len() >= QWEN4_STEP_INLINE_CAPACITY {
+                if steps.len() >= layer_env.step_limit() {
                     return Err(invalid(
                         "Qwen4 generic layer program inline capacity exhausted",
                     ));
+                }
+                // Sequence-parallel chunk: the PLE depthwise conv reads and writes EVERY row of
+                // the streams, but each rank holds only its own rows current: rejoin them first.
+                // (At the band's first layer the streams are still the replicated embedding.)
+                if let Some(sp) = layer_env.sp.filter(|_| layer_index != band.start) {
+                    steps.push(Step::RowGather(RowGatherOp {
+                        tensor: &self.scratch.streams,
+                        f32_bf16: !bf16_state,
+                        row_elems: dims.wide(),
+                        rows: sp.rows.n,
+                        exec: sp.exec,
+                    }));
                 }
                 let (ple_step, rows_f16) =
                     layer_env.ple_step(gpu, ple_weights, ple_head_count, ple_row_width)?;
@@ -16589,6 +16819,17 @@ impl Qwen4GpuForward {
                     && gpu.qwen4_moe_sym_iu4_applies(route_n);
                 dump_ends.push((layer_index, steps.len(), bf16_grouped));
             }
+        }
+        // Sequence-parallel chunk: the final hyper read, the head and the wide-hidden capture
+        // read every row of the streams.
+        if let Some(sp) = layer_env.sp {
+            steps.push(Step::RowGather(RowGatherOp {
+                tensor: &self.scratch.streams,
+                f32_bf16: !bf16_state,
+                row_elems: dims.wide(),
+                rows: sp.rows.n,
+                exec: sp.exec,
+            }));
         }
         let capture_last = capture_layers
             .iter()
@@ -16798,6 +17039,11 @@ impl Qwen4GpuForward {
         let mut device_read: Option<u32> = None;
         let mut diagnostic_capture = false;
         let mut traced = false;
+        // Arm the sequence-parallel split for this program's writes and gathers (disarmed right
+        // after the attempt, whatever way it ends).
+        if let Some(sp) = sp_views.as_ref() {
+            crate::trunk_route::sp_begin(sp.rows);
+        }
         let attempt = (|| -> Result<
             SmallVec<[(usize, usize, usize, usize, usize, usize); QWEN4_QSA_INLINE_CAPACITY]>,
             Qwen4GpuForwardError,
@@ -17397,6 +17643,9 @@ impl Qwen4GpuForward {
             drop(steps);
             Ok(qsa_commits)
         })();
+        if sp_views.is_some() {
+            crate::trunk_route::sp_end();
+        }
         // Whatever way the attempt ended, no early id copy outlives the
         // forward: lanes, MTP and the NPU trunk write `token_ids` unfenced.
         let drained = match self.token_readback.as_mut() {

@@ -1799,13 +1799,17 @@ impl Qwen4Bundle {
                         || {
                             exchange
                                 .register(0, gpu0)
-                                .map_err(|e| format!("register trunk-shard mailbox: {e}"))
+                                .map_err(|e| format!("register trunk-shard mailbox: {e}"))?;
+                            // `HIPFIRE_QWEN4_EP_SEQ_PARALLEL`: resolve the SP kernels now (JIT is
+                            // not capture-safe); a no-op with the switch off.
+                            crate::trunk_route::sp_prepare(&exchange, gpu0)
                         },
                         &|rank, peer: &mut Qwen4EpPeer| {
                             peer.ar_hc = Some(exchange.clone());
                             exchange
                                 .register(rank, &mut peer.gpu)
-                                .map_err(|e| format!("register trunk-shard mailbox: {e}"))
+                                .map_err(|e| format!("register trunk-shard mailbox: {e}"))?;
+                            crate::trunk_route::sp_prepare(&exchange, &mut peer.gpu)
                         },
                     )
                 };

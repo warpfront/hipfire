@@ -3252,6 +3252,7 @@ fn with_tile_frames<T>(
             streams: tile_streams,
             gates: &forward.scratch.hc_gates,
             ffn_partial: false,
+            sp: None,
         })
         .collect();
     let frames: Vec<TileFrame<'_>> = (0..tiles.len())

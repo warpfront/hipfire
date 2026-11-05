@@ -11,12 +11,57 @@
 //! tables ([`install`]) and read where the forward builds its HC writes. It is leaked once
 //! per load (a few bytes): the forward borrows it as `&'static dyn HyperWriteAr`.
 
-use hipfire_dispatch::pipeline::HyperWriteAr;
+use hipfire_dispatch::pipeline::{HyperWriteAr, RowGather};
 use hipfire_runtime::ar_hc_exchange::ArHcExchange;
-use rdna_compute::ar_hc_write::StreamKind;
+use rdna_compute::ar_hc_write::{sp_even_split, SpAgElem, StreamKind};
 use rdna_compute::{Gpu, GpuTensor};
 use std::cell::Cell;
-use std::sync::Arc;
+use std::ffi::c_void;
+use std::sync::{Arc, Mutex};
+
+/// Switch of the sequence-parallel prefill route: unset (or `1` / `on` / `true`) = ON wherever
+/// the trunk-shard route runs (exact gfx1201 EP2, `HIPFIRE_QWEN4_EP_TRUNK_SHARD`); `0` / `off` /
+/// `false` is the kill switch (the all-reduce route); any other value is off (fail safe).
+pub(crate) const SP_ENV: &str = "HIPFIRE_QWEN4_EP_SEQ_PARALLEL";
+
+/// Smallest chunk (rows) that runs sequence-parallel: both halves (`n / 2` rows, floored) must
+/// sit on the same side of every HC read / write kernel-route threshold as the whole chunk
+/// (`wide_exact_rows` / the few-row limit up to `WIDE_VERIFY_MAX_ROWS`, the F16 WMMA and BF16
+/// stream floor `QWEN4_F16_WMMA_MIN_TOKENS`, the HC up `_v2` floor, the HC down fused floors), so
+/// the own-row HC read / write launches take the routes the all-rows launch takes. The binding
+/// one is `HC_DOWN_FUSED_MIN_ROWS` (1536 on gfx1201): `3072 / 2`. Pinned by a unit test.
+pub(crate) const SP_MIN_ROWS: usize = 3072;
+
+/// Whether the raw [`SP_ENV`] value asks for the sequence-parallel prefill route.
+pub(crate) fn sp_switch(raw: Option<&str>) -> bool {
+    matches!(raw.map(str::trim), None | Some("" | "1" | "on" | "true"))
+}
+
+/// Whether the process asks for the sequence-parallel prefill route ([`SP_ENV`], [`sp_switch`]).
+pub(crate) fn sp_requested() -> bool {
+    sp_switch(hipfire_config::developer_var(SP_ENV).ok().as_deref())
+}
+
+/// The row split of one sequence-parallel chunk on one rank: `own` / `peer` are
+/// `(first row, rows)` ranges of the `n`-row tile ([`sp_even_split`], mirrored on the peer).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpRows {
+    pub(crate) own: (usize, usize),
+    pub(crate) peer: (usize, usize),
+    pub(crate) n: usize,
+}
+
+impl SpRows {
+    /// The split of an `n`-row chunk on `rank` (0 or 1).
+    pub(crate) fn of(rank: usize, n: usize) -> Self {
+        let split = sp_even_split(n);
+        Self {
+            own: split[rank],
+            peer: split[1 - rank],
+            n,
+        }
+    }
+}
 
 /// One rank's route.
 pub(crate) struct TrunkShardRoute {
@@ -27,6 +72,12 @@ pub(crate) struct TrunkShardRoute {
     /// The FFN writes carry it (the sealed MoE then yields this rank's partial: no row
     /// gather).
     ffn: bool,
+    /// [`SP_ENV`] was on when the route was installed.
+    sp_on: bool,
+    /// The sequence-parallel split of the chunk program being executed ([`sp_begin`] /
+    /// [`sp_end`]); `None` outside one. A mutex, not a cell: the route is a `Sync`
+    /// [`HyperWriteAr`], though only its own rank thread ever touches the state.
+    sp: Mutex<Option<SpRows>>,
 }
 
 impl TrunkShardRoute {
@@ -36,7 +87,13 @@ impl TrunkShardRoute {
             rank,
             attn,
             ffn,
+            sp_on: sp_requested(),
+            sp: Mutex::new(None),
         }
+    }
+
+    fn sp_state(&self) -> Option<SpRows> {
+        *self.sp.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -50,6 +107,47 @@ impl HyperWriteAr for TrunkShardRoute {
         rows: usize,
         state_bf16: bool,
     ) -> Result<(), String> {
+        // Sequence-parallel chunk: the op is built over the OWN rows (`rows == own.1`, views at
+        // the own-row offset). Rebase the views to the full tile and run the reduce-scatter write,
+        // which folds and writes the own rows and pushes the peer rows to the peer.
+        if let Some(sp) = self.sp_state().filter(|sp| rows == sp.own.1) {
+            let kind = StreamKind::from_state_bf16(state_bf16);
+            let row0 = sp.own.0;
+            // SAFETY: the views were cut at row `row0` of live full-tile buffers (`[n, 2560]` f32
+            // partial, `[n, 4, 2560]` streams of `kind`, `[n, 4]` f32 gates), so the rebased
+            // pointers are those buffers' bases; `sp_rs_write` touches only rows of `own` / `peer`
+            // inside the `n`-row tile.
+            return unsafe {
+                self.exchange.sp_rs_write(
+                    self.rank,
+                    gpu,
+                    partial
+                        .buf
+                        .as_ptr()
+                        .cast::<u8>()
+                        .sub(row0 * 2560 * 4)
+                        .cast::<c_void>(),
+                    streams
+                        .buf
+                        .as_ptr()
+                        .cast::<u8>()
+                        .sub(row0 * kind.row_bytes())
+                        .cast::<c_void>(),
+                    kind,
+                    gates
+                        .buf
+                        .as_ptr()
+                        .cast::<u8>()
+                        .sub(row0 * 4 * 4)
+                        .cast::<c_void>()
+                        .cast_const(),
+                    sp.own,
+                    sp.peer,
+                    std::ptr::null_mut(),
+                )
+            }
+            .map_err(|error| format!("rank {}: sequence-parallel write: {error}", self.rank));
+        }
         // SAFETY: the tensors are live device buffers of this rank's forward with the
         // `[rows, 2560]` f32 partial, `[rows, 4, 2560]` streams of the `state_bf16` kind and `[rows, 4]` f32
         // gate extents (`execute_hyper_write_inner` validated the op).
@@ -66,6 +164,49 @@ impl HyperWriteAr for TrunkShardRoute {
             )
         }
         .map_err(|error| format!("rank {}: {error}", self.rank))
+    }
+}
+
+impl RowGather for TrunkShardRoute {
+    fn row_gather(
+        &self,
+        gpu: &mut Gpu,
+        tensor: &GpuTensor,
+        f32_bf16: bool,
+        row_elems: usize,
+        rows: usize,
+    ) -> Result<(), String> {
+        let sp = self.sp_state().ok_or_else(|| {
+            format!(
+                "rank {}: row gather outside a sequence-parallel chunk",
+                self.rank
+            )
+        })?;
+        if rows != sp.n {
+            return Err(format!(
+                "rank {}: row gather of {rows} rows in a sequence-parallel chunk of {}",
+                self.rank, sp.n
+            ));
+        }
+        let elem = if f32_bf16 {
+            SpAgElem::F32Bf16
+        } else {
+            SpAgElem::Bf16
+        };
+        // SAFETY: `tensor` is the live full tile (`rows * row_elems` elements of `elem`, the
+        // dispatch op validated it); the gather touches only the rows of `own` / `peer`.
+        unsafe {
+            self.exchange.sp_ag_rows(
+                self.rank,
+                gpu,
+                tensor.buf.as_ptr(),
+                elem,
+                row_elems,
+                sp.own,
+                sp.peer,
+            )
+        }
+        .map_err(|error| format!("rank {}: sequence-parallel gather: {error}", self.rank))
     }
 }
 
@@ -100,6 +241,47 @@ pub(crate) fn ffn_partial_active() -> bool {
     ROUTE.with(Cell::get).is_some_and(|r| r.ffn)
 }
 
+/// This thread's route when it can run sequence-parallel chunks: installed with both writers
+/// ([`attn_writer`], [`ffn_writer`]), [`SP_ENV`] on at install and an exchange with the dense
+/// mailbox region the SP launches need.
+pub(crate) fn sp_route() -> Option<&'static TrunkShardRoute> {
+    ROUTE
+        .with(Cell::get)
+        .filter(|r| r.attn && r.ffn && r.sp_on && r.exchange.sp_available())
+}
+
+/// The row split of an `n`-row chunk on this thread's rank, `None` without an [`sp_route`].
+/// Pure: arms nothing (see [`sp_begin`]).
+pub(crate) fn sp_rows(n: usize) -> Option<SpRows> {
+    sp_route().map(|route| SpRows::of(route.rank, n))
+}
+
+/// Arm the SP split for the chunk program about to execute: its `HyperWrite`s with
+/// `rows == rows.own.1` take the reduce-scatter route and its `RowGather` steps use these ranges.
+pub(crate) fn sp_begin(rows: SpRows) {
+    if let Some(route) = ROUTE.with(Cell::get) {
+        *route.sp.lock().unwrap_or_else(|p| p.into_inner()) = Some(rows);
+    }
+}
+
+/// Disarm the SP split (every path out of the chunk program, error paths included).
+pub(crate) fn sp_end() {
+    if let Some(route) = ROUTE.with(Cell::get) {
+        *route.sp.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+/// Resolve the SP kernels of `exchange` on `gpu` when [`SP_ENV`] is on and the exchange has a
+/// dense mailbox region (load time: JIT is not capture-safe); a no-op otherwise.
+pub(crate) fn sp_prepare(exchange: &ArHcExchange, gpu: &mut Gpu) -> Result<(), String> {
+    if sp_requested() && exchange.sp_available() {
+        exchange
+            .sp_ensure_kernels(gpu)
+            .map_err(|e| format!("resolve the sequence-parallel kernels: {e}"))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +298,81 @@ mod tests {
             .unwrap();
         install(None);
         assert!(ffn_writer().is_none() && !ffn_partial_active());
+    }
+
+    /// `SP_MIN_ROWS` keeps the own-row halves (`SP_MIN_ROWS / 2` rows, the smaller half of any
+    /// odd chunk of at least `SP_MIN_ROWS`) at or above every HC read / write kernel-route
+    /// threshold, and above the few-row routes, so the own-row launches pick the routes the
+    /// all-rows launches pick.
+    #[test]
+    fn sp_min_rows_covers_every_hc_route_threshold() {
+        use rdna_compute::gemm::{
+            HC_DOWN_FUSED_GFX1151_MIN_ROWS, HC_DOWN_FUSED_MIN_ROWS, QWEN4_F16_WMMA_MIN_TOKENS,
+        };
+        use rdna_compute::prefill_invariant::{FEW_ROW_ROUTE_ROWS, WIDE_VERIFY_MAX_ROWS};
+        use rdna_compute::tensor_ops::HC_UP_V2_MIN_ROWS;
+        let floor = SP_MIN_ROWS / 2;
+        // `rows >= T` thresholds.
+        for (name, threshold) in [
+            (
+                "QWEN4_F16_WMMA_MIN_TOKENS (F16 WMMA read, BF16 streams)",
+                QWEN4_F16_WMMA_MIN_TOKENS,
+            ),
+            ("HC_DOWN_FUSED_MIN_ROWS (gfx1201)", HC_DOWN_FUSED_MIN_ROWS),
+            (
+                "HC_DOWN_FUSED_GFX1151_MIN_ROWS",
+                HC_DOWN_FUSED_GFX1151_MIN_ROWS,
+            ),
+            ("HC_UP_V2_MIN_ROWS", HC_UP_V2_MIN_ROWS),
+        ] {
+            assert!(floor >= threshold, "{name}: {floor} own rows < {threshold}");
+        }
+        // `rows <= limit` few-row / wide-exact routes (`wide_exact_rows`, the k4 gate GEMV, the
+        // decode pairing): closed for both halves.
+        for (name, limit) in [
+            ("FEW_ROW_ROUTE_ROWS", FEW_ROW_ROUTE_ROWS),
+            ("WIDE_VERIFY_MAX_ROWS (few_row_limit)", WIDE_VERIFY_MAX_ROWS),
+        ] {
+            assert!(floor > limit, "{name}: {floor} own rows <= {limit}");
+        }
+        // The gfx1201 row fold floor (`hc_row_fold_gfx1201_applies`: rows >= 16).
+        assert!(floor >= 16);
+        assert!(SP_MIN_ROWS.is_multiple_of(2));
+    }
+
+    #[test]
+    fn sp_switch_is_default_on_with_a_kill_switch() {
+        for on in [
+            None,
+            Some(""),
+            Some("1"),
+            Some("on"),
+            Some("true"),
+            Some(" 1 "),
+        ] {
+            assert!(sp_switch(on), "{on:?}");
+        }
+        for off in [
+            Some("0"),
+            Some("off"),
+            Some("false"),
+            Some("lab"),
+            Some("2"),
+        ] {
+            assert!(!sp_switch(off), "{off:?}");
+        }
+    }
+
+    #[test]
+    fn sp_split_mirrors_between_ranks() {
+        for n in [SP_MIN_ROWS, SP_MIN_ROWS + 1, 4096, 4097] {
+            let (a, b) = (SpRows::of(0, n), SpRows::of(1, n));
+            assert_eq!((a.own, a.peer), (b.peer, b.own));
+            assert_eq!(a.own.0, 0);
+            assert_eq!(a.own.0 + a.own.1, a.peer.0);
+            assert_eq!(a.own.1 + a.peer.1, n);
+            assert!(a.own.1 >= SP_MIN_ROWS / 2 && b.own.1 >= SP_MIN_ROWS / 2);
+        }
     }
 
     /// Host model of the FFN partial contract (the sealed decode MoE of a trunk-shard rank):

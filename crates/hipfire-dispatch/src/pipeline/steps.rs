@@ -117,6 +117,9 @@ pub enum Step<'a> {
     LaneAttention(crate::pipeline::layer_ops::LaneAttentionOp<'a>),
     /// Launch-free clear of a preallocated scratch prefix.
     Clear(crate::pipeline::layer_ops::ClearOp<'a>),
+    /// Sequence-parallel all-gather of the rows of one scratch tensor across the EP ranks
+    /// (`HIPFIRE_QWEN4_EP_SEQ_PARALLEL`). A fusion barrier like `Clear`.
+    RowGather(crate::pipeline::layer_ops::RowGatherOp<'a>),
     /// Embedding-table lookup of device-resident token ids.
     Embed(crate::pipeline::layer_ops::EmbeddingOp<'a>),
     /// Grouped hyper-connection RMS norm.
@@ -228,6 +231,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::GatedShortConv(_)
         | Step::LaneAttention(_)
         | Step::Clear(_)
+        | Step::RowGather(_)
         | Step::Embed(_)
         | Step::HyperNorm(_)
         | Step::Project(_)
@@ -887,6 +891,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::GatedShortConv(op) => op.validate_for_gpu(gpu)?,
             Step::LaneAttention(op) => op.validate_for_gpu(gpu)?,
             Step::Clear(op) => op.validate_for_gpu(gpu)?,
+            Step::RowGather(op) => op.validate_for_gpu(gpu)?,
             Step::Embed(op) => op.validate_for_gpu(gpu)?,
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
@@ -1507,6 +1512,8 @@ fn paired_hyper_write<'s, 'a>(
             | Step::Clear(_)
             | Step::Moe(_)
             | Step::MoeStage(..) => {}
+            // A gather of rows other than the paired streams (`hc_mixed`) leaves the streams alone.
+            Step::RowGather(gather) if gather.tensor.buf.as_ptr() != streams => {}
             Step::HyperWrite(write) if write.input.buf.as_ptr() == streams => {
                 return Some((j, write));
             }
@@ -2035,6 +2042,7 @@ pub(crate) fn launch_op_rows(
         Step::GatedShortConv(op) => crate::pipeline::layer_ops::execute_gated_short_conv(gpu, op),
         Step::LaneAttention(op) => crate::pipeline::layer_ops::execute_lane_attention(gpu, op),
         Step::Clear(op) => crate::pipeline::layer_ops::execute_clear(gpu, op),
+        Step::RowGather(op) => crate::pipeline::layer_ops::execute_row_gather(gpu, op),
         Step::Embed(op) => crate::pipeline::layer_ops::execute_embedding(gpu, op),
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
