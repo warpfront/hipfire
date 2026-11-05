@@ -466,28 +466,43 @@ impl DraftHead {
     ) -> Result<(), DispatchError> {
         let (ranked, order) = ranking(self.front, self.special, self.vocab, full_steps);
         let ranking_head = self.copy.as_ref().unwrap_or(head);
-        project_weight(
-            gpu,
-            &WeightRef {
-                buf: ranking_head,
-                dtype: ranking_head.dtype,
-                m: ranked,
-                k: self.hidden,
-                row_stride: ranking_head
-                    .dtype
-                    .row_bytes(self.hidden)
-                    .unwrap_or(self.hidden * ranking_head.dtype.size()),
-                rotation: None,
-                awq_scale: None,
-                lloyd_lut_e4m3: None,
-                lloyd_lut_f16: None,
-                lloyd_lut_c16: None,
-            },
-            hidden,
-            &self.logits,
-            1,
-            Some(&self.rotation),
-        )?;
+        if ranking_head.dtype == DType::MQ2G256V2 && gpu.mq2_xbatch_pm_active(ranked, self.hidden) {
+            // The gfx1201 PeaceMaker x-batch module at one row: the bytes of
+            // the one-row GEMV (`mq2_xbatch_oracle`), the rotated input left in
+            // `self.rotation` exactly as `project_weight` leaves it.
+            hip(gpu.rotate_x_mq(hidden, &self.rotation, self.hidden))?;
+            hip(gpu.gemv_mq2g256v2_xbatch(
+                ranking_head,
+                &self.rotation,
+                &self.logits,
+                ranked,
+                self.hidden,
+                1,
+            ))?;
+        } else {
+            project_weight(
+                gpu,
+                &WeightRef {
+                    buf: ranking_head,
+                    dtype: ranking_head.dtype,
+                    m: ranked,
+                    k: self.hidden,
+                    row_stride: ranking_head
+                        .dtype
+                        .row_bytes(self.hidden)
+                        .unwrap_or(self.hidden * ranking_head.dtype.size()),
+                    rotation: None,
+                    awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
+                },
+                hidden,
+                &self.logits,
+                1,
+                Some(&self.rotation),
+            )?;
+        }
         if let Some(partial) = self.partial.as_ref() {
             // An MQ6 head reads the ranking copy's FWHT-rotated input.
             let x = if head.dtype == DType::Q8_0 {

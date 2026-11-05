@@ -42552,8 +42552,15 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        let pm = *MQ2_XBATCH_PM && self.mq2_xbatch_pm_covers(m, k);
+        let pm = self.mq2_xbatch_pm_active(m, k);
         self.gemv_mq2g256v2_xbatch_with(a_raw, x, y, m, k, batch_size, pm)
+    }
+
+    /// Whether [`Self::gemv_mq2g256v2_xbatch`] runs the gfx1201 PeaceMaker
+    /// module for this shape: `HIPFIRE_QWEN4_MTP_DRAFT_HEAD_PM` on and
+    /// [`Self::mq2_xbatch_pm_covers`].
+    pub fn mq2_xbatch_pm_active(&self, m: usize, k: usize) -> bool {
+        *MQ2_XBATCH_PM && self.mq2_xbatch_pm_covers(m, k)
     }
 
     /// Whether the gfx1201 PeaceMaker x-batched MQ2 module covers this shape:
