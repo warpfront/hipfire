@@ -65,6 +65,16 @@
    "sha256": "d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc",
    "size_bytes": 1209603072,
    "source": "https://huggingface.co/hipfire-models/qwen3.8-27b/resolve/7396d1af35c3484378a6603d93ed4a8c97237a6c/qwen38-27b-dflash-mq4.hfq"
+  },
+  "qwen3.5-0.8b.mq4": {
+   "sha256": "aedfe31be68213dbcd13cff3a63ba150c330d0d0547df30f2c629e76ab5dda39",
+   "size_bytes": 549751424,
+   "source": "https://huggingface.co/hipfire-models/qwen3.5-0.8b/resolve/2d36e870e3f042a921416a1c214341ca5c10bfa3/qwen3.5-0.8b.mq4"
+  },
+  "qwen3.8-flash-next-gptq3.mq4": {
+   "sha256": "8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+   "size_bytes": 125288544792,
+   "source": "no download: the Flash-Next XTS monolithic GPTQ3 file. The registry tag qwen3.8:flash-next-gptq3 now names qwen3.8-flash-next-base.mq4-xts, so never hipfire pull it; verify a local copy against this lock."
   }
  },
  "notes": [
@@ -1775,6 +1785,46 @@
   },
   {
    "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=$MODELS_DIR/qwen3.5-0.8b.mq4 HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1 --nocapture"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_HAVE_2_GPU": "1",
+    "HIPFIRE_PP_DEVICES": "0,1",
+    "HIPFIRE_PP_RESET_MODEL": "$MODELS_DIR/qwen3.5-0.8b.mq4",
+    "HIPFIRE_RESET_ROUNDS": "1"
+   },
+   "fixtures": [
+    "qwen3.5:0.8b"
+   ],
+   "hosts": [
+    "multi-gpu-2"
+   ],
+   "id": "g4-reset-pp-qwen35-0p8b",
+   "milestone": "G4.7",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "fault rounds are the negative of the clean baseline inside the test"
+   },
+   "note": "g4-reset-pp on the 0.55 GB dense Qwen3.5-0.8B: the same test, route (pp:2 through generate_mesh_carrier, attested rollback after injected faults) and predicate, for a 2-GPU host without the 15 GB qwen3.8-27b.mq4-xts. Does not replace the 27B row.",
+   "predicate": {
+    "forbid": [
+     "skip:"
+    ],
+    "kind": "cargo",
+    "min_passed": 1,
+    "require": [
+     "pp_qwen35_reset_rolls_back_and_recovers ok"
+    ]
+   },
+   "probe": "existing",
+   "route": "pp/text-reset-attested-rollback"
+  },
+  {
+   "commands": {
     "negative": [
      "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu dense_reset_phase_error_visible_and_unattested -- --ignored --exact --test-threads=1 # unattested reset-phase counterpart (rolled_back=false, still exactly one terminal)"
     ],
@@ -2024,6 +2074,39 @@
   },
   {
    "commands": {
+    "negative": [
+     "python3 scripts/serve_harness.py --port 28518 --model $MODEL --tp 3 --devices $DEVICES --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope-0p8b --out $OUT/nope-0p8b.json  # tp degree exceeding visible devices must fail closed"
+    ],
+    "positive": [
+     "python3 scripts/serve_harness.py --port 28517 --model $MODEL --tp 2 --devices $DEVICES --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-mesh-tp-0p8b --out $OUT/g4-mesh-tp-0p8b.json --serve-log $OUT/g4-mesh-tp-0p8b.serve.log"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "qwen3.5:0.8b"
+   ],
+   "hosts": [
+    "multi-gpu-2"
+   ],
+   "id": "g4-mesh-tp-serve-qwen35-0p8b",
+   "milestone": "G4.9",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "serve"
+   },
+   "probe": "existing",
+   "route": "tp/mesh-carrier-serve",
+   "note": "g4-mesh-tp-serve on the 0.55 GB dense Qwen3.5-0.8B: same dense TP mesh carrier, battery, positive and fail-closed --tp 3 negative, for a 2-GPU host without the 27B. Does not replace the 27B row."
+  },
+  {
+   "commands": {
     "positive": [
      "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xts HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_QWEN36_MOE_FIXTURE=$MODELS_DIR/qwen3.6-35b-a3b.mq4p cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1 --nocapture"
     ],
@@ -2130,6 +2213,48 @@
    },
    "probe": "existing",
    "route": "ep2/mesh-vs-single-oracle"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_TOPOLOGY_EP=1 cargo run --release --locked -p hipfire-loader --features lab --example fn_ep_oracle -- --model $MODELS_DIR/qwen3.8-flash-next-gptq3.mq4 --prompt-file benchmarks/prompts/bare_factual.txt --prompt-file benchmarks/prompts/glimmer_prefill_256.txt --max-seq 4096 --tokens 64 --state-steps 1,9,32,64 --skip-model-hash --out $OUT/g5-qwen4/single --arm single",
+     "HIPFIRE_TOPOLOGY_EP=2 cargo run --release --locked -p hipfire-loader --features lab --example fn_ep_oracle -- --model $MODELS_DIR/qwen3.8-flash-next-gptq3.mq4 --prompt-file benchmarks/prompts/bare_factual.txt --prompt-file benchmarks/prompts/glimmer_prefill_256.txt --max-seq 4096 --tokens 64 --state-steps 1,9,32,64 --skip-model-hash --out $OUT/g5-qwen4/ep2 --arm ep2",
+     "python3 scripts/fn_ep_compare.py $OUT/g5-qwen4/single $OUT/g5-qwen4/ep2 --expect-ranks 2"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MTP_MODE": "off",
+    "HIPFIRE_PREFILL_CHUNK_ROWS": "2048"
+   },
+   "fixture_files": [
+    "$MODELS_DIR/qwen3.8-flash-next-gptq3.mq4"
+   ],
+   "fixtures": [],
+   "hosts": [
+    "multi-gpu-2"
+   ],
+   "id": "g5-qwen4-ep2-vs-single-physical",
+   "milestone": "G5",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "the comparator fails on any differing logits/mirror/state byte"
+   },
+   "note": "#666 G5 physical EP2 on the Flash-Next (Qwen4) expert-parallel route, default host barrier: every committed rank-0 logits row (sha256, token) byte-equal to the single card at steps 0..64, every rank mirror equal, per-rank state digests equal at steps 1,9,32,64; no tolerance. HIPFIRE_MTP_MODE=off keeps the single card from reserving the native-MTP capture ring (extra digest rows an EP load never has). Covers the Qwen4 EP route only; the Qwen3.5 MoE EP route stays g5-ep2-vs-single-physical.",
+   "predicate": {
+    "forbid": [
+     "FAIL fn_ep_compare"
+    ],
+    "kind": "run",
+    "min_chars": 1,
+    "require": [
+     "PASS fn_ep_compare: EP2 == single"
+    ]
+   },
+   "probe": "existing",
+   "route": "ep2/qwen4-mesh-vs-single-oracle",
+   "timeout": 5400
   },
   {
    "commands": {
