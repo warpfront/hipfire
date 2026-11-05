@@ -11,7 +11,7 @@
 //
 // Build (CPU only, no GPU launch):  build.sh <gfx1151|gfx1201> [outdir]
 // Run (inside a bounded fabric hold):  numerics_probe <outdir> <suite[,suite...]|all>
-//   suites: identity dot wmma iu8 swmmac_map swmmac_num swmmac_valid; opt-in (not in `all`): div_scale scalar_udiv maxmin iu8_clamp
+//   suites: identity dot wmma iu8 swmmac_map swmmac_num swmmac_valid; opt-in (not in `all`): div_scale scalar_udiv maxmin iu8_clamp sfu_full
 // Output per test: <name>.json (schema/meta, mode request + MODE readback) and <name>.out.bin / <name>.in.bin.
 #include <hip/hip_runtime.h>
 #include <cstdarg>
@@ -664,6 +664,81 @@ static WSet make_iu8_clamp_set(uint64_t seed) {
 }
 static void suite_iu8_clamp() { run_wset(3, make_iu8_clamp_set(0x1a8c1a), "iu8c"); }
 
+// ============================================================================================== SFU full domain (opt-in `sfu_full`)
+// Every f32 bit pattern through one transcendental opcode (inline asm, raw bits, no compiler involvement), streamed chunk by chunk to a
+// scratch file and compared with the emulator's integer model by an external command, so the 2^32 outputs (16 GiB per opcode) never
+// accumulate. Environment: NP_SFU_OPS (comma list of exp,rcp,rcp_iflag,log,rsq,sqrt; default exp,rcp,rcp_iflag), NP_SFU_CMP (a program
+// run as `CMP <file> <op> <base> <stride> <mode_index> <mode_readback>`; the stdout lines are appended to sfu_full.log; a non-zero exit
+// is logged and counted), NP_SFU_DIR (scratch directory; default OUT). Default MODE: the whole domain, 16 chunks of 2^28 contiguous
+// inputs. The other seven MODE settings (round-to-zero/-inf/+inf for f32 and f16/f64, denormal flush bits of f32 and f16/f64; see MODES)
+// each run 2^28 inputs `m + 16 * i`, so a model claim of MODE independence is checked on a dense sample of every exponent field.
+template <int OP> __global__ void sfu_k(uint32_t* out, uint32_t base, uint32_t stride, uint32_t n, uint32_t mode, uint32_t* modeout) {
+  set_mode(mode);
+  const uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i == 0) modeout[0] = get_mode();
+  if (i >= n) return;
+  const uint32_t x = base + i * stride;
+  uint32_t r;
+  if constexpr (OP == 0) asm volatile("v_exp_f32 %0, %1" : "=v"(r) : "v"(x));
+  else if constexpr (OP == 1) asm volatile("v_rcp_f32 %0, %1" : "=v"(r) : "v"(x));
+  else if constexpr (OP == 2) asm volatile("v_rcp_iflag_f32 %0, %1" : "=v"(r) : "v"(x));
+  else if constexpr (OP == 3) asm volatile("v_log_f32 %0, %1" : "=v"(r) : "v"(x));
+  else if constexpr (OP == 4) asm volatile("v_rsq_f32 %0, %1" : "=v"(r) : "v"(x));
+  else asm volatile("v_sqrt_f32 %0, %1" : "=v"(r) : "v"(x));
+  out[i] = r;
+}
+static void sfu_launch(int op, uint32_t* out, uint32_t base, uint32_t stride, uint32_t n, uint32_t mode, uint32_t* mo) {
+  const dim3 grid(n / 256), block(256);
+  switch (op) {
+    case 0: sfu_k<0><<<grid, block>>>(out, base, stride, n, mode, mo); break;
+    case 1: sfu_k<1><<<grid, block>>>(out, base, stride, n, mode, mo); break;
+    case 2: sfu_k<2><<<grid, block>>>(out, base, stride, n, mode, mo); break;
+    case 3: sfu_k<3><<<grid, block>>>(out, base, stride, n, mode, mo); break;
+    case 4: sfu_k<4><<<grid, block>>>(out, base, stride, n, mode, mo); break;
+    default: sfu_k<5><<<grid, block>>>(out, base, stride, n, mode, mo); break;
+  }
+}
+static void suite_sfu_full() {
+  static const char* NAMES[] = {"exp", "rcp", "rcp_iflag", "log", "rsq", "sqrt"};
+  const char* ops_env = getenv("NP_SFU_OPS");
+  const std::string ops = std::string(",") + (ops_env ? ops_env : "exp,rcp,rcp_iflag") + ",";
+  const char* cmp = getenv("NP_SFU_CMP");
+  const char* dir_env = getenv("NP_SFU_DIR");
+  const std::string dir = dir_env ? dir_env : OUT;
+  if (!cmp) { fprintf(stderr, "sfu_full needs NP_SFU_CMP\n"); exit(2); }
+  constexpr uint32_t N = 1u << 28;
+  DevBuf<uint32_t> dout(N), mo(1);
+  std::vector<uint32_t> host(N);
+  FILE* log = fopen((OUT + "/sfu_full.log").c_str(), "a");
+  int failures = 0;
+  for (int op = 0; op < 6; op++) {
+    if (ops.find(std::string(",") + NAMES[op] + ",") == std::string::npos) continue;
+    for (int job = 0; job < 16 + NMODES - 1; job++) {
+      const bool full = job < 16;
+      const int m = full ? 0 : job - 16 + 1;
+      const uint32_t base = full ? uint32_t(job) * N : uint32_t(m), stride = full ? 1u : 16u;
+      sfu_launch(op, dout.p, base, stride, N, MODES[m], mo.p);
+      HIP(hipGetLastError());
+      HIP(hipDeviceSynchronize());
+      HIP(hipMemcpy(host.data(), dout.p, size_t(N) * 4, hipMemcpyDeviceToHost));
+      const std::string path = dir + "/sfu_chunk.bin";
+      write_file(path, host.data(), size_t(N) * 4);
+      const std::string cmd = fmt("%s %s %s %u %u %d 0x%08x", cmp, path.c_str(), NAMES[op], base, stride, m, popmode(mo));
+      fprintf(log, "RUN %s\n", cmd.c_str());
+      fflush(log);
+      FILE* p = popen(cmd.c_str(), "r");
+      char line[1024];
+      while (p && fgets(line, sizeof line, p)) fputs(line, log);
+      const int rc = p ? pclose(p) : -1;
+      if (rc) { failures++; fprintf(log, "CMP-FAILED rc=%d\n", rc); }
+      fflush(log);
+      remove(path.c_str());
+    }
+  }
+  fclose(log);
+  printf("sfu_full done, %d failing comparisons\n", failures);
+}
+
 // ============================================================================================== SWMMAC (gfx12)
 // Raw register images, so the index/fragment mapping is discovered rather than assumed.
 struct SCase { uint32_t a[4][32]; uint32_t b[8][32]; uint32_t idx[32]; uint32_t c[8][32]; };
@@ -1144,6 +1219,7 @@ int main(int argc, char** argv) {
   if (exact("scalar_udiv")) suite_scalar_udiv();
   if (exact("maxmin")) suite_maxmin();
   if (exact("iu8_clamp")) suite_iu8_clamp();
+  if (exact("sfu_full")) suite_sfu_full();
   std::string idx;
   for (auto& n : INDEX) idx += n + "\n";
   write_text(OUT + "/INDEX.txt", idx);

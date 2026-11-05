@@ -281,11 +281,20 @@ impl Vbuffer {
 pub enum Wmma {
     Iu4,
     Fp8,
+    /// `v_wmma_f32_16x16x16_f16` (F16 inputs, F32 accumulator and result).
+    F16,
+    /// `v_wmma_f32_16x16x16_bf16` (BF16 inputs, F32 accumulator and result).
+    Bf16,
 }
 impl Wmma {
     pub fn mnemonic(self, arch: Arch) -> Result<&'static str, String> {
         match self {
             Self::Iu4 => Ok(arch.wmma_iu4()),
+            Self::F16 | Self::Bf16 if arch.cdna().is_some() => {
+                Err("dense F16/BF16 WMMA is RDNA only (CDNA uses MFMA)".into())
+            }
+            Self::F16 => Ok("v_wmma_f32_16x16x16_f16"),
+            Self::Bf16 => Ok("v_wmma_f32_16x16x16_bf16"),
             Self::Fp8 if arch == Arch::Gfx1201 => Ok("v_wmma_f32_16x16x16_fp8_fp8"),
             _ => Err("WMMA opcode requires gfx1201".into()),
         }
@@ -311,6 +320,66 @@ impl Wmma {
             vec![dst.reg()],
             uses,
         )
+    }
+    /// Dense 16x16x16 F16 or BF16 WMMA with an F32 accumulator and result,
+    /// `dst = a * b + acc` (`acc = None` reads the inline constant 0). The A and B
+    /// fragments are `N` VGPRs of packed 16-bit halves: 8 on gfx11 (every lane
+    /// holds a full K = 16 row, lanes 16..31 replicate lanes 0..15), 4 on gfx12
+    /// (lane `l` holds K `8 * (l >> 4) ..` of row `l & 15`); `dst` and `acc` are 8
+    /// VGPRs on both. A width that does not match `arch` is refused, as is any
+    /// `kind` other than [`Wmma::F16`] / [`Wmma::Bf16`]. No modifiers are
+    /// exposed: the emulator qualifies `neg_lo`/`neg_hi` per half, but the
+    /// builder issues the plain form only. Numerics: `peacemaker_ir::emu::mma`
+    /// (`wmma_f32_f16` / `wmma_f32_bf16`; qualified on gfx1151 and gfx1201).
+    pub fn half<const N: u8>(
+        arch: Arch,
+        kind: Self,
+        dst: V<8>,
+        a: V<N>,
+        b: V<N>,
+        acc: Option<V<8>>,
+    ) -> Result<Instruction, String> {
+        if !matches!(kind, Self::F16 | Self::Bf16) {
+            return Err(format!("{kind:?} is not a dense half-precision WMMA"));
+        }
+        let opcode = kind.mnemonic(arch)?;
+        let width = if arch.gfx12() { 4 } else { 8 };
+        if N != width {
+            return Err(format!(
+                "{opcode} on {}: A/B fragments are {width} VGPRs, got {N}",
+                arch.name()
+            ));
+        }
+        let mut uses = vec![a.reg(), b.reg()];
+        let c = if let Some(acc) = acc {
+            uses.push(acc.reg());
+            acc.reg().to_string()
+        } else {
+            "0".into()
+        };
+        Ok(Instruction::new(
+            format!("{opcode} {}, {}, {}, {c}", dst.reg(), a.reg(), b.reg()),
+            vec![dst.reg()],
+            uses,
+        ))
+    }
+    pub fn f16<const N: u8>(
+        arch: Arch,
+        dst: V<8>,
+        a: V<N>,
+        b: V<N>,
+        acc: Option<V<8>>,
+    ) -> Result<Instruction, String> {
+        Self::half(arch, Self::F16, dst, a, b, acc)
+    }
+    pub fn bf16<const N: u8>(
+        arch: Arch,
+        dst: V<8>,
+        a: V<N>,
+        b: V<N>,
+        acc: Option<V<8>>,
+    ) -> Result<Instruction, String> {
+        Self::half(arch, Self::Bf16, dst, a, b, acc)
     }
     pub fn fp8(
         arch: Arch,
