@@ -147,6 +147,11 @@ pub struct IsaShapeContract {
     /// Kernel-descriptor fixed LDS the symbol must declare (0 unless set).
     #[serde(default)]
     pub group_segment_fixed_bytes: u32,
+    /// Wave-private LDS windows of the emission (`lds::private_windows(&emitted.proof.lds_slots)`): when
+    /// nonempty, the M7 pipeline proves from the object that every access of every wave stays in its own
+    /// slice (`pm_check::lds_wave_private`) and refuses a contract it cannot prove that for.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wave_private_windows: Vec<crate::lds::PrivateWindow>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -953,6 +958,12 @@ pub fn certify(
             shape.launch_dynamic_lds_bytes = Some(dynamic);
             shape.max_lds_access_end = Some(max_end);
         }
+        if !contract.wave_private_windows.is_empty() && !m7_cert {
+            return Err(format!(
+                "{}: the contract declares wave-private LDS windows, but this symbol is not M7-certified, so nothing would prove each wave stays in its own slice",
+                contract.symbol
+            ));
+        }
         if m7_cert {
             // An all-lane LDS bound over the launch allocation, then M7's
             // lift/emit identity and analyses.
@@ -965,7 +976,24 @@ pub fn certify(
             let token_list = qsa_pm
                 && (contract.symbol.starts_with("indexed_attention_gathered_")
                     || contract.symbol.starts_with("indexed_attention_kv_f16vb"));
-            let max_end = if token_list {
+            let private = !contract.wave_private_windows.is_empty();
+            if private && (token_list || mq6_pm) {
+                return Err(format!(
+                    "{}: wave-private LDS windows are certified by `lds_wave_private`, which has no host-bounded address mode",
+                    contract.symbol
+                ));
+            }
+            let max_end = if private {
+                // The all-lane bound plus the ownership proof: every access that overlaps a
+                // private window lies inside the issuing wave's slice.
+                crate::pm_check::lds_wave_private(
+                    &source_text,
+                    &contract.symbol,
+                    waves,
+                    kd.group_segment_size + dynamic,
+                    &contract.wave_private_windows,
+                )?
+            } else if token_list {
                 // The token list is the launch's dynamic LDS (`launch_dynamic_lds_bytes`
                 // is its largest size); every other access is bounded by the static part.
                 crate::pm_check::lds_bounds_host(

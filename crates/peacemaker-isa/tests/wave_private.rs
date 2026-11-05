@@ -26,6 +26,10 @@ use peacemaker_isa::pm_check::{lds_bounds, lds_wave_private};
 use peacemaker_isa::reg::{Live, RegRef};
 use peacemaker_isa::{Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V};
 
+#[macro_use]
+#[path = "support/rocm.rs"]
+mod rocm;
+
 fn v(n: u8) -> RegRef {
     V::<1>(n).reg()
 }
@@ -282,8 +286,8 @@ fn kernel<T: Target>(
 
 fn emit(arch: Arch, variant: Variant) -> Result<Emitted, String> {
     let mut plan = RegPlan::new(16, 104)?;
-    const NAMES: [&str; 15] = [
-        "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14",
+    const NAMES: [&str; 16] = [
+        "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15",
     ];
     for (n, name) in NAMES.iter().enumerate() {
         plan.v::<1>(name, n as u8, Live::Whole)?;
@@ -528,3 +532,80 @@ fn emulator_refuses_a_wave_touching_another_waves_slice() {
         );
     }
 }
+
+// ---- the contract pipeline (`toolchain::certify`) ---------------------------------
+
+#[cfg(feature = "toolchain")]
+mod pipeline {
+    use super::*;
+    use peacemaker_isa::toolchain::{build, certify, IsaShapeContract, Toolchain};
+
+    fn contract(e: &Emitted, windows: bool) -> IsaShapeContract {
+        IsaShapeContract {
+            symbol: SYMBOL.into(),
+            launch_dynamic_lds_bytes: Some(0),
+            group_segment_fixed_bytes: TILE_BASE + TILE_BYTES,
+            require_wave32: true,
+            wave_private_windows: if windows {
+                private_windows(&e.proof.lds_slots)
+            } else {
+                vec![]
+            },
+            ..Default::default()
+        }
+    }
+
+    fn run_pipeline(arch: Arch, variant: Variant, windows: bool) -> Result<(), String> {
+        let e = emit(arch, variant)?;
+        let (text, _) = peacemaker_isa::kernels::iu4_gemm::module(&[e.clone()], "wave_private_demo")?;
+        let dir = std::env::temp_dir().join(format!(
+            "peacemaker-isa-wave-private-{}-{}-{variant:?}-{windows}",
+            std::process::id(),
+            arch.name()
+        ));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        let s = dir.join("k.s");
+        std::fs::write(&s, &text).map_err(|e| e.to_string())?;
+        let toolchain = Toolchain::oracle();
+        let b = build(&toolchain, &s, &dir.join("k.hsaco"), arch.name())?;
+        certify(
+            &toolchain,
+            &b,
+            &s,
+            arch.name(),
+            &dir.join("manifest.json"),
+            Some(&contract(&e, windows)),
+            "test",
+            "test",
+        )
+    }
+
+    macro_rules! need_rocm {
+        () => {
+            for t in ["llvm-mc", "ld.lld", "clang-offload-bundler", "llvm-objdump", "llvm-readobj"] {
+                let _ = require_rocm_tool!(t);
+            }
+        };
+    }
+
+    #[test]
+    fn pipeline_certifies_an_own_slice_kernel_and_refuses_foreign_slice_emits() {
+        need_rocm!();
+        for arch in [Arch::Gfx1100, Arch::Gfx1151] {
+            run_pipeline(arch, Variant::Good, true).unwrap_or_else(|e| panic!("{arch:?}: {e}"));
+            for bad in [Variant::CrossWave, Variant::Overrun, Variant::Collide] {
+                let e = err(run_pipeline(arch, bad, true));
+                assert!(e.contains("outside its own slice"), "{arch:?} {bad:?}: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn pipeline_refuses_windows_it_cannot_prove() {
+        need_rocm!();
+        // gfx1201 `wave_private_demo` is not an M7-certified symbol: nothing would prove ownership.
+        let e = err(run_pipeline(Arch::Gfx1201, Variant::Good, true));
+        assert!(e.contains("wave-private LDS windows"), "{e}");
+    }
+}
+

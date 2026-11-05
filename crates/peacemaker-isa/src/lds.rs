@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum SlotState {
     Free,
@@ -309,7 +309,7 @@ impl Lds {
 /// (`BuilderProof::lds_slots` entries with `wave_private`): wave `w` of the
 /// workgroup owns bytes `[base + w * stride, base + (w + 1) * stride)` and
 /// no other wave touches them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PrivateWindow {
     pub base: u32,
     pub stride: u32,
