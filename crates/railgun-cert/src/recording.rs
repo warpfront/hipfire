@@ -3758,6 +3758,12 @@ pub const SITES: &[Site] = &[
     },
     Site {
         file: "rdna-compute/src/replay.rs",
+        function: "mark_body_end",
+        occurrences: 1,
+        decisions: &["replay-recorder-lifecycle"],
+    },
+    Site {
+        file: "rdna-compute/src/replay.rs",
         function: "record_hip_launch_typed_bound",
         occurrences: 1,
         decisions: &["launch-funnel-blob-path"],
