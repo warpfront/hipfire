@@ -3290,6 +3290,36 @@ impl Qwen4LaneStore {
         self.table.active()
     }
 
+    /// Whether any live lane still has prompt rows to forward once the `planned` prefill tiles
+    /// (request epoch, rows) have run: some lane is `Prefilling` and its forwarded rows plus its
+    /// planned tile do not reach the end of its prompt. A step's prefill bracket
+    /// (`lane_exec::run_prefill_tiles`) passes it as the continuation flag, so an EP tail-borrow
+    /// epoch stays open across the steps of one long lane prompt. Reads host bookkeeping only;
+    /// every rank's store is identical, so every rank answers the same.
+    pub(crate) fn prefill_continues_after<'a>(
+        &self,
+        planned: impl Iterator<Item = (&'a RequestEpoch, usize)> + Clone,
+    ) -> bool {
+        self.table
+            .cells
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| self.table.live[*slot])
+            .filter_map(|(_, cell)| cell.as_ref())
+            .any(|cell| {
+                let host = cell.host();
+                if host.status != LaneStatus::Prefilling {
+                    return false;
+                }
+                let rows: usize = planned
+                    .clone()
+                    .filter(|(epoch, _)| **epoch == host.epoch)
+                    .map(|(_, rows)| rows)
+                    .sum();
+                host.prefilled + rows < host.prompt.len()
+            })
+    }
+
     /// Free every lane state and the step buffers; the first error wins.
     pub(crate) fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
         let Self {

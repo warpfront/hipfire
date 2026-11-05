@@ -2172,6 +2172,10 @@ fn forward_lanes_scoped(
             )
         }));
     }
+    // An EP tail borrow poisoned by a failed close refuses every call, lane steps included
+    // (a lane step runs on the resident bank, correct inside an open epoch, so nothing else
+    // is needed here); a no-op on every other load.
+    fwd.ep_tail_borrow_check()?;
     // An EP reserve-sharing load: a dirty borrow epoch (a lane prefill tile on
     // the borrowed bank) is restored and the resident bank checked before any
     // launch; a no-op on every other load. An EP prefill wave took its bank

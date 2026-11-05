@@ -2075,6 +2075,13 @@ pub use ep_reserve_forward::ep_reserve_receipt_scope;
 pub(crate) mod ep_reserve_loan;
 pub(crate) mod ep_reserve_scratch;
 pub(crate) mod ep_wave;
+pub(crate) mod ep_tail_borrow;
+pub use ep_tail_borrow::{
+    parse_ep_tail_borrow_knob, qwen4_ep_tail_borrow_forward_bytes, qwen4_ep_tail_borrow_plan,
+    qwen4_set_ep_tail_borrow_plan, resolve_ep_tail_borrow, EpTailBorrowFacts, EpTailBorrowKnob,
+    EpTailBorrowPlan, EpTailBorrowResolution, EP_TAIL_BORROW_DEFAULT_ON,
+    EP_TAIL_BORROW_DEFAULT_ROWS, EP_TAIL_BORROW_ENV,
+};
 
 impl RoutedExpertWeights for Qwen4MoeLayerRuntime {
     fn len(&self) -> usize {
@@ -7921,6 +7928,10 @@ enum ScratchBackingKind {
     /// Owning roots are allocated, but `TokenIds` aliases a persistent tensor
     /// that another owner frees once (the resident bank of a decode-share load).
     ExternalIds,
+    /// Owning roots are allocated, but `TokenIds` and `MoeYDownGrouped` alias persistent
+    /// tensors another owner frees once (the resident bank of an EP tail-borrow load,
+    /// [`ep_tail_borrow`]).
+    ExternalRoots,
     /// Every root, and `TokenIds`, is a view of external memory (a decode-share
     /// prefill bank over the donor span): the bank frees nothing.
     Borrowed,
@@ -7937,7 +7948,15 @@ impl ScratchBackingKind {
         match self {
             Self::Borrowed => false,
             Self::ExternalIds if field == ScratchField::TokenIds => false,
-            Self::Owned | Self::ExternalIds => {
+            Self::ExternalRoots
+                if matches!(
+                    field,
+                    ScratchField::TokenIds | ScratchField::MoeYDownGrouped
+                ) =>
+            {
+                false
+            }
+            Self::Owned | Self::ExternalIds | Self::ExternalRoots => {
                 slot.owner.is_none()
                     && slot.elements != 0
                     && bank_kind.map_or(true, |kind| kind.owns(field))
@@ -10983,6 +11002,11 @@ pub struct Qwen4GpuForward {
     /// Set only across [`Self::share_prompt_begin_mtp_fill`]'s begin: the
     /// entry it opens is the native-MTP fill (receipt `phase`).
     receipt_mtp_fill: bool,
+    /// `Some` on an EP load planned with `HIPFIRE_QWEN4_EP_TAIL_BORROW`: the persistent token ids
+    /// and grouped-down exchange root both scratch banks view, the borrowed bank over the D2 tail
+    /// pool (attached by the mesh once the tile hook exists) and the borrow epoch
+    /// ([`ep_tail_borrow`]). `scratch` is the resident bank at every call boundary.
+    pub(crate) ep_tail_borrow: Option<ep_tail_borrow::EpTailBorrow>,
 }
 
 /// An event after a forward's device argmax and a stream independent of the
@@ -12232,6 +12256,7 @@ impl Qwen4GpuForward {
             #[cfg(target_os = "linux")]
             npu_prepared,
             None,
+            None,
         )
     }
 
@@ -12249,6 +12274,7 @@ impl Qwen4GpuForward {
         mode: Qwen4ForwardScratchMode,
         #[cfg(target_os = "linux")] npu_prepared: Option<Option<npu_forward::PreparedTrunk>>,
         ep_reserve_plan: Option<Arc<crate::ep_reserve::EpReservePlan>>,
+        tail_borrow_plan: Option<ep_tail_borrow::EpTailBorrowPlan>,
     ) -> Result<Self, Qwen4GpuForwardError> {
         Self::admit_profile(&bundle.config)?;
         let scope = bundle.weights.band_scope().clone();
@@ -12269,6 +12295,23 @@ impl Qwen4GpuForward {
                      scratch plan at exactly the planned {}-row prompt chunk (got {max_chunk} rows, \
                      {mode:?})",
                     plan.forward.prompt_rows
+                )));
+            }
+        }
+        if let Some(plan) = tail_borrow_plan {
+            if ep_reserve_plan.is_some()
+                || !flash_next
+                || !single_scope
+                || bundle.weights.ep_placement().is_none()
+                || bundle.slowlink_profile().is_some()
+                || mode != Qwen4ForwardScratchMode::FnSymGfx1201
+                || max_chunk != plan.borrowed_rows
+            {
+                return Err(invalid(format!(
+                    "an EP tail-borrow load needs the Flash-Next EP rank forward on the compact \
+                     scratch plan at exactly the planned {}-row prompt chunk (got {max_chunk} \
+                     rows, {mode:?})",
+                    plan.borrowed_rows
                 )));
             }
         }
@@ -12316,6 +12359,7 @@ impl Qwen4GpuForward {
             false
         };
         let mut reserve_banks: Option<ep_reserve_scratch::EpReserveBanks> = None;
+        let mut tail_borrow: Option<ep_tail_borrow::EpTailBorrow> = None;
         let (scratch, host_token_bytes, host_ple_bytes, share) = if share_classes {
             let donor = donor_lease.filter(|_| share_mode.uses_donor_backing());
             let (scratch, share, host_token_bytes, host_ple_bytes) = Self::build_decode_share(
@@ -12357,6 +12401,14 @@ impl Qwen4GpuForward {
             )?;
             let (host_token_bytes, host_ple_bytes) = banks.take_host_staging();
             reserve_banks = Some(banks);
+            (scratch, host_token_bytes, host_ple_bytes, None)
+        } else if let Some(plan) = tail_borrow_plan {
+            // EP tail borrow: the resident bank (today's EP chunk) over two persistent roots
+            // sized for the prompt chunk. The prompt-chunk bank is built at attach, as views of
+            // the D2 tail pool, and costs no VRAM.
+            let (scratch, borrow, host_token_bytes, host_ple_bytes) =
+                ep_tail_borrow::EpTailBorrow::build(gpu, &bundle.config, mode, &scope, plan)?;
+            tail_borrow = Some(borrow);
             (scratch, host_token_bytes, host_ple_bytes, None)
         } else {
             let (scratch, host_token_bytes, host_ple_bytes) =
@@ -12861,9 +12913,16 @@ impl Qwen4GpuForward {
             // every peer's experts are mapped.)
             // Owner-routed chunk MoE (`HIPFIRE_EP_OWNER_ROUTED_PREFILL=1`): its grouped-row
             // buffer, masked tile ids and sym scratch exist before the mesh enables peers.
+            // An EP tail borrow registers the exchange for the BORROWED-row plan (its persistent
+            // grouped-down root and masked tile ids), never the resident bank's.
             let exchange = reserve
                 .as_ref()
-                .map(|reserve| reserve.banks.exchange_capacity());
+                .map(|reserve| reserve.banks.exchange_capacity())
+                .or_else(|| {
+                    tail_borrow
+                        .as_ref()
+                        .map(ep_tail_borrow::EpTailBorrow::exchange_capacity)
+                });
             if let Some(state) = ep.as_mut() {
                 if qwen4_ep_owner_routed_prefill_enabled(reserve.is_some()) {
                     state.tile = Qwen4TileRoute::admit(
@@ -13208,6 +13267,9 @@ impl Qwen4GpuForward {
                 let _ = gpu.free_tensor(trace.device);
             }
             let _ = scratch.free_gpu(gpu);
+            if let Some(borrow) = tail_borrow {
+                let _ = borrow.release(gpu);
+            }
             if let Some(share) = share {
                 let _ = share.free_gpu(gpu);
             }
@@ -13302,6 +13364,7 @@ impl Qwen4GpuForward {
             .then(Default::default),
             receipt_mtp_fill: false,
             ep_reserve: reserve,
+            ep_tail_borrow: tail_borrow,
             #[cfg(target_os = "linux")]
             npu_trunk,
         })
@@ -14148,6 +14211,14 @@ impl Qwen4GpuForward {
     pub(crate) fn prompt_chunk_rows(&self) -> usize {
         let rows = if let Some(reserve) = self.ep_reserve.as_ref() {
             reserve.banks.prompt_rows()
+        } else if let Some(rows) = self
+            .ep_tail_borrow
+            .as_ref()
+            .and_then(ep_tail_borrow::EpTailBorrow::prompt_rows)
+        {
+            // EP tail borrow: the planned borrowed rows while the borrow is planned or attached
+            // (the resident bank holds fewer), `scratch.max_chunk` once the attach refused it.
+            rows
         } else {
             prompt_chunk_rows_of(self.share.as_ref(), &self.scratch)
         };
@@ -14413,6 +14484,7 @@ impl Qwen4GpuForward {
     /// prompt. No-op without decode-share.
     pub(crate) fn share_prompt_begin(&mut self) {
         self.ep_reserve_prompt_begin();
+        self.ep_tail_prompt_begin();
         if let Some(share) = self.share.as_mut() {
             share.prompt_depth += 1;
         }
@@ -14434,9 +14506,26 @@ impl Qwen4GpuForward {
         gpu: &mut Gpu,
         ok: bool,
     ) -> Result<(), Qwen4GpuForwardError> {
+        self.share_prompt_end_continuing(gpu, ok, false)
+    }
+
+    /// [`Self::share_prompt_end`] for a bracket whose prompt goes on in a later bracket
+    /// (`continues`: a served lane prompt split over several steps, `lane_exec`'s
+    /// `run_prefill_tiles`). Only an EP tail borrow reads the flag: a successful outermost end
+    /// that continues keeps the borrow epoch open (one restore per long prompt, not per step);
+    /// every other end behaves exactly as [`Self::share_prompt_end`].
+    pub(crate) fn share_prompt_end_continuing(
+        &mut self,
+        gpu: &mut Gpu,
+        ok: bool,
+        continues: bool,
+    ) -> Result<(), Qwen4GpuForwardError> {
         self.ep_ordinary_prompt_end(ok);
         if self.ep_reserve.is_some() {
             return self.ep_reserve_prompt_end(gpu, ok);
+        }
+        if self.ep_tail_borrow.is_some() {
+            return self.ep_tail_prompt_end(gpu, ok, continues);
         }
         let Some(share) = self.share.as_mut() else {
             return Ok(());
@@ -14478,6 +14567,9 @@ impl Qwen4GpuForward {
     pub(crate) fn forward_device_bytes(&self, config: &Qwen4Config) -> Option<u64> {
         if let Some(reserve) = self.ep_reserve.as_ref() {
             return reserve.plan.forward.dedicated_bytes().ok();
+        }
+        if let Some(borrow) = self.ep_tail_borrow.as_ref() {
+            return qwen4_ep_tail_borrow_forward_bytes(config, &borrow.plan, self.scratch.mode);
         }
         match self.share.as_ref() {
             Some(share) => {
@@ -14596,15 +14688,20 @@ impl Qwen4GpuForward {
     /// ran on (`Qwen4Bundle::free_gpu`). After a failed staged forward
     /// whose recovery also failed, two resident expert layers may still hold
     /// another layer's bytes, and nothing here restores them.
-    pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
+    pub fn free_gpu(mut self, gpu: &mut Gpu) -> Result<(), hip_bridge::HipError> {
         // Tier-split layers own pinned transfer storage and enqueued slot
         // uploads: the device is drained once, before any layer releases its
         // executor (the layers drain again before freeing their buffers).
         let cpu_split_layers = self.cpu_split_layers;
+        // EP tail borrow: an open epoch is closed (restored locally, no rendezvous) and the
+        // resident bank put back BEFORE the tail pool the borrowed bank views is released with
+        // `ep` below (`Qwen4ForwardEp::free_gpu`).
+        let tail_teardown_error = self.ep_tail_teardown(gpu);
         let Qwen4GpuForward {
             mut scratch,
             share,
             ep_reserve,
+            ep_tail_borrow,
             host_ple,
             mesh_tokens,
             lane_tokens,
@@ -14634,6 +14731,9 @@ impl Qwen4GpuForward {
         // The PLE staging bytes may still be read by an enqueued upload:
         // retire it before the device buffers and the host bytes go.
         let mut first = host_ple.free_gpu(gpu);
+        if let Some(error) = tail_teardown_error {
+            first.get_or_insert(error);
+        }
         if let Some(error) = slowlink_error {
             first.get_or_insert(hip_bridge::HipError::new(
                 999,
@@ -14690,6 +14790,10 @@ impl Qwen4GpuForward {
             reserve_teardown = Some(reserve.teardown(gpu));
         }
         if let Some(error) = scratch.free_gpu(gpu) {
+            first.get_or_insert(error);
+        }
+        // The resident bank (back in `scratch`) viewed the persistent roots; they go with it.
+        if let Some(error) = ep_tail_borrow.and_then(|borrow| borrow.release(gpu)) {
             first.get_or_insert(error);
         }
         let mut reserve_loan = None;
@@ -15886,6 +15990,7 @@ impl Qwen4GpuForward {
         output_policy: Qwen4OutputPolicy,
     ) -> Result<(), Qwen4GpuForwardError> {
         self.share_check()?;
+        self.ep_tail_borrow_check()?;
         self.ep_ordinary_note_call(tokens.len());
         // The previous singleton forward (a token or a verify window) is a retired window of
         // the D2 expert tail, if one is installed (lane steps retire theirs after their own
@@ -15895,6 +16000,18 @@ impl Qwen4GpuForward {
         }
         if self.ep_reserve.is_some() {
             return self.ep_reserve_forward_chunk(
+                bundle,
+                gpu,
+                tokens,
+                argmax_of,
+                logits,
+                top1,
+                wide_hidden_capture,
+                output_policy,
+            );
+        }
+        if self.ep_tail_borrow.is_some() {
+            return self.ep_tail_forward_chunk(
                 bundle,
                 gpu,
                 tokens,

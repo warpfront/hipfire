@@ -1283,6 +1283,16 @@ fn run_prefill_tiles(
         .filter(|r| r.kind == RequestStepKind::Prefill)
         .collect();
     if tiles.is_empty() {
+        // A step with no prefill tile and no lane left prefilling: an EP tail-borrow epoch a
+        // continuing lane prompt left open (the lane was cancelled or released before its next
+        // tile) is closed here, so decode does not run on canonical host-read tables for
+        // good. A no-op on every other load and whenever no epoch is open. Every rank's lane
+        // store is identical, so every rank closes at the same step.
+        if !store.prefill_continues_after(std::iter::empty()) {
+            bundle
+                .ep_tail_borrow_idle_close(gpu)
+                .map_err(|error| error.to_string())?;
+        }
         return Ok(());
     }
     let vocab = bundle.lane_vocab();
@@ -1290,6 +1300,10 @@ fn run_prefill_tiles(
     let lane_eos = spec_config
         .and_then(|config| config.end_of_turn)
         .unwrap_or(bundle.config.eos_token_id);
+    // The step's bracket continues the lane prompt when some lane of this store still has
+    // prompt rows after the tiles of this step: an EP tail-borrow epoch then stays open for the
+    // next step (one restore per long prompt) instead of closing at the bracket's end.
+    let continues = store.prefill_continues_after(tiles.iter().map(|r| (&r.epoch, r.rows.len)));
     let epochs: Vec<RequestEpoch> = tiles.iter().map(|r| r.epoch).collect();
     let StepParts {
         mut lanes,
@@ -1545,7 +1559,7 @@ fn run_prefill_tiles(
         Ok(())
     })();
     let ended = bundle
-        .share_prompt_end(gpu, tiles_ran.is_ok())
+        .share_prompt_end_continuing(gpu, tiles_ran.is_ok(), continues)
         .map_err(|error| error.to_string());
     tiles_ran?;
     ended?;
@@ -2705,7 +2719,7 @@ mod wave_tests {
         let count = |needle: &str| body.matches(needle).count();
         assert_eq!(count("bundle.share_prompt_begin_mtp_fill()"), 1);
         assert_eq!(count("bundle.share_prompt_begin()"), 1);
-        assert_eq!(count(".share_prompt_end(gpu"), 1);
+        assert_eq!(count(".share_prompt_end_continuing(gpu"), 1);
         assert_eq!(count(".prefill_wave("), 1);
         assert_eq!(count(".prefill_wave_wide("), 1);
         assert_eq!(count("fill_head_after_wave("), 1);
@@ -2716,7 +2730,7 @@ mod wave_tests {
         let fill = body.find("fill_head_after_wave(").unwrap();
         let finals = body.find("final_tiles.push((ordinal").unwrap();
         let tile = body.find(".lane_prefill_tile(").unwrap();
-        let end = body.find(".share_prompt_end(gpu").unwrap();
+        let end = body.find(".share_prompt_end_continuing(gpu").unwrap();
         assert!(begin < wave && wave < wide && wide < fill && fill < finals);
         assert!(finals < tile && tile < end);
         // The wave arm feeds the shared tail (top-1 download, sampled draws).

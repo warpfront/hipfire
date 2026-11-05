@@ -797,6 +797,7 @@ impl Carrier for Qwen4Carrier {
         // A chunk chosen by an earlier expert-parallel load never leaks into
         // this one: the EP plan below sets it again when it moves the chunk.
         hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(None);
+        hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_tail_borrow_plan(None);
         hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_dedicated_exchange_root(false);
         hipfire_arch_qwen4::mtp_spec::qwen4_set_lane_append_shared(false);
         self.admit_topology(
@@ -2465,6 +2466,19 @@ fn qwen4_placement_inputs(
         Qwen4PlacementForward::EpReserve(plan) => {
             hipfire_arch_qwen4::expert_residency::placement_inputs_with_ep_reserve(&args, plan)?
         }
+        // An admitted EP tail-borrow load's forward: the resident bank plus the persistent
+        // roots of the prompt chunk (`qwen4_ep_ordinary_forward`). No shadow or donor term: the
+        // forward carries no loan and the shadows stay resident and charged as ordinarily.
+        Qwen4PlacementForward::TailBorrow(bytes) => {
+            hipfire_arch_qwen4::expert_residency::placement_inputs_with_forward(
+                &args,
+                Some(hipfire_arch_qwen4::expert_residency::DecodeShareForward {
+                    dedicated: bytes,
+                    borrowed: 0,
+                    shadows_borrowed: 0,
+                }),
+            )?
+        }
         Qwen4PlacementForward::EpReserveShadowsInDonors(plan) => {
             hipfire_arch_qwen4::expert_residency::placement_inputs_with_ep_reserve_shadows_in_donors(
                 &args, plan,
@@ -3074,6 +3088,8 @@ pub fn qwen4_ep_vram_layers(
     // The plan every rank's `load_qwen4_rank` takes (`qwen4_ep_scratch_mode`: the
     // `Full` plan unless `HIPFIRE_EP_COMPACT_SCRATCH` admits the compact one).
     let scratch_mode = qwen4_ep_scratch_mode(gpu, hfq, &config, &manifest)?;
+    // PrefBorrow D3: decide the tail-borrow plan before anything reads the prompt chunk.
+    qwen4_ep_tail_borrow_publish(gpu, scratch_mode, units_path.is_some(), shared.max_seq, true);
     let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
         crate::qwen4_slab::qwen4_entry_bytes(&recipe, entry, |entry| {
             hfq.tensor_data(&entry.name)
@@ -3129,7 +3145,7 @@ pub fn qwen4_ep_vram_layers(
             scratch_mode,
             ranks,
             chunk,
-            Qwen4PlacementForward::Ordinary,
+            qwen4_ep_ordinary_forward(&config, scratch_mode, chunk)?,
         )?;
         // A bound trunk overlay (Q8F16 replaces six-bit trunk tensors with
         // owned, larger copies) adds resident bytes after placement runs: every
@@ -3640,6 +3656,13 @@ fn qwen4_ep_scratch_mode(
         hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(Some(
             QWEN4_EP_COMPACT_CHUNK_ROWS,
         ));
+        // A tail-borrow plan the planner published ([`qwen4_ep_tail_borrow_publish`]) moves the
+        // prompt chunk to its borrowed rows; each rank's load re-derives the same chunk here.
+        if let Some(plan) = hipfire_arch_qwen4::gpu_forward::qwen4_ep_tail_borrow_plan() {
+            hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk(Some(
+                plan.borrowed_rows,
+            ));
+        }
     }
     // The compact plan under EP owns the tile exchange's root (the arena would alias it) unless
     // the trunk shard runs: its chunks only mask tiles, no peer ever reads the grouped rows.
@@ -3648,6 +3671,89 @@ fn qwen4_ep_scratch_mode(
             && !hipfire_arch_qwen4::weights::trunk_shard::trunk_shard_requested(),
     );
     Ok(mode)
+}
+
+/// `HIPFIRE_QWEN4_EP_TAIL_BORROW` (PrefBorrow D3): decide the EP load's tail-borrow plan once, in
+/// the planner, right after the scratch plan is known and before any placement or forward reads
+/// the prompt chunk, and publish it: the load's prompt chunk is then the borrowed rows
+/// ([`hipfire_arch_qwen4::gpu_forward::qwen4_set_ep_auto_prefill_chunk`], so every reader of the
+/// requested chunk, placement, lane commit rows, the forward attach, MTP fill, PLE staging, sees
+/// it), the placement charges the forward at the resident rows plus the growth of the persistent
+/// roots ([`qwen4_ep_ordinary_forward`]), and each rank's forward builds the resident bank beside
+/// those roots. A knob the operator set that cannot apply prints one line (`announce`: the
+/// planner only). `units_plan`: the load carries a per-expert unit plan (the D2 tail's
+/// prerequisite).
+fn qwen4_ep_tail_borrow_publish(
+    gpu: &rdna_compute::Gpu,
+    scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
+    units_plan: bool,
+    max_seq: usize,
+    announce: bool,
+) {
+    use hipfire_arch_qwen4::gpu_forward as gf;
+    let conflict = if hipfire_arch_qwen4::ep_reserve::ep_reserve_request_from_env()
+        == hipfire_arch_qwen4::ep_reserve::EpReserveRequest::Forced
+    {
+        Some("HIPFIRE_EP_RESERVE_DECOUPLE=1")
+    } else if hipfire_config::developer_var(QWEN4_EP_CHUNK_AUTOFIT_ENV).as_deref() == Ok("1") {
+        Some("HIPFIRE_EP_CHUNK_AUTOFIT=1")
+    } else if hipfire_arch_qwen4::expert_unit_tail::ep_unit_tail_pins_requested() {
+        // The tail's pin plane follows its publications; a borrow epoch canonicalizes only the
+        // decode and full tables.
+        Some("the D2 tail pins lever (HIPFIRE_EP_UNIT_TAIL_PINS)")
+    } else {
+        None
+    };
+    let facts = gf::EpTailBorrowFacts {
+        ep: true,
+        gfx1201: gpu.arch == "gfx1201",
+        mode: scratch_mode,
+        tail_prefill: units_plan
+            && hipfire_arch_qwen4::expert_unit_tail::ep_unit_tail_prefill_requested(),
+        resident_rows: QWEN4_EP_COMPACT_CHUNK_ROWS,
+        max_seq,
+        explicit_chunk: gf::qwen4_prefill_chunk_rows_pinned(),
+        conflict,
+    };
+    let resolution = gf::resolve_ep_tail_borrow(
+        hipfire_config::developer_var(gf::EP_TAIL_BORROW_ENV)
+            .ok()
+            .as_deref(),
+        gf::EP_TAIL_BORROW_DEFAULT_ON,
+        &facts,
+    );
+    if let (true, Some(note)) = (announce, &resolution.note) {
+        eprintln!("{note}");
+    }
+    gf::qwen4_set_ep_tail_borrow_plan(resolution.plan);
+    if let Some(plan) = resolution.plan {
+        gf::qwen4_set_ep_auto_prefill_chunk(Some(plan.borrowed_rows));
+        if announce {
+            eprintln!(
+                "qwen4 EP tail borrow planned: {}-row prefill tiles (the load's prompt chunk) over a \
+                 {}-row resident scratch bank; the forward is charged the resident bank plus the \
+                 persistent token-id and grouped-down roots of the prompt chunk",
+                plan.borrowed_rows, plan.resident_rows
+            );
+        }
+    }
+}
+
+/// The forward term of an ORDINARY EP placement at `chunk` rows: the tail-borrow charge when the
+/// published plan's prompt chunk is `chunk` ([`qwen4_ep_tail_borrow_publish`]), else the
+/// ordinary `qwen4_forward_device_bytes` of the chunk.
+fn qwen4_ep_ordinary_forward(
+    config: &hipfire_arch_qwen4::Qwen4Config,
+    scratch_mode: hipfire_arch_qwen4::gpu_forward::Qwen4ForwardScratchMode,
+    chunk: usize,
+) -> Result<Qwen4PlacementForward<'static>, String> {
+    use hipfire_arch_qwen4::gpu_forward as gf;
+    match gf::qwen4_ep_tail_borrow_plan().filter(|plan| plan.borrowed_rows == chunk) {
+        None => Ok(Qwen4PlacementForward::Ordinary),
+        Some(plan) => gf::qwen4_ep_tail_borrow_forward_bytes(config, &plan, scratch_mode)
+            .map(Qwen4PlacementForward::TailBorrow)
+            .ok_or_else(|| "qwen4: the EP tail borrow forward bytes overflow".to_string()),
+    }
 }
 
 fn qwen4_ep_unit_reserve_on() -> bool {
@@ -4353,6 +4459,10 @@ fn qwen4_ep_lane_request(
 enum Qwen4PlacementForward<'a> {
     /// The ordinary `qwen4_forward_device_bytes` of the chunk.
     Ordinary,
+    /// An admitted EP tail-borrow load's forward ([`qwen4_ep_ordinary_forward`]): the resident
+    /// bank plus the persistent roots of the prompt chunk, bytes charged in place of the
+    /// chunk's `qwen4_forward_device_bytes`.
+    TailBorrow(u64),
     /// An admitted single-device decode-share load's dedicated forward.
     DecodeShare(hipfire_arch_qwen4::expert_residency::DecodeShareForward),
     /// An admitted EP reserve-decoupled load's dedicated forward
@@ -6688,6 +6798,7 @@ fn load_qwen4_rank_unscoped(
             )?;
             qwen4_ep_rank_placement_forward(plan)
         }
+        None if ep.is_some() => qwen4_ep_ordinary_forward(&config, scratch_mode, placement_chunk)?,
         None => Qwen4PlacementForward::Ordinary,
     };
     let ep_reserve_mirror_bytes = ep_reserve
@@ -16898,6 +17009,42 @@ mod qwen4_ep_reserve_loader_tests {
     /// Free VRAM that keeps exactly `layers` resident layers at `reserve`.
     fn free_for(config: &Qwen4Config, layers: usize, reserve: u64) -> u64 {
         NON_EXPERT + reserve + layers as u64 * layer_bytes(config) + layer_bytes(config) / 2
+    }
+
+    /// The EP tail-borrow forward charge (`qwen4_ep_ordinary_forward`): the published plan
+    /// replaces the ordinary forward term at exactly its prompt chunk and nowhere else, and the
+    /// charge sits strictly between the resident rows' forward and the prompt chunk's whole one.
+    /// (A chunk no other test uses, so the process-wide plan cannot reach a concurrent test.)
+    #[test]
+    fn the_tail_borrow_charge_applies_only_at_the_published_chunk() {
+        use hipfire_arch_qwen4::gpu_forward as gf;
+        let config = config();
+        let plan = gf::EpTailBorrowPlan {
+            borrowed_rows: 12288,
+            resident_rows: 4096,
+        };
+        gf::qwen4_set_ep_tail_borrow_plan(None);
+        assert!(matches!(
+            qwen4_ep_ordinary_forward(&config, Mode::Full, 12288),
+            Ok(Qwen4PlacementForward::Ordinary)
+        ));
+        gf::qwen4_set_ep_tail_borrow_plan(Some(plan));
+        let at_plan = qwen4_ep_ordinary_forward(&config, Mode::Full, 12288);
+        let at_resident = qwen4_ep_ordinary_forward(&config, Mode::Full, 4096);
+        gf::qwen4_set_ep_tail_borrow_plan(None);
+        let charged = gf::qwen4_ep_tail_borrow_forward_bytes(&config, &plan, Mode::Full)
+            .expect("the plan's charge");
+        match at_plan {
+            Ok(Qwen4PlacementForward::TailBorrow(bytes)) => assert_eq!(bytes, charged),
+            _ => panic!("the published chunk takes the tail-borrow charge"),
+        }
+        assert!(matches!(
+            at_resident,
+            Ok(Qwen4PlacementForward::Ordinary)
+        ));
+        let resident = gf::qwen4_forward_device_bytes(&config, 4096, Mode::Full).unwrap();
+        let whole = gf::qwen4_forward_device_bytes(&config, 12288, Mode::Full).unwrap();
+        assert!(resident < charged && charged < whole, "{resident} < {charged} < {whole}");
     }
 
     struct Mock {

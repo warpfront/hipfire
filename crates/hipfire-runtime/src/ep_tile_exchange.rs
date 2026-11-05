@@ -113,6 +113,12 @@ pub const MAX_RANKS: usize = 8;
 pub const HOST_RESERVE_ACQUIRE: u8 = 1;
 pub const HOST_RESERVE_RESTORE: u8 = 2;
 pub const HOST_STAGE_QUIESCE: u8 = 3;
+/// D2-tail borrow epoch (`HIPFIRE_QWEN4_EP_TAIL_BORROW`): every rank's tail tables are canonical
+/// and its policy suspended before any rank's prefill bank overwrites the tail pool.
+pub const HOST_TAIL_BORROW_ACQUIRE: u8 = 4;
+/// D2-tail borrow epoch close: every rank's tail pool is restored whole before any rank resumes
+/// (republishes) tail slots.
+pub const HOST_TAIL_BORROW_RESTORE: u8 = 5;
 
 /// The layer of an exchange whose caller did not name one.
 pub const NO_LAYER: usize = u16::MAX as usize;

@@ -1702,6 +1702,38 @@ impl Qwen4Bundle {
                 .weights
                 .expert_tiers()
                 .is_some_and(|lease| lease.decode_share().is_some());
+        // EP tail borrow (`HIPFIRE_QWEN4_EP_TAIL_BORROW`): the loader published the plan and,
+        // with it, the borrowed rows as the EP prompt chunk (`requested`), sized the placement
+        // for the resident bank plus the persistent roots, and this attach builds exactly that:
+        // the resident bank (today's EP chunk) beside persistent token ids and exchange root
+        // sized for the prompt chunk. An attach that cannot honour the plan builds as it would
+        // without the knob (the loader charged more, never less).
+        let tail_borrow = {
+            let excluded = if sharing {
+                Some("a decode-share donor tail")
+            } else if s1_tile.is_some() {
+                Some("an S1 slow-link profile")
+            } else if canonical.is_some() {
+                Some("a pipeline-parallel band")
+            } else {
+                None
+            };
+            match crate::gpu_forward::ep_tail_borrow::ep_tail_borrow_attach_plan(
+                crate::gpu_forward::qwen4_ep_tail_borrow_plan(),
+                self.weights.ep_placement().is_some(),
+                mode,
+                requested,
+                excluded,
+            ) {
+                Ok(plan) => plan,
+                Err(reason) => {
+                    eprintln!(
+                        "  qwen4 EP tail borrow: not taken ({reason}); ordinary prompt chunk"
+                    );
+                    None
+                }
+            }
+        };
         let max_chunk = match s1_tile {
             // The charged tile, with no rung downshift: admission sized the
             // placement and the arena for exactly these rows.
@@ -1725,6 +1757,30 @@ impl Qwen4Bundle {
                 }
                 requested
             }
+            None if tail_borrow.is_some() => {
+                // The chunk is final (no rung downshift): the placement was sized for exactly
+                // the resident bank plus the persistent roots of these rows.
+                let plan = tail_borrow.expect("checked by the guard");
+                let need = crate::gpu_forward::qwen4_ep_tail_borrow_forward_bytes(
+                    &self.config,
+                    &plan,
+                    mode,
+                )
+                .and_then(|bytes| bytes.checked_add(QWEN4_FORWARD_HEADROOM_BYTES))
+                .ok_or_else(|| {
+                    BundleError::Forward("EP tail borrow forward bytes overflow".into())
+                })?;
+                if need > free as u64 {
+                    return Err(BundleError::Forward(format!(
+                        "EP tail borrow: the {}-row prompt chunk the placement was sized for needs {} MiB of forward resources (the {}-row resident bank plus persistent roots) plus headroom but only {} MiB are free; set HIPFIRE_QWEN4_EP_TAIL_BORROW=0 to load without the borrow",
+                        plan.borrowed_rows,
+                        need >> 20,
+                        plan.resident_rows,
+                        free as u64 >> 20
+                    )));
+                }
+                requested
+            }
             None => attach_chunk_rows(&self.config, requested, mode, free as u64, canonical)
                 .map_err(BundleError::Forward)?,
         };
@@ -1733,13 +1789,15 @@ impl Qwen4Bundle {
             hipfire_config::load_summary::Facet::Prefill,
             format!("chunk {max_chunk} rows"),
         );
-        let attempt = Qwen4GpuForward::new_inner(
+        let attempt = Qwen4GpuForward::new_inner_with_reserve(
             gpu,
             self,
             max_chunk,
             mode,
             #[cfg(target_os = "linux")]
             Some(npu_prepared),
+            None,
+            tail_borrow,
         );
         let (mut forward, max_chunk) = match attempt {
             Ok(forward) => (forward, max_chunk),
@@ -2080,6 +2138,33 @@ impl Qwen4Bundle {
         match self.execution.as_mut() {
             Some(forward) => forward
                 .share_prompt_end(gpu, ok)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// [`Self::share_prompt_end`] for a bracket whose prompt continues in a later one (see
+    /// [`Qwen4GpuForward::share_prompt_end_continuing`]): the lane executor's per-step bracket.
+    pub(crate) fn share_prompt_end_continuing(
+        &mut self,
+        gpu: &mut Gpu,
+        ok: bool,
+        continues: bool,
+    ) -> Result<(), BundleError> {
+        match self.execution.as_mut() {
+            Some(forward) => forward
+                .share_prompt_end_continuing(gpu, ok, continues)
+                .map_err(|error| BundleError::Forward(error.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// Close an EP tail-borrow epoch a continuing lane prompt left open (see
+    /// [`Qwen4GpuForward::ep_tail_idle_close`]); a no-op without one.
+    pub(crate) fn ep_tail_borrow_idle_close(&mut self, gpu: &mut Gpu) -> Result<(), BundleError> {
+        match self.execution.as_mut() {
+            Some(forward) => forward
+                .ep_tail_idle_close(gpu)
                 .map_err(|error| BundleError::Forward(error.to_string())),
             None => Ok(()),
         }
@@ -6853,6 +6938,7 @@ impl Qwen4Bundle {
             #[cfg(target_os = "linux")]
             Some(None),
             Some(plan),
+            None,
         )
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         let spec_rows = qwen4_spec_logit_rows(rows);

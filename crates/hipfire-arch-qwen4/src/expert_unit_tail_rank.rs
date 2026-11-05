@@ -4,7 +4,8 @@
 
 //! One EP rank's D2 tail: the device part of [`crate::expert_unit_tail`].
 //!
-//! Owns, per rank: the tail pool (two blocks laid out like a unit arena), a copy
+//! Owns, per rank: the tail pool (ONE device allocation holding two blocks laid out like a unit
+//! arena, lendable for a borrow epoch: [`UnitTailRank::borrow_suspend`]), a copy
 //! stream with its completion events, the per-window usage log, and the rank's
 //! DECODE pointer tables' byte images. Only those tables are ever rewritten: an
 //! entry is the unit's canonical pointer (pinned host arena or the static core's
@@ -78,7 +79,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use crate::expert_ep_units::EpUnitPlan;
 use crate::expert_unit_tail::{
     EpUnitTailConfig, FillOp, PeerBoard, PeerDelta, PeerTake, PinDelta, PinPlanes, PinProtocol,
-    Retire, RetireCadence, TailPolicy, UnitKey, WindowUse, QUARANTINE_WINDOWS,
+    Retire, RetireCadence, SlotPhase, TailPolicy, UnitKey, WindowUse, QUARANTINE_WINDOWS,
 };
 
 /// Ids one window's log holds (`calls x slots`); a window past this stops
@@ -485,6 +486,14 @@ struct Inner {
     kinds: Vec<Kind>,
     gate_up_bytes: usize,
     down_bytes: usize,
+    /// The slot pool: ONE device allocation laid out `[gate/up block | pad | down block | pad]`
+    /// ([`pool_layout`]). The only pool tensor `release` frees, and the span a borrow epoch lends
+    /// ([`UnitTailRank::pool_span`]).
+    pool: Option<GpuTensor>,
+    /// Bytes of the `pool` allocation as laid out (what [`UnitTailRank::pool_span`] reports).
+    pool_bytes: usize,
+    /// Non-owning views of the pool's two blocks (`pool_gate_up` at offset 0, `pool_down` at the
+    /// 256-aligned down offset): what slot addresses and the fill copies use. Never freed.
     pool_gate_up: Option<GpuTensor>,
     pool_down: Option<GpuTensor>,
     copy_stream: Option<Stream>,
@@ -536,6 +545,15 @@ struct Inner {
     /// The pins lever's state, `None` without it.
     pins: Option<RankPins>,
     released: bool,
+    /// A borrow epoch is open ([`UnitTailRank::borrow_suspend`]): the pool belongs to another user,
+    /// every table this tail owns holds canonical entries, and the policy is frozen in place (no
+    /// logging, retirement, fill, publication, peer post/take or pin delta). Separate from
+    /// `frozen`: a frozen tail can be suspended and resumed.
+    suspended: bool,
+    /// The unit each slot last held a fill of (set at the seed and at every retirement's fills).
+    /// The policy forgets the unit of a `Quarantined` slot, whose bytes a peer's full table may
+    /// still name, so a borrow restore reads it here.
+    slot_units: Vec<Option<UnitKey>>,
 }
 
 /// The rank's tail (installed in the row-gather hook).
@@ -831,6 +849,8 @@ impl UnitTailRank {
             kinds,
             gate_up_bytes: gub,
             down_bytes: dnb,
+            pool: None,
+            pool_bytes: 0,
             pool_gate_up: None,
             pool_down: None,
             copy_stream: None,
@@ -866,6 +886,8 @@ impl UnitTailRank {
             peer_skipped: 0,
             pins: pin_state,
             released: false,
+            suspended: false,
+            slot_units: vec![None; slots],
         };
         let built = state.build_device(gpu, slots, &seeds);
         if let Err(error) = built {
@@ -972,6 +994,9 @@ impl UnitTailRank {
     /// End of a decode window (after its forward's D2H sync): retire it.
     pub(crate) fn step_end(&self, gpu: &mut Gpu) {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.skip_suspended_window() {
+            return;
+        }
         if inner.pins.is_some() && !inner.released {
             // The pins lever: the retirement clock runs on a frozen tail too.
             inner.step_end_pinned(gpu);
@@ -1020,9 +1045,67 @@ impl UnitTailRank {
     }
 }
 
+/// The borrow API: lend the slot pool to another user for one epoch (see
+/// `local://prefborrow-design.md`). Every call runs on the rank thread of the tail, serialised
+/// with the window protocol by `inner`'s mutex.
+impl UnitTailRank {
+    /// Device span of the slot pool: ONE allocation laid out `[gate/up block | pad | down block |
+    /// pad]`, base 256-aligned. `None` once released.
+    pub(crate) fn pool_span(&self) -> Option<(usize, usize)> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.pool_span()
+    }
+
+    /// Open: drain (issue any deferred fills, host-wait the copy stream and every pending fill
+    /// batch), suspend the policy, upload the canonical image of every tail-owned device table
+    /// synchronously; host images untouched. Err if released, already suspended, or any HIP call
+    /// fails; after an Err past those two checks the tail stays suspended, so the close sequence
+    /// (`borrow_restore`, `borrow_resume`) is the way back (the pool was not lent yet).
+    pub(crate) fn borrow_suspend(&self, gpu: &mut Gpu) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.borrow_suspend(gpu)
+    }
+
+    /// Only while suspended: re-copy every occupied slot (a slot whose fill completed: published
+    /// or filled-unpublished) from its unit's canonical pinned host bytes into the pool,
+    /// host-wait. Returns bytes copied.
+    pub(crate) fn borrow_restore(&self, gpu: &mut Gpu) -> Result<u64, String> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.borrow_restore(gpu)
+    }
+
+    /// Only while suspended, after `borrow_restore`: D2H every occupied slot, compare
+    /// byte-for-byte with the canonical host bytes. Ok(fnv-1a 64 digest over (slot, layer,
+    /// expert, bytes)) or Err naming the first mismatch.
+    pub(crate) fn borrow_verify(&self, gpu: &mut Gpu) -> Result<u64, String> {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.borrow_verify(gpu)
+    }
+
+    /// Close: upload the whole LIVE host image of every tail-owned device table synchronously,
+    /// resume the policy.
+    pub(crate) fn borrow_resume(&self, gpu: &mut Gpu) -> Result<(), String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.borrow_resume(gpu)
+    }
+
+    pub(crate) fn borrow_suspended(&self) -> bool {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.suspended && !inner.released
+    }
+
+    /// Occupied slots and their bytes (for logs/receipts). Exact once suspended (every issued
+    /// fill has completed); before that a fill still in flight counts as occupied too.
+    pub(crate) fn borrow_occupied(&self) -> (usize, u64) {
+        let inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        let slots = inner.occupied().len();
+        (slots, slots as u64 * (inner.gate_up_bytes + inner.down_bytes) as u64)
+    }
+}
+
 impl Inner {
     fn live_slots(&self, label: usize) -> Vec<LiveSlot> {
-        if self.released {
+        if self.released || self.suspended {
             return Vec::new();
         }
         let Some(index) = self.layer_of.get(label).copied().flatten() else {
@@ -1058,14 +1141,22 @@ impl Inner {
         seeds: &[FillOp],
     ) -> Result<(), String> {
         let pad = crate::expert_arena::ARENA_TAIL_PAD_BYTES;
-        self.pool_gate_up = Some(
-            gpu.zeros(&[slots * self.gate_up_bytes + pad], DType::Raw)
-                .map_err(|e| format!("the tail pool's gate/up block ({slots} slots): {e}"))?,
-        );
-        self.pool_down = Some(
-            gpu.zeros(&[slots * self.down_bytes + pad], DType::Raw)
-                .map_err(|e| format!("the tail pool's down block ({slots} slots): {e}"))?,
-        );
+        // ONE allocation (one memset): the gate/up block at offset 0, the down block at its
+        // 256-aligned offset; `pool_gate_up` / `pool_down` are non-owning views of the two blocks.
+        let layout = pool_layout(slots, self.gate_up_bytes, self.down_bytes, pad);
+        let pool = gpu.zeros(&[layout.total], DType::Raw).map_err(|e| {
+            format!(
+                "the tail pool ({slots} slots, {} bytes): {e}",
+                layout.total
+            )
+        })?;
+        self.pool_gate_up = Some(pool_view(&pool, 0, layout.gate_up_len));
+        self.pool_down = Some(pool_view(&pool, layout.down_offset, layout.down_len));
+        self.pool_bytes = layout.total;
+        self.pool = Some(pool);
+        for op in seeds {
+            self.slot_units[op.slot] = Some(op.unit);
+        }
         self.log = Some(
             gpu.zeros(&[LOG_IDS * 4], DType::Raw)
                 .map_err(|e| format!("the usage log: {e}"))?,
@@ -1232,6 +1323,10 @@ impl Inner {
     }
 
     fn note_call(&mut self, gpu: &mut Gpu, layer_idx: u16, slots: usize, topk: &GpuTensor) {
+        if self.suspended {
+            // A borrow epoch: no window counting, no deferred issue, no usage-log copy.
+            return;
+        }
         let layer = layer_idx as usize;
         // The cadence's input: every rank enters this call with the same `slots` (the extent of
         // the cross-rank row exchange), so this count is counted before any rank-local early
@@ -1492,6 +1587,9 @@ impl Inner {
         // This retirement's index (the retirement counters of all ranks are one clock: the
         // ranks retire the same groups of windows).
         let j = self.policy.stats().retirements;
+        for fill in &retire.fills {
+            self.slot_units[fill.slot] = Some(fill.unit);
+        }
         let t_retire = Instant::now();
 
         // Tables first (publish -> slot, evict -> canonical), then the copies.
@@ -1807,25 +1905,321 @@ impl Inner {
         if let Some(event) = self.tables_ready.take() {
             let _ = gpu.hip.event_destroy(event);
         }
-        for tensor in [
-            self.pool_gate_up.take(),
-            self.pool_down.take(),
-            self.log.take(),
-        ]
-        .into_iter()
-        .flatten()
-        {
+        // The two block views alias the pool's allocation: dropping them frees nothing.
+        self.pool_gate_up = None;
+        self.pool_down = None;
+        for tensor in [self.pool.take(), self.log.take()].into_iter().flatten() {
             let _ = gpu.free_tensor(tensor);
         }
+    }
+}
+
+/// Alignment of the pool's down block inside the single allocation (what a separate
+/// `hipMalloc` gave it before the pool was one allocation).
+const POOL_BLOCK_ALIGN: usize = 256;
+
+/// Layout of the slot pool's single device allocation:
+/// `[gate/up: slots * gate_up_bytes + pad | align to 256 | down: slots * down_bytes + pad]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PoolLayout {
+    /// Bytes of the gate/up block (slots plus the over-read pad), at offset 0.
+    gate_up_len: usize,
+    /// Offset of the down block: `gate_up_len` rounded up to [`POOL_BLOCK_ALIGN`].
+    down_offset: usize,
+    /// Bytes of the down block (slots plus the over-read pad).
+    down_len: usize,
+    /// Bytes of the whole allocation.
+    total: usize,
+}
+
+fn pool_layout(slots: usize, gate_up_bytes: usize, down_bytes: usize, pad: usize) -> PoolLayout {
+    let gate_up_len = slots * gate_up_bytes + pad;
+    let down_offset = gate_up_len.next_multiple_of(POOL_BLOCK_ALIGN);
+    let down_len = slots * down_bytes + pad;
+    PoolLayout {
+        gate_up_len,
+        down_offset,
+        down_len,
+        total: down_offset + down_len,
+    }
+}
+
+/// A non-owning raw tensor over bytes `[offset, offset + len)` of the pool allocation `pool`.
+/// Like every `byte_view` it must not outlive `pool` nor be freed.
+fn pool_view(pool: &GpuTensor, offset: usize, len: usize) -> GpuTensor {
+    GpuTensor {
+        buf: pool.buf.byte_view(offset, len),
+        shape: vec![len],
+        dtype: DType::Raw,
+    }
+}
+
+/// The byte image of a device pointer table holding `entries` (u64 LE per expert): the format
+/// of [`TableImage`], so uploading it makes the device table equal that canonical entry list.
+fn canonical_image(entries: &[u64]) -> Vec<u8> {
+    entries.iter().flat_map(|entry| entry.to_le_bytes()).collect()
+}
+
+/// Whether a slot holds the bytes of a completed fill that a table names now or may name after
+/// the next retirement: `Live` (published), `Quarantined` (evicted, but a peer's full table may
+/// still name it until the peer acknowledged) and `Filling` whose copy completed
+/// (`fill_completed`, a pending batch entry of the slot's current generation: published at the
+/// next retirement). A `Filling` slot whose fill was never issued (a frozen tail dropped it) and
+/// a `Free` slot hold nothing worth restoring.
+fn slot_is_occupied(phase: SlotPhase, fill_completed: bool) -> bool {
+    match phase {
+        SlotPhase::Live | SlotPhase::Quarantined => true,
+        SlotPhase::Filling => fill_completed,
+        SlotPhase::Free => false,
+    }
+}
+
+const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+/// FNV-1a 64 of `bytes`, continuing from `hash`.
+fn fnv1a64(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &byte in bytes {
+        hash = (hash ^ u64::from(byte)).wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// The offset of the first byte where `a` and `b` differ (the shorter length when one is a
+/// prefix of the other), `None` when equal.
+fn first_difference(a: &[u8], b: &[u8]) -> Option<usize> {
+    if a == b {
+        return None;
+    }
+    Some(
+        a.iter()
+            .zip(b)
+            .position(|(x, y)| x != y)
+            .unwrap_or(a.len().min(b.len())),
+    )
+}
+
+/// Synchronous upload of `bytes` to the start of `table`.
+fn upload_image(gpu: &Gpu, table: &GpuTensor, bytes: &[u8]) -> Result<(), String> {
+    gpu.hip
+        .memcpy_htod(&table.buf.byte_view(0, bytes.len()), bytes)
+        .map_err(io)
+}
+
+/// Everything the device finished: the synchronous null-stream copies of a borrow open / close
+/// and the compute and copy streams, in one wait.
+fn device_idle(gpu: &Gpu) -> Result<(), String> {
+    gpu.hip.device_synchronize().map_err(io)
+}
+
+impl Inner {
+    fn pool_span(&self) -> Option<(usize, usize)> {
+        if self.released {
+            return None;
+        }
+        self.pool
+            .as_ref()
+            .map(|pool| (pool.buf.as_ptr() as usize, self.pool_bytes))
+    }
+
+    /// A suspended tail does nothing at a window end (no retirement, no pin step, no cadence
+    /// clock): drop what the window logged, like a frozen tail, and report that the window end
+    /// is skipped.
+    fn skip_suspended_window(&mut self) -> bool {
+        if !self.suspended {
+            return false;
+        }
+        self.calls.clear();
+        self.log_used = 0;
+        true
+    }
+
+    /// The occupied slots ([`slot_is_occupied`]) as the fills that would reproduce them, ascending
+    /// by slot: the unit each holds (the policy's, or the last fill's for a `Quarantined` slot)
+    /// and its current generation. Empty once released. A `Filling` slot counts when a pending
+    /// batch holds its current generation, so the answer is exact only after a suspend has waited
+    /// every batch.
+    fn occupied(&self) -> Vec<FillOp> {
+        if self.released {
+            return Vec::new();
+        }
+        let pending: HashSet<(usize, u64)> = self
+            .batches
+            .iter()
+            .flat_map(|batch| batch.fills.iter().copied())
+            .collect();
+        (0..self.policy.slots())
+            .filter_map(|slot| {
+                let generation = self.policy.slot_generation(slot);
+                let completed = pending.contains(&(slot, generation));
+                if !slot_is_occupied(self.policy.slot_phase(slot), completed) {
+                    return None;
+                }
+                let unit = self.policy.slot_unit(slot).or(self.slot_units[slot])?;
+                Some(FillOp {
+                    slot,
+                    unit,
+                    generation,
+                })
+            })
+            .collect()
+    }
+
+    /// The canonical pinned host bytes of `unit`'s `[gate_up, down]`.
+    fn canonical_bytes(&self, unit: UnitKey) -> Result<(&[u8], &[u8]), String> {
+        let (layer, expert) = (unit.0 as usize, unit.1 as usize);
+        let index = self.layer_of[layer].ok_or("a slot names an unmanaged layer")?;
+        let canon = &self.layers[index];
+        let (src_gate_up, src_down) = (canon.canon_gate_up[expert], canon.canon_down[expert]);
+        if src_gate_up == 0 || src_down == 0 {
+            return Err(format!("unit ({layer},{expert}) has no canonical source"));
+        }
+        // SAFETY: as in `issue_copies`: a managed unit the static core does not hold lives in its
+        // layer's pinned host arena, which outlives the forward and is never written after load.
+        Ok(unsafe {
+            (
+                std::slice::from_raw_parts(src_gate_up as usize as *const u8, self.gate_up_bytes),
+                std::slice::from_raw_parts(src_down as usize as *const u8, self.down_bytes),
+            )
+        })
+    }
+
+    fn require_suspended(&self) -> Result<(), String> {
+        if self.released {
+            return Err("the tail is released".into());
+        }
+        if !self.suspended {
+            return Err("the tail is not suspended".into());
+        }
+        Ok(())
+    }
+
+    /// See [`UnitTailRank::borrow_suspend`]. The tail is marked suspended before the first device
+    /// call so a failure leaves it in a state the close sequence can leave. Invariant afterwards:
+    /// every table the tail owns holds canonical entries (decode tables: `canon_*`; full tables:
+    /// their install-time `base_*`, the entries the forward uploaded BEFORE any warm-start
+    /// publication (the images are built from the same entries ahead of `build_device`), the same
+    /// entries [`full_shared`] / [`peer_shared`] define canonical by), so no table names a slot.
+    /// The window log of the open group is dropped (the log's device bytes are not read again);
+    /// the retirement cadence is left alone: ranks suspend at the same call, so it stays
+    /// rank-identical and the retirement clock resumes where it stopped. Pending fill batches are
+    /// kept (all complete), so the next retirement polls them and publishes them as ever.
+    fn borrow_suspend(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        if self.released {
+            return Err("the tail is released".into());
+        }
+        if self.suspended {
+            return Err("the tail is already suspended".into());
+        }
+        self.suspended = true;
+        self.calls.clear();
+        self.log_used = 0;
+        self.window_routed = 0;
+        self.window_seen = false;
+        // No table upload of the window protocol is still reading a pinned image.
+        device_idle(gpu)?;
+        // A frozen tail drops its deferred fills (its slots stay `Filling`, which nothing reads).
+        self.issue_deferred(gpu)?;
+        let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
+        gpu.hip.stream_synchronize(stream).map_err(io)?;
+        for batch in &self.batches {
+            gpu.hip.event_synchronize(&batch.event).map_err(io)?;
+        }
+        for layer in &self.layers {
+            upload_image(gpu, &layer.table_gate_up, &canonical_image(&layer.canon_gate_up))?;
+            upload_image(gpu, &layer.table_down, &canonical_image(&layer.canon_down))?;
+            if let Some(full) = layer.full.as_ref() {
+                upload_image(gpu, &full.table_gate_up, &canonical_image(&full.base_gate_up))?;
+                upload_image(gpu, &full.table_down, &canonical_image(&full.base_down))?;
+            }
+        }
+        // The copies above are null-stream: nothing may run ahead of them on any stream.
+        device_idle(gpu)
+    }
+
+    /// See [`UnitTailRank::borrow_restore`].
+    fn borrow_restore(&self, gpu: &Gpu) -> Result<u64, String> {
+        self.require_suspended()?;
+        // Whatever used the pool (the compute stream) is done before its bytes are overwritten.
+        device_idle(gpu)?;
+        let fills = self.occupied();
+        self.issue_copies(gpu, &fills)?;
+        let stream = self.copy_stream.as_ref().ok_or("no copy stream")?;
+        gpu.hip.stream_synchronize(stream).map_err(io)?;
+        Ok(fills.len() as u64 * (self.gate_up_bytes + self.down_bytes) as u64)
+    }
+
+    /// See [`UnitTailRank::borrow_verify`]. The digest is FNV-1a 64 over, per occupied slot
+    /// ascending: slot, layer, expert (u64 LE each), then the gate/up bytes and the down bytes.
+    fn borrow_verify(&self, gpu: &Gpu) -> Result<u64, String> {
+        self.require_suspended()?;
+        let (pool_gate_up, pool_down) = (
+            self.pool_gate_up.as_ref().ok_or("no pool")?,
+            self.pool_down.as_ref().ok_or("no pool")?,
+        );
+        let mut device = vec![0u8; self.gate_up_bytes.max(self.down_bytes)];
+        let mut digest = FNV_OFFSET;
+        for op in self.occupied() {
+            let (layer, expert) = (op.unit.0 as usize, op.unit.1 as usize);
+            let (host_gate_up, host_down) = self.canonical_bytes(op.unit)?;
+            for (what, pool, at, host) in [
+                ("gate/up", pool_gate_up, op.slot * self.gate_up_bytes, host_gate_up),
+                ("down", pool_down, op.slot * self.down_bytes, host_down),
+            ] {
+                let device = &mut device[..host.len()];
+                gpu.hip
+                    .memcpy_dtoh(device, &pool.buf.byte_view(at, host.len()))
+                    .map_err(io)?;
+                if let Some(byte) = first_difference(device, host) {
+                    return Err(format!(
+                        "the tail pool slot {} (unit layer {layer} expert {expert}) {what} block \
+                         differs from its canonical host bytes at byte {byte}: device {:#04x}, host {:#04x}",
+                        op.slot,
+                        device.get(byte).copied().unwrap_or(0),
+                        host.get(byte).copied().unwrap_or(0)
+                    ));
+                }
+            }
+            for word in [op.slot as u64, layer as u64, expert as u64] {
+                digest = fnv1a64(digest, &word.to_le_bytes());
+            }
+            digest = fnv1a64(digest, host_gate_up);
+            digest = fnv1a64(digest, host_down);
+        }
+        Ok(digest)
+    }
+
+    /// See [`UnitTailRank::borrow_resume`]. Every table gets its whole live host image (a table a
+    /// slot publication changed and one that did not alike: the device holds canonical entries
+    /// after the open), so no dirty range remains. Fills still in flight at the open were drained
+    /// and keep their batch entries: the next retirement publishes them.
+    fn borrow_resume(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.require_suspended()?;
+        for layer in &mut self.layers {
+            upload_image(gpu, &layer.table_gate_up, &layer.image_gate_up)?;
+            upload_image(gpu, &layer.table_down, &layer.image_down)?;
+            layer.image_gate_up.dirty.take();
+            layer.image_down.dirty.take();
+            if let Some(full) = layer.full.as_mut() {
+                upload_image(gpu, &full.table_gate_up, &full.image_gate_up)?;
+                upload_image(gpu, &full.table_down, &full.image_down)?;
+                full.image_gate_up.dirty.take();
+                full.image_down.dirty.take();
+            }
+        }
+        device_idle(gpu)?;
+        self.suspended = false;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_peer_delta, changed_entry_range, entry_span, full_shared, image_entry,
-        live_slot_units, peer_shared, pin_deltas, tail_layer_selected, DirtyRange, LiveSlot,
-        ENTRY_BYTES,
+        apply_peer_delta, canonical_image, changed_entry_range, entry_span, first_difference,
+        fnv1a64, full_shared, image_entry, live_slot_units, peer_shared, pin_deltas, pool_layout,
+        slot_is_occupied, tail_layer_selected, DirtyRange, Inner, LiveSlot, ENTRY_BYTES,
+        FNV_OFFSET, LOG_IDS, POOL_BLOCK_ALIGN,
     };
     use crate::expert_unit_tail::{
         EpUnitTailConfig, PeerBoard, PeerDelta, PinDelta, Retire, RetireCadence, SlotPhase,
@@ -2611,5 +3005,213 @@ mod tests {
         let broke = (1..=4u64)
             .any(|seed| run_sim(4, 2, 1, false, seed * 0x9e37_79b9_7f4a_7c15, 300).is_err());
         assert!(broke, "the invariant never fired without the quarantine");
+    }
+
+    #[test]
+    fn the_canonical_image_is_the_table_image_byte_format() {
+        let entries = [0u64, 0x7f00_0000_1000, u64::MAX, 42];
+        let bytes = canonical_image(&entries);
+        assert_eq!(bytes, image(&entries));
+        assert_eq!(bytes.len(), entries.len() * ENTRY_BYTES);
+        for (expert, &entry) in entries.iter().enumerate() {
+            assert_eq!(image_entry(&bytes, expert), entry);
+        }
+        assert!(canonical_image(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_pool_is_one_allocation_with_an_aligned_down_block_after_the_gate_up_block() {
+        let pad = 256;
+        let layout = pool_layout(3, 1000, 500, pad);
+        assert_eq!(layout.gate_up_len, 3 * 1000 + pad);
+        assert_eq!(layout.down_offset, 3328);
+        assert_eq!(layout.down_len, 3 * 500 + pad);
+        assert_eq!(layout.total, layout.down_offset + layout.down_len);
+        // Already aligned: no gap.
+        let layout = pool_layout(4, 1024, 512, pad);
+        assert_eq!(layout.down_offset, layout.gate_up_len);
+        for (slots, gate_up, down) in [(1usize, 1usize, 1usize), (7, 3333, 1111), (1536, 2_359_296, 1_179_648)] {
+            let layout = pool_layout(slots, gate_up, down, pad);
+            assert_eq!(layout.down_offset % POOL_BLOCK_ALIGN, 0);
+            assert!(layout.down_offset >= layout.gate_up_len);
+            assert!(layout.down_offset - layout.gate_up_len < POOL_BLOCK_ALIGN);
+            // Both blocks keep their over-read pad and never overlap.
+            assert!(layout.gate_up_len >= slots * gate_up + pad);
+            assert!(layout.down_len >= slots * down + pad);
+            assert_eq!(layout.total, layout.down_offset + layout.down_len);
+        }
+    }
+
+    #[test]
+    fn only_a_slot_with_a_completed_fill_is_occupied() {
+        assert!(slot_is_occupied(SlotPhase::Live, false));
+        assert!(slot_is_occupied(SlotPhase::Quarantined, false));
+        assert!(slot_is_occupied(SlotPhase::Filling, true));
+        assert!(!slot_is_occupied(SlotPhase::Filling, false));
+        assert!(!slot_is_occupied(SlotPhase::Free, false));
+        assert!(!slot_is_occupied(SlotPhase::Free, true));
+    }
+
+    /// An `Inner` with no layer and no device state: enough for the policy-side borrow rules.
+    fn bare(policy: TailPolicy, suspended: bool) -> Inner {
+        let slots = policy.slots();
+        Inner {
+            rank: 0,
+            ranks: 1,
+            experts: 64,
+            trunk_layers: 4,
+            layer_of: vec![None; 4],
+            layers: Vec::new(),
+            kinds: Vec::new(),
+            gate_up_bytes: 16,
+            down_bytes: 8,
+            pool: None,
+            pool_bytes: 0,
+            pool_gate_up: None,
+            pool_down: None,
+            copy_stream: None,
+            tables_ready: None,
+            batches: Default::default(),
+            idle_events: Vec::new(),
+            log: None,
+            log_host: Vec::new(),
+            log_used: 0,
+            calls: Vec::new(),
+            cadence: RetireCadence::new(4096, LOG_IDS as u64),
+            window_routed: 0,
+            window_seen: false,
+            reads: Vec::new(),
+            touched: Vec::new(),
+            overflowed: 0,
+            policy,
+            frozen: None,
+            log_enabled: false,
+            host_only_reads: 0,
+            retire_ns: 0,
+            log_ns: 0,
+            upload_ns: 0,
+            fill_ns: 0,
+            fill_wait_ns: 0,
+            fill_overlap: false,
+            deferred: Vec::new(),
+            uploads: 0,
+            upload_calls: 0,
+            upload_bytes: 0,
+            peer: None,
+            peer_applied: 0,
+            peer_skipped: 0,
+            pins: None,
+            released: false,
+            suspended,
+            slot_units: vec![None; slots],
+        }
+    }
+
+    fn occupied_slots(inner: &Inner) -> Vec<(usize, UnitKey)> {
+        inner.occupied().iter().map(|op| (op.slot, op.unit)).collect()
+    }
+
+    #[test]
+    fn occupied_slots_are_the_live_and_quarantined_ones_plus_filling_only_when_unpublished_but_complete() {
+        let mut priority = HashMap::new();
+        for expert in 0..16u16 {
+            priority.insert((0u16, expert), expert as u32);
+        }
+        let mut policy = TailPolicy::new(
+            EpUnitTailConfig {
+                tail_units: 3,
+                fill_per_step: 4,
+                boundary_every: 1,
+            },
+            false,
+            priority,
+        );
+        policy.enable_peer_quarantine();
+        let seeds = policy.seed(&[(0, 1), (0, 2)]);
+        let mut inner = bare(policy, true);
+        for op in &seeds {
+            inner.slot_units[op.slot] = Some(op.unit);
+        }
+        // Two live seeds, the third slot free.
+        assert_eq!(occupied_slots(&inner), vec![(0, (0, 1)), (1, (0, 2))]);
+
+        // A miss fills the free slot: Filling, and no batch holds it (a dropped / unissued fill).
+        let retire = inner.policy.retire_peer((0, 0), &[use_(0, 9)], &[], |_| 0);
+        assert_eq!(retire.fills.len(), 1);
+        for fill in &retire.fills {
+            inner.slot_units[fill.slot] = Some(fill.unit);
+        }
+        assert_eq!(occupied_slots(&inner), vec![(0, (0, 1)), (1, (0, 2))]);
+
+        // A later miss with the pool full: the least recently used live slot is evicted into
+        // quarantine (the policy forgets its unit; the rank remembers the last fill's).
+        let retire = inner.policy.retire_peer((0, 0), &[use_(0, 12)], &[], |_| 0);
+        assert_eq!(retire.unpublish.len(), 1);
+        let evicted = retire.unpublish[0];
+        let quarantined = (0..3)
+            .find(|&slot| inner.policy.slot_phase(slot) == SlotPhase::Quarantined)
+            .expect("one quarantined slot");
+        assert_eq!(inner.policy.slot_unit(quarantined), None);
+        assert_eq!(inner.slot_units[quarantined], Some(evicted));
+        let occupied = occupied_slots(&inner);
+        assert!(occupied.contains(&(quarantined, evicted)), "{occupied:?}");
+        assert_eq!(occupied.len(), 2, "{occupied:?}");
+
+        // Released: nothing to restore.
+        inner.released = true;
+        assert!(inner.occupied().is_empty());
+    }
+
+    fn use_(layer: u16, expert: u16) -> WindowUse {
+        WindowUse {
+            unit: (layer, expert),
+            reads: 1,
+        }
+    }
+
+    #[test]
+    fn a_suspended_tail_skips_the_window_end_and_drops_the_window_log() {
+        let policy = TailPolicy::new(
+            EpUnitTailConfig {
+                tail_units: 1,
+                fill_per_step: 1,
+                boundary_every: 1,
+            },
+            false,
+            HashMap::new(),
+        );
+        let mut inner = bare(policy, true);
+        inner.calls.push((3, 8, 0));
+        inner.log_used = 32;
+        assert!(inner.skip_suspended_window());
+        assert!(inner.calls.is_empty() && inner.log_used == 0);
+        // The cadence clock did not move: no window counted.
+        assert_eq!(inner.cadence.pending(), 0);
+        assert_eq!(inner.policy.stats().retirements, 0);
+        // A live tail leaves its window alone: the real retirement runs.
+        inner.suspended = false;
+        inner.calls.push((3, 8, 0));
+        inner.log_used = 32;
+        assert!(!inner.skip_suspended_window());
+        assert_eq!((inner.calls.len(), inner.log_used), (1, 32));
+        // `released` or not, an Inner without layers has no live slot, suspended or not.
+        inner.suspended = true;
+        assert!(inner.live_slots(0).is_empty());
+    }
+
+    #[test]
+    fn the_digest_and_the_mismatch_offset_are_fnv_1a_and_the_first_differing_byte() {
+        // FNV-1a 64 reference vectors.
+        assert_eq!(fnv1a64(FNV_OFFSET, b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(FNV_OFFSET, b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(FNV_OFFSET, b"foobar"), 0x8594_4171_f739_67e8);
+        assert_eq!(
+            fnv1a64(fnv1a64(FNV_OFFSET, b"foo"), b"bar"),
+            fnv1a64(FNV_OFFSET, b"foobar")
+        );
+        assert_eq!(first_difference(b"abcd", b"abcd"), None);
+        assert_eq!(first_difference(b"abcd", b"abxd"), Some(2));
+        assert_eq!(first_difference(b"abcd", b"abc"), Some(3));
+        assert_eq!(first_difference(b"", b"a"), Some(0));
     }
 }

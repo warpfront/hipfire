@@ -721,7 +721,7 @@ fn install_unit_tail(
     rank: usize,
     trunk_layers: usize,
     bundle: &Qwen4Bundle,
-    forward: &crate::gpu_forward::Qwen4GpuForward,
+    forward: &mut crate::gpu_forward::Qwen4GpuForward,
     peer_board: &Mutex<Option<Arc<crate::expert_unit_tail::PeerBoard>>>,
 ) -> Result<(), String> {
     use crate::expert_unit_tail as tail;
@@ -839,7 +839,10 @@ fn install_unit_tail(
     if prefill {
         // The pool is visible to prefill routes: the unit stage (when this rank built one) names
         // live slots in its tables and skips their bytes in the H2D copy.
-        forward.link_unit_tail_stage(installed, log)?;
+        forward.link_unit_tail_stage(installed.clone(), log)?;
+        // A planned EP tail borrow (`HIPFIRE_QWEN4_EP_TAIL_BORROW`) lends this same pool to
+        // prefill as its extra scratch bank; the mesh attaches it once the tile hook exists.
+        forward.ep_tail_borrow_take_tail(installed);
     }
     Ok(())
 }
@@ -1961,7 +1964,7 @@ impl Qwen4Bundle {
                         rank,
                         trunk_layers,
                         bundle,
-                        &forward,
+                        &mut forward,
                         &peer_board_slot,
                     )
                 });
@@ -2058,6 +2061,57 @@ impl Qwen4Bundle {
                     "qwen4 EP: owner-routed prefill refused (per-rank admitted layers {counts:?} \
                      are not identical and complete); chunks keep the full-table route"
                 );
+            }
+        }
+
+        // 5b'. D2 tail borrow (`HIPFIRE_QWEN4_EP_TAIL_BORROW`): once the tile hook exists (its
+        // host barrier is the epoch rendezvous) or was refused, every rank of a load planned
+        // with the borrow admits it and builds its prefill bank over its own tail pool. All
+        // ranks must agree: a rank that kept 4096-row tiles while another ran 8192-row ones
+        // would diverge at the first collective, so one refusal refuses it everywhere (the
+        // prompt chunk then falls back to the resident rows on every rank). Nothing runs on a
+        // load without a planned borrow.
+        if self
+            .execution
+            .as_ref()
+            .is_some_and(|forward| forward.ep_tail_borrow.is_some())
+        {
+            let attach_borrow = |bundle: &mut Qwen4Bundle| -> Result<bool, String> {
+                let scope = crate::weights::Qwen4BandScope::single(&bundle.config);
+                let forward = bundle
+                    .execution
+                    .as_mut()
+                    .ok_or("the forward is not attached")?;
+                forward.attach_ep_tail_borrow(&bundle.config, &scope)
+            };
+            let attached = {
+                let me = &mut *self;
+                pool.run_all(
+                    || attach_borrow(me),
+                    &|_, peer: &mut Qwen4EpPeer| attach_borrow(&mut peer.bundle),
+                )
+            };
+            let attached = match attached {
+                Ok(attached) => attached,
+                Err(error) => return Err(release_rank0(gpu, error)),
+            };
+            if attached.iter().any(|&on| on) && attached.iter().any(|&on| !on) {
+                let refuse = |bundle: &mut Qwen4Bundle| -> Result<(), String> {
+                    if let Some(forward) = bundle.execution.as_mut() {
+                        forward.ep_tail_borrow_refuse("another rank did not admit it");
+                    }
+                    Ok(())
+                };
+                let refused = {
+                    let me = &mut *self;
+                    pool.run_all(
+                        || refuse(me),
+                        &|_, peer: &mut Qwen4EpPeer| refuse(&mut peer.bundle),
+                    )
+                };
+                if let Err(error) = refused {
+                    return Err(release_rank0(gpu, error));
+                }
             }
         }
 

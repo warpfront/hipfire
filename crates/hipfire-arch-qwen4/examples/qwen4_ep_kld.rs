@@ -20,8 +20,17 @@
 //! qwen4_ep_kld --model M.mq4-xts --out DIR \
 //!     --score wt2:/path/wt2.kldref --score code24:/path/code24.kldref \
 //!     [--route decode|lanes:K] [--max-chunks N] [--max-seq 4096] \
-//!     [--prefix chunk-final|prefill-final] [--no-rank-check] [--kv-mode M] [--state-quant Q]
+//!     [--prefix chunk-final|prefill-final] [--score-from N] [--score-to M] \
+//!     [--no-rank-check] [--kv-mode M] [--state-quant Q]
 //! ```
+//!
+//! `--score-from N` / `--score-to M` (lab, both routes) narrow the scored window to
+//! `[N, M)` (half-open, like the reference's `score_from..score_to`), which must lie inside
+//! the reference window. Positions `[0, N)` are prefilled as usual (decode route: `--prefix`;
+//! lanes route: the lane prefill tiles), rows `N..M` are scored against the SAME reference
+//! rows (ref row = position - reference `score_from`). `NAME.json` / `meta.json` then carry
+//! the effective `score_from`/`score_to` plus `window_override`, `ref_score_from`, `ref_score_to`;
+//! absent flags leave every output byte-identical.
 //!
 //! `--route lanes:K` (lab; K in 1..=7) scores the SAME references through the
 //! lane / mesh verify path instead of one `forward_token` per row: the scored
@@ -85,7 +94,7 @@ const TOOL: &str = "qwen4_ep_kld";
 const USAGE: &str =
     "usage: qwen4_ep_kld --model M --out DIR --score NAME:REF.kldref [--score ...] \
 [--route decode|lanes:K] [--max-chunks N] [--max-seq N] [--prefix chunk-final|prefill-final] \
-[--no-rank-check] [--kv-mode M] [--state-quant Q]";
+[--score-from N] [--score-to M] [--no-rank-check] [--kv-mode M] [--state-quant Q]";
 
 /// Process-wide host counters read before/after a token (lab diagnosis of rank-asymmetric host stalls).
 #[derive(Clone, Copy, Default)]
@@ -220,6 +229,9 @@ struct Args {
     kv_mode: Option<String>,
     state_quant: Option<String>,
     route: Route,
+    /// Lab override of the reference window start / end (half-open), within the reference window.
+    score_from: Option<usize>,
+    score_to: Option<usize>,
 }
 
 fn parse_args(args: &[String]) -> R<Args> {
@@ -234,6 +246,8 @@ fn parse_args(args: &[String]) -> R<Args> {
         kv_mode: None,
         state_quant: None,
         route: Route::Decode,
+        score_from: None,
+        score_to: None,
     };
     let mut it = args.iter();
     while let Some(flag) = it.next() {
@@ -275,6 +289,8 @@ fn parse_args(args: &[String]) -> R<Args> {
             "--kv-mode" => a.kv_mode = Some(value()?),
             "--state-quant" => a.state_quant = Some(value()?),
             "--route" => a.route = Route::parse(&value()?)?,
+            "--score-from" => a.score_from = Some(value()?.parse().map_err(e)?),
+            "--score-to" => a.score_to = Some(value()?.parse().map_err(e)?),
             "-h" | "--help" => return Err(USAGE.to_string()),
             other => return Err(format!("unknown argument {other}\n{USAGE}")),
         }
@@ -288,6 +304,34 @@ fn parse_args(args: &[String]) -> R<Args> {
         );
     }
     Ok(a)
+}
+
+/// The scored window `[from, to)`: the reference's own window unless `--score-from` /
+/// `--score-to` narrow it. Refuses anything outside the reference window.
+fn effective_window(args: &Args, ref_from: usize, ref_to: usize) -> R<(usize, usize)> {
+    let from = args.score_from.unwrap_or(ref_from);
+    let to = args.score_to.unwrap_or(ref_to);
+    if from < ref_from || to > ref_to || from >= to {
+        return Err(format!(
+            "scored window {from}..{to} must satisfy reference score_from {ref_from} <= from < to <= reference score_to {ref_to} (half-open)"
+        ));
+    }
+    Ok((from, to))
+}
+
+/// Records the reference window in the receipt when an override is active (absent otherwise,
+/// so default receipts are unchanged).
+fn window_receipt(
+    args: &Args,
+    ref_from: usize,
+    ref_to: usize,
+    extra: &mut serde_json::Map<String, serde_json::Value>,
+) {
+    if args.score_from.is_some() || args.score_to.is_some() {
+        extra.insert("window_override".into(), serde_json::json!(true));
+        extra.insert("ref_score_from".into(), serde_json::json!(ref_from));
+        extra.insert("ref_score_to".into(), serde_json::json!(ref_to));
+    }
 }
 
 fn sha256_file(path: &Path) -> R<String> {
@@ -365,7 +409,8 @@ fn score_one(
             args.max_seq
         ));
     }
-    let (from, to) = (window.score_from, window.score_to);
+    let (ref_from, ref_to) = (window.score_from, window.score_to);
+    let (from, to) = effective_window(args, ref_from, ref_to)?;
     gpu.bind_thread().map_err(e)?;
     let logits = gpu.zeros(&[vocab], DType::F32).map_err(e)?;
     let row_t = logits.sub_offset(0, vocab);
@@ -397,7 +442,7 @@ fn score_one(
         let mut klds = Vec::with_capacity(window.scored_per_chunk());
         let mut chunk_nll = 0.0f64;
         let mut chunk_digest = Sha256::new();
-        for (i, pos) in (from..to).enumerate() {
+        for pos in from..to {
             let t_tok = Instant::now();
             let probe0 = HostProbe::read();
             bundle
@@ -446,7 +491,7 @@ fn score_one(
             chunk_digest.update(&rank0_bytes);
             let row = decode_row(&rank0_bytes, vocab)
                 .map_err(|m| format!("{m} at chunk {c} pos {pos}"))?;
-            let s = score_row(&reference, &mmap, c, i, &row, chunk[pos + 1])?;
+            let s = score_row(&reference, &mmap, c, pos - ref_from, &row, chunk[pos + 1])?;
             klds.push(s.kld);
             chunk_nll += s.nll;
             top1_hits += usize::from(s.top1);
@@ -491,7 +536,11 @@ fn score_one(
         started,
         route: "decode (EP served route, teacher-forced forward_token)".to_string(),
         prefix: format!("{:?}", args.prefix),
-        extra: serde_json::Map::new(),
+        extra: {
+            let mut extra = serde_json::Map::new();
+            window_receipt(args, ref_from, ref_to, &mut extra);
+            extra
+        },
     })
 }
 
@@ -939,6 +988,8 @@ struct ScoreCtx<'a> {
     tokens: &'a [u32],
     n_ctx: usize,
     from: usize,
+    /// The reference's own `score_from`: reference row index = position - `ref_from`.
+    ref_from: usize,
     to: usize,
     vocab: usize,
 }
@@ -989,7 +1040,14 @@ impl LaneAcc {
             self.hasher.update(rb);
             let row = decode_row(rb, ctx.vocab)
                 .map_err(|m| format!("{m} at chunk {} pos {pos}", self.chunk))?;
-            let s = score_row(ctx.reference, ctx.mmap, self.chunk, i, &row, chunk[pos + 1])?;
+            let s = score_row(
+                ctx.reference,
+                ctx.mmap,
+                self.chunk,
+                pos - ctx.ref_from,
+                &row,
+                chunk[pos + 1],
+            )?;
             self.klds.push(s.kld);
             self.nll += s.nll;
             self.top1 += usize::from(s.top1);
@@ -1285,16 +1343,17 @@ fn score_lanes(
             args.max_seq
         ));
     }
-    let (from, to) = (window.score_from, window.score_to);
+    let (ref_from, ref_to) = (window.score_from, window.score_to);
+    let (from, to) = effective_window(args, ref_from, ref_to)?;
     if from == 0 || to <= from || to >= n_ctx {
         return Err(format!(
             "the lanes route needs 0 < score_from < score_to < n_ctx, got {from}..{to} of {n_ctx}"
         ));
     }
     let per = to - from;
-    if per != window.scored_per_chunk() {
+    if ref_to - ref_from != window.scored_per_chunk() {
         return Err(format!(
-            "scored window {from}..{to} != scored_per_chunk {}",
+            "reference window {ref_from}..{ref_to} != scored_per_chunk {}",
             window.scored_per_chunk()
         ));
     }
@@ -1311,6 +1370,7 @@ fn score_lanes(
         tokens: &tokens[..],
         n_ctx,
         from,
+        ref_from,
         to,
         vocab,
     };
@@ -1374,6 +1434,7 @@ fn score_lanes(
     }
     let observed = stats.step_rows.clone();
     let mut extra = serde_json::Map::new();
+    window_receipt(args, ref_from, ref_to, &mut extra);
     extra.insert("k".into(), serde_json::json!(k));
     extra.insert("lanes".into(), serde_json::json!(LANES));
     extra.insert("lane_groups".into(), serde_json::json!(stats.groups));
