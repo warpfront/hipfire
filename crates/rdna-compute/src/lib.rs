@@ -40,13 +40,13 @@ pub mod flux_fused;
 pub mod fn_gdn_dense;
 pub mod fp8_e4m3;
 pub mod gap_timing;
+pub mod gated_delta_chunk_pm;
 #[cfg(feature = "deltanet")]
 pub mod gated_delta_vector;
 #[cfg(feature = "deltanet")]
 pub mod gated_delta_vector_chunk;
 #[cfg(feature = "deltanet")]
 pub mod gated_delta_vector_pm;
-pub mod gated_delta_chunk_pm;
 pub mod gdn_chunk_prep_pm;
 #[cfg(test)]
 mod gdn_q8ef_reference;

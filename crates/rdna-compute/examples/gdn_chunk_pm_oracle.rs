@@ -15,9 +15,10 @@
 //! (the slot plus an F32 capture of the final state, so the exact final state is compared too)).
 //! Input kinds: `captured` (the product's value ranges: unit-norm BF16 q/k, negative log decay,
 //! sigmoid beta; entering state zero and chained from a real 512-row incumbent run), `random`
-//! (wide Gaussian everywhere, random entering state), `edge_finite` (signed zeros, denormals,
-//! max-finite and tiny normals sprinkled into every operand and into the entering state, huge
-//! +/- decay), `edge_nonfinite` (NaN with several payloads and +/-Inf sprinkled sparsely).
+//! (wide v / z / gate / beta and a random entering state, unit-norm q/k), `edge_subnormal` (signed
+//! zeros, denormals, tiny normals and underflowing decays sprinkled into every operand and into the
+//! entering state), `edge_huge` (max-finite values and overflowing decays), `edge_nonfinite` (NaN
+//! with several payloads and +/-Inf sprinkled sparsely).
 //!
 //! `cargo run --release -p rdna-compute --features lab --example gdn_chunk_pm_oracle -- \
 //!     [--rows 1,15,16,17,511,512,8191,8192] [--json OUT.json]`
@@ -92,21 +93,26 @@ fn par_fill_f32(buf: &mut [f32], seed: u64, f: impl Fn(&mut Rng) -> f32 + Sync) 
 enum Kind {
     Captured,
     Random,
-    EdgeFinite,
+    /// Signed zeros, denormals, tiny normals, underflowing decays: finite in, (mostly) finite out.
+    EdgeSubnormal,
+    /// Max-finite values and overflowing decays: finite in, overflow to Inf / NaN inside.
+    EdgeHuge,
     EdgeNonFinite,
 }
 impl Kind {
-    const ALL: [Kind; 4] = [
+    const ALL: [Kind; 5] = [
         Kind::Captured,
         Kind::Random,
-        Kind::EdgeFinite,
+        Kind::EdgeSubnormal,
+        Kind::EdgeHuge,
         Kind::EdgeNonFinite,
     ];
     fn name(self) -> &'static str {
         match self {
             Kind::Captured => "captured",
             Kind::Random => "random",
-            Kind::EdgeFinite => "edge_finite",
+            Kind::EdgeSubnormal => "edge_subnormal",
+            Kind::EdgeHuge => "edge_huge",
             Kind::EdgeNonFinite => "edge_nonfinite",
         }
     }
@@ -127,7 +133,12 @@ struct Inputs {
 
 fn unit_heads_bf16(buf: &mut [u16]) {
     buf.par_chunks_mut(DIM).for_each(|h| {
-        let n: f32 = h.iter().map(|&b| bf_f(b) * bf_f(b)).sum::<f32>().sqrt().max(1e-6);
+        let n: f32 = h
+            .iter()
+            .map(|&b| bf_f(b) * bf_f(b))
+            .sum::<f32>()
+            .sqrt()
+            .max(1e-6);
         for b in h {
             *b = bf(bf_f(*b) / n);
         }
@@ -146,12 +157,13 @@ fn gen_inputs(kind: Kind, rows: usize, seed: u64) -> Inputs {
     let wide = kind == Kind::Random;
     let amp = if wide { 3.0 } else { 1.0 };
     par_fill_u16(&mut projection, seed ^ 1, |r| bf(amp * r.gauss()));
-    par_fill_u16(&mut qn, seed ^ 2, |r| bf(amp * r.gauss()));
-    par_fill_u16(&mut kn, seed ^ 3, |r| bf(amp * r.gauss()));
-    if !wide {
-        unit_heads_bf16(&mut qn);
-        unit_heads_bf16(&mut kn);
-    }
+    // q/k are unit-norm heads in every kind (as `gated_delta_qk_norm_bf16_batched` leaves them:
+    // unnormalized keys of norm ~11 overflow the recurrence into NaN, which would mask a mismatch);
+    // `random` widens v, z, the gate/beta distributions and the entering state instead.
+    par_fill_u16(&mut qn, seed ^ 2, |r| bf(r.gauss()));
+    par_fill_u16(&mut kn, seed ^ 3, |r| bf(r.gauss()));
+    unit_heads_bf16(&mut qn);
+    unit_heads_bf16(&mut kn);
     if wide {
         par_fill_f32(&mut gate, seed ^ 4, |r| -0.5 * r.uniform() * r.uniform());
         par_fill_f32(&mut beta, seed ^ 5, |r| r.uniform());
@@ -170,7 +182,31 @@ fn gen_inputs(kind: Kind, rows: usize, seed: u64) -> Inputs {
     }
     let mut rng = Rng(seed ^ 0xED6E);
     match kind {
-        Kind::EdgeFinite => {
+        Kind::EdgeSubnormal => {
+            const B: [u16; 8] = [
+                0x8000, 0x0001, 0x007f, 0x8001, 0x0080, 0x8080, 0x0000, 0x3f80,
+            ];
+            const F: [f32; 8] = [-0.0, 1e-45, 1.1e-38, -1.1e-38, 1e-30, 0.0, 1.0, -1e-30];
+            let hit = |len: usize| (len / 500).max(8);
+            for buf in [&mut projection, &mut qn, &mut kn, &mut z_arena] {
+                for _ in 0..hit(buf.len()) {
+                    let at = rng.below(buf.len());
+                    buf[at] = B[rng.below(B.len())];
+                }
+            }
+            for buf in [&mut z, &mut gate, &mut beta] {
+                for _ in 0..hit(buf.len()) {
+                    let at = rng.below(buf.len());
+                    buf[at] = F[rng.below(F.len())];
+                }
+            }
+            // Decays whose exp underflows to a denormal / zero (never overflows).
+            for _ in 0..(rows * VALUE_HEADS / 64).max(4) {
+                let at = rng.below(gate.len());
+                gate[at] = [-87.0, -100.0, -103.0, -200.0, -1.0e30, -0.0, 1e-30][rng.below(7)];
+            }
+        }
+        Kind::EdgeHuge => {
             const B: [u16; 10] = [
                 0x8000, 0x0001, 0x007f, 0x8001, 0x7f7f, 0xff7f, 0x0080, 0x8080, 0x0000, 0x3f80,
             ];
@@ -401,11 +437,7 @@ fn run(
 fn diff(a: &[u8], b: &[u8]) -> (usize, usize, Option<usize>) {
     assert_eq!(a.len(), b.len());
     let bytes = a.iter().zip(b).filter(|(x, y)| x != y).count();
-    let words = a
-        .chunks(4)
-        .zip(b.chunks(4))
-        .filter(|(x, y)| x != y)
-        .count();
+    let words = a.chunks(4).zip(b.chunks(4)).filter(|(x, y)| x != y).count();
     (bytes, words, a.iter().zip(b).position(|(x, y)| x != y))
 }
 
@@ -421,6 +453,8 @@ struct Totals {
     control_nondeterministic: usize,
     negative_control_missed: usize,
     nonfinite_out_words: u64,
+    /// Non-finite incumbent output words in the kinds that must be finite (an uninformative comparison).
+    nonfinite_in_finite_kinds: u64,
     failures: Vec<String>,
 }
 
@@ -440,7 +474,9 @@ fn main() {
             }
             "--json" => json_out = args.next(),
             other => {
-                eprintln!("usage: gdn_chunk_pm_oracle [--rows a,b,c] [--json OUT]  (unknown {other})");
+                eprintln!(
+                    "usage: gdn_chunk_pm_oracle [--rows a,b,c] [--json OUT]  (unknown {other})"
+                );
                 std::process::exit(2)
             }
         }
@@ -533,10 +569,16 @@ fn main() {
                     par_fill_f32(&mut st, seed ^ 0x57, |r| 0.3 * r.gauss());
                     let mut rng = Rng(seed ^ 0x58);
                     match kind {
-                        Kind::EdgeFinite => {
+                        Kind::EdgeSubnormal => {
                             for _ in 0..2000 {
                                 let at = rng.below(st.len());
-                                st[at] = [-0.0, 1e-45, -1.1e-38, 3.0e38, 1e-30, 0.0][rng.below(6)];
+                                st[at] = [-0.0, 1e-45, -1.1e-38, 1e-30, 0.0, -1e-30][rng.below(6)];
+                            }
+                        }
+                        Kind::EdgeHuge => {
+                            for _ in 0..2000 {
+                                let at = rng.below(st.len());
+                                st[at] = [-0.0, 3.0e38, -3.0e38, 65504.0, 1e-45][rng.below(5)];
                             }
                         }
                         Kind::EdgeNonFinite => {
@@ -572,7 +614,15 @@ fn main() {
                             let frame = 12_345 + rows as u32 - 1;
                             let go = |gpu: &mut Gpu, sym: &str| {
                                 run(
-                                    gpu, sym, variant, &dev, rows, init, state_bytes, mode, out_bf16,
+                                    gpu,
+                                    sym,
+                                    variant,
+                                    &dev,
+                                    rows,
+                                    init,
+                                    state_bytes,
+                                    mode,
+                                    out_bf16,
                                     frame,
                                 )
                             };
@@ -590,12 +640,26 @@ fn main() {
                                 totals.out_word_mismatches += ow;
                                 totals.state_byte_mismatches += sb;
                                 totals.state_word_mismatches += sw;
-                                totals.nonfinite_out_words += o1
-                                    .chunks(4)
-                                    .filter(|c| {
-                                        !f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite()
-                                    })
-                                    .count() as u64;
+                                let nonfinite = if out_bf16 {
+                                    o1[..rows * VALUE_WIDTH * 2]
+                                        .chunks(2)
+                                        .filter(|c| {
+                                            u16::from_le_bytes([c[0], c[1]]) & 0x7f80 == 0x7f80
+                                        })
+                                        .count()
+                                } else {
+                                    o1[..rows * VALUE_WIDTH * 4]
+                                        .chunks(4)
+                                        .filter(|c| {
+                                            !f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+                                                .is_finite()
+                                        })
+                                        .count()
+                                } as u64;
+                                totals.nonfinite_out_words += nonfinite;
+                                if matches!(kind, Kind::Captured | Kind::Random) {
+                                    totals.nonfinite_in_finite_kinds += nonfinite;
+                                }
                                 if ctrl != 0 {
                                     totals.control_nondeterministic += 1;
                                 }
@@ -616,6 +680,7 @@ fn main() {
                                     "out_byte_mismatches": ob, "out_word_mismatches": ow,
                                     "state_byte_mismatches": sb, "state_word_mismatches": sw,
                                     "incumbent_repeat_byte_mismatches": ctrl,
+                                    "nonfinite_out_elements": nonfinite,
                                 }));
                                 Ok(())
                             })();
@@ -650,18 +715,45 @@ fn main() {
                         std::process::exit(2)
                     });
                     let zero = vec![0u8; STATE_ELEMS * 4];
-                    let (o_ref, _) = run(&mut gpu, inc, variant, &dev, rows, &zero, STATE_ELEMS * 4, 0, false, 0).unwrap();
-                    let (o_flip, _) = run(&mut gpu, inc, variant, &fd, rows, &zero, STATE_ELEMS * 4, 0, false, 0).unwrap();
+                    let (o_ref, _) = run(
+                        &mut gpu,
+                        inc,
+                        variant,
+                        &dev,
+                        rows,
+                        &zero,
+                        STATE_ELEMS * 4,
+                        0,
+                        false,
+                        0,
+                    )
+                    .unwrap();
+                    let (o_flip, _) = run(
+                        &mut gpu,
+                        inc,
+                        variant,
+                        &fd,
+                        rows,
+                        &zero,
+                        STATE_ELEMS * 4,
+                        0,
+                        false,
+                        0,
+                    )
+                    .unwrap();
                     if diff(&o_ref, &o_flip).0 == 0 {
                         totals.negative_control_missed += 1;
-                        totals
-                            .failures
-                            .push(format!("negative control missed: {} rows={rows}", kind.name()));
+                        totals.failures.push(format!(
+                            "negative control missed: {} rows={rows}",
+                            kind.name()
+                        ));
                     }
                     free_device(&mut gpu, fd);
                 }
             }
             free_device(&mut gpu, dev);
+            // Freed tensors are parked in the pool by size; a 24 GB card must not keep every case.
+            gpu.drain_pool();
             println!(
                 "done kind={} rows={rows}: {} comparisons so far, out byte mismatches {}, state byte mismatches {} ({:.0}s)",
                 kind.name(),
@@ -672,9 +764,15 @@ fn main() {
             );
         }
     }
+    if totals.nonfinite_in_finite_kinds != 0 {
+        totals.failures.push(format!(
+            "{} non-finite incumbent output words in the captured/random kinds (an uninformative comparison)",
+            totals.nonfinite_in_finite_kinds
+        ));
+    }
     let pass = totals.failures.is_empty();
     println!(
-        "SUMMARY arch={arch} comparisons={} out_bytes_compared={} state_bytes_compared={} out_byte_mismatches={} out_word_mismatches={} state_byte_mismatches={} state_word_mismatches={} incumbent_repeat_nondeterministic={} negative_control_missed={} nonfinite_incumbent_out_words={}",
+        "SUMMARY arch={arch} comparisons={} out_bytes_compared={} state_bytes_compared={} out_byte_mismatches={} out_word_mismatches={} state_byte_mismatches={} state_word_mismatches={} incumbent_repeat_nondeterministic={} negative_control_missed={} nonfinite_incumbent_out_words={} nonfinite_in_captured_random={}",
         totals.comparisons,
         totals.out_bytes_compared,
         totals.state_bytes_compared,
@@ -685,6 +783,7 @@ fn main() {
         totals.control_nondeterministic,
         totals.negative_control_missed,
         totals.nonfinite_out_words,
+        totals.nonfinite_in_finite_kinds,
     );
     for f in totals.failures.iter().take(50) {
         println!("FAIL {f}");
@@ -701,6 +800,7 @@ fn main() {
             "incumbent_repeat_nondeterministic": totals.control_nondeterministic,
             "negative_control_missed": totals.negative_control_missed,
             "nonfinite_incumbent_out_words": totals.nonfinite_out_words,
+            "nonfinite_in_captured_random": totals.nonfinite_in_finite_kinds,
             "failures": totals.failures,
             "cases": lines,
         });

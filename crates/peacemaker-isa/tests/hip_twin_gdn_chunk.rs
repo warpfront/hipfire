@@ -134,7 +134,12 @@ fn every_module_verifies_with_the_incumbent_kernarg_layout_and_text() {
         );
         // k_s, q_s, kb_s (3 * 16 * 136 f16) + kdT (128 * 16 f16) + vb_s (16 * 132 f32) + t_s, p_s
         // (2 * 16 * 16 f16) + g_s, bt_s, inv_s (3 * 16 f32) + out_s (16 * 136 u16).
-        let lds = 3 * 16 * 136 * 2 + 128 * 16 * 2 + 16 * 132 * 4 + 2 * 16 * 16 * 2 + 3 * 16 * 4 + 16 * 136 * 2;
+        let lds = 3 * 16 * 136 * 2
+            + 128 * 16 * 2
+            + 16 * 132 * 4
+            + 2 * 16 * 16 * 2
+            + 3 * 16 * 4
+            + 16 * 136 * 2;
         assert_eq!(s.lds, lds, "{}: static LDS", m.name);
         assert_eq!(s.vgprs, 240, "{}: vgprs", m.name);
 
@@ -144,7 +149,11 @@ fn every_module_verifies_with_the_incumbent_kernarg_layout_and_text() {
         let judged = &rec["judged_text_check"][0];
         assert_eq!(judged["symbol"], m.symbol);
         assert_eq!(judged["judged_candidate"], "incumbent-hipcc");
-        assert_eq!(judged["equal"], true, "{}: twin .text != incumbent .text", m.name);
+        assert_eq!(
+            judged["equal"], true,
+            "{}: twin .text != incumbent .text",
+            m.name
+        );
         assert_eq!(judged["judged_code_sha256"], judged["twin_text_sha256"]);
         assert_eq!(judged["twin_text_sha256"], s.text_sha256, "{}", m.name);
         assert_eq!(rec["reports"][0]["abi"]["incumbent_symbol"], m.incumbent);

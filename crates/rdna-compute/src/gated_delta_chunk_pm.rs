@@ -184,7 +184,13 @@ impl Gpu {
     fn gdn_chunk_load(&mut self, variant: Variant, pm: bool) -> HipResult<&'static str> {
         if pm {
             let twin = twin_for(&self.arch, variant).ok_or_else(|| {
-                HipError::new(0, &format!("no gated_delta_chunk PM twin of {variant:?} on {}", self.arch))
+                HipError::new(
+                    0,
+                    &format!(
+                        "no gated_delta_chunk PM twin of {variant:?} on {}",
+                        self.arch
+                    ),
+                )
             })?;
             self.ensure_embedded_kernel(twin.module, twin.image, twin.symbol)?;
             return Ok(twin.symbol);
@@ -221,7 +227,12 @@ mod tests {
     fn images_carry_their_symbol_and_no_other() {
         for twin in TWINS {
             let has = |sym: &str| twin.image.windows(sym.len()).any(|w| w == sym.as_bytes());
-            assert!(has(twin.symbol), "{} missing from {}", twin.symbol, twin.module);
+            assert!(
+                has(twin.symbol),
+                "{} missing from {}",
+                twin.symbol,
+                twin.module
+            );
             for other in TWINS.iter().filter(|o| o.symbol != twin.symbol) {
                 // Whole NUL-delimited names (a symbol is a substring of its `.kd` descriptor name).
                 let pat: Vec<u8> = [&[0u8][..], other.symbol.as_bytes(), &[0u8][..]].concat();
@@ -243,7 +254,12 @@ mod tests {
             assert!(twin.symbol.ends_with(twin.arch));
         }
         for arch in ["gfx1101", "gfx1150", "gfx1201", "gfx942", "gfx1151x", ""] {
-            for variant in [Variant::F32, Variant::F32Arena, Variant::Q8, Variant::Q8Arena] {
+            for variant in [
+                Variant::F32,
+                Variant::F32Arena,
+                Variant::Q8,
+                Variant::Q8Arena,
+            ] {
                 assert_eq!(twin_for(arch, variant), None, "{arch}");
             }
         }
@@ -259,14 +275,8 @@ mod tests {
 
     #[test]
     fn admission_flag_and_arch() {
-        assert_eq!(
-            admission(true, "gfx1151", Variant::F32),
-            Ok(&GFX1151_F32)
-        );
-        assert_eq!(
-            admission(true, "gfx1100", Variant::F32),
-            Ok(&GFX1100_F32)
-        );
+        assert_eq!(admission(true, "gfx1151", Variant::F32), Ok(&GFX1151_F32));
+        assert_eq!(admission(true, "gfx1100", Variant::F32), Ok(&GFX1100_F32));
         assert_eq!(
             admission(false, "gfx1151", Variant::F32),
             Err(GdnChunkPmRefusal::Disabled)
@@ -285,12 +295,22 @@ mod tests {
     /// incumbent kernel name plus the `_pm_<arch>` suffix.
     #[test]
     fn variants_follow_the_product_selection() {
-        for format in [GdnStateFormat::F32, GdnStateFormat::Q8, GdnStateFormat::Q8Ef] {
+        for format in [
+            GdnStateFormat::F32,
+            GdnStateFormat::Q8,
+            GdnStateFormat::Q8Ef,
+        ] {
             for inline in [false, true] {
                 for arena in [false, true] {
-                    let want = format!("{}_pm_gfx1151", gdn_chunk_kernel_name(format, inline, arena));
+                    let want = format!(
+                        "{}_pm_gfx1151",
+                        gdn_chunk_kernel_name(format, inline, arena)
+                    );
                     let twin = twin_for("gfx1151", Variant::of(format, inline, arena)).unwrap();
-                    assert_eq!(twin.symbol, want, "{format:?} inline {inline} arena {arena}");
+                    assert_eq!(
+                        twin.symbol, want,
+                        "{format:?} inline {inline} arena {arena}"
+                    );
                 }
             }
         }
