@@ -1483,7 +1483,8 @@ pub(crate) fn combine_order_only(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     validate_scratch(gpu, p, true, grouped_rows)?;
-    hip(gpu.moe_combine_order_top10(
+    let owners = implicit_zero_owners(gpu, p);
+    hip(gpu.moe_combine_order_top10_owned(
         p.inverse_perm,
         p.topk_indices,
         p.topk_weights,
@@ -1491,6 +1492,7 @@ pub(crate) fn combine_order_only(
         grouped_rows,
         p.batch_size,
         p.n_exp,
+        owners,
     ))
 }
 
@@ -1908,10 +1910,43 @@ pub(crate) fn tile_mask(
         // Partial mask (trunk shard): the masked tiles' grouped down rows are never written
         // (the GEMMs exit on the sentinel) and nothing is pulled into them, so they must read
         // as exact +0 BF16 rows, what the zero-dummy-table route wrote. Owned tiles overwrite
-        // their rows in the down GEMM that follows.
-        zero_grouped_down(gpu, p, grouped_rows)?;
+        // their rows in the down GEMM that follows. Under the implicit zeros the combine's
+        // rank order marks every foreign row -1 (its consumers substitute the +0 row), so
+        // nothing reads them and the clear is not owed.
+        if implicit_zero_owners(gpu, p).is_none() {
+            fill_grouped_down(gpu, p, grouped_rows, 0)?;
+        } else if gpu.flags.qwen4_ep_pmask_implicit_zero_poison() {
+            // Negative control: all-ones bytes (BF16 NaN) in every row nothing may read.
+            fill_grouped_down(gpu, p, grouped_rows, 0xFF)?;
+        }
     }
     Ok(())
+}
+
+/// `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO` (exact gfx1201, default on, `=0` kill switch): the
+/// owner table of a partial tile mask (the trunk shard's mask-only chunk route, no exchange)
+/// whose foreign grouped down rows only the rank order of `moe_combine_order_top10` would
+/// read: the BF16-row combine arm or a HC row fold. The order then marks every rank of a
+/// foreign expert `-1` with its weight and place kept, the consumers add a +0 BF16 row for
+/// it (bitwise what the cleared row gave) and [`tile_mask`] drops the full-buffer clear.
+/// `None` keeps the clear: no mask, a full exchange, the kill switch, or any other reader
+/// (FP8, slab, indexed down, the EP grouped-down unscatter).
+fn implicit_zero_owners<'p>(
+    gpu: &Gpu,
+    p: &'p MoePrefillParams<'_>,
+) -> Option<rdna_compute::hc_row_fold::CombineOwners<'p>> {
+    let tx = p.ep_tile_exchange.filter(|tx| tx.exchange.mask_only())?;
+    if !gpu.flags.qwen4_ep_pmask_implicit_zero_enabled() || is_fp8(p) || is_slab(p) {
+        return None;
+    }
+    let use_path2 = grouped_path(gpu, p, true);
+    let bf16_rows_combine = use_path2
+        && !indexed_down(gpu, p, use_path2)
+        && !ep_grouped_down_unscatter(gpu, p, use_path2)
+        && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2));
+    let (rank, table, n_exp) = tx.exchange.owners();
+    (bf16_rows_combine && n_exp == p.n_exp)
+        .then_some(rdna_compute::hc_row_fold::CombineOwners { table, rank })
 }
 
 /// Bytes of the BF16 grouped down rows `[grouped_rows, down_m]` the partial mask clears.
@@ -1921,11 +1956,13 @@ fn grouped_down_bytes(grouped_rows: usize, down_m: usize) -> Option<usize> {
         .checked_mul(std::mem::size_of::<u16>())
 }
 
-/// Stream-ordered zero fill of `y_down_grouped[..grouped_rows]` (BF16 rows).
-fn zero_grouped_down(
+/// Stream-ordered byte fill (`value`: 0 is the clear) of `y_down_grouped[..grouped_rows]`
+/// (BF16 rows).
+fn fill_grouped_down(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     grouped_rows: usize,
+    value: i32,
 ) -> Result<(), DispatchError> {
     let bytes = grouped_down_bytes(grouped_rows, p.down_m)
         .filter(|&bytes| bytes <= p.y_down_grouped.buf.size())
@@ -1938,8 +1975,8 @@ fn zero_grouped_down(
     match gpu.active_stream.as_ref() {
         Some(stream) => hip(gpu
             .hip
-            .memset_async(&p.y_down_grouped.buf, 0, bytes, stream)),
-        None => hip(gpu.hip.memset(&p.y_down_grouped.buf, 0, bytes)),
+            .memset_async(&p.y_down_grouped.buf, value, bytes, stream)),
+        None => hip(gpu.hip.memset(&p.y_down_grouped.buf, value, bytes)),
     }
 }
 
@@ -2640,8 +2677,10 @@ fn combine_stage(
     } else if use_path2 && (down_wmma(gpu, p) || sym_iu4(gpu, p, use_path2)) {
         // Both downs store BF16 grouped rows. The rank order goes to
         // `down_expanded`: unused on this route until the shared down, which
-        // runs after the combine.
-        hip(gpu.moe_down_combine_grouped_top10_bf16in(
+        // runs after the combine. Under the partial mask's implicit zeros the
+        // order marks the foreign rows -1 (their clear was skipped).
+        let owners = implicit_zero_owners(gpu, p);
+        hip(gpu.moe_down_combine_grouped_top10_bf16in_owned(
             p.y_down_grouped,
             p.inverse_perm,
             p.topk_indices,
@@ -2653,8 +2692,14 @@ fn combine_stage(
             p.batch_size,
             initial_zero,
             p.n_exp,
+            owners,
         ))?;
     } else if use_path2 {
+        if implicit_zero_owners(gpu, p).is_some() {
+            return Err(DispatchError::Hip(
+                "qt44 combine: the F32 grouped combine would read foreign rows whose clear the implicit zeros skipped".into(),
+            ));
+        }
         hip(gpu.moe_down_combine_grouped_top10(
             p.y_down_grouped,
             p.inverse_perm,

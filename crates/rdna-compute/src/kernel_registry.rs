@@ -2863,6 +2863,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
                 "slowlink_remap_sorted",
             ]
         );
+        // EP partial-mask implicit zeros: the owner-masked rank order, its own module and
+        // source for the same reason.
+        add!(
+            "moe_combine_order_owned",
+            kernels::MOE_COMBINE_ORDER_OWNED_SRC,
+            ["moe_combine_order_top10_owned"]
+        );
         add!(
             "moe_down_combine_top10_batched",
             kernels::MOE_DOWN_COMBINE_TOP10_BATCHED_SRC,
@@ -11905,6 +11912,21 @@ mod tests {
                 "{module} must not be a P0 module"
             );
         }
+        // `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO` (default on, exact gfx1201, EP2 partial tile
+        // mask): the owner-masked combine rank order.
+        const PMASK_IMPLICIT_ZERO_ADDED_MODULES: [&str; 1] = ["moe_combine_order_owned"];
+        for module in PMASK_IMPLICIT_ZERO_ADDED_MODULES {
+            assert!(
+                by_name.contains_key(module),
+                "missing EP implicit-zero module {module}"
+            );
+            assert!(
+                !expected
+                    .lines()
+                    .any(|l| l.split('\t').next() == Some(module)),
+                "{module} must not be a P0 module"
+            );
+        }
         assert_eq!(
             registry.len(),
             count
@@ -11943,7 +11965,8 @@ mod tests {
                 + LANE_HC_ALLROWS_ADDED_MODULES.len()
                 + BF16_ALLROWS_ADDED_MODULES.len()
                 + MOE_DOWN_DNI_ADDED_MODULES.len()
-                + MQ6_R8_PK_ADDED_MODULES.len(),
+                + MQ6_R8_PK_ADDED_MODULES.len()
+                + PMASK_IMPLICIT_ZERO_ADDED_MODULES.len(),
             "unexpected gfx1201 inventory size"
         );
         let default_prefill = by_name

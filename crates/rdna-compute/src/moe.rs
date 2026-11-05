@@ -2336,6 +2336,42 @@ impl Gpu {
         initial_zero: bool,
         n_experts: usize,
     ) -> HipResult<()> {
+        self.moe_down_combine_grouped_top10_bf16in_owned(
+            grouped_down,
+            inverse_perm,
+            topk_indices,
+            topk_weights,
+            residual,
+            order,
+            hidden,
+            grouped_rows,
+            tokens,
+            initial_zero,
+            n_experts,
+            None,
+        )
+    }
+
+    /// [`Gpu::moe_down_combine_grouped_top10_bf16in`] whose rank order is owner-masked
+    /// ([`Gpu::moe_combine_order_top10_owned`]) when `owners` is given: the foreign
+    /// experts' grouped rows are never read, each such rank adds a +0 BF16 row with its
+    /// own weight and rounding in the ten-term order.
+    #[allow(clippy::too_many_arguments)]
+    pub fn moe_down_combine_grouped_top10_bf16in_owned(
+        &mut self,
+        grouped_down: &GpuTensor,
+        inverse_perm: &GpuTensor,
+        topk_indices: &GpuTensor,
+        topk_weights: &GpuTensor,
+        residual: &GpuTensor,
+        order: &GpuTensor,
+        hidden: usize,
+        grouped_rows: usize,
+        tokens: usize,
+        initial_zero: bool,
+        n_experts: usize,
+        owners: Option<crate::hc_row_fold::CombineOwners<'_>>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         if hidden % 8 != 0 || order.buf.size() < tokens * 10 * 8 {
             return Err(hip_bridge::HipError::new(
@@ -2366,46 +2402,22 @@ impl Gpu {
         } else {
             "moe_down_combine_grouped_top10_bf16in"
         };
-        for func in ["moe_combine_order_top10", combine] {
-            self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, func)?;
-        }
+        self.ensure_kernel(MODULE, kernels::MOE_DOWN_COMBINE_GROUPED_TOP10_SRC, combine)?;
+        self.moe_combine_order_top10_owned(
+            inverse_perm,
+            topk_indices,
+            topk_weights,
+            order,
+            grouped_rows,
+            tokens,
+            n_experts,
+            owners,
+        )?;
         let gp = grouped_down.buf.as_ptr();
-        let ip = inverse_perm.buf.as_ptr();
-        let tp = topk_indices.buf.as_ptr();
-        let wp = topk_weights.buf.as_ptr();
         let rp = residual.buf.as_ptr();
         let op = order.buf.as_ptr();
         let hv = hidden as i32;
-        let gr = grouped_rows as i32;
         let tv = tokens as i32;
-        let nx = n_experts as i32;
-        let mut params = [
-            &ip as *const _ as *mut c_void,
-            &tp as *const _ as *mut c_void,
-            &wp as *const _ as *mut c_void,
-            &op as *const _ as *mut c_void,
-            &gr as *const _ as *mut c_void,
-            &tv as *const _ as *mut c_void,
-            &nx as *const _ as *mut c_void,
-        ];
-        self.launch_maybe_blob(
-            "moe_combine_order_top10",
-            [(tokens as u32).div_ceil(64), 1, 1],
-            [64, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ip);
-                b.push_ptr(tp);
-                b.push_ptr(wp);
-                b.push_ptr(op);
-                b.push_i32(gr);
-                b.push_i32(tv);
-                b.push_i32(nx);
-                b
-            },
-        )?;
         let mut params = [
             &gp as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
@@ -5572,6 +5584,226 @@ mod tests {
                 differing, 0,
                 "zero-init combine differs in {differing} cells, tokens={tokens}"
             );
+        }
+    }
+
+    /// Owner-masked combine over poisoned (NaN) foreign/padding rows must be
+    /// bytewise the unmasked combine over the same rows cleared to +0, and the
+    /// masked order must equal the plain order with foreign rows -> -1.
+    #[test]
+    fn combine_bf16in_owned_is_bytewise_the_cleared_foreign_rows() {
+        use std::io::Write;
+        let Ok(mut gpu) = crate::gpu_test::init() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        const HIDDEN: usize = 2560;
+        const N_EXP: usize = 512;
+        let to_bytes = |v: &[i32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let pairs = |b: &[u8]| -> Vec<(i32, u32)> {
+            b.chunks_exact(8)
+                .map(|c| {
+                    (
+                        i32::from_le_bytes(c[0..4].try_into().unwrap()),
+                        u32::from_le_bytes(c[4..8].try_into().unwrap()),
+                    )
+                })
+                .collect()
+        };
+        // (owner of expert, rank)
+        let cases: [(&str, fn(usize) -> i32, usize); 5] = [
+            ("mod2_r0", |e| (e % 2) as i32, 0),
+            ("mod2_r1", |e| (e % 2) as i32, 1),
+            ("mod5_r0", |e| if e % 5 == 0 { 0 } else { 1 }, 0),
+            ("none_owned", |_| 1, 0),
+            ("all_owned", |_| 0, 0),
+        ];
+        for tokens in [1usize, 37, 530, 4096] {
+            let slots = tokens * 10;
+            let mut state = 0x9E37_79B9u64 ^ tokens as u64;
+            let mut next = || {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as usize
+            };
+            let mut experts = vec![-1i32; slots];
+            for t in 0..tokens {
+                for r in 0..10 {
+                    let slot = t * 10 + r;
+                    if slot % 17 == 0 {
+                        continue;
+                    }
+                    loop {
+                        let e = (next() % N_EXP) as i32;
+                        if !experts[t * 10..slot].contains(&e) {
+                            experts[slot] = e;
+                            break;
+                        }
+                    }
+                }
+            }
+            let weights: Vec<f32> = (0..slots)
+                .map(|i| {
+                    if i % 23 == 3 {
+                        0.0
+                    } else {
+                        ((i.wrapping_mul(2_654_435_761) % 3001) as f32 - 1500.0) / 1000.0
+                    }
+                })
+                .collect();
+            // Grouped layout: experts ascending, rows padded to 16.
+            let mut inverse = vec![-1i32; slots];
+            let mut row_expert: Vec<i32> = Vec::new();
+            for e in 0..N_EXP as i32 {
+                let start = row_expert.len();
+                for s in 0..slots {
+                    if experts[s] == e {
+                        inverse[s] = row_expert.len() as i32;
+                        row_expert.push(e);
+                    }
+                }
+                if row_expert.len() > start {
+                    row_expert.resize(start + (row_expert.len() - start).div_ceil(16) * 16, -1);
+                }
+            }
+            let grouped_rows = row_expert.len().max(16);
+            row_expert.resize(grouped_rows, -1);
+            let inverse_t = gpu
+                .upload_raw(&to_bytes(&inverse), &[slots * 4])
+                .expect("inverse");
+            let experts_t = gpu
+                .upload_raw(&to_bytes(&experts), &[slots * 4])
+                .expect("experts");
+            let weights_t = gpu.upload_f32(&weights, &[slots]).expect("weights");
+            for (name, owner_of, rank) in cases {
+                let table: Vec<i32> = (0..N_EXP).map(owner_of).collect();
+                let owner_t = gpu
+                    .upload_raw(&to_bytes(&table), &[N_EXP * 4])
+                    .expect("owners");
+                let foreign = |r: i32| r >= 0 && table[r as usize] != rank as i32;
+                let build = |poison: bool| -> Vec<u8> {
+                    let mut out = Vec::with_capacity(grouped_rows * HIDDEN * 2);
+                    for (row, &e) in row_expert.iter().enumerate() {
+                        for c in 0..HIDDEN {
+                            let bits: u16 = if e >= 0 && table[e as usize] == rank as i32 {
+                                let h = (row * 7919 + c * 31 + 1) % 4093;
+                                let v =
+                                    (h as f32 + 1.0) / 1024.0 * if h % 3 == 0 { -1.0 } else { 1.0 };
+                                (v.to_bits() >> 16) as u16
+                            } else if poison {
+                                0xFFFF
+                            } else {
+                                0x0000
+                            };
+                            out.extend_from_slice(&bits.to_le_bytes());
+                        }
+                    }
+                    out
+                };
+                let clean = build(false);
+                let poison = build(true);
+                let clean_t = gpu.upload_raw(&clean, &[clean.len()]).expect("clean");
+                let poison_t = gpu.upload_raw(&poison, &[poison.len()]).expect("poison");
+                for initial_zero in [false, true] {
+                    let garbage: Vec<f32> = (0..tokens * HIDDEN)
+                        .map(|i| (i % 977) as f32 / 61.0 - 7.0)
+                        .collect();
+                    let prep = |gpu: &mut Gpu| {
+                        if initial_zero {
+                            gpu.upload_f32(&garbage, &[tokens * HIDDEN])
+                                .expect("garbage")
+                        } else {
+                            gpu.zeros(&[tokens * HIDDEN], DType::F32).expect("zeros")
+                        }
+                    };
+                    let base_t = prep(&mut gpu);
+                    let cand_t = prep(&mut gpu);
+                    let order_base = gpu
+                        .upload_raw(&vec![0u8; slots * 8], &[slots * 8])
+                        .expect("order");
+                    let order_cand = gpu
+                        .upload_raw(&vec![0u8; slots * 8], &[slots * 8])
+                        .expect("order");
+                    gpu.moe_down_combine_grouped_top10_bf16in(
+                        &clean_t,
+                        &inverse_t,
+                        &experts_t,
+                        &weights_t,
+                        &base_t,
+                        &order_base,
+                        HIDDEN,
+                        grouped_rows,
+                        tokens,
+                        initial_zero,
+                        N_EXP,
+                    )
+                    .expect("baseline combine");
+                    gpu.moe_down_combine_grouped_top10_bf16in_owned(
+                        &poison_t,
+                        &inverse_t,
+                        &experts_t,
+                        &weights_t,
+                        &cand_t,
+                        &order_cand,
+                        HIDDEN,
+                        grouped_rows,
+                        tokens,
+                        initial_zero,
+                        N_EXP,
+                        Some(crate::hc_row_fold::CombineOwners {
+                            table: &owner_t,
+                            rank,
+                        }),
+                    )
+                    .expect("owned combine");
+                    let a = gpu.download_f32(&base_t).expect("download");
+                    let b = gpu.download_f32(&cand_t).expect("download");
+                    assert!(
+                        !b.iter().any(|v| v.is_nan()),
+                        "NaN leaked: {name} tokens={tokens}"
+                    );
+                    if name != "none_owned" {
+                        assert!(a.iter().any(|v| *v != 0.0), "baseline all zero: {name}");
+                    }
+                    let differing = a
+                        .iter()
+                        .zip(&b)
+                        .filter(|(x, y)| x.to_bits() != y.to_bits())
+                        .count();
+                    assert_eq!(
+                        differing, 0,
+                        "owned combine differs in {differing} cells: {name} tokens={tokens} zinit={initial_zero}"
+                    );
+                    let ob = pairs(&gpu.download_raw_bytes(&order_base).expect("order"));
+                    let oc = pairs(&gpu.download_raw_bytes(&order_cand).expect("order"));
+                    assert_eq!(ob.len(), oc.len());
+                    for (i, (x, y)) in ob.iter().zip(&oc).enumerate() {
+                        assert_eq!(
+                            x.1, y.1,
+                            "weight bits differ at {i}: {name} tokens={tokens}"
+                        );
+                        let want = if x.0 >= 0 && foreign(row_expert[x.0 as usize]) {
+                            -1
+                        } else {
+                            x.0
+                        };
+                        assert_eq!(y.0, want, "order row at {i}: {name} tokens={tokens}");
+                    }
+                    if let Ok(path) = std::env::var("OWNED_COMBINE_RECEIPT") {
+                        let mut f = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                            .expect("receipt");
+                        writeln!(
+                            f,
+                            "tokens={tokens} case={name} initial_zero={initial_zero} differing=0"
+                        )
+                        .expect("receipt write");
+                    }
+                }
+            }
         }
     }
 

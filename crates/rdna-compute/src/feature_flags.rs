@@ -110,6 +110,15 @@ pub struct FeatureFlags {
     /// MoE combine zero-init (`HIPFIRE_QWEN4_MOE_COMBINE_ZINIT`), default on
     /// for gfx1151 and gfx1201, off elsewhere.
     pub qwen4_moe_combine_zinit: bool,
+    /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`),
+    /// default on for exact gfx1201, `0` is the kill switch: the foreign experts'
+    /// grouped down rows are marked `-1` in the combine order instead of being
+    /// cleared and read back as +0.
+    pub qwen4_ep_pmask_implicit_zero: bool,
+    /// Developer negative control for the above (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO_POISON=1`):
+    /// the skipped clear becomes an all-ones fill (BF16 NaN) of the grouped rows, so any
+    /// read of a foreign row poisons the output.
+    pub qwen4_ep_pmask_implicit_zero_poison: bool,
     /// HC row folds (`HIPFIRE_QWEN4_HC_ROW_FOLD`), default on for gfx1151 and
     /// gfx1201, off elsewhere.  gfx1151: combine + shared fold + HC write + the
     /// next HC read's norm/gate in one MoE row kernel.  gfx1201: the same for
@@ -1098,6 +1107,12 @@ impl FeatureFlags {
             qwen4_hc_up_v2: parse_bool("HIPFIRE_QWEN4_HC_UP_V2").unwrap_or(is_gfx1201 || arch == "gfx1151"),
             qwen4_moe_combine_zinit: parse_bool("HIPFIRE_QWEN4_MOE_COMBINE_ZINIT")
                 .unwrap_or(exact_unit_default),
+            qwen4_ep_pmask_implicit_zero: parse_bool("HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO")
+                .unwrap_or(is_gfx1201),
+            qwen4_ep_pmask_implicit_zero_poison: parse_bool(
+                "HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO_POISON",
+            )
+            .unwrap_or(false),
             qwen4_hc_row_fold: parse_bool("HIPFIRE_QWEN4_HC_ROW_FOLD")
                 .unwrap_or(halo_hyper_default || is_gfx1201),
             qwen4_router_fast: parse_bool("HIPFIRE_QWEN4_ROUTER_FAST")
@@ -1762,6 +1777,17 @@ impl FeatureFlags {
         self.qwen4_moe_combine_zinit && matches!(self.arch.as_str(), "gfx1151" | "gfx1201")
     }
 
+    /// EP partial tile mask implicit zeros (`HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO`):
+    /// exact gfx1201 only.
+    pub fn qwen4_ep_pmask_implicit_zero_enabled(&self) -> bool {
+        self.qwen4_ep_pmask_implicit_zero && self.arch == "gfx1201"
+    }
+
+    /// `HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO_POISON=1` (developer): fill instead of skip.
+    pub fn qwen4_ep_pmask_implicit_zero_poison(&self) -> bool {
+        self.qwen4_ep_pmask_implicit_zero_poison
+    }
+
     /// Row fold of the MoE tail (`HIPFIRE_QWEN4_HC_ROW_FOLD`): exact gfx1151,
     /// on top of the `HIPFIRE_QWEN4_HC_FUSE` >= 3 shared-down route and the
     /// zero-initialized combine.  gfx1201 has its own accessors
@@ -2056,6 +2082,8 @@ impl FeatureFlags {
             qwen4_hc_up_tile: false,
             qwen4_hc_up_v2: false,
             qwen4_moe_combine_zinit: false,
+            qwen4_ep_pmask_implicit_zero: false,
+            qwen4_ep_pmask_implicit_zero_poison: false,
             qwen4_hc_row_fold: false,
             qwen4_router_fast: false,
             qwen4_moe_scatter_scan: false,
@@ -3069,6 +3097,45 @@ mod tests {
                 exact,
                 "{arch}"
             );
+        }
+    }
+
+    /// The EP partial-mask implicit zeros default on for exact gfx1201 only (`0` kills, `1`
+    /// enables nothing elsewhere); the poison control is off unless `1`.
+    #[test]
+    fn qwen4_ep_pmask_implicit_zero_defaults_on_exact_gfx1201() {
+        let with = |name: &'static str, value: &'static str| {
+            move |key: &str| -> std::result::Result<String, ()> {
+                if key == name {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        const ENV: &str = "HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO";
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx1201", "gfx942"] {
+            let exact = arch == "gfx1201";
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_ep_pmask_implicit_zero_enabled(),
+                exact,
+                "{arch}"
+            );
+            assert!(!unset.qwen4_ep_pmask_implicit_zero_poison(), "{arch}");
+            let killed = FeatureFlags::from_lookup(arch, with(ENV, "0"));
+            assert!(!killed.qwen4_ep_pmask_implicit_zero_enabled(), "{arch}");
+            let forced = FeatureFlags::from_lookup(arch, with(ENV, "1"));
+            assert_eq!(
+                forced.qwen4_ep_pmask_implicit_zero_enabled(),
+                exact,
+                "{arch}"
+            );
+            let poison = FeatureFlags::from_lookup(
+                arch,
+                with("HIPFIRE_QWEN4_EP_PMASK_IMPLICIT_ZERO_POISON", "1"),
+            );
+            assert!(poison.qwen4_ep_pmask_implicit_zero_poison(), "{arch}");
         }
     }
 
