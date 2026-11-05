@@ -221,6 +221,11 @@ pub struct FeatureFlags {
     /// `Gpu::ensure_mq_signs*`) run on the active stream and wait on it
     /// (`HIPFIRE_STREAM_ORDERED_COPIES`, default on; `=0` restores the null-stream copies).
     pub stream_ordered_copies: bool,
+    /// Wide verify (past the 1..=8-row pair kernel) HC read hands its paired write the
+    /// gates (`HIPFIRE_QWEN4_HC_PAIR_ALLROWS`): the read's `hyper_norm` output feeds the
+    /// write's own k4 gate GEMV right away, so the write skips its identical norm.
+    /// Default on for exact gfx1201 (`=0` kills it).
+    pub qwen4_hc_pair_allrows: bool,
     /// Fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`), default on for gfx1151 and gfx1201, off
     /// elsewhere.
@@ -1147,6 +1152,7 @@ impl FeatureFlags {
             qwen4_hc_k4_allrows: parse_bool("HIPFIRE_QWEN4_HC_K4_ALLROWS").unwrap_or(true),
             qwen4_hc_pair_decode: parse_bool("HIPFIRE_QWEN4_HC_PAIR_DECODE").unwrap_or(true),
             stream_ordered_copies: parse_bool("HIPFIRE_STREAM_ORDERED_COPIES").unwrap_or(true),
+            qwen4_hc_pair_allrows: parse_bool("HIPFIRE_QWEN4_HC_PAIR_ALLROWS").unwrap_or(true),
             qwen4_ple_fuse: parse_bool("HIPFIRE_QWEN4_PLE_FUSE").unwrap_or(exact_unit_default),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
@@ -1944,6 +1950,12 @@ impl FeatureFlags {
         self.qwen4_hc_pair_decode && self.arch == "gfx1201"
     }
 
+    /// Wide-verify HC read hands its paired write the gates from its own norm
+    /// (`HIPFIRE_QWEN4_HC_PAIR_ALLROWS`, default on, `=0` kills it). Exact gfx1201 only.
+    pub fn qwen4_hc_pair_allrows_enabled(&self) -> bool {
+        self.qwen4_hc_pair_allrows && self.arch == "gfx1201"
+    }
+
     /// The fused PLE gate/norm/conv/stream-add tail on BF16 HC streams
     /// (`HIPFIRE_QWEN4_PLE_FUSE`). Exact gfx1151 / gfx1201.
     pub fn qwen4_ple_fuse_enabled(&self) -> bool {
@@ -2112,6 +2124,7 @@ impl FeatureFlags {
             qwen4_hc_k4_allrows: false,
             qwen4_hc_pair_decode: false,
             stream_ordered_copies: false,
+            qwen4_hc_pair_allrows: false,
             qwen4_ple_fuse: false,
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
@@ -3542,6 +3555,33 @@ mod tests {
             );
         }
         assert!(!FeatureFlags::for_test("gfx1201").qwen4_hc_pair_decode_enabled());
+    }
+
+    /// The wide-verify HC read/write gate pairing is default on (`=0` kills) and reaches exact gfx1201 only.
+    #[test]
+    fn qwen4_hc_pair_allrows_defaults_on_exact_gfx1201() {
+        let with = |value: &'static str| {
+            move |n: &str| -> std::result::Result<String, ()> {
+                if n == "HIPFIRE_QWEN4_HC_PAIR_ALLROWS" {
+                    Ok(value.into())
+                } else {
+                    Err(())
+                }
+            }
+        };
+        for arch in [
+            "gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            let unset = FeatureFlags::from_lookup(arch, |_| Err(()));
+            assert_eq!(
+                unset.qwen4_hc_pair_allrows_enabled(),
+                arch == "gfx1201",
+                "{arch}: unset"
+            );
+            let off = FeatureFlags::from_lookup(arch, with("0"));
+            assert!(!off.qwen4_hc_pair_allrows_enabled(), "{arch}: 0");
+        }
+        assert!(!FeatureFlags::for_test("gfx1201").qwen4_hc_pair_allrows_enabled());
     }
 
     /// The packed-epilogue MQ6 rows kernels are default on (`=0` kills) and reach exact gfx1201 only.

@@ -10674,6 +10674,11 @@ pub struct Qwen4GpuForward {
     /// `host_token_bytes` (its mirror): 0 for a HIP single-row body, a device
     /// argmax id or a captured upload.
     pub(crate) uploaded_id_rows: usize,
+    /// The ids the last lane forward uploaded to `scratch.token_ids` rows
+    /// `[0, n)` (lane order) and that buffer's address at the time: the lane
+    /// commit fill's in-place embedding source ([`Self::lane_uploaded_token_ids`]).
+    /// Emptied by every other forward's id upload.
+    pub(crate) lane_uploaded_ids: (usize, Vec<u32>),
     /// Host staging for the PLE rows and the fence over its asynchronous
     /// upload (`HIPFIRE_QWEN4_PLE_ASYNC_UPLOAD`).
     pub(crate) host_ple: PleHostStage,
@@ -13070,6 +13075,7 @@ impl Qwen4GpuForward {
             scratch,
             host_token_bytes,
             uploaded_id_rows: 0,
+            lane_uploaded_ids: (0, Vec::new()),
             host_ple: PleHostStage::new(
                 host_ple_bytes.len(),
                 ple_async_upload_enabled(
@@ -14383,6 +14389,7 @@ impl Qwen4GpuForward {
         }
         self.ple_lookahead.clear();
         self.uploaded_id_rows = 0;
+        self.lane_uploaded_ids.1.clear();
         Ok(self.ple_ahead.take())
     }
 
@@ -14390,6 +14397,7 @@ impl Qwen4GpuForward {
     /// earlier forward uploaded.
     pub(crate) fn slowlink_note_ids_rewritten(&mut self) {
         self.uploaded_id_rows = 0;
+        self.lane_uploaded_ids.1.clear();
     }
 
     /// Device bytes of the forward's own mixer-tile scratch (every owned slot
@@ -15126,6 +15134,27 @@ impl Qwen4GpuForward {
             tokens,
         )?;
         Some(view(&self.scratch.token_ids, byte_offset, byte_len))
+    }
+
+    /// Device view of `tokens` as rows `row..` of the last lane forward's id
+    /// upload ([`Self::lane_uploaded_ids`]), or `None` when no lane forward
+    /// uploaded them since, the buffer moved, or they differ from `tokens`.
+    /// The view borrows `scratch.token_ids`: the next forward overwrites it.
+    pub(crate) fn lane_uploaded_token_ids(&self, row: usize, tokens: &[u32]) -> Option<GpuTensor> {
+        let (address, ids) = &self.lane_uploaded_ids;
+        let end = row.checked_add(tokens.len())?;
+        if tokens.is_empty()
+            || *address != self.scratch.token_ids.buf.as_ptr() as usize
+            || ids.get(row..end)? != tokens
+        {
+            return None;
+        }
+        let id_bytes = std::mem::size_of::<i32>();
+        Some(view(
+            &self.scratch.token_ids,
+            row * id_bytes,
+            tokens.len() * id_bytes,
+        ))
     }
 
     /// Start the first tile's PLE rows now, unless a retained lookahead
@@ -16666,6 +16695,7 @@ impl Qwen4GpuForward {
         let ids = view(&self.scratch.token_ids, 0, id_bytes);
         // No claim on the device ids until this forward's own upload lands.
         self.uploaded_id_rows = 0;
+        self.lane_uploaded_ids.1.clear();
         if let Some(previous) = device_token {
             argmax_f32(
                 gpu,

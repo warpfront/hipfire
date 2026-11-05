@@ -1545,8 +1545,13 @@ impl Qwen4Bundle {
         device_ids: Vec<i32>,
     ) -> Result<Qwen4EpMesh, String> {
         let ranks = spec.ranks;
-        // 2. Register every rank's gather buffers, build the transport.
-        let builder = Mutex::new(Some(EpRowGather::builder(spec)));
+        // 2. Register every rank's gather buffers, build the transport. On exact gfx1201 a
+        // rank's gather waits its peers' producer events on its stream instead of the host
+        // (`HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT`, default on, `=0` restores the host waits):
+        // same copies in the same stream order, no host round trip per MoE layer.
+        let device_waits = gpu.arch_caps.is_gfx1201()
+            && hipfire_config::developer_bool("HIPFIRE_QWEN4_EP_GATHER_DEVICE_WAIT", true);
+        let builder = Mutex::new(Some(EpRowGather::builder(spec).device_waits(device_waits)));
         let register = |rank: usize, bundle: &Qwen4Bundle, gpu: &mut Gpu| -> Result<(), String> {
             let buffers = bundle
                 .execution

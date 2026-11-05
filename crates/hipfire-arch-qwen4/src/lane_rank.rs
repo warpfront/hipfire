@@ -746,7 +746,14 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
         let crate::lane::StepParts {
             mut lanes, spec, ..
         } = store.step_parts(&epochs).map_err(rank_error)?;
-        let hidden: Option<&GpuTensor> = spec.as_ref().map(|s| &s.hidden);
+        let commit_fill = crate::mtp_lanes::lane_commit_fill_enabled(gpu);
+        let (hidden, mut fill) = match spec {
+            Some(s) => (
+                Some(&s.hidden),
+                s.append_scratch.as_mut().filter(|_| commit_fill),
+            ),
+            None => (None, None),
+        };
         let mut first = 0usize;
         // Head rows the rank appended: round 0's catch-ups plus every lane's
         // prepare schedule; the session's receipt counts the decision's.
@@ -775,6 +782,7 @@ impl LaneMeshExecutor for LocalLaneRank<'_> {
                         row_begin: first,
                         picks: lane_picks,
                         skip_rollback,
+                        fill: fill.as_deref_mut(),
                     },
                 )
                 .map_err(rank_error)?;

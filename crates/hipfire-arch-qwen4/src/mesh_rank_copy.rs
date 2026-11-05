@@ -802,6 +802,9 @@ pub(crate) struct RankPrepare<'a> {
     pub picks: &'a [u32],
     /// Lab negative control (rejected verify keeps its rows).
     pub skip_rollback: bool,
+    /// The store's Append scratch when the lane commit fill is on
+    /// ([`crate::mtp_lanes::lane_commit_fill_enabled`]), else `None`.
+    pub fill: Option<&'a mut crate::mtp_gpu::MtpAppendScratch>,
 }
 
 /// A prepared lane and the head rows it appended (owed flush + window rows).
@@ -922,6 +925,7 @@ pub(crate) fn prepare_rank_lane(
                     head_at_start,
                     eos: LaneEos::Admitted(p.plan.eos),
                 },
+                p.fill,
             )?;
             let window = &prepared.result;
             if window.committed != d.emitted || window.accepted != d.accepted {

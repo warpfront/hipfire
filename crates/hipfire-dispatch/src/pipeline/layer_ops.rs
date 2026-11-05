@@ -1594,7 +1594,26 @@ fn execute_hyper_read_inner(
                     ))?;
                     *gates_written = true;
                 }
-                None => hip(hyper_norm(gpu, &norm))?,
+                None => {
+                    hip(hyper_norm(gpu, &norm))?;
+                    // Wide verify: the paired write's own k4 gate GEMV over this norm
+                    // (the write's norm would recompute these bytes); it runs pregated.
+                    if let Some(write) =
+                        paired.filter(|write| hyper_pair_allrows_applies(gpu, op, write))
+                    {
+                        let gates = view(write.gates, 0, op.rows * write.branches);
+                        hip(gpu.gemv_bf16_xf32_k4_rows(
+                            write.block_inject.buf,
+                            &normalized,
+                            &gates,
+                            write.block_inject.m,
+                            write.block_inject.k,
+                            None,
+                            op.rows,
+                        ))?;
+                        *gates_written = true;
+                    }
+                }
             }
         }
         let down = &op.input_mix_down;
@@ -2188,6 +2207,27 @@ fn hyper_pair_decode_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWri
         && write.block_inject.dtype == DType::BF16
         && write.block_inject.m == write.branches
         && write.block_inject.k == 4 * write.hidden
+        && write.block_inject.awq_scale.is_none()
+        && write.gates.dtype == DType::F32
+        && write.gates.numel() >= write.rows * write.branches
+}
+
+/// Whether the k4-route read `read` (past [`hyper_pair_decode_applies`]'s 1..=8 rows) hands its
+/// paired write the gates (`HIPFIRE_QWEN4_HC_PAIR_ALLROWS`, exact gfx1201): the write's gate
+/// route is the k4 GEMV over its own `hyper_norm` of the same streams with the same norm weight
+/// ([`hyper_read_pairs_write`]), so running that GEMV on the read's `normalized` is the write's
+/// launch on the same bytes, and the write skips its norm (`hyper_write` never reads it).
+fn hyper_pair_allrows_applies(gpu: &Gpu, read: &HyperReadOp<'_>, write: &HyperWriteOp<'_>) -> bool {
+    gpu.flags.qwen4_hc_pair_allrows_enabled()
+        && !HyperNormGateK4Outputs::supports(read.branches, read.hidden, read.rows)
+        && hyper_write_gates_k4(gpu, write)
+        && write.rows == read.rows
+        && write.branches == read.branches
+        && write.hidden == read.hidden
+        && write.state_bf16 == read.state_bf16
+        && write.block_inject.dtype == DType::BF16
+        && write.block_inject.m == write.branches
+        && write.block_inject.k == write.branches * write.hidden
         && write.block_inject.awq_scale.is_none()
         && write.gates.dtype == DType::F32
         && write.gates.numel() >= write.rows * write.branches

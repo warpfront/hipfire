@@ -2518,8 +2518,16 @@ fn forward_lanes_scoped(
         None
     };
     // The ids this forward uploads are not a whole-row mirror of a singleton
-    // upload: no later singleton forward may claim them.
+    // upload: no later singleton forward may claim them. The lane mirror
+    // names them for the step's own commit fill (input band, outside capture).
     fwd.uploaded_id_rows = 0;
+    fwd.lane_uploaded_ids.1.clear();
+    if ids_async {
+        fwd.lane_uploaded_ids.0 = fwd.scratch.token_ids.buf.as_ptr() as usize;
+        fwd.lane_uploaded_ids
+            .1
+            .extend(lanes.iter().flat_map(|lane| lane.tokens.iter().copied()));
+    }
     if prefill {
         // Like `lane_prefill_tile`: no lookahead names this wave's next rows,
         // and (as the singleton does for every multi-row forward) no retained

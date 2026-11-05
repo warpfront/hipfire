@@ -886,7 +886,14 @@ impl RankLane<'_> {
             let StepParts {
                 mut lanes, spec, ..
             } = store.step_parts(&epochs)?;
-            let hidden: Option<&GpuTensor> = spec.as_deref().map(|s| &s.hidden);
+            let commit_fill = crate::mtp_lanes::lane_commit_fill_enabled(gpu);
+            let (hidden, mut fill) = match spec {
+                Some(s) => (
+                    Some(&s.hidden),
+                    s.append_scratch.as_mut().filter(|_| commit_fill),
+                ),
+                None => (None, None),
+            };
             for (i, (d, lane)) in decision.lanes.iter().zip(lanes.iter_mut()).enumerate() {
                 if lane.spec.is_none() {
                     continue;
@@ -909,6 +916,7 @@ impl RankLane<'_> {
                         row_begin: win.row_begin,
                         picks: &win.picks,
                         skip_rollback,
+                        fill: fill.as_deref_mut(),
                     },
                 )?;
                 head_rows += prepared.head_rows;

@@ -3664,6 +3664,14 @@ impl Qwen4Bundle {
         self.lanes.as_ref()?.spec_append_scratch_view()
     }
 
+    /// Device view of `tokens` as rows `row..` of the last lane forward's
+    /// token-id upload (`Qwen4GpuForward::lane_uploaded_token_ids`), or `None`.
+    pub(crate) fn lane_uploaded_token_ids(&self, row: usize, tokens: &[u32]) -> Option<GpuTensor> {
+        self.execution
+            .as_ref()?
+            .lane_uploaded_token_ids(row, tokens)
+    }
+
     /// Map the MTP head's QSA context through `last_position` (the row the
     /// last Append of a run writes) in one go: the coverage each Append's own
     /// `mapped_mtp` would grow to, so those calls then find it mapped. A VMM

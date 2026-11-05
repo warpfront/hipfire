@@ -8073,6 +8073,20 @@ pub(crate) struct NativeFinish<'a> {
     /// start and the seed's row is appended instead of truncated to. A native
     /// window passes `false`.
     pub head_at_start: bool,
+    /// The lane commit fill (`HIPFIRE_QWEN4_LANE_COMMIT_FILL`): when given,
+    /// two or more kept drafts are rebuilt by one batched decode-fill Append
+    /// (`Qwen4MtpGpu::append_rows`, `MtpFillContext::DecodeFill`, the
+    /// per-row reduction order) over `verify_hidden` rows `0..kept` instead of
+    /// one `mtp_append_token` per row. `None` keeps the per-row loop.
+    pub fill: Option<CommitFill<'a>>,
+}
+
+/// [`NativeFinish::fill`]: the Append scratch, and the row of block row 0 in
+/// the lane forward's device token-id upload (the kept drafts embed from those
+/// ids in place when the forward's mirror still holds them).
+pub(crate) struct CommitFill<'a> {
+    pub scratch: &'a mut MtpAppendScratch,
+    pub ids_row: usize,
 }
 
 /// A native window whose every fallible target/head operation succeeded and
@@ -8154,6 +8168,7 @@ pub(crate) fn prepare_native_window(
         ple_normed,
         retain,
         head_at_start: head_already_at_start,
+        fill,
     } = f;
     let drafts = block
         .get(1..)
@@ -8217,18 +8232,41 @@ pub(crate) fn prepare_native_window(
             picks.ops_head_truncate_retain(mtp_ticket, 1)?;
         }
     }
-    for row in 0..target_accept_len {
-        picks
-            .copy_hidden_row(ops.gpu()?, verify_hidden, row, pending_hidden)
-            .map_err(|error| error.to_string())?;
-        picks
-            .mtp_append_token(
-                ops.gpu()?,
-                block[row + 1],
-                Some(pending_hidden),
-                position + 1 + row,
-            )
-            .map_err(|error| error.to_string())?;
+    // Token `block[row + 1]` pairs with verify hidden row `row`: the batched
+    // fill reads those rows in place; the per-row loop stages each in
+    // `pending_hidden` first. Both leave `pending_hidden` to the copy below.
+    match fill.filter(|fill| target_accept_len >= 2 && target_accept_len <= fill.scratch.rows()) {
+        Some(fill) => {
+            let kept = &block[1..=target_accept_len];
+            let ids = picks.lane_uploaded_token_ids(fill.ids_row + 1, kept);
+            picks
+                .mtp_append_rows_hidden(
+                    ops.gpu()?,
+                    MtpFillContext::DecodeFill,
+                    fill.scratch,
+                    kept,
+                    verify_hidden,
+                    None,
+                    ids.as_ref(),
+                    position + 1,
+                )
+                .map_err(|error| error.to_string())?
+        }
+        None => {
+            for row in 0..target_accept_len {
+                picks
+                    .copy_hidden_row(ops.gpu()?, verify_hidden, row, pending_hidden)
+                    .map_err(|error| error.to_string())?;
+                picks
+                    .mtp_append_token(
+                        ops.gpu()?,
+                        block[row + 1],
+                        Some(pending_hidden),
+                        position + 1 + row,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
     }
     mark_phase(&mut timers, ops.gpu()?, "commit");
     let committed_end = position
@@ -9177,6 +9215,7 @@ impl Qwen4MtpDrafter {
                     ple_normed: ple_normed.as_ref(),
                     retain: true,
                     head_at_start: false,
+                    fill: None,
                 },
                 Some(&mut timers),
             )?;

@@ -42,8 +42,8 @@ use crate::mtp_spec::{
     accept_native_greedy, floor_with_call_log, mtp_append_prefill_chunk, mtp_prefill_chunk,
     mtp_prefill_chunk_needs_pick, mtp_reuse_prefill_ids_enabled,
     mtp_skip_intermediate_pick_enabled, prepare_native_window, publish_native_window,
-    singleton_floor_ar_probe_tokens, singleton_floor_min_windows, HeadTicket, NativeFinish,
-    PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket, MTP_WINDOW_COST,
+    singleton_floor_ar_probe_tokens, singleton_floor_min_windows, CommitFill, HeadTicket,
+    NativeFinish, PreparedNativeWindow, Qwen4Floor, Qwen4Ops, TargetTicket, MTP_WINDOW_COST,
 };
 
 use hipfire_dispatch::pipeline::DraftHeadRequestState;
@@ -1068,14 +1068,27 @@ pub(crate) fn prepare_lane_window(
         picks,
         skip_rollback,
         LaneFinish::NATIVE,
+        None,
     )
+}
+
+/// Whether a lane step's prepare rebuilds a window's kept drafts with one
+/// batched decode-fill Append per lane ([`CommitFill`]) instead of one
+/// `mtp_append_token` per row (`HIPFIRE_QWEN4_LANE_COMMIT_FILL`): on unless
+/// `0`, exact gfx1201 only. The batched Append is the per-row kernels' bytes
+/// (`append_rows`' `DecodeFill` route, as the singleton takeover fill).
+pub(crate) fn lane_commit_fill_enabled(gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx1201()
+        && hipfire_config::developer_bool("HIPFIRE_QWEN4_LANE_COMMIT_FILL", true)
 }
 
 /// [`prepare_lane_window`] for any verify window of a lane (native, copy,
 /// forced): `finish` carries the acceptance a forced window fixes and the
 /// `head_at_start` rule. The head must already stand where the finish
 /// expects it (`window.position + window.steps`): a catch-up or an owed-row
-/// flush has run.
+/// flush has run. `fill` is the store's Append scratch when the commit fill
+/// is on ([`lane_commit_fill_enabled`]); the kept drafts then embed from the
+/// lane forward's device ids at `row_begin + 1..` when they are still there.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_lane_window_with(
     bundle: &mut Qwen4Bundle,
@@ -1087,6 +1100,7 @@ pub(crate) fn prepare_lane_window_with(
     picks: &[u32],
     skip_rollback: bool,
     finish: LaneFinish,
+    fill: Option<&mut MtpAppendScratch>,
 ) -> Result<PreparedLaneWindow, String> {
     let wide = bundle
         .config
@@ -1211,6 +1225,10 @@ pub(crate) fn prepare_lane_window_with(
                 ple_normed: Some(&ple_normed),
                 retain: false,
                 head_at_start: finish.head_at_start,
+                fill: fill.map(|scratch| CommitFill {
+                    scratch,
+                    ids_row: row_begin,
+                }),
             },
             None,
         )
