@@ -4071,6 +4071,8 @@ pub(crate) struct Qwen4TileRoute {
     tile_ids_owned: GpuTensor,
     /// Padded tile capacity the exchange is registered for.
     max_tiles: usize,
+    /// Bytes of one 16-row BF16 tile of grouped-down rows.
+    tile_bytes: usize,
     /// Per layer: the compact layer's verdict, taken on the full tables in `attach_ep`
     /// (gfx1201: the symmetric IU4 header verdict; gfx1100: the expert formats the F16 WMMA
     /// grouped GEMMs take). Empty until then.
@@ -4201,6 +4203,7 @@ impl Qwen4TileRoute {
             owner_table,
             tile_ids_owned,
             max_tiles,
+            tile_bytes,
             verdicts: Vec::new(),
             wmma,
             hook: None,
@@ -14128,7 +14131,20 @@ impl Qwen4GpuForward {
             .map_or(&self.scratch.moe_y_down_grouped, |reserve| {
                 &reserve.exchange_root
             });
-        Some((root, route.max_tiles))
+        // An EP tail-borrow load whose grouped-down rows have NO persistent root (the trunk
+        // shard) registers the resident bank's buffer, which holds fewer tiles than the route's
+        // borrowed-row `max_tiles`. Sound only because that route is mask-only: it runs through
+        // `PartialMaskArc`, whose `exchange` never pulls peer rows ("partial tile mask never
+        // pulls peer rows"), so no peer ever reads this buffer. The transport is built at the
+        // registered tiles, and its pull guard (`EpTileExchangeSpec::check_call`) refuses any
+        // call beyond them: a future route that starts pulling errors instead of overrunning.
+        let tiles = match self.ep_tail_borrow.as_ref() {
+            Some(borrow) if !borrow.exchange_root_persistent() => {
+                route.max_tiles.min(root.buf.size() / route.tile_bytes)
+            }
+            _ => route.max_tiles,
+        };
+        Some((root, tiles))
     }
 
     /// The per-layer symmetric verdicts taken in `attach_ep` (`None` when not admitted).

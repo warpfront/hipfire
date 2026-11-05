@@ -245,11 +245,16 @@ impl EpTileExchangeSpec {
         Ok(())
     }
 
+    /// The pull guard: a call of `tiles` tiles must fit the registered capacity. Never a silent
+    /// overrun: a transport registered with a reduced capacity (an EP tail-borrow load whose
+    /// route only masks tiles) refuses any pull beyond it, naming both sizes.
     fn check_call(&self, tiles: usize) -> HipResult<()> {
         if tiles == 0 || tiles > self.max_tiles {
             return Err(err(format!(
-                "ep_tile_exchange: call tiles {tiles} outside 1..={} (registered capacity)",
-                self.max_tiles
+                "ep_tile_exchange: call tiles {tiles} ({} B) outside 1..={} ({} B registered capacity)",
+                tiles.saturating_mul(self.tile_bytes()),
+                self.max_tiles,
+                self.buffer_bytes()
             )));
         }
         Ok(())
@@ -885,6 +890,22 @@ pub(crate) mod tests {
         assert!(s.validate().is_ok());
         assert_eq!(s.tile_bytes(), 81_920);
         assert_eq!(s.buffer_bytes(), 3_040 * 81_920);
+    }
+
+    /// An EP tail-borrow load registers a mask-only transport at the resident buffer's tiles
+    /// (3,040 x 81,920 B) while its forward route plans the borrowed 5,600; a pull of the
+    /// borrowed count must refuse, naming both sizes.
+    #[test]
+    fn reduced_capacity_transport_refuses_a_borrowed_pull() {
+        let reduced = spec(3_040);
+        assert!(reduced.check_call(3_040).is_ok());
+        let error = reduced.check_call(5_600).unwrap_err().to_string();
+        assert!(
+            error.contains("call tiles 5600 (458752000 B)")
+                && error.contains("1..=3040 (249036800 B registered capacity)"),
+            "{error}"
+        );
+        assert!(reduced.check_call(0).is_err());
     }
 
     #[test]

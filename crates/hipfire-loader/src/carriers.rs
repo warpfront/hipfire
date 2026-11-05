@@ -3697,10 +3697,6 @@ fn qwen4_ep_tail_borrow_publish(
         Some("HIPFIRE_EP_RESERVE_DECOUPLE=1")
     } else if hipfire_config::developer_var(QWEN4_EP_CHUNK_AUTOFIT_ENV).as_deref() == Ok("1") {
         Some("HIPFIRE_EP_CHUNK_AUTOFIT=1")
-    } else if hipfire_arch_qwen4::expert_unit_tail::ep_unit_tail_pins_requested() {
-        // The tail's pin plane follows its publications; a borrow epoch canonicalizes only the
-        // decode and full tables.
-        Some("the D2 tail pins lever (HIPFIRE_EP_UNIT_TAIL_PINS)")
     } else {
         None
     };

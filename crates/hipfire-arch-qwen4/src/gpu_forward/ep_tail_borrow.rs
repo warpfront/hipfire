@@ -614,6 +614,12 @@ pub(crate) struct EpTailBorrow {
 }
 
 impl EpTailBorrow {
+    /// Whether the grouped-down rows have a persistent root (registered at the borrowed rows);
+    /// `false` under the trunk shard, where they borrow with the phase arena.
+    pub(crate) fn exchange_root_persistent(&self) -> bool {
+        self.exchange_root.is_some()
+    }
+
     /// Allocate the persistent roots ([`persistent_fields`]) and build the resident bank over
     /// them. Returns the resident bank (the forward's `scratch`), the owner and the host staging
     /// vectors sized for the borrowed rows. Nothing is allocated on error.

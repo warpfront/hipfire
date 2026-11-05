@@ -2133,6 +2133,20 @@ impl Inner {
                 upload_image(gpu, &full.table_down, &canonical_image(&full.base_down))?;
             }
         }
+        // The pins lever: the pin planes follow the tail's publications, so the epoch runs on
+        // their STATIC planes (no unit pinned to a slot holder while the tables are canonical);
+        // the live host planes are untouched and re-uploaded by `borrow_resume`.
+        if let Some(pins) = self.pins.as_ref() {
+            for (index, device) in pins.device.iter().enumerate() {
+                let label = pins.proto.planes().label(index);
+                let statics = pins
+                    .proto
+                    .planes()
+                    .statics(label)
+                    .ok_or_else(|| format!("pin plane of layer {label}: no static plane"))?;
+                upload_image(gpu, device, statics)?;
+            }
+        }
         // The copies above are null-stream: nothing may run ahead of them on any stream.
         device_idle(gpu)
     }
@@ -2205,6 +2219,14 @@ impl Inner {
                 upload_image(gpu, &full.table_down, &full.image_down)?;
                 full.image_gate_up.dirty.take();
                 full.image_down.dirty.take();
+            }
+        }
+        // The pins lever: the live planes again (what the last retirement left); nothing the
+        // epoch did changed the host planes (a suspended window never retires).
+        if let Some(pins) = self.pins.as_mut() {
+            let _ = pins.proto.planes_mut().take_dirty();
+            for (index, device) in pins.device.iter().enumerate() {
+                upload_image(gpu, device, pins.proto.planes().bytes(index))?;
             }
         }
         device_idle(gpu)?;
