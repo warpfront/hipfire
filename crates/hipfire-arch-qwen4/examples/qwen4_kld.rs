@@ -788,7 +788,13 @@ impl Model {
             &gpu,
             &receipt.config,
         )?;
-        let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
+        // `HIPFIRE_KV_BACKEND=legacy` keeps the QSA context out of VMM, e.g. on a
+        // gfx1201 whose in-tree driver drops fresh VMM mappings (rocm-systems#11693).
+        let backend = if hipfire_config::process_value("HIPFIRE_KV_BACKEND").as_deref() == Some("legacy") {
+            hipfire_arch_qwen4::Qwen4KvBackend::Legacy
+        } else {
+            hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu)
+        };
         let (weights, placement_source) = {
             use hipfire_arch_qwen4::expert_residency as residency;
             let mut weights = receipt.manifest.weights.clone();

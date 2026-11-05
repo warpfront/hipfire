@@ -84,6 +84,20 @@ use hipfire_dispatch::hetero_responder::{ColdLayer, HeteroResponder, PrefillServ
 /// to it (`gpu_forward::qwen4_prefill_chunk_requested`).
 pub const HETERO_PREFILL_MAX_ROWS: usize = 2048;
 
+/// The load's hetero prefill chunk: `HIPFIRE_HETERO_PREFILL_ROWS` (whole
+/// 256-row steps, 512..=8192) or [`HETERO_PREFILL_MAX_ROWS`]. Read once.
+pub fn hetero_prefill_rows() -> usize {
+    static ROWS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("HIPFIRE_HETERO_PREFILL_ROWS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|r| r / 256 * 256)
+            .filter(|r| (512..=8192).contains(r))
+            .unwrap_or(HETERO_PREFILL_MAX_ROWS)
+    })
+}
+
 /// Prefill slots of the mailbox: the tiles the layer-major hetero schedule
 /// keeps in flight (`slowlink_prefill::try_run_hetero_prompt`); the
 /// chunk-major path uses slot 0.
