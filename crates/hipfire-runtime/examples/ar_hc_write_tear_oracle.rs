@@ -220,6 +220,8 @@ fn run_rank(
             elapsed = t0.elapsed();
             wait_err = gpu.take_device_wait_error().err().map(|er| er.to_string());
         } else {
+            // rank 1 never launches: its host arrives so rank 0's launch passes the host gate
+            x.skip_launch(1);
             std::thread::sleep(Duration::from_millis(5));
             let dst = x.mailbox_addr(0)
                 + x.region_offset(ArHcWire::Dense)

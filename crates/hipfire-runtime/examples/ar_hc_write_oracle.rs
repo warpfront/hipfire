@@ -434,6 +434,9 @@ fn run_rank(
                     }
                 }
             });
+        } else {
+            // rank 1 skips the launch: its host arrives so rank 0's passes the host gate
+            x.skip_launch(1);
         }
         barrier.wait();
         // both ranks must reset after a wait error before reuse

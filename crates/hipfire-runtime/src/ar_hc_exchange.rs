@@ -21,7 +21,21 @@
 //! calls with the same row counts (the generation words advance in lock step); a wait error
 //! (`Gpu::take_device_wait_error`) leaves the generations unequal, so the host must call
 //! [`ArHcExchange::reset`] on both drained ranks before the next launch.
+//!
+//! Host arrival gate: every launch (each slice of [`ArHcExchange::write`], of the SP launches)
+//! first counts the rank's host arrival and waits, on the host, until the peer's host has
+//! arrived at the same launch. The kernel's device wait is bounded at
+//! `rdna_compute::device_wait::DEVICE_WAIT_TIMEOUT_MS` (500 ms) from the moment this rank's
+//! GPU reaches it; without the gate a rank whose GPU runs ahead starts that clock while the
+//! peer's host has not even issued its launch, so a host-side stall of the peer (a first-use
+//! kernel load or bind on its thread, a page-cache or `mmap_lock` stall, a profiler) poisons
+//! the mesh although nothing failed. With the gate the device bound covers only the GPU-side
+//! lag behind an issued launch, and the host wait carries the EP host-barrier budget
+//! (`ep_row_gather::DEFAULT_BARRIER_TIMEOUT`, 30 s) with the same abort contract: a failing
+//! rank's pool abort ([`ArHcExchange::abort`]) releases a waiting peer at once, and a timed-out
+//! wait aborts the gate for both ranks.
 
+use crate::ep_row_gather::{DEFAULT_BARRIER_TIMEOUT, SLOW_BARRIER_REPORT};
 use hip_bridge::{DeviceBuffer, HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED};
 use rdna_compute::ar_hc_write::{
     ar_hc_bank_bytes_for, ar_hc_fold, ar_hc_geometry, ar_hc_write_model, ar_hc_write_model_f32,
@@ -29,8 +43,9 @@ use rdna_compute::ar_hc_write::{
 };
 use rdna_compute::Gpu;
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
+use std::time::Instant;
 
 fn err(message: String) -> HipError {
     HipError::new(0, &message)
@@ -58,6 +73,10 @@ pub struct ArHcExchange {
     gen_ptr: [AtomicUsize; 2],
     peers_enabled: [AtomicBool; 2],
     enabled: AtomicBool,
+    /// Host arrival gate: launches each rank's host has arrived at since the last reset.
+    arrivals: [AtomicU64; 2],
+    /// Set by [`ArHcExchange::abort`] (a failed rank) or a timed-out gate wait.
+    gate_aborted: AtomicBool,
 }
 
 /// Which mailbox wires a transport uses (see the kernel header for the two formats).
@@ -123,7 +142,74 @@ impl ArHcExchange {
             gen_ptr: [AtomicUsize::new(0), AtomicUsize::new(0)],
             peers_enabled: [AtomicBool::new(false), AtomicBool::new(false)],
             enabled: AtomicBool::new(true),
+            arrivals: [AtomicU64::new(0), AtomicU64::new(0)],
+            gate_aborted: AtomicBool::new(false),
         })
+    }
+
+    /// Host arrival gate of `rank`'s next launch (see the module docs): count this rank's
+    /// arrival, then wait until the peer's host has arrived at the same launch. Spins, then
+    /// yields (the [`crate::ep_row_gather`] host-barrier loop); Err when the gate is aborted
+    /// before or while waiting, or after [`DEFAULT_BARRIER_TIMEOUT`] (which aborts the gate so
+    /// the peer fails at once too). A wait that passes [`SLOW_BARRIER_REPORT`] is reported
+    /// once while still waiting, so a stall that later resolves stays visible.
+    fn host_gate(&self, rank: usize) -> HipResult<()> {
+        let peer = 1 - rank;
+        let ticket = self.arrivals[rank].fetch_add(1, Ordering::AcqRel) + 1;
+        let start = Instant::now();
+        let mut spins = 0u32;
+        let mut reported = false;
+        loop {
+            // Abort before arrivals, as `SpinBarrier::wait_reporting`: a peer that arrived and
+            // then aborted still reads as arrived.
+            let aborted = self.gate_aborted.load(Ordering::Acquire);
+            if self.arrivals[peer].load(Ordering::Acquire) >= ticket {
+                return Ok(());
+            }
+            if aborted {
+                return Err(err(format!(
+                    "ar_hc_exchange: rank {rank} launch {ticket} aborted while waiting for rank \
+                     {peer}'s host (the mesh failed elsewhere)"
+                )));
+            }
+            if spins < 2048 {
+                spins += 1;
+                std::hint::spin_loop();
+                continue;
+            }
+            let waited = start.elapsed();
+            if waited >= DEFAULT_BARRIER_TIMEOUT {
+                self.abort();
+                return Err(err(format!(
+                    "ar_hc_exchange: rank {rank} waited {} s on the host for rank {peer} to \
+                     arrive at launch {ticket} (rank {peer} is at {}); the gate is aborted",
+                    waited.as_secs(),
+                    self.arrivals[peer].load(Ordering::Acquire)
+                )));
+            }
+            if !reported && waited >= SLOW_BARRIER_REPORT {
+                reported = true;
+                eprintln!(
+                    "ar_hc_exchange: rank {rank} has waited {:.1} s on the host for rank {peer} \
+                     to arrive at launch {ticket} (rank {peer} is at {}); still waiting",
+                    waited.as_secs_f64(),
+                    self.arrivals[peer].load(Ordering::Acquire)
+                );
+            }
+            std::thread::yield_now();
+        }
+    }
+
+    /// Release every host-gate waiter with an error, now and until [`Self::reset`] (the rank
+    /// pool's abort callback: a failed rank never arrives).
+    pub fn abort(&self) {
+        self.gate_aborted.store(true, Ordering::Release);
+    }
+
+    /// Fault oracles only: `rank`'s host arrives at its next launch without issuing it, so the
+    /// peer's matching launch passes the host gate and its device wait runs into the bound.
+    pub fn skip_launch(&self, rank: usize) {
+        self.arrivals[rank].fetch_add(1, Ordering::AcqRel);
     }
 
     pub fn mode(&self) -> ArHcMode {
@@ -287,7 +373,8 @@ impl ArHcExchange {
     }
 
     /// Zero the rank's generation block and idle-fill its mailbox (tagged region: tag 0 never
-    /// matches a live generation; dense region: every slot EMPTY).
+    /// matches a live generation; dense region: every slot EMPTY), zero its host arrival count
+    /// and clear a gate abort.
     /// BOTH ranks must be drained and reset before either launches again.
     pub fn reset(&self, rank: usize, gpu: &mut Gpu) -> HipResult<()> {
         let slot = self.ranks[rank].lock().unwrap_or_else(|p| p.into_inner());
@@ -296,7 +383,10 @@ impl ArHcExchange {
             .ok_or_else(|| err("ar_hc_exchange: reset before register".into()))?;
         gpu.bind_thread()?;
         gpu.hip.memset(&mail.gen, 0, AR_HC_GEN_BYTES)?;
-        self.idle_fill_mailbox(gpu, &mail.mailbox)
+        self.idle_fill_mailbox(gpu, &mail.mailbox)?;
+        self.arrivals[rank].store(0, Ordering::Release);
+        self.gate_aborted.store(false, Ordering::Release);
+        Ok(())
     }
 
     /// The rank's device generation word (launches completed since the last reset). The next
@@ -409,6 +499,7 @@ impl ArHcExchange {
                     .add(done * AR_HC_HIDDEN * 4)
                     .cast::<c_void>()
             };
+            self.host_gate(rank)?;
             // SAFETY: forwarded from this function's contract; offsets stay inside the
             // `rows`-row extents.
             gpu.ar_hc_write_gfx1201(
@@ -714,6 +805,7 @@ impl ArHcExchange {
                     "ar_hc_exchange: no SP launch geometry for {own_n} own / {peer_n} peer rows"
                 ))
             })?;
+            self.host_gate(rank)?;
             // SAFETY: forwarded from this function's contract; the row ranges lie inside the
             // caller's tile.
             gpu.sp_hc_rs_write_gfx1201(
@@ -770,6 +862,7 @@ impl ArHcExchange {
                     "ar_hc_exchange: no SP all-gather geometry for {own_n} own / {peer_n} peer rows of {row_elems}"
                 ))
             })?;
+            self.host_gate(rank)?;
             // SAFETY: as above.
             gpu.sp_ag_rows_gfx1201(
                 buf,
@@ -901,6 +994,57 @@ fn u16_bytes_mut(v: &mut [u16]) -> &mut [u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    /// The host gate lets a launch through only once the peer's host arrived at the same
+    /// launch: a rank that runs ahead waits out a stalled peer (here 300 ms) instead of
+    /// launching, and mirrored sequences cross in order.
+    #[test]
+    fn host_gate_waits_for_a_stalled_peer_and_crosses_in_order() {
+        let x = Arc::new(ArHcExchange::with_mode(1, ArHcMode::Tagged).unwrap());
+        let peer = {
+            let x = x.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                for _ in 0..1000 {
+                    x.host_gate(1).unwrap();
+                }
+            })
+        };
+        let start = Instant::now();
+        x.host_gate(0).unwrap();
+        assert!(start.elapsed() >= std::time::Duration::from_millis(250));
+        for _ in 1..1000 {
+            x.host_gate(0).unwrap();
+            // never ahead of the peer's arrival
+            assert!(x.arrivals[1].load(Ordering::Acquire) >= x.arrivals[0].load(Ordering::Acquire));
+        }
+        peer.join().unwrap();
+    }
+
+    /// A failed peer never arrives: the pool's abort releases the waiter with an error, and
+    /// `skip_launch` (fault oracles) arrives without a launch.
+    #[test]
+    fn host_gate_abort_releases_and_skip_launch_arrives() {
+        let x = Arc::new(ArHcExchange::with_mode(1, ArHcMode::Tagged).unwrap());
+        let aborter = {
+            let x = x.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                x.abort();
+            })
+        };
+        let start = Instant::now();
+        let e = x.host_gate(0).unwrap_err().to_string();
+        assert!(e.contains("aborted"), "{e}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        aborter.join().unwrap();
+        // `reset` state: counts zeroed, abort cleared (no device here: set directly)
+        x.arrivals[0].store(0, Ordering::Release);
+        x.gate_aborted.store(false, Ordering::Release);
+        x.skip_launch(1);
+        x.host_gate(0).unwrap();
+    }
 
     #[test]
     fn sizes_and_bounds() {

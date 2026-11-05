@@ -1796,6 +1796,10 @@ impl Qwen4Bundle {
                     Err(error) => return Err(release_rank0(gpu, error.to_string())),
                 };
                 *lock(&ar_hc_slot) = Some(exchange.clone());
+                // A failed rank never arrives at its next launch: release a peer waiting in the
+                // exchange's host arrival gate at once.
+                let gate = exchange.clone();
+                pool.set_abort(move || gate.abort());
                 let registered = {
                     let gpu0 = &mut *gpu;
                     pool.run_all(
