@@ -30,6 +30,7 @@ pub(crate) const SP_ENV: &str = "HIPFIRE_QWEN4_EP_SEQ_PARALLEL";
 /// stream floor `QWEN4_F16_WMMA_MIN_TOKENS`, the HC up `_v2` floor, the HC down fused floors), so
 /// the own-row HC read / write launches take the routes the all-rows launch takes. The binding
 /// one is `HC_DOWN_FUSED_MIN_ROWS` (1536 on gfx1201): `3072 / 2`. Pinned by a unit test.
+// selector-receipt: receipts/selectors/sp_min_rows.json
 pub(crate) const SP_MIN_ROWS: usize = 3072;
 
 /// Whether the raw [`SP_ENV`] value asks for the sequence-parallel prefill route.
