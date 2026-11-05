@@ -1045,10 +1045,13 @@ impl CpuSplitExecutor {
     }
 
     /// The cold slot arithmetic of `join`, on the selected arm. Same contract
-    /// as [`cpu_exec::moe_cpu_host_slot_outputs`].
+    /// as [`cpu_exec::moe_cpu_host_slot_outputs`]. `shadowed` (cold bytes from a
+    /// lab [`CpuShadow`] over the artifact mmap, not the pinned tier) always runs
+    /// on the CPU: the iGPU can read pinned memory only.
     #[allow(clippy::too_many_arguments)]
     fn cold_slot_outputs(
         &self,
+        shadowed: bool,
         rows: usize,
         ids: &[i32],
         gpu_ids: &[i32],
@@ -1057,7 +1060,7 @@ impl CpuSplitExecutor {
         x: &[f32],
         out: &mut [f32],
     ) -> Result<(), DispatchError> {
-        match self.igpu.as_deref() {
+        match self.igpu.as_deref().filter(|_| !shadowed) {
             Some(arm) => arm.host_slot_outputs(rows, ids, host_slots, resolved, x, out, IGPU_ARM_BOUND),
             None => cpu_exec::moe_cpu_host_slot_outputs(
                 self.dim,
@@ -2115,6 +2118,7 @@ impl CpuSplitExecutor {
                     )?)
                 } else {
                     self.cold_slot_outputs(
+                        shadow.is_some(),
                         rows,
                         &ids[..slots],
                         &gpu_ids[..slots],
@@ -2197,6 +2201,7 @@ impl CpuSplitExecutor {
             };
             let t_cpu = diag.then(Instant::now);
             self.cold_slot_outputs(
+                shadow.is_some(),
                 rows,
                 &ids[..slots],
                 &gpu_ids[..slots],
