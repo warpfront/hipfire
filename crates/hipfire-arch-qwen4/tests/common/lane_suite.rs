@@ -478,6 +478,73 @@ pub fn lane_salt(arm: &str) -> Result<u64, String> {
 /// index (< 2^32) maps one arm's seed set onto another's.
 pub const LANE_SALT_SPLIT_BIT: u32 = 32;
 
+/// A single-request arm's seed salt: `tag` above bit 32, so it differs from
+/// every other arm's salt (lane arms included) above [`LANE_SALT_SPLIT_BIT`]
+/// whenever the tags differ (the same rule as [`lane_salt`]).
+pub const fn arm_salt(tag: u32) -> u64 {
+    (tag as u64) << LANE_SALT_SPLIT_BIT
+}
+
+/// The AR / MTP reference arms of the prose fixture and the id-determinism arms.
+pub const SALT_PROSE_AR: u64 = arm_salt(0xA11);
+pub const SALT_PROSE_MTP: u64 = arm_salt(0x5EC);
+pub const SALT_IDS: u64 = arm_salt(0x1D);
+/// The n-gram arms (`NGRAM_ARMS`) and the copied-span AR reference.
+pub const SALT_NGRAM_BATCHED: u64 = arm_salt(0x4E1);
+pub const SALT_NGRAM_INTERLEAVED: u64 = arm_salt(0x4E2);
+pub const SALT_NGRAM_ADAPTIVE: u64 = arm_salt(0x4E3);
+pub const SALT_COPY_BATCHED: u64 = arm_salt(0xC0B1);
+pub const SALT_COPY_INTERLEAVED: u64 = arm_salt(0xC0B2);
+pub const SALT_COPY_ADAPTIVE: u64 = arm_salt(0xC0B3);
+pub const SALT_COPY_AR: u64 = arm_salt(0xC0A11);
+/// The long-copy arms.
+pub const SALT_COPY_LONG_AR: u64 = arm_salt(0xC091_A200);
+pub const SALT_COPY_LONG_BATCHED: u64 = arm_salt(0xC091_BA7C);
+pub const SALT_COPY_LONG_ADAPTIVE: u64 = arm_salt(0xC091_ADA9);
+/// The late-position arms.
+pub const SALT_LATE_AR: u64 = arm_salt(0x1A7E_A200);
+pub const SALT_LATE_MTP: u64 = arm_salt(0x1A7E_5EC0);
+pub const SALT_LATE_PILOT: u64 = arm_salt(0x1A7E_9170);
+/// The think-termination arms.
+pub const SALT_THINK_AR: u64 = arm_salt(0x7A1A_A200);
+pub const SALT_THINK_MTP: u64 = arm_salt(0x7A1A_5EC0);
+/// The q8_ef arms.
+pub const SALT_Q8EF_BATCHED: u64 = arm_salt(0xE8F1);
+pub const SALT_Q8EF_INTERLEAVED: u64 = arm_salt(0xE8F2);
+pub const SALT_Q8EF_ADAPTIVE: u64 = arm_salt(0xE8F3);
+pub const SALT_Q8EF_SESSION_BATCHED: u64 = arm_salt(0xE8F4);
+pub const SALT_Q8EF_PREFIX_BATCHED: u64 = arm_salt(0xE8F5);
+pub const SALT_Q8EF_DISK: u64 = arm_salt(0xE8F6);
+
+/// Every single-request arm salt, by name (the every-pair independence test
+/// covers these together with the lane arms).
+pub const SINGLE_ARM_SALTS: [(&str, u64); 24] = [
+    ("prose_ar", SALT_PROSE_AR),
+    ("prose_mtp", SALT_PROSE_MTP),
+    ("ids", SALT_IDS),
+    ("ngram_batched", SALT_NGRAM_BATCHED),
+    ("ngram_interleaved", SALT_NGRAM_INTERLEAVED),
+    ("ngram_adaptive", SALT_NGRAM_ADAPTIVE),
+    ("copy_batched", SALT_COPY_BATCHED),
+    ("copy_interleaved", SALT_COPY_INTERLEAVED),
+    ("copy_adaptive", SALT_COPY_ADAPTIVE),
+    ("copy_ar", SALT_COPY_AR),
+    ("copy_long_ar", SALT_COPY_LONG_AR),
+    ("copy_long_batched", SALT_COPY_LONG_BATCHED),
+    ("copy_long_adaptive", SALT_COPY_LONG_ADAPTIVE),
+    ("late_ar", SALT_LATE_AR),
+    ("late_adaptive", SALT_LATE_MTP),
+    ("late_pilot", SALT_LATE_PILOT),
+    ("think_ar", SALT_THINK_AR),
+    ("think_mtp", SALT_THINK_MTP),
+    ("q8ef_batched", SALT_Q8EF_BATCHED),
+    ("q8ef_interleaved", SALT_Q8EF_INTERLEAVED),
+    ("q8ef_adaptive", SALT_Q8EF_ADAPTIVE),
+    ("q8ef_session_batched", SALT_Q8EF_SESSION_BATCHED),
+    ("q8ef_prefix_batched", SALT_Q8EF_PREFIX_BATCHED),
+    ("q8ef_disk", SALT_Q8EF_DISK),
+];
+
 /// The seed of the request that occupies `lane` of global `trial`: the
 /// SplitMix64 `trial_seed` of `salt` and the request's global index
 /// `trial * lanes + lane`. It depends on the request, never on the slot it was
@@ -1997,12 +2064,22 @@ mod tests {
         assert_eq!(LANE_ARMS[0], LANE_REFERENCE_ARM);
         // Independent arms: `salt_a ^ index` never equals `salt_b ^ index'`
         // for request indices below 2^LANE_SALT_SPLIT_BIT.
-        let all: Vec<u64> = salts.iter().copied().collect();
-        for (i, &a) in all.iter().enumerate() {
-            for &b in &all[i + 1..] {
+        // Every arm of the suite: the lane arms and every single-request arm.
+        let mut all: Vec<(String, u64)> = salts
+            .iter()
+            .map(|&salt| (format!("lane salt {salt:#x}"), salt))
+            .collect();
+        all.extend(
+            SINGLE_ARM_SALTS
+                .iter()
+                .map(|&(name, salt)| (name.to_owned(), salt)),
+        );
+        assert_eq!(all.len(), LANE_ARMS.len() + 1 + SINGLE_ARM_SALTS.len());
+        for (i, (na, a)) in all.iter().enumerate() {
+            for (nb, b) in &all[i + 1..] {
                 assert!(
                     (a ^ b) >> LANE_SALT_SPLIT_BIT != 0,
-                    "salts {a:#x} and {b:#x} share a seed set"
+                    "{na} ({a:#x}) and {nb} ({b:#x}) share a seed set"
                 );
             }
         }

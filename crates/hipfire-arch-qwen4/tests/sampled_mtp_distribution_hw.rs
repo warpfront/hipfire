@@ -502,7 +502,7 @@ const NGRAM_MIN_TRIALS: usize = 2000;
 const NGRAM_ARM_TEST: &str = "sampled_mtp_ngram_distribution_arm";
 /// The AR reference arm of the copied-span fixture.
 const COPY_AR_ARM: &str = "copy_ar";
-const COPY_AR_SALT: u64 = 0xC0A11;
+const COPY_AR_SALT: u64 = lane_suite::SALT_COPY_AR;
 
 /// Copied-span fixture: the user asks for a rewrite that keeps the wording,
 /// and the assistant turn already holds the passage's first `COPY_PRIMED`
@@ -532,37 +532,37 @@ static NGRAM_ARMS: [NgramArm; 6] = [
         name: "ngram_batched",
         reference: "ar",
         copy: false,
-        salt: 0x4E1,
+        salt: lane_suite::SALT_NGRAM_BATCHED,
     },
     NgramArm {
         name: "ngram_interleaved",
         reference: "ar",
         copy: false,
-        salt: 0x4E2,
+        salt: lane_suite::SALT_NGRAM_INTERLEAVED,
     },
     NgramArm {
         name: "ngram_adaptive",
         reference: "ar",
         copy: false,
-        salt: 0x4E3,
+        salt: lane_suite::SALT_NGRAM_ADAPTIVE,
     },
     NgramArm {
         name: "copy_batched",
         reference: COPY_AR_ARM,
         copy: true,
-        salt: 0xC0B1,
+        salt: lane_suite::SALT_COPY_BATCHED,
     },
     NgramArm {
         name: "copy_interleaved",
         reference: COPY_AR_ARM,
         copy: true,
-        salt: 0xC0B2,
+        salt: lane_suite::SALT_COPY_INTERLEAVED,
     },
     NgramArm {
         name: "copy_adaptive",
         reference: COPY_AR_ARM,
         copy: true,
-        salt: 0xC0B3,
+        salt: lane_suite::SALT_COPY_ADAPTIVE,
     },
 ];
 
@@ -1591,7 +1591,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
         for trial in start..end {
-            let seed = trial_seed(0xA11, trial) as u32;
+            let seed = trial_seed(lane_suite::SALT_PROSE_AR, trial) as u32;
             samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
         }
         loaded.gpu.free_tensor(logits).map_err(|e| e.to_string())?;
@@ -1604,7 +1604,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             loaded.mtp_request(&mut drafter, &prompt, cfg, TOKENS)
         };
         for trial in start..end {
-            let seed = trial_seed(0x5EC, trial);
+            let seed = trial_seed(lane_suite::SALT_PROSE_MTP, trial);
             let result = run(&mut loaded, seed)?;
             evidence.observe(
                 trial,
@@ -1622,7 +1622,7 @@ fn run_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             let replays = REPLAYS.min(end - start);
             for local in 0..replays {
                 let trial = start + local;
-                let replay = run(&mut loaded, trial_seed(0x5EC, trial))?;
+                let replay = run(&mut loaded, trial_seed(lane_suite::SALT_PROSE_MTP, trial))?;
                 if replay.ids != samples[local] {
                     return Err(format!(
                         "seed {} replayed {:?}, first run {:?}",
@@ -1994,7 +1994,7 @@ fn run_arm_pp(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         let logits = loaded.alloc_logits()?;
         let cfg = ar_sampler(temp, top_p, top_k, min_p, &pen);
         for trial in start..end {
-            let seed = trial_seed(0xA11, trial) as u32;
+            let seed = trial_seed(lane_suite::SALT_PROSE_AR, trial) as u32;
             samples.push(loaded.ar_ids(&logits, &prompt, &cfg, seed, TOKENS)?);
         }
         loaded.free_logits(logits)?;
@@ -2002,7 +2002,7 @@ fn run_arm_pp(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         let budget = floor_probe_budget()?;
         let mut evidence = Evidence::with_samples(EVIDENCE_SAMPLES);
         for trial in start..end {
-            let seed = trial_seed(0x5EC, trial);
+            let seed = trial_seed(lane_suite::SALT_PROSE_MTP, trial);
             let cfg = spec_request(temp, top_p, top_k, min_p, seed, &pen);
             let result = loaded.mtp_request(&prompt, cfg, TOKENS)?;
             evidence.observe(
@@ -2021,7 +2021,14 @@ fn run_arm_pp(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
             let replays = REPLAYS.min(end - start);
             for local in 0..replays {
                 let trial = start + local;
-                let cfg = spec_request(temp, top_p, top_k, min_p, trial_seed(0x5EC, trial), &pen);
+                let cfg = spec_request(
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    trial_seed(lane_suite::SALT_PROSE_MTP, trial),
+                    &pen,
+                );
                 let replay = loaded.mtp_request(&prompt, cfg, TOKENS)?;
                 if replay.ids != samples[local] {
                     return Err(format!(
@@ -2360,7 +2367,7 @@ fn run_identity_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
         }
         for (sampling, temp, top_p, top_k, min_p) in ID_SAMPLINGS {
             for n in 0..ID_SEEDS {
-                let seed = trial_seed(0x1D, n) as u32;
+                let seed = trial_seed(lane_suite::SALT_IDS, n) as u32;
                 let case = format!("{prompt_name} {sampling} seed#{n}");
                 let (ids, drafted, accepted) = match drafter.as_mut() {
                     None => {
@@ -3084,9 +3091,9 @@ const COPY_LONG_JOINTS: [(usize, usize); 4] = [(0, 1), (7, 8), (15, 16), (31, 32
 
 fn copy_long_salt(arm: &str) -> u64 {
     match arm {
-        "copy_long_ar" => 0xC091_A200,
-        "copy_long_batched" => 0xC091_BA7C,
-        "copy_long_adaptive" => 0xC091_ADA9,
+        "copy_long_ar" => lane_suite::SALT_COPY_LONG_AR,
+        "copy_long_batched" => lane_suite::SALT_COPY_LONG_BATCHED,
+        "copy_long_adaptive" => lane_suite::SALT_COPY_LONG_ADAPTIVE,
         _ => unreachable!("unknown long-copy arm {arm}"),
     }
 }
@@ -4100,9 +4107,9 @@ fn run_ngram_arm(arm: &str, model: &Path, dir: &Path) -> Result<(), String> {
 const LATE_AR_ARM: &str = "late_ar";
 const LATE_ADAPTIVE_ARM: &str = "late_adaptive";
 const LATE_PILOT_ARM: &str = "late_pilot";
-const LATE_AR_SALT: u64 = 0x1A7E_A200;
-const LATE_MTP_SALT: u64 = 0x1A7E_5EC0;
-const LATE_PILOT_SALT: u64 = 0x1A7E_9170;
+const LATE_AR_SALT: u64 = lane_suite::SALT_LATE_AR;
+const LATE_MTP_SALT: u64 = lane_suite::SALT_LATE_MTP;
+const LATE_PILOT_SALT: u64 = lane_suite::SALT_LATE_PILOT;
 /// Generated IDs per trial (`HIPFIRE_SAMPLED_MTP_LATE_TOKENS` may only raise it).
 const LATE_TOKENS_DEFAULT: usize = 128;
 /// Fewest independent trials per compared arm.
@@ -4873,8 +4880,8 @@ const THINK_SEEDS_ENV: &str = "HIPFIRE_SAMPLED_MTP_THINK_SEEDS";
 /// Generated IDs per request, shared by both arms; must leave room in `MAX_SEQ`.
 const THINK_TOKENS_DEFAULT: usize = 3500;
 const THINK_SEEDS_DEFAULT: usize = 4;
-const THINK_AR_SALT: u64 = 0x7A1A_A200;
-const THINK_MTP_SALT: u64 = 0x7A1A_5EC0;
+const THINK_AR_SALT: u64 = lane_suite::SALT_THINK_AR;
+const THINK_MTP_SALT: u64 = lane_suite::SALT_THINK_MTP;
 const THINK_CLOSE: &str = "</think>";
 /// A fixed counting problem with a cheap-to-verify answer (the answer is 400)
 /// that invites a long deliberate check; sent as one user message.
@@ -5299,12 +5306,12 @@ fn q8ef_all_arms() -> impl Iterator<Item = &'static str> {
 
 fn q8ef_salt(arm: &str) -> Result<u64, String> {
     Ok(match arm {
-        "q8ef_batched" => 0xE8F1,
-        "q8ef_interleaved" => 0xE8F2,
-        "q8ef_adaptive" => 0xE8F3,
-        "q8ef_session_batched" => 0xE8F4,
-        "q8ef_prefix_batched" => 0xE8F5,
-        Q8EF_DISK_ARM => 0xE8F6,
+        "q8ef_batched" => lane_suite::SALT_Q8EF_BATCHED,
+        "q8ef_interleaved" => lane_suite::SALT_Q8EF_INTERLEAVED,
+        "q8ef_adaptive" => lane_suite::SALT_Q8EF_ADAPTIVE,
+        "q8ef_session_batched" => lane_suite::SALT_Q8EF_SESSION_BATCHED,
+        "q8ef_prefix_batched" => lane_suite::SALT_Q8EF_PREFIX_BATCHED,
+        Q8EF_DISK_ARM => lane_suite::SALT_Q8EF_DISK,
         other => return Err(format!("{other} is not a q8_ef arm")),
     })
 }
