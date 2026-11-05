@@ -12,12 +12,16 @@
 //! `silu-bf16` `M` is the number of intermediate rows (the gate and the up
 //! matrix each have `M` rows, the kernel runs `2M` virtual rows and writes
 //! `H[N x M]`), and `M % 128 == 0` as the production launcher requires
-//! (`gemm_gate_up_silu_mq4g256v2_iu4_gfx12`). `qkvzagdn` is rejected: its
-//! 120-byte fused ABI (conv state, Q/K/V rows, ...) is not reproduced here.
+//! (`gemm_gate_up_silu_mq4g256v2_iu4_gfx12`). `qkvzagdn` (the 27B fused GDN input projection) has its
+//! own shape grammar `N=<tokens>[,K=<k>][,M=10240]` and workload, `pm_loop/qkvzagdn.rs`: its 120-byte
+//! kernarg is encoded through the `hipfire-kernel-abi` contract `families::iu4_gdn` (the launcher's
+//! own), every buffer the epilogue touches (Z, beta, alpha, q, k, v, y_qkv, conv weight and state)
+//! is synthesized with edge cases and judged byte for byte against the shipped `_b1` / `_b1s`
+//! object; extra knob `gdn-inputs` (`mixed`|`realistic`).
 //!
 //! # Knobs (candidate; names as `peacemaker-isa emit --kernel iu4_gemm`)
 //! `fold` (k128|k256s|k256shared|k256p|k256pow2), `tile`
-//! (128x128x8|256x128x16), `cacc` (1|2), `epi` (set|add|silu|silu-bf16),
+//! (128x128x8|256x128x16), `cacc` (1|2), `epi` (set|add|silu|silu-bf16|qkvzagdn),
 //! `alayout` (token|slab). Baseline overrides use the `base-` prefix on
 //! `fold|tile|cacc|alayout`; with none the baseline is the committed
 //! production bundle for the candidate's activation layout, otherwise it is
@@ -631,23 +635,23 @@ fn pack_silu(g: u64, u: u64, xq: u64, h: u64, m: usize, k: usize, n: usize) -> V
 }
 
 #[derive(Clone)]
-struct Strs {
-    fold: String,
-    tile: String,
-    cacc: String,
-    epi: String,
-    alayout: String,
-    mma: String,
+pub(crate) struct Strs {
+    pub(crate) fold: String,
+    pub(crate) tile: String,
+    pub(crate) cacc: String,
+    pub(crate) epi: String,
+    pub(crate) alayout: String,
+    pub(crate) mma: String,
     /// Generator knobs (`iu4_gemm::Tune`), the spellings `RingDepth`/`WaitPlace`/`FoldOp` parse.
-    ring: String,
-    wait: String,
-    fold_op: String,
-    fetch: String,
-    idle: String,
+    pub(crate) ring: String,
+    pub(crate) wait: String,
+    pub(crate) fold_op: String,
+    pub(crate) fetch: String,
+    pub(crate) idle: String,
 }
 
 impl Strs {
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         let mut v = json!({"fold": self.fold, "tile": self.tile, "cacc": self.cacc,
                "epi": self.epi, "alayout": self.alayout, "mma": self.mma});
         // Only non-default generator knobs are recorded: every existing record keeps its bytes.
@@ -845,12 +849,6 @@ pub fn new_with_rip(
         }),
         None => None,
     };
-    let (m, n, k) = parse_shape(shape)?;
-    if m == 0 || n == 0 || k == 0 || k % 256 != 0 || m % 4 != 0 {
-        return Err(format!(
-            "shape M={m},N={n},K={k}: need M%4==0, K%256==0, N>=1"
-        ));
-    }
     let cand_strs = Strs {
         fold: knobs.take_or("fold", "k128"),
         tile: knobs.take_or("tile", "128x128x8"),
@@ -878,8 +876,12 @@ pub fn new_with_rip(
         cand.tune.ring = rip_ring(&r.text)?;
         cand_strs.ring = cand.tune.ring.name().to_owned();
     }
-    if cand.epi == Epi::QkvzaGdn {
-        return Err("epi qkvzagdn is not supported by pm_loop (120-byte fused GDN ABI)".into());
+    let gdn = cand.epi == Epi::QkvzaGdn;
+    let (m, n, k) = if gdn { (0, 0, 0) } else { parse_shape(shape)? };
+    if !gdn && (m == 0 || n == 0 || k == 0 || k % 256 != 0 || m % 4 != 0) {
+        return Err(format!(
+            "shape M={m},N={n},K={k}: need M%4==0, K%256==0, N>=1"
+        ));
     }
     if cand.epi.is_silu() && m % 128 != 0 {
         return Err(format!(
@@ -956,6 +958,26 @@ pub fn new_with_rip(
             };
         }
         Some(o) => return Err(format!("--base-shipped {o}: expected b1s|v64")),
+    }
+    if gdn {
+        // The fused GDN projection has its own workload (`qkvzagdn.rs`): fixed 27B geometry, every
+        // buffer of the epilogue, byte-for-byte judgement against the shipped `_b1` / `_b1s` object.
+        if knobs.0.contains_key("inputs") {
+            return Err(
+                "epi qkvzagdn: --inputs capture is not supported (use --gdn-inputs)".into(),
+            );
+        }
+        let rip = rip.map(|r| (r.path, r.text));
+        return crate::qkvzagdn::build(
+            shape,
+            knobs,
+            cand,
+            cand_strs,
+            base,
+            base_strs,
+            base_emitted,
+            rip,
+        );
     }
     let capture = match knobs.take("inputs") {
         Some(spec) => {
@@ -1692,7 +1714,43 @@ mod tests {
         assert!(new("M=4,N=1,K=128", &mut knobs(&[])).is_err());
         assert!(new("M=6,N=1,K=256", &mut knobs(&[])).is_err());
         assert!(new("M=64,N=1,K=256", &mut knobs(&[("epi", "silu")])).is_err());
+        // The fused GDN projection is the 27B geometry only: any other M is refused.
         assert!(new("M=128,N=1,K=256", &mut knobs(&[("epi", "qkvzagdn")])).is_err());
+    }
+
+    /// `epi qkvzagdn` is judged (it was refused: the 120-byte fused GDN ABI was not reproduced): the
+    /// shape grammar is `N[,K][,M=10240]`, the baseline is the shipped `_b1` / `_b1s` export of the
+    /// candidate's activation layout and the workload requires byte identity with it.
+    #[test]
+    fn qkvzagdn_is_accepted_and_judged_against_the_shipped_export() {
+        for (alayout, symbol) in [
+            ("token", "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1"),
+            ("slab", "gemm_mq4g256v2_residual_mmq_iu4_qkvzagdn_b1s"),
+        ] {
+            let w = new(
+                "N=512",
+                &mut knobs(&[("epi", "qkvzagdn"), ("alayout", alayout)]),
+            )
+            .unwrap();
+            assert_eq!(w.kernel(), "iu4_gemm");
+            assert_eq!(w.shape_json()["epi"], "qkvzagdn");
+            assert_eq!(w.shape_json()["N"], 512);
+            assert_eq!(w.shape_json()["K"], 5120);
+            assert!(w.requires_baseline_identity());
+            assert_eq!(w.baseline().unwrap().launch_symbol, symbol);
+            assert_eq!(w.candidate().unwrap().launch_symbol, symbol);
+        }
+        assert!(new("M=10240,N=64,K=2560", &mut knobs(&[("epi", "qkvzagdn")])).is_ok());
+        assert!(new(
+            "N=64",
+            &mut knobs(&[("epi", "qkvzagdn"), ("mma", "s24x64")])
+        )
+        .is_err());
+        assert!(new(
+            "N=64",
+            &mut knobs(&[("epi", "qkvzagdn"), ("base-shipped", "v64")])
+        )
+        .is_err());
     }
 
     const TWIN: &str = include_str!("../../../peacemaker-isa/src/kernels/iu4_gemm.rip");

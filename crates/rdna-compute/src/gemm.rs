@@ -8,6 +8,7 @@ use crate::dispatch::{
     launch_params_blob, DType, Gpu, GpuTensor, FP8_WMMA_MIN_BATCH, LLOYD_MQ3_GROUP_BYTES,
     LLOYD_MQ4_GROUP_BYTES,
 };
+use crate::kernel_abi;
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
@@ -36204,70 +36205,48 @@ impl Gpu {
         self.flush_residual_fold()?;
         self.ensure_embedded_kernel(module, image, symbol)?;
         self.iu4_verify_note_iu4(n);
-        let mut ptrs = [a_qkv, a_z_fold].map(|t| t.buf.as_ptr());
-        let mut xq_ptr = xq;
-        let mut outs = [y_z, y_beta, y_alpha].map(|t| t.buf.as_ptr());
-        let mut ints = [dims[0] as i32, dims[1] as i32, k as i32, n as i32];
-        let mut gdn_ptrs =
-            [gdn.conv_weight, gdn.conv_state, gdn.q, gdn.k, gdn.v, y_qkv].map(|t| t.buf.as_ptr());
-        let mut scales = [gdn.q_scale, gdn.eps];
-        let [p0, p1] = &mut ptrs;
-        let [o0, o1, o2] = &mut outs;
-        let [i0, i1, i2, i3] = &mut ints;
-        let [g0, g1, g2, g3, g4, g5] = &mut gdn_ptrs;
-        let [f0, f1] = &mut scales;
-        let mut params: Vec<*mut c_void> = vec![
-            p0 as *mut _ as *mut c_void,
-            p1 as *mut _ as *mut c_void,
-            &mut xq_ptr as *mut _ as *mut c_void,
-            o0 as *mut _ as *mut c_void,
-            o1 as *mut _ as *mut c_void,
-            o2 as *mut _ as *mut c_void,
-            i0 as *mut _ as *mut c_void,
-            i1 as *mut _ as *mut c_void,
-            i2 as *mut _ as *mut c_void,
-            i3 as *mut _ as *mut c_void,
-            g0 as *mut _ as *mut c_void,
-            g1 as *mut _ as *mut c_void,
-            g2 as *mut _ as *mut c_void,
-            g3 as *mut _ as *mut c_void,
-            g4 as *mut _ as *mut c_void,
-            g5 as *mut _ as *mut c_void,
-            f0 as *mut _ as *mut c_void,
-            f1 as *mut _ as *mut c_void,
-        ];
+        // One typed contract per symbol (hipfire-kernel-abi `iu4_gdn`): operand formats, alignment,
+        // extents, launch geometry and the 120-byte explicit image are validated and encoded once.
         let row_tiles = (dims[0] + Self::iu4_gdn_fold_rows(dims[1]).0).div_ceil(128);
+        let grid = [row_tiles as u32, n.div_ceil(128) as u32, 1];
+        let slab = symbol == kernel_abi::iu4_gdn_symbol(true);
+        let whole = |t: &GpuTensor| (t.buf.as_ptr() as *const c_void, Some(t.buf.size() as u64));
+        let operands = kernel_abi::iu4_gdn_bindings(
+            slab,
+            [
+                whole(a_qkv),
+                whole(a_z_fold),
+                (xq as *const c_void, self.int4_mmq_xq_bytes(xq)),
+                whole(y_z),
+                whole(y_beta),
+                whole(y_alpha),
+                whole(gdn.conv_weight),
+                whole(gdn.conv_state),
+                whole(gdn.q),
+                whole(gdn.k),
+                whole(gdn.v),
+                whole(y_qkv),
+            ],
+        );
+        let mut v = kernel_abi::validate_iu4_gdn(
+            &self.arch,
+            slab,
+            kernel_abi::iu4_gdn_params(dims, k, n, gdn.q_scale, gdn.eps),
+            &operands,
+            grid,
+        )?;
+        let mut params = [std::ptr::null_mut::<c_void>(); hipfire_kernel_abi::MAX_FIELDS];
+        let nparams = kernel_abi::kernel_params(&mut v, &mut params)?;
         let bytes =
             (dims[0] + dims[1] + 96) * row_bytes + n * (dims[1] + 96) * 4 + n * (32 + 48) * 128 * 2;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", symbol, bytes);
-        let blob_ptrs = (ptrs, xq, outs, ints, gdn_ptrs, scales);
         let result = self.launch_maybe_blob(
             symbol,
-            [row_tiles as u32, n.div_ceil(128) as u32, 1],
+            grid,
             [256, 1, 1],
-            20480,
-            &mut params,
-            || {
-                let (ptrs, xq, outs, ints, gdn_ptrs, scales) = blob_ptrs;
-                let mut b = hip_bridge::KernargBlob::new();
-                for p in ptrs {
-                    b.push_ptr(p);
-                }
-                b.push_ptr(xq);
-                for p in outs {
-                    b.push_ptr(p);
-                }
-                for i in ints {
-                    b.push_i32(i);
-                }
-                for p in gdn_ptrs {
-                    b.push_ptr(p);
-                }
-                for f in scales {
-                    b.push_f32(f);
-                }
-                b
-            },
+            hipfire_kernel_abi::families::iu4_gdn::DYNAMIC_LDS,
+            &mut params[..nparams],
+            || kernel_abi::blob(v.explicit()),
         );
         if let Some(t) = timer {
             t.finish(&self.hip);
@@ -59366,5 +59345,211 @@ mod mq6_resid_port_gfx1100_selection {
         for g in [W8N256, W4N128] {
             assert_eq!(g.block(), 32 * (g.tile_m() / 16));
         }
+    }
+}
+
+/// CPU-only proof that the fused A4 GDN input projection's kernarg, encoded by the
+/// `hipfire-kernel-abi` contract (`iu4_gemm.qkvzagdn.b1` / `.b1s`), is byte-identical to the hand-built
+/// `KernargBlob` push `gemm_qkvza_mq4g256v2_iu4_gdn_prepared` issued before the contract.
+#[cfg(test)]
+mod iu4_gdn_contract_tests {
+    use crate::kernel_abi;
+    use hipfire_kernel_abi::families::iu4_gdn;
+    use hipfire_kernel_abi::{ValidatedInvocationV1, MAX_FIELDS};
+    use std::ffi::c_void;
+
+    const DIMS: [usize; 4] = [10240, 6144, 48, 48];
+    const HUGE: Option<u64> = Some(1 << 40);
+
+    /// Contract-order device addresses `Wqkv, Wz, Xq, Yz, Ybeta, Yalpha, ConvW, ConvState, Q, K16, V, X`
+    /// at `base + 0x10000 * i` (16-byte aligned).
+    fn addrs(base: u64) -> [u64; 12] {
+        std::array::from_fn(|i| base + 0x1_0000 * i as u64)
+    }
+
+    /// The push sequence of the launcher before the contract, verbatim: ptrs(a_qkv, a_z_fold), xq,
+    /// outs(y_z, y_beta, y_alpha), ints(dims0, dims1, k, n), gdn_ptrs(conv_weight, conv_state, q, k, v,
+    /// y_qkv), scales(q_scale, eps).
+    fn hand_push(a: [u64; 12], dims: [usize; 4], k: usize, n: usize, qs: f32, eps: f32) -> Vec<u8> {
+        let p = a.map(|p| p as usize as *const c_void);
+        let mut b = hip_bridge::KernargBlob::new();
+        for q in [p[0], p[1]] {
+            b.push_ptr(q);
+        }
+        b.push_ptr(p[2]);
+        for q in [p[3], p[4], p[5]] {
+            b.push_ptr(q);
+        }
+        for i in [dims[0] as i32, dims[1] as i32, k as i32, n as i32] {
+            b.push_i32(i);
+        }
+        for q in [p[6], p[7], p[8], p[9], p[10], p[11]] {
+            b.push_ptr(q);
+        }
+        for f in [qs, eps] {
+            b.push_f32(f);
+        }
+        b.as_bytes().to_vec()
+    }
+
+    fn grid(dims: [usize; 4], n: usize) -> [u32; 3] {
+        let rows = dims[0] + crate::dispatch::Gpu::iu4_gdn_fold_rows(dims[1]).0;
+        [rows.div_ceil(128) as u32, n.div_ceil(128) as u32, 1]
+    }
+
+    fn validate(
+        slab: bool,
+        a: [u64; 12],
+        dims: [usize; 4],
+        k: usize,
+        n: usize,
+        qs: f32,
+        eps: f32,
+    ) -> Result<ValidatedInvocationV1<'static>, hip_bridge::HipError> {
+        let ops =
+            kernel_abi::iu4_gdn_bindings(slab, a.map(|p| (p as usize as *const c_void, HUGE)));
+        kernel_abi::validate_iu4_gdn(
+            "gfx1201",
+            slab,
+            kernel_abi::iu4_gdn_params(dims, k, n, qs, eps),
+            &ops,
+            grid(dims, n),
+        )
+    }
+
+    #[test]
+    fn iu4_gdn_contract_kernarg_is_the_hand_push_byte_for_byte() {
+        let qs = 1.0 / (128f32).sqrt();
+        let cases: [(usize, usize, u64, f32, f32); 8] = [
+            (5120, 1, 0x7f00_0000_0000, qs, 1e-6),
+            (5120, 127, 0x7f12_3400_0000, qs, 1e-6),
+            (5120, 128, 0x7e00_0000_0000, qs, 1e-6),
+            (5120, 512, 0x1000_0000, qs, 1e-6),
+            (5120, 4096, 0x7fff_f000_0000, qs, 1e-5),
+            (5120, 8192, 0x7f55_aa00_0000, 0.5, 0.0),
+            (256, 129, 0x7000_0010_0000, qs, 1e-6),
+            (17408, 2048, 0x6fff_ffff_0000, f32::MIN_POSITIVE, f32::MAX),
+        ];
+        for (k, n, base, qs, eps) in cases {
+            for slab in [false, true] {
+                let a = addrs(base);
+                let hand = hand_push(a, DIMS, k, n, qs, eps);
+                assert_eq!(hand.len(), iu4_gdn::EXPLICIT_BYTES as usize);
+                let mut v = validate(slab, a, DIMS, k, n, qs, eps).unwrap();
+                assert_eq!(
+                    v.explicit(),
+                    &hand[..],
+                    "explicit image k={k} n={n} slab={slab}"
+                );
+                // The launcher's graph-capture blob and its kernelParams carry the same bytes.
+                assert_eq!(
+                    kernel_abi::blob(v.explicit()).as_bytes(),
+                    &hand[..],
+                    "blob k={k} n={n} slab={slab}"
+                );
+                let mut params = [std::ptr::null_mut::<c_void>(); MAX_FIELDS];
+                let np = kernel_abi::kernel_params(&mut v, &mut params).unwrap();
+                assert_eq!(np, 18);
+                for (f, &p) in v.abi().fields.iter().zip(&params[..np]) {
+                    let got =
+                        unsafe { std::slice::from_raw_parts(p as *const u8, f.width as usize) };
+                    let at = f.offset as usize;
+                    assert_eq!(got, &hand[at..at + f.width as usize], "param {}", f.name);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn iu4_gdn_contract_symbols_and_geometry() {
+        for slab in [false, true] {
+            let v = validate(slab, addrs(0x1000_0000), DIMS, 5120, 300, 0.25, 1e-6).unwrap();
+            assert_eq!(v.export().symbol, kernel_abi::iu4_gdn_symbol(slab));
+            assert_eq!(v.export().block, [256, 1, 1]);
+            assert_eq!(v.export().dynamic_lds, 20480);
+            assert_eq!(grid(DIMS, 300), [129, 3, 1]);
+        }
+    }
+
+    #[test]
+    fn iu4_gdn_contract_rejects_what_the_launcher_does_not_admit() {
+        let a = addrs(0x1000_0000);
+        let (qs, eps) = (0.25, 1e-6);
+        let reject = |slab: bool, a, dims, k, n| {
+            validate(slab, a, dims, k, n, qs, eps)
+                .err()
+                .expect("rejected")
+        };
+        assert!(matches!(
+            validate(false, a, [10240, 6144, 48, 48], 5120, 8, qs, eps),
+            Ok(_)
+        ));
+        for dims in [
+            [10240, 6144, 48, 49],
+            [10240, 6144, 47, 48],
+            [10241, 6144, 48, 48],
+            [10240, 6145, 48, 48],
+        ] {
+            assert!(
+                reject(false, a, dims, 5120, 8)
+                    .to_string()
+                    .contains("domain rule"),
+                "{dims:?}"
+            );
+        }
+        for (k, n) in [(0, 8), (5121, 8), (128, 8), (5120, 0)] {
+            assert!(
+                reject(true, a, DIMS, k, n)
+                    .to_string()
+                    .contains("domain rule"),
+                "k={k} n={n}"
+            );
+        }
+        // Operand alignment of every 16-byte buffer.
+        for i in [0usize, 1, 3, 4, 5, 8, 9, 10, 11] {
+            let mut bad = a;
+            bad[i] += 4;
+            assert!(
+                reject(false, bad, DIMS, 5120, 8)
+                    .to_string()
+                    .contains("not 16-byte aligned"),
+                "operand {i}"
+            );
+        }
+        // Extent: a short `Q` (n * 16 * 128 * 2 bytes needed).
+        let mut ops =
+            kernel_abi::iu4_gdn_bindings(false, a.map(|p| (p as usize as *const c_void, HUGE)));
+        ops[8].bytes = Some(8 * 16 * 128 * 2 - 1);
+        let err = kernel_abi::validate_iu4_gdn(
+            "gfx1201",
+            false,
+            kernel_abi::iu4_gdn_params(DIMS, 5120, 8, qs, eps),
+            &ops,
+            grid(DIMS, 8),
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("operand Q needs"), "{err}");
+        // A slab buffer cannot be bound as token records and vice versa.
+        let mut ops =
+            kernel_abi::iu4_gdn_bindings(true, a.map(|p| (p as usize as *const c_void, HUGE)));
+        ops[2] =
+            kernel_abi::iu4_gdn_bindings(false, a.map(|p| (p as usize as *const c_void, HUGE)))[2];
+        let err = kernel_abi::validate_iu4_gdn(
+            "gfx1201",
+            true,
+            kernel_abi::iu4_gdn_params(DIMS, 5120, 8, qs, eps),
+            &ops,
+            grid(DIMS, 8),
+        )
+        .err()
+        .unwrap();
+        assert!(err.to_string().contains("operand Xq is"), "{err}");
+        // The raw-row descriptors are 32-bit: N * 40960 must fit.
+        let big = 104_858usize;
+        assert!(reject(false, a, DIMS, 5120, big)
+            .to_string()
+            .contains("domain rule"));
+        assert!(validate(false, a, DIMS, 5120, 104_857, qs, eps).is_ok());
     }
 }

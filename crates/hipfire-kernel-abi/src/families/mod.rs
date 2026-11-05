@@ -16,6 +16,7 @@ pub mod generic_seq;
 pub mod ggml_convert;
 pub mod ggml_mmvq;
 pub mod ggml_mmvq_fused;
+pub mod iu4_gdn;
 pub mod mq6_i8;
 pub mod mq6sym_i8;
 pub mod qwen4_moe_sym;
@@ -40,6 +41,7 @@ pub fn all() -> impl Iterator<Item = &'static KernelAbiV1> {
         .chain(generic_mq8::ABIS.iter())
         .chain(generic_rda::ABIS.iter())
         .chain(generic_fused::ABIS.iter())
+        .chain(iu4_gdn::ABIS.iter())
         .copied()
 }
 
@@ -88,7 +90,7 @@ mod tests {
         }
         assert_eq!(
             ids.len(),
-            58 + super::generic_gemm::ABIS.len()
+            60 + super::generic_gemm::ABIS.len()
                 + super::generic_seq::ABIS.len()
                 + super::generic_elem::ABIS.len()
                 + super::generic_mmq::ABIS.len()

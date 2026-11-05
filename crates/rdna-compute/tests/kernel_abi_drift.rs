@@ -65,6 +65,9 @@ use peacemaker_ir::envelope::Source as IrSource;
 use peacemaker_ir::inst::{Abi, Arch as IrArch, Frontend};
 use peacemaker_ir::metadata::KernelMeta;
 use peacemaker_ir::Program;
+use peacemaker_isa::kernels::iu4_gemm::{
+    self as iu4_gen, ALayout as Iu4Layout, Epi as Iu4Epi, Spec as Iu4Spec,
+};
 use peacemaker_isa::kernels::mq6_i8_gemm::{
     self as mq6_gen,
     spec::{Epi, Spec as Mq6Spec, Tile},
@@ -971,6 +974,32 @@ static GENERATORS: LazyLock<Vec<GenEntry>> = LazyLock::new(|| {
     let emitted = moe_gen::emit_gate_up_stream8(IsaArch::Gfx1151)
         .unwrap_or_else(|e| panic!("qwen4_moe_sym::emit_gate_up_stream8: {e}"));
     entries.push(emitted_entry(&emitted, stream8, "emit_gate_up_stream8"));
+    // IU4 GEMM: the fused A4 GDN input projection of the token (`_b1`) and slab (`_b1s`) bundles
+    // (`iu4_gemm::Spec::kernargs` states the 120 explicit bytes + K1's hidden block; the emitted
+    // assembly's metadata block states the static LDS, wave size and workgroup limit).
+    for act in [Iu4Layout::Token, Iu4Layout::Slab] {
+        let spec = Iu4Spec {
+            act,
+            ..Iu4Spec::control(Iu4Epi::QkvzaGdn)
+        };
+        let layout = spec.kernargs();
+        let emitted =
+            iu4_gen::emit(spec).unwrap_or_else(|e| panic!("iu4_gemm {}: {e}", spec.variant_name()));
+        let meta = parse_emitted_metadata(&emitted.s_text);
+        assert_eq!(meta.symbol, spec.symbol(), "{}", spec.variant_name());
+        entries.push(GenEntry {
+            arch: abi_arch(spec.arch),
+            symbol: spec.symbol(),
+            args: layout_args(&layout),
+            segment_bytes: layout.size,
+            threads: spec.tile.threads(),
+            dynamic_lds: Some(spec.lds_launch()),
+            group_segment_fixed: meta.group_segment_fixed,
+            wave: Some(meta.wave),
+            max_flat: Some(meta.max_flat),
+            origin: format!("iu4_gemm::Spec {}", spec.variant_name()),
+        });
+    }
     entries
 });
 
