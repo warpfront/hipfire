@@ -557,3 +557,8 @@ global_atomic_or_b32	global	0x3d	VDST@rtn:32,VADDR:64,VSRC:32,SADDR:64	VDST	VADD
 global_atomic_xor_b32	global	0x3e	VDST@rtn:32,VADDR:64,VSRC:32,SADDR:64	VDST	VADDR,VSRC,SADDR	-	Load:1@rtn,Store:1@nortn	global_atomic_xor_b32 v2, v4, v3, s[4:5] th:TH_ATOMIC_RETURN scope:SCOPE_DEV	EE0F8004 01980002 00000004	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x0/0x40000/0x80000/0xc0000,global_th:honored:0x700000:0x0/0x100000,global_nv:honored:0x80:0x0
 global_wb	global	0x2c	-	-	-	-	-	global_wb scope:SCOPE_SE	EE0B007C 00040000 00000000	w0_extra:ignored:0xc03f00:0x0,w1_extra:ignored:0x8001ff00:0x0,vsrc_unused:ignored:0x7f800000:0x0,global_sve:honored:0x20000:0x0,global_scope:honored:0xc0000:0x40000/0x80000/0xc0000,global_th:honored:0x700000:0x0,global_nv:honored:0x80:0x0
 s_sleep	sopp	0x3	SIMM16:16	-	SIMM16	-	-	s_sleep 2	BF830002	-
+v_ceil_f32_e32	vop1	0x22	VDST:32,SRC0:32	VDST	SRC0	-	-	v_ceil_f32_e32 v17, v25	7E224519	w0_extra:ignored:0x10000:0x0
+v_max_u32_e32	vop2	0x14	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_max_u32_e32 v42, v42, v43	2854572A	-
+v_max3_u32	vop3	0x21e	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_max3_u32 v42, v42, v46, v47	D61E002A 04BE5D2A	-
+v_cmpx_neq_f16_e32	vopc	0x8d	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_neq_f16_e32 0, v42.l	7D1A5480	-
+v_cmpx_ne_u64_e32	vopc	0xdd	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ne_u64_e32 0, v[0:1]	7DBA0080	-

@@ -40,6 +40,7 @@ pub mod sync;
 pub mod vopd;
 pub mod kernels {
     pub mod bf16;
+    pub mod ceil_probe;
     pub mod common;
     pub mod dflash_accept;
     pub mod e8p_i4_moe_gemv;

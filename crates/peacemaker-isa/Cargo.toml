@@ -16,6 +16,11 @@ required-features = ["toolchain"]
 name = "hip_twin"
 required-features = ["lab"]
 
+# Native emit of the Builder v_ceil_f32 device probe (kernels/ceil_probe.rs); opt-in like the other probes.
+[[example]]
+name = "ceil_probe_emit"
+required-features = ["lab"]
+
 [[example]]
 name = "pm_r4_screen"
 required-features = ["toolchain"]

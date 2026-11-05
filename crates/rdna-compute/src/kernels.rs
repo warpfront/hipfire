@@ -26,6 +26,16 @@ pub const NPU_TRUNK_ARENA_PM_GFX1151: &[u8] =
 pub const NPU_TRUNK_ARENA_PM_GFX1151_SHA256: &str =
     "dbfaf02cbf12015b6c2b4637d82d35c5824d042a4d80490b649c2343d286cc7f";
 
+/// gfx1151 PM twins of the Flash-Next A-pack fast producers (`npu_trunk_pack_a_bf16_pm` K = 2560 and
+/// `npu_trunk_pack_a_bf16_k5120_pm`, one module): the hipcc bodies of `kernels/src/npu_trunk.hip` sealed by route A
+/// (`scripts/pm-hip-twin.sh`; every `.text` is byte-identical to the incumbent hipcc symbol, `v_ceil_f32` included); incumbent kernargs.
+/// Selected by `Gpu::npu_trunk_pack_a_bf16` (`HIPFIRE_NPU_TRUNK_PACK_A_PM=0` restores hipcc).
+pub const NPU_TRUNK_PACK_PM_GFX1151: &[u8] =
+    include_bytes!("../../../kernels/npu_trunk_pack_pm_gfx1151.hxaco");
+/// Bare lowercase SHA-256 of [`NPU_TRUNK_PACK_PM_GFX1151`], without a newline.
+pub const NPU_TRUNK_PACK_PM_GFX1151_SHA256: &str =
+    include_str!("../../../kernels/npu_trunk_pack_pm_gfx1151.hxaco.sha256");
+
 /// GEMV F32: y = alpha * A * x + beta * y
 /// Uses shared memory reduction across wavefronts.
 pub const GEMV_SRC: &str = include_str!("../../../kernels/src/gemv.hip");

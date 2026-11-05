@@ -556,3 +556,9 @@ v_cmp_ge_u64_e64	alu
 v_cmp_gt_u64_e64	alu
 global_wb	wait
 s_sleep	wait
+v_ceil_f32_e32	alu
+v_max_u32_e32	alu
+v_max3_u32	alu
+v_cmpx_neq_f16_e32	alu
+v_cmpx_ne_u64_e32	alu
+v_cmpx_le_u64_e32	alu

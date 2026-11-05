@@ -7,6 +7,7 @@
 #   kernels/gated_delta_vector_pm_gfx1100.hip          (RDA serial + depthwise conv rows, XTX judge)
 #   kernels/gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100.hip
 #   kernels/gated_delta_vector_pm_gfx1201.hip          (the same two bodies, R9700 card judge)
+#   kernels/npu_trunk_pack_pm_gfx1151.hip              (Flash-Next A-pack K2560 / K5120, the incumbent bodies verbatim)
 #
 # Each source is compiled with EXACTLY the runtime JIT argv (crates/rdna-compute/src/compiler.rs
 # `core_hipcc_flags` + the rocm path flags the card judge recorded in candidate.co.json), the
@@ -94,3 +95,11 @@ seal_module gfx1100 gemm_mq4g256v2_moe_grouped_k2_pm_gfx1100 gemm_mq4g256v2_moe_
 seal_module gfx1201 gated_delta_vector_pm_gfx1201 gated_delta_vector_pm_gfx1201.hip \
   "gated_delta_net_vector_serial_f32_pm_gfx1201:gated_delta_net_vector_serial.hip:gated_delta_net_vector_serial_f32:R2Rda-05-rs-tv8-prio:4b0f755c125e8024da75103a4c1c7d6e73bf329815b77ee15e164c67fd1485ec" \
   "causal_conv_depthwise_silu_rows_f32_pm_gfx1201:causal_conv_depthwise_rows.hip:causal_conv_depthwise_silu_rows_f32:R1Conv-04-rpw32-k4:35985539865d2a7e5a1ea193f1ee2287722fa528f551f115bd4e55f8c8fb8e83"
+
+# gfx1151 (Strix Halo): the hipcc A-pack fast producers of `kernels/src/npu_trunk.hip`, verbatim (symbol rename only), sealed so the
+# producer no longer needs the hipcc JIT (`v_ceil_f32` for the grid15-up scale snap and the other new gfx11 rows are in the PM tables). The
+# "judged" sha256 is the incumbent symbol's own `.text` as compiled by the same argv (llvm-readelf symbol bytes of the incumbent object):
+# the twin must equal it byte for byte.
+seal_module gfx1151 npu_trunk_pack_pm_gfx1151 npu_trunk_pack_pm_gfx1151.hip \
+  "npu_trunk_pack_a_bf16_pm:npu_trunk.hip:npu_trunk_pack_a_bf16:incumbent-hipcc:33b905ec30f54cf0cd09b9ea24d1f6d32406aaffd942b4ec5b78128dc06aaf5d" \
+  "npu_trunk_pack_a_bf16_k5120_pm:npu_trunk.hip:npu_trunk_pack_a_bf16_k5120:incumbent-hipcc:812d6c31c54276fe6525b6741a5b043099ce117588b674b2a988873996d91943"

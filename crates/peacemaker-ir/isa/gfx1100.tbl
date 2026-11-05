@@ -486,3 +486,12 @@ v_or_b32_dpp	vop2_dpp	0x1c	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_or_b32
 v_cmp_ge_i64_e64	vop3	0x56	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_ge_i64_e64 s28, s[12:13], s[2:3]	D456001C 0200040C	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_ashrrev_i64	vop3	0x33e	VDST:64,SRC0:32,SRC1:64	VDST	SRC0,SRC1	-	-	v_ashrrev_i64 v[0:1], 31, v[0:1]	D73E0000 0202009F	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_cmpx_gt_u64_e32	vopc	0xdc	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_gt_u64_e32 s[6:7], v[2:3]	7DB80406	-
+v_ceil_f32_e32	vop1	0x22	VDST:32,SRC0:32	VDST	SRC0	-	-	v_ceil_f32_e32 v17, v25	7E224519	w0_extra:ignored:0x10000:0x0
+s_lshl1_add_u32	sop2	0xe	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	scc:w	-	s_lshl1_add_u32 s24, s11, s2	8718020B	-
+v_max_u32_e32	vop2	0x14	VDST:32,SRC0:32,VSRC1:32	VDST	SRC0,VSRC1	-	-	v_max_u32_e32 v42, v42, v43	2854572A	-
+v_max3_u32	vop3	0x21e	VDST:32,SRC0:32,SRC1:32,SRC2:32	VDST	SRC0,SRC1,SRC2	-	-	v_max3_u32 v42, v42, v46, v47	D61E002A 04BE5D2A	-
+v_cmpx_neq_f16_e32	vopc	0x8d	SRC0:16,VSRC1:16	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_neq_f16_e32 0, v42.l	7D1A5480	-
+v_cmp_gt_u64_e64	vop3	0x5c	VDST:64,SRC0:64,SRC1:64	VDST	SRC0,SRC1	-	-	v_cmp_gt_u64_e64 s0, v[25:26], v[23:24]	D45C0000 02022F19	src2_unused:ignored:0x1ff:0x00/0x80/0x101
+v_cmpx_ne_u64_e32	vopc	0xdd	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_ne_u64_e32 0, v[0:1]	7DBA0080	-
+v_cmpx_le_u64_e32	vopc	0xdb	SRC0:64,VSRC1:64	implicit	SRC0,VSRC1	exec:w	-	v_cmpx_le_u64_e32 s[22:23], v[2:3]	7DB60416	-
+s_code_end	sopp	0x1f	-	-	-	-	-	s_code_end	BF9F0000	-

@@ -1008,6 +1008,19 @@ fn vector(
                 (Class::F32, r.to_bits())
             }
         }
+        // `v_ceil_f32`: IEEE roundToIntegralTowardPositive, so a negative result that rounds to zero is `-0`
+        // (`ceil(-0.25) = -0`), and a NaN input is quieted with sign and payload kept (`x | 0x00400000`). Measured on
+        // gfx1100, gfx1151 and gfx1201 over all 2^32 inputs (`isa/emu/numerics-probe/ceil`); the three are bit-identical, so
+        // unlike the other rows no `edge_qualified` gate is needed. Only the denormal-preserving MODE that `State::new`
+        // requires is modelled (the flush-input settings are measured in `float_edges.md` and refused by `State::new`).
+        "v_ceil_f32" => {
+            let bits = g(0, false)?;
+            if is_nan(bits) {
+                (Class::F32, bits | QUIET)
+            } else {
+                (Class::F32, f32::from_bits(bits).ceil().to_bits())
+            }
+        }
         "v_cvt_f32_f16" => {
             let h = half_src(s, o.get(1).ok_or("missing vector operand")?, i, lane, 0)?;
             if h & 0x7c00 == 0x7c00 && h & 0x3ff != 0 {
@@ -1480,6 +1493,8 @@ fn vector(
             Class::Int,
             (raw(0)? as i32).min(raw(1)? as i32).min(raw(2)? as i32) as u32,
         ),
+        // D = max(S0, S1, S2) over the raw unsigned operands (V_MAX3_U32).
+        "v_max3_u32" => (Class::Int, raw(0)?.max(raw(1)?).max(raw(2)?)),
         // The unsigned median of three (V_MED3_U32): max3/max chain of the ISA pseudocode over the raw operands.
         "v_med3_u32" => {
             let (a, b, c) = (raw(0)?, raw(1)?, raw(2)?);
@@ -4162,6 +4177,299 @@ mod tests {
         assert!(execute(Arch::Gfx1100, name, &i, &mut st).is_err());
     }
 
+    /// Hardware results of `v_ceil_f32` (denormals kept, MODE FP_DENORM = 3) for the curated edge inputs of
+    /// `isa/emu/numerics-probe/ceil/ceil_sweep.hip`; gfx1100, gfx1151 and gfx1201 returned bit-identical columns.
+    const CEIL_EDGES: &[(u32, u32)] = &[
+        (0x00000000, 0x00000000),
+        (0x80000000, 0x80000000),
+        (0x00000001, 0x3f800000),
+        (0x80000001, 0x80000000),
+        (0x007fffff, 0x3f800000),
+        (0x807fffff, 0x80000000),
+        (0x00400000, 0x3f800000),
+        (0x80400000, 0x80000000),
+        (0x00800000, 0x3f800000),
+        (0x80800000, 0x80000000),
+        (0x3f800000, 0x3f800000),
+        (0xbf800000, 0xbf800000),
+        (0x3f000000, 0x3f800000),
+        (0xbf000000, 0x80000000),
+        (0x3effffff, 0x3f800000),
+        (0xbeffffff, 0x80000000),
+        (0x3f7fffff, 0x3f800000),
+        (0xbf7fffff, 0x80000000),
+        (0x3f800001, 0x40000000),
+        (0xbf800001, 0xbf800000),
+        (0x40000000, 0x40000000),
+        (0xc0000000, 0xc0000000),
+        (0x3fc00000, 0x40000000),
+        (0xbfc00000, 0xbf800000),
+        (0x40200000, 0x40400000),
+        (0xc0200000, 0xc0000000),
+        (0x4b000000, 0x4b000000),
+        (0xcb000000, 0xcb000000),
+        (0x4afffffe, 0x4afffffe),
+        (0xcafffffe, 0xcafffffe),
+        (0x4affffff, 0x4b000000),
+        (0xcaffffff, 0xcafffffe),
+        (0x4b000001, 0x4b000001),
+        (0xcb000001, 0xcb000001),
+        (0x4b800000, 0x4b800000),
+        (0x7f7fffff, 0x7f7fffff),
+        (0xff7fffff, 0xff7fffff),
+        (0x7f800000, 0x7f800000),
+        (0xff800000, 0xff800000),
+        (0x7fc00000, 0x7fc00000),
+        (0xffc00000, 0xffc00000),
+        (0x7fc00001, 0x7fc00001),
+        (0xffc00001, 0xffc00001),
+        (0x7fa00000, 0x7fe00000),
+        (0xffa00000, 0xffe00000),
+        (0x7f800001, 0x7fc00001),
+        (0xff800001, 0xffc00001),
+        (0x7fbfffff, 0x7fffffff),
+        (0xffbfffff, 0xffffffff),
+        (0x7fffffff, 0x7fffffff),
+        (0xffffffff, 0xffffffff),
+        (0x7fc0beef, 0x7fc0beef),
+        (0xffc0beef, 0xffc0beef),
+        (0x7fa0beef, 0x7fe0beef),
+        (0xffa0beef, 0xffe0beef),
+        (0x3dcccccd, 0x3f800000),
+        (0xbdcccccd, 0x80000000),
+        (0x33800000, 0x3f800000),
+        (0xb3800000, 0x80000000),
+        (0x0000ffff, 0x3f800000),
+        (0x8000ffff, 0x80000000),
+        (0x3f7ffffe, 0x3f800000),
+        (0x3f800002, 0x40000000),
+        (0xbf7ffffe, 0x80000000),
+        (0xc0400000, 0xc0400000),
+        (0x40400000, 0x40400000),
+        (0x40490fdb, 0x40800000),
+        (0xc0490fdb, 0xc0400000),
+    ];
+
+    const CEIL_ARCHES: [Arch; 3] = [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201];
+
+    #[test]
+    fn ceil_matches_the_measured_hardware_edge_table_on_every_arch() {
+        let name = "v_ceil_f32_e32";
+        for arch in CEIL_ARCHES {
+            let i = insn_on(arch, name, vec![v(0), v(1)]);
+            let mut st = state();
+            st.exec = 1;
+            for &(x, want) in CEIL_EDGES {
+                st.v[1][0] = x;
+                execute(arch, name, &i, &mut st).unwrap();
+                assert_eq!(st.v[0][0], want, "{arch:?} ceil({x:#010x})");
+            }
+        }
+    }
+
+    // The documented corners by name: -0 for x in (-1, 0), +0 stays +0, ties up, NaN quieted with sign and payload kept,
+    // infinities and already-integral values unchanged, a positive denormal rounds up to 1.0 and a negative one to -0.
+    #[test]
+    fn ceil_corners() {
+        let name = "v_ceil_f32_e32";
+        for arch in CEIL_ARCHES {
+            for (x, want) in [
+                ((-0.25f32).to_bits(), 0x8000_0000),
+                ((-0.999_999_94f32).to_bits(), 0x8000_0000),
+                (0x8000_0000, 0x8000_0000),
+                (0x0000_0000, 0),
+                (0x0000_0001, 1.0f32.to_bits()),
+                (0x8000_0001, 0x8000_0000),
+                (1.0f32.to_bits(), 1.0f32.to_bits()),
+                (1.000_000_1f32.to_bits(), 2.0f32.to_bits()),
+                ((-1.5f32).to_bits(), (-1.0f32).to_bits()),
+                (2.5f32.to_bits(), 3.0f32.to_bits()),
+                (0x4b00_0001, 0x4b00_0001),
+                (INF, INF),
+                (SIGN | INF, SIGN | INF),
+                (0x7fa0_beef, 0x7fe0_beef),
+                (0xffa0_beef, 0xffe0_beef),
+                (0x7f80_0001, 0x7fc0_0001),
+                (0x7fc0_beef, 0x7fc0_beef),
+                (0xffff_ffff, 0xffff_ffff),
+            ] {
+                assert_eq!(
+                    lane_on(arch, name, &[x], 0xdead_beef, |_| {}),
+                    Ok(want),
+                    "{arch:?} ceil({x:#010x})"
+                );
+            }
+        }
+    }
+
+    // A NaN input with a source `abs` through the VOP3-style modifier stays a refusal, like the other NaN-propagating opcodes.
+    #[test]
+    fn ceil_nan_with_abs_modifier_is_refused() {
+        let name = "v_ceil_f32_e32";
+        let r = lane_on(Arch::Gfx1201, name, &[0x7fc0_0000], 0, |i| i.mods.abs = 1);
+        assert!(r.is_err(), "{r:?}");
+    }
+
+    // The opcodes the hipcc A-pack producers (`npu_trunk_pack_a_bf16*`) add next to `v_ceil_f32`: unsigned max (not
+    // signed), the three-way unsigned max, the f16 `neq` EXEC compare (true for NaN) and the SCC carry of the shifted add.
+    #[test]
+    fn pack_a_producer_opcodes_v_max_u32_v_max3_u32_cmpx_neq_f16_s_lshl1_add_u32() {
+        for arch in CEIL_ARCHES {
+            assert_eq!(
+                lane_on(arch, "v_max_u32_e32", &[0x8000_0000, 1], 0, |_| {}),
+                Ok(0x8000_0000),
+                "{arch:?}"
+            );
+            assert_eq!(
+                lane_on(arch, "v_max_u32_e32", &[7, 9], 0, |_| {}),
+                Ok(9),
+                "{arch:?}"
+            );
+            assert_eq!(
+                lane_on(arch, "v_max3_u32", &[3, 0xffff_fff0, 7], 0, |_| {}),
+                Ok(0xffff_fff0),
+                "{arch:?}"
+            );
+            assert_eq!(
+                lane_on(arch, "v_max3_u32", &[3, 4, 5], 0, |_| {}),
+                Ok(5),
+                "{arch:?}"
+            );
+            // V_CMPX_NEQ_F16: EXEC = !(S0 == S1) per lane (the compare is on the low halves).
+            let i = insn_on(
+                arch,
+                "v_cmpx_neq_f16_e32",
+                vec![Operand::Inline(InlineConst::Integer(0)), half(1, Half::Lo)],
+            );
+            for (x, want) in [
+                (0x0000u32, 0u64),
+                (0x8000, 0),
+                (0x3c00, 1),
+                (0x7e00, 1),
+                (0x0001, 1),
+            ] {
+                let mut st = state();
+                st.exec = 1;
+                st.v[1][0] = x;
+                execute(arch, "v_cmpx_neq_f16_e32", &i, &mut st).unwrap();
+                assert_eq!(st.exec, want, "{arch:?} cmpx_neq_f16(0, {x:#06x})");
+            }
+            let i = insn_on(arch, "s_lshl1_add_u32", vec![sreg(0), sreg(1), sreg(2)]);
+            for (a, b, want, carry) in [
+                (3u32, 1u32, 7u32, false),
+                (0x8000_0000, 0, 0, true),
+                (0x7fff_ffff, 2, 0, true),
+                (0x4000_0000, 5, 0x8000_0005, false),
+            ] {
+                let mut st = state();
+                st.exec = 1;
+                (st.s[1], st.s[2]) = (a, b);
+                execute(arch, "s_lshl1_add_u32", &i, &mut st).unwrap();
+                assert_eq!(
+                    (st.s[0], st.scc),
+                    (want, carry),
+                    "{arch:?} s_lshl1_add_u32({a:#x}, {b:#x})"
+                );
+            }
+        }
+    }
+
+    fn ceil_mix64(mut z: u64) -> u64 {
+        z = z.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    }
+
+    /// Per-chunk (65536 inputs) digests of the emulator over a chunk range, in the layout `ceil_sweep.hip` writes.
+    fn ceil_emulator_digests(arch: Arch, chunks: std::ops::Range<u32>) -> Vec<u64> {
+        let name = "v_ceil_f32_e32";
+        let i = insn_on(arch, name, vec![v(0), v(1)]);
+        let mut st = state();
+        let mut out = Vec::new();
+        for chunk in chunks {
+            let mut d = 0u64;
+            for base in (0u32..65536).step_by(32) {
+                for lane in 0..32u32 {
+                    st.v[1][lane as usize] = (chunk << 16) | (base + lane);
+                }
+                execute(arch, name, &i, &mut st).unwrap();
+                for lane in 0..32u32 {
+                    let x = (chunk << 16) | (base + lane);
+                    d ^= ceil_mix64((u64::from(x) << 32) | u64::from(st.v[0][lane as usize]));
+                }
+            }
+            out.push(d);
+        }
+        out
+    }
+
+    /// Smoke of the digest path on one chunk of each class (+0..+denormal, 1.0, +inf/NaN, negatives), always on: the
+    /// emulator digest of a chunk equals the digest of the host `ceil` formula the model is built from.
+    #[test]
+    fn ceil_digest_path_is_self_consistent() {
+        for chunk in [0u32, 0x3f80, 0x7f80, 0x8000, 0xbf80, 0xff80, 0xffff] {
+            let emu = ceil_emulator_digests(Arch::Gfx1201, chunk..chunk + 1)[0];
+            let mut d = 0u64;
+            for k in 0..65536u32 {
+                let x = (chunk << 16) | k;
+                let y = if is_nan(x) {
+                    x | QUIET
+                } else {
+                    f32::from_bits(x).ceil().to_bits()
+                };
+                d ^= ceil_mix64((u64::from(x) << 32) | u64::from(y));
+            }
+            assert_eq!(emu, d, "chunk {chunk:#x}");
+        }
+    }
+
+    /// Exhaustive 2^32 receipt: the emulator against the hardware digests of `ceil_sweep.hip`
+    /// (`PM_CEIL_DIGEST_DIR`: directory holding `ceil_digest_<gfx1100|gfx1151|gfx1201>_mode3.bin`; `PM_CEIL_ARCHES`:
+    /// comma list, default all three). Ignored by default: it runs 2^32 emulated lanes.
+    #[test]
+    #[ignore]
+    fn ceil_hardware_digest_sweep() {
+        let dir = std::env::var("PM_CEIL_DIGEST_DIR").expect("PM_CEIL_DIGEST_DIR");
+        let want =
+            std::env::var("PM_CEIL_ARCHES").unwrap_or_else(|_| "gfx1100,gfx1151,gfx1201".into());
+        let threads = std::thread::available_parallelism().map_or(1, |n| n.get()) as u32;
+        for tag in want.split(',') {
+            let arch = match tag {
+                "gfx1100" => Arch::Gfx1100,
+                "gfx1151" => Arch::Gfx1151,
+                _ => Arch::Gfx1201,
+            };
+            let raw = std::fs::read(format!("{dir}/ceil_digest_{tag}_mode3.bin")).unwrap();
+            assert_eq!(raw.len(), 65536 * 8);
+            let hw: Vec<u64> = raw
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect();
+            let per = 65536u32.div_ceil(threads);
+            let emu: Vec<u64> = std::thread::scope(|sc| {
+                let hs: Vec<_> = (0..threads)
+                    .map(|t| {
+                        let (a, b) = (t * per, ((t + 1) * per).min(65536));
+                        sc.spawn(move || ceil_emulator_digests(arch, a..b))
+                    })
+                    .collect();
+                hs.into_iter().flat_map(|h| h.join().unwrap()).collect()
+            });
+            let bad: Vec<usize> = (0..65536).filter(|&c| emu[c] != hw[c]).collect();
+            eprintln!(
+                "{tag}: {} inputs, {} chunk digest mismatches",
+                1u64 << 32,
+                bad.len()
+            );
+            assert!(
+                bad.is_empty(),
+                "{tag}: mismatching chunks {:?}",
+                &bad[..bad.len().min(16)]
+            );
+        }
+    }
+
     // Measured default NaN 0xffc00000 for invalid operations of non-NaN operands (gfx1151 and gfx1201 gids 0/2/3);
     // valid arithmetic is unchanged. v_subrev_f32 is in neither sweep: gfx1151 only takes the default NaN for it.
     // Gfx1100 keeps the hard errors.
@@ -5803,9 +6111,28 @@ mod tests {
             Ok(m(&|a, b| a == b))
         );
         assert_eq!(
-            cmp64("v_cmpx_gt_u64_e32", Arch::Gfx1201, &lanes, x).map(|r| r.2),
+            cmp64("v_cmpx_gt_u64_e32", Arch::Gfx1201, &lanes, x.clone()).map(|r| r.2),
             Ok(m(&|a, b| a > b))
         );
+        // Rows the hipcc `npu_trunk_epi_bf16` needs on gfx11 (and `ne` on gfx12): `v_cmpx_ne_u64_e32`, `v_cmpx_le_u64_e32`,
+        // `v_cmp_gt_u64_e64` (VOP3 form of an existing compare).
+        for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1201] {
+            assert_eq!(
+                cmp64("v_cmpx_ne_u64_e32", arch, &lanes, x.clone()).map(|r| r.2),
+                Ok(m(&|a, b| a != b)),
+                "{arch:?}"
+            );
+            assert_eq!(
+                cmp64("v_cmpx_le_u64_e32", arch, &lanes, x.clone()).map(|r| r.2),
+                Ok(m(&|a, b| a <= b)),
+                "{arch:?}"
+            );
+            assert_eq!(
+                cmp64("v_cmp_gt_u64_e64", arch, &lanes, e64.clone()).map(|r| r.0),
+                Ok(m(&|a, b| a > b)),
+                "{arch:?}"
+            );
+        }
         // Inline constants sign-extend: -1 as S0 equals u64::MAX and is below 0 as a signed value.
         let mut i = insn_on(
             Arch::Gfx1100,
