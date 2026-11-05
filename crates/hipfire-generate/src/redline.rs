@@ -3828,14 +3828,14 @@ fn redline_qwen4_replay_failure(
     // growth produces. The plan must refuse before the body, not after it.
     gpu.replay
         .set_prepared_max_position(context.saturating_sub(1));
-    let launches = gpu.replay.recorded_launches().len();
+    let launches = gpu.replay.retained_body_launches();
     let reprepared = if pm4 {
         gpu.replay
             .prepare_pm4_prefix(gpu.device_id as usize, launches)
             .map(|_| ())
     } else {
         gpu.replay
-            .prepare_linear_aql(gpu.device_id as usize)
+            .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
             .map(|_| ())
     };
     if let Err(reason) = reprepared {
@@ -3886,7 +3886,7 @@ fn redline_shadow_qwen4(
 ) -> Result<serde_json::Value, String> {
     // The replayed decode steps fetch PLE rows: hold the whole-request guard.
     let _ple_serving = loaded.ple_serving_guard();
-    let launches = gpu.replay.recorded_launches().len();
+    let launches = gpu.replay.retained_body_launches();
     if launches == 0 {
         return Err("Qwen4 Redline shadow requires a captured decode tape".to_string());
     }
@@ -3899,7 +3899,7 @@ fn redline_shadow_qwen4(
             .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
     } else {
         gpu.replay
-            .prepare_linear_aql(gpu.device_id as usize)
+            .prepare_linear_aql_prefix(gpu.device_id as usize, launches)
             .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
     }?;
     // Read while the plan is still installed: a replay consumes it.
@@ -3970,7 +3970,7 @@ fn redline_shadow_qwen4(
                 "command_dwords": identity.command_dwords,
                 "queues": identity.queue_count,
                 "phases": identity.phase_count,
-                "dispatch_equals_launches": identity.dispatch_count == capture.launch_count,
+                "dispatch_equals_launches": identity.dispatch_count == launches,
                 "queue_count": identity.queue_count,
                 "phase_count": identity.phase_count,
             })
@@ -4020,6 +4020,7 @@ fn redline_shadow_qwen4(
         },
         "capture": {
             "launches": capture.launch_count,
+            "body_launches": launches,
             "unique_kernels": capture.unique_kernel_count,
             "sequence_hash": format!("{:016x}", capture.sequence_hash),
             "aql_contracts": capture.unique_kernel_count,

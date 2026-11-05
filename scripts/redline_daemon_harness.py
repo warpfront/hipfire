@@ -165,7 +165,7 @@ def qwen4_shadow_failures(shadow):
     if not identity.get("dispatch_equals_launches"):
         failures.append(
             f"prepared dispatches {identity.get('dispatch_count')} != "
-            f"captured launches {capture.get('launches')}"
+            f"captured body launches {capture.get('body_launches', capture.get('launches'))}"
         )
     if identity.get("queue_count") != 1 or identity.get("phase_count") != 1:
         failures.append(f"prepared route is not single-queue/single-phase: {identity!r}")
@@ -256,7 +256,7 @@ def dflash_shadow_failures(shadow):
     if not identity.get("dispatch_equals_launches"):
         failures.append(
             f"prepared dispatches {identity.get('dispatch_count')} != "
-            f"captured launches {capture.get('launches')}"
+            f"captured body launches {capture.get('body_launches', capture.get('launches'))}"
         )
     if identity.get("queue_count") != 1 or identity.get("phase_count") != 1:
         failures.append(
