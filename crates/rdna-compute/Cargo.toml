@@ -40,6 +40,9 @@ peacemaker-rip = { path = "../peacemaker-rip" }
 name = "hetero_split_kernels_oracle"
 required-features = ["lab"]
 [[example]]
+name = "hetero_iu4_xarch_probe"
+required-features = ["lab"]
+[[example]]
 name = "npu_trunk_glue_check"
 required-features = ["lab"]
 [[example]]

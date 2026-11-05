@@ -22,7 +22,9 @@ use hipfire_dispatch::cpu_exec::CpuMoeExpert;
 use hipfire_dispatch::families::moe::{
     MoeRecipe, MoeRouteCapability, MoeRouteFormats, MoeRouteGeometry, MoeRoutePolicy,
 };
-use hipfire_dispatch::hetero_mailbox::{MailboxGeometry, PrefillGeometry, MAX_SUB_CHUNKS};
+use hipfire_dispatch::hetero_mailbox::{
+    int4_row_bytes, MailboxGeometry, PrefillGeometry, MAX_SUB_CHUNKS, ROWS_F16, ROWS_INT4,
+};
 use hipfire_dispatch::hetero_prefill::{
     run_cold_prefill, ColdPrefillConfig, ColdPrefillIo, ColdPrefillLayer, ColdPrefillScratch,
 };
@@ -37,7 +39,9 @@ const MI: usize = 640;
 const LAYERS: usize = 2;
 const SENTINEL: f32 = -7.0;
 const PREFILL_ROWS: usize = 2048;
-const F16_QUAD: [u16; 4] = [0x2c00, 0xb400, 0x3800, 0x3a00];
+/// Symmetric headers (`zp = -8 sc`: sc 1/16, zp -1/2), as Flash-Next's
+/// verified experts, so the prefill takes the symmetric IU4 route.
+const F16_QUAD: [u16; 4] = [0x2c00, 0xb800, 0x2c00, 0xb800];
 
 /// Finite synthetic weights, built as `hipfire-cpu`'s `testfix::weight_bytes`.
 fn weight_bytes(q: CpuQuant, m: usize, k: usize) -> Vec<u8> {
@@ -100,6 +104,15 @@ fn f32_to_f16_bits(v: f32) -> u16 {
         r += 1;
     }
     sign | r as u16
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = if h & 0x8000 != 0 { -1.0f32 } else { 1.0 };
+    let e = ((h >> 10) & 0x1f) as i32;
+    if e == 0 {
+        return sign * (h & 0x3ff) as f32 * 2f32.powi(-24);
+    }
+    sign * (1.0 + (h & 0x3ff) as f32 / 1024.0) * 2f32.powi(e - 15)
 }
 
 fn main() {
@@ -184,7 +197,7 @@ fn main() {
         gate_up_bytes: gu.len(),
         down_bytes: dn.len(),
         route_policy: Some(MoeRoutePolicy {
-            capability: MoeRouteCapability::Qt44Qt53Grouped,
+            capability: MoeRouteCapability::Qt44Qt53GroupedSymmetric,
             geometry: MoeRouteGeometry { experts: N_EXP, top_k: TOP_K, hidden: DIM, routed_intermediate: MI, shared_intermediate: MI },
             formats: MoeRouteFormats {
                 router: DType::BF16,
@@ -282,7 +295,9 @@ fn main() {
     let chunk = |rows: usize| {
         let ids: Vec<i32> = (0..rows * TOP_K).map(|s| ids[(s + s / TOP_K) % TOP_K]).collect();
         let w: Vec<f32> = (0..rows * TOP_K).map(|s| 0.05 + 0.01 * ((s * 7) % 11) as f32).collect();
-        let x: Vec<f32> = (0..rows * DIM).map(|i| (((i * 31) % 193) as f32 - 96.0) * 0.002).collect();
+        // F16-exact, so the int4 sidecar (quantized from these F32 rows) is
+        // the one the reference's F16 basis yields.
+        let x: Vec<f32> = (0..rows * DIM).map(|i| f16_bits_to_f32(f32_to_f16_bits((((i * 31) % 193) as f32 - 96.0) * 0.002))).collect();
         (ids, w, x)
     };
     let p_bm = upload_bytes(&mut r, &bitmap);
@@ -312,13 +327,36 @@ fn main() {
         streams[k] = r.active_stream.take();
         out
     }
-    let prefill_round = |r: &mut Gpu, streams: &mut [Option<hip_bridge::Stream>; 3], l: u32, rows: usize, subs: usize, x: &GpuTensor, ids: &GpuTensor, w: &GpuTensor, xb: &GpuTensor| {
+    // The expert device's int4 floor (0 = F16 only), published at its start.
+    // SAFETY: the slot's word, written once before `start` returned.
+    let int4_min_rows = unsafe { *((b + po.int4_min_rows as u64) as *const u32) } as usize;
+    println!("expert device int4 floor: {int4_min_rows} rows");
+    let i4_row = int4_row_bytes(DIM);
+    let marks: std::cell::RefCell<Option<Vec<(String, hip_bridge::Event)>>> = std::cell::RefCell::new(None);
+    let mark = |r: &mut Gpu, label: String| {
+        if let Some(v) = marks.borrow_mut().as_mut() {
+            let e = r.hip.event_create().unwrap();
+            r.hip.event_record(&e, r.active_stream.as_ref()).unwrap();
+            v.push((label, e));
+        }
+    };
+    let prefill_round = |r: &mut Gpu, streams: &mut [Option<hip_bridge::Stream>; 3], l: u32, rows: usize, subs: usize, int4: bool, x: &GpuTensor, ids: &GpuTensor, w: &GpuTensor, xb: &GpuTensor| {
         let split = PrefillGeometry { sub_chunks: subs, ..pgeom };
-        on(r, streams, 0, |r| {
+        let fmt = |n: usize| if int4 && int4_min_rows > 0 && n >= int4_min_rows { ROWS_INT4 } else { ROWS_F16 };
+        let sidecar = on(r, streams, 0, |r| {
+            mark(r, "start".into());
             r.hetero_token_advance(&counter).unwrap();
             r.hetero_publish_rows(x, ids, w, &p_bm, N_EXP as i32, rows as i32, TOP_K as i32, DIM as i32, &x_f16, b + po.ids as u64, b + po.weights as u64, &p_masked)
                 .unwrap();
+            // The chunk's int4 sidecar, once (the primary's own gate/up input
+            // in the real program); gathered per block below.
+            let sidecar = (0..subs).any(|i| fmt(split.sub_range(rows, i).1) == ROWS_INT4).then(|| {
+                let prepared = r.qwen4_moe_rotate256_i4(x, DIM, rows).unwrap();
+                r.int4_mmq_prepared_ptr(&prepared, DIM, rows).unwrap()
+            });
             r.hip.event_record(&published, r.active_stream.as_ref()).unwrap();
+            mark(r, "published".into());
+            sidecar
         });
         on(r, streams, 1, |r| {
             r.hip.stream_wait_event_on(r.active_stream.as_ref(), &published).unwrap();
@@ -327,10 +365,23 @@ fn main() {
                 if n == 0 {
                     continue;
                 }
-                let st = r.active_stream.as_ref().unwrap();
-                r.hip.memcpy_dtod_async_at(&mb_x, off * DIM * 2, &x_f16.buf, off * DIM * 2, n * DIM * 2, st).unwrap();
+                let f = fmt(n);
+                if f == ROWS_INT4 {
+                    // Block-major records: one run per K128 block, gathered
+                    // into the block's own [K/128][n] sidecar.
+                    let ptr = sidecar.expect("sidecar produced");
+                    // SAFETY: the live chunk sidecar.
+                    let src = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, rows * i4_row) };
+                    r.hip
+                        .memcpy_dtod_2d_async_at(&mb_x, off * i4_row, n * 72, &src, off * 72, rows * 72, n * 72, DIM / 128, r.active_stream.as_ref())
+                        .unwrap();
+                } else {
+                    let st = r.active_stream.as_ref().unwrap();
+                    r.hip.memcpy_dtod_async_at(&mb_x, off * DIM * 2, &x_f16.buf, off * DIM * 2, n * DIM * 2, st).unwrap();
+                }
                 let wd = po.sub[i];
-                r.hetero_release_rows(&counter, l, LAYERS as u32, off as i32, n as i32, b + wd.layer as u64, b + wd.req_seq as u64).unwrap();
+                r.hetero_release_rows(&counter, l, LAYERS as u32, off as i32, n as i32, f, b + wd.layer as u64, b + wd.req_seq as u64).unwrap();
+                mark(r, format!("out {i} released"));
             }
         });
         on(r, streams, 2, |r| {
@@ -344,8 +395,10 @@ fn main() {
                 let wd = po.sub[i];
                 let slot = HeteroSlotPtrs { req_seq: b + wd.req_seq as u64, resp_seq: b + wd.resp_seq as u64, error: b + po.error as u64, x_rot: 0, ids: 0, weights: 0, cold_out: 0 };
                 r.hetero_await_cold(&counter, l, LAYERS as u32, &slot, 50_000_000).unwrap();
+                mark(r, format!("back {i} answered"));
                 let st = r.active_stream.as_ref().unwrap();
                 r.hip.memcpy_dtod_async_at(&part_local.buf, off * DIM * 2, &mb_part, off * DIM * 2, n * DIM * 2, st).unwrap();
+                mark(r, format!("back {i} copied"));
             }
             r.hip.event_record(&returned, r.active_stream.as_ref()).unwrap();
         });
@@ -360,14 +413,21 @@ fn main() {
         }
     };
     let error_word = || unsafe { *((b + po.error as u64) as *const u32) };
-    for (l, rows, subs) in [(0u32, PREFILL_ROWS, 4usize), (1, 37, 4), (0, 2000, 1), (1, 5, 8)] {
+    for (l, rows, subs, int4) in [
+        (0u32, PREFILL_ROWS, 4usize, true),
+        (1, PREFILL_ROWS, 4, false),
+        (0, 1525, 2, true),
+        (1, 37, 4, true),
+        (0, 2000, 1, true),
+        (1, 5, 8, false),
+    ] {
         let (ids_v, w_v, x_v) = chunk(rows);
         let x_t = r.upload_f32(&x_v, &[rows, DIM]).unwrap();
         let ids_t = upload_bytes(&mut r, &ids_v.iter().flat_map(|v| v.to_ne_bytes()).collect::<Vec<u8>>());
         let w_t = r.upload_f32(&w_v, &[rows * TOP_K]).unwrap();
         let xb = r.upload_f32(&vec![0.0; rows * DIM], &[rows * DIM]).unwrap();
         r.hip.device_synchronize().unwrap();
-        prefill_round(&mut r, &mut streams, l, rows, subs, &x_t, &ids_t, &w_t, &xb);
+        prefill_round(&mut r, &mut streams, l, rows, subs, int4, &x_t, &ids_t, &w_t, &xb);
         sync_all(&mut r, &streams);
         if error_word() != 0 {
             fail(format!("prefill await timed out (responder: {:?})", responder.failure()));
@@ -381,7 +441,7 @@ fn main() {
             std::ptr::copy_nonoverlapping(ids_v.as_ptr(), ref_ids, ids_v.len());
             std::ptr::copy_nonoverlapping(w_v.as_ptr(), ref_w, w_v.len());
         }
-        let io = ColdPrefillIo { x_norm: ref_x as u64, ids: ref_ids as u64, weights: ref_w as u64, partial: ref_part as u64 };
+        let io = ColdPrefillIo { x_norm: ref_x as u64, format: ROWS_F16, ids: ref_ids as u64, weights: ref_w as u64, partial: ref_part as u64 };
         run_cold_prefill(&mut strix, &ref_layer, &ref_scratch, rows, io).unwrap_or_else(|e| fail(format!("ref run: {e:?}")));
         strix.hip.device_synchronize().unwrap();
         // SAFETY: as above.
@@ -398,7 +458,7 @@ fn main() {
         if let Some(i) = (0..rows * DIM).find(|&i| got[i].to_bits() != want[i].to_bits()) {
             fail(format!("prefill layer {l} rows {rows} subs {subs}: element {i}: {} != {}", got[i], want[i]));
         }
-        println!("prefill layer {l}, {rows} rows, {subs} sub-chunks: x_batch += partial bitwise == direct run_cold_prefill");
+        println!("prefill layer {l}, {rows} rows, {subs} sub-chunks, int4 {int4}: x_batch += partial bitwise == direct run_cold_prefill");
     }
     // Timing: 2,048-row layers, one per round, by sub-chunk count.
     let (ids_v, w_v, x_v) = chunk(PREFILL_ROWS);
@@ -407,11 +467,11 @@ fn main() {
     let w_t = r.upload_f32(&w_v, &[PREFILL_ROWS * TOP_K]).unwrap();
     let xb = r.upload_f32(&vec![0.0; PREFILL_ROWS * DIM], &[PREFILL_ROWS * DIM]).unwrap();
     let rounds = 48;
-    for subs in [1usize, 2, 4, 8] {
+    for (subs, int4) in [(1usize, false), (4, false), (1, true), (2, true), (4, true)] {
         r.hip.device_synchronize().unwrap();
         let t = Instant::now();
         for i in 0..rounds {
-            prefill_round(&mut r, &mut streams, (i % LAYERS) as u32, PREFILL_ROWS, subs, &x_t, &ids_t, &w_t, &xb);
+            prefill_round(&mut r, &mut streams, (i % LAYERS) as u32, PREFILL_ROWS, subs, int4, &x_t, &ids_t, &w_t, &xb);
         }
         sync_all(&mut r, &streams);
         let ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
@@ -419,9 +479,22 @@ fn main() {
             fail(format!("timed prefill hit a timeout (responder: {:?})", responder.failure()));
         }
         println!(
-            "prefill: {PREFILL_ROWS}-row layer, {subs} sub-chunks: {ms:.2} ms -> {:.0} rows/s over 48 layers",
+            "prefill: {PREFILL_ROWS}-row layer, {subs} sub-chunks, int4 {int4}: {ms:.2} ms -> {:.0} rows/s over 48 layers",
             PREFILL_ROWS as f64 / (ms * 48.0 / 1e3)
         );
+    }
+    // One instrumented round (int4, 4 blocks): event times from the start.
+    for _ in 0..3 {
+        prefill_round(&mut r, &mut streams, 0, PREFILL_ROWS, 4, true, &x_t, &ids_t, &w_t, &xb);
+    }
+    sync_all(&mut r, &streams);
+    *marks.borrow_mut() = Some(Vec::new());
+    prefill_round(&mut r, &mut streams, 1, PREFILL_ROWS, 4, true, &x_t, &ids_t, &w_t, &xb);
+    sync_all(&mut r, &streams);
+    let taken = marks.borrow_mut().take().unwrap();
+    let start = &taken[0].1;
+    for (label, e) in &taken[1..] {
+        println!("  timeline {label:>18}: {:6.2} ms", r.hip.event_elapsed_ms(start, e).unwrap());
     }
     // The link legs alone, by copy engine (10.5 MB each way).
     let time_copy = |r: &mut Gpu, dst: &hip_bridge::DeviceBuffer, src: &hip_bridge::DeviceBuffer| {
@@ -453,8 +526,8 @@ fn main() {
     let both_ms = t.elapsed().as_secs_f64() * 1e3 / rounds as f64;
     println!("prefill link legs concurrently: {both_ms:.2} ms (serial sum {:.2} ms)", out_ms + back_ms);
     // Strix compute alone per block size (direct calls on the second context).
-    for rows in [32usize, 64, 128, 192, 255, 256, 257, 320, 384, 448, 511, 512, 1024, 2048] {
-        let io = ColdPrefillIo { x_norm: ref_x as u64, ids: ref_ids as u64, weights: ref_w as u64, partial: ref_part as u64 };
+    for rows in [256usize, 512, 2048] {
+        let io = ColdPrefillIo { x_norm: ref_x as u64, format: ROWS_F16, ids: ref_ids as u64, weights: ref_w as u64, partial: ref_part as u64 };
         // SAFETY: reference buffers sized for PREFILL_ROWS.
         unsafe {
             let x16: Vec<u16> = x_v.iter().map(|&v| f32_to_f16_bits(v)).collect();

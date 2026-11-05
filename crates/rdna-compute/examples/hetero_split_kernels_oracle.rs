@@ -322,7 +322,7 @@ fn main() {
         for i in 0..SUBS {
             let (off, n) = sub_range(rows, i);
             gpu.hip.memcpy_dtod_async_default_at(&mb_x, off * DIM * 2, &x_f16.buf, off * DIM * 2, n * DIM * 2).unwrap();
-            gpu.hetero_release_rows(&counter, layer, LAYERS, off as i32, n as i32, meta(i), req(i)).unwrap();
+            gpu.hetero_release_rows(&counter, layer, LAYERS, off as i32, n as i32, (i % 2) as u32, meta(i), req(i)).unwrap();
         }
         for i in 0..SUBS {
             let (off, n) = sub_range(rows, i);
@@ -346,10 +346,11 @@ fn main() {
                         return Err(format!("sub {i}: request never seen"));
                     }
                 }
-                let (l, off, n) = (word(meta(i)).load(Ordering::Acquire), word(meta(i) + 4).load(Ordering::Acquire), word(meta(i) + 8).load(Ordering::Acquire));
+                let m = |k: u64| word(meta(i) + 4 * k).load(Ordering::Acquire);
+                let (l, off, n, f) = (m(0), m(1), m(2), m(3));
                 let (woff, wn) = sub_range(rows, i);
-                if (l, off as usize, n as usize) != (layer, woff, wn) {
-                    return Err(format!("sub {i}: meta ({l}, {off}, {n}) != ({layer}, {woff}, {wn})"));
+                if (l, off as usize, n as usize, f) != (layer, woff, wn, (i % 2) as u32) {
+                    return Err(format!("sub {i}: meta ({l}, {off}, {n}, {f}) != ({layer}, {woff}, {wn}, {})", i % 2));
                 }
                 // SAFETY: the slot's F16 rows and BF16 partial.
                 let (xg, out) = unsafe {

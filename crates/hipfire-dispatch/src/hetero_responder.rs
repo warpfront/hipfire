@@ -26,7 +26,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use crate::hetero_mailbox::{MailboxGeometry, PrefillGeometry, PrefillOffsets};
+use crate::hetero_mailbox::{
+    int4_row_bytes, MailboxGeometry, PrefillGeometry, PrefillOffsets, MIN_SUB_CHUNK_ROWS, ROWS_F16, ROWS_INT4,
+};
 use crate::hetero_prefill::{
     run_cold_prefill, ColdPrefillConfig, ColdPrefillIo, ColdPrefillLayer, ColdPrefillScratch,
 };
@@ -111,13 +113,16 @@ struct Graphs {
 }
 
 impl Prefill {
-    /// The slot's fields for the block starting at row `row_off`.
-    fn io(&self, base: u64, row_off: usize) -> ColdPrefillIo {
+    /// The slot's fields for the block starting at row `row_off`, its rows in
+    /// `format`.
+    fn io(&self, base: u64, row_off: usize, format: u32) -> ColdPrefillIo {
         let o = self.serve.offsets;
         let c = self.serve.cold;
+        let row_bytes = if format == ROWS_INT4 { int4_row_bytes(c.dim) } else { c.dim * 2 };
         let (row16, route) = ((row_off * c.dim * 2) as u64, (row_off * c.top_k * 4) as u64);
         ColdPrefillIo {
-            x_norm: base + o.x_norm as u64 + row16,
+            x_norm: base + o.x_norm as u64 + (row_off * row_bytes) as u64,
+            format,
             ids: base + o.ids as u64 + route,
             weights: base + o.weights as u64 + route,
             partial: base + o.partial as u64 + row16,
@@ -133,13 +138,14 @@ fn serve_prefill(
     layer: u32,
     row_off: u32,
     rows: u32,
+    format: u32,
 ) -> Result<(), String> {
     let p = gr.prefill.as_ref().ok_or("prefill request without a prefill slot")?;
     let (layer, row_off, rows) = (layer as usize, row_off as usize, rows as usize);
     if layer >= p.layers.len() || rows == 0 || row_off + rows > p.scratch.max_rows() {
         return Err(format!("prefill request for layer {layer}, rows {row_off}+{rows} is out of range"));
     }
-    let io = p.io(cfg.mailbox_base, row_off);
+    let io = p.io(cfg.mailbox_base, row_off, format);
     run_cold_prefill(&mut gr.gpu, &p.layers[layer], &p.scratch, rows, io).map_err(|e| format!("{e:?}"))?;
     let w = p.serve.offsets.sub[sub];
     let base = cfg.mailbox_base;
@@ -168,8 +174,9 @@ fn build_prefill(gpu: &mut rdna_compute::Gpu, cfg: &ResponderConfig, serve: Pref
         .iter()
         .enumerate()
         .find_map(|(l, cl)| cl.cold_bitmap.iter().position(|&b| b != 0).map(|e| (l, e)));
+    let mut int4_min_rows = 0u32;
     if let Some((layer, expert)) = warm {
-        let io = p.io(cfg.mailbox_base, 0);
+        let io = p.io(cfg.mailbox_base, 0, ROWS_F16);
         let slots = c.max_rows * c.top_k;
         // SAFETY: the idle prefill slot's ids/weights/x fields, sized for max_rows.
         unsafe {
@@ -185,7 +192,26 @@ fn build_prefill(gpu: &mut rdna_compute::Gpu, cfg: &ResponderConfig, serve: Pref
         }
         let st = gpu.active_stream.as_ref().expect("responder stream is installed");
         gpu.hip.stream_synchronize(st).map_err(|e| e.to_string())?;
+        // The int4 floor: blocks from MIN_SUB_CHUNK_ROWS to max_rows must
+        // take the symmetric IU4 arm (a zero sidecar is a valid activation).
+        // Any refusal publishes 0 and the primary sends F16 only.
+        if c.max_rows >= MIN_SUB_CHUNK_ROWS {
+            let io4 = p.io(cfg.mailbox_base, 0, ROWS_INT4);
+            // SAFETY: the idle prefill slot's row area holds max_rows int4 rows.
+            unsafe {
+                std::slice::from_raw_parts_mut(io4.x_norm as *mut u8, c.max_rows * int4_row_bytes(c.dim)).fill(0);
+            }
+            let admits = [MIN_SUB_CHUNK_ROWS, c.max_rows]
+                .iter()
+                .all(|&r| run_cold_prefill(gpu, &p.layers[layer], &p.scratch, r, io4).is_ok());
+            let st = gpu.active_stream.as_ref().expect("responder stream is installed");
+            gpu.hip.stream_synchronize(st).map_err(|e| e.to_string())?;
+            if admits {
+                int4_min_rows = MIN_SUB_CHUNK_ROWS as u32;
+            }
+        }
     }
+    word(cfg, serve.offsets.int4_min_rows).store(int4_min_rows, Ordering::Release);
     Ok(p)
 }
 
@@ -317,7 +343,9 @@ impl HeteroResponder {
                 let prefill_words: Vec<_> = cfg.prefill.map_or(Vec::new(), |p| {
                     p.offsets.sub[..p.sub_chunks]
                         .iter()
-                        .map(|w| (word(&cfg, w.req_seq), word(&cfg, w.layer), word(&cfg, w.row_off), word(&cfg, w.rows)))
+                        .map(|w| {
+                            (word(&cfg, w.req_seq), word(&cfg, w.layer), word(&cfg, w.row_off), word(&cfg, w.rows), word(&cfg, w.format))
+                        })
                         .collect()
                 });
                 let mut last_prefill: Vec<u32> =
@@ -326,7 +354,7 @@ impl HeteroResponder {
                 while !stop2.load(Ordering::Acquire) {
                     let mut busy = false;
                     // Sub-chunks in order: the primary releases them in order.
-                    for (i, (req, layer, row_off, rows)) in prefill_words.iter().enumerate() {
+                    for (i, (req, layer, row_off, rows, format)) in prefill_words.iter().enumerate() {
                         let r = req.load(Ordering::Acquire);
                         if r != last_prefill[i] {
                             last_prefill[i] = r;
@@ -334,12 +362,13 @@ impl HeteroResponder {
                             // The primary stores the meta before its request
                             // word (release); this Acquire load of the
                             // request orders the meta reads after it.
-                            let (l, off, rw) = (
+                            let (l, off, rw, f) = (
                                 layer.load(Ordering::Acquire),
                                 row_off.load(Ordering::Acquire),
                                 rows.load(Ordering::Acquire),
+                                format.load(Ordering::Acquire),
                             );
-                            if let Err(e) = serve_prefill(&mut graphs, &cfg, i, l, off, rw) {
+                            if let Err(e) = serve_prefill(&mut graphs, &cfg, i, l, off, rw, f) {
                                 if let Ok(mut f) = failure2.lock() {
                                     *f = Some(format!("prefill layer {l} sub {i}: {e}"));
                                 }

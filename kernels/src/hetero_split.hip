@@ -136,8 +136,8 @@ extern "C" __global__ void hetero_publish_rows(
     }
 }
 
-// Prefill, one thread: record one sub-chunk's layer, first row and row count
-// on its meta line, then release its request word. Queued after the copy of
+// Prefill, one thread: record one sub-chunk's layer, first row, row count and
+// row format on its meta line, then release its request word. Queued after the copy of
 // the sub-chunk's rows (and after hetero_publish_rows) on the same stream.
 extern "C" __global__ void hetero_release_rows(
     const unsigned* __restrict__ counter,
@@ -145,12 +145,14 @@ extern "C" __global__ void hetero_release_rows(
     unsigned layers,
     int row_off,
     int rows,
+    unsigned format,
     unsigned* meta,
     unsigned* req_seq) {
     if (blockIdx.x != 0 || threadIdx.x != 0) return;
     hs_store(meta, layer);
     hs_store(meta + 1, (unsigned)row_off);
     hs_store(meta + 2, (unsigned)rows);
+    hs_store(meta + 3, format);
     __threadfence_system();
     hs_store(req_seq, hs_seq(counter[0], layer, layers));
 }

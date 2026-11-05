@@ -978,7 +978,7 @@ impl<'a> SealedMoeOp<'a> {
                 && !selection.cpu_deferred_experts
                 && !matches!(
                     params.prelude.route,
-                    super::sealed_moe::PrefillRouteMode::HeteroCold
+                    super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
                 )
                 && super::qt44_qt53_prefill::front_applies(
                     gpu,
@@ -2641,7 +2641,7 @@ fn lower_prefill<'a>(
     append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Normalize))?;
     if matches!(
         params.prelude.route,
-        super::sealed_moe::PrefillRouteMode::HeteroCold
+        super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
     ) {
         // The hetero expert device: the primary's route is already in the
         // top-k buffers, so no router, route or shared stage runs; only the
@@ -2651,7 +2651,14 @@ fn lower_prefill<'a>(
                 "sealed moe: HeteroCold prefill admits no CPU split, CPU deferral or Paro basis".into(),
             ));
         }
-        append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+        // A shipped int4 sidecar is the gate/up's activation: no basis runs.
+        let shipped_xq = matches!(
+            params.prelude.route,
+            super::sealed_moe::PrefillRouteMode::HeteroCold { xq: Some(_) }
+        );
+        if !shipped_xq {
+            append_step(&mut steps, Step::MoeStage(op(state), MoeStage::InputBasis))?;
+        }
         if selection.uses_grouped_rows() {
             append_step(&mut steps, Step::MoeStage(op(state), MoeStage::Scatter))?;
         }
@@ -4320,12 +4327,12 @@ pub(super) fn select_prefill(
         && matches!(
             params.prelude.route,
             super::sealed_moe::PrefillRouteMode::Replicated
-                | super::sealed_moe::PrefillRouteMode::HeteroCold
+                | super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
         ))
     .then(|| {
         if matches!(
             params.prelude.route,
-            super::sealed_moe::PrefillRouteMode::HeteroCold
+            super::sealed_moe::PrefillRouteMode::HeteroCold { .. }
         ) {
             return super::select_grouped_route_routed_only(
                 &params.dtypes,

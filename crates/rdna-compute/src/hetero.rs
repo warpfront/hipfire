@@ -254,7 +254,8 @@ impl Gpu {
     }
 
     /// Prefill, one sub-chunk, after its rows were copied: write the layer,
-    /// first row and row count at `meta` (three u32), then release `req_seq`.
+    /// first row, row count and row format at `meta` (four u32), then release
+    /// `req_seq`.
     #[allow(clippy::too_many_arguments)]
     pub fn hetero_release_rows(
         &mut self,
@@ -263,12 +264,13 @@ impl Gpu {
         layers: u32,
         row_off: i32,
         rows: i32,
+        format: u32,
         meta: u64,
         req_seq: u64,
     ) -> HipResult<()> {
         let c = counter.buf.as_ptr();
         let (me, rq) = (meta as *mut c_void, req_seq as *mut c_void);
-        let mut params = vec![p(&c), p(&layer), p(&layers), p(&row_off), p(&rows), p(&me), p(&rq)];
+        let mut params = vec![p(&c), p(&layer), p(&layers), p(&row_off), p(&rows), p(&format), p(&me), p(&rq)];
         self.hetero_launch("hetero_release_rows", 1, 1, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(c);
@@ -276,6 +278,7 @@ impl Gpu {
             b.push_u32(layers);
             b.push_i32(row_off);
             b.push_i32(rows);
+            b.push_u32(format);
             b.push_ptr(me);
             b.push_ptr(rq);
             b
