@@ -239,10 +239,10 @@ mod moe_verify_iu4;
 mod mq6;
 #[path = "pm_loop/prod.rs"]
 mod prod;
-#[path = "pm_loop/qkvzaset.rs"]
-mod qkvzaset;
 #[path = "pm_loop/qkvzagdn.rs"]
 mod qkvzagdn;
+#[path = "pm_loop/qkvzaset.rs"]
+mod qkvzaset;
 #[path = "pm_loop/rotate.rs"]
 mod rotate;
 #[path = "pm_loop/workload.rs"]
